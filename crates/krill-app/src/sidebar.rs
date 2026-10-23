@@ -532,6 +532,14 @@ fn save_state(
 #[derive(Debug)]
 pub struct Selected(pub SessionId);
 
+/// 워크스페이스 선택은 마지막에 사용한 탭·칸을 셸이 복원한다.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSelected {
+    pub host: HostId,
+    pub path: PathBuf,
+    pub focus_terminal: bool,
+}
+
 /// 빈 상태의 '폴더 열기' 버튼. 셸이 기존 폴더 열기 경로(`choose_folder`)로 받는다(OWE-654).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFolder;
@@ -653,6 +661,7 @@ pub struct Sidebar {
     task: Option<Task<()>>,
     source: Option<Arc<dyn Source>>,
     card_list: viewport::CardList,
+    hovered_worktree: Option<(HostId, PathBuf)>,
     editing: Option<(PathBuf, Entity<InputState>)>,
     edit_subscription: Option<Subscription>,
     orca_import_subscription: Option<Subscription>,
@@ -695,6 +704,7 @@ pub struct Sidebar {
 }
 
 impl EventEmitter<Selected> for Sidebar {}
+impl EventEmitter<WorkspaceSelected> for Sidebar {}
 impl EventEmitter<NewSession> for Sidebar {}
 impl EventEmitter<OpenWorkspace> for Sidebar {}
 impl EventEmitter<CloseSession> for Sidebar {}
@@ -811,6 +821,7 @@ impl Sidebar {
             visible: true,
             active: true,
             cursor: None,
+            hovered_worktree: None,
             focus: None,
             back: None,
             #[cfg(test)]
@@ -1591,6 +1602,28 @@ impl Sidebar {
         self.unread.contains(&id)
     }
 
+    pub(crate) fn mark_workspace_read(
+        &mut self,
+        host: &HostId,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if !host.is_local() {
+            return;
+        }
+        let ids: Vec<_> = self
+            .snapshot_for(host)
+            .sessions
+            .iter()
+            .filter(|s| s.worktree.as_deref().or(s.cwd.as_deref()) == Some(path))
+            .map(|s| s.id)
+            .collect();
+        for id in ids {
+            self.unread.remove(&id);
+        }
+        self.rebuild(cx);
+    }
+
     /// OWE-662: 셸이 포커스 칸의 세션을 알린다. 그 세션의 미확인 표시를 끈다.
     pub fn set_focused(&mut self, session: Option<SessionId>, cx: &mut Context<Self>) {
         let changed = self.focused != session;
@@ -2269,22 +2302,21 @@ impl Sidebar {
     }
 
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(last) = self.rows.len().checked_sub(1) else {
+        let workspaces = self.visible_workspaces();
+        if workspaces.is_empty() {
             return;
-        };
-        let next = self
-            .cursor
-            .map_or(0, |i| i.saturating_add_signed(delta).min(last));
-        self.cursor = Some(next);
-        self.sync_viewport();
-        if let Some(folder) = self.cursor_folder()
-            && self.selected_worktree.as_ref() != Some(&folder)
-        {
-            self.selected_worktree = Some(folder);
-            self.write_state(cx);
         }
-        self.scroll_row_into_view(next, ScrollStrategy::Nearest);
-        cx.notify();
+        let current = workspaces
+            .iter()
+            .position(|(index, _, _)| Some(*index) == self.cursor);
+        let next = current.map_or(if delta < 0 { workspaces.len() - 1 } else { 0 }, |i| {
+            (i.cast_signed() + delta)
+                .rem_euclid(workspaces.len().cast_signed())
+                .cast_unsigned()
+        });
+        let (index, host, path) = workspaces[next].clone();
+        self.activate_worktree_card(index, host, path, false, cx);
+        self.scroll_row_into_view(index, ScrollStrategy::Nearest);
     }
 
     fn cursor_row(&self) -> Option<&Row> {
@@ -2376,7 +2408,7 @@ impl Sidebar {
         index: usize,
         host: HostId,
         path: PathBuf,
-        window: Option<&mut Window>,
+        focus_terminal: bool,
         cx: &mut Context<Self>,
     ) {
         if self.editing.as_ref().is_some_and(|(p, _)| p == &path) {
@@ -2387,24 +2419,47 @@ impl Sidebar {
             self.selected_worktree = Some(path.clone());
             self.write_state(cx);
         }
-        if let Some(sess_id) = self
-            .snapshot_for(&host)
+        cx.emit(WorkspaceSelected {
+            host,
+            path,
+            focus_terminal,
+        });
+        cx.notify();
+    }
+
+    /// 필터·접힘을 적용한 화면 순서. 호스트가 달라도 같은 경로를 구분한다.
+    pub fn session_for_workspace(&self, host: &HostId, folder: &Path) -> Option<SessionId> {
+        self.snapshot_for(host)
             .sessions
             .iter()
-            .find(|sess| {
-                sess.worktree.as_ref() == Some(&path)
-                    || (sess.worktree.is_none() && sess.cwd.as_ref() == Some(&path))
+            .find(|s| s.worktree.as_deref().or(s.cwd.as_deref()) == Some(folder))
+            .map(|s| s.id)
+    }
+
+    pub fn visible_workspaces(&self) -> Vec<(usize, HostId, PathBuf)> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| match row {
+                Row::Worktree(path) | Row::Folder(path) => {
+                    Some((index, self.row_host(index).clone(), path.clone()))
+                }
+                _ => None,
             })
-            .map(|sess| sess.id)
-        {
-            self.select_session_on(index, host, sess_id, cx);
-        } else {
-            cx.emit(OpenWorkspace { host, cwd: path });
-            if let Some(window) = window {
-                self.leave(window, cx);
-            } else {
-                cx.notify();
-            }
+            .collect()
+    }
+
+    pub fn activate_workspace_index(&mut self, position: usize, cx: &mut Context<Self>) {
+        if let Some((index, host, path)) = self.visible_workspaces().get(position).cloned() {
+            self.cursor = Some(index);
+            self.selected_worktree = Some(path.clone());
+            self.write_state(cx);
+            cx.emit(WorkspaceSelected {
+                host,
+                path,
+                focus_terminal: true,
+            });
+            cx.notify();
         }
     }
 
@@ -2466,7 +2521,8 @@ impl Sidebar {
             }
             Some(Row::Worktree(path) | Row::Folder(path)) => {
                 let host = self.row_host(cursor).clone();
-                self.new_session_on(host, path, Program::Login, Some(window), cx);
+                self.activate_worktree_card(cursor, host, path, true, cx);
+                self.leave(window, cx);
             }
             Some(Row::HiddenWorktrees(repo, _, _)) => self.toggle_external(&repo, cx),
             Some(Row::OfflineHosts(_)) => self.toggle_offline_hosts(None, cx),

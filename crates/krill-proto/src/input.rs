@@ -199,6 +199,19 @@ impl Journal {
         self.linked = false;
     }
 
+    /// Mouse reports describe the current screen only. Never hold, replay, or include them in
+    /// lost-input notices. Share the input ID sequence so late ACKs cannot acknowledge newer typing.
+    pub fn report(&mut self, bytes: &[u8]) -> Option<Input> {
+        if !self.linked || bytes.is_empty() || bytes.len() > MAX_INPUT {
+            return None;
+        }
+        self.last = self.last.saturating_add(1);
+        Some(Input {
+            id: InputId(self.last),
+            bytes: bytes.to_vec(),
+        })
+    }
+
     /// 사용자 입력. 붙어 있으면 지금 보낼 프레임들([`MAX_INPUT`]씩 나눔)을, 끊겨 있으면 보류하고 빈 목록을 준다.
     /// 보류·ACK 대기 바이트 또는 항목 상한을 넘으면 통째로 받지 않고 [`Fate::Full`].
     pub fn input(&mut self, bytes: &[u8], now: Now) -> Result<Vec<Input>, Notice> {
@@ -256,6 +269,10 @@ impl Journal {
     /// krilld의 답. 그 입력(과 krilld가 순서대로 이미 처리한 앞 입력)을 장부에서 지운다. 세션이 끝나 쓰지
     /// 않았으면 [`Fate::SessionClosed`]. 모르는 id는 무시한다.
     pub fn ack(&mut self, ack: &InputAck) -> Option<Notice> {
+        // Ephemeral reports share the ID sequence, but their ACKs cannot settle typing.
+        if !self.sent.iter().any(|entry| entry.id == ack.id) {
+            return None;
+        }
         let n = self.sent.iter().take_while(|e| e.id <= ack.id).count();
         let done: Vec<Entry> = self.sent.drain(..n).collect();
         let acked = done.last().filter(|e| e.id == ack.id)?;

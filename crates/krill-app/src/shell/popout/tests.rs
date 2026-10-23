@@ -318,7 +318,7 @@ fn status_bar_right_click_opens_menu(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("status-bar-menu-refresh").is_some());
 }
 
-fn open(cx: &mut TestAppContext) -> (Entity<Shell>, gpui::AnyWindowHandle) {
+pub(super) fn open(cx: &mut TestAppContext) -> (Entity<Shell>, gpui::AnyWindowHandle) {
     cx.update(|cx| {
         gpui_component::init(cx);
         super::super::bind_keys(cx);
@@ -965,7 +965,7 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
             let pane_b = shell.layout.active_tab().focused;
             shell.layout.set_session(pane_b, SessionId(2));
             shell.layout.focus(pane_a);
-            shell.zoomed_pane = Some(pane_a);
+            shell.layout.set_zoomed_pane(Some(pane_a));
             shell.toggle_sidebar(cx);
             assert!(!shell.sidebar.read(cx).is_visible());
             shell.sidebar.update(cx, |s, cx| {
@@ -1011,7 +1011,7 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
         assert!(shell.dashboard.is_none());
         assert!(shell.settings.is_none(), "설정 화면이 닫힌다");
         assert!(
-            shell.zoomed_pane.is_none(),
+            shell.layout.zoomed_pane().is_none(),
             "다른 칸이 확대되어 있었으면 확대를 풀어 선택한 세션을 보이게 한다"
         );
         assert!(

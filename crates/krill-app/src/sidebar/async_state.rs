@@ -26,6 +26,8 @@ pub(super) struct State {
     imported: Snapshot,
     imported_meta: Meta,
     pub folder_updated_at: BTreeMap<PathBuf, u64>,
+    /// 워크트리 폴더 생성 시각(ms). `SortBy::Created` 정렬 키.
+    pub worktree_created_at: BTreeMap<PathBuf, u64>,
 }
 
 #[derive(Default)]
@@ -194,6 +196,7 @@ pub(super) struct DiskSnapshot {
     auto_titles: BTreeMap<SessionId, String>,
     visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
     folder_updated_at: BTreeMap<PathBuf, u64>,
+    worktree_created_at: BTreeMap<PathBuf, u64>,
 }
 
 impl DiskSnapshot {
@@ -274,6 +277,12 @@ impl DiskSnapshot {
                 Some((p.clone(), ts))
             })
             .collect();
+        let worktree_created_at = snapshot
+            .trees
+            .values()
+            .flatten()
+            .filter_map(|p| Some((p.clone(), created_ms(p)?)))
+            .collect();
         Self {
             basis,
             snapshot,
@@ -291,8 +300,16 @@ impl DiskSnapshot {
             auto_titles: load_auto_titles_from_sidebar_path(path),
             visuals,
             folder_updated_at,
+            worktree_created_at,
         }
     }
+}
+
+/// 폴더 생성 시각(ms). Orca Manual 정렬의 생성 시각(`manualOrder`)에 해당한다.
+fn created_ms(path: &Path) -> Option<u64> {
+    let created = fs::metadata(path).ok()?.created().ok()?;
+    let since = created.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_millis()).ok()
 }
 
 fn folder_paths(snapshot: &Snapshot) -> BTreeSet<&Path> {
@@ -425,6 +442,7 @@ impl Sidebar {
             || self.disk.store != data.store
             || self.disk.orchestration != data.orchestration
             || self.disk.folder_updated_at != data.folder_updated_at
+            || self.disk.worktree_created_at != data.worktree_created_at
             || (self.path.is_some()
                 && (self.comments != data.comments || self.auto_titles != data.auto_titles))
             || data.prefs.keys().any(|key| !self.prefs.contains_key(key))
@@ -443,55 +461,19 @@ impl Sidebar {
         }
         self.project_visuals = data.visuals;
         self.disk.folder_updated_at = data.folder_updated_at;
+        self.disk.worktree_created_at = data.worktree_created_at;
         self.disk.store = data.store;
         self.disk.orchestration = data.orchestration;
         self.disk.imported = data.imported;
         self.disk.imported_meta = data.imported_meta;
         // Disk is the SSOT for lineage after preceding writes finish.
         let auto = if self.state_dir().is_some() {
-            let old_parents = self.parents.clone();
             self.parents = data.parents;
-            // Orca처럼 처음 묶인 계보 부모는 접힌 상태로 시작한다(하단 평탄 목록 방지).
-            // 이미 자식이 있던 부모·세션이 있는 자식은 건드리지 않아 펼침 선택을 유지한다.
-            let occupied: std::collections::BTreeSet<&Path> = data
-                .snapshot
-                .sessions
-                .iter()
-                .filter_map(|s| s.worktree.as_deref())
-                .collect();
-            let mut by_parent: std::collections::BTreeMap<&PathBuf, usize> =
-                std::collections::BTreeMap::new();
-            let mut is_new_main: std::collections::BTreeSet<&PathBuf> =
-                std::collections::BTreeSet::new();
-            for (child, parent) in &self.parents {
-                if occupied.contains(child.as_path()) {
-                    continue;
-                }
-                *by_parent.entry(parent).or_default() += 1;
-                if !old_parents.contains_key(child) {
-                    is_new_main.insert(parent);
-                }
-            }
-            let had: std::collections::BTreeSet<&PathBuf> = old_parents.values().collect();
-            let mut lineage_changed = false;
-            for (parent, count) in by_parent {
-                if count < 2 || !is_new_main.contains(parent) {
-                    continue;
-                }
-                if self.collapsed_lineage.contains(parent) {
-                    continue;
-                }
-                // 예전부터 자식이 있던 그룹은 펼침 유지: 이번에 처음 묶인 경우만 접는다.
-                if had.contains(parent) {
-                    continue;
-                }
-                self.collapsed_lineage.insert(parent.clone());
-                lineage_changed = true;
-            }
+            // 계보 부모는 펼친 상태로 시작한다. 접힘은 사용자가 토글로 고른 것만 남는다.
             self.worktree_statuses = data.statuses;
             self.worktree_updated_at = data.updated_at;
             self.issues = data.issues;
-            self.auto_collapse_idle_heavy_repos(&data.imported_paths) || lineage_changed
+            self.auto_collapse_idle_heavy_repos(&data.imported_paths)
         } else {
             false
         };

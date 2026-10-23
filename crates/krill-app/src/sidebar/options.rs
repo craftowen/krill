@@ -86,14 +86,17 @@ impl GroupBy {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SortBy {
     /// 스마트 정렬: 승인/주의 필요 → 완료 미확인 → 작업 중 → 완료 → 최근 활동순 → 이름순.
-    #[default]
     Smart,
+    #[default]
     Recent,
     Name,
+    /// Orca Manual처럼 생성 시각 내림차순(새 워크트리가 위, 활동해도 순서 고정).
+    /// sidebar.bin·모바일(`krilld::mobile::workspaces`)이 변형 인덱스를 읽으므로 끝에만 추가한다.
+    Created,
 }
 
 impl SortBy {
-    pub const ALL: [Self; 3] = [Self::Smart, Self::Recent, Self::Name];
+    pub const ALL: [Self; 4] = [Self::Smart, Self::Recent, Self::Created, Self::Name];
 
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -101,6 +104,7 @@ impl SortBy {
             Self::Smart => text::SORT_BY_SMART.get(),
             Self::Recent => text::SORT_BY_RECENT.get(),
             Self::Name => text::SORT_BY_NAME.get(),
+            Self::Created => text::SORT_BY_CREATED.get(),
         }
     }
 
@@ -110,6 +114,7 @@ impl SortBy {
             Self::Smart => text::SORT_BY_SHORT_SMART.get(),
             Self::Recent => text::SORT_BY_SHORT_RECENT.get(),
             Self::Name => text::SORT_BY_SHORT_NAME.get(),
+            Self::Created => text::SORT_BY_SHORT_CREATED.get(),
         }
     }
 
@@ -119,6 +124,7 @@ impl SortBy {
             Self::Smart => "sidebar-sort-smart",
             Self::Recent => "sidebar-sort-recent",
             Self::Name => "sidebar-sort-name",
+            Self::Created => "sidebar-sort-created",
         }
     }
 }
@@ -429,6 +435,7 @@ impl PrGroup {
 pub enum GroupKey {
     WorkspaceStatus(WorkspaceStatus),
     PrStatus(PrGroup),
+    Pinned,
 }
 
 impl PartialOrd for GroupKey {
@@ -458,6 +465,7 @@ impl GroupKey {
             Self::WorkspaceStatus(WorkspaceStatus::InReview) => text::STATUS_IN_REVIEW.get(),
             Self::WorkspaceStatus(WorkspaceStatus::Completed) => text::STATUS_COMPLETED.get(),
             Self::PrStatus(pr) => pr.label(),
+            Self::Pinned => text::PINNED_GROUP.get(),
         }
     }
 
@@ -469,6 +477,7 @@ impl GroupKey {
             Self::WorkspaceStatus(WorkspaceStatus::InReview) => "status-in-review",
             Self::WorkspaceStatus(WorkspaceStatus::Completed) => "status-completed",
             Self::PrStatus(pr) => pr.slug(),
+            Self::Pinned => "pinned",
         }
     }
 }
@@ -488,6 +497,7 @@ pub(super) struct WorktreeContext<'a> {
     pub checkpoint_prs: Option<&'a BTreeSet<PathBuf>>,
     pub statuses: Option<&'a BTreeMap<PathBuf, WorkspaceStatus>>,
     pub updated_at: Option<&'a BTreeMap<PathBuf, u64>>,
+    pub created_at: Option<&'a BTreeMap<PathBuf, u64>>,
     pub unread: Option<&'a BTreeSet<SessionId>>,
     pub unread_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub focused: Option<SessionId>,
@@ -650,29 +660,35 @@ pub(super) fn is_primary_worktree(snapshot: &Snapshot, path: &Path) -> bool {
     snapshot.trees.contains_key(path)
 }
 
-/// 정렬 기준과 무관하게 [기본] 워크트리 → 핀 고정 → 나머지(정렬 기준) 순서로 정렬한다.
+/// 선택한 정렬 키를 그대로 적용한다. 기본 워크트리 배지는 순서에 영향을 주지 않는다.
 pub(super) fn sort_worktrees(
     trees: &mut [&PathBuf],
-    snapshot: &Snapshot,
+    _snapshot: &Snapshot,
     sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
     prefs: &Preferences,
     sort_by: SortBy,
     ctx: &WorktreeContext<'_>,
 ) {
     trees.sort_by_cached_key(|a| {
-        let primary = !is_primary_worktree(snapshot, a);
-        let pin = !prefs.get(*a).is_some_and(|v| v.pinned);
         let name = worktree_sort_name(a, prefs, ctx.meta);
-        let recent = Reverse(ctx.updated_at.and_then(|u| u.get(*a)).copied().unwrap_or(0));
+        let updated = ctx.updated_at.and_then(|u| u.get(*a)).copied().unwrap_or(0);
+        let created_grace = ctx
+            .created_at
+            .and_then(|c| c.get(*a))
+            .map_or(0, |created| created.saturating_add(300));
+        let recent = Reverse(updated.max(created_grace));
         let rank = match sort_by {
             SortBy::Smart => smart_rank(a, sessions_by_wt, ctx),
-            SortBy::Recent | SortBy::Name => 0,
+            SortBy::Recent | SortBy::Name | SortBy::Created => 0,
         };
         let recent_key = match sort_by {
             SortBy::Smart | SortBy::Recent => recent,
+            SortBy::Created => {
+                Reverse(ctx.created_at.and_then(|c| c.get(*a)).copied().unwrap_or(0))
+            }
             SortBy::Name => Reverse(0),
         };
-        (primary, pin, rank, recent_key, name, *a)
+        (rank, recent_key, name, *a)
     });
 }
 
@@ -720,6 +736,41 @@ pub(super) fn rows_with_options<'a>(
             sessions_by_wt.entry(wt).or_default().push(s);
         }
     }
+    let mut pinned: Vec<_> = snapshot
+        .trees
+        .iter()
+        .filter(|(repo, _)| {
+            !ctx.removed_projects.is_some_and(|r| r.contains(*repo))
+                && options.filters.contains_repo(repo)
+        })
+        .flat_map(|(repo, trees)| {
+            trees.iter().filter(move |path| {
+                prefs.get(*path).is_some_and(|p| p.pinned)
+                    && is_worktree_visible(repo, path, trees.len(), snapshot, prefs, options, ctx)
+            })
+        })
+        .collect();
+    pinned.sort();
+    pinned.dedup();
+    sort_worktrees(
+        &mut pinned,
+        snapshot,
+        &sessions_by_wt,
+        prefs,
+        options.sort_by,
+        ctx,
+    );
+    if !pinned.is_empty() {
+        out.push(Row::GroupHeader {
+            key: GroupKey::Pinned,
+            count: pinned.len(),
+        });
+        if !collapsed_groups.contains(&GroupKey::Pinned) {
+            for path in pinned {
+                push_worktree_and_sessions(&mut out, path, &sessions_by_wt, collapsed);
+            }
+        }
+    }
     let mut waiting = snapshot
         .sessions
         .iter()
@@ -736,7 +787,10 @@ pub(super) fn rows_with_options<'a>(
         let n = trees.len();
         trees
             .iter()
-            .filter(|p| is_worktree_visible(repo, p, n, snapshot, prefs, options, ctx))
+            .filter(|p| {
+                !prefs.get(*p).is_some_and(|v| v.pinned)
+                    && is_worktree_visible(repo, p, n, snapshot, prefs, options, ctx)
+            })
             .collect()
     };
 
@@ -979,6 +1033,7 @@ impl Sidebar {
             checkpoint_prs: Some(&checkpoint_prs),
             statuses: Some(&statuses),
             updated_at: Some(&updated_at),
+            created_at: Some(&self.disk.worktree_created_at),
             unread: Some(&self.unread),
             unread_worktrees: Some(&unread_worktrees),
             focused: self.focused,

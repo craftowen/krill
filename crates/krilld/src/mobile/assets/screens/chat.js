@@ -29,13 +29,17 @@ function toolStep(name){
  const n=String(name||'');
  return /^(read|view|notebookread|read_file)$/i.test(n)?'Read {0} file(s)':/edit|write|patch/i.test(n)?'Changed {0} file(s)':/grep|glob|search|find|^ls$/i.test(n)?'Searched {0} time(s)':/bash|shell|exec|command/i.test(n)?'Ran {0} command(s)':'Did {0} other step(s)';
 }
+const cacheLimit=8,cacheByteLimit=8*1024*1024,pageLimit=2048,itemByteLimit=2*1024*1024;
+const pinned=(state,id,e)=>e.mounts>0||e.sending||e.photo||!!state.drafts?.get(id);
+function pruneCache(state){const cache=state.chatCache;if(!cache)return;let bytes=0;for(const e of cache.values())bytes+=e.retainedBytes||0;for(const [id,e] of cache){if(cache.size<=cacheLimit&&bytes<=cacheByteLimit)break;if(!pinned(state,id,e)){cache.delete(id);bytes-=e.retainedBytes||0;}}}
+function forgetSession(state,id){const e=state.chatCache?.get(id);if(e&&!pinned(state,id,e))state.chatCache.delete(id);}
 function mountChat(root,opts){
  const {ctx,sessionId,onSwitchTerm,agentIcon}=opts,agentName=a=>M.agentName?.(a)||a;
  const {el,button,state}=ctx,drafts=state.drafts||(state.drafts=new Map()),t=ctx.t||((s)=>s),itemLimit=1000;
  const cacheMap=state.chatCache||(state.chatCache=new Map());
  const entry=cacheMap.get(sessionId)||{offset:0,items:[],agent:'',bound:false};
  entry.pages||=[];entry.photoVersion||=0;
- cacheMap.set(sessionId,entry);
+ entry.mounts=(entry.mounts||0)+1;cacheMap.delete(sessionId);cacheMap.set(sessionId,entry);pruneCache(state);
  const shell=el('div',undefined,'chat-view'),feed=el('div',undefined,'chat-feed'),strip=el('div',undefined,'chat-live-strip'),composer=el('form',undefined,'chat-composer');
  const stripBadge=el('span','IDLE','badge'),stripText=el('span',t('Waiting for transcript…'),'chat-live-text'),rawBtn=button(t('Term →'),()=>onSwitchTerm?.(),'ghost small chat-raw-btn');
  strip.append(stripBadge,stripText,rawBtn);
@@ -43,7 +47,7 @@ function mountChat(root,opts){
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
  const latestBtn=button(t('Back to latest'),()=>{
   if(entry.live){entry.items=entry.live.items;entry.offset=entry.live.offset;entry.live=null;}
-  renderItems();pollNow();
+  following=true;renderItems();pollNow();
  },'ghost small');
  history.append(historyText,earlierBtn,latestBtn);
  const pollStatus=el('div',undefined,'chat-actions'),pollText=el('span',undefined,'muted');
@@ -51,9 +55,14 @@ function mountChat(root,opts){
  const retryBtn=button(t('Retry'),()=>pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
  const input=el('textarea',undefined,'chat-input');input.rows=2;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
  input.value=drafts.get(sessionId)||'';
- let composing=false,disposed=false,pollTimer=null,inFlight=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false;
- const cards=new Map(),toolRuns=new Map();
- input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;drafts.set(sessionId,input.value);});
+ let composing=false,disposed=false,pollTimer=null,inFlight=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
+ entry.initialized??=entry.offset>0;
+ entry.loaded??=entry.initialized;
+ let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
+ feed.addEventListener('scroll',()=>{if(visible)following=feed.scrollHeight-feed.scrollTop-feed.clientHeight<60;});
+ function pinLatest(){if(visible&&following&&!entry.live)feed.scrollTop=feed.scrollHeight||0;}
+ const cards=new Map(),toolRuns=new Map();let tailRun=null,renderedCount=0,renderedItems=null;
+ input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);});
  input.addEventListener('compositionstart',()=>composing=true);
  input.addEventListener('compositionend',()=>composing=false);
  const attachment=el('div',undefined,'chat-actions');attachment.setAttribute('role','status');
@@ -109,11 +118,11 @@ function mountChat(root,opts){
  });
  shell.append(history,pollStatus,feed,strip,composer);root.replaceChildren(shell);
  function itemKey(item,idx){return `${entry.generation||''}:${item.id||`${item._pageStart||0}:${idx}:${item.tool_id||''}:${item.text}`}`;}
- function renderItems(){
-  const stick=!feed.scrollHeight||(feed.scrollHeight-(feed.scrollTop||0)-(feed.clientHeight||0)<60);
-  const wanted=new Set(),wantedRuns=new Set(),nodes=[];let run=null;
+ function renderItems(appendFrom){
+  const incremental=appendFrom>0&&renderedItems===entry.items&&renderedCount===appendFrom;
+  const wanted=new Set(),wantedRuns=new Set(),nodes=[];let run=incremental?tailRun:null;
   // Retain the actual question/details nodes so selection, write-in, focus and expansion survive deltas.
-  for(const [idx,item] of entry.items.entries()){
+  for(let idx=incremental?appendFrom:0;idx<entry.items.length;idx++){const item=entry.items[idx];
    const key=itemKey(item,idx);wanted.add(key);
    let card=cards.get(key);
    if(!card){card=renderCard(item,key);card.dataset.chatId=key;cards.set(key,card);}
@@ -123,35 +132,37 @@ function mountChat(root,opts){
     const at=run.body.children?.[run.nodes.length-1];if(at!==card)run.body.insertBefore(card,at||null);
    }else{run=null;nodes.push(card);}
   }
-  for(const [idx,node] of nodes.entries()){const at=feed.children?.[idx];if(at!==node)feed.insertBefore(node,at||null);}
-  for(const [key,group] of toolRuns)if(!wantedRuns.has(key)){group.details.remove();toolRuns.delete(key);}
-  for(const [key,card] of cards)if(!wanted.has(key)){card.remove();cards.delete(key);}
-  for(const child of Array.from(feed.children||[]))if(child.className==='chat-empty')child.remove();
-  if(!entry.items.length){
+  for(const [idx,node] of nodes.entries()){const at=incremental?null:feed.children?.[idx];if(at!==node)feed.insertBefore(node,at||null);}
+  for(const [key,group] of toolRuns)if(!incremental&&!wantedRuns.has(key)){group.details.remove();toolRuns.delete(key);}
+  for(const [key,card] of cards)if(!incremental&&!wanted.has(key)){card.remove();cards.delete(key);}
+  if(!incremental){for(const child of Array.from(feed.children||[]))if(child.className==='chat-empty')child.remove();for(const key of entry.disclosures?.keys()||[])if(!cards.has(key)&&!toolRuns.has(key.replace(/^run:/,'')))entry.disclosures.delete(key);}
+  tailRun=run;renderedCount=entry.items.length;renderedItems=entry.items;
+  if(!entry.items.length&&entry.loaded){
    const empty=el('div',undefined,'chat-empty');
    empty.append(el('p',t(entry.bound?'No chat turns recorded yet.':'Waiting for agent hook or transcript binding…'),'muted'));
    feed.append(empty);
   }
   const first=entry.items[0];
   const start=first?._pageStart||0;
-  earlierBtn.hidden=!entry.pages.some(page=>page.start<start)&&!first?._clipped;
+  earlierBtn.hidden=!entry.pages.some(page=>page.start<start)&&!first?._clipped&&!(first&&start>0);
   earlierBtn.disabled=earlierPending;
   latestBtn.hidden=!entry.live;
   historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
   historyText.hidden=!entry.live;history.hidden=earlierBtn.hidden&&latestBtn.hidden;
-  if(stick&&!entry.live)feed.scrollTop=feed.scrollHeight||0;
+  pinLatest();
  }
- function rememberDetails(node,key){node.open=entry.disclosures?.get(key)||false;node.addEventListener('toggle',()=>{entry.disclosures||=new Map();entry.disclosures.set(key,node.open);});}
+ function rememberDetails(node,key){node.open=entry.disclosures?.get(key)||false;node.addEventListener('toggle',()=>{entry.disclosures||=new Map();if(node.open)entry.disclosures.set(key,true);else entry.disclosures.delete(key);});}
+ function lazyDetails(details,build){if(details.open)build();else details.addEventListener('toggle',()=>{if(details.open&&!details.dataset.loaded){details.dataset.loaded='true';build();}});if(details.open)details.dataset.loaded='true';}
  function renderCard(item,key){
   const kind=item.kind||'assistant',card=el('article',undefined,`chat-card chat-${kind}`);
   if(kind==='user'||kind==='assistant'){const role=el('header',kind==='user'?t('My request'):t('{0} reply',agentName(entry.agent)||t('Agent')),'chat-role');if(kind==='assistant'&&entry.agent&&agentIcon)role.prepend(agentIcon(entry.agent));card.append(role,renderRichText(el,item.text));}
   else if(kind==='reasoning'||kind==='tool_result'){
    const details=el('details',undefined,kind==='reasoning'?'chat-reasoning':'chat-tool-result');
-   rememberDetails(details,key);details.append(el('summary',t(kind==='reasoning'?'Reasoning':item.is_error?'Tool error':'Tool output')),kind==='reasoning'?renderRichText(el,item.text):el('pre',item.text,'chat-code'));card.append(details);
+   rememberDetails(details,key);details.append(el('summary',t(kind==='reasoning'?'Reasoning':item.is_error?'Tool error':'Tool output')));lazyDetails(details,()=>details.append(kind==='reasoning'?renderRichText(el,item.text):el('pre',item.text,'chat-code')));card.append(details);
   }else if(kind==='tool_call'){
    const details=el('details',undefined,'chat-tool-call'),head=el('summary',undefined,'chat-tool-head');head.append(el('span',item.tool_name||'tool','badge'),el('span',item.title||item.file_path||t('Tool call'),'chat-tool-title'));rememberDetails(details,key);details.append(head);
    if(item.file_path)details.append(button(t('Current diff'),()=>openDiff(item.file_path),'ghost small'));
-   if(item.text&&item.text!==item.file_path)details.append(el('pre',item.text,'chat-tool-body'));card.append(details);
+   if(item.text&&item.text!==item.file_path)lazyDetails(details,()=>details.append(el('pre',item.text,'chat-tool-body')));card.append(details);
   }else if(kind==='question')renderQuestionCard(card,item);
   else if(kind==='permission'){
    card.append(el('header',`${t('Permission')} • ${item.title||item.tool_name||t('Approval')}`,'chat-role'),el('p',item.text,'chat-p'),el('p',t('Historical request. Confirm the current request in Term.'),'muted'),button(t('Confirm in Term'),()=>onSwitchTerm?.(),'ghost small'));
@@ -187,71 +198,87 @@ function mountChat(root,opts){
   const sess=state.sessions?.get(sessionId);stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';
   stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));
  }
- function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start}));}
- function clearTranscript(){entry.items=[];entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();}
- function rememberPage(start,next){if(next>start&&!entry.pages.some(p=>p.start===start)){entry.pages.push({start,next});entry.pages.sort((a,b)=>a.start-b.start);}}
+ function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start,_retainedBytes:JSON.stringify(item).length*2}));}
+ function clearTranscript(){entry.items=[];entry.retainedBytes=0;entry.disclosures?.clear();entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();}
+ function rememberPage(start,next){if(!(next>start))return;const pages=entry.pages,last=pages.at(-1);if(last&&start>last.start)pages.push({start,next});else if(!pages.some(p=>p.start===start)){let at=0;while(at<pages.length&&pages[at].start<start)at++;pages.splice(at,0,{start,next});}if(pages.length>pageLimit){const first=entry.items[0]?._pageStart??start;while(pages.length>pageLimit){if(pages[0].next<=first)pages.shift();else pages.pop();}}}
  function trimItems(fromStart){
-  if(entry.items.length<=itemLimit)return;
+  let bytes=entry.items.reduce((n,item)=>n+(item._retainedBytes||0),0),count=0;
+  while(entry.items.length-count>1&&(entry.items.length-count>itemLimit||bytes>itemByteLimit)){const item=entry.items[fromStart?count:entry.items.length-1-count];bytes-=item._retainedBytes||0;count++;}
+  entry.retainedBytes=bytes+(entry.live?.items.reduce((n,item)=>n+(item._retainedBytes||0),0)||0);
+  if(!count)return false;
   if(fromStart){
-   const removed=entry.items.splice(0,entry.items.length-itemLimit),first=entry.items[0];
+   const removed=entry.items.splice(0,count),first=entry.items[0];
    // Re-read this page only when it actually contained an item that was clipped.
    if(first&&removed.at(-1)?._pageStart===first._pageStart)first._clipped=true;
   }
-  else entry.items.length=itemLimit;
+  else entry.items.length-=count;
+  return true;
  }
  function showPollError(error){
   failures++;pollStatus.hidden=false;
   const when=lastSuccess?new Date(lastSuccess).toLocaleTimeString():t('never');
   pollText.textContent=`${t('Chat history update failed')} (${failures}). ${t('Last updated')}: ${when}. ${t('Retry or check Term.')} ${String(error?.message||error||'')}`;
  }
- async function pollNow(){
-  if(disposed||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
+ async function pollNow(initial=false){
+  if(disposed||(!visible&&!initial)||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
   inFlight=true;
   try{
-   const start=entry.offset,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:start});
+   const start=entry.offset;let latest=!entry.initialized||refreshLatest,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest?{latest:true}:{}});
    if(disposed||earlierPending||entry.live||!res)return;
-   const changed=entry.generation&&res.generation&&entry.generation!==res.generation;
-   if(res.reset||changed){clearTranscript();entry.offset=0;}
+   let changed=entry.generation&&res.generation&&entry.generation!==res.generation;
+   // Rebinding also opens at the tail. Keep the current paint until that window is ready.
+   if(!latest&&(res.reset||changed)){
+    res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:0,latest:true});
+    if(disposed||earlierPending||entry.live||!res)return;
+    latest=true;changed=true;
+   }
+   const reset=latest||res.reset||changed,metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
+   const hadItems=entry.items.length,wasLoaded=entry.loaded;
+   if(reset){clearTranscript();following=true;}
    entry.generation=res.generation||entry.generation;entry.agent=res.agent||'';entry.bound=!!res.bound;
-   // A newly bound transcript must be read from its beginning, not from the old transcript offset.
-   if(changed&&!res.reset&&start!==0){renderItems();return;}
-   const effectiveStart=res.reset?0:start;
-   const incoming=normalizeItems(res,effectiveStart),seen=new Set(entry.items.map(item=>item.id));
-   entry.items.push(...incoming.filter(item=>!seen.has(item.id)));
-   if(incoming.length)rememberPage(effectiveStart,res.next_offset);trimItems(true);
+   entry.initialized=entry.bound;entry.loaded=true;refreshLatest=false;
+   const effectiveStart=res.page_start??(res.reset?0:start);
+   const incoming=normalizeItems(res,effectiveStart),before=entry.items.length;
+   if(incoming.length){const seen=new Set(entry.items.map(item=>item.id));entry.items.push(...incoming.filter(item=>!seen.has(item.id)));rememberPage(effectiveStart,res.next_offset);}
+   const trimmed=incoming.length&&trimItems(true);
    if(typeof res.next_offset==='number')entry.offset=res.next_offset;
    lastSuccess=entry.lastSuccess=Date.now();failures=0;pollStatus.hidden=true;
-   renderItems();updateStrip();
+   if(entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed?before:undefined);updateStrip();pruneCache(state);
   }catch(error){if(!disposed)showPollError(error);}finally{inFlight=false;}
  }
  async function loadEarlier(){
   if(disposed||earlierPending||inFlight||!entry.items.length)return;
-  earlierPending=true;renderItems();
+  earlierPending=true;following=false;renderItems();
   const anchor=Array.from(feed.children||[]).find(card=>(card.offsetTop||0)>=(feed.scrollTop||0))||feed.children?.[0];
   const oldTop=anchor?.offsetTop||0,oldScroll=feed.scrollTop||0,first=entry.items[0];
   const page=first._clipped?entry.pages.find(page=>page.start===first._pageStart):entry.pages.filter(page=>page.start<first._pageStart).at(-1);
-  const start=page?.start;
-  if(start===undefined){earlierPending=false;renderItems();return;}
+  let start=page?.start;
+  const end=page?.next??first._pageStart;
+  if(start===undefined&&!end){earlierPending=false;renderItems();return;}
   try{
-   const res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:start,end_offset:page.next});
+   const res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:start??0,end_offset:end,...start===undefined?{latest:true}:{}});
    if(disposed)return;
-   if(res.next_offset!==page.next)throw new Error(t('Transcript changed. Return to latest and retry.'));
+   if(res.next_offset!==end)throw new Error(t('Transcript changed. Return to latest and retry.'));
    if(res.reset||(res.generation&&entry.generation&&res.generation!==entry.generation))throw new Error(t('Transcript changed. Return to latest and retry.'));
+   start=res.page_start??start;rememberPage(start,res.next_offset);
    const items=normalizeItems(res,start),index=items.findIndex(item=>item.id===first.id);
    const prefix=index>=0?items.slice(0,index):items;
-   if(!entry.live)entry.live={items:entry.items.map(item=>({...item})),offset:entry.offset};
+   if(!entry.live)entry.live={items:entry.items.slice(),offset:entry.offset};
    const seen=new Set(entry.items.map(item=>item.id));entry.items.unshift(...prefix.filter(item=>!seen.has(item.id)));trimItems(false);
    if(first._clipped)delete first._clipped;
    pollStatus.hidden=true;renderItems();
    feed.scrollTop=oldScroll+((anchor?.offsetTop||0)-oldTop);
   }catch(error){showPollError(error);}finally{earlierPending=false;if(!disposed)renderItems();}
  }
- function schedule(){clearTimeout(pollTimer);if(!disposed)pollTimer=setTimeout(async()=>{await pollNow();schedule();},1500);}
+ function isVisible(){return visible&&!globalThis.document?.hidden&&globalThis.document?.visibilityState!=='hidden';}
+ function schedule(){clearTimeout(pollTimer);pollTimer=null;if(!disposed&&isVisible())pollTimer=setTimeout(async()=>{await pollNow();schedule();},1500);}
+ function visibilityChanged(){schedule();if(isVisible()){if(Date.now()-lastSuccess>3000)refreshLatest=true;pinLatest();pollNow();}}
+ globalThis.document?.addEventListener?.('visibilitychange',visibilityChanged);
  entry.notifyComposer=updateComposer;
- renderItems();updateStrip();updateComposer();pollNow();schedule();
- return {update(){updateStrip();updateComposer();pollNow();},unmount(){disposed=true;clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
+ renderItems();updateStrip();updateComposer();pollNow(true);schedule();
+ return {setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
 }
-M.chat={mount:mountChat};
+M.chat={mount:mountChat,pruneCache,forgetSession};
 M.screens.chat=(root,ctx)=>{
  const session=ctx.state.sessions.get(ctx.route.sessionId);
  if(!session){root.append(ctx.el('p',(ctx.t||((s)=>s))('Session not found'),'empty'));return {};}

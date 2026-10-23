@@ -62,6 +62,7 @@ impl Pace {
 
 /// A watcher for one worktree root (not a subdirectory). Retain it until the panel closes.
 /// notify owns the platform `FSEvents` thread on macOS; all git work uses the shared queue.
+#[must_use = "retain the watcher while observing worktree changes"]
 pub struct Watch {
     q: Arc<GitQueue>,
     repo: PathBuf,

@@ -184,13 +184,35 @@ button.account-row:disabled{opacity:1}
 .project-filter{display:flex;gap:4px;align-items:center;text-align:left;font-size:calc(16px * var(--ui-scale,1));background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-row)}.project-filter>span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-filter>svg{width:14px;transform:rotate(90deg)}
 .workspace-filters>.text-button{flex:none;min-height:32px;margin:0;padding:4px 8px}
 .workspaces .workspace-list{padding-inline:var(--space-sm)}
-/* Workspaces tree (desktop sidebar): 44px disclosure gutters, guide line under each open level. */
-.repo-toggle{display:flex;align-items:center;gap:var(--space-xs);width:100%;min-height:var(--touch-target);padding:var(--space-sm) var(--space-sm) var(--space-sm) 0;text-align:left;font-size:calc(11px * var(--ui-scale,1));font-weight:600;letter-spacing:.5px;color:var(--text-muted)}
-.repo-toggle>svg{margin:0 15px;width:14px;height:14px}.repo-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.repo-toggle>svg,.tree-toggle>svg{color:var(--text-muted)}.repo-toggle.open>svg,.tree-toggle.open>svg{transform:rotate(90deg)}
-.workspaces .tree-children{margin-left:21px;border-left:1px solid var(--border)}.workspace-item{display:flex;align-items:stretch;min-width:0}
-.workspaces .tree-toggle{height:auto;min-height:var(--touch-target);flex:none}.tree-toggle>svg{width:14px;height:14px}.tree-toggle.leaf{visibility:hidden}
-.session-list{margin-bottom:var(--space-xs)}.session-row{display:flex;align-items:center;gap:var(--space-sm);width:100%;min-height:var(--touch-target);padding:6px var(--space-md);text-align:left;border-radius:var(--radius-row)}
+/* Project-first mobile list. Ordering/depth come from the desktop snapshot;
+   folds stay local to each paired phone. No nested cards or terminal-output previews. */
+.workspaces .workspace-list{padding-inline:var(--space-sm)}
+.repo-group{border-bottom:1px solid var(--border)}
+.repo-toggle{display:flex;align-items:center;gap:var(--space-md);width:100%;min-height:72px;padding:var(--space-md) var(--space-sm);text-align:left;font-size:var(--font-body);font-weight:600;color:var(--foreground)}
+.project-icon{width:32px;height:32px;display:grid;place-items:center;flex:none;border:1px solid var(--border);border-radius:var(--radius-row);background:var(--surface-panel);color:var(--muted-foreground)}
+.project-icon svg{width:16px;height:16px}.project-icon>span{font-size:var(--font-title)}
+.repo-copy{display:flex;flex:1;min-width:0;flex-direction:column;gap:var(--space-xs)}
+.repo-label{overflow-wrap:anywhere;line-height:1.45;font-size:var(--font-body)}
+.repo-summary{font-size:var(--font-meta);font-weight:400;line-height:1.5;color:var(--muted-foreground)}
+.repo-toggle>.terminal-count{font-family:var(--font-mono);font-weight:400}
+.repo-toggle>svg,.tree-toggle>svg{color:var(--muted-foreground);width:14px;height:14px;flex:none}
+.repo-toggle.open>svg,.tree-toggle.open>svg{transform:rotate(90deg)}
+.repo-toggle.open{background:var(--surface-panel);border-radius:var(--radius-row)}
+.workspaces .tree-children{margin-left:var(--space-sm);border-left:1px solid var(--border)}
+.workspaces .tree-node[data-depth="1"]{margin-left:var(--space-sm)}
+.workspaces .tree-node[data-depth="2"]{margin-left:var(--space-lg)}
+.workspaces .tree-node[data-depth="3"]{margin-left:var(--space-xl)}
+.workspaces .tree-node[data-depth="4"]{margin-left:calc(2 * var(--space-lg))}
+.workspace-item{display:flex;align-items:stretch;min-width:0}
+.workspaces .workspace-row{padding:var(--space-md) var(--space-xs) var(--space-md) var(--space-md);min-height:64px;gap:var(--space-sm)}
+.workspaces .workspace-row:after{left:var(--space-md);right:0}
+.workspaces .workspace-row>.status-dot{margin:0}
+.workspaces .workspace-main>strong{white-space:normal;overflow-wrap:anywhere;line-height:1.5}
+.workspaces .workspace-main>.activity-line{font-family:inherit;font-size:var(--font-meta);color:var(--muted-foreground)}
+.workspaces .tree-toggle{height:auto;min-height:var(--touch-target);flex:none}
+.tree-toggle.leaf{visibility:hidden}
+.session-list{margin-bottom:var(--space-xs)}
+.session-row{display:flex;align-items:center;gap:var(--space-sm);width:100%;min-height:var(--touch-target);padding:var(--space-sm) var(--space-md);text-align:left;border-radius:var(--radius-row)}
 .session-row strong{font-weight:500}
 
 /* Conversation text leads; tool runs and their individual payloads are closed disclosures. */
@@ -239,9 +261,112 @@ button.account-row:disabled{opacity:1}
 .settings-nav{display:flex;flex:none;gap:4px;padding:4px 8px calc(4px + env(safe-area-inset-bottom));border-top:1px solid var(--border);background:var(--surface-panel)}.settings-nav button{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;min-height:var(--touch-target);padding:8px 4px;border-radius:var(--radius-row);font-size:calc(11px * var(--ui-scale,1));color:var(--muted-foreground)}.settings-nav [aria-current=page]{background:var(--surface-raised);color:var(--foreground)}.settings-nav svg{width:16px;height:16px}
 .about-block{position:relative;display:flex;flex-direction:column;gap:8px;padding:20px 16px}.about-block h3{margin:0;font-size:var(--font-body)}.about-block p{line-height:1.8}
 .key-row{gap:4px;padding:4px 12px}.key-row .key-move{background:transparent;font-size:calc(18px * var(--ui-scale,1))}.key-label input{width:20px;height:20px;margin:0 0 0 8px;accent-color:var(--foreground)}
-/* Home shortcuts, the New Workspace bar and per-worktree New session row. */
-.home-shortcuts{display:flex;flex-wrap:wrap;gap:var(--space-sm);margin:var(--space-md) 0 var(--space-xl)}
-.home-shortcuts>.secondary{flex:1;min-width:140px;margin:0;display:flex;align-items:center;justify-content:center;gap:var(--space-sm);width:auto}
-.workspace-actions{padding:var(--space-sm) var(--space-md);border-bottom:1px solid var(--border);background:var(--surface-panel)}
-.new-workspace{display:flex;align-items:center;justify-content:center;gap:var(--space-sm);width:100%}
-.workspace-add-session{display:flex;align-items:center;gap:var(--space-sm);width:100%;min-height:var(--touch-target);padding:6px var(--space-md);font-size:var(--font-meta);color:var(--muted-foreground)}.workspace-add-session>svg{width:14px;height:14px}
+
+/* Responsive shell: reading columns, a wider conversation, and a full-width PTY.
+   These are content breakpoints: split-view and folded covers keep the phone flow. */
+:root{--reading-width:720px;--workspace-width:960px;--conversation-width:1040px;--command-width:1120px;--dialog-width:512px}
+#route-root,.terminal-mount,.chat-view,.chat-feed{min-width:0}
+/* The shell owns the hit-area floor, including compact session chrome. */
+#mobile-app :is(button,summary){min-width:var(--touch-target);min-height:var(--touch-target)}
+.session.screen>.page-header{min-height:var(--touch-target)}
+.session.screen>.page-header .header-copy{min-width:0}
+.session-tab,.accessory-key{flex-shrink:0}
+.buffered-command>.command-input{min-height:var(--touch-target)}
+.chat-tool-summary,.chat-tool-call>summary,.chat-tool-result>summary,.chat-reasoning>summary{align-content:center}
+.workspace-filters>select{min-height:var(--touch-target)}
+.connection-banner>span{min-width:0;flex:1}
+.branch-name>span{min-width:0;overflow-wrap:anywhere}
+.pair-screen{padding-bottom:calc(var(--space-xl) + env(safe-area-inset-bottom))}
+.sheet{max-width:min(600px,calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right)))}
+#notice{max-width:var(--dialog-width);margin-inline:auto;overflow-wrap:anywhere;left:max(var(--space-md),env(safe-area-inset-left));right:max(var(--space-md),env(safe-area-inset-right))}
+
+@media(min-width:600px){
+ .home-topbar{width:100%;max-width:var(--reading-width);align-self:center}
+ .settings,.details{width:100%;max-width:var(--reading-width);align-self:center}
+ .workspaces{width:100%;max-width:var(--workspace-width);align-self:center}
+ .settings-list,.detail-list,.connection-log,.workspace-list{width:100%}
+ .settings-form{padding-inline:var(--space-lg)}
+ .form-sheet{border-radius:var(--radius-card)}
+ .workspace-filters>select{flex:0 1 280px;width:auto}
+ .workspace-toolbar>.spacer{flex:1}
+ .workspace-search{display:flex;align-items:center;gap:var(--space-sm)}
+ .workspace-search input{flex:1;min-width:0}
+ .workspace-search>.text-button{margin:0;flex:none}
+ .settings-nav{justify-content:center}
+ .settings-nav button{flex:0 1 160px}
+ .chat-view{width:100%;max-width:var(--conversation-width);align-self:center}
+ .chat-feed{padding-inline:max(var(--space-lg),calc((100% - 880px)/2))}
+ .chat-user{max-width:80%}
+ .chat-composer{padding-inline:var(--space-lg)}
+ .chat-composer-bar{justify-content:flex-end}
+ .chat-composer-bar>.small:first-child{margin-right:auto}
+ .chat-composer-bar>.primary{min-width:96px}
+ .command-dock>.accessory-row,.command-dock>.input-row,.command-dock>.buffered-command{width:100%;max-width:var(--command-width);margin-inline:auto}
+ .accessory-row{justify-content:center}
+ .keybar{flex:0 1 auto}
+ .sheet{width:calc(100% - 2 * var(--space-xl));max-width:var(--dialog-width);max-height:calc(100dvh - 2 * var(--space-xl) - env(safe-area-inset-top) - env(safe-area-inset-bottom));margin:auto;inset:0;border-radius:var(--radius-card)}
+ #sheet-content{padding:var(--space-lg);border-radius:var(--radius-card)}
+ .sheet-handle{display:none}
+ .sheet h2,.sheet p{overflow-wrap:anywhere}
+ .sheet .screen-text{min-height:0;height:45dvh}
+}
+
+/* Tablet shell stays mounted across session routes and width changes. */
+.tablet-shell,.tablet-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
+.tablet-body{flex-direction:column}.tablet-sidebar,.tablet-sidebar-toggle{display:none}
+@media(min-width:1000px){
+ .tablet-shell{width:100%}.tablet-sidebar{display:flex;flex-direction:column;flex:none;width:320px;min-height:0;border-right:1px solid var(--border);background:var(--surface-panel)}
+ .tablet-sidebar .workspaces{max-width:none}.tablet-sidebar .page-header{min-height:var(--touch-target)}
+ .tablet-sidebar :is(.workspace-toolbar,.workspace-filters,.workspace-search,.tree-toggle){display:none}
+ .tablet-sidebar .workspace-list{padding-inline:var(--space-sm)}.tablet-sidebar .session-row[aria-current=page]{background:var(--surface-raised);box-shadow:inset 2px 0 var(--accent)}
+ .tablet-sidebar .workspace-row{padding-inline:var(--space-sm)}.tablet-sidebar .session-list{padding-left:var(--space-sm)}
+ .tablet-sidebar-toggle{display:flex}.tablet-body .session-back,.sidebar-collapsed .tablet-sidebar{display:none}
+}
+
+.session-panels,.terminal-pane{display:flex;flex:1;min-height:0;min-width:0;overflow:hidden}
+.terminal-pane{flex-direction:column;position:relative}.split-toggle{display:none}.pane-header{display:flex;flex:none;align-items:center;min-height:var(--touch-target);border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.pane-title{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-inline:var(--space-sm);font-size:var(--font-meta)}
+.session-panels.is-split{flex-direction:column;gap:1px;background:var(--border)}
+.is-split>.terminal-pane{background:var(--surface-base);box-shadow:inset 0 0 0 1px var(--border)}
+.is-split>.terminal-pane[data-active=true]{box-shadow:inset 0 0 0 2px var(--accent)}
+.is-split>.terminal-pane[data-active=false] .command-dock{display:none}
+@media(min-width:1000px){.split-toggle{display:block}.session-panels.is-split[data-layout=columns]{flex-direction:row}}
+
+.tablet-body h1:focus{outline:none}
+.is-split>.terminal-pane[data-active=true]::after{content:"";position:absolute;inset:0;border:2px solid var(--accent);pointer-events:none;z-index:1}
+
+/* Split choices share the existing modal surface and touch target. */
+.split-controls{display:flex;flex:none;min-width:0;border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.split-direction{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);min-width:0;text-align:left;font-size:var(--font-meta)}
+.split-direction svg,.split-direction-choice svg{flex:none;width:18px;height:18px}
+.split-direction-choices{display:flex;flex-direction:column;gap:var(--space-xs)}
+.split-direction-choice{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);text-align:left}
+.split-direction-choice[aria-pressed=true]{color:var(--accent);background:var(--surface-raised);box-shadow:inset 2px 0 var(--accent)}
+@media(max-width:999px){.split-controls{display:none}}
+
+/* Matching pane headers make the active tab strip's target explicit. */
+.pane-title{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target)}
+.pane-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.pane-active{font-size:var(--font-meta);color:var(--accent);flex:none;visibility:hidden}
+.pane-title[aria-pressed=true] .pane-active{visibility:visible}
+.is-split>.terminal-pane[data-active=true]>.pane-header{background:var(--surface-raised);box-shadow:inset 0 -2px var(--accent)}
+.session-tabs[data-active-pane]::before{content:attr(aria-label);display:flex;align-items:center;flex:none;padding-inline:var(--space-sm);font-size:var(--font-meta);color:var(--accent);max-width:35%;white-space:normal}
+
+/* History stays readable while the live terminal updates below it. */
+.terminal-frame{position:relative}.terminal-scroll{-webkit-overflow-scrolling:touch}
+.terminal-latest{position:absolute;right:var(--space-md);bottom:var(--space-md);z-index:2;min-height:var(--touch-target);padding:var(--space-sm) var(--space-md);border:1px solid var(--border);border-radius:var(--radius-card);background:var(--surface-raised);color:var(--foreground);font-size:var(--font-meta)}
+.terminal-latest::before{content:'↓';margin-right:var(--space-sm)}
+.terminal-history-controls{flex-wrap:wrap}.history-status{overflow-wrap:anywhere}
+/* Keep Safari's invisible input at the keyboard dock, inside the viewport. */
+.live-capture{top:auto;bottom:0;left:0;min-height:1px;max-height:1px;resize:none}
+@media(max-width:599px){
+ .terminal-mount[data-input-mode=buffered] .direct-toggle{font-family:inherit}
+ .accessory-key,.dismiss-keyboard,.keybar>.photo-attach{min-height:var(--touch-target);height:var(--touch-target);min-width:var(--touch-target)}
+ .command-send{width:var(--touch-target);height:var(--touch-target);min-width:var(--touch-target)}
+ .session .terminal-frame{padding:var(--space-xs) var(--space-xs) 0}
+}
+
+/* Keep tree order, find-in-page and accessibility intact while skipping offscreen layout/paint.
+   Focused rows stay fully laid out, including text selection and IME in descendants. */
+.large-workspace-list .tree-node{content-visibility:auto;contain-intrinsic-block-size:auto 72px}
+.large-workspace-list .tree-node:focus-within{content-visibility:visible}

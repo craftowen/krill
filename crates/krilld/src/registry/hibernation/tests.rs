@@ -138,7 +138,16 @@ fn timer_sends_terminate_only_for_safe_group_and_preserves_resume_marker() {
             payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
         };
         let st = lock(&reg.state);
-        reg.apply_agent_hook(&st, id, &e).unwrap();
+        reg.apply_agent_hook(
+            id,
+            &e,
+            st.sessions.get(&id).map(|entry| entry.cwd.as_path()),
+            st.sessions
+                .get(&id)
+                .map(|entry| entry.session.tap())
+                .as_ref(),
+        )
+        .unwrap();
     }
     let taps: Vec<_> = {
         let st = lock(&reg.state);
@@ -195,8 +204,20 @@ fn timer_sends_terminate_only_for_safe_group_and_preserves_resume_marker() {
             input: krill_proto::hook::Input::Complete,
             payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
         };
-        reg.apply_agent_hook(&lock(&reg.state), SessionId(2), &event)
-            .unwrap();
+        reg.apply_agent_hook(
+            SessionId(2),
+            &event,
+            None,
+            reg.tap(
+                &Peer {
+                    pid: None,
+                    scope: Scope::Full,
+                },
+                SessionId(2),
+            )
+            .as_ref(),
+        )
+        .unwrap();
     }
     // 안전한 전체 묶음: PTY fd와 재개 메타데이터를 보존하며 Terminate만 전송한다.
     reg.hibernate_at(&mut Clock::default(), Instant::now(), Duration::ZERO);
@@ -319,8 +340,20 @@ fn terminate_send_failure_leaves_no_sleep_marker() {
         input: krill_proto::hook::Input::Complete,
         payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
     };
-    reg.apply_agent_hook(&lock(&reg.state), SessionId(1), &e)
-        .unwrap();
+    reg.apply_agent_hook(
+        SessionId(1),
+        &e,
+        None,
+        reg.tap(
+            &Peer {
+                pid: None,
+                scope: Scope::Full,
+            },
+            SessionId(1),
+        )
+        .as_ref(),
+    )
+    .unwrap();
     // holder 링크를 끊는다. 이후 Terminate 송신은 실패한다.
     holder_end.shutdown(std::net::Shutdown::Both).unwrap();
     drop(holder_end);

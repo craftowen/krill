@@ -14,15 +14,20 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use regex::Regex as Pattern;
+
 use crate::ipc::{self, Error};
 use crate::screen::{Cell, Msg, Revision, Seq};
 
 pub const FEAT_SEARCH: u64 = 1 << 8;
+/// 옵션 검색은 v1 DTO를 바꾸지 않고 별도 kind로 협상한다.
+pub const FEAT_SEARCH_OPTIONS: u64 = 1 << 20;
 /// 검색어의 최대 UTF-8 바이트 수(설계 상한).
 pub const MAX_QUERY: usize = 1_024;
 
 pub mod kind {
     pub const SEARCH: u8 = 0x15;
+    pub const SEARCH_OPTIONS: u8 = 0x46;
     pub const SEARCH_RESULT: u8 = 0x2a;
 }
 
@@ -73,6 +78,46 @@ impl Msg for SearchRequest {
         let request: Self = ipc::decode(Self::KIND, kind, body)?;
         if !request.valid() {
             return Err(Error::TooLong(request.query.len()));
+        }
+        Ok(request)
+    }
+}
+
+/// 새 검색의 기본값은 대소문자를 무시하는 리터럴이다. v1 요청은 기존 동작을 유지한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Options {
+    pub case_sensitive: bool,
+    pub regex: bool,
+}
+
+impl Options {
+    pub fn compile(self, query: &str) -> Result<regex::Regex, regex::Error> {
+        let pattern = if self.regex {
+            query.to_owned()
+        } else {
+            regex::escape(query)
+        };
+        regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!self.case_sensitive)
+            .size_limit(2 * 1024 * 1024)
+            .dfa_size_limit(2 * 1024 * 1024)
+            .build()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchOptionsRequest {
+    pub request: SearchRequest,
+    pub options: Options,
+}
+
+impl Msg for SearchOptionsRequest {
+    const KIND: u8 = kind::SEARCH_OPTIONS;
+
+    fn decode(kind: u8, body: &[u8]) -> Result<Self, Error> {
+        let request: Self = ipc::decode(Self::KIND, kind, body)?;
+        if !request.request.valid() {
+            return Err(Error::TooLong(request.request.query.len()));
         }
         Ok(request)
     }

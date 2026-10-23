@@ -449,6 +449,8 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(target_os = "macos")]
+        let _work = crate::responsiveness::work("terminal.paint");
         let cell = *cell;
         if let Some(p) = &self.painted {
             p.set((bounds, cell));

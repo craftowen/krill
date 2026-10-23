@@ -53,12 +53,12 @@ impl CliRunner {
     }
 
     /// 표준출력 바이트 그대로(비0 종료라도 stdout이 있으면 그것). JSON 오류 봉투를 직접 읽을 때 쓴다.
-    pub(super) fn raw(&self, args: &[OsString]) -> io::Result<Vec<u8>> {
+    pub(crate) fn raw(&self, args: &[OsString]) -> io::Result<Vec<u8>> {
         (self.0)(args)
     }
 
     /// 스테이징된 `krill` 바이너리를 하위 프로세스로 실행한다.
-    pub(super) fn process(bin: PathBuf, state_dir: Option<PathBuf>) -> Self {
+    pub(crate) fn process(bin: PathBuf, state_dir: Option<PathBuf>) -> Self {
         Self::new(move |args| {
             let mut cmd = crate::platform::background_command(&bin);
             cmd.args(args)

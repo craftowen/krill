@@ -1823,11 +1823,16 @@ fn orca_open_sessions(domains: &BTreeMap<String, Json>) -> Vec<(VaultTarget, Opt
             id.and_then(Json::as_str).map(str::trim),
             worktree.and_then(Json::as_str),
         ) else {
-            return;
+            return false;
         };
-        let cwd = split_worktree_key(worktree).1;
-        if id.is_empty() || !Path::new(&cwd).is_dir() || !seen.insert((agent, id.to_owned())) {
-            return;
+        let Some((_, cwd)) = resolve_workspace_key(domains, worktree) else {
+            return false;
+        };
+        if id.is_empty() || !Path::new(&cwd).is_dir() {
+            return false;
+        }
+        if !seen.insert((agent, id.to_owned())) {
+            return true;
         }
         let target = VaultTarget {
             agent,
@@ -1836,15 +1841,11 @@ fn orca_open_sessions(domains: &BTreeMap<String, Json>) -> Vec<(VaultTarget, Opt
             modified: 0,
         };
         out.push((target, title));
+        true
     };
-    for tab in tabs.values() {
-        push(
-            tab.pointer("/aiVaultTitle/agent"),
-            tab.pointer("/aiVaultTitle/sessionId"),
-            tab.get("worktreeId"),
-            tab_title(tab),
-        );
-    }
+    // 분할 칸의 재개 기록이 현재 대화의 원천이다. 탭의 aiVaultTitle은 이전 대화 ID가
+    // 남아 있을 수 있으므로 칸 기록이 없는 탭에서만 폴백으로 쓴다.
+    let mut captured_tabs = BTreeSet::new();
     if let Some(map) = ws
         .get("sleepingAgentSessionsByPaneKey")
         .and_then(Json::as_object)
@@ -1857,10 +1858,22 @@ fn orca_open_sessions(domains: &BTreeMap<String, Json>) -> Vec<(VaultTarget, Opt
             else {
                 continue;
             };
-            push(
+            if push(
                 pane.get("agent"),
                 pane.pointer("/providerSession/id"),
                 pane.get("worktreeId"),
+                tab_title(tab),
+            ) {
+                captured_tabs.insert(tab.get("id").and_then(Json::as_str).unwrap_or_default());
+            }
+        }
+    }
+    for (id, tab) in tabs {
+        if !captured_tabs.contains(id) {
+            push(
+                tab.pointer("/aiVaultTitle/agent"),
+                tab.pointer("/aiVaultTitle/sessionId"),
+                tab.get("worktreeId"),
                 tab_title(tab),
             );
         }
@@ -2526,6 +2539,7 @@ struct OrcaFolderWorkspace {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct OrcaWorktreeMeta {
+    host_id: Option<String>,
     display_name: Option<String>,
     comment: Option<String>,
     linked_issue: Option<u64>,
@@ -2555,9 +2569,11 @@ struct OrcaLinkedItem {
 #[serde(rename_all = "camelCase", default)]
 struct OrcaWorktreeLineage {
     repo_id: Option<String>,
+    #[serde(alias = "worktreeId", alias = "childWorkspaceKey")]
     worktree_path: Option<String>,
     branch: Option<String>,
     base_ref: Option<String>,
+    #[serde(alias = "parentWorktreeId", alias = "parentWorkspaceKey")]
     parent_worktree_path: Option<String>,
     parent_branch: Option<String>,
     created_at: Option<u64>,
@@ -2630,6 +2646,7 @@ fn import_projects_domain(
 ) -> io::Result<ProjectsImportSummary> {
     let original = read_original(&opts.state_dir.join(PROJECTS_FILE))?;
     let mut store = ProjectsStore::load(&opts.state_dir)?;
+    repair_imported_workspace_paths(&mut store);
     // worktree-comments.toml은 저장 시점에 잠금 안에서 다시 읽어 병합한다(OWE-748). 여기엔 이관분만 모은다.
     let mut wt_store = WorktreeStore::default();
     let mut lineage_parents: Vec<(String, String)> = Vec::new();
@@ -2867,6 +2884,7 @@ fn import_projects_domain(
 
             // Also apply folderWorkspace comment/status/unread/links into WorktreeStore
             let meta = OrcaWorktreeMeta {
+                host_id: None,
                 display_name: Some(display_name),
                 comment: fw.comment,
                 linked_issue: None,
@@ -2899,9 +2917,26 @@ fn import_projects_domain(
                 let Ok(meta) = serde_json::from_value::<OrcaWorktreeMeta>(val.clone()) else {
                     continue;
                 };
-                let (repo_id, raw_wt_path) = split_worktree_key(raw_key);
+                let Some((repo_id, raw_wt_path)) = resolve_workspace_key(domains, raw_key) else {
+                    continue;
+                };
+                if meta.host_id.as_deref().is_some_and(|id| id != "local") {
+                    continue;
+                }
                 let wt_path = normalize_import_path_str(&raw_wt_path);
                 if wt_path.is_empty() {
+                    continue;
+                }
+                if missing_local_worktree(&store, repo_id.as_deref(), &wt_path) {
+                    store.worktrees.remove(&wt_path);
+                    store.lineage.remove(&wt_path);
+                    continue;
+                }
+                // Krill는 같은 폴더를 한 행에 묶는다. 가상 작업 공간 메타가 실제 폴더의
+                // 이름·보관 상태를 덮어써 그 폴더의 모든 세션을 숨기지 않게 한다.
+                if workspace_instance_path(raw_key).is_some()
+                    && store.worktrees.contains_key(&wt_path)
+                {
                     continue;
                 }
                 apply_worktree_meta(
@@ -2930,36 +2965,41 @@ fn import_projects_domain(
                 let Ok(lin) = serde_json::from_value::<OrcaWorktreeLineage>(val.clone()) else {
                     continue;
                 };
-                let (key_repo_id, key_path) = split_worktree_key(raw_key);
-                let wt_path = normalize_import_path_str(
-                    &lin.worktree_path
+                let Some((key_repo_id, key_path)) = resolve_workspace_key(
+                    domains,
+                    lin.worktree_path
                         .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map_or(key_path, str::to_owned),
-                );
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(raw_key),
+                ) else {
+                    continue;
+                };
+                let wt_path = normalize_import_path_str(&key_path);
                 if wt_path.is_empty() {
                     continue;
                 }
-                if let Some(parent) = lin
-                    .parent_worktree_path
-                    .as_deref()
-                    .map(|p| normalize_import_path_str(&split_worktree_key(p).1))
-                    .filter(|s| !s.is_empty())
-                {
-                    lineage_parents.push((wt_path.clone(), parent));
+                let repo_id = lin
+                    .repo_id
+                    .or(key_repo_id)
+                    .or_else(|| split_worktree_key(raw_key).0);
+                if missing_local_worktree(&store, repo_id.as_deref(), &wt_path) {
+                    store.lineage.remove(&wt_path);
+                    continue;
                 }
                 let parent_worktree_path = lin
                     .parent_worktree_path
                     .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(normalize_import_path_str);
+                    .and_then(|p| resolve_workspace_key(domains, p))
+                    .map(|(_, p)| normalize_import_path_str(&p))
+                    .filter(|p| !p.is_empty() && *p != wt_path);
+                if let Some(parent) = &parent_worktree_path {
+                    lineage_parents.push((wt_path.clone(), parent.clone()));
+                }
                 insert_lineage_entry(
                     &mut store.lineage,
                     wt_path.clone(),
                     StoredWorktreeLineage {
-                        repo_id: lin.repo_id.or(key_repo_id),
+                        repo_id,
                         worktree_path: wt_path,
                         branch: lin.branch.filter(|s| !s.trim().is_empty()),
                         base_ref: lin.base_ref.filter(|s| !s.trim().is_empty()),
@@ -3089,14 +3129,101 @@ fn upsert_project(
 }
 
 fn split_worktree_key(raw: &str) -> (Option<String>, String) {
-    if let Some((repo_id, path)) = raw.split_once("::") {
+    let raw = raw.trim().strip_prefix("worktree:").unwrap_or(raw.trim());
+    let (repo_id, path) = if raw.starts_with('/') || Path::new(raw).is_absolute() {
+        (None, raw)
+    } else if let Some((repo_id, path)) = raw.split_once("::") {
         (
             (!repo_id.trim().is_empty()).then(|| repo_id.trim().to_owned()),
-            path.trim().to_owned(),
+            path.trim(),
         )
     } else {
-        (None, raw.trim().to_owned())
+        (None, raw)
+    };
+    (
+        repo_id,
+        workspace_instance_path(path).unwrap_or(path).to_owned(),
+    )
+}
+
+/// Orca의 가상 작업 공간 접미사는 경로가 아니다. 일반 파일명의 `::`는 보존한다.
+fn workspace_instance_path(raw: &str) -> Option<&str> {
+    let (path, id) = raw.trim().rsplit_once("::workspace:")?;
+    is_uuid_shape(id).then_some(path)
+}
+
+/// 로컬 원본 프로젝트를 확인할 수 있을 때만 삭제된 워크트리 메타를 제외한다.
+/// 접근할 수 없는 프로젝트·원격 경로는 부재로 단정하지 않는다.
+fn missing_local_worktree(store: &ProjectsStore, repo_id: Option<&str>, path: &str) -> bool {
+    store.projects.iter().any(|project| {
+        project.host_id.is_none()
+            && Some(project.id.as_str()) == repo_id
+            && Path::new(&project.path).is_dir()
+    }) && fs::metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+fn resolve_workspace_key(
+    domains: &BTreeMap<String, Json>,
+    raw: &str,
+) -> Option<(Option<String>, String)> {
+    if let Some(id) = raw.trim().strip_prefix("folder:") {
+        let folder = domains
+            .get("folderWorkspaces")?
+            .as_array()?
+            .iter()
+            .find(|f| f.get("id").and_then(Json::as_str) == Some(id))?;
+        let path = folder.get("folderPath")?.as_str()?;
+        return Path::new(path)
+            .is_absolute()
+            .then(|| (None, path.to_owned()));
     }
+    let key = raw.trim().strip_prefix("worktree:").unwrap_or(raw.trim());
+    for domain in ["worktreeMeta", "worktreeMetaByIdentity"] {
+        if domains
+            .get(domain)
+            .and_then(|m| m.get(key))
+            .and_then(|m| m.get("hostId"))
+            .and_then(Json::as_str)
+            .is_some_and(|id| id != "local")
+        {
+            return None;
+        }
+    }
+    let (repo_id, path) = split_worktree_key(key);
+    Path::new(&path).is_absolute().then_some((repo_id, path))
+}
+
+/// 이전 이관에서 접미사를 실제 경로로 저장한 항목도 다음 수동 가져오기에서 복구한다.
+fn repair_imported_workspace_paths(store: &mut ProjectsStore) {
+    let repair = |raw: &str| {
+        workspace_instance_path(raw)
+            .filter(|_| !Path::new(raw).exists())
+            .map_or_else(|| raw.to_owned(), normalize_import_path_str)
+    };
+    for project in &mut store.projects {
+        if project.host_id.is_some() {
+            continue;
+        }
+        let path = repair(&project.path);
+        if path != project.path {
+            if project.display_name == basename_str(&project.path) {
+                project.display_name = basename_str(&path);
+            }
+            project.path = path;
+        }
+    }
+    let mut worktrees = BTreeMap::new();
+    for (key, meta) in std::mem::take(&mut store.worktrees) {
+        worktrees.entry(repair(&key)).or_insert(meta);
+    }
+    store.worktrees = worktrees;
+    let mut lineage = BTreeMap::new();
+    for (key, mut meta) in std::mem::take(&mut store.lineage) {
+        meta.worktree_path = repair(&meta.worktree_path);
+        meta.parent_worktree_path = meta.parent_worktree_path.map(|p| repair(&p));
+        lineage.entry(repair(&key)).or_insert(meta);
+    }
+    store.lineage = lineage;
 }
 
 /// 같은 디렉터리를 가리키는 프로젝트 중복(심볼릭 링크 별칭 차이)을 하나로 합친다(OWE-803).
@@ -4244,6 +4371,9 @@ fn write_atomic_0600(path: &Path, bytes: &[u8], original: Option<&str>) -> io::R
     }
     res
 }
+
+#[cfg(test)]
+mod workspace_tests;
 
 #[cfg(test)]
 mod tests {

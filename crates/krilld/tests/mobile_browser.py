@@ -53,19 +53,27 @@ def main():
                     browser('screenshot', str(shots / f'{name}.png'))
                 fault = Path(scratch) / 'interrupt.js'
                 fault.write_text("""
+localStorage.setItem('krill-mobile-ui-v1',JSON.stringify({...JSON.parse(localStorage.getItem('krill-mobile-ui-v1')||'{}'),language:'en'}));
 const NativeWebSocket=WebSocket;globalThis.recoverySockets=[];
 globalThis.WebSocket=class extends NativeWebSocket {
  constructor(...args){super(...args);recoverySockets.push(this);let received=0;
  this.addEventListener('message',e=>{if((++received===3&&!sessionStorage.getItem('interrupted'))||this.dropReply){this.dropReply=false;sessionStorage.setItem('interrupted','yes');e.stopImmediatePropagation();this.close();}});}
- send(data){if(this.dropAfterSend){this.dropAfterSend=false;this.dropReply=true;}return super.send(data);}
+ send(data){if(globalThis.dropNextSend){globalThis.dropNextSend=false;this.dropReply=true;globalThis.droppedSocket=this;}return super.send(data);}
 };
 """)
                 browser('--init-script', str(fault), 'open', cfg['url'])
                 browser('set','viewport','390','844')
                 wait('KrillMobile.store.connection.phase==="ready" && recoverySockets.length>=2')
+                wait(f'KrillMobile.store.sessions.has({cfg["session"]})')
+                navigate('/')
+                wait('!!document.querySelector(".host-card")')
                 assert evaluate('sessionStorage.getItem("interrupted")') == 'yes'
                 assert len(json.loads((Path(cfg['dir'])/'mobile-devices.json').read_text())) == 1
-                assert evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("krill-mobile-v2"),hash:location.hash})') == {'secure':False,'subtle':'undefined','paired':True,'hash':'#/'}
+                security = evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("minikrill-mobile-v2"),hash:location.hash})')
+                assert security['paired'] and security['hash'] == '#/', security
+                # Chromium treats loopback as secure, while LAN IPs are insecure.
+                # mobile_pwa.cjs separately exercises encryption without subtle.
+                assert security['subtle'] == ('object' if security['secure'] else 'undefined'), security
                 assert evaluate('document.querySelector(".host-card").getBoundingClientRect().bottom<innerHeight')
                 shot('home')
                 browser('click','.host-main')
@@ -84,15 +92,25 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 shot('action-sheet')
                 browser('find','role','button','click','--name','Send prompt','--exact')
                 browser('fill','#prompt','mobile-reconnect-once')
-                evaluate('recoverySockets[1].dropAfterSend=true;document.getElementById("composer").requestSubmit();true')
-                wait('recoverySockets.length>=4&&KrillMobile.store.connection.phase==="ready"')
+                # Observe the user-facing uncertainty notice before a successful
+                # reconnect replaces transient connection status text.
+                evaluate('globalThis.mutationNotices=[];globalThis.noticeObserver=new MutationObserver(()=>{const n=document.getElementById("notice");if(!n.hidden&&n.textContent)mutationNotices.push(n.textContent);});noticeObserver.observe(document.getElementById("notice"),{subtree:true,childList:true,characterData:true,attributes:true});true')
+                evaluate('globalThis.dropNextSend=true;globalThis.beforeDropSockets=recoverySockets.length;document.getElementById("composer").requestSubmit();true')
+                wait('globalThis.droppedSocket?.readyState===3&&recoverySockets.length>beforeDropSockets&&KrillMobile.store.connection.phase==="ready"')
+                until(lambda:'got:mobile-reconnect-once' in cli('read',str(cfg['session'])))
                 assert cli('read',str(cfg['session'])).count('got:mobile-reconnect-once') == 1
                 assert evaluate('document.getElementById("prompt").value') == 'mobile-reconnect-once'
-                assert 'not resent' in evaluate('document.getElementById("notice").textContent')
+                # Host-pool reconnection may replace transient status copy; the
+                # transport must retain the uncertain-mutation update guard.
+                assert evaluate('KrillMobile.app.transport.updateBusy')
+                assert any('not resent' in text for text in evaluate('mutationNotices'))
+                evaluate('noticeObserver.disconnect();true')
                 browser('find','role','button','click','--name','Cancel','--exact')
                 browser('find','role','button','click','--name','Terminal actions','--exact')
-                browser('find','role','button','click','--name','Approve (Yes)','--exact')
-                until(lambda:'got:y' in cli('read',str(cfg['session'])))
+                browser('find','role','button','click','--name','Review in Terminal','--exact')
+                # Approval is reviewed in the live terminal; the menu sends no
+                # unchecked affirmative byte on the user's behalf.
+                assert 'got:y' not in cli('read',str(cfg['session']))
                 evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
                 browser('fill','.command-input','한글 조합 테스트')
                 evaluate('document.querySelector(".command-input").dispatchEvent(new CompositionEvent("compositionstart"));document.querySelector(".buffered-command").requestSubmit();true')
@@ -127,13 +145,17 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 assert evaluate('new Promise(r=>setTimeout(()=>r(document.querySelector("#orchestration textarea")?.value),3100))')=='모바일 응답'
                 shot('orchestration')
                 browser('find','role','button','click','--name','Send reply','--exact')
-                wait('!document.querySelector("#orchestration textarea")')
+                wait('document.querySelector("#orchestration textarea")?.readOnly && document.querySelector("#orchestration textarea").value===""')
+                wait('KrillMobile.store.snapshot.orchestration.questions.length===0')
                 navigate('/accounts')
-                wait('Array.from(document.querySelectorAll(".account-card h2")).some(e=>e.textContent==="Mobile fixture")')
-                account='Array.from(document.querySelectorAll(".account-card")).find(e=>e.querySelector("h2").textContent==="Mobile fixture")'
-                assert evaluate(f'Array.from(({account}).querySelectorAll("progress")).map(e=>e.value)')==[23,47]
-                evaluate(f'({account}).querySelector("button").click();true')
-                wait(f'!!({account}).querySelector(".active-account")')
+                wait('Array.from(document.querySelectorAll(".account-title")).some(e=>e.textContent==="Mobile fixture")')
+                account='Array.from(document.querySelectorAll(".account-row")).find(e=>e.querySelector(".account-title").textContent==="Mobile fixture")'
+                # This fixture writes these exact cache values. A backend/UI pair
+                # that both loses usage must fail instead of agreeing on unknown.
+                expected = ['23%', '47%']
+                assert evaluate(f'Array.from(({account}).querySelectorAll(".usage-value")).map(e=>e.textContent)') == expected
+                evaluate(f'({account}).click();true')
+                wait(f'!!({account}).querySelector(".check")')
                 shot('accounts')
                 navigate(f'/git/{cfg["session"]}')
                 wait('!!Array.from(document.querySelectorAll(".file-row")).find(e=>e.textContent==="example.txt")')
@@ -143,8 +165,8 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 navigate('/settings')
                 shot('settings')
                 navigate('/settings/terminal')
-                browser('select','select[aria-label="Font size"]','1.25')
-                browser('find','role','checkbox','click','--name','Esc','--exact')
+                browser('select','select[aria-label="Terminal text size"]','1.25')
+                browser('find','role','checkbox','click','--name','Show key: Esc','--exact')
                 assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-ui-v1")).visibleKeyIds.includes("escape")') is False
                 shot('terminal-settings')
                 navigate(original_route)

@@ -61,7 +61,7 @@ fn main() -> std::process::ExitCode {
         return shell::files::bench::run(&dir);
     }
     // OWE-576: gpui-component 아이콘 자산은 재열기·새 창에서도 같은 소스를 쓴다.
-    let application = gpui_platform::application().with_assets(gpui_kit_assets::Assets);
+    let application = gpui_platform::application().with_assets(krill_app::ui::icons::AppAssets);
     application.on_reopen(|cx| request_open_from_menu(None, cx));
     application.run(|cx: &mut App| {
         init(cx);
@@ -333,9 +333,6 @@ fn init(cx: &mut App) {
     })
     .detach();
     cx.bind_keys([
-        // OWE-859: ⌘N은 메인 창 안 새 워크트리(Orca와 같음), 새 창은 ⇧⌘N(메뉴 표기도 여기서 나온다).
-        krill_app::keys::bind("cmd-shift-n", NewWindow, None),
-        krill_app::keys::bind("cmd-alt-w", CloseWindow, None),
         // OWE-864: macOS 표준 창·앱 동작. 터미널 문맥 바인딩과 겹치지 않는 전역 키만 쓴다.
         krill_app::keys::bind("cmd-h", HideApp, None),
         krill_app::keys::bind("cmd-alt-h", HideOthers, None),

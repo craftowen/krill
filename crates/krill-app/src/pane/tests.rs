@@ -148,6 +148,58 @@ fn input_goes_through_journal_and_ack() {
 }
 
 #[test]
+fn mouse_reports_are_not_held_during_account_switch_or_disconnect() {
+    let now = Now::get();
+    for failed in [false, true] {
+        let mut p = linked();
+        p.pause_account_input();
+        if failed {
+            p.resume_account_input(true, now);
+        }
+        for _ in 0..2_000 {
+            assert!(p.report(b"\x1b[<35;19;42M").is_none());
+        }
+        assert!(sent(out(&mut p)).is_empty());
+        assert_eq!(p.journal.held_bytes(), 0);
+        p.input(b"held prompt\r", now);
+        assert!(p.handoff_account(SessionId(2)).is_none());
+        assert!(
+            p.link(SessionId(2), 10, Vec::new(), input::FEAT_INPUT, now)
+                .is_empty()
+        );
+        let frames = sent(out(&mut p));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            Input::decode(frames[0].0, &frames[0].1).unwrap().bytes,
+            b"held prompt\r"
+        );
+    }
+
+    let mut p = linked();
+    p.unlink();
+    p.report(b"\x1b[<64;19;42M");
+    assert!(
+        p.link(SessionId(1), 9, Vec::new(), input::FEAT_INPUT, now)
+            .is_empty()
+    );
+    assert!(sent(out(&mut p)).is_empty());
+}
+
+#[test]
+fn live_mouse_reports_are_sent_without_lost_input_notices() {
+    let mut p = linked();
+    let report = b"\x1b[<35;19;42M";
+    assert!(p.report(report).is_none());
+    let frames = sent(out(&mut p));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        Input::decode(frames[0].0, &frames[0].1).unwrap().bytes,
+        report
+    );
+    assert!(p.unlink().is_none());
+}
+
+#[test]
 fn account_handoff_holds_typing_for_the_selected_account_without_replaying_inflight_input() {
     let now = Now::get();
     let mut p = linked();

@@ -22,7 +22,7 @@ jobs:
     env:
       BUILD_PROFILE: ${{ inputs.profile }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
@@ -38,7 +38,7 @@ jobs:
       - name: Build, sign, verify and archive
         run: packaging/bundle.sh --profile "$BUILD_PROFILE"
       # ZIP 내부에 실행 권한과 코드 서명을 보존한다. 앱 디렉터리 자체는 업로드하지 않는다.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: krill-macos-adhoc
           path: |

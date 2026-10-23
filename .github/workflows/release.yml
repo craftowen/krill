@@ -30,7 +30,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -127,7 +127,7 @@ jobs:
             --output packaging/dist/latest.json
 
       - name: Upload Homebrew tap artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: homebrew-krill-${{ steps.meta.outputs.version }}
           path: packaging/dist/homebrew-krill/
@@ -155,9 +155,11 @@ jobs:
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists (publish-github.sh); signed assets are never overwritten."
           else
+            python3 packaging/release_notes.py --tag "${TAG}" --repo "${GITHUB_REPOSITORY}" > "${RUNNER_TEMP}/krill-release-notes.md"
             gh release create "${TAG}" "${ASSETS[@]}" \
               --target "${GITHUB_SHA}" \
               --title "Krill ${TAG}" \
+              --notes-file "${RUNNER_TEMP}/krill-release-notes.md" \
               --generate-notes
           fi
 
@@ -177,7 +179,7 @@ jobs:
       - name: Preserve LF before checkout
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -322,7 +324,7 @@ jobs:
           git rev-parse HEAD | Set-Content -Encoding ascii packaging/dist/source-commit-windows.txt
 
       - name: Upload Windows release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: krill-windows-${{ steps.meta.outputs.version }}-attempt-${{ github.run_attempt }}
           path: |
@@ -343,7 +345,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: krill-windows-${{ needs.build-windows.outputs.version }}-attempt-${{ github.run_attempt }}
           path: dist
@@ -365,8 +367,10 @@ jobs:
               gh release upload "${TAG}" "${ASSETS[@]}"
             fi
           else
+            python3 packaging/release_notes.py --tag "${TAG}" --repo "${GITHUB_REPOSITORY}" > "${RUNNER_TEMP}/krill-release-notes.md"
             gh release create "${TAG}" "${ASSETS[@]}" \
               --target "${GITHUB_SHA}" \
               --title "Krill ${TAG}" \
+              --notes-file "${RUNNER_TEMP}/krill-release-notes.md" \
               --generate-notes
           fi

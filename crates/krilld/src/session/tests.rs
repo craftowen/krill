@@ -261,6 +261,7 @@ fn guarded_rebuilds_engine_after_panic() {
         id: SessionId(1),
         clients: Mutex::default(),
         input: Mutex::default(),
+        capture: Mutex::default(),
         live: Mutex::new(Live {
             engine: Engine::new(size),
             revision: 0,
@@ -283,6 +284,7 @@ fn guarded_rebuilds_engine_after_panic() {
             end: 0,
             revision: 0,
             closed: false,
+            generation: 0,
         }),
         changed: Condvar::new(),
         store: None,
@@ -676,7 +678,7 @@ fn clear_scrollback_drops_hot_and_cold_history_and_keeps_new_output() {
                 stream: Stream::Screen { known: None },
             },
             1,
-            FEAT_INPUT | FEAT_CLEAR_SCROLLBACK,
+            FEAT_INPUT | FEAT_CLEAR_SCROLLBACK | krill_proto::term_modes::FEAT_CLEAR_VIEWPORT,
             Some(attached),
             Role::Interactive,
             crate::attach::FRAME_MIN,
@@ -765,6 +767,25 @@ fn clear_scrollback_drops_hot_and_cold_history_and_keeps_new_output() {
             .collect();
         assert_eq!(texts, vec!["old3", "old4"]);
     }
+
+    let (_, before_revision, before_seq) = tap.capture();
+    client
+        .write_all(&krill_proto::term_modes::ClearViewport.encode().unwrap())
+        .unwrap();
+    loop {
+        let (kind, _) = ipc::read_frame(&mut client).unwrap().unwrap();
+        if kind == krill_proto::screen::kind::UPDATE && tap.capture().1 > before_revision {
+            break;
+        }
+    }
+    let (cleared, after_revision, after_seq) = tap.capture();
+    assert!(after_revision > before_revision);
+    assert_eq!(
+        after_seq, before_seq,
+        "clear must not produce terminal input/output"
+    );
+    assert_eq!(cleared.cursor.line, 0);
+    assert_eq!(tap.history(0, 0).0, 0);
 
     client.shutdown(Shutdown::Both).unwrap();
     drop(client);

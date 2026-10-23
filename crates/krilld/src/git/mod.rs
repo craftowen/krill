@@ -29,6 +29,11 @@ pub mod worktree;
 
 /// git 동시 실행 상한(T4 G8: Orca 일반 작업 2~4).
 pub const MAX_CONCURRENT: usize = 4;
+const MAX_PENDING: usize = 256;
+const MAX_REPO_PENDING: usize = 32;
+const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const DRAIN_BYTES: usize = 64 * 1024;
 
 /// git 자식 실행 상한. 멈춘 훅·credential helper가 큐 워커를 영구 블록하지 않게 한다.
 #[cfg(not(test))]
@@ -129,10 +134,33 @@ impl GitQueue {
     {
         let (reply, rx) = mpsc::channel();
         let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+        if args
+            .iter()
+            .map(|a| a.as_os_str().as_bytes().len())
+            .sum::<usize>()
+            > MAX_ARGUMENT_BYTES
+        {
+            reply
+                .send(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "git arguments exceed byte budget",
+                )))
+                .ok();
+            return rx;
+        }
+        let submitted = Instant::now();
         self.enqueue(
             repo.into(),
             Box::new(move |program, repo| {
-                reply.send(run(program, repo, &args)).ok();
+                let result = if submitted.elapsed() >= TIMEOUT {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "git queue deadline elapsed before execution",
+                    ))
+                } else {
+                    run(program, repo, &args)
+                };
+                reply.send(result).ok();
             }),
         );
         rx
@@ -183,9 +211,16 @@ impl GitQueue {
 
     /// 링크된 워크트리는 실행 디렉터리와 직렬화할 주 저장소 키가 다르다.
     fn enqueue_key(&self, repo: PathBuf, key: PathBuf, execute: Execute) {
-        lock(&self.shared.state)
-            .pending
-            .push_back(Job { repo, key, execute });
+        let mut state = lock(&self.shared.state);
+        // Reject before starting, with no mutation retry. Retained argument payloads are bounded
+        // by MAX_ARGUMENT_BYTES (edit payloads already have stricter protocol limits).
+        if state.closed
+            || state.pending.len() >= MAX_PENDING
+            || state.pending.iter().filter(|job| job.key == key).count() >= MAX_REPO_PENDING
+        {
+            return; // dropping execute disconnects its result channel
+        }
+        state.pending.push_back(Job { repo, key, execute });
         self.shared.changed.notify_one();
     }
 }
@@ -300,8 +335,18 @@ fn run_guarded(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                drain(&mut stdout, &mut out, &mut buf).ok();
-                drain(&mut stderr, &mut err, &mut buf).ok();
+                // Pipes can outlive the leader. Keep draining with the same byte/deadline
+                // limits instead of a final unbounded read from an inherited writer.
+                if !out_eof || !err_eof {
+                    if Instant::now() >= deadline {
+                        terminate_gracefully(&mut child);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "git output timed out",
+                        ));
+                    }
+                    continue;
+                }
                 kill_and_reap(&mut child);
                 return Ok(Output {
                     status,
@@ -334,10 +379,20 @@ fn run_guarded(
 
 /// 지금 읽을 수 있는 만큼 읽는다. EOF면 `true`.
 fn drain(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<bool> {
-    loop {
+    let mut read = 0;
+    while read < DRAIN_BYTES {
         match pipe.read(buf) {
             Ok(0) => return Ok(true),
-            Ok(n) => dst.extend(buf.iter().take(n).copied()),
+            Ok(n) => {
+                if n > MAX_OUTPUT_BYTES.saturating_sub(dst.len()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "git output exceeds byte budget",
+                    ));
+                }
+                dst.extend_from_slice(buf.get(..n).unwrap_or_default());
+                read += n;
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -349,6 +404,7 @@ fn drain(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Res
             Err(e) => return Err(e),
         }
     }
+    Ok(false)
 }
 
 /// K-15: 프로세스 그룹에 먼저 SIGTERM을 보내 git이 lockfile(`index.lock`)을 정리하고

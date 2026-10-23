@@ -17,6 +17,9 @@ pub fn is_shell_shortcut(ks: &Keystroke) -> bool {
     if m.platform {
         return true;
     }
+    if m.shift && !m.control && !m.alt && matches!(ks.key.as_str(), "pageup" | "pagedown") {
+        return true;
+    }
     if m.control && !m.alt {
         match ks.key.as_str() {
             "tab" => return true,
@@ -31,22 +34,53 @@ pub fn is_shell_shortcut(ks: &Keystroke) -> bool {
     false
 }
 
-/// macOS 줄 편집 관례: Cmd+Backspace = Ctrl+U(커서 왼쪽을 줄 시작까지 지움). Terminal·iTerm2·Orca와 같다.
-fn platform_alias(ks: &Keystroke) -> Option<Keystroke> {
+// Shortcut behavior follows Orca terminal-shortcut-policy.ts and xterm-bypass-policy.ts.
+// Copyright (c) 2026 Lovecast Inc., MIT License (.ref/orca/LICENSE).
+/// 앱이 변환하는 편집 키는 kitty 협상과 무관하게 원시 바이트로 보낸다.
+fn shortcut_bytes(ks: &Keystroke, modes: Modes) -> Option<&'static [u8]> {
     let m = ks.modifiers;
-    (m.platform && !m.control && !m.alt && !m.shift && !m.function && ks.key == "backspace").then(
-        || Keystroke {
-            modifiers: Modifiers::control(),
-            key: "u".into(),
-            key_char: None,
-        },
-    )
+    if m.function {
+        return None;
+    }
+    if m.platform && !m.control && !m.alt && !m.shift {
+        return match ks.key.as_str() {
+            "backspace" => Some(b"\x15"),
+            "delete" => Some(b"\x0b"),
+            "left" => Some(b"\x01"),
+            "right" => Some(b"\x05"),
+            _ => None,
+        };
+    }
+    if m.platform {
+        return None;
+    }
+    if m.control && !m.alt && !m.shift {
+        return match ks.key.as_str() {
+            "c" => Some(b"\x03"),
+            "backspace" => Some(b"\x17"),
+            "enter" if cfg!(target_os = "macos") || modes.kitty != 0 => Some(b"\x1b[13;5u"),
+            _ => None,
+        };
+    }
+    if modes.kitty == 0 && !m.control {
+        if m.shift && !m.alt && ks.key == "enter" {
+            return Some(b"\x1b\r");
+        }
+        if m.alt && !m.shift {
+            return match ks.key.as_str() {
+                "left" => Some(b"\x1bb"),
+                "right" => Some(b"\x1bf"),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// 문자 입력은 IME로, 모호한 키·기능 키는 협상한 형식으로 보낸다.
 pub fn key(ks: &Keystroke, modes: Modes, event: Event) -> Option<Vec<u8>> {
-    if let Some(alias) = platform_alias(ks) {
-        return key(&alias, modes, event);
+    if let Some(bytes) = shortcut_bytes(ks, modes) {
+        return (event != Event::Release).then(|| bytes.to_vec());
     }
     if is_shell_shortcut(ks) {
         return None;
@@ -186,13 +220,16 @@ pub fn key(ks: &Keystroke, modes: Modes, event: Event) -> Option<Vec<u8>> {
 // ponytail: Shift는 영문자만 대문자로 바꾼다(Option+Shift+1 → ESC 1). 기호까지 필요하면 자판 배열 조회를 붙인다.
 pub fn meta(ks: &Keystroke, option_as_meta: bool) -> Option<Vec<u8>> {
     let m = ks.modifiers;
-    if !option_as_meta || !m.alt || m.control || m.platform || m.function {
+    if !m.alt || m.control || m.platform || m.function {
         return None;
     }
     let mut chars = ks.key.chars();
     let c = chars
         .next()
         .filter(|c| c.is_ascii_graphic() && chars.next().is_none())?;
+    if !option_as_meta && (m.shift || !matches!(c, 'b' | 'f' | 'd')) {
+        return None;
+    }
     let c = if m.shift { c.to_ascii_uppercase() } else { c };
     Some(vec![0x1b, u8::try_from(c).ok()?])
 }
@@ -233,9 +270,22 @@ pub enum Mouse {
     Wheel(bool),
 }
 
+/// 스크롤백 없는 대체 화면에서는 DEC 1007 설정을 따라 휠을 방향키로 보낸다.
+pub fn wheel_arrows(modes: Modes, up: bool) -> Option<&'static [u8]> {
+    if modes.mouse() || !modes.contains(Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL) {
+        return None;
+    }
+    Some(match (modes.contains(Modes::APP_CURSOR), up) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    })
+}
+
 /// SGR 1006. 칸은 0부터 받아 1부터 출력한다. Shift는 로컬 상호작용을 위해 보고를 우회한다.
 pub fn mouse(modes: Modes, event: Mouse, column: u16, line: u16, m: Modifiers) -> Option<Vec<u8>> {
-    if !modes.mouse() || !modes.contains(Modes::SGR_MOUSE) || m.shift || m.platform {
+    if !modes.mouse() || !modes.contains(Modes::SGR_MOUSE) || m.shift || m.alt || m.platform {
         return None;
     }
     let (button, release) = match event {
@@ -278,6 +328,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn alternate_wheel_respects_mouse_tracking_cursor_and_dec1007() {
+        let mut modes = Modes {
+            kitty: 0,
+            flags: Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL,
+        };
+        assert_eq!(wheel_arrows(modes, true), Some(&b"\x1b[A"[..]));
+        assert_eq!(wheel_arrows(modes, false), Some(&b"\x1b[B"[..]));
+        modes.flags |= Modes::APP_CURSOR;
+        assert_eq!(wheel_arrows(modes, true), Some(&b"\x1bOA"[..]));
+        modes.flags |= Modes::MOUSE_CLICK;
+        assert_eq!(wheel_arrows(modes, true), None);
+        modes.flags &= !Modes::MOUSE_CLICK;
+        modes.flags &= !Modes::ALTERNATE_SCROLL;
+        assert_eq!(wheel_arrows(modes, true), None);
+        assert_eq!(wheel_arrows(Modes::default(), true), None);
+    }
+
     /// OWE-658: Option+b는 켜면 ESC b, 끄면 IME(특수 문자)로 간다.
     #[test]
     fn option_as_meta_sends_escape_prefix() {
@@ -285,7 +353,8 @@ mod tests {
         // 레거시 모드에서 `key`는 Option+글자를 보내지 않아 `meta`로 넘어간다.
         assert_eq!(encode("alt-b", 0, Event::Press), None);
         assert_eq!(meta(&ks("alt-b"), true).unwrap(), b"\x1bb");
-        assert_eq!(meta(&ks("alt-b"), false), None);
+        assert_eq!(meta(&ks("alt-b"), false).unwrap(), b"\x1bb");
+        assert_eq!(meta(&ks("alt-a"), false), None);
         assert_eq!(meta(&ks("alt-shift-f"), true).unwrap(), b"\x1bF");
         assert_eq!(meta(&ks("alt-."), true).unwrap(), b"\x1b.");
         // Option 없는 글자·Ctrl/Cmd 조합·이름 있는 키는 대상이 아니다.
@@ -334,10 +403,7 @@ mod tests {
             );
             assert_eq!(encode("enter", flags, Event::Press).unwrap(), b"\r");
             assert_eq!(encode("enter", flags, Event::Release), None);
-            assert_eq!(
-                encode("ctrl-c", flags, Event::Press).unwrap(),
-                b"\x1b[99;5u"
-            );
+            assert_eq!(encode("ctrl-c", flags, Event::Press).unwrap(), b"\x03");
             assert_eq!(encode("a", flags, Event::Press), None);
         }
         assert_eq!(encode("left", 7, Event::Release).unwrap(), b"\x1b[1;1:3D");
@@ -349,12 +415,14 @@ mod tests {
         assert_eq!(encode("cmd-t", 31, Event::Press), None);
         // Cmd+Backspace = Ctrl+U(줄 시작까지 지움), 협상한 형식 그대로.
         assert_eq!(encode("cmd-backspace", 0, Event::Press).unwrap(), b"\x15");
-        assert_eq!(
-            encode("cmd-backspace", 1, Event::Press).unwrap(),
-            b"\x1b[117;5u"
-        );
+        assert_eq!(encode("cmd-backspace", 1, Event::Press).unwrap(), b"\x15");
         assert_eq!(encode("cmd-backspace", 0, Event::Release), None);
         assert_eq!(encode("cmd-shift-backspace", 0, Event::Press), None);
+        // Cmd+←/→ = Ctrl+A/E(줄 처음·끝).
+        assert_eq!(encode("cmd-left", 0, Event::Press).unwrap(), b"\x01");
+        assert_eq!(encode("cmd-right", 0, Event::Press).unwrap(), b"\x05");
+        assert_eq!(encode("cmd-right", 1, Event::Press).unwrap(), b"\x05");
+        assert_eq!(encode("cmd-shift-left", 0, Event::Press), None);
         for flags in [0, 5, 7, 31] {
             for ev in [Event::Press, Event::Repeat, Event::Release] {
                 for shortcut in [
@@ -362,6 +430,8 @@ mod tests {
                     "ctrl-shift-tab",
                     "ctrl-pageup",
                     "ctrl-pagedown",
+                    "shift-pageup",
+                    "shift-pagedown",
                     "ctrl-1",
                     "ctrl-2",
                     "ctrl-9",
@@ -372,6 +442,40 @@ mod tests {
                         "{shortcut} flags={flags}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn orca_editing_shortcuts_do_not_submit_or_leak_release_events() {
+        for (chord, bytes) in [
+            ("shift-enter", b"\x1b\r".as_slice()),
+            ("alt-left", b"\x1bb"),
+            ("alt-right", b"\x1bf"),
+            ("ctrl-backspace", b"\x17"),
+            ("cmd-delete", b"\x0b"),
+        ] {
+            assert_eq!(
+                encode(chord, 0, Event::Press).as_deref(),
+                Some(bytes),
+                "{chord}"
+            );
+            assert_eq!(encode(chord, 0, Event::Release), None, "{chord}");
+        }
+        for flags in [0, 1, 7, 31] {
+            for chord in [
+                "cmd-left",
+                "cmd-right",
+                "cmd-backspace",
+                "cmd-delete",
+                "ctrl-c",
+                "ctrl-backspace",
+            ] {
+                assert_eq!(
+                    encode(chord, flags, Event::Release),
+                    None,
+                    "{chord} flags={flags}"
+                );
             }
         }
     }
@@ -423,6 +527,7 @@ mod tests {
         );
         assert!(mouse(modes, Mouse::Move(None), 0, 0, m).is_none());
         assert!(mouse(modes, Mouse::Press(0), 0, 0, Modifiers { shift: true, ..m }).is_none());
+        assert!(mouse(modes, Mouse::Press(0), 0, 0, Modifiers { alt: true, ..m }).is_none());
         assert!(mouse(Modes::default(), Mouse::Press(0), 0, 0, m).is_none());
     }
 }

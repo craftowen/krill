@@ -149,6 +149,7 @@ pub struct Explorer {
     pub(crate) filter_query: String,
     pub(crate) filter_collapsed: BTreeSet<PathBuf>,
     pub(crate) filter_files_cache: Option<Vec<DirEntry>>,
+    filter_normalized: Vec<String>,
     pub(crate) rows: Vec<TreeRow>,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) scroll: UniformListScrollHandle,
@@ -200,6 +201,7 @@ impl Explorer {
             filter_query: String::new(),
             filter_collapsed: BTreeSet::new(),
             filter_files_cache: None,
+            filter_normalized: Vec::new(),
             rows: Vec::new(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
@@ -239,6 +241,7 @@ impl Explorer {
         self.ignored.clear();
         self.filter_collapsed.clear();
         self.filter_files_cache = None;
+        self.filter_normalized.clear();
         self.rows.clear();
         self.selected = None;
         self.editing = None;
@@ -346,6 +349,7 @@ impl Explorer {
         self.loaded_root = true;
         self.ignored.clear();
         self.filter_files_cache = None;
+        self.filter_normalized.clear();
         let root = self.repo.clone();
         self.load_dir(&root);
         let dirs: Vec<PathBuf> = self.expanded.iter().cloned().collect();
@@ -472,6 +476,7 @@ impl Explorer {
             .open(&full_path)?;
         self.expand_ancestors_to(&full_path);
         self.filter_files_cache = None;
+        self.filter_normalized.clear();
         self.selected = Some(full_path.clone());
         self.error = None;
         self.rebuild_rows();
@@ -509,6 +514,7 @@ impl Explorer {
         self.expanded.insert(full_path.clone());
         self.load_dir(&full_path);
         self.filter_files_cache = None;
+        self.filter_normalized.clear();
         self.selected = Some(full_path.clone());
         self.error = None;
         self.rebuild_rows();
@@ -604,6 +610,7 @@ impl Explorer {
             self.load_dir(&new_path);
         }
         self.filter_files_cache = None;
+        self.filter_normalized.clear();
         self.selected = Some(new_path.clone());
         self.error = None;
         self.rebuild_rows();
@@ -644,6 +651,7 @@ impl Explorer {
             self.selected = None;
         }
         self.filter_files_cache = None;
+        self.filter_normalized.clear();
         self.error = None;
         self.rebuild_rows();
         Ok(trashed)
@@ -685,9 +693,15 @@ impl Explorer {
         let Some(all_entries) = self.filter_files_cache.as_ref() else {
             return;
         };
+        if self.filter_normalized.len() != all_entries.len() {
+            self.filter_normalized = all_entries
+                .iter()
+                .map(|e| e.relative_path.to_ascii_lowercase())
+                .collect();
+        }
         let mut matched_dirs = BTreeSet::new();
-        let mut matched_entries = Vec::new();
-        for entry in all_entries {
+        let mut matched_entries = std::collections::HashSet::new();
+        for (entry, lower_rel) in all_entries.iter().zip(&self.filter_normalized) {
             if !self.show_dotfiles && is_dotfile_rel(&entry.relative_path) {
                 continue;
             }
@@ -695,7 +709,6 @@ impl Explorer {
             if !self.show_ignored && ignored {
                 continue;
             }
-            let lower_rel = entry.relative_path.to_ascii_lowercase();
             if tokens.iter().all(|t| lower_rel.contains(t)) {
                 let mut cur = entry.path.parent();
                 while let Some(parent) = cur {
@@ -705,13 +718,13 @@ impl Explorer {
                     matched_dirs.insert(parent.to_path_buf());
                     cur = parent.parent();
                 }
-                matched_entries.push(entry.clone());
+                matched_entries.insert(entry.path.as_path());
             }
         }
         let mut tree: BTreeMap<PathBuf, Vec<DirEntry>> = BTreeMap::new();
         for entry in all_entries {
             if ((entry.is_dir && matched_dirs.contains(&entry.path))
-                || matched_entries.iter().any(|m| m.path == entry.path))
+                || matched_entries.contains(entry.path.as_path()))
                 && let Some(parent) = entry.path.parent()
             {
                 tree.entry(parent.to_path_buf())
@@ -1091,6 +1104,7 @@ impl Panel {
                 }
                 // 필터 캐시는 무효화하고, 필터가 켜져 있으면 디바운스 경로로 다시 스캔한다.
                 this.explorer.filter_files_cache = None;
+                this.explorer.filter_normalized.clear();
                 let query = this.explorer.filter_query.clone();
                 if query.trim().is_empty() {
                     this.explorer.rebuild_rows();
@@ -1298,6 +1312,7 @@ impl Panel {
                             }
                             s.explorer.error = None;
                             s.explorer.filter_files_cache = None;
+                            s.explorer.filter_normalized.clear();
                             let query = s.explorer.filter_query.clone();
                             s.schedule_explorer_filter(query, cx);
                             if s.explorer

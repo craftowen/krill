@@ -535,3 +535,43 @@ fn shell_cwd_reports() {
     );
     assert_eq!(e.cwd(), Some(Path::new(quoted)));
 }
+
+#[test]
+fn clear_viewport_keeps_prompt_line_and_modes_without_pty_input() {
+    let look = fresh();
+    let mut engine = Engine::new(SIZE);
+    engine.feed(b"old output\r\nprompt> \x1b[?2004h", Feed::Live, &look);
+    let modes = engine.input_modes();
+    engine.clear_viewport();
+    let screen = engine.screen();
+    assert_eq!(screen.cursor.line, 0);
+    assert_eq!(screen.cursor.column, 8);
+    assert_eq!(
+        screen
+            .rows
+            .first()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>(),
+        "prompt>"
+    );
+    assert!(screen.rows.iter().skip(1).all(Vec::is_empty));
+    assert_eq!(engine.input_modes(), modes);
+    assert_eq!(engine.history_len(), 0);
+}
+
+#[test]
+fn alternate_screen_and_scroll_modes_follow_dec_private_sequences() {
+    use krill_proto::term_modes::Modes;
+    let mut engine = Engine::new(SIZE);
+    let look = fresh();
+    assert!(!engine.input_modes().contains(Modes::ALT_SCREEN));
+    assert!(engine.input_modes().contains(Modes::ALTERNATE_SCROLL));
+    engine.feed(b"\x1b[?1049h", Feed::Live, &look);
+    assert!(engine.input_modes().contains(Modes::ALT_SCREEN));
+    engine.feed(b"\x1b[?1007l", Feed::Live, &look);
+    assert!(!engine.input_modes().contains(Modes::ALTERNATE_SCROLL));
+    engine.feed(b"\x1b[?1049l", Feed::Live, &look);
+    assert!(!engine.input_modes().contains(Modes::ALT_SCREEN));
+}

@@ -20,6 +20,8 @@ struct Tracked {
     detector: Detector,
     /// pid 재사용을 구분하는 시작 시각. 이전 그룹의 늦은 종료는 새 그룹을 종료시키지 않는다.
     process: Option<(u32, u64)>,
+    /// Name lookups may be reused only after start identity is revalidated each tick.
+    name: Option<(u32, u64, Instant, String)>,
     /// 마지막으로 문자열화한 화면(revision·제목·평문). revision이 그대로면 다시 문자열화하지 않고
     /// 이 캐시로 감지한다(OWE-586: 유휴 20세션 문자열화 비용 제거).
     evidence: Option<(u64, String, String)>,
@@ -88,7 +90,18 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             .detector
             .observe(title, screen, *rev, &status, Instant::now());
         if let Some(pid) = tap.foreground() {
-            let name = crate::sys::process_name(pid).unwrap_or_default();
+            let identity = crate::sys::start_us(pid).ok();
+            let name = if let Some((cached_pid, cached_start, at, name)) = &t.name
+                && *cached_pid == pid
+                && identity == Some(*cached_start)
+                && at.elapsed() < Duration::from_secs(1)
+            {
+                name.clone()
+            } else {
+                let name = crate::sys::process_name(pid).unwrap_or_default();
+                t.name = identity.map(|start| (pid, start, Instant::now(), name.clone()));
+                name
+            };
             let agent = matches!(
                 name.as_str(),
                 "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity"
@@ -97,7 +110,7 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                     || evidence.is_some_and(|e| e.source == krill_proto::control::Source::Title)
                         && status.source != Some(krill_proto::control::Source::Process)));
             if agent
-                && let Ok(start) = crate::sys::start_us(pid)
+                && let Some(start) = identity
                 && t.process != Some((pid, start))
             {
                 // 먼저 등록해 직후 종료도 놓치지 않는다.

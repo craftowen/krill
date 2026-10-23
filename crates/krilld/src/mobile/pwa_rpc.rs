@@ -9,7 +9,7 @@ use krill_proto::os::{
 };
 use krill_proto::{
     SessionId,
-    control::{self, CaptureFormat, Create, Program, Reply, Request},
+    control::{self, Create, Program, Reply, Request},
     input::{Input, InputAck, InputId, InputResult},
     ipc::{self, ClientRole, ServerHello},
     orchestration::{GateStatus, MessageType, OrchestrationStore},
@@ -51,7 +51,35 @@ pub(super) struct Backend {
     host: Value,
     /// 카드 git 요약(branch·added·deleted) cwd별 캐시. 실패도 `Null`로 캐시한다.
     git_cache: Mutex<HashMap<PathBuf, (Instant, Value)>>,
+    snapshot_cache: Mutex<Option<DashboardSnapshot>>,
+    catalog_cache: Mutex<Option<CatalogSnapshot>>,
 }
+type FileStamp = Option<crate::agent::control::cache::Stamp>;
+
+struct DashboardSnapshot {
+    revision: u64,
+    paths: Vec<PathBuf>,
+    stamps: Vec<FileStamp>,
+    at: Instant,
+    data: Value,
+    etag: String,
+}
+
+struct CatalogSnapshot {
+    repositories: Vec<control::RepositoryTrees>,
+    paths: Vec<PathBuf>,
+    stamps: Vec<FileStamp>,
+    at: Instant,
+    catalog: Arc<super::workspaces::Catalog>,
+}
+
+fn file_stamps(paths: &[PathBuf]) -> Vec<FileStamp> {
+    paths
+        .iter()
+        .map(|path| crate::agent::control::cache::stamp(path))
+        .collect()
+}
+
 /// 스냅샷 폴링이 같은 cwd마다 git 자식을 다시 띄우지 않게 하는 카드 요약 수명. 상세 git 화면은 캐시를 안 쓴다.
 const GIT_TTL: Duration = Duration::from_secs(5);
 impl std::fmt::Debug for Backend {
@@ -113,6 +141,9 @@ enum Action {
         session: u64,
         #[serde(default)]
         offset: u64,
+        /// Open at the tail, or page backwards from `end_offset`.
+        #[serde(default)]
+        latest: bool,
         /// Display-only replay boundary from a previously observed page; never approval authority.
         #[serde(default)]
         end_offset: Option<u64>,
@@ -201,6 +232,8 @@ impl Backend {
             hello,
             host: host_metadata(),
             git_cache: Mutex::default(),
+            snapshot_cache: Mutex::default(),
+            catalog_cache: Mutex::default(),
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -222,22 +255,7 @@ impl Backend {
     }
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
-            Action::Snapshot { since } => {
-                let mut data = self.snapshot()?;
-                let bytes = serde_json::to_vec(&data).map_err(io::Error::other)?;
-                let etag: String =
-                    hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref())
-                        .chars()
-                        .take(16)
-                        .collect();
-                if since.as_deref() == Some(etag.as_str()) {
-                    return Ok(json!({"unchanged":true,"etag":etag}));
-                }
-                if let Some(object) = data.as_object_mut() {
-                    object.insert("etag".into(), etag.into());
-                }
-                Ok(data)
-            }
+            Action::Snapshot { since } => self.snapshot_since(since.as_deref()),
             Action::CreateTerminal {
                 cwd_session,
                 workspace,
@@ -449,10 +467,20 @@ impl Backend {
             Action::ChatPoll {
                 session,
                 offset,
+                latest,
                 end_offset,
             } => {
                 let registry = self.registry.upgrade().ok_or_else(invalid)?;
                 let snapshot = registry.chat_poll(SessionId(session), offset);
+                if latest {
+                    let (snapshot, start) =
+                        crate::agent_history::chat::latest_page(snapshot, end_offset)?;
+                    let mut value = chat_page_value(snapshot, start)?;
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("has_earlier".into(), (start > 0).into());
+                    }
+                    return Ok(value);
+                }
                 let snapshot = if let Some(end) = end_offset {
                     crate::agent_history::chat::replay_page(snapshot, offset, end)?
                 } else {
@@ -654,6 +682,138 @@ impl Backend {
         }
         Ok(PathBuf::from(std::ffi::OsString::from_vec(directory.cwd)))
     }
+    fn snapshot_since(&self, since: Option<&str>) -> io::Result<Value> {
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        // This mutex is a snapshot-only singleflight, independent of registry/session IO.
+        let mut cached = crate::session::lock(&self.snapshot_cache);
+        let revision = registry.dashboard_revision();
+        if let Some(snapshot) = cached.as_ref()
+            && snapshot.revision == revision
+            && snapshot.at.elapsed() < GIT_TTL
+            && snapshot.stamps == file_stamps(&snapshot.paths)
+        {
+            return if since == Some(snapshot.etag.as_str()) {
+                Ok(json!({"unchanged":true,"etag":snapshot.etag}))
+            } else {
+                Ok(snapshot.data.clone())
+            };
+        }
+        // Drop stale terminal bodies before rebuilding (including a viewport clear).
+        *cached = None;
+        let base_paths = self.snapshot_paths(&Value::Null);
+        let before = file_stamps(&base_paths);
+        let mut data = self.snapshot()?;
+        let bytes = serde_json::to_vec(&data).map_err(io::Error::other)?;
+        let etag: String = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref())
+            .chars()
+            .take(16)
+            .collect();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("etag".into(), etag.clone().into());
+        }
+        let mut paths = self.snapshot_paths(&data);
+        if let Some(catalog) = crate::session::lock(&self.catalog_cache).as_ref() {
+            paths.extend(catalog.paths.iter().cloned());
+        }
+        let stamps = file_stamps(&paths);
+        // Never stamp a body built across a terminal/status mutation with the newer revision.
+        if registry.dashboard_revision() == revision && before == file_stamps(&base_paths) {
+            *cached = Some(DashboardSnapshot {
+                revision,
+                paths,
+                stamps,
+                at: Instant::now(),
+                data: data.clone(),
+                etag: etag.clone(),
+            });
+        }
+        if since == Some(etag.as_str()) {
+            Ok(json!({"unchanged":true,"etag":etag}))
+        } else {
+            Ok(data)
+        }
+    }
+
+    fn snapshot_paths(&self, data: &Value) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(dir) = &self.dir {
+            for name in [
+                "projects.toml",
+                "sidebar.bin",
+                "worktree-comments.toml",
+                "session-titles.json",
+                "orchestration.json",
+                "agents.toml",
+                "agent-rules.pub",
+                "agent-rules.bin",
+                "agent-launches",
+            ] {
+                paths.push(dir.join(name));
+            }
+            // Use the actual signed rules names as well as user/profile metadata.
+            paths.push(dir.join(krill_proto::agent::rules::PUBLIC_KEY_FILE_NAME));
+            paths.push(dir.join(krill_proto::agent::rules::RULES_FILE_NAME));
+            if let Some(sessions) = data.get("sessions").and_then(Value::as_array) {
+                for id in sessions
+                    .iter()
+                    .filter_map(|session| session.get("id").and_then(Value::as_u64))
+                {
+                    paths.push(dir.join("agent-launches").join(format!("{id}.json")));
+                }
+            }
+        }
+        paths
+    }
+
+    fn catalog(
+        &self,
+        repositories: &[control::RepositoryTrees],
+    ) -> Arc<super::workspaces::Catalog> {
+        let mut cached = crate::session::lock(&self.catalog_cache);
+        if let Some(old) = cached.as_ref()
+            && old.repositories == repositories
+            && old.at.elapsed() < GIT_TTL
+            && old.stamps == file_stamps(&old.paths)
+        {
+            return Arc::clone(&old.catalog);
+        }
+        *cached = None;
+        let mut paths = self.snapshot_paths(&Value::Null);
+        for tree in repositories.iter().flat_map(|repo| &repo.worktrees) {
+            let tree = PathBuf::from(std::ffi::OsString::from_vec(tree.clone()));
+            let dot = tree.join(".git");
+            paths.push(dot.clone());
+            let git = if dot.is_dir() {
+                dot
+            } else {
+                fs::read_to_string(&dot)
+                    .ok()
+                    .and_then(|text| {
+                        text.strip_prefix("gitdir:")
+                            .map(|git| tree.join(git.trim()))
+                    })
+                    .unwrap_or(dot)
+            };
+            paths.push(git.join("HEAD"));
+            paths.push(git.join("commondir"));
+        }
+        let before = file_stamps(&paths);
+        let catalog = Arc::new(super::workspaces::Catalog::load(
+            self.dir.as_deref(),
+            repositories,
+        ));
+        if before == file_stamps(&paths) {
+            *cached = Some(CatalogSnapshot {
+                repositories: repositories.to_vec(),
+                paths,
+                stamps: before,
+                at: Instant::now(),
+                catalog: Arc::clone(&catalog),
+            });
+        }
+        catalog
+    }
+
     fn snapshot(&self) -> io::Result<Value> {
         // 세션마다 요청이 2~3개라 요청마다 스레드·소켓·Hello를 새로 만들면 세션 수의 몇 배가 된다. 한 연결로 묶는다.
         let mut wire = self.wire()?;
@@ -672,7 +832,7 @@ impl Backend {
                 repositories: Vec::new(),
             },
         };
-        let catalog = super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories);
+        let catalog = self.catalog(&sidebar.repositories);
         let truncated = sessions.len() > 64;
         let rows: Vec<_> = sessions
             .into_iter()
@@ -750,21 +910,11 @@ impl Backend {
                 .or_else(|| auto_titles.get(&info.session).map(String::as_str))
                 .or(state.title.as_deref());
             let cwd = String::from_utf8_lossy(cwd_bytes);
-            let text = match control(&Request::Capture {
-                session: info.session,
-                format: CaptureFormat::Plain,
-            })? {
-                Reply::Captured { bytes, .. } => String::from_utf8_lossy(&bytes).into_owned(),
-                _ => String::new(),
-            };
-            let mut lines: Vec<_> = text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .rev()
-                .take(3)
-                .map(|l| l.chars().take(500).collect::<String>())
-                .collect();
-            lines.reverse();
+            let lines = self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.dashboard_tail(info.session))
+                .unwrap_or_default();
             let git = git_cwd(cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
@@ -783,11 +933,10 @@ impl Backend {
     }
     fn orchestration(&self) -> io::Result<Value> {
         let store = self
-            .dir
-            .as_deref()
-            .map(OrchestrationStore::load)
-            .transpose()?
-            .unwrap_or_default();
+            .registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .orchestration_snapshot()?;
         let questions: Vec<_> = store
             .messages
             .iter()
@@ -1526,10 +1675,13 @@ mod tests {
         let outside = session_group(SessionId(3), b"/outside/sub", &repositories);
         assert_eq!(outside.repo_key, None);
         assert_eq!(outside.path.as_deref(), Some("/outside/sub"));
-        assert_eq!(
-            super::super::workspaces::Catalog::load(None, &repositories).repositories_json()[1]["worktree_keys"],
-            json!([])
-        );
+        let listed =
+            super::super::workspaces::Catalog::load(None, &repositories).repositories_json();
+        let empty = listed
+            .iter()
+            .find(|repo| repo["key"] == hex(b"/empty"))
+            .unwrap();
+        assert_eq!(empty["worktree_keys"], json!([]));
     }
 
     #[test]

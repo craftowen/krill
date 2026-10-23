@@ -1,0 +1,3 @@
+"NSDocumentsFolderUsageDescription" = "Krill이 워크스페이스 및 에이전트 세션의 문서 폴더 파일에 접근합니다.";
+"NSDesktopFolderUsageDescription" = "Krill이 워크스페이스 및 에이전트 세션의 데스크톱 폴더 파일에 접근합니다.";
+"NSDownloadsFolderUsageDescription" = "Krill이 워크스페이스 및 에이전트 세션의 다운로드 폴더 파일에 접근합니다.";

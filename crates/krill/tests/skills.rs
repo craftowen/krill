@@ -43,6 +43,58 @@ fn success(output: Output) -> String {
 }
 
 #[test]
+fn reference_search_preserves_text_json_order_and_empty_results() {
+    let root = home("reference-search");
+    let state = root.join("state");
+    let mut store = krill_proto::orchestration::WorktreeStore::default();
+    store
+        .add_reference("/repo/Zebra", "https://example.com/First")
+        .unwrap();
+    store
+        .add_reference("/repo/Zebra", "https://example.com/second")
+        .unwrap();
+    store
+        .add_reference("/repo/Alpha", "https://elsewhere.test/First")
+        .unwrap();
+    store.save(&state).unwrap();
+    let run = |args: &[&str]| {
+        success(
+            command(&root)
+                .env("KRILL_STATE_DIR", &state)
+                .args(args)
+                .output()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        run(&["reference", "find", " FIRST "]),
+        "/repo/Alpha\thttps://elsewhere.test/First\n/repo/Zebra\thttps://example.com/First\n"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run(&["reference", "find", " zebra ", "--json"])).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([
+            {"worktree": "/repo/Zebra", "url": "https://example.com/First"},
+            {"worktree": "/repo/Zebra", "url": "https://example.com/second"}
+        ])
+    );
+    assert_eq!(run(&["reference", "search", "missing"]), "");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&run(&[
+            "reference",
+            "search",
+            "missing",
+            "--json"
+        ]))
+        .unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(run(&["reference", "find"]).lines().count(), 3);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn cli_start_automatically_installs_and_updates_owned_skills_and_keeps_orca() {
     let home = home("auto");
     let orca = home.join(".gemini/config/skills/orchestration");
@@ -55,6 +107,11 @@ fn cli_start_automatically_installs_and_updates_owned_skills_and_keeps_orca() {
             .unwrap(),
     );
     for root in krill_proto::orchestration::skill_directories(&home, "all") {
+        assert!(
+            root.join("artifacts/SKILL.md").is_file(),
+            "{}",
+            root.display()
+        );
         assert!(
             root.join("krill-orchestration/references/worker-contract.md")
                 .is_file()

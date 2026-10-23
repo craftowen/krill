@@ -11,6 +11,8 @@ use crate::screen::Msg;
 pub const FEAT_USAGE: u64 = 1 << 17;
 /// Provider-specific meters and running-session account handoff results.
 pub const FEAT_PROVIDER_DETAILS: u64 = 1 << 15;
+/// Explicitly resume input on the original session after a failed account handoff.
+pub const FEAT_ACCOUNT_CANCEL: u64 = 1 << 22;
 mod details;
 pub use details::{
     AccountMeters, ProviderDetails, RESET_CREDITS_METER_KEY, RESET_CREDITS_METER_LABEL,
@@ -700,6 +702,10 @@ pub enum UsageRequest {
         provider: ProviderKind,
         account_id: String,
     },
+    /// Cancel only a failed handoff. The caller explicitly agrees to send held input to the original.
+    CancelAccountSwitch {
+        session: crate::SessionId,
+    },
 }
 
 impl UsageRequest {
@@ -738,6 +744,10 @@ impl UsageRequest {
     pub fn required_features(&self) -> u64 {
         let mut features = FEAT_USAGE;
         let provider = match self {
+            Self::CancelAccountSwitch { .. } => {
+                features |= FEAT_ACCOUNT_CANCEL;
+                None
+            }
             Self::ImportOrcaAntigravity { .. } => {
                 features |= FEAT_PROVIDER_DETAILS;
                 Some(ProviderKind::Antigravity)

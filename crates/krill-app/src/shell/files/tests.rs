@@ -127,7 +127,7 @@ fn open_type_dirty_and_save(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("file-changed-on-disk").is_none());
 
     // 같은 파일을 다시 열면 새 탭이 아니라 그 탭으로 간다.
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     assert_eq!(open_file(&view, &file, cx), pane);
     assert_eq!(layout_of(&view, cx).tabs().len(), 2);
 }
@@ -274,7 +274,7 @@ fn focus_returns_to_terminal_and_tabs_restore(cx: &mut TestAppContext) {
     let path = state_path("files-restore");
     let (view, vcx) = open(cx, path.clone());
     let pane = open_file(&view, &file, vcx);
-    vcx.simulate_keystrokes("cmd-1");
+    vcx.simulate_keystrokes("ctrl-1");
     vcx.run_until_parked();
     let on_shell = vcx.update(|window, cx| view.read(cx).focus.is_focused(window));
     assert!(on_shell);
@@ -503,7 +503,7 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
 
     // OWE-867: 터미널 탭으로 돌아가 일반 평문 URL을 ⌘+호버하면 밑줄이 생기고 ⌘+클릭하면 브라우저로 연다.
     // 에디터를 여는 동안 숨은 터미널 칸의 연결은 끊기므로(EOF) 다시 붙인다.
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     cx.run_until_parked();
     view.update(cx, |s, cx| {
         let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1060,7 +1060,7 @@ fn accepted_save_survives_tab_discard_and_quit_barrier_waits(cx: &mut TestAppCon
 /// 아티팩트 공유: .md·.html 파일 머리에만 공유 버튼이 있다. 저장 안 된 변경이 있으면 저장 안내를,
 /// 공개 공유가 꺼져 있으면 CLI를 부르지 않고 설정 > 아티팩트를 연다.
 #[gpui::test]
-fn share_button_only_on_shareable_files_and_gate_opens_settings(cx: &mut TestAppContext) {
+fn share_button_only_on_shareable_files_and_dirty_changes_block_upload(cx: &mut TestAppContext) {
     let dir = TempDir::new("share-artifact");
     let md = dir.0.join("doc.md");
     fs::write(&md, "# doc\n").unwrap();
@@ -1085,21 +1085,5 @@ fn share_button_only_on_shareable_files_and_gate_opens_settings(cx: &mut TestApp
         let s = view.read(cx);
         assert_eq!(s.notice.as_deref(), Some(atext::SAVE_FIRST.get()));
         assert!(s.settings.is_none());
-    });
-
-    cx.simulate_keystrokes("cmd-s");
-    cx.run_until_parked();
-    assert!(!dirty(&view, pane, cx));
-    cx.update(|window, cx| view.update(cx, |s, cx| s.share_file_artifact(pane, window, cx)));
-    cx.run_until_parked();
-    cx.update(|_, cx| {
-        let s = view.read(cx);
-        assert_eq!(s.notice.as_deref(), Some(atext::DISABLED.get()));
-        let settings = s.settings.as_ref().expect("settings page opened");
-        assert_eq!(
-            settings.read(cx).tab(),
-            krill_app::settings::AdminTab::Artifacts
-        );
-        assert!(s.files.sharing.is_empty());
     });
 }

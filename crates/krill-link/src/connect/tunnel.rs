@@ -24,7 +24,8 @@ use crate::identity::DeviceIdentity;
 use crate::local::Listener;
 use crate::serve::{build_iroh_endpoint, is_serve_running, raise_nofile_limit};
 use crate::store::{
-    find_host, load_devices, load_hosts, now_unix_ms, validate_host_id, write_atomic_0600,
+    acquire_instance_lock, find_host, load_devices, load_hosts, now_unix_ms, validate_host_id,
+    write_status_0600,
 };
 use crate::{ALPN_LINK, Error};
 
@@ -148,10 +149,9 @@ fn is_tunnel_alive(status: &HostTunnelStatus) -> bool {
     status.pid.is_some() && now_unix_ms().saturating_sub(status.updated_at_ms) <= STALE_MS
 }
 
-fn persist_status(status_path: &Path, status: &HostTunnelStatus) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(status) {
-        write_atomic_0600(status_path, &bytes).ok();
-    }
+fn persist_status(status_path: &Path, status: &HostTunnelStatus) -> bool {
+    serde_json::to_vec_pretty(status)
+        .is_ok_and(|bytes| write_status_0600(status_path, &bytes).is_ok())
 }
 
 /// 실행 중인 `krill-link connect` 터널 인스턴스 핸들.
@@ -210,6 +210,8 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
     let host = find_host(&state_dir, &opts.host_id)?;
     let socket_path = host_socket_path(&state_dir, &host.id)?;
     let status_path = host_status_path(&state_dir, &host.id)?;
+    let instance_lock =
+        acquire_instance_lock(&socket_path.with_extension("lock")).map_err(Error::Io)?;
     let mut cfg = LinkConfig::load(&state_dir)?;
     cfg.validate()?;
     let remote_addr = host.to_endpoint_addr(cfg.relay != RelaySetting::Off)?;
@@ -367,14 +369,16 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
     let stream_map = Arc::clone(&streams);
     let cleanup_socket = socket_path.clone();
     let join_handle = tokio::spawn(async move {
+        let _instance_lock = instance_lock;
         let mut tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(Duration::from_millis(400));
+        let mut saved_status = None;
         loop {
             tokio::select! {
                 _=&mut shutdown_rx=>break,
                 _=tick.tick()=>{
                     let conn=connection_rx.borrow().connection.clone();
-                    publish_status(&status_tx,&stream_map,conn.as_ref(),&status_path);
+                    publish_status(&status_tx,&stream_map,conn.as_ref(),&status_path,&mut saved_status);
                 }
                 _=tasks.join_next(),if !tasks.is_empty()=>{},
                 accepted=listener.accept()=>{
@@ -444,6 +448,7 @@ fn publish_status(
     streams: &StreamMap,
     connection: Option<&Connection>,
     path: &Path,
+    saved: &mut Option<HostTunnelStatus>,
 ) {
     status_tx.send_modify(|status| {
         status.streams = stream_snapshots(streams);
@@ -466,7 +471,23 @@ fn publish_status(
         }
     });
     let snapshot = status_tx.borrow().clone();
-    persist_status(path, &snapshot);
+    if status_changed_or_due(saved.as_ref(), &snapshot) && persist_status(path, &snapshot) {
+        *saved = Some(snapshot);
+    }
+}
+
+fn status_changed_or_due(previous: Option<&HostTunnelStatus>, next: &HostTunnelStatus) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    // Keep Windows' two-second liveness contract without making timestamp-only
+    // changes force a new file on every 400ms observation tick.
+    if next.updated_at_ms.saturating_sub(previous.updated_at_ms) >= 1_000 {
+        return true;
+    }
+    let mut comparable = next.clone();
+    comparable.updated_at_ms = previous.updated_at_ms;
+    &comparable != previous
 }
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> TunnelErrorKind {

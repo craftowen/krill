@@ -2,7 +2,7 @@
 'use strict';
 const assert=require('node:assert/strict'),{getEventListeners}=require('node:events'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 class Element extends EventTarget {
- constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollLeft=0;}
+ constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollLeft=0;this.classList={toggle:()=>{},remove:()=>{}};}
  append(...nodes){for(const n of nodes){n.parentElement=this;this.children.push(n);}}
  insertBefore(node,before){if(node===before)return;node.remove();const index=before?this.children.indexOf(before):-1;node.parentElement=this;if(index<0)this.children.push(node);else this.children.splice(index,0,node);}
  prepend(...nodes){for(const n of nodes)n.parentElement=this;this.children.unshift(...nodes);}
@@ -15,17 +15,59 @@ class Element extends EventTarget {
  remove(){if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(n=>n!==this);}
 }
 const longPressCode=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes('function longPress('));
-function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot){
- const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],replaced=[],backs=[],abort=new AbortController();let clock=0,id=0;
- const sandbox={AbortController,abort,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,focused:0,focus(){h.focused++;},unmount(){options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
+function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot,tablet=false){
+ const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],abort=new AbortController(),wide=new EventTarget();wide.matches=tablet;let clock=0,id=0;
+ let resize;const sandbox={ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;},focus(){h.focused++;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
  vm.createContext(sandbox);vm.runInContext(longPressCode,sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
  const group={key:'g',label:'Workspace',sessions},state={groups:new Map([['g',group]]),sessions:new Map(sessions.map(s=>[s.id,s])),connection:{phase:'ready'},preferences:{},drafts:new Map(),snapshot};
- const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(title,fallback,onBack){ctx.back=onBack;const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r,replace){routes.push(r);if(replace)replaced.push(r);},backTo:r=>backs.push(r),rerender(){},savePreferences(){},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{}};
- const view=sandbox.KrillMobile.screens.session(el('main'),ctx);
+ const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{}};
+ const root=el('main'),view=sandbox.KrillMobile.screens.session(root,ctx);
  function advance(ms){clock+=ms;for(const [key,t] of [...timers])if(t.at<=clock){timers.delete(key);t.fn();}}
- return {view,state,ctx,abort,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered,replaced,backs};
+ return {resize:width=>resize([{contentRect:{width}}]),view,state,ctx,abort,wide,root,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered};
 }
 async function main(){
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),M=f.sandbox.KrillMobile;
+  const width=value=>{f.wide.matches=value;f.wide.dispatchEvent(new Event('change'));};
+  const first=f.mounts[0];first.options.onStatus({phase:'ready'});
+  f.buttons.find(b=>b.textContent==='Split terminal').action();assert.equal(f.sheets.at(-1).length,1);assert(f.sheets.at(-1)[0].label.endsWith('#8'));f.sheets.at(-1)[0].action();
+  const second=f.mounts[1];assert.equal(M.activeTerminal,second);assert.equal(second.options.preferences.fitToPhone,true);assert.equal(first.inputActive,false);assert.equal(second.inputActive,true);
+  width(false);assert(first.unmounted);assert(!second.unmounted);assert.equal(f.timers.size,0);assert.equal(M.activeTerminal,second);
+  width(true);const restored=f.mounts[2];assert.equal(restored.options.sessionId,7);assert.equal(M.activeTerminal,second);
+  f.root.descendants().find(n=>n.className==='terminal-pane primary-pane').dispatchEvent(new Event('pointerdown'));
+  width(false);assert(!restored.unmounted);assert(second.unmounted);assert.equal(M.activeTerminal,restored);
+  width(true);const next=f.mounts.at(-1);next.options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,1);
+  f.state.connection.phase='disconnected';f.view.update();f.advance(1000);const count=f.mounts.length;assert(next.unmounted);assert.equal(f.timers.size,0);
+  f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,count+1);assert.equal(f.mounts.at(-1).options.sessionId,8);
+  f.root.descendants().find(n=>n.className==='terminal-pane secondary-pane').descendants().find(n=>n.textContent==='Close pane').action();assert(f.mounts.at(-1).unmounted);assert(!restored.unmounted);assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);f.view.cleanup();
+  assert(f.mounts.every(h=>h.unmounted));assert.equal(f.timers.size,0);
+ }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const panels=f.root.descendants().find(n=>n.className==='session-panels'),control=f.buttons.find(b=>b.className==='ghost split-direction');
+  const select=value=>{control.action();const body=new Element('div');f.sheets.at(-1).render(body);const choices=body.descendants().filter(n=>n.dataset.direction);assert.equal(choices.filter(n=>n.attrs['aria-pressed']==='true').length,1);choices.find(n=>n.dataset.direction===value).action();};
+  f.resize(799);assert.equal(panels.dataset.layout,'rows');f.resize(800);assert.equal(panels.dataset.layout,'columns');
+  select('rows');f.resize(1200);assert.equal(panels.dataset.layout,'rows');assert.equal(f.state.preferences.tabletSplits.tabletSplit.direction,'rows');
+  select('columns');f.resize(720);assert.equal(panels.dataset.layout,'rows');assert.equal(control.dataset.fallback,'true');f.resize(721);assert.equal(panels.dataset.layout,'columns');assert.equal(control.dataset.fallback,'false');
+  select('auto');assert.equal(panels.dataset.layout,'rows');f.view.cleanup();
+ }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'},{id:9,state:'Done'}],undefined,true);
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const pane=cls=>f.root.descendants().find(n=>n.className==='terminal-pane '+cls),tabs=()=>f.root.descendants().filter(n=>n.className==='session-tab');
+  assert.equal(pane('primary-pane').descendants().filter(n=>n.className==='pane-header').length,1);assert.equal(pane('secondary-pane').descendants().filter(n=>n.className==='pane-header').length,1);
+  assert.equal(pane('secondary-pane').descendants().find(n=>n.className==='ghost pane-title').attrs['aria-pressed'],'true');
+  assert.equal(tabs().find(n=>n.dataset.session===7).disabled,true);tabs().find(n=>n.dataset.session===9).action();
+  assert.equal(f.mounts.at(-1).options.sessionId,9);assert.equal(pane('secondary-pane').dataset.session,9);assert.equal(f.routes.length,0);
+  pane('primary-pane').descendants().find(n=>n.className==='ghost pane-title').action();assert.equal(f.sandbox.KrillMobile.activeTerminal.options.sessionId,7);
+  assert.equal(tabs().find(n=>n.dataset.session===9).disabled,true);tabs().find(n=>n.dataset.session===8).action();assert.equal(f.routes.length,1);
+  pane('primary-pane').descendants().find(n=>n.textContent==='Close pane').action();assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,2);f.view.cleanup();
+ }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);f.sandbox.KrillMobile.chat={mount(){return {};}};
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();f.buttons.find(b=>b.className==='ghost small mode-toggle').action();
+  assert.equal(f.state.preferences.sessionViewModes[8],'chat');assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,1);assert.equal(f.calls.length,0);f.view.cleanup();
+ }
+ console.log('PASS symmetric pane headers, active labels and tab replacement, duplicate PTY disabled and primary close preserves PTY');
+ console.log('PASS split direction selection, current choice, persisted state, automatic threshold and minimum pane width');
+ console.log('PASS tablet split excludes duplicate PTY, preserves active pane on folding, reconnects after main transport and closes only the view');
  let f=fixture();assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onStatus({phase:'disconnected'});for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
  f=fixture();f.mounts[0].options.onStatus({phase:'disconnected'});f.state.connection.phase='disconnected';f.view.update();f.advance(60000);assert.equal(f.mounts.length,1);f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,2);f.view.cleanup();
  console.log('PASS terminal-only reconnect backoff, generation/cleanup and main connection cancellation');
@@ -43,8 +85,7 @@ async function main(){
  await body.children[0].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7,"agent":"claude"}');assert.equal(f.routes.at(-1),'/s/42');assert.equal(add.disabled,false);
  await add.action();body=new Element('div');f.sheets.at(-1).render(body);await body.children[2].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7}');
  f.buttons.find(b=>b.textContent==='Terminal actions').action();assert(!f.sheets.at(-1).some(e=>/^New .* session$/.test(e.label)));f.view.cleanup();
- assert.deepEqual(f.replaced,['/s/42','/s/42']);f=fixture();f.ctx.groupRoute=(_,id)=>`/s/${id}`;f.buttons.filter(b=>b.className==='session-tab').at(-1).action();assert.deepEqual(f.replaced,f.routes);assert.equal(f.routes.length,1);f.ctx.back();assert.deepEqual(f.backs,['/host/local']);f.view.cleanup();
- console.log('PASS + opens provider sheet (old-daemon Claude/Codex fallback + Terminal), creates the picked agent and routes to its tab; tab switches replace history and Back returns to the session list');
+ console.log('PASS + opens provider sheet (old-daemon Claude/Codex fallback + Terminal), creates the picked agent and routes to its tab');
  f=fixture(undefined,{capabilities:{session_create:true},agents:[{id:'claude',name:'Claude Code'},{id:'opencode',name:'OpenCode'},{id:'my-bot',name:'My Bot'}]});f.ctx.rpc=async r=>{f.calls.push(r);return {session:43};};await f.buttons.find(b=>b.textContent==='Create Tab').action();body=new Element('div');f.sheets.at(-1).render(body);
  assert.deepEqual(body.children.map(b=>[b.textContent,b.children[0].attrs.class||b.children[0].className]),[['Claude Code','agent-icon claude'],['OpenCode','agent-icon opencode'],['My Bot','agent-icon custom'],['Terminal','agent-icon']]);
  await body.children[2].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7,"agent":"my-bot"}');f.view.cleanup();
@@ -56,7 +97,7 @@ async function main(){
  console.log('PASS pipelined ClientHello+snapshot before auth reply, hidden-tab skip and live-terminal poll interval');
  f=fixture();for(let i=0;i<100;i++)f.view.update();assert.equal(getEventListeners(f.abort.signal,'abort').length,0);
  const tab=f.buttons.filter(b=>b.className==='session-tab').at(-1),down=new Event('pointerdown');down.button=0;tab.dispatchEvent(down);assert.equal(f.timers.size,1);
- f.view.update();assert.equal(f.timers.size,0);f.advance(500);assert.equal(f.sheets.length,0);
+ f.view.update();assert.equal(f.timers.size,1,'keyed redraw preserves an ongoing long press');f.advance(500);assert.equal(f.sheets.length,1);assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,1,'100 unchanged updates allocate no new tab buttons');
  let stop;for(let i=0;i<100;i++){stop?.();stop=f.longPress(new Element('button'),()=>{});assert.equal(getEventListeners(f.abort.signal,'abort').length,1);}
  stop();assert.equal(getEventListeners(f.abort.signal,'abort').length,0);f.view.cleanup();
  console.log('PASS longPress abort listener cleanup across 100 redraws');
@@ -114,7 +155,9 @@ async function testHybridChatToggleAndQuestionCards(){
  const toggleBtn=buttons.find(b=>b.className?.includes('mode-toggle'));
  // 기본 보기는 에이전트 세션(claude)도 터미널이다. Chat은 사용자가 고르면 열리고 세션별로 저장된다.
  assert.equal(toggleBtn.textContent,'Chat');
- await flush();assert(!calls.some(c=>c.action==='chat_poll'));
+ await flush();assert(calls.some(c=>c.action==='chat_poll'&&c.latest===true),'prepare the latest chat window while Term is visible');
+ const preparedFeed=root.descendants().find(n=>n.className==='chat-feed');
+ const preparedQuestion=root.descendants().find(n=>n.className==='chat-card chat-question');
  buttons.find(b=>b.textContent==='Terminal actions').action();assert.equal(sheets.at(-1).entries[0].label,'Switch to Chat');sheets.at(-1).entries[0].action();assert.equal(toggleBtn.textContent,'Term');assert.equal(toggleBtn.getAttribute('aria-label'),'Term');assert.equal(state.preferences.sessionViewModes[7],'chat');assert.equal(mounts[0].visible,false);
  await flush();
  assert(calls.some(c=>c.action==='chat_poll'&&c.session===7));
@@ -134,6 +177,8 @@ async function testHybridChatToggleAndQuestionCards(){
  assert.equal(unmounts.length,0);
  toggleBtn.action();
  assert.equal(toggleBtn.textContent,'Term');
+ assert.equal(root.descendants().find(n=>n.className==='chat-feed'),preparedFeed,'mode changes retain the prepared DOM');
+ assert.equal(root.descendants().find(n=>n.className==='chat-card chat-question'),preparedQuestion);
  rawBtn.action();assert.equal(toggleBtn.textContent,'Chat');toggleBtn.action();
  assert.equal(mounts.length,1);
  assert.equal(unmounts.length,0);

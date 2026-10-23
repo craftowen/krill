@@ -3,14 +3,12 @@
 //! src/renderer/src/store/terminals/terminal-restart-state.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
-mod recovery;
 #[cfg(all(test, unix))]
 mod tests;
 mod transcript;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
@@ -20,23 +18,15 @@ use krill_proto::usage::{AccountsSnapshot, ConnectionStatus, ProviderKind, Sessi
 
 use super::{Peer, Registry, Scope, lock};
 use crate::usage::accounts;
-use crate::usage::accounts::switch_work::SwitchTarget;
 
 const FILE: &str = "account-handoffs.json";
 const PREPARED_FILE: &str = "account-replacement.json";
-const PREPARED_DIR: &str = "account-replacements";
-// Limit simultaneous CLI initialization and spread starts instead of launching every pane at once.
-const RESTART_WORKERS: usize = 2;
-const RESTART_SPACING: Duration = Duration::from_millis(300);
-const CONTINUE_PROMPT: &str = "The account profile was changed and this session was restarted. Continue the existing task from where you left off, using the conversation history and current workspace state. Check what is already done before acting; do not repeat completed work. If the task is complete or you were waiting for user input, remain idle and briefly report that status.";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Prepared {
     from: SessionId,
     to: SessionId,
     account_id: String,
-    #[serde(default)]
-    continue_work: bool,
 }
 
 pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
@@ -124,18 +114,15 @@ impl Registry {
     pub(super) fn queue_account_switch(&self, provider: ProviderKind, account_id: &str) {
         let mut pending = lock(&self.account_work.pending);
         self.prepare_account_switch(provider, account_id);
-        // Remember even an A -> B -> A selection, where A owns every original process.
-        // An in-progress B replacement must observe cancellation before its commit.
         pending.insert(
             provider,
-            SwitchTarget {
+            crate::usage::accounts::switch_work::SwitchTarget {
                 account_id: account_id.into(),
             },
         );
         self.account_work.wake.notify_one();
     }
 
-    // Called with the work queue locked, after account-file evaluation has finished.
     fn prepare_account_switch(&self, provider: ProviderKind, account_id: &str) {
         let sessions: Vec<_> = {
             let state = lock(&self.state);
@@ -195,13 +182,53 @@ impl Registry {
         }
     }
 
-    pub(super) fn account_switch_snapshot(&self, snapshot: &mut AccountsSnapshot) {
-        let pending = lock(&self.account_work.pending);
-        for (provider, target) in pending.iter() {
-            self.prepare_account_switch(*provider, &target.account_id);
+    pub(super) fn cancel_failed_account_switch(&self, session: SessionId) -> Result<(), Failure> {
+        let _selection = lock(&self.account_work.pending);
+        {
+            let state = lock(&self.state);
+            if !state.sessions.contains_key(&session)
+                || state.exited.contains_key(&session)
+                || state.closing.contains(&session)
+            {
+                return Err(Failure::NoSession);
+            }
         }
-        drop(pending);
-        snapshot.details.handoffs = lock(&self.account_handoffs).values().cloned().collect();
+        let mut handoffs = lock(&self.account_handoffs);
+        let Some(handoff) = handoffs
+            .get(&session)
+            .filter(|h| h.to.is_none() && h.error.is_some())
+            .cloned()
+        else {
+            return Err(Failure::BadRequest);
+        };
+        handoffs.remove(&session);
+        if let Err(error) = self.write_account_handoffs(&handoffs) {
+            handoffs.insert(session, handoff);
+            return Err(super::os(&error));
+        }
+        Ok(())
+    }
+
+    pub(super) fn account_switch_snapshot(&self, snapshot: &mut AccountsSnapshot) {
+        let handoffs = lock(&self.account_handoffs);
+        let replacements = lock(&self.account_replacements);
+        let state = lock(&self.state);
+        snapshot.details.handoffs = handoffs
+            .values()
+            .cloned()
+            .map(|mut handoff| {
+                // The durable recovery alias precedes retirement. Keep clients on the original
+                // until retirement succeeds; a failed close must not strand them on a closed replacement.
+                if handoff.to.is_some_and(|to| replacements.contains(&to))
+                    || handoff.to.is_some()
+                        && state.sessions.contains_key(&handoff.from)
+                        && !state.exited.contains_key(&handoff.from)
+                {
+                    handoff.to = None;
+                }
+                handoff
+            })
+            .collect();
     }
 
     fn save_account_handoffs(&self) -> std::io::Result<()> {
@@ -276,47 +303,28 @@ impl Registry {
         self.recover_account_work(home);
         let pending = {
             let mut pending = lock(&self.account_work.pending);
-            // Account evaluation publishes only the selected profile. Discover sessions
-            // after it releases the account-file lock, before consuming the queued work.
             for (provider, target) in pending.iter() {
                 self.prepare_account_switch(*provider, &target.account_id);
             }
             std::mem::take(&mut *pending)
         };
-        let mut jobs = VecDeque::new();
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
         for (provider, target) in pending {
+            let account_id = target.account_id;
             let from: Vec<_> = lock(&self.account_handoffs)
                 .values()
-                .filter(|h| {
-                    h.account_id == target.account_id && h.to.is_none() && h.error.is_none()
-                })
+                .filter(|h| h.account_id == account_id && h.to.is_none() && h.error.is_none())
                 .map(|h| h.from)
                 .collect();
             for old in from {
-                jobs.push_back((provider, target.account_id.clone(), old));
-            }
-        }
-        let jobs = Mutex::new(jobs);
-        let start = Mutex::new(Instant::now());
-        let worker = || {
-            let peer = Peer {
-                pid: None,
-                scope: Scope::Full,
-            };
-            loop {
-                let Some((provider, account_id, old)) = lock(&jobs).pop_front() else {
-                    break;
-                };
-                {
-                    let mut next = lock(&start);
-                    std::thread::sleep(next.saturating_duration_since(Instant::now()));
-                    *next = Instant::now() + RESTART_SPACING;
-                }
                 if lock(&self.account_work.pending)
                     .get(&provider)
                     .is_some_and(|target| target.account_id != account_id)
                 {
-                    continue;
+                    break;
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.handoff_account(&peer, old, provider, &account_id, home)
@@ -332,15 +340,19 @@ impl Registry {
                         Err(error) => {
                             let reason = match error {
                                 Failure::Denied => "selected account login or credential scope could not be verified".into(),
-                                Failure::Os(libc::EAGAIN) => "conversation identity is not bound; wait for the original agent's session-start hook or bind its exact conversation before retrying".into(),
-                                Failure::Os(libc::ENOENT) => "conversation transcript is missing; restore it in the original account profile before retrying".into(),
-                                Failure::Os(libc::EILSEQ) => "conversation transcript identity is ambiguous or mismatched; verify the original conversation and transcript before retrying".into(),
+                                Failure::Os(libc::EAGAIN) => "conversation identity is not bound; wait for the original agent's session-start hook before retrying".into(),
+                                Failure::Os(libc::ENOENT) => "conversation transcript is missing; original conversation was not replaced".into(),
+                                Failure::Os(libc::EILSEQ) => "conversation transcript identity is mismatched or ambiguous".into(),
+                                Failure::Os(libc::EEXIST) => "selected profile contains a separate or conflicting conversation copy; reconcile its history before retrying".into(),
+                                Failure::Os(libc::ETIMEDOUT) => "conversation preparation or resume confirmation timed out; check that provider hooks are enabled before retrying".into(),
                                 _ => error.to_string(),
                             };
-                            handoff.error = Some(format!(
-                                "Session {}: could not resume with selected account ({reason}); original session preserved",
-                                old.0
-                            ));
+                            if handoff.error.is_none() {
+                                handoff.error = Some(format!(
+                                    "Session {}: could not resume with selected account ({reason}); original session preserved",
+                                    old.0
+                                ));
+                            }
                         }
                     }
                 }
@@ -353,23 +365,150 @@ impl Registry {
                 drop(handoffs);
                 self.save_account_handoffs().ok();
             }
+        }
+    }
+
+    fn recover_account_work(&self, home: &Path) {
+        if self
+            .account_recovered
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        // A crash between Spawned and the durable handoff must not leave a second agent
+        // consuming the selected account while a retry starts another replacement.
+        self.recover_prepared_account();
+        let saved: Vec<_> = lock(&self.account_handoffs).values().cloned().collect();
+        if saved.is_empty() {
+            return;
+        }
+        let state_dir = self.state_dir();
+        let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
         };
-        let workers = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZero::get)
-            .min(RESTART_WORKERS)
-            .min(lock(&jobs).len());
-        std::thread::scope(|scope| {
-            for _ in 1..workers {
-                // If a thread cannot be created, the calling worker drains the queue.
-                if let Err(error) = std::thread::Builder::new()
-                    .name("account-restart".into())
-                    .spawn_scoped(scope, worker)
-                {
-                    tracing::warn!(kind = ?error.kind(), "account restart worker unavailable");
+        for mut handoff in saved {
+            let (old_live, new_live) = {
+                let state = lock(&self.state);
+                let live = |id: &SessionId| {
+                    state.sessions.contains_key(id)
+                        && !state.exited.contains_key(id)
+                        && !state.closing.contains(id)
+                };
+                (live(&handoff.from), handoff.to.is_some_and(|id| live(&id)))
+            };
+            if !old_live {
+                if handoff.to.is_none() && handoff.error.is_none() {
+                    handoff.error =
+                        Some("Original session has ended; automatic resume cancelled".into());
+                    lock(&self.account_handoffs).insert(handoff.from, handoff);
+                }
+                continue;
+            }
+            if handoff.error.is_some() {
+                continue;
+            }
+            if let Some(new) = handoff.to {
+                if new_live {
+                    lock(&self.account_replacements).insert(new);
+                    if let Err(error) = self.close(&peer, handoff.from) {
+                        self.close(&peer, new).ok();
+                        handoff.to = None;
+                        handoff.error = Some(format!(
+                            "Could not retire original session ({error}); original session preserved"
+                        ));
+                    }
+                    lock(&self.account_handoffs).insert(handoff.from, handoff.clone());
+                    lock(&self.account_replacements).remove(&new);
+                } else {
+                    handoff.to = None;
+                    handoff.error = Some(
+                        "Replacement session is unavailable; original session preserved".into(),
+                    );
+                }
+                lock(&self.account_handoffs).insert(handoff.from, handoff);
+            } else if let Some(account) = snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id == handoff.account_id)
+            {
+                lock(&self.account_work.pending)
+                    .entry(account.provider)
+                    .or_insert_with(|| crate::usage::accounts::switch_work::SwitchTarget {
+                        account_id: account.id.clone(),
+                    });
+            } else {
+                handoff.error =
+                    Some("Selected account is unavailable; original session preserved".into());
+                lock(&self.account_handoffs).insert(handoff.from, handoff);
+            }
+        }
+        self.save_account_handoffs().ok();
+    }
+
+    fn recover_prepared_account(&self) {
+        let Some(dir) = self.state_dir() else { return };
+        let path = dir.join(PREPARED_FILE);
+        let prepared = std::fs::read(&path)
+            .ok()
+            .filter(|raw| raw.len() <= 4096)
+            .and_then(|raw| serde_json::from_slice::<Prepared>(&raw).ok());
+        if let Some(prepared) = prepared {
+            let committed = lock(&self.account_handoffs)
+                .get(&prepared.from)
+                .is_some_and(|h| h.to == Some(prepared.to));
+            let source = self.agents.stored(prepared.from).ok().flatten();
+            let owned = self
+                .agents
+                .stored(prepared.to)
+                .ok()
+                .flatten()
+                .is_some_and(|a| {
+                    a.account.is_some_and(|a| a.id == prepared.account_id)
+                        && source.as_ref().is_none_or(|s| {
+                            s.profile == a.profile
+                                && (s.session_id.is_none() || s.session_id == a.session_id)
+                        })
+                });
+            if !committed && owned {
+                let old_live = {
+                    let state = lock(&self.state);
+                    state.sessions.contains_key(&prepared.from)
+                        && !state.exited.contains_key(&prepared.from)
+                        && !state.closing.contains(&prepared.from)
+                };
+                if old_live {
+                    self.close(
+                        &Peer {
+                            pid: None,
+                            scope: Scope::Full,
+                        },
+                        prepared.to,
+                    )
+                    .ok();
+                } else {
+                    // The original ended independently while the daemon was down. Keep the
+                    // replacement and make it reachable instead of closing the remaining PTY.
+                    lock(&self.account_handoffs).insert(
+                        prepared.from,
+                        SessionHandoff {
+                            from: prepared.from,
+                            to: None,
+                            account_id: prepared.account_id,
+                            error: Some(format!("Original session ended during recovery; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent", prepared.to.0)),
+                        },
+                    );
+                    self.save_account_handoffs().ok();
                 }
             }
-            worker();
-        });
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    fn account_original_ended(&self, session: SessionId) -> bool {
+        let state = lock(&self.state);
+        !state.sessions.contains_key(&session) || state.exited.contains_key(&session)
     }
 
     fn handoff_account(
@@ -441,11 +580,9 @@ impl Registry {
                 entry.session.tap().size().unwrap_or(super::FALLBACK_SIZE),
             )
         };
-        // Cwd and recency identify a project, never a conversation. Even a single
-        // matching transcript can belong to another live pane in the same project.
-        let session_id =
-            transcript::session_id(provider, &stored).map_err(|error| prepare_failure(&error))?;
-        // Preparation can fail. Until it succeeds the old process and PTY are untouched.
+        // A project path never identifies a conversation. Only launch/resume/hook bindings do.
+        let session_id = transcript::session_id(provider, &stored)
+            .map_err(|error| prepare_failure("transcript_preparation", &error))?;
         let source = crate::agent::resume_account(
             profile,
             state_dir.as_deref(),
@@ -457,25 +594,28 @@ impl Registry {
             env_key: provider.env_var().into(),
             dir: String::new(),
         });
-        // A profile change must never silently replace ongoing work with a fresh
-        // conversation, so a missing transcript fails the handoff.
-        let prepared_transcript =
-            transcript::prepare(provider, home, &source, target, &session_id, &cwd)
-                .map_err(|error| prepare_failure(&error))?;
+        let prepared_transcript = transcript::prepare_bound(
+            provider,
+            home,
+            &source,
+            target,
+            &session_id,
+            &cwd,
+            stored.transcript_path.as_deref(),
+        )
+        .map_err(|error| prepare_failure("transcript_preparation", &error))?;
         let new = self.next_id();
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
             registry: self,
+            original: old,
             session: new,
             committed: false,
-            continued: false,
         };
-        // New launches already default to YOLO. Re-evaluate the current preference rather
-        // than carrying a stale manual permission from before that default was introduced.
-        let permission = agents.permission;
+        self.agents.watch_account_resume(new);
         let (launch, sid, applied) = crate::agent::resume_in(
             profile,
-            permission,
+            stored.permission,
             new,
             state_dir.as_deref(),
             Some(&session_id),
@@ -492,22 +632,21 @@ impl Registry {
                 new,
                 &AgentLaunch {
                     profile: canonical.into(),
-                    permission,
+                    permission: stored.permission,
                 },
                 sid,
                 cwd.clone(),
                 applied,
             )
             .map_err(|e| super::os(&e))?;
-        let prepared = Prepared {
-            from: old,
-            to: new,
-            account_id: account_id.into(),
-            continue_work: true,
-        };
         if let Some(dir) = state_dir.as_deref() {
-            let raw = serde_json::to_vec(&prepared).map_err(|_| Failure::BadRequest)?;
-            accounts::write_atomic_0600(&prepared_path(dir, new), &raw)
+            let raw = serde_json::to_vec(&Prepared {
+                from: old,
+                to: new,
+                account_id: account_id.into(),
+            })
+            .map_err(|_| Failure::BadRequest)?;
+            accounts::write_atomic_0600(&dir.join(PREPARED_FILE), &raw)
                 .map_err(|e| super::os(&e))?;
         }
         let (new, _) = self.spawn_holder(
@@ -534,15 +673,21 @@ impl Registry {
                 self.close(peer, new).ok();
                 return Err(Failure::BadRequest);
             }
-            if tap.pulse().end > 0 && tap.quiet_ms() >= 150 {
+            if self.agents.account_resume_observed(new, &session_id)
+                && tap.pulse().end > 0
+                && tap.quiet_ms() >= 150
+            {
                 ready = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         if !ready {
-            self.close(peer, new).ok();
-            return Err(Failure::BadRequest);
+            tracing::warn!(
+                stage = "resume_confirmation",
+                "account handoff timed out without a confirmed conversation"
+            );
+            return Err(Failure::Os(libc::ETIMEDOUT));
         }
         // Serialize the final commit with a later user selection. A -> B -> C must never
         // strand this pane on B or erase the A -> B handoff.
@@ -554,26 +699,23 @@ impl Registry {
             self.close(peer, new).ok();
             return Err(Failure::BadRequest);
         }
-        // The provider may have rejected the resume, the copied file may have vanished,
-        // or either agent may have moved to another conversation during startup. Keep
-        // the original; dropping `replacement` terminates only the new process.
         prepared_transcript
             .verify()
-            .map_err(|error| prepare_failure(&error))?;
+            .map_err(|error| prepare_failure("transcript_preparation", &error))?;
         for session in [old, new] {
             let current = self
                 .agents
                 .stored(session)
-                .map_err(|error| super::os(&error))?
+                .map_err(|e| super::os(&e))?
                 .ok_or(Failure::Os(libc::EILSEQ))?;
             if transcript::session_id(provider, &current)
-                .map_err(|error| prepare_failure(&error))?
+                .map_err(|e| prepare_failure("conversation_recheck", &e))?
                 != session_id
             {
                 return Err(Failure::Os(libc::EILSEQ));
             }
         }
-        // Publish completion and retire the old PTY only after persistence succeeds.
+        // Persist the recovery alias before retirement; snapshots hide it while the guard lives.
         if let Err(error) = self.commit_account_handoff(
             SessionHandoff {
                 from: old,
@@ -586,7 +728,9 @@ impl Registry {
             self.close(peer, new).ok();
             return Err(super::os(&error));
         }
-        if let Err(error) = self.close(peer, old) {
+        if !self.account_original_ended(old)
+            && let Err(error) = self.close(peer, old)
+        {
             // Do not leave two live agents consuming different accounts after a failed termination.
             self.close(peer, new).ok();
             lock(&self.account_handoffs).insert(
@@ -601,15 +745,30 @@ impl Registry {
             self.save_account_handoffs().ok();
             return Err(error);
         }
+        // Holder Done acknowledges the teardown request, not process exit. Do not hold
+        // the selection mutex while waiting for the holder's Exited observation.
         drop(pending);
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while !self.account_original_ended(old) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         replacement.committed = true;
-        // Submit only after retiring the old agent, so restoring history alone does not
-        // leave the replacement idle or start the same task in two live agents.
-        match self.continue_account_work(&prepared) {
-            Ok(()) => replacement.continued = true,
-            Err(error) => {
-                tracing::warn!(kind = ?error.kind(), "account continuation pending recovery");
-            }
+        if !self.account_original_ended(old) {
+            lock(&self.account_handoffs).insert(old, SessionHandoff {
+                from: old, to: None, account_id: account_id.into(),
+                error: Some(format!("Original process termination could not be confirmed; replacement {} was retained for explicit selection. Held input was not sent", new.0)),
+            });
+            self.save_account_handoffs().ok();
+            return Err(Failure::Os(libc::ETIMEDOUT));
+        }
+        drop(replacement);
+        // A later selection can arrive while retirement is in progress. The replacement
+        // becomes eligible only after its guard is gone, so enqueue that latest selection again.
+        let later = lock(&self.account_work.pending)
+            .get(&provider)
+            .map(|target| target.account_id.clone());
+        if let Some(target) = later.filter(|target| target != account_id) {
+            self.queue_account_switch(provider, &target);
         }
         Ok(new)
     }
@@ -617,15 +776,27 @@ impl Registry {
 
 struct Replacement<'a> {
     registry: &'a Registry,
+    original: SessionId,
     session: SessionId,
     committed: bool,
-    continued: bool,
 }
 
 impl Drop for Replacement<'_> {
     fn drop(&mut self) {
+        self.registry.agents.finish_account_resume(self.session);
         lock(&self.registry.account_replacements).remove(&self.session);
-        if !self.committed {
+        let only_remaining = !self.committed
+            && self.registry.account_original_ended(self.original)
+            && !self.registry.account_original_ended(self.session);
+        if only_remaining {
+            if let Some(handoff) = lock(&self.registry.account_handoffs).get_mut(&self.original) {
+                handoff.to = None;
+                handoff.error = Some(format!(
+                    "Original session ended; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent",
+                    self.session.0
+                ));
+            }
+        } else if !self.committed {
             self.registry
                 .close(
                     &Peer {
@@ -636,25 +807,17 @@ impl Drop for Replacement<'_> {
                 )
                 .ok();
         }
-        if (!self.committed || self.continued)
-            && let Some(dir) = self.registry.state_dir()
-        {
-            std::fs::remove_file(prepared_path(&dir, self.session)).ok();
+        if let Some(dir) = self.registry.state_dir() {
+            std::fs::remove_file(dir.join(PREPARED_FILE)).ok();
         }
     }
 }
 
-fn prepared_path(dir: &Path, session: SessionId) -> std::path::PathBuf {
-    dir.join(PREPARED_DIR).join(format!("{}.json", session.0))
-}
-
-/// Transcript bridging raises errno-less kinds. Name the cause instead of a generic EIO.
-fn prepare_failure(error: &std::io::Error) -> Failure {
+// Validation errors constructed without an OS errno must retain their meaning on the wire.
+fn prepare_failure(stage: &'static str, error: &std::io::Error) -> Failure {
     use std::io::ErrorKind;
-    if error.raw_os_error().is_some() {
-        return super::os(error);
-    }
-    Failure::Os(match error.kind() {
+    tracing::warn!(stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    Failure::Os(error.raw_os_error().unwrap_or_else(|| match error.kind() {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
         ErrorKind::NotFound => libc::ENOENT,
         ErrorKind::WouldBlock => libc::EAGAIN,
@@ -662,7 +825,7 @@ fn prepare_failure(error: &std::io::Error) -> Failure {
         ErrorKind::InvalidInput => libc::EINVAL,
         ErrorKind::AlreadyExists => libc::EEXIST,
         ErrorKind::FileTooLarge => libc::EFBIG,
-        ErrorKind::BrokenPipe => libc::EPIPE,
+        ErrorKind::PermissionDenied => libc::EACCES,
         _ => libc::EIO,
-    })
+    }))
 }

@@ -49,6 +49,8 @@ pub const LAYOUT_DASHBOARD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none"
 
 /// Lucide `globe` 아이콘 SVG(ISC License). 사이드바 '아티팩트' 항목.
 pub const GLOBE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>"#;
+/// Lucide Files: published documents in the artifact library.
+pub const FILES_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M15 2H6a2 2 0 0 0-2 2v12"/><path d="M20 9h-5V4"/><path d="M20 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7l5 5Z"/></svg>"#;
 
 /// Lucide `folder-plus` 아이콘 SVG(ISC License). 사이드바 '프로젝트' 헤더 폴더 추가.
 pub const FOLDER_PLUS_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>"#;
@@ -738,5 +740,78 @@ mod tests {
         );
         assert_eq!(project_lucide("Rocket"), gpui_kit_assets::IconName::Rocket);
         assert_eq!(project_lucide("Unknown"), gpui_kit_assets::IconName::Folder);
+    }
+}
+
+// GPUI Kit's default bundle contains component icons only; application icons are explicit.
+gpui_kit_assets::icon_assets!(
+    AppIcons,
+    [
+        Bell,
+        Bot,
+        Check,
+        ChevronDown,
+        ChevronLeft,
+        ChevronRight,
+        ChevronUp,
+        CircleAlert,
+        CircleCheck,
+        CircleX,
+        Close,
+        Copy,
+        Cpu,
+        Ellipsis,
+        ExternalLink,
+        File,
+        FileText,
+        Folder,
+        FolderOpen,
+        Globe,
+        Info,
+        Keyboard,
+        Link,
+        Loader,
+        LoaderCircle,
+        MessageCircleQuestionMark,
+        Minus,
+        Monitor,
+        Moon,
+        PanelBottom,
+        PanelLeft,
+        PanelRight,
+        PanelRightClose,
+        Play,
+        Plus,
+        RefreshCw,
+        Rocket,
+        Search,
+        Server,
+        Settings,
+        Smartphone,
+        SquareTerminal,
+        Star,
+        StarFill,
+        TriangleAlert,
+        User
+    ]
+);
+
+#[derive(Debug, Clone, Copy)]
+pub struct AppAssets;
+
+impl gpui::AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(bytes) = AppIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        gpui_kit_assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        let mut paths = gpui_kit_assets::Assets.list(path)?;
+        paths.extend(AppIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 }

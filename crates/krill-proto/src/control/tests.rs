@@ -113,6 +113,7 @@ fn fixtures_v1() {
                         since_unix_ns: 1_760_000_000_000_000_000,
                         foreground: None,
                         title: None,
+                        subagents: Vec::new(),
                     },
                 },
             ])),
@@ -1029,6 +1030,7 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
                 since_unix_ns: 42,
                 foreground: None,
                 title: None,
+                subagents: Vec::new(),
             },
         },
     ];
@@ -1101,6 +1103,48 @@ fn states_title_tail_is_backward_compatible() {
     .encode()
     .unwrap();
     let (kind, body) = read_frame(&mut invalid.as_slice()).unwrap().unwrap();
+    assert!(Reply::decode(kind, &body).is_err());
+}
+
+/// 서브에이전트 꼬리는 제목 꼬리 뒤에 붙어 구 디코더가 무시하고, 새 디코더는 복원하며 상한을 넘으면 거부한다.
+#[test]
+fn states_subagent_tail_is_backward_compatible() {
+    let agent = Subagent {
+        kind: "general-purpose".into(),
+        description: "딥리서치 각도1".into(),
+        since_unix_ns: 7,
+    };
+    let mut rows = vec![
+        SessionStatus {
+            session: SessionId(1),
+            status: AgentStatus::UNKNOWN,
+        },
+        SessionStatus {
+            session: SessionId(2),
+            status: AgentStatus::UNKNOWN,
+        },
+    ];
+    let base = rows.clone();
+    rows[1].status.subagents = vec![agent.clone()];
+    let reply = Reply::States(rows);
+    let frame = reply.encode().unwrap();
+    let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), reply);
+    assert_eq!(
+        postcard::from_bytes::<Reply>(&body).unwrap(),
+        Reply::States(base)
+    );
+
+    let too_many = Reply::States(vec![SessionStatus {
+        session: SessionId(1),
+        status: AgentStatus {
+            subagents: vec![agent; MAX_SUBAGENTS + 1],
+            ..AgentStatus::UNKNOWN
+        },
+    }])
+    .encode()
+    .unwrap();
+    let (kind, body) = read_frame(&mut too_many.as_slice()).unwrap().unwrap();
     assert!(Reply::decode(kind, &body).is_err());
 }
 

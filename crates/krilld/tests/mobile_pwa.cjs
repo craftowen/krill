@@ -43,7 +43,7 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#t=x.trycloudflare.com&r=rid'),true);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
 console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
 for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','client.js','terminal.js','qr.js','sw.js','screens/chat.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
-const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
+const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','storage.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
 // Fixed-origin bootstrap and transport, with real crypto and deterministic sockets.
 async function fixedOriginTests(){
  const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,url:'https://saved.trycloudflare.com',hash};
@@ -159,9 +159,11 @@ async function connect(url,credential){
   await require('./mobile_session.cjs').main();
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');
   fs.writeFileSync(path.join(profile,'statusline_cache.json'),JSON.stringify({five_hour:{utilization:23,resets_at:new Date(Date.now()+5*3600000+600000).toISOString()},seven_day:{utilization:47,resets_at:new Date(Date.now()+7*86400000+3600000).toISOString()}}));
-  fs.writeFileSync(path.join(dir,'accounts.toml'),`[active]\nclaude = "claude-host"\n[[accounts]]\nid = "mobile-test-account"\nprovider = "claude"\nlabel = "Mobile fixture"\nprofile_dir = ${JSON.stringify(profile)}\n`);
+  fs.writeFileSync(path.join(dir,'accounts.toml'),`direct_usage = false\n[active]\nclaude = "claude-host"\n[[accounts]]\nid = "mobile-test-account"\nprovider = "claude"\nlabel = "Mobile fixture"\nprofile_dir = ${JSON.stringify(profile)}\n`);
   fs.writeFileSync(path.join(dir,'agents.toml'),'[agent.codex]\nname = "Mock Codex"\nlaunch = ["/bin/sh", "-c", "printf \'mock-agent-ready\\\\n\'; exec /bin/cat"]\n[agent.claude]\nname = "Mock Claude"\nlaunch = ["/bin/sh", "-c", "printf \'mock-agent-ready\\\\n\'; exec /bin/cat"]\n');
-  fs.writeFileSync(path.join(dir,'waiting.json'),'{"hook_event_name":"PermissionRequest"}');
+  const chatTranscript=path.join(dir,'mobile-chat.jsonl');
+  fs.writeFileSync(chatTranscript,Array.from({length:1050},(_,i)=>JSON.stringify({type:'assistant',message:{role:'assistant',content:`MOBILE CHAT ${i}`}})+'\n').join(''));
+  fs.writeFileSync(path.join(dir,'waiting.json'),JSON.stringify({hook_event_name:'PermissionRequest',session_id:'mobile-chat',transcript_path:chatTranscript}));
   holder=spawn(path.join(bin,'krill-holder'),[daemonBin,path.join(dir,'run/krilld.sock')],{env,stdio:['ignore',log,log]});await until(()=>fs.existsSync(path.join(dir,'run/krilld.sock')));
   daemon=await new Promise((resolve,reject)=>{const socket=net.createConnection(path.join(dir,'run/krilld.sock'));let bytes=Buffer.alloc(0);socket.setTimeout(5000,()=>socket.destroy(Error('hello timeout')));socket.on('error',reject);socket.on('data',part=>{bytes=Buffer.concat([bytes,part]);if(bytes.length>=4&&bytes.length>=4+bytes.readUInt32LE()){const r=reader(bytes.subarray(5));r.u();r.u();r.u();r.text();resolve(Number(r.u()));socket.destroy();}});});
   const shell=`stty -echo; sleep 0.15; '${mk}' hook claude <'${dir}/waiting.json' >/dev/null; printf 'READY\\n'; while IFS= read -r line; do printf 'got:%s\\n' "$line"; done`;
@@ -185,6 +187,13 @@ async function connect(url,credential){
     await until(()=>cli(['read',String(terminalSession)]).includes('LIVE RED'));
   }clearTimeout(deadline);fs.writeFileSync(metadata,JSON.stringify({dir,repo,url,session,terminalSession,extraSessions,base,daemon,gateId,profile}));console.log('Browser fixture ready');await new Promise(r=>process.once('SIGTERM',r));return;}
   phone=await connect(url);let data=await phone.rpc({action:'snapshot'});const same=await phone.rpc({action:'snapshot',since:data.etag});assert.deepEqual(same,{unchanged:true,etag:data.etag});const card=data.sessions.find(s=>s.id===session);assert(card);assert.equal(card.state,'Waiting');assert.equal(card.branch,'mobile-test');assert.equal(card.added,1);assert(card.lines.some(l=>l.includes('READY')));assert(data.orchestration.gates.some(g=>g.id===gateId));assert(data.orchestration.tasks.length>=1);assert(data.orchestration.questions.some(q=>q.id===question.id));
+  const latestChat=await phone.rpc({action:'chat_poll',session,latest:true});
+  assert.equal(latestChat.items.at(-1).text,'MOBILE CHAT 1049');assert(latestChat.page_start>0);assert.equal(latestChat.has_earlier,true);
+  const earlierChat=await phone.rpc({action:'chat_poll',session,latest:true,end_offset:latestChat.page_start});
+  assert.equal(earlierChat.next_offset,latestChat.page_start);assert.equal(earlierChat.items.at(-1).text,'MOBILE CHAT 921');
+  const replayChat=await phone.rpc({action:'chat_poll',session,offset:latestChat.page_start,end_offset:latestChat.next_offset});assert.deepEqual(replayChat.items,latestChat.items);
+  const liveChat=await phone.rpc({action:'chat_poll',session,offset:latestChat.next_offset});assert.equal(liveChat.items.length,0);
+  console.log('PASS real mobile chat: first reply contains latest of 1050 messages, earlier cursor has no gap, stable replay IDs and incremental polling');
   // Mobile workspace creation uses registered repository keys and the desktop git/setup path.
   assert.equal(data.capabilities.worktree_create,true);const repository=data.repositories.find(r=>r.worktree_keys.includes(card.worktree_key))?.key;assert(repository);
   for(const request of [{repository:'/tmp/forged',name:'bad'},{repository,name:' '},{repository,name:'bad',cwd:'/tmp'},{repository,name:'bad',setup_hash:'한'.repeat(64)},{repository,name:'bad',setup_hash:'aa'.repeat(32),skip_setup:true}])await assert.rejects(phone.rpc({action:'create_workspace',...request}));

@@ -12,8 +12,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -27,6 +30,44 @@ use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 
 use super::{OpenFile, OpenFileAt, Panel, Reap, text};
 use crate::ui;
+
+const MAX_TOTAL_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+struct SearchCancel(Arc<AtomicBool>);
+impl Drop for SearchCancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+struct SearchBudget {
+    deadline: Instant,
+    cancel: Arc<AtomicBool>,
+    nodes: usize,
+    bytes: u64,
+    truncated: bool,
+}
+impl SearchBudget {
+    fn new(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: Instant::now() + RG_TIMEOUT,
+            cancel,
+            nodes: 0,
+            bytes: 0,
+            truncated: false,
+        }
+    }
+    fn stopped(&mut self) -> bool {
+        let stopped = self.cancel.load(Ordering::Relaxed) || Instant::now() >= self.deadline;
+        self.truncated |= stopped;
+        stopped
+    }
+    fn node(&mut self) -> bool {
+        self.nodes = self.nodes.saturating_add(1);
+        self.truncated |= self.nodes > 50_000;
+        self.stopped() || self.nodes > 50_000
+    }
+}
 
 /// 검색 결과 최대 매치 수(상한 도달 시 `truncated = true`).
 pub const DEFAULT_MAX_RESULTS: usize = 2_000;
@@ -167,6 +208,7 @@ pub struct WorkspaceSearch {
     pub(crate) searching: bool,
     pub(crate) generation: u64,
     pub(crate) search_task: Option<Task<()>>,
+    cancel: Option<SearchCancel>,
     pub(crate) scroll: UniformListScrollHandle,
     pub(crate) query_input: Option<Entity<InputState>>,
     pub(crate) query_sub: Option<Subscription>,
@@ -204,6 +246,7 @@ impl WorkspaceSearch {
             searching: false,
             generation: 0,
             search_task: None,
+            cancel: None,
             scroll: UniformListScrollHandle::new(),
             query_input: None,
             query_sub: None,
@@ -225,6 +268,7 @@ impl WorkspaceSearch {
         self.selected_row = None;
         self.error = None;
         self.generation = self.generation.wrapping_add(1);
+        self.cancel = None;
         self.search_task = None;
         self.searching = active && !self.options.query.trim().is_empty();
         self.result = SearchResult::default();
@@ -233,6 +277,7 @@ impl WorkspaceSearch {
 
     pub fn run_sync(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.cancel = None;
         self.search_task = None;
         self.searching = false;
         if self.options.query.is_empty() {
@@ -347,6 +392,15 @@ pub fn parse_glob_patterns(raw: &str) -> Vec<String> {
 /// # Errors
 /// 정규식 구문 오류 등으로 검색 자체가 실패한 경우 오류 메시지를 반환한다.
 pub fn search_worktree(root: &Path, options: &SearchOptions) -> Result<SearchResult, String> {
+    search_worktree_control(root, options, Arc::new(AtomicBool::new(false)))
+}
+
+fn search_worktree_control(
+    root: &Path,
+    options: &SearchOptions,
+    cancel: Arc<AtomicBool>,
+) -> Result<SearchResult, String> {
+    let mut budget = SearchBudget::new(cancel);
     if options.query.is_empty() {
         return Ok(SearchResult::default());
     }
@@ -355,14 +409,24 @@ pub fn search_worktree(root: &Path, options: &SearchOptions) -> Result<SearchRes
     }
     let matcher = LineMatcher::compile(options)?;
     if let Some(rg_bin) = find_rg_binary() {
-        match search_with_rg(&rg_bin, root, options) {
+        match search_with_rg_control(
+            &rg_bin,
+            root,
+            options,
+            RG_TIMEOUT,
+            MAX_RG_STDOUT_BYTES,
+            &budget.cancel,
+        ) {
             Ok(result) => return Ok(result),
             Err(RgError::Unavailable) => {}
             Err(RgError::Execution(msg)) => return Err(msg),
         }
     }
     Ok(search_worktree_fallback_with_matcher(
-        root, options, &matcher,
+        root,
+        options,
+        &matcher,
+        &mut budget,
     ))
 }
 
@@ -378,8 +442,12 @@ pub fn search_worktree_fallback(
         return Ok(SearchResult::default());
     }
     let matcher = LineMatcher::compile(options)?;
+    let mut budget = SearchBudget::new(Arc::new(AtomicBool::new(false)));
     Ok(search_worktree_fallback_with_matcher(
-        root, options, &matcher,
+        root,
+        options,
+        &matcher,
+        &mut budget,
     ))
 }
 
@@ -895,14 +963,7 @@ fn find_rg_binary() -> Option<PathBuf> {
     None
 }
 
-fn search_with_rg(
-    rg_bin: &Path,
-    root: &Path,
-    options: &SearchOptions,
-) -> Result<SearchResult, RgError> {
-    search_with_rg_limits(rg_bin, root, options, RG_TIMEOUT, MAX_RG_STDOUT_BYTES)
-}
-
+#[cfg(test)]
 pub(crate) fn search_with_rg_limits(
     rg_bin: &Path,
     root: &Path,
@@ -910,6 +971,30 @@ pub(crate) fn search_with_rg_limits(
     timeout: Duration,
     max_stdout_bytes: usize,
 ) -> Result<SearchResult, RgError> {
+    search_with_rg_control(
+        rg_bin,
+        root,
+        options,
+        timeout,
+        max_stdout_bytes,
+        &AtomicBool::new(false),
+    )
+}
+
+fn search_with_rg_control(
+    rg_bin: &Path,
+    root: &Path,
+    options: &SearchOptions,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<SearchResult, RgError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(SearchResult {
+            truncated: true,
+            ..SearchResult::default()
+        });
+    }
     let max_results = if options.max_results == 0 {
         DEFAULT_MAX_RESULTS
     } else {
@@ -984,6 +1069,12 @@ pub(crate) fn search_with_rg_limits(
     let mut exit_code = None;
     let mut timed_out = false;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SearchResult {
+                truncated: true,
+                ..SearchResult::default()
+            });
+        }
         match child.0.try_wait() {
             Ok(Some(status)) => {
                 exit_code = status.code();
@@ -1175,6 +1266,7 @@ fn search_worktree_fallback_with_matcher(
     root: &Path,
     options: &SearchOptions,
     matcher: &LineMatcher,
+    budget: &mut SearchBudget,
 ) -> SearchResult {
     let max_results = if options.max_results == 0 {
         DEFAULT_MAX_RESULTS
@@ -1184,15 +1276,25 @@ fn search_worktree_fallback_with_matcher(
     let include_globs = parse_glob_patterns(&options.include_pattern);
     let exclude_globs = parse_glob_patterns(&options.exclude_pattern);
 
-    let candidates = collect_candidate_files(root, MAX_FALLBACK_FILES);
+    let candidates = collect_candidate_files(root, MAX_FALLBACK_FILES, budget);
     let rels: Vec<String> = candidates.iter().map(|(_, rel)| rel.clone()).collect();
-    let ignored_set = query_git_ignored_set(root, &rels);
+    let ignored_set = query_git_ignored_set_control(
+        root,
+        &rels,
+        GIT_IGNORE_TIMEOUT.min(budget.deadline.saturating_duration_since(Instant::now())),
+        MAX_GIT_IGNORE_STDOUT_BYTES,
+        &budget.cancel,
+    );
 
     let mut files = Vec::new();
     let mut total_matches = 0usize;
-    let mut truncated = false;
+    let mut truncated = budget.truncated;
 
     for (path, relative_path) in candidates {
+        if budget.stopped() {
+            truncated = true;
+            break;
+        }
         if is_rel_ignored(&ignored_set, &relative_path) {
             continue;
         }
@@ -1215,9 +1317,28 @@ fn search_worktree_fallback_with_matcher(
         if !meta.is_file() || meta.len() > MAX_SEARCH_FILE_BYTES {
             continue;
         }
-        let Ok(bytes) = fs::read(&path) else {
+        if budget.bytes.saturating_add(meta.len()) > MAX_TOTAL_READ_BYTES {
+            truncated = true;
+            break;
+        }
+        let Ok(file) = fs::File::open(&path) else {
             continue;
         };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_SEARCH_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        budget.bytes = budget
+            .bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if bytes.len() > usize::try_from(MAX_SEARCH_FILE_BYTES).unwrap_or(usize::MAX) {
+            truncated = true;
+            continue;
+        }
         if bytes.iter().take(8_192).any(|&b| b == 0) {
             continue;
         }
@@ -1227,6 +1348,10 @@ fn search_worktree_fallback_with_matcher(
 
         let mut file_matches = Vec::new();
         for (line_idx, raw_line) in content.lines().enumerate() {
+            if budget.stopped() {
+                truncated = true;
+                break;
+            }
             let line_number = u32::try_from(line_idx.saturating_add(1)).unwrap_or(u32::MAX);
             for (byte_start, byte_end) in matcher.find_spans(raw_line) {
                 if total_matches >= max_results {
@@ -1264,13 +1389,18 @@ fn search_worktree_fallback_with_matcher(
     }
 }
 
-fn collect_candidate_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> {
+fn collect_candidate_files(
+    root: &Path,
+    limit: usize,
+    budget: &mut SearchBudget,
+) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back(root.to_path_buf());
 
     while let Some(dir) = queue.pop_front() {
-        if out.len() >= limit {
+        if budget.stopped() || out.len() >= limit {
+            budget.truncated = true;
             break;
         }
         let Ok(rd) = fs::read_dir(&dir) else {
@@ -1278,6 +1408,9 @@ fn collect_candidate_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> 
         };
         let mut entries: Vec<(String, PathBuf, bool)> = Vec::new();
         for entry in rd.flatten() {
+            if budget.node() {
+                break;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == ".git" || name == "node_modules" || name == "target" {
                 continue;
@@ -1293,7 +1426,8 @@ fn collect_candidate_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> 
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         for (_, path, is_dir) in entries {
-            if out.len() >= limit {
+            if budget.stopped() || budget.truncated || out.len() >= limit {
+                budget.truncated = true;
                 break;
             }
             if is_dir {
@@ -1310,21 +1444,31 @@ fn collect_candidate_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> 
     out
 }
 
-fn query_git_ignored_set(repo: &Path, relative_paths: &[String]) -> BTreeSet<String> {
-    query_git_ignored_set_with_limits(
-        repo,
-        relative_paths,
-        GIT_IGNORE_TIMEOUT,
-        MAX_GIT_IGNORE_STDOUT_BYTES,
-    )
-}
-
 pub(crate) fn query_git_ignored_set_with_limits(
     repo: &Path,
     relative_paths: &[String],
     timeout: Duration,
     max_stdout_bytes: usize,
 ) -> BTreeSet<String> {
+    query_git_ignored_set_control(
+        repo,
+        relative_paths,
+        timeout,
+        max_stdout_bytes,
+        &AtomicBool::new(false),
+    )
+}
+
+fn query_git_ignored_set_control(
+    repo: &Path,
+    relative_paths: &[String],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    cancel: &AtomicBool,
+) -> BTreeSet<String> {
+    if cancel.load(Ordering::Relaxed) || timeout.is_zero() {
+        return BTreeSet::new();
+    }
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return BTreeSet::new();
     }
@@ -1360,6 +1504,9 @@ pub(crate) fn query_git_ignored_set_with_limits(
         return BTreeSet::new();
     };
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return BTreeSet::new();
+        }
         match child.0.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
@@ -1794,6 +1941,7 @@ impl Panel {
     }
 
     pub(crate) fn schedule_async_search(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        self.search.cancel = None;
         self.search.generation = self.search.generation.wrapping_add(1);
         let generation = self.search.generation;
         if self.search.options.query.is_empty() {
@@ -1809,6 +1957,8 @@ impl Panel {
         }
         self.search.searching = true;
         self.search.error = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.search.cancel = Some(SearchCancel(Arc::clone(&cancel)));
         let repo = self.search.repo.clone();
         let options = self.search.options.clone();
         self.search.search_task = Some(cx.spawn(async move |this, cx| {
@@ -1822,7 +1972,7 @@ impl Panel {
             }
             let outcome = cx
                 .background_executor()
-                .spawn(async move { search_worktree(&repo, &options) })
+                .spawn(async move { search_worktree_control(&repo, &options, cancel) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.search.generation != generation {

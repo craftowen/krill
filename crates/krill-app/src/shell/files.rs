@@ -164,6 +164,7 @@ pub(super) struct Files {
     loading: HashMap<PaneId, (u64, PathBuf)>,
     quick_generation: u64,
     quick_loading: bool,
+    recent: Vec<PathBuf>,
     #[cfg(test)]
     next_io: Option<tokio::sync::oneshot::Receiver<()>>,
     /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·저장·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
@@ -206,6 +207,7 @@ impl Default for Files {
             loading: HashMap::new(),
             quick_generation: 0,
             quick_loading: false,
+            recent: Vec::new(),
             #[cfg(test)]
             next_io: None,
             released: Vec::new(),
@@ -444,7 +446,7 @@ impl Shell {
     }
 
     pub(super) fn on_zoom_step(&mut self, dir: i8, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_open() {
             return;
         }
         if self.is_editor_focused(window, cx) {
@@ -476,7 +478,7 @@ impl Shell {
     }
 
     pub(super) fn on_zoom_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_open() {
             return;
         }
         if self.is_editor_focused(window, cx) {
@@ -503,6 +505,9 @@ impl Shell {
 
     /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
     pub(super) fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.files.recent.retain(|old| old != &path);
+        self.files.recent.insert(0, path.clone());
+        self.files.recent.truncate(100);
         self.close_settings(None, cx);
         self.diff
             .update(cx, krill_app::diff::Panel::clear_selection);
@@ -1048,7 +1053,7 @@ impl Shell {
     pub(super) fn share_file_artifact(
         &mut self,
         id: PaneId,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(path) = self.layout.file(id).map(Path::to_owned) else {
@@ -1067,12 +1072,7 @@ impl Shell {
             let dir = self.state_dir(cx);
             krill_app::settings::init_at(dir, cx);
         }
-        if !krill_app::settings::artifacts::sharing_enabled(cx) {
-            self.notice = Some(atext::DISABLED.get().to_owned());
-            self.open_settings(krill_app::settings::AdminTab::Artifacts, Some(window), cx);
-            return;
-        }
-        let Some(run) = krill_app::settings::artifacts::runner(cx) else {
+        let Some(run) = krill_app::artifacts::runner(cx) else {
             self.notice = Some(atext::ERROR.format(&[(
                 "error",
                 krill_app::i18n::catalog::orca_import::ERR_CLI_MISSING.get(),
@@ -1085,7 +1085,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { krill_app::settings::artifacts::share_path(&run, &path) })
+                .spawn(async move { krill_app::artifacts::share_path(&run, &path) })
                 .await;
             this.update(cx, |this, cx| {
                 this.files.sharing.remove(&id);
@@ -1395,6 +1395,7 @@ impl Shell {
         if self.jump.is_none()
             && self.dashboard.is_none()
             && self.search.is_none()
+            && self.tab_rename.is_none()
             && self.files.quick_open.is_none()
             && std::mem::take(&mut self.files.refocus)
         {
@@ -1957,29 +1958,75 @@ impl Shell {
         })
     }
 
-    /// ⌘P: 작업 폴더의 파일을 퍼지 검색해 연다. 목록은 백그라운드에서 만든 뒤 팔레트를 띄운다.
-    /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫고, 파일 모드로 연다.
+    /// ⌘P는 즉시 열고 백그라운드 스캔이 끝나면 입력을 유지한 채 목록을 갱신한다.
     pub(super) fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.files.quick_generation = self.files.quick_generation.wrapping_add(1);
         let generation = self.files.quick_generation;
-        if self.files.quick_open.take().is_some() || std::mem::take(&mut self.files.quick_loading) {
+        if self.files.quick_open.take().is_some() {
+            self.files.quick_loading = false;
             self.files.refocus = true;
             cx.notify();
             return;
         }
-        // ⌘J·⇧⌘P가 열려 있으면 먼저 닫는다(같은 위치 중복 마운트 방지).
-        if self.jump.take().is_some() {
-            window.focus(&self.focus, cx);
-            cx.notify();
+        self.close_settings(Some(window), cx);
+        self.jump = None;
+        if self.dashboard.take().is_some() {
+            self.sync_sidebar_visibility(cx);
+            self.sync_focused_session(cx);
+        }
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, Some(window), cx);
         }
         let root = self.folder();
+        let mut recent: Vec<_> = self
+            .files
+            .recent
+            .iter()
+            .filter_map(|path| path.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .collect();
+        for (_, path) in self.layout.files() {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                let relative = relative.to_path_buf();
+                if !recent.contains(&relative) {
+                    recent.push(relative);
+                }
+            }
+        }
+        let shared = Rc::new(std::cell::RefCell::new(recent.clone()));
+        let palette =
+            cx.new(|cx| jump::Palette::new(editor::quick_open::items(&recent), window, cx));
+        palette.update(cx, |p, cx| {
+            p.set_mode(jump::Mode::Files, cx);
+            p.focus(window, cx);
+        });
+        let selected_files = shared.clone();
+        let selected_root = root.clone();
+        let events = cx.subscribe_in(
+            &palette,
+            window,
+            move |this, _, event: &jump::Event, _, cx| {
+                this.files.quick_open = None;
+                this.files.quick_loading = false;
+                this.files.refocus = true;
+                if let jump::Event::Confirm(id) = *event {
+                    let file = editor::quick_open::chosen(&selected_files.borrow(), id).cloned();
+                    if let Some(file) = file {
+                        this.open_file(selected_root.join(file), cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.files.quick_open = Some((palette.clone(), events));
         self.files.quick_loading = true;
-        cx.spawn_in(window, async move |this, cx| {
-            let (files, items) = loop {
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let files = loop {
                 if !this
                     .read_with(cx, |this, _| {
                         this.files.quick_generation == generation
                             && this.files.quick_loading
+                            && this.files.quick_open.is_some()
                             && this.folder() == root
                     })
                     .unwrap_or(false)
@@ -1987,57 +2034,39 @@ impl Shell {
                     return;
                 }
                 let scan = root.clone();
-                let result = cx
+                if let Some(files) = cx
                     .background_executor()
-                    .spawn(async move {
-                        editor::quick_open::try_list(&scan).map(|files| {
-                            let items = editor::quick_open::items(&files);
-                            (files, items)
-                        })
-                    })
-                    .await;
-                if let Some(result) = result {
-                    break result;
+                    .spawn(async move { editor::quick_open::try_list(&scan) })
+                    .await
+                {
+                    break files;
                 }
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
             };
-            this.update_in(cx, |this, window, cx| {
-                if this.files.quick_generation != generation || this.folder() != root {
+            this.update(cx, |this, cx| {
+                if this.files.quick_generation != generation
+                    || !this.files.quick_loading
+                    || this.files.quick_open.is_none()
+                    || this.folder() != root
+                {
                     return;
                 }
+                let mut ordered: Vec<_> = recent
+                    .into_iter()
+                    .filter(|path| files.contains(path))
+                    .collect();
+                let mut seen: std::collections::HashSet<_> = ordered.iter().cloned().collect();
+                for file in files {
+                    if seen.insert(file.clone()) {
+                        ordered.push(file);
+                    }
+                }
+                let items = editor::quick_open::items(&ordered);
+                *shared.borrow_mut() = ordered;
+                palette.update(cx, |p, cx| p.set_items(items, cx));
                 this.files.quick_loading = false;
-                if this.settings.is_some() {
-                    // OWE-860: 설정에서 ⌘P를 누르면 설정을 닫고 빠른 열기로 전환한다.
-                    this.close_settings(Some(&mut *window), cx);
-                }
-                // 스캔 중에 ⌘J·⇧⌘P가 열렸으면 닫고 파일 팔레트를 띄운다(단일 모달, 마지막 요청 우선).
-                this.jump = None;
-                if this.dashboard.take().is_some() {
-                    this.sync_sidebar_visibility(cx);
-                    this.sync_focused_session(cx);
-                }
-                if let Some(pane) = this.layout.focused() {
-                    this.commit_ime(pane, Some(window), cx);
-                }
-                let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
-                palette.update(cx, |p, cx| {
-                    p.set_mode(jump::Mode::Files, cx);
-                    p.focus(window, cx);
-                });
-                let events =
-                    cx.subscribe_in(&palette, window, move |this, _, e: &jump::Event, _, cx| {
-                        this.files.quick_open = None;
-                        this.files.refocus = true;
-                        if let jump::Event::Confirm(id) = *e
-                            && let Some(rel) = editor::quick_open::chosen(&files, id)
-                        {
-                            this.open_file(root.join(rel), cx);
-                        }
-                        cx.notify();
-                    });
-                this.files.quick_open = Some((palette, events));
                 cx.notify();
             })
             .ok();

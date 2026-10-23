@@ -181,10 +181,17 @@ fn needs_you_precedes_pins_and_collapsed_worktrees() {
         &prefs,
         &BTreeSet::from([PathBuf::from("/repo/a")]),
     );
-    assert_eq!(rows[0], Row::NeedsYou);
-    assert!(matches!(&rows[1], Row::Session(s, false) if s.id == SessionId(2)));
-    assert!(matches!(&rows[2], Row::Session(s, false) if s.id == SessionId(3)));
-    assert_eq!(rows[4], Row::Worktree("/repo/b".into()));
+    assert!(matches!(
+        rows[0],
+        Row::GroupHeader {
+            key: GroupKey::Pinned,
+            ..
+        }
+    ));
+    assert_eq!(rows[1], Row::Worktree("/repo/b".into()));
+    let needs = rows.iter().position(|row| *row == Row::NeedsYou).unwrap();
+    assert!(matches!(&rows[needs + 1], Row::Session(s, false) if s.id == SessionId(2)));
+    assert!(matches!(&rows[needs + 2], Row::Session(s, false) if s.id == SessionId(3)));
     assert!(
         !rows
             .iter()
@@ -599,8 +606,11 @@ fn keyboard_navigation_selects_folds_and_returns_focus(cx: &mut TestAppContext) 
     let back = cx.update(|_, cx| cx.focus_handle());
     let selected = Rc::new(Cell::new(None));
     let got = selected.clone();
-    let _subscription = cx
-        .update(|_, cx| cx.subscribe(&view, move |_, event: &Selected, _| got.set(Some(event.0))));
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, _: &WorkspaceSelected, _| {
+            got.set(Some(SessionId(5)));
+        })
+    });
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.snapshot = Snapshot {
@@ -650,11 +660,11 @@ fn app_icons_resolve_in_asset_source() {
     ];
     for icon in used {
         let path = icon.path();
-        let svg = gpui_kit_assets::Assets.load(&path).unwrap();
+        let svg = crate::ui::icons::AppAssets.load(&path).unwrap();
         assert!(svg.is_some_and(|b| b.starts_with(b"<svg")), "{path}");
     }
     // OWE-605: agy 탭 아이콘(Moon)은 기본 번들에서 실제 SVG로 읽히고 핀 별과 경로가 다르다.
-    let svg = gpui_kit_assets::Assets
+    let svg = crate::ui::icons::AppAssets
         .load(&IconName::Moon.path())
         .unwrap();
     assert!(svg.is_some_and(|b| b.starts_with(b"<svg")), "moon");
@@ -688,6 +698,15 @@ fn worktree_enter_and_keyboard_actions_launch_session_pin_rename_and_open_in(
         cx.subscribe(&view, move |_, event: &NewSession, _| {
             got.borrow_mut().push(event.clone());
         })
+    });
+
+    let workspaces = Rc::new(RefCell::new(Vec::new()));
+    let got_ws = workspaces.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &WorkspaceSelected, _| {
+            got_ws.borrow_mut().push(event.path.clone());
+        })
+        .detach();
     });
 
     cx.update(|window, cx| {
@@ -739,13 +758,8 @@ fn worktree_enter_and_keyboard_actions_launch_session_pin_rename_and_open_in(
     // 워크트리 행에서 Enter를 누르면 접기 대신 `Program::Login` 새 세션 이벤트를 내보내고 `back`으로 포커스를 돌려준다.
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
-    assert_eq!(
-        launched.borrow().as_slice(),
-        &[NewSession {
-            cwd: PathBuf::from("/repo/a"),
-            program: Program::Login,
-        }]
-    );
+    assert!(launched.borrow().is_empty(), "Enter reuses the workspace");
+    assert_eq!(workspaces.borrow().last(), Some(&PathBuf::from("/repo/a")));
     assert!(cx.update(|window, _| back.is_focused(window)));
 
     // 다시 사이드바에 포커스를 주고 워크트리 행에서 `alt-cmd-1`을 누르면 첫 에이전트 프로필(claude)로 새 세션을 띄운다.
@@ -1337,6 +1351,7 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
 #[gpui::test]
 fn failed_snapshot_releases_agent_sleep_assertion_and_badge(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
+    init_sidebar_test_settings(cx, "power", r#"keep_awake = "agent""#);
     let sidebar = cx.new(|_| Sidebar::new_loaded(None));
     sidebar.update(cx, |sidebar, cx| {
         sidebar.apply(
@@ -2253,6 +2268,7 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
     .unwrap();
     let sidebar_file = dir.join("sidebar.bin");
 
+    init_sidebar_test_settings(cx, "cache", "prompt_cache_timer_enabled = true\n");
     cx.update(gpui_component::init);
     let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_file)));
     let base_ns = 10_000_000_000_000_u64;
@@ -2372,6 +2388,7 @@ fn workspace_grouping_and_sorting_modes_order_rows_and_fold_groups(cx: &mut Test
             .collect()
     };
 
+    cx.update(|_, cx| view.update(cx, |s, cx| s.set_sort_by(SortBy::Smart, cx)));
     // 1. 기본값(GroupBy::Repo + SortBy::Smart): Waiting -> Unread Done -> Working -> Done -> Idle 순
     let smart_order = cx.update(|_, cx| worktree_order(&view.read(cx).rows));
     assert_eq!(
@@ -3063,16 +3080,15 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
 
-    let selected: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected: Rc<RefCell<Vec<(HostId, PathBuf)>>> = Rc::new(RefCell::new(Vec::new()));
     let launched: Rc<RefCell<Vec<OpenWorkspace>>> = Rc::new(RefCell::new(Vec::new()));
 
     let sel_out = selected.clone();
     let _sub_sel = cx.update(|_, cx| {
-        cx.subscribe(&view, move |s, event: &Selected, cx| {
-            let host = s
-                .update(cx, |s, _| s.take_action_host())
-                .unwrap_or(HostId::Local);
-            sel_out.borrow_mut().push((host, event.0));
+        cx.subscribe(&view, move |_, event: &WorkspaceSelected, _| {
+            sel_out
+                .borrow_mut()
+                .push((event.host.clone(), event.path.clone()));
         })
     });
     let new_out = launched.clone();
@@ -3175,7 +3191,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
 
         assert_eq!(
             selected.borrow().as_slice(),
-            &[(studio_id.clone(), SessionId(21))],
+            &[(studio_id.clone(), wt_with_remote_sess.clone())],
             "clicking remote worktree card with session in {layout:?} must select remote session on studio host"
         );
         assert!(
@@ -3195,6 +3211,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
         );
         cx.run_until_parked();
 
+        assert!(launched.borrow().is_empty());
         assert_eq!(
             launched.borrow().as_slice(),
             &[OpenWorkspace {
@@ -3931,11 +3948,11 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
     vcx.simulate_resize(size(px(240.), px(720.)));
 
-    let selected_events: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected_events: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
     let selected_got = selected_events.clone();
     let _sub_sel = vcx.update(|_, cx| {
-        cx.subscribe(&view, move |_, ev: &Selected, _| {
-            selected_got.borrow_mut().push(ev.0);
+        cx.subscribe(&view, move |_, ev: &WorkspaceSelected, _| {
+            selected_got.borrow_mut().push(ev.path.clone());
         })
     });
     let launched_events: Rc<RefCell<Vec<OpenWorkspace>>> = Rc::new(RefCell::new(Vec::new()));
@@ -4004,10 +4021,10 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
 
     // 배지가 많은 `wt_feature`(row 2): 브랜치 줄이 전체 폭을 쓰고 배지 줄이 아래에 배치되어야 한다.
     let branch_bounds = vcx
-        .debug_bounds("worktree-branch-2")
+        .debug_bounds("worktree-branch-3")
         .expect("distinct branch subtitle must render on feature worktree");
     let checkpoint_bounds = vcx
-        .debug_bounds("checkpoint-badge-2")
+        .debug_bounds("checkpoint-badge-3")
         .expect("checkpoint badge must render");
     assert!(
         f32::from(branch_bounds.size.width) >= 140.0,
@@ -4028,33 +4045,25 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    let repo_idx: usize = 1;
-    let feature_idx: usize = if repo_idx == 1 { 2 } else { 1 };
-    let repo_branch: &'static str = if repo_idx == 1 {
-        "worktree-branch-1"
-    } else {
-        "worktree-branch-2"
+    let mut row_index = |path: &Path| {
+        vcx.update(|_, cx| {
+            view.read(cx)
+                .rows
+                .iter()
+                .position(|row| matches!(row, Row::Worktree(p) if p == path))
+                .unwrap()
+        })
     };
-    let feature_branch: &'static str = if feature_idx == 1 {
-        "worktree-branch-1"
-    } else {
-        "worktree-branch-2"
+    let repo_idx = row_index(&repo);
+    let feature_idx = row_index(&wt_feature);
+    let selector = |prefix: &str, index: usize| -> &'static str {
+        Box::leak(format!("{prefix}-{index}").into_boxed_str())
     };
-    let feature_pr: &'static str = if feature_idx == 1 {
-        "pr-badge-1"
-    } else {
-        "pr-badge-2"
-    };
-    let feature_pin: &'static str = if feature_idx == 1 {
-        "worktree-pin-1"
-    } else {
-        "worktree-pin-2"
-    };
-    let repo_rename: &'static str = if repo_idx == 1 {
-        "worktree-rename-1"
-    } else {
-        "worktree-rename-2"
-    };
+    let repo_branch = selector("worktree-branch", repo_idx);
+    let feature_branch = selector("worktree-branch", feature_idx);
+    let feature_pr = selector("pr-badge", feature_idx);
+    let feature_pin = selector("worktree-pin", feature_idx);
+    let repo_rename = selector("worktree-rename", repo_idx);
     assert!(
         vcx.debug_bounds(repo_branch).is_none(),
         "compact layout must also suppress duplicate branch when card_title == branch_subtitle"
@@ -4113,7 +4122,10 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
         .center();
     vcx.simulate_click(wt0_center, Modifiers::default());
     vcx.run_until_parked();
-    assert_eq!(selected_events.borrow().as_slice(), &[SessionId(77)]);
+    assert_eq!(
+        selected_events.borrow().as_slice(),
+        &[PathBuf::from("/repo/wt-000")]
+    );
 
     // 세션이 없는 두 번째 워크트리(`/repo/wt-001`) 클릭 → `NewSession`.
     // `wt-000`에 세션이 있어 행 구조가 [Repo, wt-000, Session77, wt-001, ...]이므로
@@ -4124,6 +4136,7 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
         .center();
     vcx.simulate_click(wt1_center, Modifiers::default());
     vcx.run_until_parked();
+    assert!(launched_events.borrow().is_empty());
     assert_eq!(
         launched_events.borrow().as_slice(),
         &[OpenWorkspace {
@@ -4416,16 +4429,16 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     assert!(
-        vcx.debug_bounds("rename-inline-2").is_some(),
+        vcx.debug_bounds("rename-inline-1").is_some(),
         "이름 변경 입력창은 워크트리 카드 제목 자리(행 2, [기본] /repo 다음)에 있어야 한다"
     );
     assert!(
-        vcx.debug_bounds("rename-inline-save-2").is_some()
-            && vcx.debug_bounds("rename-inline-cancel-2").is_some(),
+        vcx.debug_bounds("rename-inline-save-1").is_some()
+            && vcx.debug_bounds("rename-inline-cancel-1").is_some(),
         "인라인 이름 변경 행에는 저장(✓)·취소(✕) 버튼이 표시되어야 한다"
     );
     // 입력창 영역을 클릭해도 워크트리 카드 활성화(세션 실행/포커스 탈취)가 일어나면 안 된다.
-    let inline_center = vcx.debug_bounds("rename-inline-2").unwrap().center();
+    let inline_center = vcx.debug_bounds("rename-inline-1").unwrap().center();
     vcx.simulate_click(inline_center, Modifiers::default());
     vcx.run_until_parked();
     assert_eq!(
@@ -4445,7 +4458,7 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
             );
         });
     });
-    assert!(vcx.debug_bounds("rename-inline-2").is_none());
+    assert!(vcx.debug_bounds("rename-inline-1").is_none());
     // Enter: 저장한다.
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
@@ -4940,7 +4953,7 @@ fn primary_worktree_is_always_first_in_project() {
         parents: Some(&parents),
         ..options::WorktreeContext::default()
     };
-    for sort_by in [SortBy::Smart, SortBy::Recent, SortBy::Name] {
+    for sort_by in [SortBy::Smart, SortBy::Recent, SortBy::Name, SortBy::Created] {
         let opts = WorkspaceOptions {
             sort_by,
             ..WorkspaceOptions::default()
@@ -4963,7 +4976,11 @@ fn primary_worktree_is_always_first_in_project() {
         // 기본 → 핀(harness-ci) → 그 자식 → 나머지(대기 중·최근·이름이 앞서는 brand-identity).
         assert_eq!(
             order,
-            vec![repo.clone(), ci.clone(), child.clone(), brand.clone()],
+            if matches!(sort_by, SortBy::Smart | SortBy::Recent) {
+                vec![ci.clone(), brand.clone(), repo.clone(), child.clone()]
+            } else {
+                vec![ci.clone(), brand.clone(), child.clone(), repo.clone()]
+            },
             "{sort_by:?}"
         );
     }
@@ -5264,4 +5281,78 @@ fn selected_workspace_resolves_host_and_path(cx: &mut TestAppContext) {
             assert_eq!(s.selected_workspace(), None);
         });
     });
+}
+
+#[gpui::test]
+fn card_session_lists_running_subagents_below_it(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut lead = session(1, AgentState::Working, Some("/repo/a"));
+            lead.status.subagents = vec![krill_proto::control::Subagent {
+                kind: "general-purpose".into(),
+                description: "각도1".into(),
+                since_unix_ns: 1,
+            }];
+            s.snapshot = Snapshot {
+                sessions: vec![lead.clone()],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
+            };
+            s.rows = vec![Row::Worktree("/repo/a".into()), Row::Session(lead, true)];
+            s.expanded_cards.insert("/repo/a".into());
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let row = cx.debug_bounds("sidebar-session-1").unwrap();
+    let sub = cx.debug_bounds("session-subagent-1-0").unwrap();
+    assert!(sub.origin.y >= row.bottom_left().y);
+    assert!(sub.size.height < row.size.height);
+}
+
+#[gpui::test]
+fn virtual_worktree_toolbar_appears_on_hover_without_layout_shift(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    view.update(cx, |s, cx| {
+        s.snapshot = fixture();
+        s.rebuild(cx);
+    });
+    cx.run_until_parked();
+    let index = view.read_with(cx, |s, _| {
+        s.rows
+            .iter()
+            .position(|r| matches!(r, Row::Worktree(_)))
+            .unwrap()
+    });
+    let placeholder: &'static str =
+        Box::leak(format!("worktree-new-session-{index}").into_boxed_str());
+    let control: &'static str =
+        Box::leak(format!("worktree-new-session-control-{index}").into_boxed_str());
+    let before = cx.debug_bounds(placeholder).unwrap();
+    assert!(cx.debug_bounds(control).is_none());
+    cx.simulate_mouse_move(
+        before.center(),
+        None::<gpui::MouseButton>,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(control).is_some());
+    assert_eq!(cx.debug_bounds(placeholder).unwrap(), before);
+    // 상태 폴링으로 행이 재생성되어도 같은 워크스페이스의 툴바는 유지한다.
+    view.update(cx, Sidebar::rebuild);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(control).is_some());
+}
+
+fn init_sidebar_test_settings(cx: &mut TestAppContext, name: &str, settings: &str) {
+    let dir = std::env::temp_dir().join(format!("krill-sidebar-{name}-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("settings.toml"), settings).unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::settings::init_at(Some(dir), cx);
+    });
+    cx.run_until_parked();
 }

@@ -14,6 +14,11 @@ pub mod menu_bar;
 #[cfg(not(target_os = "macos"))]
 mod windows;
 
+#[cfg(any(windows, test))]
+mod locale;
+#[cfg(windows)]
+pub(crate) use locale::preferred_locale;
+
 pub mod permissions;
 
 /// 실행 비트(`0o111`)가 하나라도 있는지. Windows는 실행 비트가 없어 늘 `true`다(파일 여부는 호출자가 본다).

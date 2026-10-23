@@ -231,7 +231,20 @@ impl Shell {
             .as_ref()
             .and_then(|a| visible_profiles(a).position(|p| p.id == want))
             .unwrap_or(0);
-        self.new_agent_at(index, cx);
+        if self
+            .agents
+            .as_ref()
+            .is_some_and(|a| visible_profiles(a).next().is_some())
+        {
+            self.new_agent_at(index, cx);
+        } else {
+            self.notice = Some(
+                krill_app::i18n::catalog::checks::D_AGENTS_NONE
+                    .get()
+                    .to_owned(),
+            );
+            cx.notify();
+        }
     }
 
     /// 셸 루트에 새 세션 단축키 처리기를 붙인다.
@@ -293,10 +306,6 @@ impl Shell {
         let launch_host = self.launch_host.clone();
         let (this, focus) = (cx.weak_entity(), self.focus.clone());
         let (working_count, done_count) = self.sidebar.read(cx).agent_counts();
-        let artifacts_open = self
-            .settings
-            .as_ref()
-            .is_some_and(|s| s.read(cx).tab() == krill_app::settings::AdminTab::Artifacts);
         let menu = krill_app::ui::button_with_tooltip(
             Button::new("new-session")
                 .icon(IconName::Plus)
@@ -437,6 +446,19 @@ impl Shell {
             .child(
                 Self::nav_row(
                     p,
+                    "nav-artifacts",
+                    icons::FILES_SVG,
+                    krill_app::i18n::catalog::artifacts::TITLE.get(),
+                )
+                .when(self.artifacts.is_some(), |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.open_artifacts(Some(window), cx))),
+            )
+            .child(
+                Self::nav_row(
+                    p,
                     "nav-agent-dashboard",
                     icons::LAYOUT_DASHBOARD_SVG,
                     sb_text::NAV_AGENT_DASHBOARD.get(),
@@ -497,22 +519,6 @@ impl Shell {
                     )
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
-            )
-            .child(
-                // 설정 > 아티팩트 페이지(공유한 공개 링크 관리)를 메인 창 안에서 연다.
-                Self::nav_row(
-                    p,
-                    "nav-artifacts",
-                    icons::GLOBE_SVG,
-                    sb_text::NAV_ARTIFACTS.get(),
-                )
-                .when(artifacts_open, |d| {
-                    d.bg(p.sidebar_accent)
-                        .text_color(p.sidebar_accent_foreground)
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_settings(krill_app::settings::AdminTab::Artifacts, Some(window), cx);
-                })),
             )
     }
 }

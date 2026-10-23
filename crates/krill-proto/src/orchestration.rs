@@ -1929,20 +1929,27 @@ impl WorktreeStore {
         }
     }
 
-    pub fn find_references(&self, query: &str) -> Vec<(String, String)> {
+    /// 검색 결과는 저장소를 빌리며 검색어는 내부에서 소유한다. 키·URL의 저장 순서를 유지한다.
+    pub fn reference_matches<'store>(
+        &'store self,
+        query: &str,
+    ) -> impl Iterator<Item = (&'store str, &'store str)> + use<'store> {
         let q = query.trim().to_ascii_lowercase();
-        let mut matches = Vec::new();
-        for (wt, urls) in &self.references {
-            for u in urls {
-                if q.is_empty()
-                    || u.to_ascii_lowercase().contains(&q)
+        self.references
+            .iter()
+            .flat_map(|(wt, urls)| urls.iter().map(move |url| (wt.as_str(), url.as_str())))
+            .filter(move |(wt, url)| {
+                q.is_empty()
+                    || url.to_ascii_lowercase().contains(&q)
                     || wt.to_ascii_lowercase().contains(&q)
-                {
-                    matches.push((wt.clone(), u.clone()));
-                }
-            }
-        }
-        matches
+            })
+    }
+
+    /// 호출자가 소유 결과를 필요로 할 때 쓰는 호환 API.
+    pub fn find_references(&self, query: &str) -> Vec<(String, String)> {
+        self.reference_matches(query)
+            .map(|(wt, url)| (wt.to_owned(), url.to_owned()))
+            .collect()
     }
 
     pub fn symlinks_for(&self, key: &str) -> Vec<String> {
@@ -2690,6 +2697,51 @@ mod tests {
         loaded.save(&dir)?;
         assert_eq!(WorktreeStore::load(&dir)?, loaded);
         fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reference_matches_borrow_strings_and_preserve_owned_search_contract() -> io::Result<()> {
+        let mut store = WorktreeStore::default();
+        store.add_reference("/repo/Zebra", "https://example.com/First")?;
+        store.add_reference("/repo/Zebra", "https://example.com/second")?;
+        store.add_reference("/repo/Alpha", "https://elsewhere.test/First")?;
+        store.add_reference("/repo/한글", "https://example.com/Ä")?;
+        for query in ["", "  ", " FIRST ", "ZEBRA", "missing", "한글", "Ä", "ä"] {
+            let borrowed: Vec<_> = store.reference_matches(query).collect();
+            let owned = store.find_references(query);
+            assert_eq!(
+                borrowed,
+                owned
+                    .iter()
+                    .map(|(wt, url)| (wt.as_str(), url.as_str()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // iterator는 정규화한 검색어를 소유하므로 원래 검색어가 먼저 사라져도 된다.
+        let matches = {
+            let query = String::from(" zebra ");
+            store.reference_matches(&query)
+        };
+        let found: Vec<_> = matches.collect();
+        assert_eq!(
+            found,
+            vec![
+                ("/repo/Zebra", "https://example.com/First"),
+                ("/repo/Zebra", "https://example.com/second")
+            ]
+        );
+        let (stored_key, stored_urls) = store.references.get_key_value("/repo/Zebra").unwrap();
+        assert!(std::ptr::eq(found[0].0, stored_key.as_str()));
+        assert!(std::ptr::eq(found[0].1, stored_urls[0].as_str()));
+        let all: Vec<_> = store.reference_matches("").collect();
+        assert_eq!(all[0].0, "/repo/Alpha");
+        assert_eq!(all[1].1, "https://example.com/First");
+        assert_eq!(all[2].1, "https://example.com/second");
+        assert!(
+            store.reference_matches("ä").next().is_none(),
+            "ASCII 대소문자 규칙을 유지한다"
+        );
         Ok(())
     }
 

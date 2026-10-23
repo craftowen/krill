@@ -107,6 +107,8 @@ Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.so
 | FEAT_GIT_CHANGES | `1 << 6` | `krill_proto::control` (변경 파일·numstat 조회 확장, 기존 REQUEST/REPLY 사용) |
 | FEAT_HOLDER_WATCH | `1 << 7` | `krill_proto::daemon` (감시 연결의 holder 상태·상실 통보) |
 | FEAT_SEARCH | `1 << 8` | `krill_proto::search` (터미널 검색) |
+| FEAT_CLEAR_VIEWPORT | `1 << 21` | `krill_proto::term_modes` (PTY 입력 없이 현재 커서 행만 위에 남기고 화면·스크롤백 지우기) |
+| FEAT_SEARCH_OPTIONS | `1 << 20` | `krill_proto::search` (대소문자·정규식 옵션, SEARCH_OPTIONS만 새 피어에 전송) |
 | FEAT_SCREEN_META | `1 << 9` | `krill_proto::screen` (화면 부가 정보: 제목·벨·커서 모양·OSC 8 링크 URI, OWE-490) |
 | FEAT_CLI | `1 << 10` | `krill_proto::control` (CLI 화면 캡처·크기, 기존 REQUEST/REPLY 사용, OWE-410) |
 | FEAT_WAIT_STATUS | `1 << 11` | `krill_proto::control` (세션 상태·원본 출력 정지 시간 조회, Request 9 / Reply 13, OWE-412) |
@@ -114,6 +116,7 @@ Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.so
 | FEAT_TERM_MODES | `1 << 13` | `krill_proto::term_modes` (입력 모드 동기화, OWE-394) |
 | FEAT_SIDEBAR | `1 << 14` | `krill_proto::control` (세션 cwd·워크트리 조회, Request 10 / Reply 14, OWE-411 지휘자 배정) |
 | FEAT_PROVIDER_DETAILS | `1 << 15` | `krill_proto::usage` (제공자별 상세 사용량·계정 전환 상태, 기존 사용량 응답 뒤 확장) |
+| FEAT_ACCOUNT_CANCEL | `1 << 22` | `krill_proto::usage` (실패한 계정 전환 취소·원본 세션 입력 재개, 명시적 동의 후에만 보류 입력 전달) |
 | FEAT_HISTORY | `1 << 16` | `krill_proto::history` (기록 삭제, 전용 요청·응답, OWE-440) |
 | FEAT_USAGE | `1 << 17` | `krill_proto::usage` (사용량·프로바이더 다계정 조회·전환·자동전환, 전용 요청·응답, MK-084·MK-107·MK-108) |
 | FEAT_ORCH_RETAIN | `1 << 19` | `krill_proto::orchestration` (retain 요청·상태, v0.1.23 지휘자 배정; 구 피어 응답은 Stopped로 변환) |
@@ -171,6 +174,8 @@ OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisionin
 | `screen::REFUSED` | `0x25` | 데몬→클라 |
 | `screen::HISTORY_ROWS` | `0x26` | 데몬→클라 |
 | `search::SEARCH` | `0x15` | 클라→데몬 |
+| `term_modes::CLEAR_VIEWPORT` | `0x47` | 클라→데몬 (FEAT_CLEAR_VIEWPORT, interactive 권한 필요) |
+| `search::SEARCH_OPTIONS` | `0x46` | 클라→데몬 (FEAT_SEARCH_OPTIONS 필요, 응답은 기존 SEARCH_RESULT) |
 | `search::SEARCH_RESULT` | `0x2a` | 데몬→클라 |
 | `input::INPUT` | `0x13` | 클라→데몬 (FEAT_INPUT 협상) |
 | `input::INPUT_ACK` | `0x27` | 데몬→클라 (적용·종료·권한 거부 결과) |
@@ -189,11 +194,13 @@ OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisionin
 | `daemon::PING` | `0x43` | 클라→데몬 (감시 연결만, FEAT_HEARTBEAT, OWE-586) |
 | `daemon::PONG` | `0x63` | 데몬→클라 (감시 연결만, FEAT_HEARTBEAT, OWE-586) |
 
+`term_modes::Modes.flags`는 bit 0 APP_CURSOR, 1 MOUSE_CLICK, 2 MOUSE_DRAG, 3 MOUSE_MOTION, 4 SGR_MOUSE, 5 BRACKETED_PASTE, 6 ALT_SCREEN, 7 ALTERNATE_SCROLL(DEC 1007)을 사용한다. 알 수 없는 비트는 무시한다. 대체 화면에서 마우스 보고가 꺼져 있고 DEC 1007이 켜져 있으면 클라이언트는 휠을 커서 모드에 맞는 위/아래 키로 보낸다.
+
 `krill_proto::control`의 Request/Reply enum은 postcard 변형 순서가 곧 와이어 번호라 **끝에 추가만** 하고, 병렬 작업 중에는 지휘자가 변형 번호를 배정한다(2026-10-15 MK-045: Request 7·8, Reply 11·12).
 
 Resource Manager(MK-071)는 control에 `Request::Resources(Action)`·`Reply::Resources` 한 쌍만 더한다(페이로드 `krill_proto::resources`, `FEAT_RESOURCES`를 협상했을 때만 보낸다 — 앱은 미지원 데몬이면 '데몬 업데이트 필요'를 보이고 요청하지 않는다). 메모리는 krilld가 `proc_pid_rusage`로 읽은 `phys_footprint`(요청자·krilld·holder·세션 루트와 ppid 후손 합), 디스크는 상태 디렉터리의 할당 블록 합이다. `RestartDaemon`은 전체 범위 interactive만, 확인 대화상자는 앱이 띄우고, krilld는 holder `UpgradeKrilld`(MK-068과 같은 경로) 승인 뒤 답을 보내고 끝난다. 세션 kill은 기존 `Close`.
 
-**예약 번호 범위**: 기능 비트 `1 << 20`~`1 << 29`, kind 클라→데몬 `0x1A`~`0x1F`·데몬→클라 `0x2D`~`0x2F`. (`control` Request/Reply enum은 postcard 순차 인덱스라 끝에만 추가하며 현재 Request 0..=19, Reply 0..=23까지 배정됨).
+**예약 번호 범위**: 기능 비트 `1 << 22`~`1 << 29`, kind 클라→데몬 `0x1A`~`0x1F`·데몬→클라 `0x2D`~`0x2F`. (`control` Request/Reply enum은 postcard 순차 인덱스라 끝에만 추가하며 현재 Request 0..=19, Reply 0..=23까지 배정됨).
 
 **kind 확장 범위(2026-10-15)**: `0x10`~`0x1F`·`0x20`~`0x2F`가 차서 새 전용 kind는 클라→데몬 `0x40`~, 데몬→클라 `0x60`~를 배정한다. control enum에 빈 번호를 채우는 예약 변형(`#[serde(skip)]`)은 금지 — 직렬화·역직렬화 변형 번호가 어긋날 수 있다.
 

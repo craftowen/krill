@@ -1,21 +1,25 @@
-# Code of Conduct
+# Code of conduct
 
-## 약속
+[한국어](CODE_OF_CONDUCT.ko.md)
 
-열린 태도로 누구나 기여할 수 있는 환경을 유지한다. 경험·규모와 무관하게 모든 참여자를 존중한다.
+## Our commitment
 
-## 기대 행동
+Keep participation open and respectful. Treat every contributor with respect, regardless of experience or project size.
 
-- 사실과 재현 절차로 말한다. 측정하지 않은 수치는 쓰지 않는다.
-- 리뷰는 코드·근거를 지적하고 사람을 지적하지 않는다.
-- 범위를 넓히지 않는다. 이슈 밖 문제는 새 이슈로 분리한다.
+## Expected behavior
 
-## 금지 행동
+- Use facts and reproducible evidence. Do not present unmeasured numbers as measurements.
+- Review code and reasoning without attacking the person.
+- Keep work focused; move unrelated concerns into separate issues.
 
-- 괴롭힘·비하·차별·위협, 사적인 정보(연락처·소속·위치 등)의 동의 없는 공개.
-- 보안 취약점의 공개 폭로 (절차는 [SECURITY.md](SECURITY.md)).
-- 토큰·키·개인정보의 커밋·게시.
+## Unacceptable behavior
 
-## 시행
+- Harassment, insults, discrimination, threats, or sharing private information (such as contact details, affiliation, or location) without consent.
+- Public disclosure of security vulnerabilities; follow the [security policy](SECURITY.md).
+- Committing or publishing tokens, keys, or personal information.
 
-위반은 저장소 소유자에게 비공개로 신고한다. 소유자는 경고·댓글 숨김·기여 차단 중 비례 조치를 하고, 30일 이내에 처리 결과를 신고자에게 알린다. 본 강령은 이슈·PR·토론에 적용된다.
+## Enforcement
+
+Report violations privately to the repository owner, [craftowen](https://github.com/craftowen). If you cannot find a private channel, request a private contact method in an issue without naming affected people or including incident details.
+
+The owner may issue a warning, hide comments, or block contributions in proportion to the violation, and will inform the reporter of the outcome within **30 days**. This code applies to issues, pull requests, and discussions.

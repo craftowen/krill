@@ -11,11 +11,22 @@ use krill_proto::control::AgentState;
 
 use super::*;
 
-/// OWE-870: 탭 이름 변경 대화상자 상태(대상 탭 + 입력창 + Enter 구독).
+/// 탭 안에서 편집하는 이름과 입력 이벤트 구독.
 pub(super) struct TabRename {
-    pub(super) index: usize,
+    pub(super) pane: PaneId,
     pub(super) input: Entity<InputState>,
     pub(super) _enter: Subscription,
+    _blur: Subscription,
+}
+
+/// 세션은 재사용하지 않고 새 프로세스로 열되, 사용자 탭 속성은 복원한다.
+pub(super) struct ClosedTab {
+    workspace: workspaces::Workspace,
+    position: usize,
+    launch: Create,
+    file: Option<PathBuf>,
+    title: Option<String>,
+    color: Option<krill_app::layout::TabColor>,
 }
 
 const CLOSE_GROUP: &str = "session-tab";
@@ -201,8 +212,26 @@ impl Shell {
                     description
                 };
                 let file_prefix = self.file_tab_prefix(pane, cx);
+                let rename_input = self
+                    .tab_rename
+                    .as_ref()
+                    .filter(|r| tab.root.contains(r.pane))
+                    .map(|r| r.input.clone());
                 Tab::new()
-                    .label(SharedString::from(label.clone()))
+                    .when(rename_input.is_none(), |t| {
+                        t.label(SharedString::from(label.clone()))
+                    })
+                    .when_some(rename_input, |t, input| {
+                        t.child(
+                            div()
+                                .id("tab-rename-input")
+                                .debug_selector(|| "tab-rename-input".into())
+                                .w(px(140.))
+                                .min_w_0()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Input::new(&input).small()),
+                        )
+                    })
                     .text_size(ui::TEXT_SM)
                     .aria_label(description)
                     .group(CLOSE_GROUP)
@@ -299,26 +328,28 @@ impl Shell {
                             .flex()
                             .items_center()
                             .gap(ui::SPACE_1)
-                            .child(
-                                div()
-                                    .invisible()
-                                    // Orca: 활성 탭의 닫기는 항상 보이고, 비활성은 호버 때만.
-                                    .when(selected, Styled::visible)
-                                    .group_hover(CLOSE_GROUP, Styled::visible)
-                                    .child(ui::button_with_tooltip(
-                                        Button::new(("close-tab", i))
-                                            .icon(IconName::Close)
-                                            .ghost()
-                                            .xsmall()
-                                            .debug_selector(move || format!("close-tab-{i}"))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.request_close_tab(i, cx);
-                                            })),
-                                        format!("close-tab-{i}"),
-                                        text::CLOSE_TAB.get(),
-                                    )),
-                            )
+                            .when(!tab.pinned, |d| {
+                                d.child(
+                                    div()
+                                        .invisible()
+                                        // Orca: 활성 탭의 닫기는 항상 보이고, 비활성은 호버 때만.
+                                        .when(selected, Styled::visible)
+                                        .group_hover(CLOSE_GROUP, Styled::visible)
+                                        .child(ui::button_with_tooltip(
+                                            Button::new(("close-tab", i))
+                                                .icon(IconName::Close)
+                                                .ghost()
+                                                .xsmall()
+                                                .debug_selector(move || format!("close-tab-{i}"))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.request_close_tab(i, cx);
+                                                })),
+                                            format!("close-tab-{i}"),
+                                            text::CLOSE_TAB.get(),
+                                        )),
+                                )
+                            })
                             // 탭 사이 구분선(Orca `border-r`). 활성 탭 양옆은 활성 탭 테두리가 대신해
                             // 겹치지 않게 숨기되 자리는 지켜 탭 폭이 바뀌지 않는다.
                             .child(
@@ -344,11 +375,13 @@ impl Shell {
                             }
                         }),
                     )
-                    .on_mouse_down(
+                    .on_mouse_up(
                         MouseButton::Middle,
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.request_close_tab(i, cx);
+                            if !this.layout.is_tab_pinned(i) {
+                                this.request_close_tab(i, cx);
+                            }
                         }),
                     )
                     .on_mouse_down(
@@ -579,6 +612,76 @@ impl Shell {
             )
     }
 
+    pub(super) fn remember_closed_tab(&mut self, index: usize, cx: &App) {
+        let Some(workspace) = self.tab_workspace(index, cx) else {
+            return;
+        };
+        let Some(tab) = self.layout.tabs().get(index) else {
+            return;
+        };
+        let position = self
+            .tabs_in_workspace(index, cx)
+            .iter()
+            .position(|&i| i == index)
+            .unwrap_or_default();
+        let closed = ClosedTab {
+            workspace: workspace.clone(),
+            position,
+            launch: self.launch_for(tab.focused),
+            file: self.layout.file(tab.focused).map(ToOwned::to_owned),
+            title: tab.custom_title.clone(),
+            color: tab.color,
+        };
+        // 각 워크스페이스의 스택만 상한을 적용한다.
+        if self
+            .closed_tabs
+            .iter()
+            .filter(|t| t.workspace == workspace)
+            .count()
+            >= 10
+            && let Some(oldest) = self
+                .closed_tabs
+                .iter()
+                .position(|t| t.workspace == workspace)
+        {
+            self.closed_tabs.remove(oldest);
+        }
+        self.closed_tabs.push(closed);
+    }
+
+    pub(super) fn reopen_closed_tab(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.tab_workspace(self.layout.active(), cx);
+        let Some(index) = self
+            .closed_tabs
+            .iter()
+            .rposition(|t| workspace.as_ref().is_none_or(|w| &t.workspace == w))
+        else {
+            return;
+        };
+        let closed = self.closed_tabs.remove(index);
+        let visible = self.workspace_tabs(cx);
+        let destination = visible
+            .get(closed.position)
+            .copied()
+            .or_else(|| visible.last().map(|i| i + 1))
+            .unwrap_or(self.layout.tabs().len());
+        self.change(true, cx, |l| {
+            if let Some(file) = closed.file {
+                l.open_file(file);
+            } else {
+                l.new_tab();
+            }
+            if let Some(pane) = l.focused() {
+                l.set_host(pane, closed.workspace.host);
+                l.set_launch(pane, closed.launch);
+            }
+            let active = l.active();
+            l.set_tab_title(active, closed.title.as_deref());
+            l.set_tab_color(active, closed.color);
+            l.reorder_tab(active, destination.min(l.tabs().len().saturating_sub(1)));
+        });
+    }
+
     /// OWE-734: 탭 닫기 요청. 고정된 탭(`pinned`)이면 확인 모달을 띄우고, 아니면 바로 닫는다.
     pub(super) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.layout.tabs().len() {
@@ -681,8 +784,8 @@ impl Shell {
             return;
         };
         if index < self.layout.tabs().len() {
-            // OWE-872: 고정 확인 뒤에도 실행 중이면 한 번 더 묻는다.
-            self.maybe_close_tab(index, cx);
+            // 고정 탭 확인은 실행 중 세션도 포함한 한 번의 확인이다.
+            self.do_close_tab(index, cx);
         } else {
             cx.notify();
         }
@@ -705,7 +808,7 @@ impl Shell {
             .map_or(String::new(), |t| self.pane_label(t.focused, cx))
     }
 
-    /// OWE-870: 탭 이름 변경 대화상자를 연다. 입력창에는 지금 표시 이름이 미리 채워진다.
+    /// OWE-870: 탭 이름 인라인 편집을 연다. 입력창에는 지금 표시 이름이 미리 채워진다.
     pub(super) fn begin_tab_rename(
         &mut self,
         index: usize,
@@ -716,30 +819,69 @@ impl Shell {
             return;
         }
         self.tab_context_menu = None;
+        self.pending_focus = PendingFocus::None;
+        self.files.refocus = false;
+        self.change(true, cx, |l| l.activate(index));
         let current = self.tab_display_label(index, cx);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        input.update(cx, |input, cx| input.focus(window, cx));
-        let enter = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        let enter = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if this.tab_rename.as_ref().is_none_or(|r| r.input != *input) {
+                    return;
+                }
+                if let InputEvent::PressEnter { .. } = event {
+                    let composing = input.update(cx, |s, cx| {
+                        gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
+                    });
+                    if !composing {
+                        this.finish_tab_rename(true, cx);
+                        this.focus.focus(window, cx);
+                    }
+                }
+            },
+        );
+        let input_handle = gpui::Focusable::focus_handle(input.read(cx), cx);
+        let input_id = input.entity_id();
+        let blur = cx.on_blur(&input_handle, window, move |this, _, cx| {
+            if this
+                .tab_rename
+                .as_ref()
+                .is_some_and(|r| r.input.entity_id() == input_id)
+            {
                 this.finish_tab_rename(true, cx);
             }
         });
         self.tab_rename = Some(TabRename {
-            index,
+            pane: self.layout.tabs()[index].focused,
             input,
             _enter: enter,
+            _blur: blur,
         });
         cx.notify();
     }
 
-    /// OWE-870: 이름 변경 대화상자를 닫는다. `save`면 입력값을 제목으로 저장(비우면 자동 제목으로 복귀).
+    /// OWE-870: 이름 인라인 편집을 끝낸다. `save`면 입력값을 제목으로 저장(비우면 자동 제목으로 복귀).
     pub(super) fn finish_tab_rename(&mut self, save: bool, cx: &mut Context<Self>) {
         let Some(rename) = self.tab_rename.take() else {
             return;
         };
         if save {
             let title = rename.input.read(cx).value().trim().to_owned();
-            let index = rename.index;
+            let Some(index) = self
+                .layout
+                .tabs()
+                .iter()
+                .position(|tab| tab.root.contains(rename.pane))
+            else {
+                cx.notify();
+                return;
+            };
             self.change(true, cx, move |l| {
                 l.set_tab_title(index, (!title.is_empty()).then_some(title.as_str()));
             });
@@ -748,20 +890,10 @@ impl Shell {
         }
     }
 
-    /// OWE-870: 이름 변경 대화상자를 취소한다.
+    /// OWE-870: 이름 인라인 편집을 취소한다.
     pub(super) fn cancel_tab_rename(&mut self, cx: &mut Context<Self>) {
         self.finish_tab_rename(false, cx);
-    }
-
-    /// OWE-870: 이름 변경 대화상자에서 제목을 지우고 자동 제목으로 되돌린다.
-    pub(super) fn clear_tab_title(&mut self, cx: &mut Context<Self>) {
-        let Some(rename) = self.tab_rename.take() else {
-            return;
-        };
-        let index = rename.index;
-        self.change(true, cx, move |l| {
-            l.set_tab_title(index, None);
-        });
+        self.pending_focus = PendingFocus::Workspace;
     }
 
     /// OWE-734: 탭 우클릭 컨텍스트 메뉴를 연다.
@@ -819,20 +951,21 @@ impl Shell {
 
     /// OWE-734: `Ctrl+Tab` / `Ctrl+Shift+Tab`으로 최근 사용(MRU) 순서대로 탭을 순환한다.
     pub(super) fn on_recent_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_open() {
             return;
         }
         self.tab_context_menu = None;
         let tabs = self.workspace_tabs(cx);
-        self.change(true, cx, |l| l.cycle_mru_in(delta, &tabs));
+        self.layout.cycle_mru_in(delta, &tabs);
+        cx.notify();
     }
 
     /// OWE-734: `Ctrl` 키를 떼거나 스위처를 닫을 때 MRU 순서를 확정한다.
     pub(super) fn commit_mru_switcher(&mut self, cx: &mut Context<Self>) {
         if self.layout.mru_switching() {
-            self.layout.commit_mru();
-            self.save();
-            cx.notify();
+            self.change(true, cx, |l| {
+                l.commit_mru();
+            });
         }
     }
 
@@ -1093,18 +1226,18 @@ impl Shell {
                     menu_item(
                         "tab-menu-close",
                         text::CLOSE_TAB_MENU.get(),
-                        true,
-                        // OWE-864: 탭 전체를 닫는 `shell::CloseTab`(⇧⌘W)을 호출하므로
-                        // 칸 닫기(⌘W)가 아닌 ⇧⌘W로 표기한다.
+                        !is_pinned,
                         Some(if cfg!(target_os = "macos") {
-                            "⇧⌘W"
+                            "⌘W"
                         } else {
-                            "Ctrl+Alt+Shift+W"
+                            "Ctrl+Alt+W"
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab_context_menu = None;
-                        this.request_close_tab(index, cx);
+                        if !this.layout.is_tab_pinned(index) {
+                            this.request_close_tab(index, cx);
+                        }
                     })),
                 )
                 .child(
@@ -1441,81 +1574,6 @@ impl Shell {
                             .label(text::RUNNING_CLOSE_CONFIRM.get())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.confirm_running_close(cx);
-                            })),
-                    ),
-            );
-        Some(ui::modal_backdrop(window.viewport_size(), card))
-    }
-
-    /// OWE-870: 탭 이름 변경 대화상자. 비우면 자동 제목으로 복귀한다.
-    pub(super) fn render_tab_rename_dialog(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::Deferred> {
-        let rename = self.tab_rename.as_ref()?;
-        let index = rename.index;
-        let input = rename.input.clone();
-        if index >= self.layout.tabs().len() {
-            return None;
-        }
-        let p = ui::palette(cx);
-        let card = div()
-            .id("tab-rename-dialog")
-            .debug_selector(|| "tab-rename-dialog".into())
-            .occlude()
-            .w(px(360.))
-            .p_4()
-            .rounded(ui::RADIUS_LG)
-            .bg(p.popover)
-            .text_color(p.popover_foreground)
-            .border_1()
-            .border_color(p.border)
-            .font_family(ui::FONT_UI)
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(ui::TEXT_LG)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.foreground)
-                    .child(text::RENAME_TAB_TITLE.get()),
-            )
-            .child(
-                div()
-                    .id("tab-rename-input")
-                    .debug_selector(|| "tab-rename-input".into())
-                    .child(Input::new(&input).small()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        ui::ghost("cancel-tab-rename", text::RENAME_TAB_CANCEL.get())
-                            .debug_selector(|| "cancel-tab-rename".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cancel_tab_rename(cx);
-                            })),
-                    )
-                    .child(
-                        ui::ghost("clear-tab-title", text::RENAME_TAB_CLEAR.get())
-                            .debug_selector(|| "clear-tab-title".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear_tab_title(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("save-tab-rename")
-                            .debug_selector(|| "save-tab-rename".into())
-                            .small()
-                            .primary()
-                            .label(text::RENAME_TAB_SAVE.get())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.finish_tab_rename(true, cx);
                             })),
                     ),
             );

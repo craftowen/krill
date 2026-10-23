@@ -565,6 +565,13 @@ struct SearchState {
     req: u32,
     pending: Option<u32>,
     query: String,
+    options: krill_proto::search::Options,
+    pattern: Option<(
+        String,
+        krill_proto::search::Options,
+        Option<krill_proto::search::Pattern>,
+    )>,
+    top_request: Option<TopRequest>,
     cursor: Option<krill_proto::search::Cursor>,
     result: Option<krill_proto::search::SearchResult>,
     /// 스크롤백(Hot/Cold) 일치의 이웃 행 요청 번호. 늦은 답·스크롤·입력·연결 끊김 때 버린다.
@@ -577,6 +584,14 @@ struct SearchState {
     highlight: Option<crate::terminal::Highlight>,
     /// 보이는 화면의 일치 범위 전부(활성 포함 가능, 엷게 칠한다).
     highlights: Vec<crate::terminal::Highlight>,
+}
+
+/// 맨 위 이동은 페이지의 행 수를 먼저 확인한 뒤 화면 크기만큼만 읽는다.
+#[derive(Debug, Clone, Copy)]
+struct TopRequest {
+    req: u32,
+    source: Source,
+    total: Option<u32>,
 }
 
 /// 이웃 행(`HISTORY_ROWS`)이 오면 고정 보기로 둘 자리.
@@ -592,10 +607,37 @@ const MAX_SEARCH_MARKS: usize = 1_000;
 
 /// 한 행에서 리터럴 검색어와 겹치지 않게 일치하는 칸 범위들을 돌려준다.
 /// 데몬(`krilld::search`)의 `text_spans`와 같은 셀→글자 대응(SPACER 건너뜀, 넓은 문자 2칸)이다.
+#[cfg(all(test, unix))]
 fn find_matches(row: &[Cell], query: &str) -> Vec<(u16, u16)> {
+    find_matches_with_options(
+        row,
+        query,
+        krill_proto::search::Options {
+            case_sensitive: true,
+            regex: false,
+        },
+    )
+}
+
+#[cfg(all(test, unix))]
+fn find_matches_with_options(
+    row: &[Cell],
+    query: &str,
+    options: krill_proto::search::Options,
+) -> Vec<(u16, u16)> {
     if query.is_empty() {
         return Vec::new();
     }
+    let Ok(pattern) = options.compile(query) else {
+        return Vec::new();
+    };
+    find_matches_with_pattern(row, &pattern)
+}
+
+fn find_matches_with_pattern(
+    row: &[Cell],
+    pattern: &krill_proto::search::Pattern,
+) -> Vec<(u16, u16)> {
     let mut text = String::new();
     let mut spans: Vec<(usize, usize, u16, u16)> = Vec::new();
     for (column, cell) in row.iter().enumerate() {
@@ -616,8 +658,9 @@ fn find_matches(row: &[Cell], query: &str) -> Vec<(u16, u16)> {
         spans.push((start, text.len(), column, end_column));
     }
     let mut out = Vec::new();
-    for (byte, matched) in text.match_indices(query) {
-        let end = byte.saturating_add(matched.len());
+    for matched in pattern.find_iter(&text).filter(|m| !m.is_empty()) {
+        let byte = matched.start();
+        let end = matched.end();
         let mut overlaps = spans.iter().filter(|span| span.1 > byte && span.0 < end);
         let Some(first) = overlaps.next() else {
             continue;
@@ -636,6 +679,7 @@ impl SearchState {
         self.result = None;
         self.hist_req = None;
         self.hist_target = None;
+        self.top_request = None;
         self.scrolled = false;
         self.highlight = None;
         self.highlights.clear();
@@ -950,8 +994,23 @@ impl<W: Write> Pane<W> {
         notice
     }
 
+    /// Send a mouse report only to the live, unpaused PTY. Reports must not consume the held
+    /// prompt budget, reset scrollback, or appear as lost user input after a disconnect.
+    pub fn report(&mut self, bytes: &[u8]) -> Option<Notice> {
+        if self.state != State::Live
+            || self.out.is_none()
+            || self.account_switching()
+            || self.features & krill_proto::input::FEAT_INPUT == 0
+        {
+            return None;
+        }
+        let frame = self.journal.report(bytes)?;
+        self.send(&frame).err().and_then(|()| self.unlink())
+    }
+
     /// 사용자 입력. 스크롤 중이면 바닥으로 돌아간다. 보류 한도를 넘으면 알림.
     pub fn input(&mut self, bytes: &[u8], now: Now) -> Option<Notice> {
+        self.search.top_request = None;
         if self.state != State::Live && !self.account_switching() {
             return None;
         }
@@ -977,8 +1036,60 @@ impl<W: Write> Pane<W> {
         }
     }
 
+    /// 맨 위는 이력을 전부 적재하지 않고 가장 오래된 페이지의 화면 분량만 보여 준다.
+    pub fn scroll_top(&mut self) {
+        self.clear_search();
+        if self.out.is_none() || self.is_cold() {
+            self.scroll(isize::MAX);
+            return;
+        }
+        self.history.reset();
+        self.request_top(Source::Cold { page: 0 }, None);
+    }
+
+    fn request_top(&mut self, source: Source, total: Option<u32>) {
+        let count = self.view.screen.lines.clamp(1, MAX_HISTORY_ROWS);
+        self.history.req = self.history.req.wrapping_add(1);
+        let req = self.history.req;
+        let request = HistoryRequest {
+            req,
+            source,
+            skip: total.map_or(0, |total| total.saturating_sub(u32::from(count))),
+            count: if total.is_some() { count } else { 1 },
+        };
+        self.search.top_request = Some(TopRequest { req, source, total });
+        if self.send(&request).is_err() {
+            self.search.top_request = None;
+            self.unlink();
+        }
+    }
+
+    fn top_rows(&mut self, rows: &HistoryRows) -> bool {
+        let Some(top) = self.search.top_request.filter(|top| top.req == rows.req) else {
+            return false;
+        };
+        self.search.top_request = None;
+        if top.total.is_none() {
+            if rows.total > 0 {
+                self.request_top(top.source, Some(rows.total));
+            } else if matches!(top.source, Source::Cold { .. }) {
+                self.request_top(Source::Hot, None);
+            }
+        } else {
+            let req = self.history.req;
+            let mut window = rows.rows.clone();
+            window.resize(usize::from(self.view.screen.lines), Vec::new());
+            self.history = History::fixed(window);
+            self.history.req = req;
+            self.history.offset = self.history.rows.len();
+            self.search.scrolled = true;
+        }
+        true
+    }
+
     /// 화면을 `lines`행 위로(음수면 아래로) 넘긴다. 필요하면 히스토리를 요청한다. 화면이 바뀌면 `true`.
     pub fn scroll(&mut self, lines: isize) -> bool {
+        self.search.top_request = None;
         let had_mark = self.search.highlight.take().is_some();
         let had_fetch =
             self.search.hist_req.take().is_some() || self.search.hist_target.take().is_some();
@@ -1017,13 +1128,19 @@ impl<W: Write> Pane<W> {
         if had_local || view_dropped {
             self.refresh();
         }
-        if self.state == State::Live
-            && self.out.is_some()
-            && self.features & FEAT_CLEAR_SCROLLBACK != 0
-            && let Some(session) = self.session
-            && self.send(&Request::ClearScrollback { session }).is_err()
-        {
-            self.unlink();
+        if self.state == State::Live && self.out.is_some() {
+            let result = if self.features & krill_proto::term_modes::FEAT_CLEAR_VIEWPORT != 0 {
+                self.send(&krill_proto::term_modes::ClearViewport)
+            } else if self.features & FEAT_CLEAR_SCROLLBACK != 0
+                && let Some(session) = self.session
+            {
+                self.send(&Request::ClearScrollback { session })
+            } else {
+                Ok(())
+            };
+            if result.is_err() {
+                self.unlink();
+            }
         }
     }
 
@@ -1056,7 +1173,7 @@ impl<W: Write> Pane<W> {
             kind::HISTORY_ROWS => {
                 let before = self.history.visible();
                 let rows = HistoryRows::decode(k, body)?;
-                if self.search_hist_rows(&rows) {
+                if self.top_rows(&rows) || self.search_hist_rows(&rows) {
                     ev.redraw = true;
                     self.refresh();
                 } else {
@@ -1168,6 +1285,8 @@ impl<W: Write> Pane<W> {
     }
 
     fn refresh(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _work = crate::responsiveness::work("pane.refresh");
         let s = self.history.compose(&self.view.screen);
         self.shown = Rc::new(s);
         self.refresh_search_marks();
@@ -1179,6 +1298,23 @@ impl<W: Write> Pane<W> {
         if self.search.query.is_empty() || self.search.result.is_none() {
             return;
         }
+        if self
+            .search
+            .pattern
+            .as_ref()
+            .is_none_or(|(query, options, _)| {
+                *query != self.search.query || *options != self.search.options
+            })
+        {
+            self.search.pattern = Some((
+                self.search.query.clone(),
+                self.search.options,
+                self.search.options.compile(&self.search.query).ok(),
+            ));
+        }
+        let Some((_, _, Some(pattern))) = &self.search.pattern else {
+            return;
+        };
         for (line, row) in self.shown.rows.iter().enumerate() {
             if self.search.highlights.len() >= MAX_SEARCH_MARKS {
                 break;
@@ -1186,7 +1322,7 @@ impl<W: Write> Pane<W> {
             let Ok(line) = u16::try_from(line) else {
                 break;
             };
-            for (column, cols) in find_matches(row, &self.search.query) {
+            for (column, cols) in find_matches_with_pattern(row, pattern) {
                 if self.search.highlights.len() >= MAX_SEARCH_MARKS {
                     break;
                 }
@@ -1285,6 +1421,35 @@ impl<W: Write> Pane<W> {
     /// 데몬에 검색 요청(`SearchRequest`)을 보낸다. 같은 검색어로 다시 부르면 직전 결과의 커서를 `after`에 실어
     /// 다음/이전 결과로 넘어간다.
     pub fn search(&mut self, query: &str, direction: krill_proto::search::Direction) -> bool {
+        self.search_with_options(
+            query,
+            direction,
+            krill_proto::search::Options {
+                case_sensitive: true,
+                regex: false,
+            },
+        )
+    }
+
+    pub fn search_options_supported(&self) -> bool {
+        self.features & krill_proto::search::FEAT_SEARCH_OPTIONS != 0
+    }
+
+    pub fn search_with_options(
+        &mut self,
+        query: &str,
+        direction: krill_proto::search::Direction,
+        options: krill_proto::search::Options,
+    ) -> bool {
+        self.search.top_request = None;
+        let options = if self.search_options_supported() {
+            options
+        } else {
+            krill_proto::search::Options {
+                case_sensitive: true,
+                regex: false,
+            }
+        };
         if query.is_empty() || query.len() > krill_proto::search::MAX_QUERY {
             self.clear_search();
             return false;
@@ -1292,13 +1457,14 @@ impl<W: Write> Pane<W> {
         if !self.search.supported || self.is_cold() || self.out.is_none() {
             return false;
         }
-        let after = if self.search.query == query {
+        let after = if self.search.query == query && self.search.options == options {
             self.search.cursor
         } else {
             self.search.cursor = None;
             self.search.result = None;
             None
         };
+        self.search.options = options;
         query.clone_into(&mut self.search.query);
         self.search.req = self.search.req.wrapping_add(1);
         let req = self.search.req;
@@ -1311,7 +1477,15 @@ impl<W: Write> Pane<W> {
             direction,
             after,
         };
-        if self.send(&msg).is_err() {
+        let result = if self.search_options_supported() {
+            self.send(&krill_proto::search::SearchOptionsRequest {
+                request: msg,
+                options,
+            })
+        } else {
+            self.send(&msg)
+        };
+        if result.is_err() {
             self.unlink();
             return false;
         }
@@ -1600,10 +1774,20 @@ impl History {
                 (row, Vec::new())
             }
         };
-        let mut s = screen.clone();
-        (s.rows, s.links) = (0..screen.rows.len()).map(pick).unzip();
-        s.cursor.visible = false;
-        s
+        // Build only displayed rows, rather than cloning the live grid then replacing it.
+        let (rows, links) = (0..screen.rows.len()).map(pick).unzip();
+        let mut cursor = screen.cursor;
+        cursor.visible = false;
+        Screen {
+            cols: screen.cols,
+            lines: screen.lines,
+            rows,
+            links,
+            cursor,
+            title: screen.title.clone(),
+            bells: screen.bells,
+            cursor_style: screen.cursor_style,
+        }
     }
 }
 

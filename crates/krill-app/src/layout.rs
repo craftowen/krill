@@ -238,7 +238,7 @@ impl Tab {
     }
 }
 
-/// 최근 포커스 탭 순서(MRU, MK-180). 런타임 전용이라 디스크 저장·`PartialEq` 비교에는 포함하지 않는다.
+/// 최근 포커스 탭 순서(MRU, MK-180). 순서는 확장 꼬리에 저장하고 미리보기 커서는 런타임에만 둔다.
 #[derive(Clone, Debug, Default)]
 struct MruState {
     order: Vec<usize>,
@@ -306,6 +306,13 @@ struct LayoutTail {
     /// 앱이 마지막으로 살아 있던 시각(UNIX ns, 0 = 모름). 정상 종료 때와 주기적으로 갱신한다.
     /// 끝에 붙인 필드라 구버전 앱은 이 꼬리를 읽고 남는 바이트를 무시한다.
     last_seen_unix_ns: u64,
+}
+
+/// 기존 꼬리 뒤 선택적으로 덧붙인다. 구버전은 남은 바이트를 무시한다.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct FocusTail {
+    order: Vec<usize>,
+    zoomed: Vec<PaneId>,
 }
 
 /// `last_seen_unix_ns`가 붙기 전 6-필드 꼬리.
@@ -396,6 +403,8 @@ pub struct Layout {
     last_seen_unix_ns: u64,
     #[serde(skip)]
     mru: MruState,
+    #[serde(skip)]
+    zoomed: Vec<PaneId>,
 }
 
 /// v5까지의 디스크 `Tab`(OWE-734 `pinned`·`color` 이전).
@@ -493,6 +502,7 @@ impl From<LegacyLayoutV6> for Layout {
             respawn_cwds: BTreeMap::new(),
             last_seen_unix_ns: 0,
             mru: MruState::default(),
+            zoomed: Vec::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -536,6 +546,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             respawn_cwds: BTreeMap::new(),
             last_seen_unix_ns: 0,
             mru: MruState::default(),
+            zoomed: Vec::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -566,6 +577,7 @@ impl Default for Layout {
                 order: vec![0],
                 cursor: None,
             },
+            zoomed: Vec::new(),
         }
     }
 }
@@ -592,6 +604,20 @@ impl Layout {
     /// 활성 탭의 포커스 칸. 보이는 탭이 없으면 `None`.
     pub fn focused(&self) -> Option<PaneId> {
         self.tabs.get(self.active).map(|t| t.focused)
+    }
+
+    /// 탭별 확대 칸. 다른 탭으로 전환해도 그 탭의 확대 상태를 유지한다.
+    pub fn zoomed_pane(&self) -> Option<PaneId> {
+        let tab = self.tabs.get(self.active)?;
+        self.zoomed.iter().copied().find(|p| tab.root.contains(*p))
+    }
+
+    pub fn set_zoomed_pane(&mut self, pane: Option<PaneId>) {
+        let visible = self.visible();
+        self.zoomed.retain(|p| !visible.contains(p));
+        if let Some(pane) = pane.filter(|p| visible.len() > 1 && visible.contains(p)) {
+            self.zoomed.push(pane);
+        }
     }
 
     /// 보이는 칸(활성 탭의 잎).
@@ -921,8 +947,14 @@ impl Layout {
 
     fn inherited_launch(&self) -> Option<Create> {
         self.focused()
-            .and_then(|p| self.launch(p))
-            .cloned()
+            .and_then(|pane| {
+                self.launch(pane).cloned().map(|mut launch| {
+                    if let Some(cwd) = self.respawn_cwd(pane) {
+                        launch.cwd = cwd.to_vec();
+                    }
+                    launch
+                })
+            })
             .map(|mut c| {
                 c.account = None;
                 c.program = Program::Login;
@@ -953,6 +985,7 @@ impl Layout {
         self.clear_stale_preview();
         self.file_states.retain(|p, _| self.files.contains_key(p));
         self.respawn_cwds.retain(|p, _| live.contains(p));
+        self.zoomed.retain(|p| live.contains(p));
     }
 
     fn alloc_pane(&mut self) -> PaneId {
@@ -1053,21 +1086,27 @@ impl Layout {
         if eligible.is_empty() {
             return;
         }
-        let cur = eligible
-            .iter()
-            .position(|&pos| self.mru.order[pos] == self.active)
-            .unwrap_or(0);
+        let cur = self
+            .mru
+            .cursor
+            .and_then(|cursor| eligible.iter().position(|&pos| pos == cursor))
+            .unwrap_or_else(|| {
+                eligible
+                    .iter()
+                    .position(|&pos| self.mru.order[pos] == self.active)
+                    .unwrap_or(0)
+            });
         let next = (cur.cast_signed() + step)
             .rem_euclid(eligible.len().cast_signed())
             .cast_unsigned();
         let cursor = eligible[next];
         self.mru.cursor = Some(cursor);
-        self.active = self.mru.order[cursor];
     }
 
     /// `Ctrl` 키를 놓거나 스위처 선택을 확정할 때 현재 활성 탭을 MRU 맨 앞으로 올린다.
     pub fn commit_mru(&mut self) -> bool {
-        if self.mru.cursor.take().is_some() {
+        if let Some(cursor) = self.mru.cursor.take() {
+            self.active = self.mru.order[cursor];
             self.record_mru(self.active);
             true
         } else {
@@ -1075,9 +1114,14 @@ impl Layout {
         }
     }
 
-    /// 새 탭은 활성 탭 바로 오른쪽에 연다(포크 탭 `new_tab_after`와 같은 위치).
+    /// 미리보기 취소는 활성 탭과 MRU 순서를 바꾸지 않는다.
+    pub fn cancel_mru(&mut self) {
+        self.mru.cursor = None;
+    }
+
+    /// 새 탭은 탭 줄 맨 끝에 연다. 명시적인 포크 위치는 `new_tab_after`를 쓴다.
     pub fn new_tab(&mut self) {
-        self.new_tab_after(self.active);
+        self.new_tab_after(self.tabs.len().saturating_sub(1));
     }
 
     /// `index` 탭 바로 오른쪽(`index + 1`)에 새 탭을 만들고 활성화한다(OWE-736).
@@ -1507,7 +1551,26 @@ impl Layout {
                     l.hosts = hosts;
                     if !rest.is_empty() {
                         // 7-필드 꼬리가 아니면 6-필드(`last_seen` 이전), 그다음 중간 커밋의 5-필드 꼬리로 읽는다.
-                        let tail = postcard::from_bytes::<LayoutTail>(rest)
+                        let tail_and_focus = postcard::take_from_bytes::<LayoutTail>(rest);
+                        if let Ok((_, focus_bytes)) = &tail_and_focus
+                            && let Ok(focus) = postcard::from_bytes::<FocusTail>(focus_bytes)
+                        {
+                            l.mru.order = focus.order;
+                            // 불일치하는 선택 상태 때문에 세션 레이아웃을 버리지 않는다.
+                            for tab in &l.tabs {
+                                if let Some(pane) =
+                                    focus.zoomed.iter().copied().find(|p| tab.root.contains(*p))
+                                {
+                                    let mut leaves = Vec::new();
+                                    tab.root.leaves(&mut leaves);
+                                    if leaves.len() > 1 {
+                                        l.zoomed.push(pane);
+                                    }
+                                }
+                            }
+                        }
+                        let tail = tail_and_focus
+                            .map(|(tail, _)| tail)
                             .or_else(|_| postcard::from_bytes::<TailV6>(rest).map(LayoutTail::from))
                             .or_else(|_| {
                                 postcard::from_bytes::<LegacyTail>(rest).map(LayoutTail::from)
@@ -1535,10 +1598,17 @@ impl Layout {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut body = postcard::to_stdvec(self).map_err(io::Error::other)?;
         let tail = self.tail();
-        if !self.hosts.is_empty() || tail != LayoutTail::default() {
+        let focus = (self.tabs.len() > 1 || !self.zoomed.is_empty()).then(|| FocusTail {
+            order: self.mru_order(),
+            zoomed: self.zoomed.clone(),
+        });
+        if !self.hosts.is_empty() || tail != LayoutTail::default() || focus.is_some() {
             body.extend(postcard::to_stdvec(&self.hosts).map_err(io::Error::other)?);
-            if tail != LayoutTail::default() {
+            if tail != LayoutTail::default() || focus.is_some() {
                 body.extend(postcard::to_stdvec(&tail).map_err(io::Error::other)?);
+                if let Some(focus) = focus {
+                    body.extend(postcard::to_stdvec(&focus).map_err(io::Error::other)?);
+                }
             }
         }
         if u64::try_from(body.len()).map_or(true, |n| n >= MAX_FILE_BYTES) {

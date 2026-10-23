@@ -52,6 +52,7 @@ pub struct Item {
     pub worktree_name: String,
     pub is_file: bool,
     chars: Vec<char>,
+    filename_chars: Vec<char>,
 }
 
 impl Item {
@@ -74,6 +75,12 @@ impl Item {
             })
             .unwrap_or_default()
             .to_owned();
+        let filename_chars = lower_chars(
+            Path::new(&label)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&label),
+        );
         let chars = label.chars().flat_map(char::to_lowercase).collect();
         Self {
             id,
@@ -91,6 +98,7 @@ impl Item {
             worktree_name: String::new(),
             is_file: false,
             chars,
+            filename_chars,
         }
     }
 
@@ -101,6 +109,12 @@ impl Item {
     }
 
     pub fn rebuild_search_chars(&mut self) {
+        self.filename_chars = lower_chars(
+            Path::new(&self.label)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&self.label),
+        );
         let combined = format!(
             "{} {} {} {} {} {}",
             self.label, self.title, self.agent, self.repo_name, self.worktree_name, self.id.0
@@ -356,6 +370,12 @@ fn rank(all: &[&[char]], boost: &[bool], query: &str) -> Vec<usize> {
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
+    if query.is_empty() {
+        return (0..all.len())
+            .filter(|&i| boost.get(i).copied().unwrap_or(false))
+            .chain((0..all.len()).filter(|&i| !boost.get(i).copied().unwrap_or(false)))
+            .collect();
+    }
     let mut hits: Vec<_> = all
         .iter()
         .enumerate()
@@ -371,7 +391,22 @@ fn rank(all: &[&[char]], boost: &[bool], query: &str) -> Vec<usize> {
 pub fn search(items: &[Item], query: &str) -> Vec<usize> {
     let all: Vec<&[char]> = items.iter().map(|item| item.chars.as_slice()).collect();
     let boost: Vec<bool> = items.iter().map(|item| item.needs_you).collect();
-    rank(&all, &boost, query)
+    if !query.trim().is_empty() && items.iter().any(|item| item.is_file) {
+        let query = lower_chars(query.trim());
+        let mut hits: Vec<_> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let path_score = score(&query, &item.chars)?;
+                let bonus = score(&query, &item.filename_chars).map_or(0, |s| s + 100);
+                Some((Reverse(path_score + bonus), index))
+            })
+            .collect();
+        hits.sort_unstable();
+        hits.into_iter().map(|(_, index)| index).collect()
+    } else {
+        rank(&all, &boost, query)
+    }
 }
 
 fn lower_chars(text: &str) -> Vec<char> {
@@ -602,7 +637,9 @@ pub struct Palette {
     mode: Mode,
     /// 입력칸에 지금 들어 있는 플레이스홀더의 모드(언어·모드 변경 때 다시 맞춘다).
     placeholder_mode: Mode,
-    items: Vec<Item>,
+    items: std::sync::Arc<Vec<Item>>,
+    item_task: Option<gpui::Task<()>>,
+    item_generation: u64,
     matches: Vec<usize>,
     worktrees: Vec<WorktreeItem>,
     worktree_matches: Vec<usize>,
@@ -653,7 +690,7 @@ impl Palette {
             let value = input.read(cx).value();
             if *value != p.query {
                 p.query = value.to_string();
-                p.recompute_all_matches();
+                p.recompute_all_matches(cx);
                 p.selected = 0;
                 p.scroll_to_top();
                 if let Some(history) = p.history.clone() {
@@ -679,7 +716,9 @@ impl Palette {
             action_matches: Vec::new(),
             quick_commands: Vec::new(),
             quick_matches: Vec::new(),
-            items,
+            items: std::sync::Arc::new(items),
+            item_task: None,
+            item_generation: 0,
             vault_hits: Vec::new(),
             vault_matches: Vec::new(),
             projects: Vec::new(),
@@ -713,7 +752,7 @@ impl Palette {
         if !initial_hits.is_empty() {
             self.vault_hits = initial_hits;
             self.rebuild_projects();
-            self.recompute_all_matches();
+            self.recompute_all_matches(cx);
         }
         let sub = cx.observe(history, |this, history, cx| {
             let (has_loaded, hits) =
@@ -807,7 +846,7 @@ impl Palette {
     pub fn set_vault_hits(&mut self, hits: Vec<VaultHit>, cx: &mut Context<Self>) {
         self.vault_hits = hits;
         self.rebuild_projects();
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         cx.notify();
     }
 
@@ -818,13 +857,13 @@ impl Palette {
     {
         self.worktrees = worktrees.into_iter().map(Into::into).collect();
         self.rebuild_projects();
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         cx.notify();
     }
 
     pub fn set_actions(&mut self, actions: Vec<ActionEntry>, cx: &mut Context<Self>) {
         self.actions = actions;
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         cx.notify();
     }
 
@@ -834,14 +873,14 @@ impl Palette {
         cx: &mut Context<Self>,
     ) {
         self.quick_commands = quick_commands;
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         cx.notify();
     }
 
     pub fn set_scope(&mut self, scope: VaultScope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
-            self.recompute_all_matches();
+            self.recompute_all_matches(cx);
             if let Some(history) = self.history.clone() {
                 history.update(cx, |h, cx| {
                     h.set_scope(scope, cx);
@@ -857,7 +896,7 @@ impl Palette {
     pub fn set_agent_filter(&mut self, agent: Option<VaultAgent>, cx: &mut Context<Self>) {
         if self.agent_filter != agent {
             self.agent_filter = agent;
-            self.recompute_all_matches();
+            self.recompute_all_matches(cx);
             if let Some(history) = self.history.clone() {
                 history.update(cx, |h, cx| {
                     h.set_agent_filter(agent, cx);
@@ -873,7 +912,7 @@ impl Palette {
     pub fn set_project_filter(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         if self.project_filter != project {
             self.project_filter = project;
-            self.recompute_all_matches();
+            self.recompute_all_matches(cx);
             cx.notify();
         }
     }
@@ -882,7 +921,7 @@ impl Palette {
         self.project_filter = None;
         self.set_scope(VaultScope::All, cx);
         self.set_agent_filter(None, cx);
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         cx.notify();
     }
 
@@ -899,7 +938,7 @@ impl Palette {
         }
         self.workspace_path = workspace;
         self.project_paths = project;
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         cx.notify();
     }
 
@@ -909,9 +948,17 @@ impl Palette {
         }
     }
 
-    fn recompute_all_matches(&mut self) {
+    fn recompute_all_matches(&mut self, cx: &mut Context<Self>) {
+        self.item_generation = self.item_generation.wrapping_add(1);
+        self.item_task = None;
+        let generation = self.item_generation;
+        let background = self.items.len() >= 2_048 && !self.query.trim().is_empty();
         let proj = self.project_filter.as_deref();
-        let hits = search(&self.items, &self.query);
+        let hits = if background {
+            Vec::new()
+        } else {
+            search(&self.items, &self.query)
+        };
         self.matches = if let Some(p) = proj {
             hits.into_iter()
                 .filter(|&i| {
@@ -923,6 +970,38 @@ impl Palette {
         } else {
             hits
         };
+        if background {
+            let items = std::sync::Arc::clone(&self.items);
+            let query = self.query.clone();
+            let project = self.project_filter.clone();
+            self.item_task = Some(cx.spawn(async move |this, cx| {
+                let matches = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let _span =
+                            tracing::debug_span!("jump.search", items = items.len()).entered();
+                        search(&items, &query)
+                            .into_iter()
+                            .filter(|&i| {
+                                project.as_ref().is_none_or(|p| {
+                                    items.get(i).is_some_and(|item| {
+                                        item.repo_name == *p || item.worktree_name == *p
+                                    })
+                                })
+                            })
+                            .collect()
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.item_generation == generation {
+                        this.matches = matches;
+                        this.clamp_selected();
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
         if self.vault_hits.is_empty() {
             self.vault_matches.clear();
         } else {
@@ -969,9 +1048,9 @@ impl Palette {
             .and_then(|(_, pos)| self.matches.get(pos))
             .and_then(|&i| self.items.get(i))
             .map(|item| item.id);
-        self.items = items;
+        self.items = std::sync::Arc::new(items);
         self.rebuild_projects();
-        self.recompute_all_matches();
+        self.recompute_all_matches(cx);
         let selected_index = self
             .matches()
             .position(|item| Some(item.id) == selected)
@@ -1236,7 +1315,7 @@ impl Palette {
                 names.push(wt.repo_name.clone());
             }
         }
-        for item in &self.items {
+        for item in self.items.iter() {
             if !item.repo_name.is_empty() && !names.contains(&item.repo_name) {
                 names.push(item.repo_name.clone());
             }

@@ -453,7 +453,25 @@ pub struct AgentStatus {
     /// `foreground` 꼬리 뒤 두 번째 꼬리로만 오가 구버전과 상호 호환한다.
     #[serde(default, skip)]
     pub title: Option<String>,
+    /// 지금 돌고 있는 서브에이전트(Claude `SubagentStart`~`SubagentStop`). 최대 [`MAX_SUBAGENTS`]개.
+    /// `title` 꼬리 뒤 세 번째 꼬리로만 오가 구버전과 상호 호환한다.
+    #[serde(default, skip)]
+    pub subagents: Vec<Subagent>,
 }
+
+/// 세션 안에서 돌고 있는 서브에이전트 하나. 필드는 끝에만 붙인다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subagent {
+    /// `agent_type`(예: `general-purpose`). 모르면 빈 문자열. 최대 [`MAX_AGENT_TEXT`] 바이트.
+    pub kind: String,
+    /// 부모가 Agent 도구에 준 `description`. 모르면 빈 문자열. 최대 [`MAX_TITLE_TEXT`] 바이트.
+    pub description: String,
+    /// 시작 시각(UNIX epoch 나노초).
+    pub since_unix_ns: u64,
+}
+
+/// [`AgentStatus::subagents`] 상한.
+pub const MAX_SUBAGENTS: usize = 16;
 
 /// 에이전트가 터미널 제목 앞에 붙이는 상태 글리프(Claude Code `✳`·점자 스피너, Gemini `✦`·`◇` 등)와 제어 문자를
 /// 떼어 낸 제목. 바뀌는 스피너가 목록을 매번 다시 그리지 않게 하고, 남는 게 없으면 `None`이다.
@@ -487,6 +505,7 @@ impl AgentStatus {
         since_unix_ns: 0,
         foreground: None,
         title: None,
+        subagents: Vec::new(),
     };
 }
 
@@ -969,7 +988,8 @@ impl Msg for Reply {
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::States(rows) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            let has_title = rows.iter().any(|r| r.status.title.is_some());
+            let has_subagents = rows.iter().any(|r| !r.status.subagents.is_empty());
+            let has_title = has_subagents || rows.iter().any(|r| r.status.title.is_some());
             if has_title || rows.iter().any(|r| r.status.foreground.is_some()) {
                 for row in rows {
                     body.extend(
@@ -982,6 +1002,14 @@ impl Msg for Reply {
                 for row in rows {
                     body.extend(
                         postcard::to_stdvec(&row.status.title).map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            if has_subagents {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(&row.status.subagents)
+                            .map_err(crate::ipc::Error::Codec)?,
                     );
                 }
             }
@@ -1025,6 +1053,24 @@ impl Msg for Reply {
                             ));
                         }
                         row.status.title = title;
+                        tail = next;
+                    }
+                }
+                if !tail.is_empty() {
+                    for row in rows.iter_mut() {
+                        let (subagents, next) = postcard::take_from_bytes::<Vec<Subagent>>(tail)
+                            .map_err(crate::ipc::Error::Codec)?;
+                        if subagents.len() > MAX_SUBAGENTS
+                            || subagents.iter().any(|a| {
+                                a.kind.len() > MAX_AGENT_TEXT
+                                    || a.description.len() > MAX_TITLE_TEXT
+                            })
+                        {
+                            return Err(crate::ipc::Error::Codec(
+                                postcard::Error::DeserializeBadEncoding,
+                            ));
+                        }
+                        row.status.subagents = subagents;
                         tail = next;
                     }
                 }

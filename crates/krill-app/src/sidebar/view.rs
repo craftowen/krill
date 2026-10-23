@@ -144,6 +144,37 @@ fn row_menu(
             .separator();
     }
     if let Some(folder) = folder {
+        let path = folder.display().to_string();
+        let name = folder
+            .file_name()
+            .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
+        menu = menu
+            .item(
+                PopupMenuItem::new(text::COPY_PATH.get()).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+                }),
+            )
+            .item(
+                PopupMenuItem::new(text::COPY_NAME.get()).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
+                }),
+            );
+        if host.is_local() {
+            let sidebar = this.clone();
+            let path = folder.clone();
+            let host = host.clone();
+            menu = menu
+                .item(
+                    PopupMenuItem::new(text::MARK_READ.get()).on_click(move |_, _, cx| {
+                        sidebar
+                            .update(cx, |s, cx| s.mark_workspace_read(&host, &path, cx))
+                            .ok();
+                    }),
+                )
+                .separator();
+        }
+    }
+    if let Some(folder) = folder {
         let (term_this, term_host, term_folder) = (this.clone(), host.clone(), folder.clone());
         menu = menu.item(
             PopupMenuItem::new(text::NEW_TERMINAL.get())
@@ -387,10 +418,22 @@ fn row_menu(
         menu = menu.item(
             PopupMenuItem::new(text::REMOVE_PROJECT.get())
                 .icon(Icon::default().data(ui::icons::TRASH_SVG))
-                .on_click(move |_, _, cx| {
-                    remove_this
-                        .update(cx, |s, cx| s.remove_project(remove_path.clone(), cx))
-                        .ok();
+                .on_click(move |_, window, cx| {
+                    let answer = window.prompt(
+                        gpui::PromptLevel::Warning,
+                        text::REMOVE_PROJECT.get(),
+                        Some(text::REMOVE_PROJECT_CONFIRM.get()),
+                        &[text::REMOVE_PROJECT.get(), text::CANCEL.get()],
+                        cx,
+                    );
+                    let sidebar = remove_this.clone();
+                    let path = remove_path.clone();
+                    cx.spawn(async move |cx| {
+                        if answer.await == Ok(0) {
+                            sidebar.update(cx, |s, cx| s.remove_project(path, cx)).ok();
+                        }
+                    })
+                    .detach();
                 }),
         );
     }
@@ -1132,6 +1175,8 @@ impl Sidebar {
                 single_line(base)
                     .debug_selector(move || format!("sidebar-session-{index}"))
                     .h(px(if *nested { 26. } else { ROW_HEIGHT }))
+                    // Orca 에이전트 행(`text-[11px]`)처럼 카드 제목보다 한 단계 작게.
+                    .text_size(ui::TEXT_XS)
                     .aria_label(format!(
                         "{name}{}, {state}{}{}{}",
                         if detail.is_empty() {
@@ -1265,6 +1310,53 @@ impl Sidebar {
         self.card_segment(index, row, element, cx)
     }
 
+    /// 세션 행 아래 작은 서브에이전트 줄들(Orca처럼 `설명 · 종류`와 경과 시간). 상세 카드에서만 그린다.
+    fn subagent_rows(
+        &self,
+        index: usize,
+        session: &super::Session,
+        cx: &gpui::App,
+    ) -> Vec<AnyElement> {
+        let p = ui::palette(cx);
+        let now = self.now_unix_ns();
+        session
+            .status
+            .subagents
+            .iter()
+            .enumerate()
+            .map(|(n, a)| {
+                let label = match (a.description.is_empty(), a.kind.is_empty()) {
+                    (false, false) => format!("{} · {}", a.description, a.kind),
+                    (false, true) => a.description.clone(),
+                    _ => a.kind.clone(),
+                };
+                div()
+                    .debug_selector(move || format!("session-subagent-{index}-{n}"))
+                    .h(px(20.))
+                    .pl(px(22.))
+                    .pr_2()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(status::status_glyph(
+                        krill_proto::control::AgentState::Working,
+                        false,
+                        Size::Sm,
+                        cx,
+                    ))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(crate::jump::format_age_ns(a.since_unix_ns, now)),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     /// 워크트리 카드 제목 자리(OWE-847): 이름 변경 중이면 인라인 입력창 + 저장(✓)·취소(✕) 버튼
     /// (Enter 저장·Esc 취소), 아니면 기존 제목 텍스트를 돌려준다.
     fn card_title_el(
@@ -1356,6 +1448,26 @@ impl Sidebar {
 
         let p = ui::palette(cx);
         let row_host = self.row_host(index).clone();
+        let virtualized = self.rows.len() >= 100;
+        let row_key = (row_host.clone(), path.to_path_buf());
+        let show_controls = !virtualized
+            || self.hovered_worktree.as_ref() == Some(&row_key)
+            || self.cursor == Some(index);
+        let base = base.when(virtualized, |d| {
+            d.on_hover(cx.listener(move |s, hovered, _, cx| {
+                let next = if *hovered {
+                    Some(row_key.clone())
+                } else if s.hovered_worktree.as_ref() == Some(&row_key) {
+                    None
+                } else {
+                    s.hovered_worktree.clone()
+                };
+                if s.hovered_worktree != next {
+                    s.hovered_worktree = next;
+                    cx.notify();
+                }
+            }))
+        });
         let is_default_tree = self.snapshot_for(&row_host).trees.contains_key(path);
         let is_active_worktree = self.worktree_card_active(index, path);
         let (fold, pin, edit, fresh, card_path, fresh_host) = (
@@ -1484,6 +1596,7 @@ impl Sidebar {
 
         let new_session_btn = {
             let button = Button::new(("new-session", index))
+                .debug_selector(move || format!("worktree-new-session-control-{index}"))
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
@@ -1499,15 +1612,16 @@ impl Sidebar {
                         cx,
                     );
                 }));
-            let frame = div().flex_none();
+            let frame = div().flex_none().size_5();
             #[cfg(test)]
             let frame = frame.debug_selector(|| format!("worktree-new-session-{index}"));
-            hover_only(frame).child(button)
+            hover_only(frame).children(show_controls.then_some(button))
         };
 
         let pin_btn = {
             let frame = div()
                 .flex_none()
+                .size_5()
                 .flex()
                 .rounded(ui::RADIUS_XS)
                 .when(pinned, |d| {
@@ -1527,7 +1641,7 @@ impl Sidebar {
                 .when(!pinned, hover_only);
             #[cfg(test)]
             let frame = frame.debug_selector(move || format!("worktree-pin-{index}"));
-            frame.child(
+            frame.children((show_controls || pinned).then(|| {
                 Button::new(("pin", index))
                     .ghost()
                     .xsmall()
@@ -1542,15 +1656,15 @@ impl Sidebar {
                     .on_click(cx.listener(move |s, _, _, cx| {
                         cx.stop_propagation();
                         s.toggle_pin(pin.clone(), cx);
-                    })),
-            )
+                    }))
+            }))
         };
 
         let rename_btn = {
-            let frame = div().flex_none();
+            let frame = div().flex_none().size_5();
             #[cfg(test)]
             let frame = frame.debug_selector(move || format!("worktree-rename-{index}"));
-            hover_only(frame).child(
+            hover_only(frame).children(show_controls.then(|| {
                 Button::new(("rename", index))
                     .ghost()
                     .xsmall()
@@ -1560,8 +1674,8 @@ impl Sidebar {
                     .on_click(cx.listener(move |s, _, window, cx| {
                         cx.stop_propagation();
                         s.rename(edit.clone(), window, cx);
-                    })),
-            )
+                    }))
+            }))
         };
 
         let dirty_badge = dirty.map(|n| {
@@ -1810,6 +1924,7 @@ impl Sidebar {
                             .relative()
                             .w_full()
                             .h(px(26.))
+                            .when(!is_editing_this, |d| d.pr(px(64.)))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1904,7 +2019,11 @@ impl Sidebar {
                                 )
                                 .child(
                                     div()
-                                        .flex_none()
+                                        .absolute()
+                                        .right_0()
+                                        .top(px(3.))
+                                        .w(px(64.))
+                                        .h_5()
                                         .flex()
                                         .items_center()
                                         .gap_0p5()
@@ -1916,12 +2035,12 @@ impl Sidebar {
                         cx,
                     ),
                 )
-                .on_click(cx.listener(move |s, _, window, cx| {
+                .on_click(cx.listener(move |s, _, _window, cx| {
                     s.activate_worktree_card(
                         index,
                         compact_host.clone(),
                         compact_path.clone(),
-                        Some(window),
+                        true,
                         cx,
                     );
                 }));
@@ -1990,7 +2109,7 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .child(self.card_title_el(path, card_title, ui::TEXT_MD, index, cx))
+                            .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
                             .when(is_default_tree && !is_editing_this, |d| {
                                 d.child(
                                     div()
@@ -2288,14 +2407,8 @@ impl Sidebar {
             .flex_col()
             .gap_0p5()
             .child(self.with_row_menu(index, &Row::Worktree(path.to_path_buf()), header, cx))
-            .on_click(cx.listener(move |s, _, window, cx| {
-                s.activate_worktree_card(
-                    index,
-                    row_host.clone(),
-                    card_path.clone(),
-                    Some(window),
-                    cx,
-                );
+            .on_click(cx.listener(move |s, _, _window, cx| {
+                s.activate_worktree_card(index, row_host.clone(), card_path.clone(), true, cx);
             }))
     }
 
@@ -2453,6 +2566,14 @@ impl Sidebar {
                     .w_full()
                     .when(!joins_next, gpui::Styled::pb_0p5)
                     .child(s.render_row_with_menu(index, &row, cx))
+                    .children(match &row {
+                        Row::Session(session, _)
+                            if s.options.card_layout == super::CardLayout::Detailed =>
+                        {
+                            s.subagent_rows(index, session, cx)
+                        }
+                        _ => Vec::new(),
+                    })
                     .into_any_element()
             }),
         )

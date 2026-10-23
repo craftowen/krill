@@ -22,6 +22,7 @@ use crate::i18n::catalog::detached as text;
 /// `all` 가운데 `attached`(레이아웃의 칸이 가진 세션)에 없는 것. 순서는 `all`을 따른다.
 #[must_use]
 pub fn detached(all: &[Info], attached: &[SessionId]) -> Vec<Info> {
+    let attached: std::collections::HashSet<_> = attached.iter().copied().collect();
     all.iter()
         .filter(|i| !attached.contains(&i.session))
         .copied()
@@ -70,6 +71,7 @@ pub struct Panel {
     target: Option<HostTarget>,
     task: Option<Task<()>>,
     expanded: bool,
+    scroll: gpui::UniformListScrollHandle,
 }
 
 impl EventEmitter<Open> for Panel {}
@@ -204,81 +206,88 @@ impl Render for Panel {
                 )
                 .when(expanded, |d| {
                     d.pb_1().child(
-                        div()
-                            .id("detached-scroll")
-                            .max_h(gpui::px(112.))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .children(self.items.iter().map(|i| {
-                                let id = i.session;
-                                // 실행 중이면 보존 톤 점, 종료됐으면 흐린 점(같은 폭이라 라벨이 줄 맞춤된다).
-                                let dot = if i.status.is_none() {
-                                    p.preserve
-                                } else {
-                                    p.muted_foreground.opacity(0.5)
-                                };
-                                let label = match i.status {
-                                    Some(_) => text::SESSION_EXITED.format(&[
-                                        ("id", &id.0.to_string()),
-                                        ("state", text::EXITED.get()),
-                                    ]),
-                                    None => text::SESSION_PID.format(&[
-                                        ("id", &id.0.to_string()),
-                                        ("pid", &i.pid.to_string()),
-                                    ]),
-                                };
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .mx_1()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(crate::ui::RADIUS_XS)
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.sidebar_foreground)
-                                    .hover(|d| {
-                                        d.bg(p.sidebar_accent)
-                                            .text_color(p.sidebar_accent_foreground)
-                                    })
-                                    .child(
-                                        div()
-                                            .size(crate::ui::STATE_DOT)
-                                            .flex_none()
-                                            .rounded_full()
-                                            .bg(dot),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("detached-open", id.0))
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .cursor_pointer()
-                                            .child(label)
-                                            .on_click(
-                                                cx.listener(move |_, _, _, cx| cx.emit(Open(id))),
-                                            ),
-                                    )
-                                    .child(
-                                        crate::ui::button_with_tooltip(
-                                            Button::new(("detached-close", id.0))
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(IconName::Close),
-                                            format!("detached-close-{id}", id = id.0),
-                                            text::CLOSE.get(),
+                        gpui::uniform_list(
+                            "detached-scroll",
+                            self.items.len(),
+                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                let p = crate::ui::palette(cx);
+                                range
+                                    .filter_map(|index| {
+                                        let i = this.items.get(index)?;
+                                        let id = i.session;
+                                        // 실행 중이면 보존 톤 점, 종료됐으면 흐린 점(같은 폭이라 라벨이 줄 맞춤된다).
+                                        let dot = if i.status.is_none() {
+                                            p.preserve
+                                        } else {
+                                            p.muted_foreground.opacity(0.5)
+                                        };
+                                        let label = match i.status {
+                                            Some(_) => text::SESSION_EXITED.format(&[
+                                                ("id", &id.0.to_string()),
+                                                ("state", text::EXITED.get()),
+                                            ]),
+                                            None => text::SESSION_PID.format(&[
+                                                ("id", &id.0.to_string()),
+                                                ("pid", &i.pid.to_string()),
+                                            ]),
+                                        };
+                                        Some(
+                                            div()
+                                                .h(gpui::px(28.))
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .mx_1()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded(crate::ui::RADIUS_XS)
+                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_color(p.sidebar_foreground)
+                                                .hover(|d| {
+                                                    d.bg(p.sidebar_accent)
+                                                        .text_color(p.sidebar_accent_foreground)
+                                                })
+                                                .child(
+                                                    div()
+                                                        .size(crate::ui::STATE_DOT)
+                                                        .flex_none()
+                                                        .rounded_full()
+                                                        .bg(dot),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("detached-open", id.0))
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .cursor_pointer()
+                                                        .child(label)
+                                                        .on_click(cx.listener(
+                                                            move |_, _, _, cx| cx.emit(Open(id)),
+                                                        )),
+                                                )
+                                                .child(
+                                                    crate::ui::button_with_tooltip(
+                                                        Button::new(("detached-close", id.0))
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .icon(IconName::Close),
+                                                        format!("detached-close-{id}", id = id.0),
+                                                        text::CLOSE.get(),
+                                                    )
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        if let Some(target) = this.target.clone() {
+                                                            this.close(target, id, cx);
+                                                        }
+                                                    })),
+                                                ),
                                         )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                if let Some(target) = this.target.clone() {
-                                                    this.close(target, id, cx);
-                                                }
-                                            }),
-                                        ),
-                                    )
-                            })),
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .track_scroll(&self.scroll)
+                        .h(gpui::px(112.)),
                     )
                 })
         })

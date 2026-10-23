@@ -10,6 +10,30 @@ use crate::attach::Tap;
 
 /// 요청 하나. 디스크 IO/재생 중에는 라이브 Term 잠금을 잡지 않는다.
 pub fn search(tap: &Tap, req: &SearchRequest) -> SearchResult {
+    search_with_options(
+        tap,
+        req,
+        krill_proto::search::Options {
+            case_sensitive: true,
+            regex: false,
+        },
+    )
+}
+
+pub fn search_with_options(
+    tap: &Tap,
+    req: &SearchRequest,
+    options: krill_proto::search::Options,
+) -> SearchResult {
+    search_cancellable(tap, req, options, &|| false)
+}
+
+pub(crate) fn search_cancellable(
+    tap: &Tap,
+    req: &SearchRequest,
+    options: krill_proto::search::Options,
+    cancelled: &dyn Fn() -> bool,
+) -> SearchResult {
     let (screen, revision, seq) = tap.capture();
     let mut reply = SearchResult {
         req: req.req,
@@ -28,14 +52,17 @@ pub fn search(tap: &Tap, req: &SearchRequest) -> SearchResult {
     if !req.valid() {
         return reply;
     }
+    let Ok(pattern) = options.compile(&req.query) else {
+        return reply;
+    };
     // guarded()가 live.seq를 먼저 올린 뒤 recorder.append()와 publish()를 부르므로 검색 시점 seq가 디스크에 기록될 때까지 기다린다.
-    tap.wait(|p| p.end >= seq.0 || p.closed);
+    tap.wait(|p| p.end >= seq.0 || p.closed || cancelled());
     let target = req.after.and_then(|cursor| match req.direction {
         Direction::Next => cursor.index.checked_add(1),
         Direction::Previous => cursor.index.checked_sub(1),
     });
     let mut scan = Scan {
-        query: &req.query,
+        pattern: &pattern,
         target,
         total: 0,
         first: None,
@@ -49,31 +76,36 @@ pub fn search(tap: &Tap, req: &SearchRequest) -> SearchResult {
         Some(Ok(history)) if !history.is_empty() => {
             reply.approximate = true;
             let mut pages = 0u32;
-            for page in 0..history.len() {
-                let Some(result) = history.page_until(page, seq.0) else {
-                    continue;
+            let mut page_rows = 0usize;
+            history.visit_until(seq.0, cancelled, |page, event| {
+                let source = Source::Cold {
+                    page: u32::try_from(page).unwrap_or(u32::MAX),
                 };
-                pages = pages.saturating_add(1);
-                match result {
-                    Ok(data) => {
-                        if !used_cold {
-                            reply.snapshot.oldest = Seq(data.start_seq);
-                            reply.incomplete |= data.start_seq != 0;
-                        }
-                        reply.incomplete |=
-                            !data.gaps.is_empty() || (used_cold && data.start_seq != disk_end);
-                        disk_end = disk_end.max(data.end_seq);
-                        used_cold = true;
-                        scan.rows(
-                            Source::Cold {
-                                page: u32::try_from(page).unwrap_or(u32::MAX),
-                            },
-                            &data.rows,
-                        );
+                match event {
+                    crate::store::HistoryEvent::Rows(rows) => {
+                        scan.rows_at(source, &rows, page_rows);
+                        page_rows = page_rows.saturating_add(rows.len());
                     }
-                    Err(_) => reply.incomplete = true,
+                    crate::store::HistoryEvent::End(result) => {
+                        pages = pages.saturating_add(1);
+                        scan.finish_page(source, page_rows);
+                        page_rows = 0;
+                        match result {
+                            Ok(data) => {
+                                if !used_cold {
+                                    reply.snapshot.oldest = Seq(data.start_seq);
+                                    reply.incomplete |= data.start_seq != 0;
+                                }
+                                reply.incomplete |= !data.gaps.is_empty()
+                                    || (used_cold && data.start_seq != disk_end);
+                                disk_end = disk_end.max(data.end_seq);
+                                used_cold = true;
+                            }
+                            Err(_) => reply.incomplete = true,
+                        }
+                    }
                 }
-            }
+            });
             reply.snapshot.pages = pages;
         }
         _ => reply.incomplete = true,
@@ -116,7 +148,7 @@ fn cursor_valid(
 }
 
 struct Scan<'a> {
-    query: &'a str,
+    pattern: &'a krill_proto::search::Pattern,
     target: Option<u64>,
     total: u64,
     first: Option<Hit>,
@@ -126,12 +158,34 @@ struct Scan<'a> {
 
 impl Scan<'_> {
     fn rows(&mut self, source: Source, rows: &[Vec<Cell>]) {
+        self.rows_at(source, rows, 0);
+        self.finish_page(source, rows.len());
+    }
+
+    fn finish_page(&mut self, source: Source, rows: usize) {
+        for hit in [&mut self.first, &mut self.last, &mut self.selected]
+            .into_iter()
+            .flatten()
+        {
+            if hit.source == source {
+                hit.total_rows = u32::try_from(rows).unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    fn rows_at(&mut self, source: Source, rows: &[Vec<Cell>], offset: usize) {
         let total_rows = u32::try_from(rows.len()).unwrap_or(u32::MAX);
         for (row, cells) in rows.iter().enumerate() {
             let (text, spans) = text_spans(cells);
             // 겹치지 않는 리터럴 일치. 바이트 위치를 셀 대응표로 하이라이트 범위로 바꾼다.
-            for (byte, matched) in text.match_indices(self.query) {
-                let end = byte.saturating_add(matched.len());
+            let mut matches = self
+                .pattern
+                .find_iter(&text)
+                .filter(|m| !m.is_empty())
+                .peekable();
+            while let Some(matched) = matches.next() {
+                let byte = matched.start();
+                let end = matched.end();
                 let mut overlaps = spans
                     .iter()
                     .filter(|span| span.end > byte && span.start < end);
@@ -139,10 +193,17 @@ impl Scan<'_> {
                     continue;
                 };
                 let last = overlaps.next_back().unwrap_or(first);
+                if self.first.is_some()
+                    && self.target != Some(self.total)
+                    && matches.peek().is_some()
+                {
+                    self.total = self.total.saturating_add(1);
+                    continue;
+                }
                 let hit = Hit {
                     index: self.total,
                     source,
-                    row: u32::try_from(row).unwrap_or(u32::MAX),
+                    row: u32::try_from(offset.saturating_add(row)).unwrap_or(u32::MAX),
                     total_rows,
                     column: first.column,
                     cols: last.end_column.saturating_sub(first.column),

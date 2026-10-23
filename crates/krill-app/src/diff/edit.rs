@@ -764,6 +764,7 @@ pub(super) struct State {
     pub busy: bool,
     pub generating: bool,
     pub has_remote: bool,
+    sync_generation: u64,
     pub sync_capability: SyncCapability,
     pub ahead: u64,
     pub behind: u64,
@@ -783,7 +784,9 @@ impl Default for State {
             pr_service: crate::pull_request::shared(),
             busy: false,
             generating: false,
-            has_remote: true,
+            // Unknown until the background probe completes; sync actions fail closed.
+            has_remote: false,
+            sync_generation: 0,
             sync_capability: SyncCapability::Supported,
             ahead: 0,
             behind: 0,
@@ -813,9 +816,11 @@ impl State {
         let source = Arc::clone(&self.source);
         let pr_service = Arc::clone(&self.pr_service);
         let sync_capability = self.sync_capability;
+        let sync_generation = self.sync_generation.wrapping_add(1);
         *self = Self {
             source,
             pr_service,
+            sync_generation,
             sync_capability,
             ..Self::default()
         };
@@ -824,8 +829,11 @@ impl State {
 
 impl Panel {
     pub(super) fn refresh_branch_sync(&mut self, cx: &mut Context<Self>) {
+        self.editing.sync_generation = self.editing.sync_generation.wrapping_add(1);
+        let generation = self.editing.sync_generation;
         let source = Arc::clone(&self.editing.source);
         let repo = self.repo.clone();
+        let expected_repo = repo.clone();
         self.editing.sync_task = Some(cx.spawn(async move |this, cx| {
             let (sync_supported, has_remote, (ahead, behind)) = cx
                 .background_executor()
@@ -839,6 +847,9 @@ impl Panel {
                 .await;
             let sync_capability = SyncCapability::from_bool(sync_supported);
             this.update(cx, |this, cx| {
+                if this.repo != expected_repo || this.editing.sync_generation != generation {
+                    return;
+                }
                 if this.editing.sync_capability != sync_capability
                     || this.editing.has_remote != has_remote
                     || this.editing.ahead != ahead

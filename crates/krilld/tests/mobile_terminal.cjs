@@ -7,6 +7,7 @@ class Element extends EventTarget {
  get textContent(){return this.children.length?this.children.map(c=>typeof c==='string'?c:c.textContent).join(''):this.text??'';}
  set textContent(v){this.children=[];this.text=v;}
  append(...nodes){this.children.push(...nodes);for(const n of nodes)if(typeof n==='object')n.parent=this;}
+ prepend(...nodes){this.children.unshift(...nodes);for(const n of nodes)if(typeof n==='object')n.parent=this;}
  replaceChildren(...nodes){this.children=[];this.append(...nodes);}
  setAttribute(k,v){this.attrs[k]=v;}
  getAttribute(k){return this.attrs[k];}
@@ -35,17 +36,31 @@ const context=vm.createContext({Event,EventTarget,AbortController,TextEncoder,Te
 vm.runInContext(`(${fixture})()`,context);vm.runInContext(source,context);
 const api=context.KrillMobile.terminal,T=context.MkTerminalCodec,C=context.MkCrypto;
 const event=(el,type,props={})=>{const e=new Event(type,{cancelable:true});Object.assign(e,props);el.dispatchEvent(e);return e;};
-const find=(root,cls)=>{if(root.className?.split(' ').includes(cls))return root;for(const c of root.children){const found=find(c,cls);if(found)return found;}};
+const find=(root,cls)=>{if(root.className?.split(' ').includes(cls))return root;for(const c of root.children||[]){const found=find(c,cls);if(found)return found;}};
 const key=(root,id)=>find(root,'keybar').children.find(el=>el.dataset.keyId===id);
 const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
 async function advance(ms){const end=clock+ms;for(;;){const next=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;clock=next[1].at;timers.delete(next[0]);next[1].fn();await flush();}clock=end;await flush();}
 const inputs=socket=>Array.from(socket.sent).filter(a=>a instanceof Uint8Array&&a[4]===0x13).map(a=>{const r=T.reader(a.slice(5));r.n();return r.text();});
 async function mount(id=7,extra={}){const root=new Element('div'),handle=context.mountFixture(root,id,extra);await flush();const socket=context.sockets.at(-1);socket.handshake();socket.screen();await flush();return {root,handle,socket};}
+async function testHiddenPaint(){
+ const hidden=await mount(1901,{visible:false,preferences:{fitToPhone:false}});
+ // Locate the actual canvas without relying on the wrapper's class.
+ function getCanvas(node){if(node.tagName==='canvas')return node;for(const child of node.children||[]){const c=getCanvas(child);if(c)return c;}}
+ const paint=getCanvas(hidden.root);for(let n=0;n<10;n++){hidden.socket.screen('hidden '+n);await advance(16);}await advance(500);assert.equal(paint.calls.draws,0);assert.equal(paint.getAttribute('aria-label'),undefined);assert.match(hidden.handle.text(),/hidden 9/,'hidden wire frames still decode into current model');
+ await hidden.handle.setVisible(true);await advance(16);assert.equal(paint.calls.draws,1);await advance(500);assert.match(paint.getAttribute('aria-label'),/hidden 9/);context.document.visibilityState='hidden';context.document.dispatchEvent(new Event('visibilitychange'));await flush();const draws=paint.calls.draws,label=paint.getAttribute('aria-label');hidden.socket.screen('background current');await advance(600);assert.equal(paint.calls.draws,draws);assert.equal(paint.getAttribute('aria-label'),label);context.document.visibilityState='visible';context.document.dispatchEvent(new Event('visibilitychange'));await advance(16);assert.equal(paint.calls.draws,draws+1);assert.match(hidden.handle.text(),/background current/);hidden.handle.unmount();
+ console.log('PASS hidden canvas draws/aria 0, model decode retained, restore full paint once (view and document visibility)');
+}
 async function main(){
+ await testHiddenPaint();
+ for(const n of [0,1,127,128,300,65535,Number.MAX_SAFE_INTEGER]){const r=T.reader(T.v(n));assert.equal(r.n(),n);r.end();}assert.throws(()=>T.reader(T.v(128)).n(127),/Screen limit/);assert.throws(()=>T.reader(T.v(128)).n(128-1),/Screen limit/);assert.throws(()=>T.reader(T.v(1n<<53n)).n(),/Screen limit/);assert.throws(()=>T.reader(Uint8Array.of(128)).n(),/Truncated/);
+ for(const text of ['', 'a', '\0', '한글', 'é', '😀']){const r=T.reader(T.text(text));assert.equal(r.text(),text);r.end();}assert.throws(()=>T.reader(Uint8Array.of(1,255)).text());assert.throws(()=>T.reader(Uint8Array.of(2,97)).text(),/Truncated/);
  assert(!source.includes('innerHTML'));assert(!source.includes('getElementById'));assert.equal(api.keys.length,20);
  const expected=['\x1b','\t','\r','\x1b[Z',' ','\x7f','\x1b[3~','\x1b[A','\x1b[B','\x1b[D','\x1b[C','\x03','\x04','\x0c','\x1a','\x12','\x01','\x05','\x17','\x15'];
  let {root,handle,socket}=await mount();socket.autoAck=true;
  for(const k of api.keys)await handle.sendKey(k.id);assert.deepEqual(inputs(socket),expected);console.log('PASS exact 20-key order and bytes');
+ // Switching visible panes invalidates a late IME commit, deferred keys, repeat and paste review.
+ const inactiveCapture=find(root,'live-capture');handle.focus();event(inactiveCapture,'compositionstart');inactiveCapture.value='late';const deferred=handle.sendKey('enter');const rejected=assert.rejects(deferred,/Input target changed/);const inactiveCount=inputs(socket).length;handle.setInputActive(false);await rejected;assert.equal(find(root,'command-input').value,'late');event(inactiveCapture,'compositionend',{data:'final'});assert.equal(find(root,'command-input').value,'final');inactiveCapture.value='late';event(inactiveCapture,'input');event(inactiveCapture,'paste',{clipboardData:{getData:()=> 'wrong-pane'}});await assert.rejects(handle.sendKey('escape'),/Resume/);await flush();assert.equal(inputs(socket).length,inactiveCount);assert.equal(inactiveCapture.value,'');
+ handle.setInputActive(true);handle.setInputMode('direct');handle.focus();inactiveCapture.value='active';event(inactiveCapture,'input');await flush();assert.equal(inputs(socket).at(-1),'active');console.log('PASS inactive pane discards late IME, deferred keys, paste and direct input');
  assert.equal(handle.toggleShift(),true);assert.equal(key(root,'shift').getAttribute('aria-pressed'),'true');await handle.sendKey('tab');assert.equal(inputs(socket).at(-1),'\x1b[Z');assert.equal(key(root,'shift').getAttribute('aria-pressed'),'false');
  event(key(root,'shift'),'click');await handle.sendKey('arrowUp');assert.equal(inputs(socket).at(-1),'\x1b[1;2A');
  console.log('PASS Shift modifier');
@@ -70,7 +85,7 @@ async function main(){
  handle.loadHistory();sent=socket.sent.at(-1);r=T.reader(sent.slice(5));const req=r.n();assert.equal(r.n(),0);assert.equal(r.n(),0);assert.equal(r.n(),300);const rows=Array.from({length:100},()=>[{ch:'x',zero:'',flags:0}]);const row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));socket.frame(0x26,T.v(req),T.v(100),T.v(2),T.v(0),T.v(100),...Array(100).fill(row));handle.loadHistory();r=T.reader(socket.sent.at(-1).slice(5));r.n();assert.equal(r.n(),1);assert.equal(r.n(),1);let historyReq;for(let page=0;page<9;page++){r=T.reader(socket.sent.at(-1).slice(5));historyReq=r.n();socket.frame(0x26,T.v(historyReq),T.v(10000),T.v(2),T.v(page*100),T.v(100),...Array(100).fill(row));handle.loadHistory();}assert.equal(find(root,'terminal-history').textContent.split('\n').length,1001);assert.equal(find(root,'load-history').disabled,true);const before=socket.sent.length;handle.loadHistory();assert.equal(socket.sent.length,before);console.log('PASS 300-row requests, hot-to-cold history and 1000-row cap');
  ({root,handle,socket}=await mount(46));handle.loadHistory();r=T.reader(socket.sent.at(-1).slice(5));const wreq=r.n();const wc=(ch,zero,flags)=>C.concat(T.text(ch),T.v(zero.length),...zero.map(z=>T.text(z)),T.v(0),T.v(0),T.v(0),T.v(flags));
  socket.frame(0x26,T.v(wreq),T.v(1),T.v(1),T.v(0),T.v(1),C.concat(T.v(6),wc('a',[],0),wc('ᄒ',['ᅡ','ᆫ'],8),wc(' ',[],16),wc('글',[],8),wc(' ',[],16),wc('b',[],0)));
- const hist=find(root,'terminal-history'),span=hist.children.find(c=>typeof c==='object');assert.equal(hist.textContent,'a한글b\n');assert.equal(span.textContent,'한글');assert.equal(span.style.letterSpacing,'var(--wide-spacing)');assert.match(handle.text(),/^a한글b/);handle.unmount();console.log('PASS history <pre>: NFD joined to NFC, wide runs spaced to two cells');
+ const hist=find(root,'terminal-history'),span=hist.children[0].children.find(c=>typeof c==='object');assert.equal(hist.textContent,'a한글b\n');assert.equal(span.textContent,'한글');assert.equal(span.style.letterSpacing,'var(--wide-spacing)');assert.match(handle.text(),/^a한글b/);handle.unmount();console.log('PASS history <pre>: NFD joined to NFC, wide runs spaced to two cells');
  handle.unmount();let lastStatus;({root,handle,socket}=await mount(99,{onStatus:s=>{lastStatus=s;}}));const uncertain=handle.sendKey('ctrlC');socket.close();await assert.rejects(uncertain,/Input delivery is uncertain; input will not be resent\./);assert.match(lastStatus.message,/will not be resent/);assert.equal(inputs(socket).length,1);handle.unmount();console.log('PASS disconnect uncertainty, no retry and listener cleanup');
  ({root,handle,socket}=await mount());const canvas=find(root,'terminal-grid'),calls=canvas.calls;await advance(16);
  const line=(n,text)=>C.concat(T.v(2),T.v(n),T.v([...text].length),...[...text].map(ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)))),cursor=(line,column)=>C.concat(T.v(3),T.v(line),T.v(column),T.v(1));
@@ -112,6 +127,12 @@ async function main(){
  viewport.height=544;port47.clientHeight=60;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);assert.equal(root.dataset.keyboardOpen,'true');
  viewport.height=844;port47.clientHeight=360;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);
  port47.clientHeight=540;event(viewport,'resize');await advance(200);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ // Fold/rotation events refit width too. If the next fold arrives before the
+ // role acknowledgement, retain it and fit the final viewport after the reply.
+ port47.clientWidth=830;event(globalEvents,'orientationchange');await advance(150);assert.deepEqual(roles47().at(-1),[1,103,30]);
+ port47.clientWidth=320;event(globalEvents,'orientationchange');await advance(150);socket.frame(0x2c,T.v(0));await flush();await advance(150);assert.deepEqual(roles47().at(-1),[1,39,30]);socket.frame(0x2c,T.v(0));await flush();
+ port47.clientWidth=390;event(viewport,'resize');await advance(150);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ console.log('PASS fold/rotation refits width and retains the latest viewport during a pending resize');
  port47.clientWidth=0;n47=roles47().length;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47);port47.clientWidth=390;
  // 화면이 가려지면 크기 소유를 놓고(데스크톱 크기 복귀), 다시 보이면 맞춘다.
  context.document.visibilityState='hidden';event(context.document,'visibilitychange');assert.deepEqual(roles47().at(-1),[0,2,0]);socket.frame(0x2c,T.v(0));context.document.visibilityState='visible';event(context.document,'visibilitychange');assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
@@ -136,8 +157,47 @@ async function main(){
   const resizes=()=>socket.sent.filter(a=>a[4]===0x17&&a[5]===1).map(a=>[...a.slice(5)]);assert.equal(JSON.stringify(resizes()),"[[1,48,33]]");
   socket.screen();await flush();assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');socket.frame(0x2c,T.v(0));await flush();
   assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'true');assert.equal(resizes().length,1);handle.unmount();console.log('PASS auto-fit resize pipelined with attach, no duplicate after first frame');}
+ await testHistoryGestures();
+ await testHistoryPrefetch();
  await testFailurePaths();
  console.log('All terminal adapter regression checks passed.');
+}
+async function testHistoryPrefetch(){
+ const {root,handle,socket}=await mount(1300),port=find(root,'terminal-scroll');port.clientHeight=400;port.scrollHeight=20000;port.scrollTop=19600;event(port,'scroll');
+ const requests=()=>socket.sent.filter(a=>a[4]===0x12),row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));
+ const reply=skip=>{const r=T.reader(requests().at(-1).slice(5));socket.frame(0x26,T.v(r.n()),T.v(5000),T.v(1),T.v(skip),T.v(300),...Array(300).fill(row));};
+ handle.loadHistory();reply(0);const first=find(root,'terminal-history').children[0];await advance(0);assert.equal(requests().length,2);reply(300);assert.equal(find(root,'terminal-history').children[300],first);await advance(0);assert.equal(requests().length,3);reply(600);await advance(0);assert.equal(requests().length,3);assert.equal(find(root,'terminal-history').children.length,900);
+ port.scrollTop=1000;event(port,'scroll');assert.equal(requests().length,4);assert(port.scrollTop>0);reply(900);assert.equal(find(root,'terminal-history').children.length,1000);assert.equal(find(root,'terminal-history').children[900],first);handle.unmount();await advance(0);assert.equal(requests().length,4);
+ const hidden=await mount(1301,{visible:false});find(hidden.root,'terminal-scroll').clientHeight=400;hidden.handle.loadHistory();let r=T.reader(hidden.socket.sent.at(-1).slice(5));hidden.socket.frame(0x26,T.v(r.n()),T.v(5000),T.v(1),T.v(0),T.v(300),...Array(300).fill(row));await advance(0);assert.equal(hidden.socket.sent.filter(a=>a[4]===0x12).length,1);hidden.handle.unmount();
+ const partial=await mount(1302),pp=find(partial.root,'terminal-scroll');pp.clientHeight=400;pp.scrollHeight=20000;partial.handle.loadHistory();
+ const pr=()=>partial.socket.sent.filter(a=>a[4]===0x12).at(-1),respond=(total,skip,n)=>{const r=T.reader(pr().slice(5));partial.socket.frame(0x26,T.v(r.n()),T.v(total),T.v(1),T.v(skip),T.v(n),...Array(n).fill(row));};respond(160,0,160);await advance(0);respond(5000,0,300);await advance(0);respond(5000,300,300);await advance(0);r=T.reader(pr().slice(5));r.n();r.n();r.n();r.n();assert.equal(r.n(),140);respond(5000,600,140);await advance(0);assert.equal(find(partial.root,'terminal-history').children.length,900);assert.equal(find(partial.root,'terminal-grid').hidden,false);partial.handle.unmount();
+ console.log('PASS 900 rows warm before scrolling, 3-viewport lookahead, existing DOM retained, 1000-row bound, hidden/unmounted terminals stop warming');
+}
+async function testHistoryGestures(){
+ const {root,handle,socket}=await mount(1201),port=find(root,'terminal-scroll');port.clientHeight=400;port.scrollHeight=400;
+ const requests=()=>socket.sent.filter(a=>a[4]===0x12),last=()=>{const r=T.reader(requests().at(-1).slice(5));return {id:r.n(),source:r.n(),skip:r.n(),count:r.n()};};
+ const cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),row=ch=>C.concat(T.v(1),cell(ch));
+ const reply=(total,pages,skip,rows)=>socket.frame(0x26,T.v(last().id),T.v(total),T.v(pages),T.v(skip),T.v(rows.length),...rows.map(row));
+ handle.loadHistory();reply(0,0,0,[]);const n=requests().length;handle.loadHistory();assert.equal(requests().length,n);
+ // Later output revives history even after the first hot/cold snapshot was empty.
+ socket.screen('new output');await flush();event(port,'touchstart',{touches:[{clientX:150,clientY:200}]});event(port,'touchmove',{touches:[{clientX:150,clientY:220}]});assert.equal(requests().length,n+1);assert.equal(last().source,0);reply(1,0,0,['a']);assert.equal(find(root,'terminal-history').textContent,'a\n');assert.equal(find(root,'terminal-latest').hidden,false);event(port,'touchend',{touches:[]});
+ // Already-loaded history still accepts pulling at the top, without requiring
+ // a native scroll event (a fitted canvas can fill the viewport exactly).
+ socket.screen('newer output');port.scrollHeight=800;port.scrollTop=400;event(port,'scroll');event(port,'touchstart',{touches:[{clientX:150,clientY:200}]});event(port,'touchmove',{touches:[{clientX:150,clientY:230}]});port.scrollTop=2000;reply(2,1,0,['b','c']);assert.equal(find(root,'terminal-history').textContent,'b\nc\n');event(port,'touchend',{touches:[]});
+ handle.loadHistory(false,true);reply(0,1,0,[]);assert.equal(find(root,'terminal-history').textContent,'b\nc\n');assert.equal(last().source,1);reply(5000,1,0,Array(300).fill('d'));
+ port.scrollTop=0;event(port,'touchstart',{touches:[{clientX:150,clientY:200}]});event(port,'touchmove',{touches:[{clientX:150,clientY:220}]});assert.equal(last().source,1);reply(5000,1,300,Array(300).fill('e'));event(port,'touchend',{touches:[]});
+ for(let i=2;i<5;i++){handle.loadHistory();reply(5000,1,i*300,Array(300).fill(String(i)));}
+ assert.equal(find(root,'terminal-history').textContent.split('\n').length,1001);assert.equal(find(root,'terminal-grid').hidden,true);assert.equal(find(root,'load-history').disabled,false);
+ const before=requests().length;handle.loadHistory();assert.equal(requests().length,before+1);reply(5000,1,1500,Array(300).fill('z'));assert.equal(find(root,'terminal-history').textContent[0],'z');assert.equal(find(root,'terminal-history').textContent.split('\n').length,1001);
+ event(find(root,'terminal-latest'),'click');assert.equal(find(root,'terminal-grid').hidden,false);assert.equal(last().source,0);reply(2,1,0,['b','c']);assert.equal(find(root,'terminal-latest').hidden,true);assert.equal(port.scrollTop,port.scrollHeight);handle.unmount();
+ console.log('PASS empty history refreshes after output, upward gestures reload hot and cold, bounded 1000-row window keeps paging, Latest restores live canvas');
+ context.innerWidth=390;const phone=await mount(1202,{preferences:{fitToPhone:false}});assert.equal(phone.handle.getInputMode(),'buffered');let focused=0;find(phone.root,'command-input').addEventListener('focus',()=>focused++);event(find(phone.root,'terminal-scroll'),'click');assert.equal(focused,0);phone.handle.setInputMode('direct');phone.handle.unmount();const saved=await mount(1202,{preferences:{fitToPhone:false}});assert.equal(saved.handle.getInputMode(),'direct');saved.handle.unmount();delete context.innerWidth;
+ console.log('PASS phone defaults to editable buffered input, terminal taps keep reading position, saved direct preference survives');
+ const retry=await mount(1203),rp=find(retry.root,'terminal-scroll'),rs=retry.socket;rp.clientHeight=400;rp.scrollHeight=1000;rp.scrollTop=600;event(rp,'scroll');retry.handle.loadHistory();
+ const historyRequests=()=>rs.sent.filter(a=>a[4]===0x12),answer=()=>{const r=T.reader(historyRequests().at(-1).slice(5));rs.frame(0x26,T.v(r.n()),T.v(1),T.v(1),T.v(0),T.v(1),row('a'));};answer();
+ rs.screen('resize');event(rp,'wheel',{deltaX:0,deltaY:-20});rp.scrollTop=0;event(rp,'scroll');const count=historyRequests().length;answer();assert.equal(historyRequests().length,count+1);const next=T.reader(historyRequests().at(-1).slice(5));next.n();assert.equal(next.n(),1);retry.handle.unmount();
+ console.log('PASS stale hot refresh at scrollTop zero continues into cold history without another native scroll event');
+
 }
 async function testFailurePaths(){
  let {root,handle,socket}=await mount(701,{preferences:{inputMode:'direct'},onPhoto:()=>{}});socket.autoAck=true;handle.focus();let capture=find(root,'live-capture');

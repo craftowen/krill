@@ -322,6 +322,7 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = temp_dir("pmset");
+    fs::write(dir.join("settings.toml"), r#"keep_awake = "agent""#).unwrap();
     init_settings(cx, &dir);
 
     // 기본값: notifications = true, keep_awake = "agent". Working 세션이 있으면 pmset에 표시된다.
@@ -408,6 +409,7 @@ fn startup_and_reconnect_are_baselines_and_active_focus_is_silent(cx: &mut TestA
     let dir = temp_dir("baseline");
     // 포커스 억제는 창이 있을 때만 적용된다(메뉴바 상주). 억제 구간은 창을 열어 둔다.
     init_settings(cx, &dir);
+    cx.update(|cx| settings::edit(cx, |s| s.keep_awake = settings::KeepAwake::Agent));
     let window = cx.update(|cx| {
         cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| gpui::Empty))
             .unwrap()
@@ -590,8 +592,12 @@ fn notify_event_matrix_and_legacy_defaults() {
     use super::AlertEvent;
     const ALL: [AlertEvent; 3] = [AlertEvent::InputWait, AlertEvent::Done, AlertEvent::Bell];
 
-    // 기본값은 전부 켬.
-    let all_on = settings::Settings::default();
+    // 입력·완료는 기본 켬, 벨은 기본 끔. 행렬은 벨도 명시적으로 켠 상태로 검사한다.
+    assert!(!settings::Settings::default().notify_on_bell);
+    let all_on = settings::Settings {
+        notify_on_bell: true,
+        ..settings::Settings::default()
+    };
     assert!(all_on.notify_on_input && all_on.notify_on_done && all_on.notify_on_bell);
     for event in ALL {
         assert!(should_notify(&all_on, event), "{event:?}");
@@ -609,6 +615,7 @@ fn notify_event_matrix_and_legacy_defaults() {
     // 각 토글을 하나씩 끄면 해당 이벤트만 꺼진다.
     let off_input = settings::Settings {
         notify_on_input: false,
+        notify_on_bell: true,
         ..settings::Settings::default()
     };
     assert!(!should_notify(&off_input, AlertEvent::InputWait));
@@ -616,6 +623,7 @@ fn notify_event_matrix_and_legacy_defaults() {
     assert!(should_notify(&off_input, AlertEvent::Bell));
     let off_done = settings::Settings {
         notify_on_done: false,
+        notify_on_bell: true,
         ..settings::Settings::default()
     };
     assert!(should_notify(&off_done, AlertEvent::InputWait));
@@ -631,7 +639,7 @@ fn notify_event_matrix_and_legacy_defaults() {
 
     // 기존 settings.toml(키 없음)은 켬으로 읽히고, 왕복해도 같다.
     let legacy = settings::Settings::parse("notifications = true\n").unwrap();
-    assert!(legacy.notify_on_input && legacy.notify_on_done && legacy.notify_on_bell);
+    assert!(legacy.notify_on_input && legacy.notify_on_done && !legacy.notify_on_bell);
     assert_eq!(
         settings::Settings::parse(&all_on.to_toml()).unwrap(),
         all_on

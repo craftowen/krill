@@ -111,6 +111,70 @@ pub(crate) fn replay_page(
     ))
 }
 
+/// A bounded tail window for mobile's first paint, or the page before its oldest row.
+/// The resolved snapshot supplies the path; the client only supplies a byte boundary.
+pub(crate) fn latest_page(
+    snapshot: ChatPollSnapshot,
+    before: Option<u64>,
+) -> std::io::Result<(ChatPollSnapshot, u64)> {
+    if !snapshot.bound {
+        return Ok((snapshot, 0));
+    }
+    let agent = VaultAgent::parse(&snapshot.agent)
+        .ok_or_else(|| std::io::Error::other("unknown chat transcript agent"))?;
+    let path = Path::new(&snapshot.transcript_path);
+    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json") {
+        let page = poll_opencode_json_file(
+            &snapshot.agent,
+            &snapshot.session_id,
+            path,
+            &snapshot.transcript_path,
+            0,
+            true,
+        );
+        return Ok((page, 0));
+    }
+    let mut file = File::open(path)?;
+    let end = before.unwrap_or(u64::MAX).min(file.metadata()?.len());
+    let scan_start = end.saturating_sub(MAX_POLL_BYTES);
+    file.seek(SeekFrom::Start(scan_start))?;
+    let mut bytes = Vec::new();
+    file.take(end - scan_start).read_to_end(&mut bytes)?;
+    // Drop a leading fragment and a trailing unflushed record. Never parse half a JSONL row.
+    let leading = if scan_start > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let mut start = scan_start + u64::try_from(complete.max(leading)).unwrap_or(0);
+    let mut count = 0;
+    for line in bytes
+        .get(leading..complete)
+        .unwrap_or_default()
+        .split_inclusive(|b| *b == b'\n')
+        .rev()
+    {
+        let mut items = Vec::new();
+        if let Ok(value) = serde_json::from_slice::<Value>(line) {
+            parse_line_into_items(agent, &value, &mut items);
+        }
+        if count > 0 && count + items.len() > MAX_CHAT_ITEMS {
+            break;
+        }
+        count += items.len();
+        start = start.saturating_sub(u64::try_from(line.len()).unwrap_or(0));
+        if count >= MAX_CHAT_ITEMS {
+            break;
+        }
+    }
+    let page = poll_transcript_file_until(agent, &snapshot.session_id, path, start, Some(end));
+    Ok((page, start))
+}
+
 fn poll_transcript_file_until(
     agent: VaultAgent,
     session_id: &str,
@@ -123,7 +187,7 @@ fn poll_transcript_file_until(
     let sid_str = bounded(session_id, MAX_TEXT);
 
     if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json") {
-        return poll_opencode_json_file(&agent_str, &sid_str, path, &path_str, offset);
+        return poll_opencode_json_file(&agent_str, &sid_str, path, &path_str, offset, false);
     }
 
     let Ok(mut file) = File::open(path) else {
@@ -272,6 +336,7 @@ fn poll_opencode_json_file(
     path: &Path,
     path_str: &str,
     offset: u64,
+    tail: bool,
 ) -> ChatPollSnapshot {
     let Ok(bytes) = fs::read(path) else {
         return ChatPollSnapshot {
@@ -325,8 +390,12 @@ fn poll_opencode_json_file(
     }
 
     let mut items = Vec::new();
-    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-        parse_opencode_value(&v, storage_root, &mut items);
+    let embedded = serde_json::from_slice::<Value>(&bytes).ok();
+    if !tail && let Some(v) = &embedded {
+        parse_opencode_value(v, storage_root, &mut items);
+    }
+    if tail {
+        msg_files.reverse();
     }
     for msg_file in msg_files {
         if items.len() >= MAX_CHAT_ITEMS {
@@ -335,7 +404,23 @@ fn poll_opencode_json_file(
         if let Ok(text) = fs::read_to_string(&msg_file)
             && let Ok(v) = serde_json::from_str::<Value>(&text)
         {
-            parse_opencode_message_record(&v, storage_root, &mut items);
+            if tail {
+                prepend_opencode_message(&v, storage_root, &mut items);
+            } else {
+                parse_opencode_message_record(&v, storage_root, &mut items);
+            }
+        }
+    }
+    if tail && let Some(v) = &embedded {
+        if let Some(messages) = v.get("messages").and_then(Value::as_array) {
+            for message in messages.iter().rev() {
+                if items.len() >= MAX_CHAT_ITEMS {
+                    break;
+                }
+                prepend_opencode_message(message, storage_root, &mut items);
+            }
+        } else if items.len() < MAX_CHAT_ITEMS {
+            prepend_opencode_message(v, storage_root, &mut items);
         }
     }
     if items.len() > MAX_CHAT_ITEMS {
@@ -350,6 +435,14 @@ fn poll_opencode_json_file(
         bound: true,
         items,
     }
+}
+
+fn prepend_opencode_message(v: &Value, storage_root: Option<&Path>, items: &mut Vec<ChatItem>) {
+    let mut older = Vec::new();
+    parse_opencode_message_record(v, storage_root, &mut older);
+    let available = MAX_CHAT_ITEMS.saturating_sub(items.len());
+    let keep_from = older.len().saturating_sub(available);
+    items.splice(0..0, older.drain(keep_from..));
 }
 
 /// Appends do not change identity; replacement/rebinding changes the generation.
@@ -1683,6 +1776,87 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
     use std::io::Write as _;
+
+    #[test]
+    fn mobile_latest_window_pages_back_without_gaps_and_leaves_partial_record_for_poll() {
+        let dir = std::env::temp_dir().join(format!("chat-latest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let mut text = String::new();
+        for index in 0..1050 {
+            writeln!(text, "{}", serde_json::json!({"type":"assistant","message":{"role":"assistant","content":format!("message {index} {}", "x".repeat(1024))}})).unwrap();
+        }
+        let complete_end = u64::try_from(text.len()).unwrap();
+        let partial = r#"{"type":"user","message":{"role":"user","content":"next"}}"#;
+        text.push_str(partial);
+        fs::write(&path, text).unwrap();
+        let resolved = poll_transcript_file(VaultAgent::Claude, "sid", &path, 0);
+        let (latest, mut start) = latest_page(resolved.clone(), None).unwrap();
+        assert_eq!(latest.items.len(), MAX_CHAT_ITEMS);
+        assert!(
+            latest
+                .items
+                .last()
+                .unwrap()
+                .text
+                .starts_with("message 1049 ")
+        );
+        assert_eq!(latest.next_offset, complete_end);
+        assert!(start > MAX_POLL_BYTES);
+        assert_eq!(
+            replay_page(resolved.clone(), start, complete_end).unwrap(),
+            latest
+        );
+        let mut all = latest.items.clone();
+        while start > 0 {
+            let (earlier, next_start) = latest_page(resolved.clone(), Some(start)).unwrap();
+            assert_eq!(earlier.next_offset, start);
+            assert!(next_start < start);
+            let mut items = earlier.items;
+            items.extend(all);
+            all = items;
+            start = next_start;
+        }
+        assert_eq!(all.len(), 1050);
+        for (index, item) in all.iter().enumerate() {
+            assert!(item.text.starts_with(&format!("message {index} ")));
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        let appended = poll_transcript_file(VaultAgent::Claude, "sid", &path, complete_end);
+        assert_eq!(appended.items.len(), 1);
+        assert_eq!(appended.items[0].text, "next");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mobile_latest_opencode_json_uses_last_messages() {
+        let dir = std::env::temp_dir().join(format!("chat-latest-json-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        let messages: Vec<_> = (0..300)
+            .map(|i| serde_json::json!({"role":"assistant","content":format!("message {i}")}))
+            .collect();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"messages":messages})).unwrap(),
+        )
+        .unwrap();
+        let resolved = poll_transcript_file(VaultAgent::OpenCode, "sid", &path, 0);
+        let (latest, start) = latest_page(resolved, None).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(latest.items.len(), MAX_CHAT_ITEMS);
+        assert_eq!(latest.items.last().unwrap().text, "message 299");
+        assert_eq!(
+            latest.items.first().unwrap().text,
+            format!("message {}", 300 - MAX_CHAT_ITEMS)
+        );
+        fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn mobile_replay_stops_at_observed_end_even_inside_a_record() {

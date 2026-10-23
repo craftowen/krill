@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+same-file = { workspace = true }
 krill-log = { workspace = true }
 tracing = { workspace = true }
 krill-proto = { workspace = true }

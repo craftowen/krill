@@ -7,7 +7,7 @@
 #    - 비공개 저장소: gh release download -R craftowen/krill -p install.sh -O - | bash
 #    - 공개 저장소:   curl -fsSL https://github.com/craftowen/krill/releases/latest/download/install.sh | bash
 #
-# 2) 소스 빌드 모드:
+# 2) Source mode installs CLI + daemon/holder only (no GUI app):
 #    bash packaging/install.sh --source-dir <krill 체크아웃>
 #    bash packaging/install.sh --tag main [--prefix ~/.local]
 #    bash packaging/install.sh --commit <sha> [--prefix ~/.local]
@@ -179,6 +179,7 @@ for root, dirs, files in os.walk(dst, topdown=False):
 fi
 
 command -v cargo >/dev/null || { echo "cargo not found (need 1.98+)" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "python3 not found" >&2; exit 2; }
 
 SRC=""
 if [[ "${MODE}" == "dir" ]]; then
@@ -203,22 +204,54 @@ else
     SRC="${WORK}/src"
 fi
 
-if [[ -d "${SRC}/.git" ]]; then
-    (cd "${SRC}" && git status --porcelain | grep -q . && { echo "dirty checkout, refusing" >&2; exit 2; } || true)
+SRC="$(cd "${SRC}" && pwd)"
+if [[ -e "${SRC}/.git" ]]; then
+    CHECKOUT_STATUS="$(git -C "${SRC}" status --porcelain)"
+    if [[ -n "${CHECKOUT_STATUS}" ]]; then
+        echo "dirty checkout, refusing" >&2
+        exit 2
+    fi
 fi
 
-perl -e 'alarm shift; exec @ARGV' 300 cargo build --release --locked \
-    --manifest-path "${SRC}/Cargo.toml" -p krill -p krill-holder -p krilld
+# Run from the checkout so its Cargo config and relative target-dir apply.
+# Compiler artifacts report the actual paths, including external CARGO_TARGET_DIR.
+(cd "${SRC}" && perl -e 'alarm shift; exec @ARGV' 300 cargo build --release --locked \
+    --manifest-path "${SRC}/Cargo.toml" -p krill -p krill-holder -p krilld \
+    --message-format=json) > "${WORK}/artifacts.jsonl"
 
 BIN="${PREFIX}/bin"
-mkdir -p "${BIN}"
-for exe in krill krill-holder krilld; do
-    dst="${BIN}/${exe}"
-    [[ -e "${dst}" ]] && { echo "refusing to overwrite ${dst}" >&2; exit 2; }
-    cp "${SRC}/target/release/${exe}" "${dst}"
-    chmod 755 "${dst}"
-    echo "installed ${dst}"
-done
+python3 - "${WORK}/artifacts.jsonl" "${BIN}" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+names = ("krill", "krill-holder", "krilld")
+artifacts = {}
+with open(sys.argv[1]) as stream:
+    for line in stream:
+        item = json.loads(line)
+        name = item.get("target", {}).get("name")
+        if item.get("reason") == "compiler-artifact" and name in names and item.get("executable"):
+            artifacts[name] = Path(item["executable"])
+destination = Path(sys.argv[2])
+# Validate every input and destination before installing any file.
+for name in names:
+    source = artifacts.get(name)
+    if source is None or not source.is_file() or not os.access(source, os.X_OK):
+        sys.exit(f"cargo did not report an executable for {name}")
+    target = destination / name
+    if target.exists() or target.is_symlink():
+        sys.exit(f"refusing to overwrite {target}")
+destination.mkdir(parents=True, exist_ok=True)
+for name in names:
+    target = destination / name
+    with artifacts[name].open("rb") as source, target.open("xb") as output:
+        shutil.copyfileobj(source, output)
+    target.chmod(0o755)
+    print(f"installed {target}")
+PY
 
 echo "done. export PATH=\"${BIN}:\$PATH\""
-echo "GUI .app 번들은 MK-061 이후 packaging/README.md 절차를 따른다."
+echo "CLI-only installation. For the GUI app, follow packaging/README.md (bundle.sh)."

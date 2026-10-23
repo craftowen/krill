@@ -96,10 +96,19 @@ test('a photo prepared for a previous desktop cannot send to its replacement',as
  const line=read('app.js').split('\n').find(l=>l.includes('async function photo(session,'));let decode;const decoded=new Promise(done=>decode=done),calls=[];
  const A={rpc:r=>calls.push(['A',r])},B={rpc:r=>calls.push(['B',r])};let holds=0;
  const context=vm.createContext({transport:A,hostGeneration:1,M:{update:{hold(){holds++;return ()=>holds--;}}},URL:{createObjectURL:()=>'',revokeObjectURL(){}},Image:class{decode(){return decoded;}},document:{createElement:()=>({getContext:()=>({drawImage(){}}),toBlob:done=>done({size:1,arrayBuffer:async()=>new Uint8Array([1]).buffer})})},Uint8Array,btoa:()=>'',toast(){}});
- vm.runInContext(line+';globalThis.testPhoto=photo;',context);const pending=context.testPhoto(7,{type:'image/jpeg',size:1});assert.equal(holds,1);context.transport=B;context.hostGeneration=2;decode();await assert.rejects(pending,/target changed/);assert.equal(holds,0);assert.deepEqual(calls,[]);
+ context.decodeImage=async()=>{await decoded;return {source:{},width:1,height:1,close(){}};};vm.runInContext(line+';globalThis.testPhoto=photo;',context);const pending=context.testPhoto(7,{type:'image/jpeg',size:1});assert.equal(holds,1);context.transport=B;context.hostGeneration=2;decode();await assert.rejects(pending,/target changed/);assert.equal(holds,0);assert.deepEqual(calls,[]);
 });
 test('closing a sheet discards hidden pairing inputs so secrets cannot keep safe updates busy',()=>{
  const line=read('app.js').split('\n').find(l=>l.includes('function closeSheet()'));let cleared=0,restored=0;
  const dialog={open:true,close(){this.open=false;}},sheetBody={replaceChildren(){assert.equal(dialog.open,false);cleared++;}},context=vm.createContext({dialog,sheetBody,restoreFocus(){restored++;}});
  vm.runInContext(line+';globalThis.close=closeSheet;',context);context.close();assert.equal(cleared,1);assert.equal(restored,1);context.close();assert.equal(cleared,2);
+});
+test('update body reader limits individual and total decoded bytes, including chunked bodies',async()=>{
+ for(const kind of ['header','chunked','total']){const f=fixture(),fetch=f.context.fetch;f.context.fetch=async(url,options)=>{const response=await fetch(url,options);if(url.endsWith('/'))return response;if(kind==='header')return new Response('x',{headers:{'content-length':String(3*1024*1024)}});if(kind==='chunked')return new Response(new ReadableStream({start(controller){controller.enqueue(new Uint8Array(3*1024*1024));controller.close();}}));return new Response(new Uint8Array(1024*1024));};await assert.rejects(f.context.KrillMobile.updates.prepare(f.hash,new AbortController().signal),/too large/);assert.equal(f.cache.size,0);}
+});
+test('update preparation has at most two active decoded bodies and worker hashing leaves UI thread',async()=>{
+ const f=fixture(),fetch=f.context.fetch;let active=0,peak=0,hashes=0,terminated=0;
+ f.context.fetch=async(url,options)=>{const response=await fetch(url,options),reader=response.body.getReader();active++;peak=Math.max(peak,active);return {ok:response.ok,redirected:false,headers:response.headers,body:{getReader:()=>({async read(){await Promise.resolve();const value=await reader.read();if(value.done)active--;return value;},cancel:()=>reader.cancel(),releaseLock:()=>reader.releaseLock()})}};};
+ f.context.Worker=class{constructor(url){assert.equal(url,'updates.js');}postMessage(buffer,transfer){assert.equal(transfer[0],buffer);hashes++;queueMicrotask(()=>this.onmessage({data:{hash:crypto.createHash('sha256').update(new Uint8Array(buffer)).digest('hex').slice(0,16)}}));}terminate(){terminated++;}};
+ await f.context.KrillMobile.updates.prepare(f.hash,new AbortController().signal);assert.equal(peak,2);assert.equal(active,0);assert.equal(hashes,1);assert.equal(terminated,1);assert.equal(f.cache.size,inventory.length+1);
 });

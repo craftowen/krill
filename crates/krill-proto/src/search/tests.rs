@@ -97,3 +97,62 @@ proptest! {
         SearchResult::decode(kind::SEARCH_RESULT, &bytes).ok();
     }
 }
+
+#[test]
+fn options_request_has_frozen_bytes_and_preserves_v1() {
+    let request = SearchOptionsRequest {
+        request: SearchRequest {
+            req: 1,
+            query: "x".into(),
+            direction: Direction::Next,
+            after: None,
+        },
+        options: Options::default(),
+    };
+    let bytes = [8, 0, 0, 0, 0x46, 1, 1, b'x', 0, 0, 0, 0];
+    assert_eq!(request.encode().unwrap(), bytes);
+    let (kind, body) = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+    assert_eq!(SearchOptionsRequest::decode(kind, &body).unwrap(), request);
+    let legacy = [6, 0, 0, 0, 0x15, 1, 1, b'x', 0, 0];
+    assert_eq!(request.request.encode().unwrap(), legacy);
+}
+
+#[test]
+fn options_match_unicode_and_validate_regular_expressions() {
+    assert!(Options::default().compile("Ä가").unwrap().is_match("ä가"));
+    assert!(
+        !Options {
+            case_sensitive: true,
+            regex: false
+        }
+        .compile("Ä")
+        .unwrap()
+        .is_match("ä")
+    );
+    assert!(Options::default().compile("a.b").unwrap().is_match("a.b"));
+    assert!(!Options::default().compile("a.b").unwrap().is_match("axb"));
+    assert!(
+        Options {
+            regex: true,
+            ..Options::default()
+        }
+        .compile("N[0-9]+")
+        .unwrap()
+        .is_match("n123")
+    );
+    assert!(
+        Options {
+            regex: true,
+            ..Options::default()
+        }
+        .compile("[")
+        .is_err()
+    );
+}
+
+proptest! {
+    #[test]
+    fn options_decoder_never_panics(body in proptest::collection::vec(any::<u8>(), 0..2048)) {
+        drop(SearchOptionsRequest::decode(kind::SEARCH_OPTIONS, &body));
+    }
+}

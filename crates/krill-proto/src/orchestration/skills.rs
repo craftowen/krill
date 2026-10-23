@@ -19,9 +19,14 @@ pub struct SkillEntry {
 
 pub const BUILTIN_SKILLS: &[SkillEntry] = &[
     SkillEntry {
-        name: "krill",
-        description: "Operate Krill sessions, worktrees, checkpoints, references, handoffs, ports, and artifacts (public HTML/Markdown share links, 크릴 아티팩트) via the `krill` CLI.",
-        content: "---\nname: krill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, ports, and artifacts via the krill CLI. Use for \"krill artifact\", \"크릴 아티팩트\", sharing an HTML or Markdown page as a public link, or managing shared links.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n\n## Artifacts (public share links)\n\n- Share one self-contained `.html`/`.htm`/`.md`/`.markdown` file (max 2 MiB) as a public link: `krill artifacts share <file> --json` (re-running on the same path updates the same link). Relative images/CSS are not uploaded.\n- Check a file's link without network: `krill artifacts status <file> --json`. Manage links: `krill artifacts list --json`, `krill artifacts unshare <file>`, `krill artifacts delete <slug>`.\n- Public sharing is off by default and only a human can turn it on (Krill app: Settings > Artifacts). If a command returns `{\"error\":{\"code\":\"artifact_sharing_disabled\"}}`, do not retry or work around it: ask the user to enable it, or deliver the file locally.\n- Never print or paste edit/owner tokens from the Krill state directory.\n",
+        name: "artifacts",
+        description: "Create documents, reports, plans, charts, and interactive visual deliverables as Krill artifacts by default; publish and update them with the krill CLI.",
+        content: include_str!("skills/artifacts/SKILL.md"),
+    },
+    SkillEntry {
+        name: "minikrill",
+        description: "Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the `krill` CLI.",
+        content: "---\nname: minikrill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the krill CLI.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n",
     },
     SkillEntry {
         name: "orchestration",

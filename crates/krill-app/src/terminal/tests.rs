@@ -59,7 +59,7 @@ fn paints_and_sizes_to_grid(cx: &mut TestAppContext) {
         TerminalElement::new(screen.clone(), DEFAULT)
     });
     // 기본 글꼴 13pt × 1.25줄 높이 = 16px(반올림).
-    assert!(cell.width > px(0.) && cell.height == px(16.));
+    assert!(cell.width > px(0.) && cell.height == px(18.));
 }
 
 #[gpui::test]
@@ -236,7 +236,7 @@ fn paints_emoji_zwj_vs16_rows(cx: &mut TestAppContext) {
     let (cell, ()) = cx.draw(point(px(0.), px(0.)), size(px(800.), px(600.)), |_, _| {
         TerminalElement::new(screen.clone(), DEFAULT)
     });
-    assert!(cell.width > px(0.) && cell.height == px(16.));
+    assert!(cell.width > px(0.) && cell.height == px(18.));
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn terminal_cell_size_scales_with_window_zoom(cx: &mut TestAppContext) {
         "base={base:?} zoomed={zoomed:?}"
     );
     // 13pt × 2배 줌 = 26px × 1.25 = 32.5 → 33px(반올림).
-    assert_eq!(zoomed.height, px(33.));
+    assert_eq!(zoomed.height, px(35.));
 }
 
 /// OWE-615 원인 3: preedit 묶음은 확정 셀과 같은 칸 단위로 나뉜다(2칸 글자는 2칸 강제 폭).

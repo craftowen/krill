@@ -24,6 +24,111 @@ fn agent_status_hooks_default_on_and_fail_closed_on_unreadable_settings() {
 }
 
 #[test]
+fn first_launch_locale_matches_korean_primary_subtag_else_english() {
+    for locale in ["ko", "ko-KR", "ko_KR.UTF-8", "KO-kr", " ko@modifier "] {
+        assert_eq!(
+            locale::language_from_locale(Some(locale)),
+            Language::Ko,
+            "{locale}"
+        );
+    }
+    for locale in [
+        "",
+        "en",
+        "en-US",
+        "ja-JP",
+        "fr_FR.UTF-8",
+        "C",
+        "POSIX",
+        "korean",
+        "kok-IN",
+    ] {
+        assert_eq!(
+            locale::language_from_locale(Some(locale)),
+            Language::En,
+            "{locale}"
+        );
+    }
+    assert_eq!(locale::language_from_locale(None), Language::En);
+}
+
+proptest::proptest! {
+    #[test]
+    fn first_launch_locale_parser_handles_arbitrary_tags(value in ".*") {
+        // Arbitrary Unicode must not panic, and a non-Korean primary tag cannot match
+        // merely because its later subtags or malformed suffix contain "ko".
+        let _ = locale::language_from_locale(Some(&value));
+        proptest::prop_assert_eq!(
+            locale::language_from_locale(Some(&format!("x{value}"))),
+            Language::En
+        );
+    }
+}
+
+#[test]
+fn missing_language_uses_first_launch_choice_but_saved_selection_wins() {
+    for default_language in [Language::En, Language::Ko] {
+        for body in ["", "theme = 'light'\nnotifications = false"] {
+            let parsed = Settings::parse_with_language(body, default_language).unwrap();
+            assert_eq!(parsed.language, default_language);
+            // Once written, the resolved choice survives a different OS preference on upgrade.
+            for later_default in [Language::Ko, Language::En] {
+                assert_eq!(
+                    Settings::parse_with_language(&parsed.to_toml(), later_default).unwrap(),
+                    parsed
+                );
+            }
+        }
+        for (body, saved) in [
+            ("language = 'en'", Language::En),
+            ("language = 'ko'", Language::Ko),
+        ] {
+            assert_eq!(
+                Settings::parse_with_language(body, default_language)
+                    .unwrap()
+                    .language,
+                saved
+            );
+        }
+        assert!(Settings::parse_with_language("language = 'fr'", default_language).is_err());
+    }
+}
+
+#[gpui::test]
+fn first_window_uses_resolved_language_before_async_config_read(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for language in [Language::En, Language::Ko] {
+        cx.update(|cx| {
+            init_at_with_language(None, language, cx);
+            assert_eq!(current(cx).language, language);
+            assert_eq!(crate::i18n::language(), language);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(current(cx).language, language));
+    }
+}
+
+#[test]
+fn unrelated_saved_config_edit_preserves_explicit_language() {
+    let d = dir("saved-language-edit");
+    for (name, language) in [("ko", Language::Ko), ("en", Language::En)] {
+        let body = format!("# User preference\nlanguage = '{name}'\nnotifications = true\n");
+        fs::write(d.join(SETTINGS_FILE), body).unwrap();
+        let (settings, _) =
+            persist_settings_edit(&d, |settings| settings.notifications = false).unwrap();
+        assert_eq!(settings.language, language);
+        let saved = fs::read_to_string(d.join(SETTINGS_FILE)).unwrap();
+        assert!(saved.contains("# User preference"));
+        for later_default in [Language::Ko, Language::En] {
+            let reopened = Settings::parse_with_language(&saved, later_default).unwrap();
+            assert_eq!(reopened.language, language);
+            assert!(!reopened.notifications);
+        }
+    }
+    fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
 fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
     assert!(Settings::default().yolo_mode);
     assert!(toml::from_str::<Settings>("").unwrap().yolo_mode);
@@ -117,7 +222,7 @@ fn settings_parse_defaults_and_zoom() {
     assert_eq!(Settings::parse("").unwrap(), def);
     assert!(def.notifications);
     assert!(def.webhooks.is_empty());
-    assert_eq!(def.keep_awake, KeepAwake::Agent);
+    assert_eq!(def.keep_awake, KeepAwake::Off);
     // OWE-872: 실행 중 닫기 확인은 기본 켜짐이며, 끈 값도 그대로 왕복한다.
     assert!(def.confirm_running_close);
     let off = Settings::parse("confirm_running_close = false").unwrap();
@@ -1256,10 +1361,10 @@ fn accounts_tab_puts_add_button_above_cards_and_host_default_first(cx: &mut Test
     fs::remove_dir_all(d).unwrap();
 }
 
-/// OWE-696·697: Orca 감지 계정은 전환 버튼 없이 "Krill에서 실행 불가(Orca 관리)"로 보이되 … 메뉴(목록에서 제거)는 남고,
+/// Orca 캐시 감지 계정은 행 자체를 숨기고, 사용 가능한 계정은 계속 표시한다.
 /// 데몬에 닿지 못한 화면은 "데몬 연결 필요" 배너와 함께 계정 변경을 거부한다(로컬 파일 쓰기 없음).
 #[gpui::test]
-fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppContext) {
+fn orca_accounts_are_hidden_and_offline_view_is_read_only(cx: &mut TestAppContext) {
     use krill_proto::usage::{AccountInfo, ProviderKind, UsageRequest};
 
     let d = dir("owe696-orca-offline");
@@ -1281,11 +1386,6 @@ fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppCont
         stale: false,
         usage: krill_proto::usage::Snapshot::default(),
     };
-    assert_eq!(
-        account_heading(&orca).1,
-        text::ACCOUNT_ORCA_MANAGED.get(),
-        "orca card must say it can't run in Krill"
-    );
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.accounts_snapshot.accounts.push(orca.clone());
@@ -1295,6 +1395,13 @@ fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppCont
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-accounts-daemon-required").is_some());
+    assert!(vcx.debug_bounds("admin-account-row-claude-host").is_some());
+    assert!(vcx.debug_bounds("admin-accounts-empty-claude").is_some());
+    assert!(
+        vcx.debug_bounds("admin-account-row-claude-orca-96f8c826")
+            .is_none(),
+        "Orca cache-only accounts must not render a row"
+    );
     assert!(
         vcx.debug_bounds("admin-switch-account-claude-orca-96f8c826")
             .is_none()
@@ -1303,11 +1410,22 @@ fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppCont
         vcx.debug_bounds("admin-remove-account-claude-orca-96f8c826")
             .is_none()
     );
+    // 같은 이름의 실제 프로필은 숨기지 않는다(Orca에서 가져온 사용 가능 계정 포함).
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            let mut imported = orca.clone();
+            imported.id = "claude-imported".into();
+            imported.profile_dir = d.join("imported").display().to_string();
+            v.accounts_snapshot.accounts.push(imported);
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
     assert!(
-        vcx.debug_bounds("admin-account-menu-claude-orca-96f8c826")
-            .is_some(),
-        "orca account must keep the … menu so it can be removed from Krill"
+        vcx.debug_bounds("admin-account-row-claude-imported")
+            .is_some()
     );
+    assert!(vcx.debug_bounds("admin-accounts-empty-claude").is_none());
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.apply_account_request(
@@ -2356,7 +2474,7 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
     let d = dir("owe655-options");
     init(cx, &d);
     cx.update(|cx| {
-        assert_eq!(terminal_font_pt(cx), 13);
+        assert_eq!(terminal_font_pt(cx), DEFAULT_TERMINAL_FONT_SIZE);
         assert_eq!(terminal_opacity_pct(cx), 100);
         assert!((terminal_opacity_alpha(cx) - 1.).abs() < f32::EPSILON);
         assert!(notification_sound(cx));
@@ -2467,9 +2585,14 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
     );
     click(vcx, "font-inc");
     click(vcx, "opacity-dec");
-    vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), 14));
+    vcx.update(|_, cx| {
+        assert_eq!(
+            current(cx).terminal_font_size(),
+            DEFAULT_TERMINAL_FONT_SIZE + 1
+        );
+    });
     click(vcx, "font-reset");
-    vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), 13));
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), DEFAULT_TERMINAL_FONT_SIZE));
     // OWE-843: 에디터 글꼴 행도 같은 탭에서 조절·영속된다.
     click(vcx, "editor-font-inc");
     vcx.update(|_, cx| assert_eq!(current(cx).editor_font_size(), 13));
@@ -2479,7 +2602,7 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap())
             .unwrap()
             .terminal_font_size(),
-        13
+        DEFAULT_TERMINAL_FONT_SIZE
     );
     click(vcx, "font-inc");
     vcx.update(|window, cx| {
@@ -2489,7 +2612,10 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("sound-toggle").is_some());
     click(vcx, "sound-toggle");
     vcx.update(|_, cx| {
-        assert_eq!(current(cx).terminal_font_size(), 14);
+        assert_eq!(
+            current(cx).terminal_font_size(),
+            DEFAULT_TERMINAL_FONT_SIZE + 1
+        );
         assert_eq!(current(cx).terminal_opacity_pct(), 95);
         assert!(!current(cx).notification_sound);
     });
@@ -3019,9 +3145,9 @@ fn owe658_terminal_settings_defaults_and_serialization(cx: &mut TestAppContext) 
     let s = Settings::default();
     assert_eq!(s.terminal_font_family, "Menlo");
     assert_eq!(s.terminal_cursor_shape, TerminalCursorShape::Block);
-    assert!(!s.terminal_cursor_blink && !s.option_as_meta && !s.copy_on_select);
+    assert!(s.terminal_cursor_blink && !s.option_as_meta && !s.copy_on_select);
     // 새 키가 없는 기존 파일도 그대로 읽힌다(빠진 키는 기본값).
-    assert_eq!(Settings::parse("theme = \"dark\"\n").unwrap(), s);
+    assert_eq!(Settings::parse("theme = \"system\"\n").unwrap(), s);
     let parsed = Settings::parse(
         "terminal_font_family = \"Monaco\"\nterminal_cursor_shape = \"bar\"\n\
          terminal_cursor_blink = true\noption_as_meta = true\ncopy_on_select = true\n",
@@ -3047,7 +3173,10 @@ fn owe658_terminal_settings_defaults_and_serialization(cx: &mut TestAppContext) 
         assert_eq!(terminal_font_family(cx), "Menlo");
         assert_eq!(
             terminal_cursor(cx),
-            krill_proto::screen::CursorStyle::default()
+            krill_proto::screen::CursorStyle {
+                blink: true,
+                ..krill_proto::screen::CursorStyle::default()
+            }
         );
         assert!(!option_as_meta(cx) && !copy_on_select(cx));
         edit(cx, |s| {
@@ -3116,7 +3245,7 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.terminal_cursor_shape, TerminalCursorShape::Bar);
-        assert!(s.terminal_cursor_blink && s.option_as_meta && s.copy_on_select);
+        assert!(!s.terminal_cursor_blink && s.option_as_meta && s.copy_on_select);
     });
     click(vcx, "option-meta-toggle");
     vcx.update(|_, cx| assert!(!current(cx).option_as_meta));
@@ -4453,7 +4582,7 @@ fn admin_tab_icons_all_resolve_to_svg() {
     for tab in AdminTab::ALL {
         let path = tab.icon().path();
         // 기본 번들은 없는 경로에 Err를 돌려준다(앱에선 빈 아이콘).
-        let svg = gpui_kit_assets::Assets
+        let svg = crate::ui::icons::AppAssets
             .load(&path)
             .ok()
             .flatten()
@@ -5116,6 +5245,7 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
 ) {
     let d = dir("owe737-agent-settings");
     init(cx, &d);
+    cx.update(|cx| edit(cx, |s| s.prompt_cache_timer_enabled = true));
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
     vcx.update(|_, cx| {
@@ -6522,6 +6652,7 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
 ) {
     let d = dir("owe793-layout-primitives");
     init(cx, &d);
+    cx.update(|cx| edit(cx, |s| s.prompt_cache_timer_enabled = true));
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
 
     // 좁은 창(820px)에서도 모든 카드·행 내부 우측 컨트롤이 부모 우측 경계 안에 들어와야 한다.
@@ -6673,6 +6804,7 @@ fn owe806_account_detail_does_not_repeat_org_name_when_auto_label_matches_org(
 fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut TestAppContext) {
     let d = dir("owe796-agents-tab");
     init(cx, &d);
+    cx.update(|cx| edit(cx, |s| s.prompt_cache_timer_enabled = true));
 
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));
@@ -6937,7 +7069,7 @@ fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notificati
         assert!(s.notifications);
         assert!(s.notify_on_input);
         assert!(s.notify_on_done);
-        assert!(s.notify_on_bell);
+        assert!(!s.notify_on_bell);
         assert!(s.notification_sound);
         assert!(!s.notify_only_inactive);
     });
@@ -6959,7 +7091,7 @@ fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notificati
         assert!(
             s.notify_on_input
                 && s.notify_on_done
-                && s.notify_on_bell
+                && !s.notify_on_bell
                 && s.notification_sound
                 && !s.notify_only_inactive,
             "subordinate notification toggles must be disabled while master notifications is false"
@@ -7029,7 +7161,7 @@ fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notificati
     click(vcx, "font-reset");
     click(vcx, "opacity-reset");
     vcx.update(|_, cx| {
-        assert_eq!(current(cx).terminal_font_size(), 13);
+        assert_eq!(current(cx).terminal_font_size(), DEFAULT_TERMINAL_FONT_SIZE);
         assert_eq!(current(cx).terminal_opacity_pct(), 100);
     });
 
@@ -8475,100 +8607,6 @@ fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
     fs::remove_dir_all(root).unwrap();
 }
 
-/// 아티팩트 탭: 공개 공유 스위치가 게이트 파일을 켜고 끄며, `krill artifacts list --json` 목록을 그리고
-/// 행 삭제가 `krill artifacts delete <slug> --json`으로 전달된다. 오류 봉투는 배너로 보인다.
-#[gpui::test]
-fn artifacts_tab_lists_toggles_gate_and_deletes(cx: &mut TestAppContext) {
-    use std::sync::{Arc, Mutex};
-
-    let d = dir("artifacts-tab");
-    init(cx, &d);
-    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let fail_list = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let run = {
-        let calls = calls.clone();
-        let fail_list = fail_list.clone();
-        space::CliRunner::new(move |args| {
-            let args: Vec<String> = args
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            calls.lock().unwrap().push(args.clone());
-            let out = match args.get(1).map(String::as_str) {
-                Some("list") if fail_list.load(std::sync::atomic::Ordering::SeqCst) => {
-                    r#"{"error":{"code":"http_500","message":"server returned HTTP 500"}}"#
-                }
-                Some("list") => {
-                    r#"{"artifacts":[{"artifact":{"slug":"s1","title":"Report","sourceContentType":"text/markdown","expiresAt":"2026-12-01T00:00:00Z"},"shareUrl":"https://share.krill.page/a/s1"},{"artifact":{"slug":"s2","originalFileName":"page.html"},"shareUrl":"https://share.krill.page/a/s2"}]}"#
-                }
-                Some("delete") => r#"{"deleted":true,"slug":"s1"}"#,
-                _ => "{}",
-            };
-            Ok(out.as_bytes().to_vec())
-        })
-    };
-
-    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(1200.), px(2000.)));
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            v.set_artifacts_runner(run, cx);
-            v.set_tab(AdminTab::Artifacts, cx);
-        });
-        window.draw(cx).clear(cx);
-    });
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
-    for selector in [
-        "admin-tab-artifacts",
-        "admin-artifacts-sharing",
-        "admin-artifacts-howto",
-        "admin-artifacts-list",
-        "admin-artifact-row-s1",
-        "admin-artifact-row-s2",
-        "admin-artifact-delete-s1",
-    ] {
-        assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
-    }
-    assert!(vcx.debug_bounds("admin-artifacts-error").is_none());
-    assert_eq!(calls.lock().unwrap()[0], ["artifacts", "list", "--json"]);
-
-    // 공개 공유 스위치 = 상태 디렉터리 게이트 파일.
-    let gate = d.join(krill_proto::artifacts::SHARING_ENABLED_FILE);
-    assert!(!gate.exists());
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_artifact_sharing(true, cx)));
-    assert!(gate.is_file());
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_artifact_sharing(false, cx)));
-    assert!(!gate.exists());
-
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.delete_artifact("s1".into(), cx)));
-    vcx.run_until_parked();
-    assert!(
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c == &["artifacts", "delete", "s1", "--json"])
-    );
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert_eq!(v.artifacts.items.len(), 1);
-        assert_eq!(v.artifacts.items[0].artifact.slug, "s2");
-        assert!(v.artifacts.notice.as_ref().unwrap().contains("Report"));
-    });
-
-    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
-    vcx.update(|window, cx| {
-        view.update(cx, SettingsView::refresh_artifacts);
-        window.draw(cx).clear(cx);
-    });
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(vcx.debug_bounds("admin-artifacts-error").is_some());
-
-    fs::remove_dir_all(d).ok();
-}
-
 /// 앱 테마 선택: 누르면 바로 팔레트가 바뀌고 저장되며, 짝 터미널 테마는 사용자가 바꾸지 않았을 때만 따라 바뀐다.
 #[gpui::test]
 fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
@@ -8656,4 +8694,28 @@ fn workflow_repo_candidates_keep_only_absolute_paths() {
         .into_iter()
         .collect();
     assert_eq!(got, vec!["/repo/alpha".to_owned(), "/repo/beta".to_owned()]);
+}
+
+#[test]
+fn orca_option_auto_preserves_explicit_legacy_overrides() {
+    assert!(Settings::parse("").unwrap().option_as_meta_auto);
+    let disabled = Settings::parse("option_as_meta = false").unwrap();
+    assert!(!disabled.option_as_meta && !disabled.option_as_meta_auto);
+    let enabled = Settings::parse("option_as_meta = true").unwrap();
+    assert!(enabled.option_as_meta && !enabled.option_as_meta_auto);
+    for id in [
+        "com.apple.keylayout.US",
+        "com.apple.keylayout.ABC",
+        "00000409",
+        "us",
+    ] {
+        assert!(us_keyboard_layout(id));
+    }
+    for id in [
+        "com.apple.keylayout.German",
+        "com.apple.inputmethod.Korean.2SetKorean",
+        "unknown",
+    ] {
+        assert!(!us_keyboard_layout(id));
+    }
 }

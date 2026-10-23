@@ -54,6 +54,8 @@ pub struct Recorder {
     pause_epoch: u64,
     snapshots: Snapshots,
     generation: u64,
+    /// Reused only for record encoding; never retains privacy-sensitive data between writes.
+    encoded: Vec<u8>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -91,6 +93,7 @@ impl Recorder {
                 Snapshots::Allowed
             },
             generation,
+            encoded: Vec::new(),
         };
         if !store.recording {
             return Ok(rec);
@@ -365,11 +368,14 @@ impl Recorder {
         let Some(open) = &mut self.open else {
             return Err(io::ErrorKind::NotFound.into());
         };
-        let mut buf = Vec::new();
+        self.encoded.clear();
         for r in recs {
-            r.encode_into(&mut buf);
+            r.encode_into(&mut self.encoded);
         }
-        open.enc.write_all(&buf)?;
+        let written = open.enc.write_all(&self.encoded);
+        self.encoded.fill(0);
+        self.encoded.clear();
+        written?;
         open.enc.flush()?;
         if let Some(crypto) = &mut open.crypto {
             crypto.seal(open.enc.get_mut())?;

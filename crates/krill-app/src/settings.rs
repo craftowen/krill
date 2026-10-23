@@ -24,6 +24,8 @@ use crate::ui::{DarkUiTheme, LightUiTheme};
 
 pub use crate::i18n::Language;
 
+mod locale;
+
 const SETTINGS_FILE: &str = "settings.toml";
 const KEYS_FILE: &str = "keys.toml";
 /// gpui 창의 기본 rem 크기. 줌 1.0일 때 값.
@@ -41,13 +43,13 @@ actions!(
     [OpenSettings, ZoomIn, ZoomOut, ZoomReset, FocusSearch]
 );
 
-/// 테마 선택. 기본값은 Orca와 동일한 `Dark`이며, `System`은 적용 시점의 macOS 모양을 따른다.
+/// 테마 선택. 기본값은 Orca와 동일한 `System`이며, `System`은 적용 시점의 macOS 모양을 따른다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeChoice {
+    #[default]
     System,
     Light,
-    #[default]
     Dark,
 }
 
@@ -57,10 +59,10 @@ pub enum ThemeChoice {
 pub enum KeepAwake {
     /// 앱이 켜져 있는 동안 항상 유휴 잠자기 방지.
     On,
-    /// `working` 상태인 세션이 하나라도 있을 때만 유휴 잠자기 방지(기본값).
-    #[default]
+    /// `working` 상태인 세션이 하나라도 있을 때만 유휴 잠자기 방지.
     Agent,
-    /// 잠자기 방지를 쓰지 않음.
+    /// 잠자기 방지를 쓰지 않음(기본값).
+    #[default]
     Off,
 }
 
@@ -77,6 +79,7 @@ pub struct Settings {
     pub ui_theme_dark: crate::ui::DarkUiTheme,
     /// 라이트 모드에서 쓸 앱 색 조합.
     pub ui_theme_light: crate::ui::LightUiTheme,
+    /// Saved choices win; an absent key uses the OS preferred language (ko, otherwise en).
     pub language: Language,
     /// UI 배율(1.0 = 100%). 적용할 때 `ZOOM_MIN..=ZOOM_MAX`로 자른다.
     /// 레거시 `zoom` 키는 첫 로드 시 `terminal_font_size`로 이관하고 `ui_zoom = 1.0`으로 초기화한다(OWE-843).
@@ -93,7 +96,7 @@ pub struct Settings {
     pub copy_context_lines: u16,
     /// 저장 명령·프롬프트(MK-092). 클릭하면 실행 키 없이 붙여넣는다.
     pub quick_commands: Vec<crate::commands::QuickCommand>,
-    /// 터미널 글꼴 크기(10..=24pt, 기본 13).
+    /// 터미널 글꼴 크기(10..=24pt, 기본 14).
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: u8,
     /// 코드 에디터 글꼴 크기(8..=32pt, 기본 12, OWE-843).
@@ -109,12 +112,15 @@ pub struct Settings {
     /// 프로그램이 커서 모양을 지정하지 않았을 때의 기본 커서(기본 블록, OWE-658).
     #[serde(default)]
     pub terminal_cursor_shape: TerminalCursorShape,
-    /// 기본 커서 깜박임(기본 끔, OWE-658). 프로그램이 지정하지 않았을 때만 쓴다.
-    #[serde(default)]
+    /// 기본 커서 깜박임(기본 켬). 프로그램이 지정하지 않았을 때만 쓴다.
+    #[serde(default = "default_true")]
     pub terminal_cursor_blink: bool,
     /// Option+글자 키를 ESC+글자(Meta)로 보낸다(기본 끔, OWE-658).
     #[serde(default)]
     pub option_as_meta: bool,
+    /// 미국식 키보드 레이아웃에서 Option을 Meta로 자동 설정한다. 기존 명시값은 수동으로 이관한다.
+    #[serde(default = "default_true")]
+    pub option_as_meta_auto: bool,
     /// 마우스로 선택을 마치면 바로 클립보드에 복사한다(기본 끔, OWE-658).
     #[serde(default)]
     pub copy_on_select: bool,
@@ -130,8 +136,8 @@ pub struct Settings {
     /// 작업 완료 알림(기본 켬, OWE-659).
     #[serde(default = "default_true")]
     pub notify_on_done: bool,
-    /// 터미널 벨 알림(기본 켬, OWE-659).
-    #[serde(default = "default_true")]
+    /// 터미널 벨 알림(기본 끔).
+    #[serde(default)]
     pub notify_on_bell: bool,
     /// 기본 에이전트 ID(기본 `"claude"`).
     #[serde(default = "default_agent_id")]
@@ -154,8 +160,8 @@ pub struct Settings {
     /// 새 버전 스테이징 완료 시 자동으로 앱을 재시작해 적용(기본 false, MK-156).
     #[serde(default)]
     pub auto_restart_update: bool,
-    /// Claude 프롬프트 캐시 카운트다운 표시 켜기/끄기(기본 true, OWE-737).
-    #[serde(default = "default_true")]
+    /// Claude 프롬프트 캐시 카운트다운 표시 켜기/끄기(기본 false).
+    #[serde(default)]
     pub prompt_cache_timer_enabled: bool,
     /// Claude 프롬프트 캐시 TTL(초, 기본 300초 = 5분, OWE-737).
     #[serde(default = "default_prompt_cache_ttl_secs")]
@@ -186,7 +192,7 @@ pub struct Settings {
     pub terminal_custom_themes: Vec<crate::ui::CustomTerminalTheme>,
 }
 
-pub const DEFAULT_TERMINAL_FONT_SIZE: u8 = 13;
+pub const DEFAULT_TERMINAL_FONT_SIZE: u8 = 14;
 pub const TERMINAL_FONT_SIZE_MIN: u8 = 10;
 pub const TERMINAL_FONT_SIZE_MAX: u8 = 24;
 
@@ -256,13 +262,13 @@ fn default_agent_id() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::Dark,
+            theme: ThemeChoice::System,
             ui_theme_dark: crate::ui::DarkUiTheme::Deep,
             ui_theme_light: crate::ui::LightUiTheme::Classic,
-            language: Language::Ko,
+            language: locale::system_language(),
             zoom: 1.0,
             notifications: true,
-            keep_awake: KeepAwake::Agent,
+            keep_awake: KeepAwake::Off,
             webhooks: Vec::new(),
             copy_context_lines: 100,
             quick_commands: Vec::new(),
@@ -271,14 +277,15 @@ impl Default for Settings {
             terminal_opacity_pct: 100,
             terminal_font_family: default_terminal_font_family(),
             terminal_cursor_shape: TerminalCursorShape::Block,
-            terminal_cursor_blink: false,
+            terminal_cursor_blink: true,
             option_as_meta: false,
+            option_as_meta_auto: true,
             copy_on_select: false,
             notification_sound: true,
             notify_only_inactive: false,
             notify_on_input: true,
             notify_on_done: true,
-            notify_on_bell: true,
+            notify_on_bell: false,
             default_agent: "claude".to_owned(),
             yolo_mode: true,
             hibernation_enabled: false,
@@ -286,7 +293,7 @@ impl Default for Settings {
             recording_paused: false,
             secure_keyboard_entry: false,
             auto_restart_update: false,
-            prompt_cache_timer_enabled: true,
+            prompt_cache_timer_enabled: false,
             prompt_cache_ttl_secs: DEFAULT_PROMPT_CACHE_TTL_SECS,
             auto_rename_branch_from_work: true,
             confirm_running_close: true,
@@ -328,6 +335,11 @@ impl Settings {
     }
 
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
+        Self::parse_with_language(s, locale::system_language())
+    }
+
+    /// Inject the first-launch choice so parsing regressions do not depend on the host locale.
+    fn parse_with_language(s: &str, default_language: Language) -> Result<Self, toml::de::Error> {
         let mut parsed: Self = toml::from_str(s)?;
         parsed.terminal_font_size = parsed
             .terminal_font_size
@@ -344,6 +356,12 @@ impl Settings {
             parsed.terminal_theme_light = default_terminal_theme_light();
         }
         let table: toml::Table = toml::from_str(s)?;
+        if !table.contains_key("language") {
+            parsed.language = default_language;
+        }
+        if table.contains_key("option_as_meta") && !table.contains_key("option_as_meta_auto") {
+            parsed.option_as_meta_auto = false;
+        }
         if !table.contains_key("ui_zoom")
             && let Some(val) = table.get("zoom")
         {
@@ -361,12 +379,18 @@ impl Settings {
             )]
             let z = (raw as f32).clamp(ZOOM_MIN, ZOOM_MAX);
             if z.is_finite() && (z - 1.0).abs() > f32::EPSILON {
+                // 옛 zoom의 기준은 13pt다. 기본값 변경으로 기존 사용자 크기를 다시 바꾸지 않는다.
+                let legacy_font = if table.contains_key("terminal_font_size") {
+                    parsed.terminal_font_size
+                } else {
+                    13
+                };
                 #[expect(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
                     reason = "10..=24 * 0.5..=2.0 반올림은 양수 u8 범위 내"
                 )]
-                let migrated = (f32::from(parsed.terminal_font_size) * z).round() as u8;
+                let migrated = (f32::from(legacy_font) * z).round() as u8;
                 parsed.terminal_font_size =
                     migrated.clamp(TERMINAL_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX);
             }
@@ -569,7 +593,6 @@ impl Global for Config {}
 
 fn own_bindings() -> Vec<KeyBinding> {
     vec![
-        crate::keys::bind("cmd-,", OpenSettings, None),
         crate::keys::bind("cmd-=", ZoomIn, None),
         crate::keys::bind("cmd-+", ZoomIn, None),
         crate::keys::bind("cmd--", ZoomOut, None),
@@ -922,6 +945,17 @@ pub fn init(cx: &mut App) {
 
 /// `dir`의 설정으로 초기화한다(테스트는 임시 디렉터리를 준다).
 pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
+    init_at_with_language(dir, locale::system_language(), cx);
+}
+
+fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App) {
+    let settings = Settings {
+        language,
+        ..Settings::default()
+    };
+    // The disk read is asynchronous; render the first window in the OS language
+    // until a saved selection arrives, rather than the catalog's bootstrap language.
+    crate::i18n::set_language(settings.language, cx);
     let mut defaults: Vec<_> = cx.key_bindings().borrow().bindings().cloned().collect();
     for b in own_bindings() {
         if !defaults
@@ -932,9 +966,9 @@ pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
         }
     }
     cx.set_global(Config {
-        settings: Settings::default(),
+        settings: settings.clone(),
         initial_loaded: false,
-        durable: Settings::default(),
+        durable: settings,
         epoch: next_revision(),
         revision: next_revision(),
         error: None,
@@ -1245,8 +1279,22 @@ pub fn terminal_cursor(cx: &App) -> krill_proto::screen::CursorStyle {
 
 /// Option+키를 Meta(ESC+키)로 보낼지(OWE-658). `init` 전이면 false.
 pub fn option_as_meta(cx: &App) -> bool {
-    cx.try_global::<Config>()
-        .is_some_and(|c| c.settings.option_as_meta)
+    let Some(config) = cx.try_global::<Config>() else {
+        return false;
+    };
+    config.settings.option_as_meta
+        || (config.settings.option_as_meta_auto && us_keyboard_layout(cx.keyboard_layout().id()))
+}
+
+fn us_keyboard_layout(id: &str) -> bool {
+    matches!(
+        id,
+        "com.apple.keylayout.US"
+            | "com.apple.keylayout.ABC"
+            | "com.apple.keylayout.USExtended"
+            | "00000409"
+            | "us"
+    )
 }
 
 /// 선택을 마치면 바로 복사할지(OWE-658). `init` 전이면 false.
@@ -1453,7 +1501,7 @@ fn apply(cx: &mut App) {
 /// 설정을 고쳐 바로 적용하고 `settings.toml`에 쓴다. 디스크의 유효한 최신 파일을
 /// 바탕으로 변경을 적용해 1초 폴링 전 외부 편집이 메모리 설정으로 덮어쓰기되지 않게 한다.
 /// 디스크 파일이 손상됐거나 읽을 수 없으면 쓰지 않고 오류만 남긴다.
-fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
+pub(crate) fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
     let c = cx.global::<Config>();
     let Some(dir) = c.dir.clone() else {
         cx.global_mut::<Config>().error = Some(text::NO_STATE_DIR.get().into());
@@ -1865,15 +1913,13 @@ pub enum AdminTab {
     Shortcuts,
     Resources,
     Mobile,
-    /// HTML·Markdown 공개 링크 공유(`krill artifacts`).
-    Artifacts,
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
 gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor]);
 
 impl AdminTab {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::General,
         Self::Terminal,
         Self::Accounts,
@@ -1883,7 +1929,6 @@ impl AdminTab {
         Self::Workflows,
         Self::Shortcuts,
         Self::Mobile,
-        Self::Artifacts,
         Self::Resources,
     ];
 
@@ -1899,7 +1944,6 @@ impl AdminTab {
             Self::Shortcuts => "admin-tab-shortcuts",
             Self::Resources => "admin-tab-resources",
             Self::Mobile => "admin-tab-mobile",
-            Self::Artifacts => "admin-tab-artifacts",
         }
     }
 
@@ -1915,7 +1959,6 @@ impl AdminTab {
             Self::Shortcuts => text::TAB_SHORTCUTS.get(),
             Self::Resources => text::TAB_RESOURCES.get(),
             Self::Mobile => crate::i18n::catalog::mobile::TAB.get(),
-            Self::Artifacts => crate::i18n::catalog::artifacts::TAB.get(),
         }
     }
 
@@ -1931,7 +1974,6 @@ impl AdminTab {
             Self::Shortcuts => text::SHORTCUTS_DESC,
             Self::Resources => text::TAB_RESOURCES_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
-            Self::Artifacts => crate::i18n::catalog::artifacts::TAB_DESC,
         }
     }
 
@@ -1953,7 +1995,6 @@ impl AdminTab {
             Self::Shortcuts => IconName::Keyboard,
             Self::Resources => IconName::CircleCheck,
             Self::Mobile => IconName::Smartphone,
-            Self::Artifacts => IconName::Globe,
         }
     }
 
@@ -2555,7 +2596,6 @@ pub struct SettingsView {
     workflow_form: Option<WorkflowRepoForm>,
     /// 워크스페이스 디스크 용량 분석(Space) 및 워크트리 일괄 클린업 패널(MK-175·OWE-729).
     space: space::Panel,
-    artifacts: artifacts::Panel,
     /// 스케줄 추가/편집 모달 상태(OWE-740).
     schedule_modal: Option<schedules::ScheduleModal>,
     schedule_form_generation: u64,
@@ -2822,7 +2862,6 @@ impl SettingsView {
             shortcuts: shortcuts::Recorder::default(),
             workflow_form: None,
             space: space::Panel::default(),
-            artifacts: artifacts::Panel::default(),
             schedule_modal: None,
             schedule_form_generation: 0,
             schedule_log_generation: 0,
@@ -3097,9 +3136,6 @@ impl SettingsView {
         if tab == AdminTab::Mobile {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
             self.mobile_enter(cx);
-        }
-        if tab == AdminTab::Artifacts {
-            self.artifacts_enter(cx);
         }
         if tab == AdminTab::Resources && self.space.report.is_none() && !self.space.scanning {
             self.scan_workspace_space(cx);
@@ -6336,7 +6372,33 @@ impl SettingsView {
                         "option-meta-toggle",
                         s.option_as_meta,
                         false,
-                        |next, _, cx| edit(cx, move |s| s.option_as_meta = next),
+                        |next, _, cx| {
+                            edit(cx, move |s| {
+                                s.option_as_meta = next;
+                                s.option_as_meta_auto = false;
+                            });
+                        },
+                    ))),
+            )
+            .child(
+                row()
+                    .child(label(
+                        text::OPTION_META_AUTO.get(),
+                        text::OPTION_META_AUTO_DESC.get(),
+                    ))
+                    .child(layout::controls().child(layout::switch(
+                        p,
+                        "option-meta-auto",
+                        s.option_as_meta_auto,
+                        false,
+                        |next, _, cx| {
+                            edit(cx, move |s| {
+                                s.option_as_meta_auto = next;
+                                if next {
+                                    s.option_as_meta = false;
+                                }
+                            });
+                        },
                     ))),
             )
             .child(
@@ -7465,7 +7527,8 @@ impl SettingsView {
                 .accounts_snapshot
                 .accounts
                 .iter()
-                .filter(|a| a.provider == provider)
+                // Orca 캐시 감지 행은 실행할 프로필이 없으므로 계정 목록에 노출하지 않는다.
+                .filter(|a| a.provider == provider && !crate::accounts::orca_managed(a))
                 .cloned()
                 .collect();
             // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
@@ -11356,12 +11419,7 @@ impl Render for SettingsView {
             ),
             (
                 text::GROUP_WORKFLOW.get(),
-                &[
-                    AdminTab::Workflows,
-                    AdminTab::Mobile,
-                    AdminTab::Artifacts,
-                    AdminTab::Resources,
-                ],
+                &[AdminTab::Workflows, AdminTab::Mobile, AdminTab::Resources],
             ),
         ];
 
@@ -11628,7 +11686,6 @@ impl Render for SettingsView {
                 AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),
                 AdminTab::Resources => self.render_resources_tab(&s, cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
-                AdminTab::Artifacts => self.render_artifacts_tab(cx),
             }
             .w_full()
             .min_w_0();
@@ -11771,7 +11828,6 @@ impl Render for SettingsView {
     }
 }
 
-pub mod artifacts;
 pub(crate) mod layout;
 mod mobile;
 pub mod schedules;
@@ -11781,3 +11837,30 @@ pub mod space;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+pub fn usage_color(pct: u8, normal: gpui::Hsla, p: &crate::ui::Palette) -> gpui::Hsla {
+    match usage_tone(pct) {
+        UsageTone::Critical => p.destructive,
+        UsageTone::Warn => p.warning,
+        UsageTone::Normal => normal,
+    }
+}
+
+/// 사용률 단계. 색 판정과 테스트가 공유한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageTone {
+    Normal,
+    Warn,
+    Critical,
+}
+
+#[must_use]
+pub fn usage_tone(pct: u8) -> UsageTone {
+    if pct >= krill_proto::usage::CRITICAL_PERCENT {
+        UsageTone::Critical
+    } else if pct >= krill_proto::usage::WARN_PERCENT {
+        UsageTone::Warn
+    } else {
+        UsageTone::Normal
+    }
+}

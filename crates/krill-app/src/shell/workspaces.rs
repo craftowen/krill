@@ -8,10 +8,10 @@ use std::path::Path;
 #[cfg(all(test, unix))]
 mod tests;
 
-#[derive(Debug, PartialEq, Eq)]
-struct Workspace {
-    host: HostId,
-    folder: PathBuf,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Workspace {
+    pub(super) host: HostId,
+    pub(super) folder: PathBuf,
 }
 
 impl Shell {
@@ -194,7 +194,7 @@ impl Shell {
         }
     }
 
-    fn tab_workspace(&self, index: usize, cx: &App) -> Option<Workspace> {
+    pub(super) fn tab_workspace(&self, index: usize, cx: &App) -> Option<Workspace> {
         let selected = self
             .sidebar
             .read(cx)
@@ -244,6 +244,37 @@ impl Shell {
         Some(Workspace { host, folder })
     }
 
+    pub(super) fn open_workspace_on(
+        &mut self,
+        host: HostId,
+        folder: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let folder = self
+            .sidebar
+            .read(cx)
+            .workspace_for_path_on(&host, &folder)
+            .unwrap_or(folder);
+        self.launch_host = host.clone();
+        let target = self.layout.mru_order().into_iter().find(|&index| {
+            self.tab_workspace(index, cx)
+                .is_some_and(|w| w.host == host && w.folder == folder)
+        });
+        if let Some(index) = target {
+            self.dashboard = None;
+            self.close_settings(None, cx);
+            self.launch_host = host;
+            self.change(true, cx, |l| l.activate(index));
+            return;
+        }
+        let session = self.sidebar.read(cx).session_for_workspace(&host, &folder);
+        if let Some(session) = session {
+            self.open_session_on(host, session, cx);
+        } else {
+            self.new_folder_tab_on(host, &folder, Program::Login, cx);
+        }
+    }
+
     pub(super) fn workspace_tabs(&self, cx: &App) -> Vec<usize> {
         self.tabs_in_workspace(self.layout.active(), cx)
     }
@@ -258,12 +289,41 @@ impl Shell {
     }
 
     pub(super) fn cycle_workspace_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let tabs = self.workspace_tabs(cx);
+        self.cycle_workspace_tab_matching(delta, None, cx);
+    }
+
+    pub(super) fn cycle_workspace_tab_matching(
+        &mut self,
+        delta: isize,
+        editor: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let tabs: Vec<_> = self
+            .workspace_tabs(cx)
+            .into_iter()
+            .filter(|&i| editor.is_none_or(|editor| self.layout.is_editor_tab(i) == editor))
+            .collect();
+        if tabs.is_empty() {
+            return;
+        }
         if let Some(pos) = tabs.iter().position(|&i| i == self.layout.active()) {
             let next = (pos.cast_signed() + delta)
                 .rem_euclid(tabs.len().cast_signed())
                 .cast_unsigned();
             self.change(true, cx, |l| l.activate(tabs[next]));
+        } else {
+            let active = self.layout.active();
+            let next = if delta > 0 {
+                tabs.iter().find(|&&i| i > active).or_else(|| tabs.first())
+            } else {
+                tabs.iter()
+                    .rev()
+                    .find(|&&i| i < active)
+                    .or_else(|| tabs.last())
+            };
+            if let Some(&next) = next {
+                self.change(true, cx, |l| l.activate(next));
+            }
         }
     }
 
@@ -286,6 +346,13 @@ impl Shell {
     ) {
         let tabs = self.workspace_tabs(cx);
         let remaining = std::iter::once(prefer)
+            .filter(|i| !closing.contains(i))
+            .chain(
+                self.layout
+                    .mru_order()
+                    .into_iter()
+                    .filter(|i| tabs.contains(i)),
+            )
             .chain(tabs.iter().copied().filter(|&i| i > prefer))
             .chain(tabs.iter().rev().copied().filter(|&i| i < prefer))
             .find(|i| !closing.contains(i))

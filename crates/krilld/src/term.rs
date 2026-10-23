@@ -379,6 +379,8 @@ impl Engine {
             (TermMode::MOUSE_MOTION, Modes::MOUSE_MOTION),
             (TermMode::SGR_MOUSE, Modes::SGR_MOUSE),
             (TermMode::BRACKETED_PASTE, Modes::BRACKETED_PASTE),
+            (TermMode::ALT_SCREEN, Modes::ALT_SCREEN),
+            (TermMode::ALTERNATE_SCROLL, Modes::ALTERNATE_SCROLL),
         ] {
             if mode.contains(flag) {
                 out.flags |= bit;
@@ -413,6 +415,15 @@ impl Engine {
     /// 핫 스크롤백을 비운다. 보이는 화면·커서·모드는 그대로 둔다(OWE-873b).
     pub(crate) fn clear_history(&mut self) {
         self.term.grid_mut().clear_history();
+    }
+
+    /// Orca/xterm clear처럼 현재 커서 행만 맨 위에 남긴다. PTY나 모드에는 쓰지 않는다.
+    pub(crate) fn clear_viewport(&mut self) {
+        let row = self.term.grid()[self.term.grid().cursor.point.line].clone();
+        ansi::Handler::clear_screen(&mut self.term, ansi::ClearMode::All);
+        self.term.grid_mut()[Line(0)] = row;
+        self.term.grid_mut().cursor.point.line = Line(0);
+        self.clear_history();
     }
 
     /// 스크롤백을 오래된 행부터 꺼내고 비운다. 콜드 페이지 재생이 메모리를 일정하게 두려고 쓴다.
@@ -553,6 +564,32 @@ impl Engine {
         }
         self.capture_cli(krill_proto::control::CaptureFormat::Ansi)
             .map(Some)
+    }
+
+    /// Plain non-empty tail lines, with bounded output and no Cell clones.
+    pub(crate) fn screen_tail(&self, count: usize, chars: usize) -> Vec<String> {
+        let grid = self.term.grid();
+        let mut lines = Vec::new();
+        for row in (0..grid.screen_lines()).rev() {
+            let Ok(row) = i32::try_from(row) else {
+                continue;
+            };
+            let text: String = (0..grid.columns())
+                .map(|col| &grid[Line(row)][alacritty_terminal::index::Column(col)])
+                .filter(|cell| !cell.flags.contains(AFlags::WIDE_CHAR_SPACER))
+                .take(chars)
+                .map(|cell| cell.c)
+                .collect();
+            // Match screen_text(): whitespace is retained in a non-empty line.
+            if !text.trim().is_empty() {
+                lines.push(text);
+            }
+            if lines.len() >= count {
+                break;
+            }
+        }
+        lines.reverse();
+        lines
     }
 
     /// 보이는 화면을 줄마다 평문으로(진단·테스트용, 색·속성 없음).

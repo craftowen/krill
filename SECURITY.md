@@ -1,29 +1,36 @@
-# Security Policy
+# Security policy
 
-## 지원하는 버전
+[한국어](SECURITY.ko.md)
 
-| 버전 | 지원 여부 |
-|------|-----------|
-| `main` 최신 | 지원 |
-| 릴리스 태그 (첫 릴리스 이후) | 최신 태그만 지원 |
+## Supported versions
 
-첫 정식 릴리스 전까지는 `main` 최신만 본다.
+| Version | Support |
+|---|---|
+| Latest `main` | Supported |
+| Release tags (after the first release) | Latest tag only |
 
-## 신고 방법
+Before the first formal release, only the latest `main` is supported.
 
-취약점을 공개 이슈·PR·토론에 올리지 않는다. 저장소 소유자에게 비공개로 연락하고, 다음을 포함한다:
+## Report a vulnerability privately
 
-- 영향 범위 (어떤 바이너리·어떤 입력에서)
-- 재현 절차 (명령·입력·환경: macOS 버전·rustc 버전)
-- 실제 영향 (임의 코드 실행·세션 탈취·민감정보 유출 등)
+Use [GitHub's private vulnerability report form](https://github.com/craftowen/krill/security/advisories/new). Private vulnerability reporting was enabled and verified in this repository's settings on **2026-10-23**.
 
-신고 응답 목표는 7일 이내다. 수정이 릴리스되기 전까지 세부 사항 공개를 미뤄준다.
+If the form is disabled or unavailable, [open an issue asking the owner for a private contact method](https://github.com/craftowen/krill/issues/new?template=feature_request.md&title=Private%20security%20contact%20request). Include only that request. Do **not** include the vulnerability, reproduction steps, affected inputs, logs, or exploit details in that public issue. Wait for a private channel before sending the report. Do not disclose vulnerabilities in public issues, pull requests, or discussions.
 
-## 범위·제외
+In the private report, include:
 
-- 범위: `crates/` Rust 코드, `packaging/install.sh`·`packaging/release.sh`, GitHub Actions 워크플로.
-- Known limitations: ad-hoc 서명·미공증 상태에서는 Gatekeeper 우회 설치를 권한 상승 취약점으로 보지 않는다. 대신 [README.md](README.md)의 소스 빌드를 쓴다.
+- Affected binary/component and input.
+- Reproduction commands and environment: Krill commit/tag, OS version and architecture, and Rust version for source builds.
+- Actual impact, such as code execution, session takeover, or exposure of sensitive information.
 
-## 비밀 취급
+The response target is **within 7 days**. Please delay disclosure of technical details until a fix has been released.
 
-Krill은 진단 번들·크래시 로그의 비밀을 `[REDACTED]`로 가린다(`crates/krill-proto/src/diag.rs` 규칙). 가려야 할 패턴이 새는 것을 발견하면 보안 신고로 다뤄준다. 업데이터 배포 서명 개인키는 저장소에 절대 커밋하지 않는다.
+## Scope and limitations
+
+In scope: Rust code in `crates/`, `packaging/install.sh`, `packaging/release.sh`, and GitHub Actions workflows.
+
+Known limitation: the documented Gatekeeper bypass used to install a locally/ad-hoc signed, unnotarized macOS build is not itself treated as a privilege-escalation vulnerability. Use the [source-build path](docs/GETTING_STARTED.md#build-from-source-on-macos) if you prefer to build locally. This does not exclude unrelated installer or updater vulnerabilities.
+
+## Secrets and diagnostics
+
+Krill applies redaction rules to diagnostic bundles and crash logs (`[REDACTED]`; see [the diagnostic implementation](crates/krill-proto/src/diag.rs)). Review logs and bundles before sharing them; redaction is not a guarantee that every secret is removed. Treat a missed sensitive pattern as a security report. Never commit the updater's distribution-signing private key.

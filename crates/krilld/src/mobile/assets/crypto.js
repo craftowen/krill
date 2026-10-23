@@ -31,16 +31,16 @@ const MkCrypto=(()=>{
   const out=new Uint8Array(64),view=new DataView(out.buffer);for(let i=0;i<16;i++)view.setUint32(i*4,(x[i]+state[i])>>>0,true);return out;
  }
  function xor(key,nonce,data){const out=new Uint8Array(data.length);for(let at=0;at<data.length;at+=64){const stream=chacha(key,nonce,1+at/64);for(let i=0;i<Math.min(64,data.length-at);i++)out[at+i]=data[at+i]^stream[i];}return out;}
- function poly1305(key,data){const r=bigint(key.slice(0,16))&0x0ffffffc0ffffffc0ffffffc0fffffffn,s=bigint(key.slice(16,32)),p=(1n<<130n)-5n;let a=0n;for(let at=0;at<data.length;at+=16){let part=data.slice(at,at+16);a=((a+bigint(part)+(1n<<BigInt(part.length*8)))*r)%p;}return le((a+s)&((1n<<128n)-1n),16);}
+ function poly1305(key,data){const r=bigint(key.subarray(0,16))&0x0ffffffc0ffffffc0ffffffc0fffffffn,s=bigint(key.subarray(16,32)),p=(1n<<130n)-5n;let a=0n;for(let at=0;at<data.length;at+=16){let part=data.subarray(at,at+16);a=((a+bigint(part)+(1n<<BigInt(part.length*8)))*r)%p;}return le((a+s)&((1n<<128n)-1n),16);}
  const pad=b=>new Uint8Array((16-b.length%16)%16);
- const tag=(key,nonce,aad,data)=>poly1305(chacha(key,nonce,0).slice(0,32),concat(aad,pad(aad),data,pad(data),le(aad.length),le(data.length)));
+ const tag=(key,nonce,aad,data)=>poly1305(chacha(key,nonce,0).subarray(0,32),concat(aad,pad(aad),data,pad(data),le(aad.length),le(data.length)));
  const hex=b=>Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');
  const unhex=s=>{if(!/^[0-9a-f]{64}$/i.test(s))throw Error('Invalid key');return Uint8Array.from(s.match(/../g),v=>parseInt(v,16));};
  const unbase64=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
  class Channel {
   constructor(secret,salt,client=true){this.tx=hkdf(secret,salt,client?'mk-mobile-v2/client-to-daemon':'mk-mobile-v2/daemon-to-client');this.rx=hkdf(secret,salt,client?'mk-mobile-v2/daemon-to-client':'mk-mobile-v2/client-to-daemon');this.txPrefix=enc.encode(client?'MKC2':'MKD2');this.rxPrefix=enc.encode(client?'MKD2':'MKC2');this.sequence=0n;this.received=-1n;}
   seal(plain){if(this.sequence>0xffffffffffffffffn||plain.length>1048580)throw Error('Frame limit');const seq=le(this.sequence++),nonce=concat(this.txPrefix,seq),body=xor(this.tx,nonce,plain);return concat(seq,body,tag(this.tx,nonce,seq,body));}
-  open(frame){frame=new Uint8Array(frame);if(frame.length<24||frame.length>1048604)throw Error('Frame size');const seq=frame.slice(0,8),number=bigint(seq);if(number<=this.received)throw Error('Replay rejected');const nonce=concat(this.rxPrefix,seq),body=frame.slice(8,-16),expected=tag(this.rx,nonce,seq,body);let different=0;for(let i=0;i<16;i++)different|=expected[i]^frame[frame.length-16+i];if(different)throw Error('Authentication failed');this.received=number;return xor(this.rx,nonce,body);}
+  open(frame){frame=new Uint8Array(frame);if(frame.length<24||frame.length>1048604)throw Error('Frame size');const seq=frame.subarray(0,8),number=bigint(seq);if(number<=this.received)throw Error('Replay rejected');const nonce=concat(this.rxPrefix,seq),body=frame.subarray(8,-16),expected=tag(this.rx,nonce,seq,body);let different=0;for(let i=0;i<16;i++)different|=expected[i]^frame[frame.length-16+i];if(different)throw Error('Authentication failed');this.received=number;return xor(this.rx,nonce,body);}
  }
  return {sha256,hmac,hkdf,Channel,concat,hex,unhex,unbase64,enc};
 })();

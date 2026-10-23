@@ -195,6 +195,14 @@ done
 cp -X "$root/packaging/macos/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 [ -f "$root/packaging/macos/krill-chime.caf" ] || fail "missing sound: $root/packaging/macos/krill-chime.caf"
 cp -X "$root/packaging/macos/krill-chime.caf" "$app/Contents/Resources/krill-chime.caf"
+# Standard macOS InfoPlist localization; retain Korean plist fallback values.
+for language in en ko; do
+    strings="$root/packaging/macos/$language.lproj/InfoPlist.strings"
+    [ -f "$strings" ] || fail "missing localization: $strings"
+    /usr/bin/plutil -lint "$strings"
+    mkdir -p "$app/Contents/Resources/$language.lproj"
+    cp -X "$strings" "$app/Contents/Resources/$language.lproj/InfoPlist.strings"
+done
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -204,6 +212,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleName</key><string>Krill</string>
     <key>CFBundleDisplayName</key><string>Krill</string>
+    <key>CFBundleDevelopmentRegion</key><string>ko</string>
+    <key>CFBundleLocalizations</key><array><string>en</string><string>ko</string></array>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>

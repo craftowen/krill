@@ -277,6 +277,18 @@ fn requests(
                 };
                 conn.send(&InputAck { id: i.id, result }.encode()?)?;
             }
+            (search::kind::SEARCH_OPTIONS, Stream::Screen { .. })
+                if features & (FEAT_SEARCH | search::FEAT_SEARCH_OPTIONS)
+                    == (FEAT_SEARCH | search::FEAT_SEARCH_OPTIONS) =>
+            {
+                let req = search::SearchOptionsRequest::decode(k, &body)?;
+                if search.is_none() {
+                    search = Some(search_worker::Worker::start(tap.clone(), Arc::clone(conn))?);
+                }
+                if let Some(worker) = &search {
+                    worker.submit_options(req);
+                }
+            }
             (search::kind::SEARCH, Stream::Screen { .. }) if features & FEAT_SEARCH != 0 => {
                 let req = SearchRequest::decode(k, &body)?;
                 if search.is_none() {
@@ -284,6 +296,19 @@ fn requests(
                 }
                 if let Some(worker) = &search {
                     worker.submit(req);
+                }
+            }
+            (krill_proto::term_modes::CLEAR_VIEWPORT, Stream::Screen { .. })
+                if features & krill_proto::term_modes::FEAT_CLEAR_VIEWPORT != 0 =>
+            {
+                krill_proto::term_modes::ClearViewport::decode(k, &body)?;
+                if client.can_modify() {
+                    if let Some(worker) = &history {
+                        worker.invalidate();
+                    }
+                    tap.clear_viewport();
+                } else {
+                    conn.send(&Refused::BadRequest.encode()?)?;
                 }
             }
             (kind::RESYNC, Stream::Screen { .. }) => {
@@ -404,7 +429,7 @@ fn screen_loop(
         }
         ops
     };
-    let (mut sent, rev, seq, mut modes) = tap.capture_with_modes();
+    let (mut sent, rev, seq, mut modes) = tap.capture_shared_with_modes();
     if modes_enabled {
         conn.send(&modes.encode()?)?;
     }
@@ -431,7 +456,7 @@ fn screen_loop(
         if !wait.is_zero() {
             thread::sleep(wait);
         }
-        let (next, rev, seq, next_modes) = tap.capture_with_modes();
+        let (next, rev, seq, next_modes) = tap.capture_shared_with_modes();
         // 전송할 변경이 없어도 계산 시도는 제한한다. sync/제어열만 이어질 때
         // 마지막 전송 시각만 쓰면 매 PTY batch마다 전체 화면을 비교하게 된다.
         clock.mark(Instant::now());
@@ -630,37 +655,57 @@ fn row_hash(r: &[Cell]) -> u64 {
 
 /// 행 해시가 가장 많이 맞는 이동량. 이동 없음보다 엄격히 많이 맞을 때만 이동한다. 빈 행끼리는 세지 않는다
 /// (빈 화면 아래쪽이 우연히 맞아 이동을 고르지 않게).
-// ponytail: 이동량마다 전체 행을 비교해 O(행²)(50행 2,500회 비교). 화면 행이 수백이 되면 위·아래 앵커 행으로 후보를 줄인다.
+// Scroll is only a compression hint: a bounded anchor set avoids a quadratic shift
+// search on tall grids. Every scored row is compared exactly after its hash matches.
 fn best_shift(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> i16 {
-    let hp: Vec<Option<u64>> = prev
-        .iter()
-        .map(|r| (!r.is_empty()).then(|| row_hash(r)))
-        .collect();
-    let hn: Vec<Option<u64>> = next
-        .iter()
-        .map(|r| (!r.is_empty()).then(|| row_hash(r)))
-        .collect();
-    let len = hp.len();
-    let score = |up: bool, k: usize| {
+    let hp: Vec<u64> = prev.iter().map(|r| row_hash(r)).collect();
+    let hn: Vec<u64> = next.iter().map(|r| row_hash(r)).collect();
+    let len = prev.len().min(next.len());
+    if len == 0 {
+        return 0;
+    }
+    let mut candidates = std::collections::BTreeSet::from([0i16]);
+    // Up to eight evenly spaced anchors, with at most eight matches per anchor.
+    for anchor in 0..8usize.min(len) {
+        let row = anchor * (len - 1) / 7usize.min(len.saturating_sub(1)).max(1);
+        let Some(next_row) = next.get(row) else {
+            continue;
+        };
+        if next_row.is_empty() {
+            continue;
+        }
+        for (old, _) in hp
+            .iter()
+            .enumerate()
+            .filter(|(old, hash)| hn.get(row) == Some(*hash) && prev.get(*old) == Some(next_row))
+            .take(8)
+        {
+            if let Ok(n) =
+                i16::try_from(old).and_then(|old| i16::try_from(row).map(|row| old - row))
+            {
+                candidates.insert(n);
+            }
+        }
+    }
+    let score = |n: i16| {
+        let k = usize::from(n.unsigned_abs());
         (0..len.saturating_sub(k))
             .filter(|&i| {
-                let (a, b) = if up {
-                    (hn.get(i), hp.get(i + k))
-                } else {
-                    (hn.get(i + k), hp.get(i))
-                };
-                matches!((a, b), (Some(Some(x)), Some(Some(y))) if x == y)
+                let (a, b) = if n >= 0 { (i + k, i) } else { (i, i + k) };
+                prev.get(a).zip(next.get(b)).is_some_and(|(old, new)| {
+                    !old.is_empty() && hp.get(a) == hn.get(b) && old == new
+                })
             })
             .count()
     };
-    let mut best = (score(true, 0), 0i16);
-    for k in 1..len {
-        let Ok(n) = i16::try_from(k) else { break };
-        for (up, n) in [(true, n), (false, -n)] {
-            let s = score(up, k);
-            if s > best.0 {
-                best = (s, n);
-            }
+    let mut best = (score(0), 0);
+    // Preserve the original preference: smaller magnitude, then upward scrolling.
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_by_key(|n| (n.unsigned_abs(), *n < 0));
+    for n in candidates {
+        let matched = score(n);
+        if matched > best.0 {
+            best = (matched, n);
         }
     }
     best.1

@@ -97,6 +97,54 @@ fn linked_input_is_sent_once_and_acked() {
 }
 
 #[test]
+fn reports_are_ephemeral_and_do_not_acknowledge_newer_typing() {
+    let now = Now::get();
+    let mut j = Journal::new();
+    assert!(j.report(b"\x1b[<35;19;42M").is_none());
+    assert_eq!(j.held_bytes(), 0);
+    j.relink(Incarnation::Same, now);
+    let report = j.report(b"\x1b[<35;19;42M").unwrap();
+    assert!(!j.has_pending_input());
+    assert!(!j.stalled(at(now, 10)));
+    let typing = j.input(b"prompt\r", now).unwrap();
+    assert!(report.id < typing[0].id);
+    for result in [
+        InputResult::Applied,
+        InputResult::Closed,
+        InputResult::Denied,
+    ] {
+        assert_eq!(
+            j.ack(&InputAck {
+                id: report.id,
+                result
+            }),
+            None
+        );
+    }
+    assert_eq!(j.unlink().unwrap().bytes, b"prompt\r");
+    assert!(j.relink(Incarnation::Same, now).0.is_empty());
+    j.report(b"\x1b[<0;19;42M").unwrap();
+    assert_eq!(j.unlink(), None);
+}
+
+#[test]
+fn paused_reports_leave_the_entire_hold_budget_for_typing() {
+    let now = Now::get();
+    let mut j = Journal::new();
+    j.relink(Incarnation::Same, now);
+    j.pause();
+    for _ in 0..2_000 {
+        assert!(j.report(b"\x1b[<35;19;42M").is_none());
+    }
+    let prompt = vec![b'x'; HOLD_MAX];
+    assert!(j.input(&prompt, now).unwrap().is_empty());
+    let (frames, notices) = j.relink(Incarnation::Same, now);
+    assert!(notices.is_empty());
+    assert_eq!(concat(&frames), prompt);
+    assert_eq!(ids(&frames), [1]);
+}
+
+#[test]
 fn big_paste_is_split() {
     let now = Now::get();
     let mut j = Journal::new();
@@ -286,4 +334,36 @@ proptest::proptest! {
         Input::decode(kind::INPUT, &bytes).ok();
         InputAck::decode(kind::INPUT_ACK, &bytes).ok();
     }
+}
+
+#[test]
+fn report_ack_does_not_discard_earlier_unacknowledged_typing() {
+    let now = Now::get();
+    let mut journal = Journal::new();
+    journal.relink(Incarnation::Same, now);
+    let typing = journal.input(b"keep me", now).unwrap();
+    let report = journal.report(b"\x1b[<35;89;50M").unwrap();
+    for result in [
+        InputResult::Applied,
+        InputResult::Closed,
+        InputResult::Denied,
+    ] {
+        assert!(
+            journal
+                .ack(&InputAck {
+                    id: report.id,
+                    result
+                })
+                .is_none()
+        );
+        assert!(journal.has_pending_input());
+    }
+    let notice = journal
+        .ack(&InputAck {
+            id: typing[0].id,
+            result: InputResult::Denied,
+        })
+        .unwrap();
+    assert_eq!(notice.bytes, b"keep me");
+    assert_eq!(notice.fate, Fate::Unsupported);
 }

@@ -33,8 +33,14 @@ fn highlights_use_terminal_cells_for_wide_and_combining_characters() {
         },
     ];
     for (query, column, cols) in [("한e\u{301}", 1, 3), ("\u{301}", 3, 1), ("🙂", 4, 2)] {
+        let pattern = krill_proto::search::Options {
+            case_sensitive: true,
+            regex: false,
+        }
+        .compile(query)
+        .unwrap();
         let mut scan = Scan {
-            query,
+            pattern: &pattern,
             target: Some(0),
             total: 0,
             first: None,

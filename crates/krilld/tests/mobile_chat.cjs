@@ -15,18 +15,19 @@ class Element extends EventTarget{
 }
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};};
 const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
-function fixture(){
+function fixture(options={}){
  const buttons=[],calls=[],sheets=[],errors=[],tasks=[],timers=new Map();let id=0,term=0;
- const sandbox={Event,Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{}};
+ const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible'});
+ const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{}};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
  const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:'ready'},drafts:new Map()};
  const root=new Element('root'),el=(...args)=>new Element(...args);
- let handler=async request=>request.action==='chat_poll'?{generation:'g1',agent:'claude',bound:true,items:[],next_offset:request.offset}:{sent:true};
+ let handler=options.handler|| (async request=>request.action==='chat_poll'?{generation:'g1',agent:'claude',bound:true,items:[],next_offset:request.offset}:{sent:true});
  let prepare=async()=>({mime:'image/jpeg',data:'encoded'});
  const ctx={el,state,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},rpc:async request=>{calls.push(request);return handler(request);},photo:(...args)=>prepare(...args),act(fn){const p=Promise.resolve().then(fn).catch(e=>errors.push(e));tasks.push(p);return p;},refresh:async()=>{},sheet(title,_,__,render){const body=el('body');render(body);sheets.push({title,body});}};
- let view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});
+ let view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,visible:options.visible,onSwitchTerm:()=>term++});
  const find=cls=>root.descendants().find(n=>n.className===cls),button=label=>root.descendants().find(n=>n.tag==='button'&&n.textContent===label);
- return {root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
+ return {root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
 }
 function unitServer(f){let total=0;const page=q=>{const start=q.offset,end=Math.min(total,start+128,q.end_offset??Infinity);return {generation:'g1',items:Array.from({length:end-start},(_,i)=>({id:start+':'+i,kind:'assistant',text:'Message '+(start+i)})),next_offset:end,bound:true};};f.handler=async q=>page(q);return {page,set total(n){total=n;}};}
 async function historyRace(){
@@ -37,7 +38,42 @@ async function historyRace(){
  const before=Array.from(f.entry.items,x=>x.id);assert.equal(f.entry.items[0].text,'Message 49');server.total=1060;live.resolve(server.page({offset:1050}));await flush();
  const after=Array.from(f.entry.items,x=>x.id);console.log('historyRace first/last:',f.entry.items[0].text,f.entry.items.at(-1).text);f.dispose();assert.deepEqual(after,before,'a live poll queued during earlier-page load must not mutate the historical view');
 }
+async function renderBudgets(){
+ const f=fixture({visible:false});await flush();const initial=f.calls.length;for(let n=0;n<10;n++){f.update();for(const [id,fn] of [...f.timers]){f.timers.delete(id);await fn();}await flush();}assert.equal(f.calls.length,initial,'hidden repeated update/timer polls are zero');assert.equal(f.timers.size,0);f.setVisible(true);await flush();assert.equal(f.calls.length,initial+1,'visibility restore catches up once');assert.equal(f.timers.size,1);
+ f.doc.hidden=true;f.doc.visibilityState='hidden';f.doc.dispatchEvent(new Event('visibilitychange'));assert.equal(f.timers.size,0);f.update();await flush();assert.equal(f.calls.length,initial+1);f.doc.hidden=false;f.doc.visibilityState='visible';f.doc.dispatchEvent(new Event('visibilitychange'));await flush();assert.equal(f.calls.length,initial+2,'document foreground catches up once');
+ f.input('');assert(!f.state.drafts.has(7),'empty drafts do not pin session caches');f.dispose();
+ const incremental=fixture();await flush();await incremental.poll({bound:true,generation:'g1',next_offset:500,items:Array.from({length:500},(_,i)=>({id:'i'+i,kind:'assistant',text:'Message '+i}))});const liveFeed=incremental.find('chat-feed');let reads=0;const original=liveFeed.children;Object.defineProperty(liveFeed,'children',{configurable:true,get(){reads++;return original;},set(value){original.splice(0,original.length,...value);}});await incremental.poll({bound:true,generation:'g1',next_offset:500,items:[]});assert.equal(reads,0,'live no-op poll does not traverse/reconcile existing feed children');await incremental.poll({bound:true,generation:'g1',next_offset:501,items:[{id:'append',kind:'assistant',text:'Append'}]});assert(reads<10,'append reconciliation only touches the appended node');incremental.dispose();
+ const cache=fixture();await flush();cache.dispose();cache.state.chatCache.clear();for(let n=0;n<20;n++)cache.state.chatCache.set(n,{items:[],retainedBytes:100});cache.state.drafts.set(0,'unsent');cache.state.chatCache.get(1).photo={status:'ready'};cache.state.chatCache.get(2).sending=true;cache.state.chatCache.get(3).mounts=1;cache.M.chat.pruneCache(cache.state);assert.equal(cache.state.chatCache.size,8);for(const n of [0,1,2,3])assert(cache.state.chatCache.has(n));
+ cache.state.chatCache.set(99,{retainedBytes:9*1024*1024});cache.M.chat.pruneCache(cache.state);assert(!cache.state.chatCache.has(99),'byte pressure removes inactive clean entries');for(const n of [0,1,2,3])assert(cache.state.chatCache.has(n));
+ const pages=fixture();await flush();const server=unitServer(pages);for(let n=1;n<=2400;n++){server.total=n;pages.update();await flush();}assert(pages.entry.pages.length<=2048);assert.equal(pages.entry.items.length,1000);assert.equal(pages.entry.items[0].text,'Message 1400');pages.button('Load earlier messages').action();await flush();assert.equal(pages.entry.items[0].text,'Message 1399','pruned page metadata retains exact preceding byte boundary');
+ const feed=pages.find('chat-feed'),nodes=feed.children.slice();let touched=0;const insert=feed.insertBefore.bind(feed);feed.insertBefore=(...args)=>{touched++;return insert(...args);};pages.update();await flush();assert.equal(touched,0,'paused/no-op update never reconciles feed children');assert.deepEqual(feed.children,nodes);pages.dispose();
+ const lazy=fixture();await flush();await lazy.poll({bound:true,generation:'g1',next_offset:1,items:[{id:'huge',kind:'reasoning',text:'reasoning line\n'.repeat(5000)}]});const details=lazy.find('chat-reasoning');assert.equal(details.children.length,1,'large closed reasoning only creates its summary');details.open=true;details.dispatchEvent(new Event('toggle'));assert.equal(details.children.length,2);details.open=false;details.dispatchEvent(new Event('toggle'));assert.equal(lazy.entry.disclosures.size,0);lazy.dispose();
+ console.log('PASS render budgets: hidden poll 0, one catch-up, cache 8 with draft/photo/sending/active pins, pages <=2048, exact older boundary, lazy disclosure');
+}
 async function main(){
+ await renderBudgets();
+ const cold=deferred(),recent=Array.from({length:128},(_,i)=>({id:`872:${i}`,kind:'assistant',text:`Message ${872+i}`}));
+ let now=Date.now();const chatClock=class extends Date{static now(){return now;}};
+ const warm=fixture({visible:false,Date:chatClock,handler:()=>cold.promise});
+ assert.equal(warm.calls[0].latest,true);assert.equal(warm.find('chat-empty'),undefined,'no false empty transcript before the first reply');
+ cold.resolve({generation:'g1',agent:'claude',bound:true,items:recent,page_start:872,next_offset:1000,has_earlier:true});await flush();
+ assert.equal(warm.calls.length,1,'one request reaches the current tail');
+ assert.equal(warm.entry.items.at(-1).text,'Message 999');
+ const preparedFeed=warm.find('chat-feed'),preparedLast=preparedFeed.children.at(-1);
+ warm.handler=async req=>req.latest?{generation:'g1',bound:true,page_start:744,next_offset:872,items:Array.from({length:128},(_,i)=>({id:`744:${i}`,kind:'assistant',text:`Message ${744+i}`}))}:{generation:'g1',bound:true,page_start:1000,next_offset:1000,items:[]};
+ warm.setVisible(true);assert.equal(preparedFeed.scrollTop,preparedFeed.scrollHeight,'first visible frame is pinned to the latest message');await flush();
+ warm.input('draft');warm.setVisible(false);warm.setVisible(true);await flush();
+ assert.equal(warm.find('chat-feed'),preparedFeed);assert.equal(preparedFeed.children.at(-1),preparedLast);assert.equal(warm.find('chat-input').value,'draft');
+ preparedFeed.scrollTop=0;preparedFeed.dispatchEvent(new Event('scroll'));warm.update();await flush();assert.equal(preparedFeed.scrollTop,0,'live poll respects reading position');
+ const warmAnchor=preparedFeed.children[0];warm.button('Load earlier messages').action();await flush();
+ assert.equal(warm.calls.at(-1).latest,true);assert.equal(warm.calls.at(-1).end_offset,872);
+ assert.equal(warm.entry.items[0].text,'Message 744');assert.equal(preparedFeed.children[128],warmAnchor);assert.equal(preparedFeed.scrollTop,12800);
+ warm.button('Back to latest').action();await flush();assert.equal(warm.entry.items[0].text,'Message 872');assert.equal(preparedFeed.scrollTop,preparedFeed.scrollHeight);
+ warm.setVisible(false);now+=5000;
+ warm.handler=async()=>({generation:'g1',bound:true,page_start:9872,next_offset:10000,items:[{id:'9872:0',kind:'assistant',text:'Message 9999'}]});
+ warm.setVisible(true);await flush();assert.equal(warm.calls.at(-1).latest,true,'after a long stay in Term, skip the backlog in one tail request');assert.equal(warm.entry.items.at(-1).text,'Message 9999');
+ warm.dispose();
+ console.log('PASS first response opens at latest, hidden prefetch survives mode flips, backward paging anchors and explicit latest pins');
  await historyRace();
  const tools=fixture();await flush();await tools.poll({generation:'g1',bound:true,next_offset:1,items:[{id:'user',kind:'user',text:'Please review'},{id:'call',kind:'tool_call',tool_name:'Read',file_path:'/work/a.rs',text:'Large tool arguments'},{id:'result',kind:'tool_result',text:'Long tool output'},{id:'answer',kind:'assistant',text:'Here is the answer'}]});
  const run=tools.find('chat-tool-run');assert(run);assert(!run.open);assert(!tools.find('chat-tool-call').open);assert(!tools.find('chat-tool-result').open);assert.equal(tools.find('chat-feed').children.length,3);assert(run.children[0].textContent.includes('Read'));

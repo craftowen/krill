@@ -760,7 +760,13 @@ fn negotiated_input_modes_initial_change_and_reconnect() {
     loop {
         let (k, body) = frame(&mut c);
         if k == TERM_MODES {
-            assert_eq!(Modes::decode(k, &body).unwrap(), Modes::default());
+            assert_eq!(
+                Modes::decode(k, &body).unwrap(),
+                Modes {
+                    kitty: 0,
+                    flags: Modes::ALTERNATE_SCROLL
+                }
+            );
             break;
         }
     }

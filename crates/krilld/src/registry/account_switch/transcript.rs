@@ -62,6 +62,7 @@ impl PreparedTranscript {
     }
 }
 
+#[cfg(test)]
 pub(super) fn prepare(
     provider: ProviderKind,
     home: &Path,
@@ -69,6 +70,18 @@ pub(super) fn prepare(
     target: &AccountInfo,
     id: &str,
     cwd: &[u8],
+) -> io::Result<PreparedTranscript> {
+    prepare_bound(provider, home, source, target, id, cwd, None)
+}
+
+pub(super) fn prepare_bound(
+    provider: ProviderKind,
+    home: &Path,
+    source: &LaunchAccount,
+    target: &AccountInfo,
+    id: &str,
+    cwd: &[u8],
+    bound_path: Option<&str>,
 ) -> io::Result<PreparedTranscript> {
     let from = if source.dir.is_empty() {
         accounts::host_default_dir(home, provider)
@@ -91,14 +104,33 @@ pub(super) fn prepare(
                 "sessions"
             };
             let root = from.join(base);
-            let path = find_transcript(&root, provider, id)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "conversation transcript is not available yet",
-                )
-            })?;
-            let relative = path.strip_prefix(&from).map_err(io::Error::other)?;
-            let destination = to.join(relative);
+            let bound = bound_path.map(Path::new).filter(|path| path.exists());
+            let path = if let Some(path) = bound {
+                let canonical = path.canonicalize()?;
+                if !canonical.starts_with(root.canonicalize()?)
+                    || file_session_id(path, provider)? != id
+                {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                path.to_path_buf()
+            } else {
+                find_transcript(&root, provider, id)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "conversation transcript is not available yet",
+                    )
+                })?
+            };
+            // A renamed profile may retain a symlink alias, while its hook reports the
+            // canonical path. Preserve the provider-relative layout in either spelling.
+            let canonical = path.canonicalize()?;
+            let provider_root = root.canonicalize()?;
+            let relative = Path::new(base).join(
+                canonical
+                    .strip_prefix(&provider_root)
+                    .map_err(io::Error::other)?,
+            );
+            let destination = to.join(&relative);
             if !same_profile {
                 link_file(&path, &destination)?;
                 if provider == ProviderKind::Claude {
@@ -299,20 +331,11 @@ fn link_file(from: &Path, to: &Path) -> io::Result<()> {
             if !fs::symlink_metadata(to)?.is_file() {
                 return Err(e);
             }
-            let (mut a, mut b) = (File::open(from)?, File::open(to)?);
-            if a.metadata()?.len() != b.metadata()?.len() {
-                return Err(e);
-            }
-            let (mut left, mut right) = ([0; 8192], [0; 8192]);
-            loop {
-                let an = a.read(&mut left)?;
-                let bn = b.read(&mut right)?;
-                if an != bn || left.get(..an) != right.get(..bn) {
-                    return Err(e);
-                }
-                if an == 0 {
-                    return Ok(());
-                }
+            // Equal bytes in separate files do not share the original's subsequent writes.
+            if same_file::is_same_file(from, to)? {
+                Ok(())
+            } else {
+                Err(e)
             }
         }
         Err(e) => Err(e),
@@ -553,6 +576,11 @@ esac
         );
         prepare(ProviderKind::Codex, &root, &source, &target, id, b"").unwrap();
         fs::remove_file(to.join(&name)).unwrap();
+        fs::copy(from.join(&name), to.join(&name)).unwrap();
+        assert!(
+            matches!(prepare(ProviderKind::Codex, &root, &source, &target, id, b""), Err(error) if error.kind() == io::ErrorKind::AlreadyExists)
+        );
+        fs::remove_file(to.join(&name)).unwrap();
         fs::write(to.join(&name), "conflicting conversation").unwrap();
         assert!(prepare(ProviderKind::Codex, &root, &source, &target, id, b"").is_err());
         assert!(fs::read_to_string(from.join(&name)).unwrap().contains(id));
@@ -736,6 +764,84 @@ esac
                 b"/same/project"
             )
             .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bound_path_tests {
+    use super::*;
+
+    #[test]
+    fn bound_path_preserves_relative_layout_and_rejects_other_profiles() {
+        let root = std::env::temp_dir().join(format!("kas-bound-path-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let from = root.join("from");
+        let to = root.join("to");
+        let path = from.join("sessions/2026/10/23/rollout-known.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(&path, r#"{"type":"session_meta","payload":{"id":"known"}}"#).unwrap();
+        // The bound path works without a filename-derived ID and avoids scanning unrelated trees.
+        let source = LaunchAccount {
+            id: "source".into(),
+            env_key: "CODEX_HOME".into(),
+            dir: from.display().to_string(),
+        };
+        let target = AccountInfo {
+            id: "target".into(),
+            provider: ProviderKind::Codex,
+            label: "Target".into(),
+            email: None,
+            profile_dir: to.display().to_string(),
+            active: true,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+        prepare_bound(
+            ProviderKind::Codex,
+            &root,
+            &source,
+            &target,
+            "known",
+            b"",
+            path.to_str(),
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        let relative = path.strip_prefix(&from).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            fs::read(to.join(relative)).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            let alias = root.join("source-alias");
+            std::os::unix::fs::symlink(&from, &alias).unwrap();
+            let alias_source = LaunchAccount {
+                dir: alias.display().to_string(),
+                ..source.clone()
+            };
+            prepare_bound(
+                ProviderKind::Codex,
+                &root,
+                &alias_source,
+                &target,
+                "known",
+                b"",
+                path.to_str(),
+            )
+            .unwrap()
+            .verify()
+            .unwrap();
+        }
+        let foreign = root.join("foreign.jsonl");
+        fs::write(&foreign, fs::read(&path).unwrap()).unwrap();
+        assert!(
+            matches!(prepare_bound(ProviderKind::Codex, &root, &source, &target, "known", b"", foreign.to_str()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -1,3 +1,4 @@
+use gpui::Focusable as _;
 use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext, point, px};
 
 use super::*;
@@ -185,7 +186,7 @@ fn close_and_cycle_keys(cx: &mut TestAppContext) {
     let l = layout_of(&view, cx);
     // 3탭 → 다음 탭(0)으로 순환 → 분할 후 닫기 → 탭 0 닫기 → 2탭, 이전 탭으로.
     assert_eq!(l.tabs().len(), 2);
-    assert_eq!(l.active(), 1);
+    assert_eq!(l.active(), 0);
     assert!(matches!(l.active_tab().root, PaneTree::Leaf(_)));
     assert_eq!(Layout::load(&path).unwrap(), l);
 }
@@ -234,7 +235,10 @@ fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
         .expect("split focuses a pane");
     cx.simulate_keystrokes("cmd-shift-enter");
     cx.run_until_parked();
-    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), Some(id));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).layout.zoomed_pane()),
+        Some(id)
+    );
     let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
     assert!(
         cx.debug_bounds(badge).is_some(),
@@ -246,7 +250,7 @@ fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
     cx.simulate_mouse_down(at, MouseButton::Left, none);
     cx.simulate_mouse_up(at, MouseButton::Left, none);
     cx.run_until_parked();
-    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), None);
+    assert_eq!(cx.update(|_, cx| view.read(cx).layout.zoomed_pane()), None);
     assert_eq!(layout_of(&view, cx).visible().len(), 2);
     assert!(cx.debug_bounds(badge).is_none());
 }
@@ -266,7 +270,10 @@ fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
     });
     cx.simulate_keystrokes("cmd-shift-enter");
     cx.run_until_parked();
-    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), Some(id));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).layout.zoomed_pane()),
+        Some(id)
+    );
     let header: &'static str = Box::leak(format!("pane-header-{}", id.get()).into_boxed_str());
     assert!(cx.debug_bounds(header).is_some(), "zoomed header shows");
     let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
@@ -288,7 +295,7 @@ fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
     let (zoomed, panes, closed) = cx.update(|_, cx| {
         let s = view.read(cx);
         (
-            s.zoomed_pane,
+            s.layout.zoomed_pane(),
             s.layout.visible().len(),
             s.closed_sessions.clone(),
         )
@@ -789,7 +796,7 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("shift-enter enter ctrl-c");
     assert_eq!(input(), b"\x1b[13;2u");
     assert_eq!(input(), b"\r");
-    assert_eq!(input(), b"\x1b[99;5u");
+    assert_eq!(input(), b"\x03");
     // 한글 조합은 전송하지 않고 확정할 때 report-all + associated-text 형식으로 보낸다.
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
@@ -2125,7 +2132,7 @@ fn active_tab_stays_visible_after_keyboard_switch(cx: &mut TestAppContext) {
     };
     let (active, ok) = visible(cx, &view);
     assert!(ok, "new last tab {active} must be visible");
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     cx.run_until_parked();
     let (active, ok) = visible(cx, &view);
     assert_eq!(active, 0);
@@ -2172,7 +2179,7 @@ fn new_last_tab_is_revealed_with_motion_in_narrow_window(cx: &mut TestAppContext
         );
     }
     // 다른 탭으로 갔다가 마지막 탭으로 돌아와도(복원처럼 이미 있는 탭) ⌄ 밑에 가리지 않는다.
-    for keys in ["cmd-1", "cmd-4"] {
+    for keys in ["ctrl-1", "ctrl-4"] {
         cx.simulate_keystrokes(keys);
         cx.run_until_parked();
         for _ in 0..60 {
@@ -2251,7 +2258,7 @@ fn tabs_have_padding_min_width_and_separators(cx: &mut TestAppContext) {
         cx.simulate_keystrokes("cmd-t");
         cx.run_until_parked();
     }
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert_eq!(layout_of(&view, cx).tabs().len(), 6);
@@ -3343,6 +3350,14 @@ fn daemon_watch_disconnect_releases_assertion_when_sidebar_polling_is_stopped(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_component::init);
+    let config_dir = state_path("daemon-watch-power")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("settings.toml"), r#"keep_awake = "agent""#).unwrap();
+    cx.update(|cx| krill_app::settings::init_at(Some(config_dir), cx));
+    cx.run_until_parked();
     let view = cx.new(|cx| Shell::new(None, cx));
     view.update(cx, |s, cx| {
         s.sidebar
@@ -3373,7 +3388,7 @@ fn daemon_watch_disconnect_releases_assertion_when_sidebar_polling_is_stopped(
 #[cfg(target_os = "macos")]
 fn shifted_brackets_cycle_tabs_with_macos_keystrokes(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("shifted-bracket-tabs"));
-    cx.simulate_keystrokes("cmd-t cmd-t cmd-1 cmd-d");
+    cx.simulate_keystrokes("cmd-t cmd-t ctrl-1 cmd-d");
     let panes = layout_of(&view, cx).visible();
     assert_eq!(panes.len(), 2);
 
@@ -3420,11 +3435,11 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
     // Zoom focused pane (cmd-shift-enter) and unzoom.
     cx.simulate_keystrokes("cmd-shift-enter");
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).zoomed_pane),
+        cx.update(|_, cx| view.read(cx).layout.zoomed_pane()),
         Some(visible[2])
     );
     cx.simulate_keystrokes("cmd-shift-enter");
-    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), None);
+    assert_eq!(cx.update(|_, cx| view.read(cx).layout.zoomed_pane()), None);
 
     // Toggle right diff panel via cmd-l and cmd-shift-g (Orca parity: cmd-shift-g switches to Changes tab if another tab is active, and collapses only when Changes is already active).
     let before_panel = cx.update(|_, cx| view.read(cx).panel_collapsed);
@@ -3465,19 +3480,20 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
     // Create 3 tabs and verify ctrl-2, ctrl-tab, ctrl-shift-tab, ctrl-pagedown, ctrl-pageup switch tabs.
     cx.simulate_keystrokes("cmd-t cmd-t");
     assert_eq!(layout_of(&view, cx).tabs().len(), 3);
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     assert_eq!(layout_of(&view, cx).active(), 0);
     cx.simulate_keystrokes("ctrl-2");
     assert_eq!(layout_of(&view, cx).active(), 1);
     cx.simulate_keystrokes("ctrl-tab");
-    assert_eq!(layout_of(&view, cx).active(), 0);
+    assert_eq!(layout_of(&view, cx).active(), 1);
     cx.simulate_keystrokes("ctrl-shift-tab");
     assert_eq!(layout_of(&view, cx).active(), 1);
+    cx.simulate_keystrokes("escape");
     cx.simulate_keystrokes("ctrl-pageup");
     assert_eq!(layout_of(&view, cx).active(), 0);
     cx.simulate_keystrokes("ctrl-pagedown");
     assert_eq!(layout_of(&view, cx).active(), 1);
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     assert_eq!(layout_of(&view, cx).active(), 0);
 
     // Attach live session on tab 0 in kitty report-events mode (kitty = 7).
@@ -3512,17 +3528,13 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
     cx.simulate_keystrokes("cmd-a");
     assert!(cx.update(|_, cx| view.read(cx).live.get(&pane0).unwrap().selection.is_some()));
     cx.simulate_keystrokes("cmd-k");
-    {
-        use krill_proto::screen::Msg as _;
-        let (k, b) = krill_proto::ipc::read_frame(&mut theirs0).unwrap().unwrap();
-        assert_eq!(
-            krill_proto::input::Input::decode(k, &b).unwrap().bytes,
-            b"\x0c"
-        );
-    }
+    theirs0
+        .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+        .unwrap();
+    assert!(krill_proto::ipc::read_frame(&mut theirs0).is_err());
 
-    // Jump to tab 2 via cmd-9, attach a session, close tab 2 (cmd-shift-w): the session ends, so cmd-shift-t opens a fresh tab.
-    cx.simulate_keystrokes("cmd-9");
+    // Jump to tab 2 via ctrl-9, attach a session, close tab 2 (cmd-shift-w): the session ends, so cmd-shift-t opens a fresh tab.
+    cx.simulate_keystrokes("ctrl-3");
     assert_eq!(layout_of(&view, cx).active(), 2);
     let (ours, _theirs) = UnixStream::pair().unwrap();
     let pane = layout_of(&view, cx).active_tab().focused;
@@ -4348,40 +4360,66 @@ fn custom_tab_title_overrides_label_and_persists(cx: &mut TestAppContext) {
     assert_eq!(label, auto);
 }
 
-/// OWE-870: 이름 변경 대화상자에서 저장·초기화를 누르면 제목이 바뀌고 대화상자가 닫힌다.
+/// 인라인 이름은 Enter·blur로 저장하고, 빈 값은 자동 제목으로 복귀한다.
 #[gpui::test]
-fn tab_rename_dialog_saves_and_clears(cx: &mut TestAppContext) {
-    let (view, cx) = open(cx, state_path("tab-rename-dialog"));
-    cx.update(|window, cx| {
-        view.update(cx, |s, cx| s.begin_tab_rename(0, window, cx));
-    });
+fn tab_rename_inline_saves_clears_and_cancels(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-rename-inline"));
+    cx.update(|window, _| window.activate_window());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("tab-rename-dialog").is_some());
+    cx.simulate_keystrokes("cmd-r");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-rename-input").is_some());
+    assert!(cx.debug_bounds("tab-rename-dialog").is_none());
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
-            let rename = s.tab_rename.as_ref().expect("rename open");
-            rename.input.update(cx, |input, cx| {
-                input.set_value("  배포 탭  ", window, cx);
-            });
+            s.tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| {
+                    input.set_value("  배포 탭  ", window, cx);
+                });
         });
     });
-    let save: &'static str = "save-tab-rename";
-    let at = cx.debug_bounds(save).expect("save button").center();
-    let none = Modifiers::default();
-    cx.simulate_mouse_down(at, MouseButton::Left, none);
-    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).tab_title(0), Some("배포 탭"));
-    assert!(cx.debug_bounds("tab-rename-dialog").is_none());
-    // 다시 열어 초기화를 누르면 자동 제목으로 복귀한다.
-    cx.update(|window, cx| {
-        view.update(cx, |s, cx| s.begin_tab_rename(0, window, cx));
-    });
+    assert!(cx.debug_bounds("tab-rename-input").is_none());
+    cx.simulate_keystrokes("cmd-r");
     cx.run_until_parked();
-    let clear: &'static str = "clear-tab-title";
-    let at = cx.debug_bounds(clear).expect("clear button").center();
-    cx.simulate_mouse_down(at, MouseButton::Left, none);
-    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.set_value("취소", window, cx));
+        });
+    });
+    cx.simulate_keystrokes("escape");
+    assert_eq!(layout_of(&view, cx).tab_title(0), Some("배포 탭"));
+    cx.simulate_keystrokes("cmd-r");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            assert!(
+                s.tab_rename
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "inline input must retain focus"
+            );
+            s.focus.focus(window, cx);
+        });
+    });
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).tab_title(0), None);
 }
@@ -4412,12 +4450,11 @@ fn sidebar_rename_session_opens_tab_rename(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
-            let active = s.layout.active();
             assert_eq!(
                 s.layout.session(s.layout.active_tab().focused),
                 Some(krill_proto::SessionId(77))
             );
-            assert_eq!(s.tab_rename.as_ref().map(|r| r.index), Some(active));
+            assert_eq!(s.tab_rename.as_ref().map(|r| r.pane), s.layout.focused());
             let rename = s.tab_rename.as_ref().expect("rename open");
             rename.input.update(cx, |input, cx| {
                 input.set_value("  사용자 지정 세션  ", window, cx);
@@ -4437,7 +4474,12 @@ fn sidebar_rename_session_opens_tab_rename(cx: &mut TestAppContext) {
         view.update(cx, |s, cx| {
             let active = s.layout.active();
             s.begin_tab_rename(active, window, cx);
-            s.clear_tab_title(cx);
+            s.tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            s.finish_tab_rename(true, cx);
         });
     });
     cx.run_until_parked();
@@ -5272,7 +5314,7 @@ fn owe855_main_window_title_restored_after_settings(cx: &mut TestAppContext) {
 /// OWE-860: ⌘,는 설정 토글이다. 열린 상태에서 누르면 닫히고, 탐색 단축키(⌘J·⌘B)는
 /// 설정을 먼저 닫고 동작한다. Shell 키 문맥이 설정 화면에서도 유지되기 때문이다.
 #[gpui::test]
-fn settings_cmd_comma_toggles_and_nav_keys_close_first(cx: &mut TestAppContext) {
+fn settings_unbound_comma_and_nav_keys_close_first(cx: &mut TestAppContext) {
     let layout = state_path("owe-860-toggle");
     let (view, cx) = open(cx, layout);
     cx.run_until_parked();
@@ -5282,21 +5324,7 @@ fn settings_cmd_comma_toggles_and_nav_keys_close_first(cx: &mut TestAppContext) 
     cx.simulate_click(btn.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_some());
-    // 단축키 탭으로 옮긴 뒤 ⌘, → 토글로 닫힌다.
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::Shortcuts, None, cx);
-        });
-    });
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("admin-center").is_some());
-    cx.simulate_keystrokes("cmd-,");
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("admin-center").is_none(),
-        "cmd-, closes in-app settings"
-    );
-    // 닫힌 상태에서 ⌘, → 일반 탭으로 다시 열린다.
+    // Orca의 기본값대로 ⌘,는 설정 전역 토글을 등록하지 않는다.
     cx.simulate_keystrokes("cmd-,");
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_some());
@@ -5331,7 +5359,7 @@ fn settings_cmd_comma_toggles_and_nav_keys_close_first(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accounts_tab(
+fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accounts_tab(
     cx: &mut TestAppContext,
 ) {
     use krill_proto::usage::{
@@ -5350,6 +5378,17 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
         view.update(cx, |shell, cx| {
             shell.accounts_snapshot = AccountsSnapshot {
                 accounts: vec![
+                    AccountInfo {
+                        id: "claude-orca-cache-only".into(),
+                        provider: ProviderKind::Claude,
+                        label: "Orca cache only".into(),
+                        email: None,
+                        profile_dir: String::new(),
+                        active: false,
+                        host_default: false,
+                        stale: false,
+                        usage: Snapshot::default(),
+                    },
                     AccountInfo {
                         id: "work".into(),
                         provider: ProviderKind::Claude,
@@ -5424,16 +5463,16 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
     cx.run_until_parked();
 
     for selector in [
-        "status-provider-card-claude",
-        "status-provider-bar-claude-5h",
-        "status-provider-bar-claude-7d",
+        "status-provider-table-header",
+        "status-provider-account-claude-host_default-5h",
+        "status-provider-account-claude-host_default-7d",
         "status-provider-account-claude-host_default",
         "status-provider-account-claude-work",
         "status-provider-open-accounts",
     ] {
         assert!(
             cx.debug_bounds(selector).is_some(),
-            "missing Orca provider popover element: {selector}"
+            "missing provider comparison element: {selector}"
         );
     }
 
@@ -5447,6 +5486,11 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
     );
 
     // host_default must be sorted above other accounts.
+    assert!(
+        cx.debug_bounds("status-provider-account-claude-claude-orca-cache-only")
+            .is_none(),
+        "Orca cache-only accounts must not render in the status menu"
+    );
     let host_row = cx
         .debug_bounds("status-provider-account-claude-host_default")
         .unwrap();
@@ -5544,6 +5588,9 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
             .debug_bounds("status-provider-pill-codex")
             .expect("Codex provider pill");
         cx.simulate_click(pill.center(), Modifiers::default());
+        cx.run_until_parked();
+        // 마지막 설정 행에서 두 칸 위의 전환·초기화 서브메뉴를 연다.
+        cx.simulate_keystrokes("up up up right");
         cx.run_until_parked();
     };
     open_menu(cx);
@@ -5772,14 +5819,9 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     cx.simulate_click(artifacts.center(), gpui::Modifiers::none());
     cx.run_until_parked();
     cx.update(|_, cx| {
-        let settings = view
-            .read(cx)
-            .settings
-            .as_ref()
-            .expect("settings page opened");
-        assert_eq!(
-            settings.read(cx).tab(),
-            krill_app::settings::AdminTab::Artifacts
+        assert!(
+            view.read(cx).artifacts.is_some(),
+            "artifact library opened in the main window"
         );
     });
     for unimplemented in ["nav-tasks", "nav-skills", "nav-automations", "nav-mobile"] {
@@ -5788,6 +5830,54 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
             "unimplemented sidebar nav item {unimplemented} must not be rendered"
         );
     }
+}
+
+#[gpui::test]
+fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("artifacts-default"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let before = layout_of(&view, cx);
+    let nav = cx.debug_bounds("nav-artifacts").unwrap();
+    cx.simulate_click(nav.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("artifacts-page").is_some());
+    assert!(cx.debug_bounds("artifact-list").is_some());
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        assert!(shell.settings.is_none());
+        assert!(shell.artifacts.is_some());
+        assert!(shell.focused_local_session().is_none());
+        assert_eq!(shell.layout, before);
+        assert_eq!(shell.nav_history.entries.last(), Some(&NavEntry::Artifacts));
+    });
+    cx.simulate_keystrokes("cmd-d");
+    assert_eq!(
+        layout_of(&view, cx),
+        before,
+        "library shortcuts must not split a hidden terminal"
+    );
+    let back = cx.debug_bounds("artifacts-back").unwrap();
+    cx.simulate_click(back.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("artifacts-page").is_none());
+    assert_eq!(layout_of(&view, cx), before);
+
+    // Navigation history and normal Settings remain separate destinations.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.open_artifacts(Some(window), cx);
+            s.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            assert!(s.artifacts.is_none());
+            s.navigate_back(None, cx);
+            assert!(s.artifacts.is_some());
+            assert!(s.settings.is_none());
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("artifacts-page").is_none());
+    assert_eq!(layout_of(&view, cx), before);
 }
 
 /// 여러 `Shell` 창이 열려 있을 때 한 창에서 인앱 설정을 닫으면 해당 창의 설정만 닫히고,
@@ -6007,7 +6097,7 @@ fn pinned_tab_guards_close_and_context_menu_colors_persist(cx: &mut TestAppConte
     assert_eq!(disk.tab_color(0), Some(krill_app::layout::TabColor::Purple));
 
     // 고정된 탭 0을 활성화하고 `⌘W`를 누르면 탭이 바로 닫히지 않고 확인 모달이 뜬다.
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).active(), 0);
     cx.simulate_keystrokes("cmd-w");
@@ -6044,7 +6134,7 @@ fn ctrl_tab_mru_switcher_and_bulk_close_actions(cx: &mut TestAppContext) {
     let path = state_path("mru-bulk");
     let (view, cx) = open(cx, path);
     // 탭 4개 생성 (0, 1, 2, 3), 탭 1·3 순서로 포커스 → MRU = [3, 1, 2, 0]
-    cx.simulate_keystrokes("cmd-t cmd-t cmd-t cmd-2 cmd-4");
+    cx.simulate_keystrokes("cmd-t cmd-t cmd-t ctrl-2 ctrl-4");
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).tabs().len(), 4);
     assert_eq!(layout_of(&view, cx).active(), 3);
@@ -6052,7 +6142,7 @@ fn ctrl_tab_mru_switcher_and_bulk_close_actions(cx: &mut TestAppContext) {
     // Ctrl+Tab 1회 → 직전 포커스 탭인 1번 탭으로 전환되고 RecentTabSwitcher 오버레이가 표시된다.
     cx.simulate_keystrokes("ctrl-tab");
     cx.run_until_parked();
-    assert_eq!(layout_of(&view, cx).active(), 1);
+    assert_eq!(layout_of(&view, cx).active(), 3);
     assert!(cx.debug_bounds("recent-tab-switcher").is_some());
 
     // Ctrl을 놓으면(ModifiersChangedEvent) 스위처가 닫히고 MRU가 [1, 3, 2, 0]으로 확정된다.
@@ -6063,7 +6153,7 @@ fn ctrl_tab_mru_switcher_and_bulk_close_actions(cx: &mut TestAppContext) {
     // 다시 Ctrl+Tab 1회 → 방금 직전 탭이었던 3번 탭으로 돌아간다.
     cx.simulate_keystrokes("ctrl-tab");
     cx.run_until_parked();
-    assert_eq!(layout_of(&view, cx).active(), 3);
+    assert_eq!(layout_of(&view, cx).active(), 1);
     cx.simulate_modifiers_change(Modifiers::default());
     cx.run_until_parked();
 
@@ -6179,11 +6269,11 @@ fn navigation_history_back_forward_shortcuts_and_buttons(cx: &mut TestAppContext
     assert_eq!(layout_of(&view, cx).active(), 1);
 
     // 탭 2를 닫은 뒤 앞으로 이동하면 닫힌 탭 2는 건너뛰고 설정 뷰로 이동한다.
-    cx.simulate_keystrokes("cmd-3");
+    cx.simulate_keystrokes("ctrl-3");
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).active(), 2);
     // 탭 0 -> 탭 1 -> 탭 2 상태에서 탭 1을 닫고 뒤로 가기 검증:
-    cx.simulate_keystrokes("cmd-2");
+    cx.simulate_keystrokes("ctrl-2");
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).active(), 1);
     cx.simulate_keystrokes("cmd-w");
@@ -6359,7 +6449,10 @@ fn owe843_terminal_zoom_shortcuts_adjust_only_terminal_font_and_preserve_ui_rem(
 
     let cell_13 = cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE
+        );
         assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
         assert_eq!(cx.theme().font_size, px(13.));
         assert_eq!(cx.theme().mono_font_size, px(12.));
@@ -6371,7 +6464,10 @@ fn owe843_terminal_zoom_shortcuts_adjust_only_terminal_font_and_preserve_ui_rem(
     cx.run_until_parked();
     cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 12);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE - 1
+        );
         assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
         assert_eq!(cx.theme().font_size, px(13.));
         assert_eq!(cx.theme().mono_font_size, px(12.));
@@ -6384,7 +6480,10 @@ fn owe843_terminal_zoom_shortcuts_adjust_only_terminal_font_and_preserve_ui_rem(
     cx.run_until_parked();
     cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 14);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE + 1
+        );
         assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
         let cell_14 = krill_app::terminal::cell_size(window, cx);
         assert!(cell_14.height > cell_13.height);
@@ -6395,7 +6494,10 @@ fn owe843_terminal_zoom_shortcuts_adjust_only_terminal_font_and_preserve_ui_rem(
     cx.run_until_parked();
     cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE
+        );
         assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
     });
 
@@ -6430,7 +6532,10 @@ fn owe843_editor_zoom_shortcuts_adjust_only_editor_font_and_preserve_terminal_an
     cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
         assert_eq!(krill_app::settings::editor_font_pt(cx), 11);
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE
+        );
         assert_eq!(cx.theme().font_size, px(13.));
         assert_eq!(cx.theme().mono_font_size, px(11.));
     });
@@ -6441,7 +6546,10 @@ fn owe843_editor_zoom_shortcuts_adjust_only_editor_font_and_preserve_terminal_an
     cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
         assert_eq!(krill_app::settings::editor_font_pt(cx), 13);
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE
+        );
         assert_eq!(cx.theme().mono_font_size, px(13.));
     });
 
@@ -6451,7 +6559,10 @@ fn owe843_editor_zoom_shortcuts_adjust_only_editor_font_and_preserve_terminal_an
     cx.update(|window, cx| {
         assert_eq!(window.rem_size(), px(16.));
         assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
-        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(
+            krill_app::settings::terminal_font_pt(cx),
+            krill_app::settings::DEFAULT_TERMINAL_FONT_SIZE
+        );
         assert_eq!(cx.theme().mono_font_size, px(12.));
     });
 
@@ -8582,4 +8693,207 @@ fn cmd_t_uses_selected_local_workspace(cx: &mut TestAppContext) {
             "cmd-t must open the selected local worktree, not home"
         );
     });
+}
+
+/// 닫은 칸은 스택에 넣지 않고, 탭의 제목·색·프로그램·위치는 같은 워크스페이스에서 복원한다.
+#[gpui::test]
+fn reopen_closed_tab_restores_metadata_and_workspace_stack(cx: &mut TestAppContext) {
+    use krill_app::layout::TabColor;
+    let (view, cx) = open(cx, state_path("reopen-metadata"));
+    cx.simulate_keystrokes("cmd-shift-t");
+    assert_eq!(
+        layout_of(&view, cx).tabs().len(),
+        1,
+        "empty stack is a no-op"
+    );
+    cx.simulate_keystrokes("cmd-t cmd-t ctrl-2");
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            l.set_tab_title(1, Some("review"));
+            l.set_tab_color(1, Some(TabColor::Purple));
+        });
+        s.do_close_tab(1, cx);
+        s.reopen_closed_tab(cx);
+    });
+    let restored = layout_of(&view, cx);
+    assert_eq!(restored.active(), 1);
+    assert_eq!(restored.tab_title(1), Some("review"));
+    assert_eq!(restored.tab_color(1), Some(TabColor::Purple));
+    view.update(cx, |s, cx| {
+        s.do_close_tab(1, cx);
+        s.new_folder_tab_on(
+            krill_app::hosts::HostId::Local,
+            std::path::Path::new("/another-workspace"),
+            Program::Login,
+            cx,
+        );
+        let count = s.layout.tabs().len();
+        s.reopen_closed_tab(cx);
+        assert_eq!(
+            s.layout.tabs().len(),
+            count,
+            "another workspace must not consume the stack"
+        );
+        s.change(true, cx, |l| l.activate(0));
+        s.reopen_closed_tab(cx);
+        assert_eq!(s.layout.tab_title(s.layout.active()), Some("review"));
+        let before = s.closed_tabs.len();
+        s.change(true, cx, |l| l.split(Axis::Horizontal));
+        s.do_close_pane(s.layout.focused().unwrap(), cx);
+        assert_eq!(
+            s.closed_tabs.len(),
+            before,
+            "closing one split is not a closed tab"
+        );
+    });
+}
+
+#[gpui::test]
+fn pinned_tab_has_no_pointer_close_and_menu_close_is_disabled(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pin-pointer"));
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            l.toggle_pin_tab(0);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("close-tab-0").is_none());
+    let tab = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_mouse_down(tab, MouseButton::Middle, Modifiers::default());
+    cx.simulate_mouse_up(tab, MouseButton::Middle, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(cx.debug_bounds("pinned-tab-close-dialog").is_none());
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    let close = cx.debug_bounds("tab-menu-close").unwrap().center();
+    cx.simulate_click(close, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(cx.debug_bounds("pinned-tab-close-dialog").is_none());
+}
+
+#[gpui::test]
+fn tab_kind_shortcuts_skip_other_kind(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-kind-shortcuts"));
+    cx.simulate_keystrokes("cmd-t");
+    view.update(cx, |s, cx| {
+        s.open_file(PathBuf::from("/tmp/krill-kind.txt"), cx);
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).is_editor_tab(2));
+    cx.simulate_keystrokes("ctrl-1 cmd-alt-]");
+    assert_eq!(layout_of(&view, cx).active(), 1);
+    cx.simulate_keystrokes("cmd-alt-]");
+    assert_eq!(layout_of(&view, cx).active(), 0);
+    cx.simulate_keystrokes("ctrl-3 cmd-alt-]");
+    assert_eq!(
+        layout_of(&view, cx).active(),
+        2,
+        "only editor stays selected"
+    );
+    cx.simulate_keystrokes("ctrl-pagedown");
+    assert_eq!(layout_of(&view, cx).active(), 0);
+    cx.simulate_keystrokes("ctrl-pageup");
+    assert_eq!(layout_of(&view, cx).active(), 1);
+}
+
+#[gpui::test]
+fn inactive_window_cancels_mru_preview(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("mru-inactive"));
+    cx.simulate_keystrokes("cmd-t cmd-t ctrl-1 ctrl-tab");
+    view.update(cx, |s, cx| {
+        assert!(s.layout.mru_switching());
+        let active = s.layout.active();
+        let order = s.layout.mru_order();
+        s.on_window_active_changed(false, cx);
+        assert!(!s.layout.mru_switching());
+        s.commit_mru_switcher(cx);
+        assert_eq!(s.layout.active(), active);
+        assert_eq!(s.layout.mru_order(), order);
+    });
+}
+
+#[gpui::test]
+fn inline_rename_follows_tab_after_reordering(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("inline-rename-reorder"));
+    cx.simulate_keystrokes("cmd-t cmd-t");
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.begin_tab_rename(1, window, cx);
+            s.tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.set_value("moved", window, cx));
+            s.change(true, cx, |l| l.reorder_tab(1, 2));
+            s.finish_tab_rename(true, cx);
+            assert_eq!(s.layout.tab_title(1), None);
+            assert_eq!(s.layout.tab_title(2), Some("moved"));
+        });
+    });
+}
+
+#[gpui::test]
+fn account_failure_recovery_holds_input_and_dismissed_notice_stays_dismissed(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Input;
+    use krill_proto::screen::Msg as _;
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+    let (view, cx) = open(cx, state_path("account-recovery"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let session = SessionId(91);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let mut failed = AccountsSnapshot::default();
+    failed.details.supported = true;
+    failed.details.handoffs.push(SessionHandoff {
+        from: session,
+        to: None,
+        account_id: "selected".into(),
+        error: Some("fixture failure".into()),
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            shell.paths = None;
+            shell.attach_test(pane, session, ours, cx);
+            shell.layout.set_session(pane, session);
+            shell.apply_accounts_snapshot(failed.clone(), cx);
+            assert_eq!(shell.failed_account_input(), Some(session));
+            assert!(shell.notice.is_some());
+            shell
+                .live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .input(b"held prompt\r", Now::get());
+            shell.notice = None;
+            shell.apply_accounts_snapshot(failed, cx);
+            assert!(
+                shell.notice.is_none(),
+                "the same failed snapshot must not repeat a dismissed toast"
+            );
+            assert!(shell.live[&pane].pane.account_switching());
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("account-continue-original").is_some());
+    // Only the acknowledged cancellation removes the failed handoff and releases typing.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            let mut cancelled = AccountsSnapshot::default();
+            cancelled.details.supported = true;
+            shell.apply_accounts_snapshot(cancelled, cx);
+            assert_eq!(shell.failed_account_input(), None);
+            assert!(!shell.live[&pane].pane.account_switching());
+        });
+    });
+    let bytes = loop {
+        let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+        if kind == Input::KIND {
+            break Input::decode(kind, &body).unwrap().bytes;
+        }
+    };
+    assert_eq!(bytes, b"held prompt\r");
 }

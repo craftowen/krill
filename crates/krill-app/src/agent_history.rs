@@ -189,6 +189,7 @@ pub struct Panel {
     language: crate::i18n::Language,
     error: Option<String>,
     task: Option<Task<()>>,
+    list_state: gpui::ListState,
 }
 
 impl std::fmt::Debug for Panel {
@@ -232,6 +233,7 @@ impl Panel {
             language: crate::i18n::language(),
             error: None,
             task: None,
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(100.)),
         }
     }
 
@@ -422,7 +424,17 @@ impl Panel {
     /// 현재 범위·에이전트·검색어 필터가 적용된 결과 목록을 돌려준다.
     #[must_use]
     pub fn visible_hits(&self) -> Vec<VaultHit> {
-        let base = self.loaded_hits();
+        let fallback;
+        let base = if let Some(vault) = &self.vault {
+            &vault.hits
+        } else {
+            fallback = self
+                .data
+                .as_ref()
+                .map(|d| d.entries.iter().map(VaultHit::from).collect::<Vec<_>>())
+                .unwrap_or_default();
+            &fallback
+        };
         if base.is_empty() {
             return Vec::new();
         }
@@ -435,7 +447,7 @@ impl Panel {
             })
             .map(str::to_lowercase)
             .collect();
-        base.into_iter()
+        base.iter()
             .filter(|hit| self.agent_filter.is_none_or(|a| hit.agent == a))
             .filter(|hit| path_matches_scope(&hit.cwd, &scope_paths))
             .filter(|hit| {
@@ -452,6 +464,7 @@ impl Panel {
                 );
                 terms.iter().all(|t| hay.contains(t))
             })
+            .cloned()
             .collect()
     }
 
@@ -571,6 +584,86 @@ impl Panel {
 
     pub fn resume_vault(&mut self, target: VaultTarget, cx: &mut Context<Self>) {
         self.run(Action::ResumeVault(target), cx);
+    }
+}
+
+impl Panel {
+    fn render_hit(&mut self, i: usize, hit: &VaultHit, cx: &mut Context<Self>) -> gpui::Div {
+        let p = crate::ui::palette(cx);
+        let from_vault = self.vault.is_some();
+        let matching_entry = (!from_vault)
+            .then(|| {
+                self.data
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|d| d.entries.iter())
+                    .find(|e| e.id == hit.id && VaultAgent::from(e.agent) == hit.agent)
+                    .cloned()
+            })
+            .flatten();
+        let header_line = if hit.title.is_empty() {
+            format!("{} · {}", hit.agent.profile(), hit.id)
+        } else {
+            format!("{} · {} ({})", hit.agent.profile(), hit.title, hit.id)
+        };
+        let mut detail = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(crate::ui::icons::agent_brand_icon(
+                        hit.agent.profile(),
+                        crate::ui::ICON_SM,
+                        p.foreground,
+                    ))
+                    .child(render_highlighted(&header_line, &self.query, p)),
+            );
+        if !hit.snippet.is_empty() {
+            detail = detail.child(
+                div()
+                    .text_color(p.muted_foreground)
+                    .child(render_highlighted(&hit.snippet, &self.query, p)),
+            );
+        }
+        detail = detail.child(
+            div()
+                .truncate()
+                .font_family(crate::ui::FONT_MONO)
+                .text_color(p.muted_foreground)
+                .child(hit.cwd.clone()),
+        );
+        let row = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap_1()
+            .pb_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(detail.w_full());
+        let busy = self.busy;
+        let target = hit.target();
+        row.child(
+            crate::ui::secondary(("agent-history-resume", i), text::RESUME.get())
+                .debug_selector(move || format!("agent-history-resume-{i}"))
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !busy {
+                        if let Some(entry) = &matching_entry {
+                            this.resume(entry.clone(), cx);
+                        } else {
+                            this.resume_vault(target.clone(), cx);
+                        }
+                    }
+                })),
+        )
     }
 }
 
@@ -713,8 +806,7 @@ impl Render for Panel {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .overflow_y_scroll();
+                .gap_2();
 
             let hits = self.visible_hits();
             let has_loaded = self.vault.is_some() || self.data.is_some();
@@ -722,88 +814,24 @@ impl Render for Panel {
                 content = content.child(text::EMPTY.get());
             }
 
-            let from_vault = self.vault.is_some();
-            let raw_entries = self
-                .data
-                .as_ref()
-                .map(|d| d.entries.clone())
-                .unwrap_or_default();
-
-            for (i, hit) in hits.into_iter().enumerate() {
-                let matching_entry = (!from_vault)
-                    .then(|| {
-                        raw_entries
-                            .iter()
-                            .find(|e| e.id == hit.id && VaultAgent::from(e.agent) == hit.agent)
-                            .cloned()
-                    })
-                    .flatten();
-                let header_line = if hit.title.is_empty() {
-                    format!("{} · {}", hit.agent.profile(), hit.id)
-                } else {
-                    format!("{} · {} ({})", hit.agent.profile(), hit.title, hit.id)
-                };
-                let mut detail = div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(crate::ui::icons::agent_brand_icon(
-                                hit.agent.profile(),
-                                crate::ui::ICON_SM,
-                                p.foreground,
-                            ))
-                            .child(render_highlighted(&header_line, &self.query, p)),
-                    );
-                if !hit.snippet.is_empty() {
-                    detail = detail.child(
-                        div()
-                            .text_color(p.muted_foreground)
-                            .child(render_highlighted(&hit.snippet, &self.query, p)),
-                    );
-                }
-                detail = detail.child(
-                    div()
-                        .truncate()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_color(p.muted_foreground)
-                        .child(hit.cwd.clone()),
-                );
-                let row = div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_1()
-                    .pb_2()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .child(detail.w_full());
-                let busy = self.busy;
-                let target = hit.target();
-                content = content.child(
-                    row.child(
-                        crate::ui::secondary(("agent-history-resume", i), text::RESUME.get())
-                            .debug_selector(move || format!("agent-history-resume-{i}"))
-                            .disabled(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !busy {
-                                    if let Some(entry) = &matching_entry {
-                                        this.resume(entry.clone(), cx);
-                                    } else {
-                                        this.resume_vault(target.clone(), cx);
-                                    }
-                                }
-                            })),
-                    ),
-                );
+            let count = hits.len();
+            // Keep list identity and scroll state while only constructing visible rows.
+            if self.list_state.item_count() != count {
+                self.list_state.reset(count);
             }
+            let hits = Arc::new(hits);
+            let weak = cx.entity().downgrade();
+            content = content.child(
+                gpui::list(self.list_state.clone(), move |i, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        hits.get(i)
+                            .map_or_else(div, |hit| this.render_hit(i, hit, cx))
+                    })
+                    .unwrap_or_else(|_| div())
+                    .into_any_element()
+                })
+                .flex_1(),
+            );
 
             let truncated = self.vault.as_ref().map_or_else(
                 || self.data.as_ref().is_some_and(|d| d.truncated),

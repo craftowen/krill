@@ -1,0 +1,3 @@
+"NSDocumentsFolderUsageDescription" = "Krill accesses files in your Documents folder for workspaces and agent sessions.";
+"NSDesktopFolderUsageDescription" = "Krill accesses files on your Desktop for workspaces and agent sessions.";
+"NSDownloadsFolderUsageDescription" = "Krill accesses files in your Downloads folder for workspaces and agent sessions.";

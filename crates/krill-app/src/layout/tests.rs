@@ -573,9 +573,9 @@ fn new_tab_after_inserts_adjacent_and_activates() {
     assert!(l.is_valid());
 }
 
-/// 하-10: 새 탭(⌘T)은 맨 끝이 아니라 활성 탭 바로 오른쪽에 열린다.
+/// Orca: 새 탭(⌘T)은 맨 끝에 열린다.
 #[test]
-fn new_tab_opens_right_of_active_tab() {
+fn new_tab_appends_after_last_tab() {
     let mut l = Layout::default();
     let first = l.active_tab().focused;
     l.new_tab();
@@ -583,9 +583,9 @@ fn new_tab_opens_right_of_active_tab() {
     l.activate(0);
     l.new_tab();
     assert_eq!(l.tabs().len(), 3);
-    assert_eq!(l.active(), 1);
+    assert_eq!(l.active(), 2);
     assert_eq!(l.tabs()[0].focused, first);
-    assert_eq!(l.tabs()[2].focused, last);
+    assert_eq!(l.tabs()[1].focused, last);
     assert!(l.is_valid());
 }
 
@@ -712,17 +712,17 @@ fn ctrl_tab_mru_cycles_and_commits_recent_order() {
     // 첫 Ctrl+Tab: 직전 탭(3)으로 이동
     l.cycle_mru(1);
     assert!(l.mru_switching());
-    assert_eq!(l.active(), 3);
+    assert_eq!(l.active(), 0);
     assert_eq!(l.mru_cursor(), Some(1));
 
     // Ctrl을 누른 채 한 번 더 Ctrl+Tab: 그 이전 탭(1)으로 이동
     l.cycle_mru(1);
-    assert_eq!(l.active(), 1);
+    assert_eq!(l.active(), 0);
     assert_eq!(l.mru_cursor(), Some(2));
 
     // Ctrl+Shift+Tab: 다시 탭 3으로 역방향 이동
     l.cycle_mru(-1);
-    assert_eq!(l.active(), 3);
+    assert_eq!(l.active(), 0);
     assert_eq!(l.mru_cursor(), Some(1));
 
     // Ctrl 해제(확정): 탭 3이 MRU 최상단으로 올라간다([3, 0, 1, 2]).
@@ -732,8 +732,13 @@ fn ctrl_tab_mru_cycles_and_commits_recent_order() {
 
     // 다시 Ctrl+Tab 한 번 누르고 확정하면 탭 0으로 토글된다.
     l.cycle_mru(1);
-    assert_eq!(l.active(), 0);
+    assert_eq!(l.active(), 3);
+    l.cancel_mru();
+    assert_eq!(l.active(), 3);
+    assert_eq!(l.mru_order(), vec![3, 0, 1, 2]);
+    l.cycle_mru(1);
     assert!(l.commit_mru());
+    assert_eq!(l.active(), 0);
     assert_eq!(l.mru_order(), vec![0, 3, 1, 2]);
 }
 

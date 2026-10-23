@@ -28,9 +28,9 @@ impl Selection {
         }
     }
 
-    /// 단어 문자인지(OWE-866): 영숫자·밑줄. 공백·구두점은 구분자다.
+    /// Orca/xterm 단어 경계: 공백·괄호·따옴표만 구분해 경로·URL·하이픈을 함께 선택한다.
     pub fn is_word_char(ch: char) -> bool {
-        ch.is_alphanumeric() || ch == '_'
+        !ch.is_whitespace() && !"()[]{}'\",`".contains(ch)
     }
 
     /// 화면 `at` 칸의 글자. 2칸 글자의 둘째 칸(`SPACER`)이면 앞 칸(`WIDE`)의 글자로 푼다.
@@ -362,8 +362,8 @@ mod tests {
                 head: at(11),
             }
         );
-        assert_eq!(Selection::word_at(&s, at(13)).text(&s), "foo");
-        assert_eq!(Selection::word_at(&s, at(16)).text(&s), "bar");
+        assert_eq!(Selection::word_at(&s, at(13)).text(&s), "foo-bar");
+        assert_eq!(Selection::word_at(&s, at(16)).text(&s), "foo-bar");
         // 공백 위는 한 칸만.
         assert_eq!(
             Selection::word_at(&s, at(5)),

@@ -1136,3 +1136,22 @@ fn reset_credit_request_reply_roundtrip_and_feature_gate() {
     let gated = reply.for_features(FEAT_USAGE);
     assert_eq!(gated, UsageReply::Accounts(AccountsSnapshot::default()));
 }
+
+#[test]
+fn cancel_account_switch_is_appended_feature_gated_and_not_read_only() {
+    let request = UsageRequest::CancelAccountSwitch {
+        session: crate::SessionId(7),
+    };
+    let bytes = postcard::to_stdvec(&request).unwrap();
+    assert_eq!(bytes, [18, 7]);
+    assert_eq!(
+        postcard::from_bytes::<UsageRequest>(&bytes).unwrap(),
+        request
+    );
+    assert_eq!(
+        request.required_features(),
+        FEAT_USAGE | FEAT_ACCOUNT_CANCEL
+    );
+    assert!(!request.is_read());
+    assert!(!request.contains_removed_provider());
+}

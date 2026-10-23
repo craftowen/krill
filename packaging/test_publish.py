@@ -49,6 +49,7 @@ class PublishGuardTests(unittest.TestCase):
             "elif os.environ.get('FAKE_BINARY_PROOF_FAIL'): sys.exit(1)\n"
             "else: print('/validated/release/bin')\n")
         (self.work / "packaging/macos").mkdir(exist_ok=True)
+        shutil.copy2(HERE / "macos/identity_paths.py", self.work / "packaging/macos/identity_paths.py")
         (self.work / "packaging/macos/smoke.py").write_text("# stub; actual packaged smoke is a native release gate\n")
         # 실제 해석기는 홈의 키체인 별칭을 만들므로 경로 출력만 스텁한다(test_identity_paths가 검증).
         (self.work / "packaging/macos/identity_paths.py").write_text(

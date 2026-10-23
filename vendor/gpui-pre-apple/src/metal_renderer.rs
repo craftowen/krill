@@ -1,10 +1,10 @@
-// Krill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
+// Minikrill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
 // 크기 변경 때 미리 만들지 않고 처음 그릴 때 만들며, 경로 없는 프레임을 그리면 놓는다.
-// Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 화면에 아직 안 올라간 드로어블이 꽉 차면 `nextDrawable`에서 메인 스레드를
-// 무기한 막지 않고 그 프레임을 건너뛴다(`DrawableBacklog`). 호출자가 다음 틱에 다시 present한다.
-// Krill 변경(앱 멈춤, Apache-2.0 §4(b)): 표시 신호(presented handler)를 GPU 완료 뒤 50ms만 기다리고 자리를 회수하며,
-// 늦거나 안 온 신호를 초당 요약에 남긴다. 드로어블 획득·렌더 실패는 버리지 않고 백오프로 다시 present한다(연속 5회 상한).
+// Krill modification (Apache-2.0 §4(b)): acquire drawables off the UI thread;
+// present asynchronously instead of waiting for GPU scheduling in a CA transaction.
+mod acquisition;
 use crate::metal_atlas::MetalAtlas;
+use acquisition::Acquisition;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
@@ -29,256 +29,8 @@ use objc2_core_video::{
 };
 use parking_lot::Mutex;
 
-use std::{
-    cell::Cell,
-    ffi::c_void,
-    mem,
-    mem::MaybeUninit,
-    ops::Range,
-    ptr, slice,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-/// Drawables queued for display but not yet on screen. With `maximumDrawableCount` 3 and one more
-/// drawable held on screen, reaching this count means `nextDrawable` would block until the
-/// compositor catches up, stalling input handling on the main thread meanwhile.
-const MAX_DRAWABLES_IN_FLIGHT: usize = 2;
-/// How long a drawable the GPU has finished may wait for its presented handler before its slot is
-/// reclaimed. The compositor shows a finished drawable within a vsync or two, so a handler still
-/// missing after this is late or lost (hidden window, dropped drawable, a compositor that is not
-/// showing this layer); skipping on would leave the window frozen while the next drawable is
-/// likely free already. Acquiring early costs at most a `nextDrawable` wait, which is logged.
-const PRESENT_GRACE: Duration = Duration::from_millis(50);
-/// Reclaims a drawable whose GPU completion was never reported either. `nextDrawable` itself is
-/// bounded by the layer's one-second timeout.
-const STALE_BACKLOG: Duration = Duration::from_millis(250);
-/// `nextDrawable` waits longer than this are logged: they are the stalls users see as freezes.
-const SLOW_DRAWABLE: Duration = Duration::from_millis(100);
-/// After a failed acquire or render, `draw` waits this long before trying again, doubling per
-/// failure in a row up to `MAX_RETRY_BACKOFF`. A nil `nextDrawable` can come after its one-second
-/// timeout, so retrying every tick could hold the main thread most of the time.
-const RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(1);
-/// Failures in a row after which `draw` drops the frame instead of asking for a retry; the next
-/// scene change tries again once the backoff has passed.
-const MAX_PRESENT_RETRIES: u32 = 5;
-
-/// A presented drawable whose presented handler has not run yet.
-struct Queued {
-    id: u64,
-    queued_at: Instant,
-    gpu_done_at: Option<Instant>,
-}
-
-impl Queued {
-    fn lost(&self, now: Instant) -> bool {
-        match self.gpu_done_at {
-            Some(done) => now.saturating_duration_since(done) >= PRESENT_GRACE,
-            None => now.saturating_duration_since(self.queued_at) >= STALE_BACKLOG,
-        }
-    }
-}
-
-#[derive(Default)]
-struct InFlight {
-    next_id: u64,
-    queued: Vec<Queued>,
-}
-
-/// Tracks presented-but-not-yet-on-screen drawables so `draw` can skip instead of blocking.
-#[derive(Default)]
-struct DrawableBacklog {
-    in_flight: Arc<Mutex<InFlight>>,
-    stats: Arc<Mutex<FrameStats>>,
-    failures: PresentFailures,
-}
-
-/// Failed acquires or renders in a row, so `draw` retries on later ticks without hammering
-/// `nextDrawable`.
-#[derive(Default)]
-struct PresentFailures {
-    streak: u32,
-    last: Option<Instant>,
-}
-
-impl PresentFailures {
-    /// While backing off after a failure, `Some(retry)`: `draw` should not try now, and `retry`
-    /// tells whether to ask for another attempt on a later tick.
-    fn hold(&self, now: Instant) -> Option<bool> {
-        let last = self.last?;
-        let backoff = RETRY_BACKOFF
-            .saturating_mul(1 << self.streak.saturating_sub(1).min(16))
-            .min(MAX_RETRY_BACKOFF);
-        (now.saturating_duration_since(last) < backoff).then_some(self.streak < MAX_PRESENT_RETRIES)
-    }
-}
-
-/// One second of presentation outcomes. Logged only when something was off, so a frozen window
-/// leaves a record of whether frames were skipped, dropped by the compositor, shown late, or
-/// waited on presented handlers that came late or never.
-#[derive(Default)]
-struct FrameStats {
-    since: Option<Instant>,
-    rendered: u32,
-    skipped: u32,
-    shown: u32,
-    // `presentedTime == 0`: the drawable never reached the screen.
-    dropped: u32,
-    slowest_shown: Duration,
-    // Slots taken back from drawables whose presented handler had not run in time.
-    reclaimed: u32,
-    // Presented handlers that ran after their slot was reclaimed.
-    late_handlers: u32,
-    failures: u32,
-    last_error: Option<String>,
-    size_changes: u32,
-    last_size: Option<(i32, i32)>,
-}
-
-impl FrameStats {
-    /// Returns the summary line for a finished one-second window that had anything unusual.
-    /// `oldest_pending` is how long the oldest drawable still in flight has waited for its handler.
-    fn roll(&mut self, now: Instant, oldest_pending: Duration) -> Option<String> {
-        let since = *self.since.get_or_insert(now);
-        if now.saturating_duration_since(since) < Duration::from_secs(1) {
-            return None;
-        }
-        let unusual = self.skipped > 0
-            || self.dropped > 0
-            || self.reclaimed > 0
-            || self.late_handlers > 0
-            || self.failures > 0
-            || self.size_changes > 0
-            || self.slowest_shown >= SLOW_DRAWABLE
-            || oldest_pending >= SLOW_DRAWABLE;
-        let line = unusual.then(|| {
-            let mut line = format!(
-                "frames in {}ms: rendered {}, skipped {}, shown {}, dropped {}, slowest shown {}ms, reclaimed {}, late handlers {}, oldest pending {}ms, failures {}, size changes {}",
-                now.saturating_duration_since(since).as_millis(),
-                self.rendered,
-                self.skipped,
-                self.shown,
-                self.dropped,
-                self.slowest_shown.as_millis(),
-                self.reclaimed,
-                self.late_handlers,
-                oldest_pending.as_millis(),
-                self.failures,
-                self.size_changes,
-            );
-            if let Some(error) = &self.last_error {
-                line.push_str(&format!(", last failure: {error}"));
-            }
-            line
-        });
-        *self = FrameStats {
-            since: Some(now),
-            last_size: self.last_size,
-            ..FrameStats::default()
-        };
-        line
-    }
-}
-
-impl DrawableBacklog {
-    /// Whether a drawable can be acquired now without waiting on the compositor.
-    fn admit(&mut self, now: Instant) -> bool {
-        let mut in_flight = self.in_flight.lock();
-        let before = in_flight.queued.len();
-        in_flight.queued.retain(|queued| !queued.lost(now));
-        let reclaimed = before - in_flight.queued.len();
-        let admitted = in_flight.queued.len() < MAX_DRAWABLES_IN_FLIGHT;
-        drop(in_flight);
-        let mut stats = self.stats.lock();
-        stats.reclaimed += reclaimed as u32;
-        stats.skipped += u32::from(!admitted);
-        admitted
-    }
-
-    /// Records a drawable about to be presented. Returns the guards to run when the GPU finishes
-    /// it and when it reaches the screen.
-    fn queued(&mut self, now: Instant) -> (impl Fn(Instant) + 'static, impl Fn(f64) + 'static) {
-        self.failures = PresentFailures::default();
-        self.stats.lock().rendered += 1;
-        let id = {
-            let mut in_flight = self.in_flight.lock();
-            let id = in_flight.next_id;
-            in_flight.next_id += 1;
-            in_flight.queued.push(Queued {
-                id,
-                queued_at: now,
-                gpu_done_at: None,
-            });
-            id
-        };
-        let in_flight = Arc::clone(&self.in_flight);
-        let gpu_done = move |at| {
-            if let Some(queued) = in_flight.lock().queued.iter_mut().find(|q| q.id == id) {
-                queued.gpu_done_at = Some(at);
-            }
-        };
-        let in_flight = Arc::clone(&self.in_flight);
-        let stats = Arc::clone(&self.stats);
-        let on_screen = move |presented_time| {
-            let reclaimed = {
-                let mut in_flight = in_flight.lock();
-                match in_flight.queued.iter().position(|q| q.id == id) {
-                    Some(index) => {
-                        in_flight.queued.remove(index);
-                        false
-                    }
-                    None => true,
-                }
-            };
-            let mut stats = stats.lock();
-            stats.late_handlers += u32::from(reclaimed);
-            if presented_time > 0.0 {
-                stats.shown += 1;
-                stats.slowest_shown = stats.slowest_shown.max(now.elapsed());
-            } else {
-                stats.dropped += 1;
-            }
-        };
-        (gpu_done, on_screen)
-    }
-
-    /// Records a failed acquire or render; returns whether the frame should be retried later.
-    fn failed(&mut self, now: Instant, error: String) -> bool {
-        self.failures.streak = self.failures.streak.saturating_add(1);
-        self.failures.last = Some(now);
-        if self.failures.streak == MAX_PRESENT_RETRIES {
-            log::error!(
-                "giving up on this frame after {MAX_PRESENT_RETRIES} failures in a row: {error}"
-            );
-        }
-        let mut stats = self.stats.lock();
-        stats.failures += 1;
-        stats.last_error = Some(error);
-        self.failures.streak < MAX_PRESENT_RETRIES
-    }
-
-    /// Notes the drawable size and logs the previous second's outcomes if they were unusual.
-    fn observe_frame(&self, size: (i32, i32), now: Instant) {
-        let oldest_pending = self
-            .in_flight
-            .lock()
-            .queued
-            .iter()
-            .map(|queued| now.saturating_duration_since(queued.queued_at))
-            .max()
-            .unwrap_or_default();
-        let mut stats = self.stats.lock();
-        if stats.last_size.is_some_and(|last| last != size) {
-            stats.size_changes += 1;
-        }
-        stats.last_size = Some(size);
-        if let Some(line) = stats.roll(now, oldest_pending) {
-            drop(stats);
-            log::warn!("{line}");
-        }
-    }
-}
+use std::time::{Duration, Instant};
+use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -367,8 +119,8 @@ pub struct MetalRenderer {
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
-    presents_with_transaction: bool,
-    drawable_backlog: DrawableBacklog,
+    drawable_acquisition: Option<Acquisition<metal::MetalLayer, Option<metal::MetalDrawable>>>,
+    drawable_retry_at: Option<Instant>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -445,9 +197,9 @@ impl MetalRenderer {
         // metal-rs doesn't bind these setters, so view the same object through
         // objc2's typed CAMetalLayer binding.
         let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
-        // Apple's default: `nextDrawable` gives up after one second instead of blocking the main
-        // thread for as long as the compositor holds every drawable (Zed #53390).
+        // A worker may outlive a closing window until this bounded wait ends.
         objc2_layer.setAllowsNextDrawableTimeout(true);
+        layer.set_presents_with_transaction(false);
         objc2_layer.setNeedsDisplayOnBoundsChange(true);
         // UIKit sizes a view's backing layer itself; only AppKit-hosted
         // layers need to track their superlayer's bounds.
@@ -641,11 +393,19 @@ impl MetalRenderer {
             CFRetained::from_raw(ptr::NonNull::new(cache).expect("CoreVideo returned a null cache"))
         };
 
+        let drawable_acquisition = layer.as_ref().and_then(|_| {
+            Acquisition::new(|layer: metal::MetalLayer| {
+                // Retain the drawable before draining the worker's autorelease pool.
+                objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
+            })
+            .map_err(|error| log::error!("failed to start drawable worker: {error}"))
+            .ok()
+        });
         Self {
             device,
             layer,
-            presents_with_transaction: false,
-            drawable_backlog: DrawableBacklog::default(),
+            drawable_acquisition,
+            drawable_retry_at: None,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -685,22 +445,15 @@ impl MetalRenderer {
         &self.sprite_atlas
     }
 
-    pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
-        self.presents_with_transaction = presents_with_transaction;
-        if let Some(layer) = &self.layer {
-            layer.set_presents_with_transaction(presents_with_transaction);
-        }
-    }
-
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        // Krill 변경(OWE-665): 새 크기의 경로 텍스처는 경로를 처음 그릴 때 만든다.
+        // Minikrill 변경(OWE-665): 새 크기의 경로 텍스처는 경로를 처음 그릴 때 만든다.
         self.release_path_intermediate_textures();
     }
 
-    // Krill 변경(OWE-665)
+    // Minikrill 변경(OWE-665)
     fn release_path_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
@@ -755,10 +508,7 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    /// Renders and presents `scene`. Returns `false` when the frame was not presented and the caller
-    /// should present again on the next display tick: the compositor still holds every drawable,
-    /// or acquiring or rendering failed and is being retried with backoff. Failures are counted in
-    /// the per-second frame summary; after `MAX_PRESENT_RETRIES` in a row the frame is dropped.
+    /// Returns false when the latest scene needs presentation on a later tick.
     pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -774,63 +524,46 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let now = Instant::now();
-        self.drawable_backlog
-            .observe_frame((viewport_size.width.0, viewport_size.height.0), now);
-        // While backing off, keep the frame pending: a change that arrives during the wait (even
-        // after giving up on an earlier frame) is drawn once the wait ends instead of being lost.
-        if self.drawable_backlog.failures.hold(now).is_some() {
+        if self.drawable_retry_at.is_some_and(|at| Instant::now() < at) {
             return false;
         }
-        if !self.drawable_backlog.admit(now) {
+        let Some(acquisition) = &mut self.drawable_acquisition else {
             return false;
-        }
-        let acquire_started = Instant::now();
-        let drawable = layer.next_drawable();
-        let waited = acquire_started.elapsed();
-        if waited > SLOW_DRAWABLE {
-            log::warn!("nextDrawable waited {}ms", waited.as_millis());
-        }
-        let Some(drawable) = drawable else {
-            let error = format!("no next drawable, drawable size: {viewport_size:?}");
-            return !self.drawable_backlog.failed(Instant::now(), error);
         };
+        let drawable = match acquisition.poll(layer) {
+            Ok(Some(Some(drawable))) => drawable,
+            Ok(None) => return false,
+            Ok(Some(None)) => {
+                self.drawable_retry_at = Some(Instant::now() + Duration::from_millis(100));
+                log::warn!("drawable unavailable, retrying without blocking input");
+                return false;
+            }
+            Err(()) => {
+                self.drawable_acquisition = None;
+                log::error!("drawable worker stopped");
+                return false;
+            }
+        };
+        // A resize may finish while the worker is acquiring an older surface.
+        // Discard it and retry; never encode a new scene into a stale-sized target.
+        if drawable.texture().width() != viewport_size.width.0 as u64
+            || drawable.texture().height() != viewport_size.height.0 as u64
+        {
+            return false;
+        }
+        self.drawable_retry_at = None;
 
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
-                let error = format!("render failed: {error:#}");
-                return !self.drawable_backlog.failed(Instant::now(), error);
+                log::error!("failed to render: {error:#}");
+                self.drawable_retry_at = Some(Instant::now() + Duration::from_millis(100));
+                return false;
             }
         };
 
-        let (gpu_done, on_screen) = self.drawable_backlog.queued(Instant::now());
-        let completed = RcBlock::new(move |_: ptr::NonNull<AnyObject>| gpu_done(Instant::now()));
-        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI;
-        // Metal copies the block, so it outlives this frame.
-        unsafe {
-            command_buffer.add_completed_handler(&*RcBlock::as_ptr(&completed).cast());
-        }
-        let block = RcBlock::new(move |presented: ptr::NonNull<AnyObject>| {
-            // SAFETY: Metal passes the presented `MTLDrawable`; `presentedTime` is a plain getter.
-            let presented_time: f64 =
-                unsafe { objc2::msg_send![presented.as_ptr(), presentedTime] };
-            on_screen(presented_time)
-        });
-        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI;
-        // Metal copies the block, so it outlives this frame.
-        unsafe {
-            drawable.add_presented_handler(&*RcBlock::as_ptr(&block).cast());
-        }
-
-        if self.presents_with_transaction {
-            command_buffer.commit();
-            command_buffer.wait_until_scheduled();
-            drawable.present();
-        } else {
-            command_buffer.present_drawable(drawable);
-            command_buffer.commit();
-        }
+        command_buffer.present_drawable(&drawable);
+        command_buffer.commit();
         true
     }
 
@@ -1041,7 +774,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
-                    // Krill 변경(OWE-665): 경로 텍스처 지연 생성.
+                    // Minikrill 변경(OWE-665): 경로 텍스처 지연 생성.
                     if self.path_intermediate_texture.is_none() {
                         self.update_path_intermediate_textures(viewport_size);
                     }
@@ -1103,7 +836,7 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
-        // Krill 변경(OWE-665): 경로 없는 프레임이면 창 크기 경로 텍스처를 놓는다(진행 중 명령 버퍼는 자기 참조를 쥔다).
+        // Minikrill 변경(OWE-665): 경로 없는 프레임이면 창 크기 경로 텍스처를 놓는다(진행 중 명령 버퍼는 자기 참조를 쥔다).
         if scene.paths.is_empty() {
             self.release_path_intermediate_textures();
         }
@@ -2010,144 +1743,61 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_drawables_keep_foreground_responsive_and_recover() {
+        let mut renderer = objc2::rc::autoreleasepool(|_| {
+            let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(Default::default())), false);
+            renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
+            renderer
+        });
+        let layer = renderer.layer.as_ref().unwrap().clone();
+        // Occupy all three real CAMetalLayer surfaces, reproducing the native
+        // wait captured in the v0.1.37 tailspin without touching the running app.
+        let held: Vec<_> = (0..3)
+            .map(|_| objc2::rc::autoreleasepool(|_| layer.next_drawable().unwrap().to_owned()))
+            .collect();
+        let scene = Scene::default();
+        for _ in 0..10 {
+            let start = Instant::now();
+            assert!(!renderer.draw(&scene));
+            assert!(start.elapsed() < Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !renderer.draw(&scene) {
+            assert!(Instant::now() < deadline, "presentation did not recover");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn resize_discards_a_previously_acquired_drawable() {
+        let mut renderer = objc2::rc::autoreleasepool(|_| {
+            let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(Default::default())), false);
+            renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
+            renderer
+        });
+        let scene = Scene::default();
+        assert!(!renderer.draw(&scene));
+        // The worker may already own the old-sized surface when resize arrives.
+        renderer.update_drawable_size(size(DevicePixels(128), DevicePixels(96)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !renderer.draw(&scene) {
+            assert!(
+                Instant::now() < deadline,
+                "resized presentation did not recover"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
         CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
-
-    #[test]
-    fn frame_stats_log_only_unusual_seconds() {
-        let mut backlog = DrawableBacklog::default();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        backlog.observe_frame((100, 100), t0);
-        backlog.queued(t0).1(1.0);
-        assert_eq!(
-            backlog.stats.lock().roll(t0 + ms(1000), Duration::ZERO),
-            None,
-            "a clean second is quiet"
-        );
-        backlog.queued(t0).1(0.0);
-        backlog.observe_frame((200, 100), t0 + ms(1100));
-        let line = backlog
-            .stats
-            .lock()
-            .roll(t0 + ms(2000), SLOW_DRAWABLE)
-            .unwrap();
-        assert!(
-            line.contains("dropped 1")
-                && line.contains("size changes 1")
-                && line.contains("oldest pending 100ms"),
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn drawable_backlog_skips_instead_of_blocking_and_reclaims_missing_handlers() {
-        let mut backlog = DrawableBacklog::default();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (first_done, first) = backlog.queued(t0);
-        assert!(backlog.admit(t0), "one queued drawable leaves one free");
-        let (second_done, _second) = backlog.queued(t0);
-        assert!(
-            !backlog.admit(t0),
-            "two queued drawables would block nextDrawable"
-        );
-        first(1.0);
-        assert!(backlog.admit(t0 + ms(10)), "presentation frees a slot");
-
-        let (third_done, third) = backlog.queued(t0 + ms(20));
-        second_done(t0 + ms(30));
-        third_done(t0 + ms(30));
-        assert!(!backlog.admit(t0 + ms(30) + PRESENT_GRACE - ms(1)));
-        assert!(
-            backlog.admit(t0 + ms(30) + PRESENT_GRACE),
-            "a finished drawable whose handler is missing gives its slot back within the grace"
-        );
-        third(1.0);
-        first_done(t0);
-        let stats = backlog.stats.lock();
-        assert_eq!(
-            (stats.skipped, stats.reclaimed, stats.late_handlers),
-            (2, 2, 1),
-            "skips, reclaimed slots and the handler that came after its reclaim are all counted"
-        );
-    }
-
-    #[test]
-    fn drawable_backlog_reclaims_unfinished_drawables_only_after_the_stale_fallback() {
-        let mut backlog = DrawableBacklog::default();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let _first = backlog.queued(t0);
-        let _second = backlog.queued(t0);
-        assert!(
-            !backlog.admit(t0 + PRESENT_GRACE),
-            "the GPU has not finished either drawable, so the compositor cannot have shown them"
-        );
-        assert!(!backlog.admit(t0 + STALE_BACKLOG - ms(1)));
-        assert!(backlog.admit(t0 + STALE_BACKLOG));
-    }
-
-    #[test]
-    fn failed_presents_retry_with_backoff_then_give_up_until_the_next_change() {
-        let mut backlog = DrawableBacklog::default();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        backlog.observe_frame((100, 100), t0);
-        assert_eq!(backlog.failures.hold(t0), None);
-        assert!(backlog.failed(t0, "no next drawable".into()), "retry");
-        assert_eq!(backlog.failures.hold(t0 + ms(49)), Some(true));
-        assert_eq!(backlog.failures.hold(t0 + RETRY_BACKOFF), None);
-        let mut at = t0;
-        for streak in 2..MAX_PRESENT_RETRIES {
-            at += ms(1000);
-            assert!(backlog.failed(at, "no next drawable".into()));
-            let backoff = RETRY_BACKOFF * (1 << (streak - 1));
-            assert_eq!(backlog.failures.hold(at + backoff - ms(1)), Some(true));
-            assert_eq!(backlog.failures.hold(at + backoff), None);
-        }
-        at += ms(1000);
-        assert!(
-            !backlog.failed(at, "render failed".into()),
-            "the cap drops the frame instead of retrying forever"
-        );
-        assert_eq!(
-            backlog.failures.hold(at + ms(799)),
-            Some(false),
-            "a capped streak still backs off"
-        );
-        assert_eq!(backlog.failures.hold(at + ms(800)), None);
-        at += ms(1000);
-        assert!(!backlog.failed(at, "render failed".into()));
-        assert_eq!(
-            backlog.failures.hold(at + MAX_RETRY_BACKOFF - ms(1)),
-            Some(false)
-        );
-        assert_eq!(
-            backlog.failures.hold(at + MAX_RETRY_BACKOFF),
-            None,
-            "the backoff stops doubling at its cap"
-        );
-        let line = backlog
-            .stats
-            .lock()
-            .roll(at + ms(5000), Duration::ZERO)
-            .unwrap();
-        assert!(
-            line.contains("failures 6") && line.contains("last failure: render failed"),
-            "{line}"
-        );
-        let _ = backlog.queued(at);
-        assert_eq!(
-            backlog.failures.hold(at),
-            None,
-            "a presented frame ends the streak"
-        );
-    }
 
     #[test]
     fn render_core_video_surface() {

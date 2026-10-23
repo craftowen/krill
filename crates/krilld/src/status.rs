@@ -35,6 +35,7 @@ use crate::usage::accounts;
 
 pub mod detect;
 mod monitor;
+mod subagents;
 pub(crate) use monitor::monitor;
 
 /// 상태 디렉터리 안 파일 이름.
@@ -72,7 +73,10 @@ impl Record {
 #[derive(Debug)]
 pub struct Statuses {
     path: Option<PathBuf>,
+    commit: Mutex<()>,
     map: Mutex<BTreeMap<SessionId, Record>>,
+    /// 서브에이전트 목록. 저장하지 않는다(krilld 재기동이면 빈 목록).
+    subagents: Mutex<BTreeMap<SessionId, subagents::Roster>>,
 }
 
 impl Statuses {
@@ -85,21 +89,38 @@ impl Statuses {
             .unwrap_or_default();
         Self {
             path,
+            commit: Mutex::new(()),
             map: Mutex::new(map),
+            subagents: Mutex::default(),
         }
     }
 
     /// 세션의 지금 상태. 근거가 없으면 [`AgentStatus::UNKNOWN`].
     pub fn get(&self, session: SessionId) -> AgentStatus {
-        lock(&self.map)
+        let mut status = lock(&self.map)
             .get(&session)
-            .map_or(AgentStatus::UNKNOWN, |r| r.status.clone())
+            .map_or(AgentStatus::UNKNOWN, |r| r.status.clone());
+        if let Some(r) = lock(&self.subagents).get(&session) {
+            status.subagents = r.list();
+        }
+        status
+    }
+
+    /// 서브에이전트 목록에 hook 하나를 반영한다. `from_parent`는 부모 세션 자신의 이벤트인지다. 바뀌었으면 참.
+    pub fn subagent_hook(&self, session: SessionId, e: &HookEvent, from_parent: bool) -> bool {
+        let mut map = lock(&self.subagents);
+        let r = map.entry(session).or_default();
+        let changed = r.observe(&e.payload, e.id.unix_ns, from_parent);
+        if r.is_empty() {
+            map.remove(&session);
+        }
+        changed
     }
 
     /// hook 이벤트들을 저장한 뒤 반영한다. 저장 실패면 메모리·중복 제거 기준도 그대로 두어 재시도할 수 있다.
     pub fn hook(&self, events: &[(SessionId, &HookEvent)]) -> io::Result<usize> {
-        let mut map = lock(&self.map);
-        let mut next = map.clone();
+        let _commit = lock(&self.commit);
+        let mut next = lock(&self.map).clone();
         let mut n = 0;
         for &(session, e) in events {
             let Some(state) = normalize(&e.payload) else {
@@ -123,14 +144,16 @@ impl Statuses {
         }
         if n > 0 {
             self.save(&next)?;
-            *map = next;
+            *lock(&self.map) = next;
         }
         Ok(n)
     }
 
     /// 세션 루트 프로세스가 끝났다(holder `Exited`). 그 전에 시작한 hook 이벤트는 더는 상태를 바꾸지 않는다.
     pub fn exited(&self, session: SessionId) {
-        let mut map = lock(&self.map);
+        lock(&self.subagents).remove(&session);
+        let _commit = lock(&self.commit);
+        let mut map = lock(&self.map).clone();
         let r = map.entry(session).or_insert_with(|| Record {
             status: AgentStatus::UNKNOWN,
             last: Vec::new(),
@@ -138,12 +161,14 @@ impl Statuses {
         });
         r.set(AgentState::Exited, Source::Process, now_ns());
         self.save(&map).ok();
+        *lock(&self.map) = map;
     }
 
     /// 제목·화면의 보조 근거. hook이 이기며, 대화상자 소실을 확인한 waiting 해제만 예외다.
     /// 보조 근거 시각으로 hook 중복 제거 시각을 밀지 않는다(늦게 전달된 새 hook도 반영한다).
     pub fn inferred(&self, session: SessionId, evidence: detect::Evidence, ns: u64) {
-        let mut map = lock(&self.map);
+        let _commit = lock(&self.commit);
+        let mut map = lock(&self.map).clone();
         let r = map.entry(session).or_insert_with(|| Record {
             status: AgentStatus::UNKNOWN,
             last: Vec::new(),
@@ -167,11 +192,13 @@ impl Statuses {
         r.last_ns = hook_ns;
         r.status.confidence = evidence.confidence;
         self.save(&map).ok();
+        *lock(&self.map) = map;
     }
 
     /// 새 전경 에이전트가 확인되면 이전 에이전트의 종료 표식을 지운다. 셸 작업에는 호출하지 않는다.
     pub(crate) fn started(&self, session: SessionId) {
-        let mut map = lock(&self.map);
+        let _commit = lock(&self.commit);
+        let mut map = lock(&self.map).clone();
         if let Some(r) = map.get_mut(&session)
             && r.status.source == Some(Source::Process)
             && r.status.state == AgentState::Exited
@@ -181,24 +208,30 @@ impl Statuses {
             r.status.confidence = Confidence::Low;
             r.status.since_unix_ns = now_ns();
             self.save(&map).ok();
+            *lock(&self.map) = map;
         }
     }
 
     /// 지운 세션의 상태를 버린다.
     pub fn remove(&self, session: SessionId) {
-        let mut map = lock(&self.map);
+        lock(&self.subagents).remove(&session);
+        let _commit = lock(&self.commit);
+        let mut map = lock(&self.map).clone();
         if map.remove(&session).is_some() {
             self.save(&map).ok();
+            *lock(&self.map) = map;
         }
     }
 
     /// `live`에 없는 세션의 상태를 버린다(krilld 기동 때: 그사이 사라진 세션).
     pub fn retain(&self, live: &[SessionId]) {
-        let mut map = lock(&self.map);
+        let _commit = lock(&self.commit);
+        let mut map = lock(&self.map).clone();
         let before = map.len();
         map.retain(|id, _| live.contains(id));
         if map.len() != before {
             self.save(&map).ok();
+            *lock(&self.map) = map;
         }
     }
 

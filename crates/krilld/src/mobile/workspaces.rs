@@ -4,6 +4,7 @@ use krill_proto::control::RepositoryTrees;
 use krill_proto::os::ffi::OsStrExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
@@ -140,6 +141,10 @@ pub(super) struct Catalog {
     repo_badges: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
     project_order: Vec<PathBuf>,
+    /// 데스크톱 `SortBy` 변형 인덱스(0 스마트, 1 최근, 2 이름, 3 생성순).
+    sort_by: u32,
+    updated_at: BTreeMap<PathBuf, u64>,
+    unread: BTreeSet<PathBuf>,
 }
 
 fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -201,7 +206,12 @@ impl Catalog {
             .and_then(|b| String::from_utf8(b).ok())
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
-        let (preferences, bin_parents, project_order) = dir
+        let SidebarTail {
+            prefs: preferences,
+            parents: bin_parents,
+            order: project_order,
+            sort_by,
+        } = dir
             .and_then(|d| read(&d.join("sidebar.bin"), 1024 * 1024))
             .and_then(|b| {
                 let (&version, body) = b.split_first()?;
@@ -221,14 +231,32 @@ impl Catalog {
         let mut catalog = Self {
             preferences,
             project_order,
+            sort_by,
             ..Self::default()
         };
         // 데스크톱 계보의 영속 원천(`worktree-comments.toml [parents]`)을 먼저 읽고,
         // sidebar.bin의 최신 편집이 있으면 덮어쓴다.
         if let Some(dir) = dir {
-            for (child, parent) in store_parents(dir) {
-                catalog.parents.entry(child).or_insert(parent);
+            let stored = store_view(dir);
+            for (child, parent) in stored.parents {
+                if !child.trim().is_empty() && !parent.trim().is_empty() {
+                    catalog
+                        .parents
+                        .entry(normalize(Path::new(&child)))
+                        .or_insert_with(|| normalize(Path::new(&parent)));
+                }
             }
+            catalog.updated_at = stored
+                .updated_at
+                .into_iter()
+                .map(|(p, t)| (normalize(Path::new(&p)), t))
+                .collect();
+            catalog.unread = stored
+                .unread
+                .into_iter()
+                .filter(|(_, unread)| *unread)
+                .map(|(p, _)| normalize(Path::new(&p)))
+                .collect();
         }
         for (child, parent) in bin_parents {
             if can_assign_parent(&catalog.parents, &child, &parent) {
@@ -345,6 +373,23 @@ impl Catalog {
                 catalog.branches.insert(tree, branch.clone());
             }
         }
+        // PC `infer_repo_main_lineage`: 본체 포함 3개 이상인 저장소는 연결 워크트리를
+        // 본체 아래에 둔다. 명시한 부모와 사이클 방어를 우선한다.
+        for repo in &catalog.repositories {
+            if repo.worktrees.len() < 3 || !repo.worktrees.contains(&repo.repo) {
+                continue;
+            }
+            let parent = path(&repo.repo);
+            for bytes in &repo.worktrees {
+                let child = path(bytes);
+                if child != parent
+                    && !catalog.parents.contains_key(&child)
+                    && can_assign_parent(&catalog.parents, &child, &parent)
+                {
+                    catalog.parents.insert(child, parent.clone());
+                }
+            }
+        }
         for tree in catalog.repositories.iter().flat_map(|r| &r.worktrees) {
             let tree = path(tree);
             if let Some(branch) = read(&git_dir(&tree).join("HEAD"), 4096)
@@ -354,7 +399,8 @@ impl Catalog {
                 catalog.branches.insert(tree, branch);
             }
         }
-        // 데스크톱 `ordered_projects`와 같은 저장소 순서(사용자 드래그 순서, 없는 것은 삽입 순서 유지).
+        // 데스크톱 Snapshot.trees(BTreeMap) → ordered_projects와 같은 순서.
+        catalog.repositories.sort_by_key(|r| path(&r.repo));
         if !catalog.project_order.is_empty() {
             let order = catalog.project_order.clone();
             catalog.repositories.sort_by_key(|r| {
@@ -426,13 +472,25 @@ impl Catalog {
             .flat_map(|r| {
                 let repo = path(&r.repo);
                 let mut trees: Vec<PathBuf> = r.worktrees.iter().map(|t| path(t)).collect();
-                // 데스크톱 `sort_worktrees`와 같은 키: [기본] → 핀 → 스마트 순위 → 이름.
-                trees.sort_by(|a, b| {
-                    let primary = |t: &Path| t != repo;
-                    let pin = |t: &Path| !self.preferences.get(t).is_some_and(|v| v.pinned);
-                    let rank = |t: &Path| ranks.get(t).copied().unwrap_or(4);
-                    let name = |t: &Path| worktree_sort_name(t, &self.preferences);
-                    (primary(a), pin(a), rank(a), name(a), a).cmp(&(primary(b), pin(b), rank(b), name(b), b))
+                // 데스크톱 `sort_worktrees`와 같은 키: [기본] → 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
+                trees.sort_by_cached_key(|t| {
+                    let rank = if self.sort_by == 0 {
+                        let state = ranks.get(t).copied().unwrap_or(4);
+                        if state != 0 && self.unread.contains(t) { 1 } else { state }
+                    } else { 0 };
+                    let recent = match self.sort_by {
+                        0 | 1 => self.updated_at.get(t).copied().unwrap_or(0),
+                        3 => created_ms(t).unwrap_or(0),
+                        _ => 0,
+                    };
+                    (
+                        t != &repo,
+                        !self.preferences.get(t).is_some_and(|v| v.pinned),
+                        rank,
+                        Reverse(recent),
+                        worktree_sort_name(t, &self.preferences, &self.branches),
+                        t.clone(),
+                    )
                 });
                 order_lineage(&trees, &self.parents)
                     .into_iter()
@@ -473,80 +531,67 @@ impl Catalog {
             .collect()
     }
 }
-/// 데스크톱 정렬용 워크트리 표시 이름(핀 이름 → 브랜치 짧은 이름 → 폴더 이름).
-fn worktree_sort_name(path: &Path, prefs: &BTreeMap<PathBuf, Preference>) -> String {
+/// 폴더 생성 시각(ms). 데스크톱 `async_state::created_secs`와 같은 원천.
+fn created_ms(path: &Path) -> Option<u64> {
+    let created = fs::metadata(path).ok()?.created().ok()?;
+    let since = created.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_millis()).ok()
+}
+/// 데스크톱 `worktree_sort_name`: 사용자 이름 → 전체 브랜치 → 폴더 이름.
+fn worktree_sort_name(
+    path: &Path,
+    prefs: &BTreeMap<PathBuf, Preference>,
+    branches: &BTreeMap<PathBuf, String>,
+) -> String {
     prefs
         .get(path)
         .filter(|v| !v.name.is_empty())
-        .map_or_else(|| label(path), |v| v.name.clone())
+        .map(|v| v.name.clone())
+        .or_else(|| branches.get(path).cloned())
+        .unwrap_or_else(|| label(path))
 }
-/// sidebar.bin v1 꼬리에서 계보 부모와 프로젝트 순서를 꺼낸다. 형식 불일치는 기본값으로 강등한다.
-fn decode_sidebar_tail(
-    body: &[u8],
-) -> (
-    BTreeMap<PathBuf, Preference>,
-    BTreeMap<PathBuf, PathBuf>,
-    Vec<PathBuf>,
-) {
-    let Ok((prefs, mut rest)) =
-        postcard::take_from_bytes::<BTreeMap<PathBuf, Preference>>(body).map_err(|_| ())
-    else {
-        return Default::default();
+/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준을 꺼낸다. 형식 불일치는 기본값으로 강등한다.
+fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
+    let mut tail = SidebarTail::default();
+    let Ok((prefs, rest)) = postcard::take_from_bytes::<BTreeMap<PathBuf, Preference>>(body) else {
+        return tail;
     };
-    if rest.is_empty() {
-        return (prefs, BTreeMap::new(), Vec::new());
-    }
-    let Ok((_, next)) = postcard::take_from_bytes::<BinOptions>(rest).map_err(|_| ()) else {
-        return (prefs, BTreeMap::new(), Vec::new());
+    tail.prefs = prefs;
+    let Ok((options, rest)) = postcard::take_from_bytes::<BinOptions>(rest) else {
+        return tail;
     };
-    rest = next;
-    if rest.is_empty() {
-        return (prefs, BTreeMap::new(), Vec::new());
-    }
-    let Ok((lineage, next)) = postcard::take_from_bytes::<BinLineage>(rest).map_err(|_| ()) else {
-        return (prefs, BTreeMap::new(), Vec::new());
+    tail.sort_by = options.sort_by;
+    let Ok((lineage, rest)) = postcard::take_from_bytes::<BinLineage>(rest) else {
+        return tail;
     };
-    rest = next;
-    if rest.is_empty() {
-        return (prefs, lineage.parents, Vec::new());
-    }
-    let Ok((_, next)) = postcard::take_from_bytes::<BinUi>(rest).map_err(|_| ()) else {
-        return (prefs, lineage.parents, Vec::new());
+    tail.parents = lineage.parents;
+    let Ok((_, rest)) = postcard::take_from_bytes::<BinUi>(rest) else {
+        return tail;
     };
-    rest = next;
-    if rest.is_empty() {
-        return (prefs, lineage.parents, Vec::new());
+    if let Ok((order, _)) = postcard::take_from_bytes::<Vec<PathBuf>>(rest) {
+        tail.order = order;
     }
-    match postcard::take_from_bytes::<Vec<PathBuf>>(rest) {
-        Ok((order, _)) => (prefs, lineage.parents, order),
-        Err(_) => (prefs, lineage.parents, Vec::new()),
-    }
+    tail
 }
-/// 계보 저장소(`worktree-comments.toml [parents]`)의 자식→부모를 읽는다.
-fn store_parents(dir: &Path) -> BTreeMap<PathBuf, PathBuf> {
-    #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct Store {
-        parents: BTreeMap<String, String>,
-    }
-    dir.join("worktree-comments.toml")
-        .to_str()
-        .and_then(|_| read(&dir.join("worktree-comments.toml"), 512 * 1024))
+#[derive(Default)]
+struct SidebarTail {
+    prefs: BTreeMap<PathBuf, Preference>,
+    parents: BTreeMap<PathBuf, PathBuf>,
+    order: Vec<PathBuf>,
+    sort_by: u32,
+}
+/// PC와 같은 체크포인트 파일에서 계보·최근 활동·미확인을 읽는다. 모바일 전용 사본은 쓰지 않는다.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredView {
+    parents: BTreeMap<String, String>,
+    updated_at: BTreeMap<String, u64>,
+    unread: BTreeMap<String, bool>,
+}
+fn store_view(dir: &Path) -> StoredView {
+    read(&dir.join("worktree-comments.toml"), 512 * 1024)
         .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| toml::from_str::<Store>(&s).ok())
-        .map(|store| {
-            store
-                .parents
-                .into_iter()
-                .filter(|(c, p)| !c.trim().is_empty() && !p.trim().is_empty())
-                .map(|(c, p)| {
-                    (
-                        normalize(Path::new(c.trim())),
-                        normalize(Path::new(p.trim())),
-                    )
-                })
-                .collect()
-        })
+        .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
 }
 /// 자기 참조·사이클을 만들지 않을 때만 부모로 인정한다(데스크톱 `can_assign_parent`와 동일).
@@ -700,9 +745,9 @@ branch = "task/my-feature"
             Some(PathBuf::from("/repo/feature"))
         );
         assert!(catalog.cwd("unregistered").is_none());
-        // 데스크톱 순서·들여쓰기·아이콘 필드가 기본값으로 채워진다.
+        // PC와 같이 본체 포함 3개부터 하위 워크트리를 깊이 1로 묶는다.
         for row in &rows {
-            assert_eq!(row["depth"], 0);
+            assert_eq!(row["depth"], u64::from(row["path"] != "/repo"));
             assert!(row["primary"].is_boolean());
             assert!(row.get("icon").is_some() && row.get("badge_color").is_some());
         }
@@ -716,7 +761,12 @@ branch = "task/my-feature"
         fs::remove_dir_all(dir).unwrap();
     }
 
-    fn write_sidebar_tail(dir: &Path, order: &[PathBuf], parents: &BTreeMap<PathBuf, PathBuf>) {
+    fn write_sidebar_tail(
+        dir: &Path,
+        order: &[PathBuf],
+        parents: &BTreeMap<PathBuf, PathBuf>,
+        sort_by: u32,
+    ) {
         // 데스크톱 저장 순서(prefs → options → lineage → ui → order)를 그대로 둔다.
         let prefs = BTreeMap::<PathBuf, (bool, String)>::new();
         let mut bytes = vec![1];
@@ -724,7 +774,7 @@ branch = "task/my-feature"
         bytes.extend(
             postcard::to_allocvec(&BinOptions {
                 group_by: 0,
-                sort_by: 0,
+                sort_by,
                 card_layout: 0,
                 card_properties: BinCardProperties {
                     issue: true,
@@ -794,6 +844,7 @@ value = "🚀"
             &dir,
             &[PathBuf::from("/b"), PathBuf::from("/a")],
             &BTreeMap::from([(PathBuf::from("/a/child"), PathBuf::from("/a"))]),
+            0,
         );
         let repositories = vec![
             RepositoryTrees {
@@ -831,6 +882,35 @@ value = "🚀"
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// 데스크톱에서 생성순(`SortBy::Created` = 3)을 고르면 모바일도 새 워크트리를 위에 둔다.
+    #[test]
+    fn created_sort_follows_desktop_choice() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-created-{}", std::process::id()));
+        let repo = dir.join("repo");
+        let (old, new) = (repo.join("a-old"), repo.join("z-new"));
+        fs::create_dir_all(&old).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::create_dir_all(&new).unwrap();
+        write_sidebar_tail(&dir, &[], &BTreeMap::new(), 3);
+        let raw = |p: &Path| p.as_os_str().as_bytes().to_vec();
+        let repositories = vec![RepositoryTrees {
+            repo: raw(&repo),
+            worktrees: vec![raw(&repo), raw(&old), raw(&new)],
+        }];
+        let catalog = Catalog::load(Some(&dir), &repositories);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let paths: Vec<_> = rows
+            .iter()
+            .map(|w| w["path"].as_str().unwrap().to_owned())
+            .collect();
+        let want: Vec<_> = [&repo, &new, &old]
+            .iter()
+            .map(|p| normalize(p).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, want);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn smart_rank_orders_waiting_before_idle() {
         let dir = std::env::temp_dir().join(format!("krill-ws-rank-{}", std::process::id()));
@@ -847,6 +927,97 @@ value = "🚀"
             .map(|w| w["path"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(paths, vec!["/r", "/r/urgent", "/r/idle"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inferred_worktree_parents_match_desktop_and_keep_explicit_parents() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-inferred-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("worktree-comments.toml"),
+            "[parents]\n\"/r/b\" = \"/r/a\"\n",
+        )
+        .unwrap();
+        let repositories = vec![
+            RepositoryTrees {
+                repo: b"/r".to_vec(),
+                worktrees: vec![b"/r".to_vec(), b"/r/a".to_vec(), b"/r/b".to_vec()],
+            },
+            RepositoryTrees {
+                repo: b"/s".to_vec(),
+                worktrees: vec![b"/s".to_vec(), b"/s/a".to_vec()],
+            },
+        ];
+        let rows = Catalog::load(Some(&dir), &repositories)
+            .workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let depths: Vec<_> = rows
+            .iter()
+            .map(|w| (w["path"].as_str().unwrap(), w["depth"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            depths,
+            vec![("/r", 0), ("/r/a", 1), ("/r/b", 2), ("/s", 0), ("/s/a", 0)]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_desktop_sort_uses_checkpoint_recency_unread_and_full_branch() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-shared-sort-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("worktree-comments.toml"),
+            r#"
+[updated_at]
+"/r/z-old" = 100
+"/r/a-new" = 200
+"/r/m-unread" = 50
+[unread]
+"/r/m-unread" = true
+"#,
+        )
+        .unwrap();
+        let repositories = vec![RepositoryTrees {
+            repo: b"/r".to_vec(),
+            worktrees: vec![
+                b"/r".to_vec(),
+                b"/r/z-old".to_vec(),
+                b"/r/a-new".to_vec(),
+                b"/r/m-unread".to_vec(),
+            ],
+        }];
+        let ranks = BTreeMap::from([
+            (PathBuf::from("/r/z-old"), 2),
+            (PathBuf::from("/r/a-new"), 0),
+            (PathBuf::from("/r/m-unread"), 3),
+        ]);
+        for (sort_by, expected) in [
+            (0, vec!["/r", "/r/a-new", "/r/m-unread", "/r/z-old"]),
+            (1, vec!["/r", "/r/a-new", "/r/z-old", "/r/m-unread"]),
+            (2, vec!["/r", "/r/z-old", "/r/m-unread", "/r/a-new"]),
+        ] {
+            write_sidebar_tail(&dir, &[], &BTreeMap::new(), sort_by);
+            let mut catalog = Catalog::load(Some(&dir), &repositories);
+            catalog.branches = BTreeMap::from([
+                (PathBuf::from("/r/z-old"), "alpha/branch".to_owned()),
+                (PathBuf::from("/r/m-unread"), "middle/branch".to_owned()),
+                (PathBuf::from("/r/a-new"), "zeta/branch".to_owned()),
+            ]);
+            let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks);
+            let paths: Vec<_> = rows.iter().map(|w| w["path"].as_str().unwrap()).collect();
+            assert_eq!(paths, expected, "desktop sort option {sort_by}");
+        }
+        // Read fresh PC settings on the next request, without a mobile-only order file.
+        fs::write(
+            dir.join("worktree-comments.toml"),
+            "[updated_at]\n\"/r/z-old\" = 300\n",
+        )
+        .unwrap();
+        write_sidebar_tail(&dir, &[], &BTreeMap::new(), 1);
+        let rows =
+            Catalog::load(Some(&dir), &repositories).workspaces_json(&BTreeMap::new(), &ranks);
+        assert_eq!(rows[1]["path"], "/r/z-old");
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -57,13 +57,13 @@ fn workspace_tabs_render_click_cycle_and_restore(cx: &mut TestAppContext) {
     });
 
     // 화면의 두 번째 탭은 전체 index=2. 클릭과 번호 키가 같은 대상을 가리킨다.
-    cx.simulate_keystrokes("cmd-1");
+    cx.simulate_keystrokes("ctrl-1");
     assert_eq!(layout_of(&view, cx).active(), 0);
     cx.run_until_parked();
     let tab = cx.debug_bounds("session-tab-2").unwrap().center();
     cx.simulate_click(tab, Modifiers::default());
     assert_eq!(layout_of(&view, cx).active(), 2);
-    cx.simulate_keystrokes("cmd-2");
+    cx.simulate_keystrokes("ctrl-2");
     assert_eq!(layout_of(&view, cx).active(), 2);
     cx.simulate_keystrokes("ctrl-pagedown");
     assert_eq!(layout_of(&view, cx).active(), 0);
@@ -71,7 +71,7 @@ fn workspace_tabs_render_click_cycle_and_restore(cx: &mut TestAppContext) {
     assert_eq!(layout_of(&view, cx).active(), 2);
     cx.simulate_keystrokes("ctrl-tab");
     cx.run_until_parked();
-    assert_eq!(layout_of(&view, cx).active(), 0);
+    assert_eq!(layout_of(&view, cx).active(), 2);
     assert!(cx.debug_bounds("recent-tab-item-1").is_none());
     assert!(cx.debug_bounds("recent-tab-item-3").is_none());
     cx.simulate_modifiers_change(Modifiers::default());

@@ -102,6 +102,41 @@ pub fn now_unix_ms() -> u64 {
 
 /// 부모 디렉터리를 0700으로 만들고, 임시 파일(0600)에 쓰고 `sync_all` 후 `rename`으로 원자적 교체한다.
 pub fn write_atomic_0600(path: &Path, content: &[u8]) -> io::Result<()> {
+    write_atomic(path, content, true)
+}
+
+/// Diagnostic snapshots have no durable authority. Keep atomic/private reads
+/// without synchronizing the disk for every connection or stream update.
+pub(crate) fn write_status_0600(path: &Path, content: &[u8]) -> io::Result<()> {
+    write_atomic(path, content, false)
+}
+
+/// Held for an instance's lifetime, before touching its listening socket.
+pub(crate) fn acquire_instance_lock(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "link instance already owns this socket",
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn write_atomic(path: &Path, content: &[u8], durable: bool) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         DirBuilder::new()
             .recursive(true)
@@ -122,7 +157,9 @@ pub fn write_atomic_0600(path: &Path, content: &[u8]) -> io::Result<()> {
             .mode(0o600)
             .open(&tmp_path)?;
         f.write_all(content)?;
-        f.sync_all()?;
+        if durable {
+            f.sync_all()?;
+        }
         Ok(())
     })();
 

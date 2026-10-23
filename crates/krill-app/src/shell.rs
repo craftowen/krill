@@ -37,6 +37,7 @@ mod terminal_menu;
 mod workspaces;
 
 // 앱이 꺼져 있던 동안의 변화 요약.
+mod artifacts;
 mod away;
 
 use krill_proto::os::ffi::OsStringExt as _;
@@ -247,6 +248,10 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        NextSameTypeTab,
+        PrevSameTypeTab,
+        NextTerminalTab,
+        PrevTerminalTab,
         NextRecentTab,
         PrevRecentTab,
         SplitRight,
@@ -268,6 +273,21 @@ actions!(
         NavigateBack,
         NavigateForward,
         NewWorktree,
+        ScrollTop,
+        ScrollBottom,
+        ScrollPageUp,
+        ScrollPageDown,
+        RenameTab,
+        CloseEditors,
+        ActivateWorkspace1,
+        ActivateWorkspace2,
+        ActivateWorkspace3,
+        ActivateWorkspace4,
+        ActivateWorkspace5,
+        ActivateWorkspace6,
+        ActivateWorkspace7,
+        ActivateWorkspace8,
+        ActivateWorkspace9,
         ActivateTab1,
         ActivateTab2,
         ActivateTab3,
@@ -313,6 +333,7 @@ pub(super) enum NavEntry {
         worktree: Option<PathBuf>,
     },
     Settings(krill_app::settings::AdminTab),
+    Artifacts,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -371,19 +392,19 @@ impl NavHistory {
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some(KEY_CONTEXT);
-    cx.bind_keys([
+    cx.bind_keys(vec![
         krill_app::keys::bind("cmd-t", NewTab, ctx),
         krill_app::keys::bind("cmd-alt-t", NewAgentTab, ctx),
         krill_app::keys::bind("cmd-shift-w", CloseTab, ctx),
         krill_app::keys::bind("cmd-shift-t", ReopenClosedTab, ctx),
         krill_app::keys::bind("cmd-shift-]", NextTab, ctx),
         krill_app::keys::bind("cmd-shift-[", PrevTab, ctx),
-        krill_app::keys::bind("cmd-alt-]", NextTab, ctx),
-        krill_app::keys::bind("cmd-alt-[", PrevTab, ctx),
+        krill_app::keys::bind("cmd-alt-]", NextSameTypeTab, ctx),
+        krill_app::keys::bind("cmd-alt-[", PrevSameTypeTab, ctx),
         KeyBinding::new("ctrl-tab", NextRecentTab, ctx),
         KeyBinding::new("ctrl-shift-tab", PrevRecentTab, ctx),
-        KeyBinding::new("ctrl-pagedown", NextTab, ctx),
-        KeyBinding::new("ctrl-pageup", PrevTab, ctx),
+        KeyBinding::new("ctrl-pagedown", NextTerminalTab, ctx),
+        KeyBinding::new("ctrl-pageup", PrevTerminalTab, ctx),
         krill_app::keys::bind("cmd-d", SplitRight, ctx),
         krill_app::keys::bind("cmd-shift-d", SplitDown, ctx),
         krill_app::keys::bind("cmd-w", ClosePane, ctx),
@@ -400,19 +421,26 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-alt-shift-down", FocusPaneDown, ctx),
         krill_app::keys::bind("cmd-shift-enter", ToggleZoomPane, ctx),
         krill_app::keys::bind("cmd-k", ClearPane, ctx),
+        krill_app::keys::bind("cmd-up", ScrollTop, ctx),
+        krill_app::keys::bind("cmd-down", ScrollBottom, ctx),
+        KeyBinding::new("shift-pageup", ScrollPageUp, ctx),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, ctx),
+        krill_app::keys::bind("cmd-r", RenameTab, ctx),
+        krill_app::keys::bind("cmd-alt-w", CloseEditors, ctx),
         krill_app::keys::bind("cmd-a", SelectAll, ctx),
         krill_app::keys::bind("cmd-shift-up", PrevSession, ctx),
         krill_app::keys::bind("cmd-shift-down", NextSession, ctx),
         krill_app::keys::bind("cmd-n", NewWorktree, ctx),
-        krill_app::keys::bind("cmd-1", ActivateTab1, ctx),
-        krill_app::keys::bind("cmd-2", ActivateTab2, ctx),
-        krill_app::keys::bind("cmd-3", ActivateTab3, ctx),
-        krill_app::keys::bind("cmd-4", ActivateTab4, ctx),
-        krill_app::keys::bind("cmd-5", ActivateTab5, ctx),
-        krill_app::keys::bind("cmd-6", ActivateTab6, ctx),
-        krill_app::keys::bind("cmd-7", ActivateTab7, ctx),
-        krill_app::keys::bind("cmd-8", ActivateTab8, ctx),
-        krill_app::keys::bind("cmd-9", ActivateTab9, ctx),
+        krill_app::keys::bind("cmd-shift-n", NewWorktree, ctx),
+        krill_app::keys::bind("cmd-1", ActivateWorkspace1, ctx),
+        krill_app::keys::bind("cmd-2", ActivateWorkspace2, ctx),
+        krill_app::keys::bind("cmd-3", ActivateWorkspace3, ctx),
+        krill_app::keys::bind("cmd-4", ActivateWorkspace4, ctx),
+        krill_app::keys::bind("cmd-5", ActivateWorkspace5, ctx),
+        krill_app::keys::bind("cmd-6", ActivateWorkspace6, ctx),
+        krill_app::keys::bind("cmd-7", ActivateWorkspace7, ctx),
+        krill_app::keys::bind("cmd-8", ActivateWorkspace8, ctx),
+        krill_app::keys::bind("cmd-9", ActivateWorkspace9, ctx),
         KeyBinding::new("ctrl-1", ActivateTab1, ctx),
         KeyBinding::new("ctrl-2", ActivateTab2, ctx),
         KeyBinding::new("ctrl-3", ActivateTab3, ctx),
@@ -430,7 +458,6 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-l", TogglePanel, ctx),
         krill_app::keys::bind("cmd-shift-g", ToggleChanges, ctx),
         krill_app::keys::bind("cmd-q", Quit, None),
-        krill_app::keys::bind("cmd-,", krill_app::settings::OpenSettings, None),
         krill_app::keys::bind("cmd-j", Jump, ctx),
         krill_app::keys::bind("cmd-shift-p", CommandPalette, ctx),
         krill_app::keys::bind("cmd-f", Find, ctx),
@@ -572,6 +599,7 @@ pub struct Shell {
     pub(crate) dashboard: Option<gpui::Entity<popout::Dashboard>>,
     /// 열린 터미널 검색 바(MK-059)와 그 이벤트 구독.
     search: Option<(gpui::Entity<krill_app::search::Bar>, Subscription)>,
+    last_search_query: String,
     /// Resource Manager(MK-071).
     resources: gpui::Entity<krill_app::resources::Panel>,
     _resources_open: Subscription,
@@ -593,7 +621,6 @@ pub struct Shell {
     system_appearance: Option<Subscription>,
     security: krill_app::security::State,
     paste_queue: security::PasteQueue,
-    zoomed_pane: Option<PaneId>,
     /// 가운데 영역 파일(에디터) 탭(MK-119).
     files: files::Files,
     #[cfg(test)]
@@ -603,12 +630,13 @@ pub struct Shell {
     /// 닫기로 데몬 종료를 요청한 세션(테스트 확인용).
     #[cfg(test)]
     closed_sessions: Vec<krill_proto::SessionId>,
-    /// 닫은 탭·칸의 (호스트, 폴더). 세션은 닫을 때 끝나므로 ⌘⇧T는 이 폴더에 새 탭을 연다.
-    closed_dirs: Vec<(krill_app::hosts::HostId, PathBuf)>,
+    /// 워크스페이스별로 최근 닫은 탭의 표시·실행 정보를 보관한다(각 10개).
+    closed_tabs: Vec<tabs::ClosedTab>,
     pub(super) usage_refresh: Option<Task<()>>,
     /// 상태바 사용량 팝업의 "사용량 초기화" 1단계(무장). 메뉴가 닫혔다 다시 열리면 확인 행을 보인다.
     pub(super) reset_armed: Option<(krill_proto::usage::ProviderKind, String)>,
     account_handoff_poll: Option<Task<()>>,
+    account_cancel: Option<krill_proto::SessionId>,
     pub(super) accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     pub(super) ssh_hosts: Vec<krill_app::ssh_hosts::SshHost>,
     pub(super) host_manager: krill_app::hosts::HostManager,
@@ -642,6 +670,7 @@ pub struct Shell {
     ports_cache: std::cell::RefCell<HashMap<u64, popout::PortCache>>,
     /// 인앱 설정 페이지(`SettingsView`, Orca `activeView === 'settings'` 패리티).
     pub(super) settings: Option<gpui::Entity<krill_app::settings::SettingsView>>,
+    pub(super) artifacts: Option<gpui::Entity<krill_app::artifacts::View>>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
     pending_focus: PendingFocus,
@@ -651,7 +680,7 @@ pub struct Shell {
     pub(super) confirm_close_tab: Option<usize>,
     /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
     pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
-    /// OWE-870: 탭 이름 변경 대화상자(인라인 편집 대신 모달 + `InputState`).
+    /// OWE-870: 탭 이름 인라인 편집.
     tab_rename: Option<tabs::TabRename>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
     pub(super) nav_history: NavHistory,
@@ -669,6 +698,7 @@ pub(super) enum WindowRole {
 enum PendingFocus {
     None,
     Settings,
+    Artifacts,
     Workspace,
 }
 
@@ -710,6 +740,27 @@ impl Shell {
             this.reconcile_workspace_sessions(cx);
             cx.notify();
         });
+        cx.subscribe(
+            &sidebar,
+            |this, _, event: &sidebar::WorkspaceSelected, cx| {
+                this.open_workspace_on(event.host.clone(), event.path.clone(), cx);
+                this.files.refocus = event.focus_terminal;
+                if let Some(handle) = this.window {
+                    let sb = this.sidebar.clone();
+                    let focus = this.focus.clone();
+                    let focus_terminal = event.focus_terminal;
+                    cx.update_window(handle, |_, window, cx| {
+                        if focus_terminal {
+                            window.focus(&focus, cx);
+                        } else {
+                            sb.update(cx, |s, cx| s.focus(focus, window, cx));
+                        }
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
         let selection = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::Selected, cx| {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
@@ -1063,6 +1114,7 @@ impl Shell {
             pending: overlays::PendingOverlays::default(),
             dashboard: None,
             search: None,
+            last_search_query: String::new(),
             history,
             _history_open: history_open,
             resources,
@@ -1070,7 +1122,6 @@ impl Shell {
             status_menus_open: 0,
             security: krill_app::security::State::default(),
             paste_queue: security::PasteQueue::default(),
-            zoomed_pane: None,
             files: files::Files::default(),
             #[cfg(test)]
             close_call: None,
@@ -1078,11 +1129,12 @@ impl Shell {
             ime_discards: Rc::default(),
             #[cfg(test)]
             closed_sessions: Vec::new(),
-            closed_dirs: Vec::new(),
+            closed_tabs: Vec::new(),
             accounts_snapshot,
             usage_refresh: None,
             reset_armed: None,
             account_handoff_poll: None,
+            account_cancel: None,
             accounts_poll: None,
             update_poll: None,
             ssh_hosts,
@@ -1105,6 +1157,7 @@ impl Shell {
             workspace_closing: std::collections::HashSet::new(),
             ports_cache: std::cell::RefCell::default(),
             settings: None,
+            artifacts: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
@@ -1365,7 +1418,7 @@ impl Shell {
 
     /// 현재 포커스된 워크스페이스 칸(탭·세션·워크트리)을 탐색 히스토리에 기록한다.
     pub(super) fn record_workspace_nav(&mut self, cx: &App) {
-        if self.settings.is_some() {
+        if self.page_open() {
             return;
         }
         let Some(pane) = self.layout.focused() else {
@@ -1382,7 +1435,7 @@ impl Shell {
 
     fn is_entry_reachable(&self, entry: &NavEntry, cx: &App) -> bool {
         match entry {
-            NavEntry::Settings(_) => true,
+            NavEntry::Settings(_) | NavEntry::Artifacts => true,
             NavEntry::Workspace {
                 pane,
                 session,
@@ -1493,6 +1546,7 @@ impl Shell {
     ) {
         self.nav_history.navigating = true;
         match entry {
+            NavEntry::Artifacts => self.open_artifacts(window, cx),
             NavEntry::Settings(tab) => {
                 self.open_settings(tab, window, cx);
             }
@@ -1505,7 +1559,7 @@ impl Shell {
                 if self.dashboard.is_some() {
                     self.close_dashboard(window.as_deref_mut(), cx);
                 }
-                if self.settings.is_some() {
+                if self.page_open() {
                     self.close_settings(window.as_deref_mut(), cx);
                 }
                 let mut target_tab_pane = self
@@ -1564,6 +1618,7 @@ impl Shell {
         self.jump = None;
         self.continue_session = None;
         self.dashboard = None;
+        self.artifacts = None;
         self.sync_sidebar_visibility(cx);
         self.files.close_quick_open();
         if self.search.take().is_some()
@@ -1599,7 +1654,9 @@ impl Shell {
 
     /// 인앱 설정 페이지를 닫고 터미널 워크스페이스로 돌아간다.
     pub(super) fn close_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        if self.settings.take().is_none() {
+        let settings = self.settings.take();
+        let artifacts = self.artifacts.take();
+        if settings.is_none() && artifacts.is_none() {
             return;
         }
         self.record_workspace_nav(cx);
@@ -1622,18 +1679,22 @@ impl Shell {
         }
         self.sync_sidebar_visibility(cx);
         self.sync_focused_session(cx);
-        if self.settings.is_none() {
+        if !self.page_open() {
             self.files.refocus = true;
         }
         if let Some(window) = window {
             let focus = self
                 .settings
                 .as_ref()
-                .map_or_else(|| self.focus.clone(), |s| s.read(cx).focus_handle());
+                .map(|s| s.read(cx).focus_handle())
+                .or_else(|| self.artifacts.as_ref().map(|a| a.read(cx).focus_handle()))
+                .unwrap_or_else(|| self.focus.clone());
             window.focus(&focus, cx);
             self.pending_focus = PendingFocus::None;
         } else if self.settings.is_some() {
             self.pending_focus = PendingFocus::Settings;
+        } else if self.artifacts.is_some() {
+            self.pending_focus = PendingFocus::Artifacts;
         } else {
             self.pending_focus = PendingFocus::Workspace;
         }
@@ -1644,7 +1705,7 @@ impl Shell {
     /// 열 때 칸의 조합 중 글자는 확정한다(포커스 이탈).
     /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫는다.
     fn toggle_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
         if self.jump.take().is_some() {
@@ -1660,10 +1721,30 @@ impl Shell {
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
-        let (items, worktrees) = {
+        let (mut items, worktrees) = {
             let sb = self.sidebar.read(cx);
             (sb.jump_items(), sb.jump_worktrees())
         };
+        let recent: Vec<_> = self
+            .layout
+            .mru_order()
+            .into_iter()
+            .filter_map(|i| {
+                self.layout
+                    .tabs()
+                    .get(i)
+                    .and_then(|t| self.layout.session(t.focused))
+            })
+            .collect();
+        items.sort_by_key(|item| {
+            (
+                item.is_current_tab,
+                recent
+                    .iter()
+                    .position(|id| *id == item.id)
+                    .unwrap_or(usize::MAX),
+            )
+        });
         let ws = Some(self.folder().display().to_string());
         self.history
             .update(cx, |h, cx| h.update_scope_paths(ws.clone(), Vec::new(), cx));
@@ -1694,12 +1775,12 @@ impl Shell {
         let query = self
             .search
             .as_ref()
-            .map(|(bar, _)| bar.read(cx).query().to_owned());
-        if let Some(query) = query
+            .map(|(bar, _)| (bar.read(cx).query().to_owned(), bar.read(cx).options()));
+        if let Some((query, options)) = query
             && !query.is_empty()
             && let Some(l) = self.focused_live()
         {
-            l.pane.search(&query, direction);
+            l.pane.search_with_options(&query, direction, options);
         }
     }
 
@@ -1883,12 +1964,8 @@ impl Shell {
             settings.update(cx, |v, cx| v.focus_search(window, cx));
             return;
         }
-        if self.search.take().is_some() {
-            if let Some(l) = self.focused_live() {
-                l.pane.clear_search();
-            }
-            window.focus(&self.focus, cx);
-            cx.notify();
+        if let Some((bar, _)) = &self.search {
+            bar.clone().update(cx, |bar, cx| bar.focus(window, cx));
             return;
         }
         if let Some(pane) = self.layout.focused()
@@ -1905,30 +1982,44 @@ impl Shell {
             self.commit_ime(pane, Some(window), cx);
         }
         let bar = cx.new(|cx| krill_app::search::Bar::new(window, cx));
-        bar.update(cx, |b, cx| b.focus(window, cx));
+        let options_supported = self
+            .focused_live()
+            .is_some_and(|l| l.pane.search_options_supported());
+        bar.update(cx, |b, cx| {
+            b.set_options_supported(options_supported);
+            b.set_query(&self.last_search_query, window, cx);
+            b.focus(window, cx);
+        });
         let events = cx.subscribe_in(
             &bar,
             window,
             |this, bar, e: &krill_app::search::Event, window, cx| {
                 match e {
                     krill_app::search::Event::Query(q) => {
+                        let options = bar.read(cx).options();
                         if let Some(l) = this.focused_live() {
                             if q.is_empty() {
                                 l.pane.clear_search();
                             } else {
-                                l.pane.search(q, krill_proto::search::Direction::Next);
+                                l.pane.search_with_options(
+                                    q,
+                                    krill_proto::search::Direction::Next,
+                                    options,
+                                );
                             }
                         }
                     }
                     krill_app::search::Event::Step(dir) => {
                         let q = bar.read(cx).query().to_owned();
+                        let options = bar.read(cx).options();
                         if !q.is_empty()
                             && let Some(l) = this.focused_live()
                         {
-                            l.pane.search(&q, *dir);
+                            l.pane.search_with_options(&q, *dir, options);
                         }
                     }
                     krill_app::search::Event::Dismiss => {
+                        bar.read(cx).query().clone_into(&mut this.last_search_query);
                         this.search = None;
                         if let Some(l) = this.focused_live() {
                             l.pane.clear_search();
@@ -2748,6 +2839,68 @@ impl Shell {
         .detach();
     }
 
+    fn failed_account_input(&self) -> Option<krill_proto::SessionId> {
+        let pane = self.layout.focused()?;
+        if !self.layout.host(pane).is_local() {
+            return None;
+        }
+        let session = self.layout.session(pane)?;
+        if self
+            .live
+            .get(&pane)
+            .is_none_or(|live| live.pane.is_closed())
+        {
+            return None;
+        }
+        self.accounts_snapshot
+            .details
+            .handoffs
+            .iter()
+            .any(|h| h.from == session && h.to.is_none() && h.error.is_some())
+            .then_some(session)
+    }
+
+    fn continue_original_account(
+        &mut self,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account_cancel.is_some() || self.failed_account_input() != Some(session) {
+            return;
+        }
+        let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
+            return;
+        };
+        self.account_cancel = Some(session);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    krill_app::accounts::request_ipc(
+                        &paths,
+                        &krill_proto::usage::UsageRequest::CancelAccountSwitch { session },
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.account_cancel = None;
+                match result {
+                    Ok(snapshot) => {
+                        this.notice = None;
+                        this.apply_accounts_snapshot(snapshot, cx);
+                    }
+                    Err(error) => {
+                        this.notice = Some(error);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn apply_accounts_snapshot(
         &mut self,
         snap: krill_proto::usage::AccountsSnapshot,
@@ -2981,18 +3134,13 @@ impl Shell {
         self.send(&out, window, cx);
     }
 
+    #[cfg(test)]
     fn record_closed_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         #[cfg(test)]
         if let Some(session) = self.layout.session(pane) {
             self.closed_sessions.push(session);
         }
-        self.remember_closed_dir(pane, cx);
-    }
-
-    fn remember_closed_dir(&mut self, pane: PaneId, cx: &App) {
-        if let Some(dir) = self.pane_cwd(pane, cx) {
-            self.closed_dirs.push((self.layout.host(pane).clone(), dir));
-        }
+        let _ = (pane, cx);
     }
 
     /// 칸이 아직 레이아웃에 있으면 true(확인 대화상자를 기다리는 동안 닫혔을 수 있다).
@@ -3020,7 +3168,7 @@ impl Shell {
             cx.notify();
             return;
         }
-        self.zoomed_pane = None;
+        self.layout.set_zoomed_pane(None);
         if let Some(index) = self
             .layout
             .tabs()
@@ -3030,6 +3178,7 @@ impl Shell {
             self.do_close_tab(index, cx);
             return;
         }
+        #[cfg(test)]
         self.record_closed_pane(pane, cx);
         self.close_layout(cx, |l| {
             l.focus(pane);
@@ -3045,15 +3194,12 @@ impl Shell {
                 .iter()
                 .filter_map(|pane| self.layout.session(*pane)),
         );
-        if let Some(tab) = self.layout.tabs().get(tab_idx) {
-            let focused = tab.focused;
-            self.remember_closed_dir(focused, cx);
-        }
+        self.remember_closed_tab(tab_idx, cx);
     }
 
     fn open_new_worktree_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘N을 누르면 설정을 닫고 대화상자를 연다.
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
         let repo = self.folder();
@@ -3066,7 +3212,7 @@ impl Shell {
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘1~9를 누르면 설정을 닫고 해당 탭으로 전환한다.
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(None, cx);
         }
         let tabs = self.workspace_tabs(cx);
@@ -3074,9 +3220,7 @@ impl Shell {
         if len == 0 {
             return;
         }
-        let target = if index == 8 {
-            len.saturating_sub(1)
-        } else if index < len {
+        let target = if index < len {
             index
         } else {
             return;
@@ -3088,23 +3232,34 @@ impl Shell {
     }
 
     fn cycle_session_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
-        // OWE-860: 설정에서 ⌘⇧↑/↓를 누르면 설정을 닫고 세션을 전환한다.
-        if self.settings.is_some() {
-            self.close_settings(None, cx);
-        }
-        let items = self.sidebar.read(cx).jump_items();
-        if items.is_empty() {
-            self.cycle_workspace_tab(delta, cx);
+        self.close_settings(None, cx);
+        let workspaces = self.sidebar.read(cx).visible_workspaces();
+        if workspaces.is_empty() {
             return;
         }
-        let cur = self.layout.focused().and_then(|p| self.layout.session(p));
-        let pos = cur
-            .and_then(|id| items.iter().position(|i| i.id == id))
-            .unwrap_or(0);
-        let len = items.len().cast_signed();
-        let next = (pos.cast_signed() + delta).rem_euclid(len).cast_unsigned();
-        if let Some(item) = items.get(next) {
-            self.open_session(item.id, cx);
+        let current = self.tab_workspace(self.layout.active(), cx);
+        let pos = workspaces.iter().position(|(_, host, folder)| {
+            current
+                .as_ref()
+                .is_some_and(|w| &w.host == host && &w.folder == folder)
+        });
+        let next = pos.map_or(if delta < 0 { workspaces.len() - 1 } else { 0 }, |i| {
+            (i.cast_signed() + delta)
+                .rem_euclid(workspaces.len().cast_signed())
+                .cast_unsigned()
+        });
+        self.sidebar
+            .update(cx, |s, cx| s.activate_workspace_index(next, cx));
+    }
+
+    fn scroll_terminal(&mut self, lines: isize, cx: &mut Context<Self>) {
+        if self.page_open() || self.dashboard.is_some() {
+            return;
+        }
+        if let Some(live) = self.focused_live() {
+            live.clear_selection();
+            live.pane.scroll(lines);
+            cx.notify();
         }
     }
 
@@ -3780,7 +3935,7 @@ impl Shell {
     }
 
     fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || !self.focus.is_focused(window) {
+        if self.page_open() || !self.focus.is_focused(window) {
             return;
         }
         if self.confirm_close_tab.is_some() {
@@ -3816,7 +3971,8 @@ impl Shell {
         }
         if self.layout.mru_switching() {
             if e.keystroke.key == "escape" {
-                self.commit_mru_switcher(cx);
+                self.layout.cancel_mru();
+                cx.notify();
                 cx.stop_propagation();
                 return;
             }
@@ -3873,7 +4029,7 @@ impl Shell {
             }
             return;
         }
-        // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace만 Ctrl+U로 보낸다.
+        // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·←·→만 Ctrl+U·A·E로 보낸다.
         let ks = &e.keystroke;
         let Some(l) = self.focused_live() else { return };
         ime_trace(format_args!(
@@ -3905,7 +4061,7 @@ impl Shell {
     fn on_key_up(&mut self, e: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         // AS-12: `on_key_down`과 같이 포커스를 검사한다. 검색 바·Jump·사이드바 입력 중에
         // 올라온 Release가 버블링돼 터미널 PTY로 새는 것을 막는다(kitty 플래그 2 보고 모드).
-        if self.settings.is_some() || !self.focus.is_focused(window) {
+        if self.page_open() || !self.focus.is_focused(window) {
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -3954,7 +4110,7 @@ impl Shell {
         let Some(bytes) = keys::tui::mouse(l.pane.modes(), event, column, line, modifiers) else {
             return;
         };
-        let n = l.pane.input(&bytes, Now::get());
+        let n = l.pane.report(&bytes);
         self.show(n.as_ref(), cx);
         cx.stop_propagation();
     }
@@ -3970,7 +4126,8 @@ impl Shell {
         let Some(l) = self.live.get_mut(&pane) else {
             return;
         };
-        let dy = f32::from(e.delta.pixel_delta(line).y) + l.scroll_rem;
+        let speed = if e.modifiers.alt { 5.0 } else { 1.0 };
+        let dy = f32::from(e.delta.pixel_delta(line).y) * 1.15 * speed + l.scroll_rem;
         let lines = (dy / f32::from(line)).trunc();
         l.scroll_rem = dy - lines * f32::from(line);
         #[expect(
@@ -3997,8 +4154,16 @@ impl Shell {
                 for _ in 0..(lines.abs() as usize).min(100) {
                     report.extend_from_slice(&bytes);
                 }
-                let n = l.pane.input(&report, Now::get());
+                let n = l.pane.report(&report);
                 self.show(n.as_ref(), cx);
+                cx.stop_propagation();
+            } else if let Some(bytes) = keys::tui::wheel_arrows(l.pane.modes(), lines > 0.) {
+                let mut input = Vec::new();
+                for _ in 0..(lines.abs() as usize).min(100) {
+                    input.extend_from_slice(bytes);
+                }
+                let notice = l.pane.input(&input, Now::get());
+                self.show(notice.as_ref(), cx);
                 cx.stop_propagation();
             } else if l.pane.scroll(lines as isize) {
                 l.clear_selection();
@@ -4011,7 +4176,7 @@ impl Shell {
     fn selects(&self, pane: PaneId, modifiers: Modifiers) -> bool {
         self.live
             .get(&pane)
-            .is_some_and(|l| modifiers.shift || !l.pane.modes().mouse())
+            .is_some_and(|l| modifiers.shift || modifiers.alt || !l.pane.modes().mouse())
     }
 
     /// 왼쪽 버튼 누름(OWE-866): Shift+클릭은 기존 anchor를 유지한 채 head만 옮기고,
@@ -4123,7 +4288,7 @@ impl Shell {
     fn sync_cursor_blink(&mut self, active: bool, cx: &mut Context<Self>) {
         let default = krill_app::settings::terminal_cursor(cx);
         let blink = active
-            && self.settings.is_none()
+            && !self.page_open()
             && self.dashboard.is_none()
             && !self.is_active_chat_view()
             && self
@@ -4159,7 +4324,7 @@ impl Shell {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.dashboard.is_some() {
+        if self.page_open() || self.dashboard.is_some() {
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -4171,7 +4336,7 @@ impl Shell {
     }
 
     fn paste(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.dashboard.is_some() {
+        if self.page_open() || self.dashboard.is_some() {
             return;
         }
         self.paste_clipboard(window, cx);
@@ -4258,8 +4423,13 @@ impl Shell {
             self.close_removed_sessions(&before, cx);
         }
         let now_focused = self.layout.focused();
-        if self.zoomed_pane.is_some_and(|z| Some(z) != now_focused) {
-            self.zoomed_pane = None;
+        // 같은 탭 안의 포커스 이동은 확대를 풀고, 탭 전환은 탭별 상태를 유지한다.
+        if self
+            .layout
+            .zoomed_pane()
+            .is_some_and(|z| Some(z) != now_focused)
+        {
+            self.layout.set_zoomed_pane(None);
         }
         if now_focused != focused {
             self.files.refocus = true;
@@ -4292,7 +4462,7 @@ impl Shell {
     }
 
     pub(super) fn focused_local_session(&self) -> Option<krill_proto::SessionId> {
-        if self.settings.is_some() || self.dashboard.is_some() {
+        if self.page_open() || self.dashboard.is_some() {
             return None;
         }
         let pane = self.layout.focused()?;
@@ -4516,7 +4686,7 @@ impl Shell {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘B를 누르면 설정을 닫고 사이드바를 전환한다.
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(None, cx);
         }
         self.sidebar_collapsed = !self.sidebar_collapsed;
@@ -4527,7 +4697,7 @@ impl Shell {
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(None, cx);
         }
         if !self.panel_collapsed
@@ -4549,7 +4719,7 @@ impl Shell {
 
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘L 등을 누르면 설정을 닫고 패널을 전환한다.
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(None, cx);
         }
         self.panel_collapsed = !self.panel_collapsed;
@@ -4561,7 +4731,7 @@ impl Shell {
     }
 
     fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_open() {
             return;
         }
         if self.panel_collapsed {
@@ -4588,7 +4758,7 @@ impl Shell {
 
     fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘⇧E를 누르면 설정을 닫고 탐색기로 전환한다.
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
         if self.panel_collapsed {
@@ -4621,7 +4791,7 @@ impl Shell {
 
     fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘⇧F를 누르면 설정을 닫고 작업공간 검색으로 전환한다.
-        if self.settings.is_some() {
+        if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
         if self.panel_collapsed {
@@ -4988,7 +5158,7 @@ impl Shell {
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
-        let zoomed = self.zoomed_pane == Some(id);
+        let zoomed = self.layout.zoomed_pane() == Some(id);
         // Orca chromeless 패리티: 제목 행(26px 전체 폭 바) 대신 터미널 우상단
         // 투명 오버레이 칩에 배지와 컨트롤만 둔다. 첫 행을 가리지 않고 자리를
         // 차지하지 않으며, 탭 바와 제목이 이중으로 뜨지 않는다.
@@ -5028,7 +5198,8 @@ impl Shell {
                         .debug_selector(move || format!("pane-unzoom-{}", id.get()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.zoomed_pane = None;
+                            this.layout.set_zoomed_pane(None);
+                            this.save();
                             cx.notify();
                         })),
                     format!("pane-unzoom-{}", id.get()),
@@ -5043,7 +5214,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                        this.zoomed_pane = None;
+                        this.layout.set_zoomed_pane(None);
                         this.change(true, cx, |l| {
                             l.focus(id);
                             l.split(Axis::Horizontal);
@@ -5060,7 +5231,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                        this.zoomed_pane = None;
+                        this.layout.set_zoomed_pane(None);
                         this.change(true, cx, |l| {
                             l.focus(id);
                             l.split(Axis::Vertical);
@@ -5170,7 +5341,8 @@ impl Shell {
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     cx.stop_propagation();
                                                     // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
-                                                    this.zoomed_pane = None;
+                                                    this.layout.set_zoomed_pane(None);
+                                                    #[cfg(test)]
                                                     this.record_closed_pane(id, cx);
                                                     this.close_with_policy(
                                                         close::Policy::Preserve,
@@ -5548,10 +5720,15 @@ impl Render for Shell {
                     window.focus(&focus, cx);
                 }
             }
+            PendingFocus::Artifacts => {
+                if let Some(artifacts) = &self.artifacts {
+                    window.focus(&artifacts.read(cx).focus_handle(), cx);
+                }
+            }
         }
         // 첫 렌더도 실제 창의 활성 상태로 커서 타이머를 결정한다.
         self.sync_cursor_blink(window.is_window_active(), cx);
-        if self.settings.is_none() {
+        if !self.page_open() {
             self.sync_files(window, cx);
         }
         let cell = cell_size(window, cx);
@@ -5613,14 +5790,14 @@ impl Render for Shell {
         .absolute()
         .size_full();
         let settings_view = self.settings.clone();
-        let tree = if settings_view.is_none() {
-            let root = if let Some(zoomed) = self
-                .zoomed_pane
-                .filter(|p| self.layout.visible().contains(p))
-            {
+        let artifacts_view = self.artifacts.clone();
+        let tree = if self.page_open() {
+            None
+        } else {
+            let root = if let Some(zoomed) = self.layout.zoomed_pane() {
                 Some(PaneTree::Leaf(zoomed))
             } else {
-                self.zoomed_pane = None;
+                self.layout.set_zoomed_pane(None);
                 self.layout
                     .tabs()
                     .get(self.layout.active())
@@ -5630,13 +5807,11 @@ impl Render for Shell {
                 Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
                 None => Self::render_empty_workspace(cx),
             })
-        } else {
-            None
         };
-        let center_diff = if settings_view.is_none() {
-            self.render_center_diff(window, cx)
-        } else {
+        let center_diff = if self.page_open() {
             None
+        } else {
+            self.render_center_diff(window, cx)
         };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
@@ -5663,37 +5838,51 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.new_tab_on_launch_host(cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
-                if this.settings.is_some() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() {
                     return;
                 }
                 this.request_close_tab(this.layout.active(), cx);
             }))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.cycle_workspace_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.cycle_workspace_tab(-1, cx);
             }))
+            .on_action(cx.listener(|this, _: &NextSameTypeTab, _, cx| {
+                let editor = this.layout.is_editor_tab(this.layout.active());
+                this.cycle_workspace_tab_matching(1, Some(editor), cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevSameTypeTab, _, cx| {
+                let editor = this.layout.is_editor_tab(this.layout.active());
+                this.cycle_workspace_tab_matching(-1, Some(editor), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextTerminalTab, _, cx| {
+                this.cycle_workspace_tab_matching(1, Some(false), cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevTerminalTab, _, cx| {
+                this.cycle_workspace_tab_matching(-1, Some(false), cx);
+            }))
             .on_action(cx.listener(|this, _: &NextRecentTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.on_recent_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevRecentTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.on_recent_tab(-1, cx);
@@ -5709,7 +5898,7 @@ impl Render for Shell {
                     this.close_dashboard(Some(window), cx);
                     return;
                 }
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(Some(window), cx);
                     return;
                 }
@@ -5733,20 +5922,20 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
-                if this.settings.is_some() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(1));
             }))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| {
-                if this.settings.is_some() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(-1));
             }))
             // OWE-871: 2차원 분할에서 상하좌우 기하 방향으로 포커스를 옮긴다.
             .on_action(cx.listener(|this, _: &FocusPaneLeft, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -5754,7 +5943,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusPaneRight, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -5762,7 +5951,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusPaneUp, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -5770,7 +5959,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusPaneDown, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -5778,23 +5967,24 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &ToggleZoomPane, _, cx| {
-                if this.settings.is_some() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() {
                     return;
                 }
                 let Some(focused) = this.layout.focused() else {
                     return;
                 };
-                if this.zoomed_pane == Some(focused) {
-                    this.zoomed_pane = None;
+                if this.layout.zoomed_pane() == Some(focused) {
+                    this.layout.set_zoomed_pane(None);
                 } else if this.layout.visible().len() > 1 {
-                    this.zoomed_pane = Some(focused);
+                    this.layout.set_zoomed_pane(Some(focused));
                 } else {
-                    this.zoomed_pane = None;
+                    this.layout.set_zoomed_pane(None);
                 }
+                this.save();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearPane, _, cx| {
-                if this.settings.is_some() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() {
                     return;
                 }
                 let unlinked_session = this.layout.focused().and_then(|pane| {
@@ -5809,8 +5999,6 @@ impl Render for Shell {
                     l.clear_selection();
                     l.pane.clear_search();
                     l.pane.clear_scrollback();
-                    let n = l.pane.input(b"\x0c", Now::get());
-                    this.show(n.as_ref(), cx);
                     cx.notify();
                 }
                 if let Some((target, session)) = unlinked_session {
@@ -5822,7 +6010,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
-                if this.settings.is_some() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() {
                     return;
                 }
                 if let Some(l) = this.focused_live() {
@@ -5844,24 +6032,25 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewAgentTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 if this.link == Link::Up && this.agents.is_some() {
                     this.new_default_agent(cx);
                 } else {
-                    this.new_tab_on_launch_host(cx);
+                    this.notice = Some(
+                        krill_app::i18n::catalog::checks::D_AGENTS_NONE
+                            .get()
+                            .to_owned(),
+                    );
+                    cx.notify();
                 }
             }))
             .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| {
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(None, cx);
                 }
-                if let Some((host, dir)) = this.closed_dirs.pop() {
-                    this.new_folder_tab_on(host, &dir, Program::Login, cx);
-                } else {
-                    this.change(true, cx, Layout::new_tab);
-                }
+                this.reopen_closed_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &PrevSession, _, cx| {
                 this.cycle_session_focus(-1, cx);
@@ -5878,55 +6067,119 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NewWorktree, window, cx| {
                 this.open_new_worktree_dialog(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| {
-                if !this.jump_to_palette_row(0, cx) {
-                    this.activate_tab_index(0, cx);
+            .on_action(cx.listener(|this, _: &ScrollTop, _, cx| {
+                if !this.page_open() && this.dashboard.is_none() {
+                    if let Some(live) = this.focused_live() {
+                        live.clear_selection();
+                        live.pane.scroll_top();
+                    }
+                    cx.notify();
                 }
+            }))
+            .on_action(
+                cx.listener(|this, _: &ScrollBottom, _, cx| this.scroll_terminal(isize::MIN, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| {
+                let rows = this
+                    .focused_live()
+                    .map_or(1, |l| l.pane.screen().rows.len());
+                this.scroll_terminal(isize::try_from(rows).unwrap_or(isize::MAX), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| {
+                let rows = this
+                    .focused_live()
+                    .map_or(1, |l| l.pane.screen().rows.len());
+                this.scroll_terminal(-isize::try_from(rows).unwrap_or(isize::MAX), cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseEditors, _, cx| this.close_all_editor_tabs(cx)))
+            .on_action(cx.listener(|this, _: &RenameTab, window, cx| {
+                this.begin_tab_rename(this.layout.active(), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace1, _, cx| {
+                if !this.jump_to_palette_row(0, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(0, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace2, _, cx| {
+                if !this.jump_to_palette_row(1, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(1, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace3, _, cx| {
+                if !this.jump_to_palette_row(2, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(2, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace4, _, cx| {
+                if !this.jump_to_palette_row(3, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(3, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace5, _, cx| {
+                if !this.jump_to_palette_row(4, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(4, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace6, _, cx| {
+                if !this.jump_to_palette_row(5, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(5, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace7, _, cx| {
+                if !this.jump_to_palette_row(6, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(6, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace8, _, cx| {
+                if !this.jump_to_palette_row(7, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(7, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace9, _, cx| {
+                if !this.jump_to_palette_row(8, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(8, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| {
+                this.activate_tab_index(0, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| {
-                if !this.jump_to_palette_row(1, cx) {
-                    this.activate_tab_index(1, cx);
-                }
+                this.activate_tab_index(1, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| {
-                if !this.jump_to_palette_row(2, cx) {
-                    this.activate_tab_index(2, cx);
-                }
+                this.activate_tab_index(2, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab4, _, cx| {
-                if !this.jump_to_palette_row(3, cx) {
-                    this.activate_tab_index(3, cx);
-                }
+                this.activate_tab_index(3, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab5, _, cx| {
-                if !this.jump_to_palette_row(4, cx) {
-                    this.activate_tab_index(4, cx);
-                }
+                this.activate_tab_index(4, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab6, _, cx| {
-                if !this.jump_to_palette_row(5, cx) {
-                    this.activate_tab_index(5, cx);
-                }
+                this.activate_tab_index(5, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| {
-                if !this.jump_to_palette_row(6, cx) {
-                    this.activate_tab_index(6, cx);
-                }
+                this.activate_tab_index(6, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| {
-                if !this.jump_to_palette_row(7, cx) {
-                    this.activate_tab_index(7, cx);
-                }
+                this.activate_tab_index(7, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| {
-                if !this.jump_to_palette_row(8, cx) {
-                    this.activate_tab_index(8, cx);
-                }
+                this.activate_tab_index(8, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 // OWE-860: 설정에서 호출하면 설정을 닫고 사이드바에 포커스를 둔다.
-                if this.settings.is_some() {
+                if this.page_open() {
                     this.close_settings(Some(&mut *window), cx);
                 }
                 let back = this.focus.clone();
@@ -5936,7 +6189,11 @@ impl Render for Shell {
             .map(|d| Self::file_actions(d, cx))
             .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
-                this.toggle_changes(window, cx);
+                if this.search.is_some() {
+                    this.step_search(krill_proto::search::Direction::Previous, cx);
+                } else {
+                    this.toggle_changes(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
                 this.toggle_explorer(window, cx);
@@ -5980,7 +6237,7 @@ impl Render for Shell {
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_link_modifiers))
             .when(
-                settings_view.is_none() && !self.diff.read(cx).has_center_diff(),
+                !self.page_open() && !self.diff.read(cx).has_center_diff(),
                 |d| d.child(input),
             )
             .on_drag_move(
@@ -6043,7 +6300,19 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .bg(bg)
-                            .child(self.render_tab_bar(window, cx))
+                            .when(artifacts_view.is_none(), |d| {
+                                d.child(self.render_tab_bar(window, cx))
+                            })
+                            .children(self.failed_account_input().map(|session| {
+                                div().id("account-input-recovery").debug_selector(|| "account-input-recovery".into()).flex().items_center().gap_2()
+                                    .px_3().py_1p5().bg(p.warning).text_color(p.warning_foreground)
+                                    .text_size(krill_app::ui::TEXT_XS)
+                                    .child(krill_app::i18n::catalog::settings::ACCOUNT_INPUT_HELD.get())
+                                    .child(krill_app::ui::secondary("account-continue-original", krill_app::i18n::catalog::settings::ACCOUNT_CONTINUE_ORIGINAL.get())
+                                        .debug_selector(|| "account-continue-original".into())
+                                        .disabled(self.account_cancel.is_some())
+                                        .on_click(cx.listener(move |this, _, _, cx| this.continue_original_account(session, cx))))
+                            }))
                             .child(
                                 div()
                                     .flex_1()
@@ -6054,6 +6323,7 @@ impl Render for Shell {
                                         self.terminal_theme,
                                         krill_app::settings::terminal_opacity_pct(cx),
                                     ))
+                                    .children(artifacts_view.clone())
                                     .children(tree)
                                     .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
@@ -6062,7 +6332,7 @@ impl Render for Shell {
                                     .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
                             ),
                     )
-                    .when(!self.panel_collapsed, |d| {
+                    .when(!self.panel_collapsed && artifacts_view.is_none(), |d| {
                         d.child(divider(
                             "divider-panel".into(),
                             Drag::Panel,
@@ -6098,7 +6368,6 @@ impl Render for Shell {
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
             .children(self.render_running_close_dialog(window, cx))
-            .children(self.render_tab_rename_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
             .children(self.notification_overlay())
             // Action/safety toasts take priority in this corner. The update
@@ -6118,10 +6387,10 @@ impl Render for Shell {
 
 impl Shell {
     pub(super) fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.dashboard.is_some() {
+        if self.page_open() || self.dashboard.is_some() {
             return;
         }
-        self.zoomed_pane = None;
+        self.layout.set_zoomed_pane(None);
         if self.layout.tabs().is_empty() {
             self.new_tab_on_launch_host(cx);
         } else {

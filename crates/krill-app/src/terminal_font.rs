@@ -20,6 +20,9 @@
 //! 폴백되고 설정 화면에 사유가 뜬다.
 
 use gpui::{SharedString, TextSystem, font, px};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 /// 해석 실패·비고정폭 때 대신 쓰는 터미널 글꼴. 기본값(`ui::FONT_MONO`)과 같다.
 pub const FALLBACK_FAMILY: &str = crate::ui::FONT_MONO;
@@ -89,10 +92,49 @@ pub fn effective_font_with(
     }
 }
 
+#[derive(Default)]
+struct RegistryCache {
+    registry: Weak<TextSystem>,
+    entries: HashMap<String, (gpui::FontId, EffectiveFont, bool)>,
+}
+thread_local! {
+    static CACHE: RefCell<RegistryCache> = RefCell::new(RegistryCache::default());
+}
+
+fn cached_font(text: &Arc<TextSystem>, requested: &str) -> (EffectiveFont, bool) {
+    let requested = requested.trim();
+    let resolved = text.resolve_font(&font(requested));
+    CACHE.with_borrow_mut(|cache| {
+        if !Weak::ptr_eq(&cache.registry, &Arc::downgrade(text)) {
+            cache.registry = Arc::downgrade(text);
+            cache.entries.clear();
+        }
+        // resolve_font is registry-generation aware (add_fonts clears its map).
+        // Comparing the resolved id also invalidates negative/fallback decisions.
+        if let Some((id, effective, usable)) = cache.entries.get(requested)
+            && *id == resolved
+        {
+            return (effective.clone(), *usable);
+        }
+        let widths = (!requested.is_empty())
+            .then(|| measure(text, requested))
+            .flatten();
+        let usable = widths.is_some_and(|w| uniform(&w));
+        let effective = effective_font_with(requested, |_| widths);
+        if cache.entries.len() >= 128 {
+            cache.entries.clear();
+        }
+        cache
+            .entries
+            .insert(requested.to_owned(), (resolved, effective.clone(), usable));
+        (effective, usable)
+    })
+}
+
 /// 지정 글꼴을 쓰되, 고정폭으로 해석되지 않으면 Menlo로 폴백한다.
 #[must_use]
-pub fn effective_terminal_font(text: &TextSystem, requested: &str) -> EffectiveFont {
-    effective_font_with(requested, |family| measure(text, family))
+pub fn effective_terminal_font(text: &Arc<TextSystem>, requested: &str) -> EffectiveFont {
+    cached_font(text, requested).0
 }
 
 /// 해석된 글꼴이 터미널 셀 계산에 쓸 수 있는 고정폭인지 본다(OWE-899).
@@ -100,14 +142,13 @@ pub fn effective_terminal_font(text: &TextSystem, requested: &str) -> EffectiveF
 /// 빈 이름은 무조건 거짓이다. 없는 패밀리는 gpui가 (보통 비례) 글꼴로 대신하는데
 /// 그 경우 advance가 글자마다 달라 거짓이 된다.
 #[must_use]
-pub fn is_usable_terminal_font(text: &TextSystem, family: &str) -> bool {
-    let family = family.trim();
-    !family.is_empty() && measure(text, family).is_some_and(|w| uniform(&w))
+pub fn is_usable_terminal_font(text: &Arc<TextSystem>, family: &str) -> bool {
+    cached_font(text, family).1
 }
 
 /// 드롭다운에 올릴 고정폭 글꼴만 고른다(OWE-899). 순서는 호출자가 정한다.
 #[must_use]
-pub fn usable_terminal_fonts(text: &TextSystem, names: &[String]) -> Vec<String> {
+pub fn usable_terminal_fonts(text: &Arc<TextSystem>, names: &[String]) -> Vec<String> {
     names
         .iter()
         .filter(|n| is_usable_terminal_font(text, n))

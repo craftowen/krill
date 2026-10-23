@@ -543,3 +543,50 @@ fn hooks_without_event_name_cannot_replace_bound_conversation_identity() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn account_resume_requires_an_observed_parent_hook_not_launch_metadata() {
+    let dir = std::env::temp_dir().join(format!("kas-observed-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(17);
+    control.watch_account_resume(session);
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Yolo,
+            },
+            Some("expected".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    assert!(!control.account_resume_observed(session, "expected"));
+    for payload in [
+        r#"{"hook_event_name":"SessionStart","session_id":"other"}"#,
+        r#"{"hook_event_name":"SessionStart","session_id":"expected","agent_id":"child"}"#,
+        r#"{"hook_event_name":"SessionEnd","session_id":"expected"}"#,
+        r#"{"session_id":"expected"}"#,
+    ] {
+        control.record_hook_session(session, payload.as_bytes());
+        assert!(!control.account_resume_observed(session, "expected"));
+    }
+    control.record_hook_session(
+        session,
+        br#"{"hook_event_name":"SessionStart","session_id":"expected"}"#,
+    );
+    assert!(control.account_resume_observed(session, "expected"));
+    for payload in [
+        r#"{"hookEventName":"SessionStart","session_id":"expected"}"#,
+        r#"{"event":"PreInvocation","conversation_id":"expected"}"#,
+    ] {
+        control.watch_account_resume(session);
+        control.record_hook_session(session, payload.as_bytes());
+        assert!(control.account_resume_observed(session, "expected"));
+    }
+    control.finish_account_resume(session);
+    assert!(!control.account_resume_observed(session, "expected"));
+    fs::remove_dir_all(dir).unwrap();
+}

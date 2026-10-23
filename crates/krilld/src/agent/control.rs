@@ -16,6 +16,7 @@ use krill_proto::control::{
 };
 
 use crate::session::lock;
+pub(crate) mod cache;
 
 /// 디스크(`agent-launches/<id>.json`)에 남기는 에이전트 실행 기록.
 /// `session_id`와 `cwd`는 `#[serde(default)]`라 구 버전 기록도 그대로 읽는다.
@@ -53,7 +54,11 @@ pub(crate) struct Control {
     dir: Option<PathBuf>,
     /// 한 데몬의 설정 변경·조회가 서로 덮어쓰지 않게 한다.
     config: Mutex<()>,
+    signed_cache: Mutex<Option<cache::Signed>>,
     veto: Mutex<std::collections::HashSet<SessionId>>,
+    /// Only in-flight account replacements are watched. Launch metadata is an expectation,
+    /// while this observation comes from a hook attributed to the replacement process.
+    account_resumes: Mutex<std::collections::HashMap<SessionId, Option<String>>>,
 }
 
 impl Control {
@@ -61,8 +66,25 @@ impl Control {
         Self {
             dir: dir.map(Path::to_owned),
             config: Mutex::new(()),
+            signed_cache: Mutex::new(None),
             veto: Mutex::default(),
+            account_resumes: Mutex::default(),
         }
+    }
+
+    pub fn watch_account_resume(&self, session: SessionId) {
+        lock(&self.account_resumes).insert(session, None);
+    }
+
+    pub fn account_resume_observed(&self, session: SessionId, id: &str) -> bool {
+        lock(&self.account_resumes)
+            .get(&session)
+            .and_then(|id| id.as_deref())
+            == Some(id)
+    }
+
+    pub fn finish_account_resume(&self, session: SessionId) {
+        lock(&self.account_resumes).remove(&session);
     }
 
     fn user(&self) -> io::Result<Option<String>> {
@@ -93,16 +115,39 @@ impl Control {
     /// 서명 규칙(있고 서명이 맞을 때). 없거나 틀리면 `None` → 호출자는 내장을 유지한다.
     fn signed(&self) -> Option<RulesPayload> {
         let dir = self.dir.as_ref()?;
-        let key_text = fs::read_to_string(dir.join(PUBLIC_KEY_FILE_NAME)).ok()?;
+        let key_path = dir.join(PUBLIC_KEY_FILE_NAME);
+        let rules_path = dir.join(RULES_FILE_NAME);
+        let stamps = (cache::stamp(&key_path), cache::stamp(&rules_path));
+        let mut cached = lock(&self.signed_cache);
+        if let Some(old) = cached.as_ref()
+            && stamps.0.is_some()
+            && stamps.1.is_some()
+            && old.stamps == stamps
+        {
+            return old.payload.clone();
+        }
+        // Fail closed on deletion/read failures. Do not cache an unknown stamp.
+        *cached = None;
+        let key_text = fs::read_to_string(&key_path).ok()?;
         let public = krill_proto::agent::rules::decode_public_key(&key_text)?;
-        let bytes = fs::read(dir.join(RULES_FILE_NAME)).ok()?;
-        match krill_proto::agent::rules::load_signed(&public, &bytes) {
+        let bytes = fs::read(&rules_path).ok()?;
+        let payload = match krill_proto::agent::rules::load_signed(&public, &bytes) {
             Ok(signed) => Some(signed),
             Err(e) => {
                 tracing::warn!("signed agent rules rejected, keeping builtin: {e}");
                 None
             }
+        };
+        if stamps.0.is_some()
+            && stamps.1.is_some()
+            && stamps == (cache::stamp(&key_path), cache::stamp(&rules_path))
+        {
+            *cached = Some(cache::Signed {
+                stamps,
+                payload: payload.clone(),
+            });
         }
+        payload
     }
 
     /// 내장 ← 서명 ← 사용자 순으로 겹친다. 사용자 파일이 마지막이라 로컬이 우선이다.
@@ -239,10 +284,7 @@ impl Control {
         let Some(id) = extract_hook_session_id(&p) else {
             return false;
         };
-        if p.get("hook_event_name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|event| is_legitimate_session_id_rotation(event, &p))
-        {
+        if hook_event(&p).is_some_and(|event| is_legitimate_session_id_rotation(event, &p)) {
             return false;
         }
         let _guard = lock(&self.config);
@@ -350,7 +392,7 @@ impl Control {
         };
         let foreign_session_id = match (stored.session_id.as_deref(), id, payload.as_ref().ok()) {
             (Some(existing), Some(incoming), Some(p)) if existing != incoming => {
-                match p.get("hook_event_name").and_then(serde_json::Value::as_str) {
+                match hook_event(p) {
                     Some(event) => !is_legitimate_session_id_rotation(event, p),
                     None => true,
                 }
@@ -358,6 +400,27 @@ impl Control {
             _ => false,
         };
         let is_subagent_or_foreign = explicit_subagent || foreign_session_id;
+        if !is_subagent_or_foreign
+            && let Some(id) = id
+            && payload
+                .as_ref()
+                .ok()
+                .and_then(hook_event)
+                .is_some_and(|event| {
+                    matches!(
+                        event,
+                        "SessionStart"
+                            | "sessionStart"
+                            | "PreInvocation"
+                            | "UserPromptSubmit"
+                            | "PreToolUse"
+                    )
+                })
+            && let Some(observed) = lock(&self.account_resumes).get_mut(&session)
+        {
+            *observed = Some(id.to_owned());
+        }
+
         if foreign_session_id {
             self.block_hibernation(session);
         }
@@ -405,6 +468,7 @@ impl Control {
     }
 
     pub fn forget(&self, session: SessionId) {
+        self.finish_account_resume(session);
         lock(&self.veto).remove(&session);
         let _guard = lock(&self.config);
         if let Ok(path) = self.launch_path(session) {
@@ -462,13 +526,15 @@ fn infer_profile_from_transcript(transcript_path: Option<&str>) -> Option<&'stat
     }
 }
 
-fn is_explicit_subagent_payload(p: &serde_json::Value) -> bool {
-    let event = p
-        .get("hook_event_name")
+fn hook_event(p: &serde_json::Value) -> Option<&str> {
+    p.get("hook_event_name")
         .or_else(|| p.get("hookEventName"))
         .or_else(|| p.get("event"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+}
+
+fn is_explicit_subagent_payload(p: &serde_json::Value) -> bool {
+    let event = hook_event(p).unwrap_or("");
     if event.starts_with("Subagent") || event.starts_with("Teammate") {
         return true;
     }

@@ -68,7 +68,7 @@ pub struct Dialog {
     phase: Phase,
     source: Arc<dyn Source>,
     task: Option<Task<()>>,
-    _enter: [Subscription; 4],
+    _enter: [Subscription; 1],
     preparation: Option<Preparation>,
     preparation_task: Option<Task<()>>,
     preparation_ready: bool,
@@ -249,25 +249,11 @@ impl Dialog {
             InputState::new(window, cx).placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get())
         });
         name.update(cx, |input, cx| input.focus(window, cx));
-        let enter = |cx: &mut Context<Self>, input: &Entity<InputState>| {
-            cx.subscribe(input, |d, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::PressEnter { .. })
-                    && matches!(d.phase, Phase::Edit(_))
-                {
-                    d.submit(Setup::Ask, cx);
-                }
-            })
-        };
-        let subscriptions = [
-            enter(cx, &name),
-            enter(cx, &base),
-            enter(cx, &initial_prompt),
-            cx.subscribe(&base, |d, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    d.prepare(cx);
-                }
-            }),
-        ];
+        let subscriptions = [cx.subscribe(&base, |d, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                d.prepare(cx);
+            }
+        })];
         let mut dialog = Self {
             language: crate::i18n::language(),
             repo,
@@ -439,6 +425,17 @@ impl Dialog {
         if !matches!(self.phase, Phase::Edit(_)) {
             return false;
         }
+        if e.keystroke.key == "enter"
+            && (e.keystroke.modifiers.platform
+                || (!cfg!(target_os = "macos") && e.keystroke.modifiers.control))
+        {
+            self.submit(Setup::Ask, cx);
+            return true;
+        }
+        if e.keystroke.key == "enter" && self.name.read(cx).focus_handle(cx).is_focused(window) {
+            self.base.update(cx, |input, cx| input.focus(window, cx));
+            return true;
+        }
         match e.keystroke.key.as_str() {
             "escape" => {
                 if self.highlight.is_some() {
@@ -489,7 +486,9 @@ impl Dialog {
                     self.highlight = None;
                     cx.notify();
                 }
-                false
+                self.initial_prompt
+                    .update(cx, |input, cx| input.focus(window, cx));
+                true
             }
             _ => false,
         }
@@ -578,7 +577,7 @@ impl Dialog {
     }
 
     fn request(&self, setup: Setup, cx: &Context<Self>) -> Result<NewWorktree, &'static str> {
-        let name: String = self
+        let mut name: String = self
             .name
             .read(cx)
             .value()
@@ -587,7 +586,15 @@ impl Dialog {
             .filter(|c| !c.is_control())
             .collect();
         if name.is_empty() {
-            return Err(text::EMPTY_NAME.get());
+            // 비어 있으면 충돌 가능성이 작은 자동 이름으로 생성한다. 서버가 최종 중복 검사를 한다.
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            name = format!("workspace-{suffix:x}");
+        }
+        if name.len() > 255 {
+            return Err(text::NAME_TOO_LONG.get());
         }
         let base = self.base.read(cx).value().trim().to_owned();
         Ok(NewWorktree {

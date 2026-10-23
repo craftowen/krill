@@ -1,35 +1,39 @@
 ---
 name: Bug report
-about: 재현 가능한 결함을 신고한다
+about: Report a reproducible defect
 title: "[bug] "
 labels: bug
 ---
 
-## 현상
+<!-- For vulnerabilities use SECURITY.md, not a public bug report. English or Korean reports are welcome. -->
 
-<!-- 무엇이 잘못됐는지 한두 문장으로 -->
+## What happened?
 
-## 재현 절차
+<!-- Describe the problem in one or two sentences. -->
+
+## Steps to reproduce
+
+<!-- Include GUI steps or copyable commands, and whether the app/services were restarted. -->
 
 ```sh
-# 그대로 복사해 실행하면 같은 현상이 나는 명령
+# Minimal reproduction commands, if relevant
 ```
 
-## 기대 동작
+## Expected behavior
 
-<!-- 무엇이 일어나야 하는지 -->
+## Environment
 
-## 환경
+- Krill version/tag or commit:
+- OS version and architecture (macOS / Windows):
+- Installation method (release / source):
+- Shell and agent/version, if relevant:
+- Rust version (source builds only):
+- Number of sessions, if relevant:
 
-- Krill 커밋/태그:
-- macOS 버전:
-- rustc 버전 (`rustc --version`):
-- 터미널·세션 수 (해당 시):
+## Logs and evidence
 
-## 로그·근거
+<!-- Review `krill doctor --bundle` output before attaching it. Remove tokens, keys, private paths, and personal information. Add relevant screenshots or log excerpts. -->
 
-<!-- `krill doctor --bundle` 요약, 관련 로그 발췌. 토큰·키·개인정보는 지우고 낸다 -->
+## Measurements, if relevant
 
-## 측정값 (해당 시)
-
-<!-- 추정 금지. 실측 수치와 재현 명령을 함께 -->
+<!-- Include measured values, workload, and reproduction commands. Label estimates explicitly. -->

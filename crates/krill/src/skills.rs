@@ -509,10 +509,9 @@ fn cmd_reference(state_dir: &Path, args: &[String]) -> io::Result<()> {
                 }
             }
             let store = WorktreeStore::load(state_dir)?;
-            let found = store.find_references(&query);
+            let found = store.reference_matches(&query);
             if json {
                 let items: Vec<_> = found
-                    .into_iter()
                     .map(|(w, u)| serde_json::json!({ "worktree": w, "url": u }))
                     .collect();
                 print_json(&items)?;

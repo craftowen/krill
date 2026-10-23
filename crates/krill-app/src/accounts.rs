@@ -280,6 +280,7 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
     let mut hello = daemon::client_hello(ClientRole::App, "krill-app accounts");
     hello.features = FEAT_USAGE
         | krill_proto::usage::FEAT_PROVIDER_DETAILS
+        | krill_proto::usage::FEAT_ACCOUNT_CANCEL
         | krill_proto::usage::FEAT_USAGE_AGY
         | krill_proto::usage::FEAT_USAGE_RULES
         | krill_proto::usage::FEAT_USAGE_STATUS
@@ -320,6 +321,10 @@ pub fn request_local(
     req: &UsageRequest,
 ) -> io::Result<AccountsSnapshot> {
     match req {
+        UsageRequest::CancelAccountSwitch { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "account handoff cancellation requires the daemon",
+        )),
         UsageRequest::Get | UsageRequest::ListAccounts | UsageRequest::ListOrphanProfiles => {
             Ok(refresh_local(home, state_dir))
         }

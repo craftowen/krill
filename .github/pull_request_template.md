@@ -1,18 +1,31 @@
-## 무엇을 (한 줄)
+## Change and problem
 
-<!-- 이슈 번호: Closes # -->
+<!-- Link the issue: Closes #... Explain the resulting behavior. English or Korean is welcome. -->
 
-## 완료 조건 확인
+## Completion conditions
 
-- [ ] 이슈의 완료 조건만 건드렸다 (범위 밖 변경 없음)
-- [ ] `cargo fmt --all` 후 `scripts/check.sh` 0 종료
-- [ ] 새 동작에 테스트 또는 측정 근거 첨부 (추정 수치 없음)
+- [ ] The change stays within the issue's completion conditions.
+- [ ] Checks appropriate to this change passed, or limitations are recorded below.
+- [ ] Behavior changes include relevant test or reproduction evidence; measurements are labeled accurately.
 
-## 근거
+## Validation
 
-<!-- 테스트 출력·측정값·재현 명령. 스크린샷은 해당 시 -->
+<!-- Record target HEAD/commit, commands, scope, and results. Follow CONTRIBUTING.md and AGENTS.md:
+Markdown-only changes (or only allowed Cargo profile debug settings) use `git diff --check`; no Cargo run is needed.
+Code changes need formatting, affected-crate clippy, and relevant tests.
+IPC/PTY/session-survival changes need the relevant integration/survival tests.
+Windows code needs the affected Windows check.
+YAML, scripts, and other configuration changes need checks of the affected behavior.
+The full `scripts/check.sh` is a final release-candidate gate, not a blanket documentation-PR requirement.
+-->
 
-## 주의
+- Target commit:
+- Checks and results:
+- Limitations or checks not run (with reason):
 
-- [ ] 토큰·키·개인정보 포함 없음
-- [ ] GPL 코드 열람·복사 없음, Orca 차용 시 출처 표기
+## Review notes
+
+<!-- Include screenshots for UI changes and relevant compatibility or recovery limits. -->
+
+- [ ] No tokens, keys, private paths, or personal information are included.
+- [ ] No GPL terminal code was read/copied; any permitted Orca reuse is attributed.

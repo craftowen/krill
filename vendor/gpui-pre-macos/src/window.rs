@@ -3217,7 +3217,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
                 // See `display_layer` for why the link keeps running.
-                lock.renderer.set_presents_with_transaction(true);
+
                 drop(lock);
                 callback(RequestFrameOptions {
                     signal_at,
@@ -3227,7 +3227,6 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
                 lock.start_display_link();
             }
         } else {
@@ -3345,7 +3344,7 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         // No stop/start around this frame: ticks reach `step` on the main queue, so none can
         // interleave with it anyway, and restarting the link spawned a new CVDisplayLink thread per
         // call. `start_display_link` still resubscribes a window whose link was lost.
-        lock.renderer.set_presents_with_transaction(true);
+
         drop(lock);
         callback(RequestFrameOptions {
             signal_at,
@@ -3355,7 +3354,6 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
         lock.start_display_link();
     }
 }
@@ -3447,6 +3445,7 @@ extern "C" fn step(view: *mut c_void) {
     lock.link_stalls = 0;
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        let require_presentation = mem::take(&mut lock.present_pending);
         let (signal_at, signal_source) = lock
             .frame_source
             .as_ref()

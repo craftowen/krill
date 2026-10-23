@@ -22,6 +22,44 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(600);
 const SAMPLE_AFTER_MS: u64 = 1_500;
 const SAMPLE_BYTES: u64 = 2 << 20;
 
+// Aggregate only duration buckets. No query, path, terminal text, or per-frame log.
+static UI_WORK: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+pub(crate) struct Work {
+    started: Instant,
+    label: &'static str,
+}
+
+/// Measure synchronous UI work, including refresh and native terminal painting.
+pub(crate) fn work(label: &'static str) -> Work {
+    Work {
+        started: Instant::now(),
+        label,
+    }
+}
+
+fn work_bucket(elapsed: Duration) -> usize {
+    match elapsed.as_micros() {
+        0..8_000 => 0,
+        8_000..16_700 => 1,
+        16_700..33_000 => 2,
+        33_000..100_000 => 3,
+        _ => 4,
+    }
+}
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        let bucket = work_bucket(elapsed);
+        UI_WORK[bucket].fetch_add(1, Ordering::Relaxed);
+        // Opt-in trace provides attribution without allocating on normal frames.
+        tracing::trace!(target: "krill_ui_work", operation = self.label,
+            elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            "UI work completed");
+    }
+}
+
 struct Watchdog {
     _pulse: Task<()>,
     // Dropping the sender stops the observer without joining it on the UI.
@@ -97,10 +135,25 @@ fn start_with(
             let state = state();
             let mut want_sample = false;
             let mut sampled_at: Option<Instant> = None;
+            let mut pulses = 0u32;
             while matches!(
                 stopped.recv_timeout(PULSE),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
+                pulses = pulses.wrapping_add(1);
+                if pulses.is_multiple_of(20) {
+                    let counts = UI_WORK.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+                    if counts.iter().skip(1).any(|&n| n != 0) {
+                        tracing::debug!(
+                            under_8ms = counts[0],
+                            under_16_7ms = counts[1],
+                            under_33ms = counts[2],
+                            under_100ms = counts[3],
+                            over_100ms = counts[4],
+                            "UI work duration buckets"
+                        );
+                    }
+                }
                 let now = millis(epoch.elapsed());
                 let seen = Seen::unpack(observed_seen.load(Ordering::Acquire));
                 match watch.observe(now, observed.load(Ordering::Acquire), seen, display_asleep) {
@@ -358,6 +411,15 @@ fn capture(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_work_buckets_preserve_frame_boundaries() {
+        assert_eq!(work_bucket(Duration::from_micros(7_999)), 0);
+        assert_eq!(work_bucket(Duration::from_micros(8_000)), 1);
+        assert_eq!(work_bucket(Duration::from_micros(16_700)), 2);
+        assert_eq!(work_bucket(Duration::from_millis(33)), 3);
+        assert_eq!(work_bucket(Duration::from_millis(100)), 4);
+    }
 
     #[test]
     fn reports_once_per_stall_then_records_recovery_and_next_stall() {

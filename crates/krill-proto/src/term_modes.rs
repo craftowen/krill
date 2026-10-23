@@ -6,6 +6,31 @@ use serde::{Deserialize, Serialize};
 
 pub const FEAT_TERM_MODES: u64 = 1 << 13;
 pub const TERM_MODES: u8 = 0x2b;
+/// 화면 지우기는 입력 바이트 없이 엔진 화면만 바꾼다. 기존 `ClearScrollback` 계약과 분리한다.
+pub const FEAT_CLEAR_VIEWPORT: u64 = 1 << 21;
+pub const CLEAR_VIEWPORT: u8 = 0x47;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearViewport;
+
+impl crate::screen::Msg for ClearViewport {
+    const KIND: u8 = CLEAR_VIEWPORT;
+
+    fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if kind != Self::KIND {
+            return Err(crate::ipc::Error::UnexpectedKind {
+                want: Self::KIND,
+                got: kind,
+            });
+        }
+        if !body.is_empty() {
+            return Err(crate::ipc::Error::BadLength(
+                u64::try_from(body.len()).unwrap_or(u64::MAX),
+            ));
+        }
+        Ok(Self)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Modes {
@@ -21,6 +46,8 @@ impl Modes {
     pub const MOUSE_MOTION: u16 = 1 << 3;
     pub const SGR_MOUSE: u16 = 1 << 4;
     pub const BRACKETED_PASTE: u16 = 1 << 5;
+    pub const ALT_SCREEN: u16 = 1 << 6;
+    pub const ALTERNATE_SCROLL: u16 = 1 << 7;
 
     pub fn contains(self, flag: u16) -> bool {
         self.flags & flag == flag
@@ -39,6 +66,19 @@ impl crate::screen::Msg for Modes {
 mod tests {
     use super::*;
     use crate::screen::Msg as _;
+
+    #[test]
+    fn clear_viewport_frozen_frame() {
+        assert_eq!(
+            ClearViewport.encode().unwrap(),
+            [1, 0, 0, 0, CLEAR_VIEWPORT]
+        );
+        assert_eq!(
+            ClearViewport::decode(CLEAR_VIEWPORT, &[]).unwrap(),
+            ClearViewport
+        );
+        assert!(ClearViewport::decode(CLEAR_VIEWPORT, &[1]).is_err());
+    }
 
     #[test]
     fn fixed_frame_and_roundtrip() {

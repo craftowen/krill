@@ -1,22 +1,22 @@
 ---
 name: Feature request
-about: 새 기능·개선을 제안한다
+about: Propose a feature or improvement
 title: "[feat] "
 labels: enhancement
 ---
 
-## 제안
+<!-- English or Korean reports are welcome. For a private-contact request, include only the request; omit vulnerability or incident details. -->
 
-<!-- 무엇을, 왜 (어떤 워크로드·문제) -->
+## Proposal and problem
 
-## 완료 조건
+<!-- What should change, and which task or workload does it help? -->
 
-<!-- 끝나면 무엇이 달라지는지, 검증 방법은 무엇인지. 측정형이면 지표·측정 명령까지 -->
+## Completion conditions
 
-## 범위 밖
+<!-- Describe the observable result and how to verify it. For measurements, include the workload and commands. -->
 
-<!-- 이번에 하지 않는 것 -->
+## Out of scope
 
-## 대안·참고
+## Alternatives and references
 
-<!-- 고려한 다른 방법, 관련 이슈·문서 -->
+<!-- Include other approaches considered and related issues or documents. -->

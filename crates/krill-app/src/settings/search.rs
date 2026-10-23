@@ -6,38 +6,24 @@ use super::text;
 use crate::i18n::{Language, Message, SETTINGS_SEARCH_INDEX as INDEX};
 
 /// 검색어와 맞는 탭([`AdminTab::ALL`] 순). 빈 검색어면 전부. 대소문자는 가리지 않는다.
-/// 띄어쓰기로 나뉜 여러 단어는 같은 항목(탭 제목·부제·색인 한 줄) 안에
-/// 모두 들어 있으면 맞는다("worktree cleanup" → `SPACE_TITLE` 영문 + 키워드).
 pub(super) fn search_tabs(query: &str) -> Vec<AdminTab> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return AdminTab::ALL.to_vec();
     }
-    let words: Vec<&str> = query.split_whitespace().collect();
+    let hit = |s: &str| s.to_lowercase().contains(&query);
     let both = |m: Message| [Language::Ko, Language::En].map(|l| m.in_language(l));
-    let doc_hit = |doc: &[String]| {
-        doc.iter().any(|s| s.contains(&query))
-            || words.iter().all(|w| doc.iter().any(|s| s.contains(w)))
-    };
-    let mut doc: Vec<String> = Vec::new();
     AdminTab::ALL
         .into_iter()
         .filter(|&tab| {
-            doc.clear();
-            doc.extend(both(tab_title(tab)).map(str::to_lowercase));
-            doc.extend(both(tab.subtitle_message()).map(str::to_lowercase));
-            if doc_hit(&doc) {
-                return true;
-            }
-            INDEX
-                .iter()
-                .filter(|(t, ..)| *t == tab)
-                .any(|(_, title, keywords)| {
-                    doc.clear();
-                    doc.extend(both(*title).map(str::to_lowercase));
-                    doc.extend(keywords.iter().copied().map(str::to_lowercase));
-                    doc_hit(&doc)
-                })
+            both(tab_title(tab)).into_iter().any(hit)
+                || both(tab.subtitle_message()).into_iter().any(hit)
+                || INDEX
+                    .iter()
+                    .filter(|(t, ..)| *t == tab)
+                    .any(|(_, title, words)| {
+                        both(*title).into_iter().any(hit) || words.iter().copied().any(hit)
+                    })
         })
         .collect()
 }
@@ -54,7 +40,6 @@ fn tab_title(tab: AdminTab) -> Message {
         AdminTab::Shortcuts => text::TAB_SHORTCUTS,
         AdminTab::Resources => text::TAB_RESOURCES,
         AdminTab::Mobile => crate::i18n::catalog::mobile::TAB,
-        AdminTab::Artifacts => crate::i18n::catalog::artifacts::TAB,
     }
 }
 

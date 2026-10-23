@@ -42,6 +42,9 @@ pub fn events(text: Option<&str>) -> Vec<&'static str> {
         ("SessionEnd", (1, 0, 85)),
         ("PermissionRequest", (2, 0, 45)),
         ("StopFailure", (2, 1, 78)),
+        // 사이드바 서브에이전트 행. 최초 버전은 CHANGELOG 기준 추정(실측 안 함)이라 둘 다 늦은 쪽으로 묶는다.
+        ("SubagentStart", (2, 0, 43)),
+        ("SubagentStop", (2, 0, 43)),
     ];
     gates
         .into_iter()
@@ -87,7 +90,7 @@ mod tests {
         #[test]
         fn arbitrary_version_never_panics(text in ".{0,512}") {
             let events = events(Some(&text));
-            proptest::prop_assert!(events.len() <= 8);
+            proptest::prop_assert!(events.len() <= 10);
         }
     }
 
@@ -99,7 +102,8 @@ mod tests {
         assert!(!events(Some("2.1.77")).contains(&"StopFailure"));
         assert!(events(Some("2.1.78")).contains(&"StopFailure"));
         assert!(!events(Some("2.1.100")).contains(&"Notification"));
-        assert_eq!(events(Some("2.1.299 (Claude Code)")).len(), 8);
+        assert_eq!(events(Some("2.1.299 (Claude Code)")).len(), 10);
+        assert!(!events(Some("2.0.42")).contains(&"SubagentStart"));
     }
 
     #[test]

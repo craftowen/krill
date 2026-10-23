@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,9 @@ struct Slot {
 struct Lease {
     slot: Arc<Slot>,
     child: Mutex<Option<Child>>,
+    generation: AtomicU64,
+    child_generation: AtomicU64,
+    stop_pending: AtomicBool,
 }
 
 impl LinkHosts {
@@ -178,8 +181,12 @@ impl LinkHosts {
             .map(|slots| {
                 slots
                     .values()
-                    .filter_map(|s| s.lease.lock().ok()?.upgrade())
-                    .filter_map(|lease| lease.child.lock().ok()?.as_ref().map(Child::id))
+                    .flat_map(|s| {
+                        s.owned
+                            .lock()
+                            .map(|pids| pids.iter().copied().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -298,6 +305,9 @@ impl Slot {
                 let lease = Arc::new(Lease {
                     slot: self.clone(),
                     child: Mutex::new(None),
+                    generation: AtomicU64::new(0),
+                    child_generation: AtomicU64::new(0),
+                    stop_pending: AtomicBool::new(false),
                 });
                 *cached = Arc::downgrade(&lease);
                 lease
@@ -306,6 +316,9 @@ impl Slot {
             Arc::new(Lease {
                 slot: self.clone(),
                 child: Mutex::new(None),
+                generation: AtomicU64::new(0),
+                child_generation: AtomicU64::new(0),
+                stop_pending: AtomicBool::new(false),
             })
         };
         let connect = lease.clone();
@@ -348,6 +361,10 @@ impl Lease {
 
     fn ensure(&self) -> io::Result<PathBuf> {
         self.check_available()?;
+        let generation = self.generation.load(Ordering::Acquire);
+        if self.slot.closed.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         if self
             .slot
             .suspended
@@ -374,8 +391,12 @@ impl Lease {
             .child
             .lock()
             .map_err(|_| io::Error::other(text::ERR_UNAVAILABLE.get()))?;
-        self.check_available()?;
-        if restart && let Some(mut process) = child.take() {
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if (restart || self.child_generation.load(Ordering::Acquire) != generation)
+            && let Some(mut process) = child.take()
+        {
             let pid = process.id();
             process.kill().ok();
             process.wait().ok();
@@ -415,12 +436,17 @@ impl Lease {
                 pids.insert(process.id());
             }
             *child = Some(process);
+            self.child_generation.store(generation, Ordering::Release);
         }
         self.slot.starting.store(true, Ordering::Release);
         let _starting = Starting(&self.slot.starting);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            self.check_available()?;
+            if self.slot.closed.load(Ordering::Acquire)
+                || self.generation.load(Ordering::Acquire) != generation
+            {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             if let Some(process) = child.as_mut()
                 && process.try_wait()?.is_some()
             {
@@ -443,16 +469,37 @@ impl Lease {
         }
     }
 
-    fn stop(&self) {
-        if let Ok(mut guard) = self.child.lock()
-            && let Some(mut child) = guard.take()
+    fn stop(self: &Arc<Self>) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if self.stop_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let lease = Arc::clone(self);
+        if std::thread::Builder::new()
+            .name("link-stop".into())
+            .spawn(move || {
+                let child = lease.child.lock().ok().and_then(|mut guard| {
+                    lease.stop_pending.store(false, Ordering::Release);
+                    // A reconnect may already have installed a new child. An old
+                    // stop request must never reap that generation.
+                    (lease.child_generation.load(Ordering::Acquire)
+                        != lease.generation.load(Ordering::Acquire))
+                    .then(|| guard.take())
+                    .flatten()
+                });
+                if let Some(mut child) = child {
+                    let pid = child.id();
+                    child.kill().ok();
+                    child.wait().ok();
+                    if let Ok(mut pids) = lease.slot.owned.lock() {
+                        pids.remove(&pid);
+                    }
+                }
+            })
+            .is_err()
         {
-            let pid = child.id();
-            child.kill().ok();
-            child.wait().ok();
-            if let Ok(mut pids) = self.slot.owned.lock() {
-                pids.remove(&pid);
-            }
+            self.stop_pending.store(false, Ordering::Release);
+            tracing::warn!("could not start link child cleanup");
         }
     }
 }

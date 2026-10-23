@@ -49,6 +49,7 @@ use crate::store::{Limits, Store};
 mod account_switch;
 mod agent_history;
 mod hibernation;
+mod orch_cache;
 mod schedule;
 mod sidebar;
 pub mod usage_tick;
@@ -132,6 +133,8 @@ pub struct Registry {
     /// 사용자 에이전트 프로필(`agents.toml`).
     agents: crate::agent::control::Control,
     status: Statuses,
+    /// Serializes status/launch commits with deletion, outside the registry state lock.
+    hook_commit: Mutex<()>,
     /// `krill hook`의 spool 파일.
     spool: Option<PathBuf>,
     state: Mutex<State>,
@@ -156,6 +159,7 @@ pub struct Registry {
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
     webhooks: Mutex<crate::webhook::Dispatcher>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
+    orch_cache: Mutex<orch_cache::Cache>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -215,6 +219,7 @@ impl Registry {
             mobile: OnceLock::new(),
             webhooks: Mutex::new(crate::webhook::Dispatcher::new(dir)),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
+            orch_cache: Mutex::default(),
             watch: crate::watch::Watch::new(if holder.is_some() {
                 HolderStatus::Linked
             } else {
@@ -225,6 +230,7 @@ impl Registry {
             look: Arc::new(Appearance::load(at("theme"))),
             audit: Audit::new(at("audit.log")),
             agents: crate::agent::control::Control::new(dir),
+            hook_commit: Mutex::new(()),
             status: Statuses::open(dir.map(|d| d.join(status::FILE_NAME))),
             spool: dir.map(|d| d.join(hook::SPOOL_FILE)),
             state: Mutex::new(State {
@@ -315,18 +321,22 @@ impl Registry {
         let Some(path) = &self.spool else { return };
         let mut hooked = Vec::new();
         status::take_spool(path, |events| {
-            let st = lock(&self.state);
-            let found: Vec<_> = events
-                .iter()
-                .filter_map(|e| Some((scope::session_of(e.ppid, &st.roots)?, e)))
-                .collect();
-            for &(id, e) in &found {
-                self.apply_agent_hook(&st, id, e)?;
-                hooked.push((id, e.payload.clone()));
-            }
-            drop(st);
-            for &(id, e) in &found {
+            let _commit = lock(&self.hook_commit);
+            let found: Vec<_> = {
+                let st = lock(&self.state);
+                events
+                    .iter()
+                    .filter_map(|e| {
+                        let id = scope::session_of(e.ppid, &st.roots)?;
+                        let entry = st.sessions.get(&id)?;
+                        Some((id, entry.cwd.clone(), entry.session.tap(), e))
+                    })
+                    .collect()
+            };
+            for (id, cwd, tap, e) in found {
+                self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))?;
                 self.auto_switch_from_hook(id, e);
+                hooked.push((id, e.payload.clone()));
             }
             Ok(())
         })
@@ -349,8 +359,12 @@ impl Registry {
         id: SessionId,
         f: impl FnOnce(&Statuses) -> T,
     ) -> Option<T> {
-        let st = lock(&self.state);
-        (st.sessions.contains_key(&id) && !st.exited.contains_key(&id)).then(|| f(&self.status))
+        let _commit = lock(&self.hook_commit);
+        let allowed = {
+            let st = lock(&self.state);
+            st.sessions.contains_key(&id) && !st.exited.contains_key(&id)
+        };
+        allowed.then(|| f(&self.status))
     }
 
     /// 프로세스·제목·화면 보조 감시. PTY 읽기와 별도 스레드에서 호출한다.
@@ -911,7 +925,7 @@ impl Registry {
                     })
                     .collect();
                 drop(st);
-                lock(&self.sidebar).snapshot(&entries).map(|mut data| {
+                sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
                     if peer.scope == Scope::Full {
                         sidebar::include_projects(&mut data);
                     }
@@ -1679,20 +1693,27 @@ impl Registry {
 
     /// 소켓으로 온 hook 이벤트. 세션 후손이 보냈으면 그 세션만, 외부에서 왔으면 `ppid` 계보의 세션.
     fn on_hook(&self, peer: &Peer, e: &HookEvent) -> io::Result<Option<SessionId>> {
-        let st = lock(&self.state);
-        let session = match peer.scope {
-            Scope::Session(id) => Some(id),
-            Scope::Full => scope::session_of(e.ppid, &st.roots),
-            Scope::Restricted => None,
+        let _commit = lock(&self.hook_commit);
+        let target = {
+            let st = lock(&self.state);
+            let id = match peer.scope {
+                Scope::Session(id) => Some(id),
+                Scope::Full => scope::session_of(e.ppid, &st.roots),
+                Scope::Restricted => None,
+            };
+            id.and_then(|id| {
+                st.sessions
+                    .get(&id)
+                    .map(|entry| (id, entry.cwd.clone(), entry.session.tap()))
+            })
         };
-        if let Some(id) = session {
-            self.apply_agent_hook(&st, id, e)?;
-        }
-        drop(st);
-        if let Some(id) = session {
+        if let Some((id, cwd, tap)) = target {
+            self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))?;
             self.auto_switch_from_hook(id, e);
+            Ok(Some(id))
+        } else {
+            Ok(None)
         }
-        Ok(session)
     }
 
     /// OWE-737: 첫 프롬프트 hook(`UserPromptSubmit` 등)이 오면 세션 자동 제목을 기록하고,
@@ -1732,23 +1753,27 @@ impl Registry {
         }
     }
 
-    fn apply_agent_hook(&self, st: &State, id: SessionId, e: &HookEvent) -> io::Result<()> {
+    fn apply_agent_hook(
+        &self,
+        id: SessionId,
+        e: &HookEvent,
+        cwd: Option<&Path>,
+        tap: Option<&Tap>,
+    ) -> io::Result<()> {
         use krill_proto::os::ffi::OsStrExt as _;
-        let cwd_hint = st
-            .sessions
-            .get(&id)
-            .map(|entry| entry.cwd.as_os_str().as_bytes());
+        let cwd_hint = cwd.map(|cwd| cwd.as_os_str().as_bytes());
         let is_subagent_or_foreign =
             self.agents
                 .record_hook_session_with_context(id, &e.payload, Some(&e.agent), cwd_hint);
+        self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         self.observe_webhook(id);
         if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
             if status.state == control::AgentState::Done
-                && let Some(entry) = st.sessions.get(&id)
+                && let Some(tap) = tap
             {
-                entry.session.tap().agent_done(status.since_unix_ns);
+                tap.agent_done(status.since_unix_ns);
             }
         }
         // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다.
@@ -1844,13 +1869,17 @@ impl Registry {
     /// holder `Exited` 송신 큐의 워커. 응답 리더와 분리해 `Release`가 exec 잠금을 기다려도 응답을 계속 읽는다.
     /// holder를 잃은 뒤에는 [`crate::rejoin`]의 종료 감시가 부른다.
     pub(crate) fn on_exited(&self, id: SessionId, status: i32) {
-        let mut st = lock(&self.state);
-        st.exited.insert(id, status);
+        let commit = lock(&self.hook_commit);
+        let closing = {
+            let mut st = lock(&self.state);
+            st.exited.insert(id, status);
+            st.closing.contains(&id)
+        };
         self.status.exited(id);
-        if !st.closing.contains(&id) {
-            return; // 끝난 화면을 볼 수 있게 남긴다. 닫기 요청이 오면 지운다.
+        drop(commit);
+        if !closing {
+            return;
         }
-        drop(st);
         // `Release`를 링크에 쓴 뒤에 지운다. 목록에서 사라진 뒤 krilld가 죽어도 holder는 소켓에 남은 `Release`를
         // 먼저 읽고 끝난 세션을 다음 krilld에 다시 넘기지 않는다(OWE-502).
         if let Some(h) = &self.holder {
@@ -1873,6 +1902,7 @@ impl Registry {
     /// 레지스트리에서 지운다. PTY 리더는 남은 출력을 EOF까지 읽어 기록한 뒤 master를 닫는다.
     /// 지운 세션의 Claude 주입 settings도 함께 지운다(살아 있는 세션의 파일은 남는다).
     fn remove(&self, id: SessionId) {
+        let _commit = lock(&self.hook_commit);
         self.discard_settings(id);
         self.agents.forget(id);
         let mut st = lock(&self.state);
@@ -1975,6 +2005,18 @@ impl Registry {
                     self.adopt_profile_names(&home, state_ref);
                 }
                 UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+            }
+            UsageRequest::CancelAccountSwitch { session } => {
+                if features & krill_proto::usage::FEAT_ACCOUNT_CANCEL == 0 {
+                    UsageReply::Failed(Failure::BadRequest)
+                } else {
+                    match self.cancel_failed_account_switch(session) {
+                        Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
+                            &home, state_ref, false,
+                        )),
+                        Err(error) => UsageReply::Failed(error),
+                    }
+                }
             }
             UsageRequest::SwitchAccount {
                 provider,
@@ -2267,6 +2309,63 @@ impl Registry {
         Ok(Reply::InputSent)
     }
 
+    pub(crate) fn orchestration_snapshot(
+        &self,
+    ) -> io::Result<krill_proto::orchestration::OrchestrationStore> {
+        match self.state_dir() {
+            Some(dir) => lock(&self.orch_cache).load(&dir),
+            None => Ok(krill_proto::orchestration::OrchestrationStore::default()),
+        }
+    }
+
+    pub(crate) fn dashboard_tail(&self, id: SessionId) -> Option<Vec<String>> {
+        let tap = lock(&self.state)
+            .sessions
+            .get(&id)
+            .map(|entry| entry.session.tap())?;
+        Some(tap.preview_tail())
+    }
+
+    /// A cheap server revision without any grid capture or Git discovery.
+    pub(crate) fn dashboard_revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut revision = std::collections::hash_map::DefaultHasher::new();
+        let entries: Vec<_> = {
+            let state = lock(&self.state);
+            state
+                .sessions
+                .iter()
+                .map(|(&id, entry)| {
+                    (
+                        id,
+                        entry.pid,
+                        entry.cwd.clone(),
+                        state.exited.get(&id).copied(),
+                        entry.session.tap(),
+                    )
+                })
+                .collect()
+        };
+        for (id, pid, cwd, exited, tap) in entries {
+            id.hash(&mut revision);
+            pid.hash(&mut revision);
+            cwd.hash(&mut revision);
+            exited.hash(&mut revision);
+            let pulse = tap.pulse();
+            pulse.revision.hash(&mut revision);
+            pulse.end.hash(&mut revision);
+            pulse.closed.hash(&mut revision);
+            tap.cwd(pid).hash(&mut revision);
+            tap.foreground().hash(&mut revision);
+            // AgentStatus has no Hash implementation; its small metadata serialization is
+            // independent of terminal dimensions/history.
+            if let Ok(bytes) = postcard::to_stdvec(&self.status.get(id)) {
+                bytes.hash(&mut revision);
+            }
+        }
+        revision.finish()
+    }
+
     fn notify_orch(&self) {
         let (lock_gen, cvar) = &self.orch_signal;
         let mut g = lock(lock_gen);
@@ -2289,7 +2388,7 @@ impl Registry {
             return Err(Failure::Os(libc::EIO));
         };
         let res: io::Result<OrchResponse> = match action {
-            OrchAction::Snapshot => OrchestrationStore::load(&dir).map(OrchResponse::Snapshot),
+            OrchAction::Snapshot => self.orchestration_snapshot().map(OrchResponse::Snapshot),
             OrchAction::CreateRun {
                 title,
                 coordinator_session_id,
@@ -2371,7 +2470,7 @@ impl Registry {
                             Ok(s.check_messages(recipient.as_deref(), &types, unread_only, true))
                         })
                     } else {
-                        OrchestrationStore::load(&dir).map(|mut s| {
+                        self.orchestration_snapshot().map(|mut s| {
                             s.check_messages(recipient.as_deref(), &types, unread_only, false)
                         })
                     };

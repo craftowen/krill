@@ -468,6 +468,9 @@ if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]] || ! git diff --quiet HEAD; then
 fi
 [[ "$HARD_FAILS" -eq 0 ]] || { echo "publish aborted before tagging" >&2; exit 1; }
 
+RELEASE_NOTES="$OUT_DIR/release-notes.md"
+python3 packaging/release_notes.py --tag "$TAG" --repo "$REPO" > "$RELEASE_NOTES"
+
 UPDATE_PUBKEY=$(python3 packaging/macos/ed25519_manifest.py keygen --key-file "$UPDATE_KEY_FILE")
 PLAN_ARGS=(plan --directory "$OUT_DIR" --plan "$OUT_DIR/publication.json" --head "$HEAD_SHA"
   --repo "$REPO" --version "$VERSION" --key-file "$UPDATE_KEY_FILE")
@@ -486,6 +489,7 @@ CREATE_STATUS=0
 gh release create "$TAG" "${ASSETS[@]}" \
   --repo "$REPO" \
   --title "Krill $TAG" \
+  --notes-file "$RELEASE_NOTES" \
   --generate-notes \
   --verify-tag || CREATE_STATUS=$?
 

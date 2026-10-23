@@ -32,7 +32,7 @@ fn catalog_has_no_missing_translations_or_mismatched_placeholders() {
     }
     assert_eq!(
         settings::Settings::parse("").unwrap().language,
-        Language::Ko
+        settings::Settings::default().language
     );
     assert!(settings::Settings::parse("language = 'fr'").is_err());
     for language in [Language::Ko, Language::En] {
@@ -60,6 +60,7 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
     let dir = std::env::temp_dir().join(format!("mk-i18n-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.toml"), "language = 'ko'").unwrap();
     cx.update(|cx| {
         gpui_component::init(cx);
         settings::init_at(Some(dir.clone()), cx);
@@ -175,12 +176,15 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
     cx.update(|_, cx| settings::reload(cx));
     cx.run_until_parked();
     assert_eq!(i18n::language(), Language::En);
-    // Reopening configuration picks up persisted language; absent language keeps ko compatibility.
+    // Reopening honors a saved choice; removing it resolves the first-launch default again.
+    std::fs::write(dir.join("settings.toml"), "language = 'en'").unwrap();
     cx.update(|_, cx| settings::init_at(Some(dir.clone()), cx));
+    cx.run_until_parked();
+    assert_eq!(i18n::language(), Language::En);
     std::fs::write(dir.join("settings.toml"), "theme = 'dark'").unwrap();
     cx.update(|_, cx| settings::reload(cx));
     cx.run_until_parked();
-    assert_eq!(i18n::language(), Language::Ko);
+    assert_eq!(i18n::language(), settings::Settings::default().language);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

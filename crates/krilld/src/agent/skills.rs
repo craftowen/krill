@@ -107,6 +107,7 @@ mod tests {
             Some(&account),
         );
         for dir in skill_directories(&account_root, "agy") {
+            assert!(dir.join("artifacts/SKILL.md").is_file());
             assert!(
                 dir.join("krill-orchestration/references/worker-contract.md")
                     .is_file()
@@ -133,6 +134,7 @@ mod tests {
                 .join("skills/krill-orchestration/SKILL.md")
                 .is_file()
         );
+        assert!(account_root.join("skills/artifacts/SKILL.md").is_file());
         std::fs::remove_dir_all(home).unwrap();
     }
 

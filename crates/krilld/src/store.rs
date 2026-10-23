@@ -636,6 +636,12 @@ pub struct History {
     key: Option<Arc<crypto::Key>>,
 }
 
+/// A search consumes harvested batches immediately; no full page of cells is retained.
+pub(crate) enum HistoryEvent {
+    Rows(Vec<Vec<Cell>>),
+    End(io::Result<Page>),
+}
+
 /// 디스크에서 재구성한 세션 화면(크래시·재부팅 뒤 복원).
 pub struct Restored {
     engine: Engine,
@@ -812,6 +818,75 @@ impl History {
         }))
     }
 
+    /// One forward replay per contiguous run. Raw parser state, including incomplete
+    /// UTF-8/control sequences and synchronized output, carries across segment boundaries.
+    pub(crate) fn visit_until(
+        &self,
+        limit_seq: u64,
+        cancelled: &dyn Fn() -> bool,
+        mut visitor: impl FnMut(usize, HistoryEvent),
+    ) {
+        if limit_seq <= self.cleared_seq {
+            return;
+        }
+        let look = no_theme();
+        let mut engine: Option<Engine> = None;
+        let mut previous_end = None;
+        for page in 0..self.len() {
+            if cancelled() {
+                return;
+            }
+            let raw_i = self.first_page + page;
+            let seg = match self.read_raw(raw_i) {
+                Ok(seg) => seg,
+                Err(error) => {
+                    engine = None;
+                    previous_end = None;
+                    visitor(page, HistoryEvent::End(Err(error)));
+                    continue;
+                }
+            };
+            if seg.header.start_seq >= limit_seq {
+                break;
+            }
+            if previous_end != Some(seg.header.start_seq) || seg.header.base == Base::Start {
+                engine = self.warm_checked(raw_i, &seg, &look, cancelled).ok();
+            }
+            let Some(current) = engine.as_mut() else {
+                return;
+            };
+            current.resize(seg.header.size);
+            if seg.header.start_seq <= self.cleared_seq {
+                current.clear_history();
+            }
+            current.take_history();
+            let (gaps, end_seq) = replay_harvest_cancelled(
+                current,
+                &seg,
+                &look,
+                Some(&mut |batch| visitor(page, HistoryEvent::Rows(batch))),
+                Some(limit_seq),
+                self.cleared_seq,
+                cancelled,
+            );
+            if cancelled() {
+                return;
+            }
+            previous_end = Some(end_seq);
+            if end_seq > self.cleared_seq {
+                visitor(
+                    page,
+                    HistoryEvent::End(Ok(Page {
+                        start_seq: seg.header.start_seq.max(self.cleared_seq),
+                        end_seq,
+                        rows: Vec::new(),
+                        gaps,
+                    })),
+                );
+            }
+        }
+    }
+
     /// 마지막 세그먼트까지 재생해 화면과 핫 스크롤백을 되살린다.
     pub fn restore(&self) -> io::Result<Restored> {
         let raw_i = self
@@ -840,14 +915,28 @@ impl History {
 
     /// 세그먼트 `seg`(= `raw_i`번)의 시작 상태를 복원한 엔진. 키프레임이 있으면 바로 주입하고, 없으면 앞 세그먼트를 재생한다.
     fn warm(&self, raw_i: usize, seg: &Segment, look: &Appearance) -> Engine {
+        self.warm_checked(raw_i, seg, look, &|| false)
+            .unwrap_or_else(|_| Engine::new(seg.header.size))
+    }
+
+    fn warm_checked(
+        &self,
+        raw_i: usize,
+        seg: &Segment,
+        look: &Appearance,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Engine> {
         if seg.header.base == Base::Start {
-            return Engine::new(seg.header.size);
+            return Ok(Engine::new(seg.header.size));
         }
         // 안전하지 않은 TUI 상태가 여러 세그먼트에 걸쳐도 마지막 안전 키프레임/시작점부터 순서대로 재생한다.
         // 한 번에 세그먼트 하나만 메모리에 두며, GC로 끊긴 구간 너머는 재생하지 않는다.
         let mut first = raw_i;
         let mut start = seg.header.start_seq;
         while let Some(p) = first.checked_sub(1) {
+            if cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let Ok(prev) = self.read_raw(p) else { break };
             if prev.end_seq() != start {
                 break;
@@ -871,19 +960,30 @@ impl History {
                 Engine::new(initial.as_ref().map_or(seg.header.size, |s| s.header.size))
             });
         for p in first..raw_i {
+            if cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             if let Ok(previous) = self.read_raw(p) {
                 engine.resize(previous.header.size);
                 if previous.header.start_seq < self.cleared_seq {
                     engine.clear_history();
                 }
-                replay(&mut engine, &previous, look, None, self.cleared_seq);
+                replay_harvest_cancelled(
+                    &mut engine,
+                    &previous,
+                    look,
+                    None,
+                    None,
+                    self.cleared_seq,
+                    cancelled,
+                );
             }
         }
         engine.resize(seg.header.size);
         if seg.header.start_seq <= self.cleared_seq {
             engine.clear_history();
         }
-        engine
+        Ok(engine)
     }
 }
 
@@ -940,9 +1040,23 @@ fn replay_harvest(
     engine: &mut Engine,
     seg: &Segment,
     look: &Appearance,
+    harvest: Option<&mut dyn FnMut(Vec<Vec<Cell>>)>,
+    limit_seq: Option<u64>,
+    cleared_seq: u64,
+) -> (Vec<Gap>, u64) {
+    replay_harvest_cancelled(engine, seg, look, harvest, limit_seq, cleared_seq, &|| {
+        false
+    })
+}
+
+fn replay_harvest_cancelled(
+    engine: &mut Engine,
+    seg: &Segment,
+    look: &Appearance,
     mut harvest: Option<&mut dyn FnMut(Vec<Vec<Cell>>)>,
     limit_seq: Option<u64>,
     cleared_seq: u64,
+    cancelled: &dyn Fn() -> bool,
 ) -> (Vec<Gap>, u64) {
     let mut gaps = Vec::new();
     let mut seq = seg.header.start_seq;
@@ -958,7 +1072,7 @@ fn replay_harvest(
         engine.clear_history();
     }
     for rec in &seg.records {
-        if limit_seq.is_some_and(|limit| seq >= limit) {
+        if cancelled() || limit_seq.is_some_and(|limit| seq >= limit) {
             break;
         }
         match rec {
@@ -973,6 +1087,9 @@ fn replay_harvest(
                     .unwrap_or(usize::MAX)
                     .min(slice.len());
                 for part in slice.get(..pre).unwrap_or_default().chunks(REPLAY_STEP) {
+                    if cancelled() {
+                        return (gaps, seq);
+                    }
                     let fed = panic::catch_unwind(AssertUnwindSafe(|| {
                         engine.feed(part, Feed::Replay, look);
                     }));
@@ -982,6 +1099,9 @@ fn replay_harvest(
                     engine.clear_history();
                 }
                 for part in slice.get(pre..).unwrap_or_default().chunks(REPLAY_STEP) {
+                    if cancelled() {
+                        return (gaps, seq);
+                    }
                     // 라이브에서 panic한 바이트는 재생에서도 panic한다. 세션 리더와 같은 방식으로 엔진을 새로 만든다.
                     let fed = panic::catch_unwind(AssertUnwindSafe(|| {
                         engine.feed(part, Feed::Replay, look);

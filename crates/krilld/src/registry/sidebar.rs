@@ -1,8 +1,10 @@
 //! Read-only MK-046 metadata. No session lock is held during git or process queries.
 
+use crate::session::lock;
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
@@ -13,82 +15,160 @@ pub(super) struct Cache {
     directories: BTreeMap<SessionId, PathBuf>,
     trees: BTreeMap<PathBuf, (Instant, Option<Vec<u8>>)>,
     repositories: BTreeMap<Vec<u8>, (Instant, RepositoryTrees)>,
+    inflight: BTreeMap<PathBuf, Arc<Discovery>>,
 }
 
-impl Cache {
-    pub(super) fn snapshot(
-        &mut self,
-        entries: &[(SessionId, u32, Option<crate::session::Tap>)],
-    ) -> Result<SidebarData, Failure> {
-        // Scope-specific requests must never expose cached directories from another scope.
-        let mut sessions = Vec::new();
-        let mut repositories = BTreeMap::new();
-        let mut bytes = 0;
-        for (session, pid, live) in entries {
-            let (session, pid) = (*session, *pid);
-            if let Some(tap) = live
-                && let Some(path) = tap.cwd(pid)
-            {
-                self.directories.insert(session, path);
+#[derive(Default)]
+enum DiscoveryResult {
+    #[default]
+    Pending,
+    Ready(Option<RepositoryTrees>),
+}
+
+#[derive(Default)]
+struct Discovery {
+    result: Mutex<DiscoveryResult>,
+    ready: Condvar,
+}
+
+pub(super) fn snapshot(
+    cache: &Mutex<Cache>,
+    entries: &[(SessionId, u32, Option<crate::session::Tap>)],
+) -> Result<SidebarData, Failure> {
+    let mut sessions = Vec::new();
+    let mut repositories = BTreeMap::new();
+    let mut bytes = 0usize;
+    for (session, pid, live) in entries {
+        // OS cwd and Git IO never run under the shared metadata cache lock.
+        let observed = live.as_ref().and_then(|tap| tap.cwd(*pid));
+        let path = {
+            let mut cache = lock(cache);
+            if let Some(path) = observed {
+                cache.directories.insert(*session, path);
             }
-            let path = self.directories.get(&session);
-            let cwd = path.map_or_else(Vec::new, |p| p.as_os_str().as_bytes().to_vec());
-            sessions.push(SessionDirectory { session, cwd });
-            let Some(path) = path else {
-                continue;
-            };
-            let expired = self
-                .trees
-                .get(path)
-                .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(3));
-            if expired {
-                let known = self
-                    .trees
-                    .get(path)
-                    .and_then(|(_, repo)| repo.as_ref())
-                    .filter(|repo| {
-                        self.repositories
-                            .get(*repo)
-                            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(3))
-                    })
-                    .cloned();
-                let repo = known.or_else(|| {
-                    let trees = discover(path)?;
-                    let repo = trees.repo.clone();
-                    self.repositories
-                        .insert(repo.clone(), (Instant::now(), trees));
-                    Some(repo)
-                });
-                self.trees.insert(path.clone(), (Instant::now(), repo));
-            }
-            if let Some((_, Some(repo))) = self.trees.get(path)
-                && !repositories.contains_key(repo)
-                && let Some((_, trees)) = self.repositories.get(repo)
-            {
-                bytes += trees.repo.len() + trees.worktrees.iter().map(Vec::len).sum::<usize>();
-                if bytes > 512 * 1024 {
-                    return Err(Failure::BadRequest);
-                }
-                repositories.insert(repo.clone(), trees.clone());
-            }
-        }
-        // Bound caches to directories reachable from current (scoped) queries; never hold a grid.
-        if self.directories.len() > krill_proto::holder::MAX_SESSIONS {
-            self.directories
-                .retain(|id, _| entries.iter().any(|(s, _, _)| s == id));
-        }
-        self.trees
-            .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(6));
-        self.repositories.retain(|repo, _| {
-            self.trees
-                .values()
-                .any(|(_, key)| key.as_ref() == Some(repo))
+            cache.directories.get(session).cloned()
+        };
+        sessions.push(SessionDirectory {
+            session: *session,
+            cwd: path
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.as_os_str().as_bytes().to_vec()),
         });
-        Ok(SidebarData {
-            sessions,
-            repositories: repositories.into_values().collect(),
-        })
+        if let Some(path) = path
+            && let Some(trees) = discover_cached(cache, &path)
+            && !repositories.contains_key(&trees.repo)
+        {
+            bytes += trees.repo.len() + trees.worktrees.iter().map(Vec::len).sum::<usize>();
+            if bytes > 512 * 1024 {
+                return Err(Failure::BadRequest);
+            }
+            repositories.insert(trees.repo.clone(), trees);
+        }
     }
+    let mut cache = lock(cache);
+    if cache.directories.len() > krill_proto::holder::MAX_SESSIONS {
+        cache
+            .directories
+            .retain(|id, _| entries.iter().any(|(s, _, _)| s == id));
+    }
+    cache
+        .trees
+        .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(6));
+    let reachable: Vec<_> = cache
+        .trees
+        .values()
+        .filter_map(|(_, key)| key.as_ref())
+        .cloned()
+        .collect();
+    cache
+        .repositories
+        .retain(|repo, _| reachable.contains(repo));
+    Ok(SidebarData {
+        sessions,
+        repositories: repositories.into_values().collect(),
+    })
+}
+
+fn discover_cached(cache: &Mutex<Cache>, path: &Path) -> Option<RepositoryTrees> {
+    let key = repository_key(path);
+    let (flight, owner) = {
+        let mut cache = lock(cache);
+        if let Some((at, repo)) = cache.trees.get(path)
+            && at.elapsed() < Duration::from_secs(3)
+        {
+            if repo.is_none() {
+                return None;
+            }
+            if let Some((at, trees)) = repo.as_ref().and_then(|repo| cache.repositories.get(repo))
+                && at.elapsed() < Duration::from_secs(3)
+            {
+                return Some(trees.clone());
+            }
+        }
+        if let Some(flight) = cache.inflight.get(&key) {
+            (Arc::clone(flight), false)
+        } else {
+            let flight = Arc::new(Discovery::default());
+            cache.inflight.insert(key.clone(), Arc::clone(&flight));
+            (flight, true)
+        }
+    };
+    let result = if owner {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discover(path)))
+            .ok()
+            .flatten();
+        *lock(&flight.result) = DiscoveryResult::Ready(result.clone());
+        flight.ready.notify_all();
+        lock(cache).inflight.remove(&key);
+        result
+    } else {
+        let mut result = lock(&flight.result);
+        while matches!(*result, DiscoveryResult::Pending) {
+            result = flight
+                .ready
+                .wait(result)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        match &*result {
+            DiscoveryResult::Ready(trees) => trees.clone(),
+            DiscoveryResult::Pending => None,
+        }
+    };
+    let mut cache = lock(cache);
+    cache.trees.insert(
+        path.to_owned(),
+        (
+            Instant::now(),
+            result.as_ref().map(|trees| trees.repo.clone()),
+        ),
+    );
+    if let Some(trees) = &result {
+        cache
+            .repositories
+            .insert(trees.repo.clone(), (Instant::now(), trees.clone()));
+    }
+    result
+}
+
+fn repository_key(cwd: &Path) -> PathBuf {
+    for root in cwd.ancestors() {
+        let dot = root.join(".git");
+        let dir = if dot.is_dir() {
+            Some(dot)
+        } else {
+            std::fs::read_to_string(&dot).ok().and_then(|text| {
+                text.strip_prefix("gitdir:")
+                    .map(|dir| root.join(dir.trim()))
+            })
+        };
+        if let Some(dir) = dir {
+            let common = std::fs::read_to_string(dir.join("commondir"))
+                .ok()
+                .map_or(dir.clone(), |text| dir.join(text.trim()));
+            return common.canonicalize().unwrap_or(common);
+        }
+    }
+    cwd.to_owned()
 }
 
 /// 앱에 등록된 프로젝트(`<state>/projects.toml`)를 루트 경로만 덧붙인다. 원격 앱이 세션 없는
@@ -242,14 +322,14 @@ mod tests {
 
     #[test]
     fn scoped_metadata_cannot_leak_cached_sessions() {
-        let mut cache = Cache::default();
-        cache
+        let cache = Mutex::new(Cache::default());
+        lock(&cache)
             .directories
             .insert(SessionId(1), PathBuf::from("/does-not-exist/one"));
-        cache
+        lock(&cache)
             .directories
             .insert(SessionId(2), PathBuf::from("/does-not-exist/two"));
-        let snapshot = cache.snapshot(&[(SessionId(1), 0, None)]).unwrap();
+        let snapshot = snapshot(&cache, &[(SessionId(1), 0, None)]).unwrap();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].session, SessionId(1));
         assert!(snapshot.repositories.is_empty());

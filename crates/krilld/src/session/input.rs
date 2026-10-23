@@ -3,7 +3,7 @@
 use crate::os::OwnedFd;
 use std::sync::TryLockError;
 
-use super::{BorrowedFd, Duration, MutexGuard, Tap, io, lock, thread};
+use super::{BorrowedFd, Duration, MutexGuard, Tap, io, thread};
 use crate::os::AsFd as _;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
@@ -93,7 +93,10 @@ fn turn<'a>(tap: &'a Tap, peer: Option<BorrowedFd<'_>>) -> io::Result<MutexGuard
         alive(tap, if waited { peer } else { None })?;
         match tap.0.input.try_lock() {
             Ok(guard) => return Ok(guard),
-            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            // 이미 PTY에 쓴 접두사와 장부의 대응을 증명할 수 없으므로 입력만 거부한다.
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("terminal input state poisoned"));
+            }
             Err(TryLockError::WouldBlock) => {
                 waited = true;
                 thread::sleep(Duration::from_millis(20));
@@ -112,7 +115,7 @@ fn write_all(
         alive(tap, None)?;
         let result = {
             #[cfg(unix)]
-            let _live = lock(&tap.0.live);
+            let _live = tap.0.live();
             #[cfg(unix)]
             let result = write(&tap.0.master, bytes).map_err(io::Error::from);
             #[cfg(windows)]
@@ -158,11 +161,15 @@ fn write_all(
 pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {
     let mut state = turn(tap, peer)?;
     {
-        let clients = lock(&tap.0.clients);
+        let clients = tap
+            .0
+            .clients
+            .lock()
+            .map_err(|_| io::Error::other("terminal client state poisoned"))?;
         if clients.sleeping {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        let mut live = lock(&tap.0.live);
+        let mut live = tap.0.live();
         live.input_since_done = true;
         live.last_input_ns = crate::status::now_ns();
     }
@@ -189,8 +196,8 @@ pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>)
 pub(super) fn finish_input(tap: &Tap) {
     let mut state = match tap.0.input.try_lock() {
         Ok(state) => state,
-        Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(TryLockError::WouldBlock) => return,
+        // 상태가 불확실하면 종료 표지조차 임의로 PTY에 쓰지 않는다.
+        Err(TryLockError::Poisoned(_) | TryLockError::WouldBlock) => return,
     };
     if state.owner == Some(thread::current().id()) {
         state.finish(tap).ok();

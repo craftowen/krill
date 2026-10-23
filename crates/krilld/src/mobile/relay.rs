@@ -4,8 +4,8 @@
 use super::devices::{decode_hex, hex};
 use super::e2ee::{Channel, Endpoint, MAX_PLAINTEXT, invalid, random};
 use super::gateway::{
-    AuthHello, AuthProof, Authenticated, Connection, MAX_CONNECTIONS, MAX_PENDING, Shared,
-    ShutdownHandle, TIMEOUT, now_ms,
+    AuthHello, AuthProof, Authenticated, Connection, MAX_CONNECTIONS, MAX_PENDING, RPC_STACK,
+    Shared, ShutdownHandle, TIMEOUT, now_ms,
 };
 use super::tunnel::Publication;
 use super::ws;
@@ -26,7 +26,14 @@ pub const MUX_TEXT: u8 = 2;
 pub const MUX_BINARY: u8 = 3;
 pub const MUX_CLOSE: u8 = 4;
 
+mod mailbox;
+use mailbox::Mailbox;
+
 const STACK: usize = 128 * 1024;
+const OUTBOX_BYTES: usize = 4 * MAX_PLAINTEXT;
+const PEER_QUEUE_BYTES: usize = 2 * MAX_PLAINTEXT;
+const READ_BUDGET: usize = 64 * 1024;
+const MAX_RX_BUFFER: usize = MAX_PLAINTEXT + 80;
 const PING: Duration = Duration::from_secs(30);
 
 pub fn encode_mux(kind: u8, conn_id: u32, payload: &[u8]) -> Vec<u8> {
@@ -95,14 +102,16 @@ impl Drop for RelayClient {
 
 #[derive(Clone)]
 struct Outbox {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: Arc<Mailbox<Vec<u8>>>,
     wake: Arc<Mutex<UnixStream>>,
 }
 impl Outbox {
     fn send_mux(&self, kind: u8, conn_id: u32, payload: &[u8]) -> io::Result<()> {
-        self.tx
-            .send(encode_mux(kind, conn_id, payload))
-            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        self.tx.send(
+            conn_id,
+            encode_mux(kind, conn_id, payload),
+            payload.len().saturating_add(5),
+        )?;
         lock(&self.wake).write_all(&[1]).ok();
         Ok(())
     }
@@ -112,7 +121,7 @@ impl Outbox {
 }
 
 struct MuxSession {
-    tx: mpsc::Sender<(u8, Vec<u8>)>,
+    tx: Arc<Mailbox<(u8, Vec<u8>)>>,
     stream: UnixStream,
 }
 
@@ -146,66 +155,66 @@ impl Transport {
         self.tcp().set_nonblocking(true).ok();
         res
     }
-    fn read_available(&mut self, rx_buf: &mut Vec<u8>) -> io::Result<bool> {
+    fn read_available(&mut self, rx_buf: &mut Vec<u8>) -> io::Result<(bool, bool)> {
         self.tcp().set_nonblocking(true)?;
+        let mut budget = READ_BUDGET;
+        let mut chunk = [0_u8; 8192];
         match self {
-            Self::Plain(s) => {
-                let mut chunk = [0_u8; 8192];
-                loop {
-                    match s.read(&mut chunk) {
-                        Ok(0) => return Ok(false),
-                        Ok(n) => {
-                            if let Some(bytes) = chunk.get(..n) {
-                                rx_buf.extend_from_slice(bytes);
-                            }
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-                        Err(e) => return Err(e),
-                    }
+            Self::Plain(socket) => loop {
+                let room = read_room(rx_buf, budget);
+                if room == 0 {
+                    return Ok((true, true));
                 }
-            }
-            Self::Tls(s) => {
-                let mut chunk = [0_u8; 8192];
+                match socket.read(chunk.get_mut(..room).ok_or_else(invalid)?) {
+                    Ok(0) => return Ok((false, false)),
+                    Ok(n) => {
+                        rx_buf.extend_from_slice(chunk.get(..n).ok_or_else(invalid)?);
+                        budget -= n;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok((true, false)),
+                    Err(e) => return Err(e),
+                }
+            },
+            Self::Tls(stream) => loop {
                 loop {
-                    match s.conn.reader().read(&mut chunk) {
+                    let room = read_room(rx_buf, budget);
+                    if room == 0 {
+                        return Ok((true, true));
+                    }
+                    match stream
+                        .conn
+                        .reader()
+                        .read(chunk.get_mut(..room).ok_or_else(invalid)?)
+                    {
                         Ok(0) => break,
                         Ok(n) => {
-                            if let Some(bytes) = chunk.get(..n) {
-                                rx_buf.extend_from_slice(bytes);
-                            }
+                            rx_buf.extend_from_slice(chunk.get(..n).ok_or_else(invalid)?);
+                            budget -= n;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e),
                     }
                 }
-                loop {
-                    match s.conn.read_tls(&mut s.sock) {
-                        Ok(0) => return Ok(false),
-                        Ok(_) => {
-                            s.conn
-                                .process_new_packets()
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                            loop {
-                                match s.conn.reader().read(&mut chunk) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if let Some(bytes) = chunk.get(..n) {
-                                            rx_buf.extend_from_slice(bytes);
-                                        }
-                                    }
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-                        Err(e) => return Err(e),
+                match stream.conn.read_tls(&mut stream.sock) {
+                    Ok(0) => return Ok((false, false)),
+                    Ok(_) => {
+                        stream
+                            .conn
+                            .process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok((true, false)),
+                    Err(e) => return Err(e),
                 }
-            }
+            },
         }
     }
 }
+fn read_room(rx_buf: &[u8], budget: usize) -> usize {
+    8192.min(budget)
+        .min(MAX_RX_BUFFER.saturating_sub(rx_buf.len()))
+}
+
 impl Read for Transport {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -456,26 +465,27 @@ fn run_once(
     settled.store(true, Ordering::Release);
     shared.wake();
 
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let out_rx = Arc::new(Mailbox::new(OUTBOX_BYTES, PEER_QUEUE_BYTES, 128));
     let outbox = Outbox {
-        tx: out_tx,
+        tx: Arc::clone(&out_rx),
         wake: Arc::clone(wake_writer),
     };
     let mut sessions: HashMap<u32, MuxSession> = HashMap::new();
     let mut rx_buf = Vec::with_capacity(8192);
     let max_frame = MAX_PLAINTEXT.saturating_add(64);
-    if !transport.read_available(&mut rx_buf)? {
-        return Ok(());
-    }
+    let (mut transport_alive, mut read_pending) = transport.read_available(&mut rx_buf)?;
     let mut last_rx = Instant::now();
     let mut last_ping = Instant::now();
 
     let res = (|| -> io::Result<()> {
         while !stop.cancelled() {
-            while let Ok(mux_payload) = out_rx.try_recv() {
-                transport.write_masked(ws::BINARY, &mux_payload)?;
-            }
-            while let Some((opcode, body)) = ws::try_decode_unmasked(&mut rx_buf, max_frame)? {
+            drain_outbox(&mut transport, &out_rx)?;
+            let mut decoded = 0usize;
+            while decoded < 64 {
+                let Some((opcode, body)) = ws::try_decode_unmasked(&mut rx_buf, max_frame)? else {
+                    break;
+                };
+                decoded += 1;
                 last_rx = Instant::now();
                 match opcode {
                     ws::BINARY => {
@@ -496,25 +506,49 @@ fn run_once(
                 transport.write_masked(9, &[])?;
                 last_ping = Instant::now();
             }
+            if !transport_alive {
+                if decoded == 64 {
+                    continue;
+                }
+                return if rx_buf.is_empty() {
+                    Ok(())
+                } else {
+                    Err(invalid())
+                };
+            }
+            if read_pending || decoded == 64 || !out_rx.is_empty() {
+                (transport_alive, read_pending) = transport.read_available(&mut rx_buf)?;
+                continue;
+            }
             let wait_dur = PING.saturating_sub(last_ping.elapsed());
             wait_io(transport.tcp(), wake_rx, wait_dur);
             if stop.cancelled() {
                 return Ok(());
             }
-            while let Ok(mux_payload) = out_rx.try_recv() {
-                transport.write_masked(ws::BINARY, &mux_payload)?;
-            }
-            if !transport.read_available(&mut rx_buf)? {
-                return Ok(());
-            }
+            drain_outbox(&mut transport, &out_rx)?;
+            (transport_alive, read_pending) = transport.read_available(&mut rx_buf)?;
         }
         Ok(())
     })();
     for (_, sess) in sessions.drain() {
-        sess.tx.send((8, Vec::new())).ok();
+        sess.tx.close();
         sess.stream.shutdown(Shutdown::Both).ok();
     }
+    out_rx.close();
     res
+}
+
+fn drain_outbox(transport: &mut Transport, queue: &Mailbox<Vec<u8>>) -> io::Result<()> {
+    let mut sent = 0usize;
+    for _ in 0..16 {
+        let Ok(payload) = queue.try_recv() else { break };
+        sent = sent.saturating_add(payload.len());
+        transport.write_masked(ws::BINARY, &payload)?;
+        if sent >= 128 * 1024 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -548,7 +582,14 @@ fn handle_mux_frame(
     let Ok((kind, conn_id, payload)) = decode_mux(body) else {
         return;
     };
-    sessions.retain(|_, s| s.tx.send((0, Vec::new())).is_ok());
+    sessions.retain(|_, s| {
+        if s.tx.is_closed() {
+            s.stream.shutdown(Shutdown::Both).ok();
+            false
+        } else {
+            true
+        }
+    });
     match kind {
         // 챌린지는 데몬이 만든다(serve_mux_client). DO가 정하면 같은 챌린지로 녹화한 세션을 재생할 수 있다.
         // DO는 빈 OPEN만 보낸다. 내용이 있거나(서버 지정 챌린지) 이미 열린 conn_id면 거부한다.
@@ -562,7 +603,8 @@ fn handle_mux_frame(
                 outbox.send_close(conn_id, 1011);
                 return;
             };
-            let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
+            let tx = Arc::new(Mailbox::new(PEER_QUEUE_BYTES, PEER_QUEUE_BYTES, 32));
+            let rx = Arc::clone(&tx);
             let Ok((local, server)) = UnixStream::pair() else {
                 outbox.send_close(conn_id, 1011);
                 return;
@@ -641,18 +683,30 @@ fn handle_mux_frame(
             }
         }
         MUX_TEXT => {
-            if let Some(s) = sessions.get(&conn_id) {
-                s.tx.send((ws::TEXT, payload.to_vec())).ok();
+            if let Some(s) = sessions.get(&conn_id)
+                && s.tx
+                    .send(0, (ws::TEXT, payload.to_vec()), payload.len())
+                    .is_err()
+            {
+                s.tx.close();
+                s.stream.shutdown(Shutdown::Both).ok();
+                outbox.send_close(conn_id, 1013);
             }
         }
         MUX_BINARY => {
-            if let Some(s) = sessions.get(&conn_id) {
-                s.tx.send((ws::BINARY, payload.to_vec())).ok();
+            if let Some(s) = sessions.get(&conn_id)
+                && s.tx
+                    .send(0, (ws::BINARY, payload.to_vec()), payload.len())
+                    .is_err()
+            {
+                s.tx.close();
+                s.stream.shutdown(Shutdown::Both).ok();
+                outbox.send_close(conn_id, 1013);
             }
         }
         MUX_CLOSE => {
             if let Some(s) = sessions.remove(&conn_id) {
-                s.tx.send((8, Vec::new())).ok();
+                s.tx.close();
                 s.stream.shutdown(Shutdown::Both).ok();
             }
         }
@@ -660,10 +714,7 @@ fn handle_mux_frame(
     }
 }
 
-fn recv_client_frame(
-    rx: &mpsc::Receiver<(u8, Vec<u8>)>,
-    timeout: Duration,
-) -> io::Result<(u8, Vec<u8>)> {
+fn recv_client_frame(rx: &Mailbox<(u8, Vec<u8>)>, timeout: Duration) -> io::Result<(u8, Vec<u8>)> {
     let deadline = Instant::now() + timeout;
     loop {
         let remain = deadline.saturating_duration_since(Instant::now());
@@ -681,7 +732,7 @@ fn recv_client_frame(
     }
 }
 
-fn recv_open_frame(rx: &mpsc::Receiver<(u8, Vec<u8>)>) -> io::Result<(u8, Vec<u8>)> {
+fn recv_open_frame(rx: &Mailbox<(u8, Vec<u8>)>) -> io::Result<(u8, Vec<u8>)> {
     loop {
         match rx.recv() {
             Ok((0, _)) => {}
@@ -698,8 +749,8 @@ fn recv_open_frame(rx: &mpsc::Receiver<(u8, Vec<u8>)>) -> io::Result<(u8, Vec<u8
 fn serve_mux_client(
     conn_id: u32,
     challenge: [u8; 32],
-    rx: &mpsc::Receiver<(u8, Vec<u8>)>,
-    close_tx: &mpsc::Sender<(u8, Vec<u8>)>,
+    rx: &Mailbox<(u8, Vec<u8>)>,
+    close_tx: &Arc<Mailbox<(u8, Vec<u8>)>>,
     mut local: UnixStream,
     server: UnixStream,
     outbox: &Outbox,
@@ -781,13 +832,13 @@ fn serve_mux_client(
                 }
                 Ok(())
             })();
-            close_clone.send((8, Vec::new())).ok();
+            close_clone.close();
             result
         })?;
     let hello_owned = hello.clone();
     let worker = thread::Builder::new()
         .name("mobile-relay-ipc".into())
-        .stack_size(STACK)
+        .stack_size(RPC_STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
             let done = server.try_clone();

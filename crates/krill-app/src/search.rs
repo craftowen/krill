@@ -8,7 +8,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
-use gpui_component::{IconName, Sizable as _};
+use gpui_component::{IconName, Selectable as _, Sizable as _};
 use krill_proto::search::{Direction, SearchResult};
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -48,6 +48,8 @@ pub fn status_text(result: Option<&SearchResult>) -> String {
 pub struct Bar {
     language: crate::i18n::Language,
     query: String,
+    options: krill_proto::search::Options,
+    options_supported: bool,
     status: SharedString,
     result: Option<SearchResult>,
     input: Entity<InputState>,
@@ -92,6 +94,8 @@ impl Bar {
         Self {
             language: crate::i18n::language(),
             query: String::new(),
+            options: krill_proto::search::Options::default(),
+            options_supported: false,
             status: SharedString::default(),
             result: None,
             input,
@@ -101,7 +105,38 @@ impl Bar {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+    }
+
+    pub fn set_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_value(query, window, cx));
+    }
+
+    pub fn options(&self) -> krill_proto::search::Options {
+        self.options
+    }
+
+    pub fn set_options_supported(&mut self, supported: bool) {
+        self.options_supported = supported;
+    }
+
+    fn toggle_option(&mut self, regex: bool, cx: &mut Context<Self>) {
+        if regex {
+            self.options.regex = !self.options.regex;
+        } else {
+            self.options.case_sensitive = !self.options.case_sensitive;
+        }
+        self.result = None;
+        self.status = SharedString::default();
+        if self.options.regex && self.options.compile(&self.query).is_err() {
+            self.status = text::INVALID_REGEX.get().into();
+        }
+        cx.emit(Event::Query(self.query.clone()));
+        cx.notify();
     }
 
     pub fn input(&self) -> &Entity<InputState> {
@@ -118,7 +153,11 @@ impl Bar {
 
     pub fn set_result(&mut self, result: Option<&SearchResult>, cx: &mut Context<Self>) {
         self.result = result.cloned();
-        self.status = SharedString::from(status_text(result));
+        self.status = if self.options.regex && self.options.compile(&self.query).is_err() {
+            text::INVALID_REGEX.get().into()
+        } else {
+            SharedString::from(status_text(result))
+        };
         cx.notify();
     }
 
@@ -186,6 +225,26 @@ impl Render for Bar {
                 bar.dismiss(cx);
             }))
             .child(div().flex_1().min_w_0().child(Input::new(&self.input)))
+            .when(self.options_supported, |bar| {
+                bar.child(
+                    Button::new("search-case-sensitive")
+                        .ghost()
+                        .xsmall()
+                        .label(text::CASE_LABEL.get())
+                        .selected(self.options.case_sensitive)
+                        .accessibility_label(text::CASE_SENSITIVE.get())
+                        .on_click(cx.listener(|bar, _, _, cx| bar.toggle_option(false, cx))),
+                )
+                .child(
+                    Button::new("search-regex")
+                        .ghost()
+                        .xsmall()
+                        .label(text::REGEX_LABEL.get())
+                        .selected(self.options.regex)
+                        .accessibility_label(text::REGEX.get())
+                        .on_click(cx.listener(|bar, _, _, cx| bar.toggle_option(true, cx))),
+                )
+            })
             .when(!self.status.is_empty(), |d| {
                 d.child(
                     div()

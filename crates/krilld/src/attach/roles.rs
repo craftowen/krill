@@ -10,7 +10,6 @@ use krill_proto::roles::{self, Ack, FEAT_ROLES, Request, Role};
 use krill_proto::screen::{MAX_COLS, MAX_LINES, Msg};
 
 use super::Tap;
-use crate::session::lock;
 
 #[derive(Default)]
 pub(crate) struct Clients {
@@ -44,14 +43,21 @@ impl Clients {
     }
 
     fn apply(&mut self, tap: &Tap) -> io::Result<()> {
-        let size = self
-            .owner()
-            .map(|e| e.size)
-            .or_else(|| self.mobile_fallback.take());
+        self.apply_with(tap, Tap::resize)
+    }
+
+    fn apply_with(
+        &mut self,
+        tap: &Tap,
+        resize: impl FnOnce(&Tap, WinSize) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let size = self.owner().map(|e| e.size).or(self.mobile_fallback);
         if let Some(size) = size
             && self.applied != Some(size)
         {
-            tap.resize(size)?;
+            // 오류가 OS 변경 뒤에 올 수도 있다. 다음 소유자는 실제 크기를 다시 적용해야 한다.
+            self.applied = None;
+            resize(tap, size)?;
             self.applied = Some(size);
         }
         if !self.entries.iter().any(|entry| {
@@ -64,6 +70,7 @@ impl Clients {
 }
 
 /// 연결이 끝나면 장부에서 지운다. 화면·PTY·holder의 수명은 건드리지 않는다.
+#[must_use = "연결이 끝날 때까지 역할 등록을 보관해야 한다"]
 pub(crate) struct Client {
     tap: Tap,
     id: u64,
@@ -71,7 +78,10 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) fn new(tap: Tap, role: Role) -> io::Result<Self> {
-        let mut clients = lock(tap.clients());
+        let mut clients = tap
+            .clients()
+            .lock()
+            .map_err(|_| io::Error::other("terminal client state poisoned"))?;
         if clients.sleeping {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -93,7 +103,9 @@ impl Client {
     }
 
     pub(crate) fn request(&self, request: Request) -> Ack {
-        let mut clients = lock(self.tap.clients());
+        let Ok(mut clients) = self.tap.clients().lock() else {
+            return Ack::Closed;
+        };
         let Some(at) = clients.entries.iter().position(|e| e.id == self.id) else {
             return Ack::Closed;
         };
@@ -142,7 +154,11 @@ impl Client {
     /// 역할 검사·크기 변경은 장부 잠금 안에서, 쓰기는 그 밖에서 한다(PTY가 막혀도 새 연결이 붙는다, OWE-579).
     /// `peer`는 보낸 연결이다([`Tap::write_input`]).
     pub(super) fn input(&self, bytes: &[u8], peer: BorrowedFd<'_>) -> io::Result<()> {
-        let mut clients = lock(self.tap.clients());
+        let mut clients = self
+            .tap
+            .clients()
+            .lock()
+            .map_err(|_| io::Error::other("terminal client state poisoned"))?;
         let Some(at) = clients.entries.iter().position(|e| e.id == self.id) else {
             return Err(io::ErrorKind::BrokenPipe.into());
         };
@@ -159,7 +175,9 @@ impl Client {
     }
 
     pub(super) fn can_modify(&self) -> bool {
-        let clients = lock(self.tap.clients());
+        let Ok(clients) = self.tap.clients().lock() else {
+            return false;
+        };
         clients
             .entries
             .iter()
@@ -170,7 +188,9 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let mut clients = lock(self.tap.clients());
+        let Ok(mut clients) = self.tap.clients().lock() else {
+            return;
+        };
         clients.entries.retain(|e| e.id != self.id);
         clients.last_attached = Some(std::time::Instant::now());
         clients.apply(&self.tap).ok();
@@ -196,3 +216,6 @@ pub(crate) fn first(stream: &mut UnixStream, features: u64) -> io::Result<(Role,
     }
     Ok((Role::Interactive, first))
 }
+
+#[cfg(all(test, unix))]
+mod tests;

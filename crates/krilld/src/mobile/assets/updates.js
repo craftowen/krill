@@ -1,5 +1,7 @@
 // Same-tab, host-compatible PWA updates. Never persist or replay commands or credentials.
 (()=>{
+ // Reuse this static asset as a hash worker; HTTP deployments need no SubtleCrypto.
+ if(typeof document==='undefined'&&typeof importScripts==='function'){importScripts('crypto.js');globalThis.onmessage=event=>{try{const bytes=new Uint8Array(event.data);if(bytes.length>8*1024*1024+16384)throw Error('Update too large');postMessage({hash:MkCrypto.hex(MkCrypto.sha256(bytes)).slice(0,16)});}catch{postMessage({error:true});}};return;}
  const M=globalThis.KrillMobile||={},C=MkCrypto,KEY='krill-mobile-update-v1',CACHE='krill-mobile-v1';
  const validHash=h=>typeof h==='string'&&/^[0-9a-f]{16}$/.test(h);
  const manifest=html=>{
@@ -9,23 +11,36 @@
   if(files.length>64||new Set(files).size!==files.length||!files.includes('index.html')||!files.includes('updates.js')||files.some(f=>!f||f.includes('..')||! /^(?:[a-z0-9_-]+\/)*[a-z0-9_.-]+$/.test(f)))throw Error('Invalid update inventory');
   return files.sort();
  };
+ async function digest(bytes,signal){
+  if(signal?.aborted)throw Error('Update cancelled');
+  if(globalThis.crypto?.subtle){const result=await crypto.subtle.digest('SHA-256',bytes);return C.hex(new Uint8Array(result)).slice(0,16);}
+  if(globalThis.Worker)return new Promise((resolve,reject)=>{let worker;const stop=()=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);worker?.terminate();},abort=()=>{stop();reject(Error('Update cancelled'));},timer=setTimeout(abort,15000);try{worker=new Worker('updates.js');worker.onmessage=event=>{stop();if(event.data?.hash)resolve(event.data.hash);else reject(Error('Update hash failed'));};worker.onerror=()=>{stop();reject(Error('Update hash failed'));};signal?.addEventListener('abort',abort,{once:true});worker.postMessage(bytes.buffer,[bytes.buffer]);}catch(error){stop();reject(error);}});
+  // Older browsers still verify the bounded bundle rather than accepting unchecked assets.
+  return C.hex(C.sha256(bytes)).slice(0,16);
+ }
  async function prepare(hash,signal){
   if(!validHash(hash)||!globalThis.caches)throw Error('Update cache unavailable');
-  const base=`/m/${hash}/`,get=async path=>{const response=await fetch(path,{cache:'no-store',redirect:'error',signal});if(!response.ok||response.redirected)throw Error('Incomplete update');return response;};
+  const base=`/m/${hash}/`,controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();let total=0;
+  const get=async path=>{const response=await fetch(path,{cache:'no-store',redirect:'error',signal:controller.signal});if(!response.ok||response.redirected)throw Error('Incomplete update');const advertised=Number(response.headers?.get('content-length'));if(advertised>2*1024*1024)throw Error('Update asset too large');
+   const parts=[];let size=0;const add=bytes=>{size+=bytes.length;total+=bytes.length;if(size>2*1024*1024||total>8*1024*1024)throw Error('Update too large');parts.push(bytes);};
+   if(response.body?.getReader){const reader=response.body.getReader();try{while(true){if(controller.signal.aborted)throw Error('Update cancelled');const {done,value}=await reader.read();if(done)break;add(value);}}catch(error){await reader.cancel().catch(()=>{});throw error;}finally{reader.releaseLock();}}else add(new Uint8Array(await response.arrayBuffer()));
+   const bytes=C.concat(...parts),headers=new Response(null,{headers:response.headers}).headers;headers.delete('content-encoding');headers.delete('content-length');return {bytes,response:new Response(bytes,{headers})};};
   try{
-  const index=await get(base),html=await index.clone().text(),files=manifest(html),responses=new Map([['index.html',index]]);
-  await Promise.all(files.filter(f=>f!=='index.html').map(async f=>responses.set(f,await get(base+f))));
-  let total=0;const parts=[];
-  for(const name of files){const bytes=new Uint8Array(await responses.get(name).clone().arrayBuffer());total+=bytes.length;if(total>8*1024*1024)throw Error('Update too large');parts.push(C.enc.encode(`${name}\n${bytes.length}\n`),bytes);}
-  if(C.hex(C.sha256(C.concat(...parts))).slice(0,16)!==hash)throw Error('Update hash mismatch');
-  const cache=await caches.open(CACHE);
-  for(const [name,response] of responses){if(signal.aborted)throw Error('Update cancelled');await cache.put(new URL(base+name,location.origin).href,response.clone());}
-  await cache.put(new URL(base,location.origin).href,index.clone());
+   const index=await get(base),html=new TextDecoder().decode(index.bytes),files=manifest(html),responses=new Map([['index.html',index]]),queue=files.filter(f=>f!=='index.html');
+   // Limit both outstanding fetches and decoded bodies, including chunked responses.
+   const consume=async()=>{while(queue.length){if(controller.signal.aborted)throw Error('Update cancelled');const name=queue.shift();responses.set(name,await get(base+name));}};
+   await Promise.all([consume(),consume()]);
+   const parts=[];for(const name of files){const bytes=responses.get(name).bytes;parts.push(C.enc.encode(`${name}\n${bytes.length}\n`),bytes);}
+   if(await digest(C.concat(...parts),controller.signal)!==hash)throw Error('Update hash mismatch');
+   const cache=await caches.open(CACHE);
+   for(const [name,{response}] of responses){if(controller.signal.aborted)throw Error('Update cancelled');await cache.put(new URL(base+name,location.origin).href,response.clone());}
+   await cache.put(new URL(base,location.origin).href,index.response.clone());
   }catch(error){
+   controller.abort();
    // The deployed worker is cache-first. Evict this failed candidate so a repaired deploy can recover.
    try{const cache=await caches.open(CACHE);for(const request of await cache.keys()){const url=new URL(request.url);if(url.origin===location.origin&&url.pathname.startsWith(base))await cache.delete(request);}}catch{}
    throw error;
-  }
+  }finally{signal?.removeEventListener('abort',abort);}
  }
  const scrollSelectors=['.home-list','.workspace-list','.detail-list','.account-list','.terminal-scroll','.chat-feed','.tab-scroll','.diff-patch'];
  function captureView(root){return scrollSelectors.flatMap(selector=>[...root.querySelectorAll(selector)].map((node,index)=>({selector,index,top:node.scrollTop,left:node.scrollLeft})));}

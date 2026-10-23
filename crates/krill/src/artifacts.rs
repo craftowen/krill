@@ -622,7 +622,7 @@ fn request(
         cmd.args([
             "-sS",
             "--max-time",
-            "120",
+            if method == "GET" { "15" } else { "120" },
             "-X",
             method,
             "-w",

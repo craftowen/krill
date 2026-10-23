@@ -610,10 +610,7 @@ impl Panel {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let explorer = Explorer::new(repo.clone());
         let search = WorkspaceSearch::new(repo.clone());
-        let mut editing = edit::State::default();
-        if repo.exists() {
-            editing.has_remote = edit::repo_has_remote(&repo);
-        }
+        let editing = edit::State::default();
         Self {
             repo,
             tab: PanelTab::default(),
@@ -754,9 +751,6 @@ impl Panel {
         self.review = comments::Review::default();
         self.viewed.clear();
         self.editing.reset_repo();
-        if repo.exists() {
-            self.editing.has_remote = edit::repo_has_remote(&repo);
-        }
         self.explorer.set_repo(repo.clone(), false);
         if self.tab == PanelTab::Files {
             self.ensure_explorer_loaded_async(cx);

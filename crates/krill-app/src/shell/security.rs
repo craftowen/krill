@@ -59,8 +59,11 @@ impl Shell {
     }
 
     pub(super) fn on_window_active_changed(&mut self, active: bool, cx: &mut Context<Self>) {
-        if !active && let Some(pane) = self.layout.focused() {
-            self.cancel_pending_paste_for(pane, cx);
+        if !active {
+            self.layout.cancel_mru();
+            if let Some(pane) = self.layout.focused() {
+                self.cancel_pending_paste_for(pane, cx);
+            }
         }
         self.security.set_window_active(active);
         // 비활성화 뒤 다음 렌더를 기다리지 않고 커서 타이머를 끊는다.
@@ -272,7 +275,7 @@ impl Shell {
                 self.paste_queue.entries.push_back(entry);
                 continue;
             }
-            if self.settings.is_some()
+            if self.page_open()
                 || self.dashboard.is_some()
                 || self.layout.focused() != Some(entry.pane)
             {

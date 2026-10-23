@@ -137,6 +137,55 @@ fn next_previous_wrap_and_highlight_over_twelve_thousand_lines() {
     assert!(store.history(SessionId(1)).unwrap().len() > 3);
     let (mut client, worker) = connection(tap.clone(), FEATURES);
 
+    for (query, options, expected) in [
+        ("NEEDLE", search::Options::default(), 3),
+        (
+            "NEEDLE",
+            search::Options {
+                case_sensitive: true,
+                regex: false,
+            },
+            0,
+        ),
+        (
+            "N[E]+DLE",
+            search::Options {
+                case_sensitive: false,
+                regex: true,
+            },
+            3,
+        ),
+        (
+            "[",
+            search::Options {
+                case_sensitive: false,
+                regex: true,
+            },
+            0,
+        ),
+    ] {
+        let request = search::SearchOptionsRequest {
+            request: request(query, Direction::Next, None),
+            options,
+        };
+        client.write_all(&request.encode().unwrap()).unwrap();
+        loop {
+            let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+            if kind == search::kind::SEARCH_RESULT {
+                assert_eq!(
+                    SearchResult::decode(kind, &body).unwrap().total,
+                    expected,
+                    "{query}"
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        ask(&mut client, &request("NEEDLE", Direction::Next, None)).total,
+        0
+    );
+
     let first = ask(&mut client, &request("needle", Direction::Next, None));
     assert_eq!(first.total, 3, "중복 핫/콜드 결과 없음");
     assert!(
@@ -288,7 +337,7 @@ fn hot_fallback_and_single_match_wrap_without_recording() {
     assert!(child.wait().unwrap().success());
     let tap = session.tap();
     tap.wait(|pulse| pulse.closed);
-    let (mut client, worker) = connection(tap, FEATURES);
+    let (mut client, worker) = connection(tap.clone(), FEATURES);
     let first = ask(&mut client, &request("needle", Direction::Next, None));
     assert!(first.incomplete && !first.approximate && !first.stale);
     assert_eq!(first.total, 1);

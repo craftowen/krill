@@ -18,13 +18,14 @@
 //!   디스크에 기록하지 않는 세션은 강등하지 않는다.
 
 mod input;
+mod park;
+mod recovery;
 #[cfg(windows)]
 mod windows;
 
 use std::collections::VecDeque;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-#[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -182,6 +183,8 @@ struct Out {
     /// 마지막으로 알린 화면 revision.
     revision: u64,
     closed: bool,
+    /// publish·wake 세대. 잠금 밖에서 대기 조건을 평가하는 동안 지난 알림을 놓치지 않는다.
+    generation: u64,
 }
 
 /// [`Tap::wait`]이 돌려주는 세션 상태.
@@ -192,6 +195,8 @@ pub struct Pulse {
     pub closed: bool,
 }
 
+type Captured = (Arc<Screen>, Revision, Seq, krill_proto::term_modes::Modes);
+
 struct Shared {
     id: SessionId,
     clients: Mutex<crate::attach::roles::Clients>,
@@ -200,6 +205,7 @@ struct Shared {
     input: Mutex<input::State>,
     /// PTY 쓰기(질의 응답·알림)는 모두 `live` 잠금 안에서 해서 서로 섞이지 않는다.
     live: Mutex<Live>,
+    capture: Mutex<Option<Captured>>,
     gaps: Mutex<Vec<Gap>>,
     master: Master,
     #[cfg(windows)]
@@ -226,18 +232,28 @@ impl Shared {
         out.end += bytes.len() as u64;
         out.revision = out.revision.max(revision);
         out.closed |= closed;
+        out.generation = out.generation.wrapping_add(1);
         drop(out);
         self.changed.notify_all();
     }
 
     /// 구독자가 0이 된 지 [`PARK_GRACE`]가 지났다. 그 사이 구독자가 오갔으면(`epoch`가 다르면) 아무것도 안 한다.
     fn park(&self, epoch: u64) {
-        let mut live = lock(&self.live);
+        self.park_with(epoch, |engine| engine.demote(&self.look));
+    }
+
+    fn park_with(&self, epoch: u64, demote: impl FnOnce(&mut Engine)) {
+        let mut live = self.live();
         if live.viewers > 0 || live.epoch != epoch || live.parked {
             return;
         }
-        let look = &*self.look;
-        live.parked = panic::catch_unwind(AssertUnwindSafe(|| live.engine.demote(look))).is_ok();
+        if live.update_engine(demote).is_some() {
+            live.parked = true;
+        } else {
+            let revision = live.revision;
+            drop(live);
+            self.publish(&[], revision, false);
+        }
     }
 }
 
@@ -246,26 +262,16 @@ fn park_later(shared: &Arc<Shared>, epoch: u64) {
     if shared.store.is_none() {
         return;
     }
-    let weak = Arc::downgrade(shared);
-    // ponytail: 구독자가 0이 될 때마다 [`PARK_GRACE`] 자는 스레드 하나(세션 fd를 잡지 않게 Weak). 탭을 빠르게 오가면
-    // 그만큼 쌓였다 끝난다. 수백 개가 쌓이는 사용이 보이면 krilld 전역 타이머 스레드 하나로 모은다.
-    thread::Builder::new()
-        .name("park".to_owned())
-        .spawn(move || {
-            thread::sleep(PARK_GRACE);
-            if let Some(shared) = weak.upgrade() {
-                shared.park(epoch);
-            }
-        })
-        .ok();
+    park::schedule(shared, epoch);
 }
 
 /// 화면 구독자 하나(MK-035, [`Tap::watch`]). 들고 있는 동안 세션은 핫 스크롤백을 쌓는다.
+#[must_use = "화면을 구독하는 동안 보관해야 한다"]
 pub(crate) struct Viewer(Arc<Shared>);
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        let mut live = lock(&self.0.live);
+        let mut live = self.0.live();
         live.viewers = live.viewers.saturating_sub(1);
         if live.viewers == 0 {
             live.epoch = live.epoch.wrapping_add(1);
@@ -313,6 +319,7 @@ impl Session {
             id,
             clients: Mutex::default(),
             input: Mutex::default(),
+            capture: Mutex::default(),
             live: Mutex::new(Live {
                 engine: Engine::new(size),
                 revision: 0,
@@ -337,6 +344,7 @@ impl Session {
                 end: seq,
                 revision: 0,
                 closed: false,
+                generation: 0,
             }),
             changed: Condvar::new(),
             store: rec
@@ -379,7 +387,7 @@ impl Session {
 
     /// 보이는 화면 평문(진단·테스트용).
     pub fn screen_text(&self) -> String {
-        lock(&self.shared.live).engine.screen_text()
+        self.shared.live().engine.screen_text()
     }
 
     /// 화면·원본 구독 핸들(MK-023). 세션이 끝나도 쓸 수 있다(마지막 화면·남은 원본).
@@ -390,7 +398,7 @@ impl Session {
     /// [`Appearance::set_theme`]이 `true`를 돌려준 뒤 부른다. 모드 2031을 켠 세션이면 `CSI ?997;Nn`을 쓴다.
     pub fn theme_changed(&self) {
         let theme = self.shared.look.theme();
-        let live = lock(&self.shared.live);
+        let live = self.shared.live();
         if let Some(notice) = live.engine.scheme_notice(&theme) {
             write_reply(&self.shared.master, notice.as_bytes());
         }
@@ -446,6 +454,7 @@ pub enum Read {
 }
 
 /// 묶음 종료 동안 새 attach·입력·출력을 막는다. holder fd는 계속 유지한다.
+#[must_use = "묶음 종료가 끝날 때까지 보관해야 한다"]
 pub(crate) struct HibernationGuard<'a> {
     _input: MutexGuard<'a, input::State>,
     clients: MutexGuard<'a, crate::attach::roles::Clients>,
@@ -461,17 +470,17 @@ impl HibernationGuard<'_> {
 impl Tap {
     /// 목록 표시용 터미널 제목([`krill_proto::control::display_title`]).
     pub(crate) fn title(&self) -> Option<String> {
-        krill_proto::control::display_title(lock(&self.0.live).engine.title())
+        krill_proto::control::display_title(self.0.live().engine.title())
     }
 
     /// 원본 출력 정지 시간(MK-047). 재기동 시 보수적으로 0부터 센다.
     pub(crate) fn quiet_ms(&self) -> u64 {
-        u64::try_from(lock(&self.0.live).last_output.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(self.0.live().last_output.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// 새로 수락한 완료 hook만 입력 보호 기준을 갱신한다(벽시계 역행에도 입력은 보호된다).
     pub(crate) fn agent_done(&self, ns: u64) {
-        let mut live = lock(&self.0.live);
+        let mut live = self.0.live();
         live.done_ns = ns;
         live.input_since_done = live.last_input_ns >= ns;
     }
@@ -483,8 +492,8 @@ impl Tap {
         idle: Duration,
     ) -> Option<HibernationGuard<'_>> {
         let input = self.0.input.try_lock().ok()?;
-        let clients = lock(&self.0.clients);
-        let live = lock(&self.0.live);
+        let clients = self.0.clients.lock().ok()?;
+        let live = self.0.live();
         if clients.sleeping
             || !clients.is_empty()
             || live.viewers != 0
@@ -504,20 +513,30 @@ impl Tap {
 
     /// 화면 구독을 시작한다(MK-035). 강등된 세션이면 핫 스크롤백을 다시 쌓기 시작한다. 화면을 뜨기 전에 부른다.
     pub(crate) fn watch(&self) -> Viewer {
-        let mut live = lock(&self.0.live);
+        self.watch_with(|engine| engine.promote(&self.0.look))
+    }
+
+    fn watch_with(&self, promote: impl FnOnce(&mut Engine)) -> Viewer {
+        let mut live = self.0.live();
         live.viewers = live.viewers.saturating_add(1);
+        let mut recovered = None;
         if live.parked {
-            let look = &*self.0.look;
-            // panic하면 강등 상태로 남는다(스크롤백만 덜 쌓인다).
-            live.parked =
-                panic::catch_unwind(AssertUnwindSafe(|| live.engine.promote(look))).is_err();
+            if live.update_engine(promote).is_some() {
+                live.parked = false;
+            } else {
+                recovered = Some(live.revision);
+            }
+        }
+        drop(live);
+        if let Some(revision) = recovered {
+            self.0.publish(&[], revision, false);
         }
         Viewer(Arc::clone(&self.0))
     }
 
     /// 핫 스크롤백을 쥐고 있지 않은(강등된) 세션인지.
     pub fn is_parked(&self) -> bool {
-        lock(&self.0.live).parked
+        self.0.live().parked
     }
 
     pub(crate) fn clients(&self) -> &Mutex<crate::attach::roles::Clients> {
@@ -530,9 +549,9 @@ impl Tap {
     )]
     pub(crate) fn size(&self) -> io::Result<WinSize> {
         #[cfg(unix)]
-        let _live = lock(&self.0.live);
+        let _live = self.0.live();
         #[cfg(windows)]
-        let live = lock(&self.0.live);
+        let live = self.0.live();
         #[cfg(unix)]
         return pty::size(&self.0.master);
         #[cfg(windows)]
@@ -551,7 +570,7 @@ impl Tap {
 
     /// OSC 52 쓰기 수와, 그 수가 `seen`보다 늘었으면 마지막 값(MK-033). 엔진을 새로 만들면 수가 0으로 돌아간다.
     pub(crate) fn clipboard(&self, seen: u64) -> (u64, Option<String>) {
-        let live = lock(&self.0.live);
+        let live = self.0.live();
         let (n, text) = live.engine.clipboard();
         (n, (n > seen).then(|| text.to_owned()))
     }
@@ -560,25 +579,45 @@ impl Tap {
     pub(crate) fn capture_with_modes(
         &self,
     ) -> (Screen, Revision, Seq, krill_proto::term_modes::Modes) {
-        let live = lock(&self.0.live);
-        (
-            live.engine.screen(),
+        let (screen, revision, seq, modes) = self.capture_shared_with_modes();
+        ((*screen).clone(), revision, seq, modes)
+    }
+
+    /// Compose once per revision, shared by all screen subscribers.
+    pub(crate) fn capture_shared_with_modes(&self) -> Captured {
+        let live = self.0.live();
+        let mut cached = lock(&self.0.capture);
+        if let Some(captured) = cached.as_ref()
+            && captured.1.0 == live.revision
+            && captured.2.0 == live.seq
+        {
+            return captured.clone();
+        }
+        let captured = (
+            Arc::new(live.engine.screen()),
             Revision(live.revision),
             Seq(live.seq),
             live.engine.input_modes(),
-        )
+        );
+        *cached = Some(captured.clone());
+        captured
+    }
+
+    /// Dashboard cards need only a few tail lines, without screen cell composition.
+    pub(crate) fn preview_tail(&self) -> Vec<String> {
+        lock(&self.0.live).engine.screen_tail(3, 500)
     }
 
     /// 현재 평문 화면과 입력 모드를 `Screen` 셀 복제 없이 한 잠금 안에서 읽는다(OWE-944·OWE-946).
     pub(crate) fn screen_text_and_modes(&self) -> (String, krill_proto::term_modes::Modes) {
-        let live = lock(&self.0.live);
+        let live = self.0.live();
         (live.engine.screen_text(), live.engine.input_modes())
     }
 
     /// 보조 상태 감지용 제목·평문·revision. `seen`과 revision이 같으면 문자열화 없이 `None`이다.
     /// 제목·화면이 바뀌면 revision도 오르므로(출력·리사이즈) 캐시 무효화에 revision 하나로 충분하다.
     pub(crate) fn evidence_since(&self, seen: Option<u64>) -> Option<(String, String, u64)> {
-        let live = lock(&self.0.live);
+        let live = self.0.live();
         if seen == Some(live.revision) {
             return None;
         }
@@ -591,12 +630,9 @@ impl Tap {
 
     /// 세션 셸의 현재 디렉터리: 프로세스 `pid`의 cwd, 읽지 못하면(Windows) 셸이 OSC 7·9;9로 알린 값.
     pub(crate) fn cwd(&self, pid: u32) -> Option<std::path::PathBuf> {
-        crate::sys::current_directory(pid).ok().or_else(|| {
-            lock(&self.0.live)
-                .engine
-                .cwd()
-                .map(std::path::Path::to_path_buf)
-        })
+        crate::sys::current_directory(pid)
+            .ok()
+            .or_else(|| self.0.live().engine.cwd().map(std::path::Path::to_path_buf))
     }
 
     /// 전경 프로세스 그룹. PTY 소유권은 holder에 그대로 둔다.
@@ -619,7 +655,7 @@ impl Tap {
         &self,
         format: krill_proto::control::CaptureFormat,
     ) -> io::Result<(Seq, Vec<u8>)> {
-        let live = lock(&self.0.live);
+        let live = self.0.live();
         let bytes = live.engine.capture_cli(format)?;
         let rewind = u64::try_from(live.engine.capture_rewind()).unwrap_or(u64::MAX);
         let seq = Seq(live.seq.saturating_sub(rewind));
@@ -634,35 +670,51 @@ impl Tap {
     /// 거대 크기는 와이어 상한으로 자른다(K-01). PTY만 키우면 엔진과 어긋나
     /// 프로그램 줄바꿈이 화면과 달라지므로 둘 다 같은 값으로 둔다.
     pub fn resize(&self, size: WinSize) -> io::Result<()> {
+        self.resize_with(size, Engine::resize)
+    }
+
+    fn resize_with(
+        &self,
+        size: WinSize,
+        resize: impl FnOnce(&mut Engine, WinSize),
+    ) -> io::Result<()> {
         let size = crate::term::clamp_size(size);
-        let mut live = lock(&self.0.live);
+        let mut live = self.0.live();
         #[cfg(unix)]
         pty::resize(&self.0.master, size)?;
         #[cfg(windows)]
         windows::resize(&self.0, size)?;
-        live.engine.resize(size);
+        // OS가 바뀐 뒤에는 panic 복구도 같은 크기와 기록 이벤트를 사용해야 한다.
         live.size = size;
         live.resized = Some(size);
+        let resized = live.update_engine(|engine| resize(engine, size));
         live.revision = live.revision.wrapping_add(1);
         let revision = live.revision;
         drop(live);
         self.0.publish(&[], revision, false);
-        Ok(())
+        resized.ok_or_else(|| io::Error::other("terminal engine panicked during resize"))
     }
 
     /// 핫 스크롤백 행 수와, 아래에서 `skip`행 위부터 위로 최대 `count`행(오래된 행부터).
     pub fn history(&self, skip: usize, count: usize) -> (usize, Vec<Vec<Cell>>) {
-        lock(&self.0.live).engine.history_rows(skip, count)
+        self.0.live().engine.history_rows(skip, count)
     }
 
     /// 핫 스크롤백을 비우고 콜드 세그먼트의 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 보이는 화면·세션·PTY는 건드리지 않는다.
     pub fn clear_scrollback(&self) -> u64 {
-        let seq = {
-            let mut live = lock(&self.0.live);
-            panic::catch_unwind(AssertUnwindSafe(|| live.engine.clear_history())).ok();
-            live.seq
+        self.clear_scrollback_with(Engine::clear_history)
+    }
+
+    fn clear_scrollback_with(&self, clear: impl FnOnce(&mut Engine)) -> u64 {
+        let (seq, recovered) = {
+            let mut live = self.0.live();
+            let recovered = live.update_engine(clear).is_none().then_some(live.revision);
+            (live.seq, recovered)
         };
+        if let Some(revision) = recovered {
+            self.0.publish(&[], revision, false);
+        }
         // guarded()가 live.seq를 먼저 올린 뒤 recorder.append()와 publish()를 부르므로
         // 지운 시점 seq까지의 기록이 디스크에 안착할 때까지 기다린 뒤 기준선을 남긴다.
         self.wait(|p| p.end >= seq || p.closed);
@@ -670,6 +722,24 @@ impl Tap {
             store.clear_scrollback(self.0.id, seq);
         }
         seq
+    }
+
+    /// 입력은 보내지 않고 화면만 지운 뒤 구독자에게 새 revision을 알린다.
+    pub fn clear_viewport(&self) -> bool {
+        let (seq, revision) = {
+            let mut live = lock(&self.0.live);
+            if panic::catch_unwind(AssertUnwindSafe(|| live.engine.clear_viewport())).is_err() {
+                return false;
+            }
+            live.revision = live.revision.wrapping_add(1);
+            (live.seq, live.revision)
+        };
+        self.wait(|p| p.end >= seq || p.closed);
+        if let Some(store) = &self.0.store {
+            store.clear_scrollback(self.0.id, seq);
+        }
+        self.0.publish(&[], revision, false);
+        true
     }
 
     /// 디스크 저장소(콜드 페이지·링 밖 원본). 기록하지 않는 세션이면 `None`.
@@ -696,21 +766,28 @@ impl Tap {
                 end: out.end,
                 closed: out.closed,
             };
+            let generation = out.generation;
+            // 조건이 화면 조회나 복구 발행을 해도 out에 재진입하지 않는다.
+            drop(out);
             if ready(&p) {
                 return p;
             }
-            out = self
-                .0
-                .changed
-                .wait(out)
-                .unwrap_or_else(PoisonError::into_inner);
+            out = lock(&self.0.out);
+            if out.generation == generation {
+                out = self
+                    .0
+                    .changed
+                    .wait(out)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
         }
     }
 
     /// [`Tap::wait`] 중인 스레드를 모두 깨운다(조건을 다시 본다).
     pub fn wake(&self) {
-        // 기다리는 쪽이 조건을 본 뒤 잠들기 전에 알림이 지나가지 않도록 잠금을 한 번 거친다.
-        drop(lock(&self.0.out));
+        let mut out = lock(&self.0.out);
+        out.generation = out.generation.wrapping_add(1);
+        drop(out);
         self.0.changed.notify_all();
     }
 
@@ -768,7 +845,8 @@ impl Tap {
     }
 }
 
-/// 엔진 panic은 `catch_unwind`가 잠금 안에서 잡으므로 독(poison)은 생기지 않는다. 생겨도 값은 쓸 수 있다.
+/// 기존 장부의 관대한 잠금 정책. 호출자가 unwind 뒤 불변식을 보장해야 한다.
+/// 엔진은 `Shared::live`로 재생성하고, 입력·역할 장부는 poison이면 작업을 거부한다.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -782,27 +860,17 @@ fn guarded(
     fed: usize,
     f: impl FnOnce(&mut Engine) -> String,
 ) -> (bool, u64, Option<WinSize>) {
-    let mut live = lock(&shared.live);
+    let mut live = shared.live();
     let mut resized = None;
     if fed > 0 {
         live.last_output = Instant::now();
         resized = live.resized.take();
     }
-    let ok = if let Ok(reply) = panic::catch_unwind(AssertUnwindSafe(|| f(&mut live.engine))) {
+    let ok = if let Some(reply) = live.update_engine(f) {
         write_reply(&shared.master, reply.as_bytes());
         true
     } else {
-        // ponytail: 화면을 빈 Term으로 되돌린다. 데몬 권위 키프레임(MK-006 포크 승인 대기)이 생기면 마지막
-        // 키프레임 + 원본 재생으로 복원하고, 같은 바이트로 재차 panic할 때만 그 구간을 건너뛴다(ARCHITECTURE §4).
-        // 시작 크기가 아니라 현재 크기로 만든다. 리사이즈 뒤 panic에 예전 격자로 돌아가면
-        // 화면이 PTY 크기와 다음 resize까지 어긋난다(K-19).
-        let size = live.size;
-        live.engine = Engine::new(size);
-        if live.parked {
-            let look = &*shared.look;
-            live.parked =
-                panic::catch_unwind(AssertUnwindSafe(|| live.engine.demote(look))).is_ok();
-        }
+        // 복구 엔진은 현재 크기·강등 여부로 생성하며 원본은 기존 Gap 경로로 남긴다.
         false
     };
     live.revision += 1;
@@ -835,7 +903,7 @@ fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
     }));
     let Ok(Some(engine)) = restored else { return };
     let rev = {
-        let mut live = lock(&shared.live);
+        let mut live = shared.live();
         live.engine = engine;
         live.size = size;
         live.revision += 1;
@@ -859,7 +927,7 @@ type Source<'a> = windows::Reader;
 fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
     let look = &*shared.look;
     let mut buf = vec![0u8; BATCH];
-    let mut seq = lock(&shared.live).seq;
+    let mut seq = shared.live().seq;
     let mut errors = 0u32;
     loop {
         // Unix has not read ahead. Windows must drain the bounded pipe queue
@@ -871,7 +939,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             }
             return Ok(());
         }
-        let deadline = lock(&shared.live).engine.sync_deadline();
+        let deadline = shared.live().engine.sync_deadline();
         if deadline.is_some_and(|at| at <= Instant::now()) {
             let (_, rev, _) = guarded(shared, 0, |e| e.end_sync(Feed::Live, look));
             shared.publish(&[], rev, false);
@@ -938,7 +1006,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
                 // unwind 뒤의 인코더를 다시 쓰지 않는다. 디스크의 온전한 꼬리부터
                 // 새 기록기를 열고 빠진 seq를 Gap으로 넘긴다. 복구 실패도 PTY를 멈추지 않는다.
                 panic::catch_unwind(AssertUnwindSafe(|| {
-                    let size = lock(&shared.live).size;
+                    let size = shared.live().size;
                     recorder.recover_after_panic(seq.saturating_add(n as u64), size)
                 }))
                 .ok()
@@ -1005,7 +1073,7 @@ fn backoff(consecutive: u32) -> Duration {
 /// 봉인 중 panic해도 리더를 끝내지 않는다. 리더가 죽으면 PTY를 읽는 쪽이 없어진다(K-05).
 fn seal(shared: &Shared, rec: &mut Recorder) {
     if panic::catch_unwind(AssertUnwindSafe(|| {
-        if let Some(size) = lock(&shared.live).resized.take() {
+        if let Some(size) = shared.live().resized.take() {
             rec.resize(size);
         }
         rec.seal();

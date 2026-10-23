@@ -115,22 +115,27 @@ fn hangul_name_setup_approval_and_sidebar_refresh(cx: &mut TestAppContext) {
     let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
     let phase = |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| dialog.read(cx).phase.clone());
 
-    // 빈 이름은 보내지 않는다.
+    // Enter는 다음 입력칸으로만 이동하며 생성하지 않는다.
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
-    assert_eq!(phase(cx), Phase::Edit(Some(text::EMPTY_NAME.get().into())));
+    assert_eq!(phase(cx), Phase::Edit(None));
     assert!(fake.requests.lock().unwrap().is_empty());
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.name.update(cx, |input, cx| input.focus(window, cx));
+        });
+    });
 
     // 데몬 오류는 입력을 유지한 채 보인다.
     cx.simulate_input("한글 이름");
-    cx.simulate_keystrokes("enter");
+    cx.simulate_keystrokes("cmd-enter");
     cx.run_until_parked();
     assert_eq!(
         phase(cx),
         Phase::Edit(Some("name is empty after normalization".into()))
     );
 
-    cx.simulate_keystrokes("enter");
+    cx.simulate_keystrokes("cmd-enter");
     cx.run_until_parked();
     assert_eq!(
         phase(cx),

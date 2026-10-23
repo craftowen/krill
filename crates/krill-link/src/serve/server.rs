@@ -26,8 +26,9 @@ use crate::pair::{
     generate_invite_for_addr, read_pair_frame, write_pair_frame,
 };
 use crate::store::{
-    AllowedDevice, compact_endpoint_addr, load_allowed_node_set, now_unix_ms, now_unix_secs,
-    remove_device, sanitize_id_slug, upsert_device, verify_and_consume_invite, write_atomic_0600,
+    AllowedDevice, acquire_instance_lock, compact_endpoint_addr, load_allowed_node_set,
+    now_unix_ms, now_unix_secs, remove_device, sanitize_id_slug, upsert_device,
+    verify_and_consume_invite, write_atomic_0600, write_status_0600,
 };
 use crate::{ALPN_LINK, ALPN_PAIR, Error};
 
@@ -347,6 +348,8 @@ enum ControlResponse {
 pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
     raise_nofile_limit();
     let state_dir = opts.state_dir.clone();
+    let instance_lock =
+        acquire_instance_lock(&state_dir.join("run/link-serve.lock")).map_err(Error::Io)?;
     let krilld_sock = opts.effective_krilld_socket();
     let cfg = LinkConfig::load(&state_dir)?;
     let identity = DeviceIdentity::load_or_create(&state_dir)?;
@@ -434,14 +437,22 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
     let krilld_arc = Arc::new(krilld_sock);
 
     let join_handle = tokio::spawn(async move {
+        let _instance_lock = instance_lock;
         let mut tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut saved_status = None;
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => break,
                 _=tick.tick()=> {
                     streams_loop.sweep();
-                    if let Ok(bytes)=serde_json::to_vec(&streams_loop.statuses()) { write_atomic_0600(&state_loop.join("run/link-streams.status.json"),&bytes).ok(); }
+                    let statuses = streams_loop.statuses();
+                    if saved_status.as_ref() != Some(&statuses)
+                        && let Ok(bytes) = serde_json::to_vec(&statuses)
+                        && write_status_0600(&state_loop.join("run/link-streams.status.json"), &bytes).is_ok()
+                    {
+                        saved_status = Some(statuses);
+                    }
                 }
                 _=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming_opt = endpoint.accept() => {

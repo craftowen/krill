@@ -1,33 +1,48 @@
 # Contributing to Krill
 
-Krill은 순수 Rust macOS 앱이다. 처음이라면 [README.md](README.md), [아키텍처](docs/ARCHITECTURE.md), [로드맵](docs/ROADMAP.md), [코드 규칙](docs/CONVENTIONS.md), [디자인 시스템](docs/STYLEGUIDE.md) 순서로 읽는다. `docs/planning/`·`docs/research/`는 조사 기록이라 규범 문서와 다르면 규범 문서를 따른다.
+[한국어](CONTRIBUTING.ko.md)
 
-## 작업 흐름
+Start with the [README](README.md) and [Getting started](docs/GETTING_STARTED.md), then read [AGENTS.md](AGENTS.md), [Architecture](docs/ARCHITECTURE.md), [Roadmap](docs/ROADMAP.md), [Code conventions](docs/CONVENTIONS.md), and [UI style guide](docs/STYLEGUIDE.md). These design and repository rules currently remain in Korean. Architecture, Roadmap, Conventions, and Style Guide take precedence over research records in `docs/planning/` and `docs/research/`.
 
-1. GitHub 이슈를 먼저 확인하고, 없으면 만든다. 한 이슈 = 하나의 완료 조건, 범위를 넓히지 않는다.
-2. 개발 브랜치는 `dev`에서 따고 완료한 변경을 `dev`에 통합한다. `main`은 검증한 릴리스 이력이다. 커밋 첫 줄은 이슈가 있으면 `<이슈 ID>: <무엇을>` (예: `OWE-873: ⌘K 스크롤백 지우기 시 기준선 갱신`), 없으면 `<영역>: <무엇을>` (예: `krilld: …`, `scripts: …`). 한 커밋 = 한 논리 변경.
-3. 수정 중에는 변경 크레이트의 `cargo check -p <크레이트> --locked`와 관련 테스트만 실행한다. 작업 완료·커밋 전에는 다음 범위를 확인한다:
-   ```sh
-   cargo fmt --all
-   cargo clippy -p <크레이트> --all-targets --locked -- -D warnings
-   cargo nextest run -p <크레이트> --locked
-   ```
-   작은 수정마다 전체 빌드·`scripts/check.sh`를 돌리지 않는다. IPC·PTY·세션 생존 계약을 바꾸면 해당 경로의 통합·생존 테스트도 확인한다. Markdown 문서 또는 `[profile.*]`의 `debug`·`split-debuginfo`만 바뀌면 AGENTS.md의 예외대로 `git diff --check`만 확인한다.
-4. Push 정책: 메인테이너 또는 사용자의 명시적인 배포·릴리스·push 지시를 받은 에이전트는 필요한 `main`·`v*` 태그 push를 수행할 수 있다. `KRILL_ALLOW_PROTECTED_PUSH='<사용자 지시와 작업 사유>'`로 사유를 기록한다. 클론마다 `scripts/install-hooks.sh`로 pre-push 훅을 켜면 승인 사유와 공개 표면을 점검한다. 최종 HEAD 검사와 CI 통과는 필수다. 외부 기여는 fork 브랜치에서 PR로 보낸다.
-5. PR은 템플릿을 채운다. 작은 PR을 선호한다.
+## Workflow
 
-매일 한국시간 자정에 로컬 맥의 [야간 배포](packaging/README.md#야간-자동-배포)가 **원격 `dev`에 push된 변경**과 원격 `main`을 별도 clone에 고정한다. 최종 버전 커밋에서 전체 검사·메모리·release 생존 E2E·Windows 검사·Windows/Linux 네이티브 빌드와 스모크·CI를 통과한 뒤에만 `main` 반영과 릴리스 게시를 한다. 변경이 없으면 생략하고, 실패하면 기존 릴리스를 유지한다. 작업 완료 후 `dev`에 커밋·push해 둔다. 미커밋 파일, push하지 않은 로컬 커밋, 통합하지 않은 기능 브랜치는 배포 대상이 아니다.
+1. Check existing issues, or open one with a clear completion condition. Keep unrelated changes in separate issues.
+2. Base development on `dev`; `main` records validated releases. External contributors submit a pull request from a fork to `dev`. Use one logical change per commit. Start the subject with an issue ID when available (`OWE-873: …`), otherwise an area (`krilld: …`).
+3. Validate the affected scope as described below. Fill in the PR template with the tested commit, commands, results, and any limitations.
+4. Maintainers integrate completed work into `dev`. Only changes pushed to remote `dev` participate in the nightly release process; uncommitted work, local-only commits, and unmerged feature branches do not. Publishing and protected-ref pushes require explicit authorization; opening a PR is not authorization for an agent to release.
 
-## 코드 규칙 요약 (상세는 CONVENTIONS.md)
+Install the pre-push hooks once per clone with `scripts/install-hooks.sh`. An explicitly authorized protected-ref push records the actual instruction and reason in `KRILL_ALLOW_PROTECTED_PUSH='<user instruction and reason>'`; do not set this as a routine bypass. The [nightly release process](packaging/README.md#야간-자동-배포) pins remote revisions in a separate clone and retains the previous release when its gates fail.
 
-- 의존성 버전은 루트 `[workspace.dependencies]`에만. `Cargo.lock` 커밋, `--locked` 빌드.
-- 비테스트 코드 `unwrap`·`expect`·`panic!`·`todo!`·`dbg!` 금지. 불변식은 `#[expect(..., reason = "...")]`.
-- `unsafe`는 `krill-holder`·`krilld`의 FFI 모듈과 `krill-app`의 `platform` 모듈에만, 모든 블록에 `// SAFETY:` 주석.
-- Zed `terminal`·`terminal_view`(GPL-3.0) 코드는 열지 않는다. Orca 소스 차용 시 파일 상단에 출처·저작권 표기.
-- 허용 라이선스: Apache-2.0, MIT, BSD-2/3, ISC, Unicode-3.0, Zlib. GPL 계열 금지.
-- 측정하지 않은 수치는 문서·커밋·이슈에 쓰지 않는다. 추정은 "추정"이라고 쓴다.
+## Checks by change scope
 
-## 보고 금지·주의
+During iteration, run `cargo check -p <crate> --locked` and tests relevant to the changed behavior. Before finishing a logical code change or committing it, check formatting, clippy for affected crates, and relevant tests. Replace `<crate>` with each affected package:
 
-- 보안 문제는 이슈·PR에 올리지 말고 [SECURITY.md](SECURITY.md) 절차를 따른다.
-- 토큰·키·개인정보를 커밋하지 않는다. 실수로 올렸으면 즉시 maintainers에게 알린다 (이력 정리는 maintainers가 판단).
+```sh
+cargo fmt --all -- --check
+cargo clippy -p <crate> --all-targets --locked -- -D warnings
+cargo nextest run -p <crate> --locked
+git diff --check
+```
+
+IPC, shared-protocol, PTY/FFI, or session-survival changes also require integration and survival tests for that path. For Windows code changes, run `scripts/check-windows.sh -p <crate>` (add `--clippy` as appropriate). Record the target HEAD and the exact scope; a partial check is not a full-workspace result.
+
+If **all** changed files are Markdown (`*.md`), or the only other changes are `debug`/`split-debuginfo` settings under Cargo `[profile.*]`, skip Cargo checks and run `git diff --check`. When committing such a change, include `check.sh 생략(<reason>)` in the commit message as required by AGENTS.md. Script, YAML, lint, or other code changes do not qualify for that exception; validate their affected behavior.
+
+The full `scripts/check.sh` is required for a **final release candidate**, rather than every small development change or documentation PR. It covers formatting, clippy, nextest, doctests, dependency policy, third-party notices, and the public surface. Release only the HEAD that passed; a candidate containing Windows changes must also pass `scripts/check-windows.sh --clippy`. CI and other release-specific gates still apply.
+
+## Source-build environment
+
+Use the [source walkthrough](docs/GETTING_STARTED.md#build-from-source-on-macos). Rust's MSRV is 1.98; do not rely on features first introduced in 1.99. Homebrew Rust is the repository's local reference toolchain; rustup is not required. Keep Cargo build output under `/Volumes/krill-build/targets/<name>` in the shared maintainer workspace, including when overriding `CARGO_TARGET_DIR`. Do not create a target directory on the internal SSD.
+
+## Code and review rules
+
+- Declare dependency versions only in root `[workspace.dependencies]`; commit `Cargo.lock` and use `--locked`.
+- Keep PTY ownership in `krill-holder`. App or daemon failure must not close live sessions; check the documented [failure boundaries](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범).
+- Do not use `unwrap`, `expect`, `panic!`, `todo!`, or `dbg!` in non-test code; narrowly justified invariants use `#[expect(..., reason = "...")]`.
+- Limit `unsafe` to holder/daemon FFI modules and the app's platform modules. Every unsafe block needs a `// SAFETY:` explanation.
+- UI work follows `docs/STYLEGUIDE.md` and `krill_app::ui` tokens/primitives. Display only implemented functionality.
+- Do not change harness files (including AGENTS.md, Conventions, scripts, lint/deny/fmt configuration) without maintainer approval.
+- Do not read or copy Zed's GPL-3.0 `terminal`/`terminal_view` code. Permitted Orca source reuse needs source and copyright attribution at the top of the file. Allowed dependency licenses include Apache-2.0, MIT, BSD-2/3, ISC, Unicode-3.0, and Zlib; GPL-family dependencies are prohibited.
+- Report measured values with reproduction evidence. Label estimates as estimates; do not turn old benchmark results into new performance claims.
+
+Do not post tokens, keys, private paths, or personal information in changes, logs, or screenshots. If a secret was committed, tell the maintainers promptly; they decide how to repair history. Report vulnerabilities through [Security](SECURITY.md), and follow the [Code of conduct](CODE_OF_CONDUCT.md).

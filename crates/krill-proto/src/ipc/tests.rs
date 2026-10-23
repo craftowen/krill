@@ -271,7 +271,17 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_SCREEN", crate::screen::FEAT_SCREEN, 0),
         ("FEAT_SCREEN_META", crate::screen::FEAT_SCREEN_META, 9),
         ("FEAT_SEARCH", crate::search::FEAT_SEARCH, 8),
+        (
+            "FEAT_SEARCH_OPTIONS",
+            crate::search::FEAT_SEARCH_OPTIONS,
+            20,
+        ),
         ("FEAT_TERM_MODES", crate::term_modes::FEAT_TERM_MODES, 13),
+        (
+            "FEAT_CLEAR_VIEWPORT",
+            crate::term_modes::FEAT_CLEAR_VIEWPORT,
+            21,
+        ),
         ("FEAT_USAGE", crate::usage::FEAT_USAGE, 17),
         (
             "FEAT_PROVIDER_DETAILS",
@@ -294,6 +304,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ),
         ("FEAT_USAGE_MANAGE", crate::usage::FEAT_USAGE_MANAGE, 59),
         ("FEAT_ACCOUNT_POLICY", crate::usage::FEAT_ACCOUNT_POLICY, 61),
+        ("FEAT_ACCOUNT_CANCEL", crate::usage::FEAT_ACCOUNT_CANCEL, 22),
         (
             "FEAT_ACCOUNT_CONNECTION",
             crate::usage::FEAT_ACCOUNT_CONNECTION,
@@ -392,6 +403,10 @@ fn client_channel_kinds() -> Vec<(&'static str, u8)> {
         ("mobile::MOBILE_REPLY", crate::mobile::MOBILE_REPLY),
         ("theme::THEME", crate::theme::THEME),
         ("term_modes::TERM_MODES", crate::term_modes::TERM_MODES),
+        (
+            "term_modes::CLEAR_VIEWPORT",
+            crate::term_modes::CLEAR_VIEWPORT,
+        ),
         ("ipc::SERVER_HELLO", kind::SERVER_HELLO),
         ("ipc::CLIENT_HELLO", kind::CLIENT_HELLO),
         ("screen::ATTACH", screen::kind::ATTACH),
@@ -405,6 +420,7 @@ fn client_channel_kinds() -> Vec<(&'static str, u8)> {
         ("screen::REFUSED", screen::kind::REFUSED),
         ("screen::HISTORY_ROWS", screen::kind::HISTORY_ROWS),
         ("search::SEARCH", search::kind::SEARCH),
+        ("search::SEARCH_OPTIONS", search::kind::SEARCH_OPTIONS),
         ("search::SEARCH_RESULT", search::kind::SEARCH_RESULT),
         ("input::INPUT", input::kind::INPUT),
         ("input::INPUT_ACK", input::kind::INPUT_ACK),
