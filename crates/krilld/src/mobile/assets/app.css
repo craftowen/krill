@@ -287,3 +287,15 @@ button.account-row:disabled{opacity:1}
  .sheet h2,.sheet p{overflow-wrap:anywhere}
  .sheet .screen-text{min-height:0;height:45dvh}
 }
+
+/* Tablet shell stays mounted across session routes and width changes. */
+.tablet-shell,.tablet-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
+.tablet-body{flex-direction:column}.tablet-sidebar,.tablet-sidebar-toggle{display:none}
+@media(min-width:1000px){
+ .tablet-shell{width:100%}.tablet-sidebar{display:flex;flex-direction:column;flex:none;width:320px;min-height:0;border-right:1px solid var(--border);background:var(--surface-panel)}
+ .tablet-sidebar .workspaces{max-width:none}.tablet-sidebar .page-header{min-height:var(--touch-target)}
+ .tablet-sidebar :is(.workspace-toolbar,.workspace-filters,.workspace-search,.tree-toggle){display:none}
+ .tablet-sidebar .workspace-list{padding-inline:var(--space-sm)}.tablet-sidebar .session-row[aria-current=page]{background:var(--surface-raised);box-shadow:inset 2px 0 var(--accent)}
+ .tablet-sidebar .workspace-row{padding-inline:var(--space-sm)}.tablet-sidebar .session-list{padding-left:var(--space-sm)}
+ .tablet-sidebar-toggle{display:flex}.tablet-body .session-back,.sidebar-collapsed .tablet-sidebar{display:none}
+}

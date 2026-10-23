@@ -2,6 +2,8 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Sessions": "세션",
+ "Toggle session list": "세션 목록 접기/펴기",
  "Recent sessions": "최근 세션",
  "Open Krill desktop → Settings → Mobile, then scan the QR code.": "PC의 Krill에서 설정 → 모바일을 열고 QR 코드를 스캔하세요.",
  "No terminals in this workspace.": "이 작업 공간에는 터미널이 없습니다.",
