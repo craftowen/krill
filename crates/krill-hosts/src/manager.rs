@@ -24,6 +24,23 @@ const OFFLINE_AFTER_FAILURES: u32 = 10;
 /// 꺼진 기기 재시도 간격. 사이드바 '다시 연결'([`HostManager::reconnect_now`])은 이 대기를 바로 푼다.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
 
+/// 같은 접속 대상을 가리키는 관리자끼리 나누는 '꺼진 기기' 판정의 키.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OfflineKey {
+    ssh_bin: Option<std::ffi::OsString>,
+    local_dir: Option<PathBuf>,
+    destination: String,
+    port: Option<u16>,
+    identity_file: Option<String>,
+    remote_socket: Option<String>,
+}
+
+/// 앱은 창마다 관리자를 따로 둔다. 판정을 나누지 않으면 꺼진 기기에 띄우는 ssh 재시도와 그에 따른
+/// 상태 깜빡임(연결 중 → 끊김)이 창 수만큼, 창마다 다른 위상으로 [`OFFLINE_BACKOFF`]마다 반복된다.
+/// 값은 다음 재시도 시각과 마지막 오류.
+static OFFLINE: std::sync::LazyLock<Mutex<BTreeMap<OfflineKey, (Instant, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
 /// 백그라운드에서 수집한 전송 상태. UI에서는 이 스냅샷만 읽는다.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HostConnectionInfo {
@@ -332,6 +349,10 @@ impl HostManager {
         let Ok(mut s) = slot.lock() else {
             return;
         };
+        // 사용자가 직접 누른 재연결은 다른 창이 내린 '꺼진 기기' 판정도 바로 푼다.
+        if let Ok(mut offline) = OFFLINE.lock() {
+            offline.remove(&self.offline_key(&s.spec));
+        }
         // 살아 있는 터널도 내린다: 원격 데몬 재탐색·깨우기는 터널을 새로 만들 때만 돈다(remote_query).
         s.generation = s.generation.wrapping_add(1);
         s.tunnel = None;
@@ -419,6 +440,17 @@ impl HostManager {
         self.slots.lock().ok()?.get(&id).cloned()
     }
 
+    fn offline_key(&self, spec: &RemoteHostSpec) -> OfflineKey {
+        OfflineKey {
+            ssh_bin: self.ssh_bin.clone(),
+            local_dir: self.local_dir.clone(),
+            destination: spec.address.clone(),
+            port: spec.port,
+            identity_file: spec.identity_file.clone(),
+            remote_socket: spec.remote_socket.clone(),
+        }
+    }
+
     fn ensure_tunnel_socket(&self, id: &str) -> io::Result<PathBuf> {
         let slot = self.slot(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "unknown remote host")
@@ -466,6 +498,21 @@ impl HostManager {
             s.status = HostStatus::Connecting;
         }
 
+        let key = self.offline_key(&s.spec);
+        if let Some((until, error)) = OFFLINE
+            .lock()
+            .ok()
+            .and_then(|offline| offline.get(&key).cloned())
+            .filter(|(until, _)| Instant::now() < *until)
+        {
+            // 다른 창의 관리자가 방금 꺼진 기기로 판정했다. ssh를 다시 띄우지 않고 그 판정을 따른다.
+            s.failures = s.failures.max(OFFLINE_AFTER_FAILURES.saturating_add(1));
+            s.next_retry_at = Some(until);
+            s.last_error = Some(error.clone());
+            s.status = HostStatus::Disconnected;
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
+        }
+
         s.status = HostStatus::Connecting;
         let opts = s.spec.to_ssh_options();
         let generation = s.generation;
@@ -491,6 +538,9 @@ impl HostManager {
         }
         match started {
             Ok(tunnel) => {
+                if let Ok(mut offline) = OFFLINE.lock() {
+                    offline.remove(&key);
+                }
                 let sock = tunnel.socket().to_path_buf();
                 s.placeholder_socket.clone_from(&sock);
                 s.tunnel = Some(tunnel);
@@ -500,9 +550,15 @@ impl HostManager {
             Err(err) => {
                 s.failures = s.failures.saturating_add(1);
                 let delay = Self::backoff_delay(s.failures);
-                s.next_retry_at = Some(Instant::now() + delay);
+                let until = Instant::now() + delay;
+                s.next_retry_at = Some(until);
                 s.last_error = Some(err.to_string());
                 s.status = HostStatus::Disconnected;
+                if delay == OFFLINE_BACKOFF
+                    && let Ok(mut offline) = OFFLINE.lock()
+                {
+                    offline.insert(key, (until, err.to_string()));
+                }
                 // Normalize NotFound so callers (e.g. shell::is_permanent_error) treat remote
                 // tunnel setup failure as transient and keep retrying with backoff.
                 let kind = if err.kind() == io::ErrorKind::NotFound {
