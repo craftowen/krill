@@ -1,3 +1,5 @@
+// Krill 변경(앱 멈춤, Apache-2.0 §4(b)): 링크가 멈추면 디스플레이의 링크를 새로 만든다(`recreate_display_link`). 이미 같은
+// 디스플레이를 구독 중인 창의 `WindowFrameSource::start`는 구독을 유지한다(링크를 멈췄다 켜지 않는다).
 //! Frame pacing for macOS windows, built on `CVDisplayLink`.
 //!
 //! CVDisplayLink has no safe teardown: `CVDisplayLinkStop` merely flags the
@@ -361,7 +363,17 @@ impl WindowFrameSource {
         }
     }
 
+    /// Subscribes to `display_id`'s link. Already subscribed to it, this keeps the subscription:
+    /// with no other window on the display, unsubscribing would stop the link and resubscribing
+    /// start it again, which ends its io thread and spawns a new one and restarts its pacing (this
+    /// ran on every `displayLayer:`, i.e. every immediate draw). Call `stop` first to force that.
     pub fn start(&mut self, display_id: CGDirectDisplayID) -> Result<()> {
+        if self
+            .registration
+            .is_some_and(|(subscribed, _)| subscribed == display_id)
+        {
+            return Ok(());
+        }
         self.stop();
         let subscriber_id =
             subscribe(display_id, self.frame_requests.clone(), self.signal.clone())?;
@@ -620,6 +632,18 @@ mod tests {
                 received_at,
             );
         }
+    }
+
+    #[test]
+    fn starting_on_the_subscribed_display_keeps_the_subscription() {
+        extern "C" fn tick(_: *mut c_void) {}
+        let mut source = WindowFrameSource::new(std::ptr::null_mut(), tick);
+        source.registration = Some((7, SubscriberId(41)));
+        // Resubscribing would stop and restart display 7's link (and assert the main thread).
+        source.start(7).unwrap();
+        assert!(matches!(source.registration, Some((7, SubscriberId(41)))));
+        // Not registered for real, so dropping must not unsubscribe.
+        source.registration = None;
     }
 
     fn timestamp(host_time: u64) -> sys::CVTimeStamp {
