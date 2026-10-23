@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{AnyWindowHandle, App, AppContext as _, Window};
 use objc2::msg_send;
-use objc2::runtime::{AnyClass, AnyObject};
+use objc2::rc::Retained;
+use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -216,6 +218,47 @@ impl Drop for SleepAssertion {
     }
 }
 
+/// 창이 보이고 앱이 활성인 동안만 잡는 `NSProcessInfo` 활동: App Nap과 타이머 합치기를 막는다. 유휴 시스템 잠자기는
+/// 막지 않는다(그건 [`SleepAssertion`] 몫). Drop 시 끝난다.
+#[derive(Debug)]
+pub struct LatencyActivity(Retained<ProtocolObject<dyn NSObjectProtocol>>);
+
+impl LatencyActivity {
+    pub fn begin() -> Self {
+        let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+            | NSActivityOptions::LatencyCritical;
+        Self(
+            NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+                options,
+                &NSString::from_str("Krill window is visible and active"),
+            ),
+        )
+    }
+}
+
+impl Drop for LatencyActivity {
+    fn drop(&mut self) {
+        // SAFETY: `self.0`은 `beginActivityWithOptions:reason:`이 돌려준 활동 토큰이고 Drop에서 한 번만 끝낸다.
+        unsafe { NSProcessInfo::processInfo().endActivity(&self.0) };
+    }
+}
+
+/// `[NSApp isActive]`. 메인 스레드에서만 부른다. 앱이 아직 없으면(테스트 플랫폼) `false`.
+pub fn app_is_active() -> bool {
+    // SAFETY: `NSApp`은 AppKit이 내보내는 전역 포인터다. 널이면 아래에서 거른다.
+    let app = unsafe { NSApp };
+    // SAFETY: `app`은 널이 아닌 `NSApplication`, `isActive`는 BOOL을 돌려주는 표준 메서드다.
+    !app.is_null() && unsafe { msg_send![app, isActive] }
+}
+
+/// 주 디스플레이가 잠들었는지(`CGDisplayIsAsleep`). 어느 스레드에서든 부를 수 있다.
+pub fn display_asleep() -> bool {
+    // SAFETY: 인자 없는 CoreGraphics 조회 함수다.
+    let display = unsafe { CGMainDisplayID() };
+    // SAFETY: `display`는 `CGMainDisplayID`가 돌려준 ID다. 잘못된 ID여도 0을 돌려줄 뿐이다.
+    unsafe { CGDisplayIsAsleep(display) != 0 }
+}
+
 pub(super) fn cf_string(s: &str) -> Option<*const c_void> {
     let len = isize::try_from(s.len()).ok()?;
     // SAFETY: `s`는 `len` 바이트의 유효한 UTF-8 슬라이스이며 `CFStringCreateWithBytes`가 복사해 새 객체를 만든다.
@@ -323,6 +366,12 @@ unsafe extern "C" {
         is_external_representation: u8,
     ) -> *const c_void;
     fn CFRelease(cf: *const c_void);
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(display: u32) -> u32;
 }
 
 #[link(name = "IOKit", kind = "framework")]

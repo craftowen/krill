@@ -6,7 +6,7 @@ use std::mem;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -29,18 +29,57 @@ struct Watchdog {
 }
 impl Global for Watchdog {}
 
-/// Start once for the entire application, independently of individual windows.
-pub fn start(cx: &mut App) {
-    // Only a focused window has input to delay; background timers are throttled by App Nap.
-    start_with_state(cx, krill_proto::daemon::state_dir, |cx| {
-        cx.active_window().is_some()
-    });
+/// What the UI thread saw at its last heartbeat. It freezes with the UI, so a stall record
+/// shows the state just before the stall.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Seen {
+    /// `[NSApp isActive]`.
+    app_active: bool,
+    /// Some window draws frames that reach the screen: not minimized, not fully covered
+    /// (occlusion) and not on a sleeping display.
+    window_visible: bool,
 }
 
-fn start_with_state(
+impl Seen {
+    fn pack(self) -> u8 {
+        u8::from(self.app_active) | u8::from(self.window_visible) << 1
+    }
+
+    const fn unpack(bits: u8) -> Self {
+        Self {
+            app_active: bits & 1 != 0,
+            window_visible: bits & 2 != 0,
+        }
+    }
+}
+
+/// Start once for the entire application, independently of individual windows.
+pub fn start(cx: &mut App) {
+    start_with(
+        cx,
+        krill_proto::daemon::state_dir,
+        seen,
+        crate::platform::display_asleep,
+    );
+}
+
+fn seen(cx: &mut App) -> Seen {
+    let window_visible = cx.windows().into_iter().any(|handle| {
+        handle
+            .update(cx, |_, window, _| window.is_visible())
+            .unwrap_or(false)
+    });
+    Seen {
+        app_active: crate::platform::app_is_active(),
+        window_visible,
+    }
+}
+
+fn start_with(
     cx: &mut App,
     state: impl FnOnce() -> Option<std::path::PathBuf> + Send + 'static,
-    foreground: fn(&App) -> bool,
+    probe: fn(&mut App) -> Seen,
+    display_asleep: fn() -> bool,
 ) {
     if cx.has_global::<Watchdog>() {
         return;
@@ -48,15 +87,14 @@ fn start_with_state(
     let epoch = Instant::now();
     let last = Arc::new(AtomicU64::new(0));
     let observed = Arc::clone(&last);
-    let active = Arc::new(AtomicBool::new(false));
-    let observed_active = Arc::clone(&active);
+    let seen = Arc::new(AtomicU8::new(0));
+    let observed_seen = Arc::clone(&seen);
     let (stop, stopped) = mpsc::channel::<()>();
     let worker = std::thread::Builder::new()
         .name("ui-watchdog".into())
         .spawn(move || {
-            let mut monitor = Monitor::default();
+            let mut watch = Watch::default();
             let state = state();
-            let mut quiet = false;
             let mut want_sample = false;
             let mut sampled_at: Option<Instant> = None;
             while matches!(
@@ -64,32 +102,64 @@ fn start_with_state(
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
                 let now = millis(epoch.elapsed());
-                match monitor.check(now, observed.load(Ordering::Acquire)) {
-                    Some(Event::Stalled(_)) if !observed_active.load(Ordering::Acquire) => {
-                        quiet = true;
-                    }
-                    Some(Event::Recovered(_)) if mem::take(&mut quiet) => {}
-                    Some(Event::Stalled(delay_ms)) => {
-                        tracing::warn!(delay_ms, "UI heartbeat stalled");
+                let seen = Seen::unpack(observed_seen.load(Ordering::Acquire));
+                match watch.observe(now, observed.load(Ordering::Acquire), seen, display_asleep) {
+                    Some(Report::Stalled {
+                        delay_ms,
+                        late_ms,
+                        observer_gap_ms,
+                        whole_process,
+                    }) => {
+                        tracing::warn!(
+                            delay_ms,
+                            late_ms,
+                            observer_gap_ms,
+                            whole_process,
+                            app_active = seen.app_active,
+                            "UI heartbeat stalled"
+                        );
                         want_sample = sampled_at.is_none_or(|at| at.elapsed() >= SAMPLE_EVERY);
                     }
-                    Some(Event::Recovered(delay_ms)) => {
+                    Some(Report::Recovered {
+                        delay_ms,
+                        observer_gap_ms,
+                        whole_process,
+                    }) => {
                         want_sample = false;
-                        tracing::info!(delay_ms, "UI heartbeat recovered");
+                        tracing::info!(
+                            delay_ms,
+                            observer_gap_ms,
+                            whole_process,
+                            "UI heartbeat recovered"
+                        );
+                    }
+                    Some(Report::ObserverLate { observer_gap_ms }) => {
+                        tracing::warn!(
+                            observer_gap_ms,
+                            app_active = seen.app_active,
+                            "UI watchdog woke late"
+                        );
                     }
                     None => {}
                 }
-                if !want_sample || monitor.stalled_for(now) < SAMPLE_AFTER_MS {
+                if !want_sample || watch.monitor.stalled_for(now) < SAMPLE_AFTER_MS {
                     continue;
                 }
                 want_sample = false;
                 if let Some(state) = &state {
                     sampled_at = Some(Instant::now());
-                    match capture(&state.join("diagnostics")) {
-                        Ok(()) => tracing::info!("UI stall sample saved locally"),
-                        Err(error) => {
-                            tracing::warn!(kind = ?error.kind(), "UI stall sample failed");
-                        }
+                    let dir = state.join("diagnostics");
+                    // `sample` takes over a second; on this thread it would delay the recovery record.
+                    let sampler = std::thread::Builder::new()
+                        .name("ui-stall-sample".into())
+                        .spawn(move || match capture(&dir) {
+                            Ok(()) => tracing::info!("UI stall sample saved locally"),
+                            Err(error) => {
+                                tracing::warn!(kind = ?error.kind(), "UI stall sample failed");
+                            }
+                        });
+                    if sampler.is_err() {
+                        tracing::warn!("UI stall sample could not start");
                     }
                 }
             }
@@ -99,9 +169,12 @@ fn start_with_state(
         return;
     }
     let pulse = cx.spawn(async move |cx| {
+        let mut activity = None;
         loop {
             last.store(millis(epoch.elapsed()), Ordering::Release);
-            active.store(cx.update(|cx| foreground(cx)), Ordering::Release);
+            let now = cx.update(probe);
+            seen.store(now.pack(), Ordering::Release);
+            hold_activity(&mut activity, now);
             cx.background_executor().timer(PULSE).await;
         }
     });
@@ -109,6 +182,16 @@ fn start_with_state(
         _pulse: pulse,
         _stop: stop,
     });
+}
+
+/// App Nap and timer coalescing can delay this very heartbeat and the frames behind it.
+/// Prevent them only while a window is visible and the app is active, so the power cost
+/// is paid only while the user is looking at Krill.
+fn hold_activity(activity: &mut Option<crate::platform::LatencyActivity>, seen: Seen) {
+    let wanted = seen.app_active && seen.window_visible;
+    if wanted != activity.is_some() {
+        *activity = wanted.then(crate::platform::LatencyActivity::begin);
+    }
 }
 
 fn millis(elapsed: Duration) -> u64 {
@@ -142,6 +225,73 @@ impl Monitor {
             return Some(Event::Stalled(now.saturating_sub(last)));
         }
         None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    Stalled {
+        delay_ms: u64,
+        /// How long after the expected detection (`last + STALL_MS`) the observer noticed.
+        /// Normally under one pulse; more means the observer thread was not running either.
+        late_ms: u64,
+        observer_gap_ms: u64,
+        /// The observer itself slept through a stall-sized interval: the whole process was
+        /// not scheduled (external suspension, App Nap, CPU starvation), not just the UI.
+        whole_process: bool,
+    },
+    Recovered {
+        delay_ms: u64,
+        observer_gap_ms: u64,
+        whole_process: bool,
+    },
+    /// The observer overslept while the UI heartbeat kept up (or was already stalled).
+    ObserverLate { observer_gap_ms: u64 },
+}
+
+#[derive(Default)]
+struct Watch {
+    monitor: Monitor,
+    /// The current stall began while nothing was on screen; drop its recovery too.
+    quiet: bool,
+    tick: Option<u64>,
+}
+
+impl Watch {
+    fn observe(
+        &mut self,
+        now: u64,
+        last: u64,
+        seen: Seen,
+        display_asleep: impl Fn() -> bool,
+    ) -> Option<Report> {
+        let observer_gap_ms = self
+            .tick
+            .replace(now)
+            .map_or(0, |previous| now.saturating_sub(previous));
+        let whole_process = observer_gap_ms >= STALL_MS;
+        // Hidden, covered or on a sleeping display: macOS may throttle us and no one waits on input.
+        let shown = || seen.window_visible && !display_asleep();
+        match self.monitor.check(now, last) {
+            Some(Event::Stalled(_)) if !shown() => {
+                self.quiet = true;
+                None
+            }
+            Some(Event::Recovered(_)) if mem::take(&mut self.quiet) => None,
+            Some(Event::Stalled(delay_ms)) => Some(Report::Stalled {
+                delay_ms,
+                late_ms: delay_ms.saturating_sub(STALL_MS),
+                observer_gap_ms,
+                whole_process,
+            }),
+            Some(Event::Recovered(delay_ms)) => Some(Report::Recovered {
+                delay_ms,
+                observer_gap_ms,
+                whole_process,
+            }),
+            None => (whole_process && !self.quiet && shown())
+                .then_some(Report::ObserverLate { observer_gap_ms }),
+        }
     }
 }
 
@@ -231,6 +381,117 @@ mod tests {
         }
     }
 
+    const SHOWN: Seen = Seen {
+        app_active: true,
+        window_visible: true,
+    };
+
+    #[test]
+    fn stall_record_carries_detection_delay_and_observer_gap() {
+        let mut watch = Watch::default();
+        for now in (100..=600).step_by(100) {
+            assert_eq!(watch.observe(now, 200.min(now), SHOWN, || false), None);
+        }
+        assert_eq!(
+            watch.observe(700, 200, SHOWN, || false),
+            Some(Report::Stalled {
+                delay_ms: 500,
+                late_ms: 0,
+                observer_gap_ms: 100,
+                whole_process: false,
+            })
+        );
+        assert_eq!(
+            watch.observe(800, 750, SHOWN, || false),
+            Some(Report::Recovered {
+                delay_ms: 550,
+                observer_gap_ms: 100,
+                whole_process: false,
+            })
+        );
+    }
+
+    #[test]
+    fn observer_that_slept_through_the_stall_marks_the_whole_process() {
+        let mut watch = Watch::default();
+        assert_eq!(watch.observe(100, 100, SHOWN, || false), None);
+        assert_eq!(
+            watch.observe(2_800, 100, SHOWN, || false),
+            Some(Report::Stalled {
+                delay_ms: 2_700,
+                late_ms: 2_200,
+                observer_gap_ms: 2_700,
+                whole_process: true,
+            })
+        );
+        assert_eq!(
+            watch.observe(2_900, 2_850, SHOWN, || false),
+            Some(Report::Recovered {
+                delay_ms: 2_750,
+                observer_gap_ms: 100,
+                whole_process: false,
+            })
+        );
+        // The heartbeat ran first after the pause: no UI stall, but the observer overslept.
+        assert_eq!(
+            watch.observe(3_900, 3_850, SHOWN, || false),
+            Some(Report::ObserverLate {
+                observer_gap_ms: 1_000
+            })
+        );
+    }
+
+    #[test]
+    fn hidden_or_sleeping_display_is_not_recorded_as_a_stall() {
+        let hidden = Seen {
+            app_active: true,
+            window_visible: false,
+        };
+        for (seen, asleep) in [(hidden, false), (SHOWN, true)] {
+            let mut watch = Watch::default();
+            assert_eq!(watch.observe(100, 100, seen, || asleep), None);
+            assert_eq!(watch.observe(3_000, 100, seen, || asleep), None);
+            assert_eq!(watch.observe(3_100, 3_050, SHOWN, || false), None);
+            assert_eq!(watch.observe(3_200, 3_150, SHOWN, || false), None);
+        }
+    }
+
+    #[test]
+    fn app_nap_activity_is_held_only_while_visible_and_active() {
+        let mut activity = None;
+        hold_activity(&mut activity, SHOWN);
+        assert!(activity.is_some());
+        hold_activity(&mut activity, SHOWN);
+        assert!(activity.is_some());
+        for seen in [
+            Seen {
+                app_active: false,
+                window_visible: true,
+            },
+            Seen {
+                app_active: true,
+                window_visible: false,
+            },
+        ] {
+            hold_activity(&mut activity, SHOWN);
+            hold_activity(&mut activity, seen);
+            assert!(activity.is_none(), "{seen:?}");
+        }
+    }
+
+    #[test]
+    fn seen_state_round_trips_through_the_atomic() {
+        for app_active in [false, true] {
+            for window_visible in [false, true] {
+                let seen = Seen {
+                    app_active,
+                    window_visible,
+                };
+                assert_eq!(Seen::unpack(seen.pack()), seen);
+            }
+        }
+    }
+
     #[test]
     fn native_sample_is_bounded_and_rotates_in_place() {
         let dir = std::env::temp_dir().join(format!("krill-hang-sample-{}", std::process::id()));
@@ -252,7 +513,7 @@ mod tests {
         let state = std::env::temp_dir().join(format!("krill-watchdog-{}", std::process::id()));
         let sample = state.join("diagnostics/app-hang-latest.sample.txt");
         let owned = state.clone();
-        cx.update(|cx| start_with_state(cx, move || Some(owned), |_| true));
+        cx.update(|cx| start_with(cx, move || Some(owned), |_| SHOWN, || false));
         cx.run_until_parked();
         // Deliberately do not pump either GPUI executor. Only the native observer
         // can collect the blocked foreground's stack during this interval.
