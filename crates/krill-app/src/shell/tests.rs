@@ -4764,14 +4764,14 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         );
     });
 
-    // 사이드바에 '내 Mac'과 'Mac Studio' 호스트 섹션 헤더가 동시에 표시된다. 아직 연결 전이고 세션이 없는
-    // 'Mac Studio'는 '연결 안 된 호스트' 묶음 안에 있으므로 펼쳐서 본다.
+    // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트가 아직 없는 원격 호스트는
+    // 상태 확인·재연결 동작을 위해 헤더를 유지한다.
     cx.update(|_, cx| {
         let sidebar = view.read(cx).sidebar.clone();
         sidebar.update(cx, |s, cx| s.toggle_offline_hosts(Some(true), cx));
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("host-header-local").is_some());
+    assert!(cx.debug_bounds("host-header-local").is_none());
     assert!(cx.debug_bounds("host-header-studio-mac").is_some());
 
     // 로컬 탭에는 호스트 배지가 없고, 원격 탭과 원격 패인 헤더에는 호스트 배지가 표시된다.
