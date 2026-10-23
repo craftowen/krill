@@ -157,6 +157,26 @@ fn fixture() -> Snapshot {
 }
 
 #[test]
+fn windows_host_paths_name_and_nest_like_native_paths() {
+    let root = Path::new(r"C:\Users\user\orca\sd-tax");
+    assert_eq!(basename(root), "sd-tax");
+    assert_eq!(basename(Path::new(r"C:\Users\user\orca\sd-tax\")), "sd-tax");
+    assert!(path_within(root, root));
+    assert!(path_within(
+        Path::new("c:/users/user/orca/sd-tax/src"),
+        root
+    ));
+    assert!(!path_within(
+        Path::new(r"C:\Users\user\orca\sd-tax-2"),
+        root
+    ));
+    assert!(!path_within(Path::new(r"C:\Users\user"), root));
+    assert_eq!(basename(Path::new("/repo/a")), "a");
+    assert!(path_within(Path::new("/repo/a/b"), Path::new("/repo/a")));
+    assert!(!path_within(Path::new("/repo/ab"), Path::new("/repo/a")));
+}
+
+#[test]
 fn needs_you_precedes_pins_and_collapsed_worktrees() {
     let snapshot = Snapshot {
         sessions: vec![

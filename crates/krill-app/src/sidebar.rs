@@ -313,10 +313,36 @@ fn track_unread(
 }
 
 fn basename(path: &Path) -> String {
+    if windows_style(path) {
+        let text = path.to_string_lossy();
+        return windows_parts(&text).last().unwrap_or(&text).to_owned();
+    }
     path.file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+/// Windows 호스트 경로(`C:\x`, `\\server\share`). macOS 앱에서는 `\`가 구분자가 아니라
+/// `Path`가 경로 전체를 한 덩어리로 본다 — 이름·포함 판정을 문자열로 따로 한다.
+fn windows_style(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        || bytes.starts_with(br"\\")
+}
+
+fn windows_parts(path: &str) -> impl Iterator<Item = &str> {
+    path.split(['\\', '/']).filter(|part| !part.is_empty())
+}
+
+/// `path`가 `root` 아래(같은 경로 포함)인지. Windows 경로는 구분자(`\`·`/`)와 대소문자를 가리지 않는다.
+pub(crate) fn path_within(path: &Path, root: &Path) -> bool {
+    if !windows_style(root) {
+        return path.starts_with(root);
+    }
+    let (path, root) = (path.to_string_lossy(), root.to_string_lossy());
+    let mut parts = windows_parts(&path);
+    windows_parts(&root).all(|r| parts.next().is_some_and(|p| p.eq_ignore_ascii_case(r)))
 }
 
 /// 세션 행의 이름과 보조 문구. 이름은 터미널 제목 → 에이전트 → 폴더 이름 → "세션 n" 순서로 고른다.
@@ -1746,7 +1772,7 @@ impl Sidebar {
             .keys()
             .chain(snapshot.trees.values().flatten())
             .chain(snapshot.sessions.iter().filter_map(|s| s.worktree.as_ref()))
-            .filter(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+            .filter(|root| !root.as_os_str().is_empty() && path_within(path, root))
             .max_by_key(|root| root.as_os_str().len())
             .cloned()
     }

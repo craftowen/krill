@@ -394,13 +394,20 @@ impl Shell {
     }
 
     /// 칸 안의 OSC 8 URL 미리보기 툴팁 바(UI-1 디자인 토큰 적용).
+    /// 터미널 위 오버레이라 나타나고 사라져도 칸 크기(행 수)를 바꾸지 않는다.
     pub(super) fn render_pane_security(&self, id: PaneId, cx: &App) -> Option<AnyElement> {
         let uri = self.security.hover_uri(id)?;
         let p = krill_app::ui::palette(cx);
         Some(
             div()
                 .debug_selector(|| "osc8-preview".into())
-                .flex_none()
+                .absolute()
+                .left_2()
+                .bottom_2()
+                .max_w(gpui::relative(0.9))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .px_2()
                 .py_0p5()
                 .rounded(krill_app::ui::RADIUS_XS)

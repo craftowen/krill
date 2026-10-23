@@ -36,6 +36,15 @@ pub fn configure_background(command: &mut std::process::Command) {
     let _ = command;
 }
 
+/// [`std::fs::canonicalize`] without the Win32 verbatim prefix (`\\?\C:\x` → `C:\x`), so it agrees with
+/// shell-reported cwds and stays readable on other hosts' sidebars. Identity wrapper on Unix.
+pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    let path = crate::daemon::executable_path(&path);
+    Ok(path)
+}
+
 #[cfg(unix)]
 pub use std::os::unix::{ffi, fs, net};
 
