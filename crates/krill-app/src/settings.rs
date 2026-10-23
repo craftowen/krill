@@ -2256,7 +2256,12 @@ pub fn agent_install_command(agent_id: &str) -> Option<String> {
     let id = krill_proto::agent::canonical_id(agent_id);
     krill_proto::agent::Agents::load(None)
         .ok()
-        .and_then(|agents| agents.profiles.get(id).map(|p| p.install.clone()))
+        .and_then(|agents| {
+            agents
+                .profiles
+                .get(id)
+                .map(|p| p.install_command().to_owned())
+        })
         .filter(|s| !s.trim().is_empty())
 }
 

@@ -214,6 +214,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input
             "--dangerously-bypass-approvals-and-sandbox".into()
         }],
         install: String::new(),
+        install_windows: String::new(),
         env: std::collections::BTreeMap::new(),
     };
     let mut profiles = krill_proto::agent::set_user_profile(None, name, &profile).unwrap();

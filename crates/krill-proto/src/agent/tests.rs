@@ -211,3 +211,20 @@ fn which_appends_pathext_on_windows() {
     assert_eq!(which("missing", &path), None);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Windows에서는 `bash` 파이프 대신 `PowerShell` 설치 명령을, 없으면 공용 명령을 보여 준다.
+#[test]
+fn install_command_prefers_windows_variant_on_windows() {
+    let a = Agents::load(None).unwrap();
+    let claude = &a.profiles["claude"];
+    let expected = if cfg!(windows) {
+        "irm https://claude.ai/install.ps1 | iex"
+    } else {
+        "curl -fsSL https://claude.ai/install.sh | bash"
+    };
+    assert_eq!(claude.install_command(), expected);
+    assert_eq!(
+        a.profiles["codex"].install_command(),
+        "npm install -g @openai/codex"
+    );
+}
