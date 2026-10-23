@@ -1177,3 +1177,33 @@ fn orchestration_snapshot_reply_roundtrips_without_current_run() {
     }));
     roundtrip(&current);
 }
+
+#[test]
+fn capture_since_is_appended_and_distinguishes_empty_from_unchanged() {
+    let stamp = CaptureStamp {
+        session: SessionId(7),
+        revision: crate::screen::Revision(3),
+        seq: crate::screen::Seq(9),
+    };
+    let request = Request::CaptureSince {
+        session: SessionId(7),
+        since: Some(stamp),
+    };
+    let bytes = postcard::to_stdvec(&request).unwrap();
+    assert_eq!(bytes[0], 26, "new request must remain appended");
+    assert_eq!(postcard::from_bytes::<Request>(&bytes).unwrap(), request);
+    assert!(!roundtrip(&Reply::CaptureSince { stamp, bytes: None }).is_empty());
+    assert_ne!(
+        roundtrip(&Reply::CaptureSince { stamp, bytes: None }),
+        roundtrip(&Reply::CaptureSince {
+            stamp,
+            bytes: Some(Vec::new())
+        })
+    );
+    let too_large = Reply::CaptureSince {
+        stamp,
+        bytes: Some(vec![0; MAX_CAPTURE + 1]),
+    };
+    let encoded = postcard::to_stdvec(&too_large).unwrap();
+    assert!(postcard::from_bytes::<Reply>(&encoded).is_err());
+}

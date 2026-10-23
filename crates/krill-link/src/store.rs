@@ -844,6 +844,22 @@ mod tests {
     use iroh::SecretKey;
 
     #[test]
+    fn instance_lock_prevents_socket_takeover_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("krill-link-instance-{}", std::process::id()));
+        let path = dir.join("run/instance.lock");
+        let first = acquire_instance_lock(&path).unwrap();
+        assert_eq!(
+            acquire_instance_lock(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let other = acquire_instance_lock(&dir.join("run/other.lock")).unwrap();
+        drop(first);
+        let replacement = acquire_instance_lock(&path).unwrap();
+        drop((replacement, other));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn devices_and_hosts_atomic_roundtrip() {
         let dir = std::env::temp_dir().join(format!("mklink-store-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();

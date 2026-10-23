@@ -1503,3 +1503,180 @@ fn negotiated_resume_history_does_not_duplicate_temporary_prior() {
     assert!(p.history.prior.is_empty());
     assert!(!p.history.fixed);
 }
+
+#[test]
+fn compiled_search_cache_tracks_options_rows_and_invalid_regex() {
+    let mut pane = Pane::<Vec<u8>>::default();
+    pane.view.screen = Screen {
+        cols: 8,
+        lines: 1,
+        rows: vec![row("Aa")],
+        ..Screen::default()
+    };
+    pane.search.query = "a".into();
+    pane.search.result = Some(krill_proto::search::SearchResult {
+        req: 0,
+        snapshot: krill_proto::search::Snapshot::default(),
+        total: 2,
+        hit: None,
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    });
+    pane.refresh();
+    assert_eq!(pane.highlights().len(), 2);
+    pane.search.options.case_sensitive = true;
+    pane.refresh();
+    assert_eq!(pane.highlights().len(), 1);
+    assert_eq!(pane.highlights()[0].column, 1);
+    pane.view.screen.rows = vec![row("xx")];
+    pane.refresh();
+    assert!(pane.highlights().is_empty());
+    pane.search.query = "[".into();
+    pane.search.options.regex = true;
+    pane.refresh();
+    assert!(pane.highlights().is_empty());
+    assert!(pane.search.pattern.as_ref().unwrap().2.is_none());
+}
+
+#[test]
+fn history_requests_only_missing_viewport_rows() {
+    let mut history = History {
+        offset: 1,
+        ..History::default()
+    };
+    let request = history.next_request(24).unwrap();
+    assert_eq!(request.count, 25);
+    assert_eq!(request.skip, 0);
+    history.rows(HistoryRows {
+        req: request.req,
+        total: 1_000,
+        pages: 0,
+        skip: 0,
+        rows: (0..25).map(|_| row("h")).collect(),
+    });
+    assert!(history.next_request(24).is_none());
+}
+
+#[test]
+fn cold_history_publishes_a_viewport_before_reading_the_whole_page() {
+    let mut history = History {
+        phase: Phase::Cold {
+            page: 3,
+            got: 0,
+            newest: true,
+        },
+        offset: 1,
+        ..History::default()
+    };
+    let request = history.next_request(24).unwrap();
+    history.rows(HistoryRows {
+        req: request.req,
+        total: 100_000,
+        pages: 4,
+        skip: 0,
+        rows: (0..25).map(|i| row(&format!("row-{i}"))).collect(),
+    });
+    assert_eq!(history.rows.len(), 25);
+    assert!(history.page.is_empty());
+    assert!(history.next_request(24).is_none());
+    history.offset = 26;
+    let next = history.next_request(24).unwrap();
+    assert_eq!(next.source, Source::Cold { page: 3 });
+    assert_eq!(next.skip, 25);
+    assert_eq!(next.count, 25);
+}
+
+#[test]
+fn negotiated_history_missing_retains_rendered_screen_and_scroll_anchor() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+    let mut pane = Pane::default();
+    pane.link(
+        SessionId(1),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    update(&mut pane, 1, snapshot(["live-a", "live-b", "live-c"]));
+    sent(out(&mut pane));
+    pane.scroll(3);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let request = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(request.view, 0);
+    let reply = HistoryViewRows {
+        req: request.req,
+        view: 7,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 0,
+        total: 100,
+        complete: false,
+        rows: vec![row("old-c"), row("old-b"), row("old-a")],
+    };
+    assert!(feed(&mut pane, &reply.encode().unwrap()).redraw);
+    let shown = Rc::clone(&pane.shown);
+    assert_eq!(pane.scroll_offset(), 3);
+    pane.scroll(3);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let request = HistoryViewRequest::decode(*kind, body).unwrap();
+    let unavailable = HistoryViewRows {
+        req: request.req,
+        view: 7,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Missing,
+        identity: None,
+        skip: 3,
+        total: 100,
+        complete: false,
+        rows: Vec::new(),
+    };
+    let ev = feed(&mut pane, &unavailable.encode().unwrap());
+    assert!(!ev.redraw);
+    assert!(ev.history_notice.unwrap().contains("retained"));
+    assert_eq!(pane.scroll_offset(), 3);
+    assert!(Rc::ptr_eq(&shown, &pane.shown));
+    update(&mut pane, 2, snapshot(["new-a", "new-b", "new-c"]));
+    assert_eq!(pane.scroll_offset(), 3);
+    assert_eq!(
+        pane.shown.rows, shown.rows,
+        "live output cannot shift frozen history anchors"
+    );
+}
+
+#[test]
+fn feature_loss_keeps_expired_stable_view_without_invisible_legacy_fetch() {
+    let mut pane = linked();
+    pane.history.stable = Some(stable_history::Cache::new(SessionId(1)));
+    pane.history.offset = usize::MAX;
+    pane.link(SessionId(1), 10, Vec::new(), input::FEAT_INPUT, Now::get());
+    sent(out(&mut pane));
+    pane.fetch();
+    assert!(sent(out(&mut pane)).is_empty());
+    assert!(pane.history.rows.is_empty());
+    assert!(pane.history.stable.is_some());
+    pane.history.reset();
+    pane.history.scroll(1);
+    pane.fetch();
+    let frames = sent(out(&mut pane));
+    assert!(
+        frames
+            .iter()
+            .any(|(kind, _)| *kind == krill_proto::screen::kind::HISTORY),
+        "fresh explicit view still supports a legacy daemon"
+    );
+}

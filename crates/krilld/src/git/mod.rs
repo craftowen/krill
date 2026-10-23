@@ -32,7 +32,8 @@ pub const MAX_CONCURRENT: usize = 4;
 const MAX_PENDING: usize = 256;
 const MAX_REPO_PENDING: usize = 32;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
-const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 const DRAIN_BYTES: usize = 64 * 1024;
 
 /// git 자식 실행 상한. 멈춘 훅·credential helper가 큐 워커를 영구 블록하지 않게 한다.
@@ -66,11 +67,13 @@ struct Job {
     /// 직렬화 키. `repo`의 정규 경로.
     key: PathBuf,
     execute: Execute,
+    retained: usize,
 }
 
 #[derive(Default)]
 struct State {
     pending: VecDeque<Job>,
+    pending_bytes: usize,
     busy: HashSet<PathBuf>,
     closed: bool,
 }
@@ -134,12 +137,8 @@ impl GitQueue {
     {
         let (reply, rx) = mpsc::channel();
         let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-        if args
-            .iter()
-            .map(|a| a.as_os_str().as_bytes().len())
-            .sum::<usize>()
-            > MAX_ARGUMENT_BYTES
-        {
+        let retained = argument_bytes(&args);
+        if retained > MAX_ARGUMENT_BYTES {
             reply
                 .send(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -151,8 +150,11 @@ impl GitQueue {
         let submitted = Instant::now();
         self.enqueue(
             repo.into(),
+            retained,
             Box::new(move |program, repo| {
-                let result = if submitted.elapsed() >= TIMEOUT {
+                // Queue residence and execution have separate budgets so one
+                // timed-out predecessor cannot expire the next accepted job.
+                let result = if submitted.elapsed() >= TIMEOUT.saturating_mul(2) {
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "git queue deadline elapsed before execution",
@@ -181,8 +183,18 @@ impl GitQueue {
     {
         let (tx, rx) = mpsc::channel();
         let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+        let retained = argument_bytes(&args);
+        if retained > MAX_ARGUMENT_BYTES {
+            tx.send(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "git arguments exceed byte budget",
+            )))
+            .ok();
+            return rx;
+        }
         self.enqueue(
             repo,
+            retained,
             Box::new(move |program, repo| {
                 let mut checked = Instant::now().checked_sub(Duration::from_secs(1));
                 let result = run_guarded(program, repo, &args, || {
@@ -204,23 +216,33 @@ impl GitQueue {
         rx
     }
 
-    fn enqueue(&self, repo: PathBuf, execute: Execute) {
+    fn enqueue(&self, repo: PathBuf, retained: usize, execute: Execute) {
         let key = fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
-        self.enqueue_key(repo, key, execute);
+        self.enqueue_key(repo, key, retained, execute);
     }
 
     /// 링크된 워크트리는 실행 디렉터리와 직렬화할 주 저장소 키가 다르다.
-    fn enqueue_key(&self, repo: PathBuf, key: PathBuf, execute: Execute) {
+    fn enqueue_key(&self, repo: PathBuf, key: PathBuf, retained: usize, execute: Execute) {
+        let retained = retained
+            .saturating_add(repo.as_os_str().as_bytes().len())
+            .saturating_add(key.as_os_str().as_bytes().len());
         let mut state = lock(&self.shared.state);
         // Reject before starting, with no mutation retry. Retained argument payloads are bounded
         // by MAX_ARGUMENT_BYTES (edit payloads already have stricter protocol limits).
         if state.closed
             || state.pending.len() >= MAX_PENDING
+            || retained > MAX_PENDING_BYTES.saturating_sub(state.pending_bytes)
             || state.pending.iter().filter(|job| job.key == key).count() >= MAX_REPO_PENDING
         {
             return; // dropping execute disconnects its result channel
         }
-        state.pending.push_back(Job { repo, key, execute });
+        state.pending_bytes += retained;
+        state.pending.push_back(Job {
+            repo,
+            key,
+            execute,
+            retained,
+        });
         self.shared.changed.notify_one();
     }
 }
@@ -258,7 +280,8 @@ fn next(shared: &Shared) -> Option<Job> {
             .position(|j| !busy.contains(&j.key))
             .and_then(|i| pending.remove(i))
         {
-            busy.insert(job.key.clone());
+            st.pending_bytes = st.pending_bytes.saturating_sub(job.retained);
+            st.busy.insert(job.key.clone());
             return Some(job);
         }
         st = shared
@@ -266,6 +289,14 @@ fn next(shared: &Shared) -> Option<Job> {
             .wait(st)
             .unwrap_or_else(PoisonError::into_inner);
     }
+}
+
+fn argument_bytes(args: &[OsString]) -> usize {
+    args.iter().fold(0usize, |bytes, arg| {
+        bytes
+            .saturating_add(std::mem::size_of::<OsString>())
+            .saturating_add(arg.as_os_str().as_bytes().len())
+    })
 }
 
 fn command(program: &Path, repo: &Path, args: &[OsString]) -> Command {
@@ -317,7 +348,7 @@ fn run_guarded(
     let (mut out_eof, mut err_eof) = (false, false);
     loop {
         if let Err(error) = guard() {
-            kill_and_reap(&mut child);
+            terminate_gracefully(&mut child);
             return Err(error);
         }
         match (
@@ -329,7 +360,9 @@ fn run_guarded(
                 err_eof |= b;
             }
             (Err(e), _) | (_, Err(e)) => {
-                kill_and_reap(&mut child);
+                // Output budgets abort mutations too: allow Git to release its
+                // index/worktree locks before the bounded KILL fallback.
+                terminate_gracefully(&mut child);
                 return Err(e);
             }
         }
@@ -345,6 +378,13 @@ fn run_guarded(
                             "git output timed out",
                         ));
                     }
+                    crate::child::wait_readable(
+                        &[
+                            (!out_eof).then_some(&stdout as &dyn AsFd),
+                            (!err_eof).then_some(&stderr as &dyn AsFd),
+                        ],
+                        Duration::from_millis(5),
+                    );
                     continue;
                 }
                 kill_and_reap(&mut child);

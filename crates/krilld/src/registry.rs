@@ -47,6 +47,7 @@ use crate::status::{self, Statuses};
 use crate::store::{Limits, Store};
 
 mod account_switch;
+pub mod admission;
 mod agent_history;
 mod hibernation;
 mod orch_cache;
@@ -450,15 +451,34 @@ impl Registry {
     /// 화면·제어·hook feature 없이 협상만 했으면 감시 연결(MK-026)이다. holder 감시 기능을 협상한 연결에는
     /// 초기 상태를 보내고, 재결합 소켓 준비 뒤 holder 상실을 알린다(OWE-493).
     pub fn serve(&self, s: UnixStream, hello: &ServerHello) -> io::Result<()> {
-        self.serve_as(s, hello, false)
+        let permit = admission::handshake().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "local connection admission full")
+        })?;
+        self.serve_admitted(s, hello, permit)
+    }
+
+    /// Called by the accept loop after reserving a slot before spawning a thread.
+    pub fn serve_admitted(
+        &self,
+        s: UnixStream,
+        hello: &ServerHello,
+        permit: admission::Permit,
+    ) -> io::Result<()> {
+        self.serve_as(s, hello, false, Some(permit))
     }
 
     /// 모바일 인증을 마친 내부 pair에만 사용한다. 원격 PID 대신 명시적 전체 범위를 부여한다.
     pub(crate) fn serve_mobile(&self, s: UnixStream, hello: &ServerHello) -> io::Result<()> {
-        self.serve_as(s, hello, true)
+        self.serve_as(s, hello, true, None)
     }
 
-    fn serve_as(&self, mut s: UnixStream, hello: &ServerHello, mobile: bool) -> io::Result<()> {
+    fn serve_as(
+        &self,
+        mut s: UnixStream,
+        hello: &ServerHello,
+        mobile: bool,
+        admission: Option<admission::Permit>,
+    ) -> io::Result<()> {
         // macOS는 닫힌 피어의 LOCAL_PEERPID도 EINVAL로 거부하므로 ServerHello를 보내기 전에 피어를 읽는다.
         let mut peer = if mobile {
             Peer {
@@ -503,6 +523,7 @@ impl Registry {
             == 0
         {
             let app = peer.pid.filter(|_| client.role == ipc::ClientRole::App);
+            drop(admission);
             if n.features & FEAT_HOLDER_WATCH != 0 {
                 return self.watch.serve(s, app);
             }
@@ -522,6 +543,7 @@ impl Registry {
         let Some((k, body)) = first else {
             return Ok(());
         };
+        drop(admission);
         if k == krill_proto::mobile::MOBILE_REQ
             && n.features & krill_proto::mobile::FEAT_MOBILE != 0
         {
@@ -657,8 +679,18 @@ impl Registry {
         s.set_read_timeout(None).ok();
         let mut body = body;
         let mut clients = HashMap::new();
+        let mut control_slot = None;
         loop {
             let decoded = Request::decode(control::kind::REQUEST, &body);
+            if !mobile {
+                if decoded.as_ref().is_ok_and(admission::protected) {
+                    control_slot = None;
+                } else if control_slot.is_none() {
+                    control_slot = Some(admission::control().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::WouldBlock, "local control admission full")
+                    })?);
+                }
+            }
             let restart = matches!(decoded, Ok(Request::Resources(Action::RestartDaemon)));
             let reply = match decoded {
                 Ok(Request::States) if n.features & FEAT_HOOK == 0 => {
@@ -683,6 +715,12 @@ impl Registry {
                 Ok(
                     Request::Capture { .. } | Request::Resize { .. } | Request::SendInput { .. },
                 ) if n.features & control::FEAT_CLI == 0 => Reply::Failed(Failure::BadRequest),
+                Ok(Request::CaptureSince { .. })
+                    if n.features & (control::FEAT_CAPTURE_SINCE | control::FEAT_CLI)
+                        != (control::FEAT_CAPTURE_SINCE | control::FEAT_CLI) =>
+                {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(Request::WaitStatus { .. }) if n.features & control::FEAT_WAIT_STATUS == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
@@ -870,6 +908,13 @@ impl Registry {
                         self.status.get(session).state
                     },
                     quiet_ms: tap.quiet_ms(),
+                }),
+            Request::CaptureSince { session, since } => self
+                .tap(peer, session)
+                .ok_or(Failure::NoSession)
+                .and_then(|tap| {
+                    tap.capture_plain_since(since)
+                        .map_err(|_| Failure::BadRequest)
                 }),
             Request::Capture { session, format } => {
                 let tap = self.tap(peer, session).ok_or(Failure::NoSession);
@@ -2365,6 +2410,12 @@ impl Registry {
             pulse.closed.hash(&mut revision);
             tap.cwd(pid).hash(&mut revision);
             tap.foreground().hash(&mut revision);
+            if let Some(dir) = &self.dir {
+                crate::agent::control::cache::stamp(
+                    &dir.join("agent-launches").join(format!("{}.json", id.0)),
+                )
+                .hash(&mut revision);
+            }
             // AgentStatus has no Hash implementation; its small metadata serialization is
             // independent of terminal dimensions/history.
             if let Ok(bytes) = postcard::to_stdvec(&self.status.get(id)) {
@@ -2633,6 +2684,7 @@ fn read_only(req: &Request) -> bool {
         Request::List
             | Request::States
             | Request::SessionAccounts
+            | Request::CaptureSince { .. }
             | Request::Capture { .. }
             | Request::GitChanges { .. }
             | Request::WaitStatus { .. }

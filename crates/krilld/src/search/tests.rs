@@ -42,6 +42,7 @@ fn highlights_use_terminal_cells_for_wide_and_combining_characters() {
         let mut scan = Scan {
             pattern: &pattern,
             target: Some(0),
+            forward: true,
             total: 0,
             first: None,
             last: None,
@@ -94,4 +95,139 @@ fn cursor_survives_segment_seal_but_not_loss() {
     assert!(!cursor_valid(&cursor, &gc, 3));
     // 범위를 벗어나면 무효로 본다.
     assert!(!cursor_valid(&cursor, &sealed, 1));
+}
+
+#[test]
+fn batched_cold_scan_keeps_exact_total_cursor_and_page_coordinates() {
+    let pattern = krill_proto::search::Options::default()
+        .compile("a")
+        .unwrap();
+    let mut scan = Scan {
+        pattern: &pattern,
+        target: Some(3),
+        forward: true,
+        total: 0,
+        first: None,
+        last: None,
+        selected: None,
+    };
+    let source = Source::Cold { page: 7 };
+    let row = |text: &str| {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    };
+    scan.rows_at(source, &[row("aa"), row("skip")], 0);
+    scan.rows_at(source, &[row("aaa")], 2);
+    scan.finish_page(source, 3);
+    assert_eq!(scan.total, 5);
+    let hit = scan.selected.unwrap();
+    assert_eq!(
+        (hit.index, hit.row, hit.column, hit.total_rows),
+        (3, 2, 1, 3)
+    );
+    assert_eq!(scan.first.unwrap().index, 0);
+    assert!(
+        scan.last.is_none(),
+        "forward queries do not need cells from intermediate last hits"
+    );
+    let mut backwards = Scan {
+        pattern: &pattern,
+        target: None,
+        forward: false,
+        total: 0,
+        first: None,
+        last: None,
+        selected: None,
+    };
+    backwards.rows_at(source, &[row("aa"), row("skip")], 0);
+    backwards.rows_at(source, &[row("aaa")], 2);
+    backwards.finish_page(source, 3);
+    assert_eq!(backwards.total, 5);
+    assert_eq!(backwards.last.unwrap().index, 4);
+    assert!(backwards.first.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_cold_search_refreshes_its_snapshot_after_viewport_clear() {
+    use std::fs::{self, File};
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use krill_proto::SessionId;
+    use krill_proto::holder::WinSize;
+
+    let root = std::env::temp_dir().join(format!("queued-search-clear-{}", std::process::id()));
+    let store = crate::store::Store::open(&root, crate::store::Limits::default()).unwrap();
+    let id = SessionId(99);
+    let size = WinSize { cols: 40, rows: 3 };
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let mut output = File::from(pty.user);
+    let session = crate::Session::start(
+        id,
+        pty.controller,
+        size,
+        Arc::new(crate::Appearance::load(PathBuf::new())),
+        Some(store.recorder(id, size).unwrap()),
+    )
+    .unwrap();
+    let tap = session.tap();
+    let old = b"OLD\r\na\r\nb\r\nc\r\nkeep\r\n";
+    output.write_all(old).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tap.pulse().end < u64::try_from(old.len()).unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!store.history(id).unwrap().is_empty());
+    let active = replay::acquire(&|| false).unwrap();
+    let waiting = tap.clone();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&checks);
+    let worker = std::thread::spawn(move || {
+        search_cancellable(
+            &waiting,
+            &SearchRequest {
+                req: 1,
+                query: "OLD".into(),
+                direction: Direction::Next,
+                after: None,
+            },
+            krill_proto::search::Options::default(),
+            &|| {
+                observed.fetch_add(1, Ordering::AcqRel);
+                false
+            },
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while checks.load(Ordering::Acquire) < 2 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(tap.clear_viewport());
+    let new = b"\x1b[2J\x1b[HNEW\r\nlast\r\n";
+    output.write_all(new).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tap.pulse().end < u64::try_from(old.len() + new.len()).unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(active);
+    let result = worker.join().unwrap();
+    assert_eq!(
+        result.total, 0,
+        "a waiting search must not reuse the pre-clear manifest/grid"
+    );
+    assert!(result.hit.is_none());
+    drop(output);
+    session.wait().unwrap();
+    fs::remove_dir_all(root).unwrap();
 }

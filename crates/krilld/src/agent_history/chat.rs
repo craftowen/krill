@@ -4,11 +4,14 @@
 //! 4대 에이전트(`claude`·`codex`·`agy`·`opencode`)의 대화를 단일 `ChatItem` 스키마
 //! (`User`·`Assistant`·`Reasoning`·`ToolCall`·`ToolResult`·`Question`·`Permission`)로 정규화한다.
 
+use crate::session::lock;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use krill_proto::agent_history::{
     ChatItem, ChatItemKind, ChatPollSnapshot, ChatQuestionOption, MAX_CHAT_ITEMS, MAX_CHAT_TEXT,
@@ -25,6 +28,45 @@ use super::vault::{
 
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
 const MAX_POLL_BYTES: u64 = 512 * 1024;
+
+/// Global per-resolution work budget shared by recursive directory walks.
+struct ScanBudget {
+    remaining: usize,
+    deadline: Instant,
+}
+impl ScanBudget {
+    fn new() -> Self {
+        Self {
+            remaining: 2048,
+            deadline: Instant::now() + Duration::from_millis(100),
+        }
+    }
+    fn take(&mut self) -> bool {
+        if self.remaining == 0 || Instant::now() >= self.deadline {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+fn read_json_bounded(path: &Path, remaining: &mut u64) -> std::io::Result<Value> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > *remaining {
+        *remaining = 0;
+        return Err(std::io::Error::other("chat JSON byte budget exceeded"));
+    }
+    let mut bytes = Vec::new();
+    file.take(len.saturating_add(1).min(remaining.saturating_add(1)))
+        .read_to_end(&mut bytes)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    *remaining = remaining.saturating_sub(read);
+    if read > len {
+        return Err(std::io::Error::other("chat JSON changed while reading"));
+    }
+    serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+}
 
 /// 세션의 `StoredLaunch`와 작업 디렉터리를 바탕으로 트랜스크립트를 증분 폴링한다.
 pub(crate) fn poll_session(
@@ -338,7 +380,8 @@ fn poll_opencode_json_file(
     offset: u64,
     tail: bool,
 ) -> ChatPollSnapshot {
-    let Ok(bytes) = fs::read(path) else {
+    let mut remaining = MAX_POLL_BYTES;
+    let Ok(meta) = fs::metadata(path) else {
         return ChatPollSnapshot {
             agent: agent_str.to_owned(),
             session_id: sid_str.to_owned(),
@@ -350,7 +393,11 @@ fn poll_opencode_json_file(
         };
     };
     let storage_root = path.parent().and_then(Path::parent);
-    let mut synthetic_len = u64::try_from(bytes.len()).unwrap_or(0);
+    // OpenCode offsets are synthetic. Include identity/mtime so same-size rewrites and
+    // updated tool parts are observable without parsing unchanged JSON.
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    crate::agent::control::cache::stamp(path).hash(&mut fingerprint);
+    meta.len().hash(&mut fingerprint);
     let resolved_sid = if sid_str.is_empty() {
         path.file_stem()
             .and_then(|s| s.to_str())
@@ -370,13 +417,39 @@ fn poll_opencode_json_file(
                 && let Ok(meta) = entry.metadata()
                 && meta.is_file()
             {
-                synthetic_len = synthetic_len.saturating_add(meta.len());
                 msg_files.push(p);
             }
         }
         msg_files.sort();
     }
 
+    for path in &msg_files {
+        path.hash(&mut fingerprint);
+        crate::agent::control::cache::stamp(path).hash(&mut fingerprint);
+    }
+    // Parts can change independently of the message/session JSON.
+    if let Some(sr) = storage_root {
+        for msg in &msg_files {
+            if let Some(id) = msg.file_stem() {
+                let dir = sr.join("part").join(id);
+                crate::agent::control::cache::stamp(&dir).hash(&mut fingerprint);
+                if let Ok(entries) = fs::read_dir(dir) {
+                    let mut paths: Vec<_> = entries
+                        .take(32)
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .collect();
+                    paths.sort();
+                    for path in paths {
+                        path.hash(&mut fingerprint);
+                        crate::agent::control::cache::stamp(&path).hash(&mut fingerprint);
+                    }
+                }
+            }
+        }
+    }
+    // Mobile round-trips this cursor through a JavaScript number.
+    let synthetic_len = (fingerprint.finish() & ((1_u64 << 53) - 1)).max(1);
     if offset == synthetic_len && offset > 0 {
         return ChatPollSnapshot {
             agent: agent_str.to_owned(),
@@ -390,9 +463,21 @@ fn poll_opencode_json_file(
     }
 
     let mut items = Vec::new();
-    let embedded = serde_json::from_slice::<Value>(&bytes).ok();
+    let embedded = read_json_bounded(path, &mut remaining).ok();
+    if embedded.is_none() {
+        // A refused/incomplete JSON document is not a successful cursor advance.
+        return ChatPollSnapshot {
+            agent: agent_str.to_owned(),
+            session_id: bounded(&resolved_sid, MAX_TEXT),
+            transcript_path: path_str.to_owned(),
+            next_offset: 0,
+            reset: offset > 0,
+            bound: false,
+            items: Vec::new(),
+        };
+    }
     if !tail && let Some(v) = &embedded {
-        parse_opencode_value(v, storage_root, &mut items);
+        parse_opencode_value(v, storage_root, &mut items, &mut remaining);
     }
     if tail {
         msg_files.reverse();
@@ -401,13 +486,11 @@ fn poll_opencode_json_file(
         if items.len() >= MAX_CHAT_ITEMS {
             break;
         }
-        if let Ok(text) = fs::read_to_string(&msg_file)
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-        {
+        if let Ok(v) = read_json_bounded(&msg_file, &mut remaining) {
             if tail {
-                prepend_opencode_message(&v, storage_root, &mut items);
+                prepend_opencode_message(&v, storage_root, &mut items, &mut remaining);
             } else {
-                parse_opencode_message_record(&v, storage_root, &mut items);
+                parse_opencode_message_record(&v, storage_root, &mut items, &mut remaining);
             }
         }
     }
@@ -417,14 +500,25 @@ fn poll_opencode_json_file(
                 if items.len() >= MAX_CHAT_ITEMS {
                     break;
                 }
-                prepend_opencode_message(message, storage_root, &mut items);
+                prepend_opencode_message(message, storage_root, &mut items, &mut remaining);
             }
         } else if items.len() < MAX_CHAT_ITEMS {
-            prepend_opencode_message(v, storage_root, &mut items);
+            prepend_opencode_message(v, storage_root, &mut items, &mut remaining);
         }
     }
     if items.len() > MAX_CHAT_ITEMS {
         items.truncate(MAX_CHAT_ITEMS);
+    }
+    if remaining == 0 {
+        return ChatPollSnapshot {
+            agent: agent_str.to_owned(),
+            session_id: bounded(&resolved_sid, MAX_TEXT),
+            transcript_path: path_str.to_owned(),
+            next_offset: 0,
+            reset: offset > 0,
+            bound: false,
+            items: Vec::new(),
+        };
     }
     ChatPollSnapshot {
         agent: agent_str.to_owned(),
@@ -437,9 +531,14 @@ fn poll_opencode_json_file(
     }
 }
 
-fn prepend_opencode_message(v: &Value, storage_root: Option<&Path>, items: &mut Vec<ChatItem>) {
+fn prepend_opencode_message(
+    v: &Value,
+    storage_root: Option<&Path>,
+    items: &mut Vec<ChatItem>,
+    remaining: &mut u64,
+) {
     let mut older = Vec::new();
-    parse_opencode_message_record(v, storage_root, &mut older);
+    parse_opencode_message_record(v, storage_root, &mut older, remaining);
     let available = MAX_CHAT_ITEMS.saturating_sub(items.len());
     let keep_from = older.len().saturating_sub(available);
     items.splice(0..0, older.drain(keep_from..));
@@ -463,6 +562,37 @@ fn resolve_transcript(
     agent: VaultAgent,
     stored: &StoredLaunch,
     cwd: &str,
+) -> Option<(PathBuf, String)> {
+    type PathCache = BTreeMap<String, (Instant, Option<(PathBuf, String)>)>;
+    static CACHE: OnceLock<Mutex<PathCache>> = OnceLock::new();
+    let key = format!("{agent:?}|{roots:?}|{stored:?}|{cwd}");
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some((at, result)) = lock(cache).get(&key) {
+        let ttl = if result.is_some() {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_millis(500)
+        };
+        if at.elapsed() < ttl && result.as_ref().is_none_or(|(path, _)| path.is_file()) {
+            return result.clone();
+        }
+    }
+    let result = resolve_transcript_uncached(roots, agent, stored, cwd, &mut ScanBudget::new());
+    let mut cached = lock(cache);
+    cached.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(3));
+    if cached.len() >= 256 {
+        cached.clear();
+    }
+    cached.insert(key, (Instant::now(), result.clone()));
+    result
+}
+
+fn resolve_transcript_uncached(
+    roots: &VaultRoots,
+    agent: VaultAgent,
+    stored: &StoredLaunch,
+    cwd: &str,
+    budget: &mut ScanBudget,
 ) -> Option<(PathBuf, String)> {
     let sid = stored.session_id.as_deref().unwrap_or("").trim();
     if let Some(tp) = stored.transcript_path.as_deref()
@@ -505,7 +635,7 @@ fn resolve_transcript(
 
     if !sid.is_empty() {
         for root in &search_dirs {
-            if let Some(found) = find_transcript_by_id(root, agent, sid) {
+            if let Some(found) = find_transcript_by_id(root, agent, sid, budget) {
                 return Some((found, sid.to_owned()));
             }
         }
@@ -515,11 +645,14 @@ fn resolve_transcript(
     if !norm_cwd.is_empty() {
         let mut best: Option<(u64, PathBuf, String)> = None;
         for root in &search_dirs {
-            if let Some(cand) = find_newest_transcript_by_cwd(root, agent, &norm_cwd)
+            if let Some(cand) = find_newest_transcript_by_cwd(root, agent, &norm_cwd, budget)
                 && best.as_ref().is_none_or(|b| cand.0 > b.0)
             {
                 best = Some(cand);
             }
+        }
+        if budget.remaining == 0 || Instant::now() >= budget.deadline {
+            return None;
         }
         if let Some((_, path, found_sid)) = best {
             return Some((path, found_sid));
@@ -528,13 +661,21 @@ fn resolve_transcript(
     None
 }
 
-fn find_transcript_by_id(root: &Path, agent: VaultAgent, sid: &str) -> Option<PathBuf> {
+fn find_transcript_by_id(
+    root: &Path,
+    agent: VaultAgent,
+    sid: &str,
+    budget: &mut ScanBudget,
+) -> Option<PathBuf> {
     match agent {
         VaultAgent::Claude => {
             let projects = root.join("projects");
             let file_name = format!("{sid}.jsonl");
             let entries = fs::read_dir(projects).ok()?;
             for entry in entries.take(512).flatten() {
+                if !budget.take() {
+                    break;
+                }
                 if entry.file_type().is_ok_and(|t| t.is_dir()) {
                     let cand = entry.path().join(&file_name);
                     if cand.is_file() {
@@ -544,7 +685,7 @@ fn find_transcript_by_id(root: &Path, agent: VaultAgent, sid: &str) -> Option<Pa
             }
             None
         }
-        VaultAgent::Codex => find_codex_by_id(&root.join("sessions"), sid, 4),
+        VaultAgent::Codex => find_codex_by_id(&root.join("sessions"), sid, 4, budget),
         VaultAgent::Agy => {
             for cand in agy_candidate_dirs(root, true) {
                 let conv_dir = cand.join("brain").join(sid);
@@ -572,6 +713,9 @@ fn find_transcript_by_id(root: &Path, agent: VaultAgent, sid: &str) -> Option<Pa
                 }
                 if let Ok(groups) = fs::read_dir(&base) {
                     for group in groups.take(256).flatten() {
+                        if !budget.take() {
+                            break;
+                        }
                         if group.file_type().is_ok_and(|k| k.is_dir()) {
                             for ext in ["jsonl", "json"] {
                                 let nested = group.path().join(format!("{sid}.{ext}"));
@@ -588,12 +732,20 @@ fn find_transcript_by_id(root: &Path, agent: VaultAgent, sid: &str) -> Option<Pa
     }
 }
 
-fn find_codex_by_id(dir: &Path, sid: &str, depth: usize) -> Option<PathBuf> {
+fn find_codex_by_id(
+    dir: &Path,
+    sid: &str,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Option<PathBuf> {
     if depth == 0 {
         return None;
     }
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.take(256).flatten() {
+        if !budget.take() {
+            break;
+        }
         let Ok(ft) = entry.file_type() else {
             continue;
         };
@@ -602,7 +754,7 @@ fn find_codex_by_id(dir: &Path, sid: &str, depth: usize) -> Option<PathBuf> {
         }
         let path = entry.path();
         if ft.is_dir() {
-            if let Some(found) = find_codex_by_id(&path, sid, depth - 1) {
+            if let Some(found) = find_codex_by_id(&path, sid, depth - 1, budget) {
                 return Some(found);
             }
         } else if ft.is_file() {
@@ -620,6 +772,7 @@ fn find_newest_transcript_by_cwd(
     root: &Path,
     agent: VaultAgent,
     norm_cwd: &str,
+    budget: &mut ScanBudget,
 ) -> Option<(u64, PathBuf, String)> {
     let mut best: Option<(u64, PathBuf, String)> = None;
     match agent {
@@ -628,6 +781,9 @@ fn find_newest_transcript_by_cwd(
                 return None;
             };
             for proj in projects.take(256).flatten() {
+                if !budget.take() {
+                    break;
+                }
                 if !proj.file_type().is_ok_and(|t| t.is_dir()) {
                     continue;
                 }
@@ -635,6 +791,9 @@ fn find_newest_transcript_by_cwd(
                     continue;
                 };
                 for file in files.take(256).flatten() {
+                    if !budget.take() {
+                        break;
+                    }
                     let p = file.path();
                     if p.extension().is_none_or(|e| e != "jsonl") {
                         continue;
@@ -654,13 +813,16 @@ fn find_newest_transcript_by_cwd(
             }
         }
         VaultAgent::Codex => {
-            walk_codex_for_cwd(&root.join("sessions"), 4, norm_cwd, &mut best);
+            walk_codex_for_cwd(&root.join("sessions"), 4, norm_cwd, &mut best, budget);
         }
         VaultAgent::Agy => {
             for cand in agy_candidate_dirs(root, true) {
-                scan_agy_brain_for_cwd(&cand, norm_cwd, &mut best);
+                scan_agy_brain_for_cwd(&cand, norm_cwd, &mut best, budget);
                 if let Ok(files) = fs::read_dir(cand.join("sessions")) {
                     for file in files.take(128).flatten() {
+                        if !budget.take() {
+                            break;
+                        }
                         let p = file.path();
                         if p.extension().is_some_and(|e| e == "jsonl")
                             && let Some(mtime) = file_mtime(&p)
@@ -678,6 +840,9 @@ fn find_newest_transcript_by_cwd(
             for base in opencode_candidate_bases(root) {
                 if let Ok(files) = fs::read_dir(&base) {
                     for file in files.take(128).flatten() {
+                        if !budget.take() {
+                            break;
+                        }
                         let p = file.path();
                         if p.extension().is_some_and(|e| e == "jsonl" || e == "json")
                             && let Some(mtime) = file_mtime(&p)
@@ -700,6 +865,7 @@ fn walk_codex_for_cwd(
     depth: usize,
     norm_cwd: &str,
     best: &mut Option<(u64, PathBuf, String)>,
+    budget: &mut ScanBudget,
 ) {
     if depth == 0 {
         return;
@@ -708,6 +874,9 @@ fn walk_codex_for_cwd(
         return;
     };
     for entry in entries.take(256).flatten() {
+        if !budget.take() {
+            break;
+        }
         let Ok(ft) = entry.file_type() else {
             continue;
         };
@@ -716,7 +885,7 @@ fn walk_codex_for_cwd(
         }
         let p = entry.path();
         if ft.is_dir() {
-            walk_codex_for_cwd(&p, depth - 1, norm_cwd, best);
+            walk_codex_for_cwd(&p, depth - 1, norm_cwd, best, budget);
         } else if ft.is_file()
             && p.extension().is_some_and(|e| e == "jsonl")
             && let Some(mtime) = file_mtime(&p)
@@ -729,12 +898,20 @@ fn walk_codex_for_cwd(
     }
 }
 
-fn scan_agy_brain_for_cwd(cand: &Path, norm_cwd: &str, best: &mut Option<(u64, PathBuf, String)>) {
+fn scan_agy_brain_for_cwd(
+    cand: &Path,
+    norm_cwd: &str,
+    best: &mut Option<(u64, PathBuf, String)>,
+    budget: &mut ScanBudget,
+) {
     let Ok(brain_dir) = fs::read_dir(cand.join("brain")) else {
         return;
     };
     let mut transcripts: Vec<(u64, PathBuf, String)> = Vec::new();
     for entry in brain_dir.take(1024).flatten() {
+        if !budget.take() {
+            break;
+        }
         let Ok(ft) = entry.file_type() else {
             continue;
         };
@@ -924,7 +1101,10 @@ fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) 
         VaultAgent::Claude => parse_claude_line(v, out),
         VaultAgent::Codex => parse_codex_line(v, out),
         VaultAgent::Agy => parse_agy_line(v, out),
-        VaultAgent::OpenCode => parse_opencode_value(v, None, out),
+        VaultAgent::OpenCode => {
+            let mut remaining = MAX_POLL_BYTES;
+            parse_opencode_value(v, None, out, &mut remaining);
+        }
     }
 }
 
@@ -1236,19 +1416,29 @@ fn parse_agy_line(v: &Value, out: &mut Vec<ChatItem>) {
     }
 }
 
-fn parse_opencode_value(v: &Value, storage_root: Option<&Path>, out: &mut Vec<ChatItem>) {
+fn parse_opencode_value(
+    v: &Value,
+    storage_root: Option<&Path>,
+    out: &mut Vec<ChatItem>,
+    remaining: &mut u64,
+) {
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         for item in arr {
-            parse_opencode_message_record(item, storage_root, out);
+            parse_opencode_message_record(item, storage_root, out, remaining);
         }
         return;
     }
     if v.get("role").is_some() || v.get("parts").is_some() || v.get("content").is_some() {
-        parse_opencode_message_record(v, storage_root, out);
+        parse_opencode_message_record(v, storage_root, out, remaining);
     }
 }
 
-fn parse_opencode_message_record(v: &Value, storage_root: Option<&Path>, out: &mut Vec<ChatItem>) {
+fn parse_opencode_message_record(
+    v: &Value,
+    storage_root: Option<&Path>,
+    out: &mut Vec<ChatItem>,
+    remaining: &mut u64,
+) {
     let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
     let default_kind = if role == "assistant" {
         ChatItemKind::Assistant
@@ -1272,9 +1462,7 @@ fn parse_opencode_message_record(v: &Value, storage_root: Option<&Path>, out: &m
             .collect();
         part_files.sort();
         for pf in part_files {
-            if let Ok(pt) = fs::read_to_string(pf)
-                && let Ok(pv) = serde_json::from_str::<Value>(&pt)
-            {
+            if let Ok(pv) = read_json_bounded(&pf, remaining) {
                 parse_opencode_part(default_kind, &pv, out);
             }
         }
@@ -1851,6 +2039,7 @@ mod tests {
         assert_eq!(start, 0);
         assert_eq!(latest.items.len(), MAX_CHAT_ITEMS);
         assert_eq!(latest.items.last().unwrap().text, "message 299");
+        assert!(latest.next_offset < 1_u64 << 53);
         assert_eq!(
             latest.items.first().unwrap().text,
             format!("message {}", 300 - MAX_CHAT_ITEMS)
@@ -2119,6 +2308,80 @@ mod tests {
         assert_eq!(snap.items[4].kind, ChatItemKind::Assistant);
         assert_eq!(snap.items[4].text, "수정을 마쳤습니다.");
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod performance_tests {
+    use super::*;
+    #[test]
+    fn opencode_oversized_json_is_not_read_or_acknowledged_as_complete() {
+        let dir = std::env::temp_dir().join(format!("chat-opencode-bound-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_POLL_BYTES + 1).unwrap();
+        let result = poll_transcript_file(VaultAgent::OpenCode, "session", &path, 13);
+        assert!(!result.bound);
+        assert!(result.reset);
+        assert_eq!(result.next_offset, 0);
+        assert!(result.items.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opencode_same_size_rewrite_invalidates_synthetic_cursor() {
+        let dir =
+            std::env::temp_dir().join(format!("chat-opencode-rewrite-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        fs::write(&path, r#"{"messages":[{"role":"user","content":"first"}]}"#).unwrap();
+        let first = poll_transcript_file(VaultAgent::OpenCode, "session", &path, 0);
+        let unchanged =
+            poll_transcript_file(VaultAgent::OpenCode, "session", &path, first.next_offset);
+        assert!(unchanged.items.is_empty());
+        let replacement = dir.join("replace.json");
+        fs::write(
+            &replacement,
+            r#"{"messages":[{"role":"user","content":"other"}]}"#,
+        )
+        .unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let changed =
+            poll_transcript_file(VaultAgent::OpenCode, "session", &path, first.next_offset);
+        assert!(changed.reset);
+        assert_eq!(changed.items[0].text, "other");
+        assert_ne!(changed.next_offset, first.next_offset);
+        assert!(changed.next_offset < (1_u64 << 53));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transcript_resolution_cache_is_scoped_to_account_and_stored_binding() {
+        let dir = std::env::temp_dir().join(format!("chat-path-scope-{}", std::process::id()));
+        let roots = VaultRoots {
+            claude: vec![dir.clone()],
+            ..VaultRoots::default()
+        };
+        let mut stored = StoredLaunch {
+            profile: "claude".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: Some("first".into()),
+            transcript_path: None,
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+        assert!(resolve_transcript(&roots, VaultAgent::Claude, &stored, "").is_none());
+        fs::create_dir_all(dir.join("projects/demo")).unwrap();
+        let path = dir.join("projects/demo/other.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        stored.session_id = Some("other".into());
+        assert_eq!(
+            resolve_transcript(&roots, VaultAgent::Claude, &stored, ""),
+            Some((path, "other".into()))
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

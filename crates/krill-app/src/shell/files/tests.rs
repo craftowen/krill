@@ -1087,3 +1087,254 @@ fn share_button_only_on_shareable_files_and_dirty_changes_block_upload(cx: &mut 
         assert!(s.settings.is_none());
     });
 }
+
+#[gpui::test]
+fn crlf_baseline_stays_clean_on_open_and_reload(cx: &mut TestAppContext) {
+    let dir = TempDir::new("crlf-baseline");
+    let file = dir.0.join("source.txt");
+    fs::write(&file, "first\r\nsecond\r\n").unwrap();
+    let (view, cx) = open(cx, state_path("crlf-baseline"));
+    let pane = open_file(&view, &file, cx);
+    assert_eq!(editor_text(&view, pane, cx), "first\r\nsecond\r\n");
+    assert!(!dirty(&view, pane, cx));
+    fs::write(&file, "third\r\nfourth\r\n").unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.reload_file(pane, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "third\r\nfourth\r\n");
+    assert!(!dirty(&view, pane, cx));
+}
+
+#[gpui::test]
+fn hidden_clean_cache_evicts_but_dirty_and_selected_documents_survive(cx: &mut TestAppContext) {
+    let dir = TempDir::new("clean-cache-pins");
+    let (view, cx) = open(cx, state_path("clean-cache-pins"));
+    let dirty_path = dir.0.join("dirty.txt");
+    fs::write(&dirty_path, "unsaved baseline").unwrap();
+    let dirty_pane = open_file(&view, &dirty_path, cx);
+    view.update(cx, |shell, _| {
+        shell
+            .files
+            .tabs
+            .get_mut(&dirty_pane)
+            .unwrap()
+            .doc
+            .as_mut()
+            .unwrap()
+            .edited(false)
+    });
+    let selected_path = dir.0.join("selected.txt");
+    fs::write(&selected_path, "selected text").unwrap();
+    let selected = open_file(&view, &selected_path, cx);
+    cx.update(|window, cx| {
+        let editor = view.read(cx).files.tabs[&selected]
+            .editor()
+            .unwrap()
+            .clone();
+        editor.update(cx, |editor, cx| editor.select_all(window, cx));
+    });
+    let oldest_path = dir.0.join("oldest.txt");
+    fs::write(&oldest_path, "old content").unwrap();
+    let oldest = open_file(&view, &oldest_path, cx);
+    for index in 0..CLEAN_CACHE_TABS + 3 {
+        let path = dir.0.join(format!("{index}.txt"));
+        fs::write(&path, "small document").unwrap();
+        open_file(&view, &path, cx);
+    }
+    view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs.contains_key(&dirty_pane));
+        assert!(shell.files.tabs.contains_key(&selected));
+        assert!(!shell.files.tabs.contains_key(&oldest));
+        assert!(shell.files.tabs.len() <= CLEAN_CACHE_TABS);
+    });
+    fs::write(&oldest_path, "fresh content after eviction").unwrap();
+    let reopened = open_file(&view, &oldest_path, cx);
+    assert_eq!(
+        editor_text(&view, reopened, cx),
+        "fresh content after eviction"
+    );
+}
+
+#[gpui::test]
+fn undo_to_original_content_finishes_coalesced_dirty_comparison(cx: &mut TestAppContext) {
+    let dir = TempDir::new("coalesced-undo");
+    let path = dir.0.join("source.txt");
+    fs::write(&path, "original\r\n").unwrap();
+    let (view, cx) = open(cx, state_path("coalesced-undo"));
+    let pane = open_file(&view, &path, cx);
+    cx.simulate_input("x");
+    cx.run_until_parked();
+    assert!(dirty(&view, pane, cx));
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "original\r\n");
+    assert!(!dirty(&view, pane, cx));
+    view.read_with(cx, |shell, _| assert!(shell.files.comparing.is_empty()));
+}
+
+#[gpui::test]
+fn saving_hidden_dirty_tabs_releases_cache_pins_without_switching_tabs(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cache-save-unpin");
+    let (view, cx) = open(cx, state_path("cache-save-unpin"));
+    for index in 0..CLEAN_CACHE_TABS + 5 {
+        let path = dir.0.join(format!("{index}.txt"));
+        fs::write(&path, "document").unwrap();
+        let pane = open_file(&view, &path, cx);
+        view.update(cx, |shell, _| {
+            shell
+                .files
+                .tabs
+                .get_mut(&pane)
+                .unwrap()
+                .doc
+                .as_mut()
+                .unwrap()
+                .edited(false);
+        });
+    }
+    let focused = view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs.len() > CLEAN_CACHE_TABS);
+        shell.layout.focused()
+    });
+    view.update(cx, |shell, cx| {
+        let panes: Vec<_> = shell.files.tabs.keys().copied().collect();
+        for pane in panes {
+            shell.save_file(pane, cx).detach();
+        }
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout.focused(), focused);
+        assert!(shell.files.tabs.len() <= CLEAN_CACHE_TABS);
+        assert!(
+            shell
+                .files
+                .tabs
+                .values()
+                .all(|tab| !tab.is_dirty() && !tab.saving)
+        );
+    });
+}
+
+#[gpui::test]
+fn clearing_hidden_selection_releases_cache_pin_without_switching_tabs(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cache-selection-unpin");
+    let (view, cx) = open(cx, state_path("cache-selection-unpin"));
+    let mut editors = Vec::new();
+    for index in 0..CLEAN_CACHE_TABS + 3 {
+        let path = dir.0.join(format!("{index}.txt"));
+        fs::write(&path, "selected text").unwrap();
+        let pane = open_file(&view, &path, cx);
+        cx.update(|window, cx| {
+            let editor = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+            editor.update(cx, |editor, cx| editor.select_all(window, cx));
+            editors.push(editor);
+        });
+        cx.run_until_parked();
+    }
+    let focused = view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs.len() > CLEAN_CACHE_TABS);
+        shell.layout.focused()
+    });
+    for editor in editors {
+        cx.update(|_, cx| editor.update(cx, |editor, cx| editor.set_selected_range(0..0, cx)));
+    }
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout.focused(), focused);
+        assert!(shell.files.tabs.len() <= CLEAN_CACHE_TABS);
+    });
+}
+
+#[gpui::test]
+fn global_quit_after_last_window_waits_for_app_owned_pending_writes(cx: &mut TestAppContext) {
+    let (_view, visual) = open(cx, state_path("windowless-quit-writes"));
+    visual.update(|window, _| window.remove_window());
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let quitting = std::rc::Rc::new(std::cell::Cell::new(false));
+    cx.update(|cx| {
+        assert!(cx.windows().is_empty());
+        cx.set_global(PendingEditorWrites(Some(gate)));
+        cx.set_global(QuitObserved(quitting.clone()));
+        cx.dispatch_action(&Quit);
+    });
+    cx.run_until_parked();
+    assert!(
+        !quitting.get(),
+        "queued writes must finish before GPUI shutdown starts"
+    );
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert!(quitting.get());
+}
+
+#[gpui::test]
+fn closing_window_materializes_latest_pending_layout_without_waiting_for_debounce(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("close-ui-layout-debounce");
+    let (view, visual) = open(cx, path.clone());
+    let (before, expected) = view.update(visual, |shell, _| {
+        shell.flush_layout();
+        let before = shell.layout_save_requests.snapshots();
+        for width in 240_u16..320 {
+            shell.layout.sidebar_width = f32::from(width);
+            shell.save();
+        }
+        (before, shell.layout.clone())
+    });
+    visual.update(|window, cx| view.update(cx, |shell, cx| shell.request_close(window, cx)));
+    visual.run_until_parked();
+    assert!(cx.update(|cx| cx.windows().is_empty()));
+    assert_eq!(Layout::load(&path).unwrap(), expected);
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+    });
+    cx.executor()
+        .advance_clock(super::super::persist::DELAY * 2);
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+    });
+}
+
+#[gpui::test]
+fn quit_preflush_materializes_latest_layout_before_shutdown_waits(cx: &mut TestAppContext) {
+    let path = state_path("quit-ui-layout-debounce");
+    let (view, visual) = open(cx, path.clone());
+    let (before, expected) = view.update(visual, |shell, _| {
+        shell.flush_layout();
+        let before = shell.layout_save_requests.snapshots();
+        for width in 260_u16..340 {
+            shell.layout.panel_width = f32::from(width);
+            shell.save();
+        }
+        (before, shell.layout.clone())
+    });
+    let quitting = std::rc::Rc::new(std::cell::Cell::new(false));
+    // No UI timer advance: quit must materialize the last pending request now.
+    visual.update(|_, cx| {
+        cx.set_global(QuitObserved(quitting.clone()));
+        quit_app(cx);
+    });
+    visual.run_until_parked();
+    view.read_with(visual, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+        assert!(!shell.layout_save_requests.is_pending());
+        shell.saver.flush();
+        let persisted = Layout::load(&path).unwrap();
+        assert_eq!(persisted, shell.layout);
+        assert_eq!(
+            persisted.panel_width.to_bits(),
+            expected.panel_width.to_bits()
+        );
+        assert!(shell.quit_layout_ready.get());
+    });
+    visual.run_until_parked();
+    assert!(
+        quitting.get(),
+        "platform quit is requested only after durable preflush"
+    );
+    view.read_with(visual, |shell, _| {
+        assert_eq!(Layout::load(&path).unwrap(), shell.layout);
+    });
+}

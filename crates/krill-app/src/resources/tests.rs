@@ -242,3 +242,20 @@ fn toggle_exposes_button_role_and_label(cx: &mut TestAppContext) {
     assert_eq!(role, Some(gpui::Role::Button));
     assert_eq!(label.as_deref(), Some(text::TITLE.get()));
 }
+
+#[gpui::test]
+fn hidden_resource_panel_pauses_measurement_and_catches_up_on_return(cx: &mut TestAppContext) {
+    let (call, log) = fake();
+    let (panel, cx) = open(cx, call);
+    panel.update(cx, Panel::toggle);
+    cx.run_until_parked();
+    assert_eq!(log.lock().unwrap().len(), 1);
+    panel.update(cx, |panel, cx| panel.set_visible(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(10));
+    cx.run_until_parked();
+    assert_eq!(log.lock().unwrap().len(), 1);
+    panel.read_with(cx, |panel, _| assert!(panel.is_open()));
+    panel.update(cx, |panel, cx| panel.set_visible(true, cx));
+    cx.run_until_parked();
+    assert_eq!(log.lock().unwrap().len(), 2);
+}

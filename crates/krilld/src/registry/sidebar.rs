@@ -2,7 +2,7 @@
 
 use crate::session::lock;
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ enum DiscoveryResult {
 
 #[derive(Default)]
 struct Discovery {
+    paths: Mutex<BTreeSet<PathBuf>>,
     result: Mutex<DiscoveryResult>,
     ready: Condvar,
 }
@@ -109,20 +110,20 @@ fn discover_cached(cache: &Mutex<Cache>, path: &Path) -> Option<RepositoryTrees>
             }
         }
         if let Some(flight) = cache.inflight.get(&key) {
+            lock(&flight.paths).insert(path.to_owned());
             (Arc::clone(flight), false)
         } else {
             let flight = Arc::new(Discovery::default());
+            lock(&flight.paths).insert(path.to_owned());
             cache.inflight.insert(key.clone(), Arc::clone(&flight));
             (flight, true)
         }
     };
-    let result = if owner {
+    if owner {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discover(path)))
             .ok()
             .flatten();
-        *lock(&flight.result) = DiscoveryResult::Ready(result.clone());
-        flight.ready.notify_all();
-        lock(cache).inflight.remove(&key);
+        publish_discovery(cache, &key, &flight, result.clone());
         result
     } else {
         let mut result = lock(&flight.result);
@@ -136,21 +137,41 @@ fn discover_cached(cache: &Mutex<Cache>, path: &Path) -> Option<RepositoryTrees>
             DiscoveryResult::Ready(trees) => trees.clone(),
             DiscoveryResult::Pending => None,
         }
-    };
-    let mut cache = lock(cache);
-    cache.trees.insert(
-        path.to_owned(),
-        (
-            Instant::now(),
-            result.as_ref().map(|trees| trees.repo.clone()),
-        ),
-    );
-    if let Some(trees) = &result {
-        cache
-            .repositories
-            .insert(trees.repo.clone(), (Instant::now(), trees.clone()));
     }
-    result
+}
+
+fn publish_discovery(
+    cache: &Mutex<Cache>,
+    key: &Path,
+    flight: &Arc<Discovery>,
+    result: Option<RepositoryTrees>,
+) {
+    {
+        let mut cache = lock(cache);
+        if cache
+            .inflight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            let completed = Instant::now();
+            for path in lock(&flight.paths).iter() {
+                cache.trees.insert(
+                    path.clone(),
+                    (completed, result.as_ref().map(|trees| trees.repo.clone())),
+                );
+            }
+            if let Some(trees) = &result {
+                cache
+                    .repositories
+                    .insert(trees.repo.clone(), (completed, trees.clone()));
+            }
+            cache.inflight.remove(key);
+        }
+    }
+    // Waiters return this flight's result without changing the authoritative
+    // cache or refreshing its TTL after a newer discovery has completed.
+    *lock(&flight.result) = DiscoveryResult::Ready(result);
+    flight.ready.notify_all();
 }
 
 fn repository_key(cwd: &Path) -> PathBuf {
@@ -347,6 +368,75 @@ mod tests {
                 .canonicalize()
                 .unwrap(),
             std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    #[test]
+    fn an_old_discovery_waiter_cannot_replace_a_newer_cache_or_refresh_its_ttl() {
+        let path = PathBuf::from("/krill-sidebar-old-waiter-not-a-repository");
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let flight = Arc::new(Discovery::default());
+        lock(&cache)
+            .inflight
+            .insert(repository_key(&path), Arc::clone(&flight));
+        let pending = Arc::clone(&cache);
+        let requested = path.clone();
+        let waiter = std::thread::spawn(move || discover_cached(&pending, &requested));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&flight) < 3 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let old = RepositoryTrees {
+            repo: b"/repo".to_vec(),
+            worktrees: vec![b"/old".to_vec()],
+        };
+        let new = RepositoryTrees {
+            repo: b"/repo".to_vec(),
+            worktrees: vec![b"/new".to_vec()],
+        };
+        let completed = Instant::now();
+        {
+            let mut state = lock(&cache);
+            state.inflight.clear();
+            state
+                .trees
+                .insert(path.clone(), (completed, Some(new.repo.clone())));
+            state
+                .repositories
+                .insert(new.repo.clone(), (completed, new.clone()));
+        }
+        *lock(&flight.result) = DiscoveryResult::Ready(Some(old.clone()));
+        flight.ready.notify_all();
+        assert_eq!(waiter.join().unwrap(), Some(old));
+        let state = lock(&cache);
+        assert_eq!(state.repositories.get(&new.repo), Some(&(completed, new)));
+        assert_eq!(state.trees.get(&path).unwrap().0, completed);
+    }
+    #[test]
+    fn repository_discovery_wait_releases_global_cache_lock() {
+        let path = PathBuf::from("/krill-sidebar-inflight-fixture-not-a-repository");
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let flight = Arc::new(Discovery::default());
+        lock(&cache)
+            .inflight
+            .insert(repository_key(&path), Arc::clone(&flight));
+        let pending = Arc::clone(&cache);
+        let thread = std::thread::spawn(move || discover_cached(&pending, &path));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&flight) < 3 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let unlocked = cache.try_lock().is_ok();
+        *lock(&flight.result) = DiscoveryResult::Ready(None);
+        flight.ready.notify_all();
+        assert!(thread.join().unwrap().is_none());
+        assert!(
+            unlocked,
+            "an inflight discovery must not retain the global cache lock"
         );
     }
 }

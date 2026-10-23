@@ -24,7 +24,7 @@ test('RPC total deadline breaks serial queue and never resends a mutation',async
 test('updates wait for queued RPCs and uncertain mutation results until explicit reconnect',async()=>{
  const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;assert.equal(h.transport.updateBusy,false);
  const read=h.transport.rpc({action:'snapshot'}),mutation=h.transport.rpc({action:'prompt',text:'once'});mutation.catch(()=>{});assert.equal(h.transport.updateBusy,true);await flush();h.response(socket,{sessions:[]});await read;await flush();assert.equal(h.transport.updateBusy,true);
- await h.tick(15000);await assert.rejects(mutation,/timed out/);assert.equal(h.transport.updateBusy,true);const count=socket.sent.length;h.transport.resume(true);await flush();await h.advance(h.sockets.at(-1));h.response(h.sockets.at(-1),{sessions:[]});await flush();assert.equal(h.transport.updateBusy,true);h.transport.reconnect();await flush();assert.equal(socket.sent.length,count);await h.advance(h.sockets.at(-1));h.response(h.sockets.at(-1),{sessions:[]});await flush();assert.equal(h.transport.updateBusy,false);h.transport.close();
+ await h.tick(15000);await assert.rejects(mutation,/timed out/);assert.equal(h.transport.updateBusy,true);const count=socket.sent.length;h.transport.resume(true);await flush();const resumed=h.sockets.at(-1);await h.advance(resumed);h.response(resumed,{sessions:[]});await flush();assert.equal(h.transport.updateBusy,true);h.transport.reconnect();await flush();assert.equal(socket.sent.length,count);const reconnected=h.sockets.at(-1);await h.advance(reconnected);h.response(reconnected,{sessions:[]});await flush();assert.equal(h.transport.updateBusy,false);h.transport.close();
 });
 test('a definitive daemon rejection does not leave automatic updates blocked',async()=>{const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;const rejected=h.transport.rpc({action:'prompt',text:'rejected'});await flush();h.response(socket,{},false);await assert.rejects(rejected,/request rejected/);assert.equal(h.transport.updateBusy,false);h.transport.close();});
 for(const stage of [0,1])test(`version mismatch at handshake stage ${stage} pauses retries for a safe update`,async()=>{
@@ -155,11 +155,55 @@ test('storage notifications during a new pairing leave its endpoint and handshak
 });
 test('identical background host descriptions skip localStorage writes and credential rotation stays durable',()=>{
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,peer=e.forHost(e.profiles()[0].id);let writes=0;const set=h.context.localStorage.setItem;h.context.localStorage.setItem=(...args)=>{writes++;set(...args);};
- peer.describeHost({display_name:'Same PC',platform:'macos'});const once=writes;for(let i=0;i<20;i++)peer.describeHost({display_name:'Same PC',platform:'macos'});peer.authenticated({});assert.equal(writes,once);peer.authenticated({credential:'22'.repeat(32)});assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).credential,'22'.repeat(32));peer.describeHost({display_name:'Renamed PC'});assert.equal(e.profiles()[0].name,'Renamed PC');h.transport.close();
+ peer.authenticated({});peer.describeHost({display_name:'Same PC',platform:'macos'});const once=writes;for(let i=0;i<20;i++)peer.describeHost({display_name:'Same PC',platform:'macos'});peer.authenticated({});assert.equal(writes,once);peer.authenticated({credential:'22'.repeat(32)});assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).credential,'22'.repeat(32));peer.describeHost({display_name:'Renamed PC'});assert.equal(e.profiles()[0].name,'Renamed PC');h.transport.close();
 });
 test('latest read coalesces only unsent reads and preserves sent replies, mutation position and deadlines',async()=>{
  const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;const base=socket.sent.length;
  const blocker=h.transport.rpc({action:'accounts'});await flush();const first=h.transport.rpcLatest('diff',{action:'git',session:1}),latest=h.transport.rpcLatest('diff',{action:'git',session:3});assert.equal(first,latest);const mutation=h.transport.rpc({action:'prompt',text:'once'});await flush();assert.equal(socket.sent.length,base+1);
  h.response(socket,{accounts:[]});await blocker;await flush();assert.equal(socket.sent.length,base+2);assert(Buffer.from(socket.sent.at(-1)).includes(Buffer.from('"session":3')));h.response(socket,{diff:'newest'});assert.equal((await latest).diff,'newest');await flush();assert.equal(socket.sent.length,base+3);assert(Buffer.from(socket.sent.at(-1)).includes(Buffer.from('"action":"prompt"')));h.response(socket,{sent:true});await mutation;
  await assert.rejects(h.transport.rpcLatest('no',{action:'input',text:'forbidden'}),/Only reads/);assert.equal(socket.sent.length,base+3);h.transport.close();
+});
+
+
+test('only the selected host prewarms one reusable terminal connection and demotion closes its spare',async()=>{
+ const h=harness(),t=h.transport;t.setActive(false);const {pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;assert.equal(h.sockets.length,1);
+ t.setActive(true);const warm=h.sockets.at(-1);assert.equal(h.sockets.length,2);t.setActive(true);assert.equal(h.sockets.length,2);
+ warm.emit('open');warm.emit('message',{data:JSON.stringify({version:2,challenge:'aa'})});await flush();assert.equal(warm.sent.length,3);
+ const taken=t.terminalConnect();assert.equal(taken.socket,warm);assert(taken.channel);assert.equal(h.sockets.length,3);
+ const spare=h.sockets.at(-1);t.setActive(false);assert.equal(spare.closed,true);assert.notEqual(warm.closed,true,'attached terminal remains owned by its view');
+ t.setActive(true);assert.equal(h.sockets.length,4);t.close();assert.equal(h.sockets.at(-1).closed,true);taken.socket.close();
+});
+
+test('last authenticated relay route wins over a stale saved tunnel after reload and host switch',()=>{
+ const saved={device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),url:'https://stale.trycloudflare.com',hash:'0123456789abcdef'},h=harness(saved,undefined,true),e=h.endpoint,id=e.profiles()[0].id,peer=e.forHost(id);
+ assert.match(peer.socketUrl(),/stale/);peer.fallback(peer.socketUrl());assert.match(peer.socketUrl(),/\/r\/aaaa/);peer.authenticated({});
+ const stored=JSON.parse(h.store.get('krill-mobile-v2'));assert.equal(stored.preferred_route,'relay');assert.equal(stored.url,saved.url,'alternate remains available');
+ const reload=h.context.KrillMobile.transport.bootstrap();assert.match(reload.socketUrl(),/\/r\/aaaa/);reload.selectHost(id);assert.match(reload.socketUrl(),/\/r\/aaaa/);assert.match(reload.forHost(id).socketUrl(),/\/r\/aaaa/);
+ const again=reload.forHost(id);again.fallback(again.socketUrl());again.authenticated({});assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).preferred_route,'tunnel');
+ assert.match(h.context.KrillMobile.transport.bootstrap().socketUrl(),/stale/);h.transport.close();
+});
+
+test('successful discovery route is attempted directly instead of being toggled back to relay',async()=>{
+ const saved={device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),url:'https://stale.trycloudflare.com',hash:'0123456789abcdef'},h=harness(saved,undefined,true);
+ h.context.fetch=async()=>({ok:true,json:async()=>({hash:saved.hash,url:'https://fresh.trycloudflare.com'})});
+ const {pending,socket}=await h.start();socket.emit('error');await pending;assert.match(h.endpoint.socketUrl(),/fresh/);await h.tick(0);assert.match(h.sockets.at(-1).url,/fresh/);h.transport.close();
+});
+
+test('a previously healthy connection redials without the one-second delay and still backs off repeated failures',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;const before=h.sockets.length;
+ socket.emit('close',{code:1006});await flush();await h.tick(0);assert.equal(h.sockets.length,before+1);
+ const retry=h.sockets.at(-1);retry.emit('error');await flush();const failed=h.sockets.length;await h.tick(1999);assert.equal(h.sockets.length,failed);await h.tick(1);assert.equal(h.sockets.length,failed+1);h.transport.close();
+});
+
+test('connection timing separates socket challenge proof authentication and first snapshot without endpoint secrets',async()=>{
+ const h=harness(),{pending,socket}=await h.start();await h.tick(40);await h.advance(socket,1);await h.tick(30);socket.emit('message',{data:JSON.stringify({version:2,challenge:'aa'})});await flush();await h.tick(20);socket.emit('message',{data:enc.encode('{}')});await flush();await h.tick(10);socket.emit('message',{data:Uint8Array.from([0,0,0,0,1])});await flush();await h.tick(50);h.response(socket,{sessions:[]});await pending;assert.equal(h.transport.ready,true);
+ const t=h.transport.state.timings;assert.equal(t.route,'direct');assert.equal(t.socketOpenMs,40);assert.equal(t.challengeMs,70);assert.equal(t.proofSentMs,70);assert.equal(t.authenticatedMs,90);assert.equal(t.helloMs,100);assert.equal(t.readyMs,150);assert(!JSON.stringify(t).includes('desktop.test'));assert(!JSON.stringify(t).includes('credential'));h.transport.close();
+});
+
+
+test('selected terminal preauthentication overlaps the first snapshot instead of waiting for its payload',async()=>{
+ const h=harness();h.transport.setActive(false);const {pending,socket}=await h.start(3);h.transport.setActive(true);assert.equal(h.sockets.length,1);
+ socket.emit('message',{data:Uint8Array.from([0,0,0,0,1])});await flush();assert.equal(h.sockets.length,2);assert.equal(h.transport.state.phase,'connecting','snapshot deadline still applies');
+ const warm=h.sockets.at(-1);warm.emit('open');warm.emit('message',{data:JSON.stringify({version:2,challenge:'aa'})});await flush();assert.equal(warm.sent.length,3);
+ h.response(socket,{sessions:[]});await pending;assert.equal(h.transport.state.phase,'ready');const taken=h.transport.terminalConnect();assert.equal(taken.socket,warm);h.transport.close();taken.socket.close();
 });

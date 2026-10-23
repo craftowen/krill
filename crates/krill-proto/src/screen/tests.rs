@@ -567,3 +567,40 @@ fn history_fit_keeps_newest_rows_within_one_frame() {
     let f = h.encode().unwrap();
     assert!(f.len() <= MAX_FRAME + 4);
 }
+
+#[test]
+fn frozen_history_has_new_kinds_and_old_history_stays_frozen() {
+    let req = HistoryViewRequest {
+        req: 1,
+        view: 2,
+        skip: 3,
+        count: 4,
+    };
+    assert_eq!(hex(&req.encode().unwrap()), "050000001801020304");
+    let (kind, body) = frame(&req.encode().unwrap());
+    assert_eq!(HistoryViewRequest::decode(kind, &body).unwrap(), req);
+    assert!(HistoryRequest::decode(kind, &body).is_err());
+    let mut reply = HistoryViewRows {
+        req: 1,
+        view: 2,
+        session: crate::SessionId(7),
+        epoch: [1, 2, 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: crate::SessionId(7),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(9),
+            digest: [3; 32],
+        }),
+        skip: 3,
+        total: 8,
+        complete: true,
+        rows: vec![vec![cell('a')], vec![cell('b')]],
+    };
+    let (kind, body) = frame(&reply.encode().unwrap());
+    assert_eq!(HistoryViewRows::decode(kind, &body).unwrap(), reply);
+    reply.rows = vec![Vec::new(); usize::from(MAX_HISTORY_ROWS) + 1];
+    let (kind, body) = frame(&reply.encode().unwrap());
+    assert!(HistoryViewRows::decode(kind, &body).is_err());
+}

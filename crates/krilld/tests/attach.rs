@@ -624,6 +624,134 @@ fn lazy_history_hot_and_cold_pages() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// Frozen ranges travel through the negotiated socket and cannot survive a clear or connection change.
+#[test]
+fn negotiated_frozen_history_wire_preserves_identity_and_invalidates_on_clear() {
+    use krill_proto::screen::{HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+    let dir = tmp("frozen-wire");
+    let st = store(
+        &dir,
+        Limits {
+            seal_bytes: 64 << 10,
+            ..Limits::default()
+        },
+    );
+    // Full-width ordinary rows must fit the frozen budget even though capture
+    // vectors reserve more cells than they retain after trimming.
+    let script =
+        "/usr/bin/perl -e '$|=1; for $i (1..2500) { printf \"%07d 한글 %s\\n\", $i, \"x\" x 100 }'";
+    let (mut child, session) = spawn(Some(&st), 71, WIDE, script);
+    assert!(child.wait().unwrap().success());
+    let tap = session.tap();
+    tap.wait(|progress| progress.closed);
+    let sock = server(&dir, vec![tap.clone()]);
+    let (mut connection, _) = connect(&sock, screen(71, None));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    read_snapshot(&mut connection, &mut View::default());
+    let ask = |connection: &mut UnixStream, request: HistoryViewRequest| {
+        connection.write_all(&request.encode().unwrap()).unwrap();
+        loop {
+            match frame(connection) {
+                (kind::HISTORY_VIEW_ROWS, body) => {
+                    return HistoryViewRows::decode(kind::HISTORY_VIEW_ROWS, &body).unwrap();
+                }
+                (kind::UPDATE | kind::CLOSED, _) => {}
+                (kind, _) => unreachable!("unexpected frame {kind:#04x}"),
+            }
+        }
+    };
+    let opened = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 1,
+            view: 0,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(opened.status, HistoryViewStatus::Ready);
+    assert_ne!(opened.view, 0);
+    assert_eq!(opened.session, SessionId(71));
+    assert_eq!(opened.rows.len(), 4);
+    let repeated = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 2,
+            view: opened.view,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(repeated.identity, opened.identity);
+    assert_eq!(repeated.rows, opened.rows);
+    let oldest = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 3,
+            view: opened.view,
+            skip: u64::MAX,
+            count: 4,
+        },
+    );
+    assert_eq!(oldest.status, HistoryViewStatus::Ready);
+    assert!(oldest.complete);
+    assert!(oldest.total > 1_000);
+    let row: String = oldest
+        .rows
+        .last()
+        .unwrap()
+        .iter()
+        .filter(|cell| !cell.flags.contains(krill_proto::screen::Flags::SPACER))
+        .map(|cell| cell.ch)
+        .collect();
+    assert!(row.starts_with("0000001 한글"), "{row}");
+
+    let (mut another, _) = connect(&sock, screen(71, None));
+    another
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    read_snapshot(&mut another, &mut View::default());
+    let foreign = ask(
+        &mut another,
+        HistoryViewRequest {
+            req: 4,
+            view: opened.view,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(foreign.status, HistoryViewStatus::Invalidated);
+    assert!(foreign.rows.is_empty());
+    tap.clear_scrollback();
+    let cleared = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 5,
+            view: opened.view,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(cleared.status, HistoryViewStatus::Invalidated);
+    assert!(cleared.rows.is_empty());
+    assert!(cleared.identity.is_none());
+    let fresh = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 6,
+            view: 0,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(fresh.status, HistoryViewStatus::Ready);
+    assert_ne!(fresh.view, opened.view);
+    assert!(fresh.rows.is_empty());
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// 측정용 자식: 화면 스트림을 `Closed`까지 따라간 뒤 `READY`를 찍고 stdin이 닫힐 때까지 기다린다.
 #[test]
 #[ignore = "client_footprint_is_flat_in_output_length가 자식으로 실행한다"]

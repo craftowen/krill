@@ -262,9 +262,11 @@ fn guarded_rebuilds_engine_after_panic() {
         clients: Mutex::default(),
         input: Mutex::default(),
         capture: Mutex::default(),
+        history_access: Mutex::default(),
         live: Mutex::new(Live {
             engine: Engine::new(size),
             revision: 0,
+            history_epoch: 0,
             seq: 0,
             last_output: Instant::now(),
             input_since_done: true,
@@ -874,4 +876,224 @@ fn slow_record_warning_is_rate_limited_to_one_per_second() {
         t0 + Duration::from_secs(1)
     ));
     assert_eq!(last, Some(t0 + Duration::from_secs(1)));
+}
+
+#[test]
+fn shared_capture_invalidates_on_output_and_clear_and_retains_no_old_grid() {
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(81),
+        pty.controller,
+        WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    let first = tap.capture_shared_with_modes();
+    let again = tap.capture_shared_with_modes();
+    assert!(Arc::ptr_eq(&first.0, &again.0));
+    let (_, revision, _) = guarded(&tap.0, 6, |engine| {
+        engine.feed(b"SECRET", Feed::Live, &tap.0.look)
+    });
+    tap.0.publish(b"SECRET", revision, false);
+    let updated = tap.capture_shared_with_modes();
+    assert!(!Arc::ptr_eq(&first.0, &updated.0));
+    assert!(
+        tap.preview_tail()
+            .iter()
+            .any(|line| line.contains("SECRET"))
+    );
+    let (_, revision, _) = guarded(&tap.0, 0, |engine| {
+        engine.feed(b"\x1b[2J\x1b[H", Feed::Live, &tap.0.look)
+    });
+    tap.0.publish(&[], revision, false);
+    let cleared = tap.capture_shared_with_modes();
+    assert!(!Arc::ptr_eq(&updated.0, &cleared.0));
+    assert!(
+        !tap.preview_tail()
+            .iter()
+            .any(|line| line.contains("SECRET"))
+    );
+    // Keep a live subscription and an old epoch: either condition must veto a stale timer.
+    let viewer = tap.watch();
+    let epoch = lock(&tap.0.live).epoch;
+    tap.0.park(epoch);
+    assert!(!tap.is_parked());
+    drop(viewer);
+    tap.0.park(epoch);
+    assert!(
+        !tap.is_parked(),
+        "a previous grace epoch cannot demote a new one"
+    );
+    drop(pty.user);
+    session.wait().unwrap();
+}
+
+#[test]
+fn capture_since_checks_session_revision_resize_clear_and_sync_without_publish_wait() {
+    use krill_proto::control::Reply;
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(991),
+        pty.controller,
+        WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    let Reply::CaptureSince {
+        stamp,
+        bytes: Some(_),
+    } = tap.capture_plain_since(None).unwrap()
+    else {
+        panic!("first capture");
+    };
+    assert_eq!(
+        tap.capture_plain_since(Some(stamp)).unwrap(),
+        Reply::CaptureSince { stamp, bytes: None }
+    );
+    let mut wrong = stamp;
+    wrong.session = SessionId(992);
+    assert!(matches!(
+        tap.capture_plain_since(Some(wrong)).unwrap(),
+        Reply::CaptureSince { bytes: Some(_), .. }
+    ));
+    tap.resize(WinSize { cols: 90, rows: 24 }).unwrap();
+    let Reply::CaptureSince {
+        stamp: resized,
+        bytes: Some(_),
+    } = tap.capture_plain_since(Some(stamp)).unwrap()
+    else {
+        panic!("resize capture");
+    };
+    assert_eq!(stamp.seq, resized.seq);
+    assert_ne!(stamp.revision, resized.revision);
+    assert!(tap.clear_viewport());
+    let Reply::CaptureSince {
+        stamp: cleared,
+        bytes: Some(_),
+    } = tap.capture_plain_since(Some(resized)).unwrap()
+    else {
+        panic!("clear capture");
+    };
+    assert_eq!(cleared.seq, resized.seq);
+    assert_ne!(cleared.revision, resized.revision);
+    let raw = b"\x1b[?2026hready";
+    guarded(&tap.0, raw.len(), |engine| {
+        engine.feed(raw, Feed::Live, &tap.0.look)
+    });
+    let Reply::CaptureSince { stamp: pending, .. } =
+        tap.capture_plain_since(Some(cleared)).unwrap()
+    else {
+        panic!("pending capture");
+    };
+    guarded(&tap.0, 0, |engine| engine.end_sync(Feed::Live, &tap.0.look));
+    let Reply::CaptureSince {
+        stamp: flushed,
+        bytes: Some(bytes),
+    } = tap.capture_plain_since(Some(pending)).unwrap()
+    else {
+        panic!("sync capture");
+    };
+    assert_eq!(pending.seq, flushed.seq);
+    assert_ne!(pending.revision, flushed.revision);
+    assert!(String::from_utf8_lossy(&bytes).contains("ready"));
+    drop(pty.user);
+    session.wait().unwrap();
+}
+
+#[test]
+fn stable_history_publish_rechecks_clear_epoch_without_losing_newer_view() {
+    use krill_proto::screen::{HistoryViewRows, HistoryViewStatus};
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(993),
+        pty.controller,
+        WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    let (epoch, _, _) = tap.history_snapshot(&|| false).unwrap();
+    assert!(tap.clear_viewport());
+    let mut reply = HistoryViewRows {
+        req: 1,
+        view: 1,
+        session: tap.id(),
+        epoch,
+        status: HistoryViewStatus::Ready,
+        identity: None,
+        skip: 0,
+        total: 1,
+        complete: true,
+        rows: vec![Vec::new()],
+    };
+    let mut encoded = Vec::new();
+    tap.publish_history(&mut reply, &|| false, |bytes| {
+        encoded.extend_from_slice(bytes);
+        Ok(())
+    })
+    .unwrap();
+    let (kind, body) = ipc::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+    let result = HistoryViewRows::decode(kind, &body).unwrap();
+    assert_eq!(result.status, HistoryViewStatus::Invalidated);
+    assert!(result.rows.is_empty());
+    drop(pty.user);
+    session.wait().unwrap();
+}
+
+#[test]
+fn frozen_snapshot_waits_for_publication_but_cancels_without_holding_pty_live_lock() {
+    use std::sync::{atomic::AtomicBool, mpsc};
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(994),
+        pty.controller,
+        WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    lock(&tap.0.live).seq = 1_000_000;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&cancel);
+    let waiting = tap.clone();
+    let (done, finished) = mpsc::channel();
+    let (parked, at_publication_wait) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let polls = std::cell::Cell::new(0_u32);
+        let result = waiting.history_snapshot(&|| {
+            // The first cancellation probe admits snapshot access; the next
+            // occurs after the initial live snapshot, at the publication wait.
+            if polls.replace(polls.get() + 1) > 0 {
+                parked.try_send(()).ok();
+            }
+            stopped.load(Ordering::Acquire)
+        });
+        done.send(result.err().map(|e| e.kind())).unwrap();
+    });
+    at_publication_wait
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        finished.try_recv().is_err(),
+        "unpublished source must not become a frozen manifest"
+    );
+    assert!(
+        tap.0.live.try_lock().is_ok(),
+        "snapshot waiting must not block parsing/input"
+    );
+    super::input::write_input(&tap, b"x", None).unwrap();
+    cancel.store(true, Ordering::Release);
+    assert_eq!(
+        finished.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Some(io::ErrorKind::Interrupted)
+    );
+    worker.join().unwrap();
+    drop(pty.user);
+    session.wait().unwrap();
 }

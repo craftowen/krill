@@ -763,7 +763,7 @@ pub(super) struct State {
     pub pr_service: Arc<crate::pull_request::Service>,
     pub busy: bool,
     pub generating: bool,
-    pub has_remote: bool,
+    pub has_remote: Option<bool>,
     sync_generation: u64,
     pub sync_capability: SyncCapability,
     pub ahead: u64,
@@ -785,7 +785,7 @@ impl Default for State {
             busy: false,
             generating: false,
             // Unknown until the background probe completes; sync actions fail closed.
-            has_remote: false,
+            has_remote: None,
             sync_generation: 0,
             sync_capability: SyncCapability::Supported,
             ahead: 0,
@@ -803,11 +803,18 @@ impl Default for State {
 }
 
 impl State {
+    pub const fn has_remote(&self) -> bool {
+        matches!(self.has_remote, Some(true))
+    }
+
     pub const fn sync_supported(&self) -> bool {
         matches!(self.sync_capability, SyncCapability::Supported)
     }
 
     pub fn connect(&mut self, target: impl Into<HostTarget>) {
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.sync_task = None;
+        self.has_remote = None;
         self.source = Arc::new(Daemon(Some(target.into())));
     }
     pub fn reset_repo(&mut self) {
@@ -851,12 +858,12 @@ impl Panel {
                     return;
                 }
                 if this.editing.sync_capability != sync_capability
-                    || this.editing.has_remote != has_remote
+                    || this.editing.has_remote != Some(has_remote)
                     || this.editing.ahead != ahead
                     || this.editing.behind != behind
                 {
                     this.editing.sync_capability = sync_capability;
-                    this.editing.has_remote = has_remote;
+                    this.editing.has_remote = Some(has_remote);
                     this.editing.ahead = ahead;
                     this.editing.behind = behind;
                     cx.notify();
@@ -1093,7 +1100,7 @@ impl Panel {
             cx.notify();
             return;
         }
-        if edit.requires_sync() && !self.editing.has_remote {
+        if edit.requires_sync() && !self.editing.has_remote() {
             self.editing.note = text::NO_REMOTE.get().into();
             cx.notify();
             return;
@@ -1109,7 +1116,7 @@ impl Panel {
             cx.notify();
             return;
         }
-        if edit.requires_sync() && !self.editing.has_remote {
+        if edit.requires_sync() && !self.editing.has_remote() {
             self.editing.busy = false;
             self.editing.note = text::NO_REMOTE.get().into();
             cx.notify();
@@ -1177,7 +1184,7 @@ impl Panel {
         if self.editing.busy
             || self.editing.generating
             || !self.has_staged()
-            || (and_push && (!self.editing.sync_supported() || !self.editing.has_remote))
+            || (and_push && (!self.editing.sync_supported() || !self.editing.has_remote()))
         {
             return;
         }
@@ -1416,7 +1423,8 @@ impl Panel {
         }
         let busy = self.editing.busy || self.editing.generating;
         let sync_supported = self.editing.sync_supported();
-        let has_remote = self.editing.has_remote;
+        let has_remote = self.editing.has_remote();
+        let remote_unknown = self.editing.has_remote.is_none();
         let sync_disabled = busy || !sync_supported || !has_remote;
         let has_staged = self.has_staged();
         let (ahead, behind) = (self.editing.ahead, self.editing.behind);
@@ -1543,6 +1551,8 @@ impl Panel {
                                     .label(text::COMMIT_AND_PUSH.get())
                                     .tooltip(if !sync_supported {
                                         text::OUTDATED.get()
+                                    } else if remote_unknown {
+                                        super::text::LOADING.get()
                                     } else if !has_remote {
                                         text::NO_REMOTE.get()
                                     } else {
@@ -1587,6 +1597,8 @@ impl Panel {
                                     .label(pull_label)
                                     .tooltip(if !sync_supported {
                                         text::OUTDATED.get()
+                                    } else if remote_unknown {
+                                        super::text::LOADING.get()
                                     } else if !has_remote {
                                         text::NO_REMOTE.get()
                                     } else {
@@ -1605,6 +1617,8 @@ impl Panel {
                                     .label(push_label)
                                     .tooltip(if !sync_supported {
                                         text::OUTDATED.get()
+                                    } else if remote_unknown {
+                                        super::text::LOADING.get()
                                     } else if !has_remote {
                                         text::NO_REMOTE.get()
                                     } else {
@@ -1623,6 +1637,8 @@ impl Panel {
                                     .label(text::SYNC.get())
                                     .tooltip(if !sync_supported {
                                         text::OUTDATED.get()
+                                    } else if remote_unknown {
+                                        super::text::LOADING.get()
                                     } else if !has_remote {
                                         text::NO_REMOTE.get()
                                     } else {

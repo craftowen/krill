@@ -5,12 +5,12 @@
 //! 렌더링하고 1-클릭으로 `[Chat | Term]` 양방향 전환을 제공한다.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
     AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement as _,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Task, Window, div,
+    ParentElement as _, SharedString, Styled as _, Subscription, Task, Window, div,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::Disableable as _;
@@ -33,9 +33,17 @@ pub(crate) struct SessionChatLog {
     pub offset: u64,
     pub bound: bool,
     pub base_index: usize,
-    pub items: Vec<ChatItem>,
+    pub items: Vec<Arc<ChatItem>>,
+    pub revision: u64,
     pub answered: BTreeSet<String>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
+}
+
+struct ChatList {
+    base_index: usize,
+    count: usize,
+    revision: u64,
+    state: gpui::ListState,
 }
 
 #[derive(Default)]
@@ -217,6 +225,9 @@ impl Shell {
             log.agent = snap.agent;
         }
         log.bound = snap.bound;
+        if snap.reset || !snap.items.is_empty() {
+            log.revision = log.revision.wrapping_add(1);
+        }
         if snap.reset {
             log.items.clear();
             log.base_index = 0;
@@ -224,7 +235,7 @@ impl Shell {
             log.multi_selected.clear();
         }
         if !snap.items.is_empty() {
-            log.items.extend(snap.items);
+            log.items.extend(snap.items.into_iter().map(Arc::new));
             if log.items.len() > 250 {
                 let excess = log.items.len() - 250;
                 log.items.drain(0..excess);
@@ -423,6 +434,205 @@ impl Shell {
         None
     }
 
+    fn render_chat_item(
+        &mut self,
+        pane: super::PaneId,
+        session: SessionId,
+        abs_idx: usize,
+        item: &ChatItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let panel_bg = theme.muted;
+        let border = theme.border;
+        let fg = theme.foreground;
+        let muted_fg = theme.muted_foreground;
+        let warning = theme.warning;
+        let role_label = match item.kind {
+            ChatItemKind::User => "YOU",
+            ChatItemKind::Assistant => "AGENT",
+            ChatItemKind::Reasoning => "REASONING",
+            ChatItemKind::ToolCall => "TOOL CALL",
+            ChatItemKind::ToolResult => "TOOL RESULT",
+            ChatItemKind::Question => "QUESTION",
+            ChatItemKind::Permission => "PERMISSION",
+        };
+        let card_border = if matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission)
+        {
+            warning
+        } else {
+            border
+        };
+        let item_selector = format!("chat-item-{}-{abs_idx}", pane.get());
+        let debug_selector = item_selector.clone();
+        let mut card = div()
+            .id(SharedString::from(item_selector))
+            .debug_selector(move || debug_selector.clone())
+            .p_3()
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .border_color(card_border)
+            .bg(panel_bg)
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(ui::TEXT_XS).text_color(muted_fg).child(
+                        if item.title.is_empty() {
+                            SharedString::from(role_label)
+                        } else {
+                            SharedString::from(format!("{role_label} • {}", item.title))
+                        },
+                    ))
+                    .children((!item.file_path.is_empty()).then(|| {
+                        let raw_path = std::path::PathBuf::from(&item.file_path);
+                        let path = if raw_path.is_relative() {
+                            self.pane_cwd(pane, cx)
+                                .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
+                        } else {
+                            raw_path
+                        };
+                        Button::new(SharedString::from(format!(
+                            "chat-open-file-{}-{abs_idx}",
+                            pane.get()
+                        )))
+                        .label(item.file_path.clone())
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_file_at(path.clone(), 1, 1, cx);
+                        }))
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(fg)
+                    .child(item.text.clone()),
+            );
+
+        if item.kind == ChatItemKind::Question && !item.options.is_empty() {
+            let answer_key = format!("{}:{abs_idx}", item.tool_id);
+            let answered = self
+                .chat
+                .logs
+                .get(&session)
+                .is_some_and(|l| l.answered.contains(&answer_key));
+            let multi_select = item.multi_select;
+            let selected_set = self
+                .chat
+                .logs
+                .get(&session)
+                .and_then(|l| l.multi_selected.get(&answer_key))
+                .cloned()
+                .unwrap_or_default();
+            let option_labels: Vec<String> = item.options.iter().map(|o| o.label.clone()).collect();
+            let mut opts_row = div().flex().flex_wrap().gap_1p5();
+            for (opt_idx, opt) in item.options.iter().enumerate() {
+                let key_clone = answer_key.clone();
+                let labels_clone = option_labels.clone();
+                let is_checked = selected_set.contains(&opt_idx);
+                let prefix = if multi_select {
+                    if is_checked { "[✓] " } else { "[ ] " }
+                } else {
+                    ""
+                };
+                let label = if opt.description.is_empty() {
+                    format!("{prefix}{}", opt.label)
+                } else {
+                    format!("{prefix}{} — {}", opt.label, opt.description)
+                };
+                opts_row = opts_row.child(
+                    Button::new(SharedString::from(format!(
+                        "chat-q-{}-{abs_idx}-{opt_idx}",
+                        pane.get()
+                    )))
+                    .label(label)
+                    .small()
+                    .ghost()
+                    .disabled(answered)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if multi_select {
+                            this.toggle_chat_multi_option(session, key_clone.clone(), opt_idx, cx);
+                        } else {
+                            this.answer_chat_question(
+                                session,
+                                key_clone.clone(),
+                                &labels_clone,
+                                vec![opt_idx],
+                                false,
+                                cx,
+                            );
+                        }
+                    })),
+                );
+            }
+            if multi_select {
+                let key_submit = answer_key.clone();
+                let labels_submit = option_labels;
+                let picks: Vec<usize> = selected_set.into_iter().collect();
+                opts_row = opts_row.child(
+                    Button::new(SharedString::from(format!(
+                        "chat-q-submit-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .label(format!("{} ({})", ctext::SUBMIT.get(), picks.len()))
+                    .small()
+                    .primary()
+                    .disabled(answered || picks.is_empty())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.answer_chat_question(
+                            session,
+                            key_submit.clone(),
+                            &labels_submit,
+                            picks.clone(),
+                            true,
+                            cx,
+                        );
+                    })),
+                );
+            }
+            card = card.child(opts_row);
+        } else if item.kind == ChatItemKind::Permission {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "chat-perm-yes-{}-{abs_idx}",
+                            pane.get()
+                        )))
+                        .label(ctext::APPROVE.get())
+                        .small()
+                        .primary()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.approve_chat_permission(session, true, cx);
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "chat-perm-no-{}-{abs_idx}",
+                            pane.get()
+                        )))
+                        .label(ctext::DENY.get())
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.approve_chat_permission(session, false, cx);
+                        })),
+                    ),
+            );
+        }
+
+        div().pb_2().child(card).into_any_element()
+    }
+
     pub(super) fn render_pane_chat_overlay(
         &mut self,
         pane: super::PaneId,
@@ -441,9 +651,7 @@ impl Shell {
         let bg = theme.background;
         let panel_bg = theme.muted;
         let border = theme.border;
-        let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
-        let warning = theme.warning;
 
         let log = self.chat.logs.get(&session);
         let agent_label = log
@@ -452,7 +660,8 @@ impl Shell {
             .to_owned();
         let bound = log.is_some_and(|l| l.bound);
         let base_index = log.map_or(0, |l| l.base_index);
-        let items: Vec<ChatItem> = log.map_or_else(Vec::new, |l| l.items.clone());
+        let revision = log.map_or(0, |l| l.revision);
+        let items = log.map_or_else(Vec::new, |l| l.items.clone());
 
         let mut feed = div()
             .id(SharedString::from(format!(
@@ -461,7 +670,7 @@ impl Shell {
             )))
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .p_3()
             .flex()
             .flex_col()
@@ -485,205 +694,52 @@ impl Shell {
                     .child(empty_msg),
             );
         } else {
-            for (idx, item) in items.iter().enumerate() {
-                let abs_idx = base_index + idx;
-                let role_label = match item.kind {
-                    ChatItemKind::User => "YOU",
-                    ChatItemKind::Assistant => "AGENT",
-                    ChatItemKind::Reasoning => "REASONING",
-                    ChatItemKind::ToolCall => "TOOL CALL",
-                    ChatItemKind::ToolResult => "TOOL RESULT",
-                    ChatItemKind::Question => "QUESTION",
-                    ChatItemKind::Permission => "PERMISSION",
-                };
-                let card_border =
-                    if matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission) {
-                        warning
+            let count = items.len();
+            let list_id =
+                SharedString::from(format!("desktop-chat-list-{}-{}", pane.get(), session.0));
+            let state = window.use_keyed_state(list_id, cx, |_, _| ChatList {
+                base_index,
+                count,
+                revision,
+                state: gpui::ListState::new(count, gpui::ListAlignment::Top, ui::SPACE_4),
+            });
+            let list_state = state.update(cx, |list, _| {
+                let removed = base_index.saturating_sub(list.base_index);
+                if base_index < list.base_index || removed > list.count {
+                    list.state.reset(count);
+                } else {
+                    if removed != 0 {
+                        list.state.splice(0..removed, 0);
+                    }
+                    let kept = list.count - removed;
+                    if count >= kept {
+                        list.state.splice(kept..kept, count - kept);
                     } else {
-                        border
-                    };
-                let mut card = div()
-                    .id(SharedString::from(format!(
-                        "chat-item-{}-{abs_idx}",
-                        pane.get()
-                    )))
-                    .p_3()
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(card_border)
-                    .bg(panel_bg)
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().text_size(ui::TEXT_XS).text_color(muted_fg).child(
-                                if item.title.is_empty() {
-                                    SharedString::from(role_label)
-                                } else {
-                                    SharedString::from(format!("{role_label} • {}", item.title))
-                                },
-                            ))
-                            .children((!item.file_path.is_empty()).then(|| {
-                                let raw_path = std::path::PathBuf::from(&item.file_path);
-                                let path = if raw_path.is_relative() {
-                                    self.pane_cwd(pane, cx)
-                                        .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
-                                } else {
-                                    raw_path
-                                };
-                                Button::new(SharedString::from(format!(
-                                    "chat-open-file-{}-{abs_idx}",
-                                    pane.get()
-                                )))
-                                .label(item.file_path.clone())
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.open_file_at(path.clone(), 1, 1, cx);
-                                    },
-                                ))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_SM)
-                            .text_color(fg)
-                            .child(item.text.clone()),
-                    );
-
-                if item.kind == ChatItemKind::Question && !item.options.is_empty() {
-                    let answer_key = format!("{}:{abs_idx}", item.tool_id);
-                    let answered = self
-                        .chat
-                        .logs
-                        .get(&session)
-                        .is_some_and(|l| l.answered.contains(&answer_key));
-                    let multi_select = item.multi_select;
-                    let selected_set = self
-                        .chat
-                        .logs
-                        .get(&session)
-                        .and_then(|l| l.multi_selected.get(&answer_key))
-                        .cloned()
-                        .unwrap_or_default();
-                    let option_labels: Vec<String> =
-                        item.options.iter().map(|o| o.label.clone()).collect();
-                    let mut opts_row = div().flex().flex_wrap().gap_1p5();
-                    for (opt_idx, opt) in item.options.iter().enumerate() {
-                        let key_clone = answer_key.clone();
-                        let labels_clone = option_labels.clone();
-                        let is_checked = selected_set.contains(&opt_idx);
-                        let prefix = if multi_select {
-                            if is_checked { "[✓] " } else { "[ ] " }
-                        } else {
-                            ""
-                        };
-                        let label = if opt.description.is_empty() {
-                            format!("{prefix}{}", opt.label)
-                        } else {
-                            format!("{prefix}{} — {}", opt.label, opt.description)
-                        };
-                        opts_row = opts_row.child(
-                            Button::new(SharedString::from(format!(
-                                "chat-q-{}-{abs_idx}-{opt_idx}",
-                                pane.get()
-                            )))
-                            .label(label)
-                            .small()
-                            .ghost()
-                            .disabled(answered)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    if multi_select {
-                                        this.toggle_chat_multi_option(
-                                            session,
-                                            key_clone.clone(),
-                                            opt_idx,
-                                            cx,
-                                        );
-                                    } else {
-                                        this.answer_chat_question(
-                                            session,
-                                            key_clone.clone(),
-                                            &labels_clone,
-                                            vec![opt_idx],
-                                            false,
-                                            cx,
-                                        );
-                                    }
-                                },
-                            )),
-                        );
+                        list.state.splice(count..kept, 0);
                     }
-                    if multi_select {
-                        let key_submit = answer_key.clone();
-                        let labels_submit = option_labels;
-                        let picks: Vec<usize> = selected_set.into_iter().collect();
-                        opts_row = opts_row.child(
-                            Button::new(SharedString::from(format!(
-                                "chat-q-submit-{}-{abs_idx}",
-                                pane.get()
-                            )))
-                            .label(format!("{} ({})", ctext::SUBMIT.get(), picks.len()))
-                            .small()
-                            .primary()
-                            .disabled(answered || picks.is_empty())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.answer_chat_question(
-                                        session,
-                                        key_submit.clone(),
-                                        &labels_submit,
-                                        picks.clone(),
-                                        true,
-                                        cx,
-                                    );
-                                },
-                            )),
-                        );
+                    if revision != list.revision {
+                        list.state.remeasure();
                     }
-                    card = card.child(opts_row);
-                } else if item.kind == ChatItemKind::Permission {
-                    card =
-                        card.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "chat-perm-yes-{}-{abs_idx}",
-                                        pane.get()
-                                    )))
-                                    .label(ctext::APPROVE.get())
-                                    .small()
-                                    .primary()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.approve_chat_permission(session, true, cx);
-                                    })),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "chat-perm-no-{}-{abs_idx}",
-                                        pane.get()
-                                    )))
-                                    .label(ctext::DENY.get())
-                                    .small()
-                                    .ghost()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.approve_chat_permission(session, false, cx);
-                                    })),
-                                ),
-                        );
                 }
-
-                feed = feed.child(card);
-            }
+                list.base_index = base_index;
+                list.count = count;
+                list.revision = revision;
+                list.state.clone()
+            });
+            let owner = cx.weak_entity();
+            feed = feed.child(
+                gpui::list(list_state, move |index, _, cx| {
+                    let Some(item) = items.get(index) else {
+                        return div().into_any_element();
+                    };
+                    owner
+                        .update(cx, |this, cx| {
+                            this.render_chat_item(pane, session, base_index + index, item, cx)
+                        })
+                        .unwrap_or_else(|_| div().into_any_element())
+                })
+                .size_full(),
+            );
         }
 
         let composer = div()
@@ -856,6 +912,48 @@ mod tests {
         assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    fn long_chat_renders_viewport_rows_and_shares_message_text(cx: &mut TestAppContext) {
+        use crate::shell::tests::{open, state_path};
+        let (shell, cx) = open(cx, state_path("virtual-chat"));
+        let pane = shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            shell.layout.set_session(pane, SessionId(444));
+            shell.chat.active_sessions.insert(SessionId(444));
+            shell.apply_chat_poll(
+                SessionId(444),
+                ChatPollSnapshot {
+                    bound: true,
+                    reset: true,
+                    items: (0..250)
+                        .map(|index| ChatItem {
+                            kind: ChatItemKind::Assistant,
+                            text: format!("message {index}\n{}", "long answer\n".repeat(16)),
+                            ..ChatItem::default()
+                        })
+                        .collect(),
+                    ..ChatPollSnapshot::default()
+                },
+            );
+            let messages = shell.chat.logs[&SessionId(444)].items.clone();
+            assert!(Arc::ptr_eq(
+                &messages[0],
+                &shell.chat.logs[&SessionId(444)].items[0]
+            ));
+            cx.notify();
+            pane
+        });
+        cx.run_until_parked();
+        // The GPUI test selector API requires static strings; these two
+        // fixture-only selectors live for the test process.
+        let first = Box::leak(format!("chat-item-{}-0", pane.get()).into_boxed_str());
+        let last = Box::leak(format!("chat-item-{}-249", pane.get()).into_boxed_str());
+        assert!(cx.debug_bounds(first).is_some());
+        assert!(cx.debug_bounds(last).is_none());
+        assert!(cx.debug_bounds("desktop-chat-send").is_some());
+    }
+
     #[test]
     fn base_index_preserves_answer_key_after_250_item_drain() {
         let mut log = SessionChatLog::default();
@@ -866,7 +964,7 @@ mod tests {
                 ..ChatItem::default()
             })
             .collect();
-        log.items.extend(items);
+        log.items.extend(items.into_iter().map(Arc::new));
         let excess = log.items.len() - 250;
         log.items.drain(0..excess);
         log.base_index = log.base_index.saturating_add(excess);

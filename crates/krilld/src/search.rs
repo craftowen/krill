@@ -8,6 +8,8 @@ use krill_proto::search::{Direction, Hit, SearchRequest, SearchResult, Snapshot,
 
 use crate::attach::Tap;
 
+use crate::store::replay_gate as replay;
+
 /// 요청 하나. 디스크 IO/재생 중에는 라이브 Term 잠금을 잡지 않는다.
 pub fn search(tap: &Tap, req: &SearchRequest) -> SearchResult {
     search_with_options(
@@ -33,6 +35,16 @@ pub(crate) fn search_cancellable(
     req: &SearchRequest,
     options: krill_proto::search::Options,
     cancelled: &dyn Fn() -> bool,
+) -> SearchResult {
+    search_admitted(tap, req, options, cancelled, None)
+}
+
+fn search_admitted(
+    tap: &Tap,
+    req: &SearchRequest,
+    options: krill_proto::search::Options,
+    cancelled: &dyn Fn() -> bool,
+    admitted: Option<replay::Permit<'static>>,
 ) -> SearchResult {
     let (screen, revision, seq) = tap.capture();
     let mut reply = SearchResult {
@@ -64,6 +76,7 @@ pub(crate) fn search_cancellable(
     let mut scan = Scan {
         pattern: &pattern,
         target,
+        forward: req.direction == Direction::Next,
         total: 0,
         first: None,
         last: None,
@@ -74,6 +87,20 @@ pub(crate) fn search_cancellable(
     let mut disk_end = 0;
     match history {
         Some(Ok(history)) if !history.is_empty() => {
+            // Limit the paired cold engines only; input, live capture and hot/UI
+            // reads never acquire this permit. Cancellation remains generation-based.
+            if admitted.is_none() {
+                let Some(permit) = replay::acquire(cancelled) else {
+                    reply.incomplete = true;
+                    return reply;
+                };
+                // A queued query may have crossed clear/privacy/output changes. Drop
+                // its old grid/manifest and take one fresh snapshot while admitted.
+                drop(scan);
+                drop(screen);
+                drop(history);
+                return search_admitted(tap, req, options, cancelled, Some(permit));
+            }
             reply.approximate = true;
             let mut pages = 0u32;
             let mut page_rows = 0usize;
@@ -109,6 +136,12 @@ pub(crate) fn search_cancellable(
             reply.snapshot.pages = pages;
         }
         _ => reply.incomplete = true,
+    }
+    // Release the paired-engine admission before hot/screen matching.
+    drop(admitted);
+    if cancelled() {
+        reply.incomplete = true;
+        return reply;
     }
     reply.incomplete |= used_cold && disk_end < seq.0;
     if !used_cold {
@@ -150,6 +183,7 @@ fn cursor_valid(
 struct Scan<'a> {
     pattern: &'a krill_proto::search::Pattern,
     target: Option<u64>,
+    forward: bool,
     total: u64,
     first: Option<Hit>,
     last: Option<Hit>,
@@ -193,10 +227,9 @@ impl Scan<'_> {
                     continue;
                 };
                 let last = overlaps.next_back().unwrap_or(first);
-                if self.first.is_some()
-                    && self.target != Some(self.total)
-                    && matches.peek().is_some()
-                {
+                let keep_first = self.forward && self.first.is_none();
+                let keep_last = !self.forward && matches.peek().is_none();
+                if !keep_first && self.target != Some(self.total) && !keep_last {
                     self.total = self.total.saturating_add(1);
                     continue;
                 }
@@ -209,13 +242,15 @@ impl Scan<'_> {
                     cols: last.end_column.saturating_sub(first.column),
                     cells: cells.clone(),
                 };
-                if self.first.is_none() {
+                if keep_first {
                     self.first = Some(hit.clone());
                 }
                 if self.target == Some(self.total) {
                     self.selected = Some(hit.clone());
                 }
-                self.last = Some(hit);
+                if keep_last {
+                    self.last = Some(hit);
+                }
                 self.total = self.total.saturating_add(1);
             }
         }

@@ -474,3 +474,34 @@ fn hidden_consumer_refreshes_query_and_changed_scope_paths(cx: &mut TestAppConte
     cx.run_until_parked();
     assert_eq!(requests.lock().unwrap().len(), before);
 }
+
+#[gpui::test]
+fn history_rows_are_virtualized_and_same_count_replacements_refresh(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, _| {
+        let mut panel = Panel::new(Arc::new(|_| Err(io::ErrorKind::NotConnected.into())));
+        panel.open = true;
+        panel.data = Some(Snapshot {
+            entries: (0..10_000)
+                .map(|i| Entry {
+                    agent: krill_proto::agent_history::Agent::Claude,
+                    id: format!("conversation-{i}"),
+                    cwd: "/repo".into(),
+                    modified: 0,
+                })
+                .collect(),
+            truncated: false,
+            skipped: false,
+        });
+        panel
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("agent-history-resume-0").is_some());
+    assert!(cx.debug_bounds("agent-history-resume-9999").is_none());
+    panel.update(cx, |panel, cx| {
+        panel.data.as_mut().unwrap().entries[0].id = "replaced".into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _| assert_eq!(panel.list_hits[0].id, "replaced"));
+}

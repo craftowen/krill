@@ -801,3 +801,35 @@ fn remote_disconnect_failure_keeps_the_row_and_allows_retry(cx: &mut TestAppCont
     assert!(panel.read_with(vcx, |p, _| p.error.is_none()));
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[gpui::test]
+fn hidden_server_panel_clock_pauses_without_canceling_active_invite(cx: &mut TestAppContext) {
+    let backend = Arc::new(MockLinkBackend::new());
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.set_visible(false, cx);
+            panel.now_secs = 1;
+        });
+    });
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(panel.read(cx).now_secs, 1));
+    vcx.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            panel.invite = Some(Invite {
+                link: "krill://pair?code=fixture".into(),
+                expires_at: current_epoch_secs() + 60,
+            });
+        });
+    });
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(panel.read(cx).now_secs > 1);
+        assert!(panel.read(cx).invite.is_some());
+    });
+}

@@ -68,6 +68,10 @@ use crate::theme::Rgb;
 
 /// 이 모듈의 kind를 쓸 수 있다는 feature 비트.
 pub const FEAT_SCREEN: u64 = 1;
+/// Attach-local frozen history ranges with explicit invalidation and bounded decoded caches.
+pub const FEAT_HISTORY_VIEW: u64 = 1 << 24;
+mod history_view;
+pub use history_view::{HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
 /// 화면 부가 정보 [`Op`](제목·벨·커서 모양·링크 URI)를 받을 수 있다는 feature 비트(모듈 문서).
 pub const FEAT_SCREEN_META: u64 = 1 << 9;
 /// [`Op::Title`] 최대 바이트. krilld는 넘는 제목을 글자 경계에서 자른다.
@@ -122,6 +126,8 @@ pub mod kind {
     pub const RESYNC: u8 = 0x11;
     /// 클라이언트 → krilld: [`super::HistoryRequest`].
     pub const HISTORY: u8 = 0x12;
+    /// Negotiated frozen range request.
+    pub const HISTORY_VIEW: u8 = 0x18;
     /// krilld → 클라이언트: [`super::Attached`].
     pub const ATTACHED: u8 = 0x20;
     /// krilld → 클라이언트: [`super::Update`].
@@ -136,6 +142,8 @@ pub mod kind {
     pub const REFUSED: u8 = 0x25;
     /// krilld → 클라이언트: [`super::HistoryRows`].
     pub const HISTORY_ROWS: u8 = 0x26;
+    /// Negotiated frozen range reply.
+    pub const HISTORY_VIEW_ROWS: u8 = 0x2d;
 }
 
 /// 원본 바이트 오프셋(모듈 문서 "두 번호").

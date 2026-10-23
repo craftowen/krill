@@ -520,6 +520,21 @@ impl Shell {
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
             )
+            .child(
+                Self::nav_row(
+                    p,
+                    "nav-mobile",
+                    icons::SMARTPHONE_SVG,
+                    sb_text::NAV_MOBILE.get(),
+                )
+                .when(self.mobile_page_open(cx), |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_mobile_page(Some(window), cx);
+                })),
+            )
     }
 }
 

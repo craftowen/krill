@@ -590,3 +590,16 @@ fn account_resume_requires_an_observed_parent_hook_not_launch_metadata() {
     assert!(!control.account_resume_observed(session, "expected"));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn cached_signed_rules_fail_closed_after_public_key_removal() {
+    let dir = std::env::temp_dir().join(format!("rules-cache-delete-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    write_signed(&dir, SIGNED_PAYLOAD);
+    let control = Control::new(Some(&dir));
+    assert!(control.agents().unwrap().profiles.contains_key("aider"));
+    fs::remove_file(dir.join(PUBLIC_KEY_FILE_NAME)).unwrap();
+    assert!(!control.agents().unwrap().profiles.contains_key("aider"));
+    assert_eq!(control.screen_rules(), ScreenRules::default());
+    fs::remove_dir_all(dir).unwrap();
+}

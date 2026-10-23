@@ -30,9 +30,17 @@ pub fn apply(q: &GitQueue, repo: &Path, edit: Edit) -> Result<(), String> {
     };
     let key = std::fs::canonicalize(&key).map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
+    let retained = match &edit {
+        Edit::Stage { path, old_path } | Edit::Unstage { path, old_path } => path
+            .len()
+            .saturating_add(old_path.as_ref().map_or(0, Vec::len)),
+        Edit::Commit { message } | Edit::CommitAndPush { message } => message.len(),
+        Edit::Push | Edit::Pull | Edit::Sync => 0,
+    };
     q.enqueue_key(
         root,
         key,
+        retained,
         Box::new(move |program, repo| {
             tx.send(run(program, repo, edit)).ok();
         }),

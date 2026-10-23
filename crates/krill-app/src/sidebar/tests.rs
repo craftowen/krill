@@ -1338,7 +1338,14 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
         krill_proto::git::GitWatchReply::Unchanged { pending: false },
         "collapsing sidebar must not reset or force-recreate diff panel's active watch"
     );
-    // 원격 폴링 경로(`poll_snapshot`)는 호스트 전용 스레드에서 연결을 열고, 이어지는 fetch와 같은 연결을 쓰며
+    // 사이드바를 다시 열어 감시 요청으로 연결을 확실히 만든다. 빈 레지스트리의 스냅샷은 캐시에서
+    // 돌아올 수 있으므로 poll_snapshot 자체가 새 연결을 열 것이라고 가정하면 실행 환경·TTL에 의존한다.
+    sidebar_sock.set_visible(true);
+    let reopened = sidebar_sock.meta(&trees);
+    assert_eq!(reopened.get(&repo).and_then(|tree| tree.dirty), Some(1));
+    assert_eq!(accepts.load(Ordering::SeqCst), 3);
+
+    // 원격 폴링 경로(`poll_snapshot`)는 호스트 전용 스레드에서 기존 연결을 재사용하고,
     // 결과도 fetch + meta와 같다.
     let (snap, meta) = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -5370,4 +5377,31 @@ fn init_sidebar_test_settings(cx: &mut TestAppContext, name: &str, settings: &st
         crate::settings::init_at(Some(dir), cx);
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn status_summary_reuses_snapshot_until_sidebar_changes(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![
+                        session(1, AgentState::Waiting, Some("/repo")),
+                        session(2, AgentState::Working, Some("/repo")),
+                    ],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+    });
+    let first = sidebar.read_with(cx, |sidebar, _| sidebar.status_summary());
+    let second = sidebar.read_with(cx, |sidebar, _| sidebar.status_summary());
+    assert_eq!(first.0, 1);
+    assert_eq!(*first.1, vec![AgentState::Waiting, AgentState::Working]);
+    assert!(Arc::ptr_eq(&first.1, &second.1));
 }
