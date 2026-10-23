@@ -2,6 +2,8 @@
 // 링크를 다시 시작한다. 거듭되면 그 디스플레이의 링크를 새로 만든다(`spawn_display_link_watchdog`).
 // Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 렌더러가 드로어블을 못 받아 프레임을 건너뛰면(`present_pending`) 다음
 // 디스플레이 틱에 `require_presentation`으로 다시 present한다.
+// Krill 변경(앱 멈춤, Apache-2.0 §4(b)): `displayLayer:`(즉시 그리기)·창 활성화 때 디스플레이 링크를 멈췄다 다시 켜지
+// 않는다. 같은 디스플레이를 이미 구독 중이면 `start_display_link`가 그대로 둔다(매번 CVDisplayLink 스레드가 새로 생겼다).
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -843,19 +845,22 @@ impl MacWindowState {
         }
     }
 
+    /// Subscribes to the link of the window's display, keeping a subscription that already matches
+    /// (`WindowFrameSource::start`). Call `stop_display_link` first to force a restart.
     fn start_display_link(&mut self) {
-        self.stop_display_link();
         unsafe {
             if !self
                 .native_window
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
+                self.stop_display_link();
                 return;
             }
         }
         let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
+            self.stop_display_link();
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
@@ -3211,8 +3216,8 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
+                // See `display_layer` for why the link keeps running.
                 lock.renderer.set_presents_with_transaction(true);
-                lock.stop_display_link();
                 drop(lock);
                 callback(RequestFrameOptions {
                     signal_at,
@@ -3337,8 +3342,10 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        // No stop/start around this frame: ticks reach `step` on the main queue, so none can
+        // interleave with it anyway, and restarting the link spawned a new CVDisplayLink thread per
+        // call. `start_display_link` still resubscribes a window whose link was lost.
         lock.renderer.set_presents_with_transaction(true);
-        lock.stop_display_link();
         drop(lock);
         callback(RequestFrameOptions {
             signal_at,
@@ -3423,6 +3430,7 @@ fn spawn_display_link_watchdog(state: &Arc<Mutex<MacWindowState>>) {
                 {
                     crate::display_link::recreate_display_link(display).log_err();
                 }
+                lock.stop_display_link();
                 lock.start_display_link();
                 // Give the restarted link a full window before judging it again.
                 lock.last_step_at = Some(now);
