@@ -41,7 +41,7 @@ pub const FEAT_USAGE_MANAGE: u64 = 1 << 59;
 /// (구 데몬은 모르는 variant를 `BadRequest`로 거부한다).
 pub const FEAT_USAGE_RESET: u64 = 1 << 49;
 /// 수동 '사용량 새로고침' [`UsageRequest::RefreshUsage`]. 협상하지 않은 데몬에는 `ListAccounts`를 보낸다.
-pub const FEAT_USAGE_REFRESH: u64 = 1 << 20;
+pub const FEAT_USAGE_REFRESH: u64 = 1 << 23;
 /// 상태바 경고 기준 사용률(MK-084 완료 조건: 80% 경고). krilld와 UI가 같은 값을 쓴다.
 pub const WARN_PERCENT: u8 = 80;
 /// 상태바·계정 카드 위험 색 기준 사용률(OWE-708). [`WARN_PERCENT`] 이상은 경고, 이 값 이상은 위험.
