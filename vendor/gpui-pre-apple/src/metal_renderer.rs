@@ -1752,8 +1752,8 @@ mod tests {
             renderer
         });
         let layer = renderer.layer.as_ref().unwrap().clone();
-        // Occupy all three real CAMetalLayer surfaces, reproducing the native
-        // wait captured in the v0.1.37 tailspin without touching the running app.
+        // Retain three CAMetalLayer surfaces to exercise delayed acquisition and
+        // recovery without touching the running app. This is not the full tailspin scenario.
         let held: Vec<_> = (0..3)
             .map(|_| objc2::rc::autoreleasepool(|_| layer.next_drawable().unwrap().to_owned()))
             .collect();

@@ -3437,6 +3437,24 @@ fn spawn_display_link_watchdog(state: &Arc<Mutex<MacWindowState>>) {
         .detach();
 }
 
+// Consume a deferred presentation together with the frame metadata. Keeping this in one
+// operation prevents a second take from discarding a drawable retry before callback delivery.
+fn take_frame_request(
+    present_pending: &mut bool,
+    signal: Option<(std::time::Instant, FrameRequestSource)>,
+) -> RequestFrameOptions {
+    let (signal_at, signal_source) = signal.map_or(
+        (None, FrameRequestSource::NativeCallback),
+        |(at, source)| (Some(at), source),
+    );
+    RequestFrameOptions {
+        require_presentation: mem::take(present_pending),
+        signal_at,
+        signal_source,
+        ..Default::default()
+    }
+}
+
 extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
@@ -3445,23 +3463,13 @@ extern "C" fn step(view: *mut c_void) {
     lock.link_stalls = 0;
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        let require_presentation = mem::take(&mut lock.present_pending);
-        let (signal_at, signal_source) = lock
+        let signal = lock
             .frame_source
             .as_ref()
-            .and_then(WindowFrameSource::take_signal)
-            .map_or(
-                (None, FrameRequestSource::NativeCallback),
-                |(at, source)| (Some(at), source),
-            );
-        let require_presentation = mem::take(&mut lock.present_pending);
+            .and_then(WindowFrameSource::take_signal);
+        let request = take_frame_request(&mut lock.present_pending, signal);
         drop(lock);
-        callback(RequestFrameOptions {
-            require_presentation,
-            signal_at,
-            signal_source,
-            ..Default::default()
-        });
+        callback(request);
         window_state.lock().request_frame_callback = Some(callback);
     }
 }
@@ -4086,6 +4094,36 @@ mod tests {
         assert_eq!(link_stall(false, false, &mut last, t0 + ms(9000)), None);
         assert_eq!(last, None, "hidden windows reset the clock");
         assert_eq!(link_stall(true, false, &mut last, t0 + ms(9500)), None);
+    }
+
+    #[test]
+    fn deferred_presentation_reaches_the_next_frame_and_can_be_rearmed() {
+        let mut pending = true;
+        let requested_at = std::time::Instant::now();
+        let request = take_frame_request(
+            &mut pending,
+            Some((requested_at, FrameRequestSource::LocalSchedule)),
+        );
+        assert!(
+            request.require_presentation,
+            "a skipped draw must be retried"
+        );
+        assert_eq!(request.signal_at, Some(requested_at));
+        assert_eq!(request.signal_source, FrameRequestSource::LocalSchedule);
+        assert!(!pending);
+
+        let idle = take_frame_request(&mut pending, None);
+        assert!(
+            !idle.require_presentation,
+            "a successful draw needs no retry"
+        );
+        assert_eq!(idle.signal_at, None);
+        assert_eq!(idle.signal_source, FrameRequestSource::NativeCallback);
+
+        // If the drawable is still unavailable, draw() rearms the next display tick.
+        pending = true;
+        assert!(take_frame_request(&mut pending, None).require_presentation);
+        assert!(!pending);
     }
 
     #[test]

@@ -35,7 +35,9 @@ impl<I: Send + 'static, O: Send + 'static> Acquisition<I, O> {
         if self.pending {
             return match self.results.try_recv() {
                 Ok(output) => {
-                    self.pending = false;
+                    // Start the next bounded acquisition before returning this frame. Otherwise
+                    // every successful presentation needs a request-only display tick in between.
+                    self.requests.try_send(input).map_err(|_| ())?;
                     Ok(Some(output))
                 }
                 Err(TryRecvError::Empty) => Ok(None),
@@ -79,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_is_consumed_once_and_next_request_uses_latest_input() {
+    fn completion_prefetches_the_latest_input_without_a_request_only_tick() {
         let (started, running) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
         let mut acquisition = Acquisition::new(move |input: u32| {
@@ -101,8 +103,24 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(completed, 1);
+        // No intervening poll: consuming frame 1 must already have requested frame 3.
+        assert_eq!(running.recv_timeout(Duration::from_secs(5)).unwrap(), 3);
         assert_eq!(acquisition.poll(4), Ok(None));
-        assert_eq!(running.recv_timeout(Duration::from_secs(5)).unwrap(), 4);
+        assert!(
+            running.try_recv().is_err(),
+            "only one prefetch may be active"
+        );
+        release.send(()).unwrap();
+        let completed = loop {
+            if let Some(output) = acquisition.poll(5).unwrap() {
+                break output;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(completed, 3, "an in-flight acquire is never duplicated");
+        assert_eq!(running.recv_timeout(Duration::from_secs(5)).unwrap(), 5);
+        drop(acquisition);
         release.send(()).unwrap();
     }
 }
