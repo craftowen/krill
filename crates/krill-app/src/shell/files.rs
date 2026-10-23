@@ -1029,22 +1029,22 @@ impl Shell {
         }
         let busy = self.files.sharing.contains(&id);
         Some(
-            Button::new(("file-share-artifact", id.get()))
-                .debug_selector(|| "file-share-artifact".into())
-                .icon(IconName::Globe)
-                .label(if busy {
-                    atext::SHARING.get()
-                } else {
-                    atext::SHARE_BUTTON.get()
-                })
-                .ghost()
-                .xsmall()
-                .disabled(busy)
-                .tooltip(atext::SHARE_TOOLTIP.get())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.share_file_artifact(id, window, cx);
-                })),
+            krill_app::ui::button_with_reserved_label(
+                ("file-share-artifact", id.get()),
+                atext::SHARE_BUTTON.get(),
+                atext::SHARING.get(),
+                busy,
+            )
+            .debug_selector(|| "file-share-artifact".into())
+            .icon(IconName::Globe)
+            .ghost()
+            .xsmall()
+            .disabled(busy)
+            .tooltip(atext::SHARE_TOOLTIP.get())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.share_file_artifact(id, window, cx);
+            })),
         )
     }
 

@@ -19,7 +19,7 @@ use gpui::{
     App, AppContext as _, Deferred, Div, FontWeight, InteractiveElement as _, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use serde::{Deserialize, Serialize};
 
@@ -1182,12 +1182,6 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
     let import_all_id: SharedString = format!("{id_prefix}-orca-import-all-btn").into();
     let import_all_sel = import_all_id.to_string();
 
-    let import_all_label = if st.importing {
-        text::IMPORTING.get()
-    } else {
-        text::IMPORT_ALL.get()
-    };
-
     Some(
         ui::card(p)
             .id(banner_id.clone())
@@ -1252,13 +1246,17 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
                                     .on_click(|_, _, cx| open_modal(cx)),
                             )
                             .child(
-                                Button::new(import_all_id)
-                                    .debug_selector(move || import_all_sel.clone())
-                                    .small()
-                                    .primary()
-                                    .disabled(st.importing)
-                                    .label(import_all_label)
-                                    .on_click(|_, _, cx| import_all(cx)),
+                                ui::button_with_reserved_label(
+                                    import_all_id,
+                                    text::IMPORT_ALL.get(),
+                                    text::IMPORTING.get(),
+                                    st.importing,
+                                )
+                                .debug_selector(move || import_all_sel.clone())
+                                .small()
+                                .primary()
+                                .disabled(st.importing)
+                                .on_click(|_, _, cx| import_all(cx)),
                             ),
                     ),
             )
@@ -1320,11 +1318,7 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
         .and_then(OrcaImportReport::accounts_skipped_daemon_reason)
         .map(str::to_owned);
 
-    let submit_label = if importing {
-        text::IMPORTING.get().to_owned()
-    } else {
-        text::IMPORT_SELECTED.format(&[("n", &selected_count.to_string())])
-    };
+    let submit_label = text::IMPORT_SELECTED.format(&[("n", &selected_count.to_string())]);
 
     let rows = ImportDomain::ALL.into_iter().map(|domain| {
         let checked = st.selected.contains(&domain);
@@ -1425,13 +1419,17 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
                                 .on_click(|_, _, cx| close_modal(cx)),
                         )
                         .child(
-                            Button::new("orca-modal-submit")
-                                .debug_selector(|| "orca-modal-submit".to_owned())
-                                .small()
-                                .primary()
-                                .disabled(importing || selected_count == 0)
-                                .label(submit_label)
-                                .on_click(|_, _, cx| import_selected(cx)),
+                            ui::button_with_reserved_label(
+                                "orca-modal-submit",
+                                submit_label,
+                                text::IMPORTING.get(),
+                                importing,
+                            )
+                            .debug_selector(|| "orca-modal-submit".to_owned())
+                            .small()
+                            .primary()
+                            .disabled(importing || selected_count == 0)
+                            .on_click(|_, _, cx| import_selected(cx)),
                         ),
                 ),
         );
