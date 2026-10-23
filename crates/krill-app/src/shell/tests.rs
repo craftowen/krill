@@ -8982,3 +8982,33 @@ fn account_failure_recovery_holds_input_and_dismissed_notice_stays_dismissed(
     };
     assert_eq!(bytes, b"held prompt\r");
 }
+
+/// 프로젝트 추가 대화상자는 연결된 원격 호스트를 실행 위치로 고르게 한다(Orca처럼).
+#[gpui::test]
+fn add_project_offers_connected_hosts(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+
+    let (view, cx) = open(cx, state_path("add-project-hosts"));
+    let remote = HostId::Remote("studio".into());
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.host_statuses = vec![(
+                RemoteHostSpec {
+                    id: "studio".into(),
+                    label: "Mac Studio".into(),
+                    address: "owen@studio.local".into(),
+                    port: None,
+                    identity_file: None,
+                    remote_socket: None,
+                },
+                HostStatus::Connected,
+            )];
+            s.launch_host = remote.clone();
+            s.open_add_project(window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("add-project-host-local").is_some());
+    assert!(cx.debug_bounds("add-project-host-studio").is_some());
+}

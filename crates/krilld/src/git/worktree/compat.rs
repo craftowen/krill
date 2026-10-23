@@ -15,11 +15,112 @@ type Environment = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// 셸·에이전트·setup 세션의 자식 환경. ROOT는 주 워크트리, WORKTREE는 cwd가 속한 워크트리다.
 /// git 아닌 디렉터리에서는 호환 변수를 만들지 않는다. 모든 git 호출은 데몬 큐를 거친다.
+///
+/// 새 칸 생성(`Create`)이 이 값을 기다리므로, 흔한 배치(`.git` 디렉터리·연결 워크트리)는 git 자식 없이
+/// 파일시스템만 읽어 정한다. git 두 번(큐 대기 포함)이 생성 시간의 대부분이었다(디버그 빌드 측정 50~225ms).
+/// 확신할 수 없는 배치(서브모듈·`core.worktree`·GIT_* 환경·파일시스템 경계)는 git에 맡긴다.
 pub fn environment(cwd: &Path) -> Environment {
+    match discover(cwd) {
+        Some(Discovered::Repo { root, worktree }) => {
+            return variables(root.as_os_str().as_bytes(), &worktree);
+        }
+        Some(Discovered::NotRepo) => return Vec::new(),
+        None => {}
+    }
     super::queue().map_or_else(
         |_| Vec::new(),
         |q| environment_in(q, cwd).unwrap_or_default(),
     )
+}
+
+/// [`discover`]가 git 없이 확정한 결과.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Discovered {
+    /// `root`는 주 워크트리, `worktree`는 cwd가 속한 워크트리.
+    Repo {
+        root: std::path::PathBuf,
+        worktree: std::path::PathBuf,
+    },
+    NotRepo,
+}
+
+/// cwd의 워크트리를 git 없이 찾는다. `None`이면 판단을 git에 넘긴다.
+pub(super) fn discover(cwd: &Path) -> Option<Discovered> {
+    const GIT_ENV: [&str; 5] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+    if GIT_ENV.iter().any(|k| std::env::var_os(k).is_some()) {
+        return None;
+    }
+    let start = std::fs::canonicalize(cwd).ok()?;
+    let start_device = device(&start)?;
+    for dir in start.ancestors() {
+        if device(dir)? != start_device {
+            return None; // git은 파일시스템 경계에서 멈춘다.
+        }
+        let dot = dir.join(".git");
+        let Ok(meta) = std::fs::symlink_metadata(&dot) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if !dot.join("HEAD").is_file() || dot.join("commondir").exists() {
+                return None;
+            }
+            // `core.worktree`·`bare = true`·워크트리별 설정이 있으면 작업 트리가 `.git`의 부모가 아닐 수 있다.
+            let config = std::fs::read(dot.join("config")).ok()?;
+            if config.split(|b| *b == b'\n').any(unusual_config) {
+                return None;
+            }
+            return Some(Discovered::Repo {
+                root: dir.to_path_buf(),
+                worktree: dir.to_path_buf(),
+            });
+        }
+        if !meta.is_file() {
+            return None;
+        }
+        // 연결 워크트리: `.git` 파일의 `gitdir: <main>/.git/worktrees/<name>`과 그 안 `commondir`.
+        let text = std::fs::read(&dot).ok()?;
+        let gitdir = text.strip_prefix(b"gitdir: ")?.trim_ascii_end();
+        let gitdir = dir.join(OsStr::from_bytes(gitdir));
+        let common = std::fs::read(gitdir.join("commondir")).ok()?; // 없으면 서브모듈
+        let common =
+            std::fs::canonicalize(gitdir.join(OsStr::from_bytes(common.trim_ascii_end()))).ok()?;
+        if common.file_name() != Some(OsStr::new(".git")) {
+            return None;
+        }
+        return Some(Discovered::Repo {
+            root: common.parent()?.to_path_buf(),
+            worktree: dir.to_path_buf(),
+        });
+    }
+    Some(Discovered::NotRepo)
+}
+
+/// 빠른 경로가 틀릴 수 있는 설정 줄(`worktree = …`, `bare = true`, `worktreeConfig = …`).
+fn unusual_config(line: &[u8]) -> bool {
+    let key: Vec<u8> = line
+        .iter()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(u8::to_ascii_lowercase)
+        .collect();
+    key == b"bare=true" || key.starts_with(b"worktree=") || key.starts_with(b"worktreeconfig=")
+}
+
+/// 파일시스템 번호. Windows는 경로 규칙(`\\?\` 접두사 등)이 달라 빠른 경로를 쓰지 않는다(`None` → git).
+#[cfg(unix)]
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn device(_: &Path) -> Option<u64> {
+    None
 }
 
 pub(super) fn environment_in(q: &super::GitQueue, cwd: &Path) -> Result<Environment, String> {
@@ -36,9 +137,13 @@ pub(super) fn environment_in(q: &super::GitQueue, cwd: &Path) -> Result<Environm
         .split(|b| *b == 0)
         .find_map(|line| line.strip_prefix(b"worktree "))
         .ok_or("cannot find main worktree")?;
+    Ok(variables(root, &worktree))
+}
+
+fn variables(root: &[u8], worktree: &Path) -> Environment {
     let name = worktree.file_name().unwrap_or(OsStr::new("")).as_bytes();
     let path = worktree.as_os_str().as_bytes();
-    Ok([
+    [
         ("KRILL_ROOT_PATH", root),
         ("KRILL_WORKTREE_PATH", path),
         ("KRILL_WORKSPACE_NAME", name),
@@ -50,7 +155,7 @@ pub(super) fn environment_in(q: &super::GitQueue, cwd: &Path) -> Result<Environm
     ]
     .into_iter()
     .map(|(k, v)| (k.as_bytes().to_vec(), v.to_vec()))
-    .collect())
+    .collect()
 }
 
 const ORCA_CONFIG: &str = "orca.yaml";

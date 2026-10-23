@@ -195,11 +195,17 @@ struct Live {
     selecting_kind: SelectKind,
     task: Task<()>,
     creation: Arc<std::sync::Mutex<close::Creation>>,
+    /// 만든 때. 붙기 전 [`CONNECTING_GRACE`] 동안은 문구 없이 빈 터미널로 보인다.
+    born: Instant,
 }
 
 /// 새 에이전트 세션이 이 시간 안에 끝나면 시작 실패로 보고 이유를 안내한다.
 // ponytail: 시간만 본다(종료 코드는 앱까지 오지 않는다). 미설치·로그인 실패를 구분하려면 Closed에 종료 코드를 싣는다.
 const EARLY_EXIT: Duration = Duration::from_secs(10);
+
+/// 새 칸이 세션에 붙기 전 "연결 중" 문구를 숨기는 시간. 즉시 반응 규칙(STYLEGUIDE): 보통의 붙기(수십 ms)는
+/// 빈 터미널이 곧바로 프롬프트로 바뀌는 것으로 보이고, 정말 늦을 때만 문구가 뜬다.
+const CONNECTING_GRACE: Duration = Duration::from_secs(1);
 
 impl Live {
     fn new(task: Task<()>) -> Self {
@@ -223,6 +229,7 @@ impl Live {
             selecting_kind: SelectKind::Char,
             task,
             creation: Arc::default(),
+            born: Instant::now(),
         }
     }
 
@@ -3436,6 +3443,7 @@ impl Shell {
                     live.target = Some(target);
                     live.creation = Arc::clone(self.creations.entry(p).or_default());
                     entry.insert(live);
+                    Self::redraw_after_grace(cx);
                 }
                 Entry::Occupied(mut entry) => {
                     let live = entry.get_mut();
@@ -3459,6 +3467,15 @@ impl Shell {
             })
             .detach();
         }
+    }
+
+    /// [`CONNECTING_GRACE`]가 지나도 못 붙은 칸이 "연결 중" 문구를 그리도록 한 번 다시 그린다.
+    fn redraw_after_grace(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONNECTING_GRACE).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
     }
 
     /// 칸 하나의 IO 태스크: 세션을 정해 붙고, 프레임을 읽어 UI에 넘기고, 끊기면 다시 붙는다. 칸이 안 보이게 되면
@@ -3746,6 +3763,7 @@ impl Shell {
                 live.target = Some(target);
                 live.creation = Arc::clone(self.creations.entry(pane).or_default());
                 self.live.insert(pane, live);
+                Self::redraw_after_grace(cx);
             }
             cx.notify();
         } else {
@@ -5406,6 +5424,10 @@ impl Shell {
                 } else {
                     el.into_any_element()
                 }
+            }
+            // 붙기 직전의 새 칸은 빈 터미널로 곧바로 보인다(즉시 반응 규칙). 오류는 바로 알린다.
+            Some(l) if l.error.is_none() && l.born.elapsed() < CONNECTING_GRACE => {
+                div().into_any_element()
             }
             Some(l) => div()
                 .text_size(krill_app::ui::TEXT_XS)
