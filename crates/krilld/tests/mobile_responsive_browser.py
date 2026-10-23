@@ -345,6 +345,10 @@ def main():
                                 capture('tablet-split-ko-large-light', width, height)
                                 click('.secondary-pane .pane-close')
                         click('.session .mode-toggle')
+                        # Native details toggle events can land after a remount.
+                        # Pin disclosure state and scroll before geometry captures.
+                        evaluate('document.querySelectorAll(".chat-feed details").forEach(n=>n.open=true);document.querySelector(".chat-feed").scrollTop=0;true')
+                        settle()
                         capture('chat-ko-large-light', width, height)
                         click('.session .page-header .icon-button:last-child')
                         capture('dialog-ko-large-light', width, height)
