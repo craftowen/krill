@@ -1484,3 +1484,153 @@ fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
     drop(reg);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// A hook sent before the holder's Spawned reply must wait for root/session registration,
+/// both on the socket and when the CLI has already fallen back to its spool.
+#[test]
+fn first_hook_waits_for_spawn_registration_on_socket_and_spool() {
+    use crate::holder::link::Link;
+    use crate::os::AsFd as _;
+    use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+    use krill_proto::hook::{EventId, Input};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for spooled in [false, true] {
+        let dir =
+            std::env::temp_dir().join(format!("krill-first-hook-{}-{spooled}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Arc::new(Registry::new(Some((holder, vec![])), Some(&dir)));
+        let reader_reg = Arc::clone(&reg);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let id = SessionId(1);
+        let spawn_reg = Arc::clone(&reg);
+        let spawning = std::thread::spawn(move || {
+            spawn_reg
+                .spawn_holder(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    spawn_reg.holder.as_ref().unwrap(),
+                    id,
+                    vec![b"/bin/sh".to_vec()],
+                    vec![],
+                    b"/tmp".to_vec(),
+                    80,
+                    24,
+                )
+                .unwrap()
+        });
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn { req, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+            panic!("expected Spawn");
+        };
+        // The fake holder deliberately withholds Spawned, leaving the child unregistered.
+        let event = HookEvent {
+            id: EventId {
+                pid: std::process::id(),
+                unix_ns: 1,
+            },
+            agent: "claude".into(),
+            ppid: std::process::id(),
+            input: Input::Complete,
+            payload: br#"{"hook_event_name":"UserPromptSubmit"}"#.to_vec(),
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let hook_reg = Arc::clone(&reg);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        if spooled {
+            hook::append_spool(
+                &dir.join(hook::SPOOL_FILE),
+                &event.encode().unwrap(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        } else {
+            let hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+            client.write_all(&hello.encode().unwrap()).unwrap();
+            client.write_all(&event.encode().unwrap()).unwrap();
+        }
+        let applying = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            if spooled {
+                hook_reg.drain_spool();
+            } else {
+                let hello = ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: ipc::FEATURES,
+                    build: "test".into(),
+                    instance_id: 1,
+                };
+                hook_reg.serve(server, &hello).unwrap();
+            }
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "unregistered hook was consumed"
+        );
+        if spooled {
+            // A blocked drain must leave the spool unlocked so another CLI can append.
+            let mut next = event.clone();
+            next.id.unix_ns = 2;
+            hook::append_spool(
+                &dir.join(hook::SPOOL_FILE),
+                &next.encode().unwrap(),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .unwrap();
+        }
+        let (master, _pty) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req,
+                    id,
+                    pid: std::process::id(),
+                }
+                .encode()
+                .unwrap(),
+                &[master.as_fd()],
+            )
+            .unwrap();
+        assert_eq!(spawning.join().unwrap(), (id, std::process::id()));
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        applying.join().unwrap();
+        assert_eq!(reg.status.get(id).state, control::AgentState::Working);
+        if !spooled {
+            let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+            ServerHello::decode(kind, &body).unwrap();
+            let (kind, _) = ipc::read_frame(&mut client).unwrap().unwrap();
+            assert_eq!(kind, hook::kind::ACK);
+        }
+        drop(holder_link);
+        reader.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

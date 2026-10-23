@@ -320,8 +320,9 @@ impl Registry {
     pub fn drain_spool(&self) {
         let Some(path) = &self.spool else { return };
         let mut hooked = Vec::new();
+        // Spawn 등록을 기다리는 동안 spool 파일을 잠그면 CLI fallback의 append 예산도 소진한다.
+        let commit = lock(&self.hook_commit);
         status::take_spool(path, |events| {
-            let _commit = lock(&self.hook_commit);
             let found: Vec<_> = {
                 let st = lock(&self.state);
                 events
@@ -341,6 +342,7 @@ impl Registry {
             Ok(())
         })
         .ok();
+        drop(commit);
         for (id, payload) in &hooked {
             self.maybe_rename_from_hook(*id, payload);
         }
@@ -464,6 +466,8 @@ impl Registry {
                 scope: Scope::Full,
             }
         } else {
+            // Spawn 직후의 피어가 아직 미등록 루트나 상위 세션으로 분류되지 않게 한다.
+            let _commit = lock(&self.hook_commit);
             Peer::of(&s, &lock(&self.state).roots)
         };
         // 서명 정책이 강제되면 전체 피어의 코드서명을 핸드셰이크 전에 검증한다(MK-096). 닫힌 피어의 토큰
@@ -1517,6 +1521,10 @@ impl Registry {
             .roots
             .record_creator(id, peer.scope)
             .map_err(|e| os(&e))?;
+        // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
+        // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
+        // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
+        let _commit = lock(&self.hook_commit);
         match holder.request(spawn).map_err(|_| Failure::NoHolder)? {
             (FromHolder::Spawned { pid, .. }, Some(master)) => {
                 let session = self.start(id, master, size).map_err(|e| {
