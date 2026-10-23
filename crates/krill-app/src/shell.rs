@@ -5162,9 +5162,9 @@ impl Shell {
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.layout.zoomed_pane() == Some(id);
-        // Orca chromeless 패리티: 제목 행(26px 전체 폭 바) 대신 터미널 우상단
-        // 투명 오버레이 칩에 배지와 컨트롤만 둔다. 첫 행을 가리지 않고 자리를
-        // 차지하지 않으며, 탭 바와 제목이 이중으로 뜨지 않는다.
+        // 실행 중인 패인은 터미널 우상단의 투명 오버레이 칩에 컨트롤만 둔다.
+        // 종료·콜드 패인은 헤더를 일반 흐름에 넣어 UI 배율에 맞는 높이를 확보하고
+        // 아래 배너와 겹치지 않게 한다. 탭 바의 제목은 중복하지 않는다.
         let pane_header = div()
             .debug_selector(move || format!("pane-header-{}", id.get()))
             .when(!ended, |d| d.absolute().top(px(4.)).right(px(4.)))
@@ -5412,8 +5412,8 @@ impl Shell {
                             .child(body)
                             .children(self.fit_probe(id, cx))
                             .children(self.scroll_chrome(id, cx))
-                            // Orca 패리티: 페인 헤더는 자리를 차지하는 행이 아니라
-                            // 터미널 위 투명 오버레이 칩이다(OWE-653 / MK-131).
+                            // 실행 중인 패인의 헤더만 터미널 위 오버레이로 남는다.
+                            // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
                             .children(pane_header.filter(|_| show_header)),
                     )
                     .children(self.render_pane_chat_overlay(id, window, cx)),
