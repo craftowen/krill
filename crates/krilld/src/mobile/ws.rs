@@ -390,7 +390,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        write!(client, "GET /ws{query} HTTP/1.1\r\nHost: tunnel.test\r\nOrigin: {origin}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap(); // gitleaks:allow -- RFC 6455 section 1.3 public example nonce.
+        write!(client, "GET /ws{query} HTTP/1.1\r\nHost: tunnel.test\r\nOrigin: {origin}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
         let result = upgrade(&mut server, allowed);
         drop(server);
         let mut response = String::new();

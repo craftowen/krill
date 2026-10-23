@@ -86,7 +86,7 @@ fn websocket(port: u16) -> (TcpStream, [u8; 32]) {
     let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-    s.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap(); // gitleaks:allow -- RFC 6455 section 1.3 public example nonce.
+    s.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         let mut b = [0];
@@ -421,7 +421,7 @@ fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    socket.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap(); // gitleaks:allow -- RFC 6455 section 1.3 public example nonce.
+    socket.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
     let mut bytes = Vec::new();
     socket.read_to_end(&mut bytes).unwrap();
     let header_end = bytes
