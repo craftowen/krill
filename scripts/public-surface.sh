@@ -7,6 +7,12 @@
 # (a) docs/ 최상위 허용 목록 밖 파일, (b) gitleaks(.gitleaks.toml) 또는 내장 grep 규칙 위반이면 위치를 찍고 1로 끝난다.
 set -euo pipefail
 
+# CI는 정식 검사기 없이 축소된 grep 검사로 통과시키지 않는다.
+if [[ ${CI:-} == true ]] && ! command -v gitleaks >/dev/null; then
+  echo "public-surface: CI requires gitleaks; refusing the grep fallback" >&2
+  exit 1
+fi
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 fail=0
 
