@@ -170,7 +170,12 @@ fn spawn_probe(
             cache.insert(job.clone(), (Instant::now(), stamp, status));
             drop(cache);
             // 기록 이행은 별도 작업으로 보낸다. 사용 중이던 프로필도 종료 후 다음 조회에서 재시도한다.
-            if !host && matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+            if !host
+                && matches!(
+                    provider,
+                    ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Antigravity
+                )
+            {
                 super::super::provision::provision_if_enabled(
                     &home,
                     state.as_deref(),

@@ -52,6 +52,15 @@ impl Store<'_> {
     }
 
     pub(super) fn share(&self, idle: &dyn Fn() -> bool, report: &mut Report) -> io::Result<()> {
+        self.share_using(idle, report, &merge)
+    }
+
+    pub(super) fn share_using(
+        &self,
+        idle: &dyn Fn() -> bool,
+        report: &mut Report,
+        merge_tree: &dyn Fn(&Path, &Path, &Path, usize) -> io::Result<()>,
+    ) -> io::Result<()> {
         let (host, profile) = (self.host, self.profile);
         // 호출자가 host/profile의 경로 겹침을 먼저 거부한 뒤에만 쓰기 시작한다.
         real_dir(host)?;
@@ -120,7 +129,7 @@ impl Store<'_> {
                     fs::rename(&source, &original)?;
                 }
                 // 중단 후 original만 남아도 동일 경로에서 다시 병합한다.
-                let result = merge(&original, &target, &backup.join("displaced"), 0)
+                let result = merge_tree(&original, &target, &backup.join("displaced"), 0)
                     .and_then(|()| std::os::unix::fs::symlink(&target, &source));
                 if let Err(error) = result {
                     // 부분 게시된 공용 파일은 보존하고 프로필의 원본 경로를 복구한다.
@@ -202,7 +211,7 @@ pub(super) fn archive_root(host: &Path, profile: &Path, backup_name: &str) -> Pa
     host.join(backup_name).join(format!("{slug}-{digest}"))
 }
 
-fn real_dir(path: &Path) -> io::Result<()> {
+pub(super) fn real_dir(path: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.symlink_metadata()?.is_dir() => {
@@ -212,7 +221,7 @@ fn real_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-fn make_archive(host: &Path, path: &Path) -> io::Result<()> {
+pub(super) fn make_archive(host: &Path, path: &Path) -> io::Result<()> {
     let mut parent = host.to_path_buf();
     for part in path
         .strip_prefix(host)
@@ -246,7 +255,12 @@ fn preferred(incoming: &Metadata, current: &Metadata) -> io::Result<bool> {
         || (incoming.len() == current.len() && incoming.modified()? > current.modified()?))
 }
 
-fn merge(source: &Path, target: &Path, displaced: &Path, depth: usize) -> io::Result<()> {
+pub(super) fn merge(
+    source: &Path,
+    target: &Path,
+    displaced: &Path,
+    depth: usize,
+) -> io::Result<()> {
     if depth > 64 {
         return Err(io::ErrorKind::InvalidData.into());
     }
@@ -302,7 +316,7 @@ fn merge(source: &Path, target: &Path, displaced: &Path, depth: usize) -> io::Re
     Ok(())
 }
 
-fn unused_path(base: &Path) -> PathBuf {
+pub(super) fn unused_path(base: &Path) -> PathBuf {
     let mut candidate = base.to_path_buf();
     let mut sequence = 0_u64;
     while candidate.symlink_metadata().is_ok() {

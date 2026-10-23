@@ -54,9 +54,11 @@ pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
     })
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(unused_variables, reason = "기록 이행 프로브는 Unix에서만 사용한다")
+)]
 fn provision_inner(home: &Path, profile: &Path, idle: &dyn Fn() -> bool) -> io::Result<Report> {
-    #[cfg(not(unix))]
-    let _ = idle;
     let mut report = Report::default();
     let profile = profile.canonicalize()?;
     let host = match home.join(".codex").canonicalize() {
@@ -456,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_opt_in_still_cannot_touch_native_stores() {
+    fn agy_history_opt_in_keeps_native_credentials_untouched() {
         let (home, _, profile) = fixture("agy-native-gate");
         let state = home.join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -468,9 +470,16 @@ mod tests {
         .unwrap();
         let dir = profile.to_str().unwrap();
         std::fs::write(state.join("accounts.toml"), format!("provisioning = true\n[[accounts]]\nid = \"agy\"\nprovider = \"agy\"\nlabel = \"agy\"\nprofile_dir = \"{dir}\"\n")).unwrap();
-        let before = snapshot(&home);
         provision_if_enabled(&home, Some(&state), ProviderKind::Antigravity, dir);
-        assert_eq!(snapshot(&home), before);
+        assert_eq!(
+            std::fs::read(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+            b"fake native credential"
+        );
+        assert!(
+            !profile
+                .join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .exists()
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
     #[test]

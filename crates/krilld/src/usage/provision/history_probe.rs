@@ -10,6 +10,10 @@ const LIMIT: u64 = 16 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn quiescent(profile: &Path, env_key: &str) -> bool {
+    quiescent_at(profile, profile, env_key)
+}
+
+pub(super) fn quiescent_at(files: &Path, profile: &Path, env_key: &str) -> bool {
     let mut ps = Command::new("/bin/ps");
     ps.args([
         "eww",
@@ -33,7 +37,7 @@ pub(super) fn quiescent(profile: &Path, env_key: &str) -> bool {
     let lsof = "lsof";
     // +D는 디렉터리 아래 열린 fd/cwd를 조회한다. 링크 대상은 따라가지 않는다.
     let mut command = Command::new(lsof);
-    command.args(["-t", "+D"]).arg(profile);
+    command.args(["-t", "+D"]).arg(files);
     capture(&mut command, TIMEOUT)
         .is_ok_and(|result| no_open_files(result.status.code(), &result.stdout, &result.stderr))
 }
@@ -50,10 +54,22 @@ pub(super) fn has_writer(text: &str, profile: &Path, env_key: &str) -> bool {
         .ok()
         .map(|path| format!("{env_key}={}", path.display()));
     // ps eww는 폭 제한을 해제한다. 경로에 공백이 있거나 경계가 불분명해도 보수적으로 보류한다.
-    text.contains(&marker)
-        || canonical.is_some_and(|marker| text.contains(&marker))
+    path_marker(text, &marker)
+        || canonical.is_some_and(|marker| path_marker(text, &marker))
         || text.lines().any(|line| {
             let executable = line.split_whitespace().next().unwrap_or_default();
+            if env_key == "ANTIGRAVITY_CLI_HOME"
+                && Path::new(executable)
+                    .file_name()
+                    .is_some_and(|name| name == "agy")
+            {
+                let gemini = profile.join(".gemini");
+                return path_marker(line, &format!("--gemini_dir={}", gemini.display()))
+                    || path_marker(line, &format!("--gemini_dir {}", gemini.display()))
+                    || (!line.contains("--gemini_dir")
+                        && path_marker(line, &format!("HOME={}", profile.display())))
+                    || (!line.contains(" HOME=") && !line.contains(" PATH="));
+            }
             let claude = Path::new(executable)
                 .file_name()
                 .is_some_and(|name| name == "claude")
@@ -63,6 +79,14 @@ pub(super) fn has_writer(text: &str, profile: &Path, env_key: &str) -> bool {
             // Claude 후보의 환경이 보이지 않으면 다른 계정이라고 단정하지 않는다.
             claude && !line.contains(" HOME=") && !line.contains(" PATH=")
         })
+}
+
+// /home/account와 /home/account-other, 기본 HOME과 그 아래 프로필을 구분한다.
+fn path_marker(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(start, _)| {
+        text.get(start + marker.len()..)
+            .is_some_and(|tail| tail.as_bytes().first().is_none_or(u8::is_ascii_whitespace))
+    })
 }
 
 fn read_pipe(pipe: impl io::Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {

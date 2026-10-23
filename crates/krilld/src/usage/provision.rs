@@ -100,6 +100,7 @@ pub fn provision_if_enabled(
             claude_history::needs_merge(&home.join(".claude"), Path::new(profile_dir))
         }
         ProviderKind::Codex => codex::needs_merge(home, Path::new(profile_dir)),
+        ProviderKind::Antigravity => agy::needs_merge(home, Path::new(profile_dir)),
         _ => false,
     } {
         let home = home.to_path_buf();
@@ -136,7 +137,10 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
             tracing::warn!(conflicts = ?report.conflicts, "profile provisioning left existing entries");
         }
         Ok(_) => {}
-        Err(error) if provider == ProviderKind::Antigravity => {
+        Err(error)
+            if provider == ProviderKind::Antigravity
+                && error.kind() == io::ErrorKind::Unsupported =>
+        {
             // OWE-901: agy 미지원은 예상된 보류 상태라 debug로 둔다(매 실행 warn 스팸 방지).
             tracing::debug!(kind = ?error.kind(), "agy native account switching is unsupported; owner decision required");
         }
@@ -155,13 +159,15 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
     provision_claude_inner(home, profile, &idle)
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(unused_variables, reason = "기록 이행 프로브는 Unix에서만 사용한다")
+)]
 fn provision_claude_inner(
     home: &Path,
     profile: &Path,
     idle: &dyn Fn() -> bool,
 ) -> io::Result<Report> {
-    #[cfg(not(unix))]
-    let _ = idle;
     let host = super::accounts::host_default_dir(home, ProviderKind::Claude);
     let mut report = Report::default();
     let profile_real = profile.canonicalize()?;
