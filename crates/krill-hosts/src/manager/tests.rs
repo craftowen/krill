@@ -270,14 +270,26 @@ fn offline_verdict_is_shared_across_managers_until_reconnect() {
     assert!(first.ensure_tunnel_socket("studio").is_err());
     assert_eq!(attempts(), 1);
 
+    // 새 창은 첫 시도를 한다: 그사이 기기가 켜졌을 수 있다.
+    assert!(second.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(
+        attempts(),
+        2,
+        "a fresh window tries once before trusting the verdict"
+    );
+    second.slot("studio").unwrap().lock().unwrap().next_retry_at = None;
     let err = second.ensure_tunnel_socket("studio").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-    assert_eq!(attempts(), 1, "second window must not spawn its own ssh");
+    assert_eq!(
+        attempts(),
+        2,
+        "after its own failure the window follows the shared verdict"
+    );
     assert_eq!(second.status("studio"), HostStatus::Disconnected);
     assert!(second.ensure_tunnel_socket("studio").is_err());
-    assert_eq!(attempts(), 1);
+    assert_eq!(attempts(), 2);
 
     second.reconnect_now("studio");
     assert!(second.ensure_tunnel_socket("studio").is_err());
-    assert_eq!(attempts(), 2, "explicit reconnect retries right away");
+    assert_eq!(attempts(), 3, "explicit reconnect retries right away");
 }

@@ -499,13 +499,15 @@ impl HostManager {
         }
 
         let key = self.offline_key(&s.spec);
+        let tried = s.failures > 0;
         if let Some((until, error)) = OFFLINE
             .lock()
             .ok()
             .and_then(|offline| offline.get(&key).cloned())
-            .filter(|(until, _)| Instant::now() < *until)
+            .filter(|(until, _)| tried && Instant::now() < *until)
         {
-            // 다른 창의 관리자가 방금 꺼진 기기로 판정했다. ssh를 다시 띄우지 않고 그 판정을 따른다.
+            // 다른 창의 관리자가 방금 꺼진 기기로 판정했다. 이 관리자도 한 번은 직접 시도해 봤으면(새 창은 첫 시도를 한다:
+            // 그사이 사용자가 기기를 켰을 수 있다) ssh를 다시 띄우지 않고 그 판정을 따른다.
             s.failures = s.failures.max(OFFLINE_AFTER_FAILURES.saturating_add(1));
             s.next_retry_at = Some(until);
             s.last_error = Some(error.clone());
