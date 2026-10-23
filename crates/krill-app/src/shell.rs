@@ -5394,6 +5394,7 @@ impl Shell {
         let pane = div()
             .id(ElementId::Name(format!("pane-{}", id.get()).into()))
             .size_full()
+            .relative()
             .overflow_hidden()
             .bg(term_bg)
             .text_color(p.muted_foreground)
