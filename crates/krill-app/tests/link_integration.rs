@@ -544,9 +544,9 @@ fn real_backend_pairs_lists_creates_revokes_and_releases_shared_connect() {
         "revoke must have explicit public status evidence",
     );
     manager.sync_external_hosts(service.registrations().unwrap());
-    assert!(
-        service.owned_pids().is_empty(),
-        "revoked transport must stop its owned process"
+    until(
+        || service.owned_pids().is_empty(),
+        "revoked transport must stop its owned process",
     );
     let err = target
         .connect(&client_hello(ClientRole::App, "revoked"))
@@ -635,7 +635,10 @@ fn real_backend_pairs_lists_creates_revokes_and_releases_shared_connect() {
     for service in krill_app::hosts::link::begin_shutdown() {
         service.shutdown();
     }
-    assert!(service.owned_pids().is_empty());
+    until(
+        || service.owned_pids().is_empty(),
+        "release the shutdown connection",
+    );
     assert!(
         closing_target
             .connect(&client_hello(ClientRole::App, "after-close"))

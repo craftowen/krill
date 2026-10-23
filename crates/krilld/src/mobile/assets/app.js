@@ -154,5 +154,6 @@
  applyPreferences();
  const keyboardInset=()=>{const vv=globalThis.visualViewport,focused=document.activeElement?.matches?.('.chat-input,.chat-question-custom input');const inset=vv&&focused&&Math.abs((vv.scale||1)-1)<.02?Math.max(0,innerHeight-vv.height-vv.offsetTop):0;document.documentElement.style.setProperty('--chat-keyboard-inset',`${inset}px`);};
  globalThis.visualViewport?.addEventListener('resize',keyboardInset);globalThis.visualViewport?.addEventListener('scroll',keyboardInset);globalThis.addEventListener('resize',keyboardInset);globalThis.addEventListener('orientationchange',keyboardInset);document.addEventListener('focusin',keyboardInset);document.addEventListener('focusout',()=>setTimeout(keyboardInset,0));
+ if(pairing)startPairing();
  let hiddenAt=0;const resume=e=>{if(document.hidden){hiddenAt=Date.now();return;}const stale=e?.type==='online'||hiddenAt>0&&Date.now()-hiddenAt>10000;pool.resume(stale);if(credentials&&!pairing&&!pool.owns(transport))transport.resume(stale);hiddenAt=0;};document.addEventListener('visibilitychange',resume);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);render();if(!pairing&&credentials&&!pool.owns(transport))transport.connect();
 })();

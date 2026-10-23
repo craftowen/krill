@@ -8611,6 +8611,7 @@ fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
 #[gpui::test]
 fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
     let d = dir("ui-theme");
+    fs::write(d.join(SETTINGS_FILE), "theme = 'dark'\n").unwrap();
     init(cx, &d);
     let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));

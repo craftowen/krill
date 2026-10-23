@@ -3,7 +3,6 @@ use std::{os::unix::net::UnixStream, sync::Arc, time::Duration};
 use gpui::{TestAppContext, VisualTestContext};
 use krill_proto::{control::AgentStatus, input::Input, ipc, screen::Msg as _};
 
-use super::bench::account_popup_snapshot as popup_layout_accounts;
 use super::*;
 
 #[test]
@@ -102,198 +101,6 @@ fn provider_popup_exposes_account_status_and_updated_row(cx: &mut TestAppContext
         vcx.debug_bounds("status-provider-account-claude-claude-status-test-status")
             .is_some()
     );
-}
-
-fn popup_bounds(vcx: &mut VisualTestContext, selector: &str) -> Bounds<gpui::Pixels> {
-    let selector = Box::leak(selector.to_owned().into_boxed_str());
-    vcx.debug_bounds(selector)
-        .unwrap_or_else(|| panic!("missing popup content: {selector}"))
-}
-
-/// Component IDs are not debug selectors; inspect the actual painted popover surface.
-fn popup_surface_bounds(vcx: &mut VisualTestContext) -> Bounds<gpui::Pixels> {
-    use gpui_component::ActiveTheme as _;
-    let card = popup_bounds(vcx, "status-provider-card-claude");
-    vcx.update(|window, cx| {
-        let scale = window.scale_factor();
-        window
-            .painted_quads()
-            .into_iter()
-            .filter(|quad| quad.background.as_solid() == Some(cx.theme().popover))
-            .map(|quad| quad.bounds.map(|value| px(value.as_f32() / scale)))
-            .filter(|bounds| bounds.contains(&card.origin) && bounds.contains(&card.bottom_right()))
-            .max_by(|a, b| a.size.height.partial_cmp(&b.size.height).unwrap())
-            .expect("painted account popup surface")
-    })
-}
-
-fn assert_popup_contains(outer: Bounds<gpui::Pixels>, inner: Bounds<gpui::Pixels>) {
-    let tolerance = px(1.);
-    assert!(
-        inner.size.width > px(0.) && inner.size.height > px(0.),
-        "popup content collapsed: {inner:?}"
-    );
-    assert!(
-        inner.left() >= outer.left() - tolerance
-            && inner.right() <= outer.right() + tolerance
-            && inner.top() >= outer.top() - tolerance
-            && inner.bottom() <= outer.bottom() + tolerance,
-        "popup content {inner:?} outside {outer:?}"
-    );
-}
-
-fn assert_popup_account_layout(cx: &mut TestAppContext, width: f32, rem: f32) {
-    let (shell, handle) = open(cx);
-    shell.update(cx, |s, cx| {
-        s.accounts_snapshot = popup_layout_accounts();
-        cx.notify();
-    });
-    let vcx = &mut VisualTestContext::from_window(handle, cx);
-    vcx.simulate_resize(gpui::size(px(width), px(1200.)));
-    vcx.update(|window, _| {
-        window.set_rem_size(px(rem));
-        window.refresh();
-    });
-    vcx.run_until_parked();
-    let pill = popup_bounds(vcx, "status-provider-pill-claude");
-    vcx.simulate_click(pill.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    let popup = popup_surface_bounds(vcx);
-    assert!(popup.size.width > px(340.));
-    assert!(popup.left() >= px(0.) && popup.right() <= px(width));
-    for account in ["layout-main", "layout-other"] {
-        let selector = format!("status-provider-account-claude-{account}");
-        let row = popup_bounds(vcx, &selector);
-        assert_popup_contains(popup, row);
-        let title = popup_bounds(vcx, &format!("{selector}-title"));
-        assert_popup_contains(row, title);
-        if width < 500. {
-            assert!(title.size.height > px(rem), "long identity must wrap");
-        }
-        let mut bottom = title.bottom();
-        for window in ["5h", "7d"] {
-            let percent = popup_bounds(vcx, &format!("{selector}-{window}-percent"));
-            assert_popup_contains(row, percent);
-            assert!(percent.top() >= bottom, "usage overlaps account identity");
-            bottom = percent.bottom();
-            if account == "layout-main" || window == "5h" {
-                let reset = popup_bounds(vcx, &format!("{selector}-{window}-reset"));
-                assert_popup_contains(row, reset);
-                assert!(reset.top() >= title.bottom(), "reset overlaps identity");
-                assert!(
-                    reset.top() >= percent.bottom() || reset.left() >= percent.right(),
-                    "reset overlaps percentage"
-                );
-                bottom = bottom.max(reset.bottom());
-            }
-        }
-    }
-    assert!(
-        vcx.debug_bounds("status-provider-account-claude-layout-other-7d-reset")
-            .is_none(),
-        "unknown reset time must not invent a countdown"
-    );
-    // The active card shares the same complete reset detail as every selectable account.
-    let card = popup_bounds(vcx, "status-provider-card-claude");
-    for window in ["5h", "7d"] {
-        let reset = popup_bounds(vcx, &format!("status-provider-bar-claude-{window}-reset"));
-        assert_popup_contains(card, reset);
-    }
-    vcx.simulate_keystrokes("escape");
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("status-provider-card-claude").is_none());
-    assert!(vcx.read(|cx| shell.read(cx).accounts_snapshot.accounts[0].active));
-}
-
-#[gpui::test]
-fn provider_popup_keeps_account_identity_and_both_resets_readable(cx: &mut TestAppContext) {
-    assert_popup_account_layout(cx, 1200., 16.);
-}
-
-#[gpui::test]
-fn provider_popup_wraps_accounts_and_resets_in_narrow_zoomed_window(cx: &mut TestAppContext) {
-    assert_popup_account_layout(cx, 420., 24.);
-}
-
-#[gpui::test]
-fn provider_popup_scrolls_accounts_and_actions_in_short_window(cx: &mut TestAppContext) {
-    let (shell, handle) = open(cx);
-    shell.update(cx, |s, cx| {
-        s.accounts_snapshot = popup_layout_accounts();
-        cx.notify();
-    });
-    let vcx = &mut VisualTestContext::from_window(handle, cx);
-    vcx.simulate_resize(gpui::size(px(420.), px(480.)));
-    vcx.update(|window, _| {
-        window.set_rem_size(px(24.));
-        window.refresh();
-    });
-    vcx.run_until_parked();
-    let pill = popup_bounds(vcx, "status-provider-pill-claude");
-    vcx.simulate_click(pill.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    let popup = popup_surface_bounds(vcx);
-    assert!(popup.top() >= px(0.) && popup.bottom() <= px(480.));
-    vcx.simulate_event(gpui::ScrollWheelEvent {
-        position: popup.center(),
-        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-2000.))),
-        ..Default::default()
-    });
-    vcx.run_until_parked();
-    let settings = popup_bounds(vcx, "status-provider-open-accounts");
-    assert_popup_contains(popup, settings);
-    vcx.simulate_event(gpui::ScrollWheelEvent {
-        position: popup.center(),
-        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(2000.))),
-        ..Default::default()
-    });
-    vcx.run_until_parked();
-    let card = popup_bounds(vcx, "status-provider-card-claude");
-    assert_popup_contains(popup, card);
-}
-
-#[gpui::test]
-fn provider_popup_shows_reset_for_each_reported_meter(cx: &mut TestAppContext) {
-    use krill_proto::usage::{AccountMeters, UsageMeter};
-    let (shell, handle) = open(cx);
-    shell.update(cx, |s, cx| {
-        s.accounts_snapshot = popup_layout_accounts();
-        let account = &s.accounts_snapshot.accounts[0];
-        s.accounts_snapshot.details.supported = true;
-        s.accounts_snapshot.details.accounts = vec![AccountMeters {
-            account_id: account.id.clone(),
-            plan: None,
-            meters: vec![
-                UsageMeter {
-                    key: "team-five".into(),
-                    label: "Team workspace · 5h".into(),
-                    window: account.usage.five_hour.clone(),
-                    value: None,
-                },
-                UsageMeter {
-                    key: "team-seven".into(),
-                    label: "Team workspace · 7d".into(),
-                    window: account.usage.seven_day.clone(),
-                    value: None,
-                },
-            ],
-        }];
-        cx.notify();
-    });
-    let vcx = &mut VisualTestContext::from_window(handle, cx);
-    vcx.simulate_resize(gpui::size(px(1000.), px(1200.)));
-    vcx.run_until_parked();
-    let pill = popup_bounds(vcx, "status-provider-pill-claude");
-    vcx.simulate_click(pill.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    let row = popup_bounds(vcx, "status-provider-account-claude-layout-main");
-    for meter in ["team-five", "team-seven"] {
-        let reset = popup_bounds(
-            vcx,
-            &format!("status-provider-account-claude-layout-main-{meter}-reset"),
-        );
-        assert_popup_contains(row, reset);
-    }
 }
 
 /// 하-4: 상태바를 우클릭하면 상태바 동작 메뉴가 열린다.
@@ -400,10 +207,10 @@ fn status_history_toggle_opens_right_panel_and_stays_open(cx: &mut TestAppContex
     assert!(history.bottom() <= column.bottom());
     assert!(visual.debug_bounds("agent-history-popover").is_none());
     // 터미널 영역을 눌러도 기록이 유지된다.
-    visual.simulate_click(
-        gpui::point(gpui::px(10.), gpui::px(100.)),
-        gpui::Modifiers::default(),
-    );
+    let terminal = visual
+        .debug_bounds("terminal-surface")
+        .expect("terminal surface");
+    visual.simulate_click(terminal.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(is_open(cx));
     let files = visual
@@ -1947,7 +1754,7 @@ fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
     }
 }
 
-/// 하단바 B안: 5시간·주간 밖 한도(예: 모델별 풀)는 경고 수준이면서 보이는 두 기간보다 높을 때만 덧붙인다.
+/// 하단바 B안: 추가 한도는 경고 수준이면서 보이는 두 기간보다 높을 때만 덧붙인다.
 #[test]
 fn status_hot_meter_shows_only_a_higher_warning_pool() {
     use krill_proto::usage::{

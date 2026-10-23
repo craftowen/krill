@@ -3213,12 +3213,9 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
 
         assert!(launched.borrow().is_empty());
         assert_eq!(
-            launched.borrow().as_slice(),
-            &[OpenWorkspace {
-                host: studio_id.clone(),
-                cwd: wt_without_remote_sess.clone(),
-            }],
-            "clicking remote worktree card without remote session in {layout:?} must spawn on studio host even if local has same path"
+            selected.borrow().last(),
+            Some(&(studio_id.clone(), wt_without_remote_sess.clone())),
+            "clicking remote worktree card without remote session in {layout:?} must select studio host even if local has same path"
         );
     }
 }
@@ -4138,11 +4135,8 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     vcx.run_until_parked();
     assert!(launched_events.borrow().is_empty());
     assert_eq!(
-        launched_events.borrow().as_slice(),
-        &[OpenWorkspace {
-            host: HostId::Local,
-            cwd: PathBuf::from("/repo/wt-001"),
-        }]
+        selected_events.borrow().last(),
+        Some(&PathBuf::from("/repo/wt-001"))
     );
     fs::remove_dir_all(dir).ok();
 }
@@ -5301,6 +5295,7 @@ fn card_session_lists_running_subagents_below_it(cx: &mut TestAppContext) {
             };
             s.rows = vec![Row::Worktree("/repo/a".into()), Row::Session(lead, true)];
             s.expanded_cards.insert("/repo/a".into());
+            s.sync_viewport();
             cx.notify();
         });
     });

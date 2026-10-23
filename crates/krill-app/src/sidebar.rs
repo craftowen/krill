@@ -2302,21 +2302,22 @@ impl Sidebar {
     }
 
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let workspaces = self.visible_workspaces();
-        if workspaces.is_empty() {
+        let Some(last) = self.rows.len().checked_sub(1) else {
             return;
+        };
+        let next = self
+            .cursor
+            .map_or(0, |i| i.saturating_add_signed(delta).min(last));
+        self.cursor = Some(next);
+        self.sync_viewport();
+        if let Some(folder) = self.cursor_folder()
+            && self.selected_worktree.as_ref() != Some(&folder)
+        {
+            self.selected_worktree = Some(folder);
+            self.write_state(cx);
         }
-        let current = workspaces
-            .iter()
-            .position(|(index, _, _)| Some(*index) == self.cursor);
-        let next = current.map_or(if delta < 0 { workspaces.len() - 1 } else { 0 }, |i| {
-            (i.cast_signed() + delta)
-                .rem_euclid(workspaces.len().cast_signed())
-                .cast_unsigned()
-        });
-        let (index, host, path) = workspaces[next].clone();
-        self.activate_worktree_card(index, host, path, false, cx);
-        self.scroll_row_into_view(index, ScrollStrategy::Nearest);
+        self.scroll_row_into_view(next, ScrollStrategy::Nearest);
+        cx.notify();
     }
 
     fn cursor_row(&self) -> Option<&Row> {

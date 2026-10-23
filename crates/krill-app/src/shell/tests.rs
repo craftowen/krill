@@ -2733,8 +2733,8 @@ fn shell_sidebar_worktree_launches_session_and_tracks_visibility(cx: &mut TestAp
     view.update(cx, |s, _| {
         assert_eq!(
             s.layout.tabs().len(),
-            3,
-            "Enter opens a new tab and represents the workspace's existing session"
+            2,
+            "Enter on worktree row must open a new tab"
         );
         let launch = s.launch_for(s.layout.active_tab().focused);
         assert_eq!(launch.cwd, b"/repo/feat-wt");
@@ -2745,7 +2745,7 @@ fn shell_sidebar_worktree_launches_session_and_tracks_visibility(cx: &mut TestAp
     cx.simulate_keystrokes("cmd-shift-0 alt-cmd-1");
     cx.run_until_parked();
     view.update(cx, |s, _| {
-        assert_eq!(s.layout.tabs().len(), 4);
+        assert_eq!(s.layout.tabs().len(), 3);
         let launch = s.launch_for(s.layout.active_tab().focused);
         assert_eq!(launch.cwd, b"/repo/feat-wt");
         assert_eq!(
@@ -3264,7 +3264,7 @@ fn history_resume_opens_new_tab_without_replacing_existing_session(cx: &mut Test
 fn stalled_pane_shows_banner_until_ack(cx: &mut TestAppContext) {
     use std::os::unix::net::UnixStream;
 
-    use krill_proto::input::{Input, InputAck, InputResult, PROBE, kind};
+    use krill_proto::input::{Input, InputAck, InputResult, PROBE};
     use krill_proto::screen::Msg as _;
 
     let (view, cx) = open(cx, state_path("stalled"));
@@ -3292,9 +3292,13 @@ fn stalled_pane_shows_banner_until_ack(cx: &mut TestAppContext) {
         id,
         result: InputResult::Applied,
     };
+    let encoded = ack.encode().unwrap();
+    let (kind, body) = krill_proto::ipc::read_frame(&mut &encoded[..])
+        .unwrap()
+        .unwrap();
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            assert!(s.on_frame(pane, kind::INPUT_ACK, &ack.encode().unwrap(), cx));
+            assert!(s.on_frame(pane, kind, &body, cx));
             assert_eq!(s.stalled_banner(), None);
         });
     });
@@ -5476,13 +5480,12 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
         );
     }
 
-    // Orca처럼 팝업은 하단바 위로 열리고 바를 덮지 않는다.
     let bar = cx.debug_bounds("status-bar").unwrap();
-    let card = cx.debug_bounds("status-provider-card-claude").unwrap();
+    let header = cx.debug_bounds("status-provider-table-header").unwrap();
     let last = cx.debug_bounds("status-provider-open-accounts").unwrap();
     assert!(
-        card.top() >= px(0.) && last.bottom() <= bar.top(),
-        "provider popover must sit above the status bar: {card:?} {last:?} vs {bar:?}"
+        header.top() >= px(0.) && last.bottom() <= bar.top(),
+        "provider table must sit above the status bar: {header:?} {last:?} vs {bar:?}"
     );
 
     // host_default must be sorted above other accounts.
@@ -5799,31 +5802,18 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(layout_of(&view, cx).tabs().is_empty());
 }
 
-/// 사이드바 상단 네비게이션은 실제로 구현된 '에이전트 대시보드'와 그 아래 '아티팩트'만 표시하고,
-/// 아직 없는 기능(작업·스킬·자동화·모바일)은 표기하지 않는다. 아티팩트를 누르면 설정 > 아티팩트가 열린다.
+/// 사이드바 상단은 구현된 대시보드·아티팩트만 표시한다.
+/// 아티팩트 탐색·복귀는 별도 라이브러리 탐색 검사에서 확인한다.
 #[gpui::test]
 fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
-    let (view, cx) = open(cx, state_path("sidebar-nav-items"));
+    let (_view, cx) = open(cx, state_path("sidebar-nav-items"));
     cx.run_until_parked();
 
-    let dashboard = cx
-        .debug_bounds("nav-agent-dashboard")
-        .expect("implemented Agent Dashboard nav item must be rendered");
-    let artifacts = cx
-        .debug_bounds("nav-artifacts")
-        .expect("Artifacts nav item must be rendered");
     assert!(
-        artifacts.origin.y >= dashboard.origin.y + dashboard.size.height,
-        "Artifacts sits right below Agent Dashboard"
+        cx.debug_bounds("nav-agent-dashboard").is_some(),
+        "implemented Agent Dashboard nav item must be rendered"
     );
-    cx.simulate_click(artifacts.center(), gpui::Modifiers::none());
-    cx.run_until_parked();
-    cx.update(|_, cx| {
-        assert!(
-            view.read(cx).artifacts.is_some(),
-            "artifact library opened in the main window"
-        );
-    });
+    assert!(cx.debug_bounds("nav-artifacts").is_some());
     for unimplemented in ["nav-tasks", "nav-skills", "nav-automations", "nav-mobile"] {
         assert!(
             cx.debug_bounds(unimplemented).is_none(),

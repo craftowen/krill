@@ -690,6 +690,7 @@ impl SearchState {
 enum AccountInput {
     Normal,
     Switching,
+    Failed,
     Delivering,
 }
 
@@ -935,7 +936,10 @@ impl<W: Write> Pane<W> {
     }
 
     pub fn account_switching(&self) -> bool {
-        self.account_input == AccountInput::Switching
+        matches!(
+            self.account_input,
+            AccountInput::Switching | AccountInput::Failed
+        )
     }
 
     /// Keep a hidden pane alive until its held prompts have reached the replacement PTY.
@@ -949,18 +953,20 @@ impl<W: Write> Pane<W> {
     /// one, and the pane goes back to the preserved original session. The daemon keeps failed
     /// handoffs in every snapshot, so a pane that is not switching ignores the failure.
     pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
-        if !self.account_switching() {
+        if failed {
+            self.account_input = AccountInput::Failed;
+            self.journal.pause();
             return Vec::new();
         }
-        let mut notices = Vec::new();
-        if failed {
-            notices.extend(self.journal.discard_held(input::Fate::AccountSwitchFailed));
+        if !self.account_switching() {
+            return Vec::new();
         }
         self.account_input = if self.journal.has_pending_input() {
             AccountInput::Delivering
         } else {
             AccountInput::Normal
         };
+        let mut notices = Vec::new();
         if self.out.is_some() {
             let (frames, relink_notices) = self.journal.relink(input::Incarnation::Same, now);
             notices.extend(relink_notices);

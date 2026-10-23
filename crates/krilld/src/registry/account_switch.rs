@@ -449,8 +449,31 @@ impl Registry {
 
     fn recover_prepared_account(&self) {
         let Some(dir) = self.state_dir() else { return };
-        let path = dir.join(PREPARED_FILE);
-        let prepared = std::fs::read(&path)
+        // v0.1.37 stored one journal per replacement; earlier versions used one file.
+        // Recover both layouts so upgrading never leaves an unconfirmed duplicate behind.
+        let mut paths = vec![dir.join(PREPARED_FILE)];
+        if let Ok(entries) = std::fs::read_dir(dir.join("account-replacements")) {
+            paths.extend(
+                entries
+                    .flatten()
+                    .take(krill_proto::holder::MAX_SESSIONS)
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        (entry.file_type().is_ok_and(|kind| kind.is_file())
+                            && path
+                                .extension()
+                                .is_some_and(|extension| extension == "json"))
+                        .then_some(path)
+                    }),
+            );
+        }
+        for path in paths {
+            self.recover_prepared_record(&path);
+        }
+    }
+
+    fn recover_prepared_record(&self, path: &Path) {
+        let prepared = std::fs::read(path)
             .ok()
             .filter(|raw| raw.len() <= 4096)
             .and_then(|raw| serde_json::from_slice::<Prepared>(&raw).ok());

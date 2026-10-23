@@ -502,59 +502,68 @@ fn kept_fixture(root: &Path, id: SessionId) -> (Registry, UnixStream) {
 
 #[test]
 fn recovery_keeps_only_remaining_unconfirmed_replacement_without_publishing_completion() {
-    let root = Path::new("/tmp").join(format!("kas-only-{}", std::process::id()));
-    fs::remove_dir_all(&root).ok();
-    let (reg, _process) = kept_fixture(&root, SessionId(8));
-    let launch = AgentLaunch {
-        profile: "codex".into(),
-        permission: Permission::Yolo,
-    };
-    for session in [SessionId(7), SessionId(8)] {
-        reg.agents
-            .remember_session(
-                session,
-                &launch,
-                Some("expected".into()),
-                Vec::new(),
-                Some(LaunchAccount {
-                    id: "selected".into(),
-                    env_key: "CODEX_HOME".into(),
-                    dir: root.display().to_string(),
-                }),
-            )
-            .unwrap();
-    }
-    fs::write(
-        root.join(PREPARED_FILE),
-        serde_json::to_vec(&Prepared {
-            from: SessionId(7),
-            to: SessionId(8),
-            account_id: "selected".into(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    reg.recover_prepared_account();
-    let saved = load(Some(&root));
-    let handoff = saved.get(&SessionId(7)).unwrap();
-    assert!(handoff.to.is_none());
-    assert!(handoff.error.as_deref().unwrap().contains("retained"));
-    assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
-    let mut snapshot = AccountsSnapshot::default();
-    reg.account_switch_snapshot(&mut snapshot);
-    assert!(snapshot.details.handoffs.iter().all(|h| h.to.is_none()));
-    // The same safety rule also applies if the original exits before a live attempt finishes.
-    {
-        let _replacement = Replacement {
-            registry: &reg,
-            original: SessionId(7),
-            session: SessionId(8),
-            committed: false,
+    for per_session in [false, true] {
+        let root = Path::new("/tmp").join(format!("kas-only-{}-{per_session}", std::process::id()));
+        let journal = if per_session {
+            root.join("account-replacements/8.json")
+        } else {
+            root.join(PREPARED_FILE)
         };
+        fs::remove_dir_all(&root).ok();
+        let (reg, _process) = kept_fixture(&root, SessionId(8));
+        let launch = AgentLaunch {
+            profile: "codex".into(),
+            permission: Permission::Yolo,
+        };
+        for session in [SessionId(7), SessionId(8)] {
+            reg.agents
+                .remember_session(
+                    session,
+                    &launch,
+                    Some("expected".into()),
+                    Vec::new(),
+                    Some(LaunchAccount {
+                        id: "selected".into(),
+                        env_key: "CODEX_HOME".into(),
+                        dir: root.display().to_string(),
+                    }),
+                )
+                .unwrap();
+        }
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(
+            &journal,
+            serde_json::to_vec(&Prepared {
+                from: SessionId(7),
+                to: SessionId(8),
+                account_id: "selected".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        reg.recover_prepared_account();
+        assert!(!journal.exists());
+        let saved = load(Some(&root));
+        let handoff = saved.get(&SessionId(7)).unwrap();
+        assert!(handoff.to.is_none());
+        assert!(handoff.error.as_deref().unwrap().contains("retained"));
+        assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
+        let mut snapshot = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut snapshot);
+        assert!(snapshot.details.handoffs.iter().all(|h| h.to.is_none()));
+        // The same safety rule also applies if the original exits before a live attempt finishes.
+        {
+            let _replacement = Replacement {
+                registry: &reg,
+                original: SessionId(7),
+                session: SessionId(8),
+                committed: false,
+            };
+        }
+        assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
     }
-    assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
-    drop(reg);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

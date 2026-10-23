@@ -141,8 +141,7 @@ fn hanging_git_times_out_reaps_child_and_queue_proceeds() {
     ));
     let queue = GitQueue::with_program(git, 1).unwrap();
     let hung = queue.submit(&dir.0, ["hang"]);
-    let next = queue.submit(&dir.0, ["next"]);
-
+    let expired = queue.submit(&dir.0, ["next"]);
     let err = hung.recv().unwrap().expect_err("hanging git must time out");
     assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err:?}");
     let pids: Vec<i32> = fs::read_to_string(&pid_file)
@@ -163,7 +162,11 @@ fn hanging_git_times_out_reaps_child_and_queue_proceeds() {
         );
     }
 
-    let out = next.recv().unwrap().unwrap();
+    assert_eq!(
+        expired.recv().unwrap().unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    let out = queue.submit(&dir.0, ["next"]).recv().unwrap().unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"ok:next\n");
 }

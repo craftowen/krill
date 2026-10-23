@@ -2387,6 +2387,7 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
             "space",
             "disk",
             "cleanup",
+            "worktree cleanup",
             "target",
             "node_modules",
         ],
