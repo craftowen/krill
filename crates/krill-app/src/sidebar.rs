@@ -147,6 +147,10 @@ pub struct Snapshot {
 pub type Meta = BTreeMap<PathBuf, Tree>;
 
 /// IPC boundary: gpui tests supply snapshots without waiting for external IO.
+/// [`Source::poll_snapshot`]의 결과를 기다리는 future.
+pub type PollSnapshot =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<(Snapshot, Meta)>> + Send>>;
+
 pub trait Source: Send + Sync {
     fn fetch(&self) -> io::Result<Snapshot>;
     /// 등록 세대가 바뀐 원격 연결의 캐시·폴링 작업을 교체하기 위한 타깃.
@@ -156,6 +160,15 @@ pub trait Source: Send + Sync {
     /// 워크트리 행의 git 정보. 모르면 비워 둔다(UI가 숨긴다).
     fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
         Meta::new()
+    }
+    /// 폴링 한 번: `fetch` 뒤 그 트리로 `meta`. 기본은 호출한 스레드에서 바로 돈다.
+    /// 소켓 소스는 호스트 전용 스레드에서 돌려 원격 ssh·IPC 대기가 공유 실행기 스레드를 붙잡지 않게 한다.
+    fn poll_snapshot(&self) -> PollSnapshot {
+        let polled = self.fetch().map(|snap| {
+            let meta = self.meta(&snap.trees);
+            (snap, meta)
+        });
+        Box::pin(std::future::ready(polled))
     }
     /// 사이드바 가시성·창 활성 여부가 바뀔 때 git 감시를 켜거나 끈다(N19).
     fn set_visible(&self, _visible: bool) {}
@@ -1378,10 +1391,7 @@ impl Sidebar {
                     tasks.push(cx.spawn(async move |cx| {
                         let (id, source, res) = bg
                             .spawn(async move {
-                                let res = source.fetch().map(|snap| {
-                                    let meta = source.meta(&snap.trees);
-                                    (snap, meta)
-                                });
+                                let res = source.poll_snapshot().await;
                                 (id, source, res)
                             })
                             .await;
