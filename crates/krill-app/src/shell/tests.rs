@@ -2601,18 +2601,33 @@ fn unreadable_layout_disables_saving(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn close_ended_pane_targets_its_own_pane(cx: &mut TestAppContext) {
-    close_ended_pane_in_language(cx, krill_app::i18n::Language::En);
+    close_ended_pane_in_language(cx, krill_app::i18n::Language::En, px(16.));
 }
 
 #[gpui::test]
 fn close_ended_pane_targets_its_own_pane_in_korean(cx: &mut TestAppContext) {
-    close_ended_pane_in_language(cx, krill_app::i18n::Language::Ko);
+    close_ended_pane_in_language(cx, krill_app::i18n::Language::Ko, px(16.));
 }
 
-fn close_ended_pane_in_language(cx: &mut TestAppContext, language: krill_app::i18n::Language) {
+#[gpui::test]
+fn close_ended_pane_targets_its_own_pane_at_maximum_english_zoom(cx: &mut TestAppContext) {
+    close_ended_pane_in_language(cx, krill_app::i18n::Language::En, px(32.));
+}
+
+#[gpui::test]
+fn close_ended_pane_targets_its_own_pane_at_maximum_korean_zoom(cx: &mut TestAppContext) {
+    close_ended_pane_in_language(cx, krill_app::i18n::Language::Ko, px(32.));
+}
+
+fn close_ended_pane_in_language(
+    cx: &mut TestAppContext,
+    language: krill_app::i18n::Language,
+    rem_size: gpui::Pixels,
+) {
     let (view, cx) = open(cx, state_path("close-ended-pane"));
     cx.update(|_, cx| krill_app::settings::set_language(language, cx));
     cx.run_until_parked();
+    cx.update(|window, _| window.set_rem_size(rem_size));
     let ended = layout_of(&view, cx).active_tab().focused;
     let (ours, _theirs) = UnixStream::pair().unwrap();
     view.update(cx, |s, cx| {

@@ -5153,6 +5153,9 @@ impl Shell {
         let focused = self.layout.focused() == Some(id);
         let is_split = self.layout.visible().len() > 1;
         let show_header = is_split || self.layout.host(id).is_remote();
+        let ended = self.live.get(&id).is_some_and(|live| {
+            live.pane.session().is_some() && (live.pane.is_cold() || live.pane.is_closed())
+        });
         let p = krill_app::ui::palette(cx);
         // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
@@ -5164,9 +5167,8 @@ impl Shell {
         // 차지하지 않으며, 탭 바와 제목이 이중으로 뜨지 않는다.
         let pane_header = div()
             .debug_selector(move || format!("pane-header-{}", id.get()))
-            .absolute()
-            .top(px(4.))
-            .right(px(4.))
+            .when(!ended, |d| d.absolute().top(px(4.)).right(px(4.)))
+            .when(ended, |d| d.self_end().mb_2())
             .flex_none()
             .flex()
             .items_center()
@@ -5257,6 +5259,7 @@ impl Shell {
                     text::CLOSE_PANE.get(),
                 ))
             });
+        let mut pane_header = Some(pane_header);
         let body = match self.live.get(&id) {
             Some(l) if l.pane.session().is_some() => {
                 let mut el = TerminalElement::new(l.pane.shown(), self.terminal_theme)
@@ -5290,9 +5293,8 @@ impl Shell {
                         .size_full()
                         .flex()
                         .flex_col()
-                        .when(show_header, |d| {
-                            d.pt(krill_app::ui::PANE_HEADER_HEIGHT + krill_app::ui::SPACE_2)
-                        })
+                        // Ended/cold panes reserve the header's measured height, including UI zoom.
+                        .when(show_header, |d| d.children(pane_header.take()))
                         // OWE-653: 배너는 테두리 있는 띠로, 문구는 본문 색·왼쪽, 버튼은 오른쪽 끝(다시 시작=주 버튼).
                         .child(
                             div()
@@ -5412,7 +5414,7 @@ impl Shell {
                             .children(self.scroll_chrome(id, cx))
                             // Orca 패리티: 페인 헤더는 자리를 차지하는 행이 아니라
                             // 터미널 위 투명 오버레이 칩이다(OWE-653 / MK-131).
-                            .children(show_header.then_some(pane_header)),
+                            .children(pane_header.filter(|_| show_header)),
                     )
                     .children(self.render_pane_chat_overlay(id, window, cx)),
             )
