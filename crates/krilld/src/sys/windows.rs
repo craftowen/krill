@@ -55,6 +55,26 @@ const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// 종료 감시 폴링 간격.
 const EXIT_POLL: Duration = Duration::from_millis(100);
 
+/// Keep the waiting agent launcher alive on Ctrl+C/Break; the agent handles its own console events.
+/// Use a callback rather than the inheritable NULL-handler ignore flag, so children still receive Ctrl+C.
+pub(crate) fn protect_agent_launcher() -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCtrlHandler};
+    // SAFETY: no pointers; a zero codepage means this background invocation has no console.
+    if unsafe { GetConsoleCP() } == 0 {
+        return Ok(());
+    }
+    // SAFETY: static nonpanicking callback, registered for this helper process's lifetime only.
+    if unsafe { SetConsoleCtrlHandler(Some(agent_launcher_control), 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+extern "system" fn agent_launcher_control(event: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    i32::from(matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT))
+}
+
 fn unsupported<T>() -> io::Result<T> {
     Err(io::ErrorKind::Unsupported.into())
 }

@@ -2,6 +2,7 @@
 //!
 //! - 에이전트는 로그인·대화형 셸(`-l -i -c`)을 거쳐 띄운다. rc 파일이 만드는 PATH(nvm·mise·`~/.local/bin`)에서
 //!   찾아야 Terminal.app에서 친 것과 같은 바이너리가 뜬다.
+//!   Windows는 셸 문법을 거치지 않는 내부 런처가 `Command`로 실행한다(npm `.cmd` 포함).
 //! - preflight: 셸 안에서 `command -v`로 설치를 먼저 확인하고, 없으면 설치 안내를 pane에 찍고 127로 끝난다.
 //! - 환경은 [`Shell`]의 launchd 기준 환경 그대로다(allowlist). krilld의 내부 값이 자식에게 가지 않는다.
 //!   프로필의 `env`(OWE-657)는 그 위에 덮어쓴다.
@@ -27,9 +28,14 @@ use control::LaunchAccount;
 pub(crate) mod claude;
 pub(crate) mod control;
 mod skills;
+#[cfg(any(windows, test))]
+mod windows;
+#[cfg(windows)]
+pub use windows::run as run_windows_agent;
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
 // ponytail: POSIX 문법이라 fish·nu 같은 로그인 셸에서는 깨진다. 지원하려면 그때 `/bin/zsh -l -i -c`로 감싼다.
+#[cfg(unix)]
 const PREFLIGHT: &str = r#"
 case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
@@ -1715,17 +1721,10 @@ fn wrap_account(
     account: Option<&LaunchAccount>,
 ) -> Launch {
     skills::prepare(Some(profile), &login, account);
-    let Launch { mut argv, env } = login;
-    argv.truncate(1);
     let hint = format!(
         "{}: not installed. install: {}",
         profile.program().unwrap_or_default(),
         profile.install
-    );
-    argv.extend(
-        ["-l", "-i", "-c", PREFLIGHT, "mk-agent", &hint]
-            .into_iter()
-            .map(|s| s.as_bytes().to_vec()),
     );
     let mut agent_argv = profile.argv(permission);
     if (is(profile, "agy") || is(profile, "antigravity"))
@@ -1734,8 +1733,22 @@ fn wrap_account(
         let gemini_dir = Path::new(&account.dir).join(".gemini");
         agent_argv.insert(1, format!("--gemini_dir={}", gemini_dir.display()));
     }
-    argv.extend(agent_argv.into_iter().map(String::into_bytes));
-    Launch { argv, env }
+    #[cfg(windows)]
+    {
+        windows::wrap(login, &hint, agent_argv)
+    }
+    #[cfg(unix)]
+    {
+        let Launch { mut argv, env } = login;
+        argv.truncate(1);
+        argv.extend(
+            ["-l", "-i", "-c", PREFLIGHT, "mk-agent", &hint]
+                .into_iter()
+                .map(|s| s.as_bytes().to_vec()),
+        );
+        argv.extend(agent_argv.into_iter().map(String::into_bytes));
+        Launch { argv, env }
+    }
 }
 
 #[cfg(test)]

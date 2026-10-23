@@ -12,7 +12,9 @@ use std::fs::File;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -338,15 +340,23 @@ fn uuid() -> io::Result<String> {
 pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
     let mut profile = profile.clone();
     profile.launch = vec![profile.program()?.to_owned(), "--version".into()];
+    #[cfg(unix)]
     let launch = wrap(&profile, Permission::Manual, login.clone());
+    #[cfg(unix)]
     let (program, args) = launch.argv.split_first()?;
+    #[cfg(unix)]
     let mut command = Command::new(OsStr::from_bytes(program));
+    #[cfg(windows)]
+    let mut command = super::windows::command(OsStr::new(profile.program()?), login.env.clone())?;
+    #[cfg(windows)]
+    command.arg("--version");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = command
+    #[cfg(unix)]
+    command
         .args(args.iter().map(|a| OsStr::from_bytes(a)))
         .env_clear()
         .envs(
@@ -354,7 +364,8 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
                 .env
                 .iter()
                 .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
-        )
+        );
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
