@@ -45,7 +45,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Install verified gitleaks 8.30.1
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$archive" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
       - name: Release pipeline regressions
         run: |
           python3 packaging/test_ci_evidence.py
@@ -53,9 +64,14 @@ jobs:
           python3 packaging/test_release_verify.py
           python3 packaging/test_nightly.py
           python3 packaging/test_publish.py
+          python3 scripts/test_hooks.py
 
-      - name: Public surface
-        run: bash scripts/public-surface.sh
+      - name: Public surface and reachable history
+        run: |
+          bash scripts/public-surface.sh
+          gitleaks git . --log-opts='HEAD --full-history' --config .gitleaks.toml \
+            --redact=100 --ignore-gitleaks-allow --no-banner --exit-code 1 \
+            --gitleaks-ignore-path "$RUNNER_TEMP/krill-no-ignore"
 
   ci:
     name: ci
