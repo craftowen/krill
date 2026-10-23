@@ -25,6 +25,7 @@ const SAMPLE_BYTES: u64 = 2 << 20;
 // Aggregate only duration buckets. No query, path, terminal text, or per-frame log.
 static UI_WORK: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
+#[derive(Debug)]
 pub(crate) struct Work {
     started: Instant,
     label: &'static str,

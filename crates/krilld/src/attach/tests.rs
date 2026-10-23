@@ -259,3 +259,23 @@ fn app_ping_late_only_beyond_interval_plus_threshold() {
         Some(Duration::from_millis(3_500))
     );
 }
+
+#[test]
+fn bounded_scroll_candidates_reconstruct_tall_and_repeated_grids_exactly() {
+    let texts: Vec<_> = (0..300).map(|row| format!("row-{row}")).collect();
+    let borrowed: Vec<_> = texts.iter().map(String::as_str).collect();
+    let previous = screen(&borrowed);
+    for shift in [1, 19, 121, 299] {
+        let mut next = previous.clone();
+        next.rows.rotate_left(shift);
+        for cells in next.rows.iter_mut().rev().take(shift) {
+            *cells = row("new");
+        }
+        roundtrip(&previous, &next);
+    }
+    let repeated = screen(&["same", "same", "same", "other", "same", "same"]);
+    roundtrip(
+        &repeated,
+        &screen(&["same", "other", "same", "same", "same", "new"]),
+    );
+}

@@ -2,6 +2,25 @@
 // See docs/research/orca-mobile-ui-spec.md §5.1 for the MIT notice.
 // Icons: Lucide (ISC), Copyright (c) Lucide Contributors, from gpui-kit-assets.
 
+// Soft keyboard = the strip the visual viewport leaves uncovered at the bottom (Orca keyboard-occlusion.web.ts).
+// One reader per frame writes --keyboard-inset on <html>; the fixed shell shrinks by it, so nothing else measures the keyboard.
+globalThis.MkKeyboard=(()=>{
+ const vv=globalThis.visualViewport,doc=globalThis.document,raf=globalThis.requestAnimationFrame?.bind(globalThis)||(fn=>setTimeout(fn,16)),listeners=new Set(),field=n=>!!n?.matches?.('input,textarea,[contenteditable]:not([contenteditable=false])');let inset=0,frame=0,resized=false;
+ // 핀치 줌(scale≠1)은 키보드와 기하가 같아 구분할 수 없으므로 0으로 본다. scale이 없는 WebView는 1이다. offsetTop은 내려간 시각 뷰포트 아래 띠를 키보드로 세지 않게 뺀다.
+ const occlusion=()=>!vv||Math.abs((vv.scale??1)-1)>.01?0:Math.max(0,Math.round(innerHeight-vv.height-vv.offsetTop));
+ const measure=()=>{frame=0;let next=occlusion();
+  // iOS는 포커스한 입력을 키보드 위로 보이려고 문서를 민다. 셸은 고정이고 dock·composer·sheet는 inset만큼 스스로 올라가므로 문서 위치를 되돌린다.
+  if(next>0&&doc?.activeElement?.closest?.('.command-dock,.chat-composer,.sheet')&&((globalThis.scrollY||0)>0||(vv.offsetTop||0)>0)){globalThis.scrollTo?.(0,0);next=occlusion();}
+  const changed=next!==inset,notify=changed||resized;resized=false;if(changed){inset=next;doc?.documentElement?.style.setProperty('--keyboard-inset',`${inset}px`);}
+  // 스크롤·포커스만 있었던 프레임은 알리지 않는다(구독자의 Fit 디바운스를 다시 걸지 않게).
+  if(notify)for(const fn of listeners)fn(inset);};
+ const schedule=e=>{if(e?.type==='resize'||e?.type==='orientationchange')resized=true;if(!frame)frame=raf(measure);};
+ if(vv){vv.addEventListener('resize',schedule);vv.addEventListener('scroll',schedule);}for(const type of ['resize','orientationchange'])globalThis.addEventListener?.(type,schedule);for(const type of ['focusin','focusout'])doc?.addEventListener?.(type,schedule);
+ return Object.freeze({inset:()=>inset,subscribe(fn){listeners.add(fn);return ()=>listeners.delete(fn);},
+  // Orca keyboard-persisting-taps('handled'): 입력 중 버튼 tap이 포커스를 가져가 키보드를 닫거나 첫 tap을 삼키지 않게 한다. click은 그대로 온다.
+  keepFocus(container,signal){container?.addEventListener?.('mousedown',e=>{const b=e.target?.closest?.('button');if(b&&container.contains(b)&&field(doc?.activeElement)&&!field(e.target))e.preventDefault();},{capture:true,signal});}});
+})();
+
 // The live stream uses the same postcard DTOs as desktop; no terminal emulation or query replies.
 globalThis.MkTerminalCodec=(()=>{
  const C=MkCrypto,decoder=new TextDecoder('utf-8',{fatal:true});
@@ -95,7 +114,7 @@ globalThis.MkTerminalCodec=(()=>{
    }
    if(this.options.onEditKeys){const edit=button('accessory-key edit-keys','Edit terminal keys','edit');keybar.append(edit);this.listen(edit,'click',()=>this.options.onEditKeys());}
    this.dock.append(accessory,inputRow,this.capture);this.root.append(this.frame,this.dock);
-   let lastTop=0;this.listen(this.historyButton,'click',()=>this.guard(()=>this.loadHistory()));this.listen(this.port,'scroll',()=>{const top=this.port.scrollTop,up=top<lastTop,refresh=up&&this.stick&&this.historyLoadedVersion!==this.historyVersion;const now=globalThis.performance?.now?.()??Date.now(),elapsed=now-(this.historyScrollAt??now);this.historyVelocity=up&&elapsed>0?(lastTop-top)/elapsed:0;this.historyScrollAt=now;lastTop=top;this.stick=this.atBottom();this.latestButton.hidden=this.stick;if(refresh||up&&top<this.historyThreshold())this.guard(()=>this.loadHistory(false,refresh));},{passive:true});
+   let lastTop=0;this.listen(this.historyButton,'click',()=>this.guard(()=>this.loadHistory()));this.listen(this.port,'scroll',()=>{const top=this.port.scrollTop,up=top<lastTop,refresh=up&&this.stick&&this.historyLoadedVersion!==this.historyVersion;const now=globalThis.performance?.now?.()??Date.now(),elapsed=now-(this.historyScrollAt??now);this.historyVelocity=up&&elapsed>0?(lastTop-top)/elapsed:0;this.historyScrollAt=now;lastTop=top;this.stick=this.atBottom(1);this.latestButton.hidden=this.stick;if(refresh||up&&top<this.historyThreshold())this.guard(()=>this.loadHistory(false,refresh));},{passive:true});
    for(const b of [this.fitButton,this.directButton,this.shiftButton,this.historyButton])this.listen(b,'pointerdown',e=>e.preventDefault());this.listen(this.shiftButton,'click',()=>this.toggleShift());
    this.listen(this.fitButton,'click',()=>this.guard(()=>this.fitToPhone()));this.listen(this.directButton,'click',()=>this.setInputMode(this.inputMode==='direct'?'buffered':'direct'));
    this.listen(this.dismiss,'click',()=>{this.capture.blur();this.command.blur();});this.listen(this.live,'click',()=>this.focus());
@@ -141,7 +160,8 @@ globalThis.MkTerminalCodec=(()=>{
     this.guard(async()=>{try{await this.input(bytes+'\r');if(!this.disposed&&generation===this.generation&&version===this.bufferedVersion&&this.command.value===value){this.command.value='';drafts.delete(this.stateKey);this.sizeCommand();}}finally{this.bufferedPending=false;this.sendButton.disabled=false;}});
    });
   }
-  sizeCommand(){this.command.style.height='auto';this.command.style.height=`${this.command.scrollHeight||34}px`;this.queueFit();}
+  // 자동 높이는 프레임당 한 번만 잰다(키 입력마다 강제 레이아웃을 하지 않는다). 높이가 바뀌면 port의 ResizeObserver가 다시 맞춘다.
+  sizeCommand(){if(this.sizeFrame)return;this.sizeFrame=(globalThis.requestAnimationFrame||setTimeout)(()=>{this.sizeFrame=0;if(this.disposed)return;this.command.style.height='auto';this.command.style.height=`${this.command.scrollHeight||34}px`;});}
   updateMode(){this.root.dataset.inputMode=this.inputMode;this.capture.hidden=this.inputMode!=='direct';this.live.hidden=this.capture.hidden||this.root.dataset.keyboardOpen==='true';this.form.hidden=this.inputRow.hidden=this.inputMode==='direct';this.directButton.textContent=translate(this.inputMode==='direct'?'Direct input':'Buffered input');this.directButton.title=this.directButton.textContent;this.directButton.setAttribute('aria-label',this.directButton.title);if(this.inputMode==='buffered')this.sizeCommand();}
   setInputMode(mode){if(this.disposed||!['direct','buffered'].includes(mode)||mode===this.inputMode)return;const typing=[this.capture,this.command].includes(globalThis.document?.activeElement);this.invalidateInput();this.inputMode=mode;modes.set(this.stateKey,mode);const value=settings();value.terminalInputModes={...value.terminalInputModes,[this.stateKey]:mode};try{localStorage.setItem(UI_KEY,JSON.stringify(value));}catch{}this.options.onPreferenceChange?.({inputMode:mode,sessionId:this.session});this.updateMode();if(typing)this.focus();}
   getInputMode(){return this.inputMode;}
@@ -171,12 +191,11 @@ globalThis.MkTerminalCodec=(()=>{
   consumeShift(bytes,isKey=false){if(!this.shiftArmed)return bytes;this.toggleShift(false);return isKey?encodeKey(bytes,true):bytes.replace(/^[a-z]/,c=>c.toUpperCase());}
   sendKey(id){const key=KEYS.find(k=>k.id===id);if(!key)return Promise.reject(Error('Unknown terminal key'));if(this.disposed)return Promise.reject(Error('Input target changed'));const bytes=this.consumeShift(key.bytes,true);if(this.composing)return new Promise((resolve,reject)=>this.deferredKeys.push({bytes,resolve,reject}));return this.controlInput(bytes);}
   bindViewport(){
-   const viewport=()=>{const vv=globalThis.visualViewport,inset=vv&&Math.abs(vv.scale-1)<.05?Math.max(0,innerHeight-vv.height-vv.offsetTop):0;this.keyboardInset=inset;this.root.style.setProperty('--keyboard-inset',`${inset}px`);const open=inset>80;
-    // iOS는 키보드가 열릴 때 문서를 위로 밀어 헤더가 화면 밖으로 나간다. 셸은 스크롤하지 않으므로 문서 위치를 되돌린다.
-    if(open&&(globalThis.scrollY||0)>0)globalThis.scrollTo?.(0,0);if(open&&this.root.dataset.keyboardOpen!=='true')(globalThis.requestAnimationFrame||setTimeout)(()=>this.revealCursor());this.root.dataset.keyboardOpen=String(open);this.dismiss.hidden=!open;this.live.hidden=open||this.inputMode!=='direct';this.queueFit();};
-   if(globalThis.visualViewport){this.listen(visualViewport,'resize',viewport);this.listen(visualViewport,'scroll',viewport);}this.listen(globalThis,'resize',viewport);this.listen(globalThis,'orientationchange',viewport);this.listen(globalThis,'pagehide',()=>this.disconnect());
+   // 키보드 높이는 MkKeyboard가 프레임당 한 번 재서 셸을 줄인다. 여기서는 쓰기만 한다(측정·스크롤 보정 없음).
+   const viewport=inset=>{if(this.disposed)return;this.keyboardInset=inset;const open=inset>80;if(open&&this.root.dataset.keyboardOpen!=='true')(globalThis.requestAnimationFrame||setTimeout)(()=>this.revealCursor());this.root.dataset.keyboardOpen=String(open);this.dismiss.hidden=!open;this.live.hidden=open||this.inputMode!=='direct';this.queueFit();};
+   this.listen(this.abort.signal,'abort',MkKeyboard.subscribe(viewport));MkKeyboard.keepFocus(this.dock,this.abort.signal);this.listen(globalThis,'pagehide',()=>this.disconnect());
    // PTY는 데스크톱과 공유한다. 화면이 가려지면(잠금·앱 전환) 크기 소유를 놓아 데스크톱 크기로 돌리고, 다시 보이면 맞춘다.
-   this.listen(globalThis.document||globalThis,'visibilitychange',()=>this.guard(()=>this.syncVisibility()));this.listen(globalThis,'blur',()=>this.stopRepeat());viewport();
+   this.listen(globalThis.document||globalThis,'visibilitychange',()=>this.guard(()=>this.syncVisibility()));this.listen(globalThis,'blur',()=>this.stopRepeat());viewport(MkKeyboard.inset());
    if(globalThis.ResizeObserver){this.observer=new ResizeObserver(()=>{if(this.stick)this.scrollBottom();this.queueFit();});this.observer.observe(this.port);}
   }
   setFontScale(scale,notify=true){if(this.disposed)return;this.fontScale=snap(Number(scale)||1);this.fontSize=Math.max(6,Math.round(13*this.fontScale));this.cellWidth=8*this.fontSize/13;this.cellHeight=18*this.fontSize/13;this.historyElement.style.fontSize=`${this.fontSize}px`;this.historyElement.style.lineHeight=`${this.cellHeight}px`;
@@ -187,7 +206,8 @@ globalThis.MkTerminalCodec=(()=>{
   setVisible(visible){if(this.disposed)return Promise.resolve();this.visible=!!visible;return this.syncVisibility();}
   async syncVisibility(){const visible=this.isVisible(),version=this.visibilityVersion=(this.visibilityVersion||0)+1;clearTimeout(this.fitTimer);if(!visible){this.invalidateInput();clearTimeout(this.labelTimer);this.labelTimer=null;if(this.rafId)(globalThis.cancelAnimationFrame||clearTimeout)(this.rafId);this.rafId=0;this.full=true;}else this.schedule(true);if(!this.ready)return;if(this.resizePending)await this.resizePending.catch(()=>{});if(this.disposed||!this.ready||version!==this.visibilityVersion)return;if(!visible){await this.role(Uint8Array.from([0,2,0]));return;}if(this.autoFit&&!this.fit)await this.fitToPhone(true,false);else if(this.fit)await this.resize(true);}
   queueFit(){clearTimeout(this.fitTimer);if(!this.isVisible()||!this.fit||!this.ready||this.fitPending)return;this.fitTimer=setTimeout(()=>{if(this.resizePending)return this.queueFit();if(this.isVisible()&&this.fit&&this.ready&&!this.fitPending&&!this.disposed)this.guard(()=>this.resize());},150);}
-  atBottom(){const p=this.port;return !this.historyWindowed&&p.scrollHeight-p.scrollTop-p.clientHeight<(this.cellHeight||18);}
+  // 스크롤 이벤트는 정확히 바닥(1px 미만)일 때만 바닥 따라가기로 돌린다. 한 줄 여유를 주면 위로 막 끌기 시작한 손가락이 따라가기로 되돌아가, 그때 온 히스토리 응답이 화면을 바닥으로 끌어내린다.
+  atBottom(slack=this.cellHeight||18){const p=this.port;return !this.historyWindowed&&p.scrollHeight-p.scrollTop-p.clientHeight<slack;}
   returnToLive(){if(this.historyWindowed){this.resetHistory();this.guard(()=>this.loadHistory());}this.scrollBottom();}
   scrollBottom(){this.port.scrollTop=this.port.scrollHeight;this.stick=true;this.latestButton.hidden=true;}
   async open(){
@@ -242,7 +262,8 @@ globalThis.MkTerminalCodec=(()=>{
    refresh=refresh||this.historyEnd&&!this.historyRows.length&&this.historyLoadedVersion!==(this.historyVersion||0);
    if(this.historyEnd&&!refresh)return;
    this.historyReveal=reveal===true;this.historyControls.hidden=false;
-   if(refresh)this.historyReplacing=true;const req=++this.historyId,source=refresh?null:this.historySource,skip=refresh?0:this.historySkip;
+   // 새로고침은 이미 받은 행 수만큼 받아 캔버스 위 높이를 그대로 둔다. 손가락·관성 스크롤 중 scrollTop을 고치면 관성이 끊긴다.
+   if(refresh){this.historyReplacing=true;count=Math.min(1000,Math.max(count,this.historyRows.length));}const req=++this.historyId,source=refresh?null:this.historySource,skip=refresh?0:this.historySkip;
    this.historyPending={req,source,skip,refresh,replace:this.historyReplacing,started:globalThis.performance?.now?.()??Date.now(),version:this.historyVersion||0};this.historyButton.disabled=true;this.historyStatus.textContent=translate('Loading earlier output…');
    this.send(0x12,C.concat(T.v(req),source===null?T.v(0):C.concat(T.v(1),T.v(source)),T.v(skip),T.v(count)));
   }
@@ -263,7 +284,7 @@ globalThis.MkTerminalCodec=(()=>{
    // Already-visible rows keep their DOM, selection and layout. Only new rows are built.
    if(pending.replace)this.historyElement.replaceChildren(...added);else this.historyElement.prepend(...added);
    while(this.historyElement.children.length>1000)this.historyElement.children[this.historyElement.children.length-1].remove();
-   if(following&&!this.historyReveal&&!this.historyWindowed)this.scrollBottom();else{const moved=!pending.replace&&anchor!=null?this.historyElement.children[reply.rows.length]?.getBoundingClientRect?.().top-anchor:null;this.port.scrollTop+=moved??(this.historyWindowed?reply.rows.length*this.cellHeight:(this.canvas.offsetTop??this.port.scrollHeight)-before);}
+   if(following&&!this.historyReveal&&!this.historyWindowed)this.scrollBottom();else{const moved=!pending.replace&&anchor!=null?this.historyElement.children[reply.rows.length]?.getBoundingClientRect?.().top-anchor:null,delta=moved??(this.historyWindowed?reply.rows.length*this.cellHeight:(this.canvas.offsetTop??this.port.scrollHeight)-before);if(delta)this.port.scrollTop+=delta;}
    this.historyButton.disabled=this.historyEnd;this.historyStatus.textContent=translate(this.historyEnd?'Beginning of saved output':'Scroll up for earlier output');
    if(this.historyEnd&&!this.historyRows.length)this.historyControls.hidden=true;
    if(this.historyReveal){this.historyReveal=false;this.port.scrollTop=0;this.stick=false;}

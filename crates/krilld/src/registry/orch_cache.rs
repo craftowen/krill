@@ -31,3 +31,24 @@ impl Cache {
         Ok(store)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cache, ORCH_FILE, OrchestrationStore};
+    #[test]
+    fn snapshots_see_external_atomic_replacement_and_deletion() {
+        let dir = std::env::temp_dir().join(format!("orch-revision-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = Cache::default();
+        let mut store = OrchestrationStore::default();
+        store.create_run("first", None).unwrap();
+        store.save(&dir).unwrap();
+        assert_eq!(cache.load(&dir).unwrap().runs.len(), 1);
+        store.create_run("other", None).unwrap();
+        store.save(&dir).unwrap();
+        assert_eq!(cache.load(&dir).unwrap().runs.len(), 2);
+        std::fs::remove_file(dir.join(ORCH_FILE)).unwrap();
+        assert!(cache.load(&dir).unwrap().runs.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

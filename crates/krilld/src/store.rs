@@ -22,7 +22,9 @@ pub(crate) mod archive;
 mod crypto;
 mod privacy;
 mod recorder;
+pub(crate) mod replay_gate;
 mod segment;
+pub(crate) mod stable;
 
 pub use recorder::Recorder;
 
@@ -132,6 +134,7 @@ pub struct Store {
     generation: AtomicU64,
     /// 생성·rename만 직렬화한다. 압축·열린 파일 쓰기·재귀 삭제는 이 잠금 밖이다.
     gate: Mutex<()>,
+    history_publication: RwLock<()>,
     limits: Limits,
     bucket: Mutex<Bucket>,
     written: AtomicU64,
@@ -195,6 +198,7 @@ impl Store {
             key,
             generation: AtomicU64::new(0),
             gate: Mutex::new(()),
+            history_publication: RwLock::new(()),
             bucket: Mutex::new(Bucket {
                 scaled: u128::from(limits.burst) * MINUTE_NS,
                 at: Instant::now(),
@@ -247,6 +251,10 @@ impl Store {
     /// 세션 `id`의 콜드 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 세그먼트 파일은 지우지 않고 기준선 이전 원본에서 밀려난 행만 히스토리 응답에서 제외한다.
     pub fn clear_scrollback(&self, id: SessionId, seq: u64) {
+        let _publication = self
+            .history_publication
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let pause = self.record_guard();
         let _gate = lock(&self.gate);
         let generation = self.generation.load(Ordering::Acquire);
@@ -818,53 +826,90 @@ impl History {
         }))
     }
 
-    /// One forward replay per contiguous run. Raw parser state, including incomplete
-    /// UTF-8/control sequences and synchronized output, carries across segment boundaries.
+    /// Read each segment once, with bounded canonical and harvesting replay views.
+    /// The canonical view never loses history needed by a later resize/reflow; the
+    /// harvesting view keeps its raw parser but rebases terminal state at each page.
+    /// Production callers hold a shared `replay_gate` permit; this method does not
+    /// acquire again so snapshot validation and index construction can share that scope.
     pub(crate) fn visit_until(
         &self,
         limit_seq: u64,
         cancelled: &dyn Fn() -> bool,
         mut visitor: impl FnMut(usize, HistoryEvent),
     ) {
-        if limit_seq <= self.cleared_seq {
+        if limit_seq <= self.cleared_seq || self.is_empty() {
             return;
         }
         let look = no_theme();
-        let mut engine: Option<Engine> = None;
+        let mut canonical: Option<Engine> = None;
+        let mut harvested: Option<Engine> = None;
         let mut previous_end = None;
-        for page in 0..self.len() {
+        let mut parser_reset = false;
+        // Cleared pages still contain parser state needed by the first visible page.
+        // Warm that prefix once in forward order too, instead of rereading it twice.
+        for raw_i in 0..self.segs.len() {
             if cancelled() {
                 return;
             }
-            let raw_i = self.first_page + page;
+            let page = raw_i.checked_sub(self.first_page);
             let seg = match self.read_raw(raw_i) {
                 Ok(seg) => seg,
                 Err(error) => {
-                    engine = None;
+                    canonical = None;
+                    harvested = None;
                     previous_end = None;
-                    visitor(page, HistoryEvent::End(Err(error)));
+                    if let Some(page) = page {
+                        visitor(page, HistoryEvent::End(Err(error)));
+                    }
                     continue;
                 }
             };
             if seg.header.start_seq >= limit_seq {
                 break;
             }
-            if previous_end != Some(seg.header.start_seq) || seg.header.base == Base::Start {
-                engine = self.warm_checked(raw_i, &seg, &look, cancelled).ok();
+            let new_run =
+                previous_end != Some(seg.header.start_seq) || seg.header.base == Base::Start;
+            if new_run {
+                let start = || {
+                    if cancelled() {
+                        return None;
+                    }
+                    Some(if seg.header.base == Base::Start {
+                        Engine::new(seg.header.size)
+                    } else {
+                        keyframe_engine(&seg, &look).unwrap_or_else(|| Engine::new(seg.header.size))
+                    })
+                };
+                canonical = start();
+                harvested = start();
+            } else if parser_reset {
+                // A parser panic can reset only one view. Rebuild that exceptional
+                // prefix once; ordinary resize/alt/sync histories never use this path.
+                harvested = self.warm_checked(raw_i, &seg, &look, cancelled).ok();
             }
-            let Some(current) = engine.as_mut() else {
+            let (Some(raw), Some(view)) = (canonical.as_mut(), harvested.as_mut()) else {
                 return;
             };
-            current.resize(seg.header.size);
+            raw.resize(seg.header.size);
             if seg.header.start_seq <= self.cleared_seq {
-                current.clear_history();
+                raw.clear_history();
             }
-            current.take_history();
-            let (gaps, end_seq) = replay_harvest_cancelled(
-                current,
+            if page.is_some() {
+                view.rebase_replay(raw);
+                view.clear_history();
+            } else {
+                view.resize(seg.header.size);
+                if seg.header.start_seq <= self.cleared_seq {
+                    view.clear_history();
+                }
+            }
+            // Same raw bytes, sizes, feed boundaries and explicit Gap handling in both
+            // views. No disk reread and no ANSI snapshot masquerading as parser state.
+            let (_, _, raw_reset) = replay_harvest_report(
+                raw,
                 &seg,
                 &look,
-                Some(&mut |batch| visitor(page, HistoryEvent::Rows(batch))),
+                None,
                 Some(limit_seq),
                 self.cleared_seq,
                 cancelled,
@@ -872,8 +917,34 @@ impl History {
             if cancelled() {
                 return;
             }
+            let (gaps, end_seq, view_reset) = match page {
+                Some(page) => replay_harvest_report(
+                    view,
+                    &seg,
+                    &look,
+                    Some(&mut |batch| visitor(page, HistoryEvent::Rows(batch))),
+                    Some(limit_seq),
+                    self.cleared_seq,
+                    cancelled,
+                ),
+                None => replay_harvest_report(
+                    view,
+                    &seg,
+                    &look,
+                    None,
+                    Some(limit_seq),
+                    self.cleared_seq,
+                    cancelled,
+                ),
+            };
+            if cancelled() {
+                return;
+            }
+            parser_reset = raw_reset || view_reset;
             previous_end = Some(end_seq);
-            if end_seq > self.cleared_seq {
+            if let Some(page) = page
+                && end_seq > self.cleared_seq
+            {
                 visitor(
                     page,
                     HistoryEvent::End(Ok(Page {
@@ -905,6 +976,8 @@ impl History {
     }
 
     fn read_raw(&self, raw_i: usize) -> io::Result<Segment> {
+        #[cfg(all(test, unix))]
+        tests::note_raw_read();
         let path = self
             .segs
             .get(raw_i)
@@ -1053,12 +1126,34 @@ fn replay_harvest_cancelled(
     engine: &mut Engine,
     seg: &Segment,
     look: &Appearance,
-    mut harvest: Option<&mut dyn FnMut(Vec<Vec<Cell>>)>,
+    harvest: Option<&mut dyn FnMut(Vec<Vec<Cell>>)>,
     limit_seq: Option<u64>,
     cleared_seq: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> (Vec<Gap>, u64) {
+    let (gaps, end, _) = replay_harvest_report(
+        engine,
+        seg,
+        look,
+        harvest,
+        limit_seq,
+        cleared_seq,
+        cancelled,
+    );
+    (gaps, end)
+}
+
+fn replay_harvest_report(
+    engine: &mut Engine,
+    seg: &Segment,
+    look: &Appearance,
+    mut harvest: Option<&mut dyn FnMut(Vec<Vec<Cell>>)>,
+    limit_seq: Option<u64>,
+    cleared_seq: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> (Vec<Gap>, u64, bool) {
     let mut gaps = Vec::new();
+    let mut parser_reset = false;
     let mut seq = seg.header.start_seq;
     let mut size = seg.header.size;
     let mut reap = |engine: &mut Engine| {
@@ -1088,19 +1183,20 @@ fn replay_harvest_cancelled(
                     .min(slice.len());
                 for part in slice.get(..pre).unwrap_or_default().chunks(REPLAY_STEP) {
                     if cancelled() {
-                        return (gaps, seq);
+                        return (gaps, seq, parser_reset);
                     }
                     let fed = panic::catch_unwind(AssertUnwindSafe(|| {
                         engine.feed(part, Feed::Replay, look);
                     }));
                     if fed.is_err() {
                         *engine = Engine::new(size);
+                        parser_reset = true;
                     }
                     engine.clear_history();
                 }
                 for part in slice.get(pre..).unwrap_or_default().chunks(REPLAY_STEP) {
                     if cancelled() {
-                        return (gaps, seq);
+                        return (gaps, seq, parser_reset);
                     }
                     // 라이브에서 panic한 바이트는 재생에서도 panic한다. 세션 리더와 같은 방식으로 엔진을 새로 만든다.
                     let fed = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1108,6 +1204,7 @@ fn replay_harvest_cancelled(
                     }));
                     if fed.is_err() {
                         *engine = Engine::new(size);
+                        parser_reset = true;
                     }
                     reap(engine);
                 }
@@ -1150,7 +1247,7 @@ fn replay_harvest_cancelled(
         }
         seq = seq.saturating_add(rec.seq_len());
     }
-    (gaps, seq)
+    (gaps, seq, parser_reset)
 }
 
 #[cfg(test)]

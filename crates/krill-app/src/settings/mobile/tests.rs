@@ -97,3 +97,30 @@ fn obsolete_pairing_result_cannot_replace_selection_or_finish_current_job() {
     assert_eq!(panel.mode, ConnectMode::Tailscale);
     assert!(panel.offer.is_some());
 }
+
+#[gpui::test]
+fn hidden_mobile_poll_skips_inventory_but_active_pairing_continues(cx: &mut gpui::TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    cx.update(gpui_component::init);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut view = SettingsView::new(cx);
+        view.visible = false;
+        view.tab = super::super::AdminTab::Mobile;
+        view.mobile = Panel::new(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            Err("fixture offline".into())
+        }));
+        view.mobile_poll(cx);
+        view
+    });
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(Duration::from_secs(3));
+    vcx.run_until_parked();
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    vcx.update(|_, cx| view.update(cx, |view, _| view.mobile.pairing = PairingState::Connecting));
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+}

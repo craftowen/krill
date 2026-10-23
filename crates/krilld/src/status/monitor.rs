@@ -90,7 +90,7 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             .detector
             .observe(title, screen, *rev, &status, Instant::now());
         if let Some(pid) = tap.foreground() {
-            let identity = crate::sys::start_us(pid).ok();
+            let mut identity = crate::sys::start_us(pid).ok();
             let name = if let Some((cached_pid, cached_start, at, name)) = &t.name
                 && *cached_pid == pid
                 && identity == Some(*cached_start)
@@ -99,6 +99,9 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                 name.clone()
             } else {
                 let name = crate::sys::process_name(pid).unwrap_or_default();
+                if crate::sys::start_us(pid).ok() != identity {
+                    identity = None;
+                }
                 t.name = identity.map(|start| (pid, start, Instant::now(), name.clone()));
                 name
             };

@@ -35,13 +35,18 @@ pub(crate) fn measure(
         Vec::new()
     };
     let children = children(&parents);
+    let mut footprints = HashMap::new();
     let sessions = sessions
         .iter()
         .map(|&(session, root)| {
             let tree = root.map(|r| tree(r, &children)).unwrap_or_default();
             let sizes: Vec<u64> = tree
                 .iter()
-                .filter_map(|&p| sys::footprint(p).ok())
+                .filter_map(|&p| {
+                    *footprints
+                        .entry(p)
+                        .or_insert_with(|| sys::footprint(p).ok())
+                })
                 .collect();
             SessionUsage {
                 session,
@@ -208,5 +213,22 @@ mod tests {
             .and_then(|t| t.split_whitespace().next())
             .unwrap_or_else(|| panic!("footprint output: {text}"));
         n.parse().unwrap()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cache_tests {
+    use super::*;
+    #[test]
+    fn disk_walk_does_not_follow_symlinks_outside_state() {
+        let root = std::env::temp_dir().join(format!("disk-no-follow-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("large"), vec![0; 100_000]).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(disk_usage(&root, MAX_DEPTH) < 100_000);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

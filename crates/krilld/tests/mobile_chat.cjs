@@ -18,7 +18,7 @@ const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 function fixture(options={}){
  const buttons=[],calls=[],sheets=[],errors=[],tasks=[],timers=new Map();let id=0,term=0;
  const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible'});
- const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{}};
+ const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
  const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:'ready'},drafts:new Map()};
  const root=new Element('root'),el=(...args)=>new Element(...args);
@@ -43,14 +43,32 @@ async function renderBudgets(){
  f.doc.hidden=true;f.doc.visibilityState='hidden';f.doc.dispatchEvent(new Event('visibilitychange'));assert.equal(f.timers.size,0);f.update();await flush();assert.equal(f.calls.length,initial+1);f.doc.hidden=false;f.doc.visibilityState='visible';f.doc.dispatchEvent(new Event('visibilitychange'));await flush();assert.equal(f.calls.length,initial+2,'document foreground catches up once');
  f.input('');assert(!f.state.drafts.has(7),'empty drafts do not pin session caches');f.dispose();
  const incremental=fixture();await flush();await incremental.poll({bound:true,generation:'g1',next_offset:500,items:Array.from({length:500},(_,i)=>({id:'i'+i,kind:'assistant',text:'Message '+i}))});const liveFeed=incremental.find('chat-feed');let reads=0;const original=liveFeed.children;Object.defineProperty(liveFeed,'children',{configurable:true,get(){reads++;return original;},set(value){original.splice(0,original.length,...value);}});await incremental.poll({bound:true,generation:'g1',next_offset:500,items:[]});assert.equal(reads,0,'live no-op poll does not traverse/reconcile existing feed children');await incremental.poll({bound:true,generation:'g1',next_offset:501,items:[{id:'append',kind:'assistant',text:'Append'}]});assert(reads<10,'append reconciliation only touches the appended node');incremental.dispose();
- const cache=fixture();await flush();cache.dispose();cache.state.chatCache.clear();for(let n=0;n<20;n++)cache.state.chatCache.set(n,{items:[],retainedBytes:100});cache.state.drafts.set(0,'unsent');cache.state.chatCache.get(1).photo={status:'ready'};cache.state.chatCache.get(2).sending=true;cache.state.chatCache.get(3).mounts=1;cache.M.chat.pruneCache(cache.state);assert.equal(cache.state.chatCache.size,8);for(const n of [0,1,2,3])assert(cache.state.chatCache.has(n));
- cache.state.chatCache.set(99,{retainedBytes:9*1024*1024});cache.M.chat.pruneCache(cache.state);assert(!cache.state.chatCache.has(99),'byte pressure removes inactive clean entries');for(const n of [0,1,2,3])assert(cache.state.chatCache.has(n));
+ const cache=fixture();await flush();cache.dispose();cache.state.chatCache.clear();for(let n=0;n<20;n++)cache.state.chatCache.set(n,{items:[],retainedBytes:100});cache.state.drafts.set(0,'unsent');cache.state.chatCache.get(1).photo={status:'ready'};cache.state.chatCache.get(2).sending=true;cache.state.chatCache.get(3).mounts=1;cache.state.chatCache.get(4).live={items:[],offset:1};cache.M.chat.pruneCache(cache.state);assert.equal(cache.state.chatCache.size,8);for(const n of [0,1,2,3,4])assert(cache.state.chatCache.has(n));
+ cache.state.chatCache.set(99,{retainedBytes:9*1024*1024});cache.M.chat.pruneCache(cache.state);assert(!cache.state.chatCache.has(99),'byte pressure removes inactive clean entries');for(const n of [0,1,2,3,4])assert(cache.state.chatCache.has(n));
  const pages=fixture();await flush();const server=unitServer(pages);for(let n=1;n<=2400;n++){server.total=n;pages.update();await flush();}assert(pages.entry.pages.length<=2048);assert.equal(pages.entry.items.length,1000);assert.equal(pages.entry.items[0].text,'Message 1400');pages.button('Load earlier messages').action();await flush();assert.equal(pages.entry.items[0].text,'Message 1399','pruned page metadata retains exact preceding byte boundary');
  const feed=pages.find('chat-feed'),nodes=feed.children.slice();let touched=0;const insert=feed.insertBefore.bind(feed);feed.insertBefore=(...args)=>{touched++;return insert(...args);};pages.update();await flush();assert.equal(touched,0,'paused/no-op update never reconciles feed children');assert.deepEqual(feed.children,nodes);pages.dispose();
+ const bounded=fixture();await flush();await bounded.poll({bound:true,generation:'g1',next_offset:100,items:Array.from({length:100},(_,i)=>({id:'b'+i,kind:'assistant',text:'x'.repeat(15000)}))});assert(bounded.entry.retainedBytes<=2*1024*1024);assert(bounded.entry.items.length<100);assert.equal(bounded.entry.items[0]._clipped,true,'byte-trim retains replay information for its partial page');bounded.dispose();
  const lazy=fixture();await flush();await lazy.poll({bound:true,generation:'g1',next_offset:1,items:[{id:'huge',kind:'reasoning',text:'reasoning line\n'.repeat(5000)}]});const details=lazy.find('chat-reasoning');assert.equal(details.children.length,1,'large closed reasoning only creates its summary');details.open=true;details.dispatchEvent(new Event('toggle'));assert.equal(details.children.length,2);details.open=false;details.dispatchEvent(new Event('toggle'));assert.equal(lazy.entry.disclosures.size,0);lazy.dispose();
  console.log('PASS render budgets: hidden poll 0, one catch-up, cache 8 with draft/photo/sending/active pins, pages <=2048, exact older boundary, lazy disclosure');
 }
+async function tailFollow(){
+ const observers=[];class RO{constructor(fn){this.fn=fn;this.targets=new Set();observers.push(this);}observe(n){this.targets.add(n);}unobserve(n){this.targets.delete(n);}disconnect(){this.targets.clear();}}
+ const page=(from,to)=>({generation:'g1',agent:'claude',bound:true,page_start:0,next_offset:to,items:Array.from({length:to-from},(_,i)=>({id:'t'+(from+i),kind:'assistant',text:'Message '+(from+i)}))});
+ const f=fixture({ResizeObserver:RO});await flush();await f.poll(page(0,30));f.dispose();
+ // A cached transcript paints at the tail synchronously, before the reopen poll answers.
+ const reopen=deferred();f.handler=()=>reopen.promise;f.remount();const feed=f.find('chat-feed'),ro=observers.at(-1);assert.equal(feed.children.length,30);assert.equal(feed.scrollTop,feed.scrollHeight,'first chat render is already at the latest message');
+ assert(ro.targets.has(feed)&&ro.targets.has(feed.children.at(-1)),'feed and rendered cards are observed for late layout');
+ Object.defineProperty(feed,'scrollHeight',{value:5000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,5000,'late code/image/disclosure growth keeps a following reader at the bottom');delete feed.scrollHeight;
+ reopen.resolve(page(0,30));await flush();
+ feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));assert.equal(feed.scrollTop,2900,'scroll near the tail keeps following');
+ feed.scrollTop=400;feed.dispatchEvent(new Event('scroll'));Object.defineProperty(feed,'scrollHeight',{value:6000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,400,'late growth never drags a reader who scrolled up');delete feed.scrollHeight;
+ await f.poll(page(30,32));assert.equal(feed.children.length,32);assert.equal(feed.scrollTop,400,'new messages do not pull a reader who scrolled up');
+ feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));await f.poll(page(32,33));assert.equal(feed.scrollTop,feed.scrollHeight,'returning to the bottom resumes following');
+ f.dispose();assert.equal(ro.targets.size,0,'unmount disconnects the observer');
+ console.log('PASS chat tail: cached first render at bottom, ResizeObserver re-pin while following, scrolled-up reader kept in place, bottom resumes');
+}
 async function main(){
+ await tailFollow();
  await renderBudgets();
  const cold=deferred(),recent=Array.from({length:128},(_,i)=>({id:`872:${i}`,kind:'assistant',text:`Message ${872+i}`}));
  let now=Date.now();const chatClock=class extends Date{static now(){return now;}};
@@ -72,6 +90,7 @@ async function main(){
  warm.setVisible(false);now+=5000;
  warm.handler=async()=>({generation:'g1',bound:true,page_start:9872,next_offset:10000,items:[{id:'9872:0',kind:'assistant',text:'Message 9999'}]});
  warm.setVisible(true);await flush();assert.equal(warm.calls.at(-1).latest,true,'after a long stay in Term, skip the backlog in one tail request');assert.equal(warm.entry.items.at(-1).text,'Message 9999');
+ const unchangedTail=preparedFeed.children.at(-1);warm.setVisible(false);now+=5000;warm.setVisible(true);await flush();assert.equal(preparedFeed.children.at(-1),unchangedTail,'an unchanged tail refresh keeps the existing message nodes');
  warm.dispose();
  console.log('PASS first response opens at latest, hidden prefetch survives mode flips, backward paging anchors and explicit latest pins');
  await historyRace();

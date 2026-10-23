@@ -67,6 +67,8 @@ pub const FEAT_GIT_CHANGES: u64 = 1 << 6;
 pub const FEAT_CLI: u64 = 1 << 10;
 /// 세션 상태·원본 출력 정지 시간 조회(MK-047). `FEAT_CONTROL`과 함께 협상한다.
 pub const FEAT_WAIT_STATUS: u64 = 1 << 11;
+/// Read-only plain capture with an unchanged stamp; requires `FEAT_CLI` and `FEAT_CONTROL`.
+pub const FEAT_CAPTURE_SINCE: u64 = 1 << 23;
 /// MK-046 repository/worktree metadata, Request 10 / Reply 14.
 pub const FEAT_SIDEBAR: u64 = 1 << 14;
 /// 에이전트 전역 권한·프로필과 세션별 실행 권한 조회(OWE-488). 기존 Create는 그대로 쓴다.
@@ -232,6 +234,12 @@ pub enum Request {
     },
     /// 멀티에이전트 오케스트레이션 제어·대기 요청(MK-227).
     Orchestration(crate::orchestration::OrchAction),
+    /// Appended extension: a stamp is scoped to this session and daemon incarnation.
+    /// An equal stamp avoids screen composition/encoding. It is not a raw replay cursor.
+    CaptureSince {
+        session: SessionId,
+        since: Option<CaptureStamp>,
+    },
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -877,6 +885,39 @@ pub enum Reply {
     InputSent,
     /// 멀티에이전트 오케스트레이션 응답(MK-227).
     Orchestration(crate::orchestration::OrchResponse),
+    /// `None` means unchanged, including an empty screen after a previous changed reply.
+    CaptureSince {
+        stamp: CaptureStamp,
+        #[serde(deserialize_with = "optional_capture_bytes")]
+        bytes: Option<Vec<u8>>,
+    },
+}
+
+/// Only meaningful in one negotiated daemon incarnation; includes session to prevent cross-scope reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureStamp {
+    pub session: SessionId,
+    pub revision: crate::screen::Revision,
+    pub seq: crate::screen::Seq,
+}
+
+fn optional_capture_bytes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<u8>>, D::Error> {
+    struct Optional;
+    impl<'de> serde::de::Visitor<'de> for Optional {
+        type Value = Option<Vec<u8>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("optional bounded plain capture")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            capture_bytes(d).map(Some)
+        }
+    }
+    d.deserialize_option(Optional)
 }
 
 /// 프로세스가 사라진 세션의 마지막 화면과 스크롤백(디스크 세그먼트 재생, 읽기 전용). 필드는 끝에만 붙인다.

@@ -1,4 +1,3 @@
-use std::io::Read as _;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::Command;
@@ -1642,5 +1641,193 @@ mod rename_mode {
         ] {
             assert_eq!(read(&install, rel).as_deref(), Some("new"), "{rel}");
         }
+    }
+}
+
+#[test]
+fn archive_file_hash_streams_and_checks_size_before_publish() {
+    let dir = TempGuard(temp_dir("stream-hash"));
+    let path = dir.0.join("archive");
+    let bytes = vec![17_u8; 3 * 65536 + 7];
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(archive_sha(&path).unwrap(), sha256_hex(&bytes));
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(u64::try_from(MAX_ARCHIVE_BYTES).unwrap() + 1)
+        .unwrap();
+    assert!(archive_sha(&path).is_err());
+}
+
+#[test]
+fn streamed_download_creates_private_file_without_archive_vec() {
+    let dir = TempGuard(temp_dir("stream-download"));
+    let path = dir.0.join("download.zip");
+    stream_download(
+        Command::new("/bin/sh").args(["-c", "printf 'archive-bytes'"]),
+        &path,
+    )
+    .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"archive-bytes");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // create_new refuses to follow/overwrite an earlier destination.
+    assert!(
+        stream_download(
+            Command::new("/bin/sh").args(["-c", "printf overwrite"]),
+            &path
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"archive-bytes");
+}
+
+#[test]
+fn update_single_flight_reuses_inflight_success_and_releases_after_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = TempGuard(temp_dir("flight"));
+    let key = directory.0.display().to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (started, ready) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let owner_key = key.clone();
+    let owner_calls = calls.clone();
+    let owner = thread::spawn(move || {
+        single_flight(&owner_key, || {
+            owner_calls.fetch_add(1, Ordering::Relaxed);
+            started.send(()).unwrap();
+            held.recv().unwrap();
+            Ok(CheckStatus::UpToDate {
+                version: "1.0.0".into(),
+            })
+        })
+    });
+    ready.recv().unwrap();
+    let waiting_calls = calls.clone();
+    let (entered, at_flight) = std::sync::mpsc::channel();
+    let waiting_key = key.clone();
+    let waiter = thread::spawn(move || {
+        entered.send(()).unwrap();
+        single_flight(&waiting_key, || {
+            waiting_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(CheckStatus::UpToDate {
+                version: "1.0.0".into(),
+            })
+        })
+    });
+    at_flight.recv().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while flight_registry()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .waiters
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "waiter did not reach the shared flight"
+        );
+        thread::yield_now();
+    }
+    release.send(()).unwrap();
+    assert_eq!(
+        owner.join().unwrap().unwrap(),
+        waiter.join().unwrap().unwrap()
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(single_flight(&key, || Err(Error::BadSignature)).is_err());
+    assert!(
+        single_flight(&key, || Ok(CheckStatus::UpToDate {
+            version: "1.0.0".into()
+        }))
+        .is_ok()
+    );
+}
+
+#[test]
+fn completed_flight_waiter_keeps_its_result_when_next_owner_starts() {
+    let directory = TempGuard(temp_dir("flight-generations"));
+    let key = directory.0.display().to_string();
+    let (first, owner) = update_flight(&key);
+    assert!(owner);
+    let (waiting, owner) = update_flight(&key);
+    assert!(!owner);
+    {
+        let mut state = first.state.lock().unwrap();
+        state.result = Some(Ok(CheckStatus::UpToDate {
+            version: "first".into(),
+        }));
+        state.running = false;
+    }
+    let (next, owner) = update_flight(&key);
+    assert!(owner);
+    assert!(!Arc::ptr_eq(&next, &waiting));
+    assert_eq!(
+        await_flight(&waiting).unwrap(),
+        CheckStatus::UpToDate {
+            version: "first".into()
+        }
+    );
+    {
+        let mut state = next.state.lock().unwrap();
+        state.running = false;
+        state.result = Some(Err(Error::BadSignature));
+    }
+    assert!(matches!(await_flight(&next), Err(Error::BadSignature)));
+    assert_eq!(
+        await_flight(&waiting).unwrap(),
+        CheckStatus::UpToDate {
+            version: "first".into()
+        }
+    );
+}
+
+#[test]
+fn interrupted_stage_publication_restores_previous_or_finishes_verified_incoming() {
+    for phase in ["prepared", "moved-old", "published", "initial"] {
+        let dir = TempGuard(temp_dir(&format!("stage-publish-{phase}")));
+        let bundle = dir.0.join("Krill.app");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("installed"), "untouched").unwrap();
+        let staging = staging_path(&bundle);
+        let backup = append_ext(&bundle, "staging.previous");
+        let incoming = append_ext(&bundle, "staging.incoming");
+        if phase != "initial" {
+            fs::create_dir_all(&staging).unwrap();
+            fs::write(staging.join("version"), "old").unwrap();
+        }
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("version"), "new").unwrap();
+        write_stage_marker(&bundle).unwrap();
+        if matches!(phase, "moved-old" | "published") {
+            fs::rename(&staging, &backup).unwrap();
+        }
+        if phase == "published" {
+            fs::rename(&incoming, &staging).unwrap();
+        }
+        recover_stage_publish_locked(&bundle).unwrap();
+        assert_eq!(
+            fs::read_to_string(staging.join("version")).unwrap(),
+            if matches!(phase, "published" | "initial") {
+                "new"
+            } else {
+                "old"
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(bundle.join("installed")).unwrap(),
+            "untouched"
+        );
+        assert!(!append_ext(&bundle, "stage-publish").exists());
+        assert!(!backup.exists());
+        assert!(!incoming.exists());
     }
 }

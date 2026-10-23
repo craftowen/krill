@@ -70,7 +70,11 @@ impl CliRunner {
             if let Some(dir) = &state_dir {
                 cmd.env("KRILL_STATE_DIR", dir);
             }
-            let output = cmd.output()?;
+            let output = super::child::output(
+                &mut cmd,
+                std::time::Duration::from_secs(120),
+                4 * 1024 * 1024,
+            )?;
             // `cleanup`은 일부 삭제 실패 시 비0으로 끝나도 JSON 요약을 출력한다.
             if !output.stdout.is_empty() {
                 return Ok(output.stdout);

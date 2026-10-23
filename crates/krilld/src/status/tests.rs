@@ -696,6 +696,25 @@ fn foreground_process_distinguishes_root_shell_and_child_command() {
     assert!(resolved.is_some_and(|name| !name.is_empty()));
 }
 
+#[test]
+fn status_reads_continue_while_a_durable_writer_is_serialized() {
+    let statuses = std::sync::Arc::new(Statuses::open(None));
+    statuses
+        .hook(&[(
+            S1,
+            &event(1, 10, "codex", r#"{"hook_event_name":"UserPromptSubmit"}"#),
+        )])
+        .unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let writer = lock(&statuses.commit);
+    let reader = std::sync::Arc::clone(&statuses);
+    let thread = std::thread::spawn(move || sent.send(reader.get(S1)).unwrap());
+    let observed = received.recv_timeout(Duration::from_secs(1));
+    drop(writer);
+    thread.join().unwrap();
+    assert_eq!(observed.unwrap().state, AgentState::Working);
+}
+
 /// 네이티브 설치 Claude Code(`…/claude/versions/<버전>`)는 짧은 이름이 버전 번호라도 `claude`다.
 #[cfg(unix)]
 #[test]

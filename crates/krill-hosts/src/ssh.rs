@@ -324,12 +324,12 @@ fn query_remote_home_with_program(
         Duration::from_secs(30),
     )?;
     #[cfg(unix)]
-    let out = Command::new(ssh_bin)
-        .args(opts.remote_home_args())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let out = crate::managed::run_piped_ssh_with_timeout(
+        ssh_bin,
+        &opts.remote_home_args(),
+        None,
+        Duration::from_secs(30),
+    )?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let detail = stderr.trim();
@@ -426,7 +426,7 @@ pub fn machine_key(destination: &str, port: Option<u16>) -> String {
     {
         return value.clone();
     }
-    let value = machine_key_uncached(destination, port);
+    let value = machine_key_with_program(destination, port, &ssh_program());
     if let Ok(mut cache) = MACHINE_KEYS.lock() {
         cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
         cache.insert(key, (Instant::now(), mtime, value.clone()));
@@ -434,7 +434,11 @@ pub fn machine_key(destination: &str, port: Option<u16>) -> String {
     value
 }
 
-fn machine_key_uncached(destination: &str, port: Option<u16>) -> String {
+fn machine_key_with_program(
+    destination: &str,
+    port: Option<u16>,
+    program: &std::ffi::OsStr,
+) -> String {
     let fallback = || match port {
         Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
         None => destination.to_ascii_lowercase(),
@@ -448,13 +452,10 @@ fn machine_key_uncached(destination: &str, port: Option<u16>) -> String {
     }
     args.push(destination.to_owned());
     #[cfg(windows)]
-    let out = windows::stdio::output(&ssh_program(), &args, None, Duration::from_secs(5));
+    let out = windows::stdio::output(program, &args, None, Duration::from_secs(5));
     #[cfg(unix)]
-    let out = Command::new(ssh_program())
-        .args(&args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    let out =
+        crate::managed::run_piped_ssh_with_timeout(program, &args, None, Duration::from_secs(5));
     match out {
         Ok(o) if o.status.success() => {
             machine_key_from_config(&String::from_utf8_lossy(&o.stdout)).unwrap_or_else(fallback)

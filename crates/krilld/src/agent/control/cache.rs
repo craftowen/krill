@@ -1,5 +1,5 @@
 //! Metadata identities for atomic file replacement and same-size in-place edits.
-use super::{Path, RulesPayload, fs};
+use super::{Arc, Path, RulesPayload, fs};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::time::SystemTime;
@@ -27,5 +27,5 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
 #[derive(Debug)]
 pub(super) struct Signed {
     pub stamps: (Option<Stamp>, Option<Stamp>),
-    pub payload: Option<RulesPayload>,
+    pub payload: Option<Arc<RulesPayload>>,
 }

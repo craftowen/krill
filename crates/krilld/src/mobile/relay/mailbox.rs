@@ -24,7 +24,19 @@ pub(super) struct Mailbox<T> {
     item_limit: usize,
 }
 
+pub(super) struct CloseGuard<'a, T>(&'a Mailbox<T>);
+
+impl<T> Drop for CloseGuard<'_, T> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 impl<T> Mailbox<T> {
+    pub(super) fn close_guard(&self) -> CloseGuard<'_, T> {
+        CloseGuard(self)
+    }
+
     pub(super) fn new(byte_limit: usize, peer_limit: usize, item_limit: usize) -> Self {
         Self {
             state: Mutex::new(State {
@@ -150,6 +162,24 @@ impl<T> Mailbox<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn early_worker_exit_closes_mailbox_even_when_a_session_retains_it() {
+        let queue = std::sync::Arc::new(Mailbox::new(8, 8, 2));
+        let session = queue.clone();
+        queue.send(0, vec![1], 1).unwrap();
+        let worker = std::thread::spawn(move || {
+            let _close = queue.close_guard();
+            // Authentication can fail before creating the normal output reader.
+            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(worker.join().unwrap().is_err());
+        assert!(session.is_closed());
+        assert!(session.is_empty());
+        assert!(matches!(
+            session.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
     #[test]
     fn budgets_are_nonblocking_and_connections_are_fair() {
         let queue = Mailbox::new(8, 6, 4);

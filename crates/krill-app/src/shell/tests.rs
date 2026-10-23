@@ -120,7 +120,7 @@ fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
 pub(super) fn layout_of(view: &Entity<Shell>, cx: &mut VisualTestContext) -> Layout {
     cx.run_until_parked();
     cx.update(|_, cx| {
-        view.read(cx).saver.flush();
+        view.read(cx).flush_layout();
         view.read(cx).layout.clone()
     })
 }
@@ -3331,19 +3331,30 @@ fn stalled_pane_shows_banner_until_ack(cx: &mut TestAppContext) {
     std::thread::sleep(PROBE + std::time::Duration::from_millis(200));
     assert!(cx.update(|_, cx| view.read(cx).stalled_banner()).is_some());
     // ack가 오면 배너가 사라진다(SIGCONT 뒤 복구).
-    let (k, body) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
-    let id = Input::decode(k, &body).unwrap().id;
+    let id = loop {
+        let (kind, body) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
+        if kind != Input::KIND {
+            continue;
+        }
+        let input = Input::decode(kind, &body).unwrap();
+        // Focus/resize reports share the ID sequence, but ACKing those must
+        // not settle the real Enter key journal entry.
+        if input.bytes == b"\r" {
+            break input.id;
+        }
+    };
     let ack = InputAck {
         id,
         result: InputResult::Applied,
     };
     let encoded = ack.encode().unwrap();
-    let (kind, body) = krill_proto::ipc::read_frame(&mut &encoded[..])
+    let (ack_kind, body) = krill_proto::ipc::read_frame(&mut encoded.as_slice())
         .unwrap()
         .unwrap();
+    assert_eq!(ack_kind, InputAck::KIND);
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            assert!(s.on_frame(pane, kind, &body, cx));
+            assert!(s.on_frame(pane, ack_kind, &body, cx));
             assert_eq!(s.stalled_banner(), None);
         });
     });
@@ -3358,7 +3369,7 @@ fn unchanged_focus_does_not_save_and_focus_changes_are_coalesced(cx: &mut TestAp
         for _ in 0..10 {
             s.change(true, cx, |layout| layout.focus(pane));
         }
-        s.saver.flush();
+        s.flush_layout();
         assert!(
             !path.exists(),
             "unchanged focus must not create a layout file"
@@ -3367,7 +3378,7 @@ fn unchanged_focus_does_not_save_and_focus_changes_are_coalesced(cx: &mut TestAp
         let other = s.layout.active_tab().focused;
         s.change(true, cx, |layout| layout.focus(pane));
         s.change(true, cx, |layout| layout.focus(other));
-        s.saver.flush();
+        s.flush_layout();
         assert_eq!(Layout::load(&path).unwrap(), s.layout);
     });
 }
@@ -3906,13 +3917,14 @@ fn status_bar_keeps_provider_controls_left_and_session_tools_right(cx: &mut Test
                     seven_day: None,
                 },
             };
-            shell.accounts_snapshot = krill_proto::usage::AccountsSnapshot {
+            shell.accounts_snapshot = (krill_proto::usage::AccountsSnapshot {
                 accounts: vec![
                     account(ProviderKind::Claude, "host", true, Some(7)),
                     account(ProviderKind::Codex, "codex-main", true, None),
                 ],
                 ..Default::default()
-            };
+            })
+            .into();
         });
     });
     cx.simulate_resize(gpui::size(px(1800.), px(900.)));
@@ -5475,7 +5487,7 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
     cx.run_until_parked();
     cx.update(|_, cx| {
         view.update(cx, |shell, cx| {
-            shell.accounts_snapshot = AccountsSnapshot {
+            shell.accounts_snapshot = (AccountsSnapshot {
                 accounts: vec![
                     AccountInfo {
                         id: "claude-orca-cache-only".into(),
@@ -5548,7 +5560,8 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
                 advanced: krill_proto::usage::AccountPolicyState::default(),
                 connections: Box::default(),
                 details: Box::default(),
-            };
+            })
+            .into();
             cx.notify();
         });
     });
@@ -5675,7 +5688,7 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
     };
     cx.update(|_, cx| {
         view.update(cx, |shell, cx| {
-            shell.accounts_snapshot = with_credits("2");
+            shell.accounts_snapshot = (with_credits("2")).into();
             cx.notify();
         });
     });
@@ -5739,7 +5752,7 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
     cx.update(|_, cx| {
         view.update(cx, |shell, cx| {
             shell.notice = None;
-            shell.accounts_snapshot = with_credits("0");
+            shell.accounts_snapshot = (with_credits("0")).into();
             cx.notify();
         });
     });
@@ -5897,11 +5910,10 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(layout_of(&view, cx).tabs().is_empty());
 }
 
-/// 사이드바 상단은 구현된 대시보드·아티팩트만 표시한다.
-/// 아티팩트 탐색·복귀는 별도 라이브러리 탐색 검사에서 확인한다.
+/// 구현된 아티팩트 목록·에이전트 대시보드·모바일을 표시하고 없는 기능은 표기하지 않는다.
 #[gpui::test]
 fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
-    let (_view, cx) = open(cx, state_path("sidebar-nav-items"));
+    let (view, cx) = open(cx, state_path("sidebar-nav-items"));
     cx.run_until_parked();
 
     assert!(
@@ -5909,12 +5921,45 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
         "implemented Agent Dashboard nav item must be rendered"
     );
     assert!(cx.debug_bounds("nav-artifacts").is_some());
-    for unimplemented in ["nav-tasks", "nav-skills", "nav-automations", "nav-mobile"] {
+    for unimplemented in ["nav-tasks", "nav-skills", "nav-automations"] {
         assert!(
             cx.debug_bounds(unimplemented).is_none(),
             "unimplemented sidebar nav item {unimplemented} must not be rendered"
         );
     }
+
+    // 'Krill 모바일'은 사이드바를 둔 채 본문에 모바일 페이지를 연다.
+    let mobile = cx.debug_bounds("nav-mobile").unwrap();
+    cx.simulate_click(mobile.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_some());
+    assert!(cx.debug_bounds("mobile-page-phone").is_some());
+    assert!(cx.debug_bounds("sidebar-column").is_some());
+    assert!(cx.debug_bounds("admin-sidebar").is_none());
+    cx.update(|_, cx| {
+        let settings = view.read(cx).settings.clone().unwrap();
+        assert_eq!(
+            settings.read(cx).tab(),
+            krill_app::settings::AdminTab::Mobile
+        );
+        assert!(settings.read(cx).mobile_page());
+    });
+
+    // '기기 관리'는 전체 설정의 모바일 탭으로 넘어간다.
+    let manage = cx.debug_bounds("mobile-page-manage").unwrap();
+    cx.simulate_click(manage.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_none());
+    assert!(cx.debug_bounds("admin-section-mobile").is_some());
+
+    // 다시 페이지로 열고 닫기 버튼으로 워크스페이스에 돌아온다.
+    cx.update(|window, cx| view.update(cx, |s, cx| s.open_mobile_page(Some(window), cx)));
+    cx.run_until_parked();
+    let close = cx.debug_bounds("mobile-page-close").unwrap();
+    cx.simulate_click(close.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_none());
+    cx.update(|_, cx| assert!(view.read(cx).settings.is_none()));
 }
 
 #[gpui::test]
@@ -6931,7 +6976,7 @@ fn new_session_menu_keeps_shortcut_with_single_account_and_applies_launch_host_f
             snap.advanced.supported = true;
             snap.accounts
                 .push(account("claude-default", "Host (.claude)", true, true));
-            s.accounts_snapshot = snap;
+            s.accounts_snapshot = (snap).into();
             cx.notify();
         });
         window.draw(cx).clear(cx);
@@ -7176,7 +7221,7 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
         })
     });
     cx.run_until_parked();
-    cx.update(|_, cx| view.read(cx).saver.flush());
+    cx.update(|_, cx| view.read(cx).flush_layout());
 
     assert_eq!(Layout::peek_window_bounds(&path), Some(bounds_full));
 
@@ -9011,4 +9056,60 @@ fn add_project_offers_connected_hosts(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("add-project-host-local").is_some());
     assert!(cx.debug_bounds("add-project-host-studio").is_some());
+}
+
+#[gpui::test]
+fn persistence_burst_builds_one_snapshot_after_last_ui_request(cx: &mut TestAppContext) {
+    let path = state_path("ui-layout-debounce");
+    let (view, cx) = open(cx, path.clone());
+    let before = view.update(cx, |shell, _| {
+        shell.flush_layout();
+        let before = shell.layout_save_requests.snapshots();
+        for width in 220_u16..300 {
+            shell.layout.sidebar_width = f32::from(width);
+            shell.save();
+        }
+        assert_eq!(shell.layout_save_requests.snapshots(), before);
+        before
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(persist::DELAY / 2);
+    cx.run_until_parked();
+    let bounds = layout::SavedWindowBounds {
+        x: 71.,
+        y: 83.,
+        width: 1200.,
+        height: 800.,
+        mode: layout::SavedWindowMode::Maximized,
+    };
+    view.update(cx, |shell, _| {
+        for width in 300_u16..380 {
+            shell.layout.panel_width = f32::from(width);
+            shell.save();
+        }
+        shell.layout.set_window_bounds(bounds);
+        shell.save();
+        assert_eq!(shell.layout_save_requests.snapshots(), before);
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(
+        persist::DELAY
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    );
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before);
+    });
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+        shell.flush_layout();
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+        assert_eq!(Layout::load(&path).unwrap(), shell.layout);
+        assert_eq!(shell.layout.window_bounds(), Some(bounds));
+        assert_eq!(shell.layout.sidebar_width.to_bits(), 299_f32.to_bits());
+        assert_eq!(shell.layout.panel_width.to_bits(), 379_f32.to_bits());
+    });
 }

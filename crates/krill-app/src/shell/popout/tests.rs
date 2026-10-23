@@ -71,7 +71,7 @@ fn provider_popup_exposes_account_status_and_updated_row(cx: &mut TestAppContext
     let (shell, handle) = open(cx);
     cx.run_until_parked();
     shell.update(cx, |s, cx| {
-        s.accounts_snapshot.accounts = vec![AccountInfo {
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts = vec![AccountInfo {
             id: "claude-status-test".into(),
             provider: ProviderKind::Claude,
             label: "Test".into(),
@@ -82,7 +82,7 @@ fn provider_popup_exposes_account_status_and_updated_row(cx: &mut TestAppContext
             stale: false,
             usage: Snapshot::default(),
         }];
-        s.accounts_snapshot.statuses = vec![AccountStatusInfo {
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).statuses = vec![AccountStatusInfo {
             account_id: "claude-status-test".into(),
             status: AccountStatus::RateLimited,
             updated_at: Some(krill_app::accounts::display::now()),
@@ -162,7 +162,7 @@ fn linked_account_refresh_keeps_daemon_snapshot_on_ipc_failure(cx: &mut TestAppC
             krilld: root.join("missing-daemon"),
         });
         shell.link = Link::Up;
-        shell.accounts_snapshot = snapshot.clone();
+        shell.accounts_snapshot = (snapshot.clone()).into();
         shell.notice = None;
         shell.refresh_accounts(UsageRequest::ListAccounts, cx);
     });
@@ -172,7 +172,8 @@ fn linked_account_refresh_keeps_daemon_snapshot_on_ipc_failure(cx: &mut TestAppC
     let (actual, notice) =
         shell.read_with(cx, |s, _| (s.accounts_snapshot.clone(), s.notice.clone()));
     assert_eq!(
-        actual, snapshot,
+        actual.as_ref(),
+        &snapshot,
         "연결 중 IPC 실패를 로컬 스냅샷으로 숨기지 않는다"
     );
     assert!(notice.is_some(), "명시적 새로고침 실패를 알린다");
@@ -1024,7 +1025,7 @@ fn status_bar_hides_pills_of_not_installed_providers(cx: &mut TestAppContext) {
         ])));
     });
     shell.update(cx, |s, cx| {
-        s.accounts_snapshot.accounts = vec![
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts = vec![
             account(ProviderKind::Claude, "claude-a"),
             account(ProviderKind::Codex, "codex-a"),
         ];
@@ -1491,7 +1492,7 @@ fn status_bar_hides_unconfigured_opencode_host_default_and_shows_managed_opencod
         ])));
     });
     shell.update(cx, |s, cx| {
-        s.accounts_snapshot.accounts = vec![
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts = vec![
             AccountInfo {
                 id: "claude:default".into(),
                 provider: ProviderKind::Claude,
@@ -1526,7 +1527,7 @@ fn status_bar_hides_unconfigured_opencode_host_default_and_shows_managed_opencod
     );
 
     shell.update(cx, |s, cx| {
-        s.accounts_snapshot.accounts[1].host_default = false;
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts[1].host_default = false;
         cx.notify();
     });
     vcx.run_until_parked();
@@ -1659,7 +1660,7 @@ fn status_bar_switches_provider_windows_when_resized(cx: &mut TestAppContext) {
     use krill_proto::usage::{AccountInfo, Snapshot, Window};
     let (shell, handle) = open(cx);
     shell.update(cx, |s, cx| {
-        s.accounts_snapshot.accounts = ProviderKind::ALL
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts = ProviderKind::ALL
             .into_iter()
             .map(|provider| AccountInfo {
                 id: provider.as_str().into(),

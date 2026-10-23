@@ -18,19 +18,35 @@ struct Deadlines {
 }
 
 pub(super) fn schedule(session: &Arc<Shared>, epoch: u64) {
-    static TIMER: OnceLock<Option<Arc<Deadlines>>> = OnceLock::new();
-    let Some(timer) = TIMER.get_or_init(|| {
-        let timer = Arc::new(Deadlines::default());
-        let worker = Arc::clone(&timer);
-        thread::Builder::new()
-            .name("park".into())
-            .spawn(move || run(&worker))
-            .ok()?;
-        Some(timer)
-    }) else {
-        return;
+    static TIMER: OnceLock<Mutex<Option<Arc<Deadlines>>>> = OnceLock::new();
+    let timer = {
+        let mut current = lock(TIMER.get_or_init(Mutex::default));
+        if current.is_none() {
+            let timer = Arc::new(Deadlines::default());
+            let worker = Arc::clone(&timer);
+            if thread::Builder::new()
+                .name("park".into())
+                .spawn(move || run(&worker))
+                .is_err()
+            {
+                return;
+            }
+            *current = Some(timer);
+        }
+        let Some(timer) = current.as_ref() else {
+            return;
+        };
+        Arc::clone(timer)
     };
     let mut pending = lock(&timer.pending);
+    {
+        let live = lock(&session.live);
+        // A delayed schedule call from an older viewer drop must not replace the
+        // newer epoch's deadline after a quick tab round trip.
+        if live.epoch != epoch || live.viewers > 0 {
+            return;
+        }
+    }
     // Replace this session's old deadline, and discard dead sessions on every insertion.
     pending.retain(|d| d.session.strong_count() > 0 && !d.session.ptr_eq(&Arc::downgrade(session)));
     pending.push(Deadline {

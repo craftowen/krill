@@ -71,6 +71,7 @@ pub struct ServerPanel {
     now_secs: u64,
     refresh_task: Option<Task<()>>,
     clock_task: Option<Task<()>>,
+    visible: bool,
     task: Option<Task<()>>,
 }
 
@@ -118,11 +119,22 @@ impl ServerPanel {
             now_secs: current_epoch_secs(),
             refresh_task: None,
             clock_task: None,
+            visible: true,
             task: None,
         };
         panel.refresh(cx);
         panel.start_clock(cx);
         panel
+    }
+
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
+            self.refresh(cx);
+        }
     }
 
     fn start_clock(&mut self, cx: &mut Context<Self>) {
@@ -132,8 +144,19 @@ impl ServerPanel {
             loop {
                 bg.timer(std::time::Duration::from_secs(1)).await;
                 let Ok(backend) = this.update(cx, |panel, cx| {
+                    if !panel.visible
+                        && !panel.busy
+                        && panel
+                            .invite
+                            .as_ref()
+                            .is_none_or(|invite| invite.is_expired(current_epoch_secs()))
+                    {
+                        return None;
+                    }
                     panel.now_secs = current_epoch_secs();
-                    cx.notify();
+                    if panel.visible {
+                        cx.notify();
+                    }
                     (!panel.busy).then(|| (panel.backend.clone(), panel.generation))
                 }) else {
                     return;
@@ -1735,6 +1758,11 @@ pub struct PairingView {
 }
 
 impl PairingView {
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.server
+            .update(cx, |server, cx| server.set_visible(visible, cx));
+    }
+
     pub fn new(backend: Arc<dyn LinkBackend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let server_backend = backend.clone();
         let server = cx.new(|cx| ServerPanel::new(server_backend, cx));

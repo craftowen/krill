@@ -190,6 +190,7 @@ pub struct Panel {
     error: Option<String>,
     task: Option<Task<()>>,
     list_state: gpui::ListState,
+    list_hits: Arc<Vec<VaultHit>>,
 }
 
 impl std::fmt::Debug for Panel {
@@ -234,6 +235,7 @@ impl Panel {
             error: None,
             task: None,
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(100.)),
+            list_hits: Arc::default(),
         }
     }
 
@@ -589,6 +591,8 @@ impl Panel {
 
 impl Panel {
     fn render_hit(&mut self, i: usize, hit: &VaultHit, cx: &mut Context<Self>) -> gpui::Div {
+        #[cfg(target_os = "macos")]
+        let _work = crate::responsiveness::work("history.row");
         let p = crate::ui::palette(cx);
         let from_vault = self.vault.is_some();
         let matching_entry = (!from_vault)
@@ -816,10 +820,11 @@ impl Render for Panel {
 
             let count = hits.len();
             // Keep list identity and scroll state while only constructing visible rows.
-            if self.list_state.item_count() != count {
+            if self.list_hits.as_ref() != &hits {
                 self.list_state.reset(count);
+                self.list_hits = Arc::new(hits);
             }
-            let hits = Arc::new(hits);
+            let hits = Arc::clone(&self.list_hits);
             let weak = cx.entity().downgrade();
             content = content.child(
                 gpui::list(self.list_state.clone(), move |i, _, cx| {
