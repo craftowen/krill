@@ -1867,12 +1867,17 @@ fn cmd_f_search_bar_requests_and_highlights(cx: &mut TestAppContext) {
     assert!(ipc::read_frame(&mut theirs).is_err());
     cx.executor().advance_clock(Duration::from_millis(1));
     cx.run_until_parked();
-    let mut requests = Vec::new();
-    while let Ok(Some((k, b))) = ipc::read_frame(&mut theirs) {
-        requests.push(SearchRequest::decode(k, &b).unwrap());
-    }
-    assert_eq!(requests.len(), 1);
-    let req1 = requests.pop().unwrap();
+    // pane-writer runs on an OS thread; parking the UI executor does not flush its queue.
+    // Keep the no-send checks nonblocking, then use the existing read timeout for delivery.
+    theirs.set_nonblocking(false).unwrap();
+    let (k, b) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+    let req1 = SearchRequest::decode(k, &b).unwrap();
+    theirs.set_nonblocking(true).unwrap();
+    assert!(
+        ipc::read_frame(&mut theirs).is_err(),
+        "one debounced request"
+    );
+    theirs.set_nonblocking(false).unwrap();
     assert_eq!(req1.query, "match");
     assert_eq!(req1.direction, Direction::Next);
     assert_eq!(req1.after, None);
