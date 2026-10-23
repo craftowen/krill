@@ -1,7 +1,7 @@
 # Windows zip 패키지 (OWE-837)
 
 관리자 권한 없이 사용자 단위로 `%LOCALAPPDATA%\Programs\Krill`에 설치하는 zip과 자체 업데이터용 레이아웃이다.
-설치 형식을 이렇게 고른 근거와 실측은 [docs/research/windows-spike-OWE-837.md](../../docs/research/windows-spike-OWE-837.md)에 있다.
+이 문서는 Windows 설치·패키징 절차를 설명한다. 내부 검증 원자료는 공개 저장소에 포함하지 않는다.
 스크립트는 서명·업로드·원격 생성을 하지 않는다. Authenticode 서명은 OWE-838(유료 인증서, 사람이 결정)에서 다룬다.
 
 ## 레이아웃

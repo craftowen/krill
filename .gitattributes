@@ -26,3 +26,12 @@ docs/reports/ export-ignore
 docs/boost-*.md export-ignore
 cloud/ export-ignore
 .night/ export-ignore
+
+# Internal records are also excluded from source distribution archives.
+docs/planning/ export-ignore
+docs/benchmarks/ export-ignore
+docs/testing/ export-ignore
+docs/marketing/ export-ignore
+docs/deep-research-*.md export-ignore
+docs/research/** export-ignore
+docs/research/orca-mobile-ui-spec.md -export-ignore

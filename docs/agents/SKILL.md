@@ -8,8 +8,7 @@ description: Krill 세션 CLI `krill` 사용법. 백그라운드 세션 만들�
 `krill`은 세션 데몬(krilld)에 직접 붙는 CLI다. 앱이 꺼져 있어도 된다.
 아래 usage·동작·종료 코드는 `krill` 0.1.0 실측(2026-10-15, 바이너리를 직접 실행해 대조)과
 `crates/krill/src` 기준이다. `krill wait`의 `idle|pattern|quiet` 조건은 MK-047 병합 뒤라 들어 있다.
-기획 기록(`docs/planning/T4-final.md`)의 `--json`·토큰 인증은
-구현에 없으므로 쓰지 않는다.
+구현된 CLI usage를 기준으로 사용한다. 오래된 기획 단계의 옵션을 현재 기능으로 가정하지 않는다.
 인자 없이 `krill`만 치면 전체 usage가 나간다(종료 2):
 
 ```text

@@ -73,4 +73,4 @@ krill worktree new <name> | krill worktree rm <path>
 
 ## 라이선스
 
-Apache-2.0 ([LICENSE](LICENSE), `Copyright 2026 Krill contributors`). 각 크레이트의 `license` 필드는 워크스페이스에서 상속한다. 서드파티 고지는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 및 [docs/licensing/README.md](docs/licensing/README.md)를 참고한다. 재현 벤치는 [docs/benchmarks/MK-074.md](docs/benchmarks/MK-074.md)(`python3 docs/benchmarks/mk074.py`)에 있다. Zed `terminal`·`terminal_view`(GPL-3.0) 코드는 읽지도 베끼지도 않는다. Orca(MIT) 설계·코드 차용 시 파일 상단에 출처·저작권을 표기한다.
+Apache-2.0 ([LICENSE](LICENSE), `Copyright 2026 Krill contributors`). 각 크레이트의 `license` 필드는 워크스페이스에서 상속한다. 서드파티 고지는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 및 [docs/licensing/README.md](docs/licensing/README.md)를 참고한다. Zed `terminal`·`terminal_view`(GPL-3.0) 코드는 읽지도 베끼지도 않는다. Orca(MIT) 설계·코드 차용 시 파일 상단에 출처·저작권을 표기한다.
