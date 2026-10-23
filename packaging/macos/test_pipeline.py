@@ -183,7 +183,7 @@ class PipelineTests(unittest.TestCase):
         # RFC 8032 §7.1 test seed must be rejected
         bad_env = dict(
             os.environ,
-            KRILL_RELEASE_SIGNING_KEY="9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            KRILL_RELEASE_SIGNING_KEY="9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",  # gitleaks:allow -- RFC 8032 section 7.1 public test seed; rejection fixture.
         )
         bad_res = subprocess.run(
             [sys.executable, script, "keygen", "--key-file", str(self.output / "unused.key")],
