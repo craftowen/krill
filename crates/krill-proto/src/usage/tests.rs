@@ -1090,8 +1090,8 @@ fn connection_tail_has_frozen_bytes_and_prior_policy_decoder_can_skip_it() {
 
 #[test]
 fn refresh_usage_request_is_appended_read_and_feature_gated() {
-    // enum 끝(discriminant 18), 본문 없음.
-    fixture(&UsageRequest::RefreshUsage, &[2, 0, 0, 0, 0x41, 18]);
+    // 기존 계정 전환 취소(18) 뒤에 추가한 요청(19), 본문 없음.
+    fixture(&UsageRequest::RefreshUsage, &[2, 0, 0, 0, 0x41, 19]);
     assert!(UsageRequest::RefreshUsage.is_read());
     assert_eq!(
         UsageRequest::RefreshUsage.required_features(),
