@@ -158,7 +158,7 @@ impl Socket {
         Self::build(target.into(), !cfg!(test))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn threaded(target: impl Into<HostTarget>) -> Self {
         Self::build(target.into(), true)
     }
@@ -200,7 +200,7 @@ impl Socket {
     }
 
     /// 테스트: 이미 넣은 작업이 모두 끝날 때까지 기다린다.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn settle(&self) {
         let (done, wait) = mpsc::channel();
         if self.enqueue(Box::new(move || {
