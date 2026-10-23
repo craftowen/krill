@@ -673,6 +673,7 @@ catalog! {
         DELETE_DIRTY => ("미커밋 변경 {n}개가 있습니다.", "{n} uncommitted changes."),
         DELETE_FORCE => ("미커밋 변경도 함께 삭제합니다 (강제 삭제)", "Also delete uncommitted changes (force)"),
         DELETE_CONFIRM => ("삭제", "Delete"),
+        CHILD_COUNT => ("{n} 하위", "{n} children"),
         FOLD_CHILDREN => ("자식 워크트리 접기", "Collapse children"),
         UNFOLD_CHILDREN => ("자식 워크트리 펼치기", "Expand children"),
         PINNED_GROUP => ("고정됨", "Pinned"),

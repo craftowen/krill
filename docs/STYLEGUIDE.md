@@ -4,7 +4,7 @@
 
 근거 및 출처: Orca 레포지토리(`.ref/orca/docs/STYLEGUIDE.md`, `.ref/orca/src/renderer/src/assets/main.css`, `.ref/orca/src/renderer/src/components/ui/*`, `.ref/orca/src/shared/terminal-themes/defaults.ts`, Copyright (c) 2026 Lovecast Inc., MIT License)의 검증된 디자인 토큰·컴포넌트 문법·UX 원칙을 순수 Rust(`gpui` + `gpui-component`) 체계로 이식했다.
 
-**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **색·브랜드·카피 톤은 Krill 고유다** — 무채색 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 3분절 스피너, 떼 미터는 Orca에 없다.
+**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **브랜드·카피 톤과 사이드바 밖 색은 Krill 고유다** — 기본 다크 사이드바는 사용자 요청(2026-10-23)에 따라 Orca 참조 이미지의 중성 회색을 쓰며, 나머지 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 3분절 스피너, 떼 미터는 Orca에 없다.
 
 ---
 
@@ -56,12 +56,12 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | `border` | `#e4e7ec` | `rgba(255,255,255,0.08)` | 모든 1px 구분선: 카드 테두리, 섹션 구분선, 입력칸 외곽선 | 강한 포커스 강조(`ring` 사용) |
 | `input` | `#e4e7ec` | `rgba(255,255,255,0.15)` | 입력 컨트롤(`Input`) 테두리·배경 | 폼 필드 바깥의 장식 |
 | `ring` | `#9aa3b5` | `#5b6478` | 키보드 포커스 링, 활성 칸 강조 테두리 | 상시 고정 테두리 |
-| `sidebar` / `sidebar_foreground` | `#f6f7f9` / `#0a0a0a` | `#12151d` / `#fafafa` | 좌측 사이드바·통합 타이틀바·탭 바 크롬 표면과 기본 글자 | 메인 캔버스나 모달 내부 |
+| `sidebar` / `sidebar_foreground` | `#f6f7f9` / `#0a0a0a` | `#282828` / `#fafafa` | 좌측 사이드바·통합 타이틀바·탭 바 크롬 표면과 기본 글자 | 메인 캔버스나 모달 내부 |
 | `sidebar_primary` / `sidebar_primary_foreground` | `#171717` / `#fafafa` | `#1447e6` / `#fafafa` | 사이드바 주요 강조점, Git 이름 변경(Renamed/Copied) 배지 | 일반 본문 |
-| `sidebar_accent` / `sidebar_accent_foreground` | `#e9ecf1` / `#171717` | `#222836` / `#fafafa` | 사이드바 내비게이션·세션 행 호버/선택 배경 | 사이드바 바깥의 패널 |
-| `sidebar_border` / `sidebar_ring` | `#e4e7ec` / `#9aa3b5` | `rgba(255,255,255,0.07)` / `#4b5366` | 사이드바 내부 구분선 및 포커스 링 | 분할선(`split_divider` 사용) |
-| `worktree_sidebar` / `worktree_sidebar_foreground` | `#f1f3f6` / `#0a0a0a` | `#232836` / `#fafafa` | 워크트리 카드/그룹 표면(다크 모드에서 `#0b0d13` 캔버스와 구분되는 리프트 표면) | 일반 설정 카드 |
-| `worktree_sidebar_accent` / `worktree_sidebar_border` | `#e6e9ef` / `#e4e7ec` | `#2e3445` / `rgba(255,255,255,0.07)` | 워크트리 행 호버·상태 요약 알약 배경 및 테두리 | 사이드바 외부 |
+| `sidebar_accent` / `sidebar_accent_foreground` | `#e9ecf1` / `#171717` | `#333333` / `#fafafa` | 사이드바 내비게이션·세션 행 호버/선택 배경 | 사이드바 바깥의 패널 |
+| `sidebar_border` / `sidebar_ring` | `#e4e7ec` / `#9aa3b5` | `rgba(255,255,255,0.07)` / `#737373` | 사이드바 내부 구분선 및 포커스 링 | 분할선(`split_divider` 사용) |
+| `worktree_sidebar` / `worktree_sidebar_foreground` | `#f1f3f6` / `#0a0a0a` | `#353535` / `#fafafa` | 워크트리 카드/그룹 표면(다크 모드에서 `#0b0d13` 캔버스와 구분되는 리프트 표면) | 일반 설정 카드 |
+| `worktree_sidebar_accent` / `worktree_sidebar_border` | `#e6e9ef` / `#e4e7ec` | `#353535` / `rgba(255,255,255,0.07)` | 워크트리 행 호버·상태 요약 알약 배경 및 테두리 | 사이드바 외부 |
 | `success` | `#15803d` | `#86efac` | 에이전트 완료(`Done`), Git 추가(`A`/`??`), 정상 연결 상태 | 일반 장식 |
 | `warning` / `warning_foreground` | `#ca8a04` / `#fafafa` | `#eab308` / `#171717` | 에이전트 작업 중(`Working` 노란 스피너), 주의 배너, Git 수정(`M`) | 질문 대기(`agent_question` 사용) |
 | `agent_question` | `#ea580c` | `#f97316` | 에이전트가 사용자에게 질문/입력 대기 중(`Waiting`, 주황색 — 작업 중 노란색과 한눈에 구분) | 일반 경고 |
@@ -70,12 +70,12 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 
 ### 3.1.1 심해 틴트와 대비 기준
 
-- 무채색 크롬(배경·사이드바·카드·팝오버·muted·accent·테두리·포커스 링)은 Orca의 순수 회색 대신 **Krill 심해 틴트**(남색 기, 색상각 약 220°)를 쓴다. 상태색(`success`·`warning`·`agent_question`·`destructive`), 탭 9색, Git 색, `primary`·`sidebar_primary`는 Orca 값 그대로다.
+- 기본 다크 사이드바·워크트리 표면을 제외한 무채색 크롬(배경·카드·팝오버·muted·accent·테두리·포커스 링)은 Orca의 순수 회색 대신 **Krill 심해 틴트**(남색 기, 색상각 약 220°)를 쓴다. 상태색(`success`·`warning`·`agent_question`·`destructive`), 탭 9색, Git 색, `primary`·`sidebar_primary`는 Orca 값 그대로다.
 - **대비 회귀 테스트 (`text_tokens_meet_wcag_aa_on_every_surface`)**: 양 팔레트에서 `foreground`·`muted_foreground`가 `background`·`sidebar`·`card`·`popover`·`muted`·`accent`·`sidebar_accent`·`worktree_sidebar` 위에서 WCAG 대비 4.5:1 이상이고, `preserve`가 `background` 위 4.5:1 이상인지 계산해 단언한다.
 - 최종 값 계산 결과(WCAG 상대휘도 공식, 2026-10-19):
-  - 다크 `muted_foreground` `#9aa3b5`: background 7.66 · sidebar 7.20 · card/popover 6.86 · muted 6.12 · sidebar_accent 5.81 · worktree_sidebar 5.80 · accent 5.19.
+  - 다크 `muted_foreground` `#9aa3b5`는 기본 다크 사이드바의 중성 회색 표면을 포함하여 위 대비 회귀 테스트로 검증한다.
   - 라이트 `muted_foreground` `#646b78`: background/card/popover 5.36 · sidebar 5.00 · muted 4.88 · worktree_sidebar 4.82 · accent 4.70 · sidebar_accent 4.53. (초안 `#666d7a`는 sidebar_accent 위 4.40이라 한 단계 어둡게 정했다.)
-  - `foreground`: 다크 12.61(accent)~18.61(background), 라이트 16.72(sidebar_accent)~19.80(background).
+  - `foreground`: 모든 표면의 대비는 위 자동 테스트로 검증한다.
   - `preserve`: 다크 `#7dd3fc` background 위 11.65, 라이트 `#0369a1` 흰 바탕 위 5.93.
 
 ### 3.2 특수 상태 상수 및 헬퍼 함수
@@ -135,8 +135,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 |---|---|---|---|
 | `TEXT_2XS` | `10px` (`0.625rem`) | `text-3xs` / `text-[10px]` | 배지, 카운터(`+N`), 미세 캡션, SHA 해시, 상태 알약, 사이드바 서브에이전트 줄 |
 | `TEXT_XS` | `11px` (`0.6875rem`) | `text-2xs` / `text-[11px]` | 사이드바 섹션 머리글, 사이드바 세션 행(Orca 에이전트 행 `text-[11px]`), 폼 설명문(`muted_foreground`), 키캡, 상태 바 |
-| `TEXT_SM` | `12px` (`0.75rem`) | `text-xs` / `12px` | 설정 행 제목, 탭 라벨, 파일 경로, 부가 텍스트, 기본 고정폭 크기, 사이드바 워크트리 카드 제목 |
-| `TEXT_MD` | `13px` (`0.8125rem`) | `13px` | 사이드바 프로젝트 머리줄, 밀도 높은 목록 행, 앱 기본 글자 크기(`theme.font_size`) |
+| `TEXT_SM` | `12px` (`0.75rem`) | `text-xs` / `12px` | 설정 행 제목, 탭 라벨, 파일 경로, 부가 텍스트, 기본 고정폭 크기, 사이드바 컴팩트 카드 제목 |
+| `TEXT_MD` | `13px` (`0.8125rem`) | `13px` | 사이드바 프로젝트 머리줄·상세 워크트리 제목, 밀도 높은 목록 행, 앱 기본 글자 크기(`theme.font_size`) |
 | `TEXT_LG` | `14px` (`0.875rem`) | `text-sm` / `14px` | 모달 대화상자 제목, 온보딩·관리자 페이지 주요 제목 |
 
 ---
@@ -168,7 +168,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
   - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 24px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
   - 상태바 사용량은 `STATUS_USAGE_CONTROLS_WIDTH = 480px`를 컨트롤에 예약하고, 프로바이더당 `STATUS_USAGE_PROVIDER_WIDTH = 280px` 여유가 있으면 두 사용량 창을 `0% 1h 31m · 92% 1d 19h`처럼 표시한다. 상태바의 창 이름·리셋 안내 문장 없이 `%`와 남은 시간(`m`·`h`·`d`)만 쓰며 앱 언어와 무관하다. UI 줌도 반영하며, 좁으면 최대 사용률 창의 `% + 남은 시간`으로 축약한다. 만료된 창은 이전 사용률을 재사용하지 않고 `— now`, 시각을 모르면 퍼센트만 표시한다.
-  - 사이드바 들여쓰기: 호스트 아래 프로젝트 8px, 프로젝트 아래 카드 12px. 루트 행의 상태 칸은 그대로 두고, 하위 세션 상태 글리프는 부모 카드 상태 칸에서 한 단계(12px) 들여써 계층을 보인다. 호스트·워크트리 계보 여백은 한 번만 적용하고 계보 깊이는 유지한다. 상세·컴팩트 카드와 대량 목록은 같은 가상화 경로와 들여쓰기를 쓴다.
+  - 프로젝트 기준 사이드바에서는 프로젝트를 루트로 배치하고 호스트 상위 단계를 두지 않는다. 같은 저장소의 연결 워크트리는 형제 행이며, 명시적으로 저장·이관된 부모 관계만 중첩한다. 원격 연결 상태·재연결은 프로젝트 헤더에 표시하며, 프로젝트가 아직 없는 호스트만 별도 연결 행을 유지한다. 상태·PR 등 다른 그룹 모드의 호스트 아래 프로젝트는 8px, 프로젝트 아래 카드는 12px 들여쓴다. 루트 행의 상태 칸은 그대로 두고, 하위 세션 상태 글리프는 부모 카드 상태 칸에서 한 단계(12px) 들여써 계층을 보인다. 호스트·워크트리 계보 여백은 한 번만 적용하고 계보 깊이는 유지한다. 상세·컴팩트 카드와 대량 목록은 같은 가상화 경로와 들여쓰기를 쓴다.
+  - 프로젝트 목록을 상단에 바로 배치하고 검색·아티팩트·대시보드·새 세션은 하단 아이콘 도구 모음으로 제공한다(이름·툴팁·키보드 접근은 유지). 워크트리 유휴 행은 투명 배경·투명 테두리, 선택 행만 채움과 테두리를 사용한다. 이름의 하이픈을 보존하고 프로젝트 머리줄만 강조한다. 브랜치는 두 번째 줄, 다중 세션은 요약 바 펼치기, 단일 세션은 직접 선택, 하위 워크트리 토글은 상세 정보 아래 별도 알약으로 표시한다.
   - 상태 요약 겹친 아이콘: `STATUS_GROUP_ICON = 15px`, 겹침 음수 마진 `STATUS_GROUP_OVERLAP = -3px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`

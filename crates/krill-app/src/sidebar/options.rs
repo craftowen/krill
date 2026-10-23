@@ -776,7 +776,7 @@ pub(super) fn rows_with_options<'a>(
         .iter()
         .filter(|s| needs_you(&s.status))
         .peekable();
-    if waiting.peek().is_some() {
+    if options.group_by != GroupBy::Repo && waiting.peek().is_some() {
         out.push(Row::NeedsYou);
         for s in waiting {
             out.push(Row::Session(s.clone(), false));
@@ -1329,6 +1329,9 @@ impl Sidebar {
         if let Some(custom) = self.worktree_hosts.get(path) {
             return Some(custom.clone());
         }
+        if self.options.group_by == GroupBy::Repo {
+            return None;
+        }
         match host {
             HostId::Remote(id) => Some(
                 self.remote_hosts
@@ -1336,7 +1339,9 @@ impl Sidebar {
                     .find(|r| r.id == *id)
                     .map_or_else(|| id.clone(), |r| r.label.clone()),
             ),
-            HostId::Local => (!self.remote_hosts.is_empty()).then(|| {
+            HostId::Local => (self.options.group_by != GroupBy::Repo
+                && !self.remote_hosts.is_empty())
+            .then(|| {
                 text::HOST_LOCAL
                     .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
                     .get()
