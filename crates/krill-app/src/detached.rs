@@ -72,6 +72,7 @@ pub struct Panel {
     task: Option<Task<()>>,
     expanded: bool,
     scroll: gpui::UniformListScrollHandle,
+    generation: u64,
 }
 
 impl EventEmitter<Open> for Panel {}
@@ -87,6 +88,12 @@ impl Panel {
         cx: &mut Context<Self>,
     ) {
         let target = target.into();
+        if self.target.as_ref() != Some(&target) {
+            self.items.clear();
+            cx.notify();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         self.target = Some(target.clone());
         self.task = Some(cx.spawn(async move |this, cx| {
             let clean_target = target.clone();
@@ -118,6 +125,9 @@ impl Panel {
                     .detach();
             }
             this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.items = rest;
                 cx.notify();
             })
@@ -127,6 +137,7 @@ impl Panel {
 
     /// 세션을 닫는다. krilld는 끝난 뒤에 목록에서 지우므로 여기서 먼저 뺀다.
     fn close(&mut self, target: HostTarget, session: SessionId, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
         self.items.retain(|i| i.session != session);
         cx.notify();
         cx.background_executor()
@@ -215,6 +226,8 @@ impl Render for Panel {
                                     .filter_map(|index| {
                                         let i = this.items.get(index)?;
                                         let id = i.session;
+                                        let generation = this.generation;
+                                        let target = this.target.clone();
                                         // 실행 중이면 보존 톤 점, 종료됐으면 흐린 점(같은 폭이라 라벨이 줄 맞춤된다).
                                         let dot = if i.status.is_none() {
                                             p.preserve
@@ -233,6 +246,9 @@ impl Render for Panel {
                                         };
                                         Some(
                                             div()
+                                                .debug_selector(move || {
+                                                    format!("detached-row-{}", id.0)
+                                                })
                                                 .h(gpui::px(28.))
                                                 .flex()
                                                 .items_center()
@@ -263,7 +279,11 @@ impl Render for Panel {
                                                         .cursor_pointer()
                                                         .child(label)
                                                         .on_click(cx.listener(
-                                                            move |_, _, _, cx| cx.emit(Open(id)),
+                                                            move |this, _, _, cx| {
+                                                                if this.generation == generation {
+                                                                    cx.emit(Open(id));
+                                                                }
+                                                            },
                                                         )),
                                                 )
                                                 .child(
@@ -276,7 +296,9 @@ impl Render for Panel {
                                                         text::CLOSE.get(),
                                                     )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        if let Some(target) = this.target.clone() {
+                                                        if this.generation == generation
+                                                            && let Some(target) = target.clone()
+                                                        {
                                                             this.close(target, id, cx);
                                                         }
                                                     })),
@@ -316,5 +338,17 @@ mod tests {
         );
         assert_eq!(detached(&all, &[]), all.to_vec());
         assert!(detached(&[], &[SessionId(1)]).is_empty());
+    }
+    #[gpui::test]
+    fn detached_list_only_constructs_visible_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|_, _| Panel {
+            items: (0..10_000).map(info).collect(),
+            expanded: true,
+            ..Panel::default()
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("detached-row-0").is_some());
+        assert!(cx.debug_bounds("detached-row-9999").is_none());
     }
 }

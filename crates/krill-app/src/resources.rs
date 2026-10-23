@@ -84,6 +84,7 @@ pub fn mb(bytes: u64) -> String {
 pub struct Panel {
     call: Call,
     open: bool,
+    visible: bool,
     data: Option<Resources>,
     /// 연결한 krilld가 [`FEAT_RESOURCES`]를 광고하지 않는다.
     outdated: bool,
@@ -116,6 +117,7 @@ impl Panel {
         Self {
             call,
             open: false,
+            visible: true,
             data: None,
             outdated: false,
             note: None,
@@ -149,6 +151,21 @@ impl Panel {
         named.unwrap_or_else(|| format!("{} {}", text::SESSION.get(), id.0))
     }
 
+    /// Pause measurements while the owning window/page is hidden; reopen catches up immediately.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if self.open {
+            self.poll = if visible {
+                Some(self.start_poll(cx))
+            } else {
+                None
+            };
+        }
+    }
+
     /// 펼치면 조회를 시작하고, 접으면 멈춘다(접힌 동안 데몬에 묻지 않는다).
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
         if self.open {
@@ -156,7 +173,9 @@ impl Panel {
             return;
         }
         self.open = true;
-        self.poll = Some(self.start_poll(cx));
+        if self.visible {
+            self.poll = Some(self.start_poll(cx));
+        }
         cx.notify();
     }
 
@@ -197,13 +216,17 @@ impl Panel {
                     .spawn(async move { call(&Request::Resources(Action::Query)) })
                     .await;
                 let alive = this.update(cx, |this, cx| {
+                    let previous_outdated = this.outdated;
                     this.outdated =
                         matches!(&got, Err(e) if e.kind() == io::ErrorKind::Unsupported);
-                    this.data = match got {
+                    let data = match got {
                         Ok(Reply::Resources(r)) => Some(r),
                         Ok(_) | Err(_) => None,
                     };
-                    cx.notify();
+                    if this.data != data || this.outdated != previous_outdated {
+                        this.data = data;
+                        cx.notify();
+                    }
                 });
                 if alive.is_err() {
                     return;

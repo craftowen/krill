@@ -575,3 +575,65 @@ fn alternate_screen_and_scroll_modes_follow_dec_private_sequences() {
     engine.feed(b"\x1b[?1049l", Feed::Live, &look);
     assert!(!engine.input_modes().contains(Modes::ALT_SCREEN));
 }
+
+#[test]
+fn dashboard_tail_matches_plain_capture_without_composing_cells() {
+    let look = Appearance::load(PathBuf::new());
+    let mut engine = Engine::new(WinSize { cols: 640, rows: 6 });
+    let mut bytes = b"first\r\n\r\nsecond\r\n".to_vec();
+    bytes.extend(std::iter::repeat_n(b' ', 520));
+    bytes.extend_from_slice(b"late-column\r\nlast");
+    engine.feed(&bytes, Feed::Replay, &look);
+    let text = engine.screen_text();
+    let mut expected: Vec<_> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(3)
+        .map(|line| line.chars().take(500).collect::<String>())
+        .collect();
+    expected.reverse();
+    assert_eq!(engine.screen_tail(3, 500), expected);
+}
+
+#[test]
+fn replay_rebase_preserves_partial_vt_sync_and_inactive_history() {
+    let look = Appearance::load(PathBuf::new());
+    let size = WinSize { cols: 12, rows: 3 };
+    let mut canonical = Engine::new(size);
+    let mut view = Engine::new(size);
+    for bytes in [
+        &b"primary1\r\nprimary2\r\nprimary3\r\nprimary4\r\n"[..],
+        &b"\x1b[?1049hALT\r\none\r\ntwo\r\n\x1b[?2026h\xe9"[..],
+    ] {
+        canonical.feed(bytes, Feed::Replay, &look);
+        view.feed(bytes, Feed::Replay, &look);
+        view.take_history();
+    }
+    canonical.resize(WinSize { cols: 24, rows: 7 });
+    view.rebase_replay(&canonical);
+    assert_eq!(view.screen(), canonical.screen());
+    assert_eq!(view.input_modes(), canonical.input_modes());
+    assert_eq!(view.capture_rewind(), canonical.capture_rewind());
+    view.clear_history();
+    for bytes in [
+        &b"\x9b\xaa\r\n\x1b[?2026l\x1b[?1049l\x1b[38;2;"[..],
+        &b"1;2;3mnormal-again\r\n"[..],
+    ] {
+        canonical.feed(bytes, Feed::Replay, &look);
+        view.feed(bytes, Feed::Replay, &look);
+        assert_eq!(view.screen(), canonical.screen());
+        assert_eq!(view.capture_rewind(), canonical.capture_rewind());
+    }
+    // The canonical primary history survives alternate-screen resizing and is restored
+    // even though the harvesting view previously drained those same rows.
+    canonical.resize(WinSize { cols: 8, rows: 2 });
+    view.rebase_replay(&canonical);
+    assert_eq!(view.screen(), canonical.screen());
+    assert_eq!(
+        view.history_rows(0, HOT_LINES),
+        canonical.history_rows(0, HOT_LINES)
+    );
+    assert!(view.history_len() <= HOT_LINES);
+    assert!(canonical.history_len() <= HOT_LINES);
+}

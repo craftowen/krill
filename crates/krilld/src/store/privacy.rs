@@ -79,6 +79,10 @@ impl Store {
     /// 게이트 안에서는 rename과 세대 교체만 한다. 기존 fd는 옮긴 디렉터리를 가리키므로 늦은 쓰기가 새 이력에
     /// 나타나지 않는다. 실제 삭제는 게이트 밖이다. 보안 소거·이미 만들어진 백업 삭제는 아니다.
     pub fn clear(&self) -> io::Result<()> {
+        let _publication = self
+            .history_publication
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let detached = {
             let _gate = lock(&self.gate);
             let next = self

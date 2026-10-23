@@ -788,7 +788,7 @@ fn repo_without_remote_disables_sync_buttons_and_blocks_sync_edits(cx: &mut Test
     cx.run_until_parked();
     panel.read_with(cx, |p, _| {
         assert!(p.editing.sync_supported());
-        assert!(!p.editing.has_remote);
+        assert_eq!(p.editing.has_remote, Some(false));
     });
 
     panel.update_in(cx, |p, window, cx| {
@@ -825,4 +825,30 @@ fn repo_without_remote_disables_sync_buttons_and_blocks_sync_edits(cx: &mut Test
             message: "feat: local only".into(),
         }]
     );
+}
+
+#[gpui::test]
+fn unknown_remote_blocks_sync_until_background_probe_and_repo_reset(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    let panel = cx.new(|cx| {
+        let mut panel = Panel::unconnected("/old".into(), cx);
+        panel.visible = false;
+        panel.editing.source = fake.clone();
+        assert_eq!(panel.editing.has_remote, None);
+        panel.run_git_action(Edit::Push, cx);
+        panel.refresh_branch_sync(cx);
+        panel
+    });
+    assert!(fake.edits.lock().unwrap().is_empty());
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| {
+        assert_eq!(panel.editing.has_remote, Some(true));
+        let generation = panel.editing.sync_generation;
+        panel.set_repo("/new".into(), cx);
+        assert_ne!(panel.editing.sync_generation, generation);
+        assert_eq!(panel.editing.has_remote, None);
+        panel.run_git_action(Edit::Push, cx);
+    });
+    cx.run_until_parked();
+    assert!(fake.edits.lock().unwrap().is_empty());
 }

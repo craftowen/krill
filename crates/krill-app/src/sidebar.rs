@@ -157,6 +157,9 @@ pub trait Source: Send + Sync {
     fn target(&self) -> Option<&HostTarget> {
         None
     }
+    fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
+        self.fetch().map(Arc::new)
+    }
     /// 워크트리 행의 git 정보. 모르면 비워 둔다(UI가 숨긴다).
     fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
         Meta::new()
@@ -687,6 +690,8 @@ pub struct Sidebar {
     task: Option<Task<()>>,
     source: Option<Arc<dyn Source>>,
     card_list: viewport::CardList,
+    status_summary: (usize, Arc<Vec<AgentState>>),
+    local_rows_cache: std::cell::RefCell<options::LocalRowsCache>,
     hovered_worktree: Option<(HostId, PathBuf)>,
     editing: Option<(PathBuf, Entity<InputState>)>,
     edit_subscription: Option<Subscription>,
@@ -831,6 +836,8 @@ impl Sidebar {
             task: None,
             source: None,
             card_list: viewport::CardList::default(),
+            status_summary: (0, Arc::new(Vec::new())),
+            local_rows_cache: std::cell::RefCell::default(),
             editing: None,
             edit_subscription: None,
             orca_import_subscription: None,
@@ -1965,6 +1972,20 @@ impl Sidebar {
                 .get(i)
                 .map(|row| (self.row_host(i).clone(), row.clone()))
         });
+        self.status_summary = (
+            self.snapshot
+                .sessions
+                .iter()
+                .filter(|s| needs_you(&s.status))
+                .count(),
+            Arc::new(
+                self.snapshot
+                    .sessions
+                    .iter()
+                    .map(|s| s.status.state)
+                    .collect(),
+            ),
+        );
         self.ensure_external_polling(cx);
         if self.remote_hosts.is_empty() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
@@ -2350,6 +2371,10 @@ impl Sidebar {
     }
 
     /// 로컬 세션들의 에이전트 상태(상태바 떼 미터).
+    pub fn status_summary(&self) -> (usize, Arc<Vec<AgentState>>) {
+        self.status_summary.clone()
+    }
+
     pub fn session_states(&self) -> Vec<krill_proto::control::AgentState> {
         self.snapshot
             .sessions

@@ -32,7 +32,7 @@ function fixture(){
 }
 const viewport=Object.assign(new EventTarget(),{scale:1,height:844,offsetTop:0});
 const globalEvents=new EventTarget(),storage=new Map(),timers=new Map();let clock=0,nextTimer=0;
-const context=vm.createContext({Event,EventTarget,AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,Map,Set,Promise,console,queueMicrotask,crypto:require('node:crypto').webcrypto,innerHeight:844,devicePixelRatio:1,visualViewport:viewport,document:Object.assign(new EventTarget(),{visibilityState:'visible',createElement:tag=>new Element(tag),createElementNS:(_,tag)=>new Element(tag)}),localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},addEventListener:globalEvents.addEventListener.bind(globalEvents),setTimeout:(fn,delay)=>{const id=++nextTimer;timers.set(id,{fn,at:clock+delay});return id;},clearTimeout:id=>timers.delete(id)});
+const context=vm.createContext({Event,EventTarget,AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,Map,Set,Promise,console,queueMicrotask,crypto:require('node:crypto').webcrypto,innerHeight:844,devicePixelRatio:1,visualViewport:viewport,document:Object.assign(new EventTarget(),{visibilityState:'visible',documentElement:new Element('html'),createElement:tag=>new Element(tag),createElementNS:(_,tag)=>new Element(tag)}),localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},addEventListener:globalEvents.addEventListener.bind(globalEvents),setTimeout:(fn,delay)=>{const id=++nextTimer;timers.set(id,{fn,at:clock+delay});return id;},clearTimeout:id=>timers.delete(id)});
 vm.runInContext(`(${fixture})()`,context);vm.runInContext(source,context);
 const api=context.KrillMobile.terminal,T=context.MkTerminalCodec,C=context.MkCrypto;
 const event=(el,type,props={})=>{const e=new Event(type,{cancelable:true});Object.assign(e,props);el.dispatchEvent(e);return e;};
@@ -64,7 +64,14 @@ async function main(){
  assert.equal(handle.toggleShift(),true);assert.equal(key(root,'shift').getAttribute('aria-pressed'),'true');await handle.sendKey('tab');assert.equal(inputs(socket).at(-1),'\x1b[Z');assert.equal(key(root,'shift').getAttribute('aria-pressed'),'false');
  event(key(root,'shift'),'click');await handle.sendKey('arrowUp');assert.equal(inputs(socket).at(-1),'\x1b[1;2A');
  console.log('PASS Shift modifier');
- viewport.height=544;event(viewport,'resize');assert.equal(root.style['--keyboard-inset'],'300px');assert.equal(find(root,'dismiss-keyboard').hidden,false);viewport.scale=1.5;event(viewport,'resize');assert.equal(root.style['--keyboard-inset'],'0px');assert.equal(find(root,'dismiss-keyboard').hidden,true);viewport.scale=1;viewport.height=844;event(viewport,'resize');console.log('PASS visualViewport keyboard inset excludes browser zoom');
+ {const html=context.document.documentElement,writes=[],set=html.style.setProperty;html.style.setProperty=(k,v)=>{writes.push([k,v]);set.call(html.style,k,v);};
+  viewport.height=700;event(viewport,'resize');viewport.height=544;event(viewport,'resize');event(viewport,'scroll');assert.deepEqual(writes,[],'keyboard events only schedule; no layout write before the frame');await advance(16);assert.deepEqual(writes,[['--keyboard-inset','300px']],'one CSS variable write per frame on <html>');assert.equal(root.style['--keyboard-inset'],undefined,'terminal does not keep its own inset');assert.equal(find(root,'dismiss-keyboard').hidden,false);assert.equal(root.dataset.keyboardOpen,'true');
+  viewport.scale=1.5;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','0px'],'pinch zoom is not a keyboard');assert.equal(find(root,'dismiss-keyboard').hidden,true);viewport.scale=undefined;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','300px'],'a WebView without scale is unzoomed');
+  const scrolls=[];context.scrollY=40;context.scrollTo=(x,y)=>{scrolls.push([x,y]);context.scrollY=0;};context.document.activeElement={closest:s=>s.includes('.command-dock')?{}:null};viewport.offsetTop=40;viewport.height=504;event(viewport,'scroll');await advance(16);assert.deepEqual(scrolls,[[0,0]],'iOS focus scroll is put back for the docked input');viewport.offsetTop=0;viewport.height=544;event(viewport,'scroll');await advance(16);assert.equal(scrolls.length,1);assert.equal(writes.length,3,'unchanged inset is not rewritten');
+  context.document.activeElement=null;viewport.scale=1;viewport.height=844;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','0px']);html.style.setProperty=set;}
+ {const prevented=[],container={addEventListener(type,fn,opts){assert.equal(type,'mousedown');assert.equal(opts.capture,true);this.fn=fn;},contains:()=>true},button={},tap=target=>{const e={target,preventDefault(){prevented.push(target);}};container.fn(e);};context.MkKeyboard.keepFocus(container);const onButton={closest:s=>s==='button'?button:null,matches:()=>false},onText={closest:()=>null,matches:()=>true};
+  context.document.activeElement={matches:()=>true};tap(onButton);tap(onText);context.document.activeElement={matches:()=>false};tap(onButton);context.document.activeElement=null;assert.deepEqual(prevented,[onButton],'a button tap keeps the text field focused only while typing');}
+ console.log('PASS visualViewport keyboard inset: one rAF-batched <html> write, pinch zoom ignored, iOS focus scroll reset, send taps keep the keyboard');
  const attach=socket.sent.find(a=>a[4]===0x10),role=socket.sent.find(a=>a[4]===0x17);assert.deepEqual([...attach.slice(-2)],[0,0]);assert.deepEqual([...role.slice(5)],[0,2,0]);
  let count=inputs(socket).length;event(key(root,'backspace'),'pointerdown',{button:0,pointerId:1});await flush();assert.equal(inputs(socket).length,count+1);await advance(399);assert.equal(inputs(socket).length,count+1);await advance(1);assert.equal(inputs(socket).length,count+2);await advance(45);assert.equal(inputs(socket).length,count+3);event(key(root,'backspace'),'pointerup');await advance(500);assert.equal(inputs(socket).length,count+3);console.log('PASS repeat immediate / 400ms / 45ms and release');
  const capture=find(root,'live-capture');handle.focus();count=inputs(socket).length;event(capture,'compositionstart');capture.value='ㅎ';event(capture,'input',{isComposing:true});capture.value='한';event(capture,'input',{isComposing:true});assert.equal(inputs(socket).length,count);event(capture,'compositionend',{data:'한'});capture.value='한';event(capture,'input',{isComposing:false});await flush();assert.deepEqual(inputs(socket).slice(count),['한']);
@@ -123,15 +130,15 @@ async function main(){
  // Fit 응답을 기다리는 동안 바뀐 높이(상태줄이 사라짐 등)도 응답 뒤에 맞춘다.
  await advance(150);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
  // 키보드가 열려 높이가 줄어도 행은 그대로, 이벤트가 몰려도 멈춘 뒤 한 번만 맞춘다.
- port47.clientHeight=360;event(viewport,'resize');event(viewport,'resize');await advance(149);let n47=roles47().length;await advance(1);assert.equal(roles47().length,n47+1);assert.deepEqual(roles47().at(-1),[1,48,20]);socket.frame(0x2c,T.v(0));socket.frame(0x21,T.v(4),T.v(4),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(20)));await flush();
+ port47.clientHeight=360;event(viewport,'resize');event(viewport,'resize');await advance(16);await advance(149);let n47=roles47().length;await advance(1);assert.equal(roles47().length,n47+1);assert.deepEqual(roles47().at(-1),[1,48,20]);socket.frame(0x2c,T.v(0));socket.frame(0x21,T.v(4),T.v(4),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(20)));await flush();
  viewport.height=544;port47.clientHeight=60;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);assert.equal(root.dataset.keyboardOpen,'true');
  viewport.height=844;port47.clientHeight=360;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);
  port47.clientHeight=540;event(viewport,'resize');await advance(200);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
  // Fold/rotation events refit width too. If the next fold arrives before the
  // role acknowledgement, retain it and fit the final viewport after the reply.
- port47.clientWidth=830;event(globalEvents,'orientationchange');await advance(150);assert.deepEqual(roles47().at(-1),[1,103,30]);
+ port47.clientWidth=830;event(globalEvents,'orientationchange');await advance(16+150);assert.deepEqual(roles47().at(-1),[1,103,30]);
  port47.clientWidth=320;event(globalEvents,'orientationchange');await advance(150);socket.frame(0x2c,T.v(0));await flush();await advance(150);assert.deepEqual(roles47().at(-1),[1,39,30]);socket.frame(0x2c,T.v(0));await flush();
- port47.clientWidth=390;event(viewport,'resize');await advance(150);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ port47.clientWidth=390;event(viewport,'resize');await advance(16+150);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
  console.log('PASS fold/rotation refits width and retains the latest viewport during a pending resize');
  port47.clientWidth=0;n47=roles47().length;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47);port47.clientWidth=390;
  // 화면이 가려지면 크기 소유를 놓고(데스크톱 크기 복귀), 다시 보이면 맞춘다.
@@ -159,6 +166,7 @@ async function main(){
   assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'true');assert.equal(resizes().length,1);handle.unmount();console.log('PASS auto-fit resize pipelined with attach, no duplicate after first frame');}
  await testHistoryGestures();
  await testHistoryPrefetch();
+ await testScrollAnchor();
  await testFailurePaths();
  console.log('All terminal adapter regression checks passed.');
 }
@@ -172,6 +180,23 @@ async function testHistoryPrefetch(){
  const partial=await mount(1302),pp=find(partial.root,'terminal-scroll');pp.clientHeight=400;pp.scrollHeight=20000;partial.handle.loadHistory();
  const pr=()=>partial.socket.sent.filter(a=>a[4]===0x12).at(-1),respond=(total,skip,n)=>{const r=T.reader(pr().slice(5));partial.socket.frame(0x26,T.v(r.n()),T.v(total),T.v(1),T.v(skip),T.v(n),...Array(n).fill(row));};respond(160,0,160);await advance(0);respond(5000,0,300);await advance(0);respond(5000,300,300);await advance(0);r=T.reader(pr().slice(5));r.n();r.n();r.n();r.n();assert.equal(r.n(),140);respond(5000,600,140);await advance(0);assert.equal(find(partial.root,'terminal-history').children.length,900);assert.equal(find(partial.root,'terminal-grid').hidden,false);partial.handle.unmount();
  console.log('PASS 900 rows warm before scrolling, 3-viewport lookahead, existing DOM retained, 1000-row bound, hidden/unmounted terminals stop warming');
+}
+// 레이아웃을 흉내 낸 스크롤 포트(scrollTop 고정 범위, 히스토리 행 18px + 캔버스 400px)로 손가락 스크롤 위치 보존을 확인한다.
+async function testScrollAnchor(){
+ const {root,handle,socket}=await mount(1400),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history'),grid=find(root,'terminal-grid'),controls=find(root,'terminal-history-controls'),latest=find(root,'terminal-latest');let top=0;port.clientHeight=400;
+ Object.defineProperty(grid,'offsetTop',{get:()=>(controls.hidden?0:32)+hist.children.length*18});Object.defineProperty(port,'scrollHeight',{get:()=>grid.offsetTop+(grid.hidden?0:400)});Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
+ const requests=()=>socket.sent.filter(a=>a[4]===0x12),row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),reply=(total,pages,n)=>{const r=T.reader(requests().at(-1).slice(5));socket.frame(0x26,T.v(r.n()),T.v(total),T.v(pages),T.v(0),T.v(n),...Array(n).fill(row));};
+ const gap=()=>port.scrollHeight-top-port.clientHeight,drag=dy=>{port.scrollTop-=dy;event(port,'scroll');};
+ handle.loadHistory();reply(100,0,100);assert.equal(gap(),0);
+ // 바닥에서 위로 10px 끌면 새로고침 요청이 나가고, 응답이 와도(그 사이 출력 20행이 스크롤백으로 넘어감) 바닥으로 끌려가지 않는다.
+ socket.screen('out 0');await flush();event(port,'touchstart',{touches:[{clientX:150,clientY:200}]});event(port,'touchmove',{touches:[{clientX:150,clientY:210}]});drag(10);
+ const n=requests().length;reply(120,2,120);assert.equal(gap(),10);assert.equal(latest.hidden,false);event(port,'touchend',{touches:[]});
+ for(let i=1;i<6;i++){socket.screen(`out ${i}`);await advance(16);}assert.equal(gap(),10);assert.equal(latest.hidden,false);assert.equal(requests().length,n);
+ // 맨 위 근처까지 올리면 cold 페이지를 앞에 붙이고, 보던 줄(캔버스 기준 위치)은 그대로다.
+ drag(top-100);assert.equal(requests().length,n+1);const rel=grid.offsetTop-top;reply(300,2,300);assert.equal(grid.offsetTop-top,rel);socket.screen('out 6');await advance(16);assert.equal(grid.offsetTop-top,rel);
+ // 손으로 바닥까지 내리면 다시 따라가고 Latest 버튼이 숨는다.
+ port.scrollTop=1e9;event(port,'scroll');assert.equal(latest.hidden,true);handle.unmount();
+ console.log('PASS upward drag from live keeps position through hot refresh and new output; cold prepend keeps anchor; reaching bottom re-sticks');
 }
 async function testHistoryGestures(){
  const {root,handle,socket}=await mount(1201),port=find(root,'terminal-scroll');port.clientHeight=400;port.scrollHeight=400;

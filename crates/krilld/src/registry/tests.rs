@@ -59,6 +59,28 @@ fn agent_settings_and_metadata_obey_peer_scope() {
 }
 
 #[test]
+fn capture_since_hides_out_of_scope_sessions_and_remains_read_only() {
+    let reg = Registry::new(None, None);
+    let mut clients = HashMap::new();
+    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+        let peer = Peer { pid: None, scope };
+        let request = Request::CaptureSince {
+            session: SessionId(9),
+            since: Some(control::CaptureStamp {
+                session: SessionId(9),
+                revision: screen::Revision(1),
+                seq: screen::Seq(2),
+            }),
+        };
+        assert!(read_only(&request));
+        assert_eq!(
+            reg.handle(&peer, request, &mut clients),
+            Reply::Failed(Failure::NoSession)
+        );
+    }
+}
+
+#[test]
 fn unnegotiated_agent_requests_and_observer_mutations_are_rejected() {
     for (features, observer, expected) in [
         (FEAT_CONTROL, false, Failure::BadRequest),
@@ -108,6 +130,10 @@ fn unnegotiated_agent_requests_and_observer_mutations_are_rejected() {
             ]
         } else {
             vec![
+                Request::CaptureSince {
+                    session: SessionId(9),
+                    since: None,
+                },
                 Request::AgentSettings { permission: None },
                 Request::AgentLaunch {
                     session: SessionId(9),
@@ -1633,4 +1659,59 @@ fn first_hook_waits_for_spawn_registration_on_socket_and_spool() {
         drop(reg);
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[test]
+fn late_hook_cannot_resurrect_a_deleted_session_or_launch_metadata() {
+    let dir = std::env::temp_dir().join(format!("hook-delete-commit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(991);
+    let (master, user) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+        },
+    );
+    reg.agents
+        .remember(
+            id,
+            &control::AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+        )
+        .unwrap();
+    reg.remove(id);
+    let event = krill_proto::hook::HookEvent {
+        id: krill_proto::hook::EventId {
+            pid: 1,
+            unix_ns: 10,
+        },
+        agent: "codex".into(),
+        ppid: 0,
+        input: krill_proto::hook::Input::Complete,
+        payload: br#"{"hook_event_name":"UserPromptSubmit","session_id":"late-conversation"}"#
+            .to_vec(),
+    };
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(id),
+    };
+    assert_eq!(reg.on_hook(&peer, &event).unwrap(), None);
+    assert_eq!(reg.status.get(id), control::AgentStatus::UNKNOWN);
+    assert!(!reg.agents.has(id));
+    drop(user);
+    std::fs::remove_dir_all(dir).unwrap();
 }

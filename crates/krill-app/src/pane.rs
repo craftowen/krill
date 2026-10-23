@@ -18,6 +18,7 @@
 
 mod context;
 mod hibernation;
+mod stable_history;
 
 use krill_proto::os::net::UnixStream;
 use std::io::{self, Write};
@@ -539,6 +540,8 @@ pub fn attach(
 /// [`Pane::frame`]의 결과(셸이 할 일).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Events {
+    /// One-shot history status; retain the current grid, selection and connection.
+    pub history_notice: Option<String>,
     /// 보이는 화면이 바뀌었다.
     pub redraw: bool,
     pub bell: bool,
@@ -584,6 +587,7 @@ struct SearchState {
     highlight: Option<crate::terminal::Highlight>,
     /// 보이는 화면의 일치 범위 전부(활성 포함 가능, 엷게 칠한다).
     highlights: Vec<crate::terminal::Highlight>,
+    row_marks: Vec<Vec<(u16, u16)>>,
 }
 
 /// 맨 위 이동은 페이지의 행 수를 먼저 확인한 뒤 화면 크기만큼만 읽는다.
@@ -658,7 +662,11 @@ fn find_matches_with_pattern(
         spans.push((start, text.len(), column, end_column));
     }
     let mut out = Vec::new();
-    for matched in pattern.find_iter(&text).filter(|m| !m.is_empty()) {
+    for matched in pattern
+        .find_iter(&text)
+        .filter(|m| !m.is_empty())
+        .take(MAX_SEARCH_MARKS)
+    {
         let byte = matched.start();
         let end = matched.end();
         let mut overlaps = spans.iter().filter(|span| span.1 > byte && span.0 < end);
@@ -675,6 +683,8 @@ impl SearchState {
     fn clear(&mut self) {
         self.pending = None;
         self.query.clear();
+        self.pattern = None;
+        self.row_marks.clear();
         self.cursor = None;
         self.result = None;
         self.hist_req = None;
@@ -881,6 +891,9 @@ impl<W: Write> Pane<W> {
         self.search.cursor = None;
         self.search.hist_req = None;
         self.search.hist_target = None;
+        if let Some(cache) = self.history.stable.as_mut() {
+            cache.expire();
+        }
         self.session = Some(session);
         self.instance = instance;
         self.out = Some(out);
@@ -1049,8 +1062,15 @@ impl<W: Write> Pane<W> {
             self.scroll(isize::MAX);
             return;
         }
-        self.history.reset();
-        self.request_top(Source::Cold { page: 0 }, None);
+        if self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
+            && self.history.prior.is_empty()
+        {
+            self.history.offset = usize::MAX;
+            self.fetch();
+        } else {
+            self.history.reset();
+            self.request_top(Source::Cold { page: 0 }, None);
+        }
     }
 
     fn request_top(&mut self, source: Source, total: Option<u32>) {
@@ -1117,7 +1137,7 @@ impl<W: Write> Pane<W> {
 
     /// 받아 둔 스크롤백 행 수(화면 바로 위부터). 아직 도착하지 않은 요청분은 세지 않는다(OWE-873).
     pub fn scrollback_len(&self) -> usize {
-        self.history.rows.len()
+        self.history.total_len()
     }
 
     /// 스크롤백을 버리고 바닥으로 돌아간다(⌘K, OWE-873 / OWE-873b).
@@ -1156,6 +1176,9 @@ impl<W: Write> Pane<W> {
     /// 상대가 프로토콜을 어겼거나 응답(RESYNC·HISTORY)을 쓰지 못했다.
     pub fn frame(&mut self, k: u8, body: &[u8]) -> io::Result<Events> {
         let mut ev = Events::default();
+        if let Some(cache) = self.history.stable.as_mut() {
+            ev.history_notice = cache.take_notice().or(ev.history_notice);
+        }
         match k {
             krill_proto::term_modes::TERM_MODES => {
                 self.modes = krill_proto::term_modes::Modes::decode(k, body)?;
@@ -1173,7 +1196,21 @@ impl<W: Write> Pane<W> {
                     self.resync = false;
                     ev.bell = self.view.screen.bells != bells;
                     ev.redraw = true;
+                    if self.history.stable.is_some() {
+                        self.fetch();
+                    }
                     self.refresh();
+                }
+            }
+            kind::HISTORY_VIEW_ROWS => {
+                let reply = krill_proto::screen::HistoryViewRows::decode(k, body)?;
+                if let Some(cache) = self.history.stable.as_mut() {
+                    ev.redraw = cache.accept(reply);
+                    ev.history_notice = cache.take_notice().or(ev.history_notice);
+                    if ev.redraw {
+                        self.refresh();
+                    }
+                    self.fetch();
                 }
             }
             kind::HISTORY_ROWS => {
@@ -1270,6 +1307,34 @@ impl<W: Write> Pane<W> {
 
     fn fetch(&mut self) {
         let lines = usize::from(self.view.screen.lines);
+        if let Some(cache) = self.history.stable.as_mut() {
+            cache.show(self.history.offset, lines);
+        }
+        if self.out.is_some()
+            && self.history.offset > 0
+            && !self.history.fixed
+            && self.history.prior.is_empty()
+            && (self.history.stable.is_some() || self.history.rows.is_empty())
+            && self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
+        {
+            if let Some(session) = self.session {
+                let cache = self
+                    .history
+                    .stable
+                    .get_or_insert_with(|| stable_history::Cache::new(session));
+                self.history.req = self.history.req.wrapping_add(1);
+                if let Some(req) = cache.next(self.history.offset, lines, self.history.req)
+                    && self.send(&req).is_err()
+                {
+                    self.unlink();
+                }
+            }
+            return;
+        }
+        // A retained token is terminal after reconnect/feature loss; never accumulate invisible legacy rows.
+        if self.history.stable.is_some() {
+            return;
+        }
         if self.out.is_some()
             && let Some(req) = self.history.next_request(lines)
             && self.send(&req).is_err()
@@ -1291,17 +1356,26 @@ impl<W: Write> Pane<W> {
     }
 
     fn refresh(&mut self) {
+        if self
+            .history
+            .stable
+            .as_ref()
+            .is_some_and(|cache| !cache.can_compose(usize::from(self.view.screen.lines)))
+        {
+            return;
+        }
         #[cfg(target_os = "macos")]
         let _work = crate::responsiveness::work("pane.refresh");
         let s = self.history.compose(&self.view.screen);
-        self.shown = Rc::new(s);
-        self.refresh_search_marks();
+        let previous = std::mem::replace(&mut self.shown, Rc::new(s));
+        self.refresh_search_marks(&previous);
     }
 
     /// 보이는 화면의 검색 일치 범위를 전부 다시 찾는다(OWE-868). 활성 일치는 그대로 둔다.
-    fn refresh_search_marks(&mut self) {
+    fn refresh_search_marks(&mut self, previous: &Screen) {
         self.search.highlights.clear();
         if self.search.query.is_empty() || self.search.result.is_none() {
+            self.search.row_marks.clear();
             return;
         }
         if self
@@ -1312,6 +1386,7 @@ impl<W: Write> Pane<W> {
                 *query != self.search.query || *options != self.search.options
             })
         {
+            self.search.row_marks.clear();
             self.search.pattern = Some((
                 self.search.query.clone(),
                 self.search.options,
@@ -1321,6 +1396,8 @@ impl<W: Write> Pane<W> {
         let Some((_, _, Some(pattern))) = &self.search.pattern else {
             return;
         };
+        let mut processed = 0;
+        let mut recomputed = 0usize;
         for (line, row) in self.shown.rows.iter().enumerate() {
             if self.search.highlights.len() >= MAX_SEARCH_MARKS {
                 break;
@@ -1328,7 +1405,17 @@ impl<W: Write> Pane<W> {
             let Ok(line) = u16::try_from(line) else {
                 break;
             };
-            for (column, cols) in find_matches_with_pattern(row, pattern) {
+            let index = usize::from(line);
+            processed = index + 1;
+            if self.search.row_marks.len() <= index {
+                self.search.row_marks.resize_with(index + 1, Vec::new);
+                recomputed += 1;
+                self.search.row_marks[index] = find_matches_with_pattern(row, pattern);
+            } else if previous.rows.get(index) != Some(row) {
+                recomputed += 1;
+                self.search.row_marks[index] = find_matches_with_pattern(row, pattern);
+            }
+            for &(column, cols) in &self.search.row_marks[index] {
                 if self.search.highlights.len() >= MAX_SEARCH_MARKS {
                     break;
                 }
@@ -1337,6 +1424,13 @@ impl<W: Write> Pane<W> {
                     .push(crate::terminal::Highlight { line, column, cols });
             }
         }
+        self.search.row_marks.truncate(processed);
+        tracing::trace!(
+            rows = processed,
+            recomputed,
+            marks = self.search.highlights.len(),
+            "terminal search marks"
+        );
     }
 
     /// 스크롤백 일치의 이웃 행을 달라고 데몬에 요청한다(OWE-868). 일치 행이 뷰포트 안에 오도록
@@ -1566,6 +1660,7 @@ enum Phase {
 // 받은 행은 바닥으로 돌아올 때까지 다 든다(핫 1,000행 + 본 콜드 페이지). 콜드를 깊이 보는 일이 잦으면 창 밖 페이지를 버린다.
 #[derive(Debug, Clone)]
 pub struct History {
+    stable: Option<stable_history::Cache>,
     /// 화면 바닥 위로 올린 행 수(0 = 라이브). 받은 행보다 클 수 있다(받는 중).
     offset: usize,
     /// 받은 행, 화면 바로 위부터 위로.
@@ -1587,6 +1682,7 @@ impl Default for History {
     fn default() -> Self {
         Self {
             offset: 0,
+            stable: None,
             rows: Vec::new(),
             prior: Vec::new(),
             hot: 0,
@@ -1658,15 +1754,28 @@ impl History {
     }
 
     fn total_len(&self) -> usize {
+        if let Some(cache) = &self.stable {
+            return cache.total();
+        }
         self.rows.len().saturating_add(self.prior.len())
     }
 
     /// 지금 보이는 히스토리 행 수.
     fn visible(&self) -> usize {
+        if let Some(cache) = &self.stable {
+            return cache.visible();
+        }
         self.offset.min(self.total_len())
     }
 
     fn scroll(&mut self, lines: isize) {
+        if let Some(cache) = &self.stable {
+            self.offset = cache.visible().saturating_add_signed(lines);
+            if self.offset == 0 {
+                self.reset();
+            }
+            return;
+        }
         // 비동기 요청량이 받은 히스토리보다 커도 이동 기준은 실제 보이는 위치다.
         let next = self.visible().saturating_add_signed(lines);
         // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 두고, 행이 오면 그만큼 보인다.
@@ -1694,13 +1803,27 @@ impl History {
             Phase::Cold { page, got, .. } => (Source::Cold { page }, got),
             Phase::Done => return None,
         };
+        // While locating the newest-page overlap, a tiny viewport request would
+        // repeatedly decode the same page. Keep full bounded chunks until found.
+        let count = if self.hot != 0 && matches!(self.phase, Phase::Cold { newest: true, .. }) {
+            MAX_HISTORY_ROWS
+        } else {
+            u16::try_from(
+                self.offset
+                    .saturating_add(lines)
+                    .saturating_sub(self.rows.len())
+                    .min(usize::from(MAX_HISTORY_ROWS)),
+            )
+            .unwrap_or(MAX_HISTORY_ROWS)
+            .max(1)
+        };
         self.req = self.req.wrapping_add(1);
         self.pending = Some(self.req);
         Some(HistoryRequest {
             req: self.req,
             source,
             skip,
-            count: MAX_HISTORY_ROWS,
+            count,
         })
     }
 
@@ -1730,27 +1853,38 @@ impl History {
                 };
             }
             Phase::Cold { page, got, newest } => {
-                self.page.extend(r.rows.into_iter().rev());
                 let got = got.saturating_add(n);
-                if n != 0 && got < r.total {
-                    self.phase = Phase::Cold { page, got, newest };
-                    return;
-                }
-                let page_rows = std::mem::take(&mut self.page);
-                let start = if newest {
-                    after_overlap(&page_rows, self.rows.get(..self.hot).unwrap_or_default())
+                let mut waiting_overlap = newest && self.hot != 0;
+                if waiting_overlap {
+                    self.page.extend(r.rows.into_iter().rev());
+                    let start =
+                        after_overlap(&self.page, self.rows.get(..self.hot).unwrap_or_default());
+                    // The first matching suffix is identical to the old whole-page rule.
+                    // Once found, publish immediately and continue at the exact source skip.
+                    if start != 0 || n == 0 || got >= r.total {
+                        let page_rows = std::mem::take(&mut self.page);
+                        self.rows.extend(page_rows.into_iter().skip(start));
+                        waiting_overlap = false;
+                    }
                 } else {
-                    0
-                };
-                self.rows.extend(page_rows.into_iter().skip(start));
-                self.phase = match page.checked_sub(1) {
-                    Some(page) => Phase::Cold {
+                    self.rows.extend(r.rows.into_iter().rev());
+                }
+                if n != 0 && got < r.total {
+                    self.phase = Phase::Cold {
                         page,
-                        got: 0,
-                        newest: false,
-                    },
-                    None => Phase::Done,
-                };
+                        got,
+                        newest: waiting_overlap,
+                    };
+                } else {
+                    self.phase = match page.checked_sub(1) {
+                        Some(page) => Phase::Cold {
+                            page,
+                            got: 0,
+                            newest: false,
+                        },
+                        None => Phase::Done,
+                    };
+                }
             }
             Phase::Done => {}
         }
@@ -1772,8 +1906,10 @@ impl History {
             } else {
                 let idx = off - l - 1;
                 let row = self
-                    .rows
-                    .get(idx)
+                    .stable
+                    .as_ref()
+                    .and_then(|cache| cache.row(idx))
+                    .or_else(|| self.rows.get(idx))
                     .or_else(|| self.prior.get(idx.saturating_sub(self.rows.len())))
                     .cloned()
                     .unwrap_or_default();

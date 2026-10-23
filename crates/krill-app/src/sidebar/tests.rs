@@ -212,7 +212,7 @@ fn needs_you_precedes_pins_and_collapsed_worktrees() {
     );
     let project_rows = super::rows(&snapshot, &prefs, &collapsed);
     assert!(
-        !project_rows.iter().any(|r| *r == Row::NeedsYou),
+        !project_rows.contains(&Row::NeedsYou),
         "project mode keeps attention inside projects and the toolbar bell"
     );
     assert!(matches!(
@@ -1775,7 +1775,7 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         let s = view.read(cx);
         assert!(!s.rows.iter().any(|r| matches!(r, Row::HostHeader { .. })));
         assert!(matches!(&s.rows[0], Row::Repository(p) if p == Path::new("/repo")));
-        assert_eq!(s.host_indent(), 0.);
+        assert_eq!(s.host_indent().to_bits(), 0_f32.to_bits());
         assert_eq!(
             s.host_badge_for(&HostId::Local, Path::new("/repo/mobile-ui")),
             None
@@ -1824,7 +1824,7 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
     let out = reconnected.clone();
     let _sub = cx.update(|_, cx| {
         cx.subscribe(&view, move |_, event: &ReconnectHost, _| {
-            out.borrow_mut().push(event.0.clone())
+            out.borrow_mut().push(event.0.clone());
         })
     });
     view.update(cx, |s, cx| {
@@ -1855,7 +1855,7 @@ fn project_toolbar_unread_reveals_folded_project_and_lineage(cx: &mut TestAppCon
     let events = out.clone();
     let _sub = cx.update(|_, cx| {
         cx.subscribe(&view, move |_, event: &Selected, _| {
-            events.borrow_mut().push(event.0)
+            events.borrow_mut().push(event.0);
         })
     });
     view.update(cx, |s, cx| {
@@ -5319,4 +5319,31 @@ fn terminal_focus_moves_the_single_workspace_selection(cx: &mut TestAppContext) 
             .collect();
         assert_eq!(active, vec![PathBuf::from("/repo/b")]);
     });
+}
+
+#[gpui::test]
+fn status_summary_reuses_snapshot_until_sidebar_changes(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![
+                        session(1, AgentState::Waiting, Some("/repo")),
+                        session(2, AgentState::Working, Some("/repo")),
+                    ],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+    });
+    let first = sidebar.read_with(cx, |sidebar, _| sidebar.status_summary());
+    let second = sidebar.read_with(cx, |sidebar, _| sidebar.status_summary());
+    assert_eq!(first.0, 1);
+    assert_eq!(*first.1, vec![AgentState::Waiting, AgentState::Working]);
+    assert!(Arc::ptr_eq(&first.1, &second.1));
 }

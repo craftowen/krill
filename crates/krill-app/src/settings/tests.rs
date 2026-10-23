@@ -8736,3 +8736,316 @@ fn orca_option_auto_preserves_explicit_legacy_overrides() {
         assert!(!us_keyboard_layout(id));
     }
 }
+
+#[test]
+fn admin_service_stamps_track_rotation_and_external_file_replacement() {
+    let d = dir("admin-service-stamps");
+    let initial = service_stamps(&d);
+    fs::write(d.join(krill_proto::schedule::RUNS), "started\n").unwrap();
+    let current = service_stamps(&d);
+    assert_ne!(initial, current);
+    fs::rename(
+        d.join(krill_proto::schedule::RUNS),
+        d.join(krill_proto::schedule::PREVIOUS_RUNS),
+    )
+    .unwrap();
+    fs::write(d.join(krill_proto::schedule::RUNS), "started\n").unwrap();
+    assert_ne!(current, service_stamps(&d));
+    let old = account_stamps(Some(&d));
+    fs::write(d.join(ACCOUNTS_FILE), "# external account configuration\n").unwrap();
+    assert_ne!(old, account_stamps(Some(&d)));
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn unrelated_settings_edits_do_not_invalidate_workflow_cache(cx: &mut TestAppContext) {
+    let d = dir("field-invalidation");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_tab(AdminTab::Workflows, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let before = vcx.update(|_, cx| view.read(cx).services.worktrees.clone());
+    vcx.update(|_, cx| {
+        edit(cx, |settings| {
+            settings.confirm_running_close = !settings.confirm_running_close;
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(std::sync::Arc::ptr_eq(
+            &before,
+            &view.read(cx).services.worktrees
+        ));
+        assert!(!view.read(cx).accounts_refresh_pending);
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn indexed_duplicate_labels_match_existing_identity_and_host_preference() {
+    use krill_proto::usage::{AccountInfo, ProviderKind};
+    let accounts: Vec<_> = (0..12)
+        .map(|n| AccountInfo {
+            id: format!("account-{n}"),
+            provider: if n == 11 {
+                ProviderKind::Codex
+            } else {
+                ProviderKind::Claude
+            },
+            label: format!("Account {n}"),
+            email: None,
+            profile_dir: format!("/profile/{n}"),
+            active: false,
+            host_default: n == 4,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        })
+        .collect();
+    let identities = accounts
+        .iter()
+        .enumerate()
+        .map(|(n, a)| {
+            (
+                a.id.clone(),
+                crate::accounts::Identity {
+                    email: if n % 2 == 0 {
+                        "ME@EXAMPLE.COM"
+                    } else {
+                        "me@example.com"
+                    }
+                    .into(),
+                    org_id: Some(if n == 9 { "other" } else { "same" }.into()),
+                    org_name: None,
+                },
+            )
+        })
+        .collect();
+    let indexed = duplicate_account_labels(&accounts, &identities);
+    for account in &accounts {
+        let expected =
+            crate::accounts::duplicate_of(account, &accounts, &identities).map(|other| {
+                if other.host_default {
+                    text::ACCOUNT_DUPLICATE_HOST.get().to_owned()
+                } else {
+                    text::ACCOUNT_DUPLICATE.format(&[("label", &other.label)])
+                }
+            });
+        assert_eq!(indexed.get(&account.id), expected.as_ref());
+    }
+}
+
+#[gpui::test]
+fn custom_theme_swatch_cache_updates_same_id_and_discards_removed_entries(cx: &mut TestAppContext) {
+    let d = dir("theme-swatch-cache");
+    init(cx, &d);
+    let custom = crate::ui::parse_warp_theme_yaml(
+        "name: Cache Fixture\nbackground: '#101418'\nforeground: '#e0e4e8'\nterminal_colors:\n  normal:\n    black: '#000000'\n",
+        "cache.yaml",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        edit(cx, move |settings| {
+            settings.terminal_custom_themes = vec![custom.clone()];
+        });
+    });
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut view = SettingsView::new(cx);
+        view.tab = AdminTab::Terminal;
+        view.terminal_theme_target = Some(ThemeMode::Dark);
+        view
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).terminal_theme_swatches.len(), 1));
+    vcx.update(|_, cx| {
+        edit(cx, |settings| {
+            settings.terminal_custom_themes[0].background = "#112233".into();
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx)
+                .terminal_theme_swatches
+                .get(&0)
+                .unwrap()
+                .0
+                .background,
+            "#112233"
+        );
+    });
+    vcx.update(|_, cx| edit(cx, |settings| settings.terminal_custom_themes.clear()));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(view.read(cx).terminal_theme_swatches.is_empty()));
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn external_workflow_reload_preserves_unsaved_hooks_and_symlink(cx: &mut TestAppContext) {
+    let d = dir("workflow-draft-revalidate");
+    init(cx, &d);
+    let repo = d.display().to_string();
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let mut view = SettingsView::new(cx);
+        view.tab = AdminTab::Workflows;
+        view.load_repo_hooks_for(&repo, window, cx);
+        view
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let form = view.workflow_form.as_ref().unwrap();
+            let setup = form.setup_script.clone();
+            let archive = form.archive_script.clone();
+            let symlink = form.symlink_path.clone();
+            setup.update(cx, |input, cx| input.set_value("unsent setup", window, cx));
+            archive.update(cx, |input, cx| {
+                input.set_value("unsent archive", window, cx);
+            });
+            symlink.update(cx, |input, cx| input.set_value("unsent-link", window, cx));
+        });
+    });
+    vcx.run_until_parked();
+    let mut external = krill_proto::orchestration::WorktreeStore::default();
+    external
+        .setup_scripts
+        .insert(repo.clone(), "disk setup".into());
+    external
+        .archive_scripts
+        .insert(repo.clone(), "disk archive".into());
+    external
+        .setup_scripts
+        .insert("/another/repo".into(), "unrelated".into());
+    external.save(&d).unwrap();
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.services_checked = None;
+            view.refresh_service_cache(cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |view, cx| view.sync_workflow_repo_hooks(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.setup_script.read(cx).value().as_str(), "unsent setup");
+        assert_eq!(
+            form.archive_script.read(cx).value().as_str(),
+            "unsent archive"
+        );
+        assert_eq!(form.symlink_path.read(cx).value().as_str(), "unsent-link");
+        assert_eq!(form.loaded_setup, "disk setup");
+        assert_eq!(form.loaded_archive, "disk archive");
+        assert_eq!(form.loaded_repo.as_deref(), Some(repo.as_str()));
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn workflow_hook_cache_prefers_resolved_root_and_preserves_legacy_raw_keys() {
+    let mut cache = ServiceCache::default();
+    let raw = "/nonexistent/worktree-alias/nested";
+    let root = "/nonexistent/worktree-alias";
+    cache.aliases.insert(raw.into(), root.into());
+    let mut store = krill_proto::orchestration::WorktreeStore::default();
+    store.setup_scripts.insert(root.into(), "root setup".into());
+    store
+        .setup_scripts
+        .insert(raw.into(), "legacy setup".into());
+    store
+        .archive_scripts
+        .insert(raw.into(), "legacy archive".into());
+    cache.worktrees = std::sync::Arc::new(store);
+    assert_eq!(cache.setup_script_for(raw).as_deref(), Some("root setup"));
+    assert_eq!(
+        cache.archive_script_for(raw).as_deref(),
+        Some("legacy archive")
+    );
+    std::sync::Arc::make_mut(&mut cache.worktrees)
+        .setup_scripts
+        .remove(root);
+    assert_eq!(cache.setup_script_for(raw).as_deref(), Some("legacy setup"));
+    assert_eq!(cache.setup_script_for("/unknown/repo"), None);
+}
+
+#[gpui::test]
+fn unresolved_workflow_alias_cannot_save_empty_hooks_over_existing_root(cx: &mut TestAppContext) {
+    let d = dir("workflow-alias-save");
+    let root_dir = d.join("repo");
+    fs::create_dir_all(root_dir.join(".git")).unwrap();
+    fs::create_dir_all(root_dir.join("nested")).unwrap();
+    let root = fs::canonicalize(&root_dir).unwrap().display().to_string();
+    let nested = fs::canonicalize(root_dir.join("nested"))
+        .unwrap()
+        .display()
+        .to_string();
+    let mut stored = krill_proto::orchestration::WorktreeStore::default();
+    stored.set_setup_script(&root, "keep setup").unwrap();
+    stored.set_archive_script(&root, "keep archive").unwrap();
+    stored.save(&d).unwrap();
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let mut view = SettingsView::new(cx);
+        view.tab = AdminTab::Workflows;
+        view.load_repo_hooks_for(&root, window, cx);
+        view
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.sync_workflow_repo_hooks(window, cx);
+            assert!(view.workflow_hooks_ready(cx));
+            // Hold only the fixture's background publication while selecting an
+            // uncached nested path that resolves to the already configured root.
+            view.services_pending = true;
+            let repo = view.workflow_form.as_ref().unwrap().repo_path.clone();
+            repo.update(cx, |input, cx| input.set_value(nested.clone(), window, cx));
+            view.sync_workflow_repo_hooks(window, cx);
+            assert!(!view.workflow_hooks_ready(cx));
+            assert_eq!(
+                view.workflow_form.as_ref().unwrap().loaded_repo.as_deref(),
+                Some(root.as_str())
+            );
+            let revision = view.file_revision;
+            view.save_workflow_form(window, cx);
+            assert_eq!(
+                view.file_revision, revision,
+                "unresolved form must not queue a write"
+            );
+            view.services_pending = false;
+            view.refresh_service_cache(cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.sync_workflow_repo_hooks(window, cx);
+            assert!(view.workflow_hooks_ready(cx));
+            let form = view.workflow_form.as_ref().unwrap();
+            assert_eq!(form.loaded_repo.as_deref(), Some(nested.as_str()));
+            assert_eq!(form.setup_script.read(cx).value().as_str(), "keep setup");
+            assert_eq!(
+                form.archive_script.read(cx).value().as_str(),
+                "keep archive"
+            );
+            view.save_workflow_form(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let stored = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
+    assert_eq!(
+        stored.setup_script_for(&root).as_deref(),
+        Some("keep setup")
+    );
+    assert_eq!(
+        stored.archive_script_for(&root).as_deref(),
+        Some("keep archive")
+    );
+    fs::remove_dir_all(d).ok();
+}

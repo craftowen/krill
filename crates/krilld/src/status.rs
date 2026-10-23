@@ -168,25 +168,30 @@ impl Statuses {
     /// 보조 근거 시각으로 hook 중복 제거 시각을 밀지 않는다(늦게 전달된 새 hook도 반영한다).
     pub fn inferred(&self, session: SessionId, evidence: detect::Evidence, ns: u64) {
         let _commit = lock(&self.commit);
+        {
+            let map = lock(&self.map);
+            if let Some(r) = map.get(&session) {
+                if r.status.source == Some(Source::Process)
+                    || (r.status.source == Some(Source::Hook)
+                        && !(r.status.state == AgentState::Waiting
+                            && evidence.dismissed_since == Some(r.status.since_unix_ns)))
+                {
+                    return;
+                }
+                if r.status.state == evidence.state
+                    && r.status.source == Some(evidence.source)
+                    && r.status.confidence == evidence.confidence
+                {
+                    return;
+                }
+            }
+        }
         let mut map = lock(&self.map).clone();
         let r = map.entry(session).or_insert_with(|| Record {
             status: AgentStatus::UNKNOWN,
             last: Vec::new(),
             last_ns: 0,
         });
-        if r.status.source == Some(Source::Process)
-            || (r.status.source == Some(Source::Hook)
-                && !(r.status.state == AgentState::Waiting
-                    && evidence.dismissed_since == Some(r.status.since_unix_ns)))
-        {
-            return;
-        }
-        if r.status.state == evidence.state
-            && r.status.source == Some(evidence.source)
-            && r.status.confidence == evidence.confidence
-        {
-            return;
-        }
         let hook_ns = r.last_ns;
         r.set(evidence.state, evidence.source, ns);
         r.last_ns = hook_ns;

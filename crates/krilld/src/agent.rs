@@ -1724,7 +1724,7 @@ fn wrap_account(
     let hint = format!(
         "{}: not installed. install: {}",
         profile.program().unwrap_or_default(),
-        profile.install
+        profile.install_command()
     );
     let mut agent_argv = profile.argv(permission);
     if (is(profile, "agy") || is(profile, "antigravity"))

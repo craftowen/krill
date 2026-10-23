@@ -389,24 +389,56 @@ fn rank(all: &[&[char]], boost: &[bool], query: &str) -> Vec<usize> {
 
 /// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 입력 대기 세션 먼저, 그다음 원래 순서. 공백은 무시한다.
 pub fn search(items: &[Item], query: &str) -> Vec<usize> {
-    let all: Vec<&[char]> = items.iter().map(|item| item.chars.as_slice()).collect();
-    let boost: Vec<bool> = items.iter().map(|item| item.needs_you).collect();
-    if !query.trim().is_empty() && items.iter().any(|item| item.is_file) {
-        let query = lower_chars(query.trim());
-        let mut hits: Vec<_> = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let path_score = score(&query, &item.chars)?;
-                let bonus = score(&query, &item.filename_chars).map_or(0, |s| s + 100);
-                Some((Reverse(path_score + bonus), index))
-            })
-            .collect();
-        hits.sort_unstable();
-        hits.into_iter().map(|(_, index)| index).collect()
-    } else {
-        rank(&all, &boost, query)
+    search_controlled(items, query, &std::sync::atomic::AtomicBool::new(false))
+}
+
+struct ItemSearchCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for ItemSearchCancel {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+fn search_controlled(
+    items: &[Item],
+    query: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..items.len())
+            .filter(|&i| items[i].needs_you)
+            .chain((0..items.len()).filter(|&i| !items[i].needs_you))
+            .collect();
+    }
+    let files = items.iter().any(|item| item.is_file);
+    let query = if files {
+        lower_chars(query.trim())
+    } else {
+        query
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut hits = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Vec::new();
+        }
+        if let Some(path_score) = score(&query, &item.chars) {
+            let bonus = if files {
+                score(&query, &item.filename_chars).map_or(0, |s| s + 100)
+            } else {
+                0
+            };
+            hits.push((Reverse(path_score + bonus), files || !item.needs_you, index));
+        }
+    }
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
+    hits.sort_unstable();
+    hits.into_iter().map(|(_, _, index)| index).collect()
 }
 
 fn lower_chars(text: &str) -> Vec<char> {
@@ -632,6 +664,16 @@ pub enum Event {
     Dismiss,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemSelection {
+    Session(SessionId),
+    File {
+        path: String,
+        root: Option<String>,
+        host: String,
+    },
+}
+
 pub struct Palette {
     language: crate::i18n::Language,
     mode: Mode,
@@ -639,7 +681,10 @@ pub struct Palette {
     placeholder_mode: Mode,
     items: std::sync::Arc<Vec<Item>>,
     item_task: Option<gpui::Task<()>>,
+    item_cancel: Option<ItemSearchCancel>,
     item_generation: u64,
+    pending_item_selection: Option<(u64, ItemSelection)>,
+    selection_epoch: u64,
     matches: Vec<usize>,
     worktrees: Vec<WorktreeItem>,
     worktree_matches: Vec<usize>,
@@ -718,7 +763,10 @@ impl Palette {
             quick_matches: Vec::new(),
             items: std::sync::Arc::new(items),
             item_task: None,
+            item_cancel: None,
             item_generation: 0,
+            pending_item_selection: None,
+            selection_epoch: 0,
             vault_hits: Vec::new(),
             vault_matches: Vec::new(),
             projects: Vec::new(),
@@ -949,10 +997,23 @@ impl Palette {
     }
 
     fn recompute_all_matches(&mut self, cx: &mut Context<Self>) {
+        self.recompute_with_selection(None, cx);
+    }
+
+    fn recompute_with_selection(&mut self, restore: Option<ItemSelection>, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        let _work = crate::responsiveness::work("jump.project");
         self.item_generation = self.item_generation.wrapping_add(1);
         self.item_task = None;
+        self.item_cancel = None;
         let generation = self.item_generation;
+        let selection_epoch = self.selection_epoch;
         let background = self.items.len() >= 2_048 && !self.query.trim().is_empty();
+        self.pending_item_selection = if background {
+            restore.clone().map(|id| (selection_epoch, id))
+        } else {
+            None
+        };
         let proj = self.project_filter.as_deref();
         let hits = if background {
             Vec::new()
@@ -971,16 +1032,19 @@ impl Palette {
             hits
         };
         if background {
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.item_cancel = Some(ItemSearchCancel(std::sync::Arc::clone(&cancel)));
             let items = std::sync::Arc::clone(&self.items);
             let query = self.query.clone();
             let project = self.project_filter.clone();
+            let restore = restore.clone();
             self.item_task = Some(cx.spawn(async move |this, cx| {
                 let matches = cx
                     .background_executor()
                     .spawn(async move {
                         let _span =
                             tracing::debug_span!("jump.search", items = items.len()).entered();
-                        search(&items, &query)
+                        search_controlled(&items, &query, &cancel)
                             .into_iter()
                             .filter(|&i| {
                                 project.as_ref().is_none_or(|p| {
@@ -995,6 +1059,10 @@ impl Palette {
                 this.update(cx, |this, cx| {
                     if this.item_generation == generation {
                         this.matches = matches;
+                        this.pending_item_selection = None;
+                        if this.selection_epoch == selection_epoch {
+                            this.restore_item_selection(restore);
+                        }
                         this.clamp_selected();
                         cx.notify();
                     }
@@ -1028,7 +1096,43 @@ impl Palette {
             .collect();
         let refs: Vec<&[char]> = all.iter().map(Vec::as_slice).collect();
         self.quick_matches = rank(&refs, &vec![false; all.len()], &self.query);
+        if !background {
+            self.restore_item_selection(restore);
+        }
         self.clamp_selected();
+    }
+
+    fn item_selection(&self, item: &Item) -> ItemSelection {
+        if item.is_file {
+            ItemSelection::File {
+                path: item.label.clone(),
+                root: self.workspace_path.clone(),
+                host: item.host_label.clone(),
+            }
+        } else {
+            ItemSelection::Session(item.id)
+        }
+    }
+
+    fn restore_item_selection(&mut self, selected: Option<ItemSelection>) {
+        if let Some(selected) = selected {
+            self.selected = self.section_base(Section::Sessions)
+                + self
+                    .matches
+                    .iter()
+                    .position(|&index| {
+                        self.items.get(index).is_some_and(|item| match &selected {
+                            ItemSelection::Session(id) => !item.is_file && item.id == *id,
+                            ItemSelection::File { path, root, host } => {
+                                item.is_file
+                                    && item.label == *path
+                                    && self.workspace_path == *root
+                                    && item.host_label == *host
+                            }
+                        })
+                    })
+                    .unwrap_or(0);
+        }
     }
 
     fn clamp_selected(&mut self) {
@@ -1047,15 +1151,21 @@ impl Palette {
             .filter(|(section, _)| *section == Section::Sessions)
             .and_then(|(_, pos)| self.matches.get(pos))
             .and_then(|&i| self.items.get(i))
-            .map(|item| item.id);
-        self.items = std::sync::Arc::new(items);
+            .map(|item| self.item_selection(item))
+            .or_else(|| {
+                self.pending_item_selection
+                    .as_ref()
+                    .filter(|(epoch, _)| *epoch == self.selection_epoch)
+                    .map(|(_, identity)| identity.clone())
+            });
+        let previous = std::mem::replace(&mut self.items, std::sync::Arc::new(items));
+        cx.background_executor()
+            .spawn(async move {
+                drop(previous);
+            })
+            .detach();
         self.rebuild_projects();
-        self.recompute_all_matches(cx);
-        let selected_index = self
-            .matches()
-            .position(|item| Some(item.id) == selected)
-            .unwrap_or(0);
-        self.selected = selected_index;
+        self.recompute_with_selection(selected, cx);
         cx.notify();
     }
 
@@ -1070,6 +1180,8 @@ impl Palette {
 
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
+            self.selection_epoch = self.selection_epoch.wrapping_add(1);
+            self.pending_item_selection = None;
             self.mode = mode;
             self.selected = 0;
             self.scroll_to_top();
@@ -1237,6 +1349,7 @@ impl Palette {
     /// OWE-862: ↑↓는 끝에서 반대쪽으로 순환하고, 고른 행이 속한
     /// 목록(세션·워크트리·빠른 명령·볼트)을 함께 스크롤한다.
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
         let total = self.row_count();
         if total == 0 {
             self.selected = 0;
@@ -1256,6 +1369,13 @@ impl Palette {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self
+            .pending_item_selection
+            .as_ref()
+            .is_some_and(|(epoch, _)| *epoch == self.selection_epoch)
+        {
+            return;
+        }
         match self.row_at(self.selected) {
             Some((Section::Sessions, pos)) => {
                 if let Some(item) = self.matches.get(pos).and_then(|&i| self.items.get(i)) {
@@ -1303,6 +1423,7 @@ impl Palette {
         if self.row_at(row).is_none() {
             return false;
         }
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
         self.selected = row;
         self.confirm(cx);
         true
@@ -1803,6 +1924,7 @@ impl Render for Palette {
                         .hover(|d| d.bg(accent.opacity(0.6)))
                         .child(div().flex_1().truncate().child(action.label.clone()))
                         .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selection_epoch = p.selection_epoch.wrapping_add(1);
                             p.selected = row_index;
                             p.confirm(cx);
                         })),
@@ -1844,6 +1966,7 @@ impl Render for Palette {
                         .hover(|d| d.bg(accent.opacity(0.6)))
                         .child(div().flex_1().truncate().child(command.name.clone()))
                         .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selection_epoch = p.selection_epoch.wrapping_add(1);
                             p.selected = row_index;
                             p.confirm(cx);
                         })),
@@ -2073,6 +2196,7 @@ impl Render for Palette {
                     }
 
                     list_body = list_body.child(row.on_click(cx.listener(move |p, _, _, cx| {
+                        p.selection_epoch = p.selection_epoch.wrapping_add(1);
                         p.selected = abs_row;
                         p.confirm(cx);
                     })));
@@ -2166,6 +2290,7 @@ impl Render for Palette {
                             .cursor_pointer()
                             .child(vault_text::RESUME.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selection_epoch = this.selection_epoch.wrapping_add(1);
                                 this.selected = abs_row;
                                 this.resume_vault_at(hit_idx, cx);
                             })),
@@ -2207,6 +2332,7 @@ impl Render for Palette {
                             )
                             .child(right_meta)
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selection_epoch = this.selection_epoch.wrapping_add(1);
                                 this.selected = abs_row;
                                 this.resume_vault_at(hit_idx, cx);
                             })),
@@ -2418,6 +2544,7 @@ impl Render for Palette {
                         )
                         .child(right_meta)
                         .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selection_epoch = p.selection_epoch.wrapping_add(1);
                             p.selected = row_index;
                             p.confirm(cx);
                         })),

@@ -100,6 +100,7 @@ fn agent_launch_uses_native_helper_instead_of_powershell() {
         launch: vec!["fake-agent".into()],
         yolo_args: vec!["--fixture-yolo".into()],
         install: "fixture install".into(),
+        install_windows: String::new(),
         env: std::collections::BTreeMap::default(),
     };
     let launch = krilld::agent::launch(

@@ -165,6 +165,7 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind) {
         launch: vec![exe.display().to_string()],
         yolo_args: Vec::new(),
         install: String::new(),
+        install_windows: String::new(),
         env: std::collections::BTreeMap::new(),
     };
     let mut profiles = krill_proto::agent::set_user_profile(None, name, &profile).unwrap();

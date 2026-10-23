@@ -16,12 +16,14 @@ fn fixture() -> (OwnedFd, Tap) {
     let size = WinSize { cols: 80, rows: 24 };
     let shared = Shared {
         capture: Mutex::new(None),
+        history_access: Mutex::new(()),
         id: SessionId(701),
         clients: Mutex::default(),
         input: Mutex::default(),
         live: Mutex::new(Live {
             engine: Engine::new(size),
             revision: 0,
+            history_epoch: 0,
             seq: 0,
             last_output: Instant::now(),
             input_since_done: true,

@@ -476,3 +476,42 @@ fn install_reports_bootstrap_failure_with_guidance_kind() {
     assert_eq!(err.kind, InstallFailureKind::Bootstrap);
     assert_eq!(err.step, "setup");
 }
+
+#[test]
+fn bounded_managed_command_upload_and_output_and_deadline() {
+    let args = vec!["-c".into(), "cat; printf warning >&2".into()];
+    let output = run_piped_ssh_with_timeout(
+        OsStr::new("/bin/sh"),
+        &args,
+        Some(b"payload"),
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"payload");
+    assert_eq!(output.stderr, b"warning");
+    let busy = vec!["-c".into(), "while :; do :; done".into()];
+    assert_eq!(
+        run_piped_ssh_with_timeout(
+            OsStr::new("/bin/sh"),
+            &busy,
+            None,
+            std::time::Duration::from_millis(30)
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn descendant_held_managed_stdio_does_not_extend_total_deadline() {
+    let args = vec!["-c".into(), "sleep 0.2 & printf ready".into()];
+    let result = run_piped_ssh_with_timeout(
+        OsStr::new("/bin/sh"),
+        &args,
+        None,
+        std::time::Duration::from_millis(30),
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+}

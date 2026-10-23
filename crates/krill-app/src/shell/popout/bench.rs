@@ -219,7 +219,7 @@ pub(crate) fn run(mode: String) -> ExitCode {
                 {
                     shell._config_observer = cx.observe_global::<krill_app::settings::Config>(|_, cx| cx.notify());
                 }
-                shell.accounts_snapshot = account_popup_snapshot();
+                shell.accounts_snapshot = account_popup_snapshot().into();
                 shell.notice = Some("Synthetic account popup preview".into());
                 shell.sidebar.update(cx, |s, cx| s.connect_source(Arc::new(AccountsPreview), cx));
                 if let Ok(width) = std::env::var("KRILL_BENCH_WIDTH")

@@ -980,3 +980,344 @@ fn resumed_history_respects_clear_and_keeps_live_ancestors_during_gc() {
     );
     fs::remove_dir_all(root).ok();
 }
+
+fn visited_pages(history: &super::History, limit: u64) -> Vec<(usize, super::Page)> {
+    let mut pages = Vec::new();
+    let mut rows = Vec::new();
+    history.visit_until(limit, &|| false, |page, event| match event {
+        super::HistoryEvent::Rows(batch) => rows.extend(batch),
+        super::HistoryEvent::End(result) => {
+            let mut data = result.unwrap();
+            data.rows = std::mem::take(&mut rows);
+            pages.push((page, data));
+        }
+    });
+    pages
+}
+
+#[test]
+fn forward_history_visitor_preserves_raw_parser_state_and_clear_boundaries() {
+    let root = tmp("forward-parser");
+    let id = SessionId(91);
+    let size = WinSize { cols: 12, rows: 3 };
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, size).unwrap();
+    // Deliberately split UTF-8, CSI, alternate screen and synchronized output across
+    // segment boundaries. An ANSI screen snapshot cannot replace this parser state.
+    for part in [
+        &b"one\r\ntwo\r\nthree\r\n\xe9"[..],
+        &b"\x9b\xaa\r\n\x1b[?20"[..],
+        &b"26hhidden\r\nnext\r\n\x1b[?2026l\x1b[?1049hALT\r\n"[..],
+        &b"alternate\r\nmore\r\n\x1b[?1049l\r\nend\r\n"[..],
+    ] {
+        rec.append(part);
+        rec.seal();
+    }
+    let limit = rec.seq().saturating_sub(3);
+    let history = store.history(id).unwrap();
+    for (page, visited) in visited_pages(&history, limit) {
+        assert_eq!(visited, history.page_until(page, limit).unwrap().unwrap());
+    }
+    store.clear_scrollback(id, rec.seq());
+    rec.append(b"\r\nafter-clear\r\nnew\r\nlast\r\n");
+    rec.seal();
+    let history = store.history(id).unwrap();
+    let pages = visited_pages(&history, rec.seq());
+    assert_eq!(pages.len(), history.len());
+    for (page, visited) in pages {
+        assert_eq!(
+            visited,
+            history.page_until(page, rec.seq()).unwrap().unwrap()
+        );
+        assert!(!visited.lines().iter().any(|line| line == "one"));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn forward_history_visitor_stops_inside_a_replay_batch() {
+    let root = tmp("forward-cancel");
+    let id = SessionId(92);
+    let store = Store::open(&root, small(1024)).unwrap();
+    let mut rec = store.recorder(id, SIZE).unwrap();
+    for _ in 0..8 {
+        rec.append(&lines(0, 1000));
+        rec.seal();
+    }
+    let history = store.history(id).unwrap();
+    let checks = std::cell::Cell::new(0usize);
+    let mut completed = 0;
+    history.visit_until(
+        rec.seq(),
+        &|| {
+            checks.set(checks.get() + 1);
+            checks.get() >= 4
+        },
+        |_, event| {
+            if matches!(event, super::HistoryEvent::End(_)) {
+                completed += 1;
+            }
+        },
+    );
+    assert_eq!(
+        completed, 0,
+        "cancelled pages must not publish a partial total"
+    );
+    assert!(
+        checks.get() < 10,
+        "cancellation must not replay the remaining segments"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn forward_history_visitor_keeps_gc_gap_metadata() {
+    let root = tmp("forward-gap");
+    let id = SessionId(93);
+    let store = Store::open(&root, small(1024)).unwrap();
+    let mut rec = store.recorder(id, SIZE).unwrap();
+    for index in 0..4 {
+        rec.append(&lines(index * 100, (index + 1) * 100));
+        rec.seal();
+    }
+    let paths = super::segments(&store.session_dir(id)).unwrap();
+    fs::remove_file(&paths[1]).unwrap();
+    let history = store.history(id).unwrap();
+    let pages = visited_pages(&history, rec.seq());
+    assert_eq!(pages.len(), 3);
+    assert!(pages[0].1.end_seq < pages[1].1.start_seq);
+    for (page, visited) in pages {
+        assert_eq!(
+            visited,
+            history.page_until(page, rec.seq()).unwrap().unwrap()
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn forward_history_resize_fallback_matches_authoritative_reflow_on_every_page() {
+    let root = tmp("forward-resize");
+    let id = SessionId(94);
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, WinSize { cols: 12, rows: 3 }).unwrap();
+    rec.append(b"abcdefghijklmnopqrstuvwx\r\nold1\r\nold2\r\nold3\r\n");
+    rec.seal();
+    // Header-only growth can pull old history into the viewport.
+    rec.resize(WinSize { cols: 24, rows: 6 });
+    rec.append(b"grown\r\n");
+    // In-segment shrink/grow also reflows history in the warm prefix.
+    rec.resize(WinSize { cols: 8, rows: 2 });
+    rec.append(b"more-content-than-a-row\r\n");
+    rec.resize(WinSize { cols: 20, rows: 5 });
+    rec.append(b"tail1\r\ntail2\r\n");
+    rec.seal();
+    for _ in 0..3 {
+        rec.append(b"next1\r\nnext2\r\nnext3\r\n");
+        rec.seal();
+    }
+    let history = store.history(id).unwrap();
+    for (page, visited) in visited_pages(&history, rec.seq()) {
+        assert_eq!(
+            visited,
+            history.page_until(page, rec.seq()).unwrap().unwrap(),
+            "page {page}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+std::thread_local! {
+    static VISITOR_RAW_READS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn note_raw_read() {
+    VISITOR_RAW_READS.with(|reads| {
+        if let Some(count) = reads.get() {
+            reads.set(Some(count + 1));
+        }
+    });
+}
+
+pub(super) fn counted_raw_reads<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            VISITOR_RAW_READS.with(|reads| reads.set(None));
+        }
+    }
+    VISITOR_RAW_READS.with(|reads| reads.set(Some(0)));
+    let reset = Reset;
+    let result = run();
+    let count = VISITOR_RAW_READS.with(|reads| reads.get().unwrap());
+    drop(reset);
+    (result, count)
+}
+
+fn assert_visitor_matches_warm(history: &super::History, limit: u64) {
+    let visited = visited_pages(history, limit);
+    let expected: Vec<_> = (0..history.len())
+        .filter_map(|page| {
+            history
+                .page_until(page, limit)
+                .map(|result| (page, result.unwrap()))
+        })
+        .collect();
+    assert_eq!(visited, expected, "limit seq {limit}");
+}
+
+/// Resize before/inside/between segments while parser, UTF-8, primary/alternate
+/// scrollback and synchronized output all straddle segment boundaries.
+fn record_reflow_fixture(rec: &mut super::Recorder) -> Vec<u64> {
+    let mut boundaries = Vec::new();
+    for turn in 0..4 {
+        rec.resize(WinSize { cols: 12, rows: 3 });
+        rec.append(&lines(turn * 100, turn * 100 + 45));
+        rec.append(b"\x1b]2;reflow-title\x07\x1b[?2026hqueued\r\n\xe9");
+        rec.seal();
+        boundaries.push(rec.seq());
+        rec.resize(WinSize { cols: 24, rows: 7 });
+        rec.append(b"\x9b\xaa\r\nsync-tail\r\n\x1b[?2026l\x1b[?1049hALT\r\na\r\nb\r\n\x1b[38;2;");
+        rec.seal();
+        boundaries.push(rec.seq());
+        rec.resize(WinSize { cols: 8, rows: 2 });
+        rec.append(b"12;34;56mcolored-wide-\xe7\x95\x8c\r\nmore-alt\r\n");
+        rec.resize(WinSize { cols: 20, rows: 6 });
+        rec.append(b"grow-alt\r\n\x1b[?1049lprimary-back\r\n\x1b[");
+        rec.seal();
+        boundaries.push(rec.seq());
+        rec.resize(WinSize { cols: 10, rows: 4 });
+        rec.append(b"2K\rtail\r\n\x1b7\x1b[2;3Hxy\x1b8\r\n\x1b[?2031h\x1b[?2031$p");
+        rec.append(&lines(turn * 100 + 45, turn * 100 + 100));
+        rec.seal();
+        boundaries.push(rec.seq());
+    }
+    boundaries
+}
+
+#[test]
+fn forward_history_resize_reads_each_segment_once_and_matches_every_warm_page() {
+    let root = tmp("forward-resize-single-read");
+    let id = SessionId(95);
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, WinSize { cols: 12, rows: 3 }).unwrap();
+    let boundaries = record_reflow_fixture(&mut rec);
+    let history = store.history(id).unwrap();
+    let (visited, reads) = counted_raw_reads(|| visited_pages(&history, rec.seq()));
+    assert_eq!(
+        reads,
+        history.len(),
+        "resize must not reread any prefix segment"
+    );
+    assert_eq!(visited.len(), history.len());
+    for (page, data) in visited {
+        assert_eq!(
+            data,
+            history.page_until(page, rec.seq()).unwrap().unwrap(),
+            "page {page}"
+        );
+    }
+    // Cut inside UTF-8, incomplete CSI and pending synchronized output, at each
+    // boundary and within later records; totals/coordinates are based on the same cutoff.
+    for limit in boundaries
+        .iter()
+        .flat_map(|end| [end.saturating_sub(1), *end])
+    {
+        assert_visitor_matches_warm(&history, limit);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn forward_history_reflow_matches_warm_after_clear_gc_and_privacy_gap() {
+    let root = tmp("forward-resize-clear-gap");
+    let id = SessionId(96);
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, WinSize { cols: 12, rows: 3 }).unwrap();
+    let boundaries = record_reflow_fixture(&mut rec);
+    // A privacy pause makes an explicit Gap without replaying the secret data.
+    store.set_paused(true);
+    rec.append(b"PRIVATE-NEVER-RECORDED\r\n");
+    store.set_paused(false);
+    rec.append(b"after-privacy-gap\r\nnew-line\r\nlast-line\r\n");
+    rec.resize(WinSize { cols: 30, rows: 8 });
+    rec.append(b"after-growth\r\nmore\r\n");
+    rec.seal();
+    let history = store.history(id).unwrap();
+    assert_visitor_matches_warm(&history, rec.seq());
+    let pages = visited_pages(&history, rec.seq());
+    assert!(pages.iter().any(|(_, page)| !page.gaps.is_empty()));
+    assert!(
+        !pages
+            .iter()
+            .flat_map(|(_, page)| page.lines())
+            .any(|line| line.contains("PRIVATE"))
+    );
+    // Clear inside a segment, then remove another segment to simulate a GC hole.
+    store.clear_scrollback(id, boundaries[4].saturating_sub(3));
+    let paths = super::segments(&store.session_dir(id)).unwrap();
+    fs::remove_file(&paths[9]).unwrap();
+    let history = store.history(id).unwrap();
+    let (_, reads) = counted_raw_reads(|| visited_pages(&history, rec.seq()));
+    assert_eq!(
+        reads,
+        history.segs.len(),
+        "clear prefix and GC runs must each be read once"
+    );
+    assert_visitor_matches_warm(&history, rec.seq());
+    for limit in [
+        boundaries[6],
+        boundaries[10].saturating_sub(2),
+        rec.seq().saturating_sub(1),
+    ] {
+        assert_visitor_matches_warm(&history, limit);
+    }
+    // A deleted incarnation cannot be retained by a process-global replay cache.
+    store.clear().unwrap();
+    rec.append(b"new-incarnation\r\nonly-new-data\r\nlast\r\n");
+    rec.seal();
+    let fresh = store.history(id).unwrap();
+    assert_visitor_matches_warm(&fresh, rec.seq());
+    assert!(
+        !visited_pages(&fresh, rec.seq())
+            .iter()
+            .flat_map(|(_, page)| page.lines())
+            .any(|line| line.contains("reflow-title") || line.contains("PRIVATE"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn forward_history_reflow_recovers_after_a_manifest_segment_becomes_corrupt() {
+    let root = tmp("forward-reflow-corrupt");
+    let id = SessionId(97);
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, WinSize { cols: 12, rows: 3 }).unwrap();
+    record_reflow_fixture(&mut rec);
+    let history = store.history(id).unwrap();
+    fs::write(&history.segs[8], b"invalid segment").unwrap();
+    let mut rows = Vec::new();
+    let mut actual = Vec::new();
+    history.visit_until(rec.seq(), &|| false, |page, event| match event {
+        super::HistoryEvent::Rows(batch) => rows.extend(batch),
+        super::HistoryEvent::End(result) => {
+            let result = result
+                .map(|mut data| {
+                    data.rows = std::mem::take(&mut rows);
+                    data
+                })
+                .map_err(|error| error.kind());
+            actual.push((page, result));
+        }
+    });
+    let expected: Vec<_> = (0..history.len())
+        .filter_map(|page| {
+            history
+                .page_until(page, rec.seq())
+                .map(|result| (page, result.map_err(|error| error.kind())))
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    assert!(actual.iter().any(|(_, result)| result.is_err()));
+    fs::remove_dir_all(root).unwrap();
+}

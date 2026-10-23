@@ -424,3 +424,35 @@ fn machine_key_reads_user_host_port_from_ssh_g() {
     // 플래그처럼 보이는 대상은 ssh에 넘기지 않고 그대로 쓴다.
     assert_eq!(machine_key("-oProxyCommand=x", None), "-oproxycommand=x");
 }
+
+#[cfg(unix)]
+#[test]
+fn bounded_home_and_machine_queries_use_injected_local_program() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = PathBuf::from(format!("/tmp/krill-ssh-query-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("fake-ssh");
+    std::fs::write(&program, "#!/bin/sh\nif [ \"$1\" = -G ]; then printf 'user local\\nhostname fixture.test\\nport 22\\n'; else printf '/Users/fixture\\n'; fi\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let opts = SshOptions::new("fixture-host");
+    assert_eq!(
+        query_remote_home_with_program(&opts, program.as_os_str()).unwrap(),
+        "/Users/fixture\n"
+    );
+    assert_eq!(
+        machine_key_with_program("fixture-host", None, program.as_os_str()),
+        "local@fixture.test:22"
+    );
+    std::fs::write(&program, "#!/bin/sh\nhead -c 1048577 /dev/zero\n").unwrap();
+    assert_eq!(
+        query_remote_home_with_program(&opts, program.as_os_str())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        machine_key_with_program("fixture-host", None, program.as_os_str()),
+        "fixture-host"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}

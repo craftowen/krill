@@ -632,6 +632,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_heartbeat_skips_timestamp_only_ticks_but_reports_changes() {
+        let mut status: HostTunnelStatus = serde_json::from_value(serde_json::json!({
+            "host_id":"test", "host_name":"Test", "node_id":"node",
+            "socket_path":"/tmp/test.sock", "state":"connecting", "route":"none",
+            "remote_addr":null, "rtt_ms":null, "reconnect_attempt":0,
+            "updated_at_ms":1000, "pid":null, "last_error":null
+        }))
+        .unwrap();
+        assert!(status_changed_or_due(None, &status));
+        let previous = status.clone();
+        status.updated_at_ms = 1400;
+        assert!(!status_changed_or_due(Some(&previous), &status));
+        status.last_error = Some("changed".into());
+        assert!(status_changed_or_due(Some(&previous), &status));
+        status.last_error = None;
+        status.updated_at_ms = 2000;
+        assert!(status_changed_or_due(Some(&previous), &status));
+    }
+
+    #[test]
     fn rejection_codes_are_machine_readable_and_network_errors_are_separate() {
         for (code, kind) in [
             (403, TunnelErrorKind::Unauthorized),

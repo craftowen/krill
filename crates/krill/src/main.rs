@@ -304,7 +304,7 @@ fn agent_list() -> ExitCode {
                 agent::version(exe).as_deref().unwrap_or("version unknown"),
                 exe.display()
             ),
-            None => format!("not installed. install: {}", p.install),
+            None => format!("not installed. install: {}", p.install_command()),
         };
         let badge = match (yolo, p.yolo_args.is_empty()) {
             (false, _) => "",

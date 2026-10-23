@@ -49,6 +49,9 @@ pub const LAYOUT_DASHBOARD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none"
 
 /// Lucide `globe` 아이콘 SVG(ISC License). 사이드바 '아티팩트' 항목.
 pub const GLOBE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>"#;
+/// Lucide `smartphone` 아이콘 SVG(ISC License). 사이드바 'Krill 모바일' 항목.
+pub const SMARTPHONE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg>"#;
+
 /// Lucide Files: published documents in the artifact library.
 pub const FILES_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M15 2H6a2 2 0 0 0-2 2v12"/><path d="M20 9h-5V4"/><path d="M20 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7l5 5Z"/></svg>"#;
 

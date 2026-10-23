@@ -22,7 +22,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use gpui::{Context, FontWeight, SharedString, Window, div, prelude::*, px};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::{Disableable as _, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -70,7 +70,11 @@ impl CliRunner {
             if let Some(dir) = &state_dir {
                 cmd.env("KRILL_STATE_DIR", dir);
             }
-            let output = cmd.output()?;
+            let output = super::child::output(
+                &mut cmd,
+                std::time::Duration::from_secs(120),
+                4 * 1024 * 1024,
+            )?;
             // `cleanup`은 일부 삭제 실패 시 비0으로 끝나도 JSON 요약을 출력한다.
             if !output.stdout.is_empty() {
                 return Ok(output.stdout);
@@ -411,18 +415,20 @@ impl SettingsView {
     /// `Settings > Resources` 탭에 들어가는 디스크 용량 분석(`Space`) 및 클린업 진입 섹션.
     pub(super) fn render_space_section(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let scan_label = if self.space.scanning {
-            text::SPACE_SCANNING.get()
-        } else {
-            text::SPACE_SCAN.get()
-        };
-        let scan_btn = layout::secondary("admin-space-scan", scan_label)
-            .icon(IconName::RefreshCw)
-            .disabled(self.space.scanning)
-            .debug_selector(|| "admin-space-scan".into())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.scan_workspace_space(cx);
-            }));
+        let scan_btn = crate::ui::button_with_reserved_label(
+            "admin-space-scan",
+            text::SPACE_SCAN.get(),
+            text::SPACE_SCANNING.get(),
+            self.space.scanning,
+        )
+        .small()
+        .outline()
+        .icon(IconName::RefreshCw)
+        .disabled(self.space.scanning)
+        .debug_selector(|| "admin-space-scan".into())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.scan_workspace_space(cx);
+        }));
         let cleanup_btn = layout::primary(
             "admin-worktree-cleanup-open",
             text::CLEANUP_OPEN_BUTTON.get(),
@@ -982,11 +988,8 @@ impl SettingsView {
         } else {
             text::CLEANUP_SELECT_ALL.get()
         };
-        let execute_label = if self.space.cleaning {
-            text::CLEANUP_EXECUTING.get().to_owned()
-        } else {
-            text::CLEANUP_EXECUTE.format(&[("count", &selected_candidates.len().to_string())])
-        };
+        let execute_label =
+            text::CLEANUP_EXECUTE.format(&[("count", &selected_candidates.len().to_string())]);
 
         let card = div()
             .id("admin-cleanup-modal")
@@ -1085,15 +1088,21 @@ impl SettingsView {
                                     })),
                             )
                             .child(
-                                Button::new("admin-cleanup-execute")
-                                    .small()
-                                    .danger()
-                                    .label(execute_label)
-                                    .disabled(selected_candidates.is_empty() || self.space.cleaning)
-                                    .debug_selector(|| "admin-cleanup-execute".into())
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                crate::ui::button_with_reserved_label(
+                                    "admin-cleanup-execute",
+                                    execute_label,
+                                    text::CLEANUP_EXECUTING.get(),
+                                    self.space.cleaning,
+                                )
+                                .small()
+                                .danger()
+                                .disabled(selected_candidates.is_empty() || self.space.cleaning)
+                                .debug_selector(|| "admin-cleanup-execute".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.execute_selected_cleanup(cx);
-                                    })),
+                                    },
+                                )),
                             ),
                     ),
             );

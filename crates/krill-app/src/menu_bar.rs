@@ -106,9 +106,9 @@ pub fn init(
         let bg = cx.background_executor().clone();
         loop {
             let source = source.clone();
-            let snapshot = bg.spawn(async move { source.fetch() }).await;
+            let snapshot = bg.spawn(async move { source.fetch_shared() }).await;
             cx.update(|cx| {
-                apply(snapshot.as_ref().ok(), cx);
+                apply(snapshot.as_deref().ok(), cx);
                 #[cfg(windows)]
                 crate::platform::sync_windows(cx);
             });
@@ -124,12 +124,8 @@ pub fn init(
                     .await;
                 cx.update(|cx| match StatusItem::take_command() {
                     Some(Command::Open) => open(None, cx),
-                    // 셸의 종료 경로가 미저장 파일을 묻는다(OWE-663). 셸 없는 앱(테스트)은 바로 끝낸다.
-                    Some(Command::Quit) if cx.windows().is_empty() => cx.quit(),
-                    Some(Command::Quit) => match cx.build_action("shell::Quit", None) {
-                        Ok(quit) => cx.dispatch_action(quit.as_ref()),
-                        Err(_) => cx.quit(),
-                    },
+                    // Global Shell action also drains app-owned writes with no windows.
+                    Some(Command::Quit) => request_quit(cx),
                     None => {}
                 });
             }
@@ -143,6 +139,14 @@ pub fn init(
         _commands: commands,
     });
     cx.on_window_closed(|cx, _| sync_window_mode(cx)).detach();
+}
+
+fn request_quit(cx: &mut App) {
+    match cx.build_action("shell::Quit", None) {
+        Ok(quit) => cx.dispatch_action(quit.as_ref()),
+        // The library can be embedded without a Shell (including its tests).
+        Err(_) => cx.quit(),
+    }
 }
 
 fn apply(snapshot: Option<&Snapshot>, cx: &mut App) {

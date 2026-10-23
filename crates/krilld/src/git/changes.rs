@@ -52,6 +52,7 @@ fn submit<T: Send + 'static>(
     let (tx, rx) = mpsc::channel();
     q.enqueue(
         repo,
+        0, // only fixed-size channel/cancellation handles; repo path is accounted by enqueue
         Box::new(move |program, repo| {
             // K-16: 숨김 처리로 취소된 조회는 큐 차례가 와도 git 자식을 띄우지 않는다.
             let result = if cancel.load(Ordering::Acquire) {

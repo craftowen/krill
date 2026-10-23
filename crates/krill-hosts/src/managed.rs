@@ -579,26 +579,135 @@ fn run_piped_ssh(
     args: &[String],
     stdin_bytes: Option<&[u8]>,
 ) -> io::Result<std::process::Output> {
+    run_piped_ssh_with_timeout(
+        ssh_bin,
+        args,
+        stdin_bytes,
+        std::time::Duration::from_secs(300),
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn run_piped_ssh_with_timeout(
+    ssh_bin: &OsStr,
+    args: &[String],
+    stdin_bytes: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    static JOBS: AtomicUsize = AtomicUsize::new(0);
+    struct Permit;
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            JOBS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    JOBS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n < 4).then_some(n + 1)
+    })
+    .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "managed SSH workers busy"))?;
+    let _permit = Permit;
+    let deadline = Instant::now() + timeout;
+    // Socket pairs provide safe nonblocking stdio without FFI or detached pipe workers.
+    let (mut stdout, child_out) = UnixStream::pair()?;
+    let (mut stderr, child_err) = UnixStream::pair()?;
+    stdout.set_nonblocking(true)?;
+    stderr.set_nonblocking(true)?;
+    let (mut input, child_input) = if stdin_bytes.is_some() {
+        let (input, child) = UnixStream::pair()?;
+        input.set_nonblocking(true)?;
+        (Some(input), Stdio::from(OwnedFd::from(child)))
+    } else {
+        (None, Stdio::null())
+    };
     let mut child = Command::new(ssh_bin)
         .args(args)
-        .stdin(if stdin_bytes.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(child_input)
+        .stdout(Stdio::from(OwnedFd::from(child_out)))
+        .stderr(Stdio::from(OwnedFd::from(child_err)))
         .spawn()?;
-    if let Some(bytes) = stdin_bytes {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh stdin is not piped"))?;
-        // `cat >` 계열 원격 명령은 stdin을 바로 읽으므로 같은 스레드 기록으로 충분하다.
-        stdin.write_all(bytes)?;
-        drop(stdin);
+    let result = (|| {
+        let mut remaining = stdin_bytes.unwrap_or_default();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (mut out_eof, mut err_eof) = (false, false);
+        let mut status = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "managed SSH timed out; remote result may be unknown",
+                ));
+            }
+            if let Some(pipe) = input.as_mut() {
+                if remaining.is_empty() {
+                    input.take();
+                } else {
+                    match pipe.write(remaining) {
+                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(n) => remaining = remaining.get(n..).unwrap_or_default(),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            for (pipe, bytes, eof) in [
+                (&mut stdout, &mut out, &mut out_eof),
+                (&mut stderr, &mut err, &mut err_eof),
+            ] {
+                if *eof {
+                    continue;
+                }
+                let mut buffer = [0_u8; 8192];
+                match pipe.read(&mut buffer) {
+                    Ok(0) => *eof = true,
+                    Ok(n) => {
+                        if bytes.len().saturating_add(n) > 1024 * 1024 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "managed SSH output exceeded limit; remote result may be unknown",
+                            ));
+                        }
+                        bytes.extend_from_slice(buffer.get(..n).unwrap_or_default());
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if let Some(status) = status
+                && out_eof
+                && err_eof
+                && input.is_none()
+            {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    })();
+    // Never enumerate or signal descendants/remote PIDs; those may outlive this management operation.
+    if result.is_err() {
+        child.kill().ok();
+        child.wait().ok();
     }
-    child.wait_with_output()
+    result
 }
 
 fn ssh_failed(opts: &SshOptions, step: &'static str, out: &std::process::Output) -> InstallError {
