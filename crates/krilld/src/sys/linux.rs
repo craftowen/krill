@@ -90,7 +90,10 @@ pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
 /// 프로세스 이름. 명령줄을 읽지 않고 커널의 짧은 실행 이름(`/proc/<pid>/comm`)만 사용한다.
 pub(crate) fn process_name(pid: u32) -> io::Result<String> {
     let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))?;
-    Ok(name.trim_end_matches('\n').to_owned())
+    let name = name.trim_end_matches('\n').to_owned();
+    Ok(super::versioned_agent_name(name, || {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+    }))
 }
 
 /// 프로세스 시작 시각(부팅 뒤 µs, `/proc/<pid>/stat` 22번째 칸). PID 재사용 구분용.

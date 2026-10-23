@@ -251,7 +251,24 @@ pub(crate) fn process_name(pid: u32) -> io::Result<String> {
         .take_while(|&&c| c != 0)
         .map(|&c| c.to_ne_bytes()[0])
         .collect();
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let name = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(super::versioned_agent_name(name, || executable_path(pid)))
+}
+
+/// 실행 파일 경로(`proc_pidpath`). 같은 UID 프로세스만 조회된다.
+fn executable_path(pid: u32) -> io::Result<PathBuf> {
+    let pid = c_int::try_from(pid).map_err(io::Error::other)?;
+    // `PROC_PIDPATHINFO_MAXSIZE`(4096).
+    let mut buf = [0_u8; 4096];
+    let size = u32::try_from(buf.len()).map_err(io::Error::other)?;
+    // SAFETY: `buf`는 `size` 바이트짜리 유효한 쓰기 위치다.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast::<c_void>(), size) };
+    let n = usize::try_from(n)
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(io::Error::last_os_error)?;
+    let bytes = buf.get(..n).ok_or(io::ErrorKind::InvalidData)?;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
 }
 
 /// 프로세스 시작 시각(µs, PID 재사용 구분용, `PROC_PIDTBSDINFO`). 같은 UID 프로세스만 조회된다.
