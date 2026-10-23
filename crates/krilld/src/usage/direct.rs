@@ -21,9 +21,20 @@ use crate::session::lock;
 type Key = (PathBuf, ProviderKind, PathBuf);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
+/// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
+static RETRY: Mutex<BTreeMap<Key, (Instant, u32)>> = Mutex::new(BTreeMap::new());
 const INTERVAL: Duration = Duration::from_secs(60);
 const REQUEST_INTERVAL: Duration = Duration::from_secs(5);
-const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const CACHE_TTL: Duration = Duration::from_secs(180);
+// 아래 값은 Orca(MIT) rate-limits/service/service-types.ts·usage-retry-after.ts를 따른다.
+// 사용량 엔드포인트는 예산이 빡빡해 실패를 촘촘히 재시도하면 429로 굳는다.
+/// 실패 재시도 간격: 30초부터 실패마다 두 배, 15분 상한.
+const FAILURE_RETRY: Duration = Duration::from_secs(30);
+const MAX_FAILURE_RETRY: Duration = Duration::from_mins(15);
+/// 429에 Retry-After가 없거나 못 읽을 때(HTTP-date·curl 7.84 미만) 기다리는 시간.
+const RATE_LIMIT_RETRY: Duration = Duration::from_mins(5);
+/// 손상된 Retry-After가 며칠씩 조회를 막지 않게 하는 상한. 429 동안 마지막 정상 값도 이만큼 유지한다.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_hours(24);
 const MAX_BYTES: u64 = 512 * 1024;
 
 /// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
@@ -38,8 +49,18 @@ pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<
     }
     lock(&CACHE)
         .get(&(home.to_path_buf(), provider, dir.to_path_buf()))
-        .filter(|(at, _)| at.elapsed() < Duration::from_secs(180))
+        .filter(|(at, usage)| alive(*at, usage))
         .map(|(_, usage)| usage.clone())
+}
+
+/// 정상 값은 `CACHE_TTL`, 429로 오래됨 처리된 값은 마지막 성공 시각부터 하루까지 쓴다.
+fn alive(at: Instant, usage: &ProfileUsage) -> bool {
+    at.elapsed()
+        < if usage.stale {
+            MAX_RATE_LIMIT_WAIT
+        } else {
+            CACHE_TTL
+        }
 }
 
 /// OWE-702의 주기 틱이 호출한다. 네트워크·자격증명 IO는 별도 스레드에서만 수행한다.
@@ -87,14 +108,14 @@ fn refresh_with_interval(home: &Path, state: Option<&Path>, interval: Duration, 
             continue;
         }
         let key = (home.to_path_buf(), provider, dir);
-        if lock(&CACHE).get(&key).is_some_and(|(at, u)| {
-            let min_age = if u.error.is_some() {
-                ERROR_RETRY_INTERVAL
-            } else {
-                interval
-            };
-            at.elapsed() < min_age
-        }) || !lock(&PENDING).insert(key.clone())
+        // 실패·429는 `RETRY` 시각만 보고, 정상 값은 주기(`interval`)만 본다.
+        if lock(&RETRY)
+            .get(&key)
+            .is_some_and(|(until, _)| Instant::now() < *until)
+            || lock(&CACHE)
+                .get(&key)
+                .is_some_and(|(at, u)| u.error.is_none() && !u.stale && at.elapsed() < interval)
+            || !lock(&PENDING).insert(key.clone())
         {
             continue;
         }
@@ -109,32 +130,49 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
         .spawn(move || {
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
-                    .ok()
-                    .flatten();
+                    .unwrap_or(Fetched::Failed);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
             let usage = match result {
-                Some((usage, meters)) => {
+                Fetched::Usage(usage, meters) => {
+                    lock(&RETRY).remove(&job);
                     super::meters::remember(&job.0, job.1, &job.2, meters);
-                    ProfileUsage {
+                    Some(ProfileUsage {
                         usage,
                         updated_at: now,
                         ..ProfileUsage::default()
-                    }
+                    })
                 }
-                None => ProfileUsage {
-                    error: Some("갱신 실패".into()),
-                    detail: Some("사용량 갱신 실패".into()),
-                    updated_at: now,
-                    ..ProfileUsage::default()
-                },
+                // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
+                Fetched::RateLimited(wait) => {
+                    let mut retry = lock(&RETRY);
+                    let streak = retry.get(&job).map_or(0, |r| r.1);
+                    let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
+                    retry.insert(job.clone(), (Instant::now() + wait, streak));
+                    drop(retry);
+                    mark_rate_limited(&mut lock(&CACHE), &job);
+                    None
+                }
+                Fetched::Failed => {
+                    let mut retry = lock(&RETRY);
+                    let streak = retry.get(&job).map_or(0, |r| r.1).saturating_add(1);
+                    retry.insert(job.clone(), (Instant::now() + failure_wait(streak), streak));
+                    Some(ProfileUsage {
+                        error: Some("갱신 실패".into()),
+                        detail: Some("사용량 갱신 실패".into()),
+                        updated_at: now,
+                        ..ProfileUsage::default()
+                    })
+                }
             };
             // 조회 중 사용자가 끈 경우에는 결과도 버린다.
-            if accounts::load_file(&job.0, state.as_deref()).direct_usage {
+            if let Some(usage) = usage
+                && accounts::load_file(&job.0, state.as_deref()).direct_usage
+            {
                 let mut cache = lock(&CACHE);
-                cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(180));
+                cache.retain(|_, (at, u)| alive(*at, u));
                 cache.insert(job.clone(), (Instant::now(), usage));
             }
             lock(&PENDING).remove(&job);
@@ -144,16 +182,42 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     }
 }
 
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "테스트 빌드의 fetch는 네트워크 없이 Failed만 돌려준다"
+    )
+)]
+enum Fetched {
+    Usage(Usage, krill_proto::usage::AccountMeters),
+    /// HTTP 429와 Retry-After. 같은 토큰을 다른 도구(Claude Code·Orca)와 함께 쓰면 자주 걸린다.
+    RateLimited(Option<Duration>),
+    Failed,
+}
+
+/// `streak`번째 연속 실패 뒤 기다릴 시간(30초·60초·…·15분).
+fn failure_wait(streak: u32) -> Duration {
+    FAILURE_RETRY
+        .saturating_mul(1 << streak.saturating_sub(1).min(5))
+        .min(MAX_FAILURE_RETRY)
+}
+
+/// 429 때: 마지막 정상 값은 받은 시각을 그대로 둔 채 오래됨으로 바꾼다. 정상 값이 없으면
+/// 오류 행을 지워 프로필 사용량 파일(statusline 캐시)로 넘어가게 한다.
+fn mark_rate_limited(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key) {
+    match cache.get_mut(key) {
+        Some((_, u)) if u.error.is_none() && !u.usage.is_empty() => u.stale = true,
+        _ => {
+            cache.remove(key);
+        }
+    }
+}
+
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
 #[cfg(test)]
-fn fetch(
-    _: ProviderKind,
-    _: &Path,
-    _: bool,
-    _: &Path,
-    _: Option<&Path>,
-) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
-    None
+fn fetch(_: ProviderKind, _: &Path, _: bool, _: &Path, _: Option<&Path>) -> Fetched {
+    Fetched::Failed
 }
 
 #[cfg(not(test))]
@@ -163,9 +227,21 @@ fn fetch(
     host: bool,
     home: &Path,
     state: Option<&Path>,
-) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
-    let (token, account) = credentials(provider, dir, host, home, state)?;
-    let mut out = query(provider, &token, account.as_deref(), get_text)?;
+) -> Fetched {
+    let Some((token, account)) = credentials(provider, dir, host, home, state) else {
+        return Fetched::Failed;
+    };
+    let mut limited = None;
+    let out = query(provider, &token, account.as_deref(), |config| {
+        let (code, retry_after, body) = curl_response(config)?;
+        if code == 429 {
+            limited = Some(retry_after);
+        }
+        (200..300).contains(&code).then_some(body)
+    });
+    let Some(mut out) = out else {
+        return limited.map_or(Fetched::Failed, Fetched::RateLimited);
+    };
     // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
     // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
     if provider == ProviderKind::Claude
@@ -178,7 +254,7 @@ fn fetch(
             value: Some(count.to_string()),
         });
     }
-    Some(out)
+    Fetched::Usage(out.0, out.1)
 }
 
 /// curl GET 전송. 설정·본문에 비밀(토큰)은 로그에 남기지 않는다.
@@ -534,35 +610,45 @@ pub(super) fn claude_claim_reset(
     }
 }
 
-/// JSON POST 후 `(상태 코드, 본문)`. `--fail`을 쓰지 않아 429·401도 구분한다.
-pub(super) fn post_json_status(config: &str) -> Option<(u16, Zeroizing<Vec<u8>>)> {
-    let mut child = Command::new("/usr/bin/curl")
-        .args([
+/// curl 전송 후 `(상태 코드, 본문)`. `--fail`을 쓰지 않아 429·401도 구분한다.
+pub(super) fn curl_status(config: &str) -> Option<(u16, Zeroizing<Vec<u8>>)> {
+    curl_response(config).map(|(code, _, body)| (code, body))
+}
+
+/// `curl_status`에 초 단위 Retry-After를 더한다.
+fn curl_response(config: &str) -> Option<(u16, Option<Duration>, Zeroizing<Vec<u8>>)> {
+    let out = pipe_command(
+        system_curl(),
+        &[
             "-q",
             "--config",
             "-",
             "--silent",
             "--max-time",
-            "8",
+            "10",
             "--max-filesize",
             "524288",
             "-w",
-            "\n%{http_code}",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(config.as_bytes()).ok()?;
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = std::str::from_utf8(&output.stdout).ok()?;
-    let (body, code) = text.rsplit_once('\n')?;
-    let code: u16 = code.trim().parse().ok()?;
-    Some((code, Zeroizing::new(body.as_bytes().to_vec())))
+            "\n%{http_code} %header{retry-after}",
+        ],
+        config.as_bytes(),
+    )?;
+    let split = out.iter().rposition(|&b| b == b'\n')?;
+    let (body, tail) = out.split_at(split);
+    let (code, retry_after) = parse_status_tail(std::str::from_utf8(tail).ok()?)?;
+    Some((code, retry_after, Zeroizing::new(body.to_vec())))
+}
+
+/// `-w` 꼬리(`429 191`)를 푼다. Retry-After는 초 단위만 읽고 HTTP-date·빈 값은 `None`이다.
+fn parse_status_tail(tail: &str) -> Option<(u16, Option<Duration>)> {
+    let mut parts = tail.split_whitespace();
+    let code = parts.next()?.parse().ok()?;
+    let retry_after = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs);
+    Some((code, retry_after))
 }
 
 fn now_secs() -> i64 {
@@ -2099,5 +2185,62 @@ mod tests {
         refresh(&home, Some(&state));
         assert!(!lock(&CACHE).contains_key(&key));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// 429는 마지막 정상 값을 받은 시각 그대로 오래됨으로 남기고, 오류 행은 지워 파일 폴백으로 넘긴다.
+    #[test]
+    fn rate_limit_keeps_last_good_usage_as_stale() {
+        let key = (
+            PathBuf::from("/h"),
+            ProviderKind::Claude,
+            PathBuf::from("/h/.claude"),
+        );
+        let good = ProfileUsage {
+            usage: Usage {
+                five_hour: Some(Window {
+                    percent: 2,
+                    resets_at: None,
+                }),
+                seven_day: None,
+            },
+            updated_at: Some(100),
+            ..ProfileUsage::default()
+        };
+        let at = Instant::now();
+        let mut cache = BTreeMap::from([(key.clone(), (at, good.clone()))]);
+        mark_rate_limited(&mut cache, &key);
+        let (kept_at, kept) = &cache[&key];
+        assert_eq!(*kept_at, at);
+        assert!(kept.stale && kept.updated_at == Some(100) && kept.usage == good.usage);
+        cache.insert(
+            key.clone(),
+            (
+                at,
+                ProfileUsage {
+                    error: Some("갱신 실패".into()),
+                    ..good
+                },
+            ),
+        );
+        mark_rate_limited(&mut cache, &key);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn retry_waits_follow_orca_policy() {
+        assert_eq!(failure_wait(1), Duration::from_secs(30));
+        assert_eq!(failure_wait(2), Duration::from_secs(60));
+        assert_eq!(failure_wait(6), MAX_FAILURE_RETRY);
+        assert_eq!(failure_wait(u32::MAX), MAX_FAILURE_RETRY);
+        assert_eq!(
+            parse_status_tail("\n429 191"),
+            Some((429, Some(Duration::from_secs(191))))
+        );
+        assert_eq!(parse_status_tail("\n200 "), Some((200, None)));
+        assert_eq!(
+            parse_status_tail("\n429 Wed, 21 Oct 2026 07:28:00 GMT"),
+            Some((429, None))
+        );
+        assert_eq!(parse_status_tail("\n"), None);
     }
 }

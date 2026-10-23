@@ -1566,12 +1566,9 @@ fn consume_claude_reset(
     let token = super::direct::claude_token(dir, host, home, state_dir)?;
     let org = super::direct::claude_org_uuid(&token, super::direct::get_text)?;
     match super::direct::claude_offered_program(&token, super::direct::get_text)? {
-        Some(program) => super::direct::claude_claim_reset(
-            &token,
-            &org,
-            program,
-            super::direct::post_json_status,
-        ),
+        Some(program) => {
+            super::direct::claude_claim_reset(&token, &org, program, super::direct::curl_status)
+        }
         None => Some((ResetConsumeOutcome::NoCredit, 0)),
     }
 }
