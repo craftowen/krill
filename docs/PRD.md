@@ -73,4 +73,4 @@ T1-final의 D8(macOS Apple Silicon 우선, 크로스플랫폼 동시 지원 안 
 
 - 아키텍처·통합 결정: `docs/ARCHITECTURE.md`
 - 로드맵·이슈 목록: `docs/ROADMAP.md`
-- 트랙별 근거(2차 검증본): `docs/planning/T1~T4-final.md`
+- 내부 조사 기록은 로컬에 보존하며 공개 제품 범위는 이 문서와 ARCHITECTURE·ROADMAP을 따른다.

@@ -6,7 +6,6 @@
 python3 docs/licensing/generate_notices.py
 python3 docs/licensing/generate_notices.py --check
 python3 -m unittest discover -s docs/licensing -p 'test_*.py' -v
-python3 -m unittest discover -s docs/benchmarks -v
 ```
 
 생성기는 설치된 `cargo-deny`의 `list --format json --layout crate`와 `cargo metadata --locked`를
@@ -25,6 +24,8 @@ crate 배포본에 단독 라이선스 파일이 없으면 잠긴 Cargo 메타�
 표준 본문의 저작권 자리표시자는 그대로 두고 Cargo authors를 저작권자로 추정하지 않는다.
 이는 라이선스 조건의 보완이며 upstream 저작권 고지의 복구가 아니므로 배포 전 출처 확인은 여전히 필요하다.
 이 목록의 완성 여부와 최종 배포물의 라이선스 충족 여부는 별도 검토가 필요하다.
+
+PWA의 Orca·jsQR 고지는 [Mobile UI notices](mobile-ui-NOTICES.md)에 보존한다.
 
 배포 전 체크리스트:
 
