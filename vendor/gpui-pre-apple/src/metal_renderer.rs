@@ -777,8 +777,10 @@ impl MetalRenderer {
         let now = Instant::now();
         self.drawable_backlog
             .observe_frame((viewport_size.width.0, viewport_size.height.0), now);
-        if let Some(retry) = self.drawable_backlog.failures.hold(now) {
-            return !retry;
+        // While backing off, keep the frame pending: a change that arrives during the wait (even
+        // after giving up on an earlier frame) is drawn once the wait ends instead of being lost.
+        if self.drawable_backlog.failures.hold(now).is_some() {
+            return false;
         }
         if !self.drawable_backlog.admit(now) {
             return false;
