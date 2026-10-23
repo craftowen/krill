@@ -37,8 +37,14 @@ function testHostViewBudgets(){
  context.activeView={id:'final',device:'final-device'};state.drafts.set(7,'kept by clearHost');H.clearHost();assert.equal(hostViews.get(key('final','final-device')).drafts.get(7),'kept by clearHost');assert.equal(state.drafts.size,0);assert.equal(context.transport,null);
  console.log('PASS hostViews count/aggregate LRU budgets, draft/photo/sending/live/mount/selection/history pins, exact device restore and clearHost retention');
 }
+function testImeDefersSnapshotUpdates(){
+ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),document=Object.assign(new EventTarget(),{hidden:false}),updates=[],context={document,routeKey:'#/s',location:{hash:'#/s'},screen:{update:()=>updates.push(document.value)},tabletMedia:null,state:{preferences:{}},tabletList:null};vm.createContext(context);vm.runInContext(['let imeComposing=','function update(){'].map(marker=>source.find(line=>line.trim().startsWith(marker))).join('\n')+'\nglobalThis.update=update;',context);
+ const fire=type=>document.dispatchEvent(new Event(type));document.value='before';context.update();fire('compositionstart');document.value='ㅎ';context.update();document.value='하';context.update();assert.deepEqual(updates,['before'],'no screen update while an IME composition is open');fire('compositionend');assert.deepEqual(updates,['before','하'],'one catch-up update when composition ends');fire('compositionend');context.update();assert.equal(updates.length,3);
+ fire('compositionstart');context.update();fire('focusout');assert.equal(updates.length,4,'blur without compositionend still releases the gate');fire('compositionstart');fire('compositionend');assert.equal(updates.length,4,'no update when nothing was missed');
+ console.log('PASS IME composition defers snapshot screen updates and catches up once');
+}
 async function main(){
- testHostViewBudgets();
+ testHostViewBudgets();testImeDefersSnapshotUpdates();
  {const sessions=Array.from({length:64},(_,n)=>({id:n+7,agent:'codex',state:'Working'})),f=fixture(sessions);const initial=f.buttons.filter(b=>b.className==='session-tab'),marks=initial.map(b=>b.children[1]);for(let i=0;i<100;i++)f.view.update();assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,64);assert(initial.every((tab,i)=>tab.children[1]===marks[i]));const removed=sessions[63],down=new Event('pointerdown');down.button=0;initial[63].dispatchEvent(down);assert.equal(f.timers.size,1);f.state.groups.get('g').sessions=sessions.slice(0,63);f.state.sessions.delete(removed.id);f.view.update();assert.equal(f.timers.size,0,'removed tab cancels pending long press');f.view.cleanup();console.log('PASS 64 keyed tabs x100 updates: new buttons/icons 0, removed-tab handlers cleaned');}
 
  {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),M=f.sandbox.KrillMobile;

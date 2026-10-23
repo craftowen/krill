@@ -59,8 +59,11 @@ function mountChat(root,opts){
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
  let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
- feed.addEventListener('scroll',()=>{if(visible)following=feed.scrollHeight-feed.scrollTop-feed.clientHeight<60;});
- function pinLatest(){if(visible&&following&&!entry.live)feed.scrollTop=feed.scrollHeight||0;}
+ // Only the reader moving up stops following; pins and late layout growth never do.
+ let lastTop=0;feed.addEventListener('scroll',()=>{if(!visible)return;const top=feed.scrollTop;if(feed.scrollHeight-top-feed.clientHeight<60)following=true;else if(top<lastTop-1)following=false;lastTop=top;});
+ function pinLatest(){if(visible&&following&&!entry.live){feed.scrollTop=feed.scrollHeight||0;lastTop=feed.scrollTop;}}
+ // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
+ const resize=globalThis.ResizeObserver?new ResizeObserver(()=>pinLatest()):null;resize?.observe(feed);
  const cards=new Map(),toolRuns=new Map();let tailRun=null,renderedCount=0,renderedItems=null;
  input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);});
  input.addEventListener('compositionstart',()=>composing=true);
@@ -73,7 +76,7 @@ function mountChat(root,opts){
  },'ghost small');
  const sendBtn=el('button',t('Send'),'primary small');sendBtn.type='submit';
  const bar=el('div',undefined,'chat-composer-bar');bar.append(attachBtn,sendBtn);
- composer.append(input,attachment,bar);
+ composer.append(input,attachment,bar);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
  // act owns product-level error presentation; local operations retain their own visible status.
  function run(fn){if(ctx.act)ctx.act(fn);else Promise.resolve().then(fn).catch(e=>ctx.error?.(e));}
  function updateComposer(sent){
@@ -132,9 +135,9 @@ function mountChat(root,opts){
     const at=run.body.children?.[run.nodes.length-1];if(at!==card)run.body.insertBefore(card,at||null);
    }else{run=null;nodes.push(card);}
   }
-  for(const [idx,node] of nodes.entries()){const at=incremental?null:feed.children?.[idx];if(at!==node)feed.insertBefore(node,at||null);}
-  for(const [key,group] of toolRuns)if(!incremental&&!wantedRuns.has(key)){group.details.remove();toolRuns.delete(key);}
-  for(const [key,card] of cards)if(!incremental&&!wanted.has(key)){card.remove();cards.delete(key);}
+  for(const [idx,node] of nodes.entries()){const at=incremental?null:feed.children?.[idx];if(at!==node){feed.insertBefore(node,at||null);resize?.observe(node);}}
+  for(const [key,group] of toolRuns)if(!incremental&&!wantedRuns.has(key)){group.details.remove();resize?.unobserve(group.details);toolRuns.delete(key);}
+  for(const [key,card] of cards)if(!incremental&&!wanted.has(key)){card.remove();resize?.unobserve(card);cards.delete(key);}
   if(!incremental){for(const child of Array.from(feed.children||[]))if(child.className==='chat-empty')child.remove();for(const key of entry.disclosures?.keys()||[])if(!cards.has(key)&&!toolRuns.has(key.replace(/^run:/,'')))entry.disclosures.delete(key);}
   tailRun=run;renderedCount=entry.items.length;renderedItems=entry.items;
   if(!entry.items.length&&entry.loaded){
@@ -199,7 +202,7 @@ function mountChat(root,opts){
   stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start,_retainedBytes:JSON.stringify(item).length*2}));}
- function clearTranscript(){entry.items=[];entry.retainedBytes=0;entry.disclosures?.clear();entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();}
+ function clearTranscript(){entry.items=[];entry.retainedBytes=0;entry.disclosures?.clear();entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();resize?.disconnect();resize?.observe(feed);}
  function rememberPage(start,next){if(!(next>start))return;const pages=entry.pages,last=pages.at(-1);if(last&&start>last.start)pages.push({start,next});else if(!pages.some(p=>p.start===start)){let at=0;while(at<pages.length&&pages[at].start<start)at++;pages.splice(at,0,{start,next});}if(pages.length>pageLimit){const first=entry.items[0]?._pageStart??start;while(pages.length>pageLimit){if(pages[0].next<=first)pages.shift();else pages.pop();}}}
  function trimItems(fromStart){
   let bytes=entry.items.reduce((n,item)=>n+(item._retainedBytes||0),0),count=0;
@@ -277,7 +280,7 @@ function mountChat(root,opts){
  globalThis.document?.addEventListener?.('visibilitychange',visibilityChanged);
  entry.notifyComposer=updateComposer;
  renderItems();updateStrip();updateComposer();pollNow(true);schedule();
- return {setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
+ return {setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
 }
 M.chat={mount:mountChat,pruneCache,forgetSession};
 M.screens.chat=(root,ctx)=>{

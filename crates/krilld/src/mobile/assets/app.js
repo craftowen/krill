@@ -94,7 +94,9 @@
  const heading=(route.screen==='session'?tabletBody:root)?.querySelector('h1');document.title=heading?.textContent?`${heading.textContent} · Krill`:'Krill';
  if(routeChanged&&heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}else{for(const [cls,top] of oldScroll){const node=Array.from(root.querySelectorAll('.home-list,.workspace-list,.detail-list,.account-list')).find(n=>n.className===cls);if(node)node.scrollTop=top;}if(focusKey)Array.from(root.querySelectorAll('[data-focus-key]')).find(n=>n.dataset.focusKey===focusKey)?.focus({preventScroll:true});}
  }
- function update(){if(routeKey!==location.hash||document.hidden)return;screen?.update?.();if(tabletMedia?.matches&&!state.preferences.tabletSidebarCollapsed)tabletList?.update?.();}
+ // IME(한글) 조합 중에는 스냅샷으로 화면을 갱신하지 않는다. 조합이 끝나거나 포커스를 잃으면 한 번 따라잡는다.
+ let imeComposing=false,imeMissed=false;const imeSettle=()=>{if(!imeComposing)return;imeComposing=false;if(imeMissed){imeMissed=false;update();}};document.addEventListener('compositionstart',()=>{imeComposing=true;},true);document.addEventListener('compositionend',imeSettle,true);document.addEventListener('focusout',imeSettle,true);
+ function update(){if(routeKey!==location.hash||document.hidden)return;if(imeComposing){imeMissed=true;return;}screen?.update?.();if(tabletMedia?.matches&&!state.preferences.tabletSidebarCollapsed)tabletList?.update?.();}
  function group(data){state.snapshot=data;state.groups=new Map((data.workspaces||[]).map(w=>[w.key,{key:w.key,label:w.label,path:w.path,repoKey:w.repo_key,pinned:w.pinned,branch:w.branch,depth:w.depth,primary:w.primary,icon:w.icon,sessions:[]}]));state.sessions=new Map();for(const s of data.sessions||[]){const key=s.worktree_key||(s.cwd?`cwd:${s.cwd}`:`unknown:${s.id}`);let group=state.groups.get(key);if(!group){group={key,label:s.group_label||s.cwd?.split('/').filter(Boolean).pop()||'Workspace',path:s.group_path||s.cwd,repoKey:s.repo_key,sessions:[]};state.groups.set(key,group);}group.sessions.push(s);s.groupKey=key;state.sessions.set(s.id,s);}M.chat?.pruneCache?.(state);}
  function snapshot(data,draw=true){try{endpoint.describeHost(data.host);}catch{error(Error('Could not save desktop details'));}group(data);state.cached=false;
  if(pendingRecent){const target=pendingRecent;pendingRecent=null;const s=M.recentSession.resolve({...state,lastSession:target});if(s){go(groupRoute(state.groups.get(s.groupKey),s.id),true);return;}error(Error('Session no longer available.'));}
@@ -158,8 +160,6 @@
  updates.restore();updates.start();
  // Reconnect after long background or network changes.
  applyPreferences();
- const keyboardInset=()=>{const vv=globalThis.visualViewport,focused=document.activeElement?.matches?.('.chat-input,.chat-question-custom input');const inset=vv&&focused&&Math.abs((vv.scale||1)-1)<.02?Math.max(0,innerHeight-vv.height-vv.offsetTop):0;document.documentElement.style.setProperty('--chat-keyboard-inset',`${inset}px`);};
- globalThis.visualViewport?.addEventListener('resize',keyboardInset);globalThis.visualViewport?.addEventListener('scroll',keyboardInset);globalThis.addEventListener('resize',keyboardInset);globalThis.addEventListener('orientationchange',keyboardInset);document.addEventListener('focusin',keyboardInset);document.addEventListener('focusout',()=>setTimeout(keyboardInset,0));
  if(pairing)startPairing();
  let hiddenAt=0;receiveEntry();const resume=e=>{if(document.hidden){hiddenAt=Date.now();return;}const stale=e?.type==='online'||hiddenAt>0&&Date.now()-hiddenAt>10000;pool.resume(stale);if(credentials&&!pairing&&!pool.owns(transport))transport.resume(stale);hiddenAt=0;receiveEntry();};document.addEventListener('visibilitychange',resume);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);render();if(!pairing&&credentials&&!pool.owns(transport))transport.connect();
 })();

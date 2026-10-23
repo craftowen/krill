@@ -18,7 +18,7 @@ const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 function fixture(options={}){
  const buttons=[],calls=[],sheets=[],errors=[],tasks=[],timers=new Map();let id=0,term=0;
  const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible'});
- const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{}};
+ const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
  const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:'ready'},drafts:new Map()};
  const root=new Element('root'),el=(...args)=>new Element(...args);
@@ -51,7 +51,24 @@ async function renderBudgets(){
  const lazy=fixture();await flush();await lazy.poll({bound:true,generation:'g1',next_offset:1,items:[{id:'huge',kind:'reasoning',text:'reasoning line\n'.repeat(5000)}]});const details=lazy.find('chat-reasoning');assert.equal(details.children.length,1,'large closed reasoning only creates its summary');details.open=true;details.dispatchEvent(new Event('toggle'));assert.equal(details.children.length,2);details.open=false;details.dispatchEvent(new Event('toggle'));assert.equal(lazy.entry.disclosures.size,0);lazy.dispose();
  console.log('PASS render budgets: hidden poll 0, one catch-up, cache 8 with draft/photo/sending/active pins, pages <=2048, exact older boundary, lazy disclosure');
 }
+async function tailFollow(){
+ const observers=[];class RO{constructor(fn){this.fn=fn;this.targets=new Set();observers.push(this);}observe(n){this.targets.add(n);}unobserve(n){this.targets.delete(n);}disconnect(){this.targets.clear();}}
+ const page=(from,to)=>({generation:'g1',agent:'claude',bound:true,page_start:0,next_offset:to,items:Array.from({length:to-from},(_,i)=>({id:'t'+(from+i),kind:'assistant',text:'Message '+(from+i)}))});
+ const f=fixture({ResizeObserver:RO});await flush();await f.poll(page(0,30));f.dispose();
+ // A cached transcript paints at the tail synchronously, before the reopen poll answers.
+ const reopen=deferred();f.handler=()=>reopen.promise;f.remount();const feed=f.find('chat-feed'),ro=observers.at(-1);assert.equal(feed.children.length,30);assert.equal(feed.scrollTop,feed.scrollHeight,'first chat render is already at the latest message');
+ assert(ro.targets.has(feed)&&ro.targets.has(feed.children.at(-1)),'feed and rendered cards are observed for late layout');
+ Object.defineProperty(feed,'scrollHeight',{value:5000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,5000,'late code/image/disclosure growth keeps a following reader at the bottom');delete feed.scrollHeight;
+ reopen.resolve(page(0,30));await flush();
+ feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));assert.equal(feed.scrollTop,2900,'scroll near the tail keeps following');
+ feed.scrollTop=400;feed.dispatchEvent(new Event('scroll'));Object.defineProperty(feed,'scrollHeight',{value:6000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,400,'late growth never drags a reader who scrolled up');delete feed.scrollHeight;
+ await f.poll(page(30,32));assert.equal(feed.children.length,32);assert.equal(feed.scrollTop,400,'new messages do not pull a reader who scrolled up');
+ feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));await f.poll(page(32,33));assert.equal(feed.scrollTop,feed.scrollHeight,'returning to the bottom resumes following');
+ f.dispose();assert.equal(ro.targets.size,0,'unmount disconnects the observer');
+ console.log('PASS chat tail: cached first render at bottom, ResizeObserver re-pin while following, scrolled-up reader kept in place, bottom resumes');
+}
 async function main(){
+ await tailFollow();
  await renderBudgets();
  const cold=deferred(),recent=Array.from({length:128},(_,i)=>({id:`872:${i}`,kind:'assistant',text:`Message ${872+i}`}));
  let now=Date.now();const chatClock=class extends Date{static now(){return now;}};
