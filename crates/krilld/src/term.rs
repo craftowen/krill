@@ -407,6 +407,51 @@ impl Engine {
         self.term.resize(Dims(size));
     }
 
+    /// Rebase the harvesting replay view onto the authoritative raw replay state.
+    ///
+    /// Both engines must have consumed identical bytes in identical feed boundaries
+    /// since their last parser initialization. The VTE/RawScan/CLI parsers (including
+    /// partial UTF-8, CSI and DEC 2026 buffers) stay in place: they depend on the raw
+    /// stream, not on removed history. Only terminal state can diverge after harvest.
+    /// Each grid is bounded by the ordinary screen and [`HOT_LINES`] limits.
+    pub(crate) fn rebase_replay(&mut self, source: &Self) {
+        // Resize first so Term's private damage bookkeeping matches the new dimensions.
+        self.resize(WinSize {
+            cols: u16::try_from(source.term.columns()).unwrap_or(u16::MAX),
+            rows: u16::try_from(source.term.screen_lines()).unwrap_or(u16::MAX),
+        });
+        self.term.grid_mut().clone_from(source.term.grid());
+        self.term
+            .inactive_grid
+            .clone_from(&source.term.inactive_grid);
+        self.term.vi_mode_cursor = source.term.vi_mode_cursor;
+        self.term.selection.clone_from(&source.term.selection);
+        self.term.is_focused = source.term.is_focused;
+        self.term.active_charset = source.term.active_charset;
+        self.term.tabs.tabs.clone_from(&source.term.tabs.tabs);
+        self.term.mode = source.term.mode;
+        self.term
+            .scroll_region
+            .clone_from(&source.term.scroll_region);
+        self.term.colors = source.term.colors;
+        self.term.cursor_style = source.term.cursor_style;
+        self.term.title.clone_from(&source.term.title);
+        self.term.title_stack.clone_from(&source.term.title_stack);
+        self.term
+            .keyboard_mode_stack
+            .clone_from(&source.term.keyboard_mode_stack);
+        self.term
+            .inactive_keyboard_mode_stack
+            .clone_from(&source.term.inactive_keyboard_mode_stack);
+        self.title.clone_from(&source.title);
+        self.bells = source.bells;
+        self.clips = source.clips;
+        self.clip.clone_from(&source.clip);
+        self.scheme.on = source.scheme.on;
+        self.scheme.asked.clone_from(&source.scheme.asked);
+        self.scheme.cwd.clone_from(&source.scheme.cwd);
+    }
+
     /// 스크롤백 행 수.
     pub(crate) fn history_len(&self) -> usize {
         self.term.grid().history_size()
@@ -574,16 +619,20 @@ impl Engine {
             let Ok(row) = i32::try_from(row) else {
                 continue;
             };
+            let cells = &grid[Line(row)];
+            if !(0..grid.columns()).any(|col| {
+                let cell = &cells[alacritty_terminal::index::Column(col)];
+                !cell.flags.contains(AFlags::WIDE_CHAR_SPACER) && !cell.c.is_whitespace()
+            }) {
+                continue;
+            }
             let text: String = (0..grid.columns())
-                .map(|col| &grid[Line(row)][alacritty_terminal::index::Column(col)])
+                .map(|col| &cells[alacritty_terminal::index::Column(col)])
                 .filter(|cell| !cell.flags.contains(AFlags::WIDE_CHAR_SPACER))
                 .take(chars)
                 .map(|cell| cell.c)
                 .collect();
-            // Match screen_text(): whitespace is retained in a non-empty line.
-            if !text.trim().is_empty() {
-                lines.push(text);
-            }
+            lines.push(text);
             if lines.len() >= count {
                 break;
             }

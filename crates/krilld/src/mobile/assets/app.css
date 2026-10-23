@@ -368,5 +368,5 @@ button.account-row:disabled{opacity:1}
 
 /* Keep tree order, find-in-page and accessibility intact while skipping offscreen layout/paint.
    Focused rows stay fully laid out, including text selection and IME in descendants. */
-.large-workspace-list .tree-node{content-visibility:auto;contain-intrinsic-block-size:auto 72px}
+.large-workspace-list .tree-node{content-visibility:auto;contain-intrinsic-block-size:auto calc(3 * var(--space-xl))}
 .large-workspace-list .tree-node:focus-within{content-visibility:visible}

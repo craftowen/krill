@@ -5351,3 +5351,30 @@ fn init_sidebar_test_settings(cx: &mut TestAppContext, name: &str, settings: &st
     });
     cx.run_until_parked();
 }
+
+#[gpui::test]
+fn status_summary_reuses_snapshot_until_sidebar_changes(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![
+                        session(1, AgentState::Waiting, Some("/repo")),
+                        session(2, AgentState::Working, Some("/repo")),
+                    ],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+    });
+    let first = sidebar.read_with(cx, |sidebar, _| sidebar.status_summary());
+    let second = sidebar.read_with(cx, |sidebar, _| sidebar.status_summary());
+    assert_eq!(first.0, 1);
+    assert_eq!(*first.1, vec![AgentState::Waiting, AgentState::Working]);
+    assert!(Arc::ptr_eq(&first.1, &second.1));
+}

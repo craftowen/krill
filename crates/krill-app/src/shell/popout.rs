@@ -1160,9 +1160,7 @@ impl Shell {
                 },
             ),
         };
-        let items = self.sidebar.read(cx).jump_items();
-        let needs_you = items.iter().filter(|i| i.needs_you).count();
-        let states = self.sidebar.read(cx).session_states();
+        let (needs_you, states) = self.sidebar.read(cx).status_summary();
         // OWE-851: 메뉴가 열려 있는 동안은 상태바 호버 툴팁을 숨긴다.
         let tooltips_on = self.status_menus_open == 0;
         let session = self.layout.focused().and_then(|p| self.layout.session(p));
@@ -1950,7 +1948,9 @@ type PreviewMap = std::collections::BTreeMap<(krill_app::hosts::HostId, SessionI
 pub(crate) struct Dashboard {
     owner: WeakEntity<Shell>,
     sidebar: Entity<sidebar::Sidebar>,
+    language: krill_app::i18n::Language,
     cards: Vec<SidebarCard>,
+    lanes: [Vec<usize>; 4],
     previews: PreviewMap,
     _changes: Subscription,
     _frames: Option<Subscription>,
@@ -1969,6 +1969,7 @@ impl Dashboard {
         let changes = cx.observe(&sidebar, |this, sidebar, cx| {
             let next = Self::collect_sidebar(&sidebar, cx);
             if this.cards != next {
+                this.lanes = Self::project_lanes(&next);
                 this.cards = next;
                 cx.notify();
             }
@@ -1986,6 +1987,8 @@ impl Dashboard {
         Self {
             owner,
             sidebar,
+            language: krill_app::i18n::language(),
+            lanes: Self::project_lanes(&cards),
             cards,
             previews,
             _changes: changes,
@@ -1993,6 +1996,14 @@ impl Dashboard {
             focus,
             focus_on_render: true,
         }
+    }
+
+    fn project_lanes(cards: &[SidebarCard]) -> [Vec<usize>; 4] {
+        let mut lanes = std::array::from_fn(|_| Vec::new());
+        for (index, card) in cards.iter().enumerate() {
+            lanes[lane(card.session.status.state)].push(index);
+        }
+        lanes
     }
 
     fn collect_sidebar(sidebar: &Entity<sidebar::Sidebar>, cx: &App) -> Vec<SidebarCard> {
@@ -2070,9 +2081,10 @@ impl Render for Dashboard {
         if std::mem::take(&mut self.focus_on_render) {
             window.focus(&self.focus, cx);
         }
-        self.cards = Self::collect_sidebar(&self.sidebar, cx);
-        if let Some(owner) = self.owner.upgrade() {
-            self.previews = Self::collect_previews(owner.read(cx));
+        if self.language != krill_app::i18n::language() {
+            self.language = krill_app::i18n::language();
+            self.cards = Self::collect_sidebar(&self.sidebar, cx);
+            self.lanes = Self::project_lanes(&self.cards);
         }
         let p = ui::palette(cx);
         let all_sessions = &self.cards;
@@ -2153,10 +2165,7 @@ impl Render for Dashboard {
                     .gap_2()
                     .p(ui::SPACE_2)
                     .children(LANES.iter().enumerate().map(|(column, title)| {
-                        let cards: Vec<_> = all_sessions
-                            .iter()
-                            .filter(|item| lane(item.session.status.state) == column)
-                            .collect();
+                        let cards = &self.lanes[column];
                         let lane_state = match column {
                             0 => AgentState::Waiting,
                             1 => AgentState::Working,
@@ -2229,7 +2238,8 @@ impl Render for Dashboard {
                                                 .child(text::EMPTY.get()),
                                         )
                                     })
-                                    .children(cards.into_iter().map(|item| {
+                                    .children(cards.iter().map(|index| {
+                                        let item = &all_sessions[*index];
                                         let session = item.session.id;
                                         let host_clone = item.host.clone();
                                         let name = item.name.clone();

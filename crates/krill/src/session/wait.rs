@@ -1,12 +1,13 @@
 //! MK-047: daemon-backed wait conditions. idle is derived, never an agent state.
 
-use super::{Error, Result, capture, fail, id, request, state_name, usage};
+use super::{Error, Result, fail, id, request, state_name, usage};
 use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
 use crate::remote::Target;
 use krill_proto::control::{
-    AgentState, CaptureFormat, FEAT_CLI, FEAT_CONTROL, FEAT_WAIT_STATUS, Reply, Request,
+    AgentState, CaptureFormat, CaptureStamp, FEAT_CAPTURE_SINCE, FEAT_CLI, FEAT_CONTROL,
+    FEAT_WAIT_STATUS, Reply, Request,
 };
 use krill_proto::daemon::{self, Connection};
 use krill_proto::ipc::{ClientHello, ClientRole};
@@ -204,6 +205,40 @@ fn done_since(
         .map(|s| s.status.since_unix_ns))
 }
 
+fn pattern_probe(
+    session: krill_proto::SessionId,
+    features: u64,
+    pattern: &Regex,
+    seen: &mut Option<CaptureStamp>,
+    mut send: impl FnMut(&Request) -> Result<Reply>,
+) -> Result<bool> {
+    let bytes = if features & FEAT_CAPTURE_SINCE != 0 {
+        let Reply::CaptureSince { stamp, bytes } = send(&Request::CaptureSince {
+            session,
+            since: *seen,
+        })?
+        else {
+            return Err(fail("unexpected capture-since reply"));
+        };
+        if stamp.session != session || (bytes.is_none() && *seen != Some(stamp)) {
+            return Err(fail("invalid capture-since stamp"));
+        }
+        *seen = Some(stamp);
+        bytes
+    } else {
+        let Reply::Captured { bytes, .. } = send(&Request::Capture {
+            session,
+            format: CaptureFormat::Plain,
+        })?
+        else {
+            return Err(fail("unexpected capture reply"));
+        };
+        Some(bytes)
+    };
+    // An unchanged screen could only repeat the preceding unsuccessful match.
+    Ok(bytes.is_some_and(|bytes| pattern.is_match(&String::from_utf8_lossy(&bytes))))
+}
+
 pub(super) fn run(args: &[OsString], target: &Target) -> Result<()> {
     let (session, args) = args.split_first().ok_or_else(usage)?;
     let session = id(session)?;
@@ -227,6 +262,7 @@ pub(super) fn run(args: &[OsString], target: &Target) -> Result<()> {
         start,
         limit,
     )?;
+    let mut capture_stamp = None;
     loop {
         if let Some(t) = limit {
             let remaining = t.saturating_sub(start.elapsed());
@@ -239,8 +275,13 @@ pub(super) fn run(args: &[OsString], target: &Target) -> Result<()> {
         }
         let matched = (|| {
             if let Some(pattern) = &options.pattern {
-                let (_, bytes) = capture(&mut c.stream, session, CaptureFormat::Plain)?;
-                return Ok(pattern.is_match(&String::from_utf8_lossy(&bytes)));
+                return pattern_probe(
+                    session,
+                    c.negotiated.features,
+                    pattern,
+                    &mut capture_stamp,
+                    |req| request(&mut c.stream, req),
+                );
             }
             let Reply::WaitStatus { state, quiet_ms } =
                 request(&mut c.stream, &Request::WaitStatus { session })?
@@ -283,5 +324,114 @@ pub(super) fn run(args: &[OsString], target: &Target) -> Result<()> {
                 .timeout
                 .map_or(POLL, |t| POLL.min(t.saturating_sub(start.elapsed()))),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krill_proto::{
+        SessionId,
+        screen::{Revision, Seq},
+    };
+
+    #[test]
+    fn pattern_stamp_is_negotiated_and_scope_checked() {
+        let session = SessionId(7);
+        let stamp = CaptureStamp {
+            session,
+            revision: Revision(1),
+            seq: Seq(8),
+        };
+        let pattern = Regex::new("ready").unwrap();
+        let mut seen = None;
+        assert!(
+            !pattern_probe(session, FEAT_CAPTURE_SINCE, &pattern, &mut seen, |req| {
+                assert_eq!(
+                    req,
+                    &Request::CaptureSince {
+                        session,
+                        since: None
+                    }
+                );
+                Ok(Reply::CaptureSince {
+                    stamp,
+                    bytes: Some(b"waiting".to_vec()),
+                })
+            })
+            .unwrap()
+        );
+        assert!(
+            !pattern_probe(session, FEAT_CAPTURE_SINCE, &pattern, &mut seen, |req| {
+                assert_eq!(
+                    req,
+                    &Request::CaptureSince {
+                        session,
+                        since: Some(stamp)
+                    }
+                );
+                Ok(Reply::CaptureSince { stamp, bytes: None })
+            })
+            .unwrap()
+        );
+        assert!(
+            pattern_probe(session, FEAT_CAPTURE_SINCE, &pattern, &mut seen, |_| {
+                Ok(Reply::CaptureSince {
+                    stamp: CaptureStamp {
+                        session: SessionId(8),
+                        ..stamp
+                    },
+                    bytes: None,
+                })
+            })
+            .is_err()
+        );
+        assert!(
+            pattern_probe(session, 0, &pattern, &mut seen, |req| {
+                assert_eq!(
+                    req,
+                    &Request::Capture {
+                        session,
+                        format: CaptureFormat::Plain
+                    }
+                );
+                Ok(Reply::Captured {
+                    seq: Seq(9),
+                    bytes: b"ready".to_vec(),
+                })
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn same_seq_resize_or_sync_revision_is_not_unchanged() {
+        let session = SessionId(7);
+        let mut seen = Some(CaptureStamp {
+            session,
+            revision: Revision(1),
+            seq: Seq(8),
+        });
+        let stamp = CaptureStamp {
+            session,
+            revision: Revision(2),
+            seq: Seq(8),
+        };
+        assert!(
+            pattern_probe(
+                session,
+                FEAT_CAPTURE_SINCE,
+                &Regex::new("ready").unwrap(),
+                &mut seen,
+                |_| {
+                    Ok(Reply::CaptureSince {
+                        stamp,
+                        bytes: Some(b"ready".to_vec()),
+                    })
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(seen, Some(stamp));
     }
 }

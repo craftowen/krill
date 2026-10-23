@@ -679,6 +679,8 @@ impl Explorer {
     }
 
     pub(crate) fn rebuild_rows(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _work = crate::responsiveness::work("explorer.filter");
         self.rows.clear();
         let tokens: Vec<String> = self
             .filter_query
@@ -735,6 +737,12 @@ impl Explorer {
         for list in tree.values_mut() {
             sort_entries(list);
         }
+        tracing::trace!(
+            entries = all_entries.len(),
+            matched = matched_entries.len(),
+            parents = matched_dirs.len(),
+            "file filter projection"
+        );
         let root = self.repo.clone();
         self.visit_filtered_dir(&tree, &root, 0);
     }
@@ -2233,4 +2241,45 @@ fn row_context_menu(
                         .ok();
                 }),
         )
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn broad_cached_filter_preserves_parents_hidden_ignored_and_order() {
+        let root = PathBuf::from("/repo");
+        let entry = |relative: &str, is_dir| DirEntry {
+            name: relative.rsplit('/').next().unwrap().to_owned(),
+            path: root.join(relative),
+            relative_path: relative.to_owned(),
+            is_dir,
+            is_symlink: false,
+        };
+        let mut explorer = Explorer::new(root.clone());
+        let mut entries = vec![
+            entry("src", true),
+            entry("src/.hidden-match", false),
+            entry("src/ignored-match", false),
+        ];
+        entries.extend((0..2_000).map(|i| entry(&format!("src/MATCH-{i:04}"), false)));
+        explorer.filter_files_cache = Some(entries);
+        explorer.filter_query = "match".into();
+        explorer.show_dotfiles = false;
+        explorer.show_ignored = false;
+        explorer.ignored.insert("src/ignored-match".into());
+        explorer.rebuild_rows();
+        assert_eq!(explorer.rows.len(), 2_001);
+        assert_eq!(explorer.rows[0].relative_path, "src");
+        assert_eq!(explorer.rows[1].relative_path, "src/MATCH-0000");
+        assert_eq!(
+            explorer.rows.last().unwrap().relative_path,
+            "src/MATCH-1999"
+        );
+        explorer.filter_query = "MATCH 0010".into();
+        explorer.rebuild_rows();
+        assert_eq!(explorer.rows.len(), 2);
+        assert_eq!(explorer.rows[1].relative_path, "src/MATCH-0010");
+    }
 }

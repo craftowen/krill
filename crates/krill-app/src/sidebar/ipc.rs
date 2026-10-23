@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use krill_proto::control::{
@@ -17,7 +17,7 @@ use krill_proto::git::{GitWatchReply, GitWatchRequest};
 use krill_proto::hook::FEAT_HOOK;
 use krill_proto::screen::Msg as _;
 
-use crate::hosts::HostTarget;
+use crate::hosts::{HostId, HostTarget};
 
 use super::{Meta, Session, Snapshot, Source, Tree};
 
@@ -136,6 +136,43 @@ type Job = Box<dyn FnOnce() + Send>;
 /// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
 const SLOW_POLL: Duration = Duration::from_secs(1);
 
+type SharedSnapshot = Mutex<Option<(Instant, Arc<Snapshot>)>>;
+type SnapshotRegistry = Mutex<Vec<(SnapshotSource, Weak<SharedSnapshot>)>>;
+
+// A registry key must not retain RemoteConnector or its transport resources.
+#[derive(PartialEq, Eq)]
+struct SnapshotSource {
+    host: HostId,
+    socket: PathBuf,
+    allow_launch: bool,
+    local_paths: Option<krill_proto::daemon::Paths>,
+}
+
+// Sources retain independent connections/git visibility; only immutable status
+// snapshots are shared across windows and the window-independent menu monitor.
+fn shared_snapshot(target: &HostTarget) -> Arc<SharedSnapshot> {
+    static SOURCES: OnceLock<SnapshotRegistry> = OnceLock::new();
+    let target = SnapshotSource {
+        host: target.host().clone(),
+        socket: target.socket().to_owned(),
+        allow_launch: target.allow_local_launch(),
+        local_paths: target.local_paths().cloned(),
+    };
+    let Ok(mut sources) = SOURCES.get_or_init(Mutex::default).lock() else {
+        return Arc::new(Mutex::new(None));
+    };
+    sources.retain(|(_, source)| source.strong_count() != 0);
+    if let Some(source) = sources
+        .iter()
+        .find_map(|(key, source)| (key == &target).then(|| source.upgrade()).flatten())
+    {
+        return source;
+    }
+    let source = Arc::new(Mutex::new(None));
+    sources.push((target, Arc::downgrade(&source)));
+    source
+}
+
 pub(super) struct Socket {
     shared: Arc<Shared>,
     /// 호스트 전용 작업 스레드. 폴링·숨김 정리를 여기서 차례로 돌려, 원격 ssh(`resolve_remote_socket`)나
@@ -151,6 +188,7 @@ struct Shared {
     conn: Mutex<Option<Conn>>,
     watches: Mutex<WatchCache>,
     external: Mutex<ExternalCache>,
+    snapshot: Arc<SharedSnapshot>,
 }
 
 impl Socket {
@@ -164,9 +202,11 @@ impl Socket {
     }
 
     fn build(target: HostTarget, threaded: bool) -> Self {
+        let snapshot = shared_snapshot(&target);
         Self {
             shared: Arc::new(Shared {
                 target,
+                snapshot,
                 conn: Mutex::new(None),
                 watches: Mutex::new(WatchCache::default()),
                 external: Mutex::new(ExternalCache::default()),
@@ -315,6 +355,22 @@ impl Shared {
     }
 
     fn fetch(&self) -> io::Result<Snapshot> {
+        self.fetch_shared().map(|snapshot| (*snapshot).clone())
+    }
+
+    fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
+        if !self.target.is_current() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let mut cached = self
+            .snapshot
+            .lock()
+            .map_err(|_| io::Error::other("sidebar snapshot mutex poisoned"))?;
+        if let Some((at, snapshot)) = cached.as_ref()
+            && at.elapsed() < Duration::from_millis(450)
+        {
+            return Ok(snapshot.clone());
+        }
         let is_local = self.target.allow_local_launch();
         // 외부 에이전트 상태는 로컬 호스트에서만 TTL 캐시에서 읽는다. 실패해도 krilld 스냅샷은 그대로 돌려준다.
         let external = if is_local {
@@ -325,11 +381,22 @@ impl Shared {
         } else {
             BTreeMap::new()
         };
-        self.with_conn(
+        let result = self.with_conn(
             FEAT_CONTROL | FEAT_HOOK | FEAT_SIDEBAR,
             Duration::from_secs(5),
             |stream| fetch_from(stream, &external, is_local),
-        )
+        );
+        match result {
+            Ok(snapshot) => {
+                let snapshot = Arc::new(snapshot);
+                *cached = Some((Instant::now(), snapshot.clone()));
+                Ok(snapshot)
+            }
+            Err(error) => {
+                *cached = None;
+                Err(error)
+            }
+        }
     }
 
     fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
@@ -381,6 +448,10 @@ impl Source for Socket {
 
     fn fetch(&self) -> io::Result<Snapshot> {
         self.shared.fetch()
+    }
+
+    fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
+        self.shared.fetch_shared()
     }
 
     fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
@@ -774,6 +845,35 @@ fn fetch_from(
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_is_shared_across_sources_but_git_watch_state_is_independent() {
+        let paths = krill_proto::daemon::Paths {
+            socket: "/unused/shared-sidebar-snapshot.sock".into(),
+            holder: "/unused/holder".into(),
+            krilld: "/unused/daemon".into(),
+        };
+        let first = Socket::new(&paths);
+        let second = Socket::new(&paths);
+        assert!(Arc::ptr_eq(&first.shared.snapshot, &second.shared.snapshot));
+        let snapshot = Arc::new(Snapshot::default());
+        *first.shared.snapshot.lock().unwrap() = Some((Instant::now(), snapshot.clone()));
+        assert!(Arc::ptr_eq(&first.fetch_shared().unwrap(), &snapshot));
+        assert!(Arc::ptr_eq(&second.fetch_shared().unwrap(), &snapshot));
+        first
+            .shared
+            .watches
+            .lock()
+            .unwrap()
+            .entries
+            .insert("/repo".into(), WatchState::default());
+        assert!(second.shared.watches.lock().unwrap().entries.is_empty());
+        let other = Socket::new(krill_proto::daemon::Paths {
+            socket: "/unused/other-sidebar.sock".into(),
+            ..paths
+        });
+        assert!(!Arc::ptr_eq(&first.shared.snapshot, &other.shared.snapshot));
+    }
 
     const FIXTURE: &str = r#"[
         {"kind":"background","id":"a1","sessionId":"s-a1","name":"build","cwd":"/repo/a","pid":11,"startedAt":1000,"state":"working","status":"busy","waitingFor":""},

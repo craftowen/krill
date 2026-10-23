@@ -438,6 +438,21 @@ pub fn remove_hosts(state_dir: Option<&Path>, ids: &[String]) -> io::Result<Vec<
     Ok(hosts)
 }
 
+/// Refuse a queued duplicate cleanup if a user edited/replaced a host since the scan.
+pub fn remove_hosts_if_current(
+    state_dir: Option<&Path>,
+    ids: &[String],
+    expected: &[SshHost],
+) -> io::Result<Vec<SshHost>> {
+    if load_hosts(state_dir) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "SSH hosts changed; refresh the duplicate list before removing entries",
+        ));
+    }
+    remove_hosts(state_dir, ids)
+}
+
 /// 같은 기기(`ssh -G`의 사용자·주소·포트)를 가리키는 중복 등록. 먼저 등록한 항목을 남기고 `(중복 id, 남길 id)`를
 /// 돌려준다. 기기마다 `ssh -G`를 한 번씩 돌리므로 UI 스레드 밖에서 부른다.
 #[must_use]
@@ -705,13 +720,15 @@ pub fn discover_tailscale_peers() -> Vec<TailscalePeer> {
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     ));
     for bin in candidates {
-        let Ok(out) = crate::platform::background_command(&bin)
-            .args(["status", "--json"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-        else {
+        let Ok(out) = crate::settings::child::output(
+            crate::platform::background_command(&bin)
+                .args(["status", "--json"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            std::time::Duration::from_secs(10),
+            1024 * 1024,
+        ) else {
             continue;
         };
         if out.status.success() {
@@ -781,13 +798,16 @@ pub fn generate_default_ssh_key(home: Option<&Path>) -> io::Result<PathBuf> {
     }
     let keygen_bin = std::env::var_os("KRILL_SSH_KEYGEN_BIN")
         .map_or_else(|| PathBuf::from("ssh-keygen"), PathBuf::from);
-    let out = crate::platform::background_command(keygen_bin)
-        .args(["-t", "ed25519", "-N", "", "-f"])
-        .arg(&key_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let out = crate::settings::child::output(
+        crate::platform::background_command(keygen_bin)
+            .args(["-t", "ed25519", "-N", "", "-f"])
+            .arg(&key_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        std::time::Duration::from_secs(30),
+        65536,
+    )?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
         return Err(io::Error::other(if err.is_empty() {
@@ -836,7 +856,9 @@ pub fn test_connection(host: &SshHost) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let out = cmd.output().map_err(|e| format!("ssh spawn failed: {e}"))?;
+    let out =
+        crate::settings::child::output(&mut cmd, std::time::Duration::from_secs(30), 1024 * 1024)
+            .map_err(|e| format!("ssh command failed: {e}"))?;
     let elapsed_ms = start.elapsed().as_millis();
     if out.status.success() {
         let info = String::from_utf8_lossy(&out.stdout)
@@ -1329,4 +1351,36 @@ fn as12_hosts_save_preserves_future_fields() {
     assert_eq!(value["future"].as_bool(), Some(true));
     assert_eq!(value["hosts"][0]["future"].as_str(), Some("nested"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn duplicate_cleanup_refuses_hosts_edited_after_scan() {
+    let dir = std::env::temp_dir().join(format!("krill-duplicate-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = config_path(Some(&dir));
+    std::fs::write(
+        &path,
+        "future = true\n[[hosts]]\nid = 'one'\nlabel = 'Old'\ndestination = 'old-host'\n",
+    )
+    .unwrap();
+    let expected = load_hosts(Some(&dir));
+    update_host(Some(&dir), "one", "Edited", "new-host", None, None).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        remove_hosts_if_current(Some(&dir), &["one".into()], &expected)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let current = load_hosts(Some(&dir));
+    assert!(
+        remove_hosts_if_current(Some(&dir), &["one".into()], &current)
+            .unwrap()
+            .is_empty()
+    );
+    let value: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["future"].as_bool(), Some(true));
+    std::fs::remove_dir_all(dir).ok();
 }

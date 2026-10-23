@@ -40,7 +40,8 @@ pub const PROTO_MIN: u16 = 1;
 /// [`crate::control::FEAT_CONTROL`]·[`crate::control::FEAT_GIT_EDIT`]와 함께 협상한다.
 pub const FEAT_GIT_SYNC: u64 = 1 << 41;
 /// 이 빌드가 지원하는 feature 비트.
-pub const FEATURES: u64 = crate::screen::FEAT_SCREEN
+pub const FEATURES: u64 = crate::screen::FEAT_HISTORY_VIEW
+    | crate::screen::FEAT_SCREEN
     | crate::control::FEAT_CONTROL
     | crate::input::FEAT_INPUT
     | crate::hook::FEAT_HOOK
@@ -53,6 +54,7 @@ pub const FEATURES: u64 = crate::screen::FEAT_SCREEN
     | crate::control::FEAT_CLI
     | crate::search::FEAT_SEARCH
     | crate::search::FEAT_SEARCH_OPTIONS
+    | crate::control::FEAT_CAPTURE_SINCE
     | crate::control::FEAT_WAIT_STATUS
     | crate::term_modes::FEAT_TERM_MODES
     | crate::term_modes::FEAT_CLEAR_VIEWPORT
@@ -93,7 +95,7 @@ pub const FEATURES: u64 = crate::screen::FEAT_SCREEN
     | crate::mobile::FEAT_MOBILE
     | crate::orchestration::FEAT_ORCH_RETAIN;
 // 기능 비트는 서로 겹치면 안 된다(2026-10-15 번호 충돌 사고 방지). 비트가 모두 다르면 합의 1 비트 수가 항목 수와 같다.
-const _: () = assert!(FEATURES.count_ones() == 52);
+const _: () = assert!(FEATURES.count_ones() == 54);
 /// 프레임 최대 길이(`len` 값 기준).
 pub const MAX_FRAME: usize = 1 << 20;
 /// [`ClientHello::name`] 최대 바이트.

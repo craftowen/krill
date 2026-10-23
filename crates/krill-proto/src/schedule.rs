@@ -2,7 +2,7 @@
 //! Cron uses five numeric UTC fields: minute, hour, day, month, weekday (Sunday 0/7).
 
 use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write as _};
 use std::path::Path;
@@ -249,18 +249,30 @@ pub fn load_runs(dir: &Path) -> io::Result<Vec<ScheduleRun>> {
 pub fn load_coalesced_runs(dir: &Path) -> io::Result<Vec<ScheduleRun>> {
     let raw = load_runs(dir)?;
     let mut entries: Vec<ScheduleRun> = Vec::new();
+    let mut sessions: HashMap<u64, BTreeSet<usize>> = HashMap::new();
+    let mut pending: HashMap<(String, u64), BTreeSet<usize>> = HashMap::new();
     for r in raw {
-        if r.phase == "started" {
-            entries.push(r);
-            continue;
-        }
-        let target = entries.iter_mut().rev().find(|e| {
-            (r.session.is_some() && e.session == r.session)
-                || (e.id == r.id
-                    && e.minute == r.minute
-                    && matches!(e.phase.as_str(), "started" | "spawned"))
-        });
-        if let Some(existing) = target {
+        let session_match = r
+            .session
+            .and_then(|id| sessions.get(&id))
+            .and_then(|set| set.last().copied());
+        let key = (r.id.clone(), r.minute);
+        let key_match = pending.get(&key).and_then(|set| set.last().copied());
+        let target = if r.phase == "started" {
+            None
+        } else {
+            session_match.into_iter().chain(key_match).max()
+        };
+        let index = target.unwrap_or(entries.len());
+        if let Some(existing) = target.and_then(|index| entries.get_mut(index)) {
+            if let Some(session) = existing.session
+                && let Some(set) = sessions.get_mut(&session)
+            {
+                set.remove(&index);
+            }
+            if let Some(set) = pending.get_mut(&(existing.id.clone(), existing.minute)) {
+                set.remove(&index);
+            }
             existing.phase = r.phase;
             if r.session.is_some() {
                 existing.session = r.session;
@@ -279,6 +291,17 @@ pub fn load_coalesced_runs(dir: &Path) -> io::Result<Vec<ScheduleRun>> {
             }
         } else {
             entries.push(r);
+        }
+        if let Some(entry) = entries.get(index) {
+            if let Some(session) = entry.session {
+                sessions.entry(session).or_default().insert(index);
+            }
+            if matches!(entry.phase.as_str(), "started" | "spawned") {
+                pending
+                    .entry((entry.id.clone(), entry.minute))
+                    .or_default()
+                    .insert(index);
+            }
         }
     }
     entries.reverse();
@@ -416,3 +439,71 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod indexed_run_tests {
+    use super::*;
+    #[test]
+    fn indexed_coalescing_matches_reverse_scan_across_duplicate_minutes_and_sessions() {
+        let dir = std::env::temp_dir().join(format!("krill-index-runs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut raw = Vec::new();
+        for n in 0_u64..300 {
+            raw.push(ScheduleRun {
+                id: format!("job-{}", n % 5),
+                minute: n % 7,
+                phase: ["started", "spawned", "finished", "failed", "skipped"]
+                    .get(usize::try_from(n % 5).unwrap())
+                    .unwrap()
+                    .to_string(),
+                session: (n % 3 != 0).then_some(n % 11),
+                error: (n % 5 == 3).then(|| "error".into()),
+                status: (n % 5 == 2).then_some(0),
+                cwd: None,
+                output: (n % 5 == 2).then(|| "한글 output".into()),
+            });
+        }
+        let mut expected: Vec<ScheduleRun> = Vec::new();
+        for r in raw.iter().cloned() {
+            let target = if r.phase == "started" {
+                None
+            } else {
+                expected.iter_mut().rev().find(|e| {
+                    r.session.is_some() && e.session == r.session
+                        || e.id == r.id
+                            && e.minute == r.minute
+                            && matches!(e.phase.as_str(), "started" | "spawned")
+                })
+            };
+            if let Some(existing) = target {
+                existing.phase = r.phase;
+                if r.session.is_some() {
+                    existing.session = r.session;
+                }
+                if r.error.is_some() {
+                    existing.error = r.error;
+                }
+                if r.status.is_some() {
+                    existing.status = r.status;
+                }
+                if r.cwd.is_some() {
+                    existing.cwd = r.cwd;
+                }
+                if r.output.is_some() {
+                    existing.output = r.output;
+                }
+            } else {
+                expected.push(r);
+            }
+        }
+        expected.reverse();
+        let mut file = File::create(dir.join(RUNS)).unwrap();
+        for r in raw {
+            serde_json::to_writer(&mut file, &r).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        drop(file);
+        assert_eq!(load_coalesced_runs(&dir).unwrap(), expected);
+        fs::remove_dir_all(dir).ok();
+    }
+}

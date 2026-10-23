@@ -529,6 +529,9 @@ pub struct Shell {
     panel_collapsed: bool,
     path: Option<PathBuf>,
     saver: persist::Saver,
+    layout_save_requests: persist::Requests,
+    quit_layout_ready: std::cell::Cell<bool>,
+    _layout_save_task: Task<()>,
     layout_loading: bool,
     restore_session: Option<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     restore_workspace: Option<(krill_app::hosts::HostId, PathBuf)>,
@@ -637,7 +640,7 @@ pub struct Shell {
     pub(super) reset_armed: Option<(krill_proto::usage::ProviderKind, String)>,
     account_handoff_poll: Option<Task<()>>,
     account_cancel: Option<krill_proto::SessionId>,
-    pub(super) accounts_snapshot: krill_proto::usage::AccountsSnapshot,
+    pub(super) accounts_snapshot: Arc<krill_proto::usage::AccountsSnapshot>,
     pub(super) ssh_hosts: Vec<krill_app::ssh_hosts::SshHost>,
     pub(super) host_manager: krill_app::hosts::HostManager,
     /// 같은 기기를 가리키는 중복 등록 id → 대표 id(`ssh -G` 기준, 백그라운드에서 구한다).
@@ -996,7 +999,7 @@ impl Shell {
                 this.toggle_panel(cx);
             });
         let terminal_theme = krill_app::ui::terminal_theme(cx);
-        let accounts_snapshot = krill_proto::usage::AccountsSnapshot::default();
+        let accounts_snapshot = Arc::new(krill_proto::usage::AccountsSnapshot::default());
         let ssh_hosts = Vec::new();
         let host_manager = krill_app::hosts::HostManager::new();
 
@@ -1043,6 +1046,8 @@ impl Shell {
                 }
             }))
         });
+        let (layout_save_requests, receiver) = persist::Requests::new();
+        let layout_save_task = persist::schedule(receiver, cx);
         let mut shell = Self {
             language: krill_app::i18n::language(),
             sidebar,
@@ -1069,6 +1074,9 @@ impl Shell {
             restore_workspace: None,
             path,
             saver: persist::Saver::new(cx),
+            layout_save_requests,
+            quit_layout_ready: std::cell::Cell::new(false),
+            _layout_save_task: layout_save_task,
             local_generation: 0,
             ssh_generation: 0,
             orch_snapshot: Arc::default(),
@@ -1167,6 +1175,12 @@ impl Shell {
             nav_history: NavHistory::default(),
             chat: chat::ChatState::default(),
         };
+        // Unexpected entity release still hands the latest state to the
+        // app-owned writer before Saver::drop disconnects it.
+        cx.on_release(|shell, _| {
+            shell.flush_layout_snapshot();
+        })
+        .detach();
         shell.sync_sidebar_custom_titles(cx);
         shell.record_workspace_nav(cx);
         Self::register_overlay_hosts(cx);
@@ -1259,7 +1273,7 @@ impl Shell {
     fn poll_orchestration(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok((dir, screens, mut previous)) = this.read_with(cx, |this, cx| {
+                let Ok((dir, screens, mut previous, old_ports)) = this.read_with(cx, |this, cx| {
                     let mut cache = this.ports_cache.borrow_mut();
                     let mut previous = HashMap::new();
                     let screens = this
@@ -1277,7 +1291,11 @@ impl Shell {
                             Some((id, screen))
                         })
                         .collect::<Vec<_>>();
-                    (this.state_dir(cx), screens, previous)
+                    let old_ports = previous
+                        .iter()
+                        .map(|(id, (_, entries))| (*id, entries.clone()))
+                        .collect::<HashMap<_, _>>();
+                    (this.state_dir(cx), screens, previous, old_ports)
                 }) else {
                     return;
                 };
@@ -1304,14 +1322,21 @@ impl Shell {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if let Some(snapshot) = snapshot {
+                        let mut changed = false;
+                        if let Some(snapshot) = snapshot
+                            && this.orch_snapshot != snapshot
+                        {
                             this.orch_snapshot = snapshot;
+                            changed = true;
                         }
                         let mut cache = this.ports_cache.borrow_mut();
-                        cache.retain(|id, _| {
-                            this.live
+                        cache.retain(|id, entry| {
+                            let retained = this
+                                .live
                                 .values()
-                                .any(|live| live.pane.session().is_some_and(|sid| sid.0 == *id))
+                                .any(|live| live.pane.session().is_some_and(|sid| sid.0 == *id));
+                            changed |= !retained && !entry.entries().is_empty();
+                            retained
                         });
                         cache.extend(ports.into_iter().filter_map(|(id, (text, entries))| {
                             let (_, screen) = screens.iter().find(|(sid, _)| *sid == id)?;
@@ -1322,11 +1347,16 @@ impl Shell {
                                         && Rc::ptr_eq(screen, &live.pane.shown())
                                 })
                                 .then(|| {
+                                    changed |=
+                                        old_ports.get(&id).map(Vec::as_slice).unwrap_or_default()
+                                            != entries.as_slice();
                                     (id, popout::PortCache::from_result(screen, text, entries))
                                 })
                         }));
                         drop(cache);
-                        cx.notify();
+                        if changed {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -1627,7 +1657,10 @@ impl Shell {
             l.pane.clear_search();
         }
         let view = if let Some(existing) = &self.settings {
-            existing.update(cx, |v, cx| v.set_tab(tab, cx));
+            existing.update(cx, |v, cx| {
+                v.set_mobile_page(false, cx);
+                v.set_tab(tab, cx);
+            });
             existing.clone()
         } else {
             let created = cx.new(|cx| {
@@ -1639,6 +1672,8 @@ impl Shell {
             self.settings = Some(created.clone());
             created
         };
+        let visible = window.as_deref().is_some_and(Window::is_window_active);
+        view.update(cx, |view, cx| view.set_visible(visible, cx));
         self.nav_history.push(NavEntry::Settings(tab));
         self.sync_focused_session(cx);
         if let Some(window) = window {
@@ -1652,9 +1687,29 @@ impl Shell {
         cx.notify();
     }
 
+    /// 사이드바 'Krill 모바일': 사이드바를 둔 채 본문에 모바일 페어링 페이지를 연다.
+    pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.open_settings(krill_app::settings::AdminTab::Mobile, window, cx);
+        if let Some(settings) = &self.settings {
+            settings.update(cx, |v, cx| v.set_mobile_page(true, cx));
+        }
+    }
+
+    /// 사이드바 'Krill 모바일' 페이지가 열려 있다.
+    pub(super) fn mobile_page_open(&self, cx: &App) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|s| s.read(cx).mobile_page())
+    }
+
     /// 인앱 설정 페이지를 닫고 터미널 워크스페이스로 돌아간다.
     pub(super) fn close_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let settings = self.settings.take();
+        if let Some(settings) = settings.clone() {
+            // Back/Escape can invoke this host while SettingsView itself is
+            // borrowed by its handler; stop hidden polling after that borrow ends.
+            cx.defer(move |cx| settings.update(cx, |view, cx| view.set_visible(false, cx)));
+        }
         let artifacts = self.artifacts.take();
         if settings.is_none() && artifacts.is_none() {
             return;
@@ -2601,8 +2656,10 @@ impl Shell {
         }));
         // 정상 종료·업데이트 재시작(`cx.quit`)은 종료 직전 시각을 디스크까지 쓴다. kill -9는 마지막 주기 저장값이 남는다.
         self.app_quit = Some(cx.on_app_quit(|this, cx| {
-            this.touch_last_seen();
-            let barrier = this.saver.barrier(cx);
+            if !this.quit_layout_ready.replace(false) {
+                this.touch_last_seen();
+            }
+            let barrier = this.layout_barrier(cx);
             async move {
                 let _ = barrier.await;
             }
@@ -2993,7 +3050,7 @@ impl Shell {
                 settings.update_accounts_snapshot(snap.clone(), cx);
             });
         }
-        self.accounts_snapshot = snap;
+        self.accounts_snapshot = Arc::new(snap);
         if rebound {
             for pane in reconnect {
                 if let Some(target) = self.target_for_pane(pane) {
@@ -3786,6 +3843,14 @@ impl Shell {
             l.cut();
             return false;
         };
+        if let Some(notice) = ev.history_notice {
+            // History availability is independent of the live stream. Keep the
+            // current viewport and selection, and leave this status in place
+            // until an explicit reset/reconnect or a later error replaces it.
+            self.notice = Some(notice.clone());
+            l.error = Some(notice);
+            cx.notify();
+        }
         if ev.closed {
             l.cut();
             l.error = None;
@@ -4671,11 +4736,37 @@ impl Shell {
     }
 
     fn save(&self) {
-        if self.layout_loading {
-            return;
+        self.quit_layout_ready.set(false);
+        if !self.layout_loading && self.path.is_some() {
+            self.layout_save_requests.request();
         }
-        if let Some(path) = &self.path {
-            self.saver.save(path, &self.layout);
+    }
+
+    /// The only production Layout clone for persistence. Close/quit use this
+    /// before their durable barrier; ordinary changes wait for UI quiet time.
+    fn flush_layout_snapshot(&self) -> bool {
+        if !self.layout_save_requests.is_pending() {
+            return true;
+        }
+        if self.layout_loading {
+            return false;
+        }
+        let Some(path) = &self.path else { return true };
+        if !self.layout_save_requests.take() {
+            return true;
+        }
+        if self.saver.save_snapshot(path, self.layout.clone()) {
+            return true;
+        }
+        self.layout_save_requests.request();
+        false
+    }
+
+    fn layout_barrier(&self, cx: &App) -> Task<bool> {
+        if self.flush_layout_snapshot() {
+            self.saver.barrier(cx)
+        } else {
+            Task::ready(false)
         }
     }
 
@@ -5694,7 +5785,7 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings.is_some() {
+            if self.settings.is_some() && !self.mobile_page_open(cx) {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
                 window.set_window_title(&self.main_window_title(cx));
@@ -5796,7 +5887,21 @@ impl Render for Shell {
         )
         .absolute()
         .size_full();
-        let settings_view = self.settings.clone();
+        if let Some(settings) = &self.settings {
+            let visible =
+                window.is_window_active() && self.dashboard.is_none() && self.artifacts.is_none();
+            settings.update(cx, |view, cx| view.set_visible(visible, cx));
+        }
+        let resources_visible =
+            window.is_window_active() && !self.page_open() && self.dashboard.is_none();
+        self.resources
+            .update(cx, |view, cx| view.set_visible(resources_visible, cx));
+        let mobile_page = self.mobile_page_open(cx);
+        let (settings_view, mobile_view) = if mobile_page {
+            (None, self.settings.clone())
+        } else {
+            (self.settings.clone(), None)
+        };
         let artifacts_view = self.artifacts.clone();
         let tree = if self.page_open() {
             None
@@ -5923,9 +6028,9 @@ impl Render for Shell {
                 if let Some(pane) = this.layout.focused() {
                     this.maybe_close_pane(pane, cx);
                 } else {
-                    // K11: 탭이 없는 빈 작업 공간에서는 macOS처럼 ⌘W가 창을 닫는다.
-                    // 파일 탭도 탭이라 여기서는 미저장 파일이 없다.
-                    window.remove_window();
+                    // Empty workspaces still flush delayed geometry/layout
+                    // state before closing, through the same durable barrier.
+                    this.request_close(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
@@ -6307,11 +6412,11 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .bg(bg)
-                            .when(artifacts_view.is_none(), |d| {
+                            .when(artifacts_view.is_none() && !mobile_page, |d| {
                                 d.child(self.render_tab_bar(window, cx))
                             })
                             .children(self.failed_account_input().map(|session| {
-                                div().id("account-input-recovery").debug_selector(|| "account-input-recovery".into()).flex().items_center().gap_2()
+                                div().id("account-input-recovery").debug_selector(|| "account-input-recovery".into()).flex().flex_wrap().items_center().gap_2()
                                     .px_3().py_1p5().bg(p.warning).text_color(p.warning_foreground)
                                     .text_size(krill_app::ui::TEXT_XS)
                                     .child(krill_app::i18n::catalog::settings::ACCOUNT_INPUT_HELD.get())
@@ -6331,6 +6436,7 @@ impl Render for Shell {
                                         krill_app::settings::terminal_opacity_pct(cx),
                                     ))
                                     .children(artifacts_view.clone())
+                                    .children(mobile_view)
                                     .children(tree)
                                     .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
@@ -6339,7 +6445,7 @@ impl Render for Shell {
                                     .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
                             ),
                     )
-                    .when(!self.panel_collapsed && artifacts_view.is_none(), |d| {
+                    .when(!self.panel_collapsed && artifacts_view.is_none() && !mobile_page, |d| {
                         d.child(divider(
                             "divider-panel".into(),
                             Drag::Panel,
@@ -6641,6 +6747,7 @@ impl Shell {
 impl Shell {
     /// 디바운스 저장 작업자의 대기분을 디스크에 반영한다(레이아웃 테스트용).
     pub(crate) fn flush_layout(&self) {
+        assert!(self.flush_layout_snapshot());
         self.saver.flush();
     }
 

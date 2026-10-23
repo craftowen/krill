@@ -20,22 +20,24 @@ pub mod ed25519;
 mod relaunch;
 mod rename;
 
+use gpui::AppContext as _;
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use krill_proto::control::is_newer;
 use krill_proto::ipc::PROTO_MAX;
 use serde::{Deserialize, Serialize};
 
-use self::ed25519::{PublicKey, Signature, decode_hex, sha256_hex};
+use self::ed25519::{PublicKey, Signature, decode_hex};
 pub use self::relaunch::{
     Journal, RelaunchOutcome, Stage, mark_ready, maybe_run_relauncher_cli, offer_rollback,
-    on_startup, recover_journal, relaunch_and_verify, rollback, spawn_detached_relauncher,
-    swap_bundles,
+    recover_journal, relaunch_and_verify, rollback, spawn_detached_relauncher, swap_bundles,
 };
 
 /// 상태 디렉터리의 업데이터 설정 파일 이름.
@@ -312,11 +314,14 @@ fn read_bundle_info_plist_json(app_bundle: &Path) -> Option<serde_json::Value> {
     if cfg!(windows) {
         return serde_json::from_slice(&fs::read(plist_path).ok()?).ok();
     }
-    let out = crate::platform::background_command("/usr/bin/plutil")
-        .args(["-convert", "json", "-o", "-"])
-        .arg(&plist_path)
-        .output()
-        .ok()?;
+    let out = crate::settings::child::output(
+        crate::platform::background_command("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&plist_path),
+        Duration::from_secs(10),
+        1024 * 1024,
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -359,6 +364,33 @@ pub enum Error {
     Unpack(String),
     NoBackup(PathBuf),
     Io(io::Error),
+}
+
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Config(v) => Self::Config(v.clone()),
+            Self::Json(v) => Self::Json(v.clone()),
+            Self::InsecureUrl(v) => Self::InsecureUrl(v.clone()),
+            Self::InvalidVersion(v) => Self::InvalidVersion(v.clone()),
+            Self::Downgrade { current, offered } => Self::Downgrade {
+                current: current.clone(),
+                offered: offered.clone(),
+            },
+            Self::InvalidRollout(v) => Self::InvalidRollout(*v),
+            Self::BadSignature => Self::BadSignature,
+            Self::Sha256Mismatch { expected, actual } => Self::Sha256Mismatch {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+            Self::Codesign(v) => Self::Codesign(v.clone()),
+            Self::BundleStructure(v) => Self::BundleStructure(v.clone()),
+            Self::Http(v) => Self::Http(v.clone()),
+            Self::Unpack(v) => Self::Unpack(v.clone()),
+            Self::NoBackup(v) => Self::NoBackup(v.clone()),
+            Self::Io(v) => Self::Io(io::Error::new(v.kind(), v.to_string())),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -664,10 +696,13 @@ impl CodeVerifier for CodesignVerifier {
         }
         run_codesign(&["--verify", "--strict", "--verbose=2"], app_bundle)?;
 
-        let info = crate::platform::background_command("/usr/bin/codesign")
-            .args(["-dv", "--verbose=4"])
-            .arg(app_bundle)
-            .output()?;
+        let info = crate::settings::child::output(
+            crate::platform::background_command("/usr/bin/codesign")
+                .args(["-dv", "--verbose=4"])
+                .arg(app_bundle),
+            Duration::from_secs(30),
+            65536,
+        )?;
         let stderr = String::from_utf8_lossy(&info.stderr);
         if !info.status.success()
             || !(stderr.contains("Signature=") || stderr.contains("Signature size="))
@@ -688,10 +723,13 @@ impl CodeVerifier for CodesignVerifier {
 }
 
 fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
-    let out = crate::platform::background_command("/usr/bin/codesign")
-        .args(args)
-        .arg(target)
-        .output()?;
+    let out = crate::settings::child::output(
+        crate::platform::background_command("/usr/bin/codesign")
+            .args(args)
+            .arg(target),
+        Duration::from_secs(30),
+        65536,
+    )?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_owned();
         return Err(Error::Codesign(format!("{}: {msg}", target.display())));
@@ -704,8 +742,8 @@ fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
 pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
     validate_url(url)?;
     let max_str = max_bytes.to_string();
-    let out = crate::platform::background_command(system_tool("curl"))
-        .args([
+    let out = crate::settings::child::output(
+        crate::platform::background_command(system_tool("curl")).args([
             "--fail",
             "--silent",
             "--show-error",
@@ -719,8 +757,10 @@ pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
             "--proto-redir",
             "=https",
             url,
-        ])
-        .output()?;
+        ]),
+        Duration::from_secs(40),
+        u64::try_from(max_bytes).unwrap_or(u64::MAX),
+    )?;
     if out.status.success() {
         if out.stdout.len() > max_bytes {
             return Err(Error::Http(format!(
@@ -820,7 +860,11 @@ fn fetch_github_release_asset_with_bin(
         cmd.arg(t);
     }
     cmd.args(["--repo", repo, "--pattern", asset, "--output", "-"]);
-    let out = cmd.output()?;
+    let out = crate::settings::child::output(
+        &mut cmd,
+        Duration::from_secs(60),
+        u64::try_from(max_bytes).unwrap_or(u64::MAX),
+    )?;
     if !out.status.success() {
         return Err(Error::Http(
             String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -888,37 +932,367 @@ pub fn stage_verified_archive(
     verifier: &dyn CodeVerifier,
 ) -> Result<PathBuf, Error> {
     manifest.verify_signature(public_key)?;
-    let actual_sha = sha256_hex(archive_bytes);
+    let path = unique_update_path(app_bundle, "download.zip");
+    if archive_bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(Error::Http("archive exceeded size limit".into()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(archive_bytes)?;
+    let result = stage_verified_file(manifest, public_key, &path, app_bundle, verifier);
+    fs::remove_file(path).ok();
+    result
+}
+
+fn unique_update_path(bundle: &Path, suffix: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    append_ext(bundle, &format!("{}-{serial}-{suffix}", std::process::id()))
+}
+
+fn archive_sha(path: &Path) -> Result<String, Error> {
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() > u64::try_from(MAX_ARCHIVE_BYTES).unwrap_or(u64::MAX) {
+        return Err(Error::Http("archive exceeded size limit".into()));
+    }
+    let mut hash = Sha256::new();
+    let mut total = 0_usize;
+    let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n);
+        if total > MAX_ARCHIVE_BYTES {
+            return Err(Error::Http("archive exceeded size limit".into()));
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(ed25519::encode_hex(&hash.finalize()))
+}
+
+fn stage_verified_file(
+    manifest: &Manifest,
+    public_key: &PublicKey,
+    archive: &Path,
+    app_bundle: &Path,
+    verifier: &dyn CodeVerifier,
+) -> Result<PathBuf, Error> {
+    manifest.verify_signature(public_key)?;
+    let actual_sha = archive_sha(archive)?;
     if !actual_sha.eq_ignore_ascii_case(&manifest.sha256) {
         return Err(Error::Sha256Mismatch {
             expected: manifest.sha256.clone(),
             actual: actual_sha,
         });
     }
-
-    let parent = app_bundle.parent().ok_or_else(|| {
-        Error::BundleStructure(format!("bundle has no parent: {}", app_bundle.display()))
-    })?;
+    let parent = app_bundle
+        .parent()
+        .ok_or_else(|| Error::BundleStructure("bundle has no parent".into()))?;
     fs::create_dir_all(parent)?;
-
-    let zip_tmp = append_ext(app_bundle, "download.zip");
-    let unpack_tmp = append_ext(app_bundle, "unpack.tmp");
+    let _lock = staging_lock(app_bundle)?;
+    recover_stage_publish_locked(app_bundle)?;
+    let unpack = unique_update_path(app_bundle, "unpack.tmp");
+    let candidate = unique_update_path(app_bundle, "candidate");
     let staging = staging_path(app_bundle);
-    fs::remove_file(&zip_tmp).ok();
-    fs::remove_dir_all(&unpack_tmp).ok();
-    fs::remove_dir_all(&staging).ok();
+    let incoming = append_ext(app_bundle, "staging.incoming");
+    let backup = append_ext(app_bundle, "staging.previous");
+    let result = (|| {
+        unpack_with_ditto(archive, &unpack, &candidate)?;
+        verifier.verify(&candidate)?;
+        fs::remove_dir_all(&incoming).ok();
+        fs::rename(&candidate, &incoming)?;
+        write_stage_marker(app_bundle)?;
+        if staging.exists() {
+            fs::rename(&staging, &backup)?;
+        }
+        if let Err(error) = fs::rename(&incoming, &staging) {
+            recover_stage_publish_locked(app_bundle).ok();
+            return Err(error.into());
+        }
+        sync_stage_parent(app_bundle)?;
+        fs::remove_file(append_ext(app_bundle, "stage-publish"))?;
+        sync_stage_parent(app_bundle)?;
+        fs::remove_dir_all(&backup).ok();
+        Ok(staging)
+    })();
+    fs::remove_dir_all(&unpack).ok();
+    fs::remove_dir_all(&candidate).ok();
+    result
+}
 
-    write_private_file(&zip_tmp, archive_bytes)?;
-    let unpack_res = unpack_with_ditto(&zip_tmp, &unpack_tmp, &staging);
-    fs::remove_file(&zip_tmp).ok();
-    fs::remove_dir_all(&unpack_tmp).ok();
-    unpack_res?;
-
-    if let Err(e) = verifier.verify(&staging) {
-        fs::remove_dir_all(&staging).ok();
-        return Err(e);
+fn staging_lock(app_bundle: &Path) -> io::Result<fs::File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(append_ext(app_bundle, "update.lock"))?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while lock.try_lock().is_err() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "update staging lock deadline exceeded",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    Ok(staging)
+    Ok(lock)
+}
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix directory sync can fail; staging shares its fallible publication contract on Windows"
+    )
+)]
+fn sync_stage_parent(app_bundle: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = app_bundle.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = app_bundle;
+    Ok(())
+}
+fn write_stage_marker(app_bundle: &Path) -> io::Result<()> {
+    let path = append_ext(app_bundle, "stage-publish");
+    let temporary = unique_update_path(app_bundle, "stage-publish.tmp");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(b"krill-stage-publish-v1\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    sync_stage_parent(app_bundle)
+}
+fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
+    let marker = append_ext(app_bundle, "stage-publish");
+    let staging = staging_path(app_bundle);
+    let incoming = append_ext(app_bundle, "staging.incoming");
+    let backup = append_ext(app_bundle, "staging.previous");
+    if !marker.exists() {
+        if staging.exists() {
+            fs::remove_dir_all(&backup).ok();
+            fs::remove_dir_all(&incoming).ok();
+        }
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(&marker)?.take(128).read_to_end(&mut bytes)?;
+    if bytes != b"krill-stage-publish-v1\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid stage publication journal",
+        ));
+    }
+    if !staging.exists() {
+        if backup.exists() {
+            fs::rename(&backup, &staging)?;
+        } else if incoming.exists() {
+            fs::rename(&incoming, &staging)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "stage publication has no recoverable bundle",
+            ));
+        }
+    }
+    sync_stage_parent(app_bundle)?;
+    fs::remove_file(marker)?;
+    sync_stage_parent(app_bundle)?;
+    fs::remove_dir_all(incoming).ok();
+    fs::remove_dir_all(backup).ok();
+    Ok(())
+}
+
+/// Recover interrupted staging publication off the event loop before normal update rollback recovery.
+pub fn on_startup(state_dir: PathBuf, window: &mut gpui::Window, cx: &mut gpui::App) {
+    let handle = window.window_handle();
+    let work = cx.background_spawn(async move {
+        if let Ok(exe) = std::env::current_exe() {
+            let configured = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
+            if let Some(bundle) = current_app_bundle_in(configured.as_deref(), &exe)
+                && append_ext(&bundle, "stage-publish").exists()
+                && let Ok(_lock) = staging_lock(&bundle)
+            {
+                recover_stage_publish_locked(&bundle).ok();
+            }
+        }
+    });
+    cx.spawn(async move |cx| {
+        work.await;
+        handle
+            .update(cx, |_, window, cx| {
+                relaunch::on_startup(state_dir, window, cx);
+            })
+            .ok();
+    })
+    .detach();
+}
+
+/// Stream stdout to a private file. A descendant holding a pipe cannot extend the total deadline.
+fn stream_download(cmd: &mut std::process::Command, path: &Path) -> Result<(), Error> {
+    use std::process::Stdio;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let result = (|| -> io::Result<()> {
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("download stdout unavailable"))?;
+        #[cfg(unix)]
+        {
+            let flags = rustix::fs::fcntl_getfl(&stdout)?;
+            rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK)?;
+        }
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("download stderr unavailable"))?;
+        let path = path.to_owned();
+        let body = crate::process_io::PipeTask::spawn(move || {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            let mut total = 0_usize;
+            let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "download body deadline exceeded",
+                    ));
+                }
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total = total.saturating_add(n);
+                        if total > MAX_ARCHIVE_BYTES {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "archive exceeded size limit",
+                            ));
+                        }
+                        file.write_all(&buffer[..n])?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            file.sync_all()
+        })?;
+        let errors = crate::process_io::read(stderr, 65537, deadline)?;
+        let mut body_done = false;
+        let status = loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "download command timed out",
+                ));
+            }
+            if !body_done && let Some(result) = body.try_finish() {
+                result?;
+                body_done = true;
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !body_done {
+            body.finish(deadline)?;
+        }
+        let errors = errors.finish(deadline)?;
+        if errors.bytes.len() > 65536 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "download stderr exceeded limit",
+            ));
+        }
+        if errors.timed_out {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "download stderr deadline exceeded",
+            ));
+        }
+        if !status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&errors.bytes).trim().to_owned(),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        child.kill().ok();
+        child.wait().ok();
+    }
+    result.map_err(Error::Io)
+}
+
+fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
+    validate_url(url)?;
+    if let Some(parent) = bundle.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let path = unique_update_path(bundle, "download.zip");
+    let mut curl = crate::platform::background_command(system_tool("curl"));
+    curl.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "30",
+        "--max-filesize",
+        &MAX_ARCHIVE_BYTES.to_string(),
+        "--proto",
+        "=https,http",
+        "--proto-redir",
+        "=https",
+        url,
+    ]);
+    match stream_download(&mut curl, &path) {
+        Ok(()) => Ok(path),
+        Err(error) => {
+            fs::remove_file(&path).ok();
+            if let Some((repo, tag, asset)) = parse_github_release_asset(url)
+                && let Some(gh) = find_gh_binary()
+            {
+                let mut cmd = crate::platform::background_command(gh);
+                cmd.args(["release", "download"]);
+                if let Some(tag) = tag {
+                    cmd.arg(tag);
+                }
+                cmd.args(["--repo", &repo, "--pattern", &asset, "--output", "-"]);
+                if stream_download(&mut cmd, &path).is_ok() {
+                    return Ok(path);
+                }
+                fs::remove_file(&path).ok();
+            }
+            Err(error)
+        }
+    }
 }
 
 /// 점진 롤아웃 판정용 안정 버킷(`0..100`). 상태 디렉터리 경로의 FNV-1a
@@ -954,24 +1328,10 @@ pub fn download_and_stage(
     if decision != Decision::Available {
         return Ok(None);
     }
-    let archive = fetch_bytes(&manifest.url, MAX_ARCHIVE_BYTES)?;
-    let staged = stage_verified_archive(manifest, public_key, &archive, app_bundle, verifier)?;
-    Ok(Some(staged))
-}
-
-/// 번들(`Info.plist` + `updater.toml`)에 대해 매니페스트를 내려받아 `<app_bundle>.staging`까지 준비한다.
-fn load_config_and_manifest(
-    manifest_url: Option<&str>,
-    app_bundle: &Path,
-    state_dir: &Path,
-) -> Result<(Config, Manifest), Error> {
-    let mut cfg = Config::load_for_bundle(state_dir, Some(app_bundle))?;
-    if let Some(url) = manifest_url.map(str::trim).filter(|s| !s.is_empty()) {
-        url.clone_into(&mut cfg.url);
-        cfg.validate()?;
-    }
-    let manifest = fetch_manifest(&cfg.url)?;
-    Ok((cfg, manifest))
+    let archive = fetch_archive(&manifest.url, app_bundle)?;
+    let staged = stage_verified_file(manifest, public_key, &archive, app_bundle, verifier);
+    fs::remove_file(archive).ok();
+    staged.map(Some)
 }
 
 /// 매니페스트 판정까지만 보고 설치 가능할 때만 스테이징한다.
@@ -1018,13 +1378,142 @@ fn decide_and_stage(
     })
 }
 
+#[derive(Default)]
+struct FlightState {
+    running: bool,
+    waiters: usize,
+    result: Option<Result<CheckStatus, Error>>,
+}
+#[derive(Default)]
+struct UpdateFlight {
+    state: Mutex<FlightState>,
+    changed: Condvar,
+}
+struct FlightOwner(Arc<UpdateFlight>, bool);
+impl Drop for FlightOwner {
+    fn drop(&mut self) {
+        if self.1 {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.running = false;
+            state.result = Some(Err(Error::Http("update worker stopped".into())));
+            self.0.changed.notify_all();
+        }
+    }
+}
+
+type FlightRegistry = std::collections::BTreeMap<String, Arc<UpdateFlight>>;
+fn flight_registry() -> &'static Mutex<FlightRegistry> {
+    static FLIGHTS: OnceLock<Mutex<FlightRegistry>> = OnceLock::new();
+    FLIGHTS.get_or_init(Mutex::default)
+}
+fn update_flight(key: &str) -> (Arc<UpdateFlight>, bool) {
+    let mut flights = flight_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(flight) = flights.get(key)
+        && flight
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
+    {
+        return (flight.clone(), false);
+    }
+    // Completed generations are immutable to their waiters. A later caller owns a new Arc.
+    let flight = Arc::new(UpdateFlight {
+        state: Mutex::new(FlightState {
+            running: true,
+            ..Default::default()
+        }),
+        changed: Condvar::new(),
+    });
+    flights.insert(key.to_owned(), flight.clone());
+    (flight, true)
+}
+fn await_flight(flight: &UpdateFlight) -> Result<CheckStatus, Error> {
+    let mut state = flight
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.waiters = state.waiters.saturating_add(1);
+    while state.running {
+        state = flight
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    state.waiters = state.waiters.saturating_sub(1);
+    state
+        .result
+        .clone()
+        .unwrap_or_else(|| Err(Error::Http("update result unavailable".into())))
+}
+fn single_flight(
+    key: &str,
+    work: impl FnOnce() -> Result<CheckStatus, Error>,
+) -> Result<CheckStatus, Error> {
+    let (flight, owns) = update_flight(key);
+    if !owns {
+        return await_flight(&flight);
+    }
+    let mut owner = FlightOwner(flight.clone(), true);
+    let result = work();
+    let mut state = flight
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.result = Some(result.clone());
+    state.running = false;
+    owner.1 = false;
+    flight.changed.notify_all();
+    result
+}
+
+fn check_and_stage_with(
+    manifest_url: Option<&str>,
+    app_bundle: &Path,
+    state_dir: &Path,
+) -> Result<CheckStatus, Error> {
+    if append_ext(app_bundle, "stage-publish").exists() {
+        let _lock = staging_lock(app_bundle)?;
+        recover_stage_publish_locked(app_bundle)?;
+    }
+    let mut cfg = Config::load_for_bundle(state_dir, Some(app_bundle))?;
+    if let Some(url) = manifest_url.map(str::trim).filter(|url| !url.is_empty()) {
+        url.clone_into(&mut cfg.url);
+        cfg.validate()?;
+    }
+    let bundle = app_bundle
+        .canonicalize()
+        .unwrap_or_else(|_| app_bundle.to_owned());
+    #[expect(
+        clippy::unnecessary_debug_formatting,
+        reason = "Escaped path representations keep distinct update-flight keys unambiguous"
+    )]
+    let key = format!(
+        "{:?}|{:?}|{}|{}|{}",
+        bundle,
+        state_dir,
+        cfg.url,
+        cfg.channel.as_str(),
+        cfg.public_key
+    );
+    single_flight(&key, || {
+        let manifest = fetch_manifest(&cfg.url)?;
+        decide_and_stage(&cfg, &manifest, app_bundle, state_dir)
+    })
+}
+
 pub fn stage_update_for_bundle(
     manifest_url: Option<&str>,
     app_bundle: &Path,
     state_dir: &Path,
 ) -> Result<Option<StagedUpdate>, Error> {
-    let (cfg, manifest) = load_config_and_manifest(manifest_url, app_bundle, state_dir)?;
-    match decide_and_stage(&cfg, &manifest, app_bundle, state_dir)? {
+    match check_and_stage_with(manifest_url, app_bundle, state_dir)? {
         CheckStatus::Ready(staged) => Ok(Some(staged)),
         _ => Ok(None),
     }
@@ -1077,8 +1566,7 @@ pub fn check_and_stage_current_app(state_dir: &Path) -> Result<CheckStatus, Erro
 /// 지정한 `.app` 번들의 업데이트를 점검하고 새 버전이 있으면 스테이징까지 완료한다.
 pub fn check_and_stage_bundle(app_bundle: &Path, state_dir: &Path) -> Result<CheckStatus, Error> {
     let manifest_env = std::env::var("KRILL_UPDATE_MANIFEST_URL").ok();
-    let (cfg, manifest) = load_config_and_manifest(manifest_env.as_deref(), app_bundle, state_dir)?;
-    decide_and_stage(&cfg, &manifest, app_bundle, state_dir)
+    check_and_stage_with(manifest_env.as_deref(), app_bundle, state_dir)
 }
 
 /// 환경 변수(`KRILL_UPDATE_*`) 또는 번들 `Info.plist`/`updater.toml` 설정으로 업데이트를 내려받아 스테이징하고,
@@ -1274,17 +1762,26 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
     }
 
     let verifier = CodesignVerifier::from_config(&cfg);
-    let archive = fetch_bytes(&manifest.url, MAX_ARCHIVE_BYTES)?;
-    let _ = stage_verified_archive(&manifest, &pk, &archive, &app_bundle, &verifier)?;
+    let _ = download_and_stage(
+        &manifest,
+        &pk,
+        &from_version,
+        cfg.channel,
+        &app_bundle,
+        &verifier,
+        rollout_bucket(&state_dir),
+    )?;
 
     // Windows는 실행 중 GUI를 끄지 않는다. 이름 바꾸기 교체라 GUI는 구 이미지로 계속 돌고 다음 실행부터 새 버전이다.
     if !cfg!(windows)
         && let Some(gui_pid) = find_running_gui_pid(&app_bundle)
     {
-        crate::platform::background_command("/bin/kill")
-            .args(["-TERM", &gui_pid.to_string()])
-            .status()
-            .ok();
+        crate::settings::child::output(
+            crate::platform::background_command("/bin/kill").args(["-TERM", &gui_pid.to_string()]),
+            Duration::from_secs(10),
+            1024,
+        )
+        .ok();
         let _ = spawn_detached_relauncher(
             &exe,
             &app_bundle,
@@ -1359,10 +1856,12 @@ fn find_running_gui_pid(app_bundle: &Path) -> Option<u32> {
     let target_canon = fs::canonicalize(&target_exe).unwrap_or(target_exe);
     let target_str = target_canon.to_string_lossy();
     let self_pid = std::process::id();
-    let out = crate::platform::background_command("/bin/ps")
-        .args(["-axo", "pid=,command="])
-        .output()
-        .ok()?;
+    let out = crate::settings::child::output(
+        crate::platform::background_command("/bin/ps").args(["-axo", "pid=,command="]),
+        Duration::from_secs(10),
+        4 * 1024 * 1024,
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1427,7 +1926,7 @@ fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Resu
         c.args(["-x", "-k"]).arg(zip_path).arg(unpack_tmp);
         c
     };
-    let out = cmd.output()?;
+    let out = crate::settings::child::output(&mut cmd, Duration::from_secs(120), 65536)?;
     if !out.status.success() {
         return Err(Error::Unpack(
             String::from_utf8_lossy(&out.stderr).trim().to_owned(),

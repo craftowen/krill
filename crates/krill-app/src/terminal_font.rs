@@ -163,6 +163,30 @@ mod tests {
     const MONO: [f32; PROBE_LEN] = [7.2; PROBE_LEN];
     const PROPORTIONAL: [f32; PROBE_LEN] = [4.1, 8.3, 10.2, 7.2, 3.5, 7.0, 4.4];
 
+    #[gpui::test]
+    fn cached_effective_font_is_scoped_to_registry_and_resolved_id(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let text = cx.text_system();
+            let expected = effective_font_with("Menlo", |family| measure(text, family));
+            assert_eq!(effective_terminal_font(text, " Menlo "), expected);
+            CACHE.with_borrow_mut(|cache| {
+                let entry = cache.entries.get_mut("Menlo").unwrap();
+                entry.0 = gpui::FontId(usize::MAX);
+                entry.1.family = "stale".into();
+            });
+            assert_eq!(effective_terminal_font(text, "Menlo"), expected);
+            CACHE.with_borrow_mut(|cache| {
+                cache.registry = Weak::new();
+                cache.entries.get_mut("Menlo").unwrap().1.family = "other-registry".into();
+            });
+            assert_eq!(effective_terminal_font(text, "Menlo"), expected);
+            assert_eq!(
+                effective_terminal_font(text, ""),
+                effective_font_with("", |_| None)
+            );
+        });
+    }
+
     #[test]
     fn uniform_accepts_only_equal_finite_advances() {
         assert!(uniform(&MONO));

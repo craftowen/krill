@@ -17,6 +17,8 @@
 //!   버퍼를 돌려준다(화면·모드는 유지). 구독자가 생기면 바로 다시 쌓는다. 버린 행은 세그먼트 콜드 페이지로 읽으므로
 //!   디스크에 기록하지 않는 세션은 강등하지 않는다.
 
+mod capture_since;
+mod history_view;
 mod input;
 mod park;
 mod recovery;
@@ -155,6 +157,7 @@ pub struct Gap {
 struct Live {
     engine: Engine,
     revision: u64,
+    history_epoch: u64,
     seq: u64,
     /// 원본 수신 시각. 화면 변화·sync flush·resize와 무관하게 원본 바이트만 갱신한다.
     last_output: Instant,
@@ -206,6 +209,7 @@ struct Shared {
     /// PTY 쓰기(질의 응답·알림)는 모두 `live` 잠금 안에서 해서 서로 섞이지 않는다.
     live: Mutex<Live>,
     capture: Mutex<Option<Captured>>,
+    history_access: Mutex<()>,
     gaps: Mutex<Vec<Gap>>,
     master: Master,
     #[cfg(windows)]
@@ -247,6 +251,7 @@ impl Shared {
         if live.viewers > 0 || live.epoch != epoch || live.parked {
             return;
         }
+        *lock(&self.capture) = None;
         if live.update_engine(demote).is_some() {
             live.parked = true;
         } else {
@@ -320,9 +325,11 @@ impl Session {
             clients: Mutex::default(),
             input: Mutex::default(),
             capture: Mutex::default(),
+            history_access: Mutex::default(),
             live: Mutex::new(Live {
                 engine: Engine::new(size),
                 revision: 0,
+                history_epoch: 0,
                 seq,
                 last_output: Instant::now(),
                 input_since_done: true,
@@ -707,9 +714,12 @@ impl Tap {
     }
 
     fn clear_scrollback_with(&self, clear: impl FnOnce(&mut Engine)) -> u64 {
+        let _history = lock(&self.0.history_access);
         let (seq, recovered) = {
             let mut live = self.0.live();
+            live.history_epoch = live.history_epoch.wrapping_add(1);
             let recovered = live.update_engine(clear).is_none().then_some(live.revision);
+            *lock(&self.0.capture) = None;
             (live.seq, recovered)
         };
         if let Some(revision) = recovered {
@@ -726,12 +736,14 @@ impl Tap {
 
     /// 입력은 보내지 않고 화면만 지운 뒤 구독자에게 새 revision을 알린다.
     pub fn clear_viewport(&self) -> bool {
+        let _history = lock(&self.0.history_access);
         let (seq, revision) = {
             let mut live = lock(&self.0.live);
             if panic::catch_unwind(AssertUnwindSafe(|| live.engine.clear_viewport())).is_err() {
                 return false;
             }
             live.revision = live.revision.wrapping_add(1);
+            live.history_epoch = live.history_epoch.wrapping_add(1);
             (live.seq, live.revision)
         };
         self.wait(|p| p.end >= seq || p.closed);

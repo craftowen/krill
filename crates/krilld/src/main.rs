@@ -254,10 +254,15 @@ fn main() -> ExitCode {
         .spawn(move || {
             loop {
                 if let Ok(s) = lis.accept() {
+                    // Bound unclassified connection threads without counting existing
+                    // attach/watch/wait clients or the dedicated holder connection.
+                    let Some(permit) = krilld::registry::admission::handshake() else {
+                        continue;
+                    };
                     let (hello, r) = (hello.clone(), Arc::clone(&registry));
                     thread::Builder::new()
                         .name("conn".to_owned())
-                        .spawn(move || r.serve(s, &hello).ok())
+                        .spawn(move || r.serve_admitted(s, &hello, permit).ok())
                         .ok();
                 }
             }

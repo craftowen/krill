@@ -30,7 +30,7 @@ function toolStep(name){
  return /^(read|view|notebookread|read_file)$/i.test(n)?'Read {0} file(s)':/edit|write|patch/i.test(n)?'Changed {0} file(s)':/grep|glob|search|find|^ls$/i.test(n)?'Searched {0} time(s)':/bash|shell|exec|command/i.test(n)?'Ran {0} command(s)':'Did {0} other step(s)';
 }
 const cacheLimit=8,cacheByteLimit=8*1024*1024,pageLimit=2048,itemByteLimit=2*1024*1024;
-const pinned=(state,id,e)=>e.mounts>0||e.sending||e.photo||!!state.drafts?.get(id);
+const pinned=(state,id,e)=>e.mounts>0||e.sending||e.photo||e.live||!!state.drafts?.get(id);
 function pruneCache(state){const cache=state.chatCache;if(!cache)return;let bytes=0;for(const e of cache.values())bytes+=e.retainedBytes||0;for(const [id,e] of cache){if(cache.size<=cacheLimit&&bytes<=cacheByteLimit)break;if(!pinned(state,id,e)){cache.delete(id);bytes-=e.retainedBytes||0;}}}
 function forgetSession(state,id){const e=state.chatCache?.get(id);if(e&&!pinned(state,id,e))state.chatCache.delete(id);}
 function mountChat(root,opts){
@@ -232,7 +232,8 @@ function mountChat(root,opts){
     if(disposed||earlierPending||entry.live||!res)return;
     latest=true;changed=true;
    }
-   const reset=latest||res.reset||changed,metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
+   const sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===(res.items||[]).length&&(res.items||[]).every((item,index)=>Object.entries(item).every(([key,value])=>JSON.stringify(entry.items[index][key])===JSON.stringify(value)));
+   const reset=latest&&!sameTail||res.reset||changed,metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
    const hadItems=entry.items.length,wasLoaded=entry.loaded;
    if(reset){clearTranscript();following=true;}
    entry.generation=res.generation||entry.generation;entry.agent=res.agent||'';entry.bound=!!res.bound;

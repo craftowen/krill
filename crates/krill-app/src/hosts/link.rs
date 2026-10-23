@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::i18n::link_ui as text;
@@ -28,11 +28,34 @@ pub struct LinkHosts {
     state_dir: PathBuf,
     executable: PathBuf,
     slots: Mutex<BTreeMap<String, Arc<Slot>>>,
+    children: Arc<OwnedChildren>,
     closed: Arc<AtomicBool>,
     repaired: Mutex<BTreeSet<String>>,
     /// 사용자가 사이드바에서 '연결 해제'를 눌러 수동으로 끊은 호스트.
     /// `paired`(재연결)로만 풀리며, 그 전까지 자식 기동·자동 재접속을 하지 않는다.
     suspended: Arc<Mutex<BTreeSet<String>>>,
+}
+
+#[derive(Debug, Default)]
+struct OwnedChildren {
+    slots: Mutex<Vec<Weak<Slot>>>,
+    pending: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl OwnedChildren {
+    fn wait(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *pending != 0 {
+            pending = self
+                .changed
+                .wait(pending)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -48,6 +71,7 @@ struct Slot {
     restart: AtomicBool,
     starting: AtomicBool,
     owned: Mutex<BTreeSet<u32>>,
+    children: Arc<OwnedChildren>,
     suspended: Arc<Mutex<BTreeSet<String>>>,
 }
 
@@ -72,6 +96,7 @@ impl LinkHosts {
                 state_dir: state_dir.clone(),
                 executable,
                 slots: Mutex::new(BTreeMap::new()),
+                children: Arc::new(OwnedChildren::default()),
                 closed: Arc::new(AtomicBool::new(false)),
                 repaired: Mutex::new(BTreeSet::new()),
                 suspended: Arc::new(Mutex::new(BTreeSet::new())),
@@ -83,6 +108,7 @@ impl LinkHosts {
             state_dir,
             executable,
             slots: Mutex::new(BTreeMap::new()),
+            children: Arc::new(OwnedChildren::default()),
             closed: Arc::new(AtomicBool::new(false)),
             repaired: Mutex::new(BTreeSet::new()),
             suspended: Arc::new(Mutex::new(BTreeSet::new())),
@@ -102,7 +128,7 @@ impl LinkHosts {
             let slot = slots
                 .entry(host.id.clone())
                 .or_insert_with(|| {
-                    Arc::new(Slot {
+                    let slot = Arc::new(Slot {
                         state_dir: self.state_dir.clone(),
                         executable: self.executable.clone(),
                         host: host.clone(),
@@ -114,8 +140,17 @@ impl LinkHosts {
                         restart: AtomicBool::new(false),
                         starting: AtomicBool::new(false),
                         owned: Mutex::new(BTreeSet::new()),
+                        children: self.children.clone(),
                         suspended: self.suspended.clone(),
-                    })
+                    });
+                    let mut tracked = self
+                        .children
+                        .slots
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    tracked.retain(|slot| slot.strong_count() > 0);
+                    tracked.push(Arc::downgrade(&slot));
+                    slot
                 })
                 .clone();
             let socket = krill_link::host_socket_path(&self.state_dir, &host.id)
@@ -264,13 +299,26 @@ impl LinkHosts {
     /// 앱 종료 훅의 백그라운드 작업에서 호출한다.
     pub fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
-        if let Ok(slots) = self.slots.lock() {
-            for slot in slots.values() {
-                if let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade()) {
-                    lease.stop();
-                }
+        // A connector can keep a removed registration alive. Track weak slots
+        // independently of the visible registry so every owned lease is stopped.
+        let slots: Vec<_> = self
+            .children
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for slot in slots {
+            let lease = slot.lease.lock().ok().and_then(|lease| lease.upgrade());
+            if let Some(lease) = lease {
+                lease.generation.fetch_add(1, Ordering::AcqRel);
+                lease.stop_blocking();
             }
+            // A Lease may already be dropping, or a detached stop worker may
+            // have taken its Child. Ownership ends only after wait(), not take().
         }
+        self.children.wait();
     }
 }
 
@@ -297,6 +345,20 @@ pub fn executable() -> PathBuf {
 }
 
 impl Slot {
+    fn forget_child(&self, pid: u32) {
+        self.owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pid);
+        let mut pending = self
+            .children
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending = pending.saturating_sub(1);
+        self.children.changed.notify_all();
+    }
+
     fn connector(self: &Arc<Self>) -> RemoteConnector {
         let lease = if let Ok(mut cached) = self.lease.lock() {
             if let Some(lease) = cached.upgrade() {
@@ -339,6 +401,16 @@ impl Lease {
             return Err(io::ErrorKind::Interrupted.into());
         }
         Ok(())
+    }
+
+    fn stop_blocking(&self) {
+        let child = self.child.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(mut child) = child {
+            let pid = child.id();
+            child.kill().ok();
+            child.wait().ok();
+            self.slot.forget_child(pid);
+        }
     }
 
     fn user_error(&self, err: &io::Error) -> io::Error {
@@ -400,18 +472,14 @@ impl Lease {
             let pid = process.id();
             process.kill().ok();
             process.wait().ok();
-            if let Ok(mut pids) = self.slot.owned.lock() {
-                pids.remove(&pid);
-            }
+            self.slot.forget_child(pid);
         }
         if let Some(process) = child.as_mut() {
             if process.try_wait()?.is_none() && socket.exists() {
                 return Ok(socket);
             }
             if process.try_wait()?.is_some() {
-                if let Ok(mut pids) = self.slot.owned.lock() {
-                    pids.remove(&process.id());
-                }
+                self.slot.forget_child(process.id());
                 *child = None;
             }
         }
@@ -423,6 +491,17 @@ impl Lease {
             return Ok(socket);
         }
         if child.is_none() {
+            // Serialize admission with the shutdown barrier, including leases
+            // whose slot was removed while preparation was running.
+            let mut owners = self
+                .slot
+                .children
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.slot.closed.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let process = crate::platform::background_command(&self.slot.executable)
                 .arg("--state-dir")
                 .arg(&self.slot.state_dir)
@@ -432,9 +511,13 @@ impl Lease {
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|err| self.user_error(&err))?;
-            if let Ok(mut pids) = self.slot.owned.lock() {
-                pids.insert(process.id());
-            }
+            self.slot
+                .owned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(process.id());
+            *owners += 1;
+            drop(owners);
             *child = Some(process);
             self.child_generation.store(generation, Ordering::Release);
         }
@@ -450,9 +533,7 @@ impl Lease {
             if let Some(process) = child.as_mut()
                 && process.try_wait()?.is_some()
             {
-                if let Ok(mut pids) = self.slot.owned.lock() {
-                    pids.remove(&process.id());
-                }
+                self.slot.forget_child(process.id());
                 *child = None;
                 return Err(self.user_error(&io::Error::from(io::ErrorKind::ConnectionRefused)));
             }
@@ -491,9 +572,7 @@ impl Lease {
                     let pid = child.id();
                     child.kill().ok();
                     child.wait().ok();
-                    if let Ok(mut pids) = lease.slot.owned.lock() {
-                        pids.remove(&pid);
-                    }
+                    lease.slot.forget_child(pid);
                 }
             })
             .is_err()
@@ -519,17 +598,34 @@ impl Drop for Lease {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(mut child) = child {
-            let pid = child.id();
+        if let Some(child) = child {
+            let process = Arc::new(Mutex::new(Some(child)));
+            let pending = Arc::clone(&process);
             let slot = self.slot.clone();
-            std::thread::spawn(move || {
-                child.kill().ok();
-                child.wait().ok();
-                if let Ok(mut pids) = slot.owned.lock() {
-                    pids.remove(&pid);
-                }
-            });
+            if std::thread::Builder::new()
+                .name("link-drop".into())
+                .spawn(move || {
+                    reap_child(&slot, &pending);
+                })
+                .is_err()
+            {
+                // Exceptional OS thread exhaustion must not orphan an owned child.
+                reap_child(&self.slot, &process);
+            }
         }
+    }
+}
+
+fn reap_child(slot: &Slot, pending: &Mutex<Option<Child>>) {
+    if let Some(mut child) = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        let pid = child.id();
+        child.kill().ok();
+        child.wait().ok();
+        slot.forget_child(pid);
     }
 }
 
@@ -567,4 +663,148 @@ pub fn connection_info(state_dir: &Path, id: &str) -> io::Result<HostConnectionI
         detail,
         error: revoked.then(|| text::ERR_REVOKED.get().to_owned()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lease() -> Arc<Lease> {
+        let slot = Arc::new(Slot {
+            state_dir: PathBuf::new(),
+            executable: PathBuf::new(),
+            host: krill_link::RemoteHost {
+                id: "fixture".into(),
+                name: "Fixture".into(),
+                node_id: String::new(),
+                relay_url: None,
+                addr_hints: Vec::new(),
+                added_at: 0,
+            },
+            identity: Arc::new(()),
+            removed: AtomicBool::new(false),
+            lease: Mutex::new(Weak::new()),
+            closed: Arc::new(AtomicBool::new(false)),
+            revoked: AtomicBool::new(false),
+            restart: AtomicBool::new(false),
+            starting: AtomicBool::new(false),
+            owned: Mutex::new(BTreeSet::new()),
+            children: Arc::new(OwnedChildren::default()),
+            suspended: Arc::new(Mutex::new(BTreeSet::new())),
+        });
+        slot.children
+            .slots
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&slot));
+        let lease = Arc::new(Lease {
+            slot: Arc::clone(&slot),
+            child: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            child_generation: AtomicU64::new(0),
+            stop_pending: AtomicBool::new(false),
+        });
+        *slot.lease.lock().unwrap() = Arc::downgrade(&lease);
+        lease
+    }
+
+    #[test]
+    fn stop_returns_while_connection_preparation_holds_child_lock() {
+        let lease = lease();
+        let held = lease.child.lock().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let request = Arc::clone(&lease);
+        let caller = std::thread::spawn(move || {
+            request.stop();
+            sent.send(()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(lease.generation.load(Ordering::Acquire), 1);
+        drop(held);
+        caller.join().unwrap();
+        lease.stop_blocking();
+    }
+
+    #[test]
+    fn shutdown_waits_for_detached_cleanup_even_after_slot_removal() {
+        let lease = lease();
+        let slot = Arc::clone(&lease.slot);
+        slot.owned.lock().unwrap().insert(42);
+        *slot.children.pending.lock().unwrap() = 1;
+        let service = Arc::new(LinkHosts {
+            state_dir: PathBuf::new(),
+            executable: PathBuf::new(),
+            slots: Mutex::new(BTreeMap::new()),
+            children: Arc::clone(&slot.children),
+            closed: Arc::clone(&slot.closed),
+            repaired: Mutex::new(BTreeSet::new()),
+            suspended: Arc::clone(&slot.suspended),
+        });
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            service.shutdown();
+            sent.send(()).unwrap();
+        });
+        let early = received.recv_timeout(Duration::from_millis(50));
+        slot.forget_child(42);
+        worker.join().unwrap();
+        assert!(matches!(
+            early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        received.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_reaps_a_removed_registration_with_a_live_connector() {
+        let lease = lease();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        lease.slot.owned.lock().unwrap().insert(pid);
+        *lease.slot.children.pending.lock().unwrap() = 1;
+        *lease.child.lock().unwrap() = Some(child);
+        let service = LinkHosts {
+            state_dir: PathBuf::new(),
+            executable: PathBuf::new(),
+            slots: Mutex::new(BTreeMap::new()), // Registration was removed; connector survives.
+            children: Arc::clone(&lease.slot.children),
+            closed: Arc::clone(&lease.slot.closed),
+            repaired: Mutex::new(BTreeSet::new()),
+            suspended: Arc::clone(&lease.slot.suspended),
+        };
+        service.shutdown();
+        assert!(lease.child.lock().unwrap().is_none());
+        assert_eq!(*lease.slot.children.pending.lock().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_stop_cannot_reap_a_new_connection_generation() {
+        let lease = lease();
+        let mut held = lease.child.lock().unwrap();
+        lease.stop(); // The reaper waits for the old preparation to finish.
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        *held = Some(child);
+        lease.child_generation.store(1, Ordering::Release);
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lease.stop_pending.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let alive = lease
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|child| child.try_wait().unwrap().is_none());
+        lease.stop_blocking();
+        assert!(alive, "an old stop request killed the reconnected child");
+    }
 }

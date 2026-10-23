@@ -490,7 +490,7 @@ pub(super) const WORKSPACE_STATUS_ORDER: [WorkspaceStatus; 4] = [
 ];
 
 /// 행 구성·정렬·필터 계산에 필요한 보조 메타데이터 뷰.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub(super) struct WorktreeContext<'a> {
     pub meta: Option<&'a Meta>,
     pub prs: Option<&'a BTreeMap<PathBuf, crate::pull_request::Status>>,
@@ -501,6 +501,7 @@ pub(super) struct WorktreeContext<'a> {
     pub unread: Option<&'a BTreeSet<SessionId>>,
     pub unread_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub focused: Option<SessionId>,
+    pub awake_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub automation_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub cli_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub parents: Option<&'a BTreeMap<PathBuf, PathBuf>>,
@@ -543,6 +544,9 @@ pub(super) fn is_worktree_awake(
         || ctx.unread_worktrees.is_some_and(|u| u.contains(path))
     {
         return true;
+    }
+    if let Some(awake) = ctx.awake_worktrees {
+        return awake.contains(path);
     }
     if let Some(focused_id) = ctx.focused
         && snapshot
@@ -736,6 +740,27 @@ pub(super) fn rows_with_options<'a>(
             sessions_by_wt.entry(wt).or_default().push(s);
         }
     }
+    let awake: BTreeSet<_> = snapshot
+        .sessions
+        .iter()
+        .filter(|s| {
+            ctx.focused == Some(s.id)
+                || ctx.unread.is_some_and(|unread| unread.contains(&s.id))
+                || matches!(
+                    s.status.state,
+                    AgentState::Working
+                        | AgentState::Waiting
+                        | AgentState::Blocked
+                        | AgentState::Done
+                )
+                || (!s.status.agent.is_empty() && s.status.state != AgentState::Exited)
+        })
+        .filter_map(|s| s.worktree.clone())
+        .collect();
+    let ctx = &WorktreeContext {
+        awake_worktrees: Some(&awake),
+        ..*ctx
+    };
     let mut pinned: Vec<_> = snapshot
         .trees
         .iter()
@@ -999,44 +1024,86 @@ pub(super) fn rows_with_options<'a>(
     out
 }
 
-impl Sidebar {
-    pub(super) fn local_rows(&self) -> Vec<Row> {
-        let mut statuses = self.worktree_statuses.clone();
-        let mut updated_at = self.worktree_updated_at.clone();
-        let mut unread_worktrees = BTreeSet::new();
-        let mut checkpoint_prs = BTreeSet::new();
+/// Reuse the merged workspace projection while unrelated session/hover state
+/// changes. Exact source equality also covers direct fixture mutations, without
+/// relying on every caller to increment an invalidation counter.
+#[derive(Default)]
+pub(super) struct LocalRowsCache {
+    base_statuses: BTreeMap<PathBuf, WorkspaceStatus>,
+    base_updated: BTreeMap<PathBuf, u64>,
+    store_statuses: BTreeMap<String, String>,
+    store_updated: BTreeMap<String, u64>,
+    store_unread: BTreeMap<String, bool>,
+    store_prs: BTreeMap<String, u64>,
+    statuses: BTreeMap<PathBuf, WorkspaceStatus>,
+    updated_at: BTreeMap<PathBuf, u64>,
+    unread_worktrees: BTreeSet<PathBuf>,
+    checkpoint_prs: BTreeSet<PathBuf>,
+}
+
+impl LocalRowsCache {
+    fn refresh(&mut self, sidebar: &Sidebar) {
+        let store = &sidebar.disk.store;
+        if self.base_statuses != sidebar.worktree_statuses || self.store_statuses != store.statuses
         {
-            let store = &self.disk.store;
-            for (k, v) in &store.statuses {
-                if let Ok(st) = WorkspaceStatus::parse(v) {
-                    statuses.entry(PathBuf::from(k)).or_insert(st);
-                }
-            }
-            for (k, &ts) in &store.updated_at {
-                updated_at.entry(PathBuf::from(k)).or_insert(ts);
-            }
-            for (k, &u) in &store.unread {
-                if u {
-                    unread_worktrees.insert(PathBuf::from(k));
-                }
-            }
-            for (k, &pr) in &store.prs {
-                if pr > 0 {
-                    checkpoint_prs.insert(PathBuf::from(k));
+            self.base_statuses.clone_from(&sidebar.worktree_statuses);
+            self.store_statuses.clone_from(&store.statuses);
+            self.statuses.clone_from(&self.base_statuses);
+            for (path, value) in &self.store_statuses {
+                if let Ok(status) = WorkspaceStatus::parse(value) {
+                    self.statuses.entry(PathBuf::from(path)).or_insert(status);
                 }
             }
         }
+        if self.base_updated != sidebar.worktree_updated_at
+            || self.store_updated != store.updated_at
+        {
+            self.base_updated.clone_from(&sidebar.worktree_updated_at);
+            self.store_updated.clone_from(&store.updated_at);
+            self.updated_at.clone_from(&self.base_updated);
+            for (path, &updated) in &self.store_updated {
+                self.updated_at
+                    .entry(PathBuf::from(path))
+                    .or_insert(updated);
+            }
+        }
+        if self.store_unread != store.unread {
+            self.store_unread.clone_from(&store.unread);
+            self.unread_worktrees = store
+                .unread
+                .iter()
+                .filter(|(_, unread)| **unread)
+                .map(|(path, _)| PathBuf::from(path))
+                .collect();
+        }
+        if self.store_prs != store.prs {
+            self.store_prs.clone_from(&store.prs);
+            self.checkpoint_prs = store
+                .prs
+                .iter()
+                .filter(|(_, pr)| **pr > 0)
+                .map(|(path, _)| PathBuf::from(path))
+                .collect();
+        }
+    }
+}
+
+impl Sidebar {
+    pub(super) fn local_rows(&self) -> Vec<Row> {
+        let mut derived = self.local_rows_cache.borrow_mut();
+        derived.refresh(self);
         let parents = self.merged_parents();
         let ctx = WorktreeContext {
             meta: Some(&self.meta),
             prs: Some(&self.prs),
-            checkpoint_prs: Some(&checkpoint_prs),
-            statuses: Some(&statuses),
-            updated_at: Some(&updated_at),
+            checkpoint_prs: Some(&derived.checkpoint_prs),
+            statuses: Some(&derived.statuses),
+            updated_at: Some(&derived.updated_at),
             created_at: Some(&self.disk.worktree_created_at),
             unread: Some(&self.unread),
-            unread_worktrees: Some(&unread_worktrees),
+            unread_worktrees: Some(&derived.unread_worktrees),
             focused: self.focused,
+            awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
             parents: Some(&parents),
@@ -1068,6 +1135,7 @@ impl Sidebar {
             statuses: Some(&self.worktree_statuses),
             updated_at: Some(&self.worktree_updated_at),
             focused: self.focused,
+            awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
             // Lineage belongs to the local store. Matching absolute paths on a remote
@@ -2428,4 +2496,52 @@ fn section_label(label: &'static str, p: &'static ui::Palette) -> gpui::Div {
 
 fn menu_separator(p: &'static ui::Palette) -> gpui::Div {
     div().my_1().h(px(1.)).w_full().bg(p.border)
+}
+
+#[cfg(all(test, unix))]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn merged_projection_reuses_maps_and_updates_only_when_sources_change() {
+        let mut sidebar = Sidebar::new(None);
+        let path = PathBuf::from("/repo/tree");
+        sidebar
+            .disk
+            .store
+            .statuses
+            .insert("/repo/tree".into(), "done".into());
+        sidebar
+            .disk
+            .store
+            .updated_at
+            .insert("/repo/tree".into(), 12);
+        sidebar.disk.store.unread.insert("/repo/tree".into(), true);
+        sidebar.disk.store.prs.insert("/repo/tree".into(), 44);
+        sidebar
+            .worktree_statuses
+            .insert(path.clone(), WorkspaceStatus::InProgress);
+        let mut cache = LocalRowsCache::default();
+        cache.refresh(&sidebar);
+        assert_eq!(cache.statuses[&path], WorkspaceStatus::InProgress);
+        assert_eq!(cache.updated_at[&path], 12);
+        assert!(cache.unread_worktrees.contains(&path));
+        assert!(cache.checkpoint_prs.contains(&path));
+        let status = &raw const cache.statuses[&path];
+        cache.refresh(&sidebar);
+        assert_eq!(status, &raw const cache.statuses[&path]);
+        sidebar.worktree_statuses.remove(&path);
+        sidebar
+            .disk
+            .store
+            .updated_at
+            .insert("/repo/tree".into(), 15);
+        sidebar.disk.store.unread.insert("/repo/tree".into(), false);
+        sidebar.disk.store.prs.remove("/repo/tree");
+        cache.refresh(&sidebar);
+        assert_eq!(cache.statuses[&path], WorkspaceStatus::Completed);
+        assert_eq!(cache.updated_at[&path], 15);
+        assert!(!cache.unread_worktrees.contains(&path));
+        assert!(!cache.checkpoint_prs.contains(&path));
+    }
 }

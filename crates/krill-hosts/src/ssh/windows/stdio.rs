@@ -40,7 +40,7 @@ impl std::fmt::Debug for Pipe {
     }
 }
 impl Pipe {
-    fn pair() -> io::Result<(Self, std::fs::File)> {
+    fn pair(deadline: Instant) -> io::Result<(Self, std::fs::File)> {
         let runtime = runtime()?;
         let name = format!(
             r"\\.\pipe\krill-ssh-{}-{}",
@@ -67,7 +67,9 @@ impl Pipe {
             let result = server.connect().await.map(|()| server);
             tx.send(result).ok();
         });
-        let io = rx.recv().map_err(io::Error::other)??;
+        let io = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
         Ok((Self { io, runtime }, child))
     }
 }
@@ -107,9 +109,17 @@ pub(super) struct Process {
     pub(super) stderr: Pipe,
 }
 pub(super) fn spawn(program: &std::ffi::OsStr, args: &[String]) -> io::Result<Process> {
-    let (stdin, input) = Pipe::pair()?;
-    let (stdout, output) = Pipe::pair()?;
-    let (stderr, error) = Pipe::pair()?;
+    spawn_until(program, args, Instant::now() + Duration::from_secs(15))
+}
+
+fn spawn_until(
+    program: &std::ffi::OsStr,
+    args: &[String],
+    deadline: Instant,
+) -> io::Result<Process> {
+    let (stdin, input) = Pipe::pair(deadline)?;
+    let (stdout, output) = Pipe::pair(deadline)?;
+    let (stderr, error) = Pipe::pair(deadline)?;
     let child = Command::new(program)
         .creation_flags(0x0800_0000)
         .args(args)
@@ -131,62 +141,113 @@ pub(crate) fn output(
     bytes: Option<&[u8]>,
     timeout: Duration,
 ) -> io::Result<Output> {
+    // Callers may already run inside Tokio. Only this control thread enters our IO runtime;
+    // all inherited pipe operations below are async and cancelled by the same deadline.
+    thread::scope(|scope| {
+        scope
+            .spawn(move || output_inner(program, args, bytes, timeout))
+            .join()
+            .map_err(|_| io::Error::other("SSH command worker stopped"))?
+    })
+}
+
+fn output_inner(
+    program: &std::ffi::OsStr,
+    args: &[String],
+    bytes: Option<&[u8]>,
+    timeout: Duration,
+) -> io::Result<Output> {
+    let deadline = Instant::now() + timeout;
     let Process {
         mut child,
         mut stdin,
-        mut stdout,
-        mut stderr,
-    } = spawn(program, args)?;
-    thread::scope(|scope| {
-        let input = scope.spawn(move || -> io::Result<()> {
-            if let Some(bytes) = bytes {
-                stdin.write_all(bytes)?;
-            }
-            Ok(())
-        });
-        let output = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let error = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.0.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Err(e) => break Err(e),
-                Ok(None) if Instant::now() >= deadline => {
-                    break Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "ssh command timed out",
-                    ));
+        stdout,
+        stderr,
+    } = spawn_until(program, args, deadline)?;
+    let runtime = stdout.runtime.clone();
+    let result = runtime.block_on(async {
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+            let input = async move {
+                let result = if let Some(bytes) = bytes {
+                    stdin.io.write_all(bytes).await
+                } else {
+                    Ok(())
+                };
+                drop(stdin);
+                Ok::<_, io::Error>(result)
+            };
+            let output = capped_output(stdout);
+            let error = capped_output(stderr);
+            let status = async {
+                loop {
+                    if let Some(status) = child.0.try_wait()? {
+                        return Ok::<_, io::Error>(status);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(20)),
+            };
+            let (status, input, stdout, stderr) = tokio::try_join!(status, input, output, error)?;
+            if status.success() {
+                input?;
             }
-        };
-        if status.is_err() {
-            child.stop();
-        }
-        let stdin_result = input
-            .join()
-            .map_err(|_| io::Error::other("ssh input worker panicked"))?;
-        let stdout = output
-            .join()
-            .map_err(|_| io::Error::other("ssh output worker panicked"))??;
-        let stderr = error
-            .join()
-            .map_err(|_| io::Error::other("ssh error worker panicked"))??;
-        let status = status?;
-        // 원격 실패 상세를 stdin BrokenPipe보다 우선한다.
-        if status.success() {
-            stdin_result?;
-        }
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
         })
-    })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH command/stdio deadline exceeded; remote result may be unknown",
+            )
+        })?
+    });
+    // Cancelling the async scope drops overlapped IO handles; never join a blocked pipe reader.
+    if result.is_err() {
+        child.stop();
+    }
+    result
+}
+
+async fn capped_output(pipe: Pipe) -> io::Result<Vec<u8>> {
+    capped_reader(pipe.io).await
+}
+async fn capped_reader(reader: impl tokio::io::AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(1024 * 1024 + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SSH output exceeded limit; remote result may be unknown",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn async_output_cap_and_descendant_like_open_writer_are_cancellable() {
+        runtime().unwrap().block_on(async {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let write =
+                tokio::spawn(async move { writer.write_all(&vec![0_u8; 1024 * 1024 + 1]).await });
+            assert_eq!(
+                capped_reader(reader).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            write.await.unwrap().ok();
+            let (reader, held_writer) = tokio::io::duplex(4096);
+            let result =
+                tokio::time::timeout(Duration::from_millis(20), capped_reader(reader)).await;
+            assert!(
+                result.is_err(),
+                "an open inherited writer must not force a blocking join"
+            );
+            drop(held_writer);
+        });
+    }
 }
