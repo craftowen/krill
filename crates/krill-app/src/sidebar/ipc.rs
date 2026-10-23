@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use krill_proto::control::{
@@ -131,7 +131,22 @@ struct Conn {
     features: u64,
 }
 
+type Job = Box<dyn FnOnce() + Send>;
+
+/// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
+const SLOW_POLL: Duration = Duration::from_secs(1);
+
 pub(super) struct Socket {
+    shared: Arc<Shared>,
+    /// 호스트 전용 작업 스레드. 폴링·숨김 정리를 여기서 차례로 돌려, 원격 ssh(`resolve_remote_socket`)나
+    /// IPC 대기가 공유 실행기(GCD) 스레드를 붙잡거나 연결 뮤텍스 앞에 줄 세우지 않는다.
+    worker: Mutex<Option<mpsc::Sender<Job>>>,
+    /// gpui 테스트 스케줄러는 다른 스레드의 깨우기를 비결정으로 보고 실패시킨다. 단위 테스트 빌드는
+    /// 기본으로 호출 스레드에서 바로 돌리고(종전 동작), 전용 스레드 경로는 [`Socket::threaded`]로 검증한다.
+    threaded: bool,
+}
+
+struct Shared {
     target: HostTarget,
     conn: Mutex<Option<Conn>>,
     watches: Mutex<WatchCache>,
@@ -140,14 +155,63 @@ pub(super) struct Socket {
 
 impl Socket {
     pub(super) fn new(target: impl Into<HostTarget>) -> Self {
+        Self::build(target.into(), !cfg!(test))
+    }
+
+    #[cfg(test)]
+    pub(super) fn threaded(target: impl Into<HostTarget>) -> Self {
+        Self::build(target.into(), true)
+    }
+
+    fn build(target: HostTarget, threaded: bool) -> Self {
         Self {
-            target: target.into(),
-            conn: Mutex::new(None),
-            watches: Mutex::new(WatchCache::default()),
-            external: Mutex::new(ExternalCache::default()),
+            shared: Arc::new(Shared {
+                target,
+                conn: Mutex::new(None),
+                watches: Mutex::new(WatchCache::default()),
+                external: Mutex::new(ExternalCache::default()),
+            }),
+            worker: Mutex::new(None),
+            threaded,
         }
     }
 
+    /// 작업을 전용 스레드에 넣는다. 스레드는 처음 쓸 때 띄우고, 소켓이 사라지면 남은 작업을 마친 뒤 끝난다.
+    fn enqueue(&self, job: Job) -> bool {
+        if !self.threaded {
+            job();
+            return true;
+        }
+        let Ok(mut worker) = self.worker.lock() else {
+            return false;
+        };
+        if worker.is_none() {
+            let (send, recv) = mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new()
+                .name("sidebar-host".into())
+                .spawn(move || recv.into_iter().for_each(|job| job()));
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "sidebar host worker could not start");
+                return false;
+            }
+            *worker = Some(send);
+        }
+        worker.as_ref().is_some_and(|send| send.send(job).is_ok())
+    }
+
+    /// 테스트: 이미 넣은 작업이 모두 끝날 때까지 기다린다.
+    #[cfg(test)]
+    pub(super) fn settle(&self) {
+        let (done, wait) = mpsc::channel();
+        if self.enqueue(Box::new(move || {
+            done.send(()).ok();
+        })) {
+            wait.recv_timeout(Duration::from_secs(10)).ok();
+        }
+    }
+}
+
+impl Shared {
     fn with_conn<T>(
         &self,
         required: u64,
@@ -249,12 +313,6 @@ impl Socket {
                 .collect()
         })
     }
-}
-
-impl Source for Socket {
-    fn target(&self) -> Option<&HostTarget> {
-        Some(&self.target)
-    }
 
     fn fetch(&self) -> io::Result<Snapshot> {
         let is_local = self.target.allow_local_launch();
@@ -290,10 +348,14 @@ impl Source for Socket {
             .collect()
     }
 
-    fn set_visible(&self, visible: bool) {
-        if visible {
-            return;
-        }
+    fn poll(&self) -> io::Result<(Snapshot, Meta)> {
+        self.fetch().map(|snap| {
+            let meta = self.meta(&snap.trees);
+            (snap, meta)
+        })
+    }
+
+    fn hide(&self) {
         let Ok(mut cache) = self.watches.lock() else {
             return;
         };
@@ -310,11 +372,64 @@ impl Source for Socket {
         cache.entries.clear();
         *connection = None;
     }
+}
+
+impl Source for Socket {
+    fn target(&self) -> Option<&HostTarget> {
+        Some(&self.shared.target)
+    }
+
+    fn fetch(&self) -> io::Result<Snapshot> {
+        self.shared.fetch()
+    }
+
+    fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
+        self.shared.meta(trees)
+    }
+
+    fn poll_snapshot(&self) -> super::PollSnapshot {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        let shared = Arc::clone(&self.shared);
+        self.enqueue(Box::new(move || {
+            // 폴링 루프가 바뀌어 기다리는 쪽이 없으면 ssh·IPC를 새로 시작하지 않는다.
+            if send.is_closed() {
+                return;
+            }
+            let started = Instant::now();
+            let polled = shared.poll();
+            // 꺼진 원격 호스트 재시도(ssh) 같은 긴 폴링을 운영 로그에 남겨 UI 멈춤 시각과 대조할 수 있게 한다.
+            let elapsed = started.elapsed();
+            if elapsed >= SLOW_POLL {
+                tracing::info!(
+                    remote = !shared.target.allow_local_launch(),
+                    ok = polled.is_ok(),
+                    elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "sidebar host poll slow"
+                );
+            }
+            send.send(polled).ok();
+        }));
+        Box::pin(async move {
+            recv.await
+                .unwrap_or_else(|_| Err(io::Error::other("sidebar host worker stopped")))
+        })
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            return;
+        }
+        // 진행 중인 폴링(원격 ssh 포함) 뒤에 차례로 정리한다. 호출자는 연결 뮤텍스를 기다리지 않는다.
+        let shared = Arc::clone(&self.shared);
+        if !self.enqueue(Box::new(move || shared.hide())) {
+            self.shared.hide();
+        }
+    }
 
     fn new_worktree(&self, req: NewWorktree) -> io::Result<Reply> {
         // ponytail: 큰 레포의 생성·include 복사를 기다리는 고정 상한. 넘으면 오류로 보이고 결과는 다음 폴링에 나타난다.
         let mut stream = control(
-            &self.target,
+            &self.shared.target,
             FEAT_CONTROL | FEAT_WORKTREE,
             Duration::from_secs(300),
         )?;
@@ -326,7 +441,7 @@ impl Source for Socket {
 
     fn remove_worktree(&self, req: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
         let mut stream = control(
-            &self.target,
+            &self.shared.target,
             FEAT_CONTROL | krill_proto::control::FEAT_WORKTREE_REMOVE,
             Duration::from_secs(60),
         )?;
@@ -338,7 +453,7 @@ impl Source for Socket {
 
     fn prepare_worktree(&self, req: krill_proto::control::PrepareWorktree) -> io::Result<Reply> {
         let mut stream = control(
-            &self.target,
+            &self.shared.target,
             FEAT_CONTROL | krill_proto::control::FEAT_WORKTREE_PREPARE,
             Duration::from_secs(2),
         )?;
@@ -349,10 +464,10 @@ impl Source for Socket {
     }
 
     fn comments(&self) -> BTreeMap<PathBuf, String> {
-        if !self.target.allow_local_launch() {
+        if !self.shared.target.allow_local_launch() {
             return BTreeMap::new();
         }
-        super::external::state_dir_from(None, Some(self.target.socket()))
+        super::external::state_dir_from(None, Some(self.shared.target.socket()))
             .map(|d| super::external::load_comments(&d))
             .unwrap_or_default()
     }
@@ -687,6 +802,49 @@ mod tests {
         assert_eq!(states.len(), 4, "{states:?}");
         assert!(states_from_json("not json").is_empty());
         assert!(states_from_json("{}").is_empty());
+    }
+
+    /// 원격 폴링은 호스트 전용 스레드에서 돈다. 응답이 늦어도 호출자(공유 실행기 스레드)는 바로 돌아오고,
+    /// 숨김 정리도 진행 중인 폴링이 쥔 연결 뮤텍스를 기다리지 않는다.
+    #[test]
+    fn slow_host_does_not_hold_caller_thread() -> io::Result<()> {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("mk-sidebar-host-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("d.sock");
+        fs::remove_file(&path).ok();
+        let listener = UnixListener::bind(&path)?;
+        let (release, released) = mpsc::channel::<()>();
+        // 연결은 받되 Hello를 보내지 않고 붙잡아 둔다(느린 ssh·응답 없는 원격 호스트 흉내).
+        let server = std::thread::spawn(move || {
+            let held = listener.accept();
+            released.recv().ok();
+            drop(held);
+        });
+        let socket = Socket::threaded(krill_proto::daemon::Paths {
+            socket: path,
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        let started = Instant::now();
+        let polled = socket.poll_snapshot();
+        socket.set_visible(false);
+        // 고치기 전에는 두 호출 모두 호출 스레드에서 읽기 상한(5초)까지 막혔다.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        release.send(()).ok();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(polled);
+        assert!(result.is_err());
+        socket.settle();
+        assert!(socket.shared.conn.lock().is_ok_and(|conn| conn.is_none()));
+        server.join().ok();
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     /// 외부 상태 읽기 전체 경로(주입 JSON·가짜 CLI 실행·TTL 캐시·fail-open)를 검증한다.
