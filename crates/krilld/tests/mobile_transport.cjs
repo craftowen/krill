@@ -153,18 +153,3 @@ test('storage notifications during a new pairing leave its endpoint and handshak
  const line=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes("globalThis.addEventListener('storage'"));let handler,reloads=0,syncs=0,updates=0;
  const context=vm.createContext({pairing:{ticket:'new-pair'},landing:false,endpoint:{reloadHosts(){reloads++;throw Error('pairing destination must not change');}},pool:{sync(){syncs++;}},update(){updates++;},addEventListener(name,fn){assert.equal(name,'storage');handler=fn;}});vm.runInContext(line,context);handler({key:'krill-mobile-hosts-v1'});context.pairing=null;context.landing=true;handler({key:'krill-mobile-removed-v1:old-device'});assert.equal(reloads,0);assert.equal(syncs,2);assert.equal(updates,2);
 });
-
-test('legacy credential migrates once and never overrides the canonical connection',()=>{
- const h=harness(),saved={device_id:'legacy',credential:'11'.repeat(32),rid:'a'.repeat(32)};
- h.store.set('minikrill-mobile-v2',JSON.stringify(saved));
- const first=h.context.KrillMobile.transport.bootstrap();assert.equal(first.credentials.device_id,'legacy');
- assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'legacy');assert.equal(h.store.has('minikrill-mobile-v2'),false);
- h.store.set('minikrill-mobile-v2',JSON.stringify({...saved,device_id:'stale'}));
- assert.equal(h.context.KrillMobile.transport.bootstrap().credentials.device_id,'legacy');h.transport.close();
-});
-test('legacy credential remains usable when migration storage is full',()=>{
- const h=harness(),saved={device_id:'legacy',credential:'11'.repeat(32),rid:'a'.repeat(32)};
- h.store.set('minikrill-mobile-v2',JSON.stringify(saved));h.context.localStorage.setItem=()=>{throw Error('quota');};
- const endpoint=h.context.KrillMobile.transport.bootstrap();assert.equal(endpoint.credentials.device_id,'legacy');
- assert.equal(h.store.has('minikrill-mobile-v2'),true);assert.equal(h.store.has('krill-mobile-v2'),false);h.transport.close();
-});

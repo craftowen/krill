@@ -64,7 +64,7 @@ async function fixedOriginTests(){
  const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
  const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
  let f=fixture(fixed+`?session=7&pair=query&key=query&t=evil&r=evil#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}`);
- assert.equal(f.endpoint.credentials,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.endpoint.pair.secret,'secret');assert.equal(f.location.href,fixed+'?session=7#/pair-confirm');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://paired.trycloudflare.com/ws?v=${hash}`);
+ assert.equal(f.endpoint.credentials,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.endpoint.pair.secret,'secret');assert.equal(f.location.href,fixed+'?session=7');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://paired.trycloudflare.com/ws?v=${hash}`);
  for(const fragment of ['#t=evil.trycloudflare.com&r=forged','#pair=only&t=evil.trycloudflare.com&r=forged','#key=only&t=evil.trycloudflare.com&r=forged']){
   f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
  }
@@ -73,7 +73,7 @@ async function fixedOriginTests(){
  f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,['/sw.js']);
  f=fixture('http://192.0.2.1:1234/#pair=ticket&key=secret',null,undefined,{serviceWorker:false});assert.equal(f.endpoint.socketUrl(),'ws://192.0.2.1:1234/ws');assert.deepEqual(f.registrations,[]);
  // Home Screen install link: pairs an empty store once; relaunches with the same start URL keep the saved device.
- f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.location.href,fixed+'#/pair-confirm');
+ f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.location.href,fixed);
  f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`);assert.equal(f.endpoint.pair,null);assert.deepEqual({...f.endpoint.credentials},saved);assert.equal(f.location.href,fixed);
  f=fixture(fixed+'#pair=ticket&key=secret&t=evil.test&r=bad');assert.throws(()=>f.endpoint.socketUrl(),/fresh QR/);
  for(const found of [{url:'https://evil.test',hash},{url:'https://ok.trycloudflare.com.evil.test',hash},{url:'https://ok.trycloudflare.com',hash:'../evil'},{url:'https://ok.trycloudflare.com',hash:'ABCDEF0123456789'},{url:'https://ok.trycloudflare.com',hash:1234567890123456}]){
@@ -188,14 +188,14 @@ async function connect(url,credential){
   // Mobile workspace creation uses registered repository keys and the desktop git/setup path.
   assert.equal(data.capabilities.worktree_create,true);const repository=data.repositories.find(r=>r.worktree_keys.includes(card.worktree_key))?.key;assert(repository);
   for(const request of [{repository:'/tmp/forged',name:'bad'},{repository,name:' '},{repository,name:'bad',cwd:'/tmp'},{repository,name:'bad',setup_hash:'한'.repeat(64)},{repository,name:'bad',setup_hash:'aa'.repeat(32),skip_setup:true}])await assert.rejects(phone.rpc({action:'create_workspace',...request}));
-  fs.writeFileSync(path.join(repo,'minikrill.toml'),'[worktree]\nsetup = "printf MOBILE_SETUP_OK"\n');
+  fs.writeFileSync(path.join(repo,'krill.toml'),'[worktree]\nsetup = "printf MOBILE_SETUP_OK"\n');
   const draft={action:'create_workspace',repository,name:'phone-workspace',base:'mobile-test'},review=await phone.rpc(draft);assert.equal(review.needs_setup,true);assert.equal(review.script,'printf MOBILE_SETUP_OK');assert.equal(review.hash.length,64);
-  fs.writeFileSync(path.join(repo,'minikrill.toml'),'[worktree]\nsetup = "printf UPDATED_SETUP_OK"\n');
+  fs.writeFileSync(path.join(repo,'krill.toml'),'[worktree]\nsetup = "printf UPDATED_SETUP_OK"\n');
   const changed=await phone.rpc({...draft,setup_hash:review.hash});assert.equal(changed.needs_setup,true);assert.notEqual(changed.hash,review.hash);
   const created=await phone.rpc({...draft,setup_hash:changed.hash});assert.equal(created.branch,'phone-workspace');assert(created.session);assert(fs.existsSync(path.join(created.path,'.git')));await until(()=>cli(['read',String(created.setup_session)]).includes('UPDATED_SETUP_OK'));
   await until(async()=>{const snapshot=await phone.rpc({action:'snapshot'});return snapshot.sessions.some(s=>s.id===created.session&&s.worktree_key===created.workspace);});
   const skipped=await phone.rpc({...draft,name:'phone-skip-setup',skip_setup:true});assert.equal(skipped.branch,'phone-skip-setup');assert(skipped.session);assert(fs.existsSync(path.join(skipped.path,'.git')));
-  await phone.rpc({action:'close_terminal',session:skipped.session});fs.unlinkSync(path.join(repo,'minikrill.toml'));
+  await phone.rpc({action:'close_terminal',session:skipped.session});fs.unlinkSync(path.join(repo,'krill.toml'));
   console.log('PASS mobile workspaces: real worktree creation, registered key validation, changed setup hash review, approved setup, skip and terminal snapshot');
   await assert.rejects(phone.rpc({action:'approve',session,value:'y'}),/historical request.*Confirm in Term/);assert(!cli(['read',String(session)]).includes('got:y'));
   await assert.rejects(phone.rpc({action:'approve',session,value:'n'}),/historical request.*Confirm in Term/);assert(!cli(['read',String(session)]).includes('got:n'));

@@ -162,8 +162,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn(str(cli), result.stdout)
             # Run the real zap resolver against nonempty isolated data. Only the
             # final Trash move is redirected, since Foundation ignores HOME for Trash.
-            # Current bundle id paths plus pre-MK-170 legacy ones (compatibility links after migration).
-            managed = [home / f"Library/{base}" for bundle, logs in [("dev.krill.app", "Krill"), ("dev.minikrill.app", "Minikrill")]
+            bundle, logs = "dev.krill.app", "Krill"
+            managed = [home / f"Library/{base}"
                        for base in [f"Application Support/{bundle}", f"Caches/{bundle}", f"Logs/{logs}",
                                     f"Preferences/{bundle}.plist", f"Saved Application State/{bundle}.savedState"]]
             for path in managed:
@@ -194,7 +194,14 @@ Cask::Utils::Trash.singleton_class.prepend(IsolatedTrash)
 cask = Cask::CaskLoader.load(ARGV.fetch(0))
 artifact = cask.artifacts.find { |item| item.is_a?(Cask::Artifact::Zap) }
 raise "missing zap" unless artifact
-artifact.zap_phase(command: SystemCommand)
+if artifact.respond_to?(:zap_phase)
+  artifact.zap_phase(command: SystemCommand)
+else
+  # Homebrew 7: zap 지시는 즉시·지연 두 단계로 나뉘어 실행된다.
+  [false, true].each do |deferred|
+    Cask::Artifact::AbstractUninstall.dispatch_directives([artifact], command: SystemCommand, deferred:)
+  end
+end
 ''')
             run([brew, "ruby", resolver, cask], env=env)
             for path in managed:

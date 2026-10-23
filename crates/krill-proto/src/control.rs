@@ -83,6 +83,8 @@ pub const MAX_AGENT_TEXT: usize = 4096;
 pub const FEAT_COLD: u64 = 1 << 18;
 /// 세션 재개 요청(MK-052, 지휘자 배정). [`FEAT_CONTROL`]과 함께 협상한다.
 pub const FEAT_RESUME: u64 = 1 << 42;
+/// 재개 전 세그먼트를 새 세션의 HISTORY 페이지로 제공한다(지휘자 배정).
+pub const FEAT_RESUME_HISTORY: u64 = 1 << 30;
 /// `FSEvents` 변경 감시·가시성 제어(OWE-585, 지휘자 배정). [`Request::GitWatch`]·[`Reply::GitWatch`] 한 쌍.
 pub const FEAT_GIT_WATCH: u64 = 1 << 44;
 /// Hibernation 표식 조회(MK-081). `FEAT_CONTROL`과 함께 협상한다.

@@ -375,7 +375,7 @@ pub fn remove_device(state_dir: &Path, target: &str) -> Result<AllowedDevice, Er
 // 2. 원격 호스트 목록 (`link/hosts.toml`)
 // ============================================================================
 
-/// 클라이언트가 짝지은 원격 서버 호스트 한 건 (`link/hosts.toml`).
+/// 클라이언트가 페어링한 원격 서버 호스트 한 건 (`link/hosts.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteHost {
     /// 호스트 ID (`run/hosts/<id>.sock` 파일명에 사용).
@@ -390,7 +390,7 @@ pub struct RemoteHost {
     /// 서버 직접 IP 주소(`ip:port`) 힌트 목록.
     #[serde(default)]
     pub addr_hints: Vec<String>,
-    /// 짝짓기 시각 (Unix epoch 초).
+    /// 페어링 시각 (Unix epoch 초).
     #[serde(default)]
     pub added_at: u64,
 }
@@ -515,6 +515,21 @@ pub fn remove_host(state_dir: &Path, id: &str) -> Result<RemoteHost, Error> {
     let host = hosts.remove(index);
     save_hosts(state_dir, &hosts)?;
     Ok(host)
+}
+
+/// 저장된 원격 호스트의 표시 이름만 바꾼다. 연결 정보와 ID는 그대로 둔다.
+pub fn rename_host(state_dir: &Path, host_id: &str, name: &str) -> Result<RemoteHost, Error> {
+    validate_host_id(host_id)?;
+    let _lock = acquire_store_lock(state_dir)?;
+    let mut hosts = load_hosts(state_dir)?;
+    let host = hosts
+        .iter_mut()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| Error::HostNotFound(host_id.to_owned()))?;
+    host.name = sanitize_display_name(name, &host.id);
+    let renamed = host.clone();
+    save_hosts(state_dir, &hosts)?;
+    Ok(renamed)
 }
 
 fn disambiguate_host_id(base_id: &str, node_id: &str, existing: &[RemoteHost]) -> String {
@@ -820,6 +835,13 @@ mod tests {
         let found = find_host(&dir, "home-mac").unwrap();
         assert_eq!(found.name, "집 맥미니");
         assert_eq!(found.to_endpoint_addr(false).unwrap(), addr);
+
+        let renamed = rename_host(&dir, "home-mac", " 세무\n사무소 ").unwrap();
+        assert_eq!(renamed.name, "세무사무소");
+        let found = find_host(&dir, "home-mac").unwrap();
+        assert_eq!(found.name, "세무사무소");
+        assert_eq!(found.to_endpoint_addr(false).unwrap(), addr);
+        assert!(rename_host(&dir, "missing", "x").is_err());
 
         // 다른 node_id가 같은 host.id("home-mac")로 들어오면 기존 호스트를 덮어쓰지 않고 구분된 ID를 부여한다.
         let sk2 = SecretKey::generate();

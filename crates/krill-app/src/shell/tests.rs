@@ -827,9 +827,9 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     );
 }
 
-/// OWE-488: 배지는 전역 토글 대신 세션의 생성 당시 권한을 쓰고 프로필 버튼은 새 칸에 해당 id를 전달한다.
+/// OWE-488: 프로필 버튼은 새 칸에 해당 id를 전달한다. YOLO 세션에도 배지는 없다.
 #[gpui::test]
-fn agent_button_and_yolo_badge_use_session_permission(cx: &mut TestAppContext) {
+fn agent_button_opens_profile_and_yolo_has_no_badge(cx: &mut TestAppContext) {
     use krill_proto::control::AgentProfile;
 
     let (view, cx) = open(cx, state_path("agents"));
@@ -854,27 +854,10 @@ fn agent_button_and_yolo_badge_use_session_permission(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("yolo-badge").is_some(),
-        "YOLO session stays marked with global Manual"
-    );
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.live
-                .get_mut(&pane)
-                .unwrap()
-                .launch
-                .as_mut()
-                .unwrap()
-                .permission = Permission::Manual;
-            s.agents.as_mut().unwrap().permission = Permission::Yolo;
-            cx.notify();
-        });
-    });
-    cx.run_until_parked();
+    // 기본 권한이 YOLO라 탭·패인 헤더에 YOLO 배지를 띄우지 않는다.
     assert!(
         cx.debug_bounds("yolo-badge").is_none(),
-        "Manual session stays unmarked with global YOLO"
+        "YOLO session shows no badge"
     );
     // OWE-576: 새 세션 메뉴의 첫 프로필 단축키(⌥⌘1). 목록 밖 단축키는 아무것도 하지 않는다.
     cx.simulate_keystrokes("alt-cmd-2");
@@ -5454,6 +5437,15 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
         );
     }
 
+    // Orca처럼 팝업은 하단바 위로 열리고 바를 덮지 않는다.
+    let bar = cx.debug_bounds("status-bar").unwrap();
+    let card = cx.debug_bounds("status-provider-card-claude").unwrap();
+    let last = cx.debug_bounds("status-provider-open-accounts").unwrap();
+    assert!(
+        card.top() >= px(0.) && last.bottom() <= bar.top(),
+        "provider popover must sit above the status bar: {card:?} {last:?} vs {bar:?}"
+    );
+
     // host_default must be sorted above other accounts.
     let host_row = cx
         .debug_bounds("status-provider-account-claude-host_default")
@@ -5760,24 +5752,37 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(layout_of(&view, cx).tabs().is_empty());
 }
 
-/// 사이드바 상단 네비게이션은 실제로 구현된 '에이전트 대시보드'만 표시하고,
-/// 아직 없는 기능(작업·아티팩트·스킬·자동화·모바일)은 표기하지 않는다.
+/// 사이드바 상단 네비게이션은 실제로 구현된 '에이전트 대시보드'와 그 아래 '아티팩트'만 표시하고,
+/// 아직 없는 기능(작업·스킬·자동화·모바일)은 표기하지 않는다. 아티팩트를 누르면 설정 > 아티팩트가 열린다.
 #[gpui::test]
 fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
-    let (_view, cx) = open(cx, state_path("sidebar-nav-items"));
+    let (view, cx) = open(cx, state_path("sidebar-nav-items"));
     cx.run_until_parked();
 
+    let dashboard = cx
+        .debug_bounds("nav-agent-dashboard")
+        .expect("implemented Agent Dashboard nav item must be rendered");
+    let artifacts = cx
+        .debug_bounds("nav-artifacts")
+        .expect("Artifacts nav item must be rendered");
     assert!(
-        cx.debug_bounds("nav-agent-dashboard").is_some(),
-        "implemented Agent Dashboard nav item must be rendered"
+        artifacts.origin.y >= dashboard.origin.y + dashboard.size.height,
+        "Artifacts sits right below Agent Dashboard"
     );
-    for unimplemented in [
-        "nav-tasks",
-        "nav-artifacts",
-        "nav-skills",
-        "nav-automations",
-        "nav-mobile",
-    ] {
+    cx.simulate_click(artifacts.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let settings = view
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings page opened");
+        assert_eq!(
+            settings.read(cx).tab(),
+            krill_app::settings::AdminTab::Artifacts
+        );
+    });
+    for unimplemented in ["nav-tasks", "nav-skills", "nav-automations", "nav-mobile"] {
         assert!(
             cx.debug_bounds(unimplemented).is_none(),
             "unimplemented sidebar nav item {unimplemented} must not be rendered"

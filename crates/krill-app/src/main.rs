@@ -71,9 +71,23 @@ fn main() -> std::process::ExitCode {
         });
         // Resolve startup files and helper paths while the application event loop stays responsive.
         let startup = cx.background_spawn(async {
-            let migrated = krill_proto::daemon::migrate::run();
             krill_log::init(krill_log::Component::App).ok();
-            tracing::info!(?migrated, "app starting");
+            krill_log::forward_log_warnings();
+            // Which build is this (installed app vs. a test/nightly binary) and which state it shares.
+            let redacted = |path: Option<PathBuf>| {
+                path.map(|p| krill_proto::diag::redact(&p.to_string_lossy()))
+            };
+            let executable = std::env::current_exe().ok();
+            let bundle = executable
+                .as_deref()
+                .and_then(|exe| krill_app::updater::current_app_bundle_in(None, exe));
+            tracing::info!(
+                version = krill_app::updater::effective_version(bundle.as_deref()),
+                executable = redacted(executable),
+                state_dir = redacted(krill_proto::daemon::state_dir()),
+                state_override = krill_proto::daemon::state_dir_override().is_some(),
+                "app starting"
+            );
             let bounds = krill_app::layout::default_path()
                 .as_deref()
                 .and_then(krill_app::layout::Layout::peek_window_bounds);

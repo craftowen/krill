@@ -64,7 +64,7 @@ macro_rules! computer_usage {
 }
 
 const USAGE: &str = concat!(
-    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
+    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
     computer_usage!()
 );
 
@@ -95,10 +95,8 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
             .get(1)
             .is_some_and(|s| s == "install" || s == "uninstall");
     if !hook_run && !statusline_run {
-        // MK-170: 경로를 정하기 전에 옛 번들 id 데이터를 옮긴다(옛 holder가 살아 있으면 그대로 둔다).
-        let migrated = daemon::migrate::run();
         krill_log::init(krill_log::Component::Cli).ok();
-        tracing::info!(?migrated, "cli starting");
+        tracing::info!("cli starting");
         // Hook/statusline hot paths and isolated runtimes must not mutate the host's skills.
         if !cfg!(test)
             && daemon::state_dir_override().is_none()

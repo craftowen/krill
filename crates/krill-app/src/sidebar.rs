@@ -147,6 +147,10 @@ pub struct Snapshot {
 pub type Meta = BTreeMap<PathBuf, Tree>;
 
 /// IPC boundary: gpui tests supply snapshots without waiting for external IO.
+/// [`Source::poll_snapshot`]의 결과를 기다리는 future.
+pub type PollSnapshot =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<(Snapshot, Meta)>> + Send>>;
+
 pub trait Source: Send + Sync {
     fn fetch(&self) -> io::Result<Snapshot>;
     /// 등록 세대가 바뀐 원격 연결의 캐시·폴링 작업을 교체하기 위한 타깃.
@@ -156,6 +160,15 @@ pub trait Source: Send + Sync {
     /// 워크트리 행의 git 정보. 모르면 비워 둔다(UI가 숨긴다).
     fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
         Meta::new()
+    }
+    /// 폴링 한 번: `fetch` 뒤 그 트리로 `meta`. 기본은 호출한 스레드에서 바로 돈다.
+    /// 소켓 소스는 호스트 전용 스레드에서 돌려 원격 ssh·IPC 대기가 공유 실행기 스레드를 붙잡지 않게 한다.
+    fn poll_snapshot(&self) -> PollSnapshot {
+        let polled = self.fetch().map(|snap| {
+            let meta = self.meta(&snap.trees);
+            (snap, meta)
+        });
+        Box::pin(std::future::ready(polled))
     }
     /// 사이드바 가시성·창 활성 여부가 바뀔 때 git 감시를 켜거나 끈다(N19).
     fn set_visible(&self, _visible: bool) {}
@@ -530,6 +543,13 @@ pub struct NewSession {
     pub program: Program,
 }
 
+/// 라이브 목록이 비어도 저장된 레이아웃의 칸을 먼저 찾아 워크스페이스를 연다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWorkspace {
+    pub host: HostId,
+    pub cwd: PathBuf,
+}
+
 /// OWE-854: 사이드바 세션 행 메뉴의 '세션 종료…'. 셸이 확인 후 데몬에 `Request::Close`를 보낸다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloseSession(pub SessionId);
@@ -605,6 +625,9 @@ pub struct Sidebar {
     comments: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
     collapsed_lineage: BTreeSet<PathBuf>,
+    /// 렌더용 계보 깊이·직계 자식 수. `rebuild`가 행과 함께 다시 계산한다.
+    lineage_depths: BTreeMap<PathBuf, usize>,
+    lineage_child_counts: BTreeMap<PathBuf, usize>,
     sleeping_worktrees: BTreeSet<PathBuf>,
     shown_external: BTreeSet<PathBuf>,
     collapsed: BTreeSet<PathBuf>,
@@ -673,6 +696,7 @@ pub struct Sidebar {
 
 impl EventEmitter<Selected> for Sidebar {}
 impl EventEmitter<NewSession> for Sidebar {}
+impl EventEmitter<OpenWorkspace> for Sidebar {}
 impl EventEmitter<CloseSession> for Sidebar {}
 impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
@@ -752,6 +776,8 @@ impl Sidebar {
             comments: BTreeMap::new(),
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
+            lineage_depths: BTreeMap::new(),
+            lineage_child_counts: BTreeMap::new(),
             sleeping_worktrees: lin.sleeping_worktrees,
             shown_external: ui.shown_external,
             collapsed: ui.collapsed,
@@ -1373,10 +1399,7 @@ impl Sidebar {
                     tasks.push(cx.spawn(async move |cx| {
                         let (id, source, res) = bg
                             .spawn(async move {
-                                let res = source.fetch().map(|snap| {
-                                    let meta = source.meta(&snap.trees);
-                                    (snap, meta)
-                                });
+                                let res = source.poll_snapshot().await;
                                 (id, source, res)
                             })
                             .await;
@@ -1865,7 +1888,7 @@ impl Sidebar {
                         .filters
                         .contains_host(&HostId::Remote(r.id.clone()))
                 })
-                // 짝지은 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 짝짓기 등)와 함께 그대로 보인다.
+                // 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
                 .partition(|r| {
                     r.status != HostStatus::Connected
                         && r.snapshot.sessions.is_empty()
@@ -1914,6 +1937,7 @@ impl Sidebar {
             .cursor
             .map(|i| i.min(self.rows.len().saturating_sub(1)))
             .filter(|_| !self.rows.is_empty());
+        self.index_lineage();
         self.sync_viewport();
         self.card_list.invalidate_heights();
         cx.notify();
@@ -2375,7 +2399,12 @@ impl Sidebar {
         {
             self.select_session_on(index, host, sess_id, cx);
         } else {
-            self.new_session_on(host, path, Program::Login, window, cx);
+            cx.emit(OpenWorkspace { host, cwd: path });
+            if let Some(window) = window {
+                self.leave(window, cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 

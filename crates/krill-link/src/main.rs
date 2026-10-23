@@ -271,7 +271,7 @@ async fn cmd_pair(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "짝짓기 완료 (Paired successfully): id={} name={} node_id={}",
+            "페어링 완료 (Paired successfully): id={} name={} node_id={}",
             host.id,
             host.name,
             host.node_id

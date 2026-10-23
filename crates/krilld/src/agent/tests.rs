@@ -672,6 +672,8 @@ fn resume_keeps_launch_account_after_switch() {
     let dir = std::env::temp_dir().join(format!("owe698-resume-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
+    // 실제 홈을 쓰므로 프로비저닝(기본 켜짐)이 ~/.claude를 링크하지 않게 끈다.
+    std::fs::write(dir.join("accounts.toml"), "provisioning = false\n").unwrap();
     let home = accounts::default_home();
     let id_of = |label: &str, dir_path: &Path| {
         accounts::add_account(

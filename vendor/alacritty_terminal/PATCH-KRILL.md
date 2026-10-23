@@ -1,4 +1,4 @@
-# vendor/alacritty_terminal 패치 기록 (Minikrill 좁은 포크)
+# vendor/alacritty_terminal 패치 기록 (Krill 좁은 포크)
 
 원본: crates.io `alacritty_terminal 0.26.0`(Apache-2.0, https://github.com/alacritty/alacritty).
 `LICENSE-APACHE`·`README.md`·`CHANGELOG.md`·`Cargo.toml.orig`는 원본 그대로 둔다(Apache-2.0 §4(b)).

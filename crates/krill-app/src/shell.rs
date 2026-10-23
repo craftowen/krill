@@ -42,7 +42,7 @@ mod away;
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Shutdown;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -504,6 +504,7 @@ pub struct Shell {
     saver: persist::Saver,
     layout_loading: bool,
     restore_session: Option<(krill_app::hosts::HostId, krill_proto::SessionId)>,
+    restore_workspace: Option<(krill_app::hosts::HostId, PathBuf)>,
     local_generation: u64,
     ssh_generation: u64,
     orch_snapshot: Arc<krill_proto::orchestration::OrchestrationStore>,
@@ -521,6 +522,7 @@ pub struct Shell {
     live: HashMap<PaneId, Live>,
     pane_liveness: Option<Task<()>>,
     creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
+    restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
     /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
     titles: HashMap<PaneId, String>,
     agents: Option<AgentSettings>,
@@ -529,6 +531,8 @@ pub struct Shell {
     agent_client: Arc<dyn pane::AgentClient>,
     /// 마지막 입력 알림(누르면 닫힘).
     notice: Option<String>,
+    /// 이미 알린 계정 전환 실패. 데몬이 매 스냅샷마다 같은 실패를 다시 보내도 한 번만 띄운다.
+    handoff_errors: HashSet<String>,
     notifications: notifications::Notifications,
     /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
     reconnected: Option<String>,
@@ -561,7 +565,7 @@ pub struct Shell {
     )>,
     /// OWE-903 온보딩 모달(메인 창 안 `ui::modal_backdrop`).
     onboarding: Option<overlays::OnboardingModal>,
-    /// OWE-903 짝짓기 모달(메인 창 안 `ui::modal_backdrop`).
+    /// OWE-903 페어링 모달(메인 창 안 `ui::modal_backdrop`).
     /// OWE-903 렌더에서 지연 생성할 모달 요청.
     pending: overlays::PendingOverlays,
     /// 인앱 에이전트 대시보드 모달.
@@ -715,6 +719,10 @@ impl Shell {
             this.launch_host = host.clone();
             this.open_session_on(host, e.0, cx);
         });
+        cx.subscribe(&sidebar, |this, _, e: &sidebar::OpenWorkspace, cx| {
+            this.open_saved_workspace(e.host.clone(), &e.cwd, cx);
+        })
+        .detach();
         let new_session = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::NewSession, cx| {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
@@ -1007,6 +1015,7 @@ impl Shell {
             panel_collapsed,
             layout_loading: path.is_some(),
             restore_session: None,
+            restore_workspace: None,
             path,
             saver: persist::Saver::new(cx),
             local_generation: 0,
@@ -1023,12 +1032,14 @@ impl Shell {
             live: HashMap::new(),
             pane_liveness: None,
             creations: HashMap::new(),
+            restoring_sessions: std::collections::HashSet::new(),
             titles: HashMap::new(),
             agents: None,
             agents_busy: false,
             agent_task: None,
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
+            handoff_errors: HashSet::new(),
             reconnected: None,
             notifications: notifications::Notifications::default(),
             reconnected_task: None,
@@ -1177,6 +1188,9 @@ impl Shell {
                 this.reconcile_workspace_sessions(cx);
                 if let Some((host, session)) = this.restore_session.take() {
                     this.open_session_on(host, session, cx);
+                }
+                if let Some((host, folder)) = this.restore_workspace.take() {
+                    this.open_saved_workspace(host, &folder, cx);
                 }
                 if edited_while_loading {
                     this.save();
@@ -1812,12 +1826,7 @@ impl Shell {
         if let Some(id) = entry.session_id {
             self.open_session(id, cx);
         } else {
-            self.new_folder_tab_on(
-                krill_app::hosts::HostId::Local,
-                &entry.path,
-                Program::Login,
-                cx,
-            );
+            self.open_saved_workspace(krill_app::hosts::HostId::Local, &entry.path, cx);
         }
     }
 
@@ -2804,6 +2813,7 @@ impl Shell {
                     }
                 } else if let Some(error) = &handoff.error
                     && self.layout.sessions().contains(&handoff.from)
+                    && self.handoff_errors.insert(error.clone())
                 {
                     // Failed switches already released the pane above; input is not held.
                     self.notice = Some(error.clone());
@@ -2814,6 +2824,12 @@ impl Shell {
                 break;
             }
         }
+        self.handoff_errors.retain(|error| {
+            snap.details
+                .handoffs
+                .iter()
+                .any(|h| h.error.as_ref() == Some(error))
+        });
         let pending = snap
             .details
             .handoffs
@@ -3185,6 +3201,7 @@ impl Shell {
             return;
         }
         let visible = self.layout.visible();
+        self.restore_hidden_sessions(&visible, cx);
         let layout = &self.layout;
         self.creations.retain(|p, _| layout.pane_exists(*p));
         self.live.retain(|p, live| {
@@ -3218,6 +3235,13 @@ impl Shell {
         }
         let mut any_terminal = false;
         for p in visible {
+            if self
+                .layout
+                .session(p)
+                .is_some_and(|id| self.restoring_sessions.contains(&id))
+            {
+                continue;
+            }
             if self.layout.file(p).is_some() {
                 continue; // 파일 칸은 세션에 붙지 않는다(MK-119)
             }
@@ -4248,7 +4272,8 @@ impl Shell {
         }
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
-        if self.folder() != folder {
+        // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
+        if now_focused.is_some() && self.folder() != folder {
             let folder = self.folder();
             self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
         }
@@ -4817,28 +4842,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// YOLO 권한 칸 표시. 단일 칸은 패인 헤더가 숨으므로 탭에도 붙인다(OWE-653).
-    fn yolo_badge(&self, pane: PaneId, cx: &App) -> Option<gpui::Div> {
-        let p = krill_app::ui::palette(cx);
-        self.live
-            .get(&pane)
-            .and_then(|l| l.launch.as_ref())
-            .filter(|launch| launch.permission == Permission::Yolo)
-            .map(|_| {
-                div()
-                    .debug_selector(|| "yolo-badge".into())
-                    .flex_none()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded(krill_app::ui::RADIUS_XS)
-                    .bg(p.warning)
-                    .text_color(p.warning_foreground)
-                    .text_size(krill_app::ui::TEXT_2XS)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(text::YOLO_BADGE.get())
-            })
-    }
-
     pub(super) fn host_name_for_pane(&self, pane: PaneId, cx: &App) -> Option<String> {
         let krill_app::hosts::HostId::Remote(id) = self.layout.host(pane) else {
             return None;
@@ -4983,7 +4986,6 @@ impl Shell {
         let p = krill_app::ui::palette(cx);
         // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
-        let yolo_badge = self.yolo_badge(id, cx);
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.zoomed_pane == Some(id);
@@ -5005,7 +5007,6 @@ impl Shell {
             .bg(p.sidebar.opacity(0.92))
             .border_1()
             .border_color(p.border)
-            .children(yolo_badge)
             .children(host_badge)
             .when(zoomed, |d| {
                 d.child(
@@ -5171,10 +5172,14 @@ impl Shell {
                                                     // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
                                                     this.zoomed_pane = None;
                                                     this.record_closed_pane(id, cx);
-                                                    this.change(true, cx, |layout| {
-                                                        layout.focus(id);
-                                                        layout.close_pane();
-                                                    });
+                                                    this.close_with_policy(
+                                                        close::Policy::Preserve,
+                                                        cx,
+                                                        |layout| {
+                                                            layout.focus(id);
+                                                            layout.close_pane();
+                                                        },
+                                                    );
                                                 })),
                                         ),
                                 )
@@ -5313,7 +5318,18 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                    // 끌지 않은 맨 클릭이 평문 URL 위면 브라우저로 연다(⌘ 없이도).
+                    let clicked = !e.modifiers.modified()
+                        && this.live.get(&id).is_some_and(|l| {
+                            l.selecting
+                                && l.selecting_kind == SelectKind::Char
+                                && l.selection.is_some_and(|s| s.anchor == s.head)
+                        });
                     if this.select_end(id, cx) {
+                        if clicked && let Some((_, uri)) = this.plain_url_at(id, e.position) {
+                            cx.open_url(&uri);
+                            return;
+                        }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
                         if krill_app::settings::copy_on_select(cx) {
                             this.copy(cx);
@@ -5492,7 +5508,7 @@ impl Render for Shell {
         );
         self.window = Some(window.window_handle());
         self.sync_notifications(window, cx);
-        // OWE-903: 라이브러리에서 들어온 온보딩·짝짓기 모달 요청을 엔티티로 만든다.
+        // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
         self.open_pending_overlays(window, cx);
         // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
         // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
@@ -6075,7 +6091,7 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(dialog, _)| dialog.clone()),
             )
-            // OWE-903: 온보딩·짝짓기는 메인 창 안 모달로 그린다(별도 OS 창 없음).
+            // OWE-903: 온보딩·페어링은 메인 창 안 모달로 그린다(별도 OS 창 없음).
             .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
             .children(self.dashboard.clone())
             .children(self.quick_open_palette())

@@ -173,7 +173,6 @@ fn probe_command_shape_is_single_sh_c_with_labels() {
         "krill-sock=",
         ".krill/bin/VERSION",
         daemon::BUNDLE_ID,
-        daemon::LEGACY_BUNDLE_ID,
     ] {
         assert!(cmd.contains(marker), "missing {marker}");
     }
@@ -193,12 +192,6 @@ fn parse_probe_covers_installed_unmanaged_missing_and_socket() {
         PathBuf::from("/Users/remote/Library/Application Support/dev.krill.app/run/krilld.sock")
     );
     assert_eq!(info.bin_dir(), PathBuf::from("/Users/remote/.krill/bin"));
-
-    let legacy = "krill-os=Darwin\nkrill-arch=x86_64\nkrill-home=/Users/r\nkrill-version=0.1.4\nkrill-sock=dev.minikrill.app\nnoise\n";
-    assert_eq!(
-        parse_probe(legacy).unwrap().socket_bundle.as_deref(),
-        Some("dev.minikrill.app")
-    );
 
     let unmanaged =
         "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=/Users/r\nkrill-version=unmanaged\n";

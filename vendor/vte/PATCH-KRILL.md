@@ -1,4 +1,4 @@
-# vendor/vte 패치 기록 (Minikrill 좁은 포크)
+# vendor/vte 패치 기록 (Krill 좁은 포크)
 
 원본: crates.io `vte 0.15.0`(Apache-2.0 또는 MIT, https://github.com/alacritty/vte).
 `LICENSE-APACHE`·`LICENSE-MIT`·`Cargo.toml.orig`는 원본 그대로 둔다(Apache-2.0 §4(b)).

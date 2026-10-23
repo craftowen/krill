@@ -4,6 +4,8 @@
 //! 호스트 섹션 헤더 배치 참고:
 //! `.ref/orca/src/renderer/src/components/sidebar/worktree-list/rows/HostSectionHeader.tsx`
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
+//! 에이전트 요약·목록의 공통 패널 배치 참고: 같은 MIT 원본의
+//! `WorktreeCardAgents.tsx`·`worktree-card-compact-agents.tsx`.
 
 use std::path::PathBuf;
 
@@ -452,11 +454,54 @@ impl Sidebar {
         };
         let last = self.session_card_index(index + 1) != Some(parent);
         let depth = if self.row_host(parent).is_local() {
-            self.lineage_depth(path)
+            self.cached_lineage_depth(path)
         } else {
             0
         };
         let p = ui::palette(cx);
+        let active = self.worktree_card_active(parent, path);
+        if self.options.card_layout == super::CardLayout::Detailed {
+            // 요약 바와 같은 안쪽 경계로 잇는다. 세션별 가상화는 유지하고
+            // 바깥 워크트리 표면과 안쪽 에이전트 패널을 각각 연속해서 그린다.
+            let session = element
+                .h(px(26.))
+                .mx_0()
+                .px_1p5()
+                .rounded_none()
+                .border_l_1()
+                .border_r_1()
+                .border_color(p.worktree_sidebar_border)
+                .when(self.cursor != Some(index), |d| {
+                    d.bg(if active {
+                        p.sidebar.opacity(0.75)
+                    } else {
+                        p.sidebar_accent.opacity(0.65)
+                    })
+                })
+                .when(last, |d| d.border_b_1().rounded_b(ui::RADIUS_XS));
+            return div()
+                .id(("card-session-surface", index))
+                .debug_selector(move || format!("card-session-surface-{index}"))
+                .flex_none()
+                .ml(px(self.worktree_margin(depth)))
+                .mr_1p5()
+                .pl(px(30.))
+                .pr_2p5()
+                .border_l_1()
+                .border_r_1()
+                .border_color(ui::TRANSPARENT)
+                .when(last, |d| {
+                    d.pb_1p5().mb_0p5().border_b_1().rounded_b(ui::RADIUS_MD)
+                })
+                .when(active, |d| {
+                    d.bg(p.worktree_sidebar)
+                        .border_color(p.sidebar_ring.opacity(0.65))
+                })
+                .when(depth > 0 && !active, |d| {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                })
+                .child(session);
+        }
         element
             .h(px(if last { ROW_HEIGHT } else { 26. }))
             .mx_0()
@@ -1114,7 +1159,7 @@ impl Sidebar {
                         let pl = match &session.worktree {
                             Some(tree) => {
                                 let depth = if row_host.is_local() {
-                                    self.lineage_depth(tree)
+                                    self.cached_lineage_depth(tree)
                                 } else {
                                     0
                                 };
@@ -1322,7 +1367,8 @@ impl Sidebar {
             row_host.clone(),
         );
         let closed = self.collapsed.contains(path);
-        let card_expanded = self.expanded_cards.contains(path);
+        let card_expanded = self.session_card_index(index + 1) == Some(index)
+            && self.card_list.contains_row(index + 1);
         let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
         let name = self.name(path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
@@ -1662,15 +1708,14 @@ impl Sidebar {
 
         let visible_comment = props.comment.then_some(comment).flatten();
         let has_agent_pill = !summary.groups.is_empty() || tree_session_count > 0;
-        let has_line3 = visible_comment.is_some() || has_agent_pill;
 
         let lineage_depth = if row_host.is_local() {
-            self.lineage_depth(path)
+            self.cached_lineage_depth(path)
         } else {
             0
         };
         let lineage_child_count = if row_host.is_local() {
-            self.lineage_children(path).len()
+            self.cached_lineage_child_count(path)
         } else {
             0
         };
@@ -1885,16 +1930,19 @@ impl Sidebar {
         let checkpoint_visible = card_checkpoint_parts
             .as_ref()
             .is_some_and(|parts| parts.label(has_issue_badge).is_some() || parts.unread);
-        let badge_count = usize::from(checkpoint_visible)
-            + usize::from(worktree_cache_badge.is_some())
-            + usize::from(host_badge.is_some())
-            + usize::from(issue_badge.is_some())
-            + usize::from(ports_badge.is_some())
-            + usize::from(dirty_badge.is_some())
-            + usize::from(pr_badge.is_some());
-        let has_badges = badge_count > 0;
-        let has_line2 = show_branch_subtitle || has_badges;
-        let dense_badges = badge_count >= 2 || checkpoint_visible;
+        // 미커밋 수(`±N`)는 1행 오른쪽 수치 열로 옮겼으므로 배지 줄에서 뺀다.
+        let has_badges = checkpoint_visible
+            || worktree_cache_badge.is_some()
+            || host_badge.is_some()
+            || issue_badge.is_some()
+            || ports_badge.is_some()
+            || pr_badge.is_some();
+        // 2행 왼쪽: 브랜치가 제목과 다르면 브랜치, 아니면 코멘트를 끌어올린다.
+        let line2_comment = (!show_branch_subtitle).then_some(visible_comment).flatten();
+        let tail_comment = visible_comment.filter(|_| line2_comment.is_none());
+        let has_line2 = !is_editing_this
+            && (show_branch_subtitle || line2_comment.is_some() || lineage_toggle_btn.is_some());
+        let has_line3 = tail_comment.is_some() || has_agent_pill;
         let checkpoint_pill = card_checkpoint_parts.as_ref().map(|parts| {
             let label = parts.label(has_issue_badge);
             let a11y = label.clone().unwrap_or_default();
@@ -1906,13 +1954,15 @@ impl Sidebar {
                 .child(super::external::checkpoint_badge_element(parts, p))
         });
 
+        // 왼쪽은 이름·브랜치·코멘트, 오른쪽 수치 열은 `±N`(1행)과 계보 접기(2행)를 세로로 맞춘다.
+        // 호버 액션은 1행 오른쪽 위에 겹쳐 띄우고, 핀 고정 별이 상시 보이는 동안만 그 폭을 비워 둔다.
         let header = div()
             .id(("worktree-header", index))
             .w_full()
             .flex()
             .flex_col()
             .gap_0p5()
-            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 + 자식 접기/펼치기 버튼 + 호버 액션 버튼 오버레이
+            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 | 미커밋 수 + 호버 액션 오버레이
             .child(
                 div()
                     .relative()
@@ -1921,6 +1971,7 @@ impl Sidebar {
                     .flex()
                     .items_center()
                     .gap_1p5()
+                    .when(pinned && !is_editing_this, |d| d.pr(px(22.)))
                     .child(
                         div()
                             .debug_selector(move || format!("worktree-state-{index}"))
@@ -1947,107 +1998,102 @@ impl Sidebar {
                                             format!("worktree-default-badge-{index}")
                                         })
                                         .flex_none()
-                                        .px_1p5()
-                                        .py(px(1.))
+                                        .px_1()
                                         .rounded(ui::RADIUS_XS)
-                                        .border_1()
-                                        .border_color(p.worktree_sidebar_border)
+                                        .bg(p.worktree_sidebar_accent)
                                         .text_size(ui::TEXT_2XS)
                                         .text_color(p.muted_foreground)
                                         .child(crate::i18n::catalog::general::DEFAULT.get()),
                                 )
-                            })
-                            .when(!is_editing_this, |d| d.children(lineage_toggle_btn)),
+                            }),
                     )
                     .when(!is_editing_this, |d| {
-                        d.child(
+                        d.children(dirty_badge).child(
                             div()
-                                .flex_none()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .h_full()
                                 .flex()
                                 .items_center()
                                 .gap_0p5()
+                                .rounded(ui::RADIUS_XS)
+                                .group_hover(ROW_GROUP, |d| {
+                                    d.bg(if is_active_worktree {
+                                        p.worktree_sidebar
+                                    } else {
+                                        p.sidebar_accent
+                                    })
+                                })
                                 .child(new_session_btn)
                                 .child(rename_btn)
                                 .child(pin_btn),
                         )
                     }),
             )
-            // 2행: 들여쓴 브랜치 이름 + 체크포인트·캐시 타이머·호스트·이슈·포트·미커밋·PR 배지
+            // 2행: 브랜치 이름(또는 코멘트) | 계보 자식 접기/펼치기
             .when(has_line2, |d| {
-                if show_branch_subtitle && dense_badges {
-                    d.child(
-                        div()
-                            .w_full()
-                            .pl(px(20.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .debug_selector(move || format!("worktree-branch-{index}"))
-                                    .w_full()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(branch_subtitle),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap_1()
-                                    .children(checkpoint_pill)
-                                    .children(worktree_cache_badge)
-                                    .children(host_badge)
-                                    .children(issue_badge)
-                                    .children(ports_badge)
-                                    .children(dirty_badge)
-                                    .children(pr_badge),
-                            ),
-                    )
-                } else {
-                    d.child(
-                        div()
-                            .w_full()
-                            .min_h(px(18.))
-                            .pl(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_1p5()
-                            .when(show_branch_subtitle, |d| {
-                                d.child(
-                                    div()
-                                        .debug_selector(move || format!("worktree-branch-{index}"))
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(branch_subtitle),
-                                )
-                            })
-                            .when(has_badges, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap_1()
-                                        .children(checkpoint_pill)
-                                        .children(worktree_cache_badge)
-                                        .children(host_badge)
-                                        .children(issue_badge)
-                                        .children(ports_badge)
-                                        .children(dirty_badge)
-                                        .children(pr_badge),
-                                )
-                            }),
-                    )
-                }
+                d.child(
+                    div()
+                        .w_full()
+                        .min_h(px(18.))
+                        .pl(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .when(pinned, |d| d.pr(px(22.)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .when(show_branch_subtitle, |d| {
+                                    d.child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("worktree-branch-{index}")
+                                            })
+                                            .w_full()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(branch_subtitle),
+                                    )
+                                })
+                                .children(
+                                    super::external::render_comment(
+                                        line2_comment,
+                                        p.muted_foreground,
+                                    )
+                                    .map(|el| {
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("worktree-comment-{index}")
+                                            })
+                                            .child(el)
+                                    }),
+                                ),
+                        )
+                        .children(lineage_toggle_btn),
+                )
+            })
+            // 배지 줄: 체크포인트·캐시 타이머·호스트·이슈·포트·PR (있을 때만)
+            .when(has_badges && !is_editing_this, |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .pl(px(20.))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .children(checkpoint_pill)
+                        .children(worktree_cache_badge)
+                        .children(host_badge)
+                        .children(issue_badge)
+                        .children(ports_badge)
+                        .children(pr_badge),
+                )
             })
             // 3행: 코멘트 또는 에이전트 상태 요약(1개 세션이면 인라인 요약 줄, 다중 세션이면 알약 바)
             .when(has_line3, |d| {
@@ -2065,7 +2111,7 @@ impl Sidebar {
                         .flex_col()
                         .gap_1()
                         .children(
-                            super::external::render_comment(visible_comment, p.muted_foreground)
+                            super::external::render_comment(tail_comment, p.muted_foreground)
                                 .map(|el| {
                                     div()
                                         .debug_selector(move || format!("worktree-comment-{index}"))
@@ -2133,12 +2179,15 @@ impl Sidebar {
                                 d.child(
                                     div()
                                         .id(("fold", index))
+                                        .debug_selector(move || format!("card-agent-summary-{index}"))
+                                        .aria_expanded(card_expanded)
                                         .w_full()
-                                        .h(px(25.))
-                                        .px_1p5()
+                                        .h(px(22.))
+                                        .px_1()
                                         .rounded(ui::RADIUS_XS)
                                         .border_1()
                                         .border_color(p.worktree_sidebar_border)
+                                        .when(card_expanded, |d| d.border_b_0().rounded_b_none())
                                         .bg(if is_active_worktree {
                                             p.sidebar.opacity(0.75)
                                         } else {

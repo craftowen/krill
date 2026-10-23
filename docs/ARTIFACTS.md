@@ -32,6 +32,9 @@ krill artifacts update ./report.html [--title "새 제목"] [--api-url <url>] [-
 # 3. 로컬 파일과 연결된 공개 링크 회수(삭제)
 krill artifacts unshare ./report.html [--api-url <url>] [--json]
 
+# 3-1. 로컬 파일의 공유 상태 확인(네트워크 없이 로컬 기록만)
+krill artifacts status ./report.html [--api-url <url>] [--json]
+
 # 4. 내 로컬 토큰이 소유한 공유 아티팩트 목록 조회 (커서 페이지네이션)
 krill artifacts list [--cursor <cursor>] [--api-url <url>] [--json]
 
@@ -40,10 +43,31 @@ krill artifacts delete <slug> [--api-url <url>] [--json]
 krill artifacts rm <slug> [--json]
 ```
 
+### 공개 게이트 (기본 꺼짐)
+
+- `share`·`update`는 `<state_dir>/artifact-sharing.enabled` 파일이 있을 때만 동작한다. 없으면 업로드하지 않고 `artifact_sharing_disabled` 오류로 끝난다. 에이전트만이 아니라 이 기기 전체에 적용된다.
+- 켜고 끄는 곳은 앱 **설정 > 아티팩트 > 공개 공유 허용** 스위치다. CLI에는 켜는 명령이 없다. 게이트 정의: [`crates/krill-proto/src/artifacts.rs`](../crates/krill-proto/src/artifacts.rs).
+- **정책 게이트일 뿐 보안 경계가 아니다.** 상태 디렉터리에 쓸 수 있는 프로세스(같은 사용자로 도는 에이전트 포함, 세션에는 `KRILL_STATE_DIR`이 들어 있다)는 파일을 직접 만들어 우회할 수 있다. 에이전트에게는 내장 `krill` 스킬이 `artifact_sharing_disabled`를 받으면 재시도·우회하지 말고 사용자에게 묻도록 안내한다.
+- **업그레이드 영향**: 이 게이트가 들어간 버전부터 `krill artifacts share`·`update`는 기본으로 거부된다. 앱 없이 CLI만 쓰는 환경에서는 `touch "<state_dir>/artifact-sharing.enabled"`(0600 권장)로 사람이 직접 켠다. 같은 변경으로 지원하지 않는 확장자의 종료 코드가 2에서 1로 바뀌었고, 경로가 붙은 `--api-url`(예: `https://host/prefix`)은 거부된다.
+- `list`·`unshare`·`delete`·`status`는 게이트와 상관없이 동작한다(이미 만든 링크를 회수할 수 있어야 한다). 게이트를 꺼도 기존 링크는 지울 때까지 남는다.
+
+### `--json` 출력
+
+- 성공 형태는 `krill_proto::artifacts`의 `ShareOutcome`(`share`·`update`), `LinkStatus`(`status`), `ListPage`(`list`, 서버 응답 그대로), `{deleted, slug}`(`unshare`·`delete`)다.
+- 실패도 stdout에 `{"error":{"code","message","nextSteps"?}}`로 내고 비0으로 끝난다. 코드: `artifact_sharing_disabled`, `not_shared`, `unsupported`, `empty`, `too_large`, `unreadable`, `invalid_argument`, 서버 오류 코드(없으면 `http_<status>`), 그 밖 `failed`.
+
+### 앱 UI
+
+- **사이드바 진입점**: 메인 창 왼쪽 사이드바의 '에이전트 대시보드' 바로 아래 '아티팩트' 항목을 누르면 아래 페이지가 열린다.
+- **설정 > 아티팩트**(메인 창 안 페이지): 공개 공유 허용 스위치, 사용 방법, 공유한 아티팩트 목록(이름·종류·만료, 링크 복사·브라우저에서 열기·두 번 눌러 삭제, 새로고침·더 보기). 목록·삭제는 `krill artifacts list|delete --json`을 하위 프로세스로 부른다.
+- **파일 머리 공유 버튼**: 열린 `.html`·`.htm`·`.md`·`.markdown` 파일 머리에 있다. 누르면 `krill artifacts share <file> --json`으로 링크를 만들거나 같은 링크의 내용을 갱신하고 링크를 클립보드에 복사한다. 저장 안 된 변경이 있으면 저장하라고 안내하고, 공개 공유가 꺼져 있으면 설정 > 아티팩트를 연다.
+
+- 앱이 부르는 CLI는 `KRILL_STATE_DIR`만 넘기고 `KRILL_ARTIFACTS_AUTH_TOKEN`은 넘기지 않는다. 셸에서 토큰을 재정의했다면 앱 목록과 터미널 목록이 다를 수 있다.
+
 ### 동작 및 로컬 상태 파일
 
-- **지원 확장자·용량**: `.html`, `.htm`, `.md`, `.markdown` 단일 파일(최대 10 MiB). 상대 경로 로컬 에셋은 업로드하지 않으므로 단일 완결형 HTML이거나 절대 URL 에셋을 사용한다.
-- **기본 서버 주소**: `https://share.krill.page` (`--api-url <url>` 플래그 또는 `KRILL_ARTIFACTS_API_URL` 환경변수로 재정의 가능; HTTPS 필수, 로컬 개발 시에만 `http://127.0.0.1`·`http://localhost` 허용).
+- **지원 확장자·용량**: `.html`, `.htm`, `.md`, `.markdown` 단일 파일(최대 2 MiB, 빈 파일 거부). 상대 경로 로컬 에셋은 업로드하지 않으므로 단일 완결형 HTML이거나 절대 URL 에셋을 사용한다.
+- **기본 서버 주소**: `https://share.krill.page` (`--api-url <url>` 플래그 또는 `KRILL_ARTIFACTS_API_URL` 환경변수로 재정의 가능; HTTPS origin만, 로컬 개발 시에만 `http://127.0.0.1`·`http://localhost` 허용. 경로·자격증명(`user@`)·쿼리는 거부).
 - **계정 없는 로컬 인증 (0600 권한)**:
   - `<state_dir>/artifact-token`: 최초 실행 시 256-bit 무작위 소유자 토큰을 자동 생성해 보관한다(`KRILL_ARTIFACTS_AUTH_TOKEN`으로 재정의 가능).
   - `<state_dir>/artifact-shares.json`: 정규화된 로컬 파일 경로(`canonical_path`) ↔ `{ slug, edit_token, share_url, api_origin, expires_at }` 매핑을 저장한다.

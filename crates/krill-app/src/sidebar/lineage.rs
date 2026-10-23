@@ -421,6 +421,44 @@ impl Sidebar {
         depth
     }
 
+    /// 렌더가 행마다 전체 워크트리 집합을 다시 만들지 않도록 깊이·자식 수를 한 번에 계산한다.
+    // ponytail: rebuild마다 O(W² log W)(워크트리마다 lineage_depth). 워크트리가 수백 개를 넘어
+    // rebuild가 느려지면 그룹 범위 집합을 한 번만 만들어 공유한다.
+    pub(super) fn index_lineage(&mut self) {
+        let mut depths = BTreeMap::new();
+        let mut child_counts = BTreeMap::new();
+        if !self.parents.is_empty() {
+            let known: BTreeSet<&Path> = self
+                .snapshot
+                .trees
+                .values()
+                .flatten()
+                .map(PathBuf::as_path)
+                .collect();
+            for &tree in &known {
+                if let Some(parent) = effective_parent(tree, &self.parents, &known) {
+                    *child_counts.entry(parent.clone()).or_insert(0) += 1;
+                }
+                let depth = self.lineage_depth(tree);
+                if depth > 0 {
+                    depths.insert(tree.to_path_buf(), depth);
+                }
+            }
+        }
+        self.lineage_depths = depths;
+        self.lineage_child_counts = child_counts;
+    }
+
+    /// [`Self::lineage_depth`]의 렌더용 캐시 값.
+    pub(super) fn cached_lineage_depth(&self, path: &Path) -> usize {
+        self.lineage_depths.get(path).copied().unwrap_or(0)
+    }
+
+    /// [`Self::lineage_children`] 개수의 렌더용 캐시 값.
+    pub(super) fn cached_lineage_child_count(&self, path: &Path) -> usize {
+        self.lineage_child_counts.get(path).copied().unwrap_or(0)
+    }
+
     /// `path`의 자식 워크트리 트리가 접혀 있는지.
     #[must_use]
     pub fn is_lineage_collapsed(&self, path: &Path) -> bool {

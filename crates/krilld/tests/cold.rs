@@ -401,6 +401,9 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
     drop((c, hook_conn, daemon));
     let (daemon, mut c) = Daemon::start(&dir);
     assert!(cold(&mut c, claude_old).is_some());
+    let latest_cwd = work.join("latest-cwd");
+    fs::create_dir_all(&latest_cwd).unwrap();
+    let latest_cwd = latest_cwd.canonicalize().unwrap();
     let Reply::Resumed {
         session: claude_resumed,
         ..
@@ -411,7 +414,7 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
             create: Create {
                 account: None,
                 program: Program::Login,
-                cwd: Vec::new(),
+                cwd: latest_cwd.as_os_str().as_encoded_bytes().to_vec(),
                 cols: 120,
                 rows: 24,
             },
@@ -427,6 +430,11 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
         "{resumed_out}"
     );
     assert!(resumed_out.contains("--settings "), "{resumed_out}");
+    let resumed_out = wait_line(&mut c, claude_resumed, "CLAUDE_PWD:");
+    assert!(
+        resumed_out.contains(&format!("CLAUDE_PWD:{}", latest_cwd.display())),
+        "{resumed_out}"
+    );
 
     let sock = daemon.sock.clone();
     drop((c, daemon));
@@ -650,5 +658,200 @@ fn agent_history_scans_on_request_and_resumes_both_agents() {
     }
     drop(stream);
     drop(daemon);
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 재부팅 재개 후 새 연결에서도 1,000행을 넘는 이전 이력과 마지막 화면을 모두 읽는다.
+#[test]
+fn reboot_resume_history_survives_reattach_and_another_reboot() {
+    use krill_proto::screen::{
+        Attach, Attached, HistoryRequest, HistoryRows, Source, Stream, kind,
+    };
+    use std::io::Write as _;
+    let dir = env::temp_dir().join(format!("reboot-history-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let create = |script: &str| Create {
+        account: None,
+        program: Program::Custom {
+            program: b"/bin/sh".to_vec(),
+            args: vec![b"-c".to_vec(), script.as_bytes().to_vec()],
+        },
+        cwd: dir.as_os_str().as_encoded_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    let (daemon, mut c) = Daemon::start(&dir);
+    let Reply::Created { session: old, .. } = request(
+        &mut c,
+        &Request::Create(create(
+            "i=1; while [ $i -le 1500 ]; do echo prior-$i; i=$((i+1)); done; echo prior-end; sleep 60",
+        )),
+    ) else {
+        panic!("create failed")
+    };
+    let deadline = Instant::now() + WAIT;
+    while !cold(&mut c, old).is_some_and(|(rows, _)| rows.iter().any(|r| r == "prior-end")) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop((c, daemon));
+    let (daemon, mut c) = Daemon::start(&dir);
+    let Reply::Resumed { session: new, .. } = request(
+        &mut c,
+        &Request::Resume {
+            session: old,
+            create: create("echo fresh; sleep 60"),
+        },
+    ) else {
+        panic!("resume failed")
+    };
+    let deadline = Instant::now() + WAIT;
+    while !cold(&mut c, new).is_some_and(|(rows, _)| rows.iter().any(|r| r == "fresh")) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let collect = |sock: &Path, session, legacy: bool| {
+        let mut s = UnixStream::connect(sock).unwrap();
+        s.set_read_timeout(Some(WAIT)).unwrap();
+        ipc::read_frame(&mut s).unwrap().unwrap();
+        let mut hello = client_hello(ClientRole::App, "restore-test");
+        if legacy {
+            hello.features &= !krill_proto::control::FEAT_RESUME_HISTORY;
+        }
+        s.write_all(&hello.encode().unwrap()).unwrap();
+        s.write_all(
+            &Attach {
+                session,
+                stream: Stream::Screen { known: None },
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        let (k, b) = ipc::read_frame(&mut s).unwrap().unwrap();
+        Attached::decode(k, &b).unwrap();
+        let mut load = |req, source, skip| {
+            s.write_all(
+                &HistoryRequest {
+                    req,
+                    source,
+                    skip,
+                    count: krill_proto::screen::MAX_HISTORY_ROWS,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+            loop {
+                let (k, b) = ipc::read_frame(&mut s).unwrap().unwrap();
+                if k == kind::HISTORY_ROWS {
+                    break HistoryRows::decode(k, &b).unwrap();
+                }
+            }
+        };
+        let pages = load(1, Source::Hot, 0).pages;
+        let mut rows = Vec::new();
+        for page in 0..pages {
+            let mut skip = 0;
+            let mut page_rows = Vec::new();
+            loop {
+                let got = load(page + 2, Source::Cold { page }, skip);
+                if got.rows.is_empty() {
+                    break;
+                }
+                skip += u32::try_from(got.rows.len()).unwrap();
+                let mut batch: Vec<_> = got.rows.iter().map(|r| text(r)).collect();
+                batch.extend(page_rows);
+                page_rows = batch;
+                if skip >= got.total {
+                    break;
+                }
+            }
+            rows.extend(page_rows);
+        }
+        rows
+    };
+    let rows = collect(&daemon.sock, new, false);
+    assert!(
+        rows.contains(&"prior-end".into()),
+        "prior final screen missing: {} rows",
+        rows.len()
+    );
+    let numbered: Vec<usize> = rows
+        .iter()
+        .filter_map(|r| r.strip_prefix("prior-")?.parse().ok())
+        .collect();
+    assert_eq!(numbered, (1..=1500).collect::<Vec<_>>());
+    assert_eq!(
+        collect(&daemon.sock, new, false),
+        rows,
+        "a fresh attachment must preserve history"
+    );
+    assert!(
+        !collect(&daemon.sock, new, true)
+            .iter()
+            .any(|r| r.starts_with("prior-")),
+        "N-1 uses its local prior"
+    );
+    // 동시 소실 뒤에도 새 세션의 원본과 prior 링크가 디스크에 남는다.
+    drop((c, daemon));
+    let (daemon, mut c) = Daemon::start(&dir);
+    let Reply::Resumed {
+        session: newest, ..
+    } = request(
+        &mut c,
+        &Request::Resume {
+            session: new,
+            create: create("echo newest; sleep 60"),
+        },
+    )
+    else {
+        panic!("resume failed")
+    };
+    assert_ne!(newest, new);
+    let deadline = Instant::now() + WAIT;
+    while !cold(&mut c, newest).is_some_and(|(rows, _)| rows.iter().any(|r| r == "newest")) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let recovered = collect(&daemon.sock, newest, false);
+    assert!(recovered.contains(&"prior-end".into()));
+    assert!(recovered.contains(&"fresh".into()));
+    assert_eq!(
+        recovered
+            .iter()
+            .filter_map(|r| r.strip_prefix("prior-")?.parse::<usize>().ok())
+            .collect::<Vec<_>>(),
+        (1..=1500).collect::<Vec<_>>()
+    );
+    // 같은 저장소를 다시 열어 영속 링크와 원본을 확인한다(프로세스는 위에서 실제로 재기동했다).
+    assert_eq!(
+        fs::read(dir.join(format!("sessions/{}.noindex/prior", newest.0))).unwrap(),
+        new.0.to_le_bytes()
+    );
+    let sock = daemon.sock.clone();
+    drop((c, daemon));
+    assert_no_holders(&sock);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// 온보딩의 버전 점검이 소켓 이름으로 해석되어 listener 오류를 남기면 안 된다.
+#[test]
+fn daemon_version_probe_does_not_start_listener() {
+    let dir = env::temp_dir().join(format!("krilld-version-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(KRILLD)
+        .arg("--version")
+        .env("KRILL_STATE_DIR", &dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        krill_proto::BUILD
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     fs::remove_dir_all(dir).ok();
 }

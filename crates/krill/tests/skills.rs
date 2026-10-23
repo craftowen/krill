@@ -19,7 +19,7 @@ fn command(home: &Path) -> Command {
     let mut cmd = Command::new(CLI);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("KRILL_") || name.starts_with("MK_") || name.starts_with("MINIKRILL_") {
+        if name.starts_with("KRILL_") || name.starts_with("MK_") {
             cmd.env_remove(key);
         }
     }
@@ -61,11 +61,7 @@ fn cli_start_automatically_installs_and_updates_owned_skills_and_keeps_orca() {
         );
     }
     let installed = home.join(".gemini/antigravity-cli/skills/krill-orchestration/SKILL.md");
-    fs::write(
-        &installed,
-        "old version\n<!-- minikrill-managed-skill -->\n",
-    )
-    .unwrap();
+    fs::write(&installed, "old version\n<!-- krill-managed-skill -->\n").unwrap();
     let canonical = success(
         command(&home)
             .args(["skills", "get", "krill-orchestration"])

@@ -221,7 +221,7 @@ def canonical_signing_payload(
     rollout_pct: int,
 ) -> bytes:
     return (
-        "minikrill-update-v1\n"
+        "krill-update-v1\n"
         f"version={version}\n"
         f"url={url}\n"
         f"sha256={sha256.lower()}\n"

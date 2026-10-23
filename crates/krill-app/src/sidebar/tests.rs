@@ -1221,7 +1221,7 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
         holder: PathBuf::new(),
         krilld: PathBuf::new(),
     };
-    let sidebar_sock = ipc::Socket::new(paths.clone());
+    let sidebar_sock = ipc::Socket::threaded(paths.clone());
     let trees = BTreeMap::from([(repo.clone(), vec![repo.clone()])]);
 
     // 1. 사이드바가 5회 연속 fetch() + meta()를 호출해도 UDS 연결은 딱 1개만 열려야 한다(500ms마다 2개씩 총 10개 금지).
@@ -1293,6 +1293,7 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
     // 3. 왼쪽 사이드바를 접어 `set_visible(false)`를 보내도 새 UDS를 열지 않고,
     // 오른쪽 diff 패널의 감시는 살아 있어 새 파일 추가가 diff에 감지되어야 한다.
     sidebar_sock.set_visible(false);
+    sidebar_sock.settle();
     assert_eq!(
         accepts.load(Ordering::SeqCst),
         2,
@@ -1303,6 +1304,32 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
         krill_proto::git::GitWatchReply::Unchanged { pending: false },
         "collapsing sidebar must not reset or force-recreate diff panel's active watch"
     );
+    // 원격 폴링 경로(`poll_snapshot`)는 호스트 전용 스레드에서 연결을 열고, 이어지는 fetch와 같은 연결을 쓰며
+    // 결과도 fetch + meta와 같다.
+    let (snap, meta) = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(sidebar_sock.poll_snapshot())
+        .unwrap();
+    // 레지스트리는 실행 환경의 다른 저장소도 보여 주고 그 변경 수는 git 감시가 비동기로 채운다. 그래서 두 번 읽은
+    // 값을 통째로 비교하지 않고 저장소 목록과 브랜치만 비교한다.
+    let again = sidebar_sock.meta(&snap.trees);
+    let shape = |m: &BTreeMap<PathBuf, _>| {
+        m.iter()
+            .map(|(k, t): (&PathBuf, &Tree)| (k.clone(), t.branch.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        snap.trees.keys().collect::<Vec<_>>(),
+        sidebar_sock
+            .fetch()
+            .unwrap()
+            .trees
+            .keys()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(shape(&meta), shape(&again));
+    assert_eq!(accepts.load(Ordering::SeqCst), 3);
 
     fs::remove_dir_all(root).ok();
 }
@@ -1940,15 +1967,29 @@ fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppC
         });
         cx.run_until_parked();
         let card = cx.debug_bounds("worktree-card-1").unwrap();
+        let summary = cx.debug_bounds("card-agent-summary-1");
+        let panel = if layout == CardLayout::Detailed {
+            summary.expect("expanded summary panel")
+        } else {
+            card
+        };
         for selector in ["sidebar-session-2", "sidebar-session-3"] {
             let row = cx.debug_bounds(selector).expect("expanded session renders");
             assert!(
-                row.origin.x == card.origin.x && row.size.width == card.size.width,
-                "{layout:?}: {selector} must share the card surface: {card:?}, {row:?}"
+                row.origin.x == panel.origin.x && row.size.width == panel.size.width,
+                "{layout:?}: {selector} must share the summary panel: {panel:?}, {row:?}"
             );
         }
         let first = cx.debug_bounds("sidebar-session-2").unwrap();
         let second = cx.debug_bounds("sidebar-session-3").unwrap();
+        if let Some(summary) = summary {
+            assert_eq!(summary.bottom_left().y, first.origin.y);
+            assert!(first.origin.x > card.origin.x);
+            let bottom = cx.debug_bounds("card-session-surface-3").unwrap();
+            assert_eq!(bottom.origin.x, card.origin.x);
+            assert_eq!(bottom.size.width, card.size.width);
+            assert!(bottom.bottom_left().y > second.bottom_left().y);
+        }
         assert_eq!(card.bottom_left().y, first.origin.y);
         assert_eq!(first.bottom_left().y, second.origin.y);
         assert!(second.bottom_left().y > collapsed.bottom_left().y);
@@ -1975,9 +2016,13 @@ fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppC
             &[SessionId(2)],
             "right-click must open the nested session menu and its first action must open that session"
         );
-        cx.update(|_, cx| {
-            view.update(cx, |s, cx| s.toggle_card_sessions(Path::new("/repo/a"), cx));
-        });
+        if let Some(summary) = summary {
+            cx.simulate_click(summary.center(), Modifiers::default());
+        } else {
+            cx.update(|_, cx| {
+                view.update(cx, |s, cx| s.toggle_card_sessions(Path::new("/repo/a"), cx));
+            });
+        }
         cx.run_until_parked();
         assert!(cx.debug_bounds("sidebar-session-2").is_none());
         assert!(cx.debug_bounds("sidebar-session-3").is_none());
@@ -1989,7 +2034,7 @@ fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn virtualized_worktree_sessions_share_card_edges(cx: &mut TestAppContext) {
+fn virtualized_worktree_sessions_share_summary_panel_edges(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
@@ -2015,16 +2060,18 @@ fn virtualized_worktree_sessions_share_card_edges(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let header = cx.debug_bounds("worktree-card-0").unwrap();
+    let summary = cx.debug_bounds("card-agent-summary-0").unwrap();
     let first = cx.debug_bounds("sidebar-session-1").unwrap();
     let second = cx.debug_bounds("sidebar-session-2").unwrap();
     for segment in [first, second] {
-        assert_eq!(segment.origin.x, header.origin.x);
-        assert_eq!(segment.size.width, header.size.width);
+        assert_eq!(segment.origin.x, summary.origin.x);
+        assert_eq!(segment.size.width, summary.size.width);
     }
+    assert!(first.origin.x > header.origin.x);
     assert_eq!(
-        header.bottom_left().y,
+        summary.bottom_left().y,
         first.origin.y,
-        "header border must continue into the session list without a gap"
+        "summary border must continue into the session list without a gap"
     );
     assert_eq!(
         first.bottom_left().y,
@@ -2803,6 +2850,25 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     });
     cx.run_until_parked();
 
+    // 렌더가 쓰는 계보 캐시는 rebuild 뒤 원래 계산과 같아야 한다.
+    let lineage = [
+        parent.clone(),
+        child_a.clone(),
+        grandchild.clone(),
+        child_b.clone(),
+        solo.clone(),
+    ];
+    let cache_matches = |s: &Sidebar| {
+        for wt in &lineage {
+            assert_eq!(s.cached_lineage_depth(wt), s.lineage_depth(wt), "{wt:?}");
+            assert_eq!(
+                s.cached_lineage_child_count(wt),
+                s.lineage_children(wt).len(),
+                "{wt:?}"
+            );
+        }
+    };
+
     // 순환 참조 방지 검증: 조상을 자손의 자식으로 지정할 수 없다.
     cx.update(|_, cx| {
         let s = view.read(cx);
@@ -2838,6 +2904,7 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
         assert_eq!(s.lineage_depth(&child_b), 1);
         assert_eq!(s.lineage_children(&child_b).len(), 0);
         assert_eq!(s.lineage_depth(&solo), 0);
+        cache_matches(s);
     });
 
     // 자식 워크트리 카드는 부모 카드보다 오른쪽으로 들여쓰기되고 접기 토글 배지가 렌더링된다.
@@ -2858,6 +2925,21 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     );
     assert!(cx.debug_bounds("worktree-lineage-toggle-0").is_some());
     assert!(cx.debug_bounds("worktree-lineage-toggle-1").is_some());
+
+    // 부모 해제·그룹 변경 뒤에도 렌더용 캐시가 다시 계산된다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.clear_worktree_parent(&grandchild, cx);
+            s.set_group_by(GroupBy::None, cx);
+            cache_matches(s);
+            assert_eq!(s.cached_lineage_depth(&grandchild), 0);
+            assert_eq!(s.cached_lineage_child_count(&child_a), 0);
+            s.set_group_by(GroupBy::Repo, cx);
+            s.set_worktree_parent(grandchild.clone(), child_a.clone(), cx);
+            cache_matches(s);
+        });
+    });
+    cx.run_until_parked();
 
     // 부모를 접으면 자손(child-a, grandchild, child-b)이 숨겨지고 다시 펼치면 복원된다.
     cx.update(|_, cx| {
@@ -2971,7 +3053,6 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     cx: &mut TestAppContext,
 ) {
     use gpui::Modifiers;
-    use krill_proto::control::Program;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2983,7 +3064,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
 
     let selected: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
-    let launched: Rc<RefCell<Vec<(HostId, NewSession)>>> = Rc::new(RefCell::new(Vec::new()));
+    let launched: Rc<RefCell<Vec<OpenWorkspace>>> = Rc::new(RefCell::new(Vec::new()));
 
     let sel_out = selected.clone();
     let _sub_sel = cx.update(|_, cx| {
@@ -2996,11 +3077,8 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     });
     let new_out = launched.clone();
     let _sub_new = cx.update(|_, cx| {
-        cx.subscribe(&view, move |s, event: &NewSession, cx| {
-            let host = s
-                .update(cx, |s, _| s.take_action_host())
-                .unwrap_or(HostId::Local);
-            new_out.borrow_mut().push((host, event.clone()));
+        cx.subscribe(&view, move |_, event: &OpenWorkspace, _| {
+            new_out.borrow_mut().push(event.clone());
         })
     });
 
@@ -3119,13 +3197,10 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
 
         assert_eq!(
             launched.borrow().as_slice(),
-            &[(
-                studio_id.clone(),
-                NewSession {
-                    cwd: wt_without_remote_sess.clone(),
-                    program: Program::Login,
-                }
-            )],
+            &[OpenWorkspace {
+                host: studio_id.clone(),
+                cwd: wt_without_remote_sess.clone(),
+            }],
             "clicking remote worktree card without remote session in {layout:?} must spawn on studio host even if local has same path"
         );
     }
@@ -3809,7 +3884,6 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
 ) {
     use crate::pull_request::Status as PrStatus;
     use gpui::{Modifiers, px, size};
-    use krill_proto::control::Program;
     use krill_proto::orchestration::WorktreeStore;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -3864,10 +3938,10 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
             selected_got.borrow_mut().push(ev.0);
         })
     });
-    let launched_events: Rc<RefCell<Vec<NewSession>>> = Rc::new(RefCell::new(Vec::new()));
+    let launched_events: Rc<RefCell<Vec<OpenWorkspace>>> = Rc::new(RefCell::new(Vec::new()));
     let launched_got = launched_events.clone();
     let _sub_new = vcx.update(|_, cx| {
-        cx.subscribe(&view, move |_, ev: &NewSession, _| {
+        cx.subscribe(&view, move |_, ev: &OpenWorkspace, _| {
             launched_got.borrow_mut().push(ev.clone());
         })
     });
@@ -4052,9 +4126,9 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     vcx.run_until_parked();
     assert_eq!(
         launched_events.borrow().as_slice(),
-        &[NewSession {
+        &[OpenWorkspace {
+            host: HostId::Local,
             cwd: PathBuf::from("/repo/wt-001"),
-            program: Program::Login,
         }]
     );
     fs::remove_dir_all(dir).ok();
@@ -4840,7 +4914,7 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
 /// 계보 자식은 여전히 부모 바로 아래에 붙는다.
 #[test]
 fn primary_worktree_is_always_first_in_project() {
-    let repo = PathBuf::from("/r/minikrill");
+    let repo = PathBuf::from("/r/krill");
     let brand = PathBuf::from("/r/brand-identity");
     let ci = PathBuf::from("/r/harness-ci");
     let child = PathBuf::from("/r/harness-ci-child");
@@ -4895,7 +4969,7 @@ fn primary_worktree_is_always_first_in_project() {
     }
 }
 
-/// 세션은 부모 상태 칸보다 한 단계 안으로 들여쓰며 호스트·계보 깊이는 한 번만 반영한다.
+/// 상세 세션은 요약 박스 안에, 컴팩트 세션은 한 단계 안에 두고 계보 깊이는 한 번만 반영한다.
 #[gpui::test]
 fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -4952,17 +5026,25 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
             let title = x(cx, format!("worktree-title-{tree}"));
             let glyph = x(cx, format!("session-state-{sess}"));
             let parent_state = x(cx, format!("worktree-state-{tree}"));
-            assert!(glyph >= parent_state + gpui::px(CHILD_INDENT));
-            assert!(glyph <= parent_state + gpui::px(CHILD_INDENT + 4.));
-            assert!(
-                glyph >= card + gpui::px(8.) && glyph < title,
-                "{layout:?}: session glyph={glyph:?} is nested one step before title={title:?} (card={card:?})"
-            );
             let session_title = x(cx, format!("session-title-{sess}"));
-            assert!(
-                session_title >= title && session_title <= title + gpui::px(36.),
-                "{layout:?}: session name {session_title:?} must stay near card title {title:?}"
-            );
+            if layout == CardLayout::Detailed {
+                let panel = cx
+                    .debug_bounds(format!("card-agent-summary-{tree}").leak())
+                    .unwrap();
+                assert_eq!(glyph, panel.origin.x + gpui::px(7.));
+                assert!(session_title > glyph && session_title < panel.top_right().x);
+            } else {
+                assert!(glyph >= parent_state + gpui::px(CHILD_INDENT));
+                assert!(glyph <= parent_state + gpui::px(CHILD_INDENT + 4.));
+                assert!(
+                    glyph >= card + gpui::px(8.) && glyph < title,
+                    "{layout:?}: session glyph={glyph:?} is nested one step before title={title:?} (card={card:?})"
+                );
+                assert!(
+                    session_title >= title && session_title <= title + gpui::px(36.),
+                    "{layout:?}: session name {session_title:?} must stay near card title {title:?}"
+                );
+            }
         }
         assert!(
             x(cx, format!("session-state-{s2}")) > x(cx, format!("session-state-{s1}")),

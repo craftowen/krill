@@ -484,10 +484,11 @@ impl Registry {
                 | krill_proto::mobile::FEAT_MOBILE)
             == 0
         {
+            let app = peer.pid.filter(|_| client.role == ipc::ClientRole::App);
             if n.features & FEAT_HOLDER_WATCH != 0 {
-                return self.watch.serve(s);
+                return self.watch.serve(s, app);
             }
-            return attach::watch(s);
+            return attach::watch(s, app);
         }
         // macOS는 닫힌 피어의 setsockopt를 EINVAL로 거부한다(OWE-487). 이미 받은 요청은 처리해야 한다.
         s.set_read_timeout(Some(if mobile {
@@ -1346,6 +1347,7 @@ impl Registry {
             .as_deref()
             .and_then(|d| crate::agent::claude::session_id(d, old));
         if let Some(s) = &stored
+            && c.cwd.is_empty()
             && !s.cwd.is_empty()
         {
             c.cwd.clone_from(&s.cwd);
@@ -1427,6 +1429,10 @@ impl Registry {
                 }
             },
         };
+        if let Some(store) = &self.store {
+            // holder Spawn 전에 연결을 남겨 데몬이 응답 전에 죽어도 이력을 잇는다.
+            store.inherit_history(session, old).map_err(|e| os(&e))?;
+        }
         let (session, pid) =
             self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows)?;
         let (has_old, exited_old) = {
@@ -1965,6 +1971,9 @@ impl Registry {
             }
             UsageRequest::Get => UsageReply::Current(accounts::primary_snapshot(&home, state_ref)),
             UsageRequest::ListAccounts => {
+                if role != Role::Observer {
+                    self.adopt_profile_names(&home, state_ref);
+                }
                 UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
             }
             UsageRequest::SwitchAccount {
@@ -2049,7 +2058,11 @@ impl Registry {
                     &label,
                     email,
                 ) {
-                    Ok(snap) => UsageReply::Accounts(snap),
+                    Ok(_) => {
+                        // 로그인 직후 이메일이 확인되는 시점이라 임시 이름 폴더를 바로 옮긴다.
+                        self.adopt_profile_names(&home, state_ref);
+                        UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+                    }
                     Err(e) => UsageReply::Failed(os(&e)),
                 }
             }
@@ -2082,6 +2095,16 @@ impl Registry {
             _ => {}
         }
         reply
+    }
+
+    /// 이메일이 확인된 임시 이름(`claude-code-profile-n`) 프로필 폴더를 이메일 이름으로 옮긴다.
+    /// 세션이 쓴 폴더는 건너뛴다. 실패는 기록만 하고 요청 응답에는 영향을 주지 않는다.
+    fn adopt_profile_names(&self, home: &Path, state: Option<&Path>) {
+        use crate::usage::accounts;
+        let in_use = self.profiles_in_use();
+        if let Err(error) = accounts::adopt_email_dirs(home, state, &in_use, &accounts::Keychain) {
+            tracing::debug!(kind = ?error.kind(), "profile rename unavailable");
+        }
     }
 
     /// 레지스트리에 남은 세션(실행·휴면·종료 표시 포함)이 실행에 쓴 계정 프로필 폴더(OWE-704).

@@ -240,7 +240,11 @@ fn hook_session_id_rejects_options_and_non_identifier_bytes() {
             "{id:?}"
         );
     }
-    c.record_hook_session(SessionId(1), br#"{"session_id":"_new-ID_123"}"#);
+    // 이벤트 이름 없는 훅은 묶인 대화를 바꾸지 못하므로 정당한 회전(SessionStart clear)으로 바꾼다.
+    c.record_hook_session(
+        SessionId(1),
+        br#"{"hook_event_name":"SessionStart","source":"clear","session_id":"_new-ID_123"}"#,
+    );
     assert_eq!(
         c.stored(SessionId(1))
             .unwrap()

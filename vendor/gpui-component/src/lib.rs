@@ -124,7 +124,7 @@ pub use virtual_list::{VirtualList, VirtualListScrollHandle, h_virtual_list, v_v
 pub use window_border::{WindowBorder, window_border, window_paddings};
 pub use window_ext::WindowExt;
 
-// Minikrill modification (OWE-459): track locale edits for incremental rebuilds.
+// Krill modification (OWE-459): track locale edits for incremental rebuilds.
 // The proc macro reads this file without emitting a Cargo dependency on it.
 const _: &str = include_str!("../locales/ui.yml");
 rust_i18n::i18n!("locales", fallback = "en");

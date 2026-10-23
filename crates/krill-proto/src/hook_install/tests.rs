@@ -238,7 +238,7 @@ fn incomplete_receipt_can_be_recovered_and_uninstall_preserves_later_user_change
 #[test]
 fn existing_opencode_plugin_is_an_already_exists_conflict_and_untouched() {
     let home = Home::new();
-    let plugin = home.0.join("minikrill.js");
+    let plugin = home.0.join("krill.js");
     fs::write(&plugin, "user plugin").unwrap();
     let error = Plan::prepare(
         Action::Install,

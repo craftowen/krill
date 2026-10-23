@@ -1,3 +1,9 @@
+// Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 창이 보이는데 디스플레이 링크 틱(`step`)이 1초 넘게 끊기면 경고를 남기고
+// 링크를 다시 시작한다. 거듭되면 그 디스플레이의 링크를 새로 만든다(`spawn_display_link_watchdog`).
+// Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 렌더러가 드로어블을 못 받아 프레임을 건너뛰면(`present_pending`) 다음
+// 디스플레이 틱에 `require_presentation`으로 다시 present한다.
+// Krill 변경(앱 멈춤, Apache-2.0 §4(b)): `displayLayer:`(즉시 그리기)·창 활성화 때 디스플레이 링크를 멈췄다 다시 켜지
+// 않는다. 같은 디스플레이를 이미 구독 중이면 `start_display_link`가 그대로 둔다(매번 CVDisplayLink 스레드가 새로 생겼다).
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -667,6 +673,12 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
+    // The last `draw` was not presented (the compositor held every drawable, or acquiring/rendering failed and
+    // is retried with backoff); present again on the next tick.
+    present_pending: bool,
+    // When the display link last delivered a frame tick, and how many stalls in a row the watchdog saw.
+    last_step_at: Option<std::time::Instant>,
+    link_stalls: u32,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -833,19 +845,22 @@ impl MacWindowState {
         }
     }
 
+    /// Subscribes to the link of the window's display, keeping a subscription that already matches
+    /// (`WindowFrameSource::start`). Call `stop_display_link` first to force a restart.
     fn start_display_link(&mut self) {
-        self.stop_display_link();
         unsafe {
             if !self
                 .native_window
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
+                self.stop_display_link();
                 return;
             }
         }
         let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
+            self.stop_display_link();
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
@@ -1107,6 +1122,9 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
+                present_pending: false,
+                last_step_at: None,
+                link_stalls: 0,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1150,6 +1168,7 @@ impl MacWindow {
                 sheet_parent: None,
             }));
             let mut window = Self(state, marker);
+            spawn_display_link_watchdog(&window.0);
 
             (*native_window).set_ivar(
                 WINDOW_STATE_IVAR,
@@ -2123,7 +2142,7 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        this.present_pending = !this.renderer.draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3197,8 +3216,8 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
+                // See `display_layer` for why the link keeps running.
                 lock.renderer.set_presents_with_transaction(true);
-                lock.stop_display_link();
                 drop(lock);
                 callback(RequestFrameOptions {
                     signal_at,
@@ -3323,8 +3342,10 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        // No stop/start around this frame: ticks reach `step` on the main queue, so none can
+        // interleave with it anyway, and restarting the link spawned a new CVDisplayLink thread per
+        // call. `start_display_link` still resubscribes a window whose link was lost.
         lock.renderer.set_presents_with_transaction(true);
-        lock.stop_display_link();
         drop(lock);
         callback(RequestFrameOptions {
             signal_at,
@@ -3339,10 +3360,91 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
+/// How often the watchdog looks at a window's frame ticks, and how long a visible window may go
+/// without one. gpui only draws from display-link ticks (plus one-off `displayLayer:` draws), so a
+/// link that silently stopped (failed start while not yet visible, no screen during reconfiguration,
+/// or a CVDisplayLink that stops calling back) leaves the window frozen while input still arrives.
+const LINK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const LINK_STALL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a visible window has gone without a frame tick, if that counts as a stall.
+/// Hidden windows are expected to have no link; their clock restarts once they are shown again.
+fn link_stall(
+    visible: bool,
+    main_was_busy: bool,
+    last_step_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    if !visible {
+        *last_step_at = None;
+        return None;
+    }
+    let quiet = now.saturating_duration_since(*last_step_at.get_or_insert(now));
+    (!main_was_busy && quiet >= LINK_STALL).then_some(quiet)
+}
+
+fn spawn_display_link_watchdog(state: &Arc<Mutex<MacWindowState>>) {
+    let weak = Arc::downgrade(state);
+    let (foreground, background) = {
+        let lock = state.lock();
+        (
+            lock.foreground_executor.clone(),
+            lock.background_executor.clone(),
+        )
+    };
+    foreground
+        .spawn(async move {
+            let mut last_check = std::time::Instant::now();
+            loop {
+                background.timer(LINK_CHECK_INTERVAL).await;
+                let Some(state) = weak.upgrade() else { return };
+                let now = std::time::Instant::now();
+                // A late check means the main thread itself was busy, which also delays ticks.
+                let main_was_busy =
+                    now.duration_since(last_check) > LINK_CHECK_INTERVAL + LINK_CHECK_INTERVAL / 2;
+                last_check = now;
+                let mut lock = state.lock();
+                let visible = unsafe {
+                    lock.native_window
+                        .occlusionState()
+                        .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+                };
+                let Some(stalled) =
+                    link_stall(visible, main_was_busy, &mut lock.last_step_at, now)
+                else {
+                    continue;
+                };
+                lock.link_stalls += 1;
+                let display = display_id_for_screen(unsafe { lock.native_window.screen() });
+                let subscribed = lock
+                    .frame_source
+                    .as_ref()
+                    .is_some_and(WindowFrameSource::is_running);
+                log::warn!(
+                    "display link stalled for {}ms (stall #{}, subscribed: {subscribed}, display: {display:?}); restarting",
+                    stalled.as_millis(),
+                    lock.link_stalls,
+                );
+                if lock.link_stalls >= 2
+                    && let Some(display) = display
+                {
+                    crate::display_link::recreate_display_link(display).log_err();
+                }
+                lock.stop_display_link();
+                lock.start_display_link();
+                // Give the restarted link a full window before judging it again.
+                lock.last_step_at = Some(now);
+            }
+        })
+        .detach();
+}
+
 extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    lock.last_step_at = Some(std::time::Instant::now());
+    lock.link_stalls = 0;
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         let (signal_at, signal_source) = lock
@@ -3353,8 +3455,10 @@ extern "C" fn step(view: *mut c_void) {
                 (None, FrameRequestSource::NativeCallback),
                 |(at, source)| (Some(at), source),
             );
+        let require_presentation = mem::take(&mut lock.present_pending);
         drop(lock);
         callback(RequestFrameOptions {
+            require_presentation,
             signal_at,
             signal_source,
             ..Default::default()
@@ -3959,6 +4063,31 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_stall_only_flags_visible_windows_after_a_quiet_second() {
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut last = None;
+        assert_eq!(
+            link_stall(true, false, &mut last, t0),
+            None,
+            "first sight starts the clock"
+        );
+        assert_eq!(link_stall(true, false, &mut last, t0 + ms(900)), None);
+        assert_eq!(
+            link_stall(true, true, &mut last, t0 + ms(1500)),
+            None,
+            "a busy main thread delays ticks too"
+        );
+        assert_eq!(
+            link_stall(true, false, &mut last, t0 + ms(1500)),
+            Some(ms(1500))
+        );
+        assert_eq!(link_stall(false, false, &mut last, t0 + ms(9000)), None);
+        assert_eq!(last, None, "hidden windows reset the clock");
+        assert_eq!(link_stall(true, false, &mut last, t0 + ms(9500)), None);
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {

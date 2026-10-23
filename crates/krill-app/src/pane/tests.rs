@@ -1364,3 +1364,92 @@ fn owe_842_cold_to_live_preserves_prior_scrollback_and_screen_above_new_session(
         vec![row("cold-hist1"), row("cold-hist2"), row("cold-scr1")]
     );
 }
+
+#[test]
+fn missing_recording_still_resumes_old_conversation_instead_of_creating_login_shell() {
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("reboot-no-recording-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = Paths {
+        socket: dir.join("k.sock"),
+        holder: dir.join("holder"),
+        krilld: dir.join("daemon"),
+    };
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: b"/new/cwd".to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    let expected = create.clone();
+    let server = std::thread::spawn(move || {
+        let hello = ipc::ServerHello {
+            proto_min: 1,
+            proto_max: 1,
+            features: FEAT_CONTROL | FEAT_COLD | FEAT_RESUME,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        let (mut watch, _) = listener.accept().unwrap();
+        watch.write_all(&hello.encode().unwrap()).unwrap();
+        ipc::read_frame(&mut watch).unwrap().unwrap();
+        drop(watch);
+        let (mut s, _) = listener.accept().unwrap();
+        s.write_all(&hello.encode().unwrap()).unwrap();
+        ipc::read_frame(&mut s).unwrap().unwrap();
+        for (expected_request, reply) in [
+            (Request::List, Reply::Sessions(Vec::new())),
+            (
+                Request::Cold {
+                    session: SessionId(7),
+                },
+                Reply::Failed(krill_proto::control::Failure::NoSession),
+            ),
+            (
+                Request::Resume {
+                    session: SessionId(7),
+                    create: expected,
+                },
+                Reply::Resumed {
+                    session: SessionId(8),
+                    pid: 300,
+                },
+            ),
+        ] {
+            let (k, b) = ipc::read_frame(&mut s).unwrap().unwrap();
+            assert_eq!(Request::decode(k, &b).unwrap(), expected_request);
+            s.write_all(&reply.encode().unwrap()).unwrap();
+        }
+    });
+    assert!(matches!(
+        ensure_session_in(&paths, Some(SessionId(7)), &create).unwrap(),
+        Found::Live(SessionId(8), true)
+    ));
+    server.join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn negotiated_resume_history_does_not_duplicate_temporary_prior() {
+    let mut p = Pane::<Vec<u8>>::default();
+    p.show_cold(
+        SessionId(7),
+        Cold {
+            screen: snapshot(["old", "", ""]),
+            history: vec![row("older")],
+        },
+    )
+    .unwrap();
+    p.link(
+        SessionId(8),
+        2,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::control::FEAT_RESUME_HISTORY,
+        Now::get(),
+    );
+    assert!(p.history.prior.is_empty());
+    assert!(!p.history.fixed);
+}

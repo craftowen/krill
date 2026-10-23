@@ -1,4 +1,4 @@
-// Minikrill 변경(OWE-665, Apache-2.0 §4(b)): 들여쓰기 안내선을 path 대신 사각형으로 그린다(editor/indent.rs).
+// Krill 변경(OWE-665, Apache-2.0 §4(b)): 들여쓰기 안내선을 path 대신 사각형으로 그린다(editor/indent.rs).
 use crate::input::{InputExtras as _, InputModeKind};
 use gpui::Corners;
 use gpui::Half;
@@ -2300,7 +2300,7 @@ pub(super) struct PrepaintState {
     range_decoration_fills: Vec<(Path<Pixels>, Hsla)>,
     range_decoration_frames: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
-    indent_guides: Vec<Bounds<Pixels>>, // Minikrill 변경(OWE-665): path 대신 사각형
+    indent_guides: Vec<Bounds<Pixels>>, // Krill 변경(OWE-665): path 대신 사각형
     /// The whole input, for deciding whether a long press started in it.
     hitbox: Hitbox,
     bounds: Bounds<Pixels>,
@@ -3118,7 +3118,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }
 
         // Paint indent guides
-        // Minikrill 변경(OWE-665): 안내선은 1px 사각형(quad)이라 경로 텍스처를 쓰지 않는다.
+        // Krill 변경(OWE-665): 안내선은 1px 사각형(quad)이라 경로 텍스처를 쓰지 않는다.
         let guide_color = editor_style.border.opacity(0.85);
         for guide in prepaint.indent_guides.drain(..) {
             window.paint_quad(gpui::fill(guide, guide_color));

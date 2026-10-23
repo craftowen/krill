@@ -96,7 +96,13 @@ fn start(executable: &Path, state_dir: &Path) -> Result<(), Error> {
         return Ok(());
     }
     #[cfg(target_os = "macos")]
-    crate::enable_launch_agent(executable, state_dir)?;
+    {
+        crate::enable_launch_agent(executable, state_dir)?;
+        // 테스트 훅으로 launchctl을 건너뛰면 서버가 뜨지 않으므로 기다리지 않는다.
+        if std::env::var_os("KRILL_LINK_SKIP_LAUNCHCTL").is_some() {
+            return Ok(());
+        }
+    }
     #[cfg(windows)]
     let mut child = {
         use std::os::windows::process::CommandExt as _;

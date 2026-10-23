@@ -249,3 +249,47 @@ fn manual_disconnect_blocks_retries_until_explicit_reconnect() {
         "reconnect allows a new tunnel attempt"
     );
 }
+
+/// 창마다 관리자가 따로 있어도 꺼진 기기 재시도 ssh는 프로세스에서 한 번만 돈다. '다시 연결'은 그 판정을 바로 푼다.
+#[test]
+fn offline_verdict_is_shared_across_managers_until_reconnect() {
+    let fake = FakeSsh::new("offline-shared", false);
+    let attempts = || {
+        fake.argv()
+            .lines()
+            .filter(|s| *s == "owen@studio.local")
+            .count()
+    };
+    let host = spec(Some("/tmp/remote.sock"));
+    let first = fake.manager();
+    let second = fake.manager();
+    first.sync_specs(std::slice::from_ref(&host));
+    second.sync_specs(std::slice::from_ref(&host));
+
+    first.slot("studio").unwrap().lock().unwrap().failures = OFFLINE_AFTER_FAILURES;
+    assert!(first.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(attempts(), 1);
+
+    // 새 창은 첫 시도를 한다: 그사이 기기가 켜졌을 수 있다.
+    assert!(second.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(
+        attempts(),
+        2,
+        "a fresh window tries once before trusting the verdict"
+    );
+    second.slot("studio").unwrap().lock().unwrap().next_retry_at = None;
+    let err = second.ensure_tunnel_socket("studio").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        attempts(),
+        2,
+        "after its own failure the window follows the shared verdict"
+    );
+    assert_eq!(second.status("studio"), HostStatus::Disconnected);
+    assert!(second.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(attempts(), 2);
+
+    second.reconnect_now("studio");
+    assert!(second.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(attempts(), 3, "explicit reconnect retries right away");
+}

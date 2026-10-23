@@ -831,3 +831,26 @@ fn mobile_attach_paces_continuous_updates() {
     drop(session);
     worker.join().unwrap().ok();
 }
+
+#[test]
+fn slow_record_warning_is_rate_limited_to_one_per_second() {
+    let t0 = Instant::now();
+    let slow = SLOW_RECORD + Duration::from_millis(1);
+    let mut last = None;
+    assert!(
+        !slow_record_due(&mut last, SLOW_RECORD, t0),
+        "100ms 이하는 경고하지 않는다"
+    );
+    assert!(slow_record_due(&mut last, slow, t0));
+    assert!(!slow_record_due(
+        &mut last,
+        slow,
+        t0 + Duration::from_millis(999)
+    ));
+    assert!(slow_record_due(
+        &mut last,
+        slow,
+        t0 + Duration::from_secs(1)
+    ));
+    assert_eq!(last, Some(t0 + Duration::from_secs(1)));
+}

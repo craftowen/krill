@@ -111,9 +111,17 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - 다크 모드 기본: `TERMINAL_DARK` = **`Krill Deep`** (`DEFAULT_TERMINAL_THEME_DARK`, 배경 `#10131b`, 전경 `#ffffff`, 커서 코랄 `#ff5238`, ANSI 16색은 Orca `Ghostty Default Style Dark` 그대로). 데몬이 앱 테마를 받기 전 색 질의(OSC 10/11/12/4)에 답하는 `krill_proto::theme::DEFAULT`와 같은 값이다 — 두 값이 어긋나면 에이전트가 실제와 다른 배경을 보고 색을 고른다. 배경이 어두워 OSC 11 응답은 계속 다크로 판정된다.
 - `TERMINAL_GHOSTTY_DARK`: Orca `Ghostty Default Style Dark`(배경 `#282c34`, 전경·커서 `#ffffff`). 내장 카탈로그에 선택지로 남긴다.
 - 라이트 모드 기본: `TERMINAL_LIGHT` (`DEFAULT_TERMINAL_THEME_LIGHT` = Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
-- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 고유 `Krill Deep` + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
+- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 고유 `Krill Deep` + Orca 내장 30종 + 앱 테마 짝 `Krill Abyss`·`Krill Tidepool`·`Krill Glow`·`Krill Paper`)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
 - 설정 화면의 테마 스와치·미리보기처럼 터미널 `Rgb` 색을 UI 요소에 입힐 때는 생 색상 대신 `ui::terminal_rgb_hsla(rgb)`를 쓴다.
 - 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
+
+### 3.5 앱 테마 (`DarkUiTheme` / `LightUiTheme`)
+
+- 앱 색 조합은 다크·라이트 모드마다 하나씩 고른다(설정 > 일반 > 모양 · 인터페이스의 `다크 테마`·`라이트 테마`, 설정 키 `ui_theme_dark`·`ui_theme_light`). 모드 선택(다크·라이트·시스템)은 그대로 `theme`이 맡는다.
+- 다크: `심해`(`DARK`, 기본) · `심연`(`ABYSS`, OLED 순수 검정·무채색 크롬) · `조수`(`TIDEPOOL`, 대비를 낮춘 청회색) · `발광`(`GLOW`, 검은 남색 + 시안). 라이트: `기본`(`LIGHT`) · `종이`(`PAPER`, 따뜻한 미색).
+- 테마는 `Palette` 값만 바꾼다. 반경·간격·글자 크기 상수는 모든 테마가 같다. 새 테마도 `Palette` 상수 하나와 짝 터미널 테마 하나로 추가하고, `text_tokens_meet_wcag_aa_on_every_surface` 목록에 넣어 대비를 고정한다.
+- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`DARK`·`LIGHT`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
+- 앱 테마를 바꿀 때 그 모드의 터미널 테마가 이전 앱 테마의 짝이면 새 짝으로 함께 바꾸고, 사용자가 다른 터미널 테마를 골라 두었으면 그대로 둔다(`Settings::set_ui_theme_dark`·`set_ui_theme_light`).
 
 ---
 
@@ -186,9 +194,9 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 | 변형 | 메서드 | 용도 |
 |---|---|---|
-| **Primary** | `ui::primary(id, label)` (`.small().primary()`) | 한 화면/대화상자 흐름 또는 카드 헤더의 대표 일괄 액션(생성, 저장, 승인, 전체 설치, 모두 자동 설정) 또는 세그먼트 토글의 활성 항목 |
+| **Primary** | `ui::primary(id, label)` (`.small().primary()`) | 한 화면/대화상자 흐름 또는 카드 헤더의 대표 일괄 액션(생성, 저장, 승인, 전체 설치, 모두 자동 설정). 세그먼트 활성 항목에는 쓰지 않는다(아래 §6.3) |
 | **Outline / Secondary** | `ui::secondary(id, label)` (`.small().outline()`) | 주 동작 옆의 보조 동작, 개별 행 액션(스킬 설치, 연결 테스트, 폴더 열기, 가져오기, 복사) 등 채움 버튼이 무거울 때 |
-| **Ghost** | `ui::ghost(id, label)` (`.small().ghost()`) | 아이콘 전용 툴바 버튼, 목록 행 부가 액션(초기화·해제), 비활성 세그먼트 항목, **취소(Cancel)·닫기(Close)·건너뛰기(Skip)** |
+| **Ghost** | `ui::ghost(id, label)` (`.small().ghost()`) | 아이콘 전용 툴바 버튼, 목록 행 부가 액션(초기화·해제), **취소(Cancel)·닫기(Close)·건너뛰기(Skip)** |
 | **Danger** | `.danger()` / `ui::danger_confirm(...)` | 삭제, 기록 지우기, 신뢰되지 않은 스크립트 강제 실행 등 되돌릴 수 없는 파괴적 동작. **절대 취소/닫기에 쓰지 않는다.** |
 
 - 버튼 크기는 주변 행 높이에 맞춘다(24~28px 툴바·상태바에는 `.xsmall()`, 설정 행에는 `.small()`, 모달 하단 주 동작에는 기본 크기).
@@ -212,7 +220,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 - **2열 설정 행**: `ui::row(p)` 안에 왼쪽 `ui::label(p, title, desc)`과 오른쪽 `ui::controls()`를 배치한다.
   - **불변식**: `ui::card`와 `ui::row`는 항상 `w_full().min_w_0()`을 가져 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에 부모 폭 밖으로 넘치지 않게 한다. `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생하며(OWE-651), 반대로 `flex_1().min_w_0()` 없이 긴 설명문을 넣으면 우측 버튼이 카드 테두리 밖으로 밀려 나간다(OWE-793).
 - **불리언 토글 스위치**: `ui::switch(p, id, checked, disabled, on_toggle)` — 켜기/끄기 불리언 설정은 2버튼 나열 대신 단일 알약 트랙(`SWITCH_WIDTH` × `SWITCH_HEIGHT`)과 원형 썸(`SWITCH_THUMB`) 스위치로 일관되게 표현한다.
-- **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다.
+- **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다. Orca `SettingsSegmentedControl`과 같게 트랙은 `background` 50% + `border` + `RADIUS_SM`, 활성 항목은 `accent` 바탕 + `accent_foreground` + `MEDIUM`, 비활성 항목은 바탕 없이 `muted_foreground` 글자다. 활성 항목을 `primary`(다크 모드 흰 채움)로 그리면 같은 화면의 주 동작 버튼과 무게가 겹치므로 금지한다. 선택지 라벨에 영어 괄호 병기(`끄기 (Off)`)를 붙이지 않는다.
 - **모달 입력 필드 라벨**: `ui::field_label(name, optional_suffix, p)` — `<Input>` 바로 위에 `gap_1`로 쌓는다.
 - **인라인 오류 배너**: `ui::error_banner(p, message)` — 모달이나 폼 안에서 실패 사유를 사용자가 읽고 재시도할 수 있게 고정 표시한다.
 - **단축키 칩**: `ui::keycap(p, keys)` — 단축키 표시가 필요한 곳에서는 개별 스타일을 만들지 않고 반드시 `ui::keycap`을 쓴다. 실제 플랫폼 바인딩(`⌘`, `⇧`, `⌥`, `⌃`)과 표기가 정확히 일치해야 한다.
@@ -263,7 +271,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 ### 7.1 미구현 기능 표시 금지 및 문구 과장 금지 (No Unimplemented Chrome or Overclaiming Copy)
 
-- **있는 기능만 표기한다**: Orca의 UI/UX를 참조하더라도 **Krill에 실제로 구현되어 동작하는 기능만 화면에 그린다.** 아직 없는 기능(예: 아티팩트, 스킬 마켓, 작업/칸반 보드, 미구현 자동화 탭, 동작하지 않는 플레이스홀더 버튼/단축키 칩)을 껍데기만 복사해 노출하는 것은 엄격히 금지한다.
+- **있는 기능만 표기한다**: Orca의 UI/UX를 참조하더라도 **Krill에 실제로 구현되어 동작하는 기능만 화면에 그린다.** 아직 없는 기능(예: 스킬 마켓, 작업/칸반 보드, 미구현 자동화 탭, 동작하지 않는 플레이스홀더 버튼/단축키 칩)을 껍데기만 복사해 노출하는 것은 엄격히 금지한다.
 - **조건부 노출**: 프로비저닝 설정이 켜져야만 성립하는 '다른 계정으로 이어가기'(`ui::status::continue_chip_visible`)나 데몬 기능 협상(`FEAT_*`)이 필요한 컨트롤은 해당 기능이 실제로 활성화된 상태에서만 노출한다.
 - **문구 정직성**: 코드가 실제 상태나 결과 데이터를 확인하기 전에는 "보호됨", "검증됨", "삭제됨", "적용 완료" 같은 결과 동사를 쓰지 않는다. 진행 중일 때는 중립적인 과정 문구를 쓰고, 실제 결과가 도착했을 때만 결과 문구를 표시한다.
 

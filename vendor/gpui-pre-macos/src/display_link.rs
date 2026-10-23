@@ -1,3 +1,5 @@
+// Krill 변경(앱 멈춤, Apache-2.0 §4(b)): 링크가 멈추면 디스플레이의 링크를 새로 만든다(`recreate_display_link`). 이미 같은
+// 디스플레이를 구독 중인 창의 `WindowFrameSource::start`는 구독을 유지한다(링크를 멈췄다 켜지 않는다).
 //! Frame pacing for macOS windows, built on `CVDisplayLink`.
 //!
 //! CVDisplayLink has no safe teardown: `CVDisplayLinkStop` merely flags the
@@ -293,6 +295,42 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     }
 }
 
+/// Replaces a display's link that stopped delivering callbacks while subscribed (kitty e4b4a353,
+/// "CVDisplayLink getting stuck"). The old link is stopped but deliberately leaked, never
+/// released: a straggler io-thread callback may still be reading it (see the module notes).
+pub fn recreate_display_link(display_id: CGDirectDisplayID) -> Result<()> {
+    debug_assert_main_thread();
+    // Created outside the registry lock; see the lock ordering note above.
+    let new_link = unsafe {
+        sys::DisplayLink::new(
+            display_id,
+            display_link_output_callback,
+            display_id as usize as *mut c_void,
+        )?
+    };
+    let (mut old_link, link_to_start) = {
+        let mut registry = lock_registry();
+        // A never-started `new_link` dropped here has no io thread, so releasing it is safe.
+        let Some(entry) = registry.displays.get_mut(&display_id) else {
+            return Ok(());
+        };
+        let old_link = std::mem::replace(&mut entry.link, new_link);
+        (old_link, entry.running.then(|| entry.link.clone()))
+    };
+    unsafe { old_link.stop().log_err() };
+    std::mem::forget(old_link);
+    if let Some(mut link) = link_to_start
+        && let Err(error) = unsafe { link.start() }
+    {
+        // Let the next `subscribe` start it again.
+        if let Some(entry) = lock_registry().displays.get_mut(&display_id) {
+            entry.running = false;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// A per-window source of frame requests, paced by the display the window is
 /// on. The wrapped dispatch source coalesces vsync ticks from the display's
 /// io thread and invokes `callback(data)` on the main queue.
@@ -325,12 +363,27 @@ impl WindowFrameSource {
         }
     }
 
+    /// Subscribes to `display_id`'s link. Already subscribed to it, this keeps the subscription:
+    /// with no other window on the display, unsubscribing would stop the link and resubscribing
+    /// start it again, which ends its io thread and spawns a new one and restarts its pacing (this
+    /// ran on every `displayLayer:`, i.e. every immediate draw). Call `stop` first to force that.
     pub fn start(&mut self, display_id: CGDirectDisplayID) -> Result<()> {
+        if self
+            .registration
+            .is_some_and(|(subscribed, _)| subscribed == display_id)
+        {
+            return Ok(());
+        }
         self.stop();
         let subscriber_id =
             subscribe(display_id, self.frame_requests.clone(), self.signal.clone())?;
         self.registration = Some((display_id, subscriber_id));
         Ok(())
+    }
+
+    /// Whether this window is subscribed to a display's link.
+    pub fn is_running(&self) -> bool {
+        self.registration.is_some()
     }
 
     pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {
@@ -579,6 +632,18 @@ mod tests {
                 received_at,
             );
         }
+    }
+
+    #[test]
+    fn starting_on_the_subscribed_display_keeps_the_subscription() {
+        extern "C" fn tick(_: *mut c_void) {}
+        let mut source = WindowFrameSource::new(std::ptr::null_mut(), tick);
+        source.registration = Some((7, SubscriberId(41)));
+        // Resubscribing would stop and restart display 7's link (and assert the main thread).
+        source.start(7).unwrap();
+        assert!(matches!(source.registration, Some((7, SubscriberId(41)))));
+        // Not registered for real, so dropping must not unsubscribe.
+        source.registration = None;
     }
 
     fn timestamp(host_time: u64) -> sys::CVTimeStamp {

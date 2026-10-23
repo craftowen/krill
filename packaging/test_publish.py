@@ -45,10 +45,14 @@ class PublishGuardTests(unittest.TestCase):
         (self.work / "packaging/release_check.py").write_text(
             "import os,sys\n"
             "if sys.argv[1] == 'target-dir': print('/Volumes/krill-build/targets/krill-publish')\n"
+            "elif sys.argv[1] == 'mobile-hash': print('0123456789abcdef')\n"
             "elif os.environ.get('FAKE_BINARY_PROOF_FAIL'): sys.exit(1)\n"
             "else: print('/validated/release/bin')\n")
         (self.work / "packaging/macos").mkdir(exist_ok=True)
         (self.work / "packaging/macos/smoke.py").write_text("# stub; actual packaged smoke is a native release gate\n")
+        # 실제 해석기는 홈의 키체인 별칭을 만들므로 경로 출력만 스텁한다(test_identity_paths가 검증).
+        (self.work / "packaging/macos/identity_paths.py").write_text(
+            "from pathlib import Path\nprint(Path.home() / 'Library/Keychains/krill-codesign.keychain-db')\n")
         (self.work / "packaging/bundle.sh").write_text("#!/bin/bash\nexit 1\n")
         (self.work / "docs/licensing").mkdir(parents=True)
         (self.work / "docs/licensing/generate_notices.py").write_text(
@@ -60,6 +64,9 @@ class PublishGuardTests(unittest.TestCase):
         bin_dir.mkdir()
         (bin_dir / "gh").write_text(FAKE_GH)
         (bin_dir / "gh").chmod(0o755)
+        # 모바일 PWA 고정 출처 확인만 스텁한다(manifest HTTP 상태).
+        (bin_dir / "curl").write_text('#!/bin/bash\nprintf %s "${FAKE_MOBILE:-200}"\n')
+        (bin_dir / "curl").chmod(0o755)
         # 실제 게시 락(/tmp/krill-publish.lock)은 건드리지 않는다.
         self.env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", KRILL_PUBLISH_LOCKED="1")
         self.env.pop("KRILL_PUBLISH_FORCE", None)
@@ -95,6 +102,10 @@ class PublishGuardTests(unittest.TestCase):
     def test_verified_binary_receipt_failure_is_not_an_overrideable_guard(self):
         self.assert_blocked(self.publish("--preflight", "--verified-release", "/receipt", FAKE_BINARY_PROOF_FAIL="1"),
                             "verified release receipt or tested binaries are invalid")
+
+    def test_undeployed_mobile_pwa_blocks(self):
+        self.assert_blocked(self.publish("--preflight", FAKE_MOBILE="404"),
+                            "mobile PWA 0123456789abcdef is not deployed")
 
     def test_existing_release_blocks(self):
         self.assert_blocked(self.publish("--preflight", FAKE_RELEASE="1"),

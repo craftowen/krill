@@ -330,11 +330,12 @@ impl Registry {
                     match result {
                         Ok(new) => handoff.to = Some(new),
                         Err(error) => {
-                            let reason = if error == Failure::Denied {
-                                "selected account login or credential scope could not be verified"
-                                    .to_owned()
-                            } else {
-                                error.to_string()
+                            let reason = match error {
+                                Failure::Denied => "selected account login or credential scope could not be verified".into(),
+                                Failure::Os(libc::EAGAIN) => "conversation identity is not bound; wait for the original agent's session-start hook or bind its exact conversation before retrying".into(),
+                                Failure::Os(libc::ENOENT) => "conversation transcript is missing; restore it in the original account profile before retrying".into(),
+                                Failure::Os(libc::EILSEQ) => "conversation transcript identity is ambiguous or mismatched; verify the original conversation and transcript before retrying".into(),
+                                _ => error.to_string(),
                             };
                             handoff.error = Some(format!(
                                 "Session {}: could not resume with selected account ({reason}); original session preserved",
@@ -440,42 +441,27 @@ impl Registry {
                 entry.session.tap().size().unwrap_or(super::FALLBACK_SIZE),
             )
         };
-        let resolved_sid = stored
-            .session_id
-            .clone()
-            .filter(|id| crate::agent::control::valid_session_id(id))
-            .or_else(|| {
-                crate::agent_history::chat::resolve_session_transcript(
-                    state_dir.as_deref(),
-                    &stored,
-                    &cwd,
-                )
-                .map(|(_, sid)| sid)
-                .filter(|id| crate::agent::control::valid_session_id(id))
-            });
+        // Cwd and recency identify a project, never a conversation. Even a single
+        // matching transcript can belong to another live pane in the same project.
+        let session_id =
+            transcript::session_id(provider, &stored).map_err(|error| prepare_failure(&error))?;
         // Preparation can fail. Until it succeeds the old process and PTY are untouched.
-        let resume_sid = if let Some(session_id) = resolved_sid.as_deref() {
-            let source = crate::agent::resume_account(
-                profile,
-                state_dir.as_deref(),
-                stored.account.as_ref(),
-                Some(session_id),
-            )
-            .unwrap_or_else(|| crate::agent::control::LaunchAccount {
-                id: accounts::host_default_id(provider),
-                env_key: provider.env_var().into(),
-                dir: String::new(),
-            });
-            match transcript::prepare(provider, home, &source, target, session_id, &cwd) {
-                Ok(()) => Some(session_id),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(prepare_failure(&e)),
-            }
-        } else {
-            None
-        };
-        // A profile change must never silently replace ongoing work with a fresh conversation.
-        let resume_sid = resume_sid.ok_or(Failure::BadRequest)?;
+        let source = crate::agent::resume_account(
+            profile,
+            state_dir.as_deref(),
+            stored.account.as_ref(),
+            Some(&session_id),
+        )
+        .unwrap_or_else(|| crate::agent::control::LaunchAccount {
+            id: accounts::host_default_id(provider),
+            env_key: provider.env_var().into(),
+            dir: String::new(),
+        });
+        // A profile change must never silently replace ongoing work with a fresh
+        // conversation, so a missing transcript fails the handoff.
+        let prepared_transcript =
+            transcript::prepare(provider, home, &source, target, &session_id, &cwd)
+                .map_err(|error| prepare_failure(&error))?;
         let new = self.next_id();
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
@@ -492,7 +478,7 @@ impl Registry {
             permission,
             new,
             state_dir.as_deref(),
-            Some(resume_sid),
+            Some(&session_id),
             account.as_ref(),
         )
         .map_err(|e| super::os(&e))?;
@@ -567,6 +553,25 @@ impl Registry {
         {
             self.close(peer, new).ok();
             return Err(Failure::BadRequest);
+        }
+        // The provider may have rejected the resume, the copied file may have vanished,
+        // or either agent may have moved to another conversation during startup. Keep
+        // the original; dropping `replacement` terminates only the new process.
+        prepared_transcript
+            .verify()
+            .map_err(|error| prepare_failure(&error))?;
+        for session in [old, new] {
+            let current = self
+                .agents
+                .stored(session)
+                .map_err(|error| super::os(&error))?
+                .ok_or(Failure::Os(libc::EILSEQ))?;
+            if transcript::session_id(provider, &current)
+                .map_err(|error| prepare_failure(&error))?
+                != session_id
+            {
+                return Err(Failure::Os(libc::EILSEQ));
+            }
         }
         // Publish completion and retire the old PTY only after persistence succeeds.
         if let Err(error) = self.commit_account_handoff(
@@ -651,6 +656,9 @@ fn prepare_failure(error: &std::io::Error) -> Failure {
     }
     Failure::Os(match error.kind() {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
+        ErrorKind::NotFound => libc::ENOENT,
+        ErrorKind::WouldBlock => libc::EAGAIN,
+        ErrorKind::InvalidData => libc::EILSEQ,
         ErrorKind::InvalidInput => libc::EINVAL,
         ErrorKind::AlreadyExists => libc::EEXIST,
         ErrorKind::FileTooLarge => libc::EFBIG,

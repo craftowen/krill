@@ -178,7 +178,11 @@ pub fn login_path(shell: &OsStr) -> Option<OsString> {
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        if let Some(chunk) = buf.get(..n) {
+                            out.extend_from_slice(chunk);
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         if std::time::Instant::now() >= deadline {
                             break;
@@ -432,10 +436,11 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
         return false;
     };
     let mut handled = false;
-    let mut i = handlers.len();
-    while i > 0 {
-        i -= 1;
-        match handlers[i](cmd, cx) {
+    for i in (0..handlers.len()).rev() {
+        let Some(handler) = handlers.get_mut(i) else {
+            continue;
+        };
+        match handler(cmd, cx) {
             Some(true) => {
                 handled = true;
                 break;

@@ -48,12 +48,17 @@ impl CliRunner {
     }
 
     fn json<T: serde::de::DeserializeOwned>(&self, args: &[OsString]) -> io::Result<T> {
-        let out = (self.0)(args)?;
+        let out = self.raw(args)?;
         serde_json::from_slice(&out).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    /// 표준출력 바이트 그대로(비0 종료라도 stdout이 있으면 그것). JSON 오류 봉투를 직접 읽을 때 쓴다.
+    pub(super) fn raw(&self, args: &[OsString]) -> io::Result<Vec<u8>> {
+        (self.0)(args)
+    }
+
     /// 스테이징된 `krill` 바이너리를 하위 프로세스로 실행한다.
-    fn process(bin: PathBuf, state_dir: Option<PathBuf>) -> Self {
+    pub(super) fn process(bin: PathBuf, state_dir: Option<PathBuf>) -> Self {
         Self::new(move |args| {
             let mut cmd = crate::platform::background_command(&bin);
             cmd.args(args)
@@ -708,7 +713,7 @@ impl SettingsView {
             p,
             pr_filters.iter().map(|&(mode, id_str, label)| {
                 let active = self.space.filter.pr_filter == mode;
-                layout::segment(id_str, label, active)
+                layout::segment(p, id_str, label, active)
                     .debug_selector(move || id_str.into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_cleanup_pr_filter(mode, cx);
@@ -757,7 +762,7 @@ impl SettingsView {
             idle_presets.iter().map(|&(preset, id_str, label)| {
                 let days = preset.days();
                 let active = self.space.filter.min_idle_days == days;
-                layout::segment(id_str, label, active)
+                layout::segment(p, id_str, label, active)
                     .debug_selector(move || id_str.into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_cleanup_idle_days(days, cx);

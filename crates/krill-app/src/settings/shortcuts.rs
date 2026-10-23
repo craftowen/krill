@@ -987,6 +987,7 @@ impl SettingsView {
                         p,
                         [
                             layout::segment(
+                                p,
                                 "sc-filter-all",
                                 text::SC_FILTER_ALL.get(),
                                 active_filter == ShortcutFilter::All,
@@ -996,6 +997,7 @@ impl SettingsView {
                                 this.set_shortcut_filter(ShortcutFilter::All, cx);
                             })),
                             layout::segment(
+                                p,
                                 "sc-filter-modified",
                                 text::SC_FILTER_MODIFIED.get(),
                                 active_filter == ShortcutFilter::Modified,

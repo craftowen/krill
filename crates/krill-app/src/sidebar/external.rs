@@ -1158,15 +1158,34 @@ static DETECTED_ICON_CACHE: LazyLock<Mutex<BTreeMap<IconProbeKey, IconProbeEntry
 static IN_FLIGHT_ICON_URLS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
-/// PNG·WebP·ICO 헤더인지 확인한다. 실제 이미지 디코딩은 gpui가 담당한다.
+/// 받기에 실패한 URL과 다시 시도할 시각. 사이드바 스냅샷은 2초마다 아이콘을 다시 풀므로, 이게 없으면 실패한 URL마다
+/// 2초 주기로 `curl`을 띄운다. 네트워크 오류는 곧 풀릴 수 있어 짧게, 이미지가 아닌 응답은 길게 쉰다.
+#[cfg(not(test))]
+static FAILED_ICON_URLS: LazyLock<Mutex<BTreeMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(not(test))]
+const ICON_RETRY_AFTER_NETWORK_ERROR: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(not(test))]
+const ICON_RETRY_AFTER_INVALID_IMAGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// PNG·JPEG·WebP·ICO 헤더인지 확인한다. 실제 이미지 디코딩은 gpui가 담당한다(내용으로 형식을 고르므로
+/// 캐시 파일 확장자가 `.png`여도 된다). GitHub 아바타(`github.com/<owner>.png`)는 실제로 JPEG를 돌려준다.
 #[must_use]
 pub fn has_valid_icon_bytes(bytes: &[u8]) -> bool {
     let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
-    let is_webp = bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP";
+    let is_jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    let is_webp = bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && bytes.get(8..).is_some_and(|tail| tail.starts_with(b"WEBP"));
     let is_ico = bytes.len() >= 6
         && bytes.starts_with(&[0, 0, 1, 0])
-        && u16::from_le_bytes([bytes[4], bytes[5]]) > 0;
-    is_png || is_webp || is_ico
+        && bytes
+            .get(4)
+            .zip(bytes.get(5))
+            .is_some_and(|(&lo, &hi)| u16::from_le_bytes([lo, hi]) > 0);
+    is_png || is_jpeg || is_webp || is_ico
 }
 
 fn has_valid_icon_magic(path: &Path) -> bool {
@@ -1183,14 +1202,14 @@ fn has_valid_icon_magic(path: &Path) -> bool {
     let Ok(n) = file.read(&mut header) else {
         return false;
     };
-    has_valid_icon_bytes(&header[..n])
+    header.get(..n).is_some_and(has_valid_icon_bytes)
 }
 
 fn short_sha256_hex(input: &str) -> String {
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(input.as_bytes());
     let mut out = String::with_capacity(16);
-    for &b in &digest[..8] {
+    for &b in digest.as_slice().iter().take(8) {
         use std::fmt::Write as _;
         write!(&mut out, "{b:02x}").ok();
     }
@@ -1303,9 +1322,15 @@ fn resolve_or_fetch_remote_icon(
     #[cfg(not(test))]
     {
         let clean_url = url.trim().to_owned();
-        let should_spawn = IN_FLIGHT_ICON_URLS
-            .lock()
-            .is_ok_and(|mut set| set.insert(clean_url.clone()));
+        let recently_failed = FAILED_ICON_URLS.lock().is_ok_and(|mut failed| {
+            let now = std::time::Instant::now();
+            failed.retain(|_, retry_at| *retry_at > now);
+            failed.contains_key(&clean_url)
+        });
+        let should_spawn = !recently_failed
+            && IN_FLIGHT_ICON_URLS
+                .lock()
+                .is_ok_and(|mut set| set.insert(clean_url.clone()));
         if should_spawn {
             std::thread::spawn(move || {
                 let out = std::process::Command::new("/usr/bin/curl")
@@ -1321,10 +1346,18 @@ fn resolve_or_fetch_remote_icon(
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
                     .output();
-                if let Ok(out) = out
-                    && out.status.success()
+                let retry_after = match out {
+                    Ok(out) if out.status.success() => {
+                        write_cached_icon_bytes(&target, &out.stdout)
+                            .err()
+                            .map(|_| ICON_RETRY_AFTER_INVALID_IMAGE)
+                    }
+                    _ => Some(ICON_RETRY_AFTER_NETWORK_ERROR),
+                };
+                if let Some(wait) = retry_after
+                    && let Ok(mut failed) = FAILED_ICON_URLS.lock()
                 {
-                    write_cached_icon_bytes(&target, &out.stdout).ok();
+                    failed.insert(clean_url.clone(), std::time::Instant::now() + wait);
                 }
                 if let Ok(mut set) = IN_FLIGHT_ICON_URLS.lock() {
                     set.remove(clean_url.as_str());
@@ -2212,7 +2245,7 @@ mod tests {
             std::process::id()
         ));
         let sidebar = dir.join("sidebar.bin");
-        let full = "/tmp/minikrill-review";
+        let full = "/tmp/krill-review";
         let store = WorktreeStore {
             comments: BTreeMap::from([("/repo/comment-only".to_owned(), "Review me".to_owned())]),
             statuses: BTreeMap::from([
@@ -2250,8 +2283,7 @@ mod tests {
             Some("REVIEW #128 OWE-626 links 2")
         );
         assert_eq!(
-            checkpoint_badge_for(Some(&sidebar), Path::new("/private/tmp/minikrill-review"))
-                .as_deref(),
+            checkpoint_badge_for(Some(&sidebar), Path::new("/private/tmp/krill-review")).as_deref(),
             Some("REVIEW #128 OWE-626 links 2")
         );
         for (path, badge) in [
@@ -2271,7 +2303,7 @@ mod tests {
             "/repo/invalid",
             "/repo/unread",
             "/repo/wip",
-            "/tmp/minikrill-review/child",
+            "/tmp/krill-review/child",
         ] {
             assert_eq!(checkpoint_badge_for(Some(&sidebar), Path::new(path)), None);
         }
@@ -2587,7 +2619,7 @@ fn orca_project_icon_detection_and_visual_meta_resolution() {
     fs::remove_dir_all(&base).ok();
     let state_dir = base.join("state");
     let repo_local_icon = base.join("aasoft-client");
-    let repo_github = base.join("minikrill");
+    let repo_github = base.join("krill");
     let folder_drive = base.join("gdrive");
     fs::create_dir_all(&state_dir).unwrap();
     fs::create_dir_all(repo_local_icon.join("public")).unwrap();
@@ -2609,7 +2641,7 @@ fn orca_project_icon_detection_and_visual_meta_resolution() {
     fs::write(
         repo_github.join(".git/config"),
         r#"[remote "origin"]
-	url = git@github.com:craftowen/minikrill.git
+	url = git@github.com:craftowen/krill.git
 "#,
     )
     .unwrap();
@@ -2646,7 +2678,7 @@ kind = "git"
 [[projects]]
 id = "p-gh"
 path = "{}"
-display_name = "minikrill"
+display_name = "krill"
 kind = "git"
 
 [[projects]]
@@ -2675,7 +2707,7 @@ kind = "folder"
     assert_eq!(v_local.icon, Some(ProjectIcon::Image(logo_path)));
 
     let v_gh = visuals.get(&repo_github).unwrap();
-    assert_eq!(v_gh.display_name.as_deref(), Some("minikrill"));
+    assert_eq!(v_gh.display_name.as_deref(), Some("krill"));
     assert_eq!(v_gh.icon, Some(ProjectIcon::Image(cached_gh)));
 
     let v_folder = visuals.get(&folder_drive).unwrap();

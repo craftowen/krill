@@ -529,11 +529,7 @@ fn render_popover_usage_detail(
                         .debug_selector(move || percent_selector.clone())
                         .font_family(ui::FONT_MONO)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(krill_app::settings::usage_color(
-                            display.percent.unwrap_or(0),
-                            p.foreground,
-                            p,
-                        ))
+                        .text_color(p.foreground)
                         .child(display.text),
                 ),
         )
@@ -606,7 +602,6 @@ fn render_popover_usage_row(
         i64::try_from(krill_app::accounts::display::now()).unwrap_or(i64::MAX),
     );
     let pct = display.percent.unwrap_or(0);
-    let bar_color = krill_app::settings::usage_color(pct, brand_color, p);
     let debug_sel = selector.clone();
     let detail = render_popover_usage_detail(window_label, &selector, win, p);
 
@@ -631,7 +626,7 @@ fn render_popover_usage_row(
                         .h_full()
                         .w(gpui::relative(f32::from(pct) / 100.0))
                         .rounded_full()
-                        .bg(bar_color),
+                        .bg(brand_color),
                 ),
         )
 }
@@ -690,19 +685,96 @@ fn expanded_account_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> Str
     )
 }
 
-fn compact_status_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> String {
-    let now_signed = i64::try_from(now).unwrap_or(i64::MAX);
-    let window = [usage.five_hour.as_ref(), usage.seven_day.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|w| {
-            krill_app::accounts::display::window(Some(w), now_signed)
-                .percent
-                .map(|pct| (pct, w))
+/// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간. `short`면 가장 큰 단위만(`9h 3m` → `9h`).
+fn status_window_parts(
+    win: Option<&krill_proto::usage::Window>,
+    now: u64,
+    short: bool,
+) -> (Option<u8>, Option<String>) {
+    let Some(win) = win else {
+        return (None, None);
+    };
+    let reset = win
+        .resets_at
+        .as_deref()
+        .map(|ts| krill_app::settings::classify_reset(ts, now));
+    match reset {
+        Some(krill_app::settings::ResetDue::Stale) => (None, Some("now".into())),
+        Some(krill_app::settings::ResetDue::Future(left)) => {
+            let full = status_reset_duration(left);
+            let reset = if short {
+                full.split(' ').next().unwrap_or_default().to_owned()
+            } else {
+                full
+            };
+            (Some(win.percent.min(100)), Some(reset))
+        }
+        _ => (Some(win.percent.min(100)), None),
+    }
+}
+
+/// 상태바 한 기간 칸: 막대 + 사용률 + 리셋. 모르면 빈 막대와 "—"(0%로 꾸미지 않음, OWE-703).
+fn status_window_segment(
+    win: Option<&krill_proto::usage::Window>,
+    now: u64,
+    short: bool,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let (pct, reset) = status_window_parts(win, now, short);
+    let bar = if short {
+        ui::SPACE_4
+    } else {
+        ui::SPACE_4 + ui::SPACE_2
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .w(bar)
+                .h(ui::SPACE_1)
+                .rounded_full()
+                .overflow_hidden()
+                .bg(p.muted)
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(f32::from(pct.unwrap_or(0)) / 100.))
+                        .bg(pct.map_or(p.muted, |_| p.muted_foreground)),
+                ),
+        )
+        .child(
+            div()
+                .text_color(pct.map_or(p.muted_foreground, |_| p.foreground))
+                .child(pct.map_or_else(|| "—".to_owned(), |pct| format!("{pct}%"))),
+        )
+        .children(reset.map(|r| div().text_color(p.muted_foreground).child(r)))
+}
+
+/// 5시간·주간 밖 한도(모델별 풀 등)가 경고 수준이고 보이는 두 기간보다 높으면 그 이름과 사용률.
+fn status_hot_meter(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+    now: u64,
+) -> Option<(String, u8)> {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let shown = [
+        account.usage.five_hour.as_ref(),
+        account.usage.seven_day.as_ref(),
+    ]
+    .into_iter()
+    .filter_map(|w| krill_app::accounts::display::window(w, now).percent)
+    .max()
+    .unwrap_or(0);
+    snap.meters_for(&account.id)?
+        .meters
+        .iter()
+        .filter_map(|m| {
+            let pct = krill_app::accounts::display::window(m.window.as_ref(), now).percent?;
+            (pct >= krill_proto::usage::WARN_PERCENT && pct > shown).then(|| (m.label.clone(), pct))
         })
-        .max_by_key(|(pct, _)| *pct)
-        .map(|(_, w)| w);
-    status_window_label(window, now)
+        .max_by_key(|(_, pct)| *pct)
 }
 
 fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) -> bool {
@@ -737,7 +809,8 @@ fn append_reset_credit_rows(
     reset_armed: Option<&(ProviderKind, String)>,
     weak: &WeakEntity<Shell>,
 ) -> PopupMenu {
-    if provider != ProviderKind::Codex {
+    // Codex banked reset와 Claude 주간 세션 리셋·프로모션 grant가 같은 행을 쓴다.
+    if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return menu;
     }
     let Some(account) = active else {
@@ -848,6 +921,13 @@ fn append_reset_credit_rows(
         );
     }
     menu
+}
+
+/// 상태바 메뉴는 바 위로 열고(Orca처럼 하단바를 가리지 않음), 창 위쪽 여백까지만
+/// 자라며 넘치면 스크롤한다. 앵커가 넘친 메뉴를 창 안으로 밀어 올리며 바를 덮지 않게 한다.
+fn fit_above_status_bar(menu: PopupMenu, window: &Window) -> PopupMenu {
+    let room = window.viewport_size().height - ui::STATUS_BAR_HEIGHT - ui::SPACE_4 * 2.;
+    menu.max_h(room.max(ui::SPACE_4 * 8.)).scrollable(true)
 }
 
 fn provider_usage_menu(
@@ -1659,26 +1739,14 @@ impl Shell {
                     now,
                 )
             });
-            let compact_label = percent.map_or_else(|| "—".to_owned(), |pct| format!("{pct}%"));
             let expanded_label = active
                 .map(|a| expanded_account_usage(&a.usage, now))
                 .unwrap_or_default();
-            let label = if expanded {
-                expanded_label.clone()
+            let hot = active.and_then(|a| status_hot_meter(&snap, a, now));
+            let color = if percent.is_some() {
+                p.foreground
             } else {
-                active
-                    .filter(|a| !a.usage.is_empty())
-                    .map_or(compact_label, |a| compact_status_usage(&a.usage, now))
-            };
-            let color = match percent {
-                _ if status.as_ref().is_some_and(|s| {
-                    s.status == krill_proto::usage::AccountStatus::RateLimited
-                }) =>
-                {
-                    p.warning
-                }
-                Some(pct) => krill_app::settings::usage_color(pct, p.foreground, p),
-                None => p.muted_foreground,
+                p.muted_foreground
             };
             let selector = format!("status-provider-pill-{}", provider.as_str());
             let debug_selector = selector.clone();
@@ -1707,36 +1775,43 @@ impl Shell {
                 if expanded { "expanded" } else { "compact" },
                 provider.as_str()
             );
+            // 프로바이더마다 5시간·주간 막대 쌍과 각 사용률·리셋(하단바 B안). 좁으면 막대를
+            // 줄이고 리셋을 가장 큰 단위 하나로 접는다.
+            let short = !expanded;
+            let usage = active.map(|a| a.usage.clone()).unwrap_or_default();
             let pill_btn = pill_btn
                 .accessibility_label(description.clone())
                 .child(ui::icons::provider_icon(provider, ui::ICON_SM, color))
-                .when(expanded && percent.is_some(), |button| {
-                    button.child(
-                        div()
-                            .w(ui::SPACE_4 * 2.)
-                            .h(ui::SPACE_1)
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(p.muted)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(f32::from(percent.unwrap_or(0)) / 100.))
-                                    .bg(color),
-                            ),
-                    )
-                })
                 .child(
                     div()
                         .debug_selector(move || detail_selector.clone())
-                        .child(label),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(status_window_segment(
+                            usage.five_hour.as_ref(),
+                            now,
+                            short,
+                            p,
+                        ))
+                        .child(status_window_segment(
+                            usage.seven_day.as_ref(),
+                            now,
+                            short,
+                            p,
+                        ))
+                        .children(hot.map(|(label, pct)| {
+                            div()
+                                .text_color(p.foreground)
+                                .child(format!("{label} {pct}%"))
+                        })),
                 );
             let reset_armed = self.reset_armed.clone();
             provider_pills = provider_pills.child(
                 ui::button_with_tooltip_when(tooltips_on, pill_btn, selector, description)
-                    .dropdown_menu(move |menu, window, cx| {
+                    .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, cx| {
                         provider_usage_menu(
-                            menu,
+                            fit_above_status_bar(menu, window),
                             &provider_snap,
                             provider,
                             weak.clone(),
@@ -1785,8 +1860,10 @@ impl Shell {
             "status-ssh-switcher",
             ssh_tooltip,
         )
-        .dropdown_menu(move |mut menu, _, _| {
-            menu = menu.min_w(px(240.)).label(text::SSH_MENU_TITLE.get());
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, move |mut menu, window, _| {
+            menu = fit_above_status_bar(menu, window)
+                .min_w(px(240.))
+                .label(text::SSH_MENU_TITLE.get());
             for host in &ssh_hosts {
                 let item_label = format!("{} ({})", host.label, host.destination);
                 let host = host.clone();
@@ -1839,11 +1916,13 @@ impl Shell {
             "status-orchestration-menu",
             orch_tooltip,
         )
-        .dropdown_menu({
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, {
                 let weak = cx.weak_entity();
                 let state_dir = state_dir.clone();
-                move |mut menu, _, _| {
-                    menu = menu.min_w(px(300.)).label(text::ORCH_MENU_TITLE.get());
+                move |mut menu, window, _| {
+                    menu = fit_above_status_bar(menu, window)
+                        .min_w(px(300.))
+                        .label(text::ORCH_MENU_TITLE.get());
                     // OWE-652: Run이 하나도 없으면 빈 상태 안내를 보인다.
                     if !orch_has_content(&orch_store) {
                         menu = menu.item(PopupMenuItem::new(text::ORCH_EMPTY.get()).disabled(true));
@@ -2100,8 +2179,10 @@ impl Shell {
             "status-ports-menu",
             ports_tooltip,
         )
-        .dropdown_menu(move |mut menu, _, _| {
-            menu = menu.min_w(px(240.)).label(text::PORTS_MENU_TITLE.get());
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, move |mut menu, window, _| {
+            menu = fit_above_status_bar(menu, window)
+                .min_w(px(240.))
+                .label(text::PORTS_MENU_TITLE.get());
             if detected_ports.is_empty() {
                 menu = menu.item(PopupMenuItem::new(text::PORTS_EMPTY.get()).disabled(true));
             } else {

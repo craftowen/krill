@@ -1,6 +1,6 @@
 # Mobile UI third-party notices
 
-## Orca mobile UI — MIT
+## Orca mobile UI MIT
 
 Mobile UI tokens and derived assets adapted from Orca. Original license:
 
@@ -29,7 +29,7 @@ SOFTWARE.
 
 ```
 
-## jsQR — Apache-2.0
+## jsQR Apache-2.0
 
 `crates/krilld/src/mobile/assets/qr.js`는 [jsQR](https://github.com/cozmo/jsQR) 1.4.0(npm `jsqr@1.4.0`, `dist/jsQR.js`)을 수정한 사본이다. 라이선스는 Apache License 2.0이다. 수정 사항: Shift-JIS(Kanji) 변환표를 빈 객체로 바꿨다(페어링 QR은 byte 모드라 쓰지 않는다). esbuild 0.28로 축소했다. 파일 머리에 출처·라이선스·변경 고지를 남겼다. PWA는 이 파일을 QR 스캔이 필요할 때만 불러온다(BarcodeDetector가 없는 iOS Safari 등). jsQR 패키지에는 NOTICE 파일이 없다.
 

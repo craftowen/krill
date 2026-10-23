@@ -56,6 +56,13 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    --agent <configured-profile> --cwd "<absolute-directory>" --prompt "<assignment>" --json`.
    Use distinct worker names across active Runs. `--account <id>` is optional;
    `--preamble full|minimal|none` controls instructions. Keep `full` for new workers.
+   A new worker is a new session; it does not create a new worktree by default.
+   Create a child worktree only when the user requests one or parallel code edits
+   would conflict in the same checkout/files. Use `--worktree new-child --name <name>`;
+   the enclosing worktree of `--cwd` (default: current directory) becomes its parent.
+   Example: `KRILL orchestration worker-start --run <run-id> --task <task-id> --worktree new-child --name <name> --agent <configured-profile> --prompt "<assignment>" --json`.
+   The base defaults to the parent branch. See [placement-and-remote](references/placement-and-remote.md)
+   for setup approval, explicit base selection, and remote limits.
    Do not pass Orca's `--model`, `--effort`, or `--retry-of`: Krill does not implement them.
 5. Inspect `task-list --run <run-id> --json`, `worker-list --run <run-id> --json`,
    and bounded `worker-read <dispatch-id> --lines 60 --json`. Wait with

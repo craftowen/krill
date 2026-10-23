@@ -12,17 +12,18 @@ use krill_proto::os::net::UnixStream;
 
 #[test]
 fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_old() {
-    for (fail, cancel, automatic, missing_transcript) in [
-        (false, false, false, false),
-        (true, false, false, false),
-        (false, true, false, false),
-        (false, false, true, false),
-        (true, false, true, false),
-        (true, false, true, true),
-        (true, false, false, true),
+    for (fail, cancel, automatic, missing_transcript, missing_copy) in [
+        (false, false, false, false, false),
+        (true, false, false, false, false),
+        (false, true, false, false, false),
+        (false, false, true, false, false),
+        (true, false, true, false, false),
+        (true, false, true, true, false),
+        (true, false, false, true, false),
+        (false, false, false, false, true),
     ] {
         let root = Path::new("/tmp").join(format!(
-            "kas-{}-{fail}-{cancel}-{automatic}-{missing_transcript}",
+            "kas-{}-{fail}-{cancel}-{automatic}-{missing_transcript}-{missing_copy}",
             std::process::id()
         ));
         fs::remove_dir_all(&root).ok();
@@ -150,17 +151,30 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                     &[master.as_fd()],
                 )
                 .unwrap();
+            if missing_copy {
+                fs::remove_file(
+                    expected_home.join(format!("sessions/2026/10/20/rollout-date-{sid}.jsonl")),
+                )
+                .unwrap();
+            }
             process.write_all(b"resumed selected account\r\n").unwrap();
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
             else {
                 panic!("expected old process retirement after new output");
             };
-            assert_eq!(old, if cancel { id } else { SessionId(7) });
+            assert_eq!(
+                old,
+                if cancel || missing_copy {
+                    id
+                } else {
+                    SessionId(7)
+                }
+            );
             holder_link
                 .send(&FromHolder::Done { req }.encode().unwrap(), &[])
                 .unwrap();
-            if !cancel {
+            if !cancel && !missing_copy {
                 process
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -218,7 +232,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 "in-flight cancellation must not rebind the original"
             );
             assert!(!lock(&reg.state).closing.contains(&SessionId(7)));
-        } else if fail {
+        } else if fail || missing_copy {
             let result = saved.get(&SessionId(7)).unwrap();
             assert!(result.to.is_none());
             assert!(result.error.is_some());
@@ -245,91 +259,165 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
 }
 
 #[test]
-fn switch_without_transcript_preserves_original_session() {
-    let root = Path::new("/tmp").join(format!("kas-fresh-{}", std::process::id()));
-    fs::remove_dir_all(&root).ok();
-    let state = root.join("state");
-    let home = root.join("home");
-    let from = root.join("from");
-    let to = root.join("to");
-    fs::create_dir_all(&state).unwrap();
-    fs::create_dir_all(&from).unwrap();
-    fs::create_dir_all(&to).unwrap();
-    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
-    let snap = accounts::add_account(
-        &home,
-        Some(&state),
-        ProviderKind::Codex,
-        "Selected",
-        None,
-        to.to_str().unwrap(),
-    )
-    .unwrap();
-    let target = snap
-        .accounts
-        .iter()
-        .find(|a| a.label == "Selected")
-        .unwrap()
-        .id
-        .clone();
-    accounts::switch_account(&home, Some(&state), ProviderKind::Codex, &target).unwrap();
-
-    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
-    let holder_link = Link::new(OwnedFd::from(holder_end));
-    for message in [
-        FromHolder::Hello {
-            version: VERSION,
-            holder_pid: 1,
-            inbox: false,
-        },
-        FromHolder::Ready,
+fn switch_without_verified_identity_or_transcript_preserves_original_session() {
+    for case in [
+        "absent",
+        "single-cwd-match",
+        "ambiguous-cwd",
+        "bound-missing",
+        "bound-mismatched",
+        "duplicate-id",
     ] {
-        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
-    }
-    let (master, _old_process) = UnixStream::pair().unwrap();
-    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
-    let reg = Arc::new(Registry::new(
-        Some((
-            holder,
-            vec![Kept {
-                id: SessionId(9),
-                pid: 900,
-                status: None,
-                master: OwnedFd::from(master),
-            }],
-        )),
-        Some(&state),
-    ));
-    reg.agents
-        .remember_session(
-            SessionId(9),
-            &AgentLaunch {
-                profile: "codex".into(),
-                permission: Permission::Yolo,
-            },
+        let root = Path::new("/tmp").join(format!("kas-preserve-{}-{case}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let home = root.join("home");
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(from.join("sessions/2026/10/20")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+        let snapshot = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Selected",
             None,
-            root.as_os_str().as_encoded_bytes().to_vec(),
-            Some(LaunchAccount {
-                id: "codex-old".into(),
-                env_key: "CODEX_HOME".into(),
-                dir: from.display().to_string(),
-            }),
+            to.to_str().unwrap(),
         )
         .unwrap();
-    let reader = Arc::clone(&reg);
-    let reader_worker =
-        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
-    reg.queue_account_switch(ProviderKind::Codex, &target);
-    reg.process_account_work_in(&home);
-    let saved = load(Some(&state));
-    let result = saved.get(&SessionId(9)).unwrap();
-    assert!(result.to.is_none());
-    assert!(result.error.is_some());
-    assert!(!lock(&reg.state).closing.contains(&SessionId(9)));
-    drop(holder_link);
-    reader_worker.join().unwrap();
-    drop(reg);
-    fs::remove_dir_all(root).unwrap();
+        let target = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.label == "Selected")
+            .unwrap()
+            .id
+            .clone();
+        let sid = "bound-conversation";
+        let cwd = root.as_os_str().as_encoded_bytes().to_vec();
+        let write_transcript = |name: &str, identity: &str| {
+            let path = from.join(format!("sessions/2026/10/20/rollout-{name}.jsonl"));
+            fs::write(path, format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{identity}\",\"cwd\":{:?}}}}}\n", root.to_str().unwrap())).unwrap();
+        };
+        if matches!(case, "single-cwd-match" | "ambiguous-cwd") {
+            write_transcript("unrelated-one", "unrelated-one");
+        }
+        if case == "ambiguous-cwd" {
+            write_transcript("unrelated-two", "unrelated-two");
+        }
+        if case == "bound-mismatched" {
+            write_transcript(sid, "unrelated-conversation");
+        }
+        if case == "duplicate-id" {
+            write_transcript(&format!("one-{sid}"), sid);
+            write_transcript(&format!("two-{sid}"), sid);
+        }
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut observer = holder_end.try_clone().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (master, mut old_process) = UnixStream::pair().unwrap();
+        let (holder, _link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: SessionId(9),
+                    pid: 900,
+                    status: None,
+                    master: OwnedFd::from(master),
+                }],
+            )),
+            Some(&state),
+        );
+        reg.agents
+            .remember_session(
+                SessionId(9),
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                case.starts_with("bound-")
+                    .then(|| sid.to_owned())
+                    .or_else(|| (case == "duplicate-id").then(|| sid.to_owned())),
+                cwd,
+                Some(LaunchAccount {
+                    id: "codex-old".into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: from.display().to_string(),
+                }),
+            )
+            .unwrap();
+        let launch_path = state.join("agent-launches/9.json");
+        let original_launch = fs::read(&launch_path).unwrap();
+        old_process
+            .write_all(b"original history before handoff\r\n")
+            .unwrap();
+        reg.queue_account_switch(ProviderKind::Codex, &target);
+        reg.process_account_work_in(&home);
+        let saved = load(Some(&state));
+        let handoff = saved.get(&SessionId(9)).unwrap();
+        assert!(handoff.to.is_none(), "{case}");
+        let error = handoff.error.as_deref().unwrap();
+        assert!(
+            error.contains("original session preserved"),
+            "{case}: {error}"
+        );
+        assert!(error.contains("before retrying"), "{case}: {error}");
+        assert!(!lock(&reg.state).closing.contains(&SessionId(9)));
+        assert!(!lock(&reg.state).exited.contains_key(&SessionId(9)));
+        assert_eq!(fs::read(&launch_path).unwrap(), original_launch, "{case}");
+        assert!(!state.join(PREPARED_FILE).exists());
+        assert_eq!(
+            fs::read_dir(state.join(PREPARED_DIR)).map_or(0, Iterator::count),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(state.join("agent-launches")).unwrap().count(),
+            1
+        );
+        let error = observer.read(&mut [0]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "no Spawn or Terminate on failure: {case}"
+        );
+        old_process
+            .write_all(b"original process still running\r\n")
+            .unwrap();
+        let tap = lock(&reg.state)
+            .sessions
+            .get(&SessionId(9))
+            .unwrap()
+            .session
+            .tap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while tap.pulse().end < 65 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!tap.pulse().closed);
+        assert!(
+            tap.pulse().end >= 65,
+            "old PTY continues capturing history: {case}"
+        );
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

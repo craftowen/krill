@@ -125,9 +125,12 @@ impl Shell {
                         ),
                     };
                     // State-dependent warnings and errors remain readable until
-                    // resolved or dismissed. Summaries use the stack's 5s timer;
-                    // the reconnected source clears after RECONNECTED_FOR.
-                    let note = note.autohide(matches!(kind, Kind::Away | Kind::Reconnected));
+                    // resolved or dismissed. One-shot notices and summaries use the
+                    // stack's 5s timer; the reconnected source clears after RECONNECTED_FOR.
+                    let note = note.autohide(matches!(
+                        kind,
+                        Kind::Notice | Kind::Away | Kind::Reconnected
+                    ));
                     let marker = kind.key();
                     let note = note.content(move |_, _, _| {
                         div()

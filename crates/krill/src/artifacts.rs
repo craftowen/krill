@@ -2,6 +2,8 @@
 //!
 //! Orca `orca artifacts` CLI를 본뜬다. HTTP 크레이트를 늘리지 않으려고 `curl`을 자식 프로세스로 부른다.
 //! 토큰이 `ps`에 보이지 않게 헤더는 0600 임시 파일(`-H @file`)로, 본문은 stdin으로 넘긴다.
+//! `share`·`update`는 기기 단위 공개 게이트([`krill_proto::artifacts::sharing_enabled`], 기본 꺼짐)가
+//! 켜져 있을 때만 동작한다. `--json`이면 실패도 `{"error":{"code","message"}}`로 stdout에 낸다.
 
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::BTreeMap;
@@ -14,6 +16,10 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+use krill_proto::artifacts::{
+    self as schema, ErrorDetail, ErrorOutput, LinkStatus, SHARING_DISABLED_CODE,
+    SHARING_DISABLED_NEXT_STEPS,
+};
 use krill_proto::daemon;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,6 +28,7 @@ const USAGE: &str =
     "usage: krill artifacts share <file> [--title <title>] [--api-url <url>] [--json]
        krill artifacts update <file> [--title <title>] [--api-url <url>] [--json]
        krill artifacts unshare <file> [--api-url <url>] [--json]
+       krill artifacts status <file> [--api-url <url>] [--json]
        krill artifacts list [--cursor <cursor>] [--api-url <url>] [--json]
        krill artifacts delete|rm <slug> [--api-url <url>] [--json]";
 const DEFAULT_API_URL: &str = "https://share.krill.page";
@@ -60,6 +67,39 @@ struct Opts {
 enum Error {
     Usage(String),
     Fail(String),
+    /// 기계가 읽는 코드가 붙은 실패.
+    Coded {
+        code: String,
+        message: String,
+        next_steps: Option<&'static str>,
+    },
+}
+
+impl Error {
+    fn coded(code: &str, message: impl Into<String>) -> Self {
+        Self::Coded {
+            code: code.to_owned(),
+            message: message.into(),
+            next_steps: None,
+        }
+    }
+
+    fn detail(self) -> ErrorDetail {
+        let (code, message, next_steps) = match self {
+            Self::Usage(m) => ("invalid_argument".to_owned(), m, None),
+            Self::Fail(m) => ("failed".to_owned(), m, None),
+            Self::Coded {
+                code,
+                message,
+                next_steps,
+            } => (code, message, next_steps.map(str::to_owned)),
+        };
+        ErrorDetail {
+            code,
+            message,
+            next_steps,
+        }
+    }
 }
 
 impl From<io::Error> for Error {
@@ -81,20 +121,40 @@ pub fn run(raw: &[OsString]) -> ExitCode {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_API_URL.to_owned()),
     };
+    let as_json = raw.iter().any(|a| a == "--json");
     match execute(&ctx, raw) {
         Ok(out) => {
             println!("{out}");
             ExitCode::SUCCESS
         }
-        Err(Error::Usage(msg)) => {
-            eprintln!("{msg}");
-            ExitCode::from(2)
-        }
-        Err(Error::Fail(msg)) => {
-            eprintln!("krill artifacts: {msg}");
-            ExitCode::FAILURE
+        Err(e) => {
+            let code = if matches!(e, Error::Usage(_)) {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            };
+            if as_json {
+                println!("{}", error_json(e));
+            } else {
+                match e {
+                    Error::Usage(msg) => eprintln!("{msg}"),
+                    e => {
+                        let d = e.detail();
+                        eprintln!("krill artifacts: {}", d.message);
+                        if let Some(next) = d.next_steps {
+                            eprintln!("{next}");
+                        }
+                    }
+                }
+            }
+            code
         }
     }
+}
+
+fn error_json(e: Error) -> String {
+    serde_json::to_string(&ErrorOutput { error: e.detail() })
+        .unwrap_or_else(|_| r#"{"error":{"code":"failed","message":"serialize"}}"#.to_owned())
 }
 
 fn default_curl() -> OsString {
@@ -129,8 +189,10 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
         .unwrap_or(&ctx.api_url)
         .trim_end_matches('/')
         .to_owned();
-    if !(api.starts_with("https://") || api.starts_with("http://")) {
-        return Err(Error::Usage(format!("invalid --api-url: {api}")));
+    if !valid_api_origin(&api) {
+        return Err(Error::Usage(format!(
+            "invalid --api-url: {api} (https origin, or http://127.0.0.1 / http://localhost)"
+        )));
     }
     let one = |what: &str| match opts.positional.as_slice() {
         [v] => Ok(v.clone()),
@@ -140,6 +202,7 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
         "share" => share(ctx, &api, &one("file")?, &opts, false),
         "update" => share(ctx, &api, &one("file")?, &opts, true),
         "unshare" => unshare(ctx, &api, &one("file")?, &opts),
+        "status" => status(ctx, &api, &one("file")?, &opts),
         "list" | "ls" if opts.positional.is_empty() => list(ctx, &api, &opts),
         "delete" | "rm" => delete(ctx, &api, &one("slug")?, &opts),
         _ => Err(Error::Usage(USAGE.into())),
@@ -169,6 +232,27 @@ fn parse(rest: &[String]) -> Result<Opts, Error> {
     Ok(opts)
 }
 
+/// 토큰이 평문으로 새지 않게 https origin만, 개발용으로 루프백 http만 허용한다. 경로·자격증명·쿼리는 거부.
+fn valid_api_origin(api: &str) -> bool {
+    let (rest, loopback_only) = if let Some(r) = api.strip_prefix("https://") {
+        (r, false)
+    } else if let Some(r) = api.strip_prefix("http://") {
+        (r, true)
+    } else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains(['/', '@', '?', '#', ' ']) {
+        return false;
+    }
+    let host = rest
+        .rsplit_once(':')
+        .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(rest, |(h, _)| h);
+    !loopback_only
+        || host.eq_ignore_ascii_case("localhost")
+        || matches!(host, "127.0.0.1" | "[::1]")
+}
+
 fn share(
     ctx: &Ctx,
     api: &str,
@@ -176,14 +260,22 @@ fn share(
     opts: &Opts,
     update_only: bool,
 ) -> Result<String, Error> {
+    if !schema::sharing_enabled(&ctx.state_dir) {
+        return Err(Error::Coded {
+            code: SHARING_DISABLED_CODE.to_owned(),
+            message: "artifact sharing is disabled on this device".to_owned(),
+            next_steps: Some(SHARING_DISABLED_NEXT_STEPS),
+        });
+    }
     let (key, body) = read_artifact(file, opts.title.as_deref())?;
     let token = owner_token(&ctx.state_dir)?;
     let mut shares = load_shares(&ctx.state_dir)?;
     let existing = shares.get(&key).filter(|r| r.api_origin == api).cloned();
     if update_only && existing.is_none() {
-        return Err(Error::Fail(format!(
-            "{file} has not been shared to {api}; run `krill artifacts share` first"
-        )));
+        return Err(Error::coded(
+            "not_shared",
+            format!("{file} has not been shared to {api}; run `krill artifacts share` first"),
+        ));
     }
     if let Some(rec) = existing {
         let url = format!("{api}/v1/artifacts/{}", rec.slug);
@@ -239,7 +331,10 @@ fn unshare(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Erro
     let key = canonical(file)?;
     let mut shares = load_shares(&ctx.state_dir)?;
     let Some(rec) = shares.get(&key).filter(|r| r.api_origin == api).cloned() else {
-        return Err(Error::Fail(format!("{file} has not been shared to {api}")));
+        return Err(Error::coded(
+            "not_shared",
+            format!("{file} has not been shared to {api}"),
+        ));
     };
     let token = owner_token(&ctx.state_dir)?;
     let url = format!("{api}/v1/artifacts/{}", rec.slug);
@@ -251,6 +346,28 @@ fn unshare(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Erro
     shares.remove(&key);
     save_shares(&ctx.state_dir, &shares)?;
     Ok(deleted_output(&rec.slug, opts.json))
+}
+
+/// 네트워크 없이 로컬 공유 기록만 본다(에이전트·스크립트가 링크 유무와 게이트 상태를 확인할 때 쓴다).
+fn status(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Error> {
+    let key = canonical(file)?;
+    let shares = load_shares(&ctx.state_dir)?;
+    let rec = shares.get(&key).filter(|r| r.api_origin == api);
+    let st = LinkStatus {
+        shared: rec.is_some(),
+        sharing_enabled: schema::sharing_enabled(&ctx.state_dir),
+        slug: rec.map(|r| r.slug.clone()),
+        share_url: rec.map(|r| r.share_url.clone()),
+        expires_at: rec.map(|r| r.expires_at.clone()).filter(|s| !s.is_empty()),
+    };
+    if opts.json {
+        return serde_json::to_string(&st).map_err(|e| Error::Fail(e.to_string()));
+    }
+    Ok(match (&st.share_url, st.sharing_enabled) {
+        (Some(url), _) => url.clone(),
+        (None, true) => "not shared".to_owned(),
+        (None, false) => "not shared (sharing disabled)".to_owned(),
+    })
 }
 
 fn list(ctx: &Ctx, api: &str, opts: &Opts) -> Result<String, Error> {
@@ -363,9 +480,10 @@ fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, String), Er
         "html" | "htm" => "text/html",
         "md" | "markdown" => "text/markdown",
         _ => {
-            return Err(Error::Usage(format!(
-                "{file}: only .html, .htm, .md, .markdown files can be shared"
-            )));
+            return Err(Error::coded(
+                "unsupported",
+                format!("{file}: only .html, .htm, .md, .markdown files can be shared"),
+            ));
         }
     };
     let meta = fs::metadata(path)?;
@@ -373,9 +491,16 @@ fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, String), Er
         return Err(Error::Fail(format!("{file}: not a regular file")));
     }
     if meta.len() > MAX_BYTES {
-        return Err(Error::Fail(format!("{file}: larger than 2 MiB")));
+        return Err(Error::coded(
+            "too_large",
+            format!("{file}: larger than 2 MiB"),
+        ));
     }
-    let content = fs::read_to_string(path).map_err(|e| Error::Fail(format!("{file}: {e}")))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| Error::coded("unreadable", format!("{file}: {e}")))?;
+    if content.trim().is_empty() {
+        return Err(Error::coded("empty", format!("{file}: file is empty")));
+    }
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -555,9 +680,13 @@ fn expect_ok(status: u16, resp: &str) -> Result<Value, Error> {
         return Ok(v);
     }
     let code = v["code"].as_str().unwrap_or(resp.trim());
-    Err(Error::Fail(format!(
-        "server returned HTTP {status}: {code}"
-    )))
+    let machine = v["code"]
+        .as_str()
+        .map_or_else(|| format!("http_{status}"), str::to_owned);
+    Err(Error::coded(
+        &machine,
+        format!("server returned HTTP {status}: {code}"),
+    ))
 }
 
 fn percent_encode(s: &str) -> String {
@@ -594,16 +723,16 @@ done
 { echo "$method $url"; cat "$hdr"; } >> "$dir/log"
 [ "$method" = POST ] || [ "$method" = PUT ] && cat > "$dir/body"
 case "$method $url" in
-  "POST http://mock/v1/artifacts")
-    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://mock/a/s1","editToken":"e1"}\n201' ;;
-  "PUT http://mock/v1/artifacts/s1")
-    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-02"},"shareUrl":"http://mock/a/s1"}\n200' ;;
-  "PUT http://mock/v1/artifacts/gone")
+  "POST http://localhost/v1/artifacts")
+    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://localhost/a/s1","editToken":"e1"}\n201' ;;
+  "PUT http://localhost/v1/artifacts/s1")
+    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-02"},"shareUrl":"http://localhost/a/s1"}\n200' ;;
+  "PUT http://localhost/v1/artifacts/gone")
     printf '{"code":"not_found"}\n404' ;;
-  "DELETE http://mock/v1/artifacts/"*)
+  "DELETE http://localhost/v1/artifacts/"*)
     printf '\n204' ;;
-  "GET http://mock/v1/artifacts"*)
-    printf '{"artifacts":[{"artifact":{"slug":"s1","title":"T","expiresAt":"x"},"shareUrl":"http://mock/a/s1"}],"nextCursor":"c2"}\n200' ;;
+  "GET http://localhost/v1/artifacts"*)
+    printf '{"artifacts":[{"artifact":{"slug":"s1","title":"T","expiresAt":"x"},"shareUrl":"http://localhost/a/s1"}],"nextCursor":"c2"}\n200' ;;
   *) printf '{"code":"not_found"}\n404' ;;
 esac
 "#;
@@ -625,8 +754,9 @@ esac
             let ctx = Ctx {
                 state_dir: dir.join("state"),
                 curl: curl.into_os_string(),
-                api_url: "http://mock/".into(),
+                api_url: "http://localhost/".into(),
             };
+            schema::enable_sharing(&ctx.state_dir).unwrap();
             Self { dir, ctx }
         }
 
@@ -666,7 +796,7 @@ esac
         let f = env.file("r.md", "# hi");
         assert_eq!(
             env.run(&["share", &f, "--title", "Report"]).unwrap(),
-            "http://mock/a/s1"
+            "http://localhost/a/s1"
         );
         let body: Value =
             serde_json::from_str(&fs::read_to_string(env.dir.join("body")).unwrap()).unwrap();
@@ -686,7 +816,7 @@ esac
                 rec.edit_token.as_str(),
                 rec.api_origin.as_str()
             ),
-            ("s1", "e1", "http://mock")
+            ("s1", "e1", "http://localhost")
         );
         assert!(
             env.log()
@@ -698,7 +828,7 @@ esac
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["change"], "updated");
         assert_eq!(v["expiresAt"], "2026-11-02");
-        assert!(env.log().contains("PUT http://mock/v1/artifacts/s1\n"));
+        assert!(env.log().contains("PUT http://localhost/v1/artifacts/s1\n"));
         assert!(env.log().contains("x-krill-edit-token: e1"));
 
         let out = env.run(&["update", &f, "--json"]).unwrap();
@@ -721,14 +851,14 @@ esac
         let stale = Record {
             slug: "gone".into(),
             edit_token: "old".into(),
-            share_url: "http://mock/a/gone".into(),
-            api_origin: "http://mock".into(),
+            share_url: "http://localhost/a/gone".into(),
+            api_origin: "http://localhost".into(),
             expires_at: String::new(),
         };
         save_shares(&env.ctx.state_dir, &Shares::from([(key.clone(), stale)])).unwrap();
-        assert_eq!(env.run(&["share", &f]).unwrap(), "http://mock/a/s1");
-        assert!(env.log().contains("PUT http://mock/v1/artifacts/gone"));
-        assert!(env.log().contains("POST http://mock/v1/artifacts"));
+        assert_eq!(env.run(&["share", &f]).unwrap(), "http://localhost/a/s1");
+        assert!(env.log().contains("PUT http://localhost/v1/artifacts/gone"));
+        assert!(env.log().contains("POST http://localhost/v1/artifacts"));
         assert_eq!(env.shares()[&key].slug, "s1");
     }
 
@@ -736,15 +866,17 @@ esac
     fn update_and_unshare_require_record_for_same_origin() {
         let env = Env::new("norecord");
         let f = env.file("r.md", "x");
-        assert!(matches!(env.run(&["update", &f]), Err(Error::Fail(_))));
+        assert!(
+            matches!(env.run(&["update", &f]), Err(Error::Coded { code, .. }) if code == "not_shared")
+        );
         env.run(&["share", &f]).unwrap();
         assert!(matches!(
-            env.run(&["update", &f, "--api-url", "http://other"]),
-            Err(Error::Fail(_))
+            env.run(&["update", &f, "--api-url", "http://127.0.0.1"]),
+            Err(Error::Coded { code, .. }) if code == "not_shared"
         ));
         assert!(matches!(
-            env.run(&["unshare", &f, "--api-url", "http://other"]),
-            Err(Error::Fail(_))
+            env.run(&["unshare", &f, "--api-url", "http://127.0.0.1"]),
+            Err(Error::Coded { code, .. }) if code == "not_shared"
         ));
     }
 
@@ -760,7 +892,7 @@ esac
         );
         assert!(
             env.log()
-                .contains("DELETE http://mock/v1/artifacts/s1\nAuthorization: Bearer ")
+                .contains("DELETE http://localhost/v1/artifacts/s1\nAuthorization: Bearer ")
         );
         assert!(env.log().ends_with("x-krill-edit-token: e1\n"));
         assert!(env.shares().is_empty());
@@ -772,11 +904,11 @@ esac
         let out = env.run(&["list", "--cursor", "a b="]).unwrap();
         assert!(
             env.log()
-                .contains("GET http://mock/v1/artifacts?cursor=a%20b%3D")
+                .contains("GET http://localhost/v1/artifacts?cursor=a%20b%3D")
         );
         assert_eq!(
             out,
-            "s1  T  http://mock/a/s1  expires x\nnext: krill artifacts list --cursor c2"
+            "s1  T  http://localhost/a/s1  expires x\nnext: krill artifacts list --cursor c2"
         );
         let v: Value = serde_json::from_str(&env.run(&["list", "--json"]).unwrap()).unwrap();
         assert_eq!(v["nextCursor"], "c2");
@@ -790,7 +922,7 @@ esac
         assert_eq!(env.run(&["rm", "s1"]).unwrap(), "deleted s1");
         let log = env.log();
         let last = log.rsplit("DELETE").next().unwrap();
-        assert!(last.starts_with(" http://mock/v1/artifacts/s1\nAuthorization: Bearer "));
+        assert!(last.starts_with(" http://localhost/v1/artifacts/s1\nAuthorization: Bearer "));
         assert!(last.ends_with("x-krill-edit-token: e1\n"));
         assert!(env.shares().is_empty());
         let out = env.run(&["delete", "other", "--json"]).unwrap();
@@ -824,7 +956,34 @@ esac
     fn rejects_bad_input() {
         let env = Env::new("bad");
         let txt = env.file("r.txt", "x");
-        assert!(matches!(env.run(&["share", &txt]), Err(Error::Usage(_))));
+        assert!(
+            matches!(env.run(&["share", &txt]), Err(Error::Coded { code, .. }) if code == "unsupported")
+        );
+        let empty = env.file("e.md", " \n");
+        assert!(
+            matches!(env.run(&["share", &empty]), Err(Error::Coded { code, .. }) if code == "empty")
+        );
+        for bad in [
+            "http://example.com",
+            "https://share.krill.page/v1",
+            "https://u:p@share.krill.page",
+            "https://x?y",
+            "https://",
+        ] {
+            assert!(
+                matches!(env.run(&["list", "--api-url", bad]), Err(Error::Usage(_))),
+                "{bad}"
+            );
+        }
+        for ok in [
+            "https://share.krill.page",
+            "http://127.0.0.1:8787",
+            "http://localhost",
+            "http://LOCALHOST:1",
+            "http://[::1]:9",
+        ] {
+            assert!(valid_api_origin(ok), "{ok}");
+        }
         assert!(matches!(env.run(&[]), Err(Error::Usage(_))));
         assert!(matches!(env.run(&["share"]), Err(Error::Usage(_))));
         assert!(matches!(
@@ -847,7 +1006,7 @@ esac
             .unwrap();
         assert!(matches!(
             env.run(&["share", big.to_str().unwrap()]),
-            Err(Error::Fail(_))
+            Err(Error::Coded { code, .. }) if code == "too_large"
         ));
         assert!(env.log().is_empty());
         assert!(
@@ -855,6 +1014,88 @@ esac
                 .unwrap()
                 .contains("krill artifacts share")
         );
+    }
+
+    #[test]
+    fn sharing_gate_blocks_share_and_update_but_not_cleanup() {
+        let env = Env::new("gate");
+        let f = env.file("r.md", "x");
+        env.run(&["share", &f]).unwrap();
+        schema::disable_sharing(&env.ctx.state_dir).unwrap();
+        for cmd in ["share", "update"] {
+            let Err(e) = env.run(&[cmd, &f, "--json"]) else {
+                panic!("{cmd} must be blocked");
+            };
+            let v: Value = serde_json::from_str(&error_json(e)).unwrap();
+            assert_eq!(v["error"]["code"], SHARING_DISABLED_CODE);
+            assert!(
+                v["error"]["nextSteps"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Do not retry")
+            );
+        }
+        assert_eq!(env.log().matches("POST ").count(), 1);
+        assert_eq!(env.log().matches("PUT ").count(), 0);
+        env.run(&["list"]).unwrap();
+        let st: LinkStatus =
+            serde_json::from_str(&env.run(&["status", &f, "--json"]).unwrap()).unwrap();
+        assert!(st.shared && !st.sharing_enabled);
+        env.run(&["unshare", &f]).unwrap();
+        assert!(env.shares().is_empty());
+    }
+
+    #[test]
+    fn status_reads_local_record_without_network() {
+        let env = Env::new("status");
+        let f = env.file("r.html", "<p>x</p>");
+        let st: LinkStatus =
+            serde_json::from_str(&env.run(&["status", &f, "--json"]).unwrap()).unwrap();
+        assert_eq!(
+            st,
+            LinkStatus {
+                sharing_enabled: true,
+                ..LinkStatus::default()
+            }
+        );
+        assert_eq!(env.run(&["status", &f]).unwrap(), "not shared");
+        assert!(env.log().is_empty());
+        env.run(&["share", &f]).unwrap();
+        let st: LinkStatus =
+            serde_json::from_str(&env.run(&["status", &f, "--json"]).unwrap()).unwrap();
+        assert_eq!(st.slug.as_deref(), Some("s1"));
+        assert_eq!(st.share_url.as_deref(), Some("http://localhost/a/s1"));
+        assert_eq!(st.expires_at.as_deref(), Some("2026-11-01"));
+        // 다른 서버 기록은 공유 안 됨으로 본다.
+        let other: LinkStatus = serde_json::from_str(
+            &env.run(&["status", &f, "--json", "--api-url", "http://127.0.0.1"])
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!other.shared);
+    }
+
+    #[test]
+    fn server_errors_carry_machine_code() {
+        let env = Env::new("servererr");
+        let f = env.file("r.md", "x");
+        let key = canonical(&f).unwrap();
+        let rec = Record {
+            slug: "gone".into(),
+            edit_token: "old".into(),
+            share_url: String::new(),
+            api_origin: "http://localhost".into(),
+            expires_at: String::new(),
+        };
+        save_shares(&env.ctx.state_dir, &Shares::from([(key, rec)])).unwrap();
+        let Err(e) = env.run(&["update", &f]) else {
+            panic!("update of lost artifact must fail");
+        };
+        assert_eq!(e.detail().code, "not_found");
+        let Err(e) = env.run(&["share", "--bogus"]) else {
+            panic!("bad flag");
+        };
+        assert_eq!(e.detail().code, "invalid_argument");
     }
 }
 

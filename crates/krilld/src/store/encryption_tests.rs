@@ -295,9 +295,6 @@ fn keychain_roundtrip_in_isolated_child() {
 #[test]
 #[ignore = "keychain_roundtrip_in_isolated_child가 HOME 오버레이로 실행한다"]
 fn keychain_child() {
-    use sha2::{Digest as _, Sha256};
-    use std::os::unix::ffi::OsStrExt as _;
-
     let Some(root) = std::env::var_os(CHILD_ROOT).map(PathBuf::from) else {
         return;
     };
@@ -328,36 +325,8 @@ fn keychain_child() {
         .unwrap();
     assert!(Key::load_from(&root, true, &lost).is_err());
     assert!(
-        lost.find_generic_password("com.minikrill.segment-key.v2", "nonexistent")
+        lost.find_generic_password("com.krill.segment-key.v2", "nonexistent")
             .is_err()
-    );
-    // A legacy master key is copied byte-for-byte, never regenerated, even
-    // when encrypted data already exists. Old binaries can still read it.
-    let account = format!(
-        "{:x}",
-        Sha256::digest(root.canonicalize().unwrap().as_os_str().as_bytes())
-    );
-    lost.add_generic_password("com.minikrill.segment-key.v2", &account, &[7; 32])
-        .unwrap();
-    let migrated = Key::load_from(&root, true, &lost).unwrap();
-    let (copied, _) = lost
-        .find_generic_password("com.krill.segment-key.v2", &account)
-        .unwrap();
-    assert_eq!(copied.as_ref(), &[7; 32]);
-    assert!(
-        lost.find_generic_password("com.minikrill.segment-key.v2", &account)
-            .is_ok()
-    );
-    let (mut stream, salt) = Stream::create(&migrated, b"legacy key").unwrap();
-    let mut body = b"still readable".to_vec();
-    stream.seal(&mut body).unwrap();
-    let reopened = Key::load_from(&root, true, &lost).unwrap();
-    assert_eq!(
-        Stream::open(&reopened, b"legacy key", &salt)
-            .unwrap()
-            .decrypt(&mut body)
-            .unwrap(),
-        b"still readable"
     );
     drop((keychain, lost));
     assert!(

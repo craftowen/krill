@@ -14,7 +14,7 @@ pub struct ServeOptions {
     pub state_dir: PathBuf,
     /// 로컬 `krilld.sock` 경로 (생략 시 `<state_dir>/run/krilld.sock`).
     pub krilld_socket: Option<PathBuf>,
-    /// 짝짓기 속도 제한기 (생략 시 기본값).
+    /// 페어링 속도 제한기 (생략 시 기본값).
     pub rate_limiter: Option<Arc<PairRateLimiter>>,
 }
 

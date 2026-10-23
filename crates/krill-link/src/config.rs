@@ -66,7 +66,7 @@ impl fmt::Display for RelaySetting {
 pub struct LinkConfig {
     /// 중계 서버 모드 (기본 `RelaySetting::N0`).
     pub relay: RelaySetting,
-    /// 서버 이름 (짝짓기 시 클라이언트에 돌려줄 표시 이름).
+    /// 서버 이름 (페어링 시 클라이언트에 돌려줄 표시 이름).
     pub server_name: Option<String>,
     /// 고정 바인드 UDP 포트 (생략 시 이전 포트 재사용 또는 동적 할당).
     pub bind_port: Option<u16>,

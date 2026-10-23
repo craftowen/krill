@@ -540,7 +540,9 @@ fn unknown_usage_is_never_auto_switch_target() {
         &fresh.display().to_string(),
     )
     .unwrap();
-    assert!(fs::read_dir(&fresh).unwrap().next().is_none());
+    // 기본 프로비저닝은 공유 기록 링크를 만들지만, 계정별 사용량 근거는 만들지 않는다.
+    assert!(!fresh.join(CLAUDE_CACHE).exists());
+    assert!(!fresh.join("usage_cache.json").exists());
     let host = home.join(".claude");
     fs::create_dir_all(&host).unwrap();
     fs::write(
@@ -1707,6 +1709,41 @@ fn rename_account_keeps_id_dir_and_active() {
         .kind(),
         std::io::ErrorKind::NotFound
     );
+    fs::remove_dir_all(home).ok();
+}
+
+/// Orca 감지 계정 삭제는 Krill 목록에서만 숨긴다. Orca 캐시 파일은 그대로 두고 새로고침해도 다시 보이지 않는다.
+#[test]
+fn delete_orca_detected_account_hides_it_without_touching_orca_cache() {
+    use accounts::{delete_account, refresh_accounts};
+    use krill_proto::usage::ProviderKind;
+    let home = dir("orca-hide");
+    let state = home.join("state");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let cache = home.join(".claude/orca-usage-cache.json");
+    let body = r#"{"accounts":[
+        {"id":"aaaa-1111","label":"keep@example.com"},
+        {"id":"bbbb-2222","label":"gone@example.com"}
+    ]}"#;
+    fs::write(&cache, body).unwrap();
+    let ids = |snap: &krill_proto::usage::AccountsSnapshot| -> Vec<String> {
+        snap.accounts
+            .iter()
+            .filter(|a| a.id.starts_with("claude-orca-"))
+            .map(|a| a.id.clone())
+            .collect()
+    };
+    let before = refresh_accounts(&home, Some(&state));
+    let gone = ids(&before)
+        .into_iter()
+        .find(|id| id.contains("bbbb"))
+        .unwrap();
+    let snap = delete_account(&home, Some(&state), ProviderKind::Claude, &gone, &[]).unwrap();
+    assert!(!ids(&snap).contains(&gone), "{:?}", ids(&snap));
+    assert_eq!(ids(&snap).len(), 1);
+    assert_eq!(fs::read_to_string(&cache).unwrap(), body);
+    let again = refresh_accounts(&home, Some(&state));
+    assert!(!ids(&again).contains(&gone));
     fs::remove_dir_all(home).ok();
 }
 

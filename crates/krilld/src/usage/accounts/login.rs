@@ -83,14 +83,28 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
         let status = match cached {
             Some((at, prior, status)) if prior == stamp => {
                 if at.elapsed() >= Duration::from_secs(30) {
-                    spawn_probe(exe, &key, stamp, host, home.to_path_buf());
+                    spawn_probe(
+                        exe,
+                        &key,
+                        stamp,
+                        host,
+                        home.to_path_buf(),
+                        state.map(Path::to_path_buf),
+                    );
                 }
                 status
             }
             // 처음이거나 파일이 바뀌었다(로그인·로그아웃): 새 결과가 올 때까지 모름.
             _ => {
                 lock(&STATES).insert(key.clone(), ConnectionStatus::Checking);
-                spawn_probe(exe, &key, stamp, host, home.to_path_buf());
+                spawn_probe(
+                    exe,
+                    &key,
+                    stamp,
+                    host,
+                    home.to_path_buf(),
+                    state.map(Path::to_path_buf),
+                );
                 None
             }
         };
@@ -104,7 +118,14 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
 /// 같은 프로필은 한 번에 하나만 조회한다.
 static PROBING: Mutex<BTreeSet<CacheKey>> = Mutex::new(BTreeSet::new());
 
-fn spawn_probe(exe: PathBuf, key: &CacheKey, stamp: Stamp, host: bool, home: PathBuf) {
+fn spawn_probe(
+    exe: PathBuf,
+    key: &CacheKey,
+    stamp: Stamp,
+    host: bool,
+    home: PathBuf,
+    state: Option<PathBuf>,
+) {
     if !lock(&PROBING).insert(key.clone()) {
         return;
     }
@@ -148,6 +169,20 @@ fn spawn_probe(exe: PathBuf, key: &CacheKey, stamp: Stamp, host: bool, home: Pat
             cache.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(60));
             cache.insert(job.clone(), (Instant::now(), stamp, status));
             drop(cache);
+            // 기록 이행은 별도 작업으로 보낸다. 사용 중이던 프로필도 종료 후 다음 조회에서 재시도한다.
+            if !host
+                && matches!(
+                    provider,
+                    ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Antigravity
+                )
+            {
+                super::super::provision::provision_if_enabled(
+                    &home,
+                    state.as_deref(),
+                    *provider,
+                    &dir.to_string_lossy(),
+                );
+            }
             lock(&PROBING).remove(&job);
         });
     if let Err(error) = spawned {

@@ -302,6 +302,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_THEME", crate::theme::FEAT_THEME, 46),
         ("FEAT_GIT_SYNC", crate::ipc::FEAT_GIT_SYNC, 41),
         ("FEAT_RESUME", crate::control::FEAT_RESUME, 42),
+        (
+            "FEAT_RESUME_HISTORY",
+            crate::control::FEAT_RESUME_HISTORY,
+            30,
+        ),
         ("FEAT_GIT_WATCH", crate::control::FEAT_GIT_WATCH, 44),
         ("FEAT_HEARTBEAT", crate::daemon::FEAT_HEARTBEAT, 45),
         (
@@ -453,4 +458,39 @@ proptest::proptest! {
         ServerHello::decode(kind::SERVER_HELLO, &bytes).ok();
         ClientHello::decode(kind::CLIENT_HELLO, &bytes).ok();
     }
+}
+
+/// 새 비트는 기존 Hello DTO 안에서만 협상한다. N-1 양방향 fixture는 그대로 읽힌다.
+#[test]
+fn resume_history_hello_fixtures_and_n_minus_1_negotiation() {
+    let mut server = server_hello();
+    server.features = crate::control::FEAT_RESUME_HISTORY;
+    let mut client = client_hello_v1();
+    client.features = crate::control::FEAT_RESUME_HISTORY;
+    let server_bytes = "17000000010101808080800405302e312e30888e98a8c0e0808101";
+    let client_bytes = "13000000020101808080800401096d6b20ed959ceab880";
+    assert_eq!(hex(&server.encode().unwrap()), server_bytes);
+    assert_eq!(hex(&client.encode().unwrap()), client_bytes);
+    let (kind, body) = frame(&unhex(server_bytes));
+    assert_eq!(ServerHello::decode(kind, &body).unwrap(), server);
+    let (kind, body) = frame(&unhex(client_bytes));
+    assert_eq!(ClientHello::decode(kind, &body).unwrap(), client);
+    assert_eq!(
+        negotiate(&server, &client).unwrap().features,
+        crate::control::FEAT_RESUME_HISTORY
+    );
+    let (kind, body) = frame(&unhex(CLIENT_HELLO_V1));
+    assert_eq!(
+        negotiate(&server, &ClientHello::decode(kind, &body).unwrap())
+            .unwrap()
+            .features,
+        0
+    );
+    let (kind, body) = frame(&unhex(SERVER_HELLO_V1));
+    assert_eq!(
+        negotiate(&ServerHello::decode(kind, &body).unwrap(), &client)
+            .unwrap()
+            .features,
+        0
+    );
 }

@@ -2,8 +2,8 @@
 //! MK-133a (`krill-link`): 오프라인(`relay = "off"` + 직접 주소) 통합 테스트.
 //!
 //! 검증 항목:
-//! 1. 짝짓기 성공 (`invite` -> `pair` -> 서버 `devices.toml` 및 클라이언트 `hosts.toml` 등록)
-//! 2. 만료 토큰 거부, 재사용 토큰 거부, 짝짓기 속도 제한(rate limit) 거부
+//! 1. 페어링 성공 (`invite` -> `pair` -> 서버 `devices.toml` 및 클라이언트 `hosts.toml` 등록)
+//! 2. 만료 토큰 거부, 재사용 토큰 거부, 페어링 속도 제한(rate limit) 거부
 //! 3. 비인가 기기(`devices.toml` 미등록 `NodeId`)의 `ALPN_LINK` 접속 거부
 //! 4. `revoke` 호출 시 활성 스트림·연결 즉시 해제 및 재접속 거부
 //! 5. 격리된 임시 `krilld`에 대해 터널(`krill-link serve` + `krill-link connect`) 너머로
@@ -121,7 +121,7 @@ async fn offline_pair_expired_reused_and_rate_limit() {
     );
     assert!(load_devices(&server_dir).unwrap().is_empty());
 
-    // 2) 정상 초대 링크 생성 + 1회 짝짓기 성공 검증
+    // 2) 정상 초대 링크 생성 + 1회 페어링 성공 검증
     let invite = create_invite_command(&server_dir, Some(Duration::from_secs(600)))
         .await
         .unwrap();
@@ -155,7 +155,7 @@ async fn offline_pair_expired_reused_and_rate_limit() {
         "expected already used error, got: {reuse_err:?}"
     );
 
-    // 4) 짝짓기 요청 속도 제한(rate limit) 검증 (burst 상한 초과 시 거부)
+    // 4) 페어링 요청 속도 제한(rate limit) 검증 (burst 상한 초과 시 거부)
     let mut saw_rate_limited = false;
     for _ in 0..10 {
         let res = pair_with_server(&client_dir, &invite.link, "스팸 기기").await;
@@ -244,7 +244,7 @@ async fn unauthorized_device_rejected_and_revoke_disconnects_immediately() {
     );
     rogue_ep.close().await;
 
-    // 짝짓기 없이 hosts.toml만 수동 기입한 비인가 터널도 스트림이 즉시 닫혀야 한다
+    // 페어링 없이 hosts.toml만 수동 기입한 비인가 터널도 스트림이 즉시 닫혀야 한다
     upsert_host(
         &rogue_dir,
         RemoteHost::from_endpoint_addr("rogue-host".to_owned(), "rogue", &server_addr, 1),
@@ -267,7 +267,7 @@ async fn unauthorized_device_rejected_and_revoke_disconnects_immediately() {
     assert!(matches!(rread, Ok(0) | Err(_)));
     rogue_tunnel.shutdown().await;
 
-    // 2) 인가된 클라이언트 짝짓기 및 터널 연결
+    // 2) 인가된 클라이언트 페어링 및 터널 연결
     let invite = create_invite_command(&server_dir, Some(Duration::from_secs(600)))
         .await
         .unwrap();
@@ -452,7 +452,7 @@ async fn tunnel_end_to_end_mk_ls_new_read_and_server_restart_auto_reconnect() {
     // 1) 서버 상태 디렉터리에 실제 격리된 krill-holder + krilld 기동
     let daemon = IsolatedKrilld::start(server_dir.clone());
 
-    // 2) krill-link serve 기동 + 짝짓기 + krill-link connect 기동
+    // 2) krill-link serve 기동 + 페어링 + krill-link connect 기동
     let server = start_server(ServeOptions::new(server_dir.clone()))
         .await
         .unwrap();

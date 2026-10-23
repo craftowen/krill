@@ -245,17 +245,16 @@ pub fn ssh_program() -> OsString {
     std::env::var_os("KRILL_SSH_BIN").unwrap_or_else(|| OsString::from("ssh"))
 }
 
-/// 원격 상태 디렉터리 후보(`$HOME` 기준, 탐색 순서): macOS 새 번들 → macOS 옛 번들 → Linux.
-fn remote_state_dirs() -> [String; 3] {
+/// 원격 상태 디렉터리 후보(`$HOME` 기준, 탐색 순서): macOS → Linux.
+fn remote_state_dirs() -> [String; 2] {
     [
         format!("Library/Application Support/{}", daemon::BUNDLE_ID),
-        format!("Library/Application Support/{}", daemon::LEGACY_BUNDLE_ID),
         format!("{}/{}", daemon::LINUX_STATE_PARENT, daemon::BUNDLE_ID),
     ]
 }
 
 /// 원격 `$HOME`과 krilld 소켓이 있는 상태 디렉터리를 한 번에 묻는 명령(MK-170). 후보는 [`remote_state_dirs`] 순서로
-/// 찾는다(구버전 원격·이관 전 원격·Linux 호환). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
+/// 찾는다(macOS·Linux). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
 ///
 /// Linux 원격은 찾기 전에 항상 원격 `krill ls`(`~/.local/bin/krill` → `PATH`)를 한 번 돌린다. 데몬이 없으면 띄우고
 /// (재부팅한 VM), holder만 죽었으면 새 holder로 재결합한다(ARCHITECTURE §4.1). krill이 없거나 실행이 실패하면
@@ -395,9 +394,47 @@ pub fn resolve_remote_socket_with_program(
     remote_socket_for_home(&remote_home)
 }
 
+/// [`machine_key`] 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
+/// `ssh` 프로세스를 띄운다. `~/.ssh/config` 수정 시각이 바뀌면 기한 전이라도 다시 묻는다. `Include`된 파일이나
+/// `/etc/ssh/ssh_config` 변경은 최대 이 시간만큼 늦게 반영된다.
+const MACHINE_KEY_TTL: Duration = Duration::from_secs(60);
+
+type MachineKeyCacheKey = (OsString, String, Option<u16>);
+type MachineKeyCacheEntry = (Instant, Option<std::time::SystemTime>, String);
+
+static MACHINE_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<MachineKeyCacheKey, MachineKeyCacheEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+fn ssh_config_mtime() -> Option<std::time::SystemTime> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    std::fs::metadata(Path::new(&home).join(".ssh").join("config"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 /// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
 /// 같은 기기를 하나로 묶는 데 쓴다. 네트워크에 붙지 않는다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+/// 결과는 [`MACHINE_KEY_TTL`] 동안 캐시한다.
 pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+    let key = (ssh_program(), destination.to_owned(), port);
+    let mtime = ssh_config_mtime();
+    if let Ok(cache) = MACHINE_KEYS.lock()
+        && let Some((at, seen, value)) = cache.get(&key)
+        && at.elapsed() < MACHINE_KEY_TTL
+        && *seen == mtime
+    {
+        return value.clone();
+    }
+    let value = machine_key_uncached(destination, port);
+    if let Ok(mut cache) = MACHINE_KEYS.lock() {
+        cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
+        cache.insert(key, (Instant::now(), mtime, value.clone()));
+    }
+    value
+}
+
+fn machine_key_uncached(destination: &str, port: Option<u16>) -> String {
     let fallback = || match port {
         Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
         None => destination.to_ascii_lowercase(),

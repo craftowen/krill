@@ -416,7 +416,7 @@ impl Gateway {
         }
         let address = state.selected?;
         let base = if state.mode == ConnectMode::Tunnel {
-            if relay_connected(&state) {
+            if relay_pairing(&state) {
                 fixed_base(&state)
             } else if let Some(tunnel) = state.tunnel.as_ref()
                 && let Some(url) = tunnel.ready_url()
@@ -504,8 +504,18 @@ impl Gateway {
                             ));
                         }
                         // 릴레이가 연결되면 퀵 터널의 DNS/엣지 정착을 기다리지 않는다.
-                        if relay_connected(&state) {
+                        if relay_pairing(&state) {
                             return pairing_offer(&state, now_ms());
+                        }
+                        // 퀵 터널 예비 경로가 없으니 릴레이 첫 시도가 실패했거나 고정 출처에 이 버전 PWA가 없으면 바로 알린다.
+                        // 릴레이는 뒤에서 계속 재시도한다.
+                        if relay_only(&state)
+                            && state
+                                .relay
+                                .as_ref()
+                                .is_some_and(|r| r.settled() && !r.pairing())
+                        {
+                            return Err(tunnel_unavailable(&state));
                         }
                         // 기한이 지나도 준비되지 않으면 찍힌 URL로 낸다(터널 출처). 몇 초 뒤 새로고침하면 열린다.
                         let timed_out = Instant::now() >= deadline;
@@ -524,7 +534,7 @@ impl Gateway {
                         let relay_failed = state
                             .relay
                             .as_ref()
-                            .is_none_or(|r| r.settled() && !r.connected());
+                            .is_none_or(|r| r.settled() && !r.pairing());
                         if timed_out || (fatal_tunnel_err && relay_failed) {
                             return Err(tunnel_unavailable(&state));
                         }
@@ -688,7 +698,7 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let address = state.selected.ok_or_else(invalid)?;
     let host = address.ip().to_string();
     let port = address.port();
-    let relay_only = state.mode == ConnectMode::Tunnel && relay_connected(state);
+    let relay_only = state.mode == ConnectMode::Tunnel && relay_pairing(state);
     let base = if state.mode == ConnectMode::Tunnel {
         if relay_only {
             fixed_base(state)
@@ -736,11 +746,11 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     })
 }
 
-fn relay_connected(state: &State) -> bool {
+fn relay_pairing(state: &State) -> bool {
     state
         .relay
         .as_ref()
-        .is_some_and(super::relay::RelayClient::connected)
+        .is_some_and(super::relay::RelayClient::pairing)
 }
 
 fn fixed_base(state: &State) -> String {
@@ -751,7 +761,17 @@ fn fixed_base(state: &State) -> String {
     )
 }
 fn tunnel_unavailable(state: &State) -> io::Error {
-    let message = if state.resolver.downloading() {
+    let message = if relay_only(state) {
+        if state
+            .relay
+            .as_ref()
+            .is_some_and(super::relay::RelayClient::connected)
+        {
+            "이 버전의 모바일 웹앱이 아직 배포되지 않아 새 기기를 연결할 수 없습니다".to_owned()
+        } else {
+            "모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도".to_owned()
+        }
+    } else if state.resolver.downloading() {
         "cloudflared 내려받는 중 — 잠시 후 다시 시도".to_owned()
     } else {
         state.tunnel_error.as_ref().map_or_else(
@@ -877,8 +897,16 @@ fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
         url: hostname.trim().to_owned(),
     })
 }
-/// 외부 접속은 릴레이를 먼저 연결한다. 릴레이 첫 시도가 실패할 때만 퀵 터널을 준비한다.
-/// 기존 터널·명시적 Named Tunnel은 유지하며, 터널 실패는 지수 백오프로 재시도한다.
+/// 운영 빌드는 늘 릴레이를 쓴다. 테스트 고정 터널(`tunnel_start`)만 릴레이 없이 돈다.
+fn relay_on(s: &State) -> bool {
+    s.tunnel_start.is_none() || s.relay_enabled
+}
+/// 릴레이만으로 외부 접속한다(Named Tunnel 없음). 퀵 터널은 무보증·엣지 연결 1개·재시작마다 주소가 바뀌어
+/// 예비 경로에서 뺐다.
+fn relay_only(s: &State) -> bool {
+    s.mode == ConnectMode::Tunnel && relay_on(s) && named_tunnel(s).is_none()
+}
+/// 외부 접속은 릴레이로 한다. 명시적 Named Tunnel만 터널을 띄우고, 터널 실패는 지수 백오프로 재시도한다.
 fn supervise_tunnel(s: &mut State) {
     if s.mode != ConnectMode::Tunnel {
         if let Some(mut tunnel) = s.tunnel.take() {
@@ -889,7 +917,7 @@ fn supervise_tunnel(s: &mut State) {
     }
     let named = named_tunnel(s);
     if named.is_none()
-        && (s.tunnel_start.is_none() || s.relay_enabled)
+        && relay_on(s)
         && s.relay.is_none()
         && let Some(ctx) = s.relay_ctx.as_ref()
         && let Some(shared) = ctx.shared.upgrade()
@@ -901,6 +929,22 @@ fn supervise_tunnel(s: &mut State) {
             &ctx.hello,
         )
         .ok();
+    }
+    if named.is_none() && relay_on(s) {
+        // 이전 버전이 띄워 둔 퀵 터널(입양 대기 PID 포함)을 정리한다.
+        if let Some(mut tunnel) = s.tunnel.take() {
+            tunnel.terminate();
+        }
+        let pid = s.saved_tunnel_pid.take();
+        let url = s.saved_tunnel_url.take();
+        if let Some(pid) = pid {
+            super::tunnel::kill_pid(pid);
+        }
+        if pid.is_some() || url.is_some() {
+            save_intent(s).ok();
+        }
+        s.tunnel_error = None;
+        return;
     }
     let Some(port) = s.selected.map(|a| a.port()) else {
         return;
@@ -943,13 +987,6 @@ fn supervise_tunnel(s: &mut State) {
         save_intent(s).ok();
     }
     if s.tunnel_retry_at.is_some_and(|at| Instant::now() < at) {
-        return;
-    }
-    if named.is_none()
-        && s.relay
-            .as_ref()
-            .is_some_and(|r| !r.settled() || r.connected())
-    {
         return;
     }
     let result = if let Some(start) = s.tunnel_start {

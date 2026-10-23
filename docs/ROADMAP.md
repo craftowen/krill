@@ -163,7 +163,7 @@
 | MK-130 | [스파이크] iroh 1.3 원격 연결 실측(rustc 1.98·cargo deny·메모리·지연) | M9 | P1 | 측정값 확인, krilld 무변경으로 터널 너머 `krill ls` 동작 | MK-099 | M9 | OWE-666 |
 | MK-131 | 호스트 인식 연결 계층 + 사이드바 호스트별 그룹(내 Mac+원격) + 새 세션 실행 위치 선택 | M9 | P1 | 로컬·원격 세션 동시 표시, 원격 krilld kill -9 후 로컬 무영향·자동 재연결 통합 테스트, 실화면 캡처, `scripts/check.sh` 0 | MK-099, MK-132 | M9 | OWE-667 |
 | MK-132 | SSH 호스트 설정 UX(실제 입력 폼·Tailscale 피어 자동 감지·첫 연결 키 등록·포트/키/원격 HOME 소켓) | M9 | P1 | argv 빌더·입력 검증·tailscale JSON 파싱·원격 HOME 경로 테스트, `scripts/check.sh` 0 | MK-112 | — | OWE-668 |
-| MK-133 | `krill-link`: iroh P2P 터널 + 기기 짝짓기(초대 링크·QR·근처 기기)·기기 회수, 앱 연동 | M9 | P1 | 오프라인 통합 테스트(짝짓기·만료 토큰·미허용 거부·revoke·krilld 터널·재연결), krill-link ≤ 20MB(별도 예산, 켤 때만), `scripts/check.sh` 0 | MK-130, MK-131 | M9 | OWE-669 |
+| MK-133 | `krill-link`: iroh P2P 터널 + 기기 페어링(초대 링크·QR·근처 기기)·기기 회수, 앱 연동 | M9 | P1 | 오프라인 통합 테스트(페어링·만료 토큰·미허용 거부·revoke·krilld 터널·재연결), krill-link ≤ 20MB(별도 예산, 켤 때만), `scripts/check.sh` 0 | MK-130, MK-131 | M9 | OWE-669 |
 | MK-134 | 끊김 복구: 입력 정확히 한 번·순서 보장, 연결 상태 칩, 세션 목록 캐시, 자동 재연결 | M9 | P1 | 네트워크 단절 중 입력이 재연결 후 1회·순서대로 도착, 상태 칩 전환 테스트, `scripts/check.sh` 0 | MK-131, MK-133 | — | OWE-670 |
 | MK-172 | Orca 데이터 스캐너 & 원클릭 전체 이관 엔진(`krill import orca` + 다계정·원격 SSH·등록 프로젝트·워크트리·설정 이관) | M10 | P0 | `profile-state.db`/`orca-data.json`·`claude-profiles`·`codex-accounts`·`sshTargets`·`repos`·`worktreeMeta` 멱등 이관 및 이관된 계정 즉시 기동 테스트 통과, `scripts/check.sh` 0 | MK-107, MK-112 | M10 | OWE-726 |
 | MK-173 | GUI Orca 마이그레이션 마법사 & Settings `Import from Orca` 카드(설정 연동; 첫 실행 온보딩 카드는 제거됨, 2026-10-18 OWE-904) | M10 | P0 | Settings에서 Orca 데이터 감지·카테고리 선택·원클릭 이관 후 재시작 없이 사이드바·계정·SSH 즉시 반영, `scripts/check.sh` 0 | MK-172 | M10 | OWE-727 |

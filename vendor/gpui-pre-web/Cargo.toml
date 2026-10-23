@@ -199,7 +199,7 @@ type_complexity = "allow"
 level = "allow"
 priority = -1
 
-# Minikrill 변경(OWE-611, Apache-2.0 §4(b)): path 의존에는 --cap-lints가 적용되지 않아
+# Krill 변경(OWE-611, Apache-2.0 §4(b)): path 의존에는 --cap-lints가 적용되지 않아
 # cargo run 출력의 vendor 경고를 숨기려고 경고 전체를 허용. vendor 갱신(MK-003 §4) 시 재적용.
 [lints.rust]
 warnings = "allow"

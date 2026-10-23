@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,18 @@ def sha256(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def mobile_hash(root=Path(".")):
+    """모바일 PWA 에셋 해시(계약 C1, `krilld::mobile::pwa::asset_hash`·`cloud/mobile/build.mjs`와 같다)."""
+    mobile = root / "crates/krilld/src/mobile"
+    names = set(re.findall(r'include_bytes!\("assets/([^"]+)"\)', (mobile / "pwa.rs").read_text()))
+    digest = hashlib.sha256()
+    for name in sorted((n for n in names if not n.endswith(".gz")), key=str.encode):
+        data = (mobile / "assets" / name).read_bytes()
+        digest.update(f"{name}\n{len(data)}\n".encode())
+        digest.update(data)
+    return digest.hexdigest()[:16]
 
 
 def target_directory(configured=None, volume=VOLUME):
@@ -201,7 +214,7 @@ def validate(head, directory, key_file):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("target-dir", "validate", "verify"))
+    parser.add_argument("action", choices=("target-dir", "validate", "verify", "mobile-hash"))
     parser.add_argument("--head")
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--receipt", type=Path)
@@ -211,6 +224,8 @@ def main():
     args = parser.parse_args()
     if args.action == "target-dir":
         print(target_directory(args.base))
+    elif args.action == "mobile-hash":
+        print(mobile_hash())
     elif args.action == "verify":
         if args.bundle:
             verify_bundle(args.receipt, args.head, args.key_file, args.bundle)

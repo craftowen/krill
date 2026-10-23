@@ -166,13 +166,9 @@ fn remote_socket_for_home_computes_remote_user_path() {
         )
     );
     assert_eq!(
-        remote_socket_for_home(
-            "/Users/remoteuser\r\nLibrary/Application Support/dev.minikrill.app"
-        )
-        .unwrap(),
-        PathBuf::from(
-            "/Users/remoteuser/Library/Application Support/dev.minikrill.app/run/krilld.sock"
-        )
+        remote_socket_for_home("/Users/remoteuser\r\nLibrary/Application Support/dev.krill.app")
+            .unwrap(),
+        sock
     );
     assert_eq!(
         remote_socket_for_home("/home/ubuntu\n.local/share/dev.krill.app").unwrap(),
@@ -290,18 +286,11 @@ fn remote_query_prefers_new_socket_then_legacy() {
     std::fs::create_dir_all(linux.parent().unwrap()).unwrap();
     let _linux = UnixListener::bind(&linux).unwrap();
     assert_eq!(resolve().unwrap(), linux, "Linux remote");
-    std::fs::create_dir_all(sock("dev.minikrill.app").parent().unwrap()).unwrap();
-    let _old = UnixListener::bind(sock("dev.minikrill.app")).unwrap();
-    assert_eq!(
-        resolve().unwrap(),
-        sock("dev.minikrill.app"),
-        "legacy remote"
-    );
     std::fs::create_dir_all(sock("dev.krill.app").parent().unwrap()).unwrap();
     let _new = UnixListener::bind(sock("dev.krill.app")).unwrap();
     assert_eq!(resolve().unwrap(), sock("dev.krill.app"), "new wins");
     if linux_os {
-        assert_eq!(woke(), "ls\nls\nls\nls\n");
+        assert_eq!(woke(), "ls\nls\nls\n");
     }
     std::fs::remove_dir_all(&home).unwrap();
 }
@@ -401,6 +390,27 @@ fn sweep_removes_only_dead_forward_sockets() {
         "non-forward sockets are never touched"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn machine_key_reuses_recent_result_without_running_ssh() {
+    let dest = "cache-probe.invalid";
+    let key = (ssh_program(), dest.to_owned(), Some(2222));
+    MACHINE_KEYS.lock().unwrap().insert(
+        key.clone(),
+        (Instant::now(), ssh_config_mtime(), "cached@host:1".into()),
+    );
+    assert_eq!(machine_key(dest, Some(2222)), "cached@host:1");
+    // 기한이 지난 항목은 쓰지 않는다(이 대상은 `ssh -G`가 실패해도 입력 그대로가 나온다).
+    // 부팅 직후라 기한 전 시각을 만들 수 없으면 이 확인은 건너뛴다.
+    let Some(stale) = Instant::now().checked_sub(MACHINE_KEY_TTL) else {
+        return;
+    };
+    MACHINE_KEYS
+        .lock()
+        .unwrap()
+        .insert(key, (stale, ssh_config_mtime(), "cached@host:1".into()));
+    assert_ne!(machine_key(dest, Some(2222)), "cached@host:1");
 }
 
 #[test]

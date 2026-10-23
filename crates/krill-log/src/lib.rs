@@ -3,6 +3,7 @@
 //! No terminal bytes, command lines, paths or error Display strings belong at call sites.
 //! Logging is fail-open: callers never depend on initialization succeeding.
 
+mod forward;
 mod subscriber;
 mod writer;
 
@@ -40,8 +41,9 @@ impl Component {
     }
 }
 
-/// Explicit override isolates tests; production uses `LocalAppData` on Windows
-/// and the Console.app-visible directory on macOS (XDG state on Linux).
+/// Explicit override isolates tests (nextest runs fall back to a temp directory);
+/// production uses `LocalAppData` on Windows and the Console.app-visible directory
+/// on macOS (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
     directory_in(
         |key| std::env::var_os(key),
@@ -66,6 +68,10 @@ fn directory_in(
     if let Some(dir) = get("KRILL_LOG_DIR") {
         return Some(PathBuf::from(dir));
     }
+    // nextest가 띄운 테스트와 그 자식(holder·krilld·앱)은 운영 로그를 더럽히지 않는다(`NEXTEST`는 nextest가 늘 1로 둔다).
+    if get("NEXTEST").is_some() {
+        return Some(std::env::temp_dir().join("krill-test-logs"));
+    }
     #[cfg(windows)]
     let base = get("LOCALAPPDATA").map(PathBuf::from).or_else(home);
     #[cfg(not(windows))]
@@ -80,22 +86,15 @@ fn directory_in(
         base.map(|h| h.join(".local/state/krill/logs"))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
-    base.map(|h| {
-        let logs = h.join("Library/Logs");
-        let (new, old) = (logs.join("Krill"), logs.join("Minikrill"));
-        // MK-170: 이관 전(새 디렉터리 없음 + 옛 디렉터리가 실제 디렉터리)에는 옛 이름에 계속 쓴다.
-        if new.symlink_metadata().is_err() && old.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            old
-        } else {
-            new
-        }
-    })
+    base.map(|h| h.join("Library/Logs/Krill"))
 }
 
 /// Install INFO/WARN/ERROR events from Krill targets. No spans are retained.
 /// File locks are nonblocking; contention and IO errors drop logs, never fail a session.
 /// Files are opened per event so other processes cannot write into a renamed/unlinked archive.
 /// This deliberately uses no thread in the fd-owning holder.
+pub use forward::forward_log_warnings;
+
 pub fn init(component: Component) -> io::Result<()> {
     let dir =
         directory().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no log directory"))?;
@@ -116,6 +115,29 @@ mod tests {
             Some(PathBuf::from("/KRILL_LOG_DIR"))
         );
         assert_eq!(directory_in(|_| None, || None), None);
+    }
+
+    #[test]
+    fn nextest_runs_never_use_the_production_directory() {
+        let nextest = |k: &str| (k == "NEXTEST").then(|| OsString::from("1"));
+        let home = PathBuf::from("/h");
+        assert_eq!(
+            directory_in(nextest, || Some(home.clone())),
+            Some(std::env::temp_dir().join("krill-test-logs"))
+        );
+        let both = |k: &str| match k {
+            "NEXTEST" => Some(OsString::from("1")),
+            "KRILL_LOG_DIR" => Some(OsString::from("/x")),
+            _ => None,
+        };
+        assert_eq!(directory_in(both, || None), Some(PathBuf::from("/x")));
+        // 실제 테스트 프로세스(이 테스트도 nextest 아래에서 돈다)가 운영 경로를 고르지 않는다.
+        if std::env::var_os("NEXTEST").is_some() && std::env::var_os("KRILL_LOG_DIR").is_none() {
+            assert_eq!(
+                directory(),
+                Some(std::env::temp_dir().join("krill-test-logs"))
+            );
+        }
     }
 
     #[cfg(not(windows))]
@@ -146,23 +168,13 @@ mod tests {
         );
     }
 
-    /// MK-170: 이관 전에는 옛 `Logs/Minikrill`, 옮겨진 뒤(옛 자리는 링크)에는 `Logs/Krill`.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: ~/Library/Logs 이관")]
-    fn directory_follows_bundle_migration() {
-        let home = std::env::temp_dir().join(format!("mk170-log-{}", std::process::id()));
-        std::fs::remove_dir_all(&home).ok();
-        let logs = home.join("Library/Logs");
-        std::fs::create_dir_all(logs.join("Minikrill")).unwrap();
-        let get_home = || Some(home.clone());
+    fn directory_is_library_logs_krill() {
+        let home = PathBuf::from("/Users/u");
         assert_eq!(
-            directory_in(|_| None, get_home),
-            Some(logs.join("Minikrill"))
+            directory_in(|_| None, || Some(home.clone())),
+            Some(home.join("Library/Logs/Krill"))
         );
-        std::fs::rename(logs.join("Minikrill"), logs.join("Krill")).unwrap();
-        std::os::unix::fs::symlink("Krill", logs.join("Minikrill")).unwrap();
-        assert_eq!(directory_in(|_| None, get_home), Some(logs.join("Krill")));
-        std::fs::remove_dir_all(&home).unwrap();
     }
 }
