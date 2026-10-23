@@ -103,17 +103,19 @@ fn provision_inner(home: &Path, profile: &Path, idle: &dyn Fn() -> bool) -> io::
     Ok(report)
 }
 
-/// 기존 `SQLite`가 있는 프로필은 직접 합치거나 전환하지 않는다. paginated 대화 본문을 보호한다.
+/// 세션 원본과 보관 기록이 기본 저장소를 가리킬 때만 인덱스 위치를 전환한다.
+/// Store가 사용 중인 프로필·이해할 수 없는 링크를 보류했으면 기존 `SQLite`를 계속 쓴다.
 #[cfg(unix)]
-fn sqlite_transition_blocked(profile: &Path) -> io::Result<bool> {
-    for entry in std::fs::read_dir(profile)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_string_lossy().ends_with(".sqlite") && entry.metadata()?.len() > 0 {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+fn history_shared(host: &Path, profile: &Path) -> bool {
+    ["sessions", "archived_sessions"].iter().all(|name| {
+        profile.join(name).is_symlink()
+            && profile
+                .join(name)
+                .canonicalize()
+                .ok()
+                .zip(host.join(name).canonicalize().ok())
+                .is_some_and(|(a, b)| a == b)
+    })
 }
 
 #[cfg(unix)]
@@ -139,7 +141,7 @@ fn configure_sqlite_home(
         }
         return Ok(());
     }
-    if sqlite_transition_blocked(profile)? || !idle() {
+    if !history_shared(host, profile) || !idle() {
         report.conflicts.push("sqlite_home");
         return Ok(());
     }
@@ -327,7 +329,7 @@ mod tests {
         std::fs::write(profile.join("config.toml"), "model = \"mine\"\n").unwrap();
         let before = snapshot(&host);
         let report = provision(&home, &profile).unwrap();
-        assert_eq!(report.conflicts, ["archived_sessions"]);
+        assert_eq!(report.conflicts, ["archived_sessions", "sqlite_home"]);
         assert!(report.changed.contains(&"sessions"));
         assert_eq!(
             std::fs::read(profile.join("sessions/mine.jsonl")).unwrap(),
@@ -542,16 +544,67 @@ mod tests {
         std::fs::write(profile.join("config.toml"), original).unwrap();
         std::fs::write(profile.join("state_5.sqlite"), b"private paginated index").unwrap();
         let report = provision(&home, &profile).unwrap();
-        assert!(report.conflicts.contains(&"sqlite_home"));
-        assert_eq!(
-            std::fs::read_to_string(profile.join("config.toml")).unwrap(),
-            original
+        assert!(report.changed.contains(&"sqlite_home"));
+        assert!(
+            std::fs::read_to_string(profile.join("config.toml"))
+                .unwrap()
+                .ends_with(original)
         );
         assert_eq!(
             std::fs::read(profile.join("state_5.sqlite")).unwrap(),
             b"private paginated index"
         );
         assert!(!host.join("state_5.sqlite").is_symlink());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn existing_sqlite_transitions_only_after_history_is_shared_and_keeps_the_database() {
+        let (home, host, profile) = fixture("sqlite-existing");
+        let original = "# account preferences\nmodel = \"fixture\"\n";
+        std::fs::write(profile.join("config.toml"), original).unwrap();
+        std::fs::write(profile.join("state_5.sqlite"), b"private database retained").unwrap();
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::write(profile.join("sessions/private.jsonl"), b"private rollout").unwrap();
+        let report = provision(&home, &profile).unwrap();
+        assert!(report.changed.contains(&"sqlite_home"));
+        assert_eq!(
+            std::fs::read(host.join("sessions/private.jsonl")).unwrap(),
+            b"private rollout"
+        );
+        assert_eq!(
+            std::fs::read(profile.join("state_5.sqlite")).unwrap(),
+            b"private database retained"
+        );
+        assert!(
+            std::fs::read_to_string(profile.join("config.toml"))
+                .unwrap()
+                .ends_with(original)
+        );
+        assert_eq!(provision(&home, &profile).unwrap(), Report::default());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn deferred_history_cannot_switch_sqlite_even_if_a_later_probe_is_idle() {
+        use std::cell::Cell;
+        let (home, _, profile) = fixture("sqlite-deferred");
+        let original = "# keep until history was imported\n";
+        std::fs::write(profile.join("config.toml"), original).unwrap();
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::write(profile.join("sessions/private.jsonl"), b"still in use").unwrap();
+        let probes = Cell::new(0);
+        let report = super::provision_inner(&home, &profile, &|| {
+            let prior = probes.get();
+            probes.set(prior + 1);
+            prior > 0
+        })
+        .unwrap();
+        assert!(report.conflicts.contains(&"sqlite_home"));
+        assert_eq!(
+            std::fs::read_to_string(profile.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!profile.join("sessions").is_symlink());
         std::fs::remove_dir_all(home).unwrap();
     }
 }
