@@ -229,7 +229,7 @@ fn watch_answers_ping_with_pong() {
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let worker = thread::spawn(move || watch(server));
+    let worker = thread::spawn(move || watch(server, Some(std::process::id())));
     client
         .write_all(&krill_proto::daemon::ping(41).unwrap())
         .unwrap();
@@ -243,4 +243,19 @@ fn watch_answers_ping_with_pong() {
     assert_eq!(kind, krill_proto::screen::kind::REFUSED);
     drop(client);
     worker.join().unwrap().unwrap();
+}
+
+/// 앱 하트비트 ping이 예상 간격(2초)보다 2초 이상 늦을 때만 앱 정지 의심으로 본다. 첫 ping은 비교 대상이 없다.
+#[test]
+fn app_ping_late_only_beyond_interval_plus_threshold() {
+    let t0 = Instant::now();
+    let interval = krill_proto::daemon::INTERVAL;
+    assert_eq!(ping_late(None, t0), None);
+    assert_eq!(ping_late(Some(t0), t0 + interval), None);
+    let just_under = interval + Duration::from_millis(1_999);
+    assert_eq!(ping_late(Some(t0), t0 + just_under), None);
+    assert_eq!(
+        ping_late(Some(t0), t0 + interval + Duration::from_millis(3_500)),
+        Some(Duration::from_millis(3_500))
+    );
 }

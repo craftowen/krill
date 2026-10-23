@@ -954,9 +954,34 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
     }
 }
 
+/// 기록(zstd·암호화·write)이 이보다 오래 걸리면 경고한다. 발행은 기록이 끝난 뒤라 그만큼 화면이 늦는다.
+const SLOW_RECORD: Duration = Duration::from_millis(100);
+/// 느린 기록 경고의 마지막 시각. 세션이 많아도 프로세스 전체에서 초당 한 줄만 남긴다.
+static SLOW_RECORD_WARNED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// `took`이 [`SLOW_RECORD`]를 넘었고 마지막 경고(`last`)에서 1초가 지났으면 `last`를 `now`로 바꾸고 `true`.
+fn slow_record_due(last: &mut Option<Instant>, took: Duration, now: Instant) -> bool {
+    let due = took > SLOW_RECORD
+        && last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
 /// 기록 panic이 화면·원본 발행에 미치는 영향을 한 경계에서 검사한다.
 fn publish_batch(shared: &Shared, seq: u64, bytes: &[u8], rev: u64, record: impl FnOnce()) -> bool {
+    let started = Instant::now();
     let recorded = panic::catch_unwind(AssertUnwindSafe(record)).is_ok();
+    let took = started.elapsed();
+    if took > SLOW_RECORD && slow_record_due(&mut lock(&SLOW_RECORD_WARNED), took, Instant::now()) {
+        let took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        tracing::warn!(
+            took_ms,
+            bytes = bytes.len(),
+            "pty recording slow; screen publish waited"
+        );
+    }
     if !recorded {
         tracing::warn!("pty batch recording panicked; kept as gap");
         lock(&shared.gaps).push(Gap {
