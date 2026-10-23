@@ -4,7 +4,7 @@ OWE-839 Windows 메모리 회귀 게이트(MK-066 Windows판). 예산을 넘으�
 
 .DESCRIPTION
 격리한 상태 디렉터리에 release krill-holder + krilld를 띄우고, 헤드리스 세션 N개(기본 10)에 한글·색·120열을 넘는 줄
-2만 개씩 흘린 뒤 10초 쉬고 PrivateUsage(커밋) 합을 잰다. 지표 근거는 docs/research/windows-spike-OWE-828.md §2:
+2만 개씩 흘린 뒤 10초 쉬고 PrivateUsage(커밋) 합을 잰다. 지표는 Windows 프로세스 메모리 API를 기준으로 한다:
 PrivateUsage가 게이트, Private Working Set은 보조 기록. 성능 카운터 이름이 지역화되므로 Get-Counter를 쓰지 않는다.
 
   기본(데몬 게이트): holder + krilld <= 60MiB. SSH 같은 비대화형 세션에서 돈다.
@@ -12,7 +12,7 @@ PrivateUsage가 게이트, Private Working Set은 보조 기록. 성능 카운�
   세션 프로세스(생성기)와 ConPTY 호스트(conhost/OpenConsole)는 예산 밖이다. 호스트 합은 기록만 한다.
 
 종료 코드: 0 통과, 1 예산 초과, 2 준비 실패(빌드·데몬 기동·세션 생성).
-문서·측정값: docs/testing/memory-gate-windows.md.
+이 스크립트의 도움말과 실행 결과를 기준으로 측정 조건을 확인한다.
 
 .PARAMETER Inject
 krilld가 그만큼(MiB) 더 쥐게 해(KRILL_TEST_BALLAST_MB) 게이트가 회귀를 잡는지 확인한다. 이때는 1이 정상이다.

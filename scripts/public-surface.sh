@@ -13,9 +13,10 @@ fail=0
 # docs/ 최상위 허용 목록. 여기 없는 것은 공개하지 않는다(내부 보고서는 gitignore된 docs/reports/에 둔다).
 # - 규범 문서: ARCHITECTURE·CONVENTIONS·ROADMAP·STYLEGUIDE(AGENTS.md 문서 우선순위)와 PRD.
 # - 사용자 문서: ARTIFACTS(공유 서비스·CLI, 계정 정보 없음), SCHEDULING(krill schedule 사용법).
-# - agents/(에이전트용 스킬·스니펫), benchmarks/(공개 측정 기록), licensing/(라이선스 고지 근거),
-#   planning/·research/(AGENTS.md가 인정하는 조사 기록), releases/(릴리스 노트), testing/(공개 QA 기록).
-allowed_docs='^docs/((ARCHITECTURE|ARTIFACTS|CONVENTIONS|PRD|ROADMAP|SCHEDULING|STYLEGUIDE)\.md|(agents|benchmarks|licensing|planning|releases|research|testing)/.+)$'
+# - agents/(에이전트용 스킬·스니펫), licensing/(라이선스 고지 근거), releases/(릴리스 노트).
+# - research/orca-mobile-ui-spec.md는 기존 소스의 라이선스 링크를 위한 공개 안내문만 허용.
+# - 기획·조사·벤치마크·QA·마케팅 원자료는 공개하지 않는다.
+allowed_docs='^docs/((ARCHITECTURE|ARTIFACTS|CONVENTIONS|PRD|ROADMAP|SCHEDULING|STYLEGUIDE|GETTING_STARTED(\.ko)?)\.md|(agents|licensing|releases)/.+|research/orca-mobile-ui-spec\.md)$'
 
 if [[ $# -gt 0 ]]; then
   scan=$(cd "$1" && pwd)

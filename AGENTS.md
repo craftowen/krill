@@ -4,7 +4,7 @@ AI 에이전트(와 사람)가 이 저장소에서 일할 때 가장 먼저 읽�
 
 Krill = 어떤 AI 코딩 에이전트든 끊기지 않게 병렬로 돌리는 순수 Rust macOS 앱. 앱(gpui)과 세션 데몬(krill-holder + krilld)이 분리돼, 앱이 죽거나 업데이트돼도 세션이 산다. 제품·설계: [docs/PRD.md](docs/PRD.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/ROADMAP.md](docs/ROADMAP.md). 코드 규칙: [docs/CONVENTIONS.md](docs/CONVENTIONS.md). UI 디자인 시스템: [docs/STYLEGUIDE.md](docs/STYLEGUIDE.md) — 아래 요약을 건너뛰지 말 것.
 
-**문서 우선순위**: ARCHITECTURE·ROADMAP·CONVENTIONS·STYLEGUIDE가 규범이다. `docs/planning/T*-final.md`·`docs/research/*`는 조사 기록이라 규범 문서와 다르면 규범 문서를 따른다.
+**문서 우선순위**: ARCHITECTURE·ROADMAP·CONVENTIONS·STYLEGUIDE가 규범이다. 내부 기획·조사·벤치마크·QA 기록은 로컬 전용이며 공개 저장소에 추가하지 않는다. 라이선스 고지와 제품·기여 문서만 공개한다.
 
 ## 디자인 시스템 (`docs/STYLEGUIDE.md`)
 
@@ -44,7 +44,7 @@ crates/krill-log/     # 상한 회전 운영 로거
 crates/krill-app/     # gpui UI (디자인 토큰·프리미티브·아이콘·상태는 src/ui/, 규범은 docs/STYLEGUIDE.md)
 crates/krill/         # CLI 단일 바이너리(`krill`, `krill hook` 포함)
 docs/STYLEGUIDE.md    # UI/UX 디자인 시스템 규범(Orca STYLEGUIDE·main.css 기반, 모든 UI 작업 시 필수 참조)
-docs/planning/        # 기획 근거(T1~T4, 2차 검증본) — 읽기 전용
+docs/licensing/       # 공개 라이선스 고지·생성 근거 (내부 조사 기록은 Git 제외)
 scripts/              # check.sh, memory-gate.sh, check-windows.sh
 packaging/            # macOS 번들·DMG·Ed25519 매니페스트·설치 스크립트
 ```

@@ -71,4 +71,4 @@ AI 코딩 에이전트를 동시에 여러 개(5~20개) 돌리는 macOS(Apple Si
 
 - 아키텍처·통합 결정: `docs/ARCHITECTURE.md`
 - 로드맵·이슈 목록: `docs/ROADMAP.md`
-- 트랙별 근거(2차 검증본): `docs/planning/T1~T4-final.md`
+- 내부 조사 기록은 로컬에 보존하며 공개 제품 범위는 이 문서와 ARCHITECTURE·ROADMAP을 따른다.
