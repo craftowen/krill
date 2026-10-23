@@ -607,8 +607,8 @@ fn keyboard_navigation_selects_folds_and_returns_focus(cx: &mut TestAppContext) 
     let selected = Rc::new(Cell::new(None));
     let got = selected.clone();
     let _subscription = cx.update(|_, cx| {
-        cx.subscribe(&view, move |_, _: &WorkspaceSelected, _| {
-            got.set(Some(SessionId(5)));
+        cx.subscribe(&view, move |_, event: &Selected, _| {
+            got.set(Some(event.0));
         })
     });
     cx.update(|window, cx| {

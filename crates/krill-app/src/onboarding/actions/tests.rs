@@ -339,7 +339,7 @@ fn automatic_setup_installs_hooks_only_for_agents_on_login_path(cx: &mut gpui::T
     cx.run_until_parked();
     assert_eq!(*result.borrow(), Some(Ok(())));
     assert!(link.is_file());
-    assert!(home.join(".claude/skills/minikrill/SKILL.md").is_file());
+    assert!(home.join(".claude/skills/krill/SKILL.md").is_file());
     for dir in krill_proto::orchestration::skill_directories(&home, "all") {
         assert!(
             dir.join("artifacts/SKILL.md").is_file(),
