@@ -1083,6 +1083,7 @@ pub(crate) mod agy {
 
     type Key = (PathBuf, PathBuf);
     static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
+    static FAILED: Mutex<BTreeMap<Key, Instant>> = Mutex::new(BTreeMap::new());
     static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
     /// 주기 실행 간격(5분)·캐시 유효(10분). 5h·주간 창에는 충분하고 agy 실행 부담을 낮춘다.
     const TTL: Duration = super::CACHE_TTL;
@@ -1105,6 +1106,7 @@ pub(crate) mod agy {
     pub(super) fn reset_latch_for_tests() {
         MODEL_TURN_LATCH.store(false, Ordering::SeqCst);
         lock(&CACHE).clear();
+        lock(&FAILED).clear();
         lock(&PENDING).clear();
         lock(&VERSION_CACHE).clear();
         lock(&VERSION_TEXT_CACHE).clear();
@@ -1122,6 +1124,7 @@ pub(crate) mod agy {
 
     pub(super) fn evict(home: &Path) {
         lock(&CACHE).retain(|(h, _), _| h != home);
+        lock(&FAILED).retain(|(h, _), _| h != home);
         lock(&PENDING).retain(|(h, _)| h != home);
     }
 
@@ -1150,17 +1153,20 @@ pub(crate) mod agy {
             profiles.push((dir, false));
         }
         for (dir, host) in profiles {
-            // 로그인 안 된 agy에 `-p /usage`를 보내면 매번 대화형 OAuth를 시작한다(설 실기, v0.1.9:
-            // 격리 HOME에서 2~3분마다 OAuth 시도 46회). 로그인된 프로필만 조회한다.
-            if !should_probe(&dir, host) {
-                continue;
-            }
             let key = (home.to_path_buf(), dir);
             if lock(&CACHE)
                 .get(&key)
                 .is_some_and(|(at, _)| at.elapsed() < interval)
-                || !lock(&PENDING).insert(key.clone())
+                || lock(&FAILED)
+                    .get(&key)
+                    .is_some_and(|at| at.elapsed() < interval)
+                || lock(&PENDING).contains(&key)
             {
+                continue;
+            }
+            // 로그인 안 된 agy에 `-p /usage`를 보내면 매번 대화형 OAuth를 시작한다(설 실기, v0.1.9:
+            // 격리 HOME에서 2~3분마다 OAuth 시도 46회). 로그인된 프로필만 조회한다.
+            if !should_probe(&key.1, host) || !lock(&PENDING).insert(key.clone()) {
                 continue;
             }
             spawn(&key, host, state.map(Path::to_path_buf));
@@ -1184,39 +1190,50 @@ pub(crate) mod agy {
                 .flatten();
                 // 조회 중 사용자가 직접 조회를 끄면 결과도 버린다.
                 let enabled = accounts::load_file(&job.0, state.as_deref()).direct_usage;
-                if enabled && let Some((usage, meters)) = usage {
-                    super::super::meters::remember(
-                        &job.0,
-                        ProviderKind::Antigravity,
-                        &job.1,
-                        meters,
-                    );
-                    // 한도 도달(100%)이면 다음 실행부터 다른 계정이 잡히게 기록한다(OWE-901).
-                    if usage_max(&usage) >= 100
-                        && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
-                    {
-                        accounts::record_rate_limited(ProviderKind::Antigravity, &id);
+                if enabled {
+                    if let Some((usage, meters)) = usage {
+                        lock(&FAILED).remove(&job);
+                        super::super::meters::remember(
+                            &job.0,
+                            ProviderKind::Antigravity,
+                            &job.1,
+                            meters,
+                        );
+                        // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
+                        // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
+                        if usage_max(&usage) < 100
+                            && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
+                        {
+                            accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
+                        }
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs());
+                        let mut cache = lock(&CACHE);
+                        cache.retain(|_, (at, _)| at.elapsed() < TTL);
+                        if cache.len() >= 256 {
+                            cache.pop_first();
+                        }
+                        cache.insert(
+                            job.clone(),
+                            (
+                                Instant::now(),
+                                ProfileUsage {
+                                    usage,
+                                    updated_at: now,
+                                    ..ProfileUsage::default()
+                                },
+                            ),
+                        );
+                    } else {
+                        let mut failed = lock(&FAILED);
+                        failed.retain(|_, at| at.elapsed() < TTL);
+                        if failed.len() >= 256 {
+                            failed.pop_first();
+                        }
+                        failed.insert(job.clone(), Instant::now());
                     }
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs());
-                    let mut cache = lock(&CACHE);
-                    cache.retain(|_, (at, _)| at.elapsed() < TTL);
-                    if cache.len() >= 256 {
-                        cache.pop_first();
-                    }
-                    cache.insert(
-                        job.clone(),
-                        (
-                            Instant::now(),
-                            ProfileUsage {
-                                usage,
-                                updated_at: now,
-                                ..ProfileUsage::default()
-                            },
-                        ),
-                    );
                 }
                 lock(&PENDING).remove(&job);
             });
@@ -1282,7 +1299,10 @@ pub(crate) mod agy {
         );
         // `--disable-slash-commands`는 절대 붙이지 않는다(OWE-901).
         debug_assert!(!argv.iter().any(|a| a.contains("disable-slash-commands")));
-        let body = run_agy(exe, &argv, TIMEOUT, MAX_BYTES)?;
+        // 호스트 기본 프로필이 macOS 키체인만으로 로그인된 경우 `SSH_CONNECTION=krill`을 주면
+        // 파일 토큰(`antigravity-oauth-token`)만 찾다가 대화형 OAuth 대기에 빠진다.
+        let ssh_connection = !host || dir.join("antigravity-oauth-token").is_file() || cfg!(test);
+        let body = run_agy(exe, &argv, ssh_connection, TIMEOUT, MAX_BYTES)?;
         let text = std::str::from_utf8(&body).ok()?;
         if has_model_turn_trace(text) {
             MODEL_TURN_LATCH.store(true, Ordering::SeqCst);
@@ -1358,9 +1378,15 @@ pub(crate) mod agy {
         if let Some(hit) = lock(&VERSION_TEXT_CACHE).get(&(exe.to_path_buf(), mtime, len)) {
             return hit.clone();
         }
-        let mut text = run_agy(exe, &["--version".to_owned()], VERSION_TIMEOUT, 64 * 1024)
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_default();
+        let mut text = run_agy(
+            exe,
+            &["--version".to_owned()],
+            true,
+            VERSION_TIMEOUT,
+            64 * 1024,
+        )
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
         // 키 팽창 방지: 앞 64바이트만 쓴다(버전 표기는 앞에 있다).
         text.truncate(64);
         let mut cache = lock(&VERSION_TEXT_CACHE);
@@ -1477,15 +1503,24 @@ pub(crate) mod agy {
     }
 
     /// agy 한 번 실행. 타임아웃·출력 상한을 지킨다. 파이프 교착을 피하려고 stdout은 별도 스레드에서 읽는다.
-    fn run_agy(exe: &Path, args: &[String], timeout: Duration, max_bytes: u64) -> Option<Vec<u8>> {
-        let mut child = Command::new(exe)
-            .args(args)
-            .env("SSH_CONNECTION", "krill")
+    fn run_agy(
+        exe: &Path,
+        args: &[String],
+        ssh_connection: bool,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Option<Vec<u8>> {
+        let mut cmd = Command::new(exe);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        if ssh_connection {
+            cmd.env("SSH_CONNECTION", "krill");
+        } else {
+            cmd.env_remove("SSH_CONNECTION");
+        }
+        let mut child = cmd.spawn().ok()?;
         let stdout = child.stdout.take()?;
         let reader = std::thread::Builder::new()
             .name("agy-read".into())

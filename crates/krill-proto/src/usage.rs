@@ -28,6 +28,9 @@ pub use connections::{AccountConnection, ConnectionStatus, ConnectionsSnapshot};
 pub const FEAT_USAGE_AGY: u64 = 1 << 53;
 /// Account-specific auto-switch rule requests and reply extension.
 pub const FEAT_USAGE_RULES: u64 = 1 << 54;
+/// Provider-specific auto-switch metrics appended after the three legacy metric variants.
+/// Peers without this capability must neither receive these rules nor be sent their mutations.
+pub const FEAT_USAGE_PROVIDER_METRICS: u64 = 1 << 26;
 /// Per-account usage status tail (`AccountStatusInfo`, OWE-703 1단계).
 /// `AccountsSnapshot` 꼬리의 rules 뒤에 붙는다.
 pub const FEAT_USAGE_STATUS: u64 = 1 << 57;
@@ -241,10 +244,24 @@ pub fn parse_antigravity_usage(s: &str) -> Snapshot {
     let Some(groups) = groups else {
         return Snapshot::default();
     };
+    let has_gemini_group = groups.iter().any(|group| {
+        group
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name.to_ascii_lowercase().contains("gemini"))
+    });
     let mut five_hour: Option<Window> = None;
     let mut seven_day: Option<Window> = None;
 
     for group in groups {
+        if has_gemini_group
+            && !group
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.to_ascii_lowercase().contains("gemini"))
+        {
+            continue;
+        }
         let Some(buckets) = group.get("buckets").and_then(serde_json::Value::as_array) else {
             continue;
         };
@@ -442,6 +459,9 @@ pub fn format_window_percent_ko(window: Option<&Window>, now_secs: i64) -> Strin
 }
 
 /// 계정별 자동전환 기준 창. 누락된 창의 사용률은 0이다.
+///
+/// 와이어 호환(postcard 순서 기반 직렬화)을 위해 기존 변형(`Max`, `FiveHour`, `SevenDay`) 뒤에
+/// 프로바이더별 변형을 추가한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoSwitchMetric {
@@ -449,14 +469,92 @@ pub enum AutoSwitchMetric {
     Max,
     FiveHour,
     SevenDay,
+    ClaudeSonnetSevenDay,
+    ClaudeOpusSevenDay,
+    CodexCodeReview,
+    AntigravityClaudeGptMax,
+    AntigravityClaudeGptFiveHour,
+    AntigravityClaudeGptSevenDay,
+    AntigravityAllMax,
+    OpenCodeThirtyDay,
 }
 
 impl AutoSwitchMetric {
+    #[must_use]
+    pub const fn requires_provider_metrics(self) -> bool {
+        !matches!(self, Self::Max | Self::FiveHour | Self::SevenDay)
+    }
+
+    #[must_use]
+    pub const fn for_provider(provider: ProviderKind) -> &'static [Self] {
+        match provider {
+            ProviderKind::Claude => &[
+                Self::Max,
+                Self::FiveHour,
+                Self::SevenDay,
+                Self::ClaudeSonnetSevenDay,
+                Self::ClaudeOpusSevenDay,
+            ],
+            ProviderKind::Codex => &[
+                Self::Max,
+                Self::FiveHour,
+                Self::SevenDay,
+                Self::CodexCodeReview,
+            ],
+            ProviderKind::Antigravity => &[
+                Self::Max,
+                Self::FiveHour,
+                Self::SevenDay,
+                Self::AntigravityClaudeGptMax,
+                Self::AntigravityClaudeGptFiveHour,
+                Self::AntigravityClaudeGptSevenDay,
+                Self::AntigravityAllMax,
+            ],
+            ProviderKind::OpenCode => &[
+                Self::Max,
+                Self::FiveHour,
+                Self::SevenDay,
+                Self::OpenCodeThirtyDay,
+            ],
+            ProviderKind::Gemini => &[Self::Max, Self::FiveHour, Self::SevenDay],
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Max => "Max(5h/7d)",
             Self::FiveHour => "5h",
             Self::SevenDay => "7d",
+            Self::ClaudeSonnetSevenDay => "Sonnet 7d",
+            Self::ClaudeOpusSevenDay => "Opus 7d",
+            Self::CodexCodeReview => "Code review",
+            Self::AntigravityClaudeGptMax => "Claude/GPT Max",
+            Self::AntigravityClaudeGptFiveHour => "Claude/GPT 5h",
+            Self::AntigravityClaudeGptSevenDay => "Claude/GPT 7d",
+            Self::AntigravityAllMax => "All Max",
+            Self::OpenCodeThirtyDay => "30d",
+        }
+    }
+
+    #[must_use]
+    pub const fn label_for(self, provider: ProviderKind) -> &'static str {
+        match (provider, self) {
+            (ProviderKind::Antigravity, Self::Max) => "Gemini Max",
+            (ProviderKind::Antigravity, Self::FiveHour) => "Gemini 5h",
+            (ProviderKind::Antigravity, Self::SevenDay) => "Gemini 7d",
+            _ => self.label(),
+        }
+    }
+
+    #[must_use]
+    pub const fn short_label_for(self, provider: ProviderKind) -> &'static str {
+        match (provider, self) {
+            (ProviderKind::Antigravity, Self::Max) => "Gemini Max",
+            (ProviderKind::Antigravity, Self::FiveHour) => "Gemini 5h",
+            (ProviderKind::Antigravity, Self::SevenDay) => "Gemini 7d",
+            (_, Self::Max) => "Max",
+            (_, Self::AntigravityClaudeGptMax) => "Claude/GPT",
+            _ => self.label(),
         }
     }
 
@@ -465,23 +563,50 @@ impl AutoSwitchMetric {
             Self::Max => "max",
             Self::FiveHour => "5h",
             Self::SevenDay => "7d",
+            Self::ClaudeSonnetSevenDay => "sonnet_7d",
+            Self::ClaudeOpusSevenDay => "opus_7d",
+            Self::CodexCodeReview => "code_review",
+            Self::AntigravityClaudeGptMax => "claude_gpt_max",
+            Self::AntigravityClaudeGptFiveHour => "claude_gpt_5h",
+            Self::AntigravityClaudeGptSevenDay => "claude_gpt_7d",
+            Self::AntigravityAllMax => "all_max",
+            Self::OpenCodeThirtyDay => "30d",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "max" | "Max" => Some(Self::Max),
-            "5h" | "five_hour" => Some(Self::FiveHour),
-            "7d" | "seven_day" => Some(Self::SevenDay),
+            "max" | "Max" | "gemini_max" => Some(Self::Max),
+            "5h" | "five_hour" | "gemini_5h" => Some(Self::FiveHour),
+            "7d" | "seven_day" | "gemini_7d" => Some(Self::SevenDay),
+            "sonnet_7d" | "claude_sonnet_seven_day" => Some(Self::ClaudeSonnetSevenDay),
+            "opus_7d" | "claude_opus_seven_day" => Some(Self::ClaudeOpusSevenDay),
+            "code_review" | "codex_code_review" => Some(Self::CodexCodeReview),
+            "claude_gpt_max" | "antigravity_claude_gpt_max" => Some(Self::AntigravityClaudeGptMax),
+            "claude_gpt_5h" | "antigravity_claude_gpt_five_hour" => {
+                Some(Self::AntigravityClaudeGptFiveHour)
+            }
+            "claude_gpt_7d" | "antigravity_claude_gpt_seven_day" => {
+                Some(Self::AntigravityClaudeGptSevenDay)
+            }
+            "all_max" | "antigravity_all_max" => Some(Self::AntigravityAllMax),
+            "30d" | "monthly" | "open_code_thirty_day" => Some(Self::OpenCodeThirtyDay),
             _ => None,
         }
     }
 
     pub fn evaluate(self, u: &Snapshot) -> u8 {
         match self {
-            Self::Max => u.max_percent(),
+            Self::Max | Self::AntigravityAllMax => u.max_percent(),
             Self::FiveHour => u.five_hour.as_ref().map_or(0, |w| w.percent),
             Self::SevenDay => u.seven_day.as_ref().map_or(0, |w| w.percent),
+            Self::ClaudeSonnetSevenDay
+            | Self::ClaudeOpusSevenDay
+            | Self::CodexCodeReview
+            | Self::AntigravityClaudeGptMax
+            | Self::AntigravityClaudeGptFiveHour
+            | Self::AntigravityClaudeGptSevenDay
+            | Self::OpenCodeThirtyDay => 0,
         }
     }
 
@@ -500,7 +625,7 @@ impl AutoSwitchMetric {
             (!expired).then_some(w.percent)
         };
         match self {
-            Self::Max => match (
+            Self::Max | Self::AntigravityAllMax => match (
                 value(usage.five_hour.as_ref()),
                 value(usage.seven_day.as_ref()),
             ) {
@@ -510,6 +635,13 @@ impl AutoSwitchMetric {
             },
             Self::FiveHour => value(usage.five_hour.as_ref()),
             Self::SevenDay => value(usage.seven_day.as_ref()),
+            Self::ClaudeSonnetSevenDay
+            | Self::ClaudeOpusSevenDay
+            | Self::CodexCodeReview
+            | Self::AntigravityClaudeGptMax
+            | Self::AntigravityClaudeGptFiveHour
+            | Self::AntigravityClaudeGptSevenDay
+            | Self::OpenCodeThirtyDay => None,
         }
     }
 }
@@ -749,6 +881,17 @@ impl UsageRequest {
 
     pub fn required_features(&self) -> u64 {
         let mut features = FEAT_USAGE;
+        let extended = match self {
+            Self::UpsertAutoSwitchRule(rule) => rule.metric.requires_provider_metrics(),
+            Self::SetAutoSwitch(policy) => policy
+                .rules
+                .iter()
+                .any(|rule| rule.metric.requires_provider_metrics()),
+            _ => false,
+        };
+        if extended {
+            features |= FEAT_USAGE_PROVIDER_METRICS;
+        }
         let provider = match self {
             Self::CancelAccountSwitch { .. } => {
                 features |= FEAT_ACCOUNT_CANCEL;
@@ -858,7 +1001,17 @@ impl UsageReply {
             // 소진 결과를 모르는 피어에는 스냅샷만 남긴다(요청 자체가 새 비트를 요구한다).
             self = Self::Accounts(snapshot);
         }
-        if let Self::Accounts(snapshot) = &mut self {
+        let snapshot = match &mut self {
+            Self::Accounts(snapshot) | Self::ResetConsumed { snapshot, .. } => Some(snapshot),
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            if features & FEAT_USAGE_PROVIDER_METRICS == 0 {
+                snapshot
+                    .auto_switch
+                    .rules
+                    .retain(|rule| !rule.metric.requires_provider_metrics());
+            }
             if features & FEAT_PROVIDER_DETAILS == 0 {
                 *snapshot.details = ProviderDetails::default();
             }

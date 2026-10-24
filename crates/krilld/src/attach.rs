@@ -75,6 +75,7 @@ struct Conn {
     /// 프레임 단위로 잠가 요청 응답과 델타가 섞이지 않게 한다.
     out: Mutex<UnixStream>,
     resync: AtomicBool,
+    echo: AtomicBool,
     gone: AtomicBool,
 }
 
@@ -208,6 +209,7 @@ pub(crate) fn run_as(
     let conn = Arc::new(Conn {
         out: Mutex::new(stream.try_clone()?),
         resync: AtomicBool::new(false),
+        echo: AtomicBool::new(false),
         gone: AtomicBool::new(false),
     });
     let p = tap.pulse();
@@ -271,10 +273,22 @@ fn requests(
             }
             (input::kind::INPUT, _) if features & FEAT_INPUT != 0 => {
                 let i = Input::decode(k, &body)?;
+                if client.can_modify() {
+                    conn.echo.store(true, Ordering::Release);
+                }
                 let result = match client.input(&i.bytes, s.as_fd()) {
-                    Ok(()) => InputResult::Applied,
-                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => InputResult::Denied,
-                    Err(_) => InputResult::Closed,
+                    Ok(()) => {
+                        conn.echo.store(true, Ordering::Release);
+                        InputResult::Applied
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                        conn.echo.store(false, Ordering::Release);
+                        InputResult::Denied
+                    }
+                    Err(_) => {
+                        conn.echo.store(false, Ordering::Release);
+                        InputResult::Closed
+                    }
                 };
                 conn.send(&InputAck { id: i.id, result }.encode()?)?;
             }
@@ -411,18 +425,53 @@ struct CaptureClock {
 }
 
 impl CaptureClock {
-    fn delay(&self, now: Instant, minimum: Duration, resync: bool) -> Duration {
-        if resync {
-            return Duration::ZERO;
-        }
+    fn next_delay(&self, now: Instant, minimum: Duration) -> Duration {
         self.last.map_or(Duration::ZERO, |at| {
             (at + minimum).saturating_duration_since(now)
         })
     }
 
+    fn delay(&self, now: Instant, minimum: Duration, resync: bool) -> Duration {
+        if resync {
+            return Duration::ZERO;
+        }
+        self.next_delay(now, minimum)
+    }
+
     fn mark(&mut self, now: Instant) {
         self.last = Some(now);
     }
+}
+
+fn frame_delay(
+    conn: &Conn,
+    clock: &CaptureClock,
+    now: Instant,
+    minimum: Duration,
+    resync: bool,
+) -> Duration {
+    if conn.echo.load(Ordering::Acquire) {
+        Duration::ZERO
+    } else {
+        clock.delay(now, minimum, resync)
+    }
+}
+
+fn sync_client(
+    conn: &Conn,
+    clock: &mut CaptureClock,
+    rev: Revision,
+    seq: Seq,
+    ops: Vec<Op>,
+    now: Instant,
+) -> io::Result<bool> {
+    if ops.is_empty() {
+        return Ok(false);
+    }
+    conn.update(rev, seq, ops)?;
+    conn.echo.store(false, Ordering::Release);
+    clock.mark(now);
+    Ok(true)
 }
 
 /// `meta`: 클라이언트가 [`FEAT_SCREEN_META`]를 협상했다(아니면 그 연산을 걸러 낸다).
@@ -468,14 +517,11 @@ fn screen_loop(
             return Ok(());
         }
         let resync = conn.resync.swap(false, Ordering::SeqCst);
-        let wait = clock.delay(Instant::now(), frame_min, resync);
+        let wait = frame_delay(conn, &clock, Instant::now(), frame_min, resync);
         if !wait.is_zero() {
             thread::sleep(wait);
         }
         let (next, rev, seq, next_modes) = tap.capture_shared_with_modes();
-        // 전송할 변경이 없어도 계산 시도는 제한한다. sync/제어열만 이어질 때
-        // 마지막 전송 시각만 쓰면 매 PTY batch마다 전체 화면을 비교하게 된다.
-        clock.mark(Instant::now());
         if modes_enabled && (resync || modes != next_modes) {
             conn.send(&next_modes.encode()?)?;
         }
@@ -492,10 +538,7 @@ fn screen_loop(
         } else {
             diff(&sent, &next)
         });
-        if !ops.is_empty() {
-            conn.update(rev, seq, ops)?;
-            clock.mark(Instant::now());
-        }
+        sync_client(conn, &mut clock, rev, seq, ops, Instant::now())?;
         sent = next;
         seen = rev.0;
         if p.closed && !closed_sent {

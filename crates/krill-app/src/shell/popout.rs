@@ -389,26 +389,23 @@ fn append_rule_menu(
         toggle,
         weak.clone(),
     ));
+    let provider = account.provider;
     let metric_rule = rule.clone();
     let metric_weak = weak.clone();
     menu = menu.submenu(
         format!(
             "{}: {}",
             provider_text::PROVIDER_RULE_METRIC.get(),
-            rule.metric.label()
+            rule.metric.label_for(provider)
         ),
         window,
         cx,
         move |mut menu, _, _| {
-            for metric in [
-                AutoSwitchMetric::Max,
-                AutoSwitchMetric::FiveHour,
-                AutoSwitchMetric::SevenDay,
-            ] {
+            for &metric in AutoSwitchMetric::for_provider(provider) {
                 let mut next = metric_rule.clone();
                 next.metric = metric;
                 menu = menu.item(rule_item(
-                    metric.label(),
+                    metric.label_for(provider),
                     metric_rule.metric == metric,
                     next,
                     metric_weak.clone(),

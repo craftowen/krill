@@ -21,20 +21,22 @@ const MkCrypto=(()=>{
  function hmac(key,data){if(key.length>64)key=sha256(key);const a=new Uint8Array(64).fill(0x36),b=new Uint8Array(64).fill(0x5c);for(let i=0;i<key.length;i++){a[i]^=key[i];b[i]^=key[i];}return sha256(concat(b,sha256(concat(a,data))));}
  const hkdf=(key,salt,info)=>hmac(hmac(salt,key),concat(enc.encode(info),Uint8Array.of(1)));
  const le=(value,n=8)=>{let b=new Uint8Array(n);value=BigInt(value);for(let i=0;i<n;i++){b[i]=Number(value&255n);value>>=8n;}return b;};
- const bigint=b=>{if(b.length===16){const view=new DataView(b.buffer,b.byteOffset,16);return view.getBigUint64(0,true)|(view.getBigUint64(8,true)<<64n);}let v=0n;for(let i=b.length-1;i>=0;i--)v=(v<<8n)|BigInt(b[i]);return v;};
+ const u32=(b,p)=>(b[p]|(b[p+1]<<8)|(b[p+2]<<16)|(b[p+3]<<24))>>>0,rotl=(a,n)=>(a<<n)|(a>>>(32-n));
+ const bigint=(b,at=0,len=b.length-at)=>{if(len===16)return BigInt(u32(b,at))|(BigInt(u32(b,at+4))<<32n)|(BigInt(u32(b,at+8))<<64n)|(BigInt(u32(b,at+12))<<96n);let v=0n;for(let i=at+len-1;i>=at;i--)v=(v<<8n)|BigInt(b[i]);return v;};
+ const chachaState=new Uint32Array(16),chachaWork=new Uint32Array(16),chachaOut=new Uint8Array(64),chachaView=new DataView(chachaOut.buffer);
  function chacha(key,nonce,counter){
-  const state=new Uint32Array(16),v=new DataView(key.buffer,key.byteOffset,key.byteLength),n=new DataView(nonce.buffer,nonce.byteOffset,nonce.byteLength);
-  state.set([0x61707865,0x3320646e,0x79622d32,0x6b206574]);for(let i=0;i<8;i++)state[i+4]=v.getUint32(i*4,true);state[12]=counter;for(let i=0;i<3;i++)state[13+i]=n.getUint32(i*4,true);
-  const x=state.slice(),rot=(a,n)=>(a<<n)|(a>>>(32-n));
-  const q=(a,b,c,d)=>{x[a]=(x[a]+x[b])>>>0;x[d]=rot(x[d]^x[a],16);x[c]=(x[c]+x[d])>>>0;x[b]=rot(x[b]^x[c],12);x[a]=(x[a]+x[b])>>>0;x[d]=rot(x[d]^x[a],8);x[c]=(x[c]+x[d])>>>0;x[b]=rot(x[b]^x[c],7);};
+  chachaState[0]=0x61707865;chachaState[1]=0x3320646e;chachaState[2]=0x79622d32;chachaState[3]=0x6b206574;
+  for(let i=0;i<8;i++)chachaState[i+4]=u32(key,i*4);chachaState[12]=counter;for(let i=0;i<3;i++)chachaState[13+i]=u32(nonce,i*4);
+  chachaWork.set(chachaState);
+  const x=chachaWork,q=(a,b,c,d)=>{x[a]=(x[a]+x[b])>>>0;x[d]=rotl(x[d]^x[a],16);x[c]=(x[c]+x[d])>>>0;x[b]=rotl(x[b]^x[c],12);x[a]=(x[a]+x[b])>>>0;x[d]=rotl(x[d]^x[a],8);x[c]=(x[c]+x[d])>>>0;x[b]=rotl(x[b]^x[c],7);};
   for(let i=0;i<10;i++){q(0,4,8,12);q(1,5,9,13);q(2,6,10,14);q(3,7,11,15);q(0,5,10,15);q(1,6,11,12);q(2,7,8,13);q(3,4,9,14);}
-  const out=new Uint8Array(64),view=new DataView(out.buffer);for(let i=0;i<16;i++)view.setUint32(i*4,(x[i]+state[i])>>>0,true);return out;
+  for(let i=0;i<16;i++)chachaView.setUint32(i*4,(x[i]+chachaState[i])>>>0,true);return chachaOut;
  }
  function xor(key,nonce,data){const out=new Uint8Array(data.length);for(let at=0;at<data.length;at+=64){const stream=chacha(key,nonce,1+at/64);for(let i=0;i<Math.min(64,data.length-at);i++)out[at+i]=data[at+i]^stream[i];}return out;}
  // Borrow read-only block views during this synchronous call; keep the input frame copy and AEAD checks.
- function poly1305(key,data){const r=bigint(key.subarray(0,16))&0x0ffffffc0ffffffc0ffffffc0fffffffn,s=bigint(key.subarray(16,32)),p=(1n<<130n)-5n;let a=0n;for(let at=0;at<data.length;at+=16){let part=data.subarray(at,at+16);a=((a+bigint(part)+(1n<<BigInt(part.length*8)))*r)%p;}return le((a+s)&((1n<<128n)-1n),16);}
+ function poly1305(key,data){const r=bigint(key,0,16)&0x0ffffffc0ffffffc0ffffffc0fffffffn,s=bigint(key,16,16),p=(1n<<130n)-5n;let a=0n;for(let at=0;at<data.length;at+=16){const n=Math.min(16,data.length-at);a=((a+bigint(data,at,n)+(1n<<BigInt(n*8)))*r)%p;}return le((a+s)&((1n<<128n)-1n),16);}
  const pad=b=>new Uint8Array((16-b.length%16)%16);
- const tag=(key,nonce,aad,data)=>poly1305(chacha(key,nonce,0).subarray(0,32),concat(aad,pad(aad),data,pad(data),le(aad.length),le(data.length)));
+ const tag=(key,nonce,aad,data)=>poly1305(chacha(key,nonce,0),concat(aad,pad(aad),data,pad(data),le(aad.length),le(data.length)));
  const hex=b=>Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');
  const unhex=s=>{if(!/^[0-9a-f]{64}$/i.test(s))throw Error('Invalid key');return Uint8Array.from(s.match(/../g),v=>parseInt(v,16));};
  const unbase64=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));

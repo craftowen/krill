@@ -12,15 +12,17 @@ use krill_proto::os::net::UnixStream;
 
 #[test]
 fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_old() {
-    for (fail, cancel, unconfirmed, close_fail) in [
-        (false, false, false, false),
-        (true, false, false, false),
-        (false, true, false, false),
-        (false, false, true, false),
-        (false, false, false, true),
+    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook) in [
+        (false, false, false, false, false, false),
+        (true, false, false, false, false, false),
+        (false, true, false, false, false, false),
+        (false, false, true, false, false, false),
+        (false, false, false, true, false, false),
+        (false, false, false, false, true, false),
+        (false, false, false, false, false, true),
     ] {
         let root = Path::new("/tmp").join(format!(
-            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}",
+            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}",
             std::process::id()
         ));
         fs::remove_dir_all(&root).ok();
@@ -55,6 +57,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
         )
         .unwrap();
+        let source_process = process_bound.then(|| FileHolder::new(&transcript));
         let (daemon_end, holder_end) = UnixStream::pair().unwrap();
         let mut holder_link = Link::new(OwnedFd::from(holder_end));
         for message in [
@@ -74,7 +77,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 holder,
                 vec![Kept {
                     id: SessionId(7),
-                    pid: 700,
+                    pid: source_process.as_ref().map_or(700, |p| p.0.id()),
                     status: None,
                     master: OwnedFd::from(master),
                 }],
@@ -88,7 +91,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                     profile: "codex".into(),
                     permission: Permission::Yolo,
                 },
-                Some(sid.into()),
+                (!process_bound && !late_hook).then(|| sid.into()),
                 root.as_os_str().as_encoded_bytes().to_vec(),
                 Some(LaunchAccount {
                     id: "codex-old".into(),
@@ -101,6 +104,9 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
         let reader_worker =
             std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
         let expected_home = to.clone();
+        let expected_transcript = to
+            .join("sessions/2026/10/20")
+            .join(transcript.file_name().unwrap());
         let reselect = cancel.then(|| Arc::clone(&reg));
         let hook_reg = Arc::clone(&reg);
         let mock = std::thread::spawn(move || {
@@ -132,15 +138,17 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                     .unwrap();
                 return None;
             }
+            let replacement_process = process_bound.then(|| FileHolder::new(&expected_transcript));
+            let pid = replacement_process.as_ref().map_or(800, |p| p.0.id());
             let (master, mut process) = UnixStream::pair().unwrap();
             holder_link
                 .send(
-                    &FromHolder::Spawned { req, id, pid: 800 }.encode().unwrap(),
+                    &FromHolder::Spawned { req, id, pid }.encode().unwrap(),
                     &[master.as_fd()],
                 )
                 .unwrap();
             process.write_all(b"resumed selected account\r\n").unwrap();
-            if !unconfirmed {
+            if !unconfirmed && !process_bound {
                 hook_reg.agents.record_hook_session(
                     id,
                     format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{sid}\"}}")
@@ -196,7 +204,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                     .unwrap();
             }
             // Keep the new PTY open until the parent has committed its handoff.
-            Some((id, process))
+            Some((id, process, replacement_process))
         });
         reg.queue_account_switch(ProviderKind::Codex, &target);
         reg.queue_account_switch(ProviderKind::Codex, "codex-old");
@@ -205,7 +213,21 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             "reselecting the running account cancels a queued handoff"
         );
         reg.queue_account_switch(ProviderKind::Codex, &target);
+        let hook_registry = Arc::clone(&reg);
+        let late_binding = late_hook.then(|| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                hook_registry.agents.record_hook_session(
+                    SessionId(7),
+                    format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{sid}\"}}")
+                        .as_bytes(),
+                );
+            })
+        });
         reg.process_account_work_in(&home);
+        if let Some(binding) = late_binding {
+            binding.join().unwrap();
+        }
         let saved = load(Some(&state));
         if cancel {
             assert!(
@@ -234,6 +256,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
         );
         drop(mock.join().unwrap());
         reader_worker.join().unwrap();
+        drop(source_process);
         drop(reg);
         fs::remove_dir_all(root).unwrap();
     }
@@ -249,6 +272,7 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
         "bound-missing",
         "bound-mismatched",
         "duplicate-id",
+        "process-mismatch",
     ] {
         let root = Path::new("/tmp").join(format!("kas-preserve-{}-{case}", std::process::id()));
         fs::remove_dir_all(&root).ok();
@@ -291,6 +315,13 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
         if case == "bound-mismatched" {
             write_transcript(sid, "unrelated-conversation");
         }
+        if case == "process-mismatch" {
+            write_transcript(sid, sid);
+            write_transcript("wrong-conversation", "wrong-conversation");
+        }
+        let source_process = (case == "process-mismatch").then(|| {
+            FileHolder::new(&from.join(format!("sessions/2026/10/20/rollout-{sid}.jsonl")))
+        });
         if case == "duplicate-id" {
             write_transcript(&format!("one-{sid}"), sid);
             write_transcript(&format!("two-{sid}"), sid);
@@ -318,7 +349,7 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
                 holder,
                 vec![Kept {
                     id: SessionId(9),
-                    pid: 900,
+                    pid: source_process.as_ref().map_or(900, |p| p.0.id()),
                     status: None,
                     master: OwnedFd::from(master),
                 }],
@@ -334,7 +365,10 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
                 },
                 case.starts_with("bound-")
                     .then(|| sid.to_owned())
-                    .or_else(|| (case == "duplicate-id").then(|| sid.to_owned())),
+                    .or_else(|| (case == "duplicate-id").then(|| sid.to_owned()))
+                    .or_else(|| {
+                        (case == "process-mismatch").then(|| "wrong-conversation".to_owned())
+                    }),
                 cwd,
                 Some(LaunchAccount {
                     id: "codex-old".into(),
@@ -345,6 +379,12 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
             .unwrap();
         let launch_path = state.join("agent-launches/9.json");
         let original_launch = fs::read(&launch_path).unwrap();
+        if matches!(case, "single-cwd-match" | "ambiguous-cwd") {
+            // Reading chat history can use a project fallback for display, but must
+            // never turn that guess into permission to replace the live agent.
+            reg.chat_poll(SessionId(9), 0);
+            assert_eq!(fs::read(&launch_path).unwrap(), original_launch, "{case}");
+        }
         old_process
             .write_all(b"original history before handoff\r\n")
             .unwrap();
@@ -393,6 +433,7 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
             "old PTY continues capturing history: {case}"
         );
         drop(reg);
+        drop(source_process);
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -616,4 +657,251 @@ fn explicit_cancel_requires_a_failed_live_original_and_preserves_untracked_accou
     assert!(!lock(&reg.state).closing.contains(&session));
     drop(reg);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_session_start_hook() {
+    for confirmed in [true, false] {
+        let root = Path::new("/tmp").join(format!("kas-agy-{}-{confirmed}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let home = root.join("home");
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&state).unwrap();
+        let sid = "8f870a24-4055-4bdb-8c26-bd8d72c64bc3";
+        let from_agy = from.join(".gemini/antigravity-cli");
+        let to_agy = to.join(".gemini/antigravity-cli");
+        fs::create_dir_all(
+            from_agy
+                .join("brain")
+                .join(sid)
+                .join(".system_generated/logs"),
+        )
+        .unwrap();
+        fs::create_dir_all(from_agy.join("conversations")).unwrap();
+        fs::create_dir_all(from_agy.join("annotations")).unwrap();
+        fs::create_dir_all(&to_agy).unwrap();
+        let tp = from_agy
+            .join("brain")
+            .join(sid)
+            .join(".system_generated/logs/transcript.jsonl");
+        fs::write(&tp, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        fs::write(
+            from_agy.join("conversations").join(format!("{sid}.db")),
+            b"SQLite format 3\0fixture-conversation",
+        )
+        .unwrap();
+        fs::write(
+            from_agy.join("annotations").join(format!("{sid}.pbtxt")),
+            b"title: \"agy switch\"",
+        )
+        .unwrap();
+        fs::write(
+            to_agy.join("antigravity-oauth-token"),
+            r#"{"access_token":"tok","expiry_date":4102444800000,"email":"agy2@example.com"}"#,
+        )
+        .unwrap();
+
+        let snap = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Antigravity,
+            "Antigravity #2",
+            Some("agy2@example.com".into()),
+            to.to_str().unwrap(),
+        )
+        .unwrap();
+        let target = snap
+            .accounts
+            .iter()
+            .find(|a| a.label == "Antigravity #2")
+            .unwrap()
+            .id
+            .clone();
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (master, _old_process) = UnixStream::pair().unwrap();
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: SessionId(11),
+                    pid: 1100,
+                    status: None,
+                    master: OwnedFd::from(master),
+                }],
+            )),
+            Some(&state),
+        ));
+        // Simulate an agy session where session_id was not bound at launch, only discovered via transcript_path
+        reg.agents
+            .remember_session(
+                SessionId(11),
+                &AgentLaunch {
+                    profile: "agy".into(),
+                    permission: Permission::Yolo,
+                },
+                None,
+                root.as_os_str().as_encoded_bytes().to_vec(),
+                Some(LaunchAccount {
+                    id: "agy-old".into(),
+                    env_key: "ANTIGRAVITY_CLI_HOME".into(),
+                    dir: from.display().to_string(),
+                }),
+            )
+            .unwrap();
+        reg.agents
+            .bind_discovered_session(SessionId(11), sid, Some(&tp));
+
+        let reader = Arc::clone(&reg);
+        let reader_worker =
+            std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+        let hook_reg = Arc::clone(&reg);
+        let expected_agy = to_agy.clone();
+        let mock = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn {
+                req, id, argv, env, ..
+            } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected replacement spawn");
+            };
+            assert!(argv.iter().any(|arg| arg == b"--conversation"));
+            assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
+            assert!(argv.iter().any(|arg| arg.starts_with(b"--gemini_dir=")));
+            assert!(
+                env.iter()
+                    .any(|(key, val)| key == b"KRILL_ACCOUNT_DIR" && !val.is_empty())
+            );
+            let presence = expected_agy.join("presence").join(format!("{sid}.lock"));
+            fs::create_dir_all(presence.parent().unwrap()).unwrap();
+            fs::write(&presence, b"").unwrap();
+            let replacement_process = confirmed.then(|| FileHolder::new(&presence));
+            let pid = replacement_process.as_ref().map_or(u32::MAX, |p| p.0.id());
+            let (master, mut process) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned { req, id, pid }.encode().unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            // Notice: NO SessionStart hook is sent for Antigravity!
+            process.write_all(b"Antigravity resumed prompt > ").unwrap();
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected old process retirement after agy output settles");
+            };
+            assert_eq!(old, if confirmed { SessionId(11) } else { id });
+            holder_link
+                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                .unwrap();
+            lock(&hook_reg.state).exited.insert(old, 0);
+            Some((id, process, replacement_process))
+        });
+
+        let wal = from_agy.join("conversations").join(format!("{sid}.db-wal"));
+        fs::write(&wal, b"active writer").unwrap();
+        reg.queue_account_switch(ProviderKind::Antigravity, &target);
+        reg.process_account_work_in(&home);
+        let pending = load(Some(&state));
+        let waiting = pending.get(&SessionId(11)).unwrap();
+        assert!(waiting.to.is_none() && waiting.error.is_none());
+        assert!(!lock(&reg.state).closing.contains(&SessionId(11)));
+        // It is scheduled, not a spin loop or a visible permanent failure.
+        reg.process_account_work_in(&home);
+        assert!(lock(&reg.account_work.pending).contains_key(&ProviderKind::Antigravity));
+        fs::remove_file(wal).unwrap();
+        lock(&reg.account_work.pending)
+            .get_mut(&ProviderKind::Antigravity)
+            .unwrap()
+            .not_before = None;
+        reg.process_account_work_in(&home);
+        let saved = load(Some(&state));
+        let result = saved.get(&SessionId(11)).unwrap();
+        if confirmed {
+            assert!(
+                result.error.is_none(),
+                "unexpected error: {:?}",
+                result.error
+            );
+            let new = result.to.expect("durable replacement for agy");
+            assert_eq!(
+                reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
+                target
+            );
+        } else {
+            assert!(result.to.is_none());
+            assert!(result.error.as_deref().unwrap().contains("timed out"));
+            assert!(!lock(&reg.state).closing.contains(&SessionId(11)));
+            assert!(!lock(&reg.state).exited.contains_key(&SessionId(11)));
+        }
+        assert!(
+            to_agy
+                .join("brain")
+                .join(sid)
+                .join(".system_generated/logs/transcript.jsonl")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(to_agy.join("conversations").join(format!("{sid}.db"))).unwrap(),
+            b"SQLite format 3\0fixture-conversation"
+        );
+        assert_eq!(
+            fs::read(to_agy.join("annotations").join(format!("{sid}.pbtxt"))).unwrap(),
+            b"title: \"agy switch\""
+        );
+
+        drop(mock.join().unwrap());
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// A real process holds the conversation file so tests exercise the kernel lookup too.
+struct FileHolder(std::process::Child);
+
+impl FileHolder {
+    #[expect(clippy::unwrap_used, reason = "real-process test fixture")]
+    fn new(path: &Path) -> Self {
+        use std::io::BufRead as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3<\"$1\"; printf 'ready\n'; read -r line",
+                "file-holder",
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        Self(child)
+    }
+}
+
+impl Drop for FileHolder {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
 }

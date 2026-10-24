@@ -3716,6 +3716,7 @@ impl Shell {
                 self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
+                self.reconcile_workspace_sessions(cx);
             }
             linked.map(|l| (session, l, fresh))
         });
@@ -6544,16 +6545,6 @@ impl Render for Shell {
                             .when(artifacts_view.is_none() && !mobile_page, |d| {
                                 d.child(self.render_tab_bar(window, cx))
                             })
-                            .children(self.failed_account_input().map(|session| {
-                                div().id("account-input-recovery").debug_selector(|| "account-input-recovery".into()).flex().flex_wrap().items_center().gap_2()
-                                    .px_3().py_1p5().bg(p.warning).text_color(p.warning_foreground)
-                                    .text_size(krill_app::ui::TEXT_XS)
-                                    .child(krill_app::i18n::catalog::settings::ACCOUNT_INPUT_HELD.get())
-                                    .child(krill_app::ui::secondary("account-continue-original", krill_app::i18n::catalog::settings::ACCOUNT_CONTINUE_ORIGINAL.get())
-                                        .debug_selector(|| "account-continue-original".into())
-                                        .disabled(self.account_cancel.is_some())
-                                        .on_click(cx.listener(move |this, _, _, cx| this.continue_original_account(session, cx))))
-                            }))
                             .child(
                                 div()
                                     .flex_1()
@@ -6574,26 +6565,29 @@ impl Render for Shell {
                                     .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
                             ),
                     )
-                    .when(!self.panel_collapsed && artifacts_view.is_none() && !mobile_page, |d| {
-                        d.child(divider(
-                            "divider-panel".into(),
-                            Drag::Panel,
-                            Axis::Horizontal,
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .id("panel-column")
-                                .debug_selector(|| "panel-column".into())
-                                .flex_none()
-                                .w(px(self.layout.panel_width))
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .bg(sidebar_bg)
-                                .child(div().flex_1().min_h_0().child(self.diff.clone())),
-                        )
-                    })
+                    .when(
+                        !self.panel_collapsed && artifacts_view.is_none() && !mobile_page,
+                        |d| {
+                            d.child(divider(
+                                "divider-panel".into(),
+                                Drag::Panel,
+                                Axis::Horizontal,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .id("panel-column")
+                                    .debug_selector(|| "panel-column".into())
+                                    .flex_none()
+                                    .w(px(self.layout.panel_width))
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .bg(sidebar_bg)
+                                    .child(div().flex_1().min_h_0().child(self.diff.clone())),
+                            )
+                        },
+                    )
             })
             .child(self.render_status_bar(window, cx))
             .children(self.jump.as_ref().map(|(palette, _)| palette.clone()))

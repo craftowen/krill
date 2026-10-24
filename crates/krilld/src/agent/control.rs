@@ -76,6 +76,14 @@ impl Control {
         lock(&self.account_resumes).insert(session, None);
     }
 
+    pub fn observe_account_resume(&self, session: SessionId, id: &str) {
+        if valid_session_id(id)
+            && let Some(observed) = lock(&self.account_resumes).get_mut(&session)
+        {
+            *observed = Some(id.to_owned());
+        }
+    }
+
     pub fn account_resume_observed(&self, session: SessionId, id: &str) -> bool {
         lock(&self.account_resumes)
             .get(&session)
@@ -252,6 +260,38 @@ impl Control {
         self.read_stored(session)
     }
 
+    /// Merge process-attributed switch metadata without overwriting a concurrent hook.
+    pub fn bind_switch_identity(
+        &self,
+        session: SessionId,
+        discovered: &StoredLaunch,
+    ) -> io::Result<StoredLaunch> {
+        let _guard = lock(&self.config);
+        let mut stored = self
+            .read_stored(session)?
+            .unwrap_or_else(|| discovered.clone());
+        if stored.profile != discovered.profile
+            || (stored.session_id.is_some() && stored.session_id != discovered.session_id)
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        stored.session_id.clone_from(&discovered.session_id);
+        if stored.transcript_path.is_none() {
+            stored.transcript_path = discovered
+                .transcript_path
+                .clone()
+                .filter(|p| valid_transcript_path(p));
+        }
+        if stored.account.is_none() {
+            stored.account.clone_from(&discovered.account);
+        }
+        if self.read_stored(session)?.as_ref() != Some(&stored) {
+            let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
+            save(&self.launch_path(session)?, &bytes)?;
+        }
+        Ok(stored)
+    }
+
     fn read_stored(&self, session: SessionId) -> io::Result<Option<StoredLaunch>> {
         if self.dir.is_none() {
             return Ok(None);
@@ -416,9 +456,8 @@ impl Control {
                             | "PreToolUse"
                     )
                 })
-            && let Some(observed) = lock(&self.account_resumes).get_mut(&session)
         {
-            *observed = Some(id.to_owned());
+            self.observe_account_resume(session, id);
         }
 
         if foreign_session_id {
@@ -460,7 +499,7 @@ impl Control {
     }
 
     /// 실행 중인 에이전트 프로세스(`presence/<id>.lock` 등)에서 발견한 대화 ID·트랜스크립트 경로를
-    /// 아직 `session_id`가 비어 있는 기존 `StoredLaunch`에 기록한다.
+    /// 아직 `session_id` 또는 `transcript_path`가 비어 있는 기존 `StoredLaunch`에 기록한다.
     pub fn bind_discovered_session(
         &self,
         session: SessionId,
@@ -474,10 +513,18 @@ impl Control {
         let Ok(Some(mut stored)) = self.read_stored(session) else {
             return;
         };
-        if stored.session_id.is_some() {
+        if stored
+            .session_id
+            .as_deref()
+            .is_some_and(|existing| existing != session_id)
+        {
             return;
         }
-        stored.session_id = Some(session_id.to_owned());
+        let mut changed = false;
+        if stored.session_id.is_none() {
+            stored.session_id = Some(session_id.to_owned());
+            changed = true;
+        }
         if stored.transcript_path.is_none()
             && let Some(tp) = transcript_path
                 .and_then(Path::to_str)
@@ -485,12 +532,66 @@ impl Control {
                 .filter(|p| valid_transcript_path(p))
         {
             stored.transcript_path = Some(tp.to_owned());
+            changed = true;
+        }
+        if !changed {
+            return;
         }
         if let Ok(path) = self.launch_path(session)
             && let Ok(bytes) = serde_json::to_vec(&stored)
         {
             save(&path, &bytes).ok();
         }
+    }
+
+    /// 세션 실행 기록(`agent-launches/<id>.json`)이 생성된 시각(epoch 초).
+    pub fn launched_at(&self, session: SessionId) -> Option<u64> {
+        let path = self.launch_path(session).ok()?;
+        let meta = fs::metadata(path).ok()?;
+        meta.created()
+            .or_else(|_| meta.modified())
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+
+    /// 다른 세션(`exclude` 제외)이 이미 바인딩한 `session_id`와 `transcript_path` 집합을 반환한다.
+    pub fn claimed_transcripts(
+        &self,
+        exclude: SessionId,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<PathBuf>,
+    ) {
+        let mut sids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        let Some(dir) = self.dir.as_ref().map(|d| d.join("agent-launches")) else {
+            return (sids, paths);
+        };
+        let _guard = lock(&self.config);
+        let Ok(entries) = fs::read_dir(dir) else {
+            return (sids, paths);
+        };
+        let skip_name = format!("{}.json", exclude.0);
+        for entry in entries.take(512).flatten() {
+            if entry.file_name().to_str() == Some(skip_name.as_str()) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(stored) = serde_json::from_slice::<StoredLaunch>(&bytes) else {
+                continue;
+            };
+            if let Some(sid) = stored.session_id.filter(|s| !s.trim().is_empty()) {
+                sids.insert(sid);
+            }
+            if let Some(tp) = stored.transcript_path.filter(|s| !s.trim().is_empty()) {
+                paths.insert(PathBuf::from(tp));
+            }
+        }
+        (sids, paths)
     }
 
     pub fn block_hibernation(&self, session: SessionId) {

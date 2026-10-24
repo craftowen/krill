@@ -1,7 +1,6 @@
 //! 모바일 목록도 데스크톱의 projects.toml·sidebar.bin을 읽는다. 세션 유무는 목록의 조건이 아니다.
 use super::devices::hex;
 use krill_proto::control::RepositoryTrees;
-use krill_proto::mobile::view::ViewChange;
 use krill_proto::os::ffi::OsStrExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -146,27 +145,16 @@ pub(super) struct Catalog {
     sort_by: u32,
     updated_at: BTreeMap<PathBuf, u64>,
     unread: BTreeSet<PathBuf>,
-    /// 데스크톱 사이드바 표시 규칙(필터·숨긴 프로젝트·접힘). 모바일 목록이 PC와 같은 항목만 보이게 한다.
+    /// PC 사이드바가 기억하는 워크트리·프로젝트 사실(잠재움·목록에서 제거·외부 워크트리 펼침).
+    /// 필터·묶음·정렬·접힘은 기기마다 따로 저장하므로 여기서 읽지 않는다.
     view: SidebarView,
     /// 워크트리 진행 상태(상태별 묶음용, `WorkspaceStatus::as_str`).
     statuses: BTreeMap<PathBuf, &'static str>,
 }
-/// 데스크톱 `is_worktree_visible`·`rows_with_options`(프로젝트 기준)가 쓰는 표시 규칙 사본.
+/// 데스크톱 `is_worktree_visible`이 옵션 말고 보는 사실들.
 #[derive(Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "mirrors the desktop sidebar filter flags persisted in sidebar.bin"
-)]
 struct SidebarView {
-    /// 데스크톱 `GroupBy` 변형 인덱스(0 프로젝트·1 상태·2 PR·3 없음).
-    group_by: u32,
-    repos: BTreeSet<PathBuf>,
-    hide_sleeping: bool,
-    always_show_default_branch: bool,
-    hide_automation: bool,
-    hide_cli: bool,
     sleeping: BTreeSet<PathBuf>,
-    collapsed: BTreeSet<PathBuf>,
     removed: BTreeSet<PathBuf>,
     shown_external: BTreeSet<PathBuf>,
 }
@@ -275,36 +263,11 @@ impl Catalog {
             .collect();
         let project_order: Vec<PathBuf> =
             project_order.into_iter().map(|p| normalize(&p)).collect();
-        let (mut view, mut sort_by) = (view, sort_by);
-        // 폰에서 바꿨지만 앱이 아직 sidebar.bin에 반영하지 않은 옵션을 덧씌운다.
-        if let Some((_, change)) = dir.and_then(ViewChange::load) {
-            view.group_by = change.group_by.unwrap_or(view.group_by);
-            sort_by = change.sort_by.unwrap_or(sort_by);
-            view.hide_sleeping = change.hide_sleeping.unwrap_or(view.hide_sleeping);
-            view.always_show_default_branch = change
-                .always_show_default_branch
-                .unwrap_or(view.always_show_default_branch);
-            view.hide_automation = change.hide_automation.unwrap_or(view.hide_automation);
-            view.hide_cli = change.hide_cli.unwrap_or(view.hide_cli);
-            if let Some(repos) = change.repos {
-                view.repos = repos;
-            }
-            for (repo, collapsed) in change.collapsed {
-                if collapsed {
-                    view.collapsed.insert(repo);
-                } else {
-                    view.collapsed.remove(&repo);
-                }
-            }
-        }
         let set = |paths: BTreeSet<PathBuf>| paths.iter().map(|p| normalize(p)).collect();
         let view = SidebarView {
-            repos: set(view.repos),
             sleeping: set(view.sleeping),
-            collapsed: set(view.collapsed),
             removed: set(view.removed),
             shown_external: set(view.shown_external),
-            ..view
         };
         let mut catalog = Self {
             preferences,
@@ -528,25 +491,12 @@ impl Catalog {
                 "label":self.repo_labels.get(&repo).cloned().unwrap_or_else(|| label(&repo)),
                 "icon":self.repo_icons.get(&repo).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
                 "badge_color":self.repo_badges.get(&repo).cloned().map_or(Value::Null, Value::String),
-                "removed":self.view.removed.contains(&repo),"collapsed":self.view.collapsed.contains(&repo),
+                "removed":self.view.removed.contains(&repo),
                 "worktree_keys":r.worktrees.iter().map(|t| hex(t)).collect::<Vec<_>>()})
             })
             .collect()
     }
-    /// 폰의 작업 공간 옵션 패널이 보여 줄 현재 PC 옵션. 프로젝트 선택은 저장소 키로 낸다.
-    pub fn view_json(&self) -> Value {
-        let view = &self.view;
-        let repos: Vec<String> = self
-            .repositories
-            .iter()
-            .filter(|r| view.repos.contains(&path(&r.repo)))
-            .map(|r| hex(&r.repo))
-            .collect();
-        json!({"group_by":view.group_by,"sort_by":self.sort_by,"hide_sleeping":view.hide_sleeping,
-            "always_show_default_branch":view.always_show_default_branch,
-            "hide_automation":view.hide_automation,"hide_cli":view.hide_cli,"repos":repos})
-    }
-    /// 데스크톱 `is_worktree_visible`이 보는 사실들. 숨길지는 폰이 현재 옵션으로 정한다(옵션을 바꾸면 왕복 없이 바로 다시 그린다).
+    /// 데스크톱 `is_worktree_visible`이 보는 사실들. 숨길지는 폰이 그 기기의 옵션으로 정한다(옵션을 바꾸면 왕복 없이 바로 다시 그린다).
     /// `awake`는 작업 중·대기·완료이거나 에이전트가 살아 있는 세션이 있는 워크트리다.
     fn visibility(
         &self,
@@ -584,8 +534,9 @@ impl Catalog {
         awake: &BTreeSet<PathBuf>,
     ) -> Vec<Value> {
         // 데스크톱 `sort_worktrees`와 같은 키: 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
-        let sort_key = |t: &PathBuf| {
-            let rank = if self.sort_by == 0 {
+        // `sort_by`는 `SortBy` 변형 인덱스(0 스마트·1 최근·2 이름·3 생성순)다.
+        let sort_key = |t: &PathBuf, sort_by: u32| {
+            let rank = if sort_by == 0 {
                 let state = ranks.get(t).copied().unwrap_or(4);
                 if state != 0 && self.unread.contains(t) {
                     1
@@ -595,7 +546,7 @@ impl Catalog {
             } else {
                 0
             };
-            let recent = match self.sort_by {
+            let recent = match sort_by {
                 0 | 1 => self.updated_at.get(t).copied().unwrap_or(0),
                 3 => created_ms(t).unwrap_or(0),
                 _ => 0,
@@ -608,28 +559,39 @@ impl Catalog {
                 t.clone(),
             )
         };
-        // 상태별·묶음 없음 보기는 프로젝트를 가로질러 같은 키로 줄 세운다(`order`).
-        let mut all: Vec<_> = self
+        // 폰은 기기별 정렬 기준으로 다시 줄 세운다. 기준마다 프로젝트를 가로지르는 순위를 낸다(`orders[sort_by]`).
+        let all: Vec<PathBuf> = self
             .repositories
             .iter()
             .flat_map(|r| r.worktrees.iter().map(|t| path(t)))
-            .map(|t| (sort_key(&t), t))
             .collect();
-        all.sort();
-        let order: BTreeMap<PathBuf, usize> = all
-            .into_iter()
-            .enumerate()
-            .map(|(i, (_, t))| (t, i))
-            .collect();
-        let order = &order;
+        let mut orders: BTreeMap<&Path, [usize; 4]> = BTreeMap::new();
+        for (mode, sort_by) in [0u32, 1, 2, 3].into_iter().enumerate() {
+            let mut sorted: Vec<_> = all.iter().map(|t| (sort_key(t, sort_by), t)).collect();
+            sorted.sort();
+            for (i, (_, t)) in sorted.into_iter().enumerate() {
+                if let Some(slot) = orders.entry(t).or_default().get_mut(mode) {
+                    *slot = i;
+                }
+            }
+        }
+        let orders = &orders;
         self.repositories
             .iter()
             .flat_map(|r| {
                 let repo = path(&r.repo);
                 let count = r.worktrees.len();
                 let mut trees: Vec<PathBuf> = r.worktrees.iter().map(|t| path(t)).collect();
-                // 프로젝트 안에서는 기본 체크아웃을 맨 위에 둔다.
-                trees.sort_by_cached_key(|t| (t != &repo, sort_key(t)));
+                // 프로젝트 안에서는 기본 체크아웃을 맨 위에 둔다. 기본 순서는 PC 정렬 기준이다.
+                trees.sort_by_cached_key(|t| (t != &repo, sort_key(t, self.sort_by)));
+                let group: BTreeSet<&Path> = trees.iter().map(PathBuf::as_path).collect();
+                let parents: BTreeMap<PathBuf, String> = trees
+                    .iter()
+                    .filter_map(|t| {
+                        let parent = effective_parent(t, &self.parents, &group)?;
+                        Some((t.clone(), hex(parent.as_os_str().as_bytes())))
+                    })
+                    .collect();
                 order_lineage(&trees, &self.parents)
                     .into_iter()
                     .map(move |(tree, depth)| {
@@ -671,7 +633,8 @@ impl Catalog {
                     "label":title,
                     "pinned":pref.is_some_and(|p| p.pinned),"branch":branch,
                     "visibility":self.visibility(&repo, &tree, count, awake),
-                    "order":order.get(&tree).copied().unwrap_or(usize::MAX),
+                    "orders":orders.get(tree.as_path()).copied().unwrap_or([usize::MAX; 4]),
+                    "parent":parents.get(&tree),
                     "status":self.statuses.get(&tree).copied().unwrap_or("todo"),
                     "depth":depth,"primary":tree == repo,
                     "icon":self.repo_icons.get(&tree).or_else(|| self.repo_icons.get(&repo)).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
@@ -712,7 +675,7 @@ fn worktree_sort_name(
         .or_else(|| branches.get(path).cloned())
         .unwrap_or_else(|| label(path))
 }
-/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준·표시 규칙을 꺼낸다. 형식 불일치는 기본값으로 강등한다.
+/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준·잠재움·숨긴 프로젝트를 꺼낸다. 형식 불일치는 기본값으로 강등한다.
 fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
     let mut tail = SidebarTail::default();
     let Ok((prefs, rest)) = postcard::take_from_bytes::<BTreeMap<PathBuf, Preference>>(body) else {
@@ -723,16 +686,6 @@ fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
         return tail;
     };
     tail.sort_by = options.sort_by;
-    let filters = options.filters;
-    tail.view = SidebarView {
-        group_by: options.group_by,
-        repos: filters.repos,
-        hide_sleeping: filters.hide_sleeping,
-        always_show_default_branch: filters.always_show_default_branch,
-        hide_automation: filters.hide_automation,
-        hide_cli: filters.hide_cli,
-        ..SidebarView::default()
-    };
     let Ok((lineage, rest)) = postcard::take_from_bytes::<BinLineage>(rest) else {
         return tail;
     };
@@ -741,7 +694,6 @@ fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
     let Ok((ui, rest)) = postcard::take_from_bytes::<BinUi>(rest) else {
         return tail;
     };
-    tail.view.collapsed = ui.collapsed;
     tail.view.removed = ui.removed_projects;
     tail.view.shown_external = ui.shown_external;
     if let Ok((order, _)) = postcard::take_from_bytes::<Vec<PathBuf>>(rest) {
@@ -1152,6 +1104,18 @@ value = "🚀"
             depths,
             vec![("/r", 0), ("/r/a", 0), ("/r/b", 1), ("/s", 0), ("/s/a", 0)]
         );
+        // 폰이 기기별 정렬로 다시 펼칠 때 쓰는 부모 키(같은 프로젝트 안의 명시 부모만).
+        let parents: Vec<_> = rows.iter().map(|w| w["parent"].clone()).collect();
+        assert_eq!(
+            parents,
+            vec![
+                Value::Null,
+                Value::Null,
+                json!(hex(b"/r/a")),
+                Value::Null,
+                Value::Null
+            ]
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1218,10 +1182,10 @@ value = "🚀"
     }
 
     #[test]
-    fn desktop_view_options_and_visibility_facts_follow_pc_sidebar() {
+    fn pc_visibility_facts_and_per_sort_orders_reach_the_phone() {
         let dir = std::env::temp_dir().join(format!("krill-ws-view-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        // 프로젝트 필터(/a, /c)·목록에서 제거(/c)·잠든 작업 공간 숨기기·/a 접힘을 PC 저장 순서대로 둔다.
+        // PC 필터·접힘은 폰에 넘기지 않는다(기기별 저장). 목록에서 제거(/c)·잠재움(/a/slept)만 사실로 넘긴다.
         let mut bytes = vec![1];
         bytes.extend(postcard::to_allocvec(&BTreeMap::<PathBuf, (bool, String)>::new()).unwrap());
         bytes.extend(
@@ -1298,23 +1262,12 @@ value = "🚀"
             .iter()
             .map(|r| {
                 let path = r["path"].as_str().unwrap().to_owned();
-                (
-                    path,
-                    r["removed"].as_bool().unwrap(),
-                    r["collapsed"].as_bool().unwrap(),
-                )
+                assert!(r.get("collapsed").is_none(), "folds are per device");
+                (path, r["removed"].as_bool().unwrap())
             })
             .collect();
-        let expected = [
-            ("/a", false, true),
-            ("/b", false, false),
-            ("/c", true, false),
-        ];
-        assert_eq!(repos, expected.map(|(p, r, c)| (p.to_owned(), r, c)));
-        let view = catalog.view_json();
-        assert_eq!(view["hide_sleeping"], true);
-        assert_eq!(view["sort_by"], 2);
-        assert_eq!(view["repos"], json!([hex(b"/a"), hex(b"/c")]));
+        let expected = [("/a", false), ("/b", false), ("/c", true)];
+        assert_eq!(repos, expected.map(|(p, r)| (p.to_owned(), r)));
         // 작업 중 세션이 있어도 PC에서 잠재운 /a/slept는 잠든 것으로 본다. 기본 체크아웃은 기본 브랜치다.
         let awake = BTreeSet::from([PathBuf::from("/a/busy"), PathBuf::from("/a/slept")]);
         let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &awake);
@@ -1334,22 +1287,26 @@ value = "🚀"
             7,
             "hidden rows stay in the payload for search and links"
         );
-        // 폰에서 바꾼 옵션은 앱이 sidebar.bin에 반영하기 전에도 덧씌워 보인다.
-        ViewChange::append(
-            &dir,
-            ViewChange {
-                hide_sleeping: Some(false),
-                repos: Some(BTreeSet::new()),
-                collapsed: BTreeMap::from([(PathBuf::from("/a"), false)]),
-                ..ViewChange::default()
-            },
-        )
-        .unwrap();
-        let catalog = Catalog::load(Some(&dir), &repositories);
-        let view = catalog.view_json();
-        assert_eq!(view["hide_sleeping"], false);
-        assert_eq!(view["repos"], json!([]));
-        assert_eq!(catalog.repositories_json()[0]["collapsed"], false);
+        // 폰은 정렬 기준마다 받은 순위로 다시 줄 세운다. 이름순(2)은 PC 정렬(이름순)과 같은 순서다.
+        let by_name: Vec<_> = {
+            let mut list: Vec<_> = rows
+                .iter()
+                .map(|w| {
+                    (
+                        w["orders"][2].as_u64().unwrap(),
+                        w["path"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            list.sort_unstable();
+            list.into_iter().map(|(_, p)| p).collect()
+        };
+        assert_eq!(by_name.len(), 7);
+        assert!(
+            rows.iter()
+                .all(|w| w["orders"].as_array().unwrap().len() == 4)
+        );
+        assert!(rows.iter().all(|w| w["parent"].is_null()));
         fs::remove_dir_all(dir).unwrap();
     }
 

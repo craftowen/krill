@@ -6105,7 +6105,11 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     vcx.update(|_, cx| {
         assert_eq!(
             take_pending_terminal_command(cx).as_deref(),
-            Some("npm install -g @openai/codex")
+            Some(if cfg!(windows) {
+                "npm.cmd install -g @openai/codex@latest"
+            } else {
+                "npm install -g @openai/codex@latest"
+            })
         );
         assert_eq!(take_pending_terminal_command(cx), None);
     });
@@ -6123,7 +6127,11 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     vcx.update(|_, cx| {
         assert_eq!(
             take_pending_terminal_command(cx).as_deref(),
-            Some("curl -fsSL https://claude.ai/install.sh | bash")
+            Some(if cfg!(windows) {
+                "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) latest"
+            } else {
+                "curl -fsSL https://claude.ai/install.sh | bash -s -- latest"
+            })
         );
     });
 
@@ -9418,4 +9426,78 @@ fn settings_navigation_exposes_selected_tab_metadata(_cx: &mut TestAppContext) {
             assert_eq!(node.is_selected(), Some(selected));
         }
     }
+}
+
+#[gpui::test]
+fn install_tab_terminal_and_copy_use_detected_package_manager(cx: &mut TestAppContext) {
+    let d = dir("install-detected-source");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(5000.)));
+    let command = "'/opt/homebrew/bin/brew' upgrade --cask 'codex'";
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Install, cx);
+            v.install.statuses.insert(
+                "codex",
+                install::ToolStatus {
+                    installed: true,
+                    binary_path: Some("/opt/homebrew/bin/codex".into()),
+                    version: Some("codex-test".into()),
+                    command: Some(command.into()),
+                },
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    click_install_control(vcx, "admin-install-copy-codex");
+    vcx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some(command)
+        );
+    });
+    click_install_control(vcx, "admin-install-term-codex");
+    vcx.update(|_, cx| {
+        assert_eq!(take_pending_terminal_command(cx).as_deref(), Some(command));
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn install_tab_package_manager_bootstrap_uses_terminal_without_claiming_success(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("install-manager-bootstrap");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(5000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Install, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    click_install_control(vcx, "admin-install-btn-pkgmgr");
+    vcx.update(|_, cx| {
+        let expected = install::CATALOG
+            .iter()
+            .find(|s| s.id == "pkgmgr")
+            .unwrap()
+            .install_command();
+        assert_eq!(take_pending_terminal_command(cx).as_deref(), Some(expected));
+        assert!(!view.read(cx).install.results.contains_key("pkgmgr"));
+        assert!(!view.read(cx).install.statuses["pkgmgr"].installed);
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+fn click_install_control(vcx: &mut gpui::VisualTestContext, selector: &'static str) {
+    let bounds = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("missing {selector}"));
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
 }

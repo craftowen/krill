@@ -30,6 +30,8 @@ mod actions;
 use actions::{RequestIdentity, Submission};
 #[cfg(test)]
 mod action_tests;
+#[cfg(test)]
+mod poll_tests;
 
 #[derive(Default)]
 pub(crate) struct SessionChatLog {
@@ -61,6 +63,8 @@ pub(crate) struct ChatState {
     pub inputs: BTreeMap<SessionId, (gpui::Entity<InputState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
+    poll_timer: Option<Task<()>>,
+    poll_failed: BTreeSet<SessionId>,
     pub poll_generation: u64,
     #[cfg(test)]
     pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -226,6 +230,23 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn toggle_chat_view_with_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_chat_view(cx);
+        if let Some(session) = self
+            .active_session_id()
+            .filter(|id| self.chat.active_sessions.contains(id))
+        {
+            let input = self.ensure_chat_input(session, window, cx);
+            input.update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            window.focus(&self.focus, cx);
+        }
+    }
+
     pub(super) fn maybe_poll_active_chat(&mut self, cx: &mut Context<Self>) {
         if !self.is_active_chat_view() {
             return;
@@ -239,6 +260,37 @@ impl Shell {
             return;
         }
         self.poll_active_chat(cx);
+    }
+
+    // Transcript flushes and hook binding can happen after the final PTY redraw.
+    // Keep retrying while Chat is visible, with at most one request in flight.
+    fn ensure_chat_poll_timer(&mut self, cx: &mut Context<Self>) {
+        if self.chat.poll_timer.is_some() {
+            return;
+        }
+        self.chat.poll_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(800))
+                    .await;
+                let keep_polling = this
+                    .update(cx, |this, cx| {
+                        if this.page_open()
+                            || this.dashboard.is_some()
+                            || !this.is_active_chat_view()
+                        {
+                            this.chat.poll_timer = None;
+                            return false;
+                        }
+                        this.poll_active_chat(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_polling {
+                    break;
+                }
+            }
+        }));
     }
 
     /// 데몬에 `Action::ChatPoll`을 요청해 활성 세션의 증분 트랜스크립트를 가져온다.
@@ -261,8 +313,12 @@ impl Shell {
         if self.chat.task.is_some() || !self.chat.active_sessions.contains(&session) {
             return;
         }
+        self.ensure_chat_poll_timer(cx);
         let host = self.layout.host(pane).clone();
         let Some(target) = self.target_for_host(&host) else {
+            if self.chat.poll_failed.insert(session) {
+                cx.notify();
+            }
             return;
         };
         let call = krill_app::agent_history::daemon_call_for(Some(target));
@@ -294,9 +350,13 @@ impl Shell {
                     && this.layout.session(pane) == Some(session)
                     && this.chat.active_sessions.contains(&session)
                     && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
-                    && let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply
                 {
-                    this.apply_chat_poll_for_host(session, host, snapshot);
+                    if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
+                        this.chat.poll_failed.remove(&session);
+                        this.apply_chat_poll_for_host(session, host, snapshot);
+                    } else {
+                        this.chat.poll_failed.insert(session);
+                    }
                     cx.notify();
                 }
                 if this
@@ -807,6 +867,7 @@ impl Shell {
         if !self.chat.active_sessions.contains(&session) {
             return None;
         }
+        self.ensure_chat_poll_timer(cx);
         let input_state = self.ensure_chat_input(session, window, cx);
         let theme = cx.theme();
         let bg = theme.background;
@@ -983,10 +1044,13 @@ impl Shell {
                         .label(ctext::TERM.get())
                         .ghost()
                         .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chat.active_sessions.remove(&session);
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.chat.active_sessions.remove(&session);
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            },
+                        )),
                     ),
             );
 
@@ -1002,10 +1066,35 @@ impl Shell {
                 .left_0()
                 .size_full()
                 .occlude()
+                // Consume bubbling events before the enclosing terminal pane can
+                // interpret chat clicks, selections, or scrolling as PTY input.
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.layout.focused() != Some(pane) {
+                            this.change(true, cx, |layout| {
+                                layout.focus(pane);
+                            });
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(gpui::MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(gpui::MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .flex()
                 .flex_col()
                 .bg(bg)
                 .child(feed)
+                .children(self.chat.poll_failed.contains(&session).then(|| {
+                    ui::error_banner(ui::palette(cx), ctext::POLL_FAILED.get())
+                        .id("chat-poll-error")
+                        .debug_selector(|| "chat-poll-error".into())
+                }))
                 .children(self.chat.prompt_failed.contains(&session).then(|| {
                     ui::error_banner(ui::palette(cx), ctext::PROMPT_FAILED.get())
                         .id("chat-prompt-error")

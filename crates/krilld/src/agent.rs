@@ -26,6 +26,7 @@ use crate::usage::accounts;
 use control::LaunchAccount;
 
 pub(crate) mod claude;
+mod codex;
 pub(crate) mod control;
 mod skills;
 #[cfg(any(windows, test))]
@@ -92,12 +93,17 @@ if [ -f "${ZDOTDIR:-$HOME}/.zshenv" ]; then
 fi
 __krill_sync_accounts() {
   local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
+  if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
+    _krill_env="$HOME/Library/Application Support/dev.krill.app/active-accounts.env"
+  fi
   if [ -f "$_krill_env" ]; then
     unset CLAUDE_CONFIG_DIR CODEX_HOME OPENCODE_CONFIG_DIR OPENCODE_DB ANTIGRAVITY_CLI_HOME GEMINI_CLI_HOME
     . "$_krill_env"
     if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
     if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
-    if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ]; then unset ANTIGRAVITY_CLI_HOME; fi
+    if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ] || [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME/.gemini/antigravity-cli" ]; then
+      unset ANTIGRAVITY_CLI_HOME
+    fi
     if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
       export XDG_DATA_HOME="$OPENCODE_CONFIG_DIR/data" XDG_STATE_HOME="$OPENCODE_CONFIG_DIR/state" OPENCODE_DB=opencode.db
       unset OPENCODE_CONFIG_DIR
@@ -116,7 +122,16 @@ if (( ! ${preexec_functions[(I)__krill_sync_accounts]} )); then
 fi
 agy() {
   __krill_sync_accounts
-  if [ -n "${ANTIGRAVITY_CLI_HOME-}" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME" ]; then
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      --gemini_dir|--gemini_dir=*|--gemini-dir|--gemini-dir=*)
+        command agy "$@"
+        return
+        ;;
+    esac
+  done
+  if [ -n "${ANTIGRAVITY_CLI_HOME-}" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME/.gemini/antigravity-cli" ]; then
     SSH_CONNECTION=krill command agy --gemini_dir="$ANTIGRAVITY_CLI_HOME/.gemini" "$@"
   else
     command agy "$@"
@@ -241,7 +256,7 @@ pub(crate) fn launch_selected_in(
         .transpose()?;
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, selected.as_ref());
-    if let Some(profile) = codex_hooks(profile, state) {
+    if let Some(profile) = codex_hooks(profile, state, &login.env)? {
         return Ok((
             wrap_account(&profile, permission, login, account.as_ref()),
             None,
@@ -341,7 +356,7 @@ pub(crate) fn resume_in(
     let account = apply_account_env(&mut login, profile, state, account);
     let kept_id = session_id.filter(|s| !s.is_empty()).map(str::to_owned);
     if is(profile, "codex") {
-        let hooked = codex_hooks(profile, state);
+        let hooked = codex_hooks(profile, state, &login.env)?;
         let profile = hooked.as_ref().unwrap_or(profile);
         let mut launch = wrap_account(profile, permission, login, account.as_ref());
         launch.argv.push(b"resume".to_vec());
@@ -412,7 +427,7 @@ pub(crate) fn fork_in(
     let account = apply_account_env(&mut login, profile, state, account);
     let kept_id = session_id.filter(|s| !s.is_empty()).map(str::to_owned);
     if is(profile, "codex") {
-        let hooked = codex_hooks(profile, state);
+        let hooked = codex_hooks(profile, state, &login.env)?;
         let profile = hooked.as_ref().unwrap_or(profile);
         let mut launch = wrap_account(profile, permission, login, account.as_ref());
         launch.argv.push(b"fork".to_vec());
@@ -448,16 +463,37 @@ pub(crate) fn resume_account(
     recorded: Option<&LaunchAccount>,
     session_id: Option<&str>,
 ) -> Option<LaunchAccount> {
+    resume_account_in(
+        &accounts::default_home(),
+        profile,
+        state,
+        recorded,
+        session_id,
+    )
+}
+
+pub(crate) fn resume_account_in(
+    home: &Path,
+    profile: &Profile,
+    state: Option<&Path>,
+    recorded: Option<&LaunchAccount>,
+    session_id: Option<&str>,
+) -> Option<LaunchAccount> {
     use krill_proto::agent_history::{VaultAgent, VaultTarget};
     let program = Path::new(profile.program()?).file_name()?.to_str()?;
     let provider = ProviderKind::parse(program)?;
+    let file = accounts::load_file(home, state);
     // 프로필의 프로그램이 바뀌었으면(다른 프로바이더) 기록을 쓰지 않는다.
     if let Some(account) = recorded.filter(|a| {
         (a.env_key == provider.env_var()
             || (provider == ProviderKind::Antigravity && a.env_key.is_empty()))
             && (a.dir.is_empty() || Path::new(&a.dir).is_dir())
     }) {
-        return Some(account.clone());
+        let mut account = account.clone();
+        if account.id.is_empty() {
+            account.id = account_id_in(home, &file, provider, &account.dir);
+        }
+        return Some(account);
     }
     let agent = match provider {
         ProviderKind::Claude => VaultAgent::Claude,
@@ -467,7 +503,6 @@ pub(crate) fn resume_account(
         ProviderKind::Gemini => return None,
     };
     let id = session_id.filter(|id| control::valid_session_id(id))?;
-    let home = accounts::default_home();
     let key = provider.env_var();
     let inherited = (provider != ProviderKind::Antigravity)
         .then(|| std::env::var_os(key))
@@ -476,14 +511,13 @@ pub(crate) fn resume_account(
         .map(PathBuf::from);
     let host = inherited
         .clone()
-        .unwrap_or_else(|| accounts::host_default_dir(&home, provider));
+        .unwrap_or_else(|| accounts::host_default_dir(home, provider));
     let target = VaultTarget {
         agent,
         id: id.to_owned(),
         cwd: String::new(),
         modified: 0,
     };
-    let file = accounts::load_file(&home, state);
     let dir = crate::agent_history::vault::profile_dir_for_vault_target_in(
         &file,
         &target,
@@ -497,10 +531,72 @@ pub(crate) fn resume_account(
         dir.into_os_string().into_string().ok()?
     };
     Some(LaunchAccount {
-        id: account_id(&file, provider, &dir),
+        id: account_id_in(home, &file, provider, &dir),
         env_key: key.to_owned(),
         dir,
     })
+}
+
+/// 저장된 실행 기록(`account` → `transcript_path` → `session_id` 볼트 탐색)에서 세션이 속한 계정을 찾는다.
+pub(crate) fn account_for_stored_in(
+    home: &Path,
+    profile: &Profile,
+    state: Option<&Path>,
+    stored: &control::StoredLaunch,
+) -> Option<LaunchAccount> {
+    let program = Path::new(profile.program()?).file_name()?.to_str()?;
+    let provider = ProviderKind::parse(program)?;
+    let file = accounts::load_file(home, state);
+    if let Some(account) = stored.account.as_ref().filter(|a| {
+        (a.env_key == provider.env_var()
+            || (provider == ProviderKind::Antigravity && a.env_key.is_empty()))
+            && (a.dir.is_empty() || Path::new(&a.dir).is_dir())
+    }) {
+        let mut account = account.clone();
+        if account.id.is_empty() {
+            account.id = account_id_in(home, &file, provider, &account.dir);
+        }
+        return Some(account);
+    }
+    if let Some(path) = stored.transcript_path.as_deref().filter(|p| !p.is_empty()) {
+        let transcript = Path::new(path);
+        for a in &file.accounts {
+            if ProviderKind::parse(&a.provider) != Some(provider) {
+                continue;
+            }
+            let cfg = a.config_dir();
+            if cfg.as_os_str().is_empty() {
+                continue;
+            }
+            let resolved = if provider == ProviderKind::Codex {
+                accounts::resolve_codex_dir(home, &a.id, cfg)
+            } else {
+                cfg.to_path_buf()
+            };
+            if transcript.starts_with(&resolved) || transcript.starts_with(cfg) {
+                return Some(LaunchAccount {
+                    id: a.id.clone(),
+                    env_key: provider.env_var().to_owned(),
+                    dir: resolved.to_string_lossy().into_owned(),
+                });
+            }
+        }
+        let host = accounts::host_default_dir(home, provider);
+        if !host.as_os_str().is_empty() && transcript.starts_with(&host) {
+            return Some(LaunchAccount {
+                id: accounts::host_default_id(provider),
+                env_key: provider.env_var().to_owned(),
+                dir: String::new(),
+            });
+        }
+    }
+    resume_account_in(
+        home,
+        profile,
+        state,
+        stored.account.as_ref(),
+        stored.session_id.as_deref(),
+    )
 }
 
 /// 지금 활성 계정. 호스트 기본이면 `dir`이 빈 기록이라 이후 계정을 바꿔도 재개는 기본 프로필로 간다.
@@ -519,11 +615,15 @@ fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> 
 }
 
 /// `accounts.toml`에서 프로필 폴더로 계정 id를 찾는다. 기본 프로필은 호스트 id, 없으면 빈 값.
-fn account_id(file: &accounts::AccountsFile, provider: ProviderKind, dir: &str) -> String {
+fn account_id_in(
+    home: &Path,
+    file: &accounts::AccountsFile,
+    provider: ProviderKind,
+    dir: &str,
+) -> String {
     if dir.is_empty() {
         return accounts::host_default_id(provider);
     }
-    let home = accounts::default_home();
     file.accounts
         .iter()
         .find(|a| {
@@ -535,7 +635,7 @@ fn account_id(file: &accounts::AccountsFile, provider: ProviderKind, dir: &str) 
                 return true;
             }
             provider == ProviderKind::Codex
-                && accounts::resolve_codex_dir(&home, &a.id, cfg) == Path::new(dir)
+                && accounts::resolve_codex_dir(home, &a.id, cfg) == Path::new(dir)
         })
         .map(|a| a.id.clone())
         .unwrap_or_default()
@@ -1764,19 +1864,40 @@ fn is(profile: &Profile, name: &str) -> bool {
 
 /// Codex 프로필이면 프로그램 바로 뒤에 `-c` hook을 넣은 사본. 명령은 설치가 끝난(`complete`, trust 등록 포함)
 /// receipt의 것 그대로다. Codex가 아니거나 receipt가 없거나 깨졌으면 `None`(hook 없이 띄운다).
-fn codex_hooks(profile: &Profile, state: Option<&Path>) -> Option<Profile> {
+/// trust는 `CODEX_HOME`마다 따로라 `env`(계정 적용 뒤 실행 env)가 가리키는 계정 홈에도 그 명령을 신뢰시킨다.
+fn codex_hooks(
+    profile: &Profile,
+    state: Option<&Path>,
+    env: &[(Vec<u8>, Vec<u8>)],
+) -> io::Result<Option<Profile>> {
     if !is(profile, "codex") {
-        return None;
+        return Ok(None);
     }
-    let bytes = std::fs::read(hooks::receipt(state?, Agent::Codex)).ok()?;
-    let receipt: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    if receipt.get("complete")?.as_bool() != Some(true) {
-        return None;
-    }
-    let command = receipt.pointer("/codex/command")?.as_str()?;
+    let receipt = state
+        .and_then(|state| std::fs::read(hooks::receipt(state, Agent::Codex)).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(receipt) =
+        receipt.filter(|r| r.get("complete").and_then(serde_json::Value::as_bool) == Some(true))
+    else {
+        return Ok(None);
+    };
+    let Some(command) = receipt
+        .pointer("/codex/command")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    codex::ensure_trust(
+        profile.program(),
+        receipt
+            .pointer("/codex/path")
+            .and_then(serde_json::Value::as_str),
+        command,
+        env,
+    )?;
     let mut profile = profile.clone();
     profile.launch.splice(1..1, hooks::codex_args(command));
-    Some(profile)
+    Ok(Some(profile))
 }
 
 /// 로그인 셸 실행([`Shell::Login`])을 에이전트 실행으로 바꾼다. env는 건드리지 않는다.

@@ -58,7 +58,19 @@ function testImeDefersSnapshotUpdates(){
  fire('compositionstart');context.update();fire('focusout');assert.equal(updates.length,4,'blur without compositionend still releases the gate');fire('compositionstart');fire('compositionend');assert.equal(updates.length,4,'no update when nothing was missed');
  console.log('PASS IME composition defers snapshot screen updates and catches up once');
 }
+function testQuickActions(){
+ const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'}],undefined,true),seen=[];
+ const wire=h=>{let mode='direct';h.getInputMode=()=>mode;h.setInputMode=value=>{mode=value;seen.push([h.options.sessionId,value]);};h.loadHistory=value=>seen.push([h.options.sessionId,'history',value]);h.fitToPhone=value=>seen.push([h.options.sessionId,'fit',value]);};
+ const first=f.mounts[0];wire(first);first.options.onQuickActions();assert.equal(f.sheets.at(-1).title,'Quick actions');assert.equal(f.sheets.at(-1)[0].label,'Send prompt');assert(!f.sheets.at(-1).some(item=>item.danger));
+ f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();const second=f.mounts.at(-1);wire(second);
+ second.options.onQuickActions();f.sheets.at(-1).find(item=>item.label==='Load earlier output').action();
+ f.sheets.at(-1).find(item=>item.label==='Fit to Phone').action();f.sheets.at(-1).find(item=>item.label==='Switch to buffered input').action();
+ assert.deepEqual(seen,[[8,'history',true],[8,'fit',true],[8,'buffered']]);assert.equal(f.calls.length,0,'quick actions never send unchecked approvals or close a PTY');
+ second.options.onQuickActions();assert(f.sheets.at(-1).some(item=>item.label==='Switch to direct input'));f.sheets.at(-1).find(item=>item.label==='Edit terminal keys').action();assert.equal(f.routes.at(-1),'/settings/terminal');
+ f.view.cleanup();console.log('PASS fixed quick actions target only the active split terminal, retain mode labels and expose key settings');
+}
 async function main(){
+ testQuickActions();
  testHostViewBudgets();testImeDefersSnapshotUpdates();testSessionBackSkipsSessionHistory();
  {const sessions=Array.from({length:64},(_,n)=>({id:n+7,agent:'codex',state:'Working'})),f=fixture(sessions);const initial=f.buttons.filter(b=>b.className==='session-tab'),marks=initial.map(b=>b.children[1]);for(let i=0;i<100;i++)f.view.update();assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,64);assert(initial.every((tab,i)=>tab.children[1]===marks[i]));const removed=sessions[63],down=new Event('pointerdown');down.button=0;initial[63].dispatchEvent(down);assert.equal(f.timers.size,1);f.state.groups.get('g').sessions=sessions.slice(0,63);f.state.sessions.delete(removed.id);f.view.update();assert.equal(f.timers.size,0,'removed tab cancels pending long press');f.view.cleanup();console.log('PASS 64 keyed tabs x100 updates: new buttons/icons 0, removed-tab handlers cleaned');}
 
@@ -104,7 +116,7 @@ async function main(){
  console.log('PASS symmetric pane headers, active labels and tab replacement, duplicate PTY disabled and primary close preserves PTY');
  console.log('PASS split direction selection, current choice, persisted state, automatic threshold and minimum pane width');
  console.log('PASS tablet split excludes duplicate PTY, preserves active pane on folding, reconnects after main transport and closes only the view');
- let f=fixture();assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onStatus({phase:'disconnected'});for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
+ let f=fixture();let reconnected=0;f.ctx.transport.reconnect=()=>reconnected++;const summaryNode=f.root.descendants().find(n=>n.className==='session-summary');assert.equal(summaryNode.dataset.reconnectable,'true');summaryNode.dispatchEvent(new Event('click'));assert.equal(reconnected,1,'tapping summary while disconnected triggers transport.reconnect');assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});assert.equal(summaryNode.dataset.reconnectable,undefined);summaryNode.dispatchEvent(new Event('click'));assert.equal(reconnected,1,'tapping summary while connected does not reconnect');f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(summaryNode.dataset.reconnectable,'true');for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
  f=fixture();f.mounts[0].options.onStatus({phase:'disconnected'});f.state.connection.phase='disconnected';f.view.update();f.advance(60000);assert.equal(f.mounts.length,1);f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,2);f.view.cleanup();
  console.log('PASS terminal-only reconnect backoff, generation/cleanup and main connection cancellation');
  f=fixture();const actions=f.buttons.find(b=>b.textContent==='Terminal actions'),git=f.buttons.find(b=>b.textContent==='Git changes');assert(git.hidden);
@@ -236,6 +248,11 @@ async function testHybridChatToggleAndQuestionCards(){
  diffBtn.action();await flush();
  assert(calls.some(c=>c.action==='git'&&c.path==='src/lib.rs'));
  const rawBtn=buttons.find(b=>b.className?.includes('chat-raw-btn'));
+ buttons.find(b=>b.textContent==='Terminal actions').action();
+ const selectTextEntry=sheets.at(-1).entries.find(e=>e.label==='Select text');assert(selectTextEntry);
+ selectTextEntry.action();const textSheetBody=new Element('div');sheets.at(-1).render(textSheetBody);
+ const screenTextArea=textSheetBody.descendants().find(n=>n.className==='screen-text');assert(screenTextArea);
+ assert(screenTextArea.value.includes('Fix bug')&&screenTextArea.value.includes('Pick one'),'Chat mode Select text falls back to .chat-feed card texts');
  buttons.find(b=>b.textContent==='Terminal actions').action();assert.equal(sheets.at(-1).entries[0].label,'Switch to Terminal');sheets.at(-1).entries[0].action();
  assert.equal(toggleBtn.textContent,'Chat');assert.equal(mounts[0].visible,true);
  // [Chat | Term] 전환 시 TerminalAdapter를 언마운트하지 않고 그대로 유지해야 한다(0ms 전환).

@@ -54,6 +54,56 @@ mod status_negotiation_tests {
     use krill_proto::usage::{AccountStatus, AccountStatusInfo, FEAT_USAGE_STATUS};
 
     #[test]
+    fn provider_metric_mutation_is_rejected_before_sending_to_legacy_daemon() {
+        use krill_proto::usage::{AutoSwitchMetric, FEAT_USAGE_PROVIDER_METRICS, FEAT_USAGE_RULES};
+        let root = std::env::temp_dir().join(format!("acct-metric-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = Paths {
+            socket: root.join("daemon.sock"),
+            holder: root.join("unused-holder"),
+            krilld: root.join("unused-daemon"),
+        };
+        let listener = krill_proto::os::net::UnixListener::bind(&paths.socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let server = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: FEAT_USAGE | FEAT_USAGE_RULES,
+                build: "legacy".into(),
+                instance_id: 1,
+            };
+            let (mut watch, _) = listener.accept().unwrap();
+            watch.write_all(&server.encode().unwrap()).unwrap();
+            ipc::read_frame(&mut watch).unwrap().unwrap();
+            drop(watch);
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(&server.encode().unwrap()).unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            let hello = ClientHello::decode(kind, &body).unwrap();
+            assert_ne!(hello.features & FEAT_USAGE_PROVIDER_METRICS, 0);
+            assert!(
+                ipc::read_frame(&mut stream).unwrap().is_none(),
+                "unsupported request must never reach the old decoder"
+            );
+        });
+        let req = UsageRequest::UpsertAutoSwitchRule(AutoSwitchRule {
+            provider: ProviderKind::Claude,
+            from_account_id: "host".into(),
+            enabled: true,
+            threshold_percent: 90,
+            metric: AutoSwitchMetric::ClaudeSonnetSevenDay,
+            target_account_id: None,
+        });
+        let error = request_ipc(&paths, &req).unwrap_err();
+        assert!(error.contains("does not support"), "{error}");
+        worker.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ipc_keeps_status_tail_after_negotiation() {
         let root = std::env::temp_dir().join(format!("acct-status-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -283,6 +333,7 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_ACCOUNT_CANCEL
         | krill_proto::usage::FEAT_USAGE_AGY
         | krill_proto::usage::FEAT_USAGE_RULES
+        | krill_proto::usage::FEAT_USAGE_PROVIDER_METRICS
         | krill_proto::usage::FEAT_USAGE_STATUS
         | krill_proto::usage::FEAT_USAGE_RATELIMIT
         | krill_proto::usage::FEAT_USAGE_MANAGE
