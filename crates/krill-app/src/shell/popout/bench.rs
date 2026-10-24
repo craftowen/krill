@@ -191,7 +191,7 @@ pub(crate) fn run(mode: String) -> ExitCode {
     }
     let failed = Arc::new(AtomicBool::new(true));
     let result = Arc::clone(&failed);
-    gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx| {
+    gpui_platform::application().with_assets(krill_app::ui::icons::AppAssets).run(move |cx| {
         crate::init(cx);
         if mode == "accounts" {
             let state = std::env::var_os("KRILL_STATE_DIR").map(std::path::PathBuf::from);

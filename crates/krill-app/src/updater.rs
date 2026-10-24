@@ -19,6 +19,9 @@
 pub mod ed25519;
 mod relaunch;
 mod rename;
+mod restart;
+
+pub use restart::{RestartStatus, restart_staged_update};
 
 use gpui::AppContext as _;
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -93,8 +96,12 @@ impl StagedUpdate {
     /// 분리된 relauncher 프로세스를 띄워 번들 스왑·재실행·헬스체크를 수행하게 한다.
     /// 호출자는 이 함수가 성공한 직후 앱을 종료(`cx.quit()`)해야 한다.
     pub fn spawn_relauncher(&self) -> Result<(), Error> {
+        self.spawn_relauncher_child().map(drop)
+    }
+
+    pub(super) fn spawn_relauncher_child(&self) -> Result<std::process::Child, Error> {
         let exe = std::env::current_exe()?;
-        let _child = spawn_detached_relauncher(
+        spawn_detached_relauncher(
             &exe,
             &self.app_bundle,
             &self.state_dir,
@@ -102,8 +109,7 @@ impl StagedUpdate {
             &self.to_version,
             Some(std::process::id()),
             DEFAULT_HEALTH_TIMEOUT,
-        )?;
-        Ok(())
+        )
     }
 
     /// 매니페스트 URL이 GitHub Releases 자산 URL이면 해당 버전의 릴리스 노트 페이지 URL을 돌려준다.
@@ -141,6 +147,7 @@ pub struct UpdateState {
     pub status: CheckStatus,
     pub staged: Option<StagedUpdate>,
     pub card_collapsed: bool,
+    pub restart: RestartStatus,
 }
 
 impl gpui::Global for UpdateState {}

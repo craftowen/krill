@@ -4,7 +4,8 @@
 //! Claude↔Codex 등 교차 핸드오프)와 추가 지시사항(프롬프트)과 함께 새 에이전트 탭으로 전달한다.
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, SharedString, Window, div, prelude::*,
+    Context, Entity, EventEmitter, FocusHandle, Focusable as _, KeyDownEvent, SharedString, Window,
+    div, prelude::*,
 };
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -33,6 +34,7 @@ pub struct Dialog {
     selected_agent: String,
     prompt: Entity<InputState>,
     focus: FocusHandle,
+    agent_focus: Vec<FocusHandle>,
 }
 
 impl EventEmitter<Event> for Dialog {}
@@ -91,6 +93,10 @@ impl Dialog {
         } else {
             agents
         };
+        let agent_focus = agents
+            .iter()
+            .map(|_| cx.focus_handle().tab_stop(true))
+            .collect();
         let selected_agent = default_agent
             .and_then(|want| {
                 agents
@@ -110,6 +116,7 @@ impl Dialog {
             selected_agent,
             prompt,
             focus,
+            agent_focus,
         }
     }
 
@@ -123,6 +130,24 @@ impl Dialog {
         if self.agents.iter().any(|(id, _)| id == &agent) {
             self.selected_agent = agent;
             cx.notify();
+        }
+    }
+
+    fn cycle_agent(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .agents
+            .iter()
+            .position(|(id, _)| id == &self.selected_agent)
+        else {
+            return;
+        };
+        let next = if delta < 0 {
+            (index + self.agents.len() - 1) % self.agents.len()
+        } else {
+            (index + 1) % self.agents.len()
+        };
+        if let Some((id, _)) = self.agents.get(next) {
+            self.select_agent(id.clone(), cx);
         }
     }
 
@@ -147,13 +172,13 @@ impl Dialog {
         });
     }
 
-    fn on_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, e: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         match e.keystroke.key.as_str() {
             "escape" => {
                 cx.stop_propagation();
                 cx.emit(Event::Close);
             }
-            "enter" => {
+            "enter" if self.prompt.read(cx).focus_handle(cx).is_focused(window) => {
                 cx.stop_propagation();
                 self.submit(cx);
             }
@@ -179,9 +204,11 @@ impl Render for Dialog {
                 div()
                     .id(("continue-agent", idx))
                     .debug_selector(move || selector.clone())
-                    .flex()
-                    .items_center()
-                    .gap_2()
+                    .track_focus(&self.agent_focus[idx])
+                    .tab_index(0)
+                    .role(gpui::Role::RadioButton)
+                    .aria_label(label.clone())
+                    .aria_toggled(is_selected.into())
                     .px_3()
                     .py_1p5()
                     .rounded(ui::RADIUS_SM)
@@ -190,15 +217,14 @@ impl Render for Dialog {
                     .bg(if is_selected { p.accent } else { p.card })
                     .cursor_pointer()
                     .hover(|d| d.bg(p.accent))
+                    .focus_visible(|d| d.border_color(p.ring))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .child(ui::icons::agent_brand_icon(id, ui::ICON_SM, p.foreground))
                     .child(
                         div()
                             .text_size(ui::TEXT_SM)
-                            .font_weight(if is_selected {
-                                gpui::FontWeight::SEMIBOLD
-                            } else {
-                                gpui::FontWeight::MEDIUM
-                            })
                             .text_color(p.foreground)
                             .child(label),
                     )
@@ -208,7 +234,30 @@ impl Render for Dialog {
             })
             .collect::<Vec<_>>();
 
+        let footer = div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("continue-session-cancel")
+                    .ghost()
+                    .label(text::CANCEL.get())
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
+            )
+            .child(
+                Button::new("continue-session-submit")
+                    .primary()
+                    .label(text::SUBMIT.get())
+                    .debug_selector(|| "continue-session-submit".into())
+                    .on_click(cx.listener(|d, _, _, cx| d.submit(cx))),
+            );
         let body = div()
+            .id("continue-session-body")
+            .debug_selector(|| "continue-session-body".into())
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_3()
@@ -224,7 +273,31 @@ impl Render for Dialog {
                     .flex_col()
                     .gap_1p5()
                     .child(ui::field_label(text::TARGET_AGENT.get(), None, p))
-                    .child(div().flex().flex_wrap().gap_2().children(agent_choices)),
+                    .child(
+                        div()
+                            .id("continue-agent-choices")
+                            .role(gpui::Role::RadioGroup)
+                            .aria_label(text::TARGET_AGENT.get())
+                            .tab_group()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .children(agent_choices)
+                            .on_key_down(cx.listener(|d, e: &KeyDownEvent, window, cx| {
+                                let delta = match e.keystroke.key.as_str() {
+                                    "left" | "up" => -1,
+                                    "right" | "down" => 1,
+                                    _ => return,
+                                };
+                                cx.stop_propagation();
+                                d.cycle_agent(delta, cx);
+                                if let Some(index) =
+                                    d.agents.iter().position(|(id, _)| id == &d.selected_agent)
+                                {
+                                    d.agent_focus[index].focus(window, cx);
+                                }
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -237,25 +310,6 @@ impl Render for Dialog {
                         p,
                     ))
                     .child(Input::new(&self.prompt)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("continue-session-cancel")
-                            .ghost()
-                            .label(text::CANCEL.get())
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
-                    )
-                    .child(
-                        Button::new("continue-session-submit")
-                            .primary()
-                            .label(text::SUBMIT.get())
-                            .debug_selector(|| "continue-session-submit".into())
-                            .on_click(cx.listener(|d, _, _, cx| d.submit(cx))),
-                    ),
             );
 
         let card = div()
@@ -264,10 +318,15 @@ impl Render for Dialog {
             .track_focus(&self.focus)
             .occlude()
             .w(ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .role(gpui::Role::Dialog)
+            .aria_label(text::TITLE.get())
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
@@ -275,10 +334,13 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
-            .capture_key_down(cx.listener(|d, e: &KeyDownEvent, _, cx| d.on_key(e, cx)))
+            .capture_key_down(
+                cx.listener(|d, e: &KeyDownEvent, window, cx| d.on_key(e, window, cx)),
+            )
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -297,8 +359,12 @@ impl Render for Dialog {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
                     ),
             )
-            .child(body);
-        ui::modal_backdrop(window.viewport_size(), card)
+            .child(body)
+            .child(footer);
+        ui::modal_backdrop(
+            window.viewport_size(),
+            ui::modal_focus_scope(card, &self.focus),
+        )
     }
 }
 

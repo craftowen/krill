@@ -405,6 +405,15 @@ impl SettingsView {
             let option_row = div()
                 .id(id)
                 .debug_selector(move || id.into())
+                .role(gpui::Role::RadioButton)
+                .aria_label(title)
+                .focus_visible(|style| style.border_color(p.ring))
+                .aria_toggled(if selected {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                })
+                .tab_index(if pending { -1 } else { 0 })
                 .w_full()
                 .min_w_0()
                 .px_3()
@@ -564,7 +573,7 @@ impl SettingsView {
                         .flex_1()
                         .min_w_0()
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .text_color(p.muted_foreground)
                         .truncate()
                         .child(url.clone()),
@@ -684,14 +693,11 @@ impl SettingsView {
                         )
                         .child(
                             layout::controls().child(
-                                layout::secondary(
-                                    ("mobile-revoke", device_index),
+                                self.confirm_button(
+                                    revoke_id.clone(),
                                     text::REVOKE.get(),
-                                )
-                                .disabled(self.mobile.pending)
-                                .debug_selector(move || revoke_id.clone())
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                                    cx,
+                                    move |this, cx| {
                                         this.mobile_action(
                                             MobileRequest::RevokeDevice {
                                                 device_id: Some(id.clone()),
@@ -700,7 +706,18 @@ impl SettingsView {
                                             cx,
                                         );
                                     },
-                                )),
+                                )
+                                .accessibility_label(format!(
+                                    "{} · {}",
+                                    if self.armed.as_deref() == Some(revoke_id.as_str()) {
+                                        super::text::CONFIRM_AGAIN.get()
+                                    } else {
+                                        text::REVOKE.get()
+                                    },
+                                    device.label
+                                ))
+                                .disabled(self.mobile.pending)
+                                .debug_selector(move || revoke_id.clone()),
                             ),
                         ),
                 );
@@ -926,7 +943,7 @@ impl SettingsView {
                             )
                             .child(
                                 div()
-                                    .text_size(crate::ui::TEXT_SM)
+                                    .text_size(crate::ui::TEXT_XS)
                                     .text_color(p.muted_foreground)
                                     .child(text::PAGE_DESC.get()),
                             )
@@ -959,7 +976,15 @@ impl SettingsView {
             );
 
         let now = krill_proto::mobile::client::now_ms();
-        let mut devices = div().flex().flex_col().gap_2();
+        let mut devices = div()
+            .id("mobile-page-phone-devices")
+            .debug_selector(|| "mobile-page-phone-devices".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2();
         let mut any = false;
         for device in self
             .mobile
@@ -971,6 +996,7 @@ impl SettingsView {
             let connected = self.mobile.connected.contains(&device.device_id);
             devices = devices.child(
                 div()
+                    .flex_none()
                     .p_3()
                     .rounded(crate::ui::RADIUS_MD)
                     .border_1()
@@ -1037,6 +1063,8 @@ impl SettingsView {
             .flex_none()
             .w(px(300.))
             .h(px(560.))
+            .max_w_full()
+            .overflow_hidden()
             .p_2()
             .rounded(px(44.))
             .border_1()
@@ -1070,7 +1098,8 @@ impl SettingsView {
                     )
                     .child(
                         div()
-                            .text_size(crate::ui::TEXT_XS)
+                            .text_size(crate::ui::TEXT_SM)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.muted_foreground)
                             .child(text::PAGE_PHONE_TITLE.get()),
                     )

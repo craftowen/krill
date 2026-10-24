@@ -959,6 +959,9 @@ impl Shell {
         self.tab_context_menu = None;
         let tabs = self.workspace_tabs(cx);
         self.layout.cycle_mru_in(delta, &tabs);
+        if let Some(cursor) = self.layout.mru_cursor() {
+            self.recent_tab_scroll.scroll_to_item(cursor);
+        }
         cx.notify();
     }
 
@@ -1006,25 +1009,20 @@ impl Shell {
         let p = ui::palette(cx);
         let viewport = window.viewport_size();
         let menu_w = px(232.);
-        // OWE-870: 이름 변경 1행 + 왼쪽 닫기 1행이 늘었다.
-        let menu_h = if peer_supports_fork {
-            px(364.)
-        } else {
-            px(300.)
-        } + if file_path.is_some() {
-            // 복사 2항목 + Finder 보기 + 구분선(항목당 약 28pt).
-            px(100.)
-        } else {
-            px(0.)
-        };
+        let max_w = (viewport.width - ui::SPACE_2 * 2.).max(px(0.));
+        let max_h = (viewport.height - ui::SPACE_2 * 2.).max(px(0.));
         let x = pos
             .x
-            .min((viewport.width - menu_w - px(8.)).max(px(8.)))
-            .max(px(8.));
-        let y = pos
-            .y
-            .min((viewport.height - menu_h - px(8.)).max(px(8.)))
-            .max(px(8.));
+            .min((viewport.width - menu_w - ui::SPACE_2).max(ui::SPACE_2))
+            .max(ui::SPACE_2);
+        // Anchor above or below the pointer, using the actual available viewport half.
+        // The scrollable menu fits even when rem-sized rows exceed the window.
+        let below = pos.y <= viewport.height / 2.;
+        let available_h = if below {
+            viewport.height - pos.y - ui::SPACE_2
+        } else {
+            pos.y - ui::SPACE_2
+        };
 
         let menu_item = |id: &'static str,
                          label: &'static str,
@@ -1033,6 +1031,11 @@ impl Shell {
             div()
                 .id(id)
                 .debug_selector(move || id.into())
+                .role(gpui::Role::MenuItem)
+                .aria_label(label)
+                .tab_index(0)
+                .tab_stop(enabled)
+                .focus_visible(|d| d.bg(p.accent).border_1().border_color(p.ring))
                 .px_2()
                 .py_1()
                 .rounded(ui::RADIUS_SM)
@@ -1066,6 +1069,9 @@ impl Shell {
             let selected = current_color.is_none();
             div()
                 .id("tab-menu-color-none")
+                .role(gpui::Role::Button)
+                .tab_index(0)
+                .focus_visible(|d| d.border_1().border_color(p.ring))
                 .debug_selector(|| "tab-menu-color-none".into())
                 .aria_label(text::COLOR_NONE.get())
                 .size(px(16.))
@@ -1098,6 +1104,9 @@ impl Shell {
                     let slug = color.slug();
                     div()
                         .id(("tab-menu-color", ci))
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .focus_visible(|d| d.border_color(p.ring))
                         .debug_selector(move || format!("tab-menu-color-{slug}"))
                         .aria_label(color_label(color))
                         .size(px(16.))
@@ -1172,12 +1181,40 @@ impl Shell {
         let menu =
             div()
                 .id("tab-context-menu")
+                .track_focus(&self.tab_menu_focus)
+                .role(gpui::Role::Menu)
+                .tab_group()
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.tab_context_menu = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    } else if event.keystroke.key == "tab"
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                    {
+                        if event.keystroke.modifiers.shift {
+                            window.focus_prev(cx);
+                        } else {
+                            window.focus_next(cx);
+                        }
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    }
+                }))
                 .debug_selector(|| "tab-context-menu".into())
                 .occlude()
                 .absolute()
                 .left(x)
-                .top(y)
+                .when(below, |d| d.top(pos.y.max(ui::SPACE_2)))
+                .when(!below, |d| {
+                    d.bottom((viewport.height - pos.y).max(ui::SPACE_2))
+                })
                 .w(menu_w)
+                .max_w(max_w)
+                .max_h(available_h.max(px(0.)).min(max_h))
+                .overflow_y_scroll()
                 .p_1()
                 .rounded(ui::RADIUS_MD)
                 .bg(p.popover)
@@ -1196,6 +1233,9 @@ impl Shell {
                 .child(
                     div()
                         .id("tab-menu-pin")
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .focus_visible(|d| d.border_1().border_color(p.ring))
                         .debug_selector(|| "tab-menu-pin".into())
                         .px_2()
                         .py_1()
@@ -1394,9 +1434,22 @@ impl Shell {
         let p = ui::palette(cx);
         let card = div()
             .id("pinned-tab-close-dialog")
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.cancel_close_pinned_tab(cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "enter" && this.tab_dialog_focus.is_focused(window)
+                {
+                    this.confirm_close_pinned_tab(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .role(gpui::Role::AlertDialog)
             .debug_selector(|| "pinned-tab-close-dialog".into())
             .occlude()
             .w(ui::DIALOG_WIDTH)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.)))
             .p_4()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
@@ -1410,6 +1463,9 @@ impl Shell {
             .gap_3()
             .child(
                 div()
+                    .id("pinned-tab-close-dialog-body")
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1423,7 +1479,7 @@ impl Shell {
                     .child(
                         div()
                             .text_size(ui::TEXT_XS)
-                            .font_family(ui::FONT_MONO)
+                            .font_family(ui::FONT_UI)
                             .text_color(p.muted_foreground)
                             .truncate()
                             .child(label),
@@ -1439,6 +1495,8 @@ impl Shell {
                 div()
                     .flex()
                     .items_center()
+                    .flex_none()
+                    .flex_wrap()
                     .justify_end()
                     .gap_2()
                     .child(
@@ -1459,7 +1517,10 @@ impl Shell {
                             })),
                     ),
             );
-        Some(ui::modal_backdrop(window.viewport_size(), card))
+        Some(ui::modal_backdrop(
+            window.viewport_size(),
+            ui::modal_focus_scope(card, &self.tab_dialog_focus),
+        ))
     }
 
     /// OWE-872: 실행 중 닫기 확인 대화상자의 본문 문구. 전경 프로세스 이름이 있으면 함께 보인다.
@@ -1507,21 +1568,38 @@ impl Shell {
         let p = ui::palette(cx);
         let card = div()
             .id("running-close-dialog")
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.cancel_running_close(cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "enter" && this.tab_dialog_focus.is_focused(window)
+                {
+                    this.confirm_running_close(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .role(gpui::Role::AlertDialog)
             .debug_selector(|| "running-close-dialog".into())
             .occlude()
-            .w(px(360.))
+            .w(ui::DIALOG_WIDTH)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.)))
             .p_4()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
+            .shadow_lg()
             .font_family(ui::FONT_UI)
             .flex()
             .flex_col()
             .gap_3()
             .child(
                 div()
+                    .id("running-close-dialog-body")
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1559,6 +1637,8 @@ impl Shell {
                 div()
                     .flex()
                     .items_center()
+                    .flex_none()
+                    .flex_wrap()
                     .justify_end()
                     .gap_2()
                     .child(
@@ -1579,7 +1659,10 @@ impl Shell {
                             })),
                     ),
             );
-        Some(ui::modal_backdrop(window.viewport_size(), card))
+        Some(ui::modal_backdrop(
+            window.viewport_size(),
+            ui::modal_focus_scope(card, &self.tab_dialog_focus),
+        ))
     }
 
     // Design adapted from Orca (.ref/orca/src/renderer/src/components/tab-bar/RecentTabSwitcher.tsx),
@@ -1613,22 +1696,29 @@ impl Shell {
                     Some(Program::Agent { id }) => launch_agent_id(id),
                     _ => "",
                 };
-                let agent = session
-                    .map_or(launch_agent, |s| {
-                        if s.status.agent.is_empty() {
-                            launch_agent
+                let agent = session.map_or_else(
+                    || launch_agent.to_owned(),
+                    |s| {
+                        let inferred = ui::status::infer_agent_from_status(&s.status, &label);
+                        if inferred.is_empty() {
+                            launch_agent.to_owned()
                         } else {
-                            &s.status.agent
+                            inferred.to_owned()
                         }
-                    })
-                    .to_owned();
+                    },
+                );
                 Some(
                     div()
                         .id(("recent-tab-item", tab_idx))
                         .debug_selector(move || format!("recent-tab-item-{tab_idx}"))
-                        .role(gpui::Role::ListItem)
+                        .role(gpui::Role::ListBoxOption)
                         .aria_selected(selected)
+                        .when(
+                            selected,
+                            gpui::StatefulInteractiveElement::aria_active_descendant,
+                        )
                         .h(px(32.))
+                        .flex_none()
                         .px_3()
                         .flex()
                         .items_center()
@@ -1672,6 +1762,8 @@ impl Shell {
             .debug_selector(|| "recent-tab-switcher".into())
             .occlude()
             .w(ui::DIALOG_WIDTH)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.)))
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)
@@ -1684,6 +1776,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
+                    .flex_none()
                     .px_3()
                     .py_2()
                     .border_b_1()
@@ -1693,7 +1786,19 @@ impl Shell {
                     .text_color(p.muted_foreground)
                     .child(text::RECENT_TABS_TITLE.get()),
             )
-            .child(div().py_1().flex().flex_col().children(rows));
+            .child(
+                div()
+                    .id("recent-tab-list")
+                    .debug_selector(|| "recent-tab-list".into())
+                    .role(gpui::Role::ListBox)
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.recent_tab_scroll)
+                    .py_1()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            );
 
         Some(ui::modal_backdrop(window.viewport_size(), card))
     }

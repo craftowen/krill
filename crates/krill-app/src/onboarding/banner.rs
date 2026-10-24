@@ -30,6 +30,7 @@ pub fn render_need(need: FixNeed, cx: &App) -> AnyElement {
         .py_1p5()
         .bg(p.popover)
         .text_color(p.popover_foreground)
+        .font_family(crate::ui::FONT_UI)
         .text_size(crate::ui::TEXT_XS)
         .flex()
         .items_center()

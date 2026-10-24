@@ -699,7 +699,7 @@ fn regression_relauncher_restarts_original_after_rename_failure() {
     let d = TempGuard(temp_dir("rename-failure"));
     let app = d.0.join("Krill.app");
     build_test_app_bundle(&app, "0.1.0", "exit 0", false);
-    fs::create_dir_all(staging_path(&app)).unwrap();
+    build_test_app_bundle(&staging_path(&app), "0.2.0", "exit 0", false);
     let result = relaunch_and_verify(
         &app,
         &d.0.join("state"),
@@ -1505,6 +1505,11 @@ mod rename_mode {
         ] {
             write(&staging, rel, "new");
         }
+        write(
+            &staging,
+            BUNDLE_INFO,
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.2.0</string></dict></plist>"#,
+        );
         (install, staging)
     }
 
@@ -1830,4 +1835,50 @@ fn interrupted_stage_publication_restores_previous_or_finishes_verified_incoming
         assert!(!backup.exists());
         assert!(!incoming.exists());
     }
+}
+
+#[test]
+fn restart_swap_rejects_changed_staging_version_before_mutation() {
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let root = TempGuard(temp_dir("restart-stale-stage"));
+    let app = root.0.join("Krill.app");
+    let stage = staging_path(&app);
+    build_test_app_bundle(&app, "0.1.0", "exit 0", false);
+    build_test_app_bundle(&stage, "0.3.0", "exit 0", false);
+    let state = root.0.join("state");
+    assert!(
+        swap_bundles(
+            &app,
+            &state,
+            "0.1.0",
+            "0.2.0",
+            Duration::from_secs(1),
+            &Accept
+        )
+        .is_err()
+    );
+    assert_eq!(bundle_short_version(&app).as_deref(), Some("0.1.0"));
+    assert_eq!(bundle_short_version(&stage).as_deref(), Some("0.3.0"));
+    assert!(!prev_path(&app).exists());
+    assert!(!journal_path(&state).exists());
+    fs::remove_file(stage.join(BUNDLE_INFO)).unwrap();
+    assert!(
+        swap_bundles(
+            &app,
+            &state,
+            "0.1.0",
+            "0.2.0",
+            Duration::from_secs(1),
+            &Accept
+        )
+        .is_err()
+    );
+    assert_eq!(bundle_short_version(&app).as_deref(), Some("0.1.0"));
+    assert!(!prev_path(&app).exists());
 }

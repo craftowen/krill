@@ -192,3 +192,30 @@ fn safety_and_hook_actions_remain_available_in_toasts(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("fix-banner").is_none());
     assert!(cx.update(|_, cx| cx.global::<FixNeeds>().items.is_empty()));
 }
+
+#[gpui::test]
+fn hook_setup_hint_expires_without_reappearing_on_render(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("toast-hook-timeout"));
+    cx.update(|_, cx| {
+        cx.set_global(FixNeeds {
+            items: vec![FixNeed {
+                check_id: "hook.codex".into(),
+                message: "Codex hook setup is available".into(),
+            }],
+        });
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("fix-banner-fix").is_some());
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("fix-banner").is_none());
+    assert!(cx.update(|_, cx| cx.global::<FixNeeds>().items.is_empty()));
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("fix-banner").is_none());
+    assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
+}

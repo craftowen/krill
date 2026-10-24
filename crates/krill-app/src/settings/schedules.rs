@@ -876,7 +876,7 @@ impl SettingsView {
                                 .child(
                                     div()
                                         .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .text_color(p.muted_foreground)
                                         .truncate()
                                         .child(meta_line),
@@ -898,6 +898,11 @@ impl SettingsView {
                                             });
                                         },
                                     )
+                                    .aria_label(format!(
+                                        "{} · {}",
+                                        text::SCHEDULES_TITLE.get(),
+                                        sched.id
+                                    ))
                                     .debug_selector(move || toggle_id.clone()),
                                 )
                                 .child(
@@ -958,7 +963,7 @@ impl SettingsView {
             .border_color(p.border)
             .child(
                 div()
-                    .text_size(crate::ui::TEXT_XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.muted_foreground)
                     .child(text::SCHEDULE_RUNS_TITLE.get()),
@@ -1034,7 +1039,7 @@ impl SettingsView {
                                         .flex_1()
                                         .min_w_0()
                                         .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .truncate()
                                         .child(summary),
                                 ),
@@ -1087,7 +1092,7 @@ impl SettingsView {
                                 .gap_2()
                                 .child(
                                     div()
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(title),
                                 )
@@ -1110,7 +1115,7 @@ impl SettingsView {
                         .id("admin-schedule-log-cwd")
                         .debug_selector(|| "admin-schedule-log-cwd".into())
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_2XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .text_color(p.muted_foreground)
                         .child(cwd.clone()),
                 );
@@ -1119,14 +1124,22 @@ impl SettingsView {
                 div()
                     .id("admin-schedule-log-content")
                     .debug_selector(|| "admin-schedule-log-content".into())
+                    .max_h(gpui::px(280.))
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .whitespace_normal()
                     .p_2()
                     .rounded(crate::ui::RADIUS_XS)
                     .bg(p.card)
                     .border_1()
                     .border_color(p.border)
                     .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(log.output.clone()),
+                    .text_size(crate::ui::TEXT_SM)
+                    .children(
+                        log.output
+                            .lines()
+                            .map(|line| div().min_h(crate::ui::TEXT_SM).child(line.to_owned())),
+                    ),
             );
             card = card.child(log_box);
         }
@@ -1219,6 +1232,9 @@ impl SettingsView {
             .debug_selector(|| "admin-schedule-modal".into())
             .occlude()
             .role(gpui::Role::Dialog)
+            .aria_label(heading.clone())
+            .max_h(window.viewport_size().height - crate::ui::SPACE_4 * 2.)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_schedule_modal(cx)))
             .w(crate::ui::DIALOG_WIDTH)
             .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
             .p_6()
@@ -1237,54 +1253,71 @@ impl SettingsView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(heading),
             )
-            .child(field(
-                text::SCHEDULE_FIELD_ID.get(),
-                "admin-schedule-input-id",
-                &modal.id,
-                None,
-            ))
-            .child(field(
-                text::SCHEDULE_FIELD_CRON.get(),
-                "admin-schedule-input-cron",
-                &modal.cron,
-                Some(text::SCHEDULE_FIELD_CRON_HINT.get()),
-            ))
-            .child(field(
-                text::SCHEDULE_FIELD_CWD.get(),
-                "admin-schedule-input-cwd",
-                &modal.cwd,
-                None,
-            ))
-            .child(field(
-                text::SCHEDULE_FIELD_COMMAND.get(),
-                "admin-schedule-input-command",
-                &modal.command,
-                None,
-            ))
-            .child(field(
-                text::SCHEDULE_FIELD_PROMPT.get(),
-                "admin-schedule-input-prompt",
-                &modal.prompt,
-                None,
-            ))
-            .child(field(
-                text::SCHEDULE_FIELD_PRECHECK.get(),
-                "admin-schedule-input-precheck",
-                &modal.precheck,
-                Some(text::SCHEDULE_FIELD_PRECHECK_HINT.get()),
-            ))
-            .child(mode_row);
-
-        if let Some(err) = &modal.error {
-            dialog = dialog.child(
-                crate::ui::error_banner(p, err.clone())
-                    .id("admin-schedule-modal-error")
-                    .debug_selector(|| "admin-schedule-modal-error".into()),
+            .child(
+                div()
+                    .id("admin-schedule-modal-body")
+                    .debug_selector(|| "admin-schedule-modal-body".into())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_component::input::Enter, window, cx| {
+                            cx.stop_propagation();
+                            this.submit_schedule_modal(window, cx);
+                        },
+                    ))
+                    .child(field(
+                        text::SCHEDULE_FIELD_ID.get(),
+                        "admin-schedule-input-id",
+                        &modal.id,
+                        None,
+                    ))
+                    .child(field(
+                        text::SCHEDULE_FIELD_CRON.get(),
+                        "admin-schedule-input-cron",
+                        &modal.cron,
+                        Some(text::SCHEDULE_FIELD_CRON_HINT.get()),
+                    ))
+                    .child(field(
+                        text::SCHEDULE_FIELD_CWD.get(),
+                        "admin-schedule-input-cwd",
+                        &modal.cwd,
+                        None,
+                    ))
+                    .child(field(
+                        text::SCHEDULE_FIELD_COMMAND.get(),
+                        "admin-schedule-input-command",
+                        &modal.command,
+                        None,
+                    ))
+                    .child(field(
+                        text::SCHEDULE_FIELD_PROMPT.get(),
+                        "admin-schedule-input-prompt",
+                        &modal.prompt,
+                        None,
+                    ))
+                    .child(field(
+                        text::SCHEDULE_FIELD_PRECHECK.get(),
+                        "admin-schedule-input-precheck",
+                        &modal.precheck,
+                        Some(text::SCHEDULE_FIELD_PRECHECK_HINT.get()),
+                    ))
+                    .child(mode_row)
+                    .children(modal.error.clone().map(|err| {
+                        div()
+                            .id("admin-schedule-modal-error")
+                            .debug_selector(|| "admin-schedule-modal-error".into())
+                            .child(crate::ui::error_banner(p, err))
+                    })),
             );
-        }
 
         dialog = dialog.child(
             div()
+                .flex_none()
+                .flex_wrap()
                 .flex()
                 .justify_end()
                 .gap_2()
@@ -1305,6 +1338,9 @@ impl SettingsView {
                 ),
         );
 
-        Some(crate::ui::modal_backdrop(window.viewport_size(), dialog))
+        Some(crate::ui::modal_backdrop(
+            window.viewport_size(),
+            crate::ui::modal_focus_scope(dialog, &self.modal_focus),
+        ))
     }
 }

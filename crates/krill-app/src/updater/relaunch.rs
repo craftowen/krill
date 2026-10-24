@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     APP_EXE, CodeVerifier, CodesignVerifier, Config, Error, READY_ENV, RELAUNCH_ARG, UPDATE_DIR,
-    append_ext, journal_path, prev_path, ready_path, rename, staging_path, trash_path,
-    write_private_file,
+    append_ext, bundle_short_version, journal_path, prev_path, ready_path, rename, staging_lock,
+    staging_path, trash_path, write_private_file,
 };
 
 const RELAUNCHER_BIN: &str = "relauncher";
@@ -146,9 +146,13 @@ pub(super) fn swap_with(
     health_timeout: Duration,
     verifier: &dyn CodeVerifier,
 ) -> Result<Journal, Error> {
+    let _staging_lock = staging_lock(app_bundle)?;
     let staging = staging_path(app_bundle);
     let prev = prev_path(app_bundle);
     let trash = trash_path(app_bundle);
+    if bundle_short_version(&staging).as_deref() != Some(to_version) {
+        return Err(Error::Config(text::CARD_PAYLOAD_CHANGED.get().to_owned()));
+    }
     verifier.verify(&staging)?;
 
     match mode {
@@ -811,6 +815,7 @@ mod tests {
         let state = dir.join("state");
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
         fs::create_dir_all(staging.join("Contents/MacOS")).unwrap();
+        fs::write(staging.join(super::super::BUNDLE_INFO), r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.2.0</string></dict></plist>"#).unwrap();
         let app_exe = app.join("Contents/MacOS/krill-app");
         let staging_exe = staging.join("Contents/MacOS/krill-app");
         compile_signed_macho(&app_exe, 11);

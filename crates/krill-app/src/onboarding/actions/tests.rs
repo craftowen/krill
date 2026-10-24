@@ -426,6 +426,83 @@ fn unsupported_agent_does_not_create_a_hook_need(cx: &mut gpui::TestAppContext) 
     });
 }
 
+#[gpui::test]
+fn hook_setup_hint_is_not_repeated_after_dismissal_and_restart(cx: &mut gpui::TestAppContext) {
+    let (root, env) = fixture("hook-hint-once");
+    std::fs::remove_file(root.join("source/krilld")).unwrap();
+    let agent = TargetAgent::Other(Agent::Codex);
+    cx.update(|cx| hook_notice::note_agent_session_at(agent, env.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(cx.global::<FixNeeds>().items[0].check_id, "hook.codex");
+        dismiss_need("hook.codex", cx);
+        // A fresh process forgets its in-memory attempts, but keeps the state directory.
+        cx.remove_global::<AccessAttempts>();
+        hook_notice::note_agent_session_at(agent, env.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|cx| assert!(cx.global::<FixNeeds>().items.is_empty()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn new_agent_automatically_installs_missing_hooks_without_a_prompt(cx: &mut gpui::TestAppContext) {
+    let (root, env) = fixture("session-auto-hook");
+    let agent = TargetAgent::Other(Agent::Cursor);
+    cx.update(|cx| hook_notice::note_agent_session_at(agent, env.clone(), cx));
+    cx.run_until_parked();
+    assert!(hook_installed(&env.state, "cursor"));
+    let config = env.home.join(".cursor/hooks.json");
+    let before = std::fs::read(&config).unwrap();
+    hook_notice::install(agent, &env, None).unwrap();
+    assert_eq!(std::fs::read(config).unwrap(), before);
+    assert!(!cx.has_pending_prompt());
+    cx.update(|cx| assert!(cx.try_global::<FixNeeds>().is_none()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn cli_link_conflict_does_not_skip_automatic_hooks(cx: &mut gpui::TestAppContext) {
+    let (root, mut env) = fixture("auto-hook-cli-conflict");
+    with_cursor_on_login_path(&root, &mut env);
+    std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
+    let cli = env.home.join(".local/bin/krill");
+    std::fs::write(&cli, "user-owned CLI").unwrap();
+    let state = env.state.clone();
+    let result = cx.update(|cx| collect_result(auto_prepare(env, cx), cx));
+    cx.run_until_parked();
+    assert!(result.borrow().as_ref().unwrap().is_err());
+    assert!(hook_installed(&state, "cursor"));
+    assert_eq!(std::fs::read_to_string(cli).unwrap(), "user-owned CLI");
+    assert!(!cx.has_pending_prompt());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn disabled_or_installed_hooks_do_not_consume_the_setup_hint() {
+    let (root, env) = fixture("hook-hint-disabled");
+    let agent = TargetAgent::Other(Agent::Codex);
+    std::fs::create_dir_all(&env.state).unwrap();
+    let settings = env.state.join("settings.toml");
+    std::fs::write(&settings, "agent_status_hooks = false\n").unwrap();
+    assert!(!hook_notice::claim(&env.state, agent));
+    assert!(!env.state.join("onboarding-notices").exists());
+    std::fs::remove_file(settings).unwrap();
+    std::fs::create_dir_all(env.state.join("hooks")).unwrap();
+    let receipt = env.state.join("hooks/codex.json");
+    std::fs::write(
+        &receipt,
+        r#"{"agent":"codex","complete":true,"changes":[],"codex":null}"#,
+    )
+    .unwrap();
+    assert!(!hook_notice::claim(&env.state, agent));
+    assert!(!env.state.join("onboarding-notices").exists());
+    std::fs::remove_file(receipt).unwrap();
+    assert!(hook_notice::claim(&env.state, agent));
+    assert!(!hook_notice::claim(&env.state, agent));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn translocation_fix_prepares_move_guidance_without_opening_finder() {
     let (root, env) = fixture("location");

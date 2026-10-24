@@ -2,6 +2,56 @@ use super::*;
 
 const ICO: &[u8] = include_bytes!("../../../../packaging/macos/favicon.ico");
 
+#[test]
+fn imported_github_avatar_does_not_hide_service_favicon() {
+    use crate::ui::icons::ProjectIcon;
+
+    let repo = fixture("imported-avatar");
+    let cache = repo.join("cache");
+    let avatar_url = "https://github.com/owner.png?size=64";
+    let avatar = ImportedRepoIcon {
+        kind: "image".into(),
+        value: avatar_url.into(),
+    };
+    let cached_avatar = cached_icon_path_for_url(&cache, avatar_url);
+    write_cached_icon_bytes(&cached_avatar, ICO).unwrap();
+    let favicon = repo.join("public/favicon.ico");
+    fs::create_dir_all(favicon.parent().unwrap()).unwrap();
+    fs::write(&favicon, ICO).unwrap();
+    assert_eq!(
+        resolve_project_icon(&repo, true, Some(&cache), Some(&avatar)),
+        Some(ProjectIcon::Image(favicon.clone()))
+    );
+
+    // 사용자가 지정한 이모지·파일은 자동 파비콘보다 우선한다.
+    let emoji = ImportedRepoIcon {
+        kind: "emoji".into(),
+        value: "🦀".into(),
+    };
+    assert_eq!(
+        resolve_project_icon(&repo, true, Some(&cache), Some(&emoji)),
+        Some(ProjectIcon::Emoji("🦀".into()))
+    );
+    let custom = ImportedRepoIcon {
+        kind: "image".into(),
+        value: cached_avatar.to_string_lossy().into_owned(),
+    };
+    assert_eq!(
+        resolve_project_icon(&repo, true, Some(&cache), Some(&custom)),
+        Some(ProjectIcon::Image(cached_avatar.clone()))
+    );
+
+    fs::remove_file(favicon).unwrap();
+    // 디렉터리 mtime 캐시와 독립된 경로에서 파비콘 없는 프로젝트의 폴백도 확인한다.
+    let empty = repo.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    assert_eq!(
+        resolve_project_icon(&empty, true, Some(&cache), Some(&avatar)),
+        Some(ProjectIcon::Image(cached_avatar))
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
 fn fixture(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("krill-icons-{name}-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();

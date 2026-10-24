@@ -1004,6 +1004,7 @@ impl Wizard {
                                 move || format!("wizard-fix-conflict-detail-{id}")
                             })
                             .font_family(ui::FONT_MONO)
+                            .text_size(ui::TEXT_SM)
                             .child(raw)
                     }))
             }))
@@ -1124,7 +1125,7 @@ impl Wizard {
                         .rounded(ui::RADIUS_XS)
                         .bg(p.muted)
                         .font_family(ui::FONT_MONO)
-                        .text_size(ui::TEXT_XS)
+                        .text_size(ui::TEXT_SM)
                         .child(diff.clone()),
                 )
                 .into_any_element(),
@@ -1244,7 +1245,7 @@ impl Render for Wizard {
             .shadow_lg()
             .on_action(cx.listener(|_, _: &CloseWizard, _, cx| Self::close(cx)))
             .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
-                if !matches!(e.keystroke.key.as_str(), "escape" | "enter") {
+                if e.keystroke.key != "escape" {
                     return;
                 }
                 Self::close(cx);

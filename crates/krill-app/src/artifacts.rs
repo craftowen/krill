@@ -276,7 +276,9 @@ impl Render for View {
                     .id(id)
                     .debug_selector(move || selector.clone())
                     .w_full()
+                    .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_3()
                     .px_3()
@@ -286,7 +288,8 @@ impl Render for View {
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(gpui::px(160.))
+                            .max_w(gpui::relative(1.))
                             .child(
                                 div()
                                     .text_size(ui::TEXT_SM)
@@ -333,6 +336,7 @@ impl Render for View {
                 div()
                     .id("artifacts-empty")
                     .p_6()
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(if self.items.is_empty() {
                         text::EMPTY.get()
@@ -357,6 +361,8 @@ impl Render for View {
             .gap_3()
             .p_4()
             .bg(p.background)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.foreground)
             .child(
                 div()
@@ -373,6 +379,7 @@ impl Render for View {
                         div()
                             .flex_1()
                             .text_size(ui::TEXT_LG)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(text::TITLE.get()),
                     )
                     .child(

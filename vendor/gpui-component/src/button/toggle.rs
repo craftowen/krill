@@ -1,3 +1,4 @@
+// Krill patch: toggles share the same rem typography as buttons and inputs.
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{
@@ -8,7 +9,9 @@ use gpui::{
 use gpui_base::{Toggle as BaseToggle, ToggleGroup as BaseToggleGroup};
 use smallvec::{SmallVec, smallvec};
 
-use crate::{ActiveTheme, Disableable, Icon, Sizable, Size, StyledExt, tooltip::ComponentTooltip};
+use crate::{
+    ActiveTheme, Disableable, Icon, Sizable, Size, StyleSized, StyledExt, tooltip::ComponentTooltip,
+};
 
 #[derive(Default, Copy, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ToggleVariant {
@@ -180,11 +183,12 @@ impl RenderOnce for Toggle {
             .items_center()
             .justify_center()
             .map(|this| match self.size {
-                Size::XSmall => this.min_w_5().h_5().px_0p5().text_xs(),
-                Size::Small => this.min_w_6().h_6().px_1().text_sm(),
-                Size::Large => this.min_w_9().h_9().px_3().text_base(),
-                _ => this.min_w_8().h_8().px_2().text_sm(),
+                Size::XSmall => this.min_w_5().h_5().px_0p5(),
+                Size::Small => this.min_w_6().h_6().px_1(),
+                Size::Large => this.min_w_9().h_9().px_3(),
+                _ => this.min_w_8().h_8().px_2(),
             })
+            .button_text_size(self.size)
             .when(self.border_corners.top_left, |this| {
                 this.rounded_tl(rounding)
             })

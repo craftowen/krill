@@ -541,7 +541,6 @@ pub struct Shell {
     _sidebar_close_session: Subscription,
     _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
-    _sidebar_disconnect: Subscription,
     _sidebar_relisted: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
@@ -699,8 +698,14 @@ pub struct Shell {
     pending_focus: PendingFocus,
     /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 인덱스, 클릭 위치)`.
     pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
+    tab_menu_focus: FocusHandle,
+    tab_menu_previous_focus: Option<FocusHandle>,
     /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
     pub(super) confirm_close_tab: Option<usize>,
+    recent_tab_scroll: gpui::ScrollHandle,
+    tab_dialog_focus: FocusHandle,
+    tab_dialog_was_open: bool,
+    tab_dialog_previous_focus: Option<FocusHandle>,
     /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
     pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
     /// OWE-870: 탭 이름 인라인 편집.
@@ -829,20 +834,6 @@ impl Shell {
             cx.subscribe(&sidebar, |this, _, e: &sidebar::ReconnectHost, cx| {
                 if let Some(id) = e.0.remote_id() {
                     this.sync_hosts_after_reconnect(Some(id.to_owned()), cx);
-                }
-                this.sync_hosts(cx);
-                this.sync(cx);
-                cx.notify();
-            });
-        let sidebar_disconnect =
-            cx.subscribe(&sidebar, |this, _, e: &sidebar::DisconnectHost, cx| {
-                if let Some(id) = e.0.remote_id() {
-                    if let Some(raw) = id.strip_prefix("iroh:")
-                        && let Some(service) = &this.link_hosts
-                    {
-                        service.disconnect(raw);
-                    }
-                    this.host_manager.disconnect_now(id);
                 }
                 this.sync_hosts(cx);
                 this.sync(cx);
@@ -1083,7 +1074,6 @@ impl Shell {
             _sidebar_close_session: close_session,
             _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
-            _sidebar_disconnect: sidebar_disconnect,
             _sidebar_relisted: sidebar_relisted,
             _sidebar_tabs: sidebar_tabs,
             layout,
@@ -1189,7 +1179,13 @@ impl Shell {
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
+            tab_menu_focus: cx.focus_handle(),
+            tab_menu_previous_focus: None,
             confirm_close_tab: None,
+            recent_tab_scroll: gpui::ScrollHandle::new(),
+            tab_dialog_focus: cx.focus_handle(),
+            tab_dialog_was_open: false,
+            tab_dialog_previous_focus: None,
             pending_running_close: None,
             tab_rename: None,
             nav_history: NavHistory::default(),
@@ -2445,6 +2441,10 @@ impl Shell {
     }
 
     fn on_config_changed(&mut self, cx: &mut Context<Self>) {
+        // 터미널 테마만 바뀌면 앱 Theme는 그대로라 전역 테마 관찰자가 호출되지 않는다.
+        if self.terminal_theme != krill_app::ui::terminal_theme(cx) {
+            self.push_appearance(cx);
+        }
         self.refresh_local_state(cx);
         self.sidebar
             .update(cx, krill_app::sidebar::Sidebar::reload_external);
@@ -2758,16 +2758,9 @@ impl Shell {
                             krill_app::settings::current(cx).auto_restart_update
                         })
                         .unwrap_or(false);
-                    let relaunch = staged.clone();
-                    let relaunched = staged.relaunched
-                        || (automatic
-                            && cx
-                                .background_executor()
-                                .spawn(async move { relaunch.spawn_relauncher().is_ok() })
-                                .await);
                     let keep_going = this
                         .update(cx, |_, cx| {
-                            if relaunched {
+                            if staged.relaunched {
                                 files::quit_app(cx);
                                 return;
                             }
@@ -2775,12 +2768,21 @@ impl Shell {
                                 .try_global::<krill_app::updater::UpdateState>()
                                 .cloned()
                                 .unwrap_or_default();
+                            if u.restart.is_starting() {
+                                return;
+                            }
+                            if u.staged.as_ref() != Some(&staged) {
+                                u.restart = krill_app::updater::RestartStatus::Idle;
+                            }
                             u.staged = Some(staged.clone());
-                            u.status = krill_app::updater::CheckStatus::Ready(staged);
+                            u.status = krill_app::updater::CheckStatus::Ready(staged.clone());
                             u.card_collapsed = false;
                             cx.set_global(u);
                             cx.refresh_windows();
                             cx.notify();
+                            if automatic {
+                                krill_app::updater::restart_staged_update(staged, cx);
+                            }
                         })
                         .is_ok();
                     if !keep_going {
@@ -3850,7 +3852,9 @@ impl Shell {
             l.started = Some(Instant::now());
         }
         l.exited_early = false;
-        if let Some(launch) = &linked.launch {
+        if let Some(launch) = &linked.launch
+            && self.layout.host(pane).is_local()
+        {
             krill_app::onboarding::actions::note_agent_session(&launch.profile, cx);
         }
         l.launch = linked.launch;
@@ -4100,6 +4104,10 @@ impl Shell {
         // OWE-870: 이름 변경 대화상자가 열려 있으면 Esc로 닫는다(Enter 저장은 입력창 구독이 맡는다).
         if self.tab_rename.is_some() && e.keystroke.key == "escape" {
             self.cancel_tab_rename(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if e.keystroke.key == "escape" && self.close_link_menu(cx) {
             cx.stop_propagation();
             return;
         }
@@ -5239,6 +5247,8 @@ impl Shell {
                 .text_color(p.muted_foreground)
                 .text_size(krill_app::ui::TEXT_2XS)
                 .font_weight(gpui::FontWeight::MEDIUM)
+                .max_w(relative(0.4))
+                .truncate()
                 .child(host_name),
         )
     }
@@ -5336,6 +5346,11 @@ impl Shell {
         // 아래 배너와 겹치지 않게 한다. 탭 바의 제목은 중복하지 않는다.
         let pane_header = div()
             .debug_selector(move || format!("pane-header-{}", id.get()))
+            .font_family(krill_app::ui::FONT_UI)
+            .text_size(krill_app::ui::TEXT_XS)
+            .max_w(relative(1.))
+            .flex_wrap()
+            .justify_end()
             .when(!ended, |d| d.absolute().top(px(4.)).right(px(4.)))
             .when(ended, |d| d.self_end().mb_2())
             .flex_none()
@@ -5366,6 +5381,7 @@ impl Shell {
                 )
                 .child(krill_app::ui::button_with_tooltip(
                     krill_app::ui::ghost(("pane-unzoom", id.get()), text::PANE_UNZOOM.get())
+                        .xsmall()
                         .debug_selector(move || format!("pane-unzoom-{}", id.get()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -5599,7 +5615,6 @@ impl Shell {
                     )
                     .children(self.render_pane_chat_overlay(id, window, cx)),
             )
-            .children(self.render_pane_security(id, cx))
             .when(self.files.hover.as_ref().is_some_and(|h| h.0 == id), |d| {
                 d.cursor_pointer()
             })
@@ -5634,7 +5649,7 @@ impl Shell {
                         } else {
                             // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
                             match file {
-                                Some(path) => this.open_terminal_file(path, action, cx),
+                                Some(path) => this.open_terminal_file(path, e.position, action, cx),
                                 None => {
                                     if let Some((_, link)) =
                                         this.path_link_at(id, e.position, Some(action), cx)
@@ -5678,7 +5693,7 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
-                    // 끌지 않은 맨 클릭이 평문 URL 위면 브라우저로 연다(⌘ 없이도).
+                    // 끌지 않은 맨 클릭이 링크 위면 대상 URL·복사·열기 팝오버를 띄운다(⌘ 없이도).
                     let clicked = !e.modifiers.modified()
                         && this.live.get(&id).is_some_and(|l| {
                             l.selecting
@@ -5686,8 +5701,8 @@ impl Shell {
                                 && l.selection.is_some_and(|s| s.anchor == s.head)
                         });
                     if this.select_end(id, cx) {
-                        if clicked && let Some((_, uri)) = this.plain_url_at(id, e.position) {
-                            cx.open_url(&uri);
+                        if clicked && let Some((_, uri)) = this.click_link_at(id, e.position) {
+                            this.open_link_menu(id, uri, e.position, cx);
                             return;
                         }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
@@ -5730,7 +5745,6 @@ impl Shell {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
-                this.update_hover_link(id, e.position, cx);
                 this.update_path_hover(id, e.position, e.modifiers.platform, cx);
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
@@ -5866,6 +5880,31 @@ impl Render for Shell {
             window,
             cx.theme().mode == gpui_component::ThemeMode::Dark,
         );
+        if self.tab_context_menu.is_some() && self.tab_menu_previous_focus.is_none() {
+            self.tab_menu_previous_focus = Some(
+                window
+                    .focused(cx)
+                    .unwrap_or_else(|| self.focus_handle().clone()),
+            );
+            self.tab_menu_focus.focus(window, cx);
+        } else if self.tab_context_menu.is_none()
+            && let Some(previous) = self.tab_menu_previous_focus.take()
+            && self.tab_menu_focus.contains_focused(window, cx)
+        {
+            previous.focus(window, cx);
+        }
+        let tab_dialog_open =
+            self.confirm_close_tab.is_some() || self.pending_running_close.is_some();
+        if tab_dialog_open && !self.tab_dialog_was_open {
+            self.tab_dialog_previous_focus = window.focused(cx);
+            self.tab_dialog_focus.focus(window, cx);
+        } else if !tab_dialog_open
+            && self.tab_dialog_was_open
+            && let Some(focus) = self.tab_dialog_previous_focus.take()
+        {
+            focus.focus(window, cx);
+        }
+        self.tab_dialog_was_open = tab_dialog_open;
         self.window = Some(window.window_handle());
         self.sync_notifications(window, cx);
         // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
@@ -6569,6 +6608,7 @@ impl Render for Shell {
             .children(self.dashboard.clone())
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
+            .children(self.render_link_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
             .children(self.render_running_close_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
@@ -6579,7 +6619,7 @@ impl Render for Shell {
             .children(
                 (self.role == WindowRole::Main && !self.has_notifications(cx))
                     .then(|| {
-                        Self::render_update_card(cx)
+                        Self::render_update_card(window, cx)
                             .map(IntoElement::into_any_element)
                             .or_else(|| krill_app::star_nag::card(cx))
                     })
@@ -6701,7 +6741,10 @@ impl Shell {
 
     // Design adapted from Orca (.ref/orca/src/renderer/src/components/UpdateCard.tsx,
     // UpdateDownloadCardContent.tsx), MIT License — Copyright (c) 2026 Orca Contributors.
-    fn render_update_card(cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+    fn render_update_card(
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         use gpui_component::button::{Button, ButtonVariants as _};
         use krill_app::i18n::catalog::updater_relaunch as utext;
         use krill_app::updater::UpdateState;
@@ -6712,7 +6755,18 @@ impl Shell {
         }
         let staged = state.staged?;
         let p = krill_app::ui::palette(cx);
-        let title = utext::CARD_READY_TITLE.get();
+        let starting = state.restart.is_starting();
+        let restart_error = state.restart.error().map(str::to_owned);
+        let title = if restart_error.is_some() {
+            utext::CARD_RESTART_FAILED_TITLE.get()
+        } else {
+            utext::CARD_READY_TITLE.get()
+        };
+        let restart_label = if restart_error.is_some() {
+            utext::CARD_RETRY_BTN.get()
+        } else {
+            utext::CARD_RESTART_BTN.get()
+        };
         let body = utext::CARD_READY_BODY.format(&[("version", &staged.to_version)]);
         let subtitle = utext::CARD_READY_SUBTITLE.get();
         let release_notes_url = staged.release_notes_url();
@@ -6726,6 +6780,9 @@ impl Shell {
                 .bottom(px(34.))
                 .right(px(12.))
                 .w(px(300.))
+                .max_w((window.viewport_size().width - krill_app::ui::SPACE_4 * 2.).max(px(0.)))
+                .max_h((window.viewport_size().height - px(50.)).max(px(0.)))
+                .overflow_y_scroll()
                 .p_3()
                 .rounded(krill_app::ui::RADIUS_MD)
                 .border_1()
@@ -6806,27 +6863,32 @@ impl Shell {
                             )
                         })),
                 )
+                .children(restart_error.map(|error| {
+                    krill_app::ui::error_banner(p, error)
+                        .debug_selector(|| "update-card-restart-error".into())
+                }))
                 .child(
                     div().w_full().child(
-                        Button::new("update-card-restart")
-                            .label(utext::CARD_RESTART_BTN.get())
-                            .debug_selector(|| "update-card-restart".into())
-                            .primary()
-                            .small()
-                            .w_full()
-                            .on_click(move |_, _, cx| {
-                                let staged = staged.clone();
-                                cx.spawn(async move |cx| {
-                                    let launched = cx
-                                        .background_executor()
-                                        .spawn(async move { staged.spawn_relauncher().is_ok() })
-                                        .await;
-                                    if launched {
-                                        cx.update(files::quit_app);
-                                    }
-                                })
-                                .detach();
-                            }),
+                        krill_app::ui::button_with_reserved_label(
+                            "update-card-restart",
+                            restart_label,
+                            utext::CARD_RESTARTING_BTN.get(),
+                            starting,
+                        )
+                        .debug_selector(|| "update-card-restart".into())
+                        .primary()
+                        .small()
+                        .disabled(
+                            starting
+                                || matches!(
+                                    state.status,
+                                    krill_app::updater::CheckStatus::Checking
+                                ),
+                        )
+                        .w_full()
+                        .on_click(move |_, _, cx| {
+                            krill_app::updater::restart_staged_update(staged.clone(), cx);
+                        }),
                     ),
                 ),
         )
@@ -7051,3 +7113,6 @@ fn start_error_text(err: &std::io::Error) -> String {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod update_tests;

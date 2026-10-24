@@ -189,14 +189,14 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - 사이드바 상단(헤더 바로 아래)에 검색·아티팩트·에이전트 대시보드(작업 중·완료 개수)·Krill 모바일 진입 행을 라벨이 있는 전체 폭 행으로 둔다. 그 아래가 프로젝트 목록이다.
   - 프로젝트 기준 보기에서는 Orca처럼 프로젝트(저장소·폴더) 행을 끊지 않고 이어 배치한다. 원격 프로젝트의 호스트·연결 상태는 프로젝트 헤더 배지로 보이고, 프로젝트가 없는 연결 호스트와 작업 폴더 없는 세션 묶음은 모든 프로젝트 뒤에 둔다. 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정). 같은 저장소의 연결 워크트리는 형제 행이며 명시적으로 저장한 부모 관계만 중첩한다(모바일 목록도 같다).
   - 사이드바 들여쓰기: 호스트 아래 프로젝트 8px, 프로젝트 아래 카드 12px. 루트 행의 상태 칸은 그대로 두고, 하위 세션 상태 글리프는 부모 카드 상태 칸에서 한 단계(12px) 들여써 계층을 보인다. 호스트·워크트리 계보 여백은 한 번만 적용하고 계보 깊이는 유지한다. 상세·컴팩트 카드와 대량 목록은 같은 가상화 경로와 들여쓰기를 쓴다.
-  - 상태 요약 겹친 아이콘: `STATUS_GROUP_ICON = 15px`, 겹침 음수 마진 `STATUS_GROUP_OVERLAP = -3px` (`ui::status::summary_element` 전용)
+  - 상태 요약 아이콘: `STATUS_GROUP_ICON = 15px`, 아이콘 사이 간격 `STATUS_GROUP_GAP = 2px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`
   - 세션 기록은 우측 패널의 탭으로 열며 `PANEL_DEFAULT_WIDTH`와 사용자가 조절한 패널 폭을 따른다. 목록은 남은 높이 전체를 스크롤 영역으로 사용하고, 바깥 클릭으로 닫지 않는다.
-  - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`, 대시보드 `DASHBOARD_SIZE = 960×600`
+  - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`. 인앱 대시보드는 창 가장자리 16px 여백 안에서 `DASHBOARD_SIZE = 1800×1100`까지 확장한다. 레인은 `DASHBOARD_LANE_MIN_WIDTH = 240px` 이상을 유지하고, 좁은 창에서는 가로로 스크롤하며 각 레인의 카드는 세로로 스크롤한다.
 
 ### 5.4 입체감과 그림자 (Elevation & Shadows)
 
@@ -257,7 +257,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
   - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 12스텝)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전한다.
   - 작업 중 스피너 모양은 Orca 3/4 링 대신 **120° 간격 3분절 아크**(크릴 등갑 모티프, `RING_SVG`)다.
   - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 분절 아크가 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
-- **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 겹쳐 그리고 나머지는 `+N`으로 축약한다.
+- **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 간격을 두고 나란히 그리고 나머지는 `+N`으로 축약한다. 세션 목록을 펼치면 요약 바는 세션 개수와 접기 화살표로 바뀌고, 요약 바·목록의 별도 배경과 테두리는 없앤다. 행 호버·선택과 활성 워크트리 표면은 유지한다.
 - **떼(swarm) 미터 (`ui::status::swarm_meter(states, max, cx)`)**: 세션마다 3px 상태색 점(`agent_state_color`, 유휴는 50% 투명)을 요약과 같은 우선순위로 최대 `SWARM_MAX`(12)개 그리고, 넘치면 `+N`(`TEXT_XS`, `muted_foreground`)을 붙인다. 점 `max`개 칸과 `+N` 칸을 늘 예약해 세션 수가 바뀌어도 폭이 흔들리지 않는다(§7.3). 순서·넘침 계산은 `ui::status::swarm_dots`.
 
 ### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)
@@ -270,7 +270,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
    - **Antigravity**: `ANTIGRAVITY_BLUE` (`#4285F4`) + `ANTIGRAVITY_CORAL` (`#EA4335`, 2레이어 A-링)
    - **OpenCode**: `OPENCODE_COLOR` (`#06B6D4`, 시안 프레임) + `OPENCODE_CORE_COLOR` (`#67E8F9`, 코어 블록)
    - **Cursor**: `CURSOR_COLOR` (`#6366F1`, 인디고 큐브) + `CURSOR_HIGHLIGHT_COLOR` (`#A5B4FC`, 상단 면 하이라이트)
-   - **커스텀 / 미분류 에이전트**: `CUSTOM_AGENT_COLOR` (`#F59E0B`, 앰버 봇 폴백)
+   - **커스텀 / 미분류 에이전트**: `CUSTOM_AGENT_COLOR` (`#F59E0B`, 일반 요소는 앰버 문자, 메뉴는 중립 봇 `CUSTOM_AGENT_SVG` 폴백)
 2. **아이콘 크기 토큰 (`crate::ui::ICON_*`)**:
    - `ICON_XS` (`12px`): 고밀도 인라인 배지 — 사이드바 세션 행(`session_row`), 관리자 계정 행 프로바이더 배지, AI Vault / Jump 에이전트 필터 칩
    - `ICON_SM` (`13px`): 기본 행·탭 아이콘 — 상단 탭 바 탭, 워크트리 카드 하단 에이전트 알약 및 요약 칩(`summary_element`), 다른 계정으로 이어가기 모달, Jump 팔레트 세션/Vault 행, AI Vault 검색 결과 행, 온보딩 점검 행(`agent.*`, `hook.*`)
@@ -313,6 +313,8 @@ Krill은 Linear처럼 **어떤 동작이든 누르는 순간 끝난 것처럼 �
 - **프로세스 이름은 정확히**: PTY와 세션은 **krill-holder**가 소유하고, **krilld**는 세션 데몬(질의 응답·저장·상태)이다. "세션은 krilld에서 실행됩니다"처럼 쓰지 않는다. 사용자 문구에서는 프로세스 이름을 빼고 "세션은 계속 실행됩니다"로 쓰거나, 구조 설명이 필요할 때만 "세션은 krill-holder가 보관합니다"라고 쓴다.
 
 ### 7.2 인앱 페이지 전환 vs 모달 대화상자
+
+모달은 `ui::modal_focus_scope`로 Tab/Shift-Tab을 내부에 가두고, 열기·닫기 때 입력 포커스를 옮기고 복구한다. 이 공용 범위는 `gpui_component::Root`가 없는 메인 셸에서도 동작하며 원래 Dialog 역할·이름을 유지한다. `ui::modal_backdrop`은 뒤쪽 화면으로 마우스 클릭이 통과하지 않게 막는다. `ui::switch`는 Switch 역할·토글 상태·포커스 링과 Enter/Space 활성화를 제공하고, 호출부는 현지화된 `aria_label`을 지정한다.
 
 - **관리자·설정 페이지는 인앱 전환**: `⌘,` 또는 사이드바 설정 버튼을 누르면 새 창을 띄우지 않고 메인 창 안에서 페이지가 전환되어야 한다.
 - **모달은 짧은 결정·생성에만**: 새 워크트리 생성이나 파괴적 충돌 확인처럼 현재 맥락 위에서 즉시 입력/결정하고 닫는 흐름만 `ui::modal_backdrop` 중앙 모달을 쓴다.

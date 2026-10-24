@@ -1183,6 +1183,32 @@ fn jump_items_fall_back_to_worktree_and_session_names() {
     }
 }
 
+#[test]
+fn jump_provider_uses_foreground_when_session_has_a_custom_title() {
+    let mut sidebar = Sidebar::new_loaded(None);
+    sidebar.snapshot.sessions = vec![Session {
+        id: SessionId(1),
+        status: AgentStatus {
+            agent: "zsh".into(),
+            foreground: Some("/opt/bin/codex".into()),
+            title: Some("Renamed task".into()),
+            ..AgentStatus::UNKNOWN
+        },
+        worktree: None,
+        cwd: None,
+        account: None,
+    }];
+    assert_eq!(sidebar.jump_items()[0].agent, "codex");
+    sidebar
+        .custom_titles
+        .insert(SessionId(1), "Codex alias".into());
+    sidebar.snapshot.sessions[0].status.foreground = None;
+    sidebar.snapshot.sessions[0].status.title = Some("Claude task".into());
+    let item = &sidebar.jump_items()[0];
+    assert_eq!(item.title, "Codex alias");
+    assert_eq!(item.agent, "claude");
+}
+
 #[gpui::test]
 fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAppContext) {
     use crate::pull_request::Status;
@@ -2164,12 +2190,12 @@ fn virtualized_worktree_sessions_share_summary_panel_edges(cx: &mut TestAppConte
     assert_eq!(
         summary.bottom_left().y,
         first.origin.y,
-        "summary border must continue into the session list without a gap"
+        "expanded summary and session list must stay aligned without a gap"
     );
     assert_eq!(
         first.bottom_left().y,
         second.origin.y,
-        "session borders must continue without a gap"
+        "expanded session rows must continue without a gap"
     );
 }
 
@@ -3528,6 +3554,20 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
         properties_summary,
     };
 
+    use gpui::{ParentElement as _, Styled as _};
+    struct MenuHost(gpui::Entity<Sidebar>);
+    impl gpui::Render for MenuHost {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+                .size_full()
+                .child(gpui::div().w(gpui::px(420.)).h_full().child(self.0.clone()))
+        }
+    }
+
     assert_eq!(format_filter_badge_count(1), "1");
     assert_eq!(format_filter_badge_count(9), "9");
     assert_eq!(format_filter_badge_count(10), "9+");
@@ -3538,8 +3578,11 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     let sidebar_bin = dir.join("sidebar.bin");
 
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
-    vcx.simulate_resize(gpui::size(gpui::px(420.), gpui::px(900.)));
+    let (host, vcx) = cx.add_window_view(|_, cx| {
+        MenuHost(cx.new(|_| Sidebar::new_loaded(Some(sidebar_bin.clone()))))
+    });
+    let view = vcx.update(|_, cx| host.read(cx).0.clone());
+    vcx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(900.)));
 
     let repo_a = PathBuf::from("/repo-alpha");
     let repo_b = PathBuf::from("/repo-beta");
@@ -3594,7 +3637,13 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     let hosts_trigger = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
     vcx.simulate_click(hosts_trigger.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("sidebar-hosts-panel").is_some());
+    let hosts_panel = vcx.debug_bounds("sidebar-hosts-panel").unwrap();
+    let hosts_row = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
+    assert!(
+        hosts_panel.origin.x >= hosts_row.right(),
+        "host choices must open to the right"
+    );
+    assert!((hosts_panel.origin.y - hosts_row.origin.y).abs() < gpui::px(12.));
     let host_studio = vcx.debug_bounds("sidebar-host-item-studio").unwrap();
     vcx.simulate_click(host_studio.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
@@ -3608,7 +3657,16 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     vcx.simulate_click(projects_trigger.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("sidebar-hosts-panel").is_none());
-    assert!(vcx.debug_bounds("sidebar-projects-panel").is_some());
+    let projects_panel = vcx.debug_bounds("sidebar-projects-panel").unwrap();
+    let projects_row = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    assert!(
+        projects_panel.origin.x >= projects_row.right(),
+        "project choices must open to the right"
+    );
+    assert_eq!(
+        projects_trigger, projects_row,
+        "opening a panel must not move its parent row"
+    );
     let proj_alpha = vcx.debug_bounds("sidebar-project-item-repo-alpha").unwrap();
     vcx.simulate_click(proj_alpha.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
@@ -3690,9 +3748,9 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     vcx.run_until_parked();
     assert!(!vcx.update(|_, cx| view.read(cx).options().card_properties.ports));
 
-    // 서브메뉴를 다시 닫아 필터 행들이 뷰포트 안에 오도록 한다.
-    let props_trigger = vcx.debug_bounds("sidebar-submenu-card-properties").unwrap();
-    vcx.simulate_click(props_trigger.center(), gpui::Modifiers::default());
+    // 부모 메뉴의 그룹화로 돌아오면 서브패널만 닫힌다.
+    let group = vcx.debug_bounds("sidebar-group-by-status").unwrap();
+    vcx.simulate_click(group.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
 
     // 5. 가시성 필터 스위치 토글 행(`FilterToggleRow`)과 조건부 들여쓰기(`always_show_default_branch`), 배지·초기화 버튼 검증
@@ -3762,6 +3820,41 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     assert!(vcx.debug_bounds("sidebar-options-badge").is_none());
     assert!(vcx.debug_bounds("sidebar-filter-reset").is_none());
 
+    // 오른쪽 패널을 연 채 Esc로 전체 메뉴를 닫고, 재진입 후 바깥 클릭으로도 닫는다.
+    let projects = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    vcx.simulate_click(projects.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_some());
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-options-menu").is_none());
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_none());
+    let button = vcx.debug_bounds("sidebar-options").unwrap();
+    vcx.simulate_click(button.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let projects = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    vcx.simulate_click(projects.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.simulate_click(
+        gpui::point(gpui::px(1050.), gpui::px(850.)),
+        gpui::Modifiers::default(),
+    );
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-options-menu").is_none());
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_none());
+    // 좁은 창에서 부모와 겹쳐 보이더라도 서브패널의 선택을 받아야 한다.
+    vcx.simulate_resize(gpui::size(gpui::px(420.), gpui::px(900.)));
+    let button = vcx.debug_bounds("sidebar-options").unwrap();
+    vcx.simulate_click(button.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let hosts = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
+    vcx.simulate_click(hosts.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let studio = vcx.debug_bounds("sidebar-host-item-studio").unwrap();
+    assert!(studio.origin.x >= gpui::px(0.) && studio.right() <= gpui::px(420.));
+    vcx.simulate_click(studio.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| view.read(cx).options().filters.hosts.contains("studio")));
     fs::remove_dir_all(dir).ok();
 }
 
@@ -5483,4 +5576,160 @@ fn status_summary_reuses_snapshot_until_sidebar_changes(cx: &mut TestAppContext)
     assert_eq!(first.0, 1);
     assert_eq!(*first.1, vec![AgentState::Waiting, AgentState::Working]);
     assert!(Arc::ptr_eq(&first.1, &second.1));
+}
+
+/// 폰에서 바꾼 작업 공간 옵션(`sidebar-mobile.json`)을 다음 디스크 폴링에서 사이드바에 반영하고 저장한 뒤 지운다.
+#[gpui::test]
+fn mobile_workspace_view_change_applies_to_desktop_sidebar(cx: &mut TestAppContext) {
+    use krill_proto::mobile::view::ViewChange;
+    let dir = std::env::temp_dir().join(format!("krill-mobile-view-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+    ViewChange::append(
+        &dir,
+        ViewChange {
+            group_by: Some(3),
+            sort_by: Some(2),
+            hide_sleeping: Some(true),
+            repos: Some(BTreeSet::from([repo.clone()])),
+            collapsed: BTreeMap::from([(repo.clone(), true)]),
+            ..ViewChange::default()
+        },
+    )
+    .unwrap();
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(repo.clone(), vec![repo.clone()]);
+            s.rebuild(cx);
+            s.reload_external(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.options().group_by, GroupBy::None);
+        assert_eq!(s.options().sort_by, SortBy::Name);
+        assert!(s.options().filters.hide_sleeping);
+        assert!(s.options().filters.repos.contains(&repo));
+        assert!(s.is_collapsed(&repo));
+    });
+    assert!(
+        ViewChange::load(&dir).is_none(),
+        "applied change is consumed"
+    );
+    let restored = Sidebar::new_loaded(Some(sidebar_bin));
+    assert_eq!(restored.options().sort_by, SortBy::Name);
+    assert!(restored.is_collapsed(&repo));
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 기본 워크트리에 프로젝트 표시 이름·폴더 이름이 `prefs`(`projects.toml` 동기화분 포함)로 들어 있어도
+/// 프로젝트 머리줄과 중복 표기하지 않고 브랜치 이름을 제목으로 쓰며, 사용자가 다른 이름으로 직접 바꾼 경우만 유지한다.
+#[gpui::test]
+fn default_worktree_ignores_redundant_project_name_in_prefs(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo = PathBuf::from("/Users/test/gwiinsaju");
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([(repo.clone(), vec![repo.clone()])]),
+            };
+            s.meta.insert(
+                repo.clone(),
+                Tree {
+                    branch: Some("main".into()),
+                    dirty: None,
+                },
+            );
+            s.prefs.insert(
+                repo.clone(),
+                Preference {
+                    pinned: false,
+                    name: "gwiinsaju".into(),
+                },
+            );
+            s.rebuild(cx);
+            assert_eq!(s.name(&repo), "main");
+        });
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("worktree-branch-1").is_none(),
+        "default worktree card title must resolve to 'main' (matching branch_subtitle) instead of repeating 'gwiinsaju'"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            s.prefs.entry(repo.clone()).or_default().name = "직접 정한 기본 워크트리".into();
+            assert_eq!(s.name(&repo), "직접 정한 기본 워크트리");
+        });
+    });
+}
+
+#[gpui::test]
+fn worktree_delete_enters_cancel_focus_and_restores_background_on_escape(cx: &mut TestAppContext) {
+    struct DeleteProbe(std::sync::atomic::AtomicUsize);
+    impl Source for DeleteProbe {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(Snapshot::default())
+        }
+        fn remove_worktree(&self, _: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let source = Arc::new(DeleteProbe(std::sync::atomic::AtomicUsize::new(0)));
+    let selected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = selected.clone();
+    let previous = cx.update(|window, cx| {
+        cx.subscribe(&view, move |_, _: &Selected, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .detach();
+        view.update(cx, |s, cx| {
+            s.connect_source(source.clone(), cx);
+            let focus = cx.focus_handle();
+            s.focus = Some(focus.clone());
+            focus.focus(window, cx);
+            s.request_delete_worktree(PathBuf::from("/repo/ui-delete-probe"), false, cx);
+            focus
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(
+            view.read(cx)
+                .delete_cancel_focus
+                .as_ref()
+                .unwrap()
+                .is_focused(window)
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).delete_confirm.is_none());
+        assert!(previous.is_focused(window));
+        view.update(cx, |s, cx| {
+            s.request_delete_worktree(PathBuf::from("/repo/ui-delete-probe"), false, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).delete_confirm.is_none());
+        assert!(previous.is_focused(window));
+    });
+    assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(selected.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

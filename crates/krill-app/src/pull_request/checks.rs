@@ -101,11 +101,22 @@ impl ReviewComment {
     }
 }
 
+/// 병합 확인에 쓰는 브랜치 이름과 커밋. 누락된 gh 응답은 병합 대상으로 삼지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrMetadata {
+    pub base_ref_name: String,
+    pub head_ref_name: String,
+    pub base_ref_oid: String,
+    pub head_ref_oid: String,
+}
+
 /// 현재 워크트리 브랜치의 PR 메타데이터·CI 체크·미해결 리뷰 코멘트 스냅샷.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrInspection {
     pub status: Status,
     pub number: Option<u64>,
+    pub metadata: Option<PrMetadata>,
     pub title: String,
     pub url: String,
     pub checks: Vec<CheckItem>,
@@ -117,6 +128,7 @@ impl Default for PrInspection {
         Self {
             status: Status::NoPr,
             number: None,
+            metadata: None,
             title: String::new(),
             url: String::new(),
             checks: Vec::new(),
@@ -126,6 +138,34 @@ impl Default for PrInspection {
 }
 
 impl PrInspection {
+    #[must_use]
+    pub fn mergeable_snapshot(&self) -> bool {
+        self.status == Status::Open
+            && self.number.is_some_and(|number| number > 0)
+            && self.url.starts_with("https://")
+            && parse_repo_owner_and_name(&self.url).is_some()
+            && self.metadata.as_ref().is_some_and(|metadata| {
+                [
+                    &metadata.base_ref_name,
+                    &metadata.head_ref_name,
+                    &metadata.base_ref_oid,
+                    &metadata.head_ref_oid,
+                ]
+                .iter()
+                .all(|value| !value.trim().is_empty())
+            })
+    }
+
+    #[must_use]
+    pub fn same_merge_target(&self, other: &Self) -> bool {
+        self.mergeable_snapshot()
+            && other.mergeable_snapshot()
+            && self.number == other.number
+            && self.url == other.url
+            && self.title == other.title
+            && self.metadata == other.metadata
+    }
+
     #[must_use]
     pub fn count(&self, state: CheckState) -> usize {
         self.checks.iter().filter(|c| c.state == state).count()
@@ -273,6 +313,8 @@ impl RawRollupEntry {
 
 #[derive(Deserialize)]
 struct RawPrDetail {
+    #[serde(flatten)]
+    metadata: Option<PrMetadata>,
     #[serde(default)]
     number: Option<u64>,
     #[serde(default)]
@@ -287,7 +329,7 @@ struct RawPrDetail {
     status_check_rollup: Vec<RawRollupEntry>,
 }
 
-/// `gh pr list --json number,title,url,state,isDraft,statusCheckRollup` 출력을 파싱한다.
+/// `gh pr list --json number,title,url,state,isDraft,statusCheckRollup,baseRefName,headRefName,baseRefOid,headRefOid` 출력을 파싱한다.
 pub fn parse_checks_from_pr_json(bytes: &[u8]) -> io::Result<PrInspection> {
     let prs: Vec<RawPrDetail> = serde_json::from_slice(bytes).map_err(io::Error::other)?;
     let Some(pr) = prs.into_iter().next() else {
@@ -309,6 +351,7 @@ pub fn parse_checks_from_pr_json(bytes: &[u8]) -> io::Result<PrInspection> {
     Ok(PrInspection {
         status,
         number: pr.number,
+        metadata: pr.metadata,
         title: pr.title.trim().to_owned(),
         url: pr.url.trim().to_owned(),
         checks,
@@ -775,7 +818,7 @@ pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspe
         "--limit",
         "1",
         "--json",
-        "number,title,url,state,isDraft,statusCheckRollup",
+        "number,title,url,state,isDraft,statusCheckRollup,baseRefName,headRefName,baseRefOid,headRefOid",
     ]);
     let bytes = execute(&mut list_cmd, TIMEOUT)?;
     let mut inspection = parse_checks_from_pr_json(&bytes)?;

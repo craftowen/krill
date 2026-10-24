@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Context, Entity, EventEmitter, FontWeight, Hsla, KeyDownEvent, ScrollHandle, Subscription,
-    Window, deferred, div, prelude::*, px,
+    Context, Entity, EventEmitter, Focusable as _, FontWeight, Hsla, KeyDownEvent, ScrollHandle,
+    Subscription, Window, deferred, div, prelude::*, px,
 };
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
 use gpui_component::{Icon, Sizable as _};
@@ -1564,48 +1564,19 @@ fn render_location_chip(
 }
 
 fn render_shortcut_combo(index: usize, pal: &crate::ui::Palette) -> gpui::Div {
-    let cap = |k: String| {
-        div()
-            .px_1()
-            .py(px(1.))
-            .rounded(crate::ui::RADIUS_XS)
-            .border_1()
-            .border_color(pal.border)
-            .bg(pal.background.opacity(0.45))
-            .font_family(crate::ui::FONT_MONO)
-            .text_size(crate::ui::TEXT_2XS)
-            .text_color(pal.muted_foreground)
-            .child(k)
-    };
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap_0p5()
-        .child(cap("⌘".to_owned()))
-        .child(cap((index + 1).to_string()))
+    crate::ui::keycap(pal, format!("⌘{}", index + 1))
 }
 
 fn render_sliders_glyph(color: Hsla) -> gpui::Div {
-    div()
-        .flex_none()
-        .text_size(crate::ui::TEXT_XS)
-        .text_color(color)
-        .child("≚")
+    crate::ui::icons::svg_box(
+        crate::ui::icons::SLIDERS_HORIZONTAL_SVG,
+        crate::ui::ICON_SM,
+        color,
+    )
 }
 
 fn render_footer_key(label: &'static str, pal: &crate::ui::Palette) -> gpui::Div {
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_full()
-        .border_1()
-        .border_color(pal.border)
-        .bg(pal.muted.opacity(0.45))
-        .text_size(crate::ui::TEXT_2XS)
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(pal.popover_foreground.opacity(0.85))
-        .child(label)
+    crate::ui::keycap(pal, label).text_color(pal.popover_foreground)
 }
 
 fn render_section_header(label: &str, pal: &crate::ui::Palette) -> gpui::Div {
@@ -1678,7 +1649,8 @@ impl Render for Palette {
             .font_weight(FontWeight::MEDIUM)
             .text_color(fg)
             .hover(|d| d.bg(accent))
-            .child(format!("≚ {}", text::FILTER.get()))
+            .child(render_sliders_glyph(fg))
+            .child(text::FILTER.get())
             .when(badge_count > 0, |d| {
                 d.child(
                     div()
@@ -1710,7 +1682,7 @@ impl Render for Palette {
             .gap_2()
             .text_size(crate::ui::TEXT_SM)
             .text_color(muted)
-            .child("⌕")
+            .child(Icon::new(IconName::Search).with_size(crate::ui::ICON_MD))
             .child(
                 div()
                     .flex_1()
@@ -1728,6 +1700,9 @@ impl Render for Palette {
 
         let filter_section = (show_project_chips || show_vault_filters).then(|| {
             let mut container = div()
+                .id("jump-filter-section")
+                .max_h(window.viewport_size().height * 0.25)
+                .overflow_y_scroll()
                 .mx_3()
                 .mt_2()
                 .px_2()
@@ -1910,6 +1885,12 @@ impl Render for Palette {
                     div()
                         .id(("jump-action", index))
                         .debug_selector(move || format!("jump-action-{index}"))
+                        .role(gpui::Role::ListBoxOption)
+                        .aria_selected(is_selected)
+                        .when(
+                            is_selected,
+                            gpui::StatefulInteractiveElement::aria_active_descendant,
+                        )
                         .h(px(ROW_HEIGHT))
                         .px_3()
                         .rounded(crate::ui::RADIUS_XS)
@@ -1952,6 +1933,12 @@ impl Render for Palette {
                     div()
                         .id(("jump-quick-command", index))
                         .debug_selector(move || format!("jump-quick-command-{index}"))
+                        .role(gpui::Role::ListBoxOption)
+                        .aria_selected(is_selected)
+                        .when(
+                            is_selected,
+                            gpui::StatefulInteractiveElement::aria_active_descendant,
+                        )
                         .h(px(ROW_HEIGHT))
                         .px_3()
                         .rounded(crate::ui::RADIUS_XS)
@@ -2002,6 +1989,7 @@ impl Render for Palette {
 
         let mut list_body = div()
             .id("jump-list")
+            .role(gpui::Role::ListBox)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -2026,7 +2014,7 @@ impl Render for Palette {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(crate::ui::TEXT_LG)
+                            .text_size(crate::ui::TEXT_MD)
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(fg)
                             .child(self.mode.empty_text()),
@@ -2125,9 +2113,13 @@ impl Render for Palette {
 
                     let title_el = div()
                         .truncate()
-                        .text_size(crate::ui::TEXT_LG)
+                        .text_size(crate::ui::TEXT_MD)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg)
+                        .when(item.is_file, |d| {
+                            d.font_family(crate::ui::FONT_MONO)
+                                .text_size(crate::ui::TEXT_SM)
+                        })
                         .child(item.title.clone());
                     let primary_line = if item.age.is_empty()
                         && !item.is_current_tab
@@ -2165,6 +2157,12 @@ impl Render for Palette {
                     let mut row = div()
                         .id(("jump-session-row", match_idx))
                         .debug_selector(move || format!("jump-session-row-{match_idx}"))
+                        .role(gpui::Role::ListBoxOption)
+                        .aria_selected(is_selected)
+                        .when(
+                            is_selected,
+                            gpui::StatefulInteractiveElement::aria_active_descendant,
+                        )
                         .px_3()
                         .py_2()
                         .rounded(crate::ui::RADIUS_MD)
@@ -2234,7 +2232,7 @@ impl Render for Palette {
                         .items_center()
                         .gap_2()
                         .overflow_hidden()
-                        .text_size(crate::ui::TEXT_LG)
+                        .text_size(crate::ui::TEXT_MD)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg)
                         .child(render_vault_highlight(&title, &self.query, pal));
@@ -2303,6 +2301,12 @@ impl Render for Palette {
                         div()
                             .id(("jump-vault-row", hit_idx))
                             .debug_selector(move || format!("jump-vault-row-{hit_idx}"))
+                            .role(gpui::Role::ListBoxOption)
+                            .aria_selected(is_selected)
+                            .when(
+                                is_selected,
+                                gpui::StatefulInteractiveElement::aria_active_descendant,
+                            )
                             .px_3()
                             .py_2()
                             .rounded(crate::ui::RADIUS_MD)
@@ -2446,7 +2450,7 @@ impl Render for Palette {
                     .child(
                         div()
                             .truncate()
-                            .text_size(crate::ui::TEXT_LG)
+                            .text_size(crate::ui::TEXT_MD)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(fg)
                             .child(wt.name.clone()),
@@ -2515,6 +2519,12 @@ impl Render for Palette {
                     div()
                         .id(("jump-worktree-row", wt_idx))
                         .debug_selector(move || format!("jump-worktree-row-{wt_idx}"))
+                        .role(gpui::Role::ListBoxOption)
+                        .aria_selected(is_selected)
+                        .when(
+                            is_selected,
+                            gpui::StatefulInteractiveElement::aria_active_descendant,
+                        )
                         .px_3()
                         .py_2()
                         .rounded(crate::ui::RADIUS_MD)
@@ -2609,6 +2619,8 @@ impl Render for Palette {
             .flex()
             .items_center()
             .justify_end()
+            .flex_none()
+            .flex_wrap()
             .gap_2()
             .text_size(crate::ui::TEXT_XS)
             .text_color(muted)
@@ -2622,14 +2634,17 @@ impl Render for Palette {
             .child(text::FOOTER_FILTER.get());
 
         let viewport = window.viewport_size();
-        let max_w = (viewport.width - crate::ui::SPACE_4 * 2.).max(px(320.));
-        let max_h = (viewport.height - px(96.)).max(px(320.));
+        let max_w = (viewport.width - crate::ui::SPACE_4 * 2.).max(px(0.));
+        let top_offset = px(80.).min(viewport.height * 0.15);
+        let max_h = (viewport.height - top_offset - crate::ui::SPACE_4).max(px(0.));
         let entity = cx.entity();
 
         // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc·Tab 처리를 대신한다.
         let palette = div()
             .id("jump-palette")
             .debug_selector(|| "jump-palette".into())
+            .role(gpui::Role::Dialog)
+            .track_focus(&self.input.read(cx).focus_handle(cx))
             .w(crate::ui::COMMAND_PALETTE_WIDTH)
             .max_w(max_w)
             .max_h(max_h)
@@ -2637,6 +2652,8 @@ impl Render for Palette {
             .flex_col()
             .overflow_hidden()
             .bg(bg)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_MD)
             .text_color(fg)
             .border_1()
             .border_color(border)
@@ -2697,7 +2714,7 @@ impl Render for Palette {
                 .flex()
                 .items_start()
                 .justify_center()
-                .pt(px(64.))
+                .pt(top_offset)
                 .child(palette),
         )
     }

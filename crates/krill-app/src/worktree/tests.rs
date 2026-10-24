@@ -523,3 +523,89 @@ fn owe924_multi_agent_fanout_and_initial_prompt(cx: &mut TestAppContext) {
     assert_eq!(p1.as_deref(), Some("Fix the flaky test"));
     assert_eq!(p2.as_deref(), Some("Fix the flaky test"));
 }
+
+#[gpui::test]
+fn worktree_modal_keeps_create_visible_with_long_hook_preview(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let fake = Arc::new(Fake::default());
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new(
+            PathBuf::from("/tmp/krill-ui-viewport-test"),
+            fake,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    dialog.update(cx, |d, cx| {
+        d.hooks.effective_setup = Some("very long setup script with many lines\n".repeat(50));
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    cx.run_until_parked();
+    let card = cx.debug_bounds("worktree-dialog").unwrap();
+    let create = cx.debug_bounds("worktree-create").unwrap();
+    let body = cx.debug_bounds("worktree-dialog-body").unwrap();
+    assert!(body.size.height > px(0.) && body.bottom() <= create.top());
+    assert!(
+        card.size.width <= px(608.) && card.size.height <= px(448.),
+        "{card:?}"
+    );
+    assert!(
+        create.left() >= card.left()
+            && create.right() <= card.right()
+            && create.top() >= card.top()
+            && create.bottom() <= card.bottom(),
+        "{create:?} outside {card:?}"
+    );
+    assert!(cx.debug_bounds("worktree-dialog-body").unwrap().size.height > px(0.));
+}
+
+#[test]
+fn fan_out_choices_resolve_to_supported_launch_profiles() {
+    let agents = krill_proto::agent::Agents::load(None).unwrap();
+    for &(id, _) in FAN_OUT_AGENTS {
+        assert!(
+            agents.resolve(id).is_some(),
+            "Fan-Out exposes unsupported agent {id}"
+        );
+    }
+}
+
+#[gpui::test]
+fn worktree_creation_keeps_dialog_until_operation_settles(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let fake = Arc::new(Fake::default());
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new(
+            PathBuf::from("/tmp/krill-ui-creating-test"),
+            fake,
+            window,
+            cx,
+        )
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, event: &Event, _| {
+            sink.lock().unwrap().push(event.clone());
+        })
+        .detach();
+    });
+    dialog.update(cx, |d, cx| {
+        d.phase = Phase::Creating;
+        cx.notify();
+    });
+    cx.simulate_keystrokes("escape");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "closing would drop pending Fan-Out state"
+    );
+    dialog.update(cx, |d, cx| {
+        d.phase = Phase::Edit(None);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("escape");
+    assert_eq!(*events.lock().unwrap(), [Event::Close]);
+}

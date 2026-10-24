@@ -13,6 +13,7 @@ use crate::agent::hooks;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::CodexTrust;
 use super::store::{self, error};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,8 @@ pub struct Record {
     pub path: PathBuf,
     pub command: String,
     pub added: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub replaced: BTreeMap<String, Value>,
 }
 
 pub struct Plan {
@@ -31,7 +34,12 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn install(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<Self> {
+    pub fn install(
+        home: &Path,
+        command: &str,
+        search: Option<&OsStr>,
+        trust: CodexTrust,
+    ) -> io::Result<Self> {
         let path = home.join("config.toml");
         let original = store::read(&path)?;
         let mut rpc = Rpc::start(home, command, search)?;
@@ -77,16 +85,22 @@ impl Plan {
             return Err(error("Codex does not support the requested session hooks"));
         }
         let mut added = BTreeMap::new();
+        let mut replaced = BTreeMap::new();
         let object = state
             .as_object_mut()
             .ok_or_else(|| error("hooks.state must be a table"))?;
         for (key, value) in found {
             match object.get(&key) {
                 Some(old) if old != &value => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("existing Codex trust conflicts: {key}"),
-                    ));
+                    if trust == CodexTrust::Preserve {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("existing Codex trust conflicts: {key}"),
+                        ));
+                    }
+                    replaced.insert(key.clone(), old.clone());
+                    object.insert(key.clone(), value.clone());
+                    added.insert(key, value);
                 }
                 Some(_) => {} // Existing trust belongs to the user, not this receipt.
                 None => {
@@ -101,6 +115,7 @@ impl Plan {
                 path,
                 command: command.to_owned(),
                 added,
+                replaced,
             },
             original,
             state,
@@ -125,7 +140,11 @@ impl Plan {
             .ok_or_else(|| error("hooks.state must be a table"))?;
         for (key, owned) in &record.added {
             if object.get(key) == Some(owned) {
-                object.remove(key);
+                if let Some(previous) = record.replaced.get(key) {
+                    object.insert(key.clone(), previous.clone());
+                } else {
+                    object.remove(key);
+                }
             } else if object.contains_key(key) {
                 eprintln!("preserved modified Codex trust: {key}");
             }

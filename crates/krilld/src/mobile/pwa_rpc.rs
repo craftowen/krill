@@ -12,7 +12,7 @@ use krill_proto::{
     control::{self, Create, Program, Reply, Request},
     input::{Input, InputAck, InputId, InputResult},
     ipc::{self, ClientRole, ServerHello},
-    orchestration::{GateStatus, MessageType, OrchestrationStore},
+    orchestration::OrchestrationStore,
     screen::{Attach, Msg, Seq, Stream},
     usage::{ProviderKind, UsageReply, UsageRequest},
 };
@@ -28,6 +28,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+mod requests;
 
 /// `create_terminal`이 받는 에이전트 프로필(`registry` create와 같은 출처) id·이름, 표준 순서. 설정을 못 읽으면 빈 목록.
 /// 미설치 CLI도 싣는다 — 띄우면 로그인 셸 preflight가 설치 안내를 보여 준다.
@@ -185,6 +187,29 @@ enum Action {
     Git {
         session: u64,
         path: Option<String>,
+    },
+    /// 작업 공간 옵션(Orca "Synced across your devices"). 보낸 항목만 바꾸고 PC 사이드바에도 반영된다.
+    SetWorkspaceView {
+        #[serde(default)]
+        group_by: Option<u32>,
+        #[serde(default)]
+        sort_by: Option<u32>,
+        #[serde(default)]
+        hide_sleeping: Option<bool>,
+        #[serde(default)]
+        always_show_default_branch: Option<bool>,
+        #[serde(default)]
+        hide_automation: Option<bool>,
+        #[serde(default)]
+        hide_cli: Option<bool>,
+        /// 보이는 프로젝트의 저장소 키(빈 목록은 전체).
+        #[serde(default)]
+        repos: Option<Vec<String>>,
+        /// 접거나 펼칠 프로젝트의 저장소 키.
+        #[serde(default)]
+        collapse: Option<String>,
+        #[serde(default)]
+        collapsed: bool,
     },
 }
 #[derive(Debug, Deserialize)]
@@ -510,6 +535,13 @@ impl Backend {
             Action::GateReply { id, decision } => {
                 let dir = self.dir.as_deref().ok_or_else(invalid)?;
                 to_value(OrchestrationStore::mutate(dir, |store| {
+                    if !store
+                        .gates
+                        .iter()
+                        .any(|g| g.id == id && requests::gate_pending(store, g))
+                    {
+                        return Err(io::Error::other("This request is no longer pending."));
+                    }
                     store.resolve_gate(&id, &decision, None, "mobile")
                 })?)
             }
@@ -519,6 +551,16 @@ impl Backend {
                 }
                 let dir = self.dir.as_deref().ok_or_else(invalid)?;
                 to_value(OrchestrationStore::mutate(dir, |store| {
+                    if body.trim().is_empty() {
+                        return Err(invalid());
+                    }
+                    if !store
+                        .messages
+                        .iter()
+                        .any(|m| m.id == id && requests::question_pending(store, m))
+                    {
+                        return Err(io::Error::other("This request is no longer pending."));
+                    }
                     store.reply_message(&id, "mobile", &body)
                 })?)
             }
@@ -557,6 +599,63 @@ impl Backend {
                 serde_json::from_slice(&output).map_err(io::Error::other)
             }
             Action::Git { session, path } => self.git(session, path.as_deref()),
+            Action::SetWorkspaceView {
+                group_by,
+                sort_by,
+                hide_sleeping,
+                always_show_default_branch,
+                hide_automation,
+                hide_cli,
+                repos,
+                collapse,
+                collapsed,
+            } => {
+                // 폰은 PR 묶음을 만들 PR 정보가 없어 프로젝트·상태·없음만 고를 수 있다.
+                if group_by.is_some_and(|g| !matches!(g, 0 | 1 | 3))
+                    || sort_by.is_some_and(|s| s > 3)
+                    || repos.as_ref().is_some_and(|r| r.len() > 512)
+                {
+                    return Err(invalid());
+                }
+                let dir = self.dir.as_deref().ok_or_else(invalid)?;
+                let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
+                    return Err(invalid());
+                };
+                let catalog = super::workspaces::Catalog::load(Some(dir), &sidebar.repositories);
+                let repo_path = |key: &str| {
+                    catalog
+                        .repository(key)
+                        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+                        .ok_or_else(invalid)
+                };
+                let repos = repos
+                    .map(|keys| keys.iter().map(|k| repo_path(k)).collect())
+                    .transpose()?;
+                let collapsed = match collapse {
+                    Some(key) => std::collections::BTreeMap::from([(repo_path(&key)?, collapsed)]),
+                    None => std::collections::BTreeMap::new(),
+                };
+                let change = krill_proto::mobile::view::ViewChange {
+                    group_by,
+                    sort_by,
+                    hide_sleeping,
+                    always_show_default_branch,
+                    hide_automation,
+                    hide_cli,
+                    repos,
+                    collapsed,
+                };
+                if change.is_empty() {
+                    return Err(invalid());
+                }
+                {
+                    // 두 기기가 동시에 바꿔도 읽고-합치고-쓰기가 섞이지 않게 한다.
+                    let _cache = crate::session::lock(&self.catalog_cache);
+                    krill_proto::mobile::view::ViewChange::append(dir, change)?;
+                }
+                *crate::session::lock(&self.catalog_cache) = None;
+                Ok(json!({"ok":true}))
+            }
         }
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
@@ -762,6 +861,7 @@ impl Backend {
             for name in [
                 "projects.toml",
                 "sidebar.bin",
+                krill_proto::mobile::view::FILE,
                 "worktree-comments.toml",
                 "session-titles.json",
                 "orchestration.json",
@@ -879,10 +979,27 @@ impl Backend {
         let mut workspace_titles = std::collections::BTreeMap::new();
         // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
         let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
+        // 데스크톱 "잠든 작업 공간 숨기기"의 깨어 있음 판정: 작업 중·대기·완료이거나 에이전트가 살아 있는 세션.
+        let mut awake = std::collections::BTreeSet::new();
         for (info, _, group) in &rows {
             let Some(path) = group.path.as_deref() else {
                 continue;
             };
+            let status = states
+                .iter()
+                .find(|s| s.session == info.session)
+                .map(|s| &s.status);
+            if status.is_some_and(|s| {
+                matches!(
+                    s.state,
+                    control::AgentState::Working
+                        | control::AgentState::Waiting
+                        | control::AgentState::Blocked
+                        | control::AgentState::Done
+                ) || !s.agent.is_empty() && s.state != control::AgentState::Exited
+            }) {
+                awake.insert(PathBuf::from(path));
+            }
             let rank = states
                 .iter()
                 .find(|s| s.session == info.session)
@@ -950,8 +1067,9 @@ impl Backend {
         }
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
-            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true},
+            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
+            "view":catalog.view_json(),
+            "capabilities":{"workspace_view":true,"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true},
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
     }
@@ -961,17 +1079,7 @@ impl Backend {
             .upgrade()
             .ok_or_else(invalid)?
             .orchestration_snapshot()?;
-        let questions: Vec<_> = store
-            .messages
-            .iter()
-            .filter(|m| m.msg_type == MessageType::Question && !m.acked)
-            .collect();
-        let gates: Vec<_> = store
-            .gates
-            .iter()
-            .filter(|g| g.status == GateStatus::Pending)
-            .collect();
-        Ok(json!({"runs":store.runs,"tasks":store.tasks,"gates":gates,"questions":questions}))
+        Ok(requests::snapshot(&store))
     }
     /// 카드용 git 요약을 cwd별로 모은다. 캐시에 없는 cwd는 큐에 전부 먼저 넣고 나서 받는다
     /// (큐 워커 [`crate::git::MAX_CONCURRENT`]개가 서로 다른 cwd를 동시에 돈다. 같은 키만 직렬).

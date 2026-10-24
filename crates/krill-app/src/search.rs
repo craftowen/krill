@@ -193,11 +193,15 @@ impl Render for Bar {
             .key_context(CONTEXT)
             .debug_selector(|| "search-bar".into())
             .w(px(360.))
+            .max_w(gpui::relative(1.))
             .p_1()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .bg(bg)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_SM)
             .text_color(fg)
             .border_1()
             .border_color(border)
@@ -224,7 +228,13 @@ impl Render for Bar {
                 cx.stop_propagation();
                 bar.dismiss(cx);
             }))
-            .child(div().flex_1().min_w_0().child(Input::new(&self.input)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex_basis(px(96.))
+                    .child(Input::new(&self.input)),
+            )
             .when(self.options_supported, |bar| {
                 bar.child(
                     Button::new("search-case-sensitive")
@@ -287,6 +297,7 @@ impl Render for Bar {
             .child(
                 crate::ui::button_with_tooltip(
                     Button::new("search-close")
+                        .debug_selector(|| "search-close".into())
                         .ghost()
                         .xsmall()
                         .icon(IconName::Close),
@@ -303,6 +314,9 @@ impl Render for Bar {
                 .absolute()
                 .top(crate::ui::SPACE_2)
                 .right(crate::ui::SPACE_4)
+                .left(crate::ui::SPACE_4)
+                .flex()
+                .justify_end()
                 .child(bar),
         )
     }

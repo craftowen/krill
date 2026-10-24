@@ -1,7 +1,5 @@
 //! 상태바 계정 비교표. 이메일 묶음은 표시만 합치며 프로필·전환 대상은 보존한다.
 
-use std::{cell::Cell, rc::Rc};
-
 use super::*;
 use krill_app::i18n::catalog::settings as account_text;
 use krill_proto::usage::{AccountStatus, Window as UsageWindow};
@@ -133,8 +131,9 @@ fn column_title(snap: &AccountsSnapshot, label: &str) -> String {
     }
 }
 
-fn usage_column() -> gpui::Pixels {
-    ui::DIALOG_WIDTH / 4.
+fn usage_column(content_width: gpui::Pixels) -> gpui::Pixels {
+    (ui::DIALOG_WIDTH / 4.)
+        .min((content_width - action_width() - px(ui::ICON_SM) - ui::SPACE_2 * 4.) / 4.)
 }
 
 fn action_width() -> gpui::Pixels {
@@ -144,6 +143,7 @@ fn action_width() -> gpui::Pixels {
 fn render_cell(
     selector: String,
     win: Option<&UsageWindow>,
+    width: gpui::Pixels,
     p: &ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
     let display = krill_app::accounts::display::window(
@@ -157,7 +157,7 @@ fn render_cell(
     div()
         .id(gpui::SharedString::from(selector))
         .debug_selector(move || debug_id.clone())
-        .w(usage_column())
+        .w(width)
         .flex_none()
         .flex()
         .flex_col()
@@ -239,16 +239,11 @@ fn render_details(
     group: &AccountGroup,
     weak: &WeakEntity<Shell>,
     menu: &WeakEntity<PopupMenu>,
-    columns: &[String],
     p: &ui::Palette,
 ) -> gpui::Div {
     let mut detail = div()
         .w_full()
         .min_w_0()
-        .mt_2()
-        .pt_2()
-        .border_t_1()
-        .border_color(p.border)
         .flex()
         .flex_col()
         .gap_2()
@@ -258,7 +253,15 @@ fn render_details(
         detail = detail.child(provider_text::PROVIDER_GROUP_PROFILES.get());
     }
     for account in &group.profiles {
-        let mut profile = div().w_full().min_w_0().flex().flex_col().gap_2();
+        let mut profile = div()
+            .w_full()
+            .min_w_0()
+            .pt_2()
+            .border_t_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .gap_2();
         if group.profiles.len() > 1 {
             let label = if account.host_default {
                 account_text::SYSTEM_DEFAULT.get().to_owned()
@@ -270,29 +273,24 @@ fn render_details(
             let selector = format!("status-provider-profile-{}", account.id);
             let debug_id = selector.clone();
             let path = account.profile_dir.clone();
-            profile = profile
-                .child(
-                    div()
-                        .id(gpui::SharedString::from(selector))
-                        .debug_selector(move || debug_id.clone())
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .child(if account.active {
-                            ui::badge(p, ui::BadgeTone::Muted, account_text::ACCOUNT_IN_USE.get())
-                                .into_any_element()
-                        } else {
-                            use_button(account, weak.clone(), menu.clone()).into_any_element()
-                        })
-                        .tooltip(move |window, cx| {
-                            ui::tooltip_view("status-profile-path", path.clone(), window, cx)
-                        }),
-                )
-                .child(krill_app::accounts::display::summary(
-                    &account.usage,
-                    krill_app::accounts::display::now(),
-                ));
+            profile = profile.child(
+                div()
+                    .id(gpui::SharedString::from(selector))
+                    .debug_selector(move || debug_id.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(if account.active {
+                        ui::badge(p, ui::BadgeTone::Muted, account_text::ACCOUNT_IN_USE.get())
+                            .into_any_element()
+                    } else {
+                        use_button(account, weak.clone(), menu.clone()).into_any_element()
+                    })
+                    .tooltip(move |window, cx| {
+                        ui::tooltip_view("status-profile-path", path.clone(), window, cx)
+                    }),
+            );
         }
         let status = krill_app::accounts::display::account(
             account,
@@ -305,10 +303,8 @@ fn render_details(
             p,
         ));
         if let Some(meters) = snap.meters_for(&account.id) {
+            profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
             for meter in &meters.meters {
-                if meter.value.is_none() && columns.contains(&meter.label) {
-                    continue;
-                }
                 let label = krill_app::accounts::display::meter_label(meter);
                 profile = profile.child(if let Some(value) = &meter.value {
                     div()
@@ -328,6 +324,25 @@ fn render_details(
                     )
                     .into_any_element()
                 });
+            }
+        } else {
+            for (label, window) in [
+                (
+                    provider_text::PROVIDER_USED_5H.get(),
+                    account.usage.five_hour.as_ref(),
+                ),
+                (
+                    provider_text::PROVIDER_USED_7D.get(),
+                    account.usage.seven_day.as_ref(),
+                ),
+            ] {
+                profile = profile.child(render_popover_usage_row(
+                    label,
+                    format!("status-provider-detail-{}-{label}", account.id),
+                    window,
+                    p.muted_foreground,
+                    p,
+                ));
             }
         }
         if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
@@ -357,8 +372,12 @@ pub(super) fn provider_usage_menu(
     reset_armed: Option<&(ProviderKind, String)>,
 ) -> PopupMenu {
     let groups = account_groups(snap, provider);
-    let width = ui::SETTINGS_MODAL_WIDTH.min(window.bounds().size.width - ui::SPACE_4 * 2.);
+    let available = window.bounds().size.width - ui::SPACE_4 * 2.;
+    // 비교표가 창 폭을 다 차지하지 않게 상세 패널 자리를 먼저 남긴다.
+    let detail_width = (ui::DIALOG_WIDTH * 0.625).min(available / 3.);
+    let width = ui::SETTINGS_MODAL_WIDTH.min(available - detail_width);
     let content_width = width - ui::SPACE_4 * 2.;
+    let column_width = usage_column(content_width);
     let columns = comparison_columns(snap, provider);
     let headers: Vec<_> = columns
         .iter()
@@ -418,12 +437,13 @@ pub(super) fn provider_usage_menu(
                         )
                         .children(headers.iter().map(|label| {
                             div()
-                                .w(usage_column())
+                                .w(column_width)
                                 .flex_none()
                                 .truncate()
                                 .child(label.clone())
                         }))
-                        .child(div().w(action_width()).flex_none()),
+                        .child(div().w(action_width()).flex_none())
+                        .child(div().w(px(ui::ICON_SM)).flex_none()),
                 )
         })
         .disabled(true),
@@ -433,14 +453,54 @@ pub(super) fn provider_usage_menu(
             continue;
         };
         let row_account = account.clone();
-        let row_weak = weak.clone();
         let detail_weak = weak.clone();
         let menu_weak = cx.weak_entity();
         let snapshot = snap.clone();
         let columns = columns.clone();
-        let opened = Rc::new(Cell::new(false));
-        menu = menu.item(
-            PopupMenuItem::element(move |_, cx| {
+        let panel_group = group.clone();
+        let panel_snap = snap.clone();
+        let panel_weak = weak.clone();
+        let parent_menu = menu_weak.clone();
+        let panel_account = account.clone();
+        let panel = PopupMenu::build(window, cx, move |menu, _, _| {
+            menu.min_w(detail_width)
+                .max_w(detail_width)
+                .scrollable(true)
+                .item(
+                    PopupMenuItem::element(move |_, cx| {
+                        let p = ui::palette(cx);
+                        let selector = format!("status-provider-details-{}", panel_account.id);
+                        let debug_id = selector.clone();
+                        div()
+                            .id(gpui::SharedString::from(selector))
+                            .debug_selector(move || debug_id.clone())
+                            .w(detail_width - ui::SPACE_4 * 2.)
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_SM)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.popover_foreground)
+                                    .child(account_name(&panel_account)),
+                            )
+                            .child(render_details(
+                                &panel_snap,
+                                &panel_group,
+                                &panel_weak,
+                                &parent_menu,
+                                p,
+                            ))
+                    })
+                    .disabled(true),
+                )
+        });
+        menu = menu.separator().item(PopupMenuItem::submenu_element(
+            account_name(&account),
+            panel,
+            move |_, cx| {
                 let p = ui::palette(cx);
                 let account = &row_account;
                 let row_id = format!(
@@ -449,10 +509,6 @@ pub(super) fn provider_usage_menu(
                     account.id
                 );
                 let debug_id = row_id.clone();
-                let toggle_id = format!("{row_id}-details-toggle");
-                let toggle_debug = toggle_id.clone();
-                let expanded = opened.clone();
-                let menu = menu_weak.clone();
                 let status = krill_app::accounts::display::account(
                     account,
                     snapshot.status_for(&account.id),
@@ -515,29 +571,13 @@ pub(super) fn provider_usage_menu(
                                                     )]),
                                                 ))
                                             }),
-                                    )
-                                    .child(
-                                        Button::new(gpui::SharedString::from(toggle_id))
-                                            .ghost()
-                                            .xsmall()
-                                            .label(provider_text::PROVIDER_DETAILS.get())
-                                            .icon(if opened.get() {
-                                                gpui_component::IconName::ChevronDown
-                                            } else {
-                                                gpui_component::IconName::ChevronRight
-                                            })
-                                            .debug_selector(move || toggle_debug.clone())
-                                            .on_click(move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                expanded.set(!expanded.get());
-                                                menu.update(cx, |_, cx| cx.notify()).ok();
-                                            }),
                                     ),
                             )
                             .children(columns.iter().map(|label| {
                                 render_cell(
                                     format!("{row_id}-{label}"),
                                     comparison_window(&snapshot, account, label),
+                                    column_width,
                                     p,
                                 )
                             }))
@@ -558,6 +598,11 @@ pub(super) fn provider_usage_menu(
                                         use_button(account, detail_weak.clone(), menu_weak.clone())
                                             .into_any_element()
                                     }),
+                            )
+                            .child(
+                                gpui_component::Icon::new(gpui_component::IconName::ChevronRight)
+                                    .size(px(ui::ICON_SM))
+                                    .text_color(p.muted_foreground),
                             ),
                     )
                     .when(status_visible, |d| {
@@ -567,23 +612,8 @@ pub(super) fn provider_usage_menu(
                             p,
                         ))
                     })
-                    .when(opened.get(), |d| {
-                        d.child(render_details(
-                            &snapshot,
-                            &group,
-                            &detail_weak,
-                            &menu_weak,
-                            &columns,
-                            p,
-                        ))
-                    })
-            })
-            .on_click(move |_, _, cx| {
-                if !account.active {
-                    switch_account(&row_weak, &account, cx);
-                }
-            }),
-        );
+            },
+        ));
     }
     let policy = snap.auto_switch.clone();
     let toggle_weak = weak.clone();

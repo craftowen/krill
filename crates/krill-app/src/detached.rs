@@ -167,7 +167,8 @@ impl Render for Panel {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .text_size(crate::ui::TEXT_2XS)
+                        .font_family(crate::ui::FONT_UI)
+                        .text_size(crate::ui::TEXT_XS)
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(p.muted_foreground.opacity(0.75))
                         .hover(|d| d.text_color(p.sidebar_foreground))
@@ -257,6 +258,7 @@ impl Render for Panel {
                                                 .px_2()
                                                 .py_1()
                                                 .rounded(crate::ui::RADIUS_XS)
+                                                .font_family(crate::ui::FONT_UI)
                                                 .text_size(crate::ui::TEXT_XS)
                                                 .text_color(p.sidebar_foreground)
                                                 .hover(|d| {

@@ -325,6 +325,7 @@ impl Panel {
             .id("resources-toggle")
             .debug_selector(|| "resources-toggle".into())
             .role(gpui::Role::Button)
+            .tab_index(0)
             .aria_label(tooltip_text.clone())
             .flex()
             .items_center()
@@ -377,7 +378,7 @@ fn row(label: impl Into<String>, value: impl Into<String>, p: &crate::ui::Palett
 }
 
 impl Render for Panel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = crate::ui::palette(cx);
         let header = self.render_toggle(cx);
         let popover = self.open.then(|| {
@@ -418,6 +419,9 @@ impl Render for Panel {
                             div()
                                 .id(("resources-session", id.0))
                                 .debug_selector(move || format!("resources-session-{}", id.0))
+                                .role(gpui::Role::Button)
+                                .aria_label(self.session_name(cx, id))
+                                .tab_index(0)
                                 .cursor_pointer()
                                 .rounded(crate::ui::RADIUS_XS)
                                 .hover(|d| d.bg(p.accent))
@@ -479,9 +483,14 @@ impl Render for Panel {
                 .bottom(gpui::px(26.))
                 .right(gpui::px(0.))
                 .w(gpui::px(260.))
+                .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
+                .max_h(window.viewport_size().height - crate::ui::SPACE_4 * 3.)
+                .overflow_y_scroll()
                 .p_3()
                 .rounded(crate::ui::RADIUS_MD)
                 .bg(p.popover)
+                .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_XS)
                 .text_color(p.popover_foreground)
                 .border_1()
                 .border_color(p.border)

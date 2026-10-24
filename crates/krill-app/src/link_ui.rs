@@ -65,6 +65,9 @@ pub struct ServerPanel {
     renaming: Option<HostRename>,
     confirm_revoke: Option<PairedDevice>,
     confirm_disconnect: Option<PairedHost>,
+    confirmation_deadline: Option<std::time::Instant>,
+    rename_return_focus: Option<gpui::FocusHandle>,
+    focus: gpui::FocusHandle,
     error: Option<SharedString>,
     busy: bool,
     generation: u64,
@@ -113,6 +116,9 @@ impl ServerPanel {
             renaming: None,
             confirm_revoke: None,
             confirm_disconnect: None,
+            confirmation_deadline: None,
+            rename_return_focus: None,
+            focus: cx.focus_handle(),
             error: None,
             busy: false,
             generation: 0,
@@ -132,6 +138,9 @@ impl ServerPanel {
             return;
         }
         self.visible = visible;
+        self.confirm_revoke = None;
+        self.confirm_disconnect = None;
+        self.confirmation_deadline = None;
         if visible {
             self.refresh(cx);
         }
@@ -152,6 +161,14 @@ impl ServerPanel {
                             .is_none_or(|invite| invite.is_expired(current_epoch_secs()))
                     {
                         return None;
+                    }
+                    if panel
+                        .confirmation_deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        panel.confirm_revoke = None;
+                        panel.confirm_disconnect = None;
+                        panel.confirmation_deadline = None;
                     }
                     panel.now_secs = current_epoch_secs();
                     if panel.visible {
@@ -406,6 +423,8 @@ impl ServerPanel {
     pub fn request_revoke(&mut self, device: PairedDevice, cx: &mut Context<Self>) {
         self.confirm_disconnect = None;
         self.confirm_revoke = Some(device);
+        self.confirmation_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
         cx.notify();
     }
 
@@ -418,6 +437,13 @@ impl ServerPanel {
     /// 확인된 기기의 연결 권한을 백그라운드 실행기에서 회수한다.
     pub fn confirm_revoke_now(&mut self, cx: &mut Context<Self>) {
         if self.busy {
+            return;
+        }
+        if self
+            .confirmation_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.cancel_revoke(cx);
             return;
         }
         let Some(target) = self.confirm_revoke.take() else {
@@ -461,13 +487,15 @@ impl ServerPanel {
 
     /// 원격 Mac 행을 이름 입력칸으로 바꾼다. Enter는 저장, Escape는 취소.
     pub fn start_rename(&mut self, host: &PairedHost, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_return_focus = window.focused(cx);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(host.name.clone()));
         input.update(cx, |input, cx| input.focus(window, cx));
-        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.save_rename(cx);
-            }
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_rename(window, cx);
+                }
+            });
         self.renaming = Some(HostRename {
             id: host.id.clone(),
             input,
@@ -476,17 +504,27 @@ impl ServerPanel {
         cx.notify();
     }
 
-    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        self.renaming = None;
+    fn finish_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<HostRename> {
+        let rename = self.renaming.take()?;
+        let focus = self
+            .rename_return_focus
+            .take()
+            .unwrap_or_else(|| self.focus.clone());
+        window.focus(&focus, cx);
+        Some(rename)
+    }
+
+    pub fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        drop(self.finish_rename(window, cx));
         cx.notify();
     }
 
     /// 입력한 이름을 저장한다. 비어 있거나 그대로면 저장 없이 닫는다.
-    pub fn save_rename(&mut self, cx: &mut Context<Self>) {
+    pub fn save_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        let Some(rename) = self.renaming.take() else {
+        let Some(rename) = self.finish_rename(window, cx) else {
             return;
         };
         let name = rename.input.read(cx).value().trim().to_owned();
@@ -535,6 +573,8 @@ impl ServerPanel {
         }
         self.confirm_revoke = None;
         self.confirm_disconnect = Some(host);
+        self.confirmation_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
         cx.notify();
     }
 
@@ -545,6 +585,13 @@ impl ServerPanel {
 
     fn confirm_disconnect_now(&mut self, cx: &mut Context<Self>) {
         if self.busy {
+            return;
+        }
+        if self
+            .confirmation_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.cancel_disconnect(cx);
             return;
         }
         let Some(host) = self.confirm_disconnect.take() else {
@@ -692,7 +739,7 @@ impl ServerPanel {
                                         .border_1()
                                         .border_color(p.border)
                                         .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .child(invite.link.clone()),
                                 )
                                 .child(
@@ -784,9 +831,16 @@ impl ServerPanel {
                     .debug_selector(|| "link-remote-rename-input".into())
                     .flex_1()
                     .min_w_0()
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_component::input::Escape, window, cx| {
+                            cx.stop_propagation();
+                            this.cancel_rename(window, cx);
+                        },
+                    ))
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                         if event.keystroke.key == "escape" {
-                            this.cancel_rename(cx);
+                            cx.stop_propagation();
+                            this.cancel_rename(window, cx);
                         }
                     }))
                     .child(Input::new(&rename.input).small())
@@ -807,13 +861,17 @@ impl ServerPanel {
                             text::RENAME_HOST_CANCEL.get(),
                         )
                         .debug_selector(|| "link-remote-rename-cancel".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_rename(cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.cancel_rename(window, cx)),
+                        ),
                     )
                     .child(
                         crate::ui::primary("link-remote-rename-save", text::RENAME_HOST_SAVE.get())
                             .disabled(self.busy)
                             .debug_selector(|| "link-remote-rename-save".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.save_rename(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_rename(window, cx)),
+                            ),
                     )
             } else {
                 let button_id = format!("link-remote-rename-{}", host.id);
@@ -1038,11 +1096,26 @@ impl Render for ServerPanel {
                 weak.update(cx, |this, cx| this.set_server_enabled(next, cx))
                     .ok();
             },
-        );
+        )
+        .aria_label(text::SERVER_TITLE.get());
 
         crate::ui::card(p)
             .id("link-server-panel")
             .debug_selector(|| "link-server-panel".into())
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "tab" | "escape")
+                    && (this.confirm_revoke.is_some() || this.confirm_disconnect.is_some())
+                {
+                    this.confirm_revoke = None;
+                    this.confirm_disconnect = None;
+                    this.confirmation_deadline = None;
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                    }
+                    cx.notify();
+                }
+            }))
             .flex()
             .flex_col()
             .gap_3()
@@ -1062,7 +1135,7 @@ impl Render for ServerPanel {
                             .gap_0p5()
                             .child(
                                 div()
-                                    .text_size(crate::ui::TEXT_MD)
+                                    .text_size(crate::ui::TEXT_SM)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(text::SERVER_TITLE.get()),
                             )
@@ -1605,7 +1678,7 @@ impl Render for ClientDialog {
                     .gap_0p5()
                     .child(
                         div()
-                            .text_size(crate::ui::TEXT_MD)
+                            .text_size(crate::ui::TEXT_SM)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(text::CLIENT_TITLE.get()),
                     )

@@ -1485,7 +1485,7 @@ impl Panel {
                         .rounded(crate::ui::RADIUS_XS)
                         .bg(p.background.opacity(0.6))
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_2XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .text_color(p.destructive)
                         .child(crate::i18n::cached_notice(&failure.error)),
                 )

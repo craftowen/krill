@@ -245,6 +245,11 @@ fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
         "zoomed pane shows a badge"
     );
     let unzoom: &'static str = Box::leak(format!("pane-unzoom-{}", id.get()).into_boxed_str());
+    assert_eq!(
+        cx.debug_bounds(unzoom).expect("unzoom button").size.height,
+        px(20.),
+        "pane header labels use the same compact control size as split/close icons"
+    );
     let at = cx.debug_bounds(unzoom).expect("unzoom button").center();
     let none = Modifiers::default();
     cx.simulate_mouse_down(at, MouseButton::Left, none);
@@ -2306,7 +2311,7 @@ fn tabs_have_padding_min_width_and_separators(cx: &mut TestAppContext) {
     assert!(tabs_right <= commands.left() && commands.right() <= titlebar.right());
 }
 
-/// OWE-590: 렌더 팔레트·설정 변경·시스템 외관·재연결의 재전송을 같은 인메모리 IPC로 확인한다.
+/// OWE-590: 터미널 테마만 변경·창 재활성화·재연결도 렌더 팔레트와 같은 값을 보낸다.
 #[gpui::test]
 fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     use gpui_component::ThemeMode;
@@ -2328,10 +2333,10 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         path.with_file_name("settings.toml"),
-        "terminal_use_separate_light_theme = true\n",
+        "theme = \"dark\"\nterminal_use_separate_light_theme = true\n",
     )
     .unwrap();
-    let (view, cx) = open(cx, path);
+    let (view, cx) = open(cx, path.clone());
     let frames = Rc::new(RefCell::new(Vec::new()));
     cx.update(|_, cx| {
         view.update(cx, |this, cx| {
@@ -2360,6 +2365,36 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     cx.update(|_, cx| assert_eq!(view.read(cx).terminal_theme, krill_app::ui::TERMINAL_DARK));
+    // 앱 모드·UI 테마는 그대로 두고 터미널 테마만 바꾼다(설정 선택·외부 편집 공통 경로).
+    frames.borrow_mut().clear();
+    std::fs::write(
+        path.with_file_name("settings.toml"),
+        "theme = \"dark\"\nterminal_theme_dark = \"Dracula\"\n",
+    )
+    .unwrap();
+    cx.update(|_, cx| krill_app::settings::notify_external_change(cx));
+    cx.run_until_parked();
+    let want = krill_app::ui::builtin_terminal_theme("Dracula")
+        .unwrap()
+        .theme;
+    cx.update(|_, cx| assert_eq!(view.read(cx).terminal_theme, want));
+    let bytes = frames.borrow_mut().split_off(0);
+    let mut bytes = bytes.as_slice();
+    let mut last = None;
+    while let Some((k, b)) = ipc::read_frame(&mut bytes).unwrap() {
+        last = Some(Push::decode(k, &b).unwrap());
+    }
+    assert_eq!(last.unwrap().theme, want);
+
+    // 비활성화 때는 보내지 않고, 다시 활성화될 때 다른 클라이언트의 덮어쓰기를 복구한다.
+    frames.borrow_mut().clear();
+    cx.update(|_, cx| view.update(cx, |this, cx| this.on_window_active_changed(false, cx)));
+    assert!(frames.borrow().is_empty());
+    cx.update(|_, cx| view.update(cx, |this, cx| this.on_window_active_changed(true, cx)));
+    let bytes = frames.borrow_mut().split_off(0);
+    let (k, b) = ipc::read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+    assert_eq!(Push::decode(k, &b).unwrap().theme, want);
+
     frames.borrow_mut().clear();
     cx.update(|_, cx| {
         view.update(cx, |this, cx| {
@@ -2371,13 +2406,10 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     });
     let bytes = frames.borrow();
     let (k, b) = ipc::read_frame(&mut bytes.as_slice()).unwrap().unwrap();
-    assert_eq!(
-        Push::decode(k, &b).unwrap().theme,
-        krill_app::ui::TERMINAL_DARK
-    );
+    assert_eq!(Push::decode(k, &b).unwrap().theme, want);
 }
 
-/// MK-076: OSC 8 호버 미리보기·Cmd+클릭 전용 열기, 제목 제어문자 필터, 비-bracketed 여러 줄 붙여넣기 경고,
+/// MK-076: OSC 8 링크 클릭 팝오버(실제 대상·복사·브라우저 열기), 제목 제어문자 필터, 비-bracketed 여러 줄 붙여넣기 경고,
 /// Secure Keyboard Entry 토글 및 비활성 창 자동 해제를 검증한다.
 #[gpui::test]
 fn security_link_preview_title_filter_multiline_paste_and_secure_input(cx: &mut TestAppContext) {
@@ -2421,7 +2453,7 @@ fn security_link_preview_title_filter_multiline_paste_and_secure_input(cx: &mut 
         Some("정상txt.exe제목".to_owned())
     );
 
-    // 2. OSC 8 호버 미리보기: 마우스를 링크 셀 위로 옮기면 실제 대상 URL 미리보기가 뜨고, 일반 클릭으로는 열리지 않는다.
+    // 2. OSC 8 링크 팝오버: 호버하면 밑줄이 생기고, 맨 클릭은 바로 열지 않고 실제 대상 URL과 복사·열기 팝오버를 띄운다.
     let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
     let link_pt = point(
         bounds.origin.x + cell.width / 2.,
@@ -2431,22 +2463,55 @@ fn security_link_preview_title_filter_multiline_paste_and_secure_input(cx: &mut 
         bounds.origin.x + cell.width * 8.,
         bounds.origin.y + cell.height / 2.,
     );
+    let link_menu = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).security.link_menu().map(|m| m.uri.clone()))
+    };
+    let hovered = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).files.hover.is_some_and(|h| h.0 == pane))
+    };
     cx.simulate_mouse_move(link_pt, None, Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_, cx| view.read(cx).security.hover_uri(pane).map(str::to_owned)),
-        Some("https://example.com/보안".to_owned())
-    );
+    assert!(hovered(cx), "OSC 8 링크는 ⌘ 없이도 밑줄이 생긴다");
     cx.simulate_mouse_down(link_pt, MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(link_pt, MouseButton::Left, Modifiers::default());
-    assert_eq!(cx.opened_url(), None, "일반 클릭은 URL을 열지 않는다");
+    cx.run_until_parked();
+    assert_eq!(cx.opened_url(), None, "일반 클릭은 URL을 바로 열지 않는다");
+    assert_eq!(link_menu(cx), Some("https://example.com/보안".to_owned()));
+    assert!(cx.debug_bounds("terminal-link-menu").is_some());
+    cx.simulate_keystrokes("escape");
+    assert_eq!(link_menu(cx), None, "Esc로 팝오버를 닫는다");
+
+    // 다시 열어 복사하면 전체 URL이 클립보드로 가고, 바깥을 누르면 닫히며, 열기는 브라우저로 간다.
+    cx.simulate_mouse_down(link_pt, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(link_pt, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let copy = cx.debug_bounds("terminal-link-copy").unwrap().center();
+    cx.simulate_click(copy, Modifiers::default());
+    assert_eq!(link_menu(cx), None);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("https://example.com/보안")
+    );
+    assert_eq!(cx.opened_url(), None);
+    cx.simulate_mouse_down(link_pt, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(link_pt, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_down(empty_pt, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(empty_pt, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(link_menu(cx), None, "바깥을 누르면 닫힌다");
+    assert_eq!(cx.opened_url(), None);
+    cx.simulate_mouse_down(link_pt, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(link_pt, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let open = cx.debug_bounds("terminal-link-open").unwrap().center();
+    cx.simulate_click(open, Modifiers::default());
+    assert_eq!(link_menu(cx), None);
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/보안"));
 
     cx.simulate_mouse_move(empty_pt, None, Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_, cx| view.read(cx).security.hover_uri(pane).map(str::to_owned)),
-        None
-    );
+    assert!(!hovered(cx));
 
     // 3. 여러 줄 붙여넣기 경고: bracketed paste가 꺼져 있을 때 개행이 포함되면 즉시 전송하지 않고 경고 배너에 보류한다.
     cx.update(|_, cx| {
@@ -5496,18 +5561,27 @@ fn owe855_main_window_title_restored_after_settings(cx: &mut TestAppContext) {
 /// OWE-860: ⌘,는 설정 토글이다. 열린 상태에서 누르면 닫히고, 탐색 단축키(⌘J·⌘B)는
 /// 설정을 먼저 닫고 동작한다. Shell 키 문맥이 설정 화면에서도 유지되기 때문이다.
 #[gpui::test]
-fn settings_unbound_comma_and_nav_keys_close_first(cx: &mut TestAppContext) {
+fn settings_comma_toggles_in_app_and_nav_keys_close_first(cx: &mut TestAppContext) {
     let layout = state_path("owe-860-toggle");
     let (view, cx) = open(cx, layout);
     cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-,");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("admin-center").is_some(),
+        "cmd-, opens settings from the workspace"
+    );
+    assert_eq!(cx.windows().len(), 1, "settings stays in the main window");
+    cx.simulate_keystrokes("cmd-,");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("admin-center").is_none(),
+        "cmd-, closes settings and returns to the workspace"
+    );
     let btn = cx
         .debug_bounds("sidebar-settings")
         .expect("sidebar-settings button");
     cx.simulate_click(btn.center(), Modifiers::default());
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("admin-center").is_some());
-    // Orca의 기본값대로 ⌘,는 설정 전역 토글을 등록하지 않는다.
-    cx.simulate_keystrokes("cmd-,");
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_some());
     // ⌘J는 설정을 닫고 Jump 팔레트를 연다.
@@ -8726,45 +8800,6 @@ fn navigation_history_tolerates_corrupt_index_without_panicking(cx: &mut TestApp
     });
 }
 
-/// The disconnect subscription must survive `Shell::new` returning.
-#[gpui::test]
-fn sidebar_disconnect_subscription_survives_window_initialization(cx: &mut TestAppContext) {
-    use krill_app::hosts::{HostId, HostManager, HostStatus};
-    cx.update(gpui_component::init);
-    let view = cx.new(|cx| Shell::new(None, cx));
-    let host = krill_app::ssh_hosts::SshHost {
-        id: "disconnect-test".into(),
-        label: "Test host".into(),
-        destination: "test.invalid".into(),
-        port: None,
-        identity_file: None,
-        remote_socket: Some("/tmp/krill-disconnect-test.sock".into()),
-        imported: false,
-        copy_id_first: false,
-    };
-    let manager = HostManager::with_ssh_program(
-        state_path("disconnect-subscription"),
-        "/usr/bin/false".into(),
-    );
-    manager.sync_specs(&krill_app::hosts::specs_from_ssh_hosts(
-        std::slice::from_ref(&host),
-    ));
-    let sidebar = view.update(cx, |shell, _| {
-        shell.host_manager = manager.clone();
-        shell.ssh_hosts = vec![host];
-        shell.sidebar.clone()
-    });
-    assert_eq!(manager.status("disconnect-test"), HostStatus::Connecting);
-    sidebar.update(cx, |_, cx| {
-        cx.emit(sidebar::DisconnectHost(HostId::Remote(
-            "disconnect-test".into(),
-        )));
-    });
-    cx.run_until_parked();
-    assert_eq!(manager.status("disconnect-test"), HostStatus::Disconnected);
-    assert_eq!(manager.tunnel_starts("disconnect-test"), 0);
-}
-
 /// 원격 워크스페이스를 고른 뒤 Cmd+T·새 에이전트는 그 원격 호스트·경로에서 새 세션을 연다
 /// (Orca `createNewTerminalTab(activeWorktreeId)` 패리티).
 #[gpui::test]
@@ -9182,5 +9217,67 @@ fn persistence_burst_builds_one_snapshot_after_last_ui_request(cx: &mut TestAppC
         assert_eq!(shell.layout.window_bounds(), Some(bounds));
         assert_eq!(shell.layout.sidebar_width.to_bits(), 299_f32.to_bits());
         assert_eq!(shell.layout.panel_width.to_bits(), 379_f32.to_bits());
+    });
+}
+
+#[gpui::test]
+fn recent_tabs_reveal_last_selection_in_small_viewport(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("mru-viewport"));
+    for _ in 0..34 {
+        cx.simulate_keystrokes("cmd-t");
+    }
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    for _ in 0..34 {
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+    }
+    let selected = view.read_with(cx, |s, _| {
+        s.layout.mru_order()[s.layout.mru_cursor().unwrap()]
+    });
+    let card = cx.debug_bounds("recent-tab-switcher").unwrap();
+    let list = cx.debug_bounds("recent-tab-list").unwrap();
+    assert_eq!(selected, 0, "34 MRU moves must select the oldest tab");
+    let row = cx.debug_bounds("recent-tab-item-0").unwrap();
+    assert!(
+        card.size.width <= px(608.) && card.size.height <= px(448.),
+        "{card:?}"
+    );
+    assert!(
+        row.left() >= list.left()
+            && row.right() <= list.right()
+            && row.top() >= list.top()
+            && row.bottom() <= list.bottom(),
+        "selected {row:?} outside {card:?}"
+    );
+    assert!(view.read_with(cx, |s, _| s.recent_tab_scroll.offset().y) < px(0.));
+}
+
+#[gpui::test]
+fn tab_close_modals_enter_scope_and_restore_terminal_focus(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-close-focus"));
+    view.update(cx, |s, cx| {
+        s.confirm_close_tab = Some(0);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(view.read(cx).tab_dialog_focus.is_focused(window)));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).confirm_close_tab.is_none());
+        assert!(view.read(cx).focus.is_focused(window));
+    });
+    view.update(cx, |s, cx| {
+        s.pending_running_close = Some((PendingRunningClose::Tab(0), false));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(view.read(cx).tab_dialog_focus.is_focused(window)));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).pending_running_close.is_none());
+        assert!(view.read(cx).focus.is_focused(window));
     });
 }

@@ -2186,10 +2186,11 @@ impl Panel {
             .pt_1p5()
             .pb_1()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .child(
-                div().flex_1().min_w_0().child(
+                div().flex_1().min_w(px(112.)).child(
                     Input::new(&query_input)
                         .xsmall()
                         .prefix(Icon::new(IconName::Search).xsmall())
@@ -2508,7 +2509,7 @@ impl Panel {
                                                 .flex_none()
                                                 .min_w_0()
                                                 .truncate()
-                                                .text_size(ui::TEXT_XS)
+                                                .text_size(ui::TEXT_SM)
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .font_family(ui::FONT_MONO)
                                                 .text_color(if is_selected {
@@ -2525,7 +2526,7 @@ impl Panel {
                                                     .min_w_0()
                                                     .truncate()
                                                     .font_family(ui::FONT_MONO)
-                                                    .text_size(ui::TEXT_2XS)
+                                                    .text_size(ui::TEXT_SM)
                                                     .text_color(muted)
                                                     .child(dir_path),
                                             )
@@ -2624,7 +2625,7 @@ impl Panel {
                                         .items_center()
                                         .overflow_hidden()
                                         .font_family(ui::FONT_MONO)
-                                        .text_size(ui::TEXT_XS)
+                                        .text_size(ui::TEXT_SM)
                                         .text_color(if is_selected {
                                             p.sidebar_accent_foreground
                                         } else {

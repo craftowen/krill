@@ -187,3 +187,155 @@ fn terminal_file_menu_ignores_missing_web_and_remote_targets(cx: &mut TestAppCon
         "원격 경로를 로컬 파일로 열지 않는다"
     );
 }
+
+#[gpui::test]
+fn wrapped_url_click_and_context_menu_copy_complete_address(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-url");
+    let (view, cx) = open(cx, state_path("terminal-menu-wrapped-url"));
+    let (pane, _) = show_output(&view, &dir.0, "placeholder", None, cx);
+    let rows = [
+        "  http://127.0.0.1:48900/#pair=abc",
+        "  def0123456789&key=testtesttestte",
+        "  st00",
+    ];
+    let expected = "http://127.0.0.1:48900/#pair=abcdef0123456789&key=testtesttesttest00";
+    view.update(cx, |s, cx| {
+        let mut ops = vec![Op::Reset { cols: 35, lines: 4 }];
+        for (line, text) in (0u16..).zip(rows) {
+            ops.push(Op::Line {
+                line,
+                cells: text
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect(),
+            });
+        }
+        let frame = &encode_update(Revision(2), Seq(0), ops).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    for line in 0u16..3 {
+        let at = point(
+            bounds.origin.x + cell.width * 3.5,
+            bounds.origin.y + cell.height * (f32::from(line) + 0.5),
+        );
+        cx.simulate_click(at, Modifiers::default());
+        cx.run_until_parked();
+        click("terminal-link-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some(expected)
+        );
+        right_click(at, cx);
+        click("terminal-url-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some(expected)
+        );
+    }
+    // 원격 세션의 웹 URL도 복사·열기가 가능해야 한다.
+    view.update(cx, |s, _| {
+        s.layout
+            .set_host(pane, krill_app::hosts::HostId::Remote("other-host".into()));
+    });
+    let at = point(
+        bounds.origin.x + cell.width * 3.5,
+        bounds.origin.y + cell.height * 1.5,
+    );
+    right_click(at, cx);
+    click("terminal-url-open", cx);
+    assert_eq!(cx.opened_url().as_deref(), Some(expected));
+    cx.simulate_click(
+        at,
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    assert_eq!(cx.opened_url().as_deref(), Some(expected));
+}
+
+#[gpui::test]
+fn osc8_url_context_menu_copies_target_instead_of_label(cx: &mut TestAppContext) {
+    let dir = TempDir::new("osc8-url");
+    let (view, cx) = open(cx, state_path("terminal-menu-osc8-url"));
+    let expected = "https://example.com/long?key=abc#fragment";
+    let (_, at) = show_output(&view, &dir.0, "friendly label", Some(expected), cx);
+    right_click(at, cx);
+    click("terminal-url-copy", cx);
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some(expected)
+    );
+}
+
+#[gpui::test]
+fn wrapped_file_menu_copies_full_path_from_each_row(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-file");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/long-name.rs");
+    fs::write(&file, "first\nsecond\n").unwrap();
+    let (view, cx) = open(cx, state_path("terminal-menu-wrapped-file"));
+    let (pane, _) = show_output(&view, &dir.0, "placeholder", None, cx);
+    for (revision, cols, rows, soft) in [
+        (2, 16, ["src/long-name.rs", ":2:3"], true),
+        (3, 14, ["  src/long-na", "  me.rs:2:3"], false),
+    ] {
+        view.update(cx, |s, cx| {
+            let mut ops = vec![Op::Reset { cols, lines: 4 }];
+            for (line, text) in (0u16..).zip(rows) {
+                let mut cells: Vec<_> = text
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect();
+                if soft && line == 0 {
+                    assert_eq!(cells.len(), usize::from(cols));
+                    cells.last_mut().unwrap().flags |= Flags::WRAPLINE;
+                }
+                ops.push(Op::Line { line, cells });
+            }
+            let frame = &encode_update(Revision(revision), Seq(0), ops).unwrap()[0];
+            let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+            assert!(s.on_frame(pane, kind, &body, cx));
+        });
+        cx.run_until_parked();
+        let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+        for line in 0u16..2 {
+            let at = point(
+                bounds.origin.x + cell.width * 3.5,
+                bounds.origin.y + cell.height * (f32::from(line) + 0.5),
+            );
+            right_click(at, cx);
+            click("terminal-file-copy-path", cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(file.to_str().unwrap())
+            );
+        }
+    }
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    right_click(
+        point(
+            bounds.origin.x + cell.width * 3.5,
+            bounds.origin.y + cell.height * 1.5,
+        ),
+        cx,
+    );
+    click("terminal-file-open", cx);
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    cx.simulate_keystrokes("shift-right cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some("c")
+    );
+}

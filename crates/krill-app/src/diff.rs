@@ -544,6 +544,8 @@ pub struct Panel {
     raw_patch: String,
     active_hunk: usize,
     scroll: UniformListScrollHandle,
+    tab_scroll: gpui::ScrollHandle,
+    tab_focus: [gpui::FocusHandle; 5],
     message: String,
     repo_error: Option<String>,
     loaded: bool,
@@ -630,6 +632,8 @@ impl Panel {
             raw_patch: String::new(),
             active_hunk: 0,
             scroll: UniformListScrollHandle::new(),
+            tab_scroll: gpui::ScrollHandle::new(),
+            tab_focus: std::array::from_fn(|_| cx.focus_handle()),
             message: text::EMPTY.get().into(),
             repo_error: None,
             loaded: false,
@@ -1334,6 +1338,9 @@ impl Panel {
             .aria_label(tip)
             // OWE-856: 활성 탭을 `aria_selected`로 알린다(VALUE 0 보고 수정).
             .aria_selected(active)
+            .tab_index(0)
+            .tab_stop(active)
+            .focus_visible(|d| d.border_1().border_color(p.ring))
             .relative()
             .h(px(24.))
             .min_w(px(26.))
@@ -1406,9 +1413,42 @@ impl Panel {
                     .items_center()
                     .gap_0p5()
                     .min_w_0()
-                    .overflow_x_hidden()
+                    .id("diff-panel-tabs")
+                    .role(gpui::Role::TabList)
+                    .tab_group()
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                        let backwards = match event.keystroke.key.as_str() {
+                            "left" => true,
+                            "right" => false,
+                            _ => return,
+                        };
+                        let tabs = [
+                            PanelTab::Changes,
+                            PanelTab::Files,
+                            PanelTab::Search,
+                            PanelTab::History,
+                            PanelTab::Checks,
+                        ];
+                        let index = tabs.iter().position(|t| *t == this.tab).unwrap_or(0);
+                        let next = if backwards {
+                            (index + tabs.len() - 1) % tabs.len()
+                        } else {
+                            (index + 1) % tabs.len()
+                        };
+                        if tabs[next] == PanelTab::Search {
+                            this.show_search(window, cx);
+                        } else {
+                            this.set_tab(tabs[next], cx);
+                        }
+                        this.tab_focus[next].focus(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .flex_1()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
                     .child(
                         Self::render_tab_button(PanelTab::Changes, changes_active, p)
+                            .track_focus(&self.tab_focus[0].clone().tab_stop(changes_active))
                             .when(show_badge, |d| {
                                 d.child(
                                     crate::ui::badge(
@@ -1425,14 +1465,18 @@ impl Panel {
                             ),
                     )
                     .child(
-                        Self::render_tab_button(PanelTab::Files, files_active, p).on_click(
-                            cx.listener(|this, _, _, cx| this.set_tab(PanelTab::Files, cx)),
-                        ),
+                        Self::render_tab_button(PanelTab::Files, files_active, p)
+                            .track_focus(&self.tab_focus[1].clone().tab_stop(files_active))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_tab(PanelTab::Files, cx)),
+                            ),
                     )
                     .child(
-                        Self::render_tab_button(PanelTab::Search, search_active, p).on_click(
-                            cx.listener(|this, _, window, cx| this.show_search(window, cx)),
-                        ),
+                        Self::render_tab_button(PanelTab::Search, search_active, p)
+                            .track_focus(&self.tab_focus[2].clone().tab_stop(search_active))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.show_search(window, cx)),
+                            ),
                     )
                     .child(
                         Self::render_tab_button(
@@ -1440,12 +1484,18 @@ impl Panel {
                             self.tab == PanelTab::History,
                             p,
                         )
+                        .track_focus(
+                            &self.tab_focus[3]
+                                .clone()
+                                .tab_stop(self.tab == PanelTab::History),
+                        )
                         .on_click(
                             cx.listener(|this, _, _, cx| this.set_tab(PanelTab::History, cx)),
                         ),
                     )
                     .child(
                         Self::render_tab_button(PanelTab::Checks, checks_active, p)
+                            .track_focus(&self.tab_focus[4].clone().tab_stop(checks_active))
                             .when_some(checks_dot, |d, dot_color| {
                                 d.child(
                                     div()
@@ -1613,7 +1663,7 @@ impl Panel {
             .gap_1p5()
             .overflow_hidden()
             .cursor_pointer()
-            .text_size(crate::ui::TEXT_XS)
+            .text_size(crate::ui::TEXT_SM)
             .text_color(if selected {
                 p.sidebar_accent_foreground
             } else {
@@ -1666,7 +1716,7 @@ impl Panel {
                             .min_w_0()
                             .truncate()
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(hint)
                     })),
@@ -1894,7 +1944,7 @@ impl Panel {
                     .min_w_0()
                     .truncate()
                     .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .text_color(if center {
                         p.foreground
                     } else {
@@ -2129,6 +2179,7 @@ impl Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.background)
                 .text_color(p.foreground)
                 .child(body)
@@ -2162,6 +2213,8 @@ impl Render for Panel {
                 .flex()
                 .flex_col()
                 .bg(p.sidebar)
+                .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
                 .child(div().flex_1().min_h_0().children(self.history.clone()));
@@ -2176,6 +2229,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2191,6 +2245,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2205,6 +2260,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2236,6 +2292,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2262,6 +2319,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2306,7 +2364,7 @@ impl Render for Panel {
             if self.split_center {
                 l.flex_1().min_h_0()
             } else {
-                l.h(px(176.)).flex_none()
+                l.h(px(176.)).max_h(gpui::relative(0.35)).flex_shrink_0()
             }
         });
 
@@ -2342,6 +2400,7 @@ impl Render for Panel {
             .min_w_0()
             .min_h_0()
             .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_SM)
             .bg(p.sidebar)
             .text_color(p.sidebar_foreground)
             .child(top_bar)

@@ -19,10 +19,10 @@ use krill_proto::SessionId;
 use krill_proto::control::{AgentProfile, Program};
 
 use super::{
-    Activate, CHILD_INDENT, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2,
-    NewAgent3, NewAgent4, OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP,
-    ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin, basename,
-    state_text, text,
+    Activate, CHILD_INDENT, Collapse, DeleteFocus, Dismiss, Expand, KEY_CONTEXT, NewAgent1,
+    NewAgent2, NewAgent3, NewAgent4, OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed,
+    ROW_GROUP, ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin,
+    basename, state_text, text,
 };
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
@@ -504,27 +504,6 @@ impl Sidebar {
                         })),
                 )
                 .into_any_element()
-        } else if remote.status == HostStatus::Connected {
-            let host = host.clone();
-            badge
-                .child(
-                    div()
-                        .invisible()
-                        .group_hover(ROW_GROUP, Styled::visible)
-                        .child(
-                            Button::new(("project-disconnect", index))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .accessibility_label(text::HOST_DISCONNECT.get())
-                                .tooltip(text::HOST_DISCONNECT.get())
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    cx.stop_propagation();
-                                    s.disconnect_host(host.clone(), cx);
-                                })),
-                        ),
-                )
-                .into_any_element()
         } else {
             badge.into_any_element()
         }
@@ -609,24 +588,15 @@ impl Sidebar {
         let p = ui::palette(cx);
         let active = self.worktree_card_active(parent, path);
         if self.options.card_layout == super::CardLayout::Detailed {
-            // 요약 바와 같은 안쪽 경계로 잇는다. 세션별 가상화는 유지하고
-            // 바깥 워크트리 표면과 안쪽 에이전트 패널을 각각 연속해서 그린다.
+            // 세션별 가상화와 정렬을 유지하고, 펼친 목록에는 별도 상자를 그리지 않는다.
             let session = element
                 .h(px(26.))
                 .mx_0()
                 .px_1p5()
-                .rounded_none()
+                .rounded(ui::RADIUS_XS)
                 .border_l_1()
                 .border_r_1()
-                .border_color(p.worktree_sidebar_border)
-                .when(self.cursor != Some(index), |d| {
-                    d.bg(if active {
-                        p.sidebar.opacity(0.75)
-                    } else {
-                        p.sidebar_accent.opacity(0.65)
-                    })
-                })
-                .when(last, |d| d.border_b_1().rounded_b(ui::RADIUS_XS));
+                .border_color(ui::TRANSPARENT);
             return div()
                 .id(("card-session-surface", index))
                 .debug_selector(move || format!("card-session-surface-{index}"))
@@ -897,24 +867,6 @@ impl Sidebar {
                             )
                         },
                     )
-                    .when(*status == HostStatus::Connected && host.is_remote(), |d| {
-                        let disconnect_host = host.clone();
-                        let disconnect_key = host.as_key().to_owned();
-                        d.child(
-                            Button::new(("host-disconnect", index))
-                                .debug_selector(move || format!("host-disconnect-{disconnect_key}"))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .label(text::HOST_DISCONNECT.get())
-                                .accessibility_label(text::HOST_DISCONNECT.get())
-                                .tooltip(text::HOST_DISCONNECT.get())
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    cx.stop_propagation();
-                                    s.disconnect_host(disconnect_host.clone(), cx);
-                                })),
-                        )
-                    })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.cursor = Some(index);
                         s.fold_host(&fold_host, None, cx);
@@ -1676,18 +1628,17 @@ impl Sidebar {
         let closed = self.collapsed.contains(path);
         let card_expanded = self.session_card_index(index + 1) == Some(index)
             && self.card_list.contains_row(index + 1);
-        let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
+        let pinned = row_host.is_local() && self.prefs.get(path).is_some_and(|p| p.pinned);
         let name = self.name(path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
         let branch = self
             .branch_on(&row_host, path)
             .filter(|b| *b != name)
             .map(str::to_owned);
-        let custom_name = self
-            .prefs
-            .get(path)
-            .map(|v| v.name.as_str())
-            .filter(|s| !s.is_empty());
+        let custom_name = row_host
+            .is_local()
+            .then(|| self.custom_worktree_name(path))
+            .flatten();
         let raw_branch = self.branch_on(&row_host, path);
         let folder_name = basename(path);
         let auto_title = row_host
@@ -2478,20 +2429,30 @@ impl Sidebar {
                                         .h(px(22.))
                                         .px_1()
                                         .rounded(ui::RADIUS_XS)
-                                        .border_1()
-                                        .border_color(p.worktree_sidebar_border)
-                                        .when(card_expanded, |d| d.border_b_0().rounded_b_none())
-                                        .bg(if is_active_worktree {
-                                            p.sidebar.opacity(0.75)
-                                        } else {
-                                            p.sidebar_accent.opacity(0.65)
+                                        .when(!card_expanded, |d| {
+                                            d.border_1().border_color(p.worktree_sidebar_border).bg(
+                                                if is_active_worktree {
+                                                    p.sidebar.opacity(0.75)
+                                                } else {
+                                                    p.sidebar_accent.opacity(0.65)
+                                                },
+                                            )
                                         })
                                         .hover(|d| d.bg(p.sidebar_accent))
                                         .flex()
                                         .items_center()
                                         .justify_between()
                                         .cursor_pointer()
-                                        .child(if summary.groups.is_empty() {
+                                        .child(if card_expanded {
+                                            div()
+                                                .text_size(ui::TEXT_XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(text::SESSION_COUNT.format(&[(
+                                                    "n",
+                                                    &tree_session_count.to_string(),
+                                                )]))
+                                                .into_any_element()
+                                        } else if summary.groups.is_empty() {
                                             div()
                                                 .flex()
                                                 .items_center()
@@ -2827,6 +2788,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let confirm = self.delete_confirm.clone()?;
+        let scope_focus = self.delete_scope_focus.as_ref()?;
+        let cancel_focus = self.delete_cancel_focus.as_ref()?;
         let p = ui::palette(cx);
         let name = self.name(&confirm.path);
         let desc = if confirm.with_descendants {
@@ -2843,10 +2806,13 @@ impl Sidebar {
             .occlude()
             .role(gpui::Role::AlertDialog)
             .w(ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(gpui::px(0.)))
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
@@ -2870,44 +2836,71 @@ impl Sidebar {
             )
             .child(
                 div()
-                    .debug_selector(|| "delete-worktree-desc".into())
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(desc),
-            )
-            .when(confirm.dirty > 0, |d| {
-                d.child(
-                    div()
-                        .debug_selector(|| "delete-worktree-dirty".into())
-                        .text_size(ui::TEXT_XS)
-                        .text_color(p.warning)
-                        .child(text::DELETE_DIRTY.format(&[("n", &confirm.dirty.to_string())])),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "delete-worktree-force".into())
+                    .id("delete-worktree-dialog-body")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .debug_selector(|| "delete-worktree-desc".into())
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(desc),
+                    )
+                    .when(confirm.dirty > 0, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "delete-worktree-dirty".into())
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.warning)
+                                .child(
+                                    text::DELETE_DIRTY.format(&[("n", &confirm.dirty.to_string())]),
+                                ),
+                        )
                         .child(
-                            Checkbox::new("delete-worktree-force")
-                                .label(text::DELETE_FORCE.get())
-                                .checked(confirm.force)
-                                .on_click(cx.listener(|s, _checked: &bool, _, cx| {
-                                    s.toggle_delete_force(cx);
-                                })),
-                        ),
-                )
-            })
+                            div()
+                                .debug_selector(|| "delete-worktree-force".into())
+                                .child(
+                                    Checkbox::new("delete-worktree-force")
+                                        .label(text::DELETE_FORCE.get())
+                                        .checked(confirm.force)
+                                        .on_click(cx.listener(|s, _checked: &bool, _, cx| {
+                                            s.toggle_delete_force(cx);
+                                        })),
+                                ),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .flex_wrap()
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("delete-worktree-cancel")
-                            .ghost()
-                            .debug_selector(|| "delete-worktree-cancel".into())
-                            .label(text::CANCEL.get())
-                            .on_click(cx.listener(|s, _, _, cx| s.cancel_delete(cx))),
+                        div()
+                            .id("delete-worktree-cancel-focus")
+                            .track_focus(cancel_focus)
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label(text::CANCEL.get())
+                            .on_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                                    cx.stop_propagation();
+                                    s.cancel_delete(cx);
+                                }
+                            }))
+                            .child(
+                                Button::new("delete-worktree-cancel")
+                                    .tab_stop(false)
+                                    .ghost()
+                                    .debug_selector(|| "delete-worktree-cancel".into())
+                                    .label(text::CANCEL.get())
+                                    .on_click(cx.listener(|s, _, _, cx| s.cancel_delete(cx))),
+                            ),
                     )
                     .child(
                         Button::new("delete-worktree-confirm")
@@ -2917,7 +2910,13 @@ impl Sidebar {
                             .on_click(cx.listener(|s, _, _, cx| s.confirm_delete(cx))),
                     ),
             );
-        Some(ui::modal_backdrop(window.viewport_size(), card).into_any_element())
+        Some(
+            ui::modal_backdrop(
+                window.viewport_size(),
+                ui::modal_focus_scope(card, scope_focus),
+            )
+            .into_any_element(),
+        )
     }
 
     /// MK-174: Setup 스크립트 감지 인앱 프롬프트 카드(`SetupScriptPromptCard`).
@@ -2979,7 +2978,7 @@ impl Sidebar {
                         .rounded(ui::RADIUS_XS)
                         .bg(p.muted)
                         .font_family(ui::FONT_MONO)
-                        .text_size(ui::TEXT_2XS)
+                        .text_size(ui::TEXT_SM)
                         .truncate()
                         .child(script),
                 )
@@ -3039,6 +3038,23 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.delete_confirm.is_some() && self.delete_focus == DeleteFocus::Pending {
+            self.delete_previous_focus = window.focused(cx);
+            self.delete_scope_focus
+                .get_or_insert_with(|| cx.focus_handle());
+            let cancel_focus = self
+                .delete_cancel_focus
+                .get_or_insert_with(|| cx.focus_handle().tab_stop(true))
+                .clone();
+            cancel_focus.focus(window, cx);
+            self.delete_focus = DeleteFocus::Focused;
+        } else if self.delete_confirm.is_none() {
+            self.delete_focus = DeleteFocus::Focused;
+            if let Some(focus) = self.delete_previous_focus.take() {
+                focus.focus(window, cx);
+            }
+        }
+
         self.ensure_external_polling(cx);
         self.ensure_setup_prompt_polling(cx);
         if self.orca_import_subscription.is_none() {
@@ -3117,6 +3133,8 @@ impl Render for Sidebar {
             .size_full()
             .flex()
             .flex_col()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.sidebar_foreground)
             .child(
                 div()

@@ -34,6 +34,7 @@ fn tab_title(tab: AdminTab) -> Message {
         AdminTab::Terminal => text::TAB_TERMINAL,
         AdminTab::Accounts => text::TAB_ACCOUNTS,
         AdminTab::Agents => text::TAB_AGENTS,
+        AdminTab::Install => text::TAB_INSTALL,
         AdminTab::Ssh => text::TAB_SSH,
         AdminTab::RemoteKrill => text::TAB_REMOTE_KRILL,
         AdminTab::Workflows => text::TAB_WORKFLOWS,

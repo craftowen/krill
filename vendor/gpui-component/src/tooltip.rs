@@ -1,3 +1,4 @@
+// Krill patch: tooltip captions use the UI's 11px rem scale and floating elevation.
 use crate::root::WindowState;
 use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -13,7 +14,7 @@ use gpui_base::{
 };
 
 use crate::{
-    ActiveTheme, Placement, StyledExt,
+    ActiveTheme, Placement, Size, StyleSized, StyledExt,
     animation::{EffectTransition, ease_in_out_cubic, ease_out_cubic},
     kbd::Kbd,
     text::Text,
@@ -117,12 +118,12 @@ impl Render for Tooltip {
                 .bg(cx.theme().tokens.popover)
                 .border_1()
                 .border_color(cx.theme().border)
-                .shadow_md()
+                .shadow_lg()
                 .rounded(cx.theme().radius)
                 .justify_between()
                 .py_0p5()
                 .px_2()
-                .text_xs()
+                .input_text_size(Size::XSmall)
                 .gap_3()
                 .refine_style(&self.style)
                 .map(|this| {
@@ -134,7 +135,7 @@ impl Render for Tooltip {
                 .when_some(key_binding, |this, kbd| {
                     this.child(
                         div()
-                            .text_xs()
+                            .input_text_size(Size::XSmall)
                             .flex_shrink_0()
                             .text_color(cx.theme().muted_foreground)
                             .child(kbd.appearance(false)),

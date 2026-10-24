@@ -355,6 +355,8 @@ pub fn card(cx: &App) -> Option<AnyElement> {
         .border_1()
         .border_color(p.border)
         .bg(p.popover)
+        .font_family(crate::ui::FONT_UI)
+        .text_size(crate::ui::TEXT_SM)
         .shadow_lg()
         .flex()
         .flex_col()

@@ -209,8 +209,15 @@ pub fn switch(
         p.muted_foreground
     };
     div()
-        .id(ElementId::Name(id))
+        .id(ElementId::Name(id.clone()))
         .debug_selector(move || selector.to_string())
+        .role(gpui::Role::Switch)
+        .aria_label(id)
+        .aria_toggled(if checked {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
         .flex_none()
         .w(SWITCH_WIDTH)
         .h(SWITCH_HEIGHT)
@@ -223,9 +230,16 @@ pub fn switch(
         .items_center()
         .when(checked, Styled::justify_end)
         .when(!checked, Styled::justify_start)
-        .when(disabled, |d| d.opacity(0.5).cursor_default())
+        .when(disabled, |d| {
+            d.opacity(0.5)
+                .cursor_default()
+                .aria_description(crate::i18n::catalog::general::CONTROL_UNAVAILABLE.get())
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        })
         .when(!disabled, |d| {
-            d.cursor_pointer()
+            d.tab_index(0)
+                .cursor_pointer()
+                .focus_visible(|s| s.border_color(p.ring))
                 .hover(|s| {
                     s.bg(hover_bg)
                         .border_color(if checked { hover_bg } else { p.ring })
@@ -437,6 +451,7 @@ pub fn modal_backdrop(viewport: gpui::Size<Pixels>, content: impl IntoElement) -
             div()
                 .w(viewport.width)
                 .h(viewport.height)
+                .occlude()
                 .bg(MODAL_BACKDROP)
                 .flex()
                 .items_center()
@@ -445,6 +460,47 @@ pub fn modal_backdrop(viewport: gpui::Size<Pixels>, content: impl IntoElement) -
         ),
     )
     .with_priority(1)
+}
+
+/// `gpui_component::Root` 없이도 동작하는 모달의 Tab/Shift-Tab 포커스 범위.
+/// 원래 요소를 그대로 반환하므로 대화상자의 역할·이름도 접근성 트리에 남는다.
+pub fn modal_focus_scope<E>(content: E, focus: &gpui::FocusHandle) -> E
+where
+    E: StatefulInteractiveElement + 'static,
+{
+    let scope = focus.clone();
+    content
+        .track_focus(focus)
+        .tab_group()
+        .capture_key_down(move |event, window, cx| {
+            let modifiers = event.keystroke.modifiers;
+            if event.keystroke.key != "tab"
+                || modifiers.control
+                || modifiers.alt
+                || modifiers.platform
+                || modifiers.function
+            {
+                return;
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+            let advance = |window: &mut gpui::Window, cx: &mut gpui::App| {
+                if modifiers.shift {
+                    window.focus_prev(cx);
+                } else {
+                    window.focus_next(cx);
+                }
+            };
+            advance(window, cx);
+            let first = window.focused(cx);
+            while !scope.contains_focused(window, cx) {
+                advance(window, cx);
+                if window.focused(cx) == first {
+                    window.focus(&scope, cx);
+                    break;
+                }
+            }
+        })
 }
 
 /// 상태바·툴바 요소의 마우스 오버 툴팁 뷰를 생성한다(OWE-788).
@@ -510,11 +566,184 @@ mod tests {
     use crate::ui::{DARK, LIGHT};
     use gpui_component::button::ButtonVariants;
 
+    #[gpui::test]
+    fn switch_exposes_checked_state_and_unavailable_description(cx: &mut gpui::TestAppContext) {
+        use gpui::Element as _;
+        for checked in [false, true] {
+            for disabled in [false, true] {
+                let element = switch(&DARK, "switch-probe", checked, disabled, |_, _, _| {})
+                    .aria_label("Notifications");
+                let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+                element.write_a11y_info(&mut node);
+                assert_eq!(element.a11y_role(), Some(gpui::Role::Switch));
+                assert_eq!(node.label(), Some("Notifications"));
+                assert_eq!(
+                    node.toggled(),
+                    Some(if checked {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                );
+                assert_eq!(node.description().is_some(), disabled);
+            }
+        }
+        cx.run_until_parked();
+    }
+
+    #[derive(Default)]
+    struct SwitchProbe {
+        checked: bool,
+        disabled: bool,
+        activations: usize,
+    }
+
+    impl gpui::Render for SwitchProbe {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let weak = cx.weak_entity();
+            div().p_4().child(
+                switch(
+                    &DARK,
+                    "keyboard-switch",
+                    self.checked,
+                    self.disabled,
+                    move |value, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.checked = value;
+                            this.activations += 1;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                )
+                .aria_label("Notifications"),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn switch_accepts_keyboard_once_and_disabled_ignores_activation(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|_, _| SwitchProbe::default());
+        visual.run_until_parked();
+        let bounds = visual.debug_bounds("keyboard-switch").unwrap();
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        visual.simulate_keystrokes("space");
+        visual.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let state = view.read(cx);
+            assert!(!state.checked);
+            assert_eq!(state.activations, 2);
+        });
+        visual.simulate_keystrokes("enter");
+        visual.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            view.update(cx, |this, cx| {
+                this.disabled = true;
+                cx.notify();
+            });
+        });
+        visual.run_until_parked();
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        visual.simulate_keystrokes("space enter");
+        visual.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            assert!(view.read(cx).checked);
+            assert_eq!(view.read(cx).activations, 3);
+        });
+    }
+
     struct ReservedLabelProbe {
         label: SharedString,
         alternate: SharedString,
         busy: bool,
         danger: bool,
+    }
+
+    struct ModalScopeProbe {
+        scope: gpui::FocusHandle,
+        first: gpui::FocusHandle,
+        last: gpui::FocusHandle,
+        outside: gpui::FocusHandle,
+    }
+
+    impl gpui::Render for ModalScopeProbe {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let control = |id, focus: &gpui::FocusHandle| {
+                div()
+                    .id(id)
+                    .track_focus(focus)
+                    .tab_index(0)
+                    .on_click(|_, _, _| {})
+                    .child(id)
+            };
+            div()
+                .tab_group()
+                .child(control("outside", &self.outside))
+                .child(modal_focus_scope(
+                    div()
+                        .id("scope")
+                        .role(gpui::Role::Dialog)
+                        .aria_label("Test dialog")
+                        .child(control("first", &self.first))
+                        .child(control("last", &self.last)),
+                    &self.scope,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn modal_scope_keeps_tab_inside_without_component_root_and_preserves_role(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Element as _;
+        let (view, visual) = cx.add_window_view(|_, cx| ModalScopeProbe {
+            scope: cx.focus_handle(),
+            first: cx.focus_handle().tab_stop(true),
+            last: cx.focus_handle().tab_stop(true),
+            outside: cx.focus_handle().tab_stop(true),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let state = view.read(cx);
+            let element = modal_focus_scope(
+                div()
+                    .id("semantics")
+                    .role(gpui::Role::Dialog)
+                    .aria_label("Test dialog"),
+                &state.scope,
+            );
+            let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+            element.write_a11y_info(&mut node);
+            assert_eq!(element.a11y_role(), Some(gpui::Role::Dialog));
+            assert_eq!(node.label(), Some("Test dialog"));
+            let first = state.first.clone();
+            window.focus(&first, cx);
+        });
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| assert!(view.read(cx).last.is_focused(window)));
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| assert!(view.read(cx).first.is_focused(window)));
+        visual.simulate_keystrokes("shift-tab");
+        visual.update(|window, cx| assert!(view.read(cx).last.is_focused(window)));
     }
 
     impl gpui::Render for ReservedLabelProbe {

@@ -998,7 +998,10 @@ fn append_reset_credit_rows(
 /// 자라며 넘치면 스크롤한다. 앵커가 넘친 메뉴를 창 안으로 밀어 올리며 바를 덮지 않게 한다.
 fn fit_above_status_bar(menu: PopupMenu, window: &Window) -> PopupMenu {
     let room = window.viewport_size().height - ui::STATUS_BAR_HEIGHT - ui::SPACE_4 * 2.;
-    menu.max_h(room.max(ui::SPACE_4 * 8.)).scrollable(true)
+    let width = (window.viewport_size().width - ui::SPACE_4 * 2.).max(ui::SPACE_4);
+    menu.max_w(width.min(px(500.)))
+        .max_h(room.max(ui::SPACE_4))
+        .scrollable(true)
 }
 
 fn open_settings_from_menu(
@@ -1461,7 +1464,10 @@ impl Shell {
         )
         .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, move |mut menu, window, _| {
             menu = fit_above_status_bar(menu, window)
-                .min_w(px(240.))
+                .min_w(
+                    px(240.)
+                        .min((window.viewport_size().width - ui::SPACE_4 * 2.).max(ui::SPACE_4)),
+                )
                 .label(text::SSH_MENU_TITLE.get());
             for host in &ssh_hosts {
                 let item_label = format!("{} ({})", host.label, host.destination);
@@ -1520,7 +1526,7 @@ impl Shell {
                 let state_dir = state_dir.clone();
                 move |mut menu, window, _| {
                     menu = fit_above_status_bar(menu, window)
-                        .min_w(px(300.))
+                        .min_w(px(300.).min((window.viewport_size().width - ui::SPACE_4 * 2.).max(ui::SPACE_4)))
                         .label(text::ORCH_MENU_TITLE.get());
                     // OWE-652: Run이 하나도 없으면 빈 상태 안내를 보인다.
                     if !orch_has_content(&orch_store) {
@@ -1555,10 +1561,12 @@ impl Shell {
                             let weak = weak.clone();
                             menu = menu.item(PopupMenuItem::element(move |_, _| {
                                 let mut row = div()
+                                    .w_full()
+                                    .min_w_0()
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().text_size(ui::TEXT_SM).child(summary.clone()));
+                                    .child(div().flex_1().min_w_0().text_size(ui::TEXT_SM).child(summary.clone()));
                                 for (answer, label) in [
                                     ("yes", text::QUESTION_YES.get()),
                                     ("no", text::QUESTION_NO.get()),
@@ -1609,10 +1617,12 @@ impl Shell {
                                 let dir = dir.clone();
                                 let weak = weak.clone();
                                 div()
+                                    .w_full()
+                                    .min_w_0()
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().text_size(ui::TEXT_SM).child(label.clone()))
+                                    .child(div().flex_1().min_w_0().text_size(ui::TEXT_SM).child(label.clone()))
                                     .child(
                                         Button::new(gpui::ElementId::Name(button_id.clone().into()))
                                             .label(text::WORKER_RELEASE.get())
@@ -1780,7 +1790,10 @@ impl Shell {
         )
         .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, move |mut menu, window, _| {
             menu = fit_above_status_bar(menu, window)
-                .min_w(px(240.))
+                .min_w(
+                    px(240.)
+                        .min((window.viewport_size().width - ui::SPACE_4 * 2.).max(ui::SPACE_4)),
+                )
                 .label(text::PORTS_MENU_TITLE.get());
             if detected_ports.is_empty() {
                 menu = menu.item(PopupMenuItem::new(text::PORTS_EMPTY.get()).disabled(true));
@@ -2067,6 +2080,15 @@ struct SidebarCard {
     unread: bool,
 }
 
+impl SidebarCard {
+    fn agent(&self) -> &str {
+        ui::status::infer_agent_from_status(
+            &self.session.status,
+            self.session.status.title.as_deref().unwrap_or(&self.name),
+        )
+    }
+}
+
 type PreviewMap = std::collections::BTreeMap<(krill_app::hosts::HostId, SessionId), String>;
 
 pub(crate) struct Dashboard {
@@ -2217,6 +2239,8 @@ impl Render for Dashboard {
         let card = div()
             .id("dashboard-modal")
             .debug_selector(|| "dashboard-modal".into())
+            .role(gpui::Role::Dialog)
+            .aria_label(text::DASHBOARD.get())
             .key_context("Dashboard")
             .track_focus(&self.focus)
             .occlude()
@@ -2283,8 +2307,11 @@ impl Render for Dashboard {
             .child(
                 div()
                     .id("dashboard-lanes")
+                    .debug_selector(|| "dashboard-lanes".into())
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .flex()
                     .gap_2()
                     .p(ui::SPACE_2)
@@ -2298,8 +2325,10 @@ impl Render for Dashboard {
                         };
                         div()
                             .id(("dashboard-lane", column))
+                            .debug_selector(move || format!("dashboard-lane-{column}"))
                             .flex_1()
-                            .min_w_0()
+                            .min_w(ui::DASHBOARD_LANE_MIN_WIDTH)
+                            .min_h_0()
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -2311,6 +2340,7 @@ impl Render for Dashboard {
                             .child(
                                 div()
                                     .w_full()
+                                    .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_between()
@@ -2349,6 +2379,7 @@ impl Render for Dashboard {
                             .child(
                                 div()
                                     .id(("dashboard-cards", column))
+                                    .debug_selector(move || format!("dashboard-cards-{column}"))
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
@@ -2368,7 +2399,7 @@ impl Render for Dashboard {
                                         let host_clone = item.host.clone();
                                         let name = item.name.clone();
                                         let detail = item.detail.clone();
-                                        let agent = item.session.status.agent.as_str();
+                                        let agent = item.agent();
                                         let state = item.session.status.state;
                                         let unread = item.unread;
                                         let screen =
@@ -2398,6 +2429,10 @@ impl Render for Dashboard {
                                         div()
                                             .id(gpui::SharedString::from(selector))
                                             .debug_selector(move || debug_sel.clone())
+                                            .role(gpui::Role::Button)
+                                            .aria_label(format!("{name} · {detail}"))
+                                            .tab_index(0)
+                                            .flex_none()
                                             .p(ui::SPACE_2)
                                             .rounded(ui::RADIUS_XS)
                                             .border_1()
@@ -2405,6 +2440,7 @@ impl Render for Dashboard {
                                             .bg(card_bg)
                                             .cursor_pointer()
                                             .hover(move |d| d.bg(hover_bg))
+                                            .focus_visible(|d| d.border_color(p.ring))
                                             .flex()
                                             .flex_col()
                                             .gap_1p5()
@@ -2415,7 +2451,7 @@ impl Render for Dashboard {
                                                     .gap_1p5()
                                                     .child(ui::status::agent_icon(
                                                         agent,
-                                                        ui::ICON_SM,
+                                                        ui::ICON_MD,
                                                         p.muted_foreground,
                                                     ))
                                                     .child(
@@ -2511,7 +2547,7 @@ impl Render for Dashboard {
                             )
                     })),
             );
-        ui::modal_backdrop(viewport, card)
+        ui::modal_backdrop(viewport, ui::modal_focus_scope(card, &self.focus))
     }
 }
 

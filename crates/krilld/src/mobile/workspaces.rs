@@ -1,6 +1,7 @@
 //! 모바일 목록도 데스크톱의 projects.toml·sidebar.bin을 읽는다. 세션 유무는 목록의 조건이 아니다.
 use super::devices::hex;
 use krill_proto::control::RepositoryTrees;
+use krill_proto::mobile::view::ViewChange;
 use krill_proto::os::ffi::OsStrExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -145,6 +146,29 @@ pub(super) struct Catalog {
     sort_by: u32,
     updated_at: BTreeMap<PathBuf, u64>,
     unread: BTreeSet<PathBuf>,
+    /// 데스크톱 사이드바 표시 규칙(필터·숨긴 프로젝트·접힘). 모바일 목록이 PC와 같은 항목만 보이게 한다.
+    view: SidebarView,
+    /// 워크트리 진행 상태(상태별 묶음용, `WorkspaceStatus::as_str`).
+    statuses: BTreeMap<PathBuf, &'static str>,
+}
+/// 데스크톱 `is_worktree_visible`·`rows_with_options`(프로젝트 기준)가 쓰는 표시 규칙 사본.
+#[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the desktop sidebar filter flags persisted in sidebar.bin"
+)]
+struct SidebarView {
+    /// 데스크톱 `GroupBy` 변형 인덱스(0 프로젝트·1 상태·2 PR·3 없음).
+    group_by: u32,
+    repos: BTreeSet<PathBuf>,
+    hide_sleeping: bool,
+    always_show_default_branch: bool,
+    hide_automation: bool,
+    hide_cli: bool,
+    sleeping: BTreeSet<PathBuf>,
+    collapsed: BTreeSet<PathBuf>,
+    removed: BTreeSet<PathBuf>,
+    shown_external: BTreeSet<PathBuf>,
 }
 
 fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -211,6 +235,7 @@ impl Catalog {
             parents: bin_parents,
             order: project_order,
             sort_by,
+            view,
         } = dir
             .and_then(|d| read(&d.join("sidebar.bin"), 1024 * 1024))
             .and_then(|b| {
@@ -228,10 +253,42 @@ impl Catalog {
             .collect();
         let project_order: Vec<PathBuf> =
             project_order.into_iter().map(|p| normalize(&p)).collect();
+        let (mut view, mut sort_by) = (view, sort_by);
+        // 폰에서 바꿨지만 앱이 아직 sidebar.bin에 반영하지 않은 옵션을 덧씌운다.
+        if let Some((_, change)) = dir.and_then(ViewChange::load) {
+            view.group_by = change.group_by.unwrap_or(view.group_by);
+            sort_by = change.sort_by.unwrap_or(sort_by);
+            view.hide_sleeping = change.hide_sleeping.unwrap_or(view.hide_sleeping);
+            view.always_show_default_branch = change
+                .always_show_default_branch
+                .unwrap_or(view.always_show_default_branch);
+            view.hide_automation = change.hide_automation.unwrap_or(view.hide_automation);
+            view.hide_cli = change.hide_cli.unwrap_or(view.hide_cli);
+            if let Some(repos) = change.repos {
+                view.repos = repos;
+            }
+            for (repo, collapsed) in change.collapsed {
+                if collapsed {
+                    view.collapsed.insert(repo);
+                } else {
+                    view.collapsed.remove(&repo);
+                }
+            }
+        }
+        let set = |paths: BTreeSet<PathBuf>| paths.iter().map(|p| normalize(p)).collect();
+        let view = SidebarView {
+            repos: set(view.repos),
+            sleeping: set(view.sleeping),
+            collapsed: set(view.collapsed),
+            removed: set(view.removed),
+            shown_external: set(view.shown_external),
+            ..view
+        };
         let mut catalog = Self {
             preferences,
             project_order,
             sort_by,
+            view,
             ..Self::default()
         };
         // 데스크톱 계보의 영속 원천(`worktree-comments.toml [parents]`)을 먼저 읽고,
@@ -256,6 +313,14 @@ impl Catalog {
                 .into_iter()
                 .filter(|(_, unread)| *unread)
                 .map(|(p, _)| normalize(Path::new(&p)))
+                .collect();
+            catalog.statuses = stored
+                .statuses
+                .into_iter()
+                .filter_map(|(p, v)| {
+                    let status = krill_proto::orchestration::WorkspaceStatus::parse(&v).ok()?;
+                    Some((normalize(Path::new(&p)), status.as_str()))
+                })
                 .collect();
         }
         for (child, parent) in bin_parents {
@@ -440,48 +505,123 @@ impl Catalog {
                 "label":self.repo_labels.get(&repo).cloned().unwrap_or_else(|| label(&repo)),
                 "icon":self.repo_icons.get(&repo).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
                 "badge_color":self.repo_badges.get(&repo).cloned().map_or(Value::Null, Value::String),
+                "removed":self.view.removed.contains(&repo),"collapsed":self.view.collapsed.contains(&repo),
                 "worktree_keys":r.worktrees.iter().map(|t| hex(t)).collect::<Vec<_>>()})
             })
             .collect()
     }
+    /// 폰의 작업 공간 옵션 패널이 보여 줄 현재 PC 옵션. 프로젝트 선택은 저장소 키로 낸다.
+    pub fn view_json(&self) -> Value {
+        let view = &self.view;
+        let repos: Vec<String> = self
+            .repositories
+            .iter()
+            .filter(|r| view.repos.contains(&path(&r.repo)))
+            .map(|r| hex(&r.repo))
+            .collect();
+        json!({"group_by":view.group_by,"sort_by":self.sort_by,"hide_sleeping":view.hide_sleeping,
+            "always_show_default_branch":view.always_show_default_branch,
+            "hide_automation":view.hide_automation,"hide_cli":view.hide_cli,"repos":repos})
+    }
+    /// 데스크톱 `is_worktree_visible`이 보는 사실들. 숨길지는 폰이 현재 옵션으로 정한다(옵션을 바꾸면 왕복 없이 바로 다시 그린다).
+    /// `awake`는 작업 중·대기·완료이거나 에이전트가 살아 있는 세션이 있는 워크트리다.
+    fn visibility(
+        &self,
+        repo: &Path,
+        tree: &Path,
+        count: usize,
+        awake: &BTreeSet<PathBuf>,
+    ) -> Value {
+        let lossy = tree.to_string_lossy();
+        let default_branch = tree == repo
+            || count <= 1
+            || self.branches.get(tree).is_some_and(|b| {
+                matches!(
+                    b.trim(),
+                    "main" | "master" | "trunk" | "develop" | "default"
+                )
+            });
+        let asleep = self.view.sleeping.contains(tree)
+            || !(self.preferences.get(tree).is_some_and(|p| p.pinned)
+                || self.unread.contains(tree)
+                || awake.contains(tree));
+        json!({"asleep":asleep,"default_branch":default_branch,
+            "automation":lossy.contains("/.orca/automations/") || lossy.contains("/automations/"),
+            // `.claude/worktrees` 외부 워크트리는 PC에서 펼치기 전까지 접혀 있다.
+            "external":tree != repo && is_claude_worktree(tree),
+            "external_shown":self.view.shown_external.contains(repo)})
+    }
     /// 데스크톱 사이드바와 같은 워크트리 순서·들여쓰기·아이콘을 낸다.
     /// `ranks`는 워크트리 경로별 스마트 순위(0 승인대기 최우선, 4 유휴)다.
+    /// PC 사이드바에서 숨는 워크트리도 데이터는 남긴다(세션 열기·검색용).
     pub fn workspaces_json(
         &self,
         auto_titles: &BTreeMap<PathBuf, String>,
         ranks: &BTreeMap<PathBuf, u8>,
+        awake: &BTreeSet<PathBuf>,
     ) -> Vec<Value> {
+        // 데스크톱 `sort_worktrees`와 같은 키: 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
+        let sort_key = |t: &PathBuf| {
+            let rank = if self.sort_by == 0 {
+                let state = ranks.get(t).copied().unwrap_or(4);
+                if state != 0 && self.unread.contains(t) {
+                    1
+                } else {
+                    state
+                }
+            } else {
+                0
+            };
+            let recent = match self.sort_by {
+                0 | 1 => self.updated_at.get(t).copied().unwrap_or(0),
+                3 => created_ms(t).unwrap_or(0),
+                _ => 0,
+            };
+            (
+                !self.preferences.get(t).is_some_and(|v| v.pinned),
+                rank,
+                Reverse(recent),
+                worktree_sort_name(t, &self.preferences, &self.branches),
+                t.clone(),
+            )
+        };
+        // 상태별·묶음 없음 보기는 프로젝트를 가로질러 같은 키로 줄 세운다(`order`).
+        let mut all: Vec<_> = self
+            .repositories
+            .iter()
+            .flat_map(|r| r.worktrees.iter().map(|t| path(t)))
+            .map(|t| (sort_key(&t), t))
+            .collect();
+        all.sort();
+        let order: BTreeMap<PathBuf, usize> = all
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, t))| (t, i))
+            .collect();
+        let order = &order;
         self.repositories
             .iter()
             .flat_map(|r| {
                 let repo = path(&r.repo);
+                let count = r.worktrees.len();
                 let mut trees: Vec<PathBuf> = r.worktrees.iter().map(|t| path(t)).collect();
-                // 데스크톱 `sort_worktrees`와 같은 키: [기본] → 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
-                trees.sort_by_cached_key(|t| {
-                    let rank = if self.sort_by == 0 {
-                        let state = ranks.get(t).copied().unwrap_or(4);
-                        if state != 0 && self.unread.contains(t) { 1 } else { state }
-                    } else { 0 };
-                    let recent = match self.sort_by {
-                        0 | 1 => self.updated_at.get(t).copied().unwrap_or(0),
-                        3 => created_ms(t).unwrap_or(0),
-                        _ => 0,
-                    };
-                    (
-                        t != &repo,
-                        !self.preferences.get(t).is_some_and(|v| v.pinned),
-                        rank,
-                        Reverse(recent),
-                        worktree_sort_name(t, &self.preferences, &self.branches),
-                        t.clone(),
-                    )
-                });
+                // 프로젝트 안에서는 기본 체크아웃을 맨 위에 둔다.
+                trees.sort_by_cached_key(|t| (t != &repo, sort_key(t)));
                 order_lineage(&trees, &self.parents)
                     .into_iter()
                     .map(move |(tree, depth)| {
                         let pref = self.preferences.get(&tree);
                         let branch = self.branches.get(&tree);
-                        let name = pref.map(|p| p.name.as_str()).filter(|s| !s.is_empty());
+                        let repo_label = self.repo_labels.get(&repo).map(String::as_str);
+                        let tree_label = label(&tree);
+                        let name = pref
+                            .map(|p| p.name.trim())
+                            .filter(|s| !s.is_empty())
+                            .filter(|n| {
+                                tree != repo
+                                    || (!n.eq_ignore_ascii_case(&tree_label)
+                                        && !repo_label.is_some_and(|r| n.eq_ignore_ascii_case(r)))
+                            });
                         let custom = name.filter(|n| {
                             !krill_proto::git::is_default_branch_or_worktree_name(n)
                         });
@@ -507,6 +647,9 @@ impl Catalog {
                         json!({"key":hex(&raw),"repo_key":hex(&r.repo),"path":tree.to_string_lossy(),
                     "label":title,
                     "pinned":pref.is_some_and(|p| p.pinned),"branch":branch,
+                    "visibility":self.visibility(&repo, &tree, count, awake),
+                    "order":order.get(&tree).copied().unwrap_or(usize::MAX),
+                    "status":self.statuses.get(&tree).copied().unwrap_or("todo"),
                     "depth":depth,"primary":tree == repo,
                     "icon":self.repo_icons.get(&tree).or_else(|| self.repo_icons.get(&repo)).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
                     "badge_color":self.repo_badges.get(&tree).or_else(|| self.repo_badges.get(&repo)).cloned().map_or(Value::Null, Value::String)})
@@ -514,6 +657,18 @@ impl Catalog {
             })
             .collect()
     }
+}
+/// `<repo>/.claude/worktrees/` 아래 워크트리(데스크톱 `external::is_claude_worktree`와 동일).
+fn is_claude_worktree(path: &Path) -> bool {
+    let mut parts = path.components().peekable();
+    while let Some(part) = parts.next() {
+        if part.as_os_str() == ".claude"
+            && parts.peek().is_some_and(|n| n.as_os_str() == "worktrees")
+        {
+            return true;
+        }
+    }
+    false
 }
 /// 폴더 생성 시각(ms). 데스크톱 `async_state::created_secs`와 같은 원천.
 fn created_ms(path: &Path) -> Option<u64> {
@@ -534,7 +689,7 @@ fn worktree_sort_name(
         .or_else(|| branches.get(path).cloned())
         .unwrap_or_else(|| label(path))
 }
-/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준을 꺼낸다. 형식 불일치는 기본값으로 강등한다.
+/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준·표시 규칙을 꺼낸다. 형식 불일치는 기본값으로 강등한다.
 fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
     let mut tail = SidebarTail::default();
     let Ok((prefs, rest)) = postcard::take_from_bytes::<BTreeMap<PathBuf, Preference>>(body) else {
@@ -545,13 +700,27 @@ fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
         return tail;
     };
     tail.sort_by = options.sort_by;
+    let filters = options.filters;
+    tail.view = SidebarView {
+        group_by: options.group_by,
+        repos: filters.repos,
+        hide_sleeping: filters.hide_sleeping,
+        always_show_default_branch: filters.always_show_default_branch,
+        hide_automation: filters.hide_automation,
+        hide_cli: filters.hide_cli,
+        ..SidebarView::default()
+    };
     let Ok((lineage, rest)) = postcard::take_from_bytes::<BinLineage>(rest) else {
         return tail;
     };
     tail.parents = lineage.parents;
-    let Ok((_, rest)) = postcard::take_from_bytes::<BinUi>(rest) else {
+    tail.view.sleeping = lineage.sleeping_worktrees;
+    let Ok((ui, rest)) = postcard::take_from_bytes::<BinUi>(rest) else {
         return tail;
     };
+    tail.view.collapsed = ui.collapsed;
+    tail.view.removed = ui.removed_projects;
+    tail.view.shown_external = ui.shown_external;
     if let Ok((order, _)) = postcard::take_from_bytes::<Vec<PathBuf>>(rest) {
         tail.order = order;
     }
@@ -563,6 +732,7 @@ struct SidebarTail {
     parents: BTreeMap<PathBuf, PathBuf>,
     order: Vec<PathBuf>,
     sort_by: u32,
+    view: SidebarView,
 }
 /// PC와 같은 체크포인트 파일에서 계보·최근 활동·미확인을 읽는다. 모바일 전용 사본은 쓰지 않는다.
 #[derive(Default, Deserialize)]
@@ -571,6 +741,7 @@ struct StoredView {
     parents: BTreeMap<String, String>,
     updated_at: BTreeMap<String, u64>,
     unread: BTreeMap<String, bool>,
+    statuses: BTreeMap<String, String>,
 }
 fn store_view(dir: &Path) -> StoredView {
     read(&dir.join("worktree-comments.toml"), 512 * 1024)
@@ -712,8 +883,8 @@ branch = "task/my-feature"
         let mut bytes = vec![1];
         bytes.extend(postcard::to_allocvec(&prefs).unwrap());
         fs::write(dir.join("sidebar.bin"), &bytes).unwrap();
-        let catalog = Catalog::load(Some(&dir), &[]);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let mut catalog = Catalog::load(Some(&dir), &[]);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(rows.len(), 3);
         let feature = rows.iter().find(|w| w["path"] == "/repo/feature").unwrap();
         assert_eq!(feature["label"], "PC 이름");
@@ -724,6 +895,15 @@ branch = "task/my-feature"
         );
         assert_eq!(catalog.repositories.len(), 1);
         assert_eq!(catalog.repositories_json()[0]["label"], "프로젝트");
+        catalog
+            .branches
+            .insert(PathBuf::from("/repo"), "main".to_owned());
+        let primary = catalog
+            .workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new())
+            .into_iter()
+            .find(|w| w["path"] == "/repo")
+            .unwrap();
+        assert_eq!(primary["label"], "main");
         assert_eq!(
             catalog.cwd(feature["key"].as_str().unwrap()),
             Some(PathBuf::from("/repo/feature"))
@@ -737,8 +917,11 @@ branch = "task/my-feature"
         }
         // 파일을 바꾸면 스냅샷 갱신에서 즉시 반영하며, 손상된 설정은 이관 이름으로 강등한다.
         fs::write(dir.join("sidebar.bin"), [2, 0]).unwrap();
-        let rows =
-            Catalog::load(Some(&dir), &[]).workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = Catalog::load(Some(&dir), &[]).workspaces_json(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         let feature = rows.iter().find(|w| w["path"] == "/repo/feature").unwrap();
         assert_eq!(feature["label"], "이관 이름");
         assert_eq!(feature["pinned"], true);
@@ -849,7 +1032,7 @@ value = "🚀"
         assert_eq!(repos[1]["icon"]["kind"], "emoji");
         assert_eq!(repos[1]["icon"]["value"], "🚀");
         assert_eq!(repos[1]["badge_color"], "#ff0000");
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(rows.len(), 3);
         // 같은 저장소 안에서 [기본]이 먼저, 자식은 부모 바로 뒤에 깊이 1로 붙는다.
         let a: Vec<_> = rows
@@ -882,7 +1065,7 @@ value = "🚀"
             worktrees: vec![raw(&repo), raw(&old), raw(&new)],
         }];
         let catalog = Catalog::load(Some(&dir), &repositories);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         let paths: Vec<_> = rows
             .iter()
             .map(|w| w["path"].as_str().unwrap().to_owned())
@@ -905,7 +1088,7 @@ value = "🚀"
         }];
         let catalog = Catalog::load(Some(&dir), &repositories);
         let ranks = BTreeMap::from([(PathBuf::from("/r/urgent"), 0u8)]);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks, &BTreeSet::new());
         let paths: Vec<_> = rows
             .iter()
             .map(|w| w["path"].as_str().unwrap().to_owned())
@@ -933,8 +1116,11 @@ value = "🚀"
                 worktrees: vec![b"/s".to_vec(), b"/s/a".to_vec()],
             },
         ];
-        let rows = Catalog::load(Some(&dir), &repositories)
-            .workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = Catalog::load(Some(&dir), &repositories).workspaces_json(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         let depths: Vec<_> = rows
             .iter()
             .map(|w| (w["path"].as_str().unwrap(), w["depth"].as_u64().unwrap()))
@@ -988,7 +1174,7 @@ value = "🚀"
                 (PathBuf::from("/r/m-unread"), "middle/branch".to_owned()),
                 (PathBuf::from("/r/a-new"), "zeta/branch".to_owned()),
             ]);
-            let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks);
+            let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks, &BTreeSet::new());
             let paths: Vec<_> = rows.iter().map(|w| w["path"].as_str().unwrap()).collect();
             assert_eq!(paths, expected, "desktop sort option {sort_by}");
         }
@@ -999,9 +1185,148 @@ value = "🚀"
         )
         .unwrap();
         write_sidebar_tail(&dir, &[], &BTreeMap::new(), 1);
-        let rows =
-            Catalog::load(Some(&dir), &repositories).workspaces_json(&BTreeMap::new(), &ranks);
+        let rows = Catalog::load(Some(&dir), &repositories).workspaces_json(
+            &BTreeMap::new(),
+            &ranks,
+            &BTreeSet::new(),
+        );
         assert_eq!(rows[1]["path"], "/r/z-old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn desktop_view_options_and_visibility_facts_follow_pc_sidebar() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-view-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // 프로젝트 필터(/a, /c)·목록에서 제거(/c)·잠든 작업 공간 숨기기·/a 접힘을 PC 저장 순서대로 둔다.
+        let mut bytes = vec![1];
+        bytes.extend(postcard::to_allocvec(&BTreeMap::<PathBuf, (bool, String)>::new()).unwrap());
+        bytes.extend(
+            postcard::to_allocvec(&BinOptions {
+                group_by: 0,
+                sort_by: 2,
+                card_layout: 0,
+                card_properties: BinCardProperties {
+                    issue: true,
+                    pr: true,
+                    comment: true,
+                    ports: true,
+                    branch: true,
+                    host: true,
+                },
+                filters: BinFilters {
+                    hide_sleeping: true,
+                    always_show_default_branch: true,
+                    hide_automation: false,
+                    hide_cli: false,
+                    repos: BTreeSet::from([PathBuf::from("/a"), PathBuf::from("/c")]),
+                    hosts: BTreeSet::new(),
+                },
+            })
+            .unwrap(),
+        );
+        bytes.extend(
+            postcard::to_allocvec(&BinLineage {
+                parents: BTreeMap::new(),
+                collapsed_lineage: BTreeSet::new(),
+                sleeping_worktrees: BTreeSet::from([PathBuf::from("/a/slept")]),
+            })
+            .unwrap(),
+        );
+        bytes.extend(
+            postcard::to_allocvec(&BinUi {
+                collapsed: BTreeSet::from([PathBuf::from("/a")]),
+                collapsed_groups: Vec::new(),
+                collapsed_hosts: Vec::new(),
+                expanded_cards: BTreeSet::new(),
+                selected_worktree: None,
+                shown_external: BTreeSet::new(),
+                removed_projects: BTreeSet::from([PathBuf::from("/c")]),
+            })
+            .unwrap(),
+        );
+        fs::write(dir.join("sidebar.bin"), bytes).unwrap();
+        let tree = |p: &str| p.as_bytes().to_vec();
+        let repositories = vec![
+            RepositoryTrees {
+                repo: tree("/a"),
+                worktrees: [
+                    "/a",
+                    "/a/idle",
+                    "/a/busy",
+                    "/a/slept",
+                    "/a/.claude/worktrees/x",
+                ]
+                .map(tree)
+                .to_vec(),
+            },
+            RepositoryTrees {
+                repo: tree("/b"),
+                worktrees: vec![tree("/b")],
+            },
+            RepositoryTrees {
+                repo: tree("/c"),
+                worktrees: vec![tree("/c")],
+            },
+        ];
+        let catalog = Catalog::load(Some(&dir), &repositories);
+        let repos: Vec<_> = catalog
+            .repositories_json()
+            .iter()
+            .map(|r| {
+                let path = r["path"].as_str().unwrap().to_owned();
+                (
+                    path,
+                    r["removed"].as_bool().unwrap(),
+                    r["collapsed"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let expected = [
+            ("/a", false, true),
+            ("/b", false, false),
+            ("/c", true, false),
+        ];
+        assert_eq!(repos, expected.map(|(p, r, c)| (p.to_owned(), r, c)));
+        let view = catalog.view_json();
+        assert_eq!(view["hide_sleeping"], true);
+        assert_eq!(view["sort_by"], 2);
+        assert_eq!(view["repos"], json!([hex(b"/a"), hex(b"/c")]));
+        // 작업 중 세션이 있어도 PC에서 잠재운 /a/slept는 잠든 것으로 본다. 기본 체크아웃은 기본 브랜치다.
+        let awake = BTreeSet::from([PathBuf::from("/a/busy"), PathBuf::from("/a/slept")]);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &awake);
+        let facts: BTreeMap<_, _> = rows
+            .iter()
+            .map(|w| (w["path"].as_str().unwrap(), w["visibility"].clone()))
+            .collect();
+        assert_eq!(facts["/a"]["default_branch"], true);
+        assert_eq!(facts["/a/idle"]["asleep"], true);
+        assert_eq!(facts["/a/idle"]["default_branch"], false);
+        assert_eq!(facts["/a/busy"]["asleep"], false);
+        assert_eq!(facts["/a/slept"]["asleep"], true);
+        assert_eq!(facts["/a/.claude/worktrees/x"]["external"], true);
+        assert_eq!(facts["/a/.claude/worktrees/x"]["external_shown"], false);
+        assert_eq!(
+            rows.len(),
+            7,
+            "hidden rows stay in the payload for search and links"
+        );
+        // 폰에서 바꾼 옵션은 앱이 sidebar.bin에 반영하기 전에도 덧씌워 보인다.
+        ViewChange::append(
+            &dir,
+            ViewChange {
+                hide_sleeping: Some(false),
+                repos: Some(BTreeSet::new()),
+                collapsed: BTreeMap::from([(PathBuf::from("/a"), false)]),
+                ..ViewChange::default()
+            },
+        )
+        .unwrap();
+        let catalog = Catalog::load(Some(&dir), &repositories);
+        let view = catalog.view_json();
+        assert_eq!(view["hide_sleeping"], false);
+        assert_eq!(view["repos"], json!([]));
+        assert_eq!(catalog.repositories_json()[0]["collapsed"], false);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1020,7 +1345,7 @@ value = "🚀"
             worktrees: vec![b"/r".to_vec()],
         }];
         let catalog = Catalog::load(Some(&dir), &repositories);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["label"], "이름");
         assert_eq!(rows[0]["depth"], 0);

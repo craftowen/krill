@@ -601,11 +601,6 @@ pub struct RenameSession(pub SessionId);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectHost(pub HostId);
 
-/// 연결된 원격 호스트 섹션에서 '연결 해제'를 눌렀을 때 내보내는 이벤트.
-/// 셸이 터널·링크 자식을 내리고 수동 끊김으로 고정한다(`reconnect`로만 복구).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisconnectHost(pub HostId);
-
 /// 로컬 데몬 재연결 뒤 처음 받은 로컬 세션 목록의 세션 수.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relisted(pub usize);
@@ -618,6 +613,12 @@ enum Relink {
     Reconnecting,
     /// 다시 붙었고, 다음 로컬 목록 도착 때 [`Relisted`]를 한 번 내보낸다.
     AwaitingList,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeleteFocus {
+    Pending,
+    Focused,
 }
 
 pub struct Sidebar {
@@ -675,6 +676,10 @@ pub struct Sidebar {
     setup_prompt: hooks::SetupPrompt,
     /// 워크트리 삭제 확인 모달 상태(OWE-847). `Some`일 때 모달을 띄운다.
     delete_confirm: Option<DeleteConfirm>,
+    delete_scope_focus: Option<gpui::FocusHandle>,
+    delete_cancel_focus: Option<gpui::FocusHandle>,
+    delete_previous_focus: Option<gpui::FocusHandle>,
+    delete_focus: DeleteFocus,
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
@@ -738,7 +743,6 @@ impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
-impl EventEmitter<DisconnectHost> for Sidebar {}
 impl EventEmitter<Relisted> for Sidebar {}
 
 impl std::fmt::Debug for Sidebar {
@@ -974,6 +978,10 @@ impl Sidebar {
             project_visuals: BTreeMap::new(),
             setup_prompt: hooks::SetupPrompt::default(),
             delete_confirm: None,
+            delete_scope_focus: None,
+            delete_cancel_focus: None,
+            delete_previous_focus: None,
+            delete_focus: DeleteFocus::Focused,
             path,
             error: None,
             poll_error: None,
@@ -1361,20 +1369,6 @@ impl Sidebar {
             self.collapsed_hosts.insert(host.clone());
         }
         self.persist(cx);
-    }
-
-    /// 연결된 원격 호스트의 '연결 해제' 버튼을 눌렀을 때 상태를 `Disconnected`로 바꾸고 해제를 요청한다.
-    /// 터널·링크 자식은 셸(`DisconnectHost` 구독)이 내리며, `reconnect_host`로만 다시 붙는다.
-    pub fn disconnect_host(&mut self, host: HostId, cx: &mut Context<Self>) {
-        if let HostId::Remote(id) = &host
-            && let Some(r) = self.remote_hosts.iter_mut().find(|r| r.id == *id)
-        {
-            r.status = HostStatus::Disconnected;
-        }
-        self.rebuild(cx);
-        cx.emit(DisconnectHost(host));
-        self.remote_task = None;
-        self.start_remote_polling(cx);
     }
 
     /// 끊긴 원격 호스트의 '다시 연결' 버튼을 눌렀을 때 상태를 `Connecting`으로 바꾸고 재연결을 요청한다.
@@ -2983,7 +2977,7 @@ impl Sidebar {
             .map(|s| {
                 let (title, detail) = self.session_label(s);
                 let agent =
-                    crate::ui::status::infer_agent_from_title(&s.status.agent, &title).to_owned();
+                    crate::ui::status::infer_agent_from_status(&s.status, &title).to_owned();
                 let folder_path = s.worktree.as_deref().or(s.cwd.as_deref());
                 let (repo_name, worktree_name) = if let Some(wt) = s.worktree.as_deref() {
                     let repo_path = self
@@ -3338,6 +3332,7 @@ impl Sidebar {
             .get(&path)
             .and_then(|m| m.dirty)
             .unwrap_or(0);
+        self.delete_focus = DeleteFocus::Pending;
         self.delete_confirm = Some(DeleteConfirm {
             path,
             with_descendants,
@@ -3378,15 +3373,16 @@ impl Sidebar {
 
     /// 바꾼 이름 → 브랜치 → 첫 프롬프트 자동 제목 → 폴더 이름.
     fn name(&self, path: &Path) -> String {
-        let pref_name = self
-            .prefs
-            .get(path)
-            .filter(|v| !v.name.is_empty())
-            .map(|v| v.name.as_str());
+        let pref_name = self.custom_worktree_name(path);
         if let Some(custom) =
             pref_name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n))
         {
             return custom.to_owned();
+        }
+        if self.snapshot.trees.contains_key(path) {
+            return self
+                .branch(path)
+                .map_or_else(|| basename(path), str::to_owned);
         }
         if let Some(branch) = self.branch(path) {
             if !krill_proto::git::is_default_branch_or_worktree_name(branch) {
@@ -3403,6 +3399,24 @@ impl Sidebar {
             return auto.to_owned();
         }
         pref_name.map_or_else(|| basename(path), str::to_owned)
+    }
+
+    /// 워크트리에 직접 지정한 이름. 기본 워크트리(`trees` 루트)에 프로젝트 표시 이름·폴더 이름이
+    /// 그대로 들어 있는 경우(`projects.toml` 동기화분 포함)는 프로젝트 머리줄과 중복이므로 제외한다.
+    pub(super) fn custom_worktree_name(&self, path: &Path) -> Option<&str> {
+        let name = self
+            .prefs
+            .get(path)
+            .map(|v| v.name.trim())
+            .filter(|s| !s.is_empty())?;
+        if self.snapshot.trees.contains_key(path) {
+            let folder = basename(path);
+            let header = self.project_header_name(path);
+            if name.eq_ignore_ascii_case(&folder) || name.eq_ignore_ascii_case(&header) {
+                return None;
+            }
+        }
+        Some(name)
     }
 
     pub(super) fn worktree_auto_title(&self, path: &Path) -> Option<&str> {

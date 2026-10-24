@@ -1,6 +1,7 @@
 //! M9 모바일 제어. variant는 끝에만 추가한다. 비밀은 Debug로 출력하지 않는다.
 pub mod client;
 pub mod qr;
+pub mod view;
 use crate::screen::Msg;
 use serde::{Deserialize, Serialize};
 

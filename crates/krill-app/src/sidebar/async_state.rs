@@ -2,6 +2,7 @@
 //! UI readers only inspect the last accepted in-memory snapshot.
 
 use super::*;
+use krill_proto::mobile::view::ViewChange;
 use krill_proto::orchestration::{OrchestrationStore, WorktreeStore};
 
 #[derive(Default)]
@@ -197,6 +198,8 @@ pub(super) struct DiskSnapshot {
     visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
     folder_updated_at: BTreeMap<PathBuf, u64>,
     worktree_created_at: BTreeMap<PathBuf, u64>,
+    /// 폰에서 바꾼 작업 공간 옵션(원본 바이트와 내용). 반영한 뒤 krilld가 더 쓰지 않았으면 지운다.
+    mobile_view: Option<(Vec<u8>, ViewChange)>,
 }
 
 impl DiskSnapshot {
@@ -298,6 +301,7 @@ impl DiskSnapshot {
             visuals,
             folder_updated_at,
             worktree_created_at,
+            mobile_view: dir.and_then(ViewChange::load),
         }
     }
 }
@@ -415,9 +419,22 @@ impl Sidebar {
     fn accept_disk_snapshot(
         &mut self,
         generation: u64,
-        data: DiskSnapshot,
+        mut data: DiskSnapshot,
         cx: &mut Context<Self>,
     ) {
+        if self.disk.generation == generation
+            && self.disk.writes_pending == 0
+            && let Some((bytes, change)) = data.mobile_view.take()
+        {
+            self.apply_mobile_view(change);
+            self.write_state(cx);
+            if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
+                // sidebar.bin 저장 뒤에 지워야 앱이 저장 전에 죽어도 변경이 남는다.
+                self.enqueue_disk_write(move || ViewChange::consume(&dir, &bytes), cx);
+            }
+            self.rebuild(cx);
+            return;
+        }
         // A scan started before an edit/delete/import must never resurrect its state.
         if self.disk.generation == generation
             && self.disk.writes_pending == 0
@@ -430,6 +447,43 @@ impl Sidebar {
                 self.write_state(cx);
             }
             self.rebuild(cx);
+        }
+    }
+
+    /// 폰에서 바꾼 옵션을 사이드바 상태에 덮어쓴다(Orca처럼 기기 사이에 같은 옵션을 쓴다).
+    fn apply_mobile_view(&mut self, change: ViewChange) {
+        let index = |i: u32| usize::try_from(i).ok();
+        if let Some(group_by) = change
+            .group_by
+            .and_then(index)
+            .and_then(|i| GroupBy::ALL.get(i).copied())
+        {
+            self.options.group_by = group_by;
+        }
+        // 폰은 변형 인덱스로 보낸다. `SortBy::ALL`은 표시 순서라 인덱스와 다르다.
+        if let Some(sort_by) = change.sort_by.and_then(index).and_then(|i| {
+            [SortBy::Smart, SortBy::Recent, SortBy::Name, SortBy::Created]
+                .get(i)
+                .copied()
+        }) {
+            self.options.sort_by = sort_by;
+        }
+        let filters = &mut self.options.filters;
+        filters.hide_sleeping = change.hide_sleeping.unwrap_or(filters.hide_sleeping);
+        filters.always_show_default_branch = change
+            .always_show_default_branch
+            .unwrap_or(filters.always_show_default_branch);
+        filters.hide_automation = change.hide_automation.unwrap_or(filters.hide_automation);
+        filters.hide_cli = change.hide_cli.unwrap_or(filters.hide_cli);
+        if let Some(repos) = change.repos {
+            filters.repos = repos;
+        }
+        for (repo, collapsed) in change.collapsed {
+            if collapsed {
+                self.collapsed.insert(repo);
+            } else {
+                self.collapsed.remove(&repo);
+            }
         }
     }
 

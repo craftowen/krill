@@ -23,6 +23,8 @@ use crate::pull_request::{
     CheckItem, CheckState, PrInspection, ReviewComment, Status, build_fix_with_ai_prompt,
 };
 
+mod merge;
+
 /// 오른쪽 사이드바 상단 탭.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PanelTab {
@@ -113,6 +115,10 @@ impl PanelTab {
 #[derive(Default)]
 pub(super) struct State {
     pub branch_override: Option<String>,
+    pending_merge: Option<merge::Confirmation>,
+    pub merging: bool,
+    merge_task: Option<Task<()>>,
+    pub action_error: Option<String>,
     pub branch: String,
     pub inspection: Option<PrInspection>,
     pub loading: bool,
@@ -128,8 +134,16 @@ pub(super) struct State {
 impl State {
     pub fn reset(&mut self) {
         let branch_override = self.branch_override.clone();
+        let generation = self.generation.wrapping_add(1);
+        // Changing repositories cannot cancel an already running synchronous mutation.
+        let merge_task = self.merge_task.take();
+        let merging = self.merging;
         *self = Self {
             branch_override,
+            generation,
+            merge_task,
+            merging,
+            loading: merging,
             ..Self::default()
         };
     }
@@ -164,6 +178,13 @@ impl Panel {
             return;
         }
         self.tab = tab;
+        self.tab_scroll.scroll_to_item(match tab {
+            PanelTab::Changes => 0,
+            PanelTab::Files => 1,
+            PanelTab::Search => 2,
+            PanelTab::History => 3,
+            PanelTab::Checks => 4,
+        });
         self.sync_history(cx);
         if tab == PanelTab::Files {
             self.ensure_explorer_loaded_async(cx);
@@ -189,12 +210,17 @@ impl Panel {
 
     /// 테스트에서 실제 git 저장소 없이 브랜치 이름을 지정할 때 사용한다.
     pub fn set_checks_branch(&mut self, branch: impl Into<String>) {
+        self.checks.pending_merge = None;
         let branch = branch.into();
         self.checks.branch_override = Some(branch.clone());
         self.checks.branch = branch;
     }
 
     pub fn refresh_checks(&mut self, cx: &mut Context<Self>) {
+        if self.checks.merging {
+            return;
+        }
+        self.checks.pending_merge = None;
         self.checks.loading = true;
         self.checks.error = None;
         self.checks.generation = self.checks.generation.wrapping_add(1);
@@ -243,43 +269,8 @@ impl Panel {
         cx.notify();
     }
 
-    pub fn merge_pr(&mut self, method: crate::pull_request::PrMergeMethod, cx: &mut Context<Self>) {
-        if self.checks.loading {
-            return;
-        }
-        self.checks.loading = true;
-        self.checks.fix_status = None;
-        let repo = self.repo.clone();
-        let branch_override = self.checks.branch_override.clone();
-        let service = Arc::clone(&self.editing.pr_service);
-        self.checks.task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let branch = resolve_branch(&repo, branch_override.as_deref());
-                    service.merge(&repo, &branch, method)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.checks.loading = false;
-                match result {
-                    Ok(()) => {
-                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
-                        this.refresh_checks(cx);
-                    }
-                    Err(_) => {
-                        this.checks.fix_status = Some(text::ACTION_FAILED);
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
     pub fn toggle_pr_draft(&mut self, cx: &mut Context<Self>) {
-        if self.checks.loading {
+        if self.checks.loading || self.checks.merging {
             return;
         }
         let Some(pr) = &self.checks.inspection else {
@@ -632,7 +623,7 @@ impl Panel {
             card = card.child(
                 div()
                     .pl_5()
-                    .text_size(crate::ui::TEXT_2XS)
+                    .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(desc.clone()),
             );
@@ -654,7 +645,7 @@ impl Panel {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_XS)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.destructive)
                             .child(text::LOGS_HEADER.get()),
@@ -662,7 +653,7 @@ impl Panel {
                     .child(
                         div()
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(p.foreground)
                             .child(log_tail.clone()),
                     ),
@@ -716,7 +707,7 @@ impl Panel {
             .min_w_0()
             .truncate()
             .font_family(crate::ui::FONT_MONO)
-            .text_size(crate::ui::TEXT_2XS)
+            .text_size(crate::ui::TEXT_SM)
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(card_fg)
             .child(comment.location());
@@ -775,7 +766,7 @@ impl Panel {
         card = card.child(header).child(
             div()
                 .pl_5()
-                .text_size(crate::ui::TEXT_XS)
+                .text_size(crate::ui::TEXT_SM)
                 .text_color(card_fg)
                 .child(comment.body.clone()),
         );
@@ -785,7 +776,7 @@ impl Panel {
                 div()
                     .pl_5()
                     .pt_0p5()
-                    .text_size(crate::ui::TEXT_2XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(format!("@{}: {}", reply.author, reply.body))
             });
@@ -797,7 +788,7 @@ impl Panel {
 
     pub(super) fn render_checks_tab(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = crate::ui::palette(cx);
@@ -993,7 +984,8 @@ impl Panel {
         }
 
         let pr_status = pr.status.clone();
-        let pr_busy = self.checks.loading;
+        let pr_busy =
+            self.checks.loading || self.checks.merging || self.checks.pending_merge.is_some();
         let pr_header =
             pr_header
                 .child(title_row)
@@ -1043,10 +1035,11 @@ impl Panel {
                                         .primary()
                                         .disabled(pr_busy)
                                         .label(text::MERGE_SQUASH.get())
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.merge_pr(
                                                 crate::pull_request::PrMergeMethod::Squash,
+                                                window,
                                                 cx,
                                             );
                                         })),
@@ -1058,10 +1051,11 @@ impl Panel {
                                         .outline()
                                         .disabled(pr_busy)
                                         .label(text::MERGE_REBASE.get())
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.merge_pr(
                                                 crate::pull_request::PrMergeMethod::Rebase,
+                                                window,
                                                 cx,
                                             );
                                         })),
@@ -1073,10 +1067,11 @@ impl Panel {
                                         .outline()
                                         .disabled(pr_busy)
                                         .label(text::MERGE_COMMIT.get())
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.merge_pr(
                                                 crate::pull_request::PrMergeMethod::Merge,
+                                                window,
                                                 cx,
                                             );
                                         })),
@@ -1294,6 +1289,13 @@ impl Panel {
                         this.send_selected_pr_fixes(cx);
                     })),
             )
+            .when_some(self.checks.action_error.as_ref(), |d, error| {
+                d.child(
+                    div()
+                        .debug_selector(|| "pr-merge-error".into())
+                        .child(crate::ui::error_banner(p, error.clone())),
+                )
+            })
             .when_some(self.checks.fix_status, |d, status| {
                 d.child(
                     div()
@@ -1336,6 +1338,7 @@ impl Panel {
                     .child(comments_section),
             )
             .child(footer)
+            .children(self.render_merge_confirmation(window, cx))
             .into_any_element()
     }
 }

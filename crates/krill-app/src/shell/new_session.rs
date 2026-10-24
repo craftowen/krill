@@ -78,6 +78,8 @@ impl Shell {
             .id("sidebar-jump")
             .group("sidebar-search-row")
             .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|d| d.border_1().border_color(p.ring))
             .aria_label(sb_text::SEARCH_SHORT.get())
             .w_full()
             .h(gpui::px(30.))
@@ -93,21 +95,22 @@ impl Shell {
             .justify_between()
             .gap_1p5()
             .text_size(krill_app::ui::TEXT_MD)
-            .text_color(p.sidebar_foreground.opacity(0.45))
+            .text_color(p.muted_foreground)
             .hover(|d| {
                 d.bg(p.sidebar_accent)
-                    .text_color(p.sidebar_foreground.opacity(0.75))
+                    .text_color(p.sidebar_accent_foreground)
             })
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
+                    .flex_1()
                     .min_w_0()
                     .child(
                         gpui_component::Icon::new(IconName::Search)
                             .with_size(krill_app::ui::ICON_MD)
-                            .text_color(p.sidebar_foreground.opacity(0.38)),
+                            .text_color(p.muted_foreground),
                     )
                     .child(div().truncate().child(sb_text::SEARCH_SHORT.get())),
             )
@@ -121,10 +124,10 @@ impl Shell {
                         div()
                             .invisible()
                             .group_hover("sidebar-search-row", gpui::Styled::visible)
-                            .font_family(krill_app::ui::FONT_MONO)
-                            .text_size(krill_app::ui::TEXT_2XS)
-                            .text_color(p.sidebar_foreground.opacity(0.4))
-                            .child(krill_app::i18n::catalog::general::JUMP_SHORTCUT.get()),
+                            .child(krill_app::ui::keycap(
+                                p,
+                                krill_app::i18n::catalog::general::JUMP_SHORTCUT.get(),
+                            )),
                     )
                     .when(yolo, |d| {
                         d.child(
@@ -154,8 +157,6 @@ impl Shell {
                         div()
                             .id("new-session-wrap")
                             .debug_selector(|| "new-session".into())
-                            .invisible()
-                            .group_hover("sidebar-search-row", gpui::Styled::visible)
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .child(menu),
                     ),
@@ -171,13 +172,15 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         use krill_app::ui::icons;
 
-        let nav_icon_color = p.sidebar_foreground.opacity(0.4);
-        let nav_text_color = p.sidebar_foreground.opacity(0.68);
+        let nav_icon_color = p.muted_foreground;
+        let nav_text_color = p.muted_foreground;
         let nav_hover_bg = p.sidebar_accent.opacity(0.6);
         div()
             .id(id)
             .debug_selector(move || id.into())
             .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|d| d.border_1().border_color(p.ring))
             .aria_label(label)
             .w_full()
             .h(gpui::px(28.))
@@ -482,7 +485,7 @@ impl Shell {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .text_color(p.sidebar_foreground.opacity(0.6))
+                                        .text_color(p.muted_foreground)
                                         .child(
                                             div()
                                                 .size(krill_app::ui::STATE_DOT)
@@ -502,7 +505,7 @@ impl Shell {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .text_color(p.sidebar_foreground.opacity(0.6))
+                                        .text_color(p.muted_foreground)
                                         .child(
                                             div()
                                                 .size(krill_app::ui::STATE_DOT)

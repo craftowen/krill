@@ -203,6 +203,7 @@ pub(super) struct Recorder {
     conflict: Option<(Target, String, Vec<&'static str>)>,
     pub(super) error: Option<SharedString>,
     intercept: Option<gpui::Subscription>,
+    return_focus: Option<gpui::FocusHandle>,
     pub(super) filter: ShortcutFilter,
     pub(super) search: Option<(
         gpui::Entity<gpui_component::input::InputState>,
@@ -573,6 +574,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         // 검색 입력에 글자가 들어가지 않게 포커스를 창 루트로 옮긴다.
+        self.shortcuts.return_focus = window.focused(cx);
         window.focus(&self.focus, cx);
         let view = cx.weak_entity();
         let id = window.window_handle().window_id();
@@ -590,6 +592,21 @@ impl SettingsView {
         self.shortcuts.error = None;
         self.shortcuts.intercept = Some(intercept);
         cx.notify();
+    }
+
+    pub(super) fn cancel_shortcut_conflict(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.shortcuts.conflict.take().is_none() {
+            return false;
+        }
+        if let Some(focus) = self.shortcuts.return_focus.take() {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+        true
     }
 
     fn on_recorded(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
@@ -715,7 +732,9 @@ impl SettingsView {
         let id = format!("sc-{action}-{}", old.as_deref().unwrap_or("add"));
         let selector = id.clone();
         let old_for_key = old.clone();
-        let cap = layout::keycap(p, label.clone());
+        let cap = layout::keycap(p, label.clone()).when(recording || old.is_none(), |cap| {
+            cap.font_family(crate::ui::FONT_UI)
+        });
         let cap = if recording {
             cap.border_color(p.primary).text_color(p.primary)
         } else {
@@ -804,7 +823,7 @@ impl SettingsView {
                 }
                 visible_count += 1;
 
-                let mut caps = layout::controls();
+                let mut caps = layout::controls().flex_wrap().flex_shrink_1().min_w_0();
                 for key in &current {
                     let del_id = format!("sc-del-{action}-{key}");
                     let del_selector = del_id.clone();
@@ -896,6 +915,8 @@ impl SettingsView {
                     layout::row(p)
                         .id(SharedString::from(row_id.clone()))
                         .debug_selector(move || row_id.clone())
+                        .flex_col()
+                        .items_start()
                         .py_2()
                         .child(left)
                         .child(caps),
@@ -1064,11 +1085,7 @@ impl SettingsView {
             .gap_3()
             .child(
                 layout::row(p)
-                    .child(layout::label(
-                        p,
-                        text::SHORTCUTS_TITLE.get(),
-                        Some(text::SHORTCUTS_DESC.get()),
-                    ))
+                    .child(layout::label(p, text::SHORTCUTS_TITLE.get(), None))
                     .child(
                         layout::controls()
                             .child(

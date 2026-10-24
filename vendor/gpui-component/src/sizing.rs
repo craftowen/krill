@@ -1,4 +1,6 @@
-use gpui::{Edges, Pixels, Styled, px};
+// Krill patch: control typography follows the application's 11/12/14px rem scale.
+// Keep in sync with krill-app/src/ui/theme.rs; its regression test checks these styles.
+use gpui::{Edges, Pixels, Styled, px, rems};
 use serde::{Deserialize, Serialize};
 
 /// A size for elements.
@@ -250,10 +252,9 @@ impl<T: Styled> StyleSized<T> for T {
     #[inline]
     fn input_text_size(self, size: Size) -> Self {
         match size {
-            Size::XSmall => self.text_xs(),
-            Size::Small => self.text_sm(),
-            Size::Medium => self.text_sm(),
-            Size::Large => self.text_base(),
+            Size::XSmall => self.text_size(rems(11. / 16.)),
+            Size::Small | Size::Medium => self.text_size(rems(12. / 16.)),
+            Size::Large => self.text_size(rems(14. / 16.)),
             Size::Size(size) => self.text_size(size * 0.875),
         }
     }
@@ -329,9 +330,9 @@ impl<T: Styled> StyleSized<T> for T {
     fn table_cell_size(self, size: Size) -> Self {
         let padding = size.table_cell_padding();
         match size {
-            Size::XSmall => self.text_xs(),
-            Size::Small | Size::Medium => self.text_sm(),
-            Size::Large => self.text_base(),
+            Size::XSmall => self.text_size(rems(11. / 16.)),
+            Size::Small | Size::Medium => self.text_size(rems(12. / 16.)),
+            Size::Large => self.text_size(rems(14. / 16.)),
             _ => self,
         }
         .pl(padding.left)
@@ -342,9 +343,9 @@ impl<T: Styled> StyleSized<T> for T {
 
     fn button_text_size(self, size: Size) -> Self {
         match size {
-            Size::XSmall => self.text_xs(),
-            Size::Small | Size::Medium => self.text_sm(),
-            _ => self.text_base(),
+            Size::XSmall => self.text_size(rems(11. / 16.)),
+            Size::Small | Size::Medium => self.text_size(rems(12. / 16.)),
+            _ => self.text_size(rems(14. / 16.)),
         }
     }
 }

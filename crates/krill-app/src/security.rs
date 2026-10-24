@@ -1,8 +1,8 @@
 //! 터미널 보안 강화(MK-076, T3#25):
 //!
-//! 1. **OSC 8 URL 미리보기**: 링크 칸 위에 마우스를 올리면 열기 전에 실제 대상 URL을 미리보기 툴팁으로 보여준다.
-//!    열기는 Cmd+클릭으로만 동작하며(`http://`·`https://`·`mailto:`·`file://`만 허용, 제어·양방향 위장 문자 거부),
-//!    일반 클릭은 링크를 열지 않는다.
+//! 1. **링크 팝오버**: 링크(OSC 8·평문 URL)를 맨 클릭하면 바로 열지 않고 클릭한 자리에 실제 대상 URL과
+//!    복사·브라우저 열기 버튼을 띄운다(Orca식). Cmd+클릭은 바로 연다(`http://`·`https://`·`mailto:`·`file://`만 허용,
+//!    제어·양방향 위장 문자 거부).
 //! 2. **창 제목(OSC 0·2) 제어문자 필터**: 데몬 엔진(`krilld::term`)·프로토콜(`krill_proto::screen::sanitize_title`)·
 //!    UI 탭 제목 모두에서 제어 문자(C0·DEL·C1)와 양방향(Bidi) 방향 전환 문자를 걸러 낸다.
 //! 3. **여러 줄 붙여넣기 경고**: 프로그램이 bracketed paste(`?2004h`)를 켰으면 `ESC[200~`…`ESC[201~`로 감싸
@@ -24,10 +24,19 @@ const PREVIEW_CHARS: usize = 48;
 /// 사용자에게 보이는 ko/en 문자열 키(MK-094).
 pub use crate::i18n::catalog::security as text;
 
-/// OSC 8 링크 칸 위에 포인터가 있을 때 보여줄 미리보기 문구(실제 대상 URL + 안내).
-pub fn format_link_preview(uri: &str) -> String {
-    let clean = sanitize_title(uri);
-    format!("{clean} ({})", text::LINK_HINT.get())
+/// 맨 클릭으로 연 링크 팝오버: 칸, 실제 대상 URL, 클릭한 창 좌표.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkMenu {
+    pub pane: PaneId,
+    pub uri: String,
+    pub position: gpui::Point<gpui::Pixels>,
+}
+
+impl LinkMenu {
+    /// 팝오버에 보일 URL(제어·양방향 위장 문자 제거).
+    pub fn display_uri(&self) -> String {
+        sanitize_title(&self.uri)
+    }
 }
 
 /// 붙여넣을 바이트에 줄바꿈(`\n` 또는 `\r`)이 들어 있는지 판정한다.
@@ -133,10 +142,10 @@ fn preview_paste(text: &[u8]) -> String {
     out
 }
 
-/// 셸이 들고 있는 보안 상태(OSC 8 링크 미리보기, 보류 중인 여러 줄 붙여넣기, Secure Keyboard Entry).
+/// 셸이 들고 있는 보안 상태(링크 팝오버, 보류 중인 여러 줄 붙여넣기, Secure Keyboard Entry).
 #[derive(Debug)]
 pub struct State {
-    hover_link: Option<(PaneId, String)>,
+    link_menu: Option<LinkMenu>,
     pending_paste: Option<PendingPaste>,
     secure_keyboard: bool,
     window_active: bool,
@@ -152,7 +161,7 @@ impl Default for State {
 impl State {
     pub fn with_applier(apply_secure: fn(bool) -> bool) -> Self {
         Self {
-            hover_link: None,
+            link_menu: None,
             pending_paste: None,
             secure_keyboard: false,
             window_active: true,
@@ -160,21 +169,18 @@ impl State {
         }
     }
 
-    /// 현재 포인터 아래의 OSC 8 링크 미리보기를 갱신한다. 값이 바뀌었으면 `true`.
-    pub fn set_hover_link(&mut self, next: Option<(PaneId, String)>) -> bool {
-        if self.hover_link == next {
-            return false;
-        }
-        self.hover_link = next;
-        true
+    /// 열려 있는 링크 팝오버.
+    pub fn link_menu(&self) -> Option<&LinkMenu> {
+        self.link_menu.as_ref()
     }
 
-    /// `pane`에서 현재 가리키고 있는 OSC 8 링크 URI.
-    pub fn hover_uri(&self, pane: PaneId) -> Option<&str> {
-        self.hover_link
-            .as_ref()
-            .filter(|(p, _)| *p == pane)
-            .map(|(_, uri)| uri.as_str())
+    /// 링크 팝오버를 열거나(`Some`) 닫는다(`None`). 값이 바뀌었으면 `true`.
+    pub fn set_link_menu(&mut self, next: Option<LinkMenu>) -> bool {
+        if self.link_menu == next {
+            return false;
+        }
+        self.link_menu = next;
+        true
     }
 
     /// 보류 중인 여러 줄 붙여넣기.
@@ -190,14 +196,14 @@ impl State {
         self.pending_paste.take()
     }
 
-    /// 안 보이게 된 칸의 링크 미리보기·보류 붙여넣기를 정리한다.
+    /// 안 보이게 된 칸의 링크 팝오버·보류 붙여넣기를 정리한다.
     pub fn retain_panes(&mut self, visible: &[PaneId]) {
         if self
-            .hover_link
+            .link_menu
             .as_ref()
-            .is_some_and(|(p, _)| !visible.contains(p))
+            .is_some_and(|m| !visible.contains(&m.pane))
         {
-            self.hover_link = None;
+            self.link_menu = None;
         }
         if self
             .pending_paste
@@ -269,13 +275,27 @@ mod tests {
     fn title_filter_strips_control_and_bidi_chars() {
         let raw = "빌드\x00\x07\x08\t\r\n\x1b[2J\x7f\u{009b}\u{202e} 완료";
         assert_eq!(sanitize_title(raw), "빌드[2J 완료");
-        let preview = format_link_preview("https://example.com/\x1b\u{202e}path");
-        let expected = if cfg!(target_os = "macos") {
-            "https://example.com/path (⌘+클릭하여 열기)"
-        } else {
-            "https://example.com/path (Ctrl+클릭하여 열기)"
+    }
+
+    #[test]
+    fn link_menu_shows_clean_target_and_closes_with_its_pane() {
+        let p = pane();
+        let menu = LinkMenu {
+            pane: p,
+            uri: "https://example.com/\x1b\u{202e}path".into(),
+            position: gpui::point(gpui::px(10.), gpui::px(20.)),
         };
-        assert_eq!(preview, expected);
+        assert_eq!(menu.display_uri(), "https://example.com/path");
+        let mut state = State::with_applier(|_| true);
+        assert!(state.set_link_menu(Some(menu.clone())));
+        assert!(
+            !state.set_link_menu(Some(menu.clone())),
+            "같은 팝오버는 다시 그리지 않는다"
+        );
+        state.retain_panes(&[p]);
+        assert_eq!(state.link_menu(), Some(&menu));
+        state.retain_panes(&[]);
+        assert_eq!(state.link_menu(), None, "칸이 사라지면 팝오버도 닫힌다");
     }
 
     #[test]

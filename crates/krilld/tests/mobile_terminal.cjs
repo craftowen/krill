@@ -174,6 +174,7 @@ async function main(){
  await testHistoryGestures();
  await testHistoryPrefetch();
  await testScrollAnchor();
+ await testEmptyHistoryHidden();
  await testFailurePaths();
  console.log('All terminal adapter regression checks passed.');
 }
@@ -187,6 +188,13 @@ async function testHistoryPrefetch(){
  const partial=await mount(1302),pp=find(partial.root,'terminal-scroll');pp.clientHeight=400;pp.scrollHeight=20000;partial.handle.loadHistory();
  const pr=()=>partial.socket.sent.filter(a=>a[4]===0x12).at(-1),respond=(total,skip,n)=>{const r=T.reader(pr().slice(5));partial.socket.frame(0x26,T.v(r.n()),T.v(total),T.v(1),T.v(skip),T.v(n),...Array(n).fill(row));};respond(160,0,160);await advance(0);respond(5000,0,300);await advance(0);respond(5000,300,300);await advance(0);r=T.reader(pr().slice(5));r.n();r.n();r.n();r.n();assert.equal(r.n(),140);respond(5000,600,140);await advance(0);assert.equal(find(partial.root,'terminal-history').children.length,900);assert.equal(find(partial.root,'terminal-grid').hidden,false);partial.handle.unmount();
  console.log('PASS 900 rows warm before scrolling, 3-viewport lookahead, existing DOM retained, 1000-row bound, hidden/unmounted terminals stop warming');
+}
+// 새 세션처럼 빈 기록을 자동으로 처음 불러올 때는 기록 줄이 잠깐 보였다 사라지며 터미널을 밀지 않는다. 행이 온 뒤에는 보인다.
+async function testEmptyHistoryHidden(){
+ const {root,handle,socket}=await mount(1500),controls=find(root,'terminal-history-controls'),requests=()=>socket.sent.filter(a=>a[4]===0x12),row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),reply=(total,pages,n)=>{const r=T.reader(requests().at(-1).slice(5));socket.frame(0x26,T.v(r.n()),T.v(total),T.v(pages),T.v(0),T.v(n),...Array(n).fill(row));};
+ handle.loadHistory();assert.equal(requests().length,1);assert.equal(controls.hidden,true);reply(0,0,0);assert.equal(controls.hidden,true);
+ socket.screen('out 0');await flush();handle.loadHistory();assert.equal(controls.hidden,true);reply(5,1,5);assert.equal(controls.hidden,false);socket.screen('out 1');await flush();handle.loadHistory(true);assert.equal(controls.hidden,false);handle.unmount();
+ console.log('PASS empty automatic history load never shows the history row; loaded rows do');
 }
 // 레이아웃을 흉내 낸 스크롤 포트(scrollTop 고정 범위, 히스토리 행 18px + 캔버스 400px)로 손가락 스크롤 위치 보존을 확인한다.
 async function testScrollAnchor(){
@@ -234,7 +242,7 @@ async function testHistoryGestures(){
 async function testFailurePaths(){
  let {root,handle,socket}=await mount(701,{preferences:{inputMode:'direct'},onPhoto:()=>{}});socket.autoAck=true;handle.focus();let capture=find(root,'live-capture');
  const hello=socket.sent.find(a=>a[4]===2),hr=T.reader(hello.slice(5));hr.n();hr.n();assert(hr.u()&8192n);
- assert.equal(find(root,'photo-picker').accept,'image/*');assert.equal(find(root,'file-picker').accept,'image/*');
+ const photo=find(root,'photo-attach'),accessory=find(root,'accessory-row');assert.equal(photo.parent,accessory,'Direct mode exposes the photo action outside its hidden buffered form');assert.equal(accessory.hidden,undefined);assert.equal(find(root,'buffered-command').hidden,true);let picked=0;find(root,'photo-picker').click=()=>picked++;event(photo,'click');assert.equal(picked,1,'Direct photo action opens its existing image picker without sending input');assert.equal(inputs(socket).length,0);assert.equal(find(root,'photo-picker').accept,'image/*');assert.equal(find(root,'file-picker').accept,'image/*');
  socket.frame(0x2b,Uint8Array.of(0),T.v(32));event(capture,'paste',{clipboardData:{getData:()=>'one\r\ntwo\x1b[201~'}});await flush();assert.deepEqual(inputs(socket),['\x1b[200~one\ntwo[201~\x1b[201~']);
  capture.value='fallback\npaste';event(capture,'input',{inputType:'insertFromPaste'});await flush();assert.equal(inputs(socket).at(-1),'\x1b[200~fallback\npaste\x1b[201~');
  socket.frame(0x2b,Uint8Array.of(0),T.v(0));capture.value='review\nsecond';event(capture,'input',{inputType:'insertFromPaste'});await flush();const review=root.children.at(-1).children.at(-1),editor=review.children[0].children[0];assert.equal(editor.tagName,'textarea');assert.equal(editor.value,'review\nsecond');const before=inputs(socket).length;assert.equal(before,2);

@@ -1,4 +1,5 @@
-//! OWE-714: 점검 ID별 조치. 파일·시스템 작업은 백그라운드에서, hook 적용은 diff 동의 뒤 실행한다.
+//! OWE-714: 점검 ID별 조치. 파일·시스템 작업은 백그라운드에서 수행한다.
+//! 수동 훅 설치는 diff 확인 뒤 실행하며, 상태 감지가 켜져 있으면 자동으로도 설치한다.
 
 use std::ffi::OsStr;
 use std::io;
@@ -529,6 +530,9 @@ fn publish(id: &str, message: String, cx: &mut App) {
             message,
         });
     }
+    if id == perm::NOTIFICATIONS_ID {
+        notifications::watch_permission(cx);
+    }
 }
 
 pub fn dismiss_need(id: &str, cx: &mut App) {
@@ -570,34 +574,21 @@ pub(super) fn hook_needed_content(agent: TargetAgent) -> (String, String) {
     )
 }
 
-/// 새 에이전트 세션에 hook 설치를 안내한다. 설정 변경은 동의 뒤에만 한다.
+/// 상태 감지가 켜져 있으면 누락된 훅을 설치하고 실패한 경우에만 안내한다.
 pub fn note_agent_session(agent: &str, cx: &mut App) {
     let Some(agent) = TargetAgent::parse(agent) else {
         return;
     };
-    let Some(state) = krill_proto::daemon::state_dir() else {
+    let Some(env) = Env::current() else {
         return;
     };
-    if !cx
-        .default_global::<AccessAttempts>()
-        .agents
-        .insert(agent.id().to_owned())
-    {
+    if env.state != super::default_state_dir(&env.home) {
         return;
     }
-    let check = cx
-        .background_executor()
-        .spawn(async move { hook_installed(&state, agent.id()) });
-    cx.spawn(async move |cx| {
-        if !check.await {
-            cx.update(|cx| {
-                let (id, message) = hook_needed_content(agent);
-                publish(&id, message, cx);
-            });
-        }
-    })
-    .detach();
+    hook_notice::note_agent_session_at(agent, env, cx);
 }
+
+pub(crate) use hook_notice::ensure_current;
 
 fn hook_installed(state: &Path, agent: &str) -> bool {
     std::fs::read(state.join("hooks").join(format!("{agent}.json")))
@@ -688,7 +679,7 @@ pub(super) fn report_failure(id: &str, error: String, cx: &mut App) {
     publish(id, error, cx);
 }
 
-/// 첫 실행 시작 준비(OWE-904: 동의 없이 `offer`가 부른다). hook과 권한은 변경하지 않는다.
+/// 시작 준비. 상태 감지가 켜져 있으면 훅도 설치하며 OS 권한은 변경하지 않는다.
 pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
     let background = cx.background_executor().clone();
     cx.spawn(async move |cx| {
@@ -698,10 +689,10 @@ pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
                 stage_helpers(&env).map_err(|e| ("bin.helpers", e))?;
                 let path = super::login_path(&env.shell)
                     .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-                install_managed_cli_at(&env, &path).map_err(|e| ("cli.path", e))?;
                 if crate::settings::agent_status_hooks_enabled_at(&env.state) {
                     install_default_hooks(&env, &path);
                 }
+                install_managed_cli_at(&env, &path).map_err(|e| ("cli.path", e))?;
                 Ok(())
             })
             .await;
@@ -728,7 +719,7 @@ const HOOK_AGENTS: [(TargetAgent, &str); 5] = [
 /// 설정의 상태 감지 훅 스위치를 바꾼 직후 백그라운드에서 반영한다. 켜면 설치된 에이전트에 훅을
 /// 설치하고, 끄면 Krill 설치 영수증이 있는 훅만 되돌린다(사용자가 고친 항목은 남는다).
 pub fn apply_hook_preference(env: Env, enabled: bool, cx: &mut App) -> Task<()> {
-    if env.is_isolated_state() {
+    if env.state != super::default_state_dir(&env.home) {
         return Task::ready(());
     }
     cx.background_executor().spawn(async move {
@@ -744,6 +735,9 @@ pub fn apply_hook_preference(env: Env, enabled: bool, cx: &mut App) -> Task<()> 
 
 /// Krill이 설치한(영수증이 있는) 상태 감지 훅을 되돌린다. 실패는 로그만 남긴다.
 fn uninstall_default_hooks(env: &Env, path: &OsStr) {
+    let _guard = hook_notice::INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = match canonical_path(&env.state) {
         Ok(state) => state,
         Err(error) => {
@@ -779,15 +773,14 @@ fn install_default_hooks(env: &Env, path: &OsStr) {
         if krill_proto::agent::which(program, path).is_none() {
             continue;
         }
-        let result = prepare_hook_with_path(agent, env, Some(path)).and_then(|prepared| {
-            prepared.map_or(Ok(()), |(_, plan)| apply_hook(plan).map_err(FixError::from))
-        });
+        let result = hook_notice::install_enabled(agent, env, Some(path));
         if let Err(error) = result {
             tracing::warn!(agent = agent.id(), ?error, "default hook install skipped");
         }
     }
 }
 
+mod hook_notice;
 mod notifications;
 pub use notifications::{dismiss_notification, show_notification};
 

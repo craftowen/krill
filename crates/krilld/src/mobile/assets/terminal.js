@@ -10,7 +10,7 @@ globalThis.MkKeyboard=(()=>{
  const occlusion=()=>!vv||Math.abs((vv.scale??1)-1)>.01?0:Math.max(0,Math.round(innerHeight-vv.height-vv.offsetTop));
  const measure=()=>{frame=0;let next=occlusion();
   // iOS는 포커스한 입력을 키보드 위로 보이려고 문서를 민다. 셸은 고정이고 dock·composer·sheet는 inset만큼 스스로 올라가므로 문서 위치를 되돌린다.
-  if(next>0&&doc?.activeElement?.closest?.('.command-dock,.chat-composer,.sheet')&&((globalThis.scrollY||0)>0||(vv.offsetTop||0)>0)){globalThis.scrollTo?.(0,0);next=occlusion();}
+  if(next>0&&doc?.activeElement?.closest?.('.command-dock,.chat-composer,.sheet,.workspace-search,.gate-card')&&((globalThis.scrollY||0)>0||(vv.offsetTop||0)>0)){globalThis.scrollTo?.(0,0);next=occlusion();}
   const changed=next!==inset,notify=changed||resized;resized=false;if(changed){inset=next;doc?.documentElement?.style.setProperty('--keyboard-inset',`${inset}px`);}
   // 스크롤·포커스만 있었던 프레임은 알리지 않는다(구독자의 Fit 디바운스를 다시 걸지 않게).
   if(notify)for(const fn of listeners)fn(inset);};
@@ -112,10 +112,10 @@ globalThis.MkTerminalCodec=(()=>{
    const ids=[...new Set([...ordered,...KEYS.map(k=>k.id)])];for(const id of ids){const key=KEYS.find(k=>k.id===id);if(!key||visible&&!visible.includes(id))continue;const b=button('accessory-key',key.label);b.dataset.keyId=id;b.dataset.testid=`terminal-key-${id}`;keybar.append(b);this.bindKey(b,key);}
    // 직접 입력의 키보드 열기는 키 줄 왼쪽 고정 버튼이다(열리면 Dismiss로 바뀜). 별도 입력 줄은 buffered에서만 보여 터미널 행을 더 쓴다.
    this.live=button('dismiss-keyboard show-keyboard','Show keyboard','keyboard');accessory.append(this.dismiss,this.live,keybar);const inputRow=this.inputRow=make('div','input-row');
-   this.capture=make('textarea','live-capture');this.capture.rows=1;this.capture.tabIndex=-1;this.capture.setAttribute('aria-label','Terminal direct input');this.capture.setAttribute('autocapitalize','none');this.capture.setAttribute('autocorrect','off');this.capture.setAttribute('autocomplete','off');this.capture.spellcheck=false;
+   this.capture=make('textarea','live-capture');this.capture.rows=1;this.capture.tabIndex=-1;this.capture.setAttribute('aria-label',translate('Terminal direct input'));this.capture.setAttribute('autocapitalize','none');this.capture.setAttribute('autocorrect','off');this.capture.setAttribute('autocomplete','off');this.capture.spellcheck=false;
    this.form=make('form','buffered-command');this.command=make('textarea','command-input');this.command.rows=1;this.command.placeholder=translate('Type a command…');this.command.setAttribute('aria-label',translate('Command'));this.command.setAttribute('enterkeyhint','enter');this.command.autocomplete='off';this.command.setAttribute('autocapitalize','none');this.command.spellcheck=false;this.command.value=drafts.get(this.stateKey)||'';
    this.sendButton=button('command-send','Send command','send');this.sendButton.type='submit';this.form.append(this.command,this.sendButton);inputRow.append(this.form);
-   if(this.options.onPhoto){const photo=button('photo-attach','Attach photo','photo'),images=make('input','photo-picker'),files=make('input','file-picker');images.type=files.type='file';images.accept=files.accept='image/*';images.setAttribute('aria-label','Choose photo');files.setAttribute('aria-label','Choose image file');images.hidden=files.hidden=true;this.form.prepend(photo);accessory.append(images,files);let held=false,timer;
+   if(this.options.onPhoto){const photo=button('photo-attach','Attach photo','photo'),images=make('input','photo-picker'),files=make('input','file-picker');images.type=files.type='file';images.accept=files.accept='image/*';images.setAttribute('aria-label',translate('Choose photo'));files.setAttribute('aria-label',translate('Choose image file'));images.hidden=files.hidden=true;accessory.append(photo);accessory.append(images,files);let held=false,timer;
     this.listen(photo,'pointerdown',()=>{held=false;timer=setTimeout(()=>{held=true;(globalThis.KrillMobile?.updates?.pickFile||((p)=>p.click()))(files);},350);});for(const event of ['pointerup','pointercancel','pointerleave'])this.listen(photo,event,()=>clearTimeout(timer));this.listen(photo,'click',()=>{if(!held)(globalThis.KrillMobile?.updates?.pickFile||((p)=>p.click()))(images);});this.listen(this.abort.signal,'abort',()=>clearTimeout(timer));
     for(const picker of [images,files])this.listen(picker,'change',()=>{const file=picker.files?.[0];if(file)this.guard(()=>this.options.onPhoto(file));picker.value='';});
    }
@@ -179,7 +179,7 @@ globalThis.MkTerminalCodec=(()=>{
    if(this.termModes&&this.termModes.flags&32){this.guard(()=>this.controlInput(prefix+'\x1b[200~'+clean+'\x1b[201~'));return;}
    if(!/[\n\t]/.test(clean)){this.guard(()=>this.controlInput(prefix+clean));return;}
    // Live paste without bracketed-paste support needs an explicit review before sending.
-   this.cancelPaste();const generation=this.generation,inputGeneration=this.inputGeneration,review=this.pasteReview=make('form','buffered-command'),label=make('label',null,translate('Review paste — sending may run commands')),editor=make('textarea','command-input'),send=button('primary','Send paste'),cancel=button('ghost','Cancel');editor.value=clean;editor.setAttribute('aria-label',translate('Review multiline paste'));send.type='submit';label.append(editor);review.append(label,send,cancel);this.dock.append(review);this.capture.blur();this.stopRepeat();
+   this.cancelPaste();const generation=this.generation,inputGeneration=this.inputGeneration,review=this.pasteReview=make('form','buffered-command'),label=make('label',null,translate('Review paste — sending may run commands')),editor=make('textarea','command-input'),send=button('primary','Send paste'),cancel=button('ghost','Cancel');review.classList.add('paste-review');editor.value=clean;editor.setAttribute('aria-label',translate('Review multiline paste'));send.type='submit';label.append(editor);review.append(label,send,cancel);this.dock.append(review);this.capture.blur();this.stopRepeat();
    let composing=false;this.listen(editor,'compositionstart',()=>composing=true);this.listen(editor,'compositionend',()=>composing=false);this.listen(cancel,'click',()=>{this.cancelPaste();this.focus();});this.listen(review,'submit',e=>{e.preventDefault();if(composing||e.isComposing||send.disabled||review!==this.pasteReview)return;send.disabled=true;const value=editor.value.replace(/\r\n?/g,'\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'');if(generation!==this.generation||inputGeneration!==this.inputGeneration||!this.isVisible()){this.cancelPaste();return;}const bytes=this.termModes&&this.termModes.flags&32?'\x1b[200~'+value+'\x1b[201~':value.replace(/\n/g,'\r');this.cancelPaste();this.guard(()=>this.controlInput(prefix+bytes));});editor.focus();
   }
   cancelPaste(){this.pasteReview?.remove();this.pasteReview=null;}
@@ -268,7 +268,8 @@ globalThis.MkTerminalCodec=(()=>{
    if(!this.ready||this.historyPending||this.disposed)return;
    refresh=refresh||this.historyEnd&&!this.historyRows.length&&this.historyLoadedVersion!==(this.historyVersion||0);
    if(this.historyEnd&&!refresh)return;
-   this.historyReveal=reveal===true;this.historyControls.hidden=false;
+   // 자동 첫 로드(새 세션 포함)는 받은 행이 생길 때까지 줄을 숨겨, 빈 기록에 '불러오는 중' 줄이 잠깐 끼었다 빠지며 터미널을 밀지 않게 한다.
+   this.historyReveal=reveal===true;if(this.historyReveal||this.historyRows.length)this.historyControls.hidden=false;
    // 새로고침은 이미 받은 행 수만큼 받아 캔버스 위 높이를 그대로 둔다. 손가락·관성 스크롤 중 scrollTop을 고치면 관성이 끊긴다.
    if(refresh){this.historyReplacing=true;count=Math.min(1000,Math.max(count,this.historyRows.length));}const req=++this.historyId,source=refresh?null:this.historySource,skip=refresh?0:this.historySkip;
    this.historyPending={req,source,skip,refresh,replace:this.historyReplacing,started:globalThis.performance?.now?.()??Date.now(),version:this.historyVersion||0};this.historyButton.disabled=true;this.historyStatus.textContent=translate('Loading earlier output…');
@@ -286,14 +287,13 @@ globalThis.MkTerminalCodec=(()=>{
    const reveal=this.historyReveal,following=this.stick,before=this.canvas.offsetTop??this.port.scrollHeight,anchor=this.historyElement.children[0]?.getBoundingClientRect?.().top,oldRows=pending.replace?[]:this.historyRows,combined=[...reply.rows,...oldRows];
    // Keep a bounded window while continuing into older cold pages. Returning to
    // live output restores the canvas instead of joining discontiguous rows.
-   this.historyWindowed=(!pending.replace&&this.historyWindowed)||combined.length>1000;this.historyRows=combined.slice(0,1000);this.canvas.hidden=this.historyWindowed;if(this.historyWindowed)this.stick=false;
+   this.historyWindowed=(!pending.replace&&this.historyWindowed)||combined.length>1000;this.historyRows=combined.slice(0,1000);this.historyControls.hidden=!this.historyRows.length;this.canvas.hidden=this.historyWindowed;if(this.historyWindowed)this.stick=false;
    const added=reply.rows.map(row=>{const line=make('span','terminal-history-row');line.append(...this.historyRow(row),'\n');return line;});
    // Already-visible rows keep their DOM, selection and layout. Only new rows are built.
    if(pending.replace)this.historyElement.replaceChildren(...added);else this.historyElement.prepend(...added);
    while(this.historyElement.children.length>1000)this.historyElement.children[this.historyElement.children.length-1].remove();
    if(following&&!this.historyReveal&&!this.historyWindowed)this.scrollBottom();else{const moved=!pending.replace&&anchor!=null?this.historyElement.children[reply.rows.length]?.getBoundingClientRect?.().top-anchor:null,delta=moved??(this.historyWindowed?reply.rows.length*this.cellHeight:(this.canvas.offsetTop??this.port.scrollHeight)-before);if(delta)this.port.scrollTop+=delta;}
    this.historyButton.disabled=this.historyEnd;this.historyStatus.textContent=translate(this.historyEnd?'Beginning of saved output':'Scroll up for earlier output');
-   if(this.historyEnd&&!this.historyRows.length)this.historyControls.hidden=true;
    if(this.historyReveal){this.historyReveal=false;this.port.scrollTop=0;this.stick=false;}
    this.latestButton.hidden=this.stick&&!this.historyWindowed;
    // A hot refresh can return the same rows after a resize. Continue the upward

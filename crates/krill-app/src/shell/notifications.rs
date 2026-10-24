@@ -175,7 +175,7 @@ impl Shell {
                 Value::Fix(need) => {
                     let need = need.clone();
                     Notification::new()
-                        .autohide(false)
+                        .autohide(need.check_id.starts_with("hook."))
                         .content(move |_, _, cx| {
                             krill_app::onboarding::banner::render_need(need.clone(), cx)
                         })

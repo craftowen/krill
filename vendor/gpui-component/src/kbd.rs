@@ -1,10 +1,11 @@
+// Krill patch: keycaps use the 11px control caption scale and monospace font.
 use gpui::{
     Action, AsKeystroke, FocusHandle, Half, InteractiveElement as _, IntoElement, KeyBinding,
     KeyContext, Keystroke, ParentElement as _, RenderOnce, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder as _, relative,
 };
 
-use crate::{ActiveTheme, StyledExt};
+use crate::{ActiveTheme, Size, StyleSized, StyledExt};
 
 /// A tag for displaying keyboard keybindings.
 #[derive(IntoElement, Clone, Debug)]
@@ -239,6 +240,7 @@ impl RenderOnce for Kbd {
             // Lets a test ask whether a given shortcut hint was painted this
             // frame; a no-op outside test-support builds.
             .debug_selector(|| format!("kbd:{}", self.stroke.unparse()))
+            .font_family(cx.theme().mono_font_family.clone())
             .text_color(cx.theme().muted_foreground)
             .bg(cx.theme().tokens.muted)
             .when(self.outline, |this| {
@@ -252,7 +254,7 @@ impl RenderOnce for Kbd {
             .text_center()
             .rounded(cx.theme().radius.half())
             .line_height(relative(1.))
-            .text_xs()
+            .input_text_size(Size::XSmall)
             .whitespace_normal()
             .flex_shrink_0()
             .refine_style(&self.style)

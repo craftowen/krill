@@ -142,6 +142,20 @@ pub trait Runner: Send + Sync {
         Ok(())
     }
 
+    fn merge_context_branch(&self, _folder: &Path) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// 기존 runner에는 명시 PR URL을 전달하고, gh runner는 head 일치도 강제한다.
+    fn merge_pr_snapshot(
+        &self,
+        folder: &Path,
+        target: &PrInspection,
+        method: PrMergeMethod,
+    ) -> io::Result<()> {
+        self.merge_pr(folder, &target.url, method)
+    }
+
     fn set_pr_draft(&self, folder: &Path, branch: &str, to_draft: bool) -> io::Result<()> {
         let _ = (folder, branch, to_draft);
         Ok(())
@@ -356,6 +370,44 @@ impl Service {
         })
     }
 
+    /// 확인한 PR과 현재 스냅샷이 같을 때만 명시 PR 대상을 병합한다.
+    pub fn merge_confirmed(
+        &self,
+        folder: &Path,
+        branch: &str,
+        target: &PrInspection,
+        method: PrMergeMethod,
+    ) -> Result<(), String> {
+        if !target.mergeable_snapshot() {
+            return Err(text::MERGE_TARGET_MISSING.get().to_owned());
+        }
+        let _slot = self.reserve_slot(Instant::now()).map_err(str::to_owned)?;
+        if self
+            .runner
+            .merge_context_branch(folder)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|current| current != branch)
+        {
+            return Err(text::MERGE_TARGET_CHANGED.get().to_owned());
+        }
+        let current = self
+            .runner
+            .inspect_pr(folder, branch)
+            .map_err(|error| error.to_string())?;
+        if !current.same_merge_target(target)
+            || self
+                .runner
+                .merge_context_branch(folder)
+                .map_err(|error| error.to_string())?
+                .is_some_and(|current| current != branch)
+        {
+            return Err(text::MERGE_TARGET_CHANGED.get().to_owned());
+        }
+        self.runner
+            .merge_pr_snapshot(folder, target, method)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn set_draft(
         &self,
         folder: &Path,
@@ -467,6 +519,22 @@ impl Runner for Gh {
         Ok(())
     }
 
+    fn merge_context_branch(&self, folder: &Path) -> io::Result<Option<String>> {
+        git_output(folder, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|branch| Some(branch.trim().to_owned()))
+    }
+
+    fn merge_pr_snapshot(
+        &self,
+        folder: &Path,
+        target: &PrInspection,
+        method: PrMergeMethod,
+    ) -> io::Result<()> {
+        let mut cmd = confirmed_merge_command(folder, target, method)?;
+        execute(&mut cmd, TIMEOUT)?;
+        Ok(())
+    }
+
     fn set_pr_draft(&self, folder: &Path, branch: &str, to_draft: bool) -> io::Result<()> {
         let mut cmd = ready_command(folder, branch, to_draft);
         execute(&mut cmd, TIMEOUT)?;
@@ -547,6 +615,24 @@ pub fn merge_command(folder: &Path, branch: &str, method: PrMergeMethod) -> Comm
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["pr", "merge", branch, method.flag()]);
     cmd
+}
+
+/// PR URL과 head OID를 고정해 조회 이후 새 커밋이 올라와도 잘못 병합하지 않는다.
+pub fn confirmed_merge_command(
+    folder: &Path,
+    target: &PrInspection,
+    method: PrMergeMethod,
+) -> io::Result<Command> {
+    let Some(metadata) = target
+        .metadata
+        .as_ref()
+        .filter(|_| target.mergeable_snapshot())
+    else {
+        return Err(io::Error::other(text::MERGE_TARGET_MISSING.get()));
+    };
+    let mut cmd = merge_command(folder, &target.url, method);
+    cmd.args(["--match-head-commit", metadata.head_ref_oid.as_str()]);
+    Ok(cmd)
 }
 
 pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
@@ -1081,6 +1167,8 @@ impl Render for Dialog {
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
