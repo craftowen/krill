@@ -835,10 +835,21 @@ fn remote_line_text(state: Option<&RemoteCardState>) -> (String, bool) {
         ),
         RemoteProbeState::Ready(info) => {
             let os = info.platform.describe();
+            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
+            // Windows 원격은 원격 krill 중계로 붙는다. Mac 바이너리를 보낼 수 없어 설치·업데이트는 그 PC에서 한다.
+            if info.platform.os == krill_hosts::managed::RemoteOs::Windows {
+                let version = match &info.version {
+                    RemoteVersion::Known(v) => format!("krill {}", short(v)),
+                    _ => text::SSH_REMOTE_UNKNOWN_VERSION.get().to_owned(),
+                };
+                return (
+                    text::SSH_REMOTE_WINDOWS.format(&[("os", &os), ("version", &version)]),
+                    false,
+                );
+            }
             if !info.platform.is_supported() {
                 return (text::SSH_REMOTE_UNSUPPORTED.format(&[("os", &os)]), false);
             }
-            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
             match &info.version {
                 RemoteVersion::Missing => (
                     format!("{os} · {}", text::SSH_REMOTE_NOT_INSTALLED.get()),

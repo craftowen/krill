@@ -1097,6 +1097,32 @@ fn owe897_managed_remote_card_shows_probe_and_confirmed_remove(cx: &mut TestAppC
     fs::remove_dir_all(d).ok();
 }
 
+#[test]
+fn windows_remote_card_shows_version_without_install() {
+    use krill_hosts::managed::{RemoteArch, RemoteInfo, RemoteOs, RemotePlatform, RemoteVersion};
+
+    let state = RemoteCardState {
+        probe: RemoteProbeState::Ready(RemoteInfo {
+            platform: RemotePlatform {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+                kernel: "windows".into(),
+            },
+            home: String::new(),
+            version: RemoteVersion::Known("0.1.44+abc".into()),
+            socket_bundle: None,
+        }),
+        install: RemoteInstallState::Idle,
+    };
+    let (line, is_error) = remote_line_text(Some(&state));
+    assert!(!is_error);
+    assert!(line.contains("Windows x86_64"), "{line}");
+    assert!(
+        line.contains("krill 0.1.44") && !line.contains("+abc"),
+        "{line}"
+    );
+}
+
 #[gpui::test]
 fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
     use krill_proto::orchestration::{OrchestrationStore, WorktreeStore, install_skill};

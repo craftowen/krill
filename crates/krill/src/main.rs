@@ -84,6 +84,10 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
+    // 원격 SSH 중계: stdout이 IPC 바이트라 로그 초기화·스킬 동기화보다 먼저 처리한다.
+    if raw.first().is_some_and(|s| s == "__bridge") {
+        return remote::bridge_main(&raw);
+    }
     // Hook stdout and its 50 ms budget take precedence over diagnostics.
     // statusline run mode is also tick-hot: no log init, like hooks.
     let hook_run = raw.first().is_some_and(|s| s == "hook")

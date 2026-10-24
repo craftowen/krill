@@ -1234,6 +1234,7 @@ catalog! {
         SSH_REMOTE_NOT_INSTALLED => ("krill 미설치", "krill not installed"),
         SSH_REMOTE_UNKNOWN_VERSION => ("버전 알 수 없음", "Unknown version"),
         SSH_REMOTE_UNSUPPORTED => ("미지원 원격 ({os})", "Unsupported remote ({os})"),
+        SSH_REMOTE_WINDOWS => ("원격: {os} · {version} · 업데이트는 그 PC에서", "Remote: {os} · {version} · Update on that PC"),
         SSH_REMOTE_PROBE_FAILED => ("원격 정보를 가져오지 못했습니다: {error}", "Could not fetch remote info: {error}"),
         SSH_REMOTE_INSTALL_OK => ("{label}: 원격 설치 완료 ({version})", "{label}: Remote install complete ({version})"),
         SSH_REMOTE_DONE => ("설치 완료 ({version})", "Installed ({version})"),        SSH_REMOTE_INSTALL_FAILED => ("{label}: 원격 설치 실패 — {guide}", "{label}: Remote install failed — {guide}"),
