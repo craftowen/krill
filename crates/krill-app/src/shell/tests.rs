@@ -6055,7 +6055,7 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(layout_of(&view, cx).tabs().is_empty());
 }
 
-/// 구현된 아티팩트 목록·에이전트 대시보드·모바일을 표시하고 없는 기능은 표기하지 않는다.
+/// 구현된 아티팩트·대시보드·자동화·모바일을 표시하고 없는 기능은 표기하지 않는다.
 #[gpui::test]
 fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("sidebar-nav-items"));
@@ -6066,12 +6066,23 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
         "implemented Agent Dashboard nav item must be rendered"
     );
     assert!(cx.debug_bounds("nav-artifacts").is_some());
-    for unimplemented in ["nav-tasks", "nav-skills", "nav-automations"] {
+    assert!(cx.debug_bounds("nav-automations").is_some());
+    for unimplemented in ["nav-tasks", "nav-skills"] {
         assert!(
             cx.debug_bounds(unimplemented).is_none(),
             "unimplemented sidebar nav item {unimplemented} must not be rendered"
         );
     }
+
+    let automations = cx.debug_bounds("nav-automations").unwrap();
+    cx.simulate_click(automations.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-page").is_some());
+    assert!(cx.debug_bounds("sidebar-column").is_some());
+    let close = cx.debug_bounds("automations-page-close").unwrap();
+    cx.simulate_click(close.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-page").is_none());
 
     // 'Krill 모바일'은 사이드바를 둔 채 본문에 모바일 페이지를 연다.
     let mobile = cx.debug_bounds("nav-mobile").unwrap();

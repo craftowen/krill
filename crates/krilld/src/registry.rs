@@ -1885,6 +1885,9 @@ impl Registry {
         if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
+            if status.state == control::AgentState::Working {
+                self.agents.clear_rate_limited(id);
+            }
             if status.state == control::AgentState::Done
                 && let Some(tap) = tap
             {
@@ -1895,17 +1898,22 @@ impl Registry {
         // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
         // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
         // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
-        if (status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload))
-            && let Ok(Some(stored)) = self.agents.stored(id)
-            && let Some(launch) = stored.account
-            && let Some(provider) = krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
-        {
-            let account_id = if launch.id.is_empty() {
-                crate::usage::accounts::host_default_id(provider)
-            } else {
-                launch.id
-            };
-            crate::usage::accounts::record_rate_limited(provider, &account_id);
+        if status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload) {
+            if !is_subagent_or_foreign {
+                self.agents.mark_rate_limited(id);
+            }
+            if let Ok(Some(stored)) = self.agents.stored(id)
+                && let Some(launch) = stored.account
+                && let Some(provider) =
+                    krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
+            {
+                let account_id = if launch.id.is_empty() {
+                    crate::usage::accounts::host_default_id(provider)
+                } else {
+                    launch.id
+                };
+                crate::usage::accounts::record_rate_limited(provider, &account_id);
+            }
         }
         Ok(())
     }

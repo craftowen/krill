@@ -1639,3 +1639,83 @@ fn account_for_stored_in_prefers_transcript_path_and_detects_agy_conversations_d
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn codex_no_daemon_probe_and_zsh_wrapper_isolate_sessions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-codex-nodaemon-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let supported_exe = dir.join("codex-modern");
+    std::fs::write(
+        &supported_exe,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  printf 'Usage: codex [--no-daemon]\\n'\n  exit 0\nfi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&supported_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(super::codex::no_daemon_supported_with(&supported_exe));
+
+    let legacy_exe = dir.join("codex-legacy");
+    std::fs::write(
+        &legacy_exe,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  printf 'Usage: codex [PROMPT]\\n'\n  exit 0\nfi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&legacy_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!super::codex::no_daemon_supported_with(&legacy_exe));
+
+    assert!(
+        super::ZSH_ACCOUNT_SYNC_ENV.contains("command codex --no-daemon \"$@\""),
+        "ZSH_ACCOUNT_SYNC_ENV must define codex() wrapper with --no-daemon"
+    );
+
+    // 심볼릭 링크된 sessions 디렉터리(예: ~/.krill/p/codex/i-*/sessions -> orca/codex-accounts/*/home/sessions)도
+    // account_for_stored_in이 계정을 역추적해야 한다.
+    let home = dir.join("home");
+    let state = dir.join("state");
+    let real_sessions = dir.join("orca-codex/home/sessions/2026/10/25");
+    std::fs::create_dir_all(&real_sessions).unwrap();
+    let prof_dir = home.join(".krill/p/codex/i-12345678");
+    std::fs::create_dir_all(&prof_dir).unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("orca-codex/home/sessions"),
+        prof_dir.join("sessions"),
+    )
+    .unwrap();
+    let sid = "0199f5ea-dd58-7cf2-a0e1-034fa939619b";
+    let real_rollout = real_sessions.join(format!("rollout-2026-10-25-{sid}.jsonl"));
+    std::fs::write(
+        &real_rollout,
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+    )
+    .unwrap();
+
+    let mut file = accounts::AccountsFile::default();
+    file.accounts.push(accounts::StoredAccount {
+        id: "codex-imported".into(),
+        provider: "codex".into(),
+        label: "Imported".into(),
+        email: Some("imported@example.com".into()),
+        profile_dir: prof_dir.display().to_string(),
+    });
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+
+    let codex_prof = profile(&["codex"]);
+    let stored = control::StoredLaunch {
+        profile: "codex".into(),
+        permission: Permission::Yolo,
+        session_id: Some(sid.into()),
+        transcript_path: Some(real_rollout.display().to_string()),
+        cwd: Vec::new(),
+        hibernation_blocked: false,
+        account: None,
+    };
+    let resolved = super::account_for_stored_in(&home, &codex_prof, Some(&state), &stored)
+        .expect("resolved symlinked codex sessions dir");
+    assert_eq!(resolved.id, "codex-imported");
+    assert_eq!(resolved.dir, prof_dir.display().to_string());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

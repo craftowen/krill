@@ -13,6 +13,7 @@ pub(super) const MAX_FRAME: usize = 1024 * 1024;
 pub(super) const QUEUE: usize = 8;
 pub(super) const OUTPUT_QUEUE: usize = 32;
 pub(super) const STALL: Duration = Duration::from_secs(3);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub(super) enum Event {
@@ -43,21 +44,29 @@ impl Drop for Transport {
 
 impl Transport {
     pub fn terminate(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
+        terminate_child(&mut self.child);
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(_) => {
+            // No positive ownership witness remains; never signal a potentially reused pid.
+            eprintln!("krill computer serve: worker status unavailable; termination unconfirmed");
             return;
         }
-        self.child.kill().ok();
-        let until = Instant::now() + Duration::from_secs(1);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(5)),
-                _ => {
-                    eprintln!(
-                        "krill computer serve: worker reap could not be confirmed within bound"
-                    );
-                    break;
-                }
+    }
+    child.kill().ok();
+    let until = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                eprintln!("krill computer serve: worker reap could not be confirmed within bound");
+                break;
             }
         }
     }
@@ -97,13 +106,11 @@ impl Transport {
             .spawn()
             .map_err(|_| "could not start computer worker")?;
         let Some(input) = child.stdin.take() else {
-            child.kill().ok();
-            child.wait().ok();
+            terminate_child(&mut child);
             return Err("worker has no private input pipe".into());
         };
         let Some(output) = child.stdout.take() else {
-            child.kill().ok();
-            child.wait().ok();
+            terminate_child(&mut child);
             return Err("worker has no private output pipe".into());
         };
         let (events_tx, events) = mpsc::sync_channel(QUEUE);
@@ -118,7 +125,7 @@ impl Transport {
             native,
             output: output_tx,
         };
-        let Ok(Event::Native(hello)) = transport.events.recv_timeout(STALL) else {
+        let Ok(Event::Native(hello)) = transport.events.recv_timeout(STARTUP_TIMEOUT) else {
             return Err("worker did not send a valid hello before deadline".into());
         };
         // Start client I/O only after the native handshake. The output writer is the sole stdout owner.
@@ -223,14 +230,19 @@ pub(super) fn read_line(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> io::R
     if count == 0 {
         return Ok(false);
     }
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    } else if bytes.len() > MAX_FRAME {
+    if bytes.len() > MAX_FRAME && bytes.last() != Some(&b'\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame exceeds limit",
         ));
     }
+    if bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "incomplete newline-delimited frame",
+        ));
+    }
+    bytes.pop();
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }

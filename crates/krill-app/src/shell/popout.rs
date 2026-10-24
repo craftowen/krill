@@ -2075,6 +2075,7 @@ struct SidebarCard {
     name: String,
     detail: String,
     unread: bool,
+    read_order: Option<u64>,
 }
 
 impl SidebarCard {
@@ -2146,6 +2147,23 @@ impl Dashboard {
         for (index, card) in cards.iter().enumerate() {
             lanes[lane(card.session.status.state)].push(index);
         }
+        // 완료(Done | Exited) 레인: 안 읽은 완료 카드를 상단에(최신 완료순),
+        // 클릭해 읽음 처리된 카드를 하단에(읽은 순서대로) 배치한다.
+        lanes[2].sort_by(|&a, &b| {
+            let ca = &cards[a];
+            let cb = &cards[b];
+            match (ca.read_order, cb.read_order) {
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, None) => cb
+                    .session
+                    .status
+                    .since_unix_ns
+                    .cmp(&ca.session.status.since_unix_ns)
+                    .then_with(|| a.cmp(&b)),
+                (Some(sa), Some(sb)) => sa.cmp(&sb).then_with(|| a.cmp(&b)),
+            }
+        });
         lanes
     }
 
@@ -2166,13 +2184,15 @@ impl Dashboard {
                         }
                     }
                 };
-                let unread = host.is_local() && sidebar.is_unread(session.id);
+                let read_order = sidebar.dashboard_read_order(&host, &session);
+                let unread = sidebar.is_dashboard_unread(&host, &session);
                 SidebarCard {
                     host,
                     session,
                     name,
                     detail,
                     unread,
+                    read_order,
                 }
             })
             .collect()
@@ -2206,6 +2226,12 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sidebar.update(cx, |s, cx| {
+            s.mark_session_read(&host, session, cx);
+        });
+        self.cards = Self::collect_sidebar(&self.sidebar, cx);
+        self.lanes = Self::project_lanes(&self.cards);
+        cx.notify();
         if let Some(owner) = self.owner.upgrade() {
             owner.update(cx, |shell, cx| {
                 shell.dashboard = None;
@@ -2410,18 +2436,47 @@ impl Render for Dashboard {
                                             }
                                         };
                                         let debug_sel = selector.clone();
+                                        let is_completed =
+                                            matches!(state, AgentState::Done | AgentState::Exited);
+                                        let is_read_completed = is_completed && !unread;
                                         let (card_border, card_bg, hover_bg) = match state {
                                             AgentState::Waiting | AgentState::Blocked => (
                                                 p.agent_question.opacity(0.4),
                                                 p.agent_question.opacity(0.06),
                                                 p.agent_question.opacity(0.12),
                                             ),
-                                            AgentState::Done => (
+                                            AgentState::Done if unread => (
                                                 p.success.opacity(0.4),
                                                 p.success.opacity(0.06),
                                                 p.success.opacity(0.12),
                                             ),
+                                            AgentState::Done | AgentState::Exited
+                                                if is_read_completed =>
+                                            {
+                                                (
+                                                    p.border.opacity(0.5),
+                                                    p.card.opacity(0.4),
+                                                    p.accent.opacity(0.5),
+                                                )
+                                            }
                                             _ => (p.border, p.card, p.accent),
+                                        };
+                                        let title_color = if is_read_completed {
+                                            p.muted_foreground
+                                        } else {
+                                            p.foreground
+                                        };
+                                        let title_weight = if unread {
+                                            gpui::FontWeight::SEMIBOLD
+                                        } else if is_read_completed {
+                                            gpui::FontWeight::NORMAL
+                                        } else {
+                                            gpui::FontWeight::MEDIUM
+                                        };
+                                        let dot_color = if is_read_completed {
+                                            p.muted_foreground.opacity(0.4)
+                                        } else {
+                                            ui::agent_state_color(state, cx)
                                         };
                                         div()
                                             .id(gpui::SharedString::from(selector))
@@ -2435,6 +2490,7 @@ impl Render for Dashboard {
                                             .border_1()
                                             .border_color(card_border)
                                             .bg(card_bg)
+                                            .when(is_read_completed, |d| d.opacity(0.7))
                                             .cursor_pointer()
                                             .hover(move |d| d.bg(hover_bg))
                                             .focus_visible(|d| d.border_color(p.ring))
@@ -2456,11 +2512,8 @@ impl Render for Dashboard {
                                                             .flex_1()
                                                             .min_w_0()
                                                             .truncate()
-                                                            .font_weight(if unread {
-                                                                gpui::FontWeight::SEMIBOLD
-                                                            } else {
-                                                                gpui::FontWeight::MEDIUM
-                                                            })
+                                                            .text_color(title_color)
+                                                            .font_weight(title_weight)
                                                             .child(name),
                                                     )
                                                     .child(
@@ -2468,7 +2521,7 @@ impl Render for Dashboard {
                                                             .size(ui::STATE_DOT)
                                                             .flex_none()
                                                             .rounded_full()
-                                                            .bg(ui::agent_state_color(state, cx)),
+                                                            .bg(dot_color),
                                                     ),
                                             )
                                             .when_some(screen.clone(), |d, screen| {

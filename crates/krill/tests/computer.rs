@@ -13,6 +13,27 @@ use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_krill");
 
+#[test]
+fn production_jxa_contract_under_synthetic_bridge() {
+    // Execute the exact production bytes in JavaScriptCore, with fake AX/input/clipboard
+    // objects. This exercises the interpreter and action branches without touching the GUI.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript"])
+        .arg(root.join("tests/fixtures/computer_jxa.js"))
+        .arg(root.join("src/computer/engine/scripts"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["failed"], 0, "{report}");
+    assert_eq!(report["total"], 43);
+}
+
 fn fixture_executor(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("fake-osascript.py");
     fs::write(&path, r"#!/usr/bin/env python3
@@ -39,7 +60,7 @@ elif 'const rawApps' in script:
 elif 'let idx = 1;' in script:
     print(json.dumps([{'id':'101','index':1,'title':'Fixture','appName':'Fixture','bundleId':'dev.fixture','pid':7777,
                       'bounds':{'x':0,'y':0,'width':400,'height':300},'isFocused':True,'isMain':True,'isMinimized':False}]))
-elif 'const start=processStart()' in script:
+elif 'const start = processStart()' in script:
     if (base/'mode').read_text()=='observation-fails' and (base/'effects').exists():
         print('AX observation unavailable after issued input',file=sys.stderr); sys.exit(75)
     print(json.dumps({'root':root,'processStart':'1000.123456789','truncated':False}))
@@ -100,7 +121,7 @@ fn stdin_secret_never_enters_executor_argv_and_unknown_never_replays() {
         observation.get("root").is_none(),
         "default output should be compact"
     );
-    let secret = "fixture value";
+    let secret = "fixture phrase";
     let mut child = command(
         &dir,
         &executor,

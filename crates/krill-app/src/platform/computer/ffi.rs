@@ -436,7 +436,7 @@ pub fn copy_multiple(element: &Cf, batch: &AttrBatch) -> Result<Vec<Option<Cf>>,
     items.into_iter().map(optional_attribute).collect()
 }
 
-/// 배치의 개별 `AXError를` 값 없음으로 오인하면 불완전한 지문으로 변경을 허용할 수 있다.
+/// 배치의 개별 `AXError`를 값 없음으로 오인하면 불완전한 지문으로 변경을 허용할 수 있다.
 fn optional_attribute(value: Cf) -> Result<Option<Cf>, AxError> {
     if ax_value_type(&value) != Some(AX_VALUE_AXERROR) {
         return Ok(Some(value));

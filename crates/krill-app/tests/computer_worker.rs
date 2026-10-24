@@ -169,3 +169,38 @@ fn isolated_worker_rejects_malformed_input_without_opening_gpui() {
     assert_eq!(worker.next()["type"], "protocol_error");
     worker.expect_exit(false);
 }
+
+#[test]
+fn isolated_worker_batch_admission_status_and_duplicate_use_one_sequence() {
+    let mut worker = Worker::start();
+    assert!(
+        worker.hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("batch"))
+    );
+    assert_eq!(worker.hello["limits"]["maxBatchSteps"], 4);
+    let mut request = worker.request(1);
+    request["op"] = json!({"kind":"batch","steps":[{"kind":"capabilities"}]});
+    worker.send(&request);
+    let rejected = worker.next();
+    assert_eq!(rejected["type"], "rejected");
+    assert_eq!(rejected["code"], "invalid_request");
+
+    // An unobserved target can never emit input. A rejected admission must not have
+    // reserved seq 1; the valid-shaped batch is admitted and its first step is refused.
+    request["op"] = json!({"kind":"batch","steps":[{"kind":"click","target":{
+        "snapshot":format!("{}/{}/1",worker.hello["epoch"].as_str().unwrap(),worker.hello["context"].as_str().unwrap()),
+        "element":"e0"}}]});
+    let result = worker.run(&request);
+    assert_eq!(result["delivery"]["state"], "not_dispatched", "{result}");
+    assert_eq!(result["state"], "not_dispatched");
+    worker.send(&json!({"type":"status","seq":1}));
+    let status = worker.next();
+    assert_eq!(status["state"], "not_dispatched");
+    assert_eq!(status["summary"]["delivery"], "not_dispatched");
+    worker.send(&request);
+    assert_eq!(worker.next()["type"], "duplicate");
+    worker.send(&json!({"type":"shutdown"}));
+    worker.expect_exit(true);
+}

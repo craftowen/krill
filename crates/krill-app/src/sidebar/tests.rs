@@ -5641,6 +5641,93 @@ fn default_worktree_ignores_redundant_project_name_in_prefs(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn dashboard_read_order_persists_and_resets_on_recompletion(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-dashboard-read-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+
+    let mut s1 = session(1, AgentState::Done, Some("/repo/a"));
+    s1.status.since_unix_ns = 100;
+    let mut s2 = session(2, AgentState::Done, Some("/repo/b"));
+    s2.status.since_unix_ns = 200;
+
+    let sidebar = cx.new(|_| Sidebar::new_loaded(Some(sidebar_bin.clone())));
+    sidebar.update(cx, |s, cx| {
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2.clone()],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(s.is_dashboard_unread(&HostId::Local, &s1));
+        assert!(s.is_dashboard_unread(&HostId::Local, &s2));
+
+        assert!(s.mark_session_read(&HostId::Local, SessionId(2), cx));
+        assert!(s.mark_session_read(&HostId::Local, SessionId(1), cx));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s2), Some(1));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
+    });
+    cx.run_until_parked();
+
+    // 재시작 후에도 dashboard-read.json에서 읽음 순서가 복원된다.
+    let reloaded = cx.new(|_| Sidebar::new_loaded(Some(sidebar_bin.clone())));
+    reloaded.update(cx, |s, cx| {
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2.clone()],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s2), Some(1));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
+
+        // s2가 다시 Working 후 새 시각으로 Done이 되면 읽음 기록이 해제되어 다시 미확인(None)이 된다.
+        let mut s2_working = s2.clone();
+        s2_working.status.state = AgentState::Working;
+        s2_working.status.since_unix_ns = 300;
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2_working],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        let mut s2_done_again = s2.clone();
+        s2_done_again.status.since_unix_ns = 400;
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2_done_again.clone()],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s2_done_again), None);
+        assert!(s.is_dashboard_unread(&HostId::Local, &s2_done_again));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
+    });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
 fn worktree_delete_enters_cancel_focus_and_restores_background_on_escape(cx: &mut TestAppContext) {
     struct DeleteProbe(std::sync::atomic::AtomicUsize);
     impl Source for DeleteProbe {

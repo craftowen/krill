@@ -447,6 +447,8 @@ impl Shell {
                         }
                         if let Some(&index) = indices.get(*i) {
                             this.change(true, cx, |l| l.activate(index));
+                            this.files.refocus = true;
+                            cx.notify();
                         }
                     })),
             )

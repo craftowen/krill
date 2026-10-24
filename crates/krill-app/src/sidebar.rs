@@ -382,6 +382,69 @@ fn rows(snapshot: &Snapshot, prefs: &Preferences, collapsed: &BTreeSet<PathBuf>)
 
 const FORMAT_VERSION: u8 = 1;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const DASHBOARD_READ_FILE: &str = "dashboard-read.json";
+
+/// 에이전트 대시보드의 완료(`Done | Exited`) 카드 읽음 상태 및 읽은 순서.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadDoneEntry {
+    pub since_unix_ns: u64,
+    pub seq: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedReadDone {
+    #[serde(default)]
+    entries: Vec<(HostId, SessionId, ReadDoneEntry)>,
+}
+
+pub(super) fn load_read_done(path: Option<&Path>) -> BTreeMap<(HostId, SessionId), ReadDoneEntry> {
+    let Some(dir) = path
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return BTreeMap::new();
+    };
+    let file = dir.join(DASHBOARD_READ_FILE);
+    let Ok(bytes) = fs::read(file) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_slice::<PersistedReadDone>(&bytes)
+        .map(|p| {
+            p.entries
+                .into_iter()
+                .map(|(host, id, entry)| ((host, id), entry))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_read_done(
+    dir: &Path,
+    read_done: &BTreeMap<(HostId, SessionId), ReadDoneEntry>,
+) -> io::Result<()> {
+    krill_proto::os::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+        .create(dir)?;
+    let path = dir.join(DASHBOARD_READ_FILE);
+    let temp = path.with_extension("json.tmp");
+    let payload = PersistedReadDone {
+        entries: read_done
+            .iter()
+            .map(|((host, id), entry)| (host.clone(), *id, *entry))
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, &path)?;
+    crate::layout::sync_parent(&path)
+}
 
 /// 사이드바 접힘/펼침·제거 UI 상태 및 마지막 선택 워크트리(`sidebar.bin` 4번째 구간, OWE-842·OWE-845).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +776,10 @@ pub struct Sidebar {
     focused: Option<SessionId>,
     /// 보지 않은 사이 완료·대기로 바뀐 세션(OWE-662).
     unread: BTreeSet<SessionId>,
+    /// 에이전트 대시보드에서 사용자가 클릭해 확인한 완료(`Done | Exited`) 세션과 읽은 순서.
+    read_done: BTreeMap<(HostId, SessionId), ReadDoneEntry>,
+    /// 다음 완료 카드 읽음 처리에 부여할 단조 증가 순번.
+    next_read_done_seq: u64,
     /// 워크트리 행 메뉴·단축키에서 띄울 에이전트 프로필 목록.
     agents: Vec<AgentProfile>,
     /// 사이드바 열이 펼쳐져 있는지.
@@ -1004,6 +1071,8 @@ impl Sidebar {
             now_override_ns: None,
             focused: None,
             unread: BTreeSet::new(),
+            read_done: BTreeMap::new(),
+            next_read_done_seq: 0,
             agents: Vec::new(),
             disk: async_state::State::default(),
             visible: true,
@@ -1342,6 +1411,7 @@ impl Sidebar {
                 error: None,
             });
         }
+        self.prune_read_done_for_host(&HostId::Remote(id.to_owned()), cx);
         self.rebuild(cx);
     }
 
@@ -1627,6 +1697,8 @@ impl Sidebar {
                                     entry.meta = meta;
                                     changed = true;
                                 }
+                                let host_id = HostId::Remote(id.clone());
+                                s.prune_read_done_for_host(&host_id, cx);
                             } else {
                                 let status = s
                                     .remote_info
@@ -1786,6 +1858,103 @@ impl Sidebar {
         self.unread.contains(&id)
     }
 
+    /// 에이전트 대시보드에서 완료(`Done | Exited`) 카드가 이미 읽음 처리된 상태면 읽은 순번(`Some(seq)`)을 돌려준다.
+    /// 아직 확인하지 않은 완료 카드이거나 새로 완료된 카드면 `None`이다.
+    #[must_use]
+    pub fn dashboard_read_order(&self, host: &HostId, session: &Session) -> Option<u64> {
+        if !matches!(session.status.state, AgentState::Done | AgentState::Exited) {
+            return None;
+        }
+        if host.is_local() && self.unread.contains(&session.id) {
+            return None;
+        }
+        let entry = self.read_done.get(&(host.clone(), session.id))?;
+        (entry.since_unix_ns == session.status.since_unix_ns || session.status.since_unix_ns == 0)
+            .then_some(entry.seq)
+    }
+
+    /// 에이전트 대시보드 기준 미확인(안 읽음) 카드인지.
+    #[must_use]
+    pub fn is_dashboard_unread(&self, host: &HostId, session: &Session) -> bool {
+        if matches!(session.status.state, AgentState::Done | AgentState::Exited) {
+            self.dashboard_read_order(host, session).is_none()
+        } else {
+            host.is_local() && self.is_unread(session.id)
+        }
+    }
+
+    /// 세션을 사용자가 열어 확인했을 때 미확인 표시를 끄고, 완료(`Done | Exited`) 세션이면
+    /// 대시보드 읽음 순서(`read_done`)에 기록한다.
+    pub fn mark_session_read(
+        &mut self,
+        host: &HostId,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = host.is_local() && self.unread.remove(&id);
+        if let Some(session) = self.session_on(host, id)
+            && matches!(session.status.state, AgentState::Done | AgentState::Exited)
+        {
+            let since_unix_ns = session.status.since_unix_ns;
+            let key = (host.clone(), id);
+            let already_read = self
+                .read_done
+                .get(&key)
+                .is_some_and(|entry| entry.since_unix_ns == since_unix_ns || since_unix_ns == 0);
+            if !already_read {
+                self.next_read_done_seq = self.next_read_done_seq.saturating_add(1);
+                let seq = self.next_read_done_seq;
+                self.read_done
+                    .insert(key, ReadDoneEntry { since_unix_ns, seq });
+                self.write_read_done(cx);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    pub(super) fn write_read_done(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.state_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        let snapshot = self.read_done.clone();
+        self.enqueue_disk_write(move || save_read_done(&dir, &snapshot), cx);
+    }
+
+    pub(super) fn prune_read_done_for_host(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        let before_len = self.read_done.len();
+        let sessions: &[Session] = match host {
+            HostId::Local => &self.snapshot.sessions,
+            HostId::Remote(id) => self
+                .remote_hosts
+                .iter()
+                .find(|r| r.id == *id)
+                .map_or(&[], |r| &r.snapshot.sessions),
+        };
+        let is_local = host.is_local();
+        let unread = &self.unread;
+        self.read_done.retain(|(h, id), entry| {
+            if h != host {
+                return true;
+            }
+            if is_local && unread.contains(id) {
+                return false;
+            }
+            let Some(session) = sessions.iter().find(|s| s.id == *id) else {
+                return false;
+            };
+            matches!(session.status.state, AgentState::Done | AgentState::Exited)
+                && (entry.since_unix_ns == session.status.since_unix_ns
+                    || session.status.since_unix_ns == 0)
+        });
+        if self.read_done.len() != before_len {
+            self.write_read_done(cx);
+        }
+    }
+
     pub(crate) fn mark_workspace_read(
         &mut self,
         host: &HostId,
@@ -1803,7 +1972,7 @@ impl Sidebar {
             .map(|s| s.id)
             .collect();
         for id in ids {
-            self.unread.remove(&id);
+            self.mark_session_read(host, id, cx);
         }
         self.rebuild(cx);
     }
@@ -2337,6 +2506,7 @@ impl Sidebar {
                         self.focused,
                     );
                     self.snapshot = snapshot;
+                    self.prune_read_done_for_host(&HostId::Local, cx);
                     self.meta = meta;
                     self.comments = comments;
                     self.auto_titles = auto_titles;
@@ -2670,6 +2840,7 @@ impl Sidebar {
     ) {
         self.cursor = Some(index);
         self.sync_viewport();
+        self.mark_session_read(&host, id, cx);
         if let Some(wt) = self.folder_on(&host, id).map(Path::to_path_buf)
             && self.selected_worktree.as_ref() != Some(&wt)
         {
@@ -2832,7 +3003,9 @@ impl Sidebar {
                 self.fold(&path, None, cx);
             }
             Some(Row::Session(session, _)) => {
-                self.action_host = Some(self.row_host(cursor).clone());
+                let host = self.row_host(cursor).clone();
+                self.mark_session_read(&host, session.id, cx);
+                self.action_host = Some(host);
                 cx.emit(Selected(session.id));
                 self.leave(window, cx);
             }

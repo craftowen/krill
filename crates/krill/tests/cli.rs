@@ -1336,6 +1336,27 @@ fn computer_cli_subcommands_and_skill_work_offline() {
     let skill = run(&["skills", "get", "computer-use"]);
     assert!(skill.status.success());
     assert!(String::from_utf8_lossy(&skill.stdout).contains("get-app-state"));
+    let capabilities = ok(&["computer", "capabilities", "--json"]);
+    assert_eq!(capabilities["contract"], "computer/2");
+    assert_eq!(capabilities["batchSupported"], false);
+    assert!(
+        capabilities["guideHash"]
+            .as_str()
+            .unwrap()
+            .starts_with("fnv1a64:")
+    );
+    let permissions = ok(&["computer", "permissions", "--json"]);
+    assert!(permissions["supported"].as_bool().unwrap());
+    let apps = ok(&["computer", "list-apps", "--json"]);
+    assert!(
+        apps["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|app| app["pid"] == 7777)
+    );
+    let windows = ok(&["computer", "list-windows", "--app", "Fixture", "--json"]);
+    assert_eq!(windows["windows"][0]["id"], "101");
     let snapshot = ok(&[
         "computer",
         "get-app-state",
@@ -1410,6 +1431,56 @@ fn computer_cli_subcommands_and_skill_work_offline() {
             .status
             .success()
     );
+
+    // Keep the legacy public actions and aliases executable through the real CLI.
+    // Each command gets fresh immutable evidence, so this is not stale-index reuse.
+    for action in [
+        vec![
+            "perform-secondary-action",
+            "--element-index",
+            "1",
+            "--action",
+            "AXConfirm",
+        ],
+        vec!["type-text", "--element-index", "1", "--text", "typed"],
+        vec!["press-key", "--key", "return", "--repeat", "2"],
+        vec!["hotkey", "--key", "cmd+shift+p"],
+        vec![
+            "scroll",
+            "--element-index",
+            "2",
+            "--direction",
+            "down",
+            "--pages",
+            "1",
+        ],
+        vec![
+            "drag",
+            "--from-element-index",
+            "1",
+            "--to-element-index",
+            "2",
+        ],
+        vec!["click", "--x", "250", "--y", "35", "--mouse-button", "left"],
+    ] {
+        save(&initial);
+        ok(&[
+            "computer",
+            "get-app-state",
+            "--app",
+            "Fixture",
+            "--format",
+            "full",
+            "--json",
+        ]);
+        let mut arguments = vec!["computer"];
+        arguments.extend(action);
+        arguments.extend(["--no-screenshot", "--json"]);
+        let result = ok(&arguments);
+        assert_eq!(result["delivery"], "submitted", "{arguments:?}: {result}");
+        assert_eq!(result["verification"]["status"], "unverified");
+        assert_eq!(result["verification"]["retried"], false);
+    }
 
     // Each rejected stale/ambiguous ref must leave the effect journal untouched.
     for adversary in ["reorder", "ambiguous", "window_replaced", "disabled"] {

@@ -59,6 +59,8 @@ pub(crate) struct Control {
     /// Only in-flight account replacements are watched. Launch metadata is an expectation,
     /// while this observation comes from a hook attributed to the replacement process.
     account_resumes: Mutex<std::collections::HashMap<SessionId, Option<String>>>,
+    /// 한도 초과(`StopFailure` / `agy_rate_limited`)로 중단돼 계정 전환 뒤 작업을 이어갈 세션.
+    rate_limited: Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl Control {
@@ -69,7 +71,20 @@ impl Control {
             signed_cache: Mutex::new(None),
             veto: Mutex::default(),
             account_resumes: Mutex::default(),
+            rate_limited: Mutex::default(),
         }
+    }
+
+    pub fn mark_rate_limited(&self, session: SessionId) {
+        lock(&self.rate_limited).insert(session);
+    }
+
+    pub fn clear_rate_limited(&self, session: SessionId) {
+        lock(&self.rate_limited).remove(&session);
+    }
+
+    pub fn take_rate_limited(&self, session: SessionId) -> bool {
+        lock(&self.rate_limited).remove(&session)
     }
 
     pub fn watch_account_resume(&self, session: SessionId) {

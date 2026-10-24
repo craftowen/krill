@@ -49,7 +49,7 @@ const ALLOWED_ACTIONS: [&str; 8] = [
 ];
 const SELF_BUNDLE_PREFIX: &str = "dev.krill.app.";
 
-const CAPABILITIES: [&str; 8] = [
+const CAPABILITIES: [&str; 9] = [
     "capabilities",
     "permissions",
     "apps",
@@ -58,8 +58,9 @@ const CAPABILITIES: [&str; 8] = [
     "set_value",
     "click",
     "type_text",
+    "batch",
 ];
-const UNSUPPORTED: [&str; 11] = [
+const UNSUPPORTED: [&str; 10] = [
     "screenshot",
     "clipboard",
     "key",
@@ -70,7 +71,6 @@ const UNSUPPORTED: [&str; 11] = [
     "restore_window",
     "observer",
     "delta",
-    "batch",
 ];
 
 // `AttrBatch` 순서.
@@ -285,8 +285,8 @@ struct Snapshot {
     complete: bool,
 }
 
-/// 관찰 그래프와 새 전체 census를 묶는다. `CFEqual은` 후보를 다시 찾는 조건 하나일 뿐이다.
-/// 이 순수 검사는 `AXParent를` 읽는 별도 검사와 함께 사용한다.
+/// 관찰 그래프와 새 전체 census를 묶는다. `CFEqual`은 후보를 다시 찾는 조건 하나일 뿐이다.
+/// 이 순수 검사는 `AXParent`를 읽는 별도 검사와 함께 사용한다.
 fn validate_observed_graph(
     snapshot: &Snapshot,
     node: &Node,
@@ -973,7 +973,7 @@ impl MacBackend {
         Ok(app)
     }
 
-    /// 관찰한 부모 순서에 `AXParent와` `AXChildren` 양쪽으로 속해야 한다.
+    /// 관찰한 부모 순서에 `AXParent`와 `AXChildren` 양쪽으로 속해야 한다.
     /// 값 비교 면제는 한 `type_text` 요청에서 이미 문자를 발행한 뒤뿐이다. 저장 스냅샷은 바꾸지 않는다.
     fn validate_path(
         &self,

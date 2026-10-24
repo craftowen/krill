@@ -291,7 +291,7 @@ pub enum Cleanup {
         not(test),
         expect(
             dead_code,
-            reason = "wire cleanup outcome exercised by backend isolation tests"
+            reason = "wire contract state; no current backend cleanup can fail, the executor already honours it"
         )
     )]
     Incomplete {

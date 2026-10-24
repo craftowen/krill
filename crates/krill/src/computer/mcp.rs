@@ -115,7 +115,7 @@ impl Session {
                 }
                 Ok(Event::InvalidClient) => {
                     self.emit(&rpc_error(
-                        Value::Null,
+                        &Value::Null,
                         -32700,
                         "invalid UTF-8 JSON line or frame limit exceeded",
                     ))?;
@@ -171,14 +171,18 @@ impl Session {
             .map(str::to_owned)
         else {
             self.emit(&rpc_error(
-                Value::Null,
+                &Value::Null,
                 -32600,
                 "expected JSON-RPC request or notification",
             ))?;
             return Ok(());
         };
         if value["jsonrpc"] != "2.0" || value.get("params").is_some_and(|v| !v.is_object()) {
-            self.emit(&rpc_error(Value::Null, -32600, "invalid JSON-RPC envelope"))?;
+            self.emit(&rpc_error(
+                &Value::Null,
+                -32600,
+                "invalid JSON-RPC envelope",
+            ))?;
             return Ok(());
         }
         let Some(id) = value.get("id").cloned() else {
@@ -186,7 +190,7 @@ impl Session {
         };
         let Some(key) = request_key(&id) else {
             return self.emit(&rpc_error(
-                Value::Null,
+                &Value::Null,
                 -32600,
                 "id must be a bounded string or integer",
             ));
@@ -194,7 +198,7 @@ impl Session {
         if let Some(old) = self.retention.requests.get(&key) {
             if old.input != value {
                 return self.emit(&rpc_error(
-                    id,
+                    &id,
                     -32600,
                     "request id reused with different payload; original request retained",
                 ));
@@ -210,7 +214,7 @@ impl Session {
             .len();
         if !self.retention.room(bytes, 0, 1, 0) {
             return self.emit(&rpc_error(
-                id,
+                &id,
                 -32000,
                 "session request/dedup limit reached; no dispatch",
             ));
@@ -237,7 +241,7 @@ impl Session {
                 "method not found; supports legacy MCP 2025-11-25 initialize",
             ),
             "initialize" => self.initialize(&key, &params),
-            "ping" => self.reply(&key, json!({})),
+            "ping" => self.reply(&key, &json!({})),
             _ if !self.ready => self.error(
                 &key,
                 -32002,
@@ -248,7 +252,7 @@ impl Session {
                 {
                     self.error(&key, -32602, "this bounded tool list has no cursor")
                 } else {
-                    self.reply(&key, self.hello.tools())
+                    self.reply(&key, &self.hello.tools())
                 }
             }
             "tools/call" => self.call(&key, &params),
@@ -272,7 +276,7 @@ impl Session {
             );
         }
         self.initialized = true;
-        self.reply(key, json!({"protocolVersion":VERSION,"capabilities":{"tools":{}},
+        self.reply(key, &json!({"protocolVersion":VERSION,"capabilities":{"tools":{}},
             "serverInfo":{"name":"krill-computer-experimental","version":env!("CARGO_PKG_VERSION")},
             "instructions":"Experimental native worker, MCP 2025-11-25 only. Call computer_session for actual capabilities/limits. Caller owns positive monotonic seq; never allocate a new seq to retry uncertain input. No worker restart, replay or backend fallback. Mutations require a native snapshot from this epoch/context."}))
     }
@@ -320,7 +324,7 @@ impl Session {
                 "maxFrameBytes":transport::MAX_FRAME,"readQueueFrames":transport::QUEUE,
                 "defaultObservationFormat":"compact","observationFormats":["compact","full"],
                 "cachePolicy":"rolling_completed_only","expiredSequenceReplay":"never"});
-            return self.reply(key, tool_result(hello));
+            return self.reply(key, &tool_result(hello));
         }
         if !matches!(
             name,
@@ -382,7 +386,7 @@ impl Session {
                 );
             }
             if let Some(result) = old.result.clone() {
-                return self.reply(key, result);
+                return self.reply(key, &result);
             }
             old.waiting.push(key.to_owned());
             return Ok(());
@@ -394,7 +398,7 @@ impl Session {
             );
             expired["state"] = json!("expired");
             expired["error"]["code"] = json!("expired");
-            return self.reply(key, tool_result(expired));
+            return self.reply(key, &tool_result(expired));
         }
         if seq.saturating_sub(self.retention.highwater) > self.hello.max_gap {
             return self.error(
@@ -531,7 +535,7 @@ impl Session {
                 }
                 let closing = must_close(&value);
                 if let Some(id) = control.id {
-                    self.reply(&id, tool_result(value))?;
+                    self.reply(&id, &tool_result(value))?;
                 }
                 if closing {
                     return Err(
@@ -545,7 +549,7 @@ impl Session {
     }
 
     fn complete(&mut self, seq: u64, result: &Value) -> Result<(), String> {
-        let retained = serde_json::to_vec(&result)
+        let retained = serde_json::to_vec(result)
             .map_err(|_| "cannot encode native result")?
             .len();
         if !self.retention.room(0, retained, 0, 0) {
@@ -560,7 +564,7 @@ impl Session {
             return Err("completion has unknown sequence".into());
         };
         for key in waiting {
-            self.reply(&key, result.clone())?;
+            self.reply(&key, result)?;
         }
         Ok(())
     }
@@ -572,30 +576,30 @@ impl Session {
             .map_or(Value::Null, |r| r.input["id"].clone())
     }
 
-    fn reply(&mut self, key: &str, result: Value) -> Result<(), String> {
-        let mut response = json!({"jsonrpc":"2.0","id":self.id(key)});
-        response["result"] = result;
-        self.respond(key, response)
+    fn reply(&mut self, key: &str, result: &Value) -> Result<(), String> {
+        self.respond(
+            key,
+            json!({"jsonrpc":"2.0","id":self.id(key),"result":result}),
+        )
     }
 
     fn error(&mut self, key: &str, code: i64, message: &str) -> Result<(), String> {
-        self.respond(key, rpc_error(self.id(key), code, message))
+        self.respond(key, rpc_error(&self.id(key), code, message))
     }
 
     fn respond(&mut self, key: &str, mut response: Value) -> Result<(), String> {
-        if encode(&response).is_err() {
-            // Preserve delivery/verification/cleanup axes when an MCP wrapper exceeds the frame cap.
-            if let Some(result) = response.get_mut("result")
-                && let Some(data) = result.get_mut("structuredContent")
-                && data.get("data").is_some()
-            {
-                if let Some(object) = data.as_object_mut() {
-                    object.remove("data");
-                }
-                data["observation"] = json!({"state":"failed","reason":"output_too_large"});
-                data["error"] = json!({"code":"output_too_large","message":"MCP frame limit exceeded; native data omitted"});
-                *result = tool_result(data.clone());
+        // Preserve delivery/verification/cleanup axes when an MCP wrapper exceeds the frame cap.
+        if encode(&response).is_err()
+            && let Some(result) = response.get_mut("result")
+            && let Some(data) = result.get_mut("structuredContent")
+            && data.get("data").is_some()
+        {
+            if let Some(object) = data.as_object_mut() {
+                object.remove("data");
             }
+            data["observation"] = json!({"state":"failed","reason":"output_too_large"});
+            data["error"] = json!({"code":"output_too_large","message":"MCP frame limit exceeded; native data omitted"});
+            *result = tool_result(data.clone());
         }
         let bytes = encode(&response)?.len();
         if !self.retention.room(0, bytes, 0, 0) {
@@ -664,7 +668,7 @@ impl Session {
                         .unwrap_or_else(|| tool_result(unknown(seq, reason)));
                     json!({"jsonrpc":"2.0","id":self.id(&key),"result":result})
                 } else {
-                    rpc_error(self.id(&key), -32000, "session closed before response")
+                    rpc_error(&self.id(&key), -32000, "session closed before response")
                 }
             };
             // Final responses bypass the replay cache: the session is closing. This also preserves
@@ -721,8 +725,6 @@ fn request_key(id: &Value) -> Option<String> {
     }
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    let mut response = json!({"jsonrpc":"2.0","error":{"code":code,"message":message}});
-    response["id"] = id;
-    response
+fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }

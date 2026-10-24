@@ -599,3 +599,27 @@ fn structurally_stable_element_with_reused_semantic_value_is_refused() {
             .contains("semantic reuse")
     );
 }
+
+#[test]
+fn observation_and_action_scripts_share_one_identity_prefix() {
+    use super::engine::{LIVE_ACTION_JXA_SCRIPT, LIVE_WINDOW_AX_JXA_SCRIPT};
+    // Behavior is exercised by the synthetic-bridge Node harness; this pins the
+    // contract so the two embedded copies cannot drift apart again.
+    let observe = include_str!("engine/scripts/common.js");
+    assert!(LIVE_WINDOW_AX_JXA_SCRIPT.starts_with(observe));
+    assert!(LIVE_ACTION_JXA_SCRIPT.starts_with(observe));
+    assert!(observe.contains("function validateTree"));
+    assert!(observe.contains("fresh.value!==target.value"));
+    assert!(observe.contains("refs.length && truncated"));
+    assert!(observe.contains("sameObservedWindow(proc,focused,win)"));
+    assert!(!observe.contains("equal(rect(focused),req.winBounds)"));
+}
+
+#[test]
+fn paste_consumption_requires_the_exact_expected_value() {
+    use super::engine::LIVE_ACTION_JXA_SCRIPT;
+    assert!(LIVE_ACTION_JXA_SCRIPT.contains("liveValue(el)===expected"));
+    assert!(LIVE_ACTION_JXA_SCRIPT.contains("AXSelectedTextRange"));
+    assert!(!LIVE_ACTION_JXA_SCRIPT.contains("indexOf(String(req.text))"));
+    assert!(!LIVE_ACTION_JXA_SCRIPT.contains("previousText"));
+}

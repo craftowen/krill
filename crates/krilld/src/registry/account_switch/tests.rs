@@ -872,6 +872,186 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
     }
 }
 
+#[test]
+fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
+    use krill_proto::hook::{EventId, HookEvent, Input};
+    use std::io::Read as _;
+
+    for rate_limited in [false, true] {
+        let root = Path::new("/tmp").join(format!(
+            "kas-autocontinue-{}-{rate_limited}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let home = root.join("home");
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(from.join("sessions/2026/10/25")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+        let snap = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Selected",
+            None,
+            to.to_str().unwrap(),
+        )
+        .unwrap();
+        let target = snap
+            .accounts
+            .iter()
+            .find(|a| a.label == "Selected")
+            .unwrap()
+            .id
+            .clone();
+        let sid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let transcript = from.join(format!("sessions/2026/10/25/rollout-date-{sid}.jsonl"));
+        fs::write(
+            &transcript,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+        )
+        .unwrap();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (master, _old_process) = UnixStream::pair().unwrap();
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: SessionId(21),
+                    pid: 721,
+                    status: None,
+                    master: OwnedFd::from(master),
+                }],
+            )),
+            Some(&state),
+        ));
+        reg.agents
+            .remember_session(
+                SessionId(21),
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                Some(sid.into()),
+                root.as_os_str().as_encoded_bytes().to_vec(),
+                Some(LaunchAccount {
+                    id: "codex-old".into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: from.display().to_string(),
+                }),
+            )
+            .unwrap();
+        // Simulate either an active Working turn (UserPromptSubmit) or a rate-limit StopFailure.
+        let prompt_event = HookEvent {
+            id: EventId {
+                pid: 721,
+                unix_ns: 1,
+            },
+            ppid: 721,
+            agent: "codex".into(),
+            input: Input::Complete,
+            payload: format!(
+                "{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{sid}\",\"prompt\":\"implement feature\"}}"
+            )
+            .into_bytes(),
+        };
+        reg.status.hook(&[(SessionId(21), &prompt_event)]).unwrap();
+        if rate_limited {
+            let stop_event = HookEvent {
+                id: EventId {
+                    pid: 721,
+                    unix_ns: 2,
+                },
+                ppid: 721,
+                agent: "codex".into(),
+                input: Input::Complete,
+                payload: format!(
+                    "{{\"hook_event_name\":\"StopFailure\",\"session_id\":\"{sid}\",\"error\":\"rate_limit\"}}"
+                )
+                .into_bytes(),
+            };
+            reg.status.hook(&[(SessionId(21), &stop_event)]).unwrap();
+            reg.agents.mark_rate_limited(SessionId(21));
+        }
+
+        let reader = Arc::clone(&reg);
+        let reader_worker =
+            std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+        let hook_reg = Arc::clone(&reg);
+        let mock = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected replacement spawn");
+            };
+            let (master, mut process) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned { req, id, pid: 821 }.encode().unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            process.write_all(b"resumed prompt > ").unwrap();
+            hook_reg.agents.record_hook_session(
+                id,
+                format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{sid}\"}}")
+                    .as_bytes(),
+            );
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected old process retirement");
+            };
+            assert_eq!(old, SessionId(21));
+            holder_link
+                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                .unwrap();
+            lock(&hook_reg.state).exited.insert(old, 0);
+
+            process
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 128];
+            let n = process
+                .read(&mut buf)
+                .expect("expected continuation prompt on new PTY");
+            let received = String::from_utf8_lossy(&buf[..n]).into_owned();
+            (id, received, process)
+        });
+
+        reg.queue_account_switch(ProviderKind::Codex, &target);
+        reg.process_account_work_in(&home);
+
+        let (_new_id, received, _process) = mock.join().unwrap();
+        assert!(
+            received.contains("Continue from where you left off."),
+            "replacement session should auto-receive continuation prompt, got: {received:?}"
+        );
+        assert!(
+            received.ends_with('\r'),
+            "continuation prompt should be submitted with CR: {received:?}"
+        );
+
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 // A real process holds the conversation file so tests exercise the kernel lookup too.
 struct FileHolder(std::process::Child);
 

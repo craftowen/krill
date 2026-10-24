@@ -16,6 +16,7 @@
 //! ⌘V·파일 드롭은 `krill_term::paste`로 bracketed paste·셸 이스케이프를 거쳐 입력으로 간다. 우클릭 메뉴(복사·붙여넣기)는
 //! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
 
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
 mod chat;
 mod close;
 mod commands;
@@ -983,11 +984,21 @@ impl Shell {
             panel.set_history(history.clone(), cx);
             panel
         });
-        cx.observe(&diff, |this, diff, cx| {
-            let tab = diff.read(cx).active_tab();
+        let mut had_center_diff = diff.read(cx).has_center_diff();
+        cx.observe(&diff, move |this, diff, cx| {
+            let d = diff.read(cx);
+            let tab = d.active_tab();
+            let has_center = d.has_center_diff();
             if this.layout.set_panel_tab(tab) {
                 this.save();
             }
+            if had_center_diff && !has_center {
+                this.files.refocus = true;
+                cx.notify();
+            } else if !had_center_diff && has_center {
+                cx.notify();
+            }
+            had_center_diff = has_center;
         })
         .detach();
         let diff_send = Self::subscribe_diff(&diff, cx);
@@ -1675,6 +1686,7 @@ impl Shell {
         let view = if let Some(existing) = &self.settings {
             existing.update(cx, |v, cx| {
                 v.set_mobile_page(false, cx);
+                v.set_automations_page(false, cx);
                 v.set_tab(tab, cx);
             });
             existing.clone()
@@ -1703,7 +1715,24 @@ impl Shell {
         cx.notify();
     }
 
-    /// 사이드바 'Krill 모바일': 사이드바를 둔 채 본문에 모바일 페어링 페이지를 연다.
+    /// 사이드바를 둔 채 본문에 자동화 페이지를 연다.
+    pub(super) fn open_automations_page(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(krill_app::settings::AdminTab::Workflows, window, cx);
+        if let Some(settings) = &self.settings {
+            settings.update(cx, |v, cx| v.set_automations_page(true, cx));
+        }
+    }
+
+    pub(super) fn automations_page_open(&self, cx: &App) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|s| s.read(cx).automations_page())
+    }
+
     pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.open_settings(krill_app::settings::AdminTab::Mobile, window, cx);
         if let Some(settings) = &self.settings {
@@ -4591,6 +4620,9 @@ impl Shell {
             }
             self.diff
                 .update(cx, krill_app::diff::Panel::clear_selection);
+        } else if self.layout != before {
+            // 비활성 탭 닫기 버튼(close-tab-{i}) 등 레이아웃 변경 시 버튼으로 빠져나간 포커스를 활성 칸으로 되돌린다.
+            self.files.refocus = true;
         }
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
@@ -4869,6 +4901,7 @@ impl Shell {
         }
         self.sidebar_collapsed = !self.sidebar_collapsed;
         self.layout.sidebar_collapsed = self.sidebar_collapsed;
+        self.files.refocus = true;
         self.save();
         self.sync_sidebar_visibility(cx);
         cx.notify();
@@ -4902,6 +4935,7 @@ impl Shell {
         }
         self.panel_collapsed = !self.panel_collapsed;
         self.layout.panel_collapsed = self.panel_collapsed;
+        self.files.refocus = true;
         self.save();
         let visible = !self.panel_collapsed && self.security.is_window_active();
         self.diff.update(cx, |d, cx| d.set_visible(visible, cx));
@@ -5621,7 +5655,7 @@ impl Shell {
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                     if e.modifiers.platform {
                         this.change(true, cx, |l| l.focus(id));
                         let action = if e.modifiers.alt {
@@ -5660,10 +5694,20 @@ impl Shell {
                                 }
                             }
                         }
+                        if this.layout.focused() == Some(id) {
+                            this.files.refocus = true;
+                            if !this.focus.is_focused(window) {
+                                window.focus(&this.focus, cx);
+                            }
+                        }
                         cx.stop_propagation();
                         return;
                     }
                     this.change(true, cx, |l| l.focus(id));
+                    this.files.refocus = true;
+                    if !this.focus.is_focused(window) {
+                        window.focus(&this.focus, cx);
+                    }
                     if this.selects(id, e.modifiers) {
                         this.select_begin(id, e.position, e.click_count, e.modifiers.shift, cx);
                     } else {
@@ -5679,15 +5723,24 @@ impl Shell {
             )
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    this.change(true, cx, |l| l.focus(id));
+                    this.files.refocus = true;
+                    if !this.focus.is_focused(window) {
+                        window.focus(&this.focus, cx);
+                    }
                     this.mouse_input(id, keys::tui::Mouse::Press(1), e.position, e.modifiers, cx);
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                     // 우클릭 메뉴의 복사·붙여넣기가 이 칸에 가도록 포커스를 옮긴다.
                     this.change(true, cx, |l| l.focus(id));
+                    this.files.refocus = true;
+                    if !this.focus.is_focused(window) {
+                        window.focus(&this.focus, cx);
+                    }
                     this.mouse_input(id, keys::tui::Mouse::Press(2), e.position, e.modifiers, cx);
                 }),
             )
@@ -5915,7 +5968,9 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings.is_some() && !self.mobile_page_open(cx) {
+            if self.settings.is_some()
+                && !(self.mobile_page_open(cx) || self.automations_page_open(cx))
+            {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
                 window.set_window_title(&self.main_window_title(cx));
@@ -6026,8 +6081,8 @@ impl Render for Shell {
             window.is_window_active() && !self.page_open() && self.dashboard.is_none();
         self.resources
             .update(cx, |view, cx| view.set_visible(resources_visible, cx));
-        let mobile_page = self.mobile_page_open(cx);
-        let (settings_view, mobile_view) = if mobile_page {
+        let sub_page = self.mobile_page_open(cx) || self.automations_page_open(cx);
+        let (settings_view, mobile_view) = if sub_page {
             (None, self.settings.clone())
         } else {
             (self.settings.clone(), None)
@@ -6542,7 +6597,7 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .bg(bg)
-                            .when(artifacts_view.is_none() && !mobile_page, |d| {
+                            .when(artifacts_view.is_none() && !sub_page, |d| {
                                 d.child(self.render_tab_bar(window, cx))
                             })
                             .child(
@@ -6566,7 +6621,7 @@ impl Render for Shell {
                             ),
                     )
                     .when(
-                        !self.panel_collapsed && artifacts_view.is_none() && !mobile_page,
+                        !self.panel_collapsed && artifacts_view.is_none() && !sub_page,
                         |d| {
                             d.child(divider(
                                 "divider-panel".into(),

@@ -921,6 +921,11 @@ impl Registry {
             self.close(peer, new).ok();
             return Err(super::os(&error));
         }
+        let should_continue = self.agents.take_rate_limited(old) || {
+            let st = self.status.get(old);
+            st.state == krill_proto::control::AgentState::Working
+                && st.source == Some(krill_proto::control::Source::Hook)
+        };
         if !self.account_original_ended(old)
             && let Err(error) = self.close(peer, old)
         {
@@ -955,6 +960,17 @@ impl Registry {
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
         drop(replacement);
+        if should_continue
+            && let Err(error) =
+                Self::deliver_input_to_tap(&tap, b"Continue from where you left off.", true)
+        {
+            tracing::warn!(
+                session = new.0,
+                from = old.0,
+                error = %error,
+                "failed to send continuation prompt after account switch"
+            );
+        }
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
         let later = lock(&self.account_work.pending)

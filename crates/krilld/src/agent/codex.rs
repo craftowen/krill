@@ -4,8 +4,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -156,4 +157,86 @@ fn search_path(program: Option<&Path>) -> OsString {
         .map(Path::to_path_buf);
     std::env::join_paths(first.into_iter().chain(std::env::split_paths(login)))
         .unwrap_or_else(|_| login.to_owned())
+}
+
+type NoDaemonKey = (PathBuf, Stamp);
+static NO_DAEMON_CACHE: Mutex<BTreeMap<NoDaemonKey, (Instant, bool)>> = Mutex::new(BTreeMap::new());
+const NO_DAEMON_TTL: Duration = Duration::from_hours(1);
+
+/// Codex 0.156+는 기본으로 `CODEX_HOME`마다 공용 백그라운드 `app-server --managed-daemon`을 띄워
+/// 모든 탭의 훅을 첫 탭 환경으로 실행하고 rollout 파일도 데몬 프로세스가 열어 둔다.
+/// 바이너리가 `--no-daemon`을 지원하면 이를 붙여 탭별 프로세스·훅·대화 귀속을 격리한다.
+pub(super) fn no_daemon_supported(program: Option<&str>) -> bool {
+    if cfg!(test)
+        || std::env::var_os("KRILL_TEST_OFFLINE").is_some_and(|v| !v.is_empty() && v != "0")
+    {
+        return false;
+    }
+    let search = search_path(program.map(Path::new));
+    let bin = program.unwrap_or("codex");
+    let Some(exe) = krill_proto::agent::which(bin, &search) else {
+        return false;
+    };
+    no_daemon_supported_cached(&exe)
+}
+
+fn no_daemon_supported_cached(exe: &Path) -> bool {
+    let key = (exe.to_path_buf(), stamp(exe));
+    if let Some(supported) = crate::session::lock(&NO_DAEMON_CACHE)
+        .get(&key)
+        .filter(|(at, _)| at.elapsed() < NO_DAEMON_TTL)
+        .map(|(_, supported)| *supported)
+    {
+        return supported;
+    }
+    let supported = no_daemon_supported_with(exe);
+    let mut cache = crate::session::lock(&NO_DAEMON_CACHE);
+    if cache.len() >= 64 {
+        cache.pop_first();
+    }
+    cache.insert(key, (Instant::now(), supported));
+    supported
+}
+
+pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
+    let Ok(mut child) = Command::new(exe)
+        .arg("--help")
+        .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(pipe) = child.stdout.take() else {
+        child.kill().ok();
+        child.wait().ok();
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut raw = Vec::new();
+        pipe.take(256 * 1024).read_to_end(&mut raw).ok();
+        tx.send(raw).ok();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                break false;
+            }
+        }
+    };
+    if !ok {
+        return false;
+    }
+    let Ok(raw) = rx.recv_timeout(Duration::from_secs(1)) else {
+        return false;
+    };
+    String::from_utf8_lossy(&raw).contains("--no-daemon")
 }

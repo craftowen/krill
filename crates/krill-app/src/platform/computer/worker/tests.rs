@@ -109,6 +109,11 @@ impl Backend for Script {
                 };
                 out.cleanup = Cleanup::Completed;
             }
+            ("sat", _) => {
+                out.verification = Verification::Satisfied {
+                    predicate: "value_equals".into(),
+                };
+            }
             ("unsat", _) => {
                 out.verification = Verification::Unsatisfied {
                     predicate: "value_equals".into(),
@@ -328,8 +333,8 @@ impl Harness {
         .is_err()
     }
 
-    /// Independently probe the BSD file lock from another process. Python is also used by
-    /// the MCP integration fixtures; macOS 14 runners do not provide the lockf executable.
+    /// Independently probe the BSD file lock from another process.
+    /// macOS 14 runners provide Python, without requiring the lockf executable.
     fn lock_held_by_process(&self) -> bool {
         let status = std::process::Command::new("python3")
             .args([
@@ -960,11 +965,13 @@ fn batch_stops_at_each_stop_point_without_retry() {
             json!({"state":"not_dispatched","reason":BATCH_STOPPED}),
             "{name}"
         );
-        assert_eq!(
-            result["data"]["issuedSteps"],
-            1 + u32::from(case.dispatched && name != "refused"),
-            "{name}"
-        );
+        // An unknown delivery makes the count of steps that really went out unknown too.
+        let issued = match name {
+            "unknown" => Value::Null,
+            "gone" | "refused" => json!(1),
+            _ => json!(2),
+        };
+        assert_eq!(result["data"]["issuedSteps"], issued, "{name}");
         assert_eq!(
             result["cleanup"]["state"],
             if name == "dirty" {
@@ -1115,5 +1122,33 @@ fn batch_with_reads_nesting_or_bad_size_is_rejected_without_reserving_seq() {
     h.request(1, &batch(&[step("click", "e1")]));
     assert_eq!(h.next()["type"], "accepted");
     assert_eq!(result_of(&mut h, 1)["state"], "completed");
+    h.finish();
+}
+
+#[test]
+fn batch_verification_is_satisfied_only_when_every_step_is() {
+    let mut h = Harness::start("batch-verify", Options::default());
+    // A verified value write followed by an unverified press proves nothing about the whole batch.
+    h.request(1, &batch(&[step("set_value", "sat"), step("action", "e1")]));
+    let mixed = result_of(&mut h, 1);
+    assert_eq!(mixed["state"], "completed");
+    assert_eq!(mixed["verification"], json!({"state":"not_requested"}));
+    assert_eq!(
+        mixed["data"]["steps"][0]["verification"],
+        json!({"state":"satisfied","predicate":"value_equals"})
+    );
+    assert_eq!(
+        mixed["data"]["steps"][1]["verification"]["state"],
+        "not_requested"
+    );
+    h.request(
+        2,
+        &batch(&[step("set_value", "sat"), step("set_value", "sat")]),
+    );
+    let all = result_of(&mut h, 2);
+    assert_eq!(
+        all["verification"],
+        json!({"state":"satisfied","predicate":ALL_STEPS_SATISFIED})
+    );
     h.finish();
 }

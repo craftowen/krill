@@ -30,6 +30,8 @@ use super::protocol::{
 
 /// `batch`가 멈춘 뒤 발행했던 것이 있으면 붙는 오류 코드.
 pub const BATCH_STOPPED: &str = "batch_stopped";
+/// 모든 단계의 검증이 충족됐을 때만 쓰는 묶음 검증 술어.
+pub const ALL_STEPS_SATISFIED: &str = "all_steps_satisfied";
 
 /// 종료 코드: 출력 전송로 실패(호출자가 읽지 않음·사라짐·쓰기 정체). 미전달 프레임이 있을 수 있다.
 pub const EXIT_TRANSPORT: u8 = 3;
@@ -601,7 +603,9 @@ impl<B: Backend> Executor<B> {
         // 전달이 `submitted`인 단계 수. 모든 단계가 그래야 결과도 `submitted`다.
         let mut submitted = 0usize;
         let mut unknown = None;
-        let mut verification = Verification::NotRequested;
+        // 검증이 충족된 단계 수와, 멈춤을 부른 검증 실패.
+        let mut satisfied = 0usize;
+        let mut failed_verification = None;
         let mut cleanup = Cleanup::NotNeeded;
         // 멈춘 단계와 이유. 발행하지 못한 단계면 그 거절, 발행한 단계면 축에서 읽은 이유다.
         let mut stop: Option<(usize, ErrorInfo)> = None;
@@ -677,8 +681,12 @@ impl<B: Backend> Executor<B> {
                 "verification": dispatched.verification,
                 "cleanup": dispatched.cleanup,
             });
-            if dispatched.verification != Verification::NotRequested {
-                verification = dispatched.verification;
+            match dispatched.verification {
+                Verification::Satisfied { .. } => satisfied += 1,
+                Verification::NotRequested => {}
+                failed @ (Verification::Unsatisfied { .. } | Verification::Unknown { .. }) => {
+                    failed_verification = Some(failed);
+                }
             }
             if dispatched.cleanup != Cleanup::NotNeeded {
                 cleanup = dispatched.cleanup;
@@ -732,6 +740,16 @@ impl<B: Backend> Executor<B> {
                 message: diagnostic(format!("batch stopped at step {index}: {reason}")),
             }),
         });
+        // 한 단계의 술어를 묶음 전체의 증거로 올리지 않는다. 실패는 그대로, 충족은 모든 단계가 충족됐을 때만이다.
+        let verification = failed_verification.unwrap_or(if satisfied == steps.len() {
+            Verification::Satisfied {
+                predicate: ALL_STEPS_SATISFIED.to_owned(),
+            }
+        } else {
+            Verification::NotRequested
+        });
+        // 불명 전달이면 실제로 나간 단계 수도 모른다.
+        let issued_steps = (!matches!(delivery, Delivery::Unknown { .. })).then_some(issued_steps);
         let state = Outcome::state_for(&delivery, &cleanup);
         if state == RequestState::Unknown {
             self.quiescing = Some(input);
