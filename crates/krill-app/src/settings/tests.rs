@@ -8625,22 +8625,31 @@ fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
 
 /// 앱 테마 선택: 누르면 바로 팔레트가 바뀌고 저장되며, 짝 터미널 테마는 사용자가 바꾸지 않았을 때만 따라 바뀐다.
 #[gpui::test]
-fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
+fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
     let d = dir("ui-theme");
     fs::write(d.join(SETTINGS_FILE), "theme = 'dark'\n").unwrap();
     init(cx, &d);
     let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));
     vcx.run_until_parked();
-    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+    let choose = |vcx: &mut gpui::VisualTestContext, selector: &'static str, index: usize| {
         let b = vcx
-            .debug_bounds(s)
-            .unwrap_or_else(|| panic!("missing selector {s}"));
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing selector {selector}"));
         vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        for _ in 0..=index {
+            vcx.simulate_keystrokes("down");
+        }
+        vcx.simulate_keystrokes("enter");
         vcx.run_until_parked();
     };
 
-    click(vcx, "ui-theme-glow");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::Trench);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::TRENCH);
+    });
+    choose(vcx, "ui-theme-dark", 9);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Glow);
@@ -8657,7 +8666,7 @@ fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut Te
     // 사용자가 고른 터미널 테마는 앱 테마를 바꿔도 그대로 둔다.
     vcx.update(|_, cx| edit(cx, |s| s.terminal_theme_dark = "Dracula".to_owned()));
     vcx.run_until_parked();
-    click(vcx, "ui-theme-abyss");
+    choose(vcx, "ui-theme-dark", 7);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Abyss);
@@ -8667,7 +8676,7 @@ fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut Te
 
     vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
     vcx.run_until_parked();
-    click(vcx, "ui-theme-paper");
+    choose(vcx, "ui-theme-light", 1);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
@@ -8681,15 +8690,53 @@ fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut Te
     fs::remove_dir_all(&d).ok();
 }
 
-/// 앱 테마 키가 없는 예전 설정 파일은 기본 테마(심해·기본)로 읽는다.
+/// 앱 테마 키가 없으면 새 기본값 해구·기본을 쓰고, 저장된 선택값은 계속 읽는다.
 #[test]
 fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("theme = \"light\"").unwrap();
-    assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Trench);
     assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
     let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
     assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+    assert_eq!(
+        s.terminal_theme_dark,
+        crate::ui::terminal_themes::KRILL_TIDEPOOL
+    );
+    assert_eq!(
+        s.terminal_theme_light,
+        crate::ui::terminal_themes::KRILL_PAPER
+    );
+    let s = Settings::parse("ui_theme_dark = 'deep'\nterminal_theme_dark = 'Krill Deep'").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
+    assert_eq!(s.terminal_theme_dark, "Krill Deep");
+}
+
+/// 새 테마 선택값이 저장·재시작을 거쳐 보존되고, 앱과 짝 터미널이 함께 바뀐다.
+#[test]
+fn all_ui_theme_choices_roundtrip_and_preserve_custom_terminal_selection() {
+    for theme in DarkUiTheme::ALL {
+        let mut s = Settings::default();
+        s.set_ui_theme_dark(theme);
+        assert_eq!(s.terminal_theme_dark, theme.terminal_theme_name());
+        let parsed = Settings::parse(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(parsed.ui_theme_dark, theme);
+        assert_eq!(parsed.terminal_theme_dark, theme.terminal_theme_name());
+        s.terminal_theme_dark = "custom:my-terminal".to_owned();
+        s.set_ui_theme_dark(DarkUiTheme::Trench);
+        assert_eq!(s.terminal_theme_dark, "custom:my-terminal");
+    }
+    for theme in LightUiTheme::ALL {
+        let mut s = Settings::default();
+        s.set_ui_theme_light(theme);
+        assert_eq!(s.terminal_theme_light, theme.terminal_theme_name());
+        let parsed = Settings::parse(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(parsed.ui_theme_light, theme);
+        assert_eq!(parsed.terminal_theme_light, theme.terminal_theme_name());
+        s.terminal_theme_light = "custom:my-terminal".to_owned();
+        s.set_ui_theme_light(LightUiTheme::Classic);
+        assert_eq!(s.terminal_theme_light, "custom:my-terminal");
+    }
 }
 
 /// 워크플로 탭 프로젝트 선택 후보에는 실제 절대 경로만 들어가고

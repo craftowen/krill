@@ -312,8 +312,12 @@ fn underline_follows_inverse_and_dim_glyph_color() {
         ),
     ];
     let plan = plan_row(&cells, &DEFAULT);
-    // 흐림: (2 × 글자 + 배경) / 3. 빨강 255·0·0, DEFAULT(Krill Deep) 배경 16·19·27.
-    let dim = Rgb { r: 175, g: 6, b: 9 };
+    // 흐림: (2 × 글자 + 배경) / 3. 빨강 255·0·0, DEFAULT(Krill Trench) 배경 6·22·32.
+    let dim = Rgb {
+        r: 172,
+        g: 7,
+        b: 10,
+    };
     assert_eq!(plan.segments[0].color_at(0), Some(DEFAULT.background));
     assert_eq!(plan.segments[0].color_at(1), Some(dim));
     let colors: Vec<_> = plan.underlines.iter().map(|s| s.color).collect();

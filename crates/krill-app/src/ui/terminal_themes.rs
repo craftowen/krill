@@ -1,4 +1,4 @@
-//! 내장 터미널 테마 카탈로그(Krill 기본 `Krill Deep` + Orca 호환 30종 + 앱 테마 짝 Krill 4종)·커스텀 테마·Ghostty/Warp 테마 가져오기(OWE-956).
+//! 내장 터미널 테마 카탈로그(Krill 15종 + Orca 호환 30종)·커스텀 테마·Ghostty/Warp 테마 가져오기(OWE-956).
 //!
 //! 출처: `.ref/orca/src/shared/terminal-themes/` (`defaults.ts`, `popular-dark-core.ts`,
 //! `popular-dark-extended.ts`, `popular-light.ts`, `classic.ts`),
@@ -10,10 +10,13 @@ use gpui::Hsla;
 use krill_proto::theme::{Rgb, Theme as TerminalTheme};
 use serde::{Deserialize, Serialize};
 
-use super::theme::{TERMINAL_DARK, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, rgba_bytes, term_rgb};
+use super::theme::{
+    TERMINAL_DARK, TERMINAL_DEEP, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, rgba_bytes, term_rgb,
+};
 
 /// 기본 다크 터미널 테마 이름(Krill 고유 [`TERMINAL_DARK`], 데몬 기본 테마와 같다).
-pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Krill Deep";
+pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Krill Trench";
+pub const KRILL_DEEP: &str = "Krill Deep";
 /// 기본 라이트 터미널 테마 이름(Orca `DEFAULT_TERMINAL_THEME_LIGHT`).
 pub const DEFAULT_TERMINAL_THEME_LIGHT: &str = "Builtin Tango Light";
 /// 앱 테마 `심연`·`조수`·`발광`·`종이`와 짝인 Krill 고유 터미널 테마 이름.
@@ -21,6 +24,15 @@ pub const KRILL_ABYSS: &str = "Krill Abyss";
 pub const KRILL_TIDEPOOL: &str = "Krill Tidepool";
 pub const KRILL_GLOW: &str = "Krill Glow";
 pub const KRILL_PAPER: &str = "Krill Paper";
+pub const KRILL_GRAPHITE: &str = "Krill Graphite";
+pub const KRILL_PINE: &str = "Krill Pine";
+pub const KRILL_AMETHYST: &str = "Krill Amethyst";
+pub const KRILL_PEAT: &str = "Krill Peat";
+pub const KRILL_MOONLIGHT: &str = "Krill Moonlight";
+pub const KRILL_LIMESTONE: &str = "Krill Limestone";
+pub const KRILL_CELADON: &str = "Krill Celadon";
+pub const KRILL_GLACIER: &str = "Krill Glacier";
+pub const KRILL_DUSK: &str = "Krill Dusk";
 /// 사용자 가져오기 테마 선택값 접두사(`custom:<id>`).
 pub const CUSTOM_TERMINAL_THEME_PREFIX: &str = "custom:";
 /// 사용자 가져오기 테마 최대 보관 개수(Orca `MAX_TERMINAL_CUSTOM_THEMES`).
@@ -81,8 +93,7 @@ const fn builtin(
     }
 }
 
-/// 내장 터미널 테마 카탈로그: Krill 기본 `Krill Deep` 다음에 Orca 내장 30종, 끝에 앱 테마 짝 Krill 4종
-/// (`.ref/orca/src/shared/terminal-themes/index.ts` 정본 순서).
+/// 내장 터미널 테마 카탈로그: 해구 기본값, 기존 심해·Orca 30종, 나머지 Krill 앱 테마 짝.
 pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
     // 0: Krill 고유 다크 기본
     BuiltinTerminalTheme {
@@ -90,7 +101,12 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
         is_dark: true,
         theme: TERMINAL_DARK,
     },
-    // 1..=2: defaults.ts
+    BuiltinTerminalTheme {
+        name: KRILL_DEEP,
+        is_dark: true,
+        theme: TERMINAL_DEEP,
+    },
+    // Orca defaults.ts
     BuiltinTerminalTheme {
         name: "Ghostty Default Style Dark",
         is_dark: true,
@@ -101,7 +117,7 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
         is_dark: false,
         theme: TERMINAL_LIGHT,
     },
-    // 3..=10: popular-dark-core.ts
+    // popular-dark-core.ts
     builtin(
         "Dracula",
         true,
@@ -904,6 +920,231 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
             0x0095_50c2,
             0x0015_97a0,
             0x00ec_e6da,
+        ],
+    ),
+    builtin(
+        KRILL_GRAPHITE,
+        true,
+        0x0017_1719,
+        0x00de_dee3,
+        0x00ee_eeef,
+        [
+            0x0085_858c,
+            0x00df_7885,
+            0x009c_c59a,
+            0x00d8_c379,
+            0x0088_add9,
+            0x00b7_9bd4,
+            0x008d_bfc7,
+            0x00d3_d3d9,
+            0x00a0_a0a7,
+            0x00f3_9aa6,
+            0x00b4_dbaa,
+            0x00ef_daa0,
+            0x00a7_c8ec,
+            0x00d1_b8ea,
+            0x00a9_d8df,
+            0x00f2_f2f5,
+        ],
+    ),
+    builtin(
+        KRILL_PINE,
+        true,
+        0x000d_1913,
+        0x00df_ebe1,
+        0x00e2_eee3,
+        [
+            0x0082_9487,
+            0x00df_8391,
+            0x009a_c79b,
+            0x00d4_c781,
+            0x0091_b8d6,
+            0x00b7_a3cf,
+            0x008d_c5bc,
+            0x00cb_dccc,
+            0x00a1_b4a5,
+            0x00f0_a1ac,
+            0x00b4_dfad,
+            0x00ec_dda2,
+            0x00af_d0e8,
+            0x00d0_bce6,
+            0x00ab_ddd2,
+            0x00ed_f5ed,
+        ],
+    ),
+    builtin(
+        KRILL_AMETHYST,
+        true,
+        0x001b_1422,
+        0x00ea_dff2,
+        0x00ee_e2f6,
+        [
+            0x0091_869c,
+            0x00e4_839c,
+            0x00a6_c599,
+            0x00d7_c581,
+            0x0097_b3dd,
+            0x00bc_a0dc,
+            0x0091_c6cb,
+            0x00db_cee3,
+            0x00b0_a0be,
+            0x00f4_a2b4,
+            0x00bf_dda9,
+            0x00ef_dda1,
+            0x00b3_cdee,
+            0x00d4_b8f0,
+            0x00af_e0e0,
+            0x00f4_ecfa,
+        ],
+    ),
+    builtin(
+        KRILL_PEAT,
+        true,
+        0x001c_1814,
+        0x00e9_dfce,
+        0x00f4_e7ce,
+        [
+            0x009b_8b77,
+            0x00dc_8592,
+            0x00ac_c28c,
+            0x00d8_c17a,
+            0x009e_b6d0,
+            0x00bc_a3cd,
+            0x0099_c5be,
+            0x00d9_cbb5,
+            0x00b8_a68e,
+            0x00f0_a2ad,
+            0x00c4_dba5,
+            0x00ef_daa0,
+            0x00ba_cfe5,
+            0x00d5_bee4,
+            0x00b4_ded3,
+            0x00f5_ecdd,
+        ],
+    ),
+    builtin(
+        KRILL_MOONLIGHT,
+        false,
+        0x00fa_fafc,
+        0x0030_343c,
+        0x0046_5268,
+        [
+            0x0034_3840,
+            0x00a4_384d,
+            0x0032_6746,
+            0x0087_640e,
+            0x0035_5e9d,
+            0x0080_518d,
+            0x0028_6a73,
+            0x005c_6068,
+            0x0065_6872,
+            0x00b2_3b50,
+            0x0028_7144,
+            0x008b_6810,
+            0x0032_69b0,
+            0x0089_5295,
+            0x0023_717b,
+            0x0024_2830,
+        ],
+    ),
+    builtin(
+        KRILL_LIMESTONE,
+        false,
+        0x00f6_f5f0,
+        0x0034_392f,
+        0x004e_5d49,
+        [
+            0x0035_392f,
+            0x00a1_3b43,
+            0x0042_683d,
+            0x0080_610e,
+            0x003d_6097,
+            0x007b_5682,
+            0x0035_6a6b,
+            0x0060_6457,
+            0x0066_6a5c,
+            0x00ad_3943,
+            0x0038_713c,
+            0x0089_680c,
+            0x0037_6aa3,
+            0x0089_5087,
+            0x002b_7274,
+            0x0029_2f27,
+        ],
+    ),
+    builtin(
+        KRILL_CELADON,
+        false,
+        0x00f4_faf5,
+        0x0029_3f34,
+        0x0036_5f4c,
+        [
+            0x002d_4035,
+            0x00a1_364b,
+            0x002d_6740,
+            0x0080_630c,
+            0x0035_5f96,
+            0x007c_508c,
+            0x0028_6970,
+            0x0057_6b5d,
+            0x005c_7062,
+            0x00af_3a50,
+            0x0026_703d,
+            0x0089_680d,
+            0x0030_69a5,
+            0x0088_4f94,
+            0x0024_727a,
+            0x0023_3a2c,
+        ],
+    ),
+    builtin(
+        KRILL_GLACIER,
+        false,
+        0x00f4_f9fd,
+        0x002b_3e53,
+        0x0038_5f83,
+        [
+            0x002c_3d51,
+            0x00a3_354d,
+            0x0032_6944,
+            0x0084_630c,
+            0x0031_5e9d,
+            0x007b_528d,
+            0x0029_6b76,
+            0x0059_6b7a,
+            0x005f_7283,
+            0x00af_3b54,
+            0x002c_7142,
+            0x0089_680c,
+            0x002c_68ad,
+            0x0089_5497,
+            0x0024_727e,
+            0x0023_384d,
+        ],
+    ),
+    builtin(
+        KRILL_DUSK,
+        true,
+        0x0025_1f2d,
+        0x00e5_dceb,
+        0x00cc_b8db,
+        [
+            0x0077_6a85,
+            0x00df_91a6,
+            0x009f_c6a3,
+            0x00d5_bb7c,
+            0x009f_b8df,
+            0x00c0_a1d5,
+            0x0090_bec7,
+            0x00d3_c8de,
+            0x00a1_94af,
+            0x00ed_9bb0,
+            0x00b0_d6ae,
+            0x00e5_ce94,
+            0x00b2_c8ed,
+            0x00d3_b5e7,
+            0x00a5_cfd8,
+            0x00ee_e7f1,
         ],
     ),
 ];
@@ -1964,20 +2205,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_catalog_has_krill_deep_and_all_30_orca_themes_with_unique_names() {
-        // Krill Deep + Orca 30종 + 앱 테마 짝 Krill 4종.
-        assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 35);
-        assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, "Krill Deep");
+    fn builtin_catalog_has_krill_trench_and_all_existing_themes_with_unique_names() {
+        // Krill 15종(기존 5종 + 신규 10종) + Orca 30종.
+        assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 45);
+        assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, "Krill Trench");
         assert_eq!(BUILTIN_TERMINAL_THEMES[0].theme, TERMINAL_DARK);
         assert_eq!(
             builtin_terminal_theme("Ghostty Default Style Dark").map(|b| b.theme),
             Some(TERMINAL_GHOSTTY_DARK)
         );
         assert_eq!(
-            BUILTIN_TERMINAL_THEMES[2].name,
-            DEFAULT_TERMINAL_THEME_LIGHT
+            builtin_terminal_theme(KRILL_DEEP).map(|b| b.theme),
+            Some(TERMINAL_DEEP)
         );
-        assert_eq!(BUILTIN_TERMINAL_THEMES[2].theme, TERMINAL_LIGHT);
+        assert_eq!(
+            builtin_terminal_theme(DEFAULT_TERMINAL_THEME_LIGHT).map(|b| b.theme),
+            Some(TERMINAL_LIGHT)
+        );
 
         let mut names = std::collections::BTreeSet::new();
         for entry in BUILTIN_TERMINAL_THEMES {
