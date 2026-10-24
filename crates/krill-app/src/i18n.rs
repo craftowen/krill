@@ -567,6 +567,11 @@ catalog! {
         CANCEL => ("취소", "Cancel"),
         SESSIONS => ("세션", "Session"),
         SESSION => ("세션", "Session"),
+        LOOSE_SESSIONS => ("작업 폴더 미확인 세션", "Sessions without a folder"),
+        LOOSE_SESSIONS_HINT => (
+            "작업 폴더를 알 수 없어 프로젝트 아래에 넣지 못한 세션입니다(셸이 현재 폴더를 알리지 않는 경우 등).",
+            "Sessions whose working folder is unknown, so they cannot be placed under a project (for example, the shell does not report its folder)."
+        ),
         NEW_TERMINAL => ("여기서 새 터미널", "New terminal here"),
         OPEN_SESSION => ("세션 열기", "Open session"),
         CONTINUE_SESSION => ("새 세션에 이어하기…", "Continue in new session…"),

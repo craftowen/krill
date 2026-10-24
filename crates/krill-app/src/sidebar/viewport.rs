@@ -737,7 +737,7 @@ mod regression_tests {
             s.parents.insert(paths[2].clone(), paths[1].clone());
             s.collapsed_lineage.insert(paths[0].clone());
             assert!(
-                s.remote_rows(&s.remote_hosts[0])
+                s.remote_rows(&s.remote_hosts[0], &s.collapsed)
                     .iter()
                     .any(|r| r == &Row::Worktree(paths[2].clone())),
                 "a local collapsed lineage must not hide remote same-path worktrees"

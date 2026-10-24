@@ -4839,11 +4839,11 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         );
     });
 
-    // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트가 아직 없는 원격 호스트는
-    // 상태 확인·재연결 동작을 위해 헤더를 유지한다.
+    // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트 없이 연결만 된 원격 호스트도
+    // 프로젝트 목록에 줄을 만들지 않는다(실행 위치 선택·설정에서 다룬다).
     cx.run_until_parked();
     assert!(cx.debug_bounds("host-header-local").is_none());
-    assert!(cx.debug_bounds("host-header-studio-mac").is_some());
+    assert!(cx.debug_bounds("host-header-studio-mac").is_none());
 
     // 로컬 탭에는 호스트 배지가 없고, 원격 탭과 원격 패인 헤더에는 호스트 배지가 표시된다.
     assert_eq!(local_pane.get(), 0);
