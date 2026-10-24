@@ -292,35 +292,6 @@ impl Shell {
                                         // OWE-886: 빈 에이전트도 `status::agent_icon` 하나로 통일(§6.5).
                                         ui::status::agent_icon(agent, ui::ICON_SM, p.foreground),
                                     )
-                                    .children(account_label.map(|l| {
-                                        let short = ui::status::account_initial(l);
-                                        let full = l.to_owned();
-                                        let tip =
-                                            krill_app::i18n::catalog::sidebar::SESSION_ACCOUNT
-                                                .format(&[("label", &full)]);
-                                        div()
-                                            .id(("tab-account-badge", i))
-                                            .aria_label(tip.clone())
-                                            .debug_selector(move || {
-                                                format!("tab-account-badge-{i}")
-                                            })
-                                            .flex_none()
-                                            .px_1()
-                                            .rounded(ui::RADIUS_XS)
-                                            .bg(p.muted)
-                                            .font_family(ui::FONT_UI)
-                                            .text_size(ui::TEXT_2XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(short)
-                                            .tooltip(move |window, cx| {
-                                                ui::tooltip_view(
-                                                    format!("tab-account-badge-{i}"),
-                                                    tip.clone(),
-                                                    window,
-                                                    cx,
-                                                )
-                                            })
-                                    }))
                                     .children(self.host_badge(tab.focused, "tab-host-badge", cx))
                                     .into_any_element()
                             }),
@@ -596,7 +567,9 @@ impl Shell {
                             .xsmall()
                             .toggled(self.is_active_chat_view())
                             .debug_selector(|| "toggle-chat-view".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_chat_view(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_chat_view_with_focus(window, cx);
+                            })),
                         "toggle-chat-view",
                         "Toggle Chat / Terminal view",
                     ))

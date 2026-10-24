@@ -22,14 +22,24 @@ impl Shell {
             return;
         }
         let sidebar = self.sidebar.read(cx);
-        self.workspace_closing.retain(|(host, session)| {
-            sidebar.session_on(host, *session).is_some_and(|session| {
-                session.status.state != krill_proto::control::AgentState::Exited
-            })
-        });
+        // An empty/disconnected snapshot is not proof that a close completed.
+        // Retain explicit close intent across relists, including stale replies.
         let Some((host, folder)) = sidebar.selected_workspace() else {
             return;
         };
+        let workspace = Workspace {
+            host: host.clone(),
+            folder: folder.clone(),
+        };
+        // Create can appear in the daemon list before its reply reaches the
+        // launching pane. Wait for that pane's ID before importing missing IDs.
+        if self.live.keys().any(|pane| {
+            self.layout.session(*pane).is_none()
+                && self.layout.file(*pane).is_none()
+                && self.pane_workspace(*pane, cx).as_ref() == Some(&workspace)
+        }) {
+            return;
+        }
         let existing = self.layout.sessions_for_host(&host);
         let missing: Vec<_> = sidebar
             .live_sessions_in_workspace(&host, &folder)

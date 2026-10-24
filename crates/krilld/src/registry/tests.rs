@@ -5,6 +5,105 @@ use std::fs;
 use krill_proto::agent::Permission;
 
 #[test]
+fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
+    use krill_proto::os::ffi::OsStrExt as _;
+
+    let dir = std::env::temp_dir().join(format!("sidebar-cwd-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let work = dir.join("project");
+    fs::create_dir_all(&work).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&work)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let work = krill_proto::os::canonicalize(&work).unwrap();
+    let id = SessionId(41);
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(id),
+    };
+    // A reader with no usable process cwd and no OSC report reproduces Windows on macOS too.
+    let insert = |reg: &Registry, cwd: PathBuf| {
+        let (master, writer) = UnixStream::pair().unwrap();
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )
+        .unwrap();
+        lock(&reg.state).sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: 0,
+                cwd,
+            },
+        );
+        writer
+    };
+    let check = |reg: &Registry, expected: &[u8]| {
+        let Reply::Sidebar(data) = reg.handle(&peer, Request::Sidebar, &mut HashMap::new()) else {
+            panic!("expected sidebar reply");
+        };
+        assert_eq!(data.sessions.len(), 1);
+        assert_eq!(data.sessions[0].session, id);
+        assert_eq!(data.sessions[0].cwd, expected);
+        if !expected.is_empty() {
+            assert_eq!(data.repositories.len(), 1);
+            assert_eq!(data.repositories[0].worktrees, [expected]);
+        }
+    };
+    let reg = Registry::new(None, Some(&dir));
+    let writer = insert(&reg, work.clone());
+    check(&reg, work.as_os_str().as_bytes());
+    // Login-shell agents persist the hook workspace, even if the initial shell directory differs.
+    assert!(
+        !reg.agents.record_hook_session_with_context(
+            id,
+            &serde_json::to_vec(&serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sidebar-cwd-conversation",
+                "cwd": work,
+            }))
+            .unwrap(),
+            Some("claude"),
+            None,
+        )
+    );
+    drop(writer);
+    drop(reg);
+
+    // Daemon replacement starts with empty Entry::cwd and an empty terminal cwd parser.
+    let reg = Registry::new(None, Some(&dir));
+    let writer = insert(&reg, PathBuf::new());
+    check(&reg, work.as_os_str().as_bytes());
+    assert_eq!(reg.session_cwd(id), Some(work.clone()));
+    lock(&reg.state).sessions.get_mut(&id).unwrap().cwd = dir.clone();
+    assert_eq!(reg.session_cwd(id), Some(work.clone()));
+    // A later observed directory must survive loss of the live cwd, ahead of stale launch data.
+    let latest = work.join("latest");
+    fs::create_dir_all(&latest).unwrap();
+    sidebar::snapshot(&reg.sidebar, &[(id, Some(latest.clone()))]).unwrap();
+    assert_eq!(reg.session_cwd(id), Some(latest));
+    drop(writer);
+    drop(reg);
+
+    // With no cwd evidence, leave the session unclassified rather than selecting another project.
+    let reg = Registry::new(None, None);
+    let writer = insert(&reg, PathBuf::new());
+    check(&reg, b"");
+    drop(writer);
+    drop(reg);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn agent_settings_and_metadata_obey_peer_scope() {
     let reg = Registry::new(None, None);
     let mut clients = HashMap::new();

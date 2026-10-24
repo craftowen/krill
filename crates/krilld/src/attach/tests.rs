@@ -279,3 +279,62 @@ fn bounded_scroll_candidates_reconstruct_tall_and_repeated_grids_exactly() {
         &screen(&["same", "other", "same", "same", "same", "new"]),
     );
 }
+
+#[test]
+fn mobile_urgent_echo_sends_immediately_after_clock_mark_and_skips_empty_diff_mark() {
+    use krill_proto::os::net::UnixStream;
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let conn = Conn {
+        out: Mutex::new(server),
+        resync: AtomicBool::new(false),
+        echo: AtomicBool::new(false),
+        gone: AtomicBool::new(false),
+    };
+    let t0 = Instant::now();
+    let mut clock = CaptureClock::default();
+
+    // 빈 diff 배치는 clock.mark를 찍지 않아야 직후 에코가 33ms 밀리지 않는다.
+    let empty_at = t0 + Duration::from_millis(1);
+    assert!(!sync_client(&conn, &mut clock, Revision(1), Seq(1), Vec::new(), empty_at).unwrap());
+    assert_eq!(clock.next_delay(empty_at, MOBILE_FRAME_MIN), Duration::ZERO);
+
+    // 직전 프레임 전송으로 clock.mark가 찍힌 직후(1ms 뒤) 일반 출력은 32ms 대기한다.
+    clock.mark(t0);
+    let t1 = t0 + Duration::from_millis(1);
+    assert_eq!(
+        frame_delay(&conn, &clock, t1, MOBILE_FRAME_MIN, false),
+        Duration::from_millis(32)
+    );
+
+    // 모바일 입력(0x13)이 Applied되어 echo = true가 되면 next_delay 대기 없이 0ms로 나간다.
+    conn.echo.store(true, Ordering::Release);
+    assert_eq!(
+        frame_delay(&conn, &clock, t1, MOBILE_FRAME_MIN, false),
+        Duration::ZERO
+    );
+
+    // 아직 화면 변경이 없는 빈 PTY 출력 배치에서는 프레임이 안 나가고 echo와 시계가 유지된다.
+    assert!(!sync_client(&conn, &mut clock, Revision(2), Seq(2), Vec::new(), t1).unwrap());
+    assert!(conn.echo.load(Ordering::Acquire));
+    assert_eq!(clock.last, Some(t0));
+
+    // 실제 에코 diff 프레임이 나가면 0ms로 전송되고 echo가 false로 리셋되며 clock.mark가 갱신된다.
+    let prev = screen(&["$ "]);
+    let next = screen(&["$ a"]);
+    let ops = diff(&prev, &next);
+    assert!(sync_client(&conn, &mut clock, Revision(3), Seq(3), ops, t1).unwrap());
+    assert!(!conn.echo.load(Ordering::Acquire));
+    assert_eq!(clock.last, Some(t1));
+
+    let (kind, body) = krill_proto::ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(kind, krill_proto::screen::kind::UPDATE);
+    let update = krill_proto::screen::Update::decode(kind, &body).unwrap();
+    assert_eq!(update.revision, Revision(3));
+    let mut got = prev;
+    got.apply(update.ops).unwrap();
+    assert_eq!(got, next);
+}

@@ -308,7 +308,7 @@ impl Shell {
         let locations = self.execution_locations(cx);
         let launch_host = self.launch_host.clone();
         let (this, focus) = (cx.weak_entity(), self.focus.clone());
-        let (working_count, done_count) = self.sidebar.read(cx).agent_counts();
+        let (waiting_count, working_count, done_count) = self.sidebar.read(cx).agent_counts();
         let menu = krill_app::ui::button_with_tooltip(
             Button::new("new-session")
                 .icon(IconName::Plus)
@@ -470,57 +470,80 @@ impl Shell {
                     d.bg(p.sidebar_accent)
                         .text_color(p.sidebar_accent_foreground)
                 })
-                .when(working_count > 0 || done_count > 0, |d| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(krill_app::ui::TEXT_XS)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .when(working_count > 0, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_color(p.muted_foreground)
-                                        .child(
-                                            div()
-                                                .size(krill_app::ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(p.warning),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family(krill_app::ui::FONT_MONO)
-                                                .child(working_count.to_string()),
-                                        ),
-                                )
-                            })
-                            .when(done_count > 0, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_color(p.muted_foreground)
-                                        .child(
-                                            div()
-                                                .size(krill_app::ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(p.success),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family(krill_app::ui::FONT_MONO)
-                                                .child(done_count.to_string()),
-                                        ),
-                                )
-                            }),
-                    )
-                })
+                .when(
+                    waiting_count > 0 || working_count > 0 || done_count > 0,
+                    |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(krill_app::ui::TEXT_XS)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .when(waiting_count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_color(p.muted_foreground)
+                                            .child(
+                                                div()
+                                                    .size(krill_app::ui::STATE_DOT)
+                                                    .rounded_full()
+                                                    .bg(p.agent_question),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(krill_app::ui::FONT_MONO)
+                                                    .child(waiting_count.to_string()),
+                                            ),
+                                    )
+                                })
+                                .when(working_count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_color(p.muted_foreground)
+                                            .child(
+                                                div()
+                                                    .size(krill_app::ui::STATE_DOT)
+                                                    .rounded_full()
+                                                    .bg(p.warning),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(krill_app::ui::FONT_MONO)
+                                                    .child(working_count.to_string()),
+                                            ),
+                                    )
+                                })
+                                .when(done_count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_color(p.muted_foreground)
+                                            .child(
+                                                div()
+                                                    .size(krill_app::ui::STATE_DOT)
+                                                    .rounded_full()
+                                                    .bg(p.success),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(krill_app::ui::FONT_MONO)
+                                                    .child(done_count.to_string()),
+                                            ),
+                                    )
+                                }),
+                        )
+                    },
+                )
                 .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
             )
             .child(

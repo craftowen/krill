@@ -835,10 +835,21 @@ fn remote_line_text(state: Option<&RemoteCardState>) -> (String, bool) {
         ),
         RemoteProbeState::Ready(info) => {
             let os = info.platform.describe();
+            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
+            // Windows 원격은 원격 krill 중계로 붙는다. Mac 바이너리를 보낼 수 없어 설치·업데이트는 그 PC에서 한다.
+            if info.platform.os == krill_hosts::managed::RemoteOs::Windows {
+                let version = match &info.version {
+                    RemoteVersion::Known(v) => format!("krill {}", short(v)),
+                    _ => text::SSH_REMOTE_UNKNOWN_VERSION.get().to_owned(),
+                };
+                return (
+                    text::SSH_REMOTE_WINDOWS.format(&[("os", &os), ("version", &version)]),
+                    false,
+                );
+            }
             if !info.platform.is_supported() {
                 return (text::SSH_REMOTE_UNSUPPORTED.format(&[("os", &os)]), false);
             }
-            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
             match &info.version {
                 RemoteVersion::Missing => (
                     format!("{os} · {}", text::SSH_REMOTE_NOT_INSTALLED.get()),
@@ -2173,11 +2184,7 @@ pub fn rule_summary(
         || text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
         |id| account_label(accounts, rule, id),
     );
-    let metric = if rule.metric == krill_proto::usage::AutoSwitchMetric::Max {
-        "Max"
-    } else {
-        rule.metric.label()
-    };
+    let metric = rule.metric.short_label_for(rule.provider);
     let mut out = format!("{metric} ≥ {}% → {target}", rule.threshold_percent);
     if !rule.enabled {
         out.push_str(" · ");
@@ -6985,10 +6992,13 @@ impl SettingsView {
         let p = crate::ui::palette(cx);
         let snap = &self.accounts_snapshot;
         let existing_rule = snap.auto_switch.rule_for(acct.provider, &acct.id).cloned();
+        let enabled = existing_rule
+            .as_ref()
+            .map_or(snap.auto_switch.enabled, |r| r.enabled);
         let rule = existing_rule.clone().unwrap_or_else(|| AutoSwitchRule {
             provider: acct.provider,
             from_account_id: acct.id.clone(),
-            enabled: true,
+            enabled,
             threshold_percent: snap.auto_switch.threshold_percent,
             metric: AutoSwitchMetric::Max,
             target_account_id: None,
@@ -7002,7 +7012,6 @@ impl SettingsView {
                         this.set_account_rule(next.clone(), cx);
                     }))
             };
-        let enabled = existing_rule.as_ref().is_some_and(|r| r.enabled);
         // OWE-719: 규칙 편집기는 프로바이더 섹션의 "고급" 하나 아래에만 있다. 계정마다 이름과 현재 규칙 요약을 머리로 둔다.
         let summary = existing_rule.as_ref().map_or_else(
             || text::ACCOUNTS_RULE_NONE.get().to_owned(),
@@ -7072,27 +7081,20 @@ impl SettingsView {
                     )),
                 ),
         );
-        let metric_btns = [
-            AutoSwitchMetric::Max,
-            AutoSwitchMetric::FiveHour,
-            AutoSwitchMetric::SevenDay,
-        ]
-        .into_iter()
-        .map(|metric| {
-            let mut next = rule.clone();
-            next.metric = metric;
-            rule_button(
-                format!("admin-rule-metric-{}-{}", acct.id, metric.short_code()),
-                if metric == AutoSwitchMetric::Max {
-                    "Max"
-                } else {
-                    metric.label()
-                }
-                .into(),
-                rule.metric == metric,
-                next,
-            )
-        });
+        let provider = acct.provider;
+        let metric_btns = AutoSwitchMetric::for_provider(provider)
+            .iter()
+            .copied()
+            .map(|metric| {
+                let mut next = rule.clone();
+                next.metric = metric;
+                rule_button(
+                    format!("admin-rule-metric-{}-{}", acct.id, metric.short_code()),
+                    metric.short_label_for(provider).into(),
+                    rule.metric == metric,
+                    next,
+                )
+            });
         let metrics = div()
             .flex()
             .items_center()

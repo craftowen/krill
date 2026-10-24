@@ -166,6 +166,8 @@ impl Shell {
         session: krill_proto::SessionId,
         cx: &mut Context<Self>,
     ) {
+        // Also cover a Create result published before the pane received its ID.
+        self.workspace_closing.insert((host.clone(), session));
         let call = self
             .target_for_host(host)
             .map(|target| krill_app::resources::daemon_call_for(Some(target)));

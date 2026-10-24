@@ -9,10 +9,9 @@
 //!   사용자 셸 설정 파일(`~/.zshrc`, `~/.bashrc`, PowerShell `$PROFILE`)의 관리 블록에 영구 등록하고,
 //!   Krill 빠른 명령(`settings.toml`의 `quick_commands`)에도 한 번에 동기화한다.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use gpui::{Context, FontWeight, SharedString, Subscription, Window, div, prelude::*, px};
@@ -24,6 +23,9 @@ use gpui_kit_assets::IconName;
 use super::{SettingsView, edit, layout, queue_terminal_command, state_dir};
 use crate::i18n::catalog::settings as text;
 use crate::ui::BadgeTone;
+
+mod plan;
+mod runner;
 
 /// 설치 탭 카테고리.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,8 +119,8 @@ pub const CATALOG: &[ToolSpec] = &[
         category: ToolCategory::FrontierAi,
         bins: &["claude"],
         version_args: &["--version"],
-        install_macos: "curl -fsSL https://claude.ai/install.sh | bash",
-        install_windows: "irm https://claude.ai/install.ps1 | iex",
+        install_macos: "curl -fsSL https://claude.ai/install.sh | bash -s -- latest",
+        install_windows: "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) latest",
         agent_icon: Some("claude"),
     },
     ToolSpec {
@@ -127,8 +129,8 @@ pub const CATALOG: &[ToolSpec] = &[
         category: ToolCategory::FrontierAi,
         bins: &["codex"],
         version_args: &["--version"],
-        install_macos: "npm install -g @openai/codex",
-        install_windows: "npm install -g @openai/codex",
+        install_macos: "npm install -g @openai/codex@latest",
+        install_windows: "npm.cmd install -g @openai/codex@latest",
         agent_icon: Some("codex"),
     },
     ToolSpec {
@@ -137,8 +139,8 @@ pub const CATALOG: &[ToolSpec] = &[
         category: ToolCategory::FrontierAi,
         bins: &["agy"],
         version_args: &["--version"],
-        install_macos: "agy install",
-        install_windows: "agy install",
+        install_macos: "if command -v agy >/dev/null 2>&1; then agy update; elif [ -x \"$HOME/.local/bin/agy\" ]; then \"$HOME/.local/bin/agy\" update; else curl -fsSL https://antigravity.google/cli/install.sh | bash; fi",
+        install_windows: "if (Get-Command agy -ErrorAction SilentlyContinue) { agy update } elseif (Test-Path \"$env:LOCALAPPDATA/agy/bin/agy.exe\") { & \"$env:LOCALAPPDATA/agy/bin/agy.exe\" update } else { irm https://antigravity.google/cli/install.ps1 | iex }",
         agent_icon: Some("agy"),
     },
     // 2. 핵심 개발 도구
@@ -148,18 +150,18 @@ pub const CATALOG: &[ToolSpec] = &[
         category: ToolCategory::CoreDev,
         bins: &["git"],
         version_args: &["--version"],
-        install_macos: "brew install git || xcode-select --install",
-        install_windows: "winget install --id Git.Git -e --source winget",
+        install_macos: "brew install git",
+        install_windows: "winget install --id Git.Git -e --source winget --accept-source-agreements --accept-package-agreements --disable-interactivity --silent",
         agent_icon: None,
     },
     ToolSpec {
         id: "node",
-        name: "Node.js (LTS)",
+        name: "Node.js",
         category: ToolCategory::CoreDev,
         bins: &["node"],
         version_args: &["--version"],
         install_macos: "brew install node",
-        install_windows: "winget install --id OpenJS.NodeJS.LTS -e --source winget",
+        install_windows: "winget install --id OpenJS.NodeJS.LTS -e --source winget --accept-source-agreements --accept-package-agreements --disable-interactivity --silent",
         agent_icon: None,
     },
     ToolSpec {
@@ -169,7 +171,7 @@ pub const CATALOG: &[ToolSpec] = &[
         bins: &["gh"],
         version_args: &["--version"],
         install_macos: "brew install gh",
-        install_windows: "winget install --id GitHub.cli -e --source winget",
+        install_windows: "winget install --id GitHub.cli -e --source winget --accept-source-agreements --accept-package-agreements --disable-interactivity --silent",
         agent_icon: None,
     },
     // 3. 패키지 매니저 · 모던 런타임
@@ -179,8 +181,8 @@ pub const CATALOG: &[ToolSpec] = &[
         category: ToolCategory::PackageAndRuntime,
         bins: &["brew"],
         version_args: &["--version"],
-        install_macos: "NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
-        install_windows: "winget --version",
+        install_macos: "krill_brew_install_script=$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh) && /bin/bash -c \"$krill_brew_install_script\"",
+        install_windows: "Start-Process 'https://aka.ms/getwinget'",
         agent_icon: None,
     },
     ToolSpec {
@@ -190,7 +192,7 @@ pub const CATALOG: &[ToolSpec] = &[
         bins: &["uv"],
         version_args: &["--version"],
         install_macos: "curl -LsSf https://astral.sh/uv/install.sh | sh",
-        install_windows: "powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\"",
+        install_windows: "irm https://astral.sh/uv/install.ps1 | iex",
         agent_icon: None,
     },
     ToolSpec {
@@ -200,7 +202,7 @@ pub const CATALOG: &[ToolSpec] = &[
         bins: &["bun"],
         version_args: &["--version"],
         install_macos: "curl -fsSL https://bun.sh/install | bash",
-        install_windows: "powershell -c \"irm bun.sh/install.ps1 | iex\"",
+        install_windows: "irm https://bun.sh/install.ps1 | iex",
         agent_icon: None,
     },
     ToolSpec {
@@ -210,7 +212,7 @@ pub const CATALOG: &[ToolSpec] = &[
         bins: &["pnpm"],
         version_args: &["--version"],
         install_macos: "curl -fsSL https://get.pnpm.io/install.sh | sh -",
-        install_windows: "powershell -c \"irm https://get.pnpm.io/install.ps1 | iex\"",
+        install_windows: "npm.cmd install -g pnpm",
         agent_icon: None,
     },
 ];
@@ -221,6 +223,8 @@ pub struct ToolStatus {
     pub installed: bool,
     pub binary_path: Option<PathBuf>,
     pub version: Option<String>,
+    /// 백그라운드에서 감지한 기존 설치 출처에 맞는 명령.
+    pub command: Option<String>,
 }
 
 /// 인라인 설치 실행 결과.
@@ -307,6 +311,8 @@ pub struct Panel {
     pub scanning: bool,
     pub statuses: BTreeMap<&'static str, ToolStatus>,
     pub installing: BTreeSet<&'static str>,
+    pending: VecDeque<&'static str>,
+    active: Option<&'static str>,
     pub results: BTreeMap<&'static str, InstallJobResult>,
     pub log_expanded: BTreeSet<&'static str>,
     alias_rows: BTreeMap<&'static str, AliasFormRow>,
@@ -340,6 +346,11 @@ pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
         home.join(".npm-global/bin"),
         home.join("Library/pnpm"),
         home.join(".local/share/pnpm"),
+        home.join("AppData/Roaming/npm"),
+        home.join("AppData/Local/Microsoft/WindowsApps"),
+        home.join("AppData/Local/Programs/Antigravity/bin"),
+        home.join("AppData/Local/agy/bin"),
+        home.join("AppData/Local/pnpm"),
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
     ];
@@ -348,6 +359,8 @@ pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
             paths.push(p);
         }
     }
+    #[cfg(windows)]
+    paths.extend(plan::windows_registry_paths());
     std::env::join_paths(paths).unwrap_or(base)
 }
 
@@ -361,6 +374,7 @@ pub fn probe_tool(spec: &ToolSpec, search_path: &OsStr) -> ToolStatus {
                 installed: true,
                 binary_path: Some(exe),
                 version,
+                command: Some(plan::command(spec, search_path)),
             };
         }
     }
@@ -368,13 +382,16 @@ pub fn probe_tool(spec: &ToolSpec, search_path: &OsStr) -> ToolStatus {
         installed: false,
         binary_path: None,
         version: None,
+        command: Some(plan::command(spec, search_path)),
     }
 }
 
 fn probe_version(exe: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = crate::platform::background_command(exe);
-    cmd.args(args);
+    let mut cmd = runner::version_command(exe, args);
     let out = super::child::output(&mut cmd, Duration::from_secs(4), 4096).ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr)
     } else {
@@ -402,66 +419,6 @@ pub fn probe_all_tools(home: &Path) -> BTreeMap<&'static str, ToolStatus> {
         .iter()
         .map(|spec| (spec.id, probe_tool(spec, &path)))
         .collect()
-}
-
-/// 인라인 백그라운드 설치 실행(최대 300초 타임아웃, 출력 캡처).
-#[must_use]
-pub fn run_install_command(command: &str, home: &Path) -> InstallJobResult {
-    let path_env = effective_search_path(home);
-    let mut cmd = if cfg!(windows) {
-        let mut c = crate::platform::background_command("powershell");
-        c.args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            command,
-        ]);
-        c
-    } else {
-        let shell = std::env::var_os("SHELL")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/zsh".into());
-        let mut c = crate::platform::background_command(shell);
-        c.args(["-l", "-c", command]);
-        c
-    };
-    cmd.env("PATH", &path_env)
-        .env("HOME", home)
-        .env("NONINTERACTIVE", "1")
-        .stdin(Stdio::null());
-
-    match super::child::output(&mut cmd, Duration::from_secs(300), 256 * 1024) {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut combined = String::new();
-            if !stdout.trim().is_empty() {
-                combined.push_str(stdout.trim());
-            }
-            if !stderr.trim().is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(stderr.trim());
-            }
-            if combined.is_empty() {
-                combined = if out.status.success() {
-                    "OK".to_owned()
-                } else {
-                    format!("exit status: {}", out.status)
-                };
-            }
-            InstallJobResult {
-                success: out.status.success(),
-                output: tail_lines(&combined, 18),
-            }
-        }
-        Err(err) => InstallJobResult {
-            success: false,
-            output: err.to_string(),
-        },
-    }
 }
 
 fn tail_lines(text: &str, max_lines: usize) -> String {
@@ -641,7 +598,7 @@ impl SettingsView {
 
     /// 도구 설치 상태를 백그라운드에서 다시 스캔한다.
     pub fn rescan_install_tools(&mut self, cx: &mut Context<Self>) {
-        if self.install.scanning {
+        if self.install.scanning || !self.install.installing.is_empty() {
             return;
         }
         self.install.scanning = true;
@@ -683,10 +640,33 @@ impl SettingsView {
         let Some(spec) = CATALOG.iter().find(|s| s.id == tool_id) else {
             return;
         };
+        let installed = self
+            .install
+            .statuses
+            .get(tool_id)
+            .is_some_and(|s| s.installed);
+        if tool_id == "pkgmgr" && (cfg!(windows) || !installed) {
+            queue_terminal_command(spec.install_command(), cx);
+            return;
+        }
+        // npm 기반 도구는 Node.js 설치를 먼저 큐에 넣는다. 다음 작업 시작 시 PATH를 다시 읽는다.
+        let cmd = self
+            .install
+            .statuses
+            .get(tool_id)
+            .and_then(|status| status.command.as_deref())
+            .unwrap_or_else(|| spec.install_command());
+        if cmd.starts_with("npm")
+            && !self
+                .install
+                .statuses
+                .get("node")
+                .is_some_and(|s| s.installed)
+        {
+            self.run_inline_install("node", cx);
+        }
         self.install.installing.insert(tool_id);
         self.install.results.remove(tool_id);
-        let home = Self::install_home_dir(cx);
-        let cmd = spec.install_command().to_owned();
         cx.notify();
 
         if cfg!(test) {
@@ -699,6 +679,7 @@ impl SettingsView {
                         spec.probe_bins().first().copied().unwrap_or(tool_id),
                     )),
                     version: Some("1.0.0-test".to_owned()),
+                    command: Some(spec.install_command().to_owned()),
                 },
             );
             self.install.results.insert(
@@ -712,23 +693,61 @@ impl SettingsView {
             return;
         }
 
+        // 설치 관리자는 공유 의존성을 잠그므로 도구 종류에 관계없이 순서대로 실행한다.
+        self.install.pending.push_back(tool_id);
+        self.start_next_install(cx);
+    }
+
+    fn start_next_install(&mut self, cx: &mut Context<Self>) {
+        if self.install.active.is_some() {
+            return;
+        }
+        let Some(tool_id) = self.install.pending.pop_front() else {
+            return;
+        };
+        let Some(spec) = CATALOG.iter().find(|s| s.id == tool_id) else {
+            return;
+        };
+        self.install.active = Some(tool_id);
+        let home = Self::install_home_dir(cx);
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let (res, new_status) = cx
+            let (res, statuses) = cx
                 .background_executor()
                 .spawn(async move {
-                    let res = run_install_command(&cmd, &home);
                     let path = effective_search_path(&home);
-                    let status = probe_tool(spec, &path);
-                    (res, status)
+                    let command = plan::command(spec, &path);
+                    let res = if let Some(message) = plan::prerequisite(spec, &path) {
+                        InstallJobResult {
+                            success: false,
+                            output: message,
+                        }
+                    } else {
+                        runner::run(&command, &home, &path)
+                    };
+                    let statuses = probe_all_tools(&home);
+                    let mut res = res;
+                    if res.success
+                        && !statuses
+                            .get(tool_id)
+                            .is_some_and(|s| s.installed && s.version.is_some())
+                    {
+                        res.success = false;
+                        res.output.push('\n');
+                        res.output.push_str(text::INSTALL_VERIFY_FAILED.get());
+                    }
+                    (res, statuses)
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.install.active = None;
                 this.install.installing.remove(tool_id);
                 if !res.success {
                     this.install.log_expanded.insert(tool_id);
                 }
                 this.install.results.insert(tool_id, res);
-                this.install.statuses.insert(tool_id, new_status);
+                this.install.statuses = statuses;
+                this.start_next_install(cx);
                 cx.notify();
             })
             .ok();
@@ -990,7 +1009,7 @@ impl SettingsView {
                                     },
                                 )
                                 .icon(IconName::RefreshCw)
-                                .disabled(self.install.scanning)
+                                .disabled(self.install.scanning || any_installing)
                                 .debug_selector(|| "admin-install-rescan".into())
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
@@ -1093,13 +1112,19 @@ impl SettingsView {
         let status = self.install.statuses.get(tool_id);
         let is_installed = status.is_some_and(|s| s.installed);
         let is_installing = self.install.installing.contains(tool_id);
+        let is_queued = is_installing && self.install.active != Some(tool_id);
         let job_result = self.install.results.get(tool_id);
         let log_open = self.install.log_expanded.contains(tool_id);
 
         let (badge_tone, badge_text) = if is_installing {
             (
                 BadgeTone::Warning,
-                text::INSTALL_STATUS_INSTALLING.get().to_owned(),
+                if is_queued {
+                    text::INSTALL_STATUS_QUEUED.get()
+                } else {
+                    text::INSTALL_STATUS_INSTALLING.get()
+                }
+                .to_owned(),
             )
         } else if is_installed {
             let ver = status
@@ -1132,7 +1157,11 @@ impl SettingsView {
                 .into_any_element()
         };
 
-        let cmd_str = spec.install_command();
+        let requires_terminal = tool_id == "pkgmgr" && (cfg!(windows) || !is_installed);
+        let cmd_str = status
+            .and_then(|s| s.command.as_deref())
+            .unwrap_or_else(|| spec.install_command())
+            .to_owned();
         let row_id = format!("admin-install-row-{tool_id}");
         let badge_id = format!("admin-install-badge-{tool_id}");
         let btn_install_id = format!("admin-install-btn-{tool_id}");
@@ -1141,7 +1170,13 @@ impl SettingsView {
         let btn_log_id = format!("admin-install-log-toggle-{tool_id}");
 
         let primary_btn_label = if is_installing {
-            text::INSTALL_BTN_INSTALLING.get()
+            if is_queued {
+                text::INSTALL_STATUS_QUEUED.get()
+            } else {
+                text::INSTALL_BTN_INSTALLING.get()
+            }
+        } else if requires_terminal {
+            text::INSTALL_IN_TERMINAL.get()
         } else if is_installed {
             text::INSTALL_BTN_REINSTALL.get()
         } else {
@@ -1159,24 +1194,29 @@ impl SettingsView {
                 primary_btn_label,
             )
         }
-        .disabled(is_installing)
+        .disabled(
+            self.install.scanning
+                || is_installing
+                || (requires_terminal && !self.install.installing.is_empty()),
+        )
         .debug_selector(move || btn_install_id.clone())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.run_inline_install(tool_id, cx);
         }));
 
-        let cmd_for_term = cmd_str.to_owned();
+        let cmd_for_term = cmd_str.clone();
         let term_btn = layout::ghost(
             gpui::ElementId::Name(btn_term_id.clone().into()),
             text::INSTALL_IN_TERMINAL.get(),
         )
+        .disabled(self.install.scanning || !self.install.installing.is_empty())
         .debug_selector(move || btn_term_id.clone())
         .on_click(move |_, _, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(cmd_for_term.clone()));
             queue_terminal_command(cmd_for_term.clone(), cx);
         });
 
-        let cmd_for_copy = cmd_str.to_owned();
+        let cmd_for_copy = cmd_str.clone();
         let copy_btn = crate::ui::button_with_tooltip(
             gpui_component::button::Button::new(gpui::ElementId::Name(btn_copy_id.clone().into()))
                 .icon(IconName::Copy)
@@ -1285,7 +1325,7 @@ impl SettingsView {
                     .child(
                         layout::controls()
                             .child(install_btn)
-                            .child(term_btn)
+                            .when(!requires_terminal, |d| d.child(term_btn))
                             .when_some(job_result, |d, res| {
                                 let label = if res.success {
                                     text::INSTALL_LOG_DONE.get()
@@ -1675,6 +1715,23 @@ mod tests {
         assert!(!is_valid_alias_name("-bad"));
         assert!(!is_valid_alias_name("bad space"));
         assert!(!is_valid_alias_name("bad;rm"));
+    }
+
+    #[test]
+    fn frontier_catalog_matches_latest_builtin_profiles_on_both_platforms() {
+        let agents = krill_proto::agent::Agents::load(None).unwrap();
+        for spec in CATALOG
+            .iter()
+            .filter(|s| s.category == ToolCategory::FrontierAi)
+        {
+            let profile = &agents.profiles[spec.id];
+            assert_eq!(spec.install_macos, profile.install, "{} macOS", spec.id);
+            assert_eq!(
+                spec.install_windows, profile.install_windows,
+                "{} Windows",
+                spec.id
+            );
+        }
     }
 
     #[test]
