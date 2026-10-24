@@ -521,10 +521,10 @@ impl HostManager {
         drop(s);
         let started = if let (Some(local_dir), Some(ssh_bin)) = (&self.local_dir, &self.ssh_bin) {
             opts.validate()
-                .and_then(|()| ssh::resolve_remote_socket_with_program(&opts, ssh_bin))
+                .and_then(|()| ssh::resolve_remote_endpoint_with_program(&opts, ssh_bin))
                 .and_then(|remote| {
                     let local = ssh::local_socket_in(local_dir, &opts.destination)?;
-                    Tunnel::start_at_with_program(&opts, local, &remote, ssh_bin)
+                    Tunnel::start_endpoint_with_program(&opts, local, &remote, ssh_bin)
                 })
         } else {
             Tunnel::start_with_options(&opts)

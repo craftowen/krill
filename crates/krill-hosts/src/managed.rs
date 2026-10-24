@@ -39,6 +39,8 @@ const EXIT_BOOTSTRAP_FAILED: i32 = 6;
 pub enum RemoteOs {
     Macos,
     Linux,
+    /// `krill __bridge`로 붙는 Windows 원격. 관리형 설치는 하지 않는다(그 PC에서 설치·업데이트).
+    Windows,
     Other(String),
 }
 
@@ -68,6 +70,8 @@ pub fn parse_os(raw: &str) -> RemoteOs {
         RemoteOs::Macos
     } else if trimmed.eq_ignore_ascii_case("linux") {
         RemoteOs::Linux
+    } else if trimmed.eq_ignore_ascii_case("windows") {
+        RemoteOs::Windows
     } else {
         RemoteOs::Other(trimmed.chars().take(32).collect())
     }
@@ -107,6 +111,7 @@ impl RemotePlatform {
         let os_label = match &self.os {
             RemoteOs::Macos => "macOS".to_owned(),
             RemoteOs::Linux => "Linux".to_owned(),
+            RemoteOs::Windows => "Windows".to_owned(),
             RemoteOs::Other(raw) => {
                 if raw.is_empty() {
                     "알 수 없는 OS".to_owned()
@@ -295,11 +300,32 @@ pub fn query_remote_info(opts: &SshOptions) -> io::Result<RemoteInfo> {
 fn query_remote_info_with_program(opts: &SshOptions, ssh_bin: &OsStr) -> io::Result<RemoteInfo> {
     let out = run_ssh(opts, ssh_bin, &opts.probe_args(), None)?;
     if !out.status.success() {
+        // POSIX 프로브가 원격에서 실패했다(Windows의 cmd.exe 등). 원격 krill 중계로 다시 묻는다.
+        if ssh::bridge::reached_remote(out.status)
+            && let Some(probe) = ssh::bridge::probe(opts, ssh_bin)?
+        {
+            return Ok(bridge_info(&probe));
+        }
         return Err(probe_failed(opts, &out));
     }
     let text =
         String::from_utf8(out.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     parse_probe(&text)
+}
+
+/// `krill __bridge --probe` 답을 [`RemoteInfo`]로 옮긴다. 원격 `HOME`은 묻지 않는다(관리형 설치 대상이 아니다).
+fn bridge_info(probe: &ssh::Probe) -> RemoteInfo {
+    RemoteInfo {
+        platform: RemotePlatform {
+            os: parse_os(&probe.os),
+            arch: parse_arch(&probe.arch),
+            kernel: probe.os.chars().take(32).collect(),
+        },
+        home: String::new(),
+        version: parse_version_value(&probe.version)
+            .map_or(RemoteVersion::Unmanaged, RemoteVersion::Known),
+        socket_bundle: None,
+    }
 }
 
 fn probe_failed(opts: &SshOptions, out: &std::process::Output) -> io::Error {
@@ -772,7 +798,9 @@ fn install_remote_with_program(
 ) -> Result<InstallReport, InstallError> {
     if !remote.platform.is_supported() {
         let kind = match remote.platform.os {
-            RemoteOs::Linux | RemoteOs::Other(_) => InstallFailureKind::UnsupportedOs,
+            RemoteOs::Linux | RemoteOs::Windows | RemoteOs::Other(_) => {
+                InstallFailureKind::UnsupportedOs
+            }
             RemoteOs::Macos => InstallFailureKind::UnsupportedArch,
         };
         // `detail`은 UI 안내문(`{os}`)에 그대로 박히므로 플랫폼 표기만 담는다.
