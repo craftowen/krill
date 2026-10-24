@@ -1147,7 +1147,13 @@ impl Shell {
             .child(div().flex_1().min_h_0().child(body))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.change(true, cx, |l| l.focus(id))),
+                cx.listener(move |this, _, window, cx| {
+                    this.change(true, cx, |l| l.focus(id));
+                    if !this.is_editor_focused(window, cx) && !this.focus.is_focused(window) {
+                        this.files.refocus = true;
+                        cx.notify();
+                    }
+                }),
             )
             .into_any_element()
     }
@@ -1560,10 +1566,16 @@ impl Shell {
             self.files.watching = true;
             self.files.watch = Some(Self::watch_files(window, cx));
         }
-        // 팔레트·모달·검색 바가 떠 있으면 그쪽 포커스를 뺏지 않는다.
+        // 팔레트·모달이 떠 있거나 터미널 칸에서 검색 바 입력창에 포커스가 있으면 그쪽 포커스를 뺏지 않는다.
+        let search_focused = self.search.as_ref().is_some_and(|(bar, _)| {
+            self.layout
+                .focused()
+                .is_none_or(|p| self.layout.file(p).is_none())
+                && bar.read(cx).is_focused(window, cx)
+        });
         if self.jump.is_none()
             && self.dashboard.is_none()
-            && self.search.is_none()
+            && !search_focused
             && self.tab_rename.is_none()
             && self.files.quick_open.is_none()
             && std::mem::take(&mut self.files.refocus)
@@ -1846,7 +1858,13 @@ impl Shell {
                     && (s.line != 0 || s.column != 0)
                 {
                     let at = gpui_component::input::Position::new(s.line, s.column);
+                    let prev_focus = window.focused(cx);
                     state.update(cx, |ed, cx| ed.set_cursor_position(at, window, cx));
+                    if shown.is_some()
+                        && let Some(prev) = prev_focus
+                    {
+                        window.focus(&prev, cx);
+                    }
                 }
                 let edits = cx.subscribe(&state, move |this, _, e: &InputEvent, cx| {
                     if matches!(e, InputEvent::Change) {
@@ -2218,12 +2236,19 @@ impl Shell {
                             ));
                         }
                         tab.comparison = None;
+                        let prev_focus = window.focused(cx);
+                        let next_shown = prepared.map(|p| build_preview(p, cx));
+                        let editor_focused =
+                            this.layout.focused() == Some(pane) && next_shown.is_none();
                         state.update(cx, |s, cx| {
                             let cursor = s.cursor_position();
                             s.set_value(text, window, cx);
                             s.set_cursor_position(cursor, window, cx);
                         });
-                        *shown = prepared.map(|p| build_preview(p, cx));
+                        if !editor_focused && let Some(prev) = prev_focus {
+                            window.focus(&prev, cx);
+                        }
+                        *shown = next_shown;
                         *doc = baseline;
                         this.files.refocus = true;
                         this.files.cache_count = usize::MAX;

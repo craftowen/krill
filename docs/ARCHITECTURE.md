@@ -84,6 +84,8 @@ Windows 열은 2026-10-19 GCP Windows Server 2022 VM 실측(release, 헤드리�
 
 Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.sock>`을 띄워 POSIX 원격 krilld에 붙는다(OWE-915). ssh.exe의 Unix 소켓 `-L`과 로컬 TCP 포워딩은 쓰지 않는다. 세 stdio의 자식 끝도 overlapped named pipe로 열며, HOME 조회·관리형 SSH 명령도 같은 경로를 쓴다. GCP Windows Server 2022 → Mac 전용 sshd에서 기존 세션 Hello·Attach·원본 출력 수신과 터널 제거 뒤 같은 세션 PID 생존을 확인했다(내부 Windows SSH 검증 기록). Windows 앱 강제 종료 뒤 SSH 재연결·원격 krilld 크래시 생존을 이번 SSH 스파이크에서 별도로 재측정하지는 않았다.
 
+Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 중계한다. Windows용 OpenSSH sshd(9.5p2)는 Unix 소켓 포워딩(`-L`·`-W` 경로)을 `open failed`로 거부하고 원격 셸도 cmd.exe라 `/bin/sh` 질의가 실패한다(2026-10-24 Windows 11 실측). 그래서 POSIX 질의가 원격에서 실패하면(ssh 종료 코드 255가 아닌 실패) `krill __bridge --probe`로 다시 묻고, 되면 로컬 소켓 연결마다 `ssh … krill __bridge`를 띄워 그 stdin/stdout을 원격 `%LOCALAPPDATA%\Krill\run\krilld.sock`에 잇는다. keepalive(`--probe`)가 `ControlMaster`를 열어 연결별 ssh는 다시 인증하지 않는다. 원격 krilld는 깨우지 않으므로 Windows PC에서 Krill이 떠 있어야 하고, 원격 krill에 `__bridge`가 없으면(구버전) 업데이트 안내로 끝난다. 관리형 설치·업데이트는 하지 않는다(그 PC에서 한다). Windows 앱에서 Windows 원격으로 붙는 경로는 아직 없다. 가짜 Windows ssh로 진짜 holder·krilld의 세션 생성·입출력을 검증했고(`crates/krill/tests/remote_bridge.rs`), 실제 Windows PC에서의 세션 왕복은 `__bridge`가 들어간 Windows 빌드를 배포한 뒤 확인한다(미확인).
+
 ### 4.2 성능 설계
 
 - PTY 리더: 직전 read가 1,024B로 꽉 찼을 때만 5~20µs 짧게 다시 읽는다(깨어남 15,513→246~577회, 처리량 1.6~2배). 타이머로 모으거나 잠들면 처리량 붕괴 — 금지(MK-019).

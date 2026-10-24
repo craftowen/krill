@@ -5975,6 +5975,7 @@ fn workflows_schedule_modal_precheck_isolated_worktree_and_log_viewer(cx: &mut T
         status: Some(0),
         cwd: Some(run_cwd.clone()),
         output: Some(format!("ISOLATED_OUTPUT_OK:{run_cwd}")),
+        ..Default::default()
     };
     let mut f = fs::OpenOptions::new()
         .append(true)
@@ -8645,6 +8646,7 @@ fn async_schedule_lock_does_not_block_action_or_other_input(cx: &mut TestAppCont
         precheck: None,
         workspace_mode: krill_proto::schedule::WorkspaceMode::default(),
         enabled: true,
+        ..Default::default()
     });
     schedules.save(&root).unwrap();
     let lock = krill_proto::schedule::Schedules::exclusive_edit(&root).unwrap();
@@ -9277,7 +9279,7 @@ fn ui_audit_settings_modal_bounds_focus_and_escape(cx: &mut TestAppContext) {
     assert!(save.origin.y >= modal.origin.y && save.bottom() <= modal.bottom());
     assert!(body.size.height < modal.size.height);
     vcx.update(|window, cx| {
-        let input = &view.read(cx).schedule_modal.as_ref().unwrap().id;
+        let input = &view.read(cx).schedule_modal.as_ref().unwrap().name;
         assert!(input.read(cx).focus_handle(cx).is_focused(window));
     });
     vcx.simulate_keystrokes("escape");
@@ -9500,4 +9502,305 @@ fn click_install_control(vcx: &mut gpui::VisualTestContext, selector: &'static s
         .unwrap_or_else(|| panic!("missing {selector}"));
     vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
+}
+
+#[test]
+fn automations_sidebar_visibility_defaults_and_toml_roundtrip() {
+    let mut settings = Settings::default();
+    assert!(settings.show_automations_button);
+    assert!(
+        Settings::parse_with_language("theme = 'dark'", Language::En)
+            .unwrap()
+            .show_automations_button
+    );
+    settings.show_automations_button = false;
+    let custom = crate::ui::terminal_themes::parse_ghostty_theme(
+        "background = #112233\nforeground = #ddeeff\n",
+        "sample",
+        None,
+    )
+    .unwrap();
+    settings.terminal_custom_themes.push(custom);
+    let encoded = settings.to_toml();
+    assert_eq!(
+        Settings::parse_with_language(&encoded, settings.language).unwrap(),
+        settings
+    );
+    assert!(encoded.contains("show_automations_button = false"));
+    if let Some(table) = encoded.find("[[terminal_custom_themes]]") {
+        assert!(encoded.find("show_automations_button").unwrap() < table);
+    }
+}
+
+#[test]
+fn automations_filters_and_retained_counts_use_exit_outcomes_and_latest_run() {
+    use krill_proto::schedule::{Schedule, ScheduleRun};
+    use schedules::model::*;
+    let entry = Schedule {
+        id: "audit".into(),
+        name: Some("Repository audit".into()),
+        cwd: "/repo/project".into(),
+        command: vec!["codex".into()],
+        enabled: true,
+        ..Schedule::default()
+    };
+    let older = ScheduleRun {
+        id: entry.id.clone(),
+        minute: 10,
+        phase: "finished".into(),
+        status: Some(0),
+        ..ScheduleRun::default()
+    };
+    let failed = ScheduleRun {
+        id: entry.id.clone(),
+        minute: 20,
+        phase: "finished".into(),
+        status: Some(7),
+        ..ScheduleRun::default()
+    };
+    assert_eq!(
+        run_outcome_badge_spec(&failed).0,
+        crate::ui::BadgeTone::Destructive
+    );
+    let runs = [older, failed];
+    let mut state = SchedulesState {
+        outcome_filter: OutcomeFilter::Failed,
+        agent_filter: Some("codex".into()),
+        ..SchedulesState::default()
+    };
+    assert!(matches_schedule(&entry, &runs, "repository", &state));
+    assert!(matches_schedule(&entry, &runs, "PROJECT", &state));
+    state.outcome_filter = OutcomeFilter::Succeeded;
+    assert!(!matches_schedule(&entry, &runs, "", &state));
+    state.outcome_filter = OutcomeFilter::Never;
+    assert!(matches_schedule(&entry, &[], "", &state));
+    state.status_filter = StatusFilter::Paused;
+    assert!(!matches_schedule(&entry, &[], "", &state));
+    assert_eq!(retained_count(&runs, 25, 10, RunOutcome::Succeeded), 0);
+    assert_eq!(retained_count(&runs, 25, 10, RunOutcome::Failed), 1);
+    assert_eq!(
+        retained_count(&runs, 15, 60, RunOutcome::Failed),
+        0,
+        "future runs excluded"
+    );
+    assert!(matches_run(
+        &runs[1],
+        "repository",
+        RunsStatusFilter::Failed,
+        "Repository audit"
+    ));
+    assert!(!matches_run(&runs[1], "", RunsStatusFilter::Succeeded, ""));
+}
+
+#[test]
+fn automations_latest_run_preserves_same_minute_ordinals_and_legacy_order() {
+    use krill_proto::schedule::{Schedule, ScheduleRun};
+    use schedules::model::*;
+    let entry = Schedule {
+        id: "same-minute".into(),
+        ..Schedule::default()
+    };
+    for (newer_number, older_number) in [(Some(2), Some(1)), (None, None)] {
+        // Coalesced history is newest-first, including legacy runs without ordinals.
+        let newer = ScheduleRun {
+            id: entry.id.clone(),
+            minute: 100,
+            run_number: newer_number,
+            phase: "finished".into(),
+            status: Some(7),
+            ..ScheduleRun::default()
+        };
+        let older = ScheduleRun {
+            run_number: older_number,
+            status: Some(0),
+            ..newer.clone()
+        };
+        let runs = [newer, older];
+        assert!(std::ptr::eq(
+            latest_run(&entry, &runs).unwrap(),
+            &raw const runs[0]
+        ));
+        assert_eq!(latest_run(&entry, &runs).unwrap().status, Some(7));
+        let mut state = SchedulesState {
+            outcome_filter: OutcomeFilter::Failed,
+            ..SchedulesState::default()
+        };
+        assert!(matches_schedule(&entry, &runs, "", &state));
+        state.outcome_filter = OutcomeFilter::Succeeded;
+        assert!(!matches_schedule(&entry, &runs, "", &state));
+        if newer_number.is_some() {
+            let reversed = [runs[1].clone(), runs[0].clone()];
+            assert_eq!(latest_run(&entry, &reversed).unwrap().status, Some(7));
+        }
+    }
+}
+
+#[gpui::test]
+fn automations_page_templates_editor_roundtrip_and_navigation(cx: &mut TestAppContext) {
+    use krill_proto::schedule::{ScheduleRun, Schedules, WorkspaceMode};
+    use schedules::model::{AutomationsSubView, DetailTab};
+    let d = dir("automations-editor");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1600.), px(1600.)));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Workflows, cx);
+            v.set_automations_page(true, cx);
+        });
+    });
+    vcx.run_until_parked();
+    for selector in [
+        "automations-page",
+        "automations-topbar",
+        "automations-template-weekday-audit",
+        "automations-template-release-readiness",
+        "automations-template-daily-review",
+        "automations-template-hourly-queue",
+    ] {
+        assert!(vcx.debug_bounds(selector).is_some(), "{selector}");
+    }
+    let template = vcx
+        .debug_bounds("automations-template-weekday-audit")
+        .unwrap();
+    vcx.simulate_click(template.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    for selector in [
+        "admin-schedule-id",
+        "admin-schedule-input-id",
+        "admin-schedule-name",
+        "admin-schedule-prompt",
+        "admin-schedule-precheck-timeout",
+        "admin-schedule-cron",
+        "admin-schedule-extra-args",
+        "admin-schedule-agent-codex",
+    ] {
+        assert!(vcx.debug_bounds(selector).is_some(), "{selector}");
+    }
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let modal = v.schedule_modal.as_mut().unwrap();
+            assert_eq!(modal.id.read(cx).value().as_ref(), "weekday-repo-audit");
+            modal
+                .name
+                .update(cx, |s, cx| s.set_value("Nightly review", window, cx));
+            modal.id.update(cx, |s, cx| s.set_value("", window, cx));
+            modal.cwd.update(cx, |s, cx| {
+                s.set_value(d.to_string_lossy().into_owned(), window, cx);
+            });
+            modal
+                .command
+                .update(cx, |s, cx| s.set_value("codex exec", window, cx));
+            modal.agent = Some("codex".into());
+            modal
+                .extra_args
+                .update(cx, |s, cx| s.set_value("--model test", window, cx));
+            modal
+                .precheck_timeout
+                .update(cx, |s, cx| s.set_value("37", window, cx));
+            modal
+                .base_branch
+                .update(cx, |s, cx| s.set_value("dev", window, cx));
+            modal
+                .grace
+                .update(cx, |s, cx| s.set_value("720", window, cx));
+            modal.reuse_session = true;
+            modal.workspace_mode = WorkspaceMode::Isolate;
+            v.submit_schedule_modal(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_none());
+    let stored = Schedules::load(&d).unwrap();
+    let entry = stored.schedule.first().unwrap();
+    assert_eq!(entry.id, "nightly-review");
+    assert_eq!(entry.name.as_deref(), Some("Nightly review"));
+    assert_eq!(entry.agent.as_deref(), Some("codex"));
+    assert_eq!(entry.extra_agent_args.as_deref(), Some("--model test"));
+    assert_eq!(entry.precheck_timeout_secs, Some(37));
+    assert_eq!(entry.base_branch.as_deref(), Some("dev"));
+    assert_eq!(entry.missed_run_grace_minutes, Some(720));
+    assert!(!entry.reuse_session);
+    let row = vcx.debug_bounds("automations-row-nightly-review").unwrap();
+    vcx.simulate_click(
+        gpui::point(row.left() + px(20.), row.center().y),
+        gpui::Modifiers::default(),
+    );
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("automations-detail-metrics").is_some());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            assert_eq!(
+                v.automations.sub_view,
+                AutomationsSubView::Detail {
+                    id: "nightly-review".into(),
+                    tab: DetailTab::Overview
+                }
+            );
+            v.services.runs = vec![ScheduleRun {
+                id: "nightly-review".into(),
+                minute: 50,
+                phase: "finished".into(),
+                status: Some(9),
+                output: Some("saved output".into()),
+                run_number: Some(1),
+                trigger: Some("manual".into()),
+                ..ScheduleRun::default()
+            }];
+            cx.notify();
+        });
+    });
+    let runs = vcx.debug_bounds("automations-open-runs-dashboard").unwrap();
+    vcx.simulate_click(runs.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("automations-runs-summary-failed-24h")
+            .is_some()
+    );
+    let run = vcx.debug_bounds("automations-dashboard-run-row-0").unwrap();
+    vcx.simulate_click(run.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("automations-run-detail-output").is_some());
+    let back = vcx.debug_bounds("automations-run-detail-back").unwrap();
+    vcx.simulate_click(back.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("automations-runs-search").is_some());
+    // Editing preserves nonpreset cron and custom argv instead of replacing them with agent defaults.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let mut custom = entry.clone();
+            custom.cron = "*/7 1-4 * * 2,6".into();
+            custom.command = vec!["/bin/sh".into(), "-c".into(), "echo 'literal text'".into()];
+            v.open_schedule_modal(Some(&custom), window, cx);
+            assert_eq!(
+                v.schedule_modal
+                    .as_ref()
+                    .unwrap()
+                    .cron
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                custom.cron
+            );
+            v.submit_schedule_modal(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let edited = Schedules::load(&d).unwrap().schedule.remove(0);
+    assert_eq!(edited.cron, "*/7 1-4 * * 2,6");
+    assert_eq!(edited.command, ["/bin/sh", "-c", "echo 'literal text'"]);
+    assert_eq!(edited.extra_agent_args.as_deref(), Some("--model test"));
+    // Escape dismisses the editor first, then returns from Runs to the list.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.open_schedule_modal(None, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_none());
+    assert!(vcx.debug_bounds("automations-runs-search").is_some());
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("automations-search-input").is_some());
+    fs::remove_dir_all(d).ok();
 }

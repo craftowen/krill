@@ -1,5 +1,7 @@
+// Automation design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
+// Shared schedule/preset and automation control behavior; independently implemented for Krill.
 //! MK-101 daemon-owned scheduling. A durable claim precedes holder spawn; uncertain
-//! attempts are never automatically replayed. No catch-up of past cron minutes.
+//! attempts are never automatically replayed. Catch-up is opt-in and only claims the latest due occurrence.
 
 use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::fs::OpenOptionsExt as _;
@@ -12,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::control::CaptureFormat;
 use krill_proto::schedule::{
-    Cron, MAX_OUTPUT_BYTES, MAX_RUNS, PREVIOUS_RUNS, RUN_NOW, RUNS, ScheduleRun as Run, Schedules,
-    WorkspaceMode, take_run_now, truncate_output,
+    Cron, MAX_OUTPUT_BYTES, MAX_PRECHECK_TIMEOUT_SECS, MAX_RUNS, PREVIOUS_RUNS, RUN_NOW, RUNS,
+    ScheduleRun as Run, Schedules, WorkspaceMode, coalesce_runs, load_runs, take_run_now,
+    tokenize_command_line, truncate_output,
 };
 
 use crate::child::{kill_and_reap as kill_precheck, nonblocking as set_nonblocking};
@@ -22,7 +25,8 @@ use super::{Create, Peer, Program, Registry, Reply, Scope, lock};
 
 /// Default execution timeout for schedule `precheck` shell commands.
 #[cfg(not(test))]
-pub const PRECHECK_TIMEOUT: Duration = Duration::from_secs(15);
+pub const PRECHECK_TIMEOUT: Duration =
+    Duration::from_secs(krill_proto::schedule::DEFAULT_PRECHECK_TIMEOUT_SECS);
 #[cfg(test)]
 pub const PRECHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -34,17 +38,20 @@ pub struct PrecheckResult {
     pub status: Option<i32>,
     pub output: Option<String>,
     pub error: Option<String>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
 }
 
 /// Runs `/bin/sh -c <command>` in `cwd` as a precheck gate (MK-186).
 /// Exit code `0` passes; any non-zero exit, timeout, or spawn error marks the run as skipped.
 #[must_use]
-pub fn run_precheck(cwd: &Path, command: &str) -> PrecheckResult {
-    run_precheck_with_timeout(cwd, command, PRECHECK_TIMEOUT)
+pub fn run_precheck(cwd: &Path, command: &str, timeout_override: Option<u64>) -> PrecheckResult {
+    run_precheck_with_timeout(cwd, command, precheck_timeout(timeout_override))
 }
 
 #[must_use]
 pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -> PrecheckResult {
+    let started = Instant::now();
     let mut child = match crate::child::own_group(&mut Command::new("/bin/sh"))
         .arg("-c")
         .arg(command)
@@ -57,6 +64,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         Ok(child) => child,
         Err(e) => {
             return PrecheckResult {
+                duration_ms: elapsed_ms(started),
+                timed_out: false,
                 passed: false,
                 status: None,
                 output: None,
@@ -67,6 +76,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
     let Some(mut stdout) = child.stdout.take() else {
         kill_precheck(&mut child);
         return PrecheckResult {
+            duration_ms: elapsed_ms(started),
+            timed_out: false,
             passed: false,
             status: None,
             output: None,
@@ -76,6 +87,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
     let Some(mut stderr) = child.stderr.take() else {
         kill_precheck(&mut child);
         return PrecheckResult {
+            duration_ms: elapsed_ms(started),
+            timed_out: false,
             passed: false,
             status: None,
             output: None,
@@ -85,6 +98,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
     if let Err(e) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
         kill_precheck(&mut child);
         return PrecheckResult {
+            duration_ms: elapsed_ms(started),
+            timed_out: false,
             passed: false,
             status: None,
             output: None,
@@ -101,6 +116,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         {
             kill_precheck(&mut child);
             return PrecheckResult {
+                duration_ms: elapsed_ms(started),
+                timed_out: false,
                 passed: false,
                 status: None,
                 output: combine_precheck_output(&out_bytes, &err_bytes),
@@ -128,6 +145,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
                 let code = status.code();
                 let passed = status.success();
                 return PrecheckResult {
+                    duration_ms: elapsed_ms(started),
+                    timed_out: false,
                     passed,
                     status: code,
                     output: combine_precheck_output(&out_bytes, &err_bytes),
@@ -139,6 +158,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
             Err(e) => {
                 kill_precheck(&mut child);
                 return PrecheckResult {
+                    duration_ms: elapsed_ms(started),
+                    timed_out: false,
                     passed: false,
                     status: None,
                     output: combine_precheck_output(&out_bytes, &err_bytes),
@@ -149,6 +170,8 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         if Instant::now() >= deadline {
             kill_precheck(&mut child);
             return PrecheckResult {
+                duration_ms: elapsed_ms(started),
+                timed_out: true,
                 passed: false,
                 status: None,
                 output: combine_precheck_output(&out_bytes, &err_bytes),
@@ -157,6 +180,16 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn precheck_timeout(override_secs: Option<u64>) -> Duration {
+    override_secs.map_or(PRECHECK_TIMEOUT, |secs| {
+        Duration::from_secs(secs.clamp(1, MAX_PRECHECK_TIMEOUT_SECS))
+    })
 }
 
 fn combine_precheck_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
@@ -249,9 +282,10 @@ impl Registry {
         }
         let mut journal = Journal::open(dir)?;
         let forced_ids = take_run_now(dir)?;
+        let mut history = load_runs(dir)?;
         // Reap only processes whose exit the holder has already reported. Live
         // PTYs are never closed by scheduling. Segment output remains on disk.
-        for (session, mut run) in journal.sessions.clone() {
+        for (session, runs) in journal.sessions.clone() {
             let id = krill_proto::SessionId(session);
             // 세션도 종료 기록도 없이 사라진 옛 실행 기록은 여기서 tombstone을 남긴다.
             // 두지 않으면 id가 재사용됐을 때 무관한 새 세션을 close한다(K-30).
@@ -261,8 +295,10 @@ impl Registry {
                 !state.sessions.contains_key(&id) && !state.exited.contains_key(&id)
             };
             if gone {
-                run.phase = "finished".into();
-                journal.append(&run)?;
+                for mut run in runs {
+                    run.phase = "finished".into();
+                    journal.append(&run)?;
+                }
                 continue;
             }
             let (status, captured) = {
@@ -288,12 +324,14 @@ impl Registry {
                 }
             };
             if let Some(status) = status {
-                run.phase = "finished".into();
-                run.status = Some(status);
-                if captured.is_some() {
-                    run.output = captured;
+                for mut run in runs {
+                    run.phase = "finished".into();
+                    run.status = Some(status);
+                    if let Some(out) = &captured {
+                        run.output = Some(out.clone());
+                    }
+                    journal.append(&run)?;
                 }
-                journal.append(&run)?;
                 self.close(
                     &Peer {
                         pid: None,
@@ -306,28 +344,53 @@ impl Registry {
         }
         for entry in schedules.schedule {
             let forced = forced_ids.iter().any(|id| id == &entry.id);
-            let due = entry.enabled
-                && cron_due
-                && Cron::parse(&entry.cron)?.matches(calendar)
-                && !journal.claimed(&entry.id, minute);
-            if !forced && !due {
+            let cron = Cron::parse(&entry.cron)?;
+            let target_minute = if forced {
+                Some(minute)
+            } else if entry.enabled && cron_due {
+                if cron.matches(calendar) && !journal.claimed(&entry.id, minute) {
+                    Some(minute)
+                } else if entry.effective_grace_minutes() > 0 {
+                    cron.latest_minute_at_or_before(minute, entry.effective_grace_minutes())
+                        .filter(|due| !journal.claimed(&entry.id, *due))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(target_minute) = target_minute else {
                 continue;
-            }
+            };
+            let summaries = coalesce_runs(&history);
+            let previous = summaries
+                .iter()
+                .filter(|r| r.id == entry.id)
+                .collect::<Vec<_>>();
+            let run_number = previous
+                .iter()
+                .filter_map(|r| r.run_number)
+                .max()
+                .unwrap_or(0)
+                .max(u64::try_from(previous.len()).unwrap_or(u64::MAX))
+                .saturating_add(1);
             let mut run = Run {
                 id: entry.id.clone(),
-                minute,
+                minute: target_minute,
                 phase: "started".into(),
-                session: None,
-                error: None,
-                status: None,
-                cwd: None,
-                output: None,
+                trigger: Some(if forced { "manual" } else { "scheduled" }.into()),
+                run_number: Some(run_number),
+                ..Default::default()
             };
+            history.push(run.clone());
             journal.append(&run)?;
             if let Some(precheck) = entry.precheck.as_deref().filter(|s| !s.trim().is_empty()) {
-                let res = run_precheck(Path::new(&entry.cwd), precheck);
+                let res =
+                    run_precheck(Path::new(&entry.cwd), precheck, entry.precheck_timeout_secs);
                 if !res.passed {
                     run.phase = "skipped".into();
+                    run.duration_ms = Some(res.duration_ms);
+                    run.timed_out = Some(res.timed_out);
                     run.status = res.status;
                     run.output = res.output;
                     run.error = res.error;
@@ -335,14 +398,53 @@ impl Registry {
                     continue;
                 }
             }
+            if entry.workspace_mode == WorkspaceMode::Reuse
+                && entry.reuse_session
+                && !entry.prompt.is_empty()
+            {
+                let prior = previous.iter().find_map(|r| r.session);
+                if let Some(id) = prior.map(krill_proto::SessionId) {
+                    let peer = Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    };
+                    let alive = {
+                        let state = lock(&self.state);
+                        !state.exited.contains_key(&id)
+                            && state
+                                .sessions
+                                .get(&id)
+                                .is_some_and(|e| !e.session.is_closed())
+                    };
+                    if alive && let Some(tap) = self.tap(&peer, id) {
+                        if let Err(e) =
+                            Registry::deliver_input_to_tap(&tap, entry.prompt.as_bytes(), true)
+                        {
+                            run.phase = "failed".into();
+                            run.error = Some(format!("session input failed: {e}"));
+                        } else {
+                            run.phase = "spawned".into();
+                            run.session = Some(id.0);
+                            run.cwd = Some(entry.cwd.clone());
+                        }
+                        journal.append(&run)?;
+                        continue;
+                    }
+                }
+            }
             let run_cwd = match entry.workspace_mode {
                 WorkspaceMode::Reuse => PathBuf::from(&entry.cwd),
                 WorkspaceMode::Isolate => {
-                    let wt_name = format!("schedule-{}-{minute}", entry.id);
-                    match crate::git::worktree::create_isolated(
-                        Path::new(&entry.cwd),
+                    let wt_name = format!("schedule-{}-{target_minute}", entry.id);
+                    match create_isolated(
+                        &entry.cwd,
                         &wt_name,
                         dir,
+                        entry
+                            .base_branch
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty()),
                     ) {
                         Ok(path) => {
                             run.cwd = Some(path.to_string_lossy().into_owned());
@@ -357,50 +459,47 @@ impl Registry {
                     }
                 }
             };
+            run.cwd = Some(run_cwd.to_string_lossy().into_owned());
+            let launch_as_agent = entry.agent.is_some()
+                || (entry.command.len() == 1 && entry.resolved_agent().is_some());
+            let extra_tokens = entry
+                .extra_agent_args
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(tokenize_command_line)
+                .transpose()?
+                .unwrap_or_default();
             let mut command = entry.command.into_iter();
             let Some(program) = command.next() else {
                 continue;
             };
-            let extra_args: Vec<String> = command.collect();
+            let mut extra_args: Vec<String> = command.collect();
+            if launch_as_agent {
+                extra_args.extend(extra_tokens);
+            }
             let resolved_agent = self
                 .agents
                 .agents()
                 .ok()
                 .and_then(|a| a.resolve(&program).map(|(c, p)| (c.to_owned(), p.clone())));
             let cwd_bytes = run_cwd.as_os_str().as_bytes().to_vec();
-            let is_agent_launch = extra_args.is_empty() && resolved_agent.is_some();
+            let is_agent_launch = launch_as_agent;
             let prompt = entry.prompt;
-            let create = if let Some((canonical, _)) = &resolved_agent
-                && is_agent_launch
-            {
-                Create {
-                    account: None,
-                    program: Program::Agent {
-                        id: canonical.clone(),
-                    },
-                    cwd: cwd_bytes,
-                    cols: 80,
-                    rows: 24,
-                }
-            } else {
-                if let Some((_, profile)) = &resolved_agent {
-                    crate::agent::pre_trust_workspace(profile, &cwd_bytes, None);
-                }
-                let args = extra_args
-                    .into_iter()
-                    .chain((!prompt.is_empty()).then(|| prompt.clone()))
-                    .map(String::into_bytes)
-                    .collect();
-                Create {
-                    account: None,
-                    program: Program::Custom {
-                        program: program.into_bytes(),
-                        args,
-                    },
-                    cwd: cwd_bytes,
-                    cols: 80,
-                    rows: 24,
-                }
+            if let Some((_, profile)) = &resolved_agent {
+                crate::agent::pre_trust_workspace(profile, &cwd_bytes, None);
+            }
+            let create = Create {
+                account: None,
+                program: schedule_program(
+                    &program,
+                    extra_args,
+                    &prompt,
+                    is_agent_launch,
+                    resolved_agent.as_ref(),
+                ),
+                cwd: cwd_bytes,
+                cols: 80,
+                rows: 24,
             };
             let peer = Peer {
                 pid: None,
@@ -441,6 +540,68 @@ impl Registry {
     }
 }
 
+fn schedule_program(
+    program: &str,
+    extra_args: Vec<String>,
+    prompt: &str,
+    is_agent: bool,
+    resolved: Option<&(String, krill_proto::agent::Profile)>,
+) -> Program {
+    if is_agent
+        && extra_args.is_empty()
+        && let Some((canonical, _)) = resolved
+    {
+        return Program::Agent {
+            id: canonical.clone(),
+        };
+    }
+    let mut args = Vec::new();
+    let executable = if is_agent && let Some((_, profile)) = resolved {
+        args.extend(profile.launch.iter().skip(1).cloned());
+        profile.program().unwrap_or(program)
+    } else {
+        program
+    };
+    args.extend(extra_args);
+    if !is_agent && !prompt.is_empty() {
+        args.push(prompt.into());
+    }
+    Program::Custom {
+        program: executable.as_bytes().to_vec(),
+        args: args.into_iter().map(String::into_bytes).collect(),
+    }
+}
+
+fn create_isolated(
+    cwd: &str,
+    name: &str,
+    dir: &Path,
+    base: Option<&str>,
+) -> Result<PathBuf, String> {
+    use krill_proto::control::{NewWorktree, Setup};
+    use krill_proto::os::ffi::OsStringExt as _;
+    let root = std::env::var_os("KRILL_WORKTREES_DIR")
+        .map_or_else(|| dir.join("worktrees"), PathBuf::from);
+    let req = NewWorktree {
+        repo: cwd.as_bytes().to_vec(),
+        name: name.into(),
+        base: base.map(str::to_owned),
+        setup: Setup::Skip,
+    };
+    let outcome = crate::git::worktree::create(
+        crate::git::queue()?,
+        &req,
+        &root,
+        &dir.join(crate::git::worktree::TRUST_FILE),
+    )?;
+    match outcome {
+        crate::git::worktree::Outcome::Created { worktree, .. } => {
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(worktree.path)))
+        }
+        crate::git::worktree::Outcome::Untrusted { .. } => Err("worktree setup untrusted".into()),
+    }
+}
+
 fn exclusive(dir: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -457,7 +618,36 @@ struct Journal<'a> {
     dir: &'a Path,
     file: File,
     latest: HashMap<String, u64>,
-    sessions: HashMap<u64, Run>,
+    sessions: HashMap<u64, Vec<Run>>,
+}
+
+fn track_session_run(sessions: &mut HashMap<u64, Vec<Run>>, run: &Run) {
+    let Some(session) = run.session else {
+        return;
+    };
+    if run.phase == "spawned" {
+        let active = sessions.entry(session).or_default();
+        if let Some(existing) = active
+            .iter_mut()
+            .find(|r| r.id == run.id && r.run_number == run.run_number && r.minute == run.minute)
+        {
+            *existing = run.clone();
+        } else {
+            active.push(run.clone());
+        }
+    } else if run.run_number.is_some() {
+        let remove_key = if let Some(active) = sessions.get_mut(&session) {
+            active.retain(|r| !(r.id == run.id && r.run_number == run.run_number));
+            active.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            sessions.remove(&session);
+        }
+    } else {
+        sessions.remove(&session);
+    }
 }
 
 impl<'a> Journal<'a> {
@@ -497,13 +687,7 @@ impl<'a> Journal<'a> {
                     .entry(run.id.clone())
                     .and_modify(|m| *m = (*m).max(run.minute))
                     .or_insert(run.minute);
-                if let Some(session) = run.session {
-                    if run.phase == "spawned" {
-                        sessions.insert(session, run);
-                    } else {
-                        sessions.remove(&session);
-                    }
-                }
+                track_session_run(&mut sessions, &run);
             }
             // Discard a SIGKILL-truncated final record before the next append.
             if name == RUNS {
@@ -535,18 +719,17 @@ impl<'a> Journal<'a> {
     }
 
     fn append(&mut self, run: &Run) -> io::Result<()> {
-        if let Some(session) = run.session {
-            if run.phase == "spawned" {
-                self.sessions.insert(session, run.clone());
-            } else {
-                self.sessions.remove(&session);
-            }
-        }
+        track_session_run(&mut self.sessions, run);
         if self.file.metadata()?.len() >= MAX_RUNS {
             fs::rename(self.dir.join(RUNS), self.dir.join(PREVIOUS_RUNS))?;
             self.file = Self::writer(self.dir)?;
-            for active in self.sessions.values() {
-                if active.session != run.session {
+            for active in self.sessions.values().flatten() {
+                let same_as_current = run.phase == "spawned"
+                    && active.session == run.session
+                    && active.id == run.id
+                    && active.run_number == run.run_number
+                    && active.minute == run.minute;
+                if !same_as_current {
                     let mut line = serde_json::to_vec(active).map_err(io::Error::other)?;
                     line.push(b'\n');
                     self.file.write_all(&line)?;

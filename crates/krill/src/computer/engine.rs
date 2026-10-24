@@ -399,7 +399,7 @@ pub fn list_windows(app_selector: &str) -> Result<Vec<WindowSummary>, String> {
             .collect());
     }
     let app = resolve_live_app(app_selector)?;
-    list_windows_for_app(&app)
+    list_windows_for_app(&app, false)
 }
 
 pub fn resolve_live_app(app_selector: &str) -> Result<AppSummary, String> {
@@ -416,16 +416,21 @@ pub fn resolve_live_app(app_selector: &str) -> Result<AppSummary, String> {
     Ok(app)
 }
 
-fn list_windows_for_app(app: &AppSummary) -> Result<Vec<WindowSummary>, String> {
+/// `include_offscreen` (restore only) lists hidden/minimized windows so they can be restored.
+fn list_windows_for_app(
+    app: &AppSummary,
+    include_offscreen: bool,
+) -> Result<Vec<WindowSummary>, String> {
     let script = r#"
 ObjC.import("CoreGraphics");
 function run(argv) {
   const targetPid = Number(argv[0] || 0);
   const targetName = String(argv[1] || "");
   const targetBundle = argv[2] ? String(argv[2]) : null;
+  const option = argv[3] === "all" ? 0 : 1;
   let list = [];
   try {
-    const rawRef = $.CGWindowListCopyWindowInfo(1, 0);
+    const rawRef = $.CGWindowListCopyWindowInfo(option, 0);
     if (rawRef) {
       const unwrapped = ObjC.deepUnwrap(ObjC.castRefToObject(rawRef));
       if (Array.isArray(unwrapped)) list = unwrapped;
@@ -466,6 +471,7 @@ function run(argv) {
             &app.pid.to_string(),
             &app.name,
             app.bundle_id.as_deref().unwrap_or(""),
+            if include_offscreen { "all" } else { "onscreen" },
         ],
     )?;
     serde_json::from_str(&out).map_err(|e| format!("parse list-windows output: {e}"))
@@ -640,7 +646,7 @@ pub fn observe_app_state(
         ));
     }
     let app = resolve_live_app(app_selector)?;
-    let windows = list_windows_for_app(&app)?;
+    let windows = list_windows_for_app(&app, restore_window)?;
     let selected_window = if let Some(id) = window_id {
         Some(
             windows
@@ -820,145 +826,11 @@ fn capture_live_window_screenshot(win: &WindowSummary) -> Result<ScreenshotMetad
     capture
 }
 
-pub const LIVE_WINDOW_AX_JXA_SCRIPT: &str = r#"
-ObjC.import("AppKit");
-ObjC.import("ApplicationServices");
-ObjC.import("CoreGraphics");
-ObjC.import("Foundation");
-function run(argv) {
-let req;
-if(String(argv[0]) === "--request-file") {
-  const data=$.NSData.dataWithContentsOfFile(String(argv[1] || ""));
-  if(!data || data.isNil() || Number(data.length)>4194304) throw Error("private request file unavailable or exceeds bound");
-  req=JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data,$.NSUTF8StringEncoding)));
-} else { req=JSON.parse(String(argv[0] || "{}")); }
-const se = Application("System Events");
-function processStart() {
-  const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(req.pid));
-  if (!running || running.isNil()) throw Error("target process exited");
-  if (Number(running.processIdentifier) === Number($.NSProcessInfo.processInfo.processIdentifier)) throw Error("executor self target");
-  const bundle = ObjC.unwrap(running.bundleIdentifier) || "";
-  if (bundle === "dev.krill.app" || bundle === "com.krill.app") throw Error("Krill self target");
-  const executable=running.executableURL ? ObjC.unwrap(running.executableURL.lastPathComponent) : "";
-  if(executable === "krill-app" || executable === "Krill") throw Error("Krill executable self target");
-  if (req.bundleId && bundle !== req.bundleId) throw Error("process bundle changed");
-  if (!running.launchDate || running.launchDate.isNil()) throw Error("process start witness unavailable");
-  return String(Number(running.launchDate.timeIntervalSince1970));
-}
-function getProcess() {
-  const targetPid = Number(req.pid);
-  if (!(targetPid > 0)) throw Error("missing process PID");
-  const proc = se.processes.whose({ unixId: targetPid }).first;
-  if (Number(proc.unixId()) !== targetPid) throw Error("process PID mismatch");
-  return proc;
-}
-function rect(el) {
-  const p = el.position(), z = el.size();
-  return {x:Number(p[0]),y:Number(p[1]),width:Number(z[0]),height:Number(z[1])};
-}
-function canonical(value) {
-  if(Array.isArray(value)) return value.map(canonical);
-  if(value !== null && typeof value === "object") {
-    const result={};Object.keys(value).sort().forEach(key=>{result[key]=canonical(value[key]);});return result;
-  }
-  return value;
-}
-function equal(a,b) { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); }
-function selectTargetWindow(proc) {
-  const wins = proc.windows;
-  const names = wins.name();
-  if (!Array.isArray(names) || names.length === 0) throw Error("AX windows unavailable; observation failed");
-  const matches = [], geometric = [];
-  for (let i=0;i<Math.min(names.length,128);i++) {
-    const w=wins[i];
-    let n=null;
-    try { n=w.attributes.byName("AXWindowNumber").value(); } catch (_) {}
-    if (n !== null && String(n) === String(req.winId)) matches.push(w);
-    try {
-      if ((!req.winTitle || String(names[i] || "") === req.winTitle) && equal(rect(w),req.winBounds)) geometric.push(w);
-    } catch (_) {}
-  }
-  if (matches.length === 1) return matches[0];
-  if (matches.length > 1 || geometric.length !== 1) throw Error("window correspondence missing or ambiguous");
-  return geometric[0];
-}
-function checkCGWindow() {
-  const raw = $.CGWindowListCopyWindowInfo(1,0);
-  const rows = raw ? ObjC.deepUnwrap(ObjC.castRefToObject(raw)) : [];
-  const matches = rows.filter(w => String(w.kCGWindowNumber) === String(req.winId) && Number(w.kCGWindowOwnerPID) === Number(req.pid));
-  if (matches.length !== 1) throw Error("window identity expired");
-  const b=matches[0].kCGWindowBounds;
-  if (!equal({x:Number(b.X),y:Number(b.Y),width:Number(b.Width),height:Number(b.Height)},req.winBounds)) throw Error("window geometry changed");
-}
-const rolesInteractive={AXButton:1,AXTextField:1,AXTextArea:1,AXCheckBox:1,AXRadioButton:1,AXPopUpButton:1,AXComboBox:1,AXMenuItem:1,AXLink:1,AXTab:1,AXSlider:1,AXRow:1,AXCell:1};
-let truncated=false, budget=160, nextRef=1, entries={};
-function readNode(el, depth, isRoot) {
-  function read(f, fallback) { try { const v=f(); return v === undefined ? fallback : v; } catch (_) { return fallback; } }
-  const role=String(read(()=>el.role(),isRoot ? "AXWindow" : "AXGroup"));
-  const actions=read(()=>el.actions.name(),[]).map(String);
-  const raw=read(()=>el.value(),null);
-  let value=(raw !== null && ["string","number","boolean"].indexOf(typeof raw)>=0) ? String(raw) : null;
-  if (value !== null && value.length > 65536) throw Error("AX value exceeds bounded full observation; no lossy identity witness");
-  const node={referenceId:null,role,subrole:read(()=>el.subrole(),null),title:read(()=>el.title(),null),description:read(()=>el.description(),null),value,
-    bounds:read(()=>rect(el),null),enabled:Boolean(read(()=>el.enabled(),false)),focused:Boolean(read(()=>el.focused(),false)),selected:false,actions,children:[]};
-  if (!isRoot && (rolesInteractive[role] || actions.length)) {node.referenceId=nextRef++;entries[node.referenceId]=el;}
-  const children=el.uiElements;
-  let childRoles;
-  try { childRoles=children.role(); } catch (_) {truncated=true;return node;}
-  if (!Array.isArray(childRoles)) {truncated=true;return node;}
-  if(isRoot && childRoles.length===0) truncated=true;
-  if (depth >= 4 || budget <= 0) {if (childRoles.length) truncated=true;return node;}
-  const count=Math.min(childRoles.length,40);
-  if (count<childRoles.length) truncated=true;
-  for(let i=0;i<count;i++) {
-    if(budget--<=0) {truncated=true;break;}
-    node.children.push(readNode(children[i],depth+1,false));
-  }
-  return node;
-}
-function identity(n, recursive) {
-  const v=[n.role,n.subrole,n.title,n.description,n.bounds,n.actions];
-  if(recursive) v.push(n.children.map(c=>identity(c,true)));
-  return v;
-}
-function validateTree(root) {
-  if (!req.baseRoot || !equal(identity(root,true),identity(req.baseRoot,true))) throw Error("snapshot structure changed or reordered");
-  const refs=(Array.isArray(req.targetRefs)?req.targetRefs:[]).concat(req.targetRef?[req.targetRef]:[]);
-  refs.forEach(ref=>{
-    let target=null,duplicates=0;
-    function original(n) {if(n.referenceId===Number(ref)) target=n;n.children.forEach(original);}
-    original(req.baseRoot);
-    if(!target) throw Error("reference absent from immutable snapshot");
-    function count(n) {if(equal(identity(n,false),identity(target,false))) duplicates++;n.children.forEach(count);}
-    count(root);
-    if(duplicates!==1 || !entries[ref]) throw Error("element identity missing or ambiguous");
-    if(!Boolean(entries[ref].enabled())) throw Error("target element disabled");
-    let actualValue=null;try {actualValue=entries[ref].value();} catch(_) {}
-    const normalizedValue=actualValue!==null && ["string","number","boolean"].indexOf(typeof actualValue)>=0?String(actualValue):null;
-    if(normalizedValue!==target.value) throw Error("target value changed since observation; possible semantic reuse");
-  });
-  return entries[req.targetRef];
-}
-function foreground(proc, win) {
-  const front=$.NSWorkspace.sharedWorkspace.frontmostApplication;
-  if(!front || Number(front.processIdentifier)!==Number(req.pid) || !Boolean(proc.frontmost())) throw Error("foreground application changed");
-  const focused=proc.attributes.byName("AXFocusedWindow").value();
-  if(!focused || !equal(rect(focused),req.winBounds)) throw Error("focused window changed");
-}
-
-const start=processStart();
-checkCGWindow();
-const proc=getProcess();
-const win=selectTargetWindow(proc);
-if(req.restore) {
-  proc.visible=true;
-  win.attributes.byName("AXMinimized").value=false;
-}
-const root=readNode(win,0,true);
-if(root.role!=="AXWindow") throw Error("AX window not ready");
-return JSON.stringify({root,processStart:start,truncated});
-}
-"#;
+/// Read-only unless `restore` is set; then restore is a leased, postcondition-checked mutation.
+pub const LIVE_WINDOW_AX_JXA_SCRIPT: &str = concat!(
+    include_str!("engine/scripts/common.js"),
+    include_str!("engine/scripts/observe.js")
+);
 
 fn query_live_window_ax_tree(
     app: &AppSummary,
@@ -1242,311 +1114,11 @@ pub fn build_live_action_payload(
     }
 }
 
-pub const LIVE_ACTION_JXA_SCRIPT: &str = r#"
-ObjC.import("AppKit");
-ObjC.import("ApplicationServices");
-ObjC.import("CoreGraphics");
-ObjC.import("Foundation");
-function run(argv) {
-let req;
-if(String(argv[0]) === "--request-file") {
-  const data=$.NSData.dataWithContentsOfFile(String(argv[1] || ""));
-  if(!data || data.isNil() || Number(data.length)>4194304) throw Error("private request file unavailable or exceeds bound");
-  req=JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data,$.NSUTF8StringEncoding)));
-} else { req=JSON.parse(String(argv[0] || "{}")); }
-const se = Application("System Events");
-function processStart() {
-  const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(req.pid));
-  if (!running || running.isNil()) throw Error("target process exited");
-  if (Number(running.processIdentifier) === Number($.NSProcessInfo.processInfo.processIdentifier)) throw Error("executor self target");
-  const bundle = ObjC.unwrap(running.bundleIdentifier) || "";
-  if (bundle === "dev.krill.app" || bundle === "com.krill.app") throw Error("Krill self target");
-  const executable=running.executableURL ? ObjC.unwrap(running.executableURL.lastPathComponent) : "";
-  if(executable === "krill-app" || executable === "Krill") throw Error("Krill executable self target");
-  if (req.bundleId && bundle !== req.bundleId) throw Error("process bundle changed");
-  if (!running.launchDate || running.launchDate.isNil()) throw Error("process start witness unavailable");
-  return String(Number(running.launchDate.timeIntervalSince1970));
-}
-function getProcess() {
-  const targetPid = Number(req.pid);
-  if (!(targetPid > 0)) throw Error("missing process PID");
-  const proc = se.processes.whose({ unixId: targetPid }).first;
-  if (Number(proc.unixId()) !== targetPid) throw Error("process PID mismatch");
-  return proc;
-}
-function rect(el) {
-  const p = el.position(), z = el.size();
-  return {x:Number(p[0]),y:Number(p[1]),width:Number(z[0]),height:Number(z[1])};
-}
-function canonical(value) {
-  if(Array.isArray(value)) return value.map(canonical);
-  if(value !== null && typeof value === "object") {
-    const result={};Object.keys(value).sort().forEach(key=>{result[key]=canonical(value[key]);});return result;
-  }
-  return value;
-}
-function equal(a,b) { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); }
-function selectTargetWindow(proc) {
-  const wins = proc.windows;
-  const names = wins.name();
-  if (!Array.isArray(names) || names.length === 0) throw Error("AX windows unavailable; observation failed");
-  const matches = [], geometric = [];
-  for (let i=0;i<Math.min(names.length,128);i++) {
-    const w=wins[i];
-    let n=null;
-    try { n=w.attributes.byName("AXWindowNumber").value(); } catch (_) {}
-    if (n !== null && String(n) === String(req.winId)) matches.push(w);
-    try {
-      if ((!req.winTitle || String(names[i] || "") === req.winTitle) && equal(rect(w),req.winBounds)) geometric.push(w);
-    } catch (_) {}
-  }
-  if (matches.length === 1) return matches[0];
-  if (matches.length > 1 || geometric.length !== 1) throw Error("window correspondence missing or ambiguous");
-  return geometric[0];
-}
-function checkCGWindow() {
-  const raw = $.CGWindowListCopyWindowInfo(1,0);
-  const rows = raw ? ObjC.deepUnwrap(ObjC.castRefToObject(raw)) : [];
-  const matches = rows.filter(w => String(w.kCGWindowNumber) === String(req.winId) && Number(w.kCGWindowOwnerPID) === Number(req.pid));
-  if (matches.length !== 1) throw Error("window identity expired");
-  const b=matches[0].kCGWindowBounds;
-  if (!equal({x:Number(b.X),y:Number(b.Y),width:Number(b.Width),height:Number(b.Height)},req.winBounds)) throw Error("window geometry changed");
-}
-const rolesInteractive={AXButton:1,AXTextField:1,AXTextArea:1,AXCheckBox:1,AXRadioButton:1,AXPopUpButton:1,AXComboBox:1,AXMenuItem:1,AXLink:1,AXTab:1,AXSlider:1,AXRow:1,AXCell:1};
-let truncated=false, budget=160, nextRef=1, entries={};
-function readNode(el, depth, isRoot) {
-  function read(f, fallback) { try { const v=f(); return v === undefined ? fallback : v; } catch (_) { return fallback; } }
-  const role=String(read(()=>el.role(),isRoot ? "AXWindow" : "AXGroup"));
-  const actions=read(()=>el.actions.name(),[]).map(String);
-  const raw=read(()=>el.value(),null);
-  let value=(raw !== null && ["string","number","boolean"].indexOf(typeof raw)>=0) ? String(raw) : null;
-  if (value !== null && value.length > 65536) throw Error("AX value exceeds bounded full observation; no lossy identity witness");
-  const node={referenceId:null,role,subrole:read(()=>el.subrole(),null),title:read(()=>el.title(),null),description:read(()=>el.description(),null),value,
-    bounds:read(()=>rect(el),null),enabled:Boolean(read(()=>el.enabled(),false)),focused:Boolean(read(()=>el.focused(),false)),selected:false,actions,children:[]};
-  if (!isRoot && (rolesInteractive[role] || actions.length)) {node.referenceId=nextRef++;entries[node.referenceId]=el;}
-  const children=el.uiElements;
-  let childRoles;
-  try { childRoles=children.role(); } catch (_) {truncated=true;return node;}
-  if (!Array.isArray(childRoles)) {truncated=true;return node;}
-  if(isRoot && childRoles.length===0) truncated=true;
-  if (depth >= 4 || budget <= 0) {if (childRoles.length) truncated=true;return node;}
-  const count=Math.min(childRoles.length,40);
-  if (count<childRoles.length) truncated=true;
-  for(let i=0;i<count;i++) {
-    if(budget--<=0) {truncated=true;break;}
-    node.children.push(readNode(children[i],depth+1,false));
-  }
-  return node;
-}
-function identity(n, recursive) {
-  const v=[n.role,n.subrole,n.title,n.description,n.bounds,n.actions];
-  if(recursive) v.push(n.children.map(c=>identity(c,true)));
-  return v;
-}
-function validateTree(root) {
-  if (!req.baseRoot || !equal(identity(root,true),identity(req.baseRoot,true))) throw Error("snapshot structure changed or reordered");
-  if (!req.targetRef) return null;
-  let target=null, duplicates=0;
-  function original(n) {if(n.referenceId===Number(req.targetRef)) target=n; n.children.forEach(original);}
-  original(req.baseRoot);
-  if(!target) throw Error("reference absent from immutable snapshot");
-  function count(n) {if(equal(identity(n,false),identity(target,false))) duplicates++;n.children.forEach(count);}
-  count(root);
-  if(duplicates!==1 || !entries[req.targetRef]) throw Error("element identity missing or ambiguous");
-  return entries[req.targetRef];
-}
-function foreground(proc, win) {
-  const front=$.NSWorkspace.sharedWorkspace.frontmostApplication;
-  if(!front || Number(front.processIdentifier)!==Number(req.pid) || !Boolean(proc.frontmost())) throw Error("foreground application changed");
-  const focused=proc.attributes.byName("AXFocusedWindow").value();
-  if(!focused || !equal(rect(focused),req.winBounds)) throw Error("focused window changed");
-}
-
-let issued=0, mayHaveEffect=false, cleanup="not_needed", clipboard=null;
-function result(ok,status,reason,note,delivery) {
-  const state=delivery || (issued ? "submitted" : "not_dispatched");
-  return {ok,status,reason,note,delivery:state,issuedUnits:state==="unknown"?null:issued,cleanup,clipboard};
-}
-function guard(proc,win) {
-  if(processStart()!==req.processStart) throw Error("process start witness changed");
-  checkCGWindow();foreground(proc,win);
-  if(["pressKey","hotkey","typeText","pasteText"].indexOf(String(req.kind))>=0) {
-    if(req.targetRef && el) {
-      if(!Boolean(el.focused())) throw Error("text receiver focus changed");
-    } else {
-      if(!req.receiver) throw Error("keyboard receiver was not observed");
-      const receiver=proc.attributes.byName("AXFocusedUIElement").value();
-      if(!receiver || String(receiver.role())!==req.receiver.role || !equal(rect(receiver),req.receiver.bounds)) throw Error("keyboard receiver changed");
-      let title=null;try {title=receiver.title();} catch(_) {}
-      if(title!==req.receiver.title) throw Error("keyboard receiver label changed");
-    }
-  }
-  if(typeof $.IsSecureEventInputEnabled === "function" && $.IsSecureEventInputEnabled()) throw Error("Secure Event Input is active");
-}
-function issue(f) {mayHaveEffect=true;f();issued++;}
-function post(event) {if(!event) throw Error("event allocation failed");issue(()=>$.CGEventPost(0,event));}
-function assertPoint(pt) {
-  const b=req.winBounds;
-  if(!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y) || pt.x<b.x || pt.y<b.y || pt.x>b.x+b.width || pt.y>b.y+b.height) throw Error("point outside observed window");
-  // CG's front-to-back list proves the pixel receiver belongs to the selected window.
-  const raw=$.CGWindowListCopyWindowInfo(1,0), rows=ObjC.deepUnwrap(ObjC.castRefToObject(raw));
-  const hit=rows.find(w=> {const z=w.kCGWindowBounds;return z && Number(w.kCGWindowLayer||0)===0 && pt.x>=z.X && pt.y>=z.Y && pt.x<=z.X+z.Width && pt.y<=z.Y+z.Height;});
-  if(!hit || String(hit.kCGWindowNumber)!==String(req.winId)) throw Error("pixel receiver is occluded or changed");
-  // A layer-0 window census alone misses overlays, sheets and menus. Require the
-  // actual AX hit to belong to the focused window already checked against our snapshot.
-  const system=$.AXUIElementCreateSystemWide(), actual=Ref(), owner=Ref(), focused=Ref();
-  if(Number($.AXUIElementCopyElementAtPosition(system,pt.x,pt.y,actual))!==0 ||
-     Number($.AXUIElementGetPid(actual[0],owner))!==0 || Number(owner[0])!==Number(req.pid)) {
-    throw Error("pixel receiver hit-test is unavailable or belongs to another application");
-  }
-  const app=$.AXUIElementCreateApplication(Number(req.pid));
-  if(Number($.AXUIElementCopyAttributeValue(app,$("AXFocusedWindow"),focused))!==0) throw Error("focused AX window unavailable");
-  let cursor=actual[0], belongs=false;
-  for(let depth=0;depth<64;depth++) {
-    if($.CFEqual(cursor,focused[0])) {belongs=true;break;}
-    const parent=Ref();
-    if(Number($.AXUIElementCopyAttributeValue(cursor,$("AXParent"),parent))!==0) break;
-    if($.CFEqual(cursor,parent[0])) break;
-    cursor=parent[0];
-  }
-  if(!belongs) throw Error("pixel receiver is outside the observed focused window");
-}
-function mouse(pt,button,count) {
-  assertPoint(pt);
-  const n=button==="right" ? 1 : button==="middle" ? 2 : 0;
-  const down=n===1?3:n===2?25:1, up=n===1?4:n===2?26:2;
-  for(let i=1;i<=count;i++) {
-    guard(proc,win);assertPoint(pt);
-    const d=$.CGEventCreateMouseEvent(null,down,pt,n),u=$.CGEventCreateMouseEvent(null,up,pt,n);
-    if(!d||!u) throw Error("mouse pair allocation failed");
-    $.CGEventSetIntegerValueField(d,1,i);$.CGEventSetIntegerValueField(u,1,i);
-    $.CGEventSetFlags(d,Number(req.cgFlags||0));$.CGEventSetFlags(u,Number(req.cgFlags||0));
-    try {post(d);} finally {post(u);}
-  }
-}
-let proc,win,el;
-try {
-  if(!req.processStart || processStart()!==req.processStart) throw Error("process instance changed");
-  checkCGWindow();proc=getProcess();win=selectTargetWindow(proc);
-  const root=readNode(win,0,true);
-  el=validateTree(root);
-  if(el && !Boolean(el.enabled())) throw Error("element disabled");
-  guard(proc,win);
-  const kind=String(req.kind||"");
-  if(kind==="click" || kind==="secondaryAction") {
-    const simple=kind==="secondaryAction" || ((!req.button || req.button==="left") && Number(req.clickCount||1)===1 && (!req.modifiers||!req.modifiers.length));
-    if(el && simple) {
-      const name=kind==="secondaryAction" ? String(req.actionName||"AXShowMenu") : "AXPress";
-      if(el.actions.name().indexOf(name)<0) throw Error("requested AX action unavailable; no coordinate fallback");
-      issue(()=>el.actions.byName(name).perform());
-    } else {
-      if(kind==="secondaryAction") throw Error("secondary action requires original reference");
-      mouse(req.point,req.button||"left",Math.min(16,Number(req.clickCount||1)));
-    }
-    return JSON.stringify(result(true,"unverified","action submitted; no business predicate requested","single dispatch; no fallback"));
-  }
-  if(kind==="setValue") {
-    if(!el) throw Error("set-value requires original reference");
-    issue(()=>{el.attributes.byName("AXValue").value=String(req.value);});
-    // Full readback on the SAME resolved object; never use the 500-character preview.
-    guard(proc,win);
-    const actual=String(el.attributes.byName("AXValue").value());
-    if(actual!==String(req.value)) return JSON.stringify(result(false,"unverified","full target value readback differs",null));
-    return JSON.stringify(result(true,"verified",null,"full AXValue equality on resolved target"));
-  }
-  if(kind==="typeText" || kind==="pasteText") {
-    if(!el) throw Error("text input requires an observed editable receiver");
-    const role=String(el.role());
-    if(["AXTextField","AXTextArea","AXComboBox"].indexOf(role)<0) throw Error("receiver is not an editable text control");
-    if(!Boolean(el.focused())) throw Error("text receiver focus changed; observe or explicitly focus first");
-    const beforeValue=String(el.value()||"");
-    if(kind==="typeText") {
-      // One System Events dispatch, no newline/tab sub-actions with unchecked receiver changes.
-      if(/[\r\n\t]/.test(String(req.text))) throw Error("multiline/tab input requires set-value or paste-text");
-      issue(()=>se.keystroke(String(req.text||"")));
-      return JSON.stringify(result(true,"unverified","keystroke submitted; inserted text not asserted",null));
-    }
-    const pb=$.NSPasteboard.generalPasteboard;
-    const initial=Number(pb.changeCount);
-    const items=pb.pasteboardItems, saved=[];
-    let size=0;
-    for(let i=0;i<Number(items.count);i++) {
-      const item=items.objectAtIndex(i), copy=$.NSPasteboardItem.alloc.init, types=item.types;
-      for(let j=0;j<Number(types.count);j++) {
-        const type=types.objectAtIndex(j), data=item.dataForType(type);
-        if(!data || data.isNil()) throw Error("clipboard promised type cannot be preserved");
-        size+=Number(data.length);
-        if(size>4194304) throw Error("clipboard preservation exceeds bound; unchanged");
-        if(!copy.setDataForType(data,type)) throw Error("clipboard type copy failed");
-      }
-      saved.push(copy);
-    }
-    if(Number(pb.changeCount)!==initial) throw Error("clipboard changed during preservation");
-    guard(proc,win);
-    clipboard={preserved:true,restored:false};cleanup="incomplete";mayHaveEffect=true;
-    pb.clearContents;
-    if(!pb.setStringForType(String(req.text||""),$.NSPasteboardTypeString)) throw Error("clipboard write failed");
-    const owned=Number(pb.changeCount);
-    try {
-      guard(proc,win);
-      if(Number(pb.changeCount)!==owned || !Boolean(el.focused())) throw Error("clipboard or receiver changed before paste");
-      issue(()=>se.keystroke("v",{using:"command down"}));
-      const deadline=Date.now()+750;
-      let consumed=false;
-      while(Date.now()<deadline) {
-        if(Number(pb.changeCount)!==owned) throw Error("clipboard conflict; user contents retained");
-        guard(proc,win);
-        const value=String(el.value()||"");
-        if(value!==beforeValue && value.indexOf(String(req.text))>=0) {consumed=true;break;}
-        $.NSThread.sleepForTimeInterval(0.025);
-      }
-      if(!consumed) throw Error("paste consumption unconfirmed; clipboard retained for delayed receiver");
-      if(Number(pb.changeCount)!==owned) throw Error("clipboard conflict before restoration");
-      pb.clearContents;
-      if(saved.length && !pb.writeObjects($(saved))) throw Error("clipboard restoration failed");
-      clipboard.restored=true;cleanup="completed";
-      return JSON.stringify(result(true,"verified",null,"receiver value changed and contains pasted text"));
-    } catch(error) {return JSON.stringify(result(false,"unverified",String(error),null,issued?"submitted":"unknown"));}
-  }
-  if(kind==="pressKey" || kind==="hotkey") {
-    const opts=Array.isArray(req.usingMods)&&req.usingMods.length ? {using:req.usingMods} : null;
-    for(let i=0;i<Math.min(32,Math.max(1,Number(req.repeat||1)));i++) {
-      guard(proc,win);
-      if(req.keyCode!==null && req.keyCode!==undefined) issue(()=>opts ? se.keyCode(Number(req.keyCode),opts) : se.keyCode(Number(req.keyCode)));
-      else issue(()=>opts ? se.keystroke(String(req.key),opts) : se.keystroke(String(req.key)));
-    }
-    return JSON.stringify(result(true,"unverified","key events submitted; no predicate requested",null));
-  }
-  if(kind==="scroll") {
-    assertPoint(req.point);guard(proc,win);
-    const move=$.CGEventCreateMouseEvent(null,5,req.point,0);
-    const scroll=$.CGEventCreateScrollWheelEvent(null,0,2,Math.round(req.deltaY||0),Math.round(req.deltaX||0));
-    if(!move||!scroll) throw Error("scroll event allocation failed");
-    post(move);guard(proc,win);post(scroll);
-    return JSON.stringify(result(true,"unverified","scroll submitted; no predicate requested",null));
-  }
-  if(kind==="drag") {
-    assertPoint(req.from);assertPoint(req.to);
-    const down=$.CGEventCreateMouseEvent(null,1,req.from,0), up=$.CGEventCreateMouseEvent(null,2,req.to,0);
-    if(!down||!up) throw Error("drag pair allocation failed");
-    cleanup="incomplete";
-    try {
-      post(down);
-      for(let i=1;i<=5;i++) {
-        guard(proc,win);
-        const point={x:req.from.x+(req.to.x-req.from.x)*i/5,y:req.from.y+(req.to.y-req.from.y)*i/5};
-        assertPoint(point);post($.CGEventCreateMouseEvent(null,6,point,0));
-        $.NSThread.sleepForTimeInterval(0.01);
-      }
-    } finally {post(up);cleanup="completed";}
-    return JSON.stringify(result(true,"unverified","drag submitted; no predicate requested",null));
-  }
-  throw Error("unsupported action");
-} catch(error) {
-  return JSON.stringify(result(false,"unverified",String(error),"no mutation replay or backend fallback",mayHaveEffect?"unknown":"not_dispatched"));
-}
-}
-"#;
+/// Shares `common.js` with observation so identity/value validation cannot drift.
+pub const LIVE_ACTION_JXA_SCRIPT: &str = concat!(
+    include_str!("engine/scripts/common.js"),
+    include_str!("engine/scripts/action.js")
+);
 
 fn focused_receiver(node: &ElementNode) -> Option<&ElementNode> {
     node.children

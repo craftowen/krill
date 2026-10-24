@@ -334,7 +334,7 @@ async function testHistoryGestures(){
 }
 async function testPasteButton(){
  let clip='one\r\ntwo';context.navigator={clipboard:{readText:async()=>{if(clip instanceof Error)throw clip;return clip;}}};
- let {root,handle,socket}=await mount(704,{preferences:{inputMode:'direct'}});socket.autoAck=true;const paste=find(root,'paste-key');assert.equal(paste.parent,find(root,'keybar'));assert.equal(paste.dataset.testid,'terminal-paste');assert.equal(event(paste,'pointerdown').defaultPrevented,true);
+ let {root,handle,socket}=await mount(704,{preferences:{inputMode:'direct'}});socket.autoAck=true;const paste=find(root,'paste-key');assert.equal(paste.parent,find(root,'accessory-row'),'paste stays outside the scrolling keys');assert.equal(paste.dataset.testid,'terminal-paste');assert.equal(event(paste,'pointerdown').defaultPrevented,true);
  socket.frame(0x2b,Uint8Array.of(0),T.v(32));event(paste,'click');await flush();assert.deepEqual(inputs(socket),['\x1b[200~one\ntwo\x1b[201~']);
  socket.frame(0x2b,Uint8Array.of(0),T.v(0));clip='ls -la';event(paste,'click');await flush();assert.equal(inputs(socket).at(-1),'ls -la');
  // 권한 거부·API 없음(비보안 연결)은 빈 확인 칸을 열어 길게 눌러 붙여넣게 한다. 빈 칸 전송은 아무것도 보내지 않는다.

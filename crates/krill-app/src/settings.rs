@@ -4,6 +4,7 @@
 //!
 //! 라이트/다크는 터미널 팔레트도 바꾸며 셸이 krilld에 전달한다(OWE-590). 줌은 rem 기반 UI 크기에 적용한다.
 
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
 use krill_proto::os::fs::OpenOptionsExt as _;
 use std::io::Write as _;
 #[cfg(unix)]
@@ -185,6 +186,9 @@ pub struct Settings {
     /// false면 라이트 모드에서도 다크 모드 테마를 쓴다.
     #[serde(default = "default_true")]
     pub terminal_use_separate_light_theme: bool,
+    /// 사이드바 자동화 진입점 표시. Workflows 설정에서 다시 켤 수 있다.
+    #[serde(default = "default_true")]
+    pub show_automations_button: bool,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
     /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -300,6 +304,7 @@ impl Default for Settings {
             terminal_theme_dark: default_terminal_theme_dark(),
             terminal_theme_light: default_terminal_theme_light(),
             terminal_use_separate_light_theme: true,
+            show_automations_button: true,
             terminal_custom_themes: Vec::new(),
         }
     }
@@ -1539,7 +1544,7 @@ fn apply(cx: &mut App) {
 /// 설정을 고쳐 바로 적용하고 `settings.toml`에 쓴다. 디스크의 유효한 최신 파일을
 /// 바탕으로 변경을 적용해 1초 폴링 전 외부 편집이 메모리 설정으로 덮어쓰기되지 않게 한다.
 /// 디스크 파일이 손상됐거나 읽을 수 없으면 쓰지 않고 오류만 남긴다.
-pub(crate) fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
+pub fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
     let c = cx.global::<Config>();
     let Some(dir) = c.dir.clone() else {
         cx.global_mut::<Config>().error = Some(text::NO_STATE_DIR.get().into());
@@ -2605,6 +2610,8 @@ pub struct SettingsView {
     mobile: mobile::Panel,
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
     mobile_page: bool,
+    automations_page: bool,
+    automations: schedules::SchedulesState,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
     accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     account_error: Option<SharedString>,
@@ -2742,6 +2749,8 @@ struct ServiceCache {
     aliases: std::collections::BTreeMap<String, String>,
     schedules: Vec<krill_proto::schedule::Schedule>,
     runs: Vec<krill_proto::schedule::ScheduleRun>,
+    schedules_error: Option<String>,
+    runs_error: Option<String>,
 }
 
 impl ServiceCache {
@@ -3034,6 +3043,8 @@ impl SettingsView {
             account_file_stamp: Vec::new(),
             mobile: mobile::Panel::default(),
             mobile_page: false,
+            automations_page: false,
+            automations: schedules::SchedulesState::default(),
             remote_krill: None,
             accounts_snapshot: krill_proto::usage::AccountsSnapshot::default(),
             account_error: None,
@@ -3292,6 +3303,10 @@ impl SettingsView {
                     if previous_stamp.as_ref() == Some(&stamp) && known_repo {
                         return (Some(stamp), None);
                     }
+                    let schedules = krill_proto::schedule::Schedules::load(&dir);
+                    let runs = krill_proto::schedule::load_coalesced_runs(&dir);
+                    let schedules_error = schedules.as_ref().err().map(ToString::to_string);
+                    let runs_error = runs.as_ref().err().map(ToString::to_string);
                     (
                         Some(stamp),
                         Some(ServiceCache {
@@ -3310,11 +3325,10 @@ impl SettingsView {
                                     (raw, canonical)
                                 })
                                 .collect(),
-                            schedules: krill_proto::schedule::Schedules::load(&dir)
-                                .unwrap_or_default()
-                                .schedule,
-                            runs: krill_proto::schedule::load_coalesced_runs(&dir)
-                                .unwrap_or_default(),
+                            schedules: schedules.unwrap_or_default().schedule,
+                            runs: runs.unwrap_or_default(),
+                            schedules_error,
+                            runs_error,
                         }),
                     )
                 })
@@ -3358,6 +3372,22 @@ impl SettingsView {
 
     pub fn tab(&self) -> AdminTab {
         self.tab
+    }
+
+    pub fn automations_page(&self) -> bool {
+        self.automations_page
+    }
+
+    pub fn set_automations_page(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.automations_page == on {
+            return;
+        }
+        self.automations_page = on;
+        if on {
+            self.mobile_page = false;
+            self.refresh_service_cache(cx);
+        }
+        cx.notify();
     }
 
     pub fn mobile_page(&self) -> bool {
@@ -12075,6 +12105,9 @@ impl Render for SettingsView {
         } else if !has_modal && let Some(focus) = self.modal_return_focus.take() {
             window.focus(&focus, cx);
         }
+        if self.automations_page {
+            return self.render_automations_page(window, cx).into_any_element();
+        }
         window.set_window_title(text::TITLE.get());
         let (s, error) = cx.try_global::<Config>().map_or_else(
             || (Settings::default(), None),
@@ -12514,6 +12547,7 @@ impl Render for SettingsView {
                 }
                 if this.schedule_modal.is_some() && ev.keystroke.key == "escape" {
                     this.close_schedule_modal(cx);
+                    window.focus(&this.focus, cx);
                     cx.stop_propagation();
                     return;
                 }

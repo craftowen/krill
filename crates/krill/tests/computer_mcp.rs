@@ -69,6 +69,10 @@ for line in sys.stdin:
     text=value['op'].get('text')
     if text=='hold': held.add(seq); continue
     if text=='eof': sys.exit(0)
+    if text=='eof-tail':
+        sys.stdout.write(json.dumps({'type':'result','seq':seq,'state':'completed','delivery':{'state':'submitted','issuedUnits':1},
+            'observation':{'state':'not_requested'},'verification':{'state':'satisfied','predicate':'spoof'},'cleanup':{'state':'completed'}}))
+        sys.stdout.flush(); sys.exit(3)
     if value['op'].get('kind')=='batch':
         send({'type':'result','seq':seq,'state':'completed','delivery':{'state':'partial','issuedUnits':1,'reason':'later_step_refused'},
               'observation':{'state':'not_requested'},'verification':{'state':'not_requested'},'cleanup':{'state':'completed'},
@@ -138,21 +142,19 @@ log({'kind':'exit'})
         panic!("MCP response limit reached");
     }
 
-    fn rpc(&mut self, id: u64, method: &str, params: Value) -> Value {
-        let mut request = json!({"jsonrpc":"2.0", "id":id, "method":method});
-        request["params"] = params;
-        self.send(&request);
+    fn rpc(&mut self, id: u64, method: &str, params: &Value) -> Value {
+        self.send(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}));
         self.response(id)
     }
 
     fn initialize(&mut self) {
         // Modern clients use this error to choose the documented legacy handshake.
-        let discover = self.rpc(0, "server/discover", json!({}));
+        let discover = self.rpc(0, "server/discover", &json!({}));
         assert_eq!(discover["error"]["code"], -32601);
         let init = self.rpc(
             1,
             "initialize",
-            json!({"protocolVersion":"2025-11-25",
+            &json!({"protocolVersion":"2025-11-25",
             "capabilities":{}, "clientInfo":{"name":"krill-e2e","version":"1"}}),
         );
         assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "{init}");
@@ -160,11 +162,13 @@ log({'kind':'exit'})
         self.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
     }
 
-    fn execute(&mut self, id: u64, seq: u64, op: Value) -> Value {
-        let mut params =
-            json!({"name":"computer_execute", "arguments":{"seq":seq,"deadlineMs":5000}});
-        params["arguments"]["op"] = op;
-        self.rpc(id, "tools/call", params)
+    fn execute(&mut self, id: u64, seq: u64, op: &Value) -> Value {
+        self.rpc(
+            id,
+            "tools/call",
+            &json!({"name":"computer_execute",
+            "arguments":{"seq":seq,"deadlineMs":5000,"op":op}}),
+        )
     }
 
     fn log(&self) -> Vec<Value> {
@@ -201,7 +205,7 @@ fn set_value(text: &str) -> Value {
 fn mcp_reuses_one_worker_and_replay_after_cache_eviction_never_dispatches() {
     let mut peer = Peer::start();
     peer.initialize();
-    let list = peer.rpc(2, "tools/list", json!({}));
+    let list = peer.rpc(2, "tools/list", &json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
     for name in [
         "computer_session",
@@ -211,20 +215,20 @@ fn mcp_reuses_one_worker_and_replay_after_cache_eviction_never_dispatches() {
     ] {
         assert!(tools.iter().any(|tool| tool["name"] == name));
     }
-    let first = peer.execute(3, 1, json!({"kind":"capabilities"}));
+    let first = peer.execute(3, 1, &json!({"kind":"capabilities"}));
     assert_eq!(first["result"]["isError"], false, "{first}");
-    let replay = peer.execute(3, 1, json!({"kind":"capabilities"}));
+    let replay = peer.execute(3, 1, &json!({"kind":"capabilities"}));
     assert_eq!(replay, first);
-    let same_seq_new_rpc = peer.execute(4, 1, json!({"kind":"capabilities"}));
+    let same_seq_new_rpc = peer.execute(4, 1, &json!({"kind":"capabilities"}));
     assert_eq!(same_seq_new_rpc["result"], first["result"]);
     for seq in 2..=150 {
-        let response = peer.execute(seq + 10, seq, json!({"kind":"capabilities"}));
+        let response = peer.execute(seq + 10, seq, &json!({"kind":"capabilities"}));
         assert_eq!(
             response["result"]["isError"], false,
             "seq {seq}: {response}"
         );
     }
-    let expired = peer.execute(200, 1, json!({"kind":"capabilities"}));
+    let expired = peer.execute(200, 1, &json!({"kind":"capabilities"}));
     assert!(
         expired.get("error").is_some() || expired["result"]["isError"] == true,
         "{expired}"
@@ -253,7 +257,7 @@ fn mcp_controls_remain_responsive_during_a_pending_native_request() {
     let status = peer.rpc(
         4,
         "tools/call",
-        json!({"name":"computer_status","arguments":{"seq":1}}),
+        &json!({"name":"computer_status","arguments":{"seq":1}}),
     );
     assert_eq!(
         status["result"]["structuredContent"]["state"], "queued",
@@ -262,7 +266,7 @@ fn mcp_controls_remain_responsive_during_a_pending_native_request() {
     let cancelled = peer.rpc(
         5,
         "tools/call",
-        json!({"name":"computer_cancel","arguments":{"seq":1}}),
+        &json!({"name":"computer_cancel","arguments":{"seq":1}}),
     );
     assert_eq!(
         cancelled["result"]["structuredContent"]["outcome"], "cancelled",
@@ -284,10 +288,10 @@ fn mcp_controls_remain_responsive_during_a_pending_native_request() {
 
 #[test]
 fn mcp_unknown_and_post_send_eof_close_without_restart_or_replay() {
-    for text in ["unknown", "eof"] {
+    for text in ["unknown", "eof", "eof-tail"] {
         let mut peer = Peer::start();
         peer.initialize();
-        let response = peer.execute(3, 1, set_value(text));
+        let response = peer.execute(3, 1, &set_value(text));
         assert_eq!(response["result"]["isError"], true, "{response}");
         assert_eq!(
             response["result"]["structuredContent"]["delivery"]["state"], "unknown",
@@ -312,19 +316,19 @@ fn mcp_unknown_and_post_send_eof_close_without_restart_or_replay() {
 fn mcp_native_zero_indices_and_foreign_epoch_refusal_match_the_worker_contract() {
     let mut peer = Peer::start();
     peer.initialize();
-    let zero_window = peer.execute(3, 1, json!({"kind":"observe","pid":42,"window":0}));
+    let zero_window = peer.execute(3, 1, &json!({"kind":"observe","pid":42,"window":0}));
     assert_eq!(zero_window["result"]["isError"], false, "{zero_window}");
     let root_action = peer.execute(
         4,
         2,
-        json!({"kind":"action","name":"AXRaise",
+        &json!({"kind":"action","name":"AXRaise",
         "target":{"snapshot":"E/C/1","element":"e0"}}),
     );
     assert_eq!(root_action["result"]["isError"], false, "{root_action}");
     let foreign = peer.execute(
         5,
         3,
-        json!({"kind":"action","name":"AXPress",
+        &json!({"kind":"action","name":"AXPress",
         "target":{"snapshot":"OLD/C/1","element":"e1"}}),
     );
     assert!(
@@ -347,7 +351,7 @@ fn mcp_known_partial_batch_is_an_error_but_does_not_poison_the_session() {
     let invalid = peer.execute(
         3,
         1,
-        json!({"kind":"batch","steps":[{"kind":"batch","steps":[]}]}),
+        &json!({"kind":"batch","steps":[{"kind":"batch","steps":[]}]}),
     );
     assert!(
         invalid.get("error").is_some() || invalid["result"]["isError"] == true,
@@ -356,7 +360,7 @@ fn mcp_known_partial_batch_is_an_error_but_does_not_poison_the_session() {
     let partial = peer.execute(
         4,
         1,
-        json!({"kind":"batch","steps":[set_value("first"), set_value("second")]}),
+        &json!({"kind":"batch","steps":[set_value("first"), set_value("second")]}),
     );
     assert_eq!(partial["result"]["isError"], true, "{partial}");
     assert_eq!(
@@ -364,7 +368,7 @@ fn mcp_known_partial_batch_is_an_error_but_does_not_poison_the_session() {
         "partial"
     );
     assert_eq!(partial["result"]["structuredContent"]["state"], "completed");
-    let next = peer.execute(5, 2, json!({"kind":"capabilities"}));
+    let next = peer.execute(5, 2, &json!({"kind":"capabilities"}));
     assert_eq!(next["result"]["isError"], false, "{next}");
     let log = peer.log();
     assert_eq!(

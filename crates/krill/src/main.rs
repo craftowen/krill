@@ -166,7 +166,10 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     if raw.first().is_some_and(|s| s == "history") {
         return history::run(&raw[1..]);
     }
-    if raw.first().is_some_and(|s| s == "schedule") {
+    if raw
+        .first()
+        .is_some_and(|s| s == "schedule" || s == "automations" || s == "automation")
+    {
         return schedule::run(&raw[1..]);
     }
     if raw.first().is_some_and(|s| s == "changes") {

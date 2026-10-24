@@ -547,3 +547,5 @@ button.account-row:disabled{opacity:1}
 .session-summary[data-reconnectable=true]{cursor:pointer;text-decoration:underline}
 body:not([data-screen=session]) #notice{bottom:calc(16px + env(safe-area-inset-bottom) + var(--keyboard-inset,0px))}
 .log-error .log-glyph,.log-error strong{color:var(--status-blocked)}
+
+.session .accessory-row>.paste-key{display:grid;place-items:center;flex:none;margin:2px 4px 2px 0;padding:4px 8px;color:var(--foreground);border:1px solid var(--border)}

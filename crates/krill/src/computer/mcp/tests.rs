@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -157,6 +157,8 @@ fn exact_frame_boundary_and_oversize_refusal_are_deterministic() {
     assert_eq!(bytes.len(), MAX_FRAME);
     assert!(read_line(&mut Cursor::new(vec![b' '; MAX_FRAME + 1]), &mut bytes).is_err());
     assert!(!read_line(&mut Cursor::new(Vec::<u8>::new()), &mut bytes).unwrap());
+    // A syntactically complete body without its framing delimiter is not a committed result.
+    assert!(read_line(&mut Cursor::new(br#"{"type":"result"}"#), &mut bytes).is_err());
 }
 
 #[test]
@@ -172,7 +174,8 @@ proptest! {
     fn arbitrary_utf8_is_one_ndjson_frame(text in ".{0,4096}") {
         let value = json!({"jsonrpc":"2.0","id":"id","result":{"text":text}});
         let bytes = encode(&value).unwrap();
-        prop_assert_eq!(bytes.split(|b| *b == b'\n').count().saturating_sub(1), 1);
+        // Exactly one delimiter: the first newline is the final byte.
+        prop_assert_eq!(bytes.iter().position(|b| *b == b'\n'), Some(bytes.len() - 1));
         let mut framed = Vec::new();
         prop_assert!(read_line(&mut Cursor::new(bytes), &mut framed).unwrap());
         prop_assert_eq!(serde_json::from_slice::<Value>(&framed).unwrap(), value);
@@ -180,11 +183,25 @@ proptest! {
 
     #[test]
     fn arbitrary_input_frames_and_hello_cannot_panic(bytes in prop::collection::vec(any::<u8>(), 0..8192)) {
+        // Bodies stay below MAX_FRAME, so only EOF framing decides the outcome: empty input is a
+        // clean end, a delimited line is a frame, and an unterminated tail is refused, never parsed.
+        let terminated = bytes.contains(&b'\n');
+        let empty = bytes.is_empty();
         let mut framed = Vec::new();
-        if read_line(&mut Cursor::new(bytes), &mut framed).unwrap()
-            && let Ok(value) = serde_json::from_slice::<Value>(&framed) {
-                Hello::parse(value).ok();
+        match read_line(&mut Cursor::new(bytes), &mut framed) {
+            Ok(true) => {
+                prop_assert!(terminated);
+                if let Ok(value) = serde_json::from_slice::<Value>(&framed) {
+                    Hello::parse(value).ok();
+                }
             }
+            Ok(false) => prop_assert!(empty),
+            Err(error) => {
+                prop_assert!(!terminated);
+                prop_assert!(!empty);
+                prop_assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            }
+        }
     }
 
     #[test]

@@ -137,6 +137,30 @@ agy() {
     command agy "$@"
   fi
 }
+codex() {
+  __krill_sync_accounts
+  if [ "${KRILL_CODEX_ISOLATE-1}" = "0" ]; then
+    command codex "$@"
+    return
+  fi
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      agents|queue|--no-daemon|--remote|--remote=*)
+        command codex "$@"
+        return
+        ;;
+    esac
+  done
+  case "$(command codex --help 2>/dev/null </dev/null)" in
+    *--no-daemon*)
+      command codex --no-daemon "$@"
+      ;;
+    *)
+      command codex "$@"
+      ;;
+  esac
+}
 "#;
 
 /// 로그인 셸(`Program::Login`) 실행 시 활성 계정 프로필 환경 변수와 셸 동기화 훅(`active-accounts.env`)을 주입한다.
@@ -560,6 +584,12 @@ pub(crate) fn account_for_stored_in(
     }
     if let Some(path) = stored.transcript_path.as_deref().filter(|p| !p.is_empty()) {
         let transcript = Path::new(path);
+        let transcript_canon = transcript.canonicalize().ok();
+        let sub = match provider {
+            ProviderKind::Codex => Some("sessions"),
+            ProviderKind::Claude => Some("projects"),
+            _ => None,
+        };
         for a in &file.accounts {
             if ProviderKind::parse(&a.provider) != Some(provider) {
                 continue;
@@ -573,7 +603,21 @@ pub(crate) fn account_for_stored_in(
             } else {
                 cfg.to_path_buf()
             };
-            if transcript.starts_with(&resolved) || transcript.starts_with(cfg) {
+            let canon_match = transcript_canon.as_ref().is_some_and(|tc| {
+                resolved.canonicalize().is_ok_and(|rc| tc.starts_with(&rc))
+                    || cfg.canonicalize().is_ok_and(|cc| tc.starts_with(&cc))
+                    || sub.is_some_and(|s| {
+                        resolved
+                            .join(s)
+                            .canonicalize()
+                            .is_ok_and(|sc| tc.starts_with(&sc))
+                            || cfg
+                                .join(s)
+                                .canonicalize()
+                                .is_ok_and(|sc| tc.starts_with(&sc))
+                    })
+            });
+            if transcript.starts_with(&resolved) || transcript.starts_with(cfg) || canon_match {
                 return Some(LaunchAccount {
                     id: a.id.clone(),
                     env_key: provider.env_var().to_owned(),
@@ -582,7 +626,15 @@ pub(crate) fn account_for_stored_in(
             }
         }
         let host = accounts::host_default_dir(home, provider);
-        if !host.as_os_str().is_empty() && transcript.starts_with(&host) {
+        let host_canon_match = transcript_canon.as_ref().is_some_and(|tc| {
+            host.canonicalize().is_ok_and(|hc| tc.starts_with(&hc))
+                || sub.is_some_and(|s| {
+                    host.join(s)
+                        .canonicalize()
+                        .is_ok_and(|sc| tc.starts_with(&sc))
+                })
+        });
+        if !host.as_os_str().is_empty() && (transcript.starts_with(&host) || host_canon_match) {
             return Some(LaunchAccount {
                 id: accounts::host_default_id(provider),
                 env_key: provider.env_var().to_owned(),
@@ -1918,6 +1970,16 @@ fn wrap_account(
         profile.install_command()
     );
     let mut agent_argv = profile.argv(permission);
+    if is(profile, "codex")
+        && std::env::var_os("KRILL_CODEX_ISOLATE").is_none_or(|v| v != "0")
+        && !agent_argv.iter().skip(1).any(|a| {
+            matches!(a.as_str(), "--no-daemon" | "agents" | "queue" | "--remote")
+                || a.starts_with("--remote=")
+        })
+        && codex::no_daemon_supported(profile.program())
+    {
+        agent_argv.insert(1, "--no-daemon".to_owned());
+    }
     if (is(profile, "agy") || is(profile, "antigravity"))
         && let Some(account) = account.filter(|a| !a.dir.is_empty())
     {

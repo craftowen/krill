@@ -1,17 +1,20 @@
+// Automation design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
+// Shared schedule/preset and automation control behavior; independently implemented for Krill.
 //! MK-101: atomically edit daemon schedule configuration and inspect launch history.
 
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{self, Read as _, Write as _};
+use std::fs;
+use std::io;
 use std::process::ExitCode;
 
 use krill_proto::daemon::{self, Paths};
 use krill_proto::ipc::ClientRole;
 use krill_proto::schedule::{
-    MAX_RUNS, PREVIOUS_RUNS, RUNS, Schedule, Schedules, WorkspaceMode, request_run_now,
+    Schedule, SchedulePreset, Schedules, WorkspaceMode, build_preset_cron, request_run_now,
+    slugify_schedule_id,
 };
 
-const USAGE: &str = "usage: krill schedule add <id> --cron '<minute hour day month weekday>' --prompt <text> [--cwd|--workdir <path>] [--precheck <cmd>] [--isolate|--new-worktree|--no-new-worktree] [--workspace-mode <reuse|isolate>] [--enable|--enabled|--disable|--disabled] [--agent <profile> | -- <executable> [args...]] [--json] | krill schedule edit <id> [--cron <expr>] [--prompt <text>] [--cwd|--workdir <path>] [--precheck <cmd>|--clear-precheck] [--isolate|--new-worktree|--no-new-worktree] [--workspace-mode <reuse|isolate>] [--enable|--enabled|--disable|--disabled] [--json] | krill schedule show <id> [--json] | krill schedule enable <id> [--json] | krill schedule disable <id> [--json] | krill schedule run <id> [--json] | krill schedule rm <id> [--json] | krill schedule list [--json] | krill schedule runs [--json] (cron is UTC; prompt is the last command argument)";
+const USAGE: &str = "usage: krill schedule|automations create|add [<id>|--id <id>] [--name <name>] --cron|--schedule <expr> | --trigger <hourly|daily|weekdays|weekly|cron|rrule> [--time HH:MM] [--day 0..6] [--cwd|--workdir|--repo|--workspace <path>] [--agent|--provider <profile> | -- <executable> [args...]] [--prompt <text>] [--extra-agent-args <args>|--clear-extra-agent-args] [--precheck <cmd>|--clear-precheck] [--precheck-timeout <seconds>] [--workspace-mode <reuse|isolate>] [--base-branch <branch>|--clear-base-branch] [--reuse-session|--fresh-session] [--missed-run-grace-minutes <minutes>] [--enabled|--disabled] [--json]; edit <id>|--id <id> accepts the same flags; show|enable|disable|run|remove|rm <id> [--json]; list|ls [--json]; runs [--id <id>] [--json]. Schedules use UTC.";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     match execute(raw) {
@@ -48,11 +51,11 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
         return Ok(());
     }
     match args {
-        ["list"] => {
+        ["list" | "ls"] => {
             let schedules = Schedules::load(dir)?;
             println!("{}", toml::to_string(&schedules).map_err(error)?);
         }
-        ["list", "--json"] => {
+        ["list" | "ls", "--json"] => {
             let schedules = Schedules::load(dir)?;
             println!(
                 "{}",
@@ -81,32 +84,52 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
             let json = args.contains(&"--json");
             set_enabled(dir, id, false, json)?;
         }
-        ["runs"] => {
-            for name in [PREVIOUS_RUNS, RUNS] {
-                match File::open(dir.join(name)) {
-                    Ok(file) => {
-                        let mut bytes = Vec::new();
-                        file.take(MAX_RUNS.saturating_add(4096))
-                            .read_to_end(&mut bytes)?;
-                        for line in bytes.split_inclusive(|b| *b == b'\n') {
-                            if line.last() == Some(&b'\n') {
-                                io::stdout().lock().write_all(line)?;
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+        ["runs", rest @ ..] => {
+            let mut id = None;
+            let mut json = false;
+            let mut flags = rest.iter();
+            while let Some(flag) = flags.next() {
+                match *flag {
+                    "--id" => id = Some(*flags.next().ok_or_else(|| usage_error(USAGE))?),
+                    "--json" => json = true,
+                    _ => return Err(usage_error(USAGE)),
+                }
+            }
+            let mut runs = if json {
+                krill_proto::schedule::load_coalesced_runs(dir)?
+            } else {
+                krill_proto::schedule::load_runs(dir)?
+            };
+            runs.retain(|run| id.is_none_or(|id| run.id == id));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs).map_err(error)?);
+            } else {
+                for run in runs {
+                    println!("{}", serde_json::to_string(&run).map_err(error)?);
                 }
             }
         }
-        ["runs", "--json"] => {
-            let runs = krill_proto::schedule::load_coalesced_runs(dir)?;
-            println!("{}", serde_json::to_string_pretty(&runs).map_err(error)?);
-        }
-        ["add", id, rest @ ..] => {
-            let (entry, json) = add(id, rest)?;
+        ["add" | "create", rest @ ..] => {
             let _guard = Schedules::exclusive_edit(dir)?;
             let mut schedules = Schedules::load(dir)?;
+            let (id, flags) = extract_id(rest)?;
+            let (mut entry, json) = add(id.unwrap_or("automation"), &flags)?;
+            if id.is_none() {
+                let name = entry
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| usage_error("create requires an ID or --name"))?;
+                entry.id = slugify_schedule_id(
+                    name,
+                    &schedules
+                        .schedule
+                        .iter()
+                        .map(|s| s.id.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let id = &entry.id;
             if schedules.schedule.iter().any(|s| s.id == *id) {
                 return Err(error(
                     "schedule ID already exists; remove it before replacing",
@@ -129,13 +152,15 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
                 println!("saved {id} (UTC)");
             }
         }
-        ["edit", id, rest @ ..] => {
+        ["edit", rest @ ..] => {
+            let (id, flags) = extract_id(rest)?;
+            let id = id.ok_or_else(|| usage_error("edit requires an ID"))?;
             let _guard = Schedules::exclusive_edit(dir)?;
             let mut schedules = Schedules::load(dir)?;
-            let Some(target) = schedules.schedule.iter_mut().find(|s| s.id == *id) else {
+            let Some(target) = schedules.schedule.iter_mut().find(|s| s.id == id) else {
                 return Err(error("unknown schedule ID"));
             };
-            let json = apply_edit(target, rest)?;
+            let json = apply_edit(target, &flags)?;
             let updated = target.clone();
             schedules.save(dir)?;
             if json {
@@ -172,7 +197,11 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
                 println!("triggered {id}");
             }
         }
-        ["rm", id] | ["rm", id, "--json"] | ["rm", "--json", id] if *id != "--json" => {
+        ["rm" | "remove", id]
+        | ["rm" | "remove", id, "--json"]
+        | ["rm" | "remove", "--json", id]
+            if *id != "--json" =>
+        {
             let json = args.contains(&"--json");
             let _guard = Schedules::exclusive_edit(dir)?;
             let mut schedules = Schedules::load(dir)?;
@@ -219,161 +248,224 @@ fn set_enabled(dir: &std::path::Path, id: &str, enabled: bool, json: bool) -> io
     Ok(())
 }
 
+fn extract_id<'a>(args: &[&'a str]) -> io::Result<(Option<&'a str>, Vec<&'a str>)> {
+    let mut id = None;
+    let mut flags = Vec::new();
+    let mut args = args.iter().copied().peekable();
+    if args.peek().is_some_and(|arg| !arg.starts_with('-')) {
+        id = args.next();
+    }
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            flags.push(arg);
+            flags.extend(args);
+            break;
+        }
+        if arg == "--id" {
+            if id.is_some() {
+                return Err(usage_error("ID supplied more than once"));
+            }
+            id = Some(args.next().ok_or_else(|| usage_error(USAGE))?);
+        } else {
+            flags.push(arg);
+            if matches!(
+                arg,
+                "--name"
+                    | "--cron"
+                    | "--schedule"
+                    | "--trigger"
+                    | "--time"
+                    | "--day"
+                    | "--cwd"
+                    | "--workdir"
+                    | "--repo"
+                    | "--workspace"
+                    | "--prompt"
+                    | "--precheck"
+                    | "--workspace-mode"
+                    | "--agent"
+                    | "--provider"
+                    | "--extra-agent-args"
+                    | "--precheck-timeout"
+                    | "--base-branch"
+                    | "--missed-run-grace-minutes"
+            ) {
+                flags.push(args.next().ok_or_else(|| usage_error(USAGE))?);
+            }
+        }
+    }
+    Ok((id, flags))
+}
+
 fn add(id: &str, args: &[&str]) -> io::Result<(Schedule, bool)> {
     let mut entry = Schedule {
         id: id.into(),
-        cron: String::new(),
         cwd: std::env::current_dir()?
             .into_os_string()
             .into_string()
             .map_err(|_| error("cwd must be UTF-8"))?,
-        command: Vec::new(),
-        prompt: String::new(),
-        precheck: None,
-        workspace_mode: WorkspaceMode::Reuse,
-        enabled: true,
+        ..Default::default()
     };
-    let mut json = false;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match *arg {
-            "--" => {
-                entry.command = args.map(|s| (*s).to_owned()).collect();
-                break;
-            }
-            "--json" => json = true,
-            "--isolate" | "--new-worktree" => {
-                entry.workspace_mode = WorkspaceMode::Isolate;
-            }
-            "--no-new-worktree" | "--reuse" => {
-                entry.workspace_mode = WorkspaceMode::Reuse;
-            }
-            "--enable" | "--enabled" => entry.enabled = true,
-            "--disable" | "--disabled" => entry.enabled = false,
-            flag @ ("--cron" | "--cwd" | "--workdir" | "--prompt" | "--precheck"
-            | "--workspace-mode" | "--agent") => {
-                let value = args.next().ok_or_else(|| usage_error(USAGE))?;
-                match flag {
-                    "--cron" => entry.cron = (*value).into(),
-                    "--cwd" | "--workdir" => {
-                        entry.cwd = fs::canonicalize(value)?
-                            .into_os_string()
-                            .into_string()
-                            .map_err(|_| error("cwd must be UTF-8"))?;
-                    }
-                    "--precheck" => {
-                        let trimmed = value.trim();
-                        if trimmed.is_empty() {
-                            return Err(usage_error(USAGE));
-                        }
-                        entry.precheck = Some(trimmed.to_owned());
-                    }
-                    "--workspace-mode" => {
-                        entry.workspace_mode = match *value {
-                            "reuse" | "existing" => WorkspaceMode::Reuse,
-                            "isolate" | "isolated" | "new_worktree" => WorkspaceMode::Isolate,
-                            _ => return Err(usage_error(USAGE)),
-                        };
-                    }
-                    "--agent" => {
-                        let trimmed = value.trim();
-                        if trimmed.is_empty() {
-                            return Err(usage_error(USAGE));
-                        }
-                        entry.command = vec![trimmed.to_owned()];
-                    }
-                    _ => entry.prompt = (*value).into(),
-                }
-            }
-            _ => return Err(usage_error(USAGE)),
-        }
-    }
-    if entry.cron.is_empty() || entry.command.is_empty() {
-        return Err(usage_error(USAGE));
-    }
+    let json = parse_entry_flags(&mut entry, args)?;
+    entry.validate().map_err(usage_error)?;
     Ok((entry, json))
 }
 
 fn apply_edit(entry: &mut Schedule, args: &[&str]) -> io::Result<bool> {
-    if args.is_empty() {
+    if args.is_empty() || args.iter().all(|a| *a == "--json") {
         return Err(usage_error(USAGE));
     }
+    let json = parse_entry_flags(entry, args)?;
+    entry.validate().map_err(usage_error)?;
+    Ok(json)
+}
+
+fn parse_entry_flags(entry: &mut Schedule, args: &[&str]) -> io::Result<bool> {
     let mut json = false;
-    let mut changed = false;
-    let mut args = args.iter();
+    let mut trigger = None;
+    let mut time = None;
+    let mut day = None;
+    let mut expression = None;
+    let mut args = args.iter().copied();
     while let Some(arg) = args.next() {
-        match *arg {
+        match arg {
             "--" => {
-                let cmd: Vec<String> = args.map(|s| (*s).to_owned()).collect();
-                if cmd.is_empty() {
-                    return Err(usage_error(USAGE));
-                }
-                entry.command = cmd;
-                changed = true;
+                entry.command = args.map(str::to_owned).collect();
+                entry.agent = None;
                 break;
             }
             "--json" => json = true,
-            "--isolate" | "--new-worktree" => {
-                entry.workspace_mode = WorkspaceMode::Isolate;
-                changed = true;
-            }
-            "--no-new-worktree" | "--reuse" => {
-                entry.workspace_mode = WorkspaceMode::Reuse;
-                changed = true;
-            }
-            "--clear-precheck" => {
-                entry.precheck = None;
-                changed = true;
-            }
-            "--enable" | "--enabled" => {
-                entry.enabled = true;
-                changed = true;
-            }
-            "--disable" | "--disabled" => {
-                entry.enabled = false;
-                changed = true;
-            }
-            flag @ ("--cron" | "--cwd" | "--workdir" | "--prompt" | "--precheck"
-            | "--workspace-mode" | "--agent") => {
+            "--isolate" | "--new-worktree" => entry.workspace_mode = WorkspaceMode::Isolate,
+            "--no-new-worktree" | "--reuse" => entry.workspace_mode = WorkspaceMode::Reuse,
+            "--enable" | "--enabled" => entry.enabled = true,
+            "--disable" | "--disabled" => entry.enabled = false,
+            "--reuse-session" => entry.reuse_session = true,
+            "--fresh-session" => entry.reuse_session = false,
+            "--clear-precheck" => entry.precheck = None,
+            "--clear-extra-agent-args" => entry.extra_agent_args = None,
+            "--clear-base-branch" => entry.base_branch = None,
+            flag @ ("--name"
+            | "--cron"
+            | "--schedule"
+            | "--trigger"
+            | "--time"
+            | "--day"
+            | "--cwd"
+            | "--workdir"
+            | "--repo"
+            | "--workspace"
+            | "--prompt"
+            | "--precheck"
+            | "--workspace-mode"
+            | "--agent"
+            | "--provider"
+            | "--extra-agent-args"
+            | "--precheck-timeout"
+            | "--base-branch"
+            | "--missed-run-grace-minutes") => {
                 let value = args.next().ok_or_else(|| usage_error(USAGE))?;
+                let optional = || (!value.trim().is_empty()).then(|| value.to_owned());
                 match flag {
-                    "--cron" => entry.cron = (*value).into(),
-                    "--cwd" | "--workdir" => {
+                    "--name" => entry.name = optional(),
+                    "--cron" | "--schedule" => expression = Some(value),
+                    "--trigger" => trigger = Some(value),
+                    "--time" => time = Some(value),
+                    "--day" => day = Some(value),
+                    "--cwd" | "--workdir" | "--repo" | "--workspace" => {
                         entry.cwd = fs::canonicalize(value)?
                             .into_os_string()
                             .into_string()
                             .map_err(|_| error("cwd must be UTF-8"))?;
                     }
+                    "--prompt" => entry.prompt = value.into(),
                     "--precheck" => {
-                        let trimmed = value.trim();
-                        if trimmed.is_empty() {
-                            return Err(usage_error(USAGE));
+                        if value.trim().is_empty() {
+                            return Err(usage_error("empty precheck; use --clear-precheck"));
                         }
-                        entry.precheck = Some(trimmed.to_owned());
+                        entry.precheck = optional();
                     }
                     "--workspace-mode" => {
-                        entry.workspace_mode = match *value {
+                        entry.workspace_mode = match value {
                             "reuse" | "existing" => WorkspaceMode::Reuse,
-                            "isolate" | "isolated" | "new_worktree" => WorkspaceMode::Isolate,
+                            "isolate" | "isolated" | "new_worktree" | "new_per_run" => {
+                                WorkspaceMode::Isolate
+                            }
                             _ => return Err(usage_error(USAGE)),
-                        };
-                    }
-                    "--agent" => {
-                        let trimmed = value.trim();
-                        if trimmed.is_empty() {
-                            return Err(usage_error(USAGE));
                         }
-                        entry.command = vec![trimmed.to_owned()];
                     }
-                    _ => entry.prompt = (*value).into(),
+                    "--agent" | "--provider" => {
+                        entry.agent = Some(value.into());
+                        entry.command = vec![value.into()];
+                    }
+                    "--extra-agent-args" => entry.extra_agent_args = optional(),
+                    "--base-branch" => entry.base_branch = optional(),
+                    "--precheck-timeout" => {
+                        entry.precheck_timeout_secs = Some(value.parse().map_err(usage_error)?);
+                    }
+                    "--missed-run-grace-minutes" => {
+                        entry.missed_run_grace_minutes = Some(value.parse().map_err(usage_error)?);
+                    }
+                    _ => return Err(usage_error(USAGE)),
                 }
-                changed = true;
             }
             _ => return Err(usage_error(USAGE)),
         }
     }
-    if !changed {
-        return Err(usage_error(USAGE));
+    if let Some(trigger) = trigger {
+        let preset = match trigger {
+            "hourly" => SchedulePreset::Hourly,
+            "daily" => SchedulePreset::Daily,
+            "weekdays" => SchedulePreset::Weekdays,
+            "weekly" => SchedulePreset::Weekly,
+            "cron" | "rrule" => SchedulePreset::Custom,
+            _ => return Err(usage_error("invalid trigger")),
+        };
+        if (time.is_some() && matches!(preset, SchedulePreset::Hourly | SchedulePreset::Custom))
+            || (day.is_some() && preset != SchedulePreset::Weekly)
+        {
+            return Err(usage_error(
+                "--time requires daily/weekdays/weekly; --day requires weekly",
+            ));
+        }
+        if preset == SchedulePreset::Custom {
+            entry.cron = expression
+                .ok_or_else(|| usage_error("cron/rrule trigger requires --schedule"))?
+                .into();
+        } else {
+            if expression.is_some() {
+                return Err(usage_error(
+                    "preset trigger and explicit schedule are mutually exclusive",
+                ));
+            }
+            let (hour, minute) = time
+                .unwrap_or("09:00")
+                .split_once(':')
+                .ok_or_else(|| usage_error("time must be HH:MM"))?;
+            let hour = hour.parse::<u8>().map_err(usage_error)?;
+            let minute = if preset == SchedulePreset::Hourly {
+                0
+            } else {
+                minute.parse::<u8>().map_err(usage_error)?
+            };
+            let weekday = match day.unwrap_or("1").to_ascii_lowercase().as_str() {
+                "sun" | "sunday" => 0,
+                "mon" | "monday" => 1,
+                "tue" | "tuesday" => 2,
+                "wed" | "wednesday" => 3,
+                "thu" | "thursday" => 4,
+                "fri" | "friday" => 5,
+                "sat" | "saturday" => 6,
+                n => n.parse().map_err(usage_error)?,
+            };
+            entry.cron = build_preset_cron(preset, hour, minute, weekday).map_err(usage_error)?;
+        }
+    } else {
+        if time.is_some() || day.is_some() {
+            return Err(usage_error("--time/--day requires --trigger"));
+        }
+        if let Some(expr) = expression {
+            entry.cron = expr.into();
+        }
     }
     Ok(json)
 }
@@ -389,6 +481,125 @@ fn usage_error(e: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_aliases_name_ids_presets_and_new_flags_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("r504-cli-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let flags = [
+            "create",
+            "--name",
+            "Daily Audit",
+            "--provider",
+            "claude",
+            "--trigger",
+            "weekly",
+            "--time",
+            "08:35",
+            "--day",
+            "friday",
+            "--extra-agent-args",
+            "--model 'two words'",
+            "--base-branch",
+            "dev",
+            "--precheck-timeout",
+            "123",
+            "--missed-run-grace-minutes",
+            "720",
+            "--disabled",
+            "--json",
+        ];
+        execute_in(&dir, &flags, false).unwrap();
+        execute_in(&dir, &flags, false).unwrap();
+        let saved = Schedules::load(&dir).unwrap();
+        assert_eq!(saved.schedule[0].id, "daily-audit");
+        assert_eq!(saved.schedule[1].id, "daily-audit-2");
+        let entry = &saved.schedule[0];
+        assert_eq!(entry.name.as_deref(), Some("Daily Audit"));
+        assert_eq!(entry.cron, "35 8 * * 5");
+        assert_eq!(entry.agent.as_deref(), Some("claude"));
+        assert_eq!(entry.precheck_timeout_secs, Some(123));
+        assert_eq!(entry.missed_run_grace_minutes, Some(720));
+        assert!(!entry.enabled);
+        execute_in(
+            &dir,
+            &[
+                "edit",
+                "--id",
+                "daily-audit",
+                "--clear-extra-agent-args",
+                "--clear-base-branch",
+                "--reuse-session",
+            ],
+            false,
+        )
+        .unwrap();
+        let saved = Schedules::load(&dir).unwrap();
+        assert!(saved.schedule[0].reuse_session);
+        assert!(saved.schedule[0].extra_agent_args.is_none());
+        assert!(saved.schedule[0].base_branch.is_none());
+        execute_in(&dir, &["ls", "--json"], false).unwrap();
+        execute_in(&dir, &["runs", "--id", "daily-audit", "--json"], false).unwrap();
+        execute_in(&dir, &["runs", "--id", "daily-audit"], false).unwrap();
+        execute_in(&dir, &["remove", "daily-audit-2"], false).unwrap();
+        assert!(
+            execute_in(
+                &dir,
+                &[
+                    "create",
+                    "--name",
+                    "bad",
+                    "--agent",
+                    "claude",
+                    "--trigger",
+                    "hourly",
+                    "--time",
+                    "09:00"
+                ],
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            execute_in(
+                &dir,
+                &[
+                    "create",
+                    "--name",
+                    "bad",
+                    "--agent",
+                    "claude",
+                    "--trigger",
+                    "daily",
+                    "--schedule",
+                    "0 9 * * *"
+                ],
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            execute_in(
+                &dir,
+                &[
+                    "create",
+                    "--id",
+                    "explicit",
+                    "--agent",
+                    "codex",
+                    "--trigger",
+                    "rrule",
+                    "--schedule",
+                    "FREQ=DAILY;BYHOUR=9",
+                    "--fresh-session"
+                ],
+                false
+            )
+            .is_ok()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn help_returns_usage_without_daemon() {

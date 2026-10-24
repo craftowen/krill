@@ -1918,3 +1918,85 @@ fn restart_quit_does_not_exit_when_helper_fails_during_unsaved_prompt(cx: &mut T
     });
     assert!(cx.update(|_, cx| !cx.windows().is_empty()));
 }
+
+#[gpui::test]
+fn session_tab_keeps_focus_after_viewing_file_and_closing_or_reloading(cx: &mut TestAppContext) {
+    let dir = TempDir::new("session-focus-after-file");
+    let md = dir.0.join("REPORT.md");
+    fs::write(&md, "# Report\n\ninitial\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("session-focus-after-file"));
+    let session_pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "초기 세션 탭은 Shell 포커스를 가져야 한다"
+    );
+
+    // 1. 마크다운 파일(`REPORT.md`)을 조회한 뒤 편집 모드로 전환해 에디터가 포커스를 가져가게 한다.
+    let file_pane = open_file(&view, &md, cx);
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane)),
+        Some(true)
+    );
+    let toggle = cx.debug_bounds("file-preview-toggle").unwrap().center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)),
+        "편집 모드 전환 후에는 에디터가 포커스를 가져야 한다"
+    );
+
+    // 2. 마우스로 세션 탭(0번)을 클릭해 돌아온 뒤 비활성 파일 탭(1번)의 닫기 버튼(`close-tab-1`)을 눌러 닫아도
+    // 세션 탭의 키보드 포커스(`shell.focus`)가 끊기지 않아야 한다.
+    let tab0 = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_click(tab0, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.layout.focused()),
+        Some(session_pane)
+    );
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "세션 탭을 클릭해 돌아오면 Shell 포커스가 복원되어야 한다"
+    );
+
+    let tab1 = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_move(tab1, None, Modifiers::default());
+    cx.run_until_parked();
+    let close_file_tab = cx.debug_bounds("close-tab-1").unwrap().center();
+    cx.simulate_click(close_file_tab, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "비활성 파일 탭의 닫기 버튼을 눌러 닫은 뒤에도 세션 포커스가 유지되어야 한다"
+    );
+
+    // 3. 다시 파일을 열어 둔 상태에서 세션 탭으로 돌아오고(검색 바가 열려 있더라도),
+    // 백그라운드 감시가 디스크 변경을 자동 리로드할 때 숨겨진 에디터가 세션 포커스를 뺏지 않아야 한다.
+    let _file_pane2 = open_file(&view, &md, cx);
+    let toggle = cx.debug_bounds("file-preview-toggle").unwrap().center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            // 검색 바를 열어 둔 채 세션 탭으로 복귀
+            let bar = cx.new(|cx| krill_app::search::Bar::new(window, cx));
+            let sub = cx.subscribe_in(&bar, window, |_, _, _: &krill_app::search::Event, _, _| {});
+            shell.search = Some((bar, sub));
+            shell.change(true, cx, |l| l.activate(0));
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "검색 바가 열려 있어도 파일 탭에서 세션 탭으로 돌아오면 Shell 포커스가 복원되어야 한다"
+    );
+
+    fs::write(&md, "# Report\n\nupdated by agent in background\n").unwrap();
+    tick(cx);
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "백그라운드 파일 자동 리로드가 실행 중인 세션 탭의 포커스를 뺏으면 안 된다"
+    );
+}

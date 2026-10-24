@@ -27,6 +27,7 @@ fn claim(minute: u64) -> Run {
         status: None,
         cwd: None,
         output: None,
+        ..Default::default()
     }
 }
 
@@ -93,6 +94,54 @@ fn rotation_retains_current_minute_claims_and_lock_excludes_other_daemons() {
     assert!(journal.claimed("test", 42));
     assert!(journal.sessions.contains_key(&777));
     assert!(dir.0.join(PREVIOUS_RUNS).exists());
+}
+
+#[test]
+fn reused_session_runs_survive_rotation_reload_and_gone_session_reaping() {
+    let dir = Temp::new("reuse-rotation");
+    let mut journal = Journal::open(&dir.0).unwrap();
+    let mut spawned = claim(100);
+    spawned.phase = "spawned".into();
+    spawned.session = Some(999);
+    spawned.run_number = Some(1);
+    journal.append(&spawned).unwrap();
+    // Updating one identity must not create another active run.
+    spawned.output = Some("updated".into());
+    journal.append(&spawned).unwrap();
+    assert_eq!(journal.sessions.get(&999).unwrap().len(), 1);
+    let bytes = serde_json::to_vec(&claim(99)).unwrap();
+    for number in [2, 3] {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.0.join(RUNS))
+            .unwrap();
+        while file.metadata().unwrap().len() < MAX_RUNS {
+            file.write_all(&bytes).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        if number == 2 {
+            spawned.run_number = Some(2);
+            journal.append(&spawned).unwrap();
+        } else {
+            journal.append(&claim(101)).unwrap();
+        }
+    }
+    drop(journal);
+    let journal = Journal::open(&dir.0).unwrap();
+    let active = journal.sessions.get(&999).unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(active.iter().any(|run| run.run_number == Some(1)));
+    assert!(active.iter().any(|run| run.run_number == Some(2)));
+    drop(journal);
+    // A session absent from the registry must tombstone every associated run.
+    Registry::new(None, Some(&dir.0))
+        .poll_schedules(UNIX_EPOCH + Duration::from_mins(102))
+        .unwrap();
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    let numbered: Vec<_> = runs.iter().filter(|run| run.run_number.is_some()).collect();
+    assert_eq!(numbered.len(), 2);
+    assert!(numbered.iter().all(|run| run.phase == "finished"));
+    assert!(Journal::open(&dir.0).unwrap().sessions.is_empty());
 }
 
 #[test]
@@ -481,4 +530,296 @@ enabled = false
     assert_eq!(runs[0].phase, "skipped");
     assert_eq!(runs[0].status, Some(5));
     assert_eq!(runs[0].output.as_deref(), Some("manual-on-paused"));
+}
+
+#[test]
+fn grace_claims_only_latest_due_once_and_keeps_manual_ordinals() {
+    use krill_proto::schedule::{Schedule, load_coalesced_runs};
+    let dir = Temp::new("grace-ordinals");
+    let entry = Schedule {
+        id: "catch-up".into(),
+        cron: "0 * * * *".into(),
+        cwd: "/tmp".into(),
+        command: vec!["/bin/echo".into()],
+        precheck: Some("exit 3".into()),
+        missed_run_grace_minutes: Some(720),
+        ..Default::default()
+    };
+    Schedules {
+        schedule: vec![entry.clone()],
+    }
+    .save(&dir.0)
+    .unwrap();
+    let now = UNIX_EPOCH + Duration::from_mins(130);
+    let registry = Registry::new(None, Some(&dir.0));
+    registry.poll_schedules(now).unwrap();
+    let runs = load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].minute, 120);
+    assert_eq!(runs[0].run_number, Some(1));
+    assert_eq!(runs[0].trigger.as_deref(), Some("scheduled"));
+    assert_eq!(runs[0].timed_out, Some(false));
+    assert!(runs[0].duration_ms.is_some());
+    Registry::new(None, Some(&dir.0))
+        .poll_schedules(now)
+        .unwrap();
+    assert_eq!(load_coalesced_runs(&dir.0).unwrap().len(), 1);
+    krill_proto::schedule::request_run_now(&dir.0, &entry.id).unwrap();
+    registry.poll_schedules(now).unwrap();
+    let runs = load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].run_number, Some(2));
+    assert_eq!(runs[0].minute, 130);
+    assert_eq!(runs[0].trigger.as_deref(), Some("manual"));
+    registry
+        .poll_schedules(now + Duration::from_mins(1))
+        .unwrap();
+    assert_eq!(load_coalesced_runs(&dir.0).unwrap().len(), 2);
+    // Disabled catch-up never fires; a grace window that excludes the last occurrence also does not.
+    let disabled = krill_proto::schedule::Schedule {
+        enabled: false,
+        ..entry.clone()
+    };
+    Schedules {
+        schedule: vec![disabled],
+    }
+    .save(&dir.0)
+    .unwrap();
+    registry
+        .poll_schedules(now + Duration::from_mins(60))
+        .unwrap();
+    assert_eq!(load_coalesced_runs(&dir.0).unwrap().len(), 2);
+    let expired = krill_proto::schedule::Schedule {
+        missed_run_grace_minutes: Some(1),
+        ..entry
+    };
+    Schedules {
+        schedule: vec![expired],
+    }
+    .save(&dir.0)
+    .unwrap();
+    registry
+        .poll_schedules(now + Duration::from_mins(61))
+        .unwrap();
+    assert_eq!(load_coalesced_runs(&dir.0).unwrap().len(), 2);
+}
+
+#[test]
+fn configured_precheck_timeout_is_recorded_in_journal() {
+    let dir = Temp::new("custom-timeout");
+    let entry = krill_proto::schedule::Schedule {
+        id: "timeout".into(),
+        cron: "* * * * *".into(),
+        cwd: "/tmp".into(),
+        command: vec!["/bin/echo".into()],
+        precheck: Some("sleep 30".into()),
+        precheck_timeout_secs: Some(1),
+        ..Default::default()
+    };
+    Schedules {
+        schedule: vec![entry],
+    }
+    .save(&dir.0)
+    .unwrap();
+    Registry::new(None, Some(&dir.0))
+        .poll_schedules(UNIX_EPOCH + Duration::from_mins(42))
+        .unwrap();
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs[0].phase, "skipped");
+    assert_eq!(runs[0].timed_out, Some(true));
+    assert!(runs[0].duration_ms.unwrap() >= 1000);
+    assert_eq!(precheck_timeout(Some(0)), Duration::from_secs(1));
+    assert_eq!(precheck_timeout(Some(900)), Duration::from_secs(600));
+}
+
+#[test]
+fn reuse_live_session_delivers_prompt_and_reaps_all_runs_after_exit() {
+    use crate::{Appearance, Session};
+    use std::sync::Arc;
+    let dir = Temp::new("reuse-session");
+    let entry = krill_proto::schedule::Schedule {
+        id: "test".into(),
+        cron: "* * * * *".into(),
+        cwd: "/tmp".into(),
+        command: vec!["claude".into()],
+        prompt: "next task".into(),
+        reuse_session: true,
+        ..Default::default()
+    };
+    Schedules {
+        schedule: vec![entry],
+    }
+    .save(&dir.0)
+    .unwrap();
+    let mut spawned = claim(41);
+    spawned.phase = "spawned".into();
+    spawned.session = Some(999);
+    spawned.run_number = Some(1);
+    Journal::open(&dir.0).unwrap().append(&spawned).unwrap();
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let registry = Registry::new(None, Some(&dir.0));
+    let id = krill_proto::SessionId(999);
+    let session = Session::start(
+        id,
+        pty.controller,
+        krill_proto::holder::WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(dir.0.join("theme"))),
+        None,
+    )
+    .unwrap();
+    lock(&registry.state).sessions.insert(
+        id,
+        super::super::Entry {
+            session,
+            pid: 0,
+            cwd: dir.0.clone(),
+        },
+    );
+    registry
+        .poll_schedules(UNIX_EPOCH + Duration::from_mins(42))
+        .unwrap();
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].phase, "spawned");
+    assert_eq!(runs[0].session, Some(999));
+    assert_eq!(runs[0].run_number, Some(2));
+    assert!(
+        !lock(&registry.state)
+            .sessions
+            .get(&id)
+            .unwrap()
+            .session
+            .is_closed()
+    );
+    let mut slave = File::from(pty.user);
+    set_nonblocking(&slave).unwrap();
+    let mut bytes = [0; 256];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match slave.read(&mut bytes) {
+            Ok(n) if n > 0 => {
+                assert!(String::from_utf8_lossy(&bytes[..n]).contains("next task"));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("PTY input: {e}"),
+        }
+        assert!(Instant::now() < deadline, "prompt not delivered");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Reload must keep both ordinals for the reused session.
+    let journal = Journal::open(&dir.0).unwrap();
+    assert_eq!(journal.sessions.get(&999).unwrap().len(), 2);
+    drop(journal);
+    Schedules::default().save(&dir.0).unwrap();
+    lock(&registry.state).exited.insert(id, 7);
+    drop(slave);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !lock(&registry.state)
+        .sessions
+        .get(&id)
+        .unwrap()
+        .session
+        .is_closed()
+    {
+        assert!(Instant::now() < deadline, "reader did not see EOF");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    registry
+        .poll_schedules(UNIX_EPOCH + Duration::from_mins(43))
+        .unwrap();
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].run_number, Some(2));
+    assert_eq!(runs[1].run_number, Some(1));
+    for run in runs {
+        assert_eq!(run.phase, "finished");
+        assert_eq!(run.status, Some(7));
+    }
+    assert!(Journal::open(&dir.0).unwrap().sessions.is_empty());
+}
+
+#[test]
+fn agent_extra_args_keep_prompt_out_of_argv_and_resolve_profile_executable() {
+    let resolved = (
+        "cursor".into(),
+        krill_proto::agent::Profile {
+            name: "Cursor".into(),
+            launch: vec!["cursor-agent".into(), "--interactive".into()],
+            yolo_args: Vec::new(),
+            install: String::new(),
+            install_windows: String::new(),
+            env: std::collections::BTreeMap::default(),
+        },
+    );
+    let program = schedule_program(
+        "cursor",
+        vec!["--model".into(), "two words".into()],
+        "literal prompt",
+        true,
+        Some(&resolved),
+    );
+    assert!(
+        matches!(program, Program::Custom { program, args } if program == b"cursor-agent" && args == [b"--interactive".to_vec(), b"--model".to_vec(), b"two words".to_vec()])
+    );
+    assert!(
+        matches!(schedule_program("cursor", vec![], "prompt", true, Some(&resolved)), Program::Agent { id } if id == "cursor")
+    );
+    assert!(
+        matches!(schedule_program("/bin/echo", vec!["hello".into()], "literal prompt", false, None), Program::Custom { args, .. } if args == [b"hello".to_vec(), b"literal prompt".to_vec()])
+    );
+}
+
+#[test]
+fn isolated_worktree_uses_schedule_base_branch() {
+    let dir = Temp::new("schedule-base");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    fs::write(repo.join("base.txt"), "main").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "main"]);
+    git(&["checkout", "-b", "alternate"]);
+    fs::write(repo.join("base.txt"), "alternate").unwrap();
+    git(&["commit", "-am", "alternate"]);
+    git(&["checkout", "main"]);
+    let entry = krill_proto::schedule::Schedule {
+        id: "base".into(),
+        cron: "* * * * *".into(),
+        cwd: repo.to_str().unwrap().into(),
+        command: vec!["/bin/echo".into()],
+        workspace_mode: WorkspaceMode::Isolate,
+        base_branch: Some("alternate".into()),
+        ..Default::default()
+    };
+    Schedules {
+        schedule: vec![entry],
+    }
+    .save(&dir.0)
+    .unwrap();
+    Registry::new(None, Some(&dir.0))
+        .poll_schedules(UNIX_EPOCH + Duration::from_mins(40))
+        .unwrap();
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(
+        fs::read_to_string(Path::new(runs[0].cwd.as_ref().unwrap()).join("base.txt")).unwrap(),
+        "alternate"
+    );
+    assert_eq!(fs::read_to_string(repo.join("base.txt")).unwrap(), "main");
 }

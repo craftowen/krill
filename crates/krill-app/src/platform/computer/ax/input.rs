@@ -49,7 +49,7 @@ fn chunk_utf16(text: &str, max: usize) -> Vec<Vec<u16>> {
 }
 
 /// 각 발행 직전에 수신기를 검사한다. down 뒤 중단해도 대응 up은 내용 없는 정리로 발행한다.
-/// 해제 검사 실패는 Partial이며 후속 down은 없다. `CGEventPost에는` 수신 ACK가 없다.
+/// 해제 검사 실패는 Partial이며 후속 down은 없다. `CGEventPost`에는 수신 ACK가 없다.
 fn dispatch_pairs<'a, E: 'a>(
     pairs: impl IntoIterator<Item = (&'a E, &'a E)>,
     units_per_pair: u32,
@@ -145,7 +145,7 @@ impl MacBackend {
     }
 
     /// 네이티브 AX 동작도 배경 수신 계약을 입증하지 않았으므로 전경의 관찰 창만 허용한다.
-    /// 모달/시트가 떠도 뒤 창은 `AXWindows에` 남는다. 창 존재 검사만으로는 입력할 수 없다.
+    /// 모달/시트가 떠도 뒤 창은 `AXWindows`에 남는다. 창 존재 검사만으로는 입력할 수 없다.
     fn require_receiver_window(
         &self,
         snapshot: &Snapshot,

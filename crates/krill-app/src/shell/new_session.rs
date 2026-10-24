@@ -1,8 +1,9 @@
 //! OWE-576: 사이드바 위 "+ 새 세션" 드롭다운(터미널·에이전트·권한 Manual/YOLO·폴더 열기).
 
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
 use gpui::{App, Context, actions, div, prelude::*};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{IconName, Sizable as _};
 use krill_app::link::Link;
 use krill_proto::agent::Permission;
@@ -301,6 +302,7 @@ impl Shell {
         use krill_app::ui::icons;
 
         let p = krill_app::ui::palette(cx);
+        let show_automations = krill_app::settings::current(cx).show_automations_button;
         let settings = self.agents.clone();
         let accounts = self.accounts_snapshot.clone();
         let permission = settings.as_ref().map(|a| a.permission).unwrap_or_default();
@@ -459,6 +461,35 @@ impl Shell {
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.open_artifacts(Some(window), cx))),
             )
+            .when(show_automations, |d| {
+                d.child(
+                    Self::nav_row(
+                        p,
+                        "nav-automations",
+                        icons::CALENDAR_CLOCK_SVG,
+                        sb_text::NAV_AUTOMATIONS.get(),
+                    )
+                    .debug_selector(|| "nav-automations".into())
+                    .when(self.automations_page_open(cx), |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_automations_page(Some(window), cx);
+                    }))
+                    .context_menu(|menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::new(sb_text::HIDE_FROM_SIDEBAR.get()).on_click(
+                                |_, _, cx| {
+                                    krill_app::settings::edit(cx, |s| {
+                                        s.show_automations_button = false;
+                                    });
+                                },
+                            ),
+                        )
+                    }),
+                )
+            })
             .child(
                 Self::nav_row(
                     p,

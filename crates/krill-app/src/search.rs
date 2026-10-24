@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, SharedString, Subscription, Task, Window, deferred, div,
-    prelude::*, px,
+    Context, Entity, EventEmitter, Focusable as _, SharedString, Subscription, Task, Window,
+    deferred, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
@@ -109,6 +109,10 @@ impl Bar {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
+    }
+
+    pub fn is_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     pub fn set_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {

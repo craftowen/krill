@@ -113,14 +113,14 @@ globalThis.MkTerminalCodec=(()=>{
    const keybar=make('div','keybar');keybar.setAttribute('role','toolbar');keybar.setAttribute('aria-label','Terminal keys');this.fitButton=button('accessory-key display-mode','Fit to Phone','monitor');this.fitButton.setAttribute('aria-pressed','false');this.directButton=button('accessory-key direct-toggle','Direct input');this.shiftButton=button('accessory-key shift-toggle','Shift');this.shiftButton.dataset.keyId='shift';this.shiftButton.dataset.testid='terminal-key-shift';this.shiftButton.setAttribute('aria-pressed','false');
    // Ctrl·Alt는 Shift처럼 다음 입력 한 번에만 붙는 고정 수정자다. 키보드로 친 글자와 키 줄 키 모두에 적용된다.
    this.modifierButtons={shift:this.shiftButton};for(const [name,label] of [['ctrl','Ctrl'],['alt','Alt']]){const b=this.modifierButtons[name]=button(`accessory-key ${name}-toggle`,label);b.dataset.keyId=name;b.dataset.testid=`terminal-key-${name}`;b.setAttribute('aria-pressed','false');this.listen(b,'pointerdown',e=>e.preventDefault());this.listen(b,'click',()=>this.toggleModifier(name));}
-   // 직접 입력은 숨은 textarea라 길게 눌러 붙여넣을 칸이 없다. 붙여넣기는 자주 쓰는 조작 키 다음에 둔다.
+   // 직접 입력의 붙여넣기는 키 줄을 스크롤하지 않아도 누를 수 있도록 오른쪽에 고정한다.
    this.pasteButton=button('accessory-key paste-key','Paste','paste');this.pasteButton.dataset.testid='terminal-paste';
    const ordered=this.options.preferences?.orderedKeyIds||[],visible=this.options.preferences?.visibleKeyIds;
    const ids=[...new Set([...ordered,...DEFAULT_KEY_ORDER])],keys=[];for(const id of ids){const key=KEYS.find(k=>k.id===id);if(!key||visible&&!visible.includes(id))continue;const b=button('accessory-key',key.label);b.dataset.keyId=id;b.dataset.testid=`terminal-key-${id}`;keys.push(b);this.bindKey(b,key);}
-   // 앞 8개는 조작 키, 그다음 붙여넣기·수정자, 나머지 키와 저빈도 표시 설정 순이다.
-   keybar.append(...keys.slice(0,8),this.pasteButton,this.shiftButton,this.modifierButtons.ctrl,this.modifierButtons.alt,...keys.slice(8),this.fitButton,this.directButton);
+   // 앞 8개는 조작 키, 그다음 수정자, 나머지 키와 저빈도 표시 설정 순이다.
+   keybar.append(...keys.slice(0,8),this.shiftButton,this.modifierButtons.ctrl,this.modifierButtons.alt,...keys.slice(8),this.fitButton,this.directButton);
    // 직접 입력의 키보드 열기는 키 줄 왼쪽 고정 버튼이다(열리면 Dismiss로 바뀜). 별도 입력 줄은 buffered에서만 보여 터미널 행을 더 쓴다.
-   this.live=button('dismiss-keyboard show-keyboard','Show keyboard','keyboard');accessory.append(this.dismiss,this.live,keybar);const inputRow=this.inputRow=make('div','input-row');
+   this.live=button('dismiss-keyboard show-keyboard','Show keyboard','keyboard');accessory.append(this.dismiss,this.live,keybar,this.pasteButton);const inputRow=this.inputRow=make('div','input-row');
    if(this.options.onQuickActions){const quick=button('accessory-key quick-actions','Quick actions','zap');quick.dataset.testid='terminal-quick-actions';quick.setAttribute('aria-haspopup','dialog');this.listen(quick,'pointerdown',e=>e.preventDefault());this.listen(quick,'click',()=>this.options.onQuickActions());accessory.append(quick);}
    this.capture=make('textarea','live-capture');this.capture.rows=1;this.capture.tabIndex=-1;this.capture.setAttribute('aria-label',translate('Terminal direct input'));this.capture.setAttribute('autocapitalize','none');this.capture.setAttribute('autocorrect','off');this.capture.setAttribute('autocomplete','off');this.capture.spellcheck=false;
    this.form=make('form','buffered-command');this.command=make('textarea','command-input');this.command.rows=1;this.command.placeholder=translate('Type a command…');this.command.setAttribute('aria-label',translate('Command'));this.command.setAttribute('enterkeyhint','enter');this.command.autocomplete='off';this.command.setAttribute('autocapitalize','none');this.command.spellcheck=false;this.command.value=drafts.get(this.stateKey)||'';
