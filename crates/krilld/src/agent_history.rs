@@ -19,7 +19,7 @@ const FILE_BYTES: usize = 128 * 1024;
 const SCAN_TIME: Duration = Duration::from_secs(2);
 
 pub(crate) fn scan(state_dir: Option<&Path>) -> Snapshot {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = krill_proto::os::home_dir();
     let root = |var, default| {
         std::env::var_os(var)
             .filter(|s| !s.is_empty())

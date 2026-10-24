@@ -55,7 +55,7 @@ function mountChat(root,opts){
  const retryBtn=button(t('Retry'),()=>pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
  const input=el('textarea',undefined,'chat-input');input.rows=2;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
  input.value=drafts.get(sessionId)||'';
- let composing=false,disposed=false,pollTimer=null,inFlight=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
+ let composing=false,disposed=false,pollTimer=null,inFlight=false,retryWithoutTail=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
  let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
@@ -223,14 +223,17 @@ function mountChat(root,opts){
   pollText.textContent=`${t('Chat history update failed')} (${failures}). ${t('Last updated')}: ${when}. ${t('Retry or check Term.')} ${String(error?.message||error||'')}`;
  }
  async function pollNow(initial=false){
-  if(disposed||(!visible&&!initial)||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
+  // 숨은 Chat도 첫 내용을 받을 때까지는 받아 둔다(실패 2회까지). 연결 전에 마운트돼 첫 프리페치를 놓쳐도 ready 뒤 update()가 다시 받아, Chat을 누른 첫 프레임에 내용이 있다.
+  if(disposed||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
   inFlight=true;
   try{
-   const start=entry.offset;let latest=!entry.initialized||refreshLatest,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest?{latest:true}:{}});
+   // v0.1.37 이하 데몬은 latest를 모르는 필드로 거부한다. chat_tail이 없는 데몬이 그렇게 거부하면 처음부터 이어 읽는다(빈 화면으로 남기지 않는다).
+   if(entry.noTail&&state.snapshot?.capabilities?.chat_tail===true)entry.noTail=false;
+   const start=entry.offset;let latest=(!entry.initialized||refreshLatest)&&!entry.noTail,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest?{latest:true}:{}});
    if(disposed||earlierPending||entry.live||!res)return;
    let changed=entry.generation&&res.generation&&entry.generation!==res.generation;
    // Rebinding also opens at the tail. Keep the current paint until that window is ready.
-   if(!latest&&(res.reset||changed)){
+   if(!latest&&!entry.noTail&&(res.reset||changed)){
     res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:0,latest:true});
     if(disposed||earlierPending||entry.live||!res)return;
     latest=true;changed=true;
@@ -248,7 +251,7 @@ function mountChat(root,opts){
    if(typeof res.next_offset==='number')entry.offset=res.next_offset;
    lastSuccess=entry.lastSuccess=Date.now();failures=0;pollStatus.hidden=true;
    if(entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed?before:undefined);updateStrip();pruneCache(state);
-  }catch(error){if(!disposed)showPollError(error);}finally{inFlight=false;}
+  }catch(error){if(disposed)return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
  }
  async function loadEarlier(){
   if(disposed||earlierPending||inFlight||!entry.items.length)return;

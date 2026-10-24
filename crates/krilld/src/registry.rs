@@ -1114,7 +1114,8 @@ impl Registry {
             return false;
         };
         let given = Path::new(std::ffi::OsStr::from_bytes(target));
-        let given = std::fs::canonicalize(given).unwrap_or_else(|_| given.to_path_buf());
+        // `session_cwd`와 같은 규칙(Windows `\\?\` 접두 제거)으로 맞춰야 같은 폴더가 같다고 나온다.
+        let given = krill_proto::os::canonicalize(given).unwrap_or_else(|_| given.to_path_buf());
         cwd == given
     }
 
@@ -1136,10 +1137,10 @@ impl Registry {
             (e.pid, live, e.cwd.clone(), e.session.tap())
         };
         if live && let Some(dir) = tap.cwd(pid) {
-            return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
+            return Some(krill_proto::os::canonicalize(&dir).unwrap_or(dir));
         }
         (!initial.as_os_str().is_empty())
-            .then(|| std::fs::canonicalize(&initial).unwrap_or(initial))
+            .then(|| krill_proto::os::canonicalize(&initial).unwrap_or(initial))
     }
 
     /// 화면 스트림이 붙을 세션. 범위 밖이면 감사 로그에 남기고 없는 세션처럼 답한다.

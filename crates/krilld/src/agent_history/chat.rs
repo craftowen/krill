@@ -633,6 +633,25 @@ fn resolve_transcript_uncached(
         }
     }
 
+    let norm_cwd = normalize_path(cwd);
+    // Claude keeps one folder per cwd. Look there first so a large `projects/` never hides the session.
+    let claude_dirs: Vec<PathBuf> = if agent == VaultAgent::Claude {
+        search_dirs
+            .iter()
+            .filter_map(|root| claude_project_dir(root, cwd))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !sid.is_empty() {
+        for dir in &claude_dirs {
+            let cand = dir.join(format!("{sid}.jsonl"));
+            if cand.is_file() {
+                return Some((cand, sid.to_owned()));
+            }
+        }
+    }
+
     if !sid.is_empty() {
         for root in &search_dirs {
             if let Some(found) = find_transcript_by_id(root, agent, sid, budget) {
@@ -641,8 +660,18 @@ fn resolve_transcript_uncached(
         }
     }
 
-    let norm_cwd = normalize_path(cwd);
+    // Krill이 `--session-id`로 띄운 Claude는 첫 프롬프트 전까지 파일이 없다. 그때 같은 폴더의 다른 대화를 묶지 않는다.
+    if agent == VaultAgent::Claude && !sid.is_empty() {
+        return None;
+    }
     if !norm_cwd.is_empty() {
+        if let Some((_, path, found_sid)) = claude_dirs
+            .iter()
+            .filter_map(|dir| newest_claude_in_dir(dir, &norm_cwd))
+            .max_by_key(|found| found.0)
+        {
+            return Some((path, found_sid));
+        }
         let mut best: Option<(u64, PathBuf, String)> = None;
         for root in &search_dirs {
             if let Some(cand) = find_newest_transcript_by_cwd(root, agent, &norm_cwd, budget)
@@ -659,6 +688,42 @@ fn resolve_transcript_uncached(
         }
     }
     None
+}
+
+/// Claude Code's project folder: the cwd with every UTF-16 unit outside `[A-Za-z0-9]` replaced by `-`.
+/// Very long paths get a hashed name instead, so a miss falls back to the bounded scan.
+fn claude_project_dir(root: &Path, cwd: &str) -> Option<PathBuf> {
+    let cwd = cwd.trim().trim_end_matches(['/', '\\']);
+    if cwd.is_empty() {
+        return None;
+    }
+    let name: String = cwd
+        .encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(b) if b.is_ascii_alphanumeric() => char::from(b),
+            _ => '-',
+        })
+        .collect();
+    let dir = root.join("projects").join(name);
+    dir.is_dir().then_some(dir)
+}
+
+/// Newest transcript in one Claude project folder whose recorded cwd matches. Only metadata is read for
+/// every file; the first lines are peeked newest-first, so one folder with thousands of sessions stays cheap.
+fn newest_claude_in_dir(dir: &Path, norm_cwd: &str) -> Option<(u64, PathBuf, String)> {
+    let mut files: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+        .ok()?
+        .take(65_536)
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|p| Some((file_mtime(&p)?, p)))
+        .collect();
+    files.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
+    files.into_iter().take(64).find_map(|(mtime, p)| {
+        let (sid, file_cwd) = peek_jsonl_id_and_cwd(&p)?;
+        (normalize_path(&file_cwd) == norm_cwd).then_some((mtime, p, sid))
+    })
 }
 
 fn find_transcript_by_id(
@@ -2381,6 +2446,58 @@ mod performance_tests {
         assert_eq!(
             resolve_transcript(&roots, VaultAgent::Claude, &stored, ""),
             Some((path, "other".into()))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_cwd_fallback_reads_the_encoded_project_folder_past_the_scan_budget() {
+        let dir = std::env::temp_dir().join(format!("chat-claude-dir-{}", std::process::id()));
+        let roots = VaultRoots {
+            claude: vec![dir.clone()],
+            ..VaultRoots::default()
+        };
+        // More decoys than the bounded `projects/` scan visits, so only the direct lookup can find it.
+        for index in 0..300 {
+            fs::create_dir_all(dir.join(format!("projects/-decoy-{index:03}"))).unwrap();
+        }
+        let cwd = "/work/한 repo.v2";
+        let project = dir.join("projects/-work---repo-v2");
+        fs::create_dir_all(&project).unwrap();
+        assert_eq!(claude_project_dir(&dir, cwd), Some(project.clone()));
+        let line = |sid: &str| format!("{}\n", serde_json::json!({"sessionId":sid,"cwd":cwd}));
+        fs::write(project.join("older.jsonl"), line("older")).unwrap();
+        fs::write(project.join("newer.jsonl"), line("newer")).unwrap();
+        File::options()
+            .write(true)
+            .open(project.join("older.jsonl"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let mut stored = StoredLaunch {
+            profile: "claude".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+        let mut budget = ScanBudget::new();
+        assert_eq!(
+            resolve_transcript_uncached(&roots, VaultAgent::Claude, &stored, cwd, &mut budget),
+            Some((project.join("newer.jsonl"), "newer".into()))
+        );
+        stored.session_id = Some("older".into());
+        assert_eq!(
+            resolve_transcript_uncached(&roots, VaultAgent::Claude, &stored, cwd, &mut budget),
+            Some((project.join("older.jsonl"), "older".into()))
+        );
+        // A launched session whose file does not exist yet never borrows another conversation in the folder.
+        stored.session_id = Some("not-written-yet".into());
+        assert_eq!(
+            resolve_transcript_uncached(&roots, VaultAgent::Claude, &stored, cwd, &mut budget),
+            None
         );
         fs::remove_dir_all(dir).unwrap();
     }

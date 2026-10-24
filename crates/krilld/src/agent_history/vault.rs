@@ -117,7 +117,7 @@ pub(crate) fn search(state_dir: Option<&Path>, query: &SearchQuery) -> SearchSna
 }
 
 pub(super) fn collect_roots(state_dir: Option<&Path>) -> VaultRoots {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = krill_proto::os::home_dir();
     let env_or_home = |var: &str, default_rel: &str| {
         std::env::var_os(var)
             .filter(|s| !s.is_empty())
@@ -655,6 +655,11 @@ impl ParsedQuery {
 
 /// macOS `/private/tmp` ↔ `/tmp`, `/private/var` ↔ `/var` 심링크 차이와 끝 `/`를 정규화한다.
 pub(crate) fn normalize_path(path: &str) -> String {
+    // Windows transcripts write `C:\x` while shells may report `c:/x` or `\\?\C:\x`: one separator, one case.
+    #[cfg(windows)]
+    let owned = path.trim().replace('\\', "/").to_lowercase();
+    #[cfg(windows)]
+    let path = owned.strip_prefix("//?/").unwrap_or(&owned);
     let trimmed = path.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return String::new();
