@@ -5,6 +5,45 @@ use krill_proto::agent::rules::{PUBLIC_KEY_FILE_NAME, RULES_FILE_NAME};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
+#[test]
+fn switch_identity_merge_keeps_late_hook_and_source_account_across_restart() {
+    let dir = std::env::temp_dir().join(format!("switch-identity-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let c = Control::new(Some(&dir));
+    let session = SessionId(1);
+    let mut discovered = StoredLaunch {
+        profile: "codex".into(),
+        permission: Permission::Manual,
+        session_id: Some("exact".into()),
+        transcript_path: Some("/tmp/exact.jsonl".into()),
+        cwd: b"/project".to_vec(),
+        hibernation_blocked: true,
+        account: Some(LaunchAccount {
+            id: "source".into(),
+            env_key: "CODEX_HOME".into(),
+            dir: "/source".into(),
+        }),
+    };
+    let first = c.bind_switch_identity(session, &discovered).unwrap();
+    assert_eq!(first, discovered);
+    c.record_hook_session(session, br#"{"hook_event_name":"SessionStart","source":"clear","session_id":"rotated","transcript_path":"/tmp/rotated.jsonl"}"#);
+    let current = c.stored(session).unwrap().unwrap();
+    assert_eq!(current.session_id.as_deref(), Some("rotated"));
+    assert!(c.bind_switch_identity(session, &discovered).is_err());
+    assert_eq!(c.stored(session).unwrap().unwrap(), current);
+    discovered.session_id = Some("rotated".into());
+    let merged = c.bind_switch_identity(session, &discovered).unwrap();
+    assert_eq!(
+        merged.transcript_path.as_deref(),
+        Some("/tmp/rotated.jsonl")
+    );
+    assert_eq!(
+        Control::new(Some(&dir)).stored(session).unwrap().unwrap(),
+        merged
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// 테스트용 서명 키와 서명 규칙 파일 바이트. 외부 서버 호출 없이 로컬에서 만든다.
 fn fresh_key() -> Ed25519KeyPair {
     Ed25519KeyPair::from_pkcs8(

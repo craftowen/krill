@@ -91,22 +91,30 @@ fn usage(socket: &Path, request: &UsageRequest) -> AccountsSnapshot {
 
 #[test]
 fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
-    switch_survives_daemon_sigkill(ProviderKind::Codex);
+    switch_survives_daemon_sigkill(ProviderKind::Codex, false);
 }
 
 #[test]
 fn claude_switch_skips_deep_subagent_trees_and_survives_daemon_sigkill() {
-    switch_survives_daemon_sigkill(ProviderKind::Claude);
+    switch_survives_daemon_sigkill(ProviderKind::Claude, false);
+}
+
+#[test]
+fn codex_without_hooks_recovers_open_transcript_and_survives_daemon_sigkill() {
+    switch_survives_daemon_sigkill(ProviderKind::Codex, true);
 }
 
 #[expect(clippy::panic, reason = "integration-test fixture")]
-fn switch_survives_daemon_sigkill(provider: ProviderKind) {
+fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
     let name = if provider == ProviderKind::Claude {
         "claude"
     } else {
         "codex"
     };
-    let root = PathBuf::from(format!("/tmp/kas-it-{}-{name}", std::process::id()));
+    let root = PathBuf::from(format!(
+        "/tmp/kas-it-{}-{name}-{without_hooks}",
+        std::process::id()
+    ));
     fs::remove_dir_all(&root).ok();
     let state = root.join("state");
     let home = root.join("home");
@@ -150,14 +158,30 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind) {
         .unwrap()
         .replace("CODEX_HOME", provider.env_var());
     let script = script.replacen("#!/bin/sh\n", "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '2.1.0 (Claude Code)\\n'; exit 0; fi\nif [ \"$1\" = auth ] && [ \"$2\" = status ]; then printf '{\"loggedIn\":true}\\n'; exit 0; fi\n", 1);
-    let signal = format!(
-        "printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{conversation}\"}}' | {} hook {name} >/dev/null\n",
-        krill_proto::agent::hooks::shell_quote(cli.to_str().unwrap())
-    );
+    let signal = if without_hooks {
+        String::new()
+    } else {
+        format!(
+            "printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{conversation}\"}}' | {} hook {name} >/dev/null\n",
+            krill_proto::agent::hooks::shell_quote(cli.to_str().unwrap())
+        )
+    };
     let script = script.replace(
         "while IFS= read -r line;",
         &format!("{signal}while IFS= read -r line;"),
     );
+    let script = if without_hooks {
+        script.replace(
+            "printf 'selected account ready:",
+            &format!(
+                "exec 3<\"${}/{}\"\nprintf 'selected account ready:",
+                provider.env_var(),
+                transcript
+            ),
+        )
+    } else {
+        script
+    };
     fs::write(&exe, script).unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
     let profile = krill_proto::agent::Profile {
@@ -204,6 +228,7 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind) {
         .env("HOME", &home)
         .env("KRILL_TEST_OFFLINE", "1")
         .env("KRILL_STATE_DIR", &state)
+        .env("KRILL_LOG_DIR", root.join("logs"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -237,8 +262,12 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind) {
     let record = state.join("agent-launches").join(format!("{}.json", old.0));
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
-    metadata["session_id"] = conversation.into();
-    fs::write(&record, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    if without_hooks {
+        assert!(metadata.get("session_id").is_none());
+    } else {
+        metadata["session_id"] = conversation.into();
+        fs::write(&record, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    }
     usage(
         &socket,
         &UsageRequest::SwitchAccount {

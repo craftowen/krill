@@ -5,7 +5,7 @@
 //! (`User`·`Assistant`·`Reasoning`·`ToolCall`·`ToolResult`·`Question`·`Permission`)로 정규화한다.
 
 use crate::session::lock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
@@ -23,7 +23,8 @@ use crate::agent::control::StoredLaunch;
 
 use super::vault::{
     VaultRoots, agy_candidate_dirs, collect_roots, extract_agy_user_request,
-    extract_agy_workspace_from_record, normalize_path, opencode_candidate_bases,
+    extract_agy_workspace_from_record, is_injected_user_context, normalize_path,
+    opencode_candidate_bases,
 };
 
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
@@ -68,25 +69,48 @@ fn read_json_bounded(path: &Path, remaining: &mut u64) -> std::io::Result<Value>
     serde_json::from_slice(&bytes).map_err(std::io::Error::other)
 }
 
-/// 세션의 `StoredLaunch`와 작업 디렉터리를 바탕으로 트랜스크립트를 증분 폴링한다.
-pub(crate) fn poll_session(
-    state_dir: Option<&Path>,
-    stored: Option<&StoredLaunch>,
-    fallback_cwd: &[u8],
-    offset: u64,
-) -> ChatPollSnapshot {
-    let roots = collect_roots(state_dir);
-    poll_session_in(&roots, stored, fallback_cwd, offset)
-}
-
+#[cfg(all(test, unix))]
 pub(crate) fn poll_session_in(
     roots: &VaultRoots,
     stored: Option<&StoredLaunch>,
     fallback_cwd: &[u8],
     offset: u64,
 ) -> ChatPollSnapshot {
+    let empty_claimed = (BTreeSet::new(), BTreeSet::new());
+    poll_session_in_bounded(roots, stored, fallback_cwd, offset, None, &empty_claimed).0
+}
+
+/// 세션의 `StoredLaunch`, 시작 시각 하한(`min_birth_secs`), 다른 세션이 이미 점유한 트랜스크립트(`claimed`)를
+/// 바탕으로 트랜스크립트를 증분 폴링하고, 해석된 `(path, session_id)`도 함께 반환한다.
+pub(crate) fn poll_session_bounded(
+    state_dir: Option<&Path>,
+    stored: Option<&StoredLaunch>,
+    fallback_cwd: &[u8],
+    offset: u64,
+    min_birth_secs: Option<u64>,
+    claimed: &(BTreeSet<String>, BTreeSet<PathBuf>),
+) -> (ChatPollSnapshot, Option<(PathBuf, String)>) {
+    let roots = collect_roots(state_dir);
+    poll_session_in_bounded(
+        &roots,
+        stored,
+        fallback_cwd,
+        offset,
+        min_birth_secs,
+        claimed,
+    )
+}
+
+pub(crate) fn poll_session_in_bounded(
+    roots: &VaultRoots,
+    stored: Option<&StoredLaunch>,
+    fallback_cwd: &[u8],
+    offset: u64,
+    min_birth_secs: Option<u64>,
+    claimed: &(BTreeSet<String>, BTreeSet<PathBuf>),
+) -> (ChatPollSnapshot, Option<(PathBuf, String)>) {
     let Some(stored) = stored else {
-        return ChatPollSnapshot::default();
+        return (ChatPollSnapshot::default(), None);
     };
     let agent = VaultAgent::parse(&stored.profile).unwrap_or(VaultAgent::Claude);
     let cwd_bytes = if stored.cwd.is_empty() {
@@ -95,19 +119,28 @@ pub(crate) fn poll_session_in(
         stored.cwd.as_slice()
     };
     let cwd_str = String::from_utf8_lossy(cwd_bytes);
-    let resolved = resolve_transcript(roots, agent, stored, &cwd_str);
-    let Some((path, session_id)) = resolved else {
-        return ChatPollSnapshot {
-            agent: bounded(agent.profile(), MAX_TEXT),
-            session_id: bounded(stored.session_id.as_deref().unwrap_or(""), MAX_TEXT),
-            transcript_path: bounded(stored.transcript_path.as_deref().unwrap_or(""), MAX_TEXT),
-            next_offset: 0,
-            reset: offset > 0,
-            bound: false,
-            items: Vec::new(),
-        };
+    let filter = CwdFallbackFilter {
+        min_birth_secs,
+        claimed_ids: &claimed.0,
+        claimed_paths: &claimed.1,
     };
-    poll_transcript_file(agent, &session_id, &path, offset)
+    let resolved = resolve_transcript(roots, agent, stored, &cwd_str, &filter);
+    let Some((path, session_id)) = resolved else {
+        return (
+            ChatPollSnapshot {
+                agent: bounded(agent.profile(), MAX_TEXT),
+                session_id: bounded(stored.session_id.as_deref().unwrap_or(""), MAX_TEXT),
+                transcript_path: bounded(stored.transcript_path.as_deref().unwrap_or(""), MAX_TEXT),
+                next_offset: 0,
+                reset: offset > 0,
+                bound: false,
+                items: Vec::new(),
+            },
+            None,
+        );
+    };
+    let snapshot = poll_transcript_file(agent, &session_id, &path, offset);
+    (snapshot, Some((path, session_id)))
 }
 
 /// 트랜스크립트 파일 하나를 `offset` 바이트부터 증분 정규화해 읽는다.
@@ -557,15 +590,43 @@ pub(crate) fn generation(snapshot: &ChatPollSnapshot) -> String {
     )
 }
 
+struct CwdFallbackFilter<'a> {
+    min_birth_secs: Option<u64>,
+    claimed_ids: &'a BTreeSet<String>,
+    claimed_paths: &'a BTreeSet<PathBuf>,
+}
+
+impl CwdFallbackFilter<'_> {
+    fn allows(&self, path: &Path, sid: &str) -> bool {
+        if !sid.is_empty() && self.claimed_ids.contains(sid) {
+            return false;
+        }
+        if self.claimed_paths.contains(path) {
+            return false;
+        }
+        if let Some(min_birth) = self.min_birth_secs
+            && let Some(birth) = file_birth_or_mtime(path)
+            && birth < min_birth.saturating_sub(2)
+        {
+            return false;
+        }
+        true
+    }
+}
+
 fn resolve_transcript(
     roots: &VaultRoots,
     agent: VaultAgent,
     stored: &StoredLaunch,
     cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
 ) -> Option<(PathBuf, String)> {
     type PathCache = BTreeMap<String, (Instant, Option<(PathBuf, String)>)>;
     static CACHE: OnceLock<Mutex<PathCache>> = OnceLock::new();
-    let key = format!("{agent:?}|{roots:?}|{stored:?}|{cwd}");
+    let key = format!(
+        "{agent:?}|{roots:?}|{stored:?}|{cwd}|{:?}|{:?}|{:?}",
+        filter.min_birth_secs, filter.claimed_ids, filter.claimed_paths
+    );
     let cache = CACHE.get_or_init(Mutex::default);
     if let Some((at, result)) = lock(cache).get(&key) {
         let ttl = if result.is_some() {
@@ -577,7 +638,8 @@ fn resolve_transcript(
             return result.clone();
         }
     }
-    let result = resolve_transcript_uncached(roots, agent, stored, cwd, &mut ScanBudget::new());
+    let result =
+        resolve_transcript_uncached(roots, agent, stored, cwd, filter, &mut ScanBudget::new());
     let mut cached = lock(cache);
     cached.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(3));
     if cached.len() >= 256 {
@@ -592,6 +654,7 @@ fn resolve_transcript_uncached(
     agent: VaultAgent,
     stored: &StoredLaunch,
     cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
     budget: &mut ScanBudget,
 ) -> Option<(PathBuf, String)> {
     let sid = stored.session_id.as_deref().unwrap_or("").trim();
@@ -660,21 +723,22 @@ fn resolve_transcript_uncached(
         }
     }
 
-    // Krill이 `--session-id`로 띄운 Claude는 첫 프롬프트 전까지 파일이 없다. 그때 같은 폴더의 다른 대화를 묶지 않는다.
-    if agent == VaultAgent::Claude && !sid.is_empty() {
+    // 이미 session_id가 알려진 세션은 첫 프롬프트 전까지 파일이 없더라도 같은 폴더의 다른 대화를 묶지 않는다.
+    if !sid.is_empty() {
         return None;
     }
     if !norm_cwd.is_empty() {
         if let Some((_, path, found_sid)) = claude_dirs
             .iter()
-            .filter_map(|dir| newest_claude_in_dir(dir, &norm_cwd))
+            .filter_map(|dir| newest_claude_in_dir(dir, &norm_cwd, filter))
             .max_by_key(|found| found.0)
         {
             return Some((path, found_sid));
         }
         let mut best: Option<(u64, PathBuf, String)> = None;
         for root in &search_dirs {
-            if let Some(cand) = find_newest_transcript_by_cwd(root, agent, &norm_cwd, budget)
+            if let Some(cand) =
+                find_newest_transcript_by_cwd(root, agent, &norm_cwd, filter, budget)
                 && best.as_ref().is_none_or(|b| cand.0 > b.0)
             {
                 best = Some(cand);
@@ -710,7 +774,11 @@ fn claude_project_dir(root: &Path, cwd: &str) -> Option<PathBuf> {
 
 /// Newest transcript in one Claude project folder whose recorded cwd matches. Only metadata is read for
 /// every file; the first lines are peeked newest-first, so one folder with thousands of sessions stays cheap.
-fn newest_claude_in_dir(dir: &Path, norm_cwd: &str) -> Option<(u64, PathBuf, String)> {
+fn newest_claude_in_dir(
+    dir: &Path,
+    norm_cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
+) -> Option<(u64, PathBuf, String)> {
     let mut files: Vec<(u64, PathBuf)> = fs::read_dir(dir)
         .ok()?
         .take(65_536)
@@ -722,7 +790,8 @@ fn newest_claude_in_dir(dir: &Path, norm_cwd: &str) -> Option<(u64, PathBuf, Str
     files.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
     files.into_iter().take(64).find_map(|(mtime, p)| {
         let (sid, file_cwd) = peek_jsonl_id_and_cwd(&p)?;
-        (normalize_path(&file_cwd) == norm_cwd).then_some((mtime, p, sid))
+        (normalize_path(&file_cwd) == norm_cwd && filter.allows(&p, &sid))
+            .then_some((mtime, p, sid))
     })
 }
 
@@ -837,6 +906,7 @@ fn find_newest_transcript_by_cwd(
     root: &Path,
     agent: VaultAgent,
     norm_cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
     budget: &mut ScanBudget,
 ) -> Option<(u64, PathBuf, String)> {
     let mut best: Option<(u64, PathBuf, String)> = None;
@@ -871,6 +941,7 @@ fn find_newest_transcript_by_cwd(
                     }
                     if let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
                         && normalize_path(&file_cwd) == norm_cwd
+                        && filter.allows(&p, &sid)
                     {
                         best = Some((mtime, p, sid));
                     }
@@ -878,11 +949,18 @@ fn find_newest_transcript_by_cwd(
             }
         }
         VaultAgent::Codex => {
-            walk_codex_for_cwd(&root.join("sessions"), 4, norm_cwd, &mut best, budget);
+            walk_codex_for_cwd(
+                &root.join("sessions"),
+                4,
+                norm_cwd,
+                filter,
+                &mut best,
+                budget,
+            );
         }
         VaultAgent::Agy => {
             for cand in agy_candidate_dirs(root, true) {
-                scan_agy_brain_for_cwd(&cand, norm_cwd, &mut best, budget);
+                scan_agy_brain_for_cwd(&cand, norm_cwd, filter, &mut best, budget);
                 if let Ok(files) = fs::read_dir(cand.join("sessions")) {
                     for file in files.take(128).flatten() {
                         if !budget.take() {
@@ -894,6 +972,7 @@ fn find_newest_transcript_by_cwd(
                             && best.as_ref().is_none_or(|b| mtime > b.0)
                             && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
                             && normalize_path(&file_cwd) == norm_cwd
+                            && filter.allows(&p, &sid)
                         {
                             best = Some((mtime, p, sid));
                         }
@@ -914,6 +993,7 @@ fn find_newest_transcript_by_cwd(
                             && best.as_ref().is_none_or(|b| mtime > b.0)
                             && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
                             && normalize_path(&file_cwd) == norm_cwd
+                            && filter.allows(&p, &sid)
                         {
                             best = Some((mtime, p, sid));
                         }
@@ -929,6 +1009,7 @@ fn walk_codex_for_cwd(
     dir: &Path,
     depth: usize,
     norm_cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
     best: &mut Option<(u64, PathBuf, String)>,
     budget: &mut ScanBudget,
 ) {
@@ -950,13 +1031,14 @@ fn walk_codex_for_cwd(
         }
         let p = entry.path();
         if ft.is_dir() {
-            walk_codex_for_cwd(&p, depth - 1, norm_cwd, best, budget);
+            walk_codex_for_cwd(&p, depth - 1, norm_cwd, filter, best, budget);
         } else if ft.is_file()
             && p.extension().is_some_and(|e| e == "jsonl")
             && let Some(mtime) = file_mtime(&p)
             && best.as_ref().is_none_or(|b| mtime > b.0)
             && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
             && normalize_path(&file_cwd) == norm_cwd
+            && filter.allows(&p, &sid)
         {
             *best = Some((mtime, p, sid));
         }
@@ -966,6 +1048,7 @@ fn walk_codex_for_cwd(
 fn scan_agy_brain_for_cwd(
     cand: &Path,
     norm_cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
     best: &mut Option<(u64, PathBuf, String)>,
     budget: &mut ScanBudget,
 ) {
@@ -995,6 +1078,9 @@ fn scan_agy_brain_for_cwd(
         .find(|p| p.is_file()) else {
             continue;
         };
+        if !filter.allows(&p, &conv_id) {
+            continue;
+        }
         let Some(mtime) = file_mtime(&p) else {
             continue;
         };
@@ -1161,6 +1247,16 @@ fn file_mtime(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+fn file_birth_or_mtime(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    meta.created()
+        .or_else(|_| meta.modified())
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) {
     let start = out.len();
     match agent {
@@ -1193,7 +1289,9 @@ fn record_time(v: &Value) -> String {
 }
 
 fn parse_claude_line(v: &Value, out: &mut Vec<ChatItem>) {
-    if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+    if v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || v.get("isMeta").and_then(Value::as_bool) == Some(true)
+    {
         return;
     }
     let rec_type = v
@@ -1343,14 +1441,17 @@ fn parse_codex_line(v: &Value, out: &mut Vec<ChatItem>) {
                     .or_else(|| payload.get("text"))
                     .and_then(Value::as_str)
                 {
-                    push_item(
-                        out,
-                        ChatItem {
-                            kind,
-                            text: bounded(msg.trim(), MAX_CHAT_TEXT),
-                            ..ChatItem::default()
-                        },
-                    );
+                    let cleaned = clean_user_or_assistant_text(kind, msg);
+                    if !cleaned.is_empty() {
+                        push_item(
+                            out,
+                            ChatItem {
+                                kind,
+                                text: bounded(&cleaned, MAX_CHAT_TEXT),
+                                ..ChatItem::default()
+                            },
+                        );
+                    }
                 }
             }
             "agent_reasoning" => {
@@ -1391,6 +1492,9 @@ fn parse_codex_line(v: &Value, out: &mut Vec<ChatItem>) {
     }
 
     if let Some(role) = v.get("role").and_then(Value::as_str) {
+        if role == "developer" || role == "system" {
+            return;
+        }
         let kind = if role == "assistant" {
             ChatItemKind::Assistant
         } else {
@@ -1431,12 +1535,13 @@ fn parse_agy_line(v: &Value, out: &mut Vec<ChatItem>) {
         || role == "user"
     {
         let req = extract_agy_user_request(content);
-        if !req.trim().is_empty() {
+        let cleaned = clean_user_or_assistant_text(ChatItemKind::User, &req);
+        if !cleaned.is_empty() {
             push_item(
                 out,
                 ChatItem {
                     kind: ChatItemKind::User,
-                    text: bounded(req.trim(), MAX_CHAT_TEXT),
+                    text: bounded(&cleaned, MAX_CHAT_TEXT),
                     ..ChatItem::default()
                 },
             );
@@ -1524,6 +1629,9 @@ fn parse_opencode_message_record(
     remaining: &mut u64,
 ) {
     let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
+    if role == "developer" || role == "system" {
+        return;
+    }
     let default_kind = if role == "assistant" {
         ChatItemKind::Assistant
     } else {
@@ -1611,14 +1719,17 @@ fn parse_opencode_part(default_kind: ChatItemKind, part: &Value, out: &mut Vec<C
                 .or_else(|| part.get("content"))
                 .and_then(Value::as_str)
             {
-                push_item(
-                    out,
-                    ChatItem {
-                        kind: default_kind,
-                        text: bounded(t.trim(), MAX_CHAT_TEXT),
-                        ..ChatItem::default()
-                    },
-                );
+                let cleaned = clean_user_or_assistant_text(default_kind, t);
+                if !cleaned.is_empty() {
+                    push_item(
+                        out,
+                        ChatItem {
+                            kind: default_kind,
+                            text: bounded(&cleaned, MAX_CHAT_TEXT),
+                            ..ChatItem::default()
+                        },
+                    );
+                }
             }
         }
     }
@@ -1996,12 +2107,7 @@ fn clean_user_or_assistant_text(kind: ChatItemKind, raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if kind == ChatItemKind::User
-        && (trimmed.starts_with("<environment_context>")
-            || trimmed.starts_with("<permissions instructions>")
-            || trimmed.starts_with("<collaboration_mode>")
-            || trimmed.starts_with("<local-command-caveat>"))
-    {
+    if kind == ChatItemKind::User && is_injected_user_context(trimmed) {
         return String::new();
     }
     trimmed.to_owned()
@@ -2483,13 +2589,20 @@ mod performance_tests {
             hibernation_blocked: false,
             account: None,
         };
-        assert!(resolve_transcript(&roots, VaultAgent::Claude, &stored, "").is_none());
+        let empty_ids = BTreeSet::new();
+        let empty_paths = BTreeSet::new();
+        let filter = CwdFallbackFilter {
+            min_birth_secs: None,
+            claimed_ids: &empty_ids,
+            claimed_paths: &empty_paths,
+        };
+        assert!(resolve_transcript(&roots, VaultAgent::Claude, &stored, "", &filter).is_none());
         fs::create_dir_all(dir.join("projects/demo")).unwrap();
         let path = dir.join("projects/demo/other.jsonl");
         fs::write(&path, "{}\n").unwrap();
         stored.session_id = Some("other".into());
         assert_eq!(
-            resolve_transcript(&roots, VaultAgent::Claude, &stored, ""),
+            resolve_transcript(&roots, VaultAgent::Claude, &stored, "", &filter),
             Some((path, "other".into()))
         );
         fs::remove_dir_all(dir).unwrap();
@@ -2528,22 +2641,145 @@ mod performance_tests {
             hibernation_blocked: false,
             account: None,
         };
+        let empty_ids = BTreeSet::new();
+        let empty_paths = BTreeSet::new();
+        let filter = CwdFallbackFilter {
+            min_birth_secs: None,
+            claimed_ids: &empty_ids,
+            claimed_paths: &empty_paths,
+        };
         let mut budget = ScanBudget::new();
         assert_eq!(
-            resolve_transcript_uncached(&roots, VaultAgent::Claude, &stored, cwd, &mut budget),
+            resolve_transcript_uncached(
+                &roots,
+                VaultAgent::Claude,
+                &stored,
+                cwd,
+                &filter,
+                &mut budget
+            ),
             Some((project.join("newer.jsonl"), "newer".into()))
         );
         stored.session_id = Some("older".into());
         assert_eq!(
-            resolve_transcript_uncached(&roots, VaultAgent::Claude, &stored, cwd, &mut budget),
+            resolve_transcript_uncached(
+                &roots,
+                VaultAgent::Claude,
+                &stored,
+                cwd,
+                &filter,
+                &mut budget
+            ),
             Some((project.join("older.jsonl"), "older".into()))
         );
         // A launched session whose file does not exist yet never borrows another conversation in the folder.
         stored.session_id = Some("not-written-yet".into());
         assert_eq!(
-            resolve_transcript_uncached(&roots, VaultAgent::Claude, &stored, cwd, &mut budget),
+            resolve_transcript_uncached(
+                &roots,
+                VaultAgent::Claude,
+                &stored,
+                cwd,
+                &filter,
+                &mut budget
+            ),
             None
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_and_claude_system_injected_user_blocks_are_filtered_from_chat_items() {
+        let dir = std::env::temp_dir().join(format!("chat-filter-injected-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let codex_path = dir.join("rollout-codex.jsonl");
+        let codex_lines = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>\nFilesystem sandboxing...\n</permissions instructions>"}]}}"#,
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /Users/macmini/Krill\n\n<INSTRUCTIONS>\n# AGENTS.md — Krill\n</INSTRUCTIONS>"},{"type":"input_text","text":"<environment_context>\n  <cwd>/Users/macmini/Krill</cwd>\n</environment_context>"}]}}"##,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/a.png\">"},{"type":"input_image","image_url":"data:image/png;base64,AAA"},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"실제 유저 질문입니다"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<skill>\n<name>krill</name>\n<path>/tmp/SKILL.md</path>\n</skill>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<subagent_notification>\n{\"agent_id\":\"123\"}\n</subagent_notification>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"답변입니다"}]}}"#,
+        ];
+        fs::write(&codex_path, format!("{}\n", codex_lines.join("\n"))).unwrap();
+        let codex_snap = poll_transcript_file(VaultAgent::Codex, "codex-sys", &codex_path, 0);
+        assert_eq!(codex_snap.items.len(), 2);
+        assert_eq!(codex_snap.items[0].kind, ChatItemKind::User);
+        assert_eq!(codex_snap.items[0].text, "실제 유저 질문입니다");
+        assert_eq!(codex_snap.items[1].kind, ChatItemKind::Assistant);
+        assert_eq!(codex_snap.items[1].text, "답변입니다");
+
+        let claude_path = dir.join("claude-meta.jsonl");
+        let claude_lines = [
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base instructions for this skill: ..."}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"클로드 실제 프롬프트"}}"#,
+        ];
+        fs::write(&claude_path, format!("{}\n", claude_lines.join("\n"))).unwrap();
+        let claude_snap = poll_transcript_file(VaultAgent::Claude, "claude-sys", &claude_path, 0);
+        assert_eq!(claude_snap.items.len(), 1);
+        assert_eq!(claude_snap.items[0].kind, ChatItemKind::User);
+        assert_eq!(claude_snap.items[0].text, "클로드 실제 프롬프트");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_agy_session_does_not_bind_older_or_claimed_transcript_in_same_cwd() {
+        let dir = std::env::temp_dir().join(format!("chat-agy-isolation-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let logs = dir.join("brain/conv-old-session/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        let lines = [
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\n이전 세션 메시지\n</USER_REQUEST>"}"#,
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","thinking":"검토","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls\"","Cwd":"\"/tmp/agy-iso\""}}]}"#,
+        ];
+        fs::write(&transcript, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let roots = VaultRoots {
+            claude: Vec::new(),
+            codex: Vec::new(),
+            agy: vec![dir.clone()],
+            opencode: Vec::new(),
+        };
+        let stored = StoredLaunch {
+            profile: "agy".to_owned(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: b"/tmp/agy-iso".to_vec(),
+            hibernation_blocked: true,
+            account: None,
+        };
+
+        // 1) 이미 다른 세션이 선점(claimed)한 대화 ID면 바인딩하지 않는다.
+        let mut claimed_ids = BTreeSet::new();
+        claimed_ids.insert("conv-old-session".to_owned());
+        let claimed = (claimed_ids, BTreeSet::new());
+        let (snap_claimed, resolved_claimed) =
+            poll_session_in_bounded(&roots, Some(&stored), b"/tmp/agy-iso", 0, None, &claimed);
+        assert!(!snap_claimed.bound);
+        assert!(snap_claimed.items.is_empty());
+        assert!(resolved_claimed.is_none());
+
+        // 2) 새 세션 시작 시각(min_birth_secs)이 기존 트랜스크립트 생성 시각보다 미래면 바인딩하지 않는다.
+        let future_launch = file_birth_or_mtime(&transcript).unwrap_or(0) + 60;
+        let empty_claimed = (BTreeSet::new(), BTreeSet::new());
+        let (snap_new, resolved_new) = poll_session_in_bounded(
+            &roots,
+            Some(&stored),
+            b"/tmp/agy-iso",
+            0,
+            Some(future_launch),
+            &empty_claimed,
+        );
+        assert!(!snap_new.bound);
+        assert!(snap_new.items.is_empty());
+        assert!(resolved_new.is_none());
+
         fs::remove_dir_all(dir).unwrap();
     }
 }

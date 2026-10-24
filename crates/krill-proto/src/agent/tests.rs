@@ -218,13 +218,17 @@ fn install_command_prefers_windows_variant_on_windows() {
     let a = Agents::load(None).unwrap();
     let claude = &a.profiles["claude"];
     let expected = if cfg!(windows) {
-        "irm https://claude.ai/install.ps1 | iex"
+        "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) latest"
     } else {
-        "curl -fsSL https://claude.ai/install.sh | bash"
+        "curl -fsSL https://claude.ai/install.sh | bash -s -- latest"
     };
     assert_eq!(claude.install_command(), expected);
     assert_eq!(
         a.profiles["codex"].install_command(),
-        "npm install -g @openai/codex"
+        if cfg!(windows) {
+            "npm.cmd install -g @openai/codex@latest"
+        } else {
+            "npm install -g @openai/codex@latest"
+        }
     );
 }

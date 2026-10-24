@@ -1256,6 +1256,10 @@ fn import_accounts_domain_inner(
     if let Some(note) = detect_agy_import_note(opts, domains) {
         warnings.push(note);
     }
+    let hidden = load_hidden_accounts(&opts.home, &opts.state_dir);
+    if !hidden.is_empty() {
+        planned.retain(|cand| !planned_account_is_hidden(&hidden, cand));
+    }
     if planned.is_empty() {
         return summary;
     }
@@ -1653,6 +1657,59 @@ fn primary_email(label: &str) -> &str {
 
 fn emails_equal(left: &str, right: &str) -> bool {
     primary_email(left).eq_ignore_ascii_case(primary_email(right))
+}
+
+fn load_hidden_accounts(home: &Path, state_dir: &Path) -> Vec<String> {
+    for path in [
+        state_dir.join("accounts.toml"),
+        home.join(".config").join("krill").join("accounts.toml"),
+    ] {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
+            continue;
+        };
+        if let Some(arr) = doc.get("hidden_accounts").and_then(toml::Value::as_array) {
+            return arr
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect();
+        }
+        return Vec::new();
+    }
+    Vec::new()
+}
+
+fn planned_account_is_hidden(hidden: &[String], cand: &PlannedOrcaAccount) -> bool {
+    let orca_id = format!("claude-orca-{}", slugify(&cand.raw_id));
+    if hidden.iter().any(|h| {
+        h.eq_ignore_ascii_case(&cand.planned_id)
+            || h.eq_ignore_ascii_case(&cand.raw_id)
+            || (cand.provider == ProviderKind::Claude && h.eq_ignore_ascii_case(&orca_id))
+    }) {
+        return true;
+    }
+    if cand.provider != ProviderKind::Claude {
+        return false;
+    }
+    let cand_mail = cand.email.as_deref().unwrap_or(cand.label.as_str());
+    let mail = primary_email(cand_mail);
+    if mail.contains('@') {
+        let marker = format!("email:{}", mail.to_ascii_lowercase());
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(&marker)) {
+            return true;
+        }
+    }
+    let clean_label = cand.label.trim();
+    if !clean_label.is_empty() {
+        let marker = format!("label:{}", clean_label.to_ascii_lowercase());
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(&marker)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 기존 프로필의 조직과 후보 조직이 충돌하지 않는지 확인한다.

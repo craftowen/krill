@@ -1231,11 +1231,10 @@ fn refresh_accounts_authenticated(
         .map(|a| (a.id.clone(), super::meters::read(home, a)))
         .collect();
     let effective = |a: &AccountInfo, metric: AutoSwitchMetric, now: i64| {
-        if metric == AutoSwitchMetric::Max {
-            readings.get(&a.id).and_then(|m| m.effective_max(now))
-        } else {
-            metric.effective_percent(&a.usage, now)
-        }
+        readings
+            .get(&a.id)
+            .and_then(|m| m.effective_for_metric(a.provider, metric, &a.usage, now))
+            .or_else(|| metric.effective_percent(&a.usage, now))
     };
 
     for provider in ProviderKind::ALL {
@@ -1316,18 +1315,27 @@ fn refresh_accounts_authenticated(
                 // 지정 타깃이 동률이거나 더 차면 폴백도 막혀 왕복이 멈춘다.
                 // 어느 한 창이라도 소진(100%)이면 후보에서 제외한다(레이트리밋 계정으로 전환 금지).
                 // OWE-703 2단계 지시: 한도 기록 계정도 후보에서 제외한다(캐시 사용량과 무관).
+                let exhaustion_metric = match metric {
+                    AutoSwitchMetric::AntigravityClaudeGptMax
+                    | AutoSwitchMetric::AntigravityClaudeGptFiveHour
+                    | AutoSwitchMetric::AntigravityClaudeGptSevenDay => {
+                        AutoSwitchMetric::AntigravityClaudeGptMax
+                    }
+                    AutoSwitchMetric::AntigravityAllMax => AutoSwitchMetric::AntigravityAllMax,
+                    _ => AutoSwitchMetric::Max,
+                };
                 let better = |a: &&AccountInfo| -> Option<u8> {
                     if a.stale
                         || auth
                             .get(&(a.provider, PathBuf::from(&a.profile_dir)))
                             .is_some_and(|status| !status.logged_in)
-                        || effective(a, AutoSwitchMetric::Max, now).is_none()
+                        || effective(a, exhaustion_metric, now).is_none()
                         || !runnable(a)
                         || rate_limited_at(&limited, provider, &a.id).is_some()
                     {
                         return None;
                     }
-                    if effective(a, AutoSwitchMetric::Max, now).is_none_or(|max| max >= 100) {
+                    if effective(a, exhaustion_metric, now).is_none_or(|max| max >= 100) {
                         return None;
                     }
                     let v = effective(a, metric, now)?;

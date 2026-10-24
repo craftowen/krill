@@ -1166,3 +1166,136 @@ fn cancel_account_switch_is_appended_feature_gated_and_not_read_only() {
     assert!(!request.is_read());
     assert!(!request.contains_removed_provider());
 }
+
+#[test]
+fn antigravity_snapshot_prefers_gemini_group_and_provider_metrics_evaluate_target_pools() {
+    let raw = r#"{
+        "status": "SUCCESS",
+        "command": {
+            "name": "usage",
+            "data": {
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "buckets": [
+                            {"id": "5h", "window": "5h", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"},
+                            {"id": "weekly", "window": "weekly", "remaining_fraction": 0.95, "reset_time": "2099-01-01T00:00:00Z"}
+                        ]
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "buckets": [
+                            {"id": "weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": "2099-01-01T00:00:00Z"}
+                        ]
+                    }
+                ]
+            }
+        }
+    }"#;
+    let snap = parse_antigravity_usage(raw);
+    assert_eq!(snap.five_hour.as_ref().map(|w| w.percent), Some(1));
+    assert_eq!(snap.seven_day.as_ref().map(|w| w.percent), Some(5));
+
+    let now = 1_792_123_200_i64;
+    let agy_meters = AccountMeters {
+        account_id: "agy-1".into(),
+        plan: None,
+        meters: vec![
+            UsageMeter {
+                key: "5h".into(),
+                label: "Gemini Models · 5h".into(),
+                window: Some(Window {
+                    percent: 1,
+                    resets_at: Some("2099-01-01T00:00:00Z".into()),
+                }),
+                value: None,
+            },
+            UsageMeter {
+                key: "weekly".into(),
+                label: "Gemini Models · 7d".into(),
+                window: Some(Window {
+                    percent: 5,
+                    resets_at: Some("2099-01-01T00:00:00Z".into()),
+                }),
+                value: None,
+            },
+            UsageMeter {
+                key: "weekly".into(),
+                label: "Claude and GPT models · 7d".into(),
+                window: Some(Window {
+                    percent: 100,
+                    resets_at: Some("2099-01-01T00:00:00Z".into()),
+                }),
+                value: None,
+            },
+        ],
+    };
+    assert_eq!(
+        agy_meters.effective_for_metric(
+            ProviderKind::Antigravity,
+            AutoSwitchMetric::Max,
+            &snap,
+            now
+        ),
+        Some(5)
+    );
+    assert_eq!(
+        agy_meters.effective_for_metric(
+            ProviderKind::Antigravity,
+            AutoSwitchMetric::FiveHour,
+            &snap,
+            now
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        agy_meters.effective_for_metric(
+            ProviderKind::Antigravity,
+            AutoSwitchMetric::SevenDay,
+            &snap,
+            now
+        ),
+        Some(5)
+    );
+    assert_eq!(
+        agy_meters.effective_for_metric(
+            ProviderKind::Antigravity,
+            AutoSwitchMetric::AntigravityClaudeGptMax,
+            &snap,
+            now
+        ),
+        Some(100)
+    );
+    assert_eq!(
+        agy_meters.effective_for_metric(
+            ProviderKind::Antigravity,
+            AutoSwitchMetric::AntigravityClaudeGptSevenDay,
+            &snap,
+            now
+        ),
+        Some(100)
+    );
+    assert_eq!(
+        agy_meters.effective_for_metric(
+            ProviderKind::Antigravity,
+            AutoSwitchMetric::AntigravityAllMax,
+            &snap,
+            now
+        ),
+        Some(100)
+    );
+
+    assert_eq!(
+        AutoSwitchMetric::Max.label_for(ProviderKind::Antigravity),
+        "Gemini Max"
+    );
+    assert_eq!(
+        AutoSwitchMetric::Max.short_label_for(ProviderKind::Claude),
+        "Max"
+    );
+    for provider in ProviderKind::ALL {
+        for &metric in AutoSwitchMetric::for_provider(provider) {
+            assert_eq!(AutoSwitchMetric::parse(metric.short_code()), Some(metric));
+        }
+    }
+}

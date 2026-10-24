@@ -236,9 +236,21 @@ pub(super) fn predictive_trigger(
     metric: AutoSwitchMetric,
     now: u64,
 ) -> bool {
+    let matches_window = |window: &str| match metric {
+        AutoSwitchMetric::Max | AutoSwitchMetric::AntigravityAllMax => true,
+        AutoSwitchMetric::FiveHour => window == "5h",
+        AutoSwitchMetric::SevenDay => window == "7d",
+        AutoSwitchMetric::ClaudeSonnetSevenDay
+        | AutoSwitchMetric::ClaudeOpusSevenDay
+        | AutoSwitchMetric::CodexCodeReview
+        | AutoSwitchMetric::AntigravityClaudeGptMax
+        | AutoSwitchMetric::AntigravityClaudeGptFiveHour
+        | AutoSwitchMetric::AntigravityClaudeGptSevenDay
+        | AutoSwitchMetric::OpenCodeThirtyDay => metric.short_code() == window,
+    };
     forecasts.iter().any(|f| {
         f.account_id == id
-            && (metric == AutoSwitchMetric::Max || metric.short_code() == f.window)
+            && matches_window(&f.window)
             && f.exhausts_at < f.resets_at
             && f.exhausts_at <= now.saturating_add(5 * 60)
     })

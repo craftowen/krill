@@ -370,3 +370,133 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod chat_process_tests {
+    use super::super::*;
+    use krill_proto::agent::Permission;
+    use krill_proto::agent_history::ChatItemKind;
+    use std::fs::{self, File};
+    use std::process::{Child, Command, Stdio};
+
+    struct HeldTranscript(Child);
+    impl Drop for HeldTranscript {
+        fn drop(&mut self) {
+            self.0.kill().ok();
+            self.0.wait().ok();
+        }
+    }
+
+    #[test]
+    fn chat_binds_process_owned_transcripts_outside_daemon_account_roots() {
+        for profile in ["codex", "claude"] {
+            for known_id in [false, true] {
+                let dir = std::env::temp_dir().join(format!(
+                    "desktop-chat-process-{}-{profile}-{known_id}",
+                    std::process::id()
+                ));
+                fs::remove_dir_all(&dir).ok();
+                let path = dir.join("external-account").join(if profile == "codex" {
+                    "sessions/2026/10/24/rollout-owned.jsonl"
+                } else {
+                    "projects/project/owned.jsonl"
+                });
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let sid = "11111111-2222-4333-8444-555555555555";
+                let data = if profile == "codex" {
+                    format!(
+                        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\",\"cwd\":\"/same/project\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"Process owned reply\"}}]}}}}\n"
+                    )
+                } else {
+                    format!(
+                        "{{\"sessionId\":\"{sid}\",\"cwd\":\"/same/project\",\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Process owned reply\"}}]}}}}\n"
+                    )
+                };
+                fs::write(&path, data).unwrap();
+                let path = fs::canonicalize(path).unwrap();
+                let child = HeldTranscript(
+                    Command::new("/bin/sleep")
+                        .arg("30")
+                        .stdin(Stdio::from(File::open(&path).unwrap()))
+                        .spawn()
+                        .unwrap(),
+                );
+                let state = dir.join("state");
+                let reg = Registry::new(None, Some(&state));
+                let id = SessionId(993);
+                reg.agents
+                    .remember_session(
+                        id,
+                        &control::AgentLaunch {
+                            profile: profile.into(),
+                            permission: Permission::Manual,
+                        },
+                        known_id.then(|| sid.into()),
+                        b"/same/project".to_vec(),
+                        None,
+                    )
+                    .unwrap();
+                let (master, _writer) = UnixStream::pair().unwrap();
+                let session = Session::start(
+                    id,
+                    OwnedFd::from(master),
+                    WinSize { cols: 80, rows: 24 },
+                    Arc::clone(&reg.look),
+                    None,
+                )
+                .unwrap();
+                lock(&reg.state).sessions.insert(
+                    id,
+                    Entry {
+                        session,
+                        pid: child.0.id(),
+                        cwd: "/same/project".into(),
+                    },
+                );
+                let snap = reg.chat_poll(id, 0);
+                assert!(snap.bound, "{profile} known_id={known_id}: {snap:?}");
+                assert_eq!(snap.session_id, sid);
+                assert_eq!(Path::new(&snap.transcript_path), path);
+                assert_eq!(snap.items.len(), 1);
+                assert_eq!(snap.items[0].kind, ChatItemKind::Assistant);
+                assert_eq!(snap.items[0].text, "Process owned reply");
+                let stored = reg.agents.stored(id).unwrap().unwrap();
+                assert_eq!(stored.session_id.as_deref(), Some(sid));
+                assert_eq!(
+                    stored.transcript_path.as_deref().map(Path::new),
+                    Some(path.as_path())
+                );
+                assert!(reg.chat_poll(id, snap.next_offset).items.is_empty());
+                // An existing hook identity cannot be overwritten by a different open transcript.
+                reg.agents
+                    .remember_session(
+                        id,
+                        &control::AgentLaunch {
+                            profile: profile.into(),
+                            permission: Permission::Manual,
+                        },
+                        Some("different-conversation".into()),
+                        b"/same/project".to_vec(),
+                        None,
+                    )
+                    .unwrap();
+                let mismatch = reg.chat_poll(id, snap.next_offset);
+                assert!(!mismatch.bound);
+                assert!(mismatch.reset);
+                assert!(mismatch.items.is_empty());
+                assert_eq!(
+                    reg.agents
+                        .stored(id)
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("different-conversation")
+                );
+                drop(child);
+                drop(reg);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+}

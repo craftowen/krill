@@ -16,6 +16,8 @@ pub(crate) struct SwitchWork {
 
 pub(crate) struct SwitchTarget {
     pub account_id: String,
+    pub prepared: bool,
+    pub not_before: Option<std::time::Instant>,
 }
 
 static WORKERS: Mutex<BTreeMap<PathBuf, Weak<SwitchWork>>> = Mutex::new(BTreeMap::new());
@@ -43,6 +45,8 @@ pub(super) fn notify(home: &Path, state: Option<&Path>, events: &[AutoSwitchEven
                 event.provider,
                 SwitchTarget {
                     account_id: event.to_id.clone(),
+                    prepared: false,
+                    not_before: None,
                 },
             );
         }

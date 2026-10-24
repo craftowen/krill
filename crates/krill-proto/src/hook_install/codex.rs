@@ -360,3 +360,6 @@ impl Rpc {
         ))
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;

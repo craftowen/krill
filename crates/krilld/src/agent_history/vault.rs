@@ -361,6 +361,14 @@ fn root_contains_target(dir: &Path, target: &VaultTarget) -> bool {
                     .join("sessions")
                     .join(format!("{}.jsonl", target.id))
                     .is_file()
+                || cand
+                    .join("conversations")
+                    .join(format!("{}.db", target.id))
+                    .is_file()
+                || cand
+                    .join("annotations")
+                    .join(format!("{}.pbtxt", target.id))
+                    .is_file()
         }),
         VaultAgent::OpenCode => {
             for base in opencode_candidate_bases(dir) {
@@ -1091,6 +1099,9 @@ impl Indexer {
                 sidechain = true;
                 return;
             }
+            if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+                return;
+            }
             if id.is_empty()
                 && let Some(s) = v
                     .get("sessionId")
@@ -1160,6 +1171,7 @@ impl Indexer {
                         .or_else(|| v.get("text"))
                         .and_then(Value::as_str)
                         && !c.trim().is_empty()
+                        && !is_injected_user_context(c)
                     {
                         messages.push(("user".to_owned(), c.to_owned()));
                     }
@@ -1332,6 +1344,9 @@ impl Indexer {
                         .get("role")
                         .and_then(Value::as_str)
                         .unwrap_or("user");
+                    if role == "developer" || role == "system" {
+                        return;
+                    }
                     extract_content_messages(role, payload, &mut messages);
                     if role == "user"
                         && first_user.is_empty()
@@ -1381,6 +1396,7 @@ impl Indexer {
                         .or_else(|| payload.get("text"))
                         .and_then(Value::as_str)
                         && !msg.trim().is_empty()
+                        && (role != "user" || !is_injected_user_context(msg))
                     {
                         if role == "user" && first_user.is_empty() {
                             first_user = truncate_chars(&one_line(msg), TITLE_CHARS);
@@ -1415,7 +1431,12 @@ impl Indexer {
                 && !msg.trim().is_empty()
             {
                 let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
-                messages.push((role.to_owned(), msg.to_owned()));
+                if role != "developer"
+                    && role != "system"
+                    && (role != "user" || !is_injected_user_context(msg))
+                {
+                    messages.push((role.to_owned(), msg.to_owned()));
+                }
             }
         });
 
@@ -1987,6 +2008,9 @@ fn extract_summary_field(val: Option<&Value>) -> String {
 }
 
 fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, String)>) {
+    if role == "developer" || role == "system" {
+        return;
+    }
     let content = record
         .get("content")
         .or_else(|| record.get("text"))
@@ -1995,7 +2019,7 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
         return;
     };
     if let Some(s) = content.as_str() {
-        if !s.trim().is_empty() {
+        if !s.trim().is_empty() && (role != "user" || !is_injected_user_context(s)) {
             out.push((role.to_owned(), s.to_owned()));
         }
         return;
@@ -2004,7 +2028,7 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
         let mut text_parts = Vec::new();
         for block in arr {
             if let Some(s) = block.as_str() {
-                if !s.trim().is_empty() {
+                if !s.trim().is_empty() && (role != "user" || !is_injected_user_context(s)) {
                     text_parts.push(s.to_owned());
                 }
                 continue;
@@ -2029,6 +2053,7 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
                 .or_else(|| block.get("content"))
                 .and_then(Value::as_str)
                 && !t.trim().is_empty()
+                && (role != "user" || !is_injected_user_context(t))
             {
                 text_parts.push(t.to_owned());
             }
@@ -2037,6 +2062,53 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
             out.push((role.to_owned(), text_parts.join("\n")));
         }
     }
+}
+
+/// 에이전트 런타임(`codex`·`claude`·`opencode`)이 `role: "user"` 메시지로 주입하는
+/// 시스템 지침·환경 컨텍스트·스킬 본문·이미지 래퍼·알림 블록인지 판별한다.
+pub(crate) fn is_injected_user_context(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with("# AGENTS.md instructions for ")
+        || (trimmed.starts_with("# ")
+            && trimmed.contains("\n<INSTRUCTIONS>")
+            && trimmed.ends_with("</INSTRUCTIONS>"))
+    {
+        return true;
+    }
+    for prefix in [
+        "<INSTRUCTIONS>",
+        "<user_instructions>",
+        "<instructions>",
+        "<environment_context>",
+        "<permissions instructions>",
+        "<collaboration_mode>",
+        "<skills_instructions>",
+        "<multi_agent_role>",
+        "<multi_agent_mode>",
+        "<subagent_notification>",
+        "<task-notification>",
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<command-name>",
+        "<command-message>",
+        "<system-reminder>",
+    ] {
+        if trimmed.starts_with(prefix) {
+            return true;
+        }
+    }
+    if trimmed.starts_with("<skill>\n")
+        || (trimmed.starts_with("<skill>") && trimmed.ends_with("</skill>"))
+        || (trimmed.starts_with("<CONTEXT_SUMMARY>") && trimmed.ends_with("</CONTEXT_SUMMARY>"))
+    {
+        return true;
+    }
+    trimmed == "<image>"
+        || trimmed == "</image>"
+        || (trimmed.starts_with("<image ") && trimmed.ends_with('>'))
 }
 
 pub(super) fn extract_agy_user_request(content: &str) -> String {
@@ -2166,16 +2238,26 @@ pub(crate) fn read_agy_annotation_title(agy_root: &Path, conv_id: &str) -> Optio
     None
 }
 
-fn agy_root_and_id_from_path(path: &Path) -> Option<(PathBuf, String)> {
-    if path.extension().and_then(|e| e.to_str()) == Some("lock")
-        && path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            == Some("presence")
+pub(crate) fn agy_root_and_id_from_path(path: &Path) -> Option<(PathBuf, String)> {
+    if let Some(parent_name) = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
     {
-        let conv_id = path.file_stem()?.to_str()?;
-        if crate::agent::control::valid_session_id(conv_id) {
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let conv_id = match parent_name {
+            "presence" => file_name.strip_suffix(".lock"),
+            "conversations" => file_name
+                .strip_suffix(".db-wal")
+                .or_else(|| file_name.strip_suffix(".db-shm"))
+                .or_else(|| file_name.strip_suffix(".db")),
+            "annotations" => file_name.strip_suffix(".pbtxt"),
+            "sessions" => file_name.strip_suffix(".jsonl"),
+            _ => None,
+        };
+        if let Some(conv_id) = conv_id
+            && crate::agent::control::valid_session_id(conv_id)
+        {
             return Some((path.parent()?.parent()?.to_path_buf(), conv_id.to_owned()));
         }
     }
@@ -2235,7 +2317,7 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
         }
         cur = parent;
     }
-    if fg_pid.is_none_or(|fg| fg == root_pid)
+    if root_pid > 1
         && let Ok(pids) = crate::sys::all_pids()
     {
         for pid in pids {
@@ -2248,6 +2330,18 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
         }
     }
     None
+}
+
+fn agy_transcript_for_conv(agy_root: &Path, conv_id: &str) -> Option<PathBuf> {
+    let conv_dir = agy_root.join("brain").join(conv_id);
+    let logs = conv_dir.join(".system_generated/logs");
+    [
+        logs.join("transcript.jsonl"),
+        logs.join("transcript_full.jsonl"),
+        conv_dir.join("transcript.jsonl"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 fn read_agy_first_user_prompt(agy_root: &Path, conv_id: &str) -> Option<String> {
@@ -2389,20 +2483,16 @@ pub(crate) fn resolve_live_agy_title(
         && !exited
         && let Some((agy_root, conv_id)) = discover_agy_from_pids(root_pid, fg_pid)
     {
-        if stored.is_some_and(|s| s.session_id.is_none()) {
-            let logs = agy_root
-                .join("brain")
-                .join(&conv_id)
-                .join(".system_generated/logs");
-            let tp = [
-                logs.join("transcript.jsonl"),
-                logs.join("transcript_full.jsonl"),
-            ]
-            .into_iter()
-            .find(|p| p.is_file());
+        resolved_pair = Some((agy_root, conv_id));
+    }
+
+    if let Some((ref agy_root, ref conv_id)) = resolved_pair
+        && stored.is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
+    {
+        let tp = agy_transcript_for_conv(agy_root, conv_id);
+        if stored.is_some_and(|s| s.session_id.is_none()) || tp.is_some() {
             discovered_for_store = Some((conv_id.clone(), tp));
         }
-        resolved_pair = Some((agy_root, conv_id));
     }
 
     if resolved_pair.is_none()

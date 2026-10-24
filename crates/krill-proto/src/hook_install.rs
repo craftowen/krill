@@ -371,6 +371,20 @@ pub fn install_hooks(
         .transpose()
 }
 
+/// Trust the exact Krill session-hook `command` in another Codex home, e.g. an account profile.
+/// Codex trusts session hooks per `CODEX_HOME`, so that home's Codex computes the hashes and
+/// persists them through its version-checked writer; stale hashes under the same keys are
+/// replaced. Returns whether it wrote. Callers pass a completed receipt's command (consent)
+/// and a symlink-free `home`; no receipt is written, so the installer's rollback is unchanged.
+pub fn refresh_codex_trust(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<bool> {
+    let mut plan = codex::Plan::install(home, command, search, CodexTrust::Refresh)?;
+    if plan.record.added.is_empty() {
+        return Ok(false);
+    }
+    plan.apply()?;
+    Ok(true)
+}
+
 fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<String> {
     hooks::install_claude_json(before, command)
 }
