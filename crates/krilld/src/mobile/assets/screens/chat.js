@@ -53,7 +53,7 @@ function mountChat(root,opts){
  const pollStatus=el('div',undefined,'chat-actions'),pollText=el('span',undefined,'muted');
  pollStatus.setAttribute('role','status');
  const retryBtn=button(t('Retry'),()=>pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
- const input=el('textarea',undefined,'chat-input');input.rows=2;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
+ const input=el('textarea',undefined,'chat-input');input.rows=1;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
  input.value=drafts.get(sessionId)||'';
  let composing=false,disposed=false,pollTimer=null,inFlight=false,retryWithoutTail=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
  entry.initialized??=entry.offset>0;
@@ -73,10 +73,41 @@ function mountChat(root,opts){
   if(entry.photo||entry.sending)return;
   const picker=el('input');picker.type='file';picker.accept='image/*';
   picker.addEventListener('change',()=>{const f=picker.files?.[0];if(f)preparePhoto(f);});if(M.updates?.pickFile)M.updates.pickFile(picker);else picker.click?.();
- },'ghost small');
- const sendBtn=el('button',t('Send'),'primary small');sendBtn.type='submit';
- const bar=el('div',undefined,'chat-composer-bar');bar.append(attachBtn,sendBtn);
- composer.append(input,attachment,bar);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
+ },'icon-button composer-icon','plus');
+ // Orca 컴포저: 둥근 카드 안에 입력, 아래 줄에 사진(+)·모델·전송(↑)을 둔다.
+ const sendBtn=el('button',undefined,'primary composer-send');sendBtn.type='submit';sendBtn.setAttribute('aria-label',t('Send'));if(ctx.icon)sendBtn.append(ctx.icon('arrowUp'));else sendBtn.textContent=t('Send');
+ const modelBtn=button(t('Model'),()=>chooseModel(),'composer-pill');
+ const bar=el('div',undefined,'chat-composer-bar'),box=el('div',undefined,'chat-composer-box');bar.append(attachBtn,modelBtn,el('span',undefined,'composer-spacer'),sendBtn);
+ box.append(input,bar);composer.append(attachment,box);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
+ // 모델 전환은 에이전트 자체의 /model 명령으로 보낸다. Claude는 별칭으로 바로 바꾸고, Codex·Gemini는 터미널의 선택 화면에서 고른다.
+ const modelChoices={claude:[['default','Default (recommended)'],['opus','Opus'],['sonnet','Sonnet'],['haiku','Haiku']]},modelPicker=new Set(['codex','gemini']);
+ function chatAgent(){return entry.agent||M.sessionAgent?.(state.sessions?.get(sessionId)||{})||'';}
+ function chooseModel(){
+  const agent=chatAgent(),choices=modelChoices[agent];
+  if(choices){ctx.sheet(t('Model'),choices.map(([id,label])=>({label:t(label),action:()=>run(()=>ctx.rpc({action:'prompt',session:sessionId,text:`/model ${id}`}))})),t('Sends /model to {0}.',agentName(agent)));return;}
+  run(async()=>{await ctx.rpc({action:'prompt',session:sessionId,text:'/model'});onSwitchTerm?.();});
+ }
+ function syncAgent(){const agent=chatAgent();modelBtn.hidden=!modelChoices[agent]&&!modelPicker.has(agent);const text=agent?t('Message {0}',agentName(agent)):t('Message agent (Bracketed Paste)…');if(input.placeholder!==text)input.placeholder=text;}
+ function copyText(text,node){
+  run(async()=>{
+   // 클립보드 권한이 거부되면(일부 웹뷰) 선택 복사로 한 번 더 시도한다.
+   let copied=false;if(globalThis.isSecureContext&&navigator.clipboard)copied=await navigator.clipboard.writeText(text).then(()=>true,()=>false);
+   if(!copied){const area=el('textarea');area.value=text;area.setAttribute('readonly','');area.className='copy-buffer';document.body.append(area);area.select();const ok=document.execCommand('copy');area.remove();if(!ok)throw Error(t('Copy is not available in this browser'));}
+   node.replaceChildren(ctx.icon('check'));node.setAttribute('aria-label',t('Copied'));node.dataset.copied='true';
+   setTimeout(()=>{node.replaceChildren(ctx.icon('copy'));node.setAttribute('aria-label',t('Copy'));delete node.dataset.copied;},1500);
+  });
+ }
+ // 오늘은 시각만, 다른 날은 날짜와 시각을 보인다(Orca 메시지 아래 표기).
+ function formatTime(at){
+  if(!at)return '';const date=new Date(/^\d+$/.test(at)?Number(at):at);if(Number.isNaN(date.getTime()))return '';
+  const lang=M.i18n?.language,today=new Date().toDateString()===date.toDateString();
+  return date.toLocaleString(lang,today?{hour:'numeric',minute:'2-digit'}:{month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'});
+ }
+ function messageMeta(item){
+  const meta=el('footer',undefined,'chat-meta'),copy=button(t('Copy'),()=>copyText(item.text,copy),'icon-button chat-copy','copy');meta.append(copy);
+  const when=formatTime(item.at);if(when){const time=el('time',when,'chat-time');time.setAttribute('datetime',new Date(/^\d+$/.test(item.at)?Number(item.at):item.at).toISOString());meta.append(time);}
+  return meta;
+ }
  // act owns product-level error presentation; local operations retain their own visible status.
  function run(fn){if(ctx.act)ctx.act(fn);else Promise.resolve().then(fn).catch(e=>ctx.error?.(e));}
  function updateComposer(sent){
@@ -158,7 +189,7 @@ function mountChat(root,opts){
  function lazyDetails(details,build){if(details.open)build();else details.addEventListener('toggle',()=>{if(details.open&&!details.dataset.loaded){details.dataset.loaded='true';build();}});if(details.open)details.dataset.loaded='true';}
  function renderCard(item,key){
   const kind=item.kind||'assistant',card=el('article',undefined,`chat-card chat-${kind}`);
-  if(kind==='user'||kind==='assistant'){const role=el('header',kind==='user'?t('My request'):t('{0} reply',agentName(entry.agent)||t('Agent')),'chat-role');if(kind==='assistant'&&entry.agent&&agentIcon)role.prepend(agentIcon(entry.agent));card.append(role,renderRichText(el,item.text));}
+  if(kind==='user'||kind==='assistant'){const role=el('header',kind==='user'?t('My request'):t('{0} reply',agentName(entry.agent)||t('Agent')),'chat-role');if(kind==='assistant'&&entry.agent&&agentIcon)role.prepend(agentIcon(entry.agent));card.append(role,renderRichText(el,item.text),messageMeta(item));}
   else if(kind==='reasoning'||kind==='tool_result'){
    const details=el('details',undefined,kind==='reasoning'?'chat-reasoning':'chat-tool-result');
    rememberDetails(details,key);details.append(el('summary',t(kind==='reasoning'?'Reasoning':item.is_error?'Tool error':'Tool output')));lazyDetails(details,()=>details.append(kind==='reasoning'?renderRichText(el,item.text):el('pre',item.text,'chat-code')));card.append(details);
@@ -198,7 +229,9 @@ function mountChat(root,opts){
   });
  }
  function updateStrip(){
-  const sess=state.sessions?.get(sessionId);stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';
+  const sess=state.sessions?.get(sessionId);stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';syncAgent();
+  // 헤더가 연결·모드를 보이므로 하단 줄은 사용자가 답해야 할 때만 띄운다.
+  strip.hidden=!['Waiting','Blocked'].includes(sess?.state);
   stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start,_retainedBytes:JSON.stringify(item).length*2}));}

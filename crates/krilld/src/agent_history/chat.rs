@@ -1162,6 +1162,7 @@ fn file_mtime(path: &Path) -> Option<u64> {
 }
 
 fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) {
+    let start = out.len();
     match agent {
         VaultAgent::Claude => parse_claude_line(v, out),
         VaultAgent::Codex => parse_codex_line(v, out),
@@ -1171,6 +1172,24 @@ fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) 
             parse_opencode_value(v, None, out, &mut remaining);
         }
     }
+    let at = record_time(v);
+    if !at.is_empty() {
+        for item in out.iter_mut().skip(start) {
+            item.at.clone_from(&at);
+        }
+    }
+}
+
+/// 한 레코드의 시각. Claude·Codex는 `timestamp`(RFC 3339), `OpenCode`는 `time.created`(epoch ms)다.
+fn record_time(v: &Value) -> String {
+    if let Some(at) = v.get("timestamp").and_then(Value::as_str) {
+        return bounded(at.trim(), 64);
+    }
+    v.get("time")
+        .and_then(|t| t.get("created"))
+        .and_then(Value::as_u64)
+        .map(|ms| ms.to_string())
+        .unwrap_or_default()
 }
 
 fn parse_claude_line(v: &Value, out: &mut Vec<ChatItem>) {
@@ -2247,6 +2266,32 @@ mod tests {
         assert!(snap_reset.reset);
         assert_eq!(snap_reset.items.len(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_time_is_copied_to_every_item_of_the_record() {
+        let mut out = Vec::new();
+        let claude: Value = serde_json::from_str(
+            r#"{"type":"assistant","timestamp":"2026-10-24T03:48:40.000Z","message":{"role":"assistant","content":[{"type":"text","text":"완료"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        )
+        .unwrap();
+        parse_line_into_items(VaultAgent::Claude, &claude, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|item| item.at == "2026-10-24T03:48:40.000Z"));
+
+        let opencode: Value = serde_json::from_str(
+            r#"{"role":"user","time":{"created":1792813690000},"content":"안녕"}"#,
+        )
+        .unwrap();
+        parse_line_into_items(VaultAgent::OpenCode, &opencode, &mut out);
+        assert_eq!(out.last().unwrap().at, "1792813690000");
+
+        let untimed: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"시각 없음"}}"#,
+        )
+        .unwrap();
+        parse_line_into_items(VaultAgent::Claude, &untimed, &mut out);
+        assert!(out.last().unwrap().at.is_empty());
     }
 
     #[test]
