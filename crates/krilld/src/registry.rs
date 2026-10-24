@@ -139,7 +139,7 @@ pub struct Registry {
     /// `krill hook`의 spool 파일.
     spool: Option<PathBuf>,
     state: Mutex<State>,
-    sidebar: Mutex<sidebar::Cache>,
+    sidebar: Arc<Mutex<sidebar::Cache>>,
     hibernation: Mutex<hibernation::Clock>,
     schedule_minute: Mutex<Option<u64>>,
     git_watch: Mutex<crate::git::watch::Hub>,
@@ -202,7 +202,7 @@ impl Registry {
         let reg = Self {
             app_opened: OnceLock::new(),
             last_gc: Mutex::new(Instant::now()),
-            sidebar: Mutex::default(),
+            sidebar: Arc::default(),
             hibernation: Mutex::default(),
             schedule_minute: Mutex::default(),
             git_watch: Mutex::default(),

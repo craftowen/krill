@@ -373,23 +373,7 @@ impl Catalog {
                 catalog.branches.insert(tree, branch.clone());
             }
         }
-        // PC `infer_repo_main_lineage`: 본체 포함 3개 이상인 저장소는 연결 워크트리를
-        // 본체 아래에 둔다. 명시한 부모와 사이클 방어를 우선한다.
-        for repo in &catalog.repositories {
-            if repo.worktrees.len() < 3 || !repo.worktrees.contains(&repo.repo) {
-                continue;
-            }
-            let parent = path(&repo.repo);
-            for bytes in &repo.worktrees {
-                let child = path(bytes);
-                if child != parent
-                    && !catalog.parents.contains_key(&child)
-                    && can_assign_parent(&catalog.parents, &child, &parent)
-                {
-                    catalog.parents.insert(child, parent.clone());
-                }
-            }
-        }
+        // PC와 같이 같은 저장소의 연결 워크트리는 형제로 두고, 명시한 부모 관계만 중첩한다.
         for tree in catalog.repositories.iter().flat_map(|r| &r.worktrees) {
             let tree = path(tree);
             if let Some(branch) = read(&git_dir(&tree).join("HEAD"), 4096)
@@ -745,9 +729,9 @@ branch = "task/my-feature"
             Some(PathBuf::from("/repo/feature"))
         );
         assert!(catalog.cwd("unregistered").is_none());
-        // PC와 같이 본체 포함 3개부터 하위 워크트리를 깊이 1로 묶는다.
+        // PC와 같이 명시한 부모가 없으면 같은 저장소의 워크트리는 형제(깊이 0)다.
         for row in &rows {
-            assert_eq!(row["depth"], u64::from(row["path"] != "/repo"));
+            assert_eq!(row["depth"], 0);
             assert!(row["primary"].is_boolean());
             assert!(row.get("icon").is_some() && row.get("badge_color").is_some());
         }
@@ -931,7 +915,7 @@ value = "🚀"
     }
 
     #[test]
-    fn inferred_worktree_parents_match_desktop_and_keep_explicit_parents() {
+    fn worktrees_stay_siblings_like_desktop_and_keep_explicit_parents() {
         let dir = std::env::temp_dir().join(format!("krill-ws-inferred-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -957,7 +941,7 @@ value = "🚀"
             .collect();
         assert_eq!(
             depths,
-            vec![("/r", 0), ("/r/a", 1), ("/r/b", 2), ("/s", 0), ("/s/a", 0)]
+            vec![("/r", 0), ("/r/a", 0), ("/r/b", 1), ("/s", 0), ("/s/a", 0)]
         );
         fs::remove_dir_all(dir).unwrap();
     }

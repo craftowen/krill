@@ -32,7 +32,7 @@ use crate::ui::status::{self, Size};
 /// 카드 테두리 2 + 안쪽 여백 10 − 세션 행 바깥 여백 4.
 const CARD_SESSION_INSET: f32 = 8.;
 /// 폴더 행의 아이콘 아래에 세션 상태를 정렬한다(이름 아래로 중복 들여쓰지 않는다).
-const FOLDER_SESSION_INSET: f32 = 8.;
+const FOLDER_SESSION_INSET: f32 = 34.;
 
 #[derive(Clone)]
 struct TreeMenuMeta {
@@ -619,6 +619,9 @@ impl Sidebar {
                     d.bg(p.worktree_sidebar)
                         .border_color(p.sidebar_ring.opacity(0.65))
                 })
+                .when(depth > 0 && !active, |d| {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                })
                 .child(session)
                 .when(last && self.row_host(parent).is_local(), |d| {
                     d.children(
@@ -642,6 +645,9 @@ impl Sidebar {
             .when(self.worktree_card_active(parent, path), |d| {
                 d.bg(p.worktree_sidebar)
                     .border_color(p.sidebar_ring.opacity(0.65))
+            })
+            .when(depth > 0 && !self.worktree_card_active(parent, path), |d| {
+                d.border_l_2().border_color(p.worktree_sidebar_border)
             })
     }
 
@@ -707,7 +713,6 @@ impl Sidebar {
         };
         let repo_heading = |d: gpui::Stateful<gpui::Div>| {
             d.h(ui::SIDEBAR_HEADER_HEIGHT)
-                .mt_2()
                 .px_2()
                 .mx_1()
                 .rounded(ui::RADIUS_SM)
@@ -961,35 +966,6 @@ impl Sidebar {
                 .aria_label(text::SESSIONS.get())
                 .child(Icon::new(IconName::SquareTerminal).xsmall())
                 .child(text::SESSIONS.get()),
-            Row::OfflineHosts(n) => {
-                let label = text::HOST_OFFLINE_GROUP.format(&[("n", &n.to_string())]);
-                let open = self.show_offline_hosts;
-                heading(base)
-                    .debug_selector(|| "host-offline-group".into())
-                    .aria_label(label.clone())
-                    .aria_expanded(open)
-                    .cursor_pointer()
-                    .pl_1()
-                    .pr_1p5()
-                    .text_color(p.muted_foreground)
-                    .hover(|d| {
-                        d.bg(p.sidebar_accent)
-                            .text_color(p.sidebar_accent_foreground)
-                    })
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .xsmall(),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        s.cursor = Some(index);
-                        s.toggle_offline_hosts(None, cx);
-                    }))
-            }
             Row::Repository(path) => {
                 let repo = path.clone();
                 let fold_btn = path.clone();
@@ -1021,6 +997,26 @@ impl Sidebar {
                             .text_color(p.sidebar_accent_foreground)
                     })
                     .child(
+                        Button::new(("repo-fold", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(if closed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if closed {
+                                text::UNFOLD.get()
+                            } else {
+                                text::FOLD.get()
+                            })
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                cx.stop_propagation();
+                                s.cursor = Some(index);
+                                s.fold(&fold_btn, None, cx);
+                            })),
+                    )
+                    .child(
                         div()
                             .debug_selector(move || format!("repo-icon-{index}"))
                             .child(ui::icons::project_header_icon(
@@ -1047,42 +1043,21 @@ impl Sidebar {
                                 basename(path)
                             }),
                     )
-                    .when(closed && wt_count > 0, |d| {
+                    .when(wt_count > 0, |d| {
                         d.child(
                             div()
                                 .debug_selector(move || format!("repo-count-{index}"))
                                 .flex_none()
+                                .px_1()
+                                .rounded(ui::RADIUS_XS)
+                                .bg(p.muted)
+                                .font_family(ui::FONT_MONO)
                                 .text_size(ui::TEXT_2XS)
                                 .text_color(p.muted_foreground)
                                 .child(wt_count.to_string()),
                         )
                     })
                     .child(self.project_host_control(index, &row_host, cx))
-                    .child(
-                        div()
-                            .invisible()
-                            .group_hover(ROW_GROUP, Styled::visible)
-                            .child(
-                                Button::new(("repo-fold", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(if closed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .accessibility_label(if closed {
-                                        text::UNFOLD.get()
-                                    } else {
-                                        text::FOLD.get()
-                                    })
-                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                        cx.stop_propagation();
-                                        s.cursor = Some(index);
-                                        s.fold(&fold_btn, None, cx);
-                                    })),
-                            ),
-                    )
                     .when(row_host.is_local(), |d| {
                         d.child(
                             div()
@@ -1142,6 +1117,26 @@ impl Sidebar {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
+                    .child(
+                        Button::new(("folder-fold", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(if closed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if closed {
+                                text::UNFOLD.get()
+                            } else {
+                                text::FOLD.get()
+                            })
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                cx.stop_propagation();
+                                s.cursor = Some(index);
+                                s.fold(&fold_btn, None, cx);
+                            })),
+                    )
                     .child(ui::icons::project_header_icon(
                         row_host
                             .is_local()
@@ -1167,31 +1162,6 @@ impl Sidebar {
                             }),
                     )
                     .child(self.project_host_control(index, &row_host, cx))
-                    .child(
-                        div()
-                            .invisible()
-                            .group_hover(ROW_GROUP, Styled::visible)
-                            .child(
-                                Button::new(("folder-fold", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(if closed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .accessibility_label(if closed {
-                                        text::UNFOLD.get()
-                                    } else {
-                                        text::FOLD.get()
-                                    })
-                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                        cx.stop_propagation();
-                                        s.cursor = Some(index);
-                                        s.fold(&fold_btn, None, cx);
-                                    })),
-                            ),
-                    )
                     .child(
                         div()
                             .invisible()
@@ -1526,7 +1496,7 @@ impl Sidebar {
             .min_w_0()
             .truncate()
             .text_size(title_size)
-            .font_weight(gpui::FontWeight::NORMAL)
+            .font_weight(gpui::FontWeight::SEMIBOLD)
             .child(card_title)
             .into_any_element()
     }
@@ -1662,19 +1632,19 @@ impl Sidebar {
         {
             custom.to_owned()
         } else if is_default_tree {
-            custom_name.unwrap_or(&folder_name).to_owned()
+            raw_branch.unwrap_or(&folder_name).to_owned()
         } else if let Some(b) =
             raw_branch.filter(|b| !krill_proto::git::is_default_branch_or_worktree_name(b))
         {
-            b.rsplit('/').next().unwrap_or(b).to_owned()
+            b.rsplit('/').next().unwrap_or(b).replace('-', " ")
         } else if let Some(auto) = auto_title {
             auto.to_owned()
         } else if let Some(custom) = custom_name {
             custom.to_owned()
         } else if let Some(b) = raw_branch {
-            b.rsplit('/').next().unwrap_or(b).to_owned()
+            b.rsplit('/').next().unwrap_or(b).replace('-', " ")
         } else {
-            folder_name.clone()
+            folder_name.replace('-', " ")
         };
         let branch_subtitle = raw_branch.map_or_else(|| folder_name, str::to_owned);
         let dirty = self
@@ -1860,7 +1830,11 @@ impl Sidebar {
         });
 
         let props = self.options.card_properties;
-        let show_branch_subtitle = props.branch && !branch_subtitle.is_empty();
+        let show_branch_subtitle = props.branch
+            && !branch_subtitle.is_empty()
+            && !card_title
+                .trim()
+                .eq_ignore_ascii_case(branch_subtitle.trim());
         let pr_badge = props
             .pr
             .then(|| {
@@ -2220,7 +2194,7 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .child(self.card_title_el(path, card_title, ui::TEXT_MD, index, cx))
+                            .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
                             .when(is_default_tree && !is_editing_this, |d| {
                                 d.child(
                                     div()
@@ -2285,7 +2259,7 @@ impl Sidebar {
                                             .w_full()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(ui::TEXT_SM)
+                                            .text_size(ui::TEXT_XS)
                                             .text_color(p.muted_foreground)
                                             .child(branch_subtitle),
                                     )
@@ -2440,7 +2414,11 @@ impl Sidebar {
                                         .border_1()
                                         .border_color(p.worktree_sidebar_border)
                                         .when(card_expanded, |d| d.border_b_0().rounded_b_none())
-                                        .bg(p.sidebar_accent.opacity(0.25))
+                                        .bg(if is_active_worktree {
+                                            p.sidebar.opacity(0.75)
+                                        } else {
+                                            p.sidebar_accent.opacity(0.65)
+                                        })
                                         .hover(|d| d.bg(p.sidebar_accent))
                                         .flex()
                                         .items_center()
@@ -2521,8 +2499,14 @@ impl Sidebar {
                     .border_color(p.sidebar_ring.opacity(0.65))
             })
             .when(!is_active_worktree, |d| {
-                d.border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)))
+                let d = d
+                    .border_color(ui::TRANSPARENT)
+                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
+                if lineage_depth > 0 {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                } else {
+                    d
+                }
             })
             .text_color(p.worktree_sidebar_foreground)
             .cursor_pointer()

@@ -171,7 +171,6 @@ pub(super) fn row_id(host: &HostId, row: &Row) -> SharedString {
         Row::Session(session, nested) => format!("session/{}/{nested}", session.id.0),
         Row::NeedsYou => "needs-you".into(),
         Row::Loose => "loose".into(),
-        Row::OfflineHosts(_) => "offline-hosts".into(),
     };
     format!("{host:?}/{identity}").into()
 }
@@ -187,7 +186,6 @@ pub(super) fn same_item(a: &Row, b: &Row) -> bool {
         (Row::Session(a, nested_a), Row::Session(b, nested_b)) => {
             a.id == b.id && nested_a == nested_b
         }
-        (Row::OfflineHosts(_), Row::OfflineHosts(_)) => true,
         _ => a == b,
     }
 }

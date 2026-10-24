@@ -16,7 +16,15 @@ pub(super) struct Cache {
     trees: BTreeMap<PathBuf, (Instant, Option<Vec<u8>>)>,
     repositories: BTreeMap<Vec<u8>, (Instant, RepositoryTrees)>,
     inflight: BTreeMap<PathBuf, Arc<Discovery>>,
+    /// cwd별 백그라운드 조회. 요청 스레드는 파일·git IO를 직접 하지 않고 시한까지만 기다린다.
+    lookups: BTreeMap<PathBuf, Arc<Discovery>>,
+    /// 조회가 시한을 넘길 때 돌려줄 cwd별 마지막 결과.
+    last: BTreeMap<PathBuf, RepositoryTrees>,
 }
+
+/// 한 사이드바 요청이 저장소 조회를 기다리는 최대 시간. 앱 읽기 시한(5초)보다 충분히 짧아야 한다.
+/// 파일 열기가 멈춰도(예: macOS 개인정보 보호 확인 지연) 응답은 이 안에 나간다.
+const LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 enum DiscoveryResult {
@@ -33,9 +41,10 @@ struct Discovery {
 }
 
 pub(super) fn snapshot(
-    cache: &Mutex<Cache>,
+    cache: &Arc<Mutex<Cache>>,
     entries: &[(SessionId, u32, Option<crate::session::Tap>)],
 ) -> Result<SidebarData, Failure> {
+    let deadline = Instant::now() + LOOKUP_BUDGET;
     let mut sessions = Vec::new();
     let mut repositories = BTreeMap::new();
     let mut bytes = 0usize;
@@ -59,7 +68,7 @@ pub(super) fn snapshot(
                 .map_or_else(Vec::new, |p| p.as_os_str().as_bytes().to_vec()),
         });
         if let Some(path) = path
-            && let Some(trees) = discover_cached(cache, &path)
+            && let Some(trees) = lookup(cache, &path, deadline)
             && !repositories.contains_key(&trees.repo)
         {
             bytes += trees.repo.len() + trees.worktrees.iter().map(Vec::len).sum::<usize>();
@@ -87,28 +96,98 @@ pub(super) fn snapshot(
     cache
         .repositories
         .retain(|repo, _| reachable.contains(repo));
+    let Cache {
+        directories, last, ..
+    } = &mut *cache;
+    last.retain(|path, _| directories.values().any(|p| p == path));
     Ok(SidebarData {
         sessions,
         repositories: repositories.into_values().collect(),
     })
 }
 
+/// 3초 안의 캐시가 있으면 IO 없이 돌려준다. 바깥 `None`은 캐시 없음, 안쪽 `None`은 저장소가 아님이다.
+#[expect(
+    clippy::option_option,
+    reason = "캐시 없음과 '저장소 아님' 캐시를 구분한다"
+)]
+fn fresh(cache: &Cache, path: &Path) -> Option<Option<RepositoryTrees>> {
+    let (at, repo) = cache.trees.get(path)?;
+    if at.elapsed() >= Duration::from_secs(3) {
+        return None;
+    }
+    let Some(repo) = repo else {
+        return Some(None);
+    };
+    let (at, trees) = cache.repositories.get(repo)?;
+    (at.elapsed() < Duration::from_secs(3)).then(|| Some(trees.clone()))
+}
+
+/// 요청 스레드용 조회. 파일·git IO는 cwd당 하나의 백그라운드 스레드가 맡고, 여기서는 `deadline`까지만
+/// 기다린다. 시한을 넘기면 마지막 결과를 돌려줘 응답이 막히거나 스레드가 쌓이지 않게 한다.
+fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<RepositoryTrees> {
+    let flight = {
+        let mut state = lock(cache);
+        if let Some(hit) = fresh(&state, path) {
+            return hit;
+        }
+        if let Some(flight) = state.lookups.get(path) {
+            Arc::clone(flight)
+        } else {
+            let flight = Arc::new(Discovery::default());
+            let (shared, owned, done) = (Arc::clone(cache), path.to_owned(), Arc::clone(&flight));
+            let spawned = std::thread::Builder::new()
+                .name("krilld-sidebar-lookup".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        discover_cached(&shared, &owned)
+                    }))
+                    .ok()
+                    .flatten();
+                    {
+                        let mut state = lock(&shared);
+                        state.lookups.remove(&owned);
+                        match &result {
+                            Some(trees) => state.last.insert(owned, trees.clone()),
+                            None => state.last.remove(&owned),
+                        };
+                    }
+                    *lock(&done.result) = DiscoveryResult::Ready(result);
+                    done.ready.notify_all();
+                });
+            if spawned.is_err() {
+                return state.last.get(path).cloned();
+            }
+            state.lookups.insert(path.to_owned(), Arc::clone(&flight));
+            flight
+        }
+    };
+    let mut result = lock(&flight.result);
+    while matches!(*result, DiscoveryResult::Pending) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            drop(result);
+            return lock(cache).last.get(path).cloned();
+        };
+        result = flight
+            .ready
+            .wait_timeout(result, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    match &*result {
+        DiscoveryResult::Ready(trees) => trees.clone(),
+        DiscoveryResult::Pending => None,
+    }
+}
+
+/// 차단 조회(백그라운드 스레드 전용). 같은 저장소의 여러 cwd는 한 번의 git 호출을 공유한다.
 fn discover_cached(cache: &Mutex<Cache>, path: &Path) -> Option<RepositoryTrees> {
+    if let Some(hit) = fresh(&lock(cache), path) {
+        return hit;
+    }
     let key = repository_key(path);
     let (flight, owner) = {
         let mut cache = lock(cache);
-        if let Some((at, repo)) = cache.trees.get(path)
-            && at.elapsed() < Duration::from_secs(3)
-        {
-            if repo.is_none() {
-                return None;
-            }
-            if let Some((at, trees)) = repo.as_ref().and_then(|repo| cache.repositories.get(repo))
-                && at.elapsed() < Duration::from_secs(3)
-            {
-                return Some(trees.clone());
-            }
-        }
         if let Some(flight) = cache.inflight.get(&key) {
             lock(&flight.paths).insert(path.to_owned());
             (Arc::clone(flight), false)
@@ -347,7 +426,7 @@ mod tests {
 
     #[test]
     fn scoped_metadata_cannot_leak_cached_sessions() {
-        let cache = Mutex::new(Cache::default());
+        let cache = Arc::new(Mutex::new(Cache::default()));
         lock(&cache)
             .directories
             .insert(SessionId(1), PathBuf::from("/does-not-exist/one"));
@@ -375,6 +454,30 @@ mod tests {
 #[cfg(test)]
 mod concurrency_tests {
     use super::*;
+    #[test]
+    fn a_stuck_lookup_answers_within_the_deadline_with_the_last_result() {
+        let path = PathBuf::from("/krill-sidebar-stuck-lookup-not-a-repository");
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let stuck = Arc::new(Discovery::default());
+        let last = RepositoryTrees {
+            repo: b"/repo".to_vec(),
+            worktrees: vec![b"/repo".to_vec()],
+        };
+        {
+            let mut state = lock(&cache);
+            state.lookups.insert(path.clone(), Arc::clone(&stuck));
+            state.last.insert(path.clone(), last.clone());
+        }
+        let started = Instant::now();
+        let got = lookup(&cache, &path, started + Duration::from_millis(50));
+        assert_eq!(got, Some(last));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // 같은 cwd의 다음 요청도 새 조회 스레드를 만들지 않고 진행 중인 조회를 기다린다.
+        assert!(Arc::ptr_eq(
+            lock(&cache).lookups.get(&path).unwrap(),
+            &stuck
+        ));
+    }
     #[test]
     fn an_old_discovery_waiter_cannot_replace_a_newer_cache_or_refresh_its_ttl() {
         let path = PathBuf::from("/krill-sidebar-old-waiter-not-a-repository");
