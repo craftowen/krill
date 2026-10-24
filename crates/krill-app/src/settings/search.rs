@@ -75,6 +75,11 @@ mod tests {
             "done",
             "테스트 알림",
             "test",
+            "스타",
+            "응원",
+            "star",
+            "github",
+            "support",
         ] {
             assert!(search_tabs(q).contains(&AdminTab::General), "{q}");
         }

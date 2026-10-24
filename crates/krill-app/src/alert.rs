@@ -284,12 +284,13 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
     let mut to_show: Vec<(SessionId, SystemNotification)> = Vec::new();
     let mut to_dismiss: Vec<SessionId> = Vec::new();
 
-    {
+    let star_nag_observation = {
         let state = cx.global_mut::<AlertState>();
         let initialized = state.initialized;
         let mut present = HashSet::with_capacity(snapshot.sessions.len());
         let mut needs_you = 0usize;
         let mut working = 0usize;
+        let mut transitioned_to_done = false;
 
         for session in &snapshot.sessions {
             present.insert(session.id);
@@ -327,6 +328,16 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                 AgentState::Done => {
                     let key = (session.status.state, session.status.since_unix_ns);
                     let is_worker = state.orchestration_workers.contains(&session.id);
+                    if initialized
+                        && prev.is_some_and(|old| {
+                            matches!(
+                                old,
+                                AgentState::Working | AgentState::Waiting | AgentState::Blocked
+                            )
+                        })
+                    {
+                        transitioned_to_done = true;
+                    }
                     // Working→Done뿐 아니라 Waiting·Blocked→Done(폴링 사이 전이)도 알린다.
                     // 같은 Done 스냅샷 반복은 notified 기록으로 걸러진다.
                     if prev.is_some_and(|old| old != AgentState::Done)
@@ -374,7 +385,10 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
         state.initialized = true;
         state.needs_you_count = needs_you;
         state.working_count = working;
-    }
+        (working > 0 || needs_you > 0, transitioned_to_done)
+    };
+    let (any_active, transitioned_to_done) = star_nag_observation;
+    crate::star_nag::observe_agent_activity(any_active, transitioned_to_done, cx);
 
     for id in to_dismiss {
         crate::onboarding::actions::dismiss_notification(&pane_tag(id), cx);
@@ -393,6 +407,7 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
 /// 명시적인 On 모드는 세션 수와 관계없이 사용자의 설정을 따른다.
 pub fn disconnected(cx: &mut App) {
     ensure_state(cx);
+    crate::star_nag::cancel_agent_value_moment(cx);
     let tags = {
         let state = cx.global_mut::<AlertState>();
         state.initialized = false;

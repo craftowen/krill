@@ -6046,7 +6046,7 @@ impl Render for Shell {
             };
             Some(match root {
                 Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
-                None => Self::render_empty_workspace(cx),
+                None => self.render_empty_workspace(cx),
             })
         };
         let center_diff = if self.page_open() {
@@ -6641,7 +6641,9 @@ impl Shell {
         }
     }
 
-    fn render_empty_workspace(cx: &mut Context<Self>) -> AnyElement {
+    fn render_empty_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        krill_app::star_nag::ensure_checked(cx);
+        let has_projects = self.sidebar.read(cx).has_projects();
         let p = krill_app::ui::palette(cx);
         let action_row = |id: &'static str, label: &'static str, shortcut: &'static str| {
             div()
@@ -6664,6 +6666,7 @@ impl Shell {
         div()
             .id("empty-workspace")
             .debug_selector(|| "empty-workspace".into())
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -6736,6 +6739,7 @@ impl Shell {
                         })),
                     ),
             )
+            .children(krill_app::star_nag::landing_star_pill(has_projects, cx))
             .into_any_element()
     }
 

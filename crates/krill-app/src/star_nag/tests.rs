@@ -185,3 +185,172 @@ fn star_without_gh_opens_web_and_defers(cx: &mut gpui::TestAppContext) {
     assert_eq!(state.next_threshold, INITIAL_THRESHOLD * 2);
     assert!(state.deferred_until > now());
 }
+
+#[test]
+fn parse_gh_starred_output_distinguishes_three_states() {
+    assert_eq!(
+        parse_gh_starred_output(true, b"HTTP/2.0 204 No Content\r\n", b""),
+        Some(true)
+    );
+    assert_eq!(
+        parse_gh_starred_output(
+            false,
+            b"HTTP/2.0 404 Not Found\r\n",
+            b"gh: Not Found (HTTP 404)"
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        parse_gh_starred_output(false, b"", b"gh: Not Found (HTTP 404)\n"),
+        Some(false)
+    );
+    assert_eq!(
+        parse_gh_starred_output(false, b"", b"error connecting to api.github.com"),
+        None
+    );
+}
+
+#[gpui::test]
+fn gh_mode_direct_star_succeeds_or_falls_back_to_web_mode(cx: &mut gpui::TestAppContext) {
+    let dir = temp_dir("gh-mode");
+    let mut s = fresh(env!("CARGO_PKG_VERSION"));
+    s.total = INITIAL_THRESHOLD - 1;
+    save(&dir, &s).unwrap();
+    cx.update(gpui_component::init);
+    cx.update(|cx| init(dir.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        cx.global_mut::<StarNag>().mock_gh = Some((Some(false), false));
+    });
+    let (_host, cx) = cx.add_window_view(|_, _| Host);
+
+    cx.update(|_, cx| record_agent_start(cx));
+    cx.run_until_parked();
+    assert_eq!(nag(cx).1, Card::Shown);
+    cx.update(|_, cx| {
+        let n = cx.global::<StarNag>();
+        assert_eq!(n.mode, Mode::Gh);
+        assert_eq!(n.repo_star, RepoStar::NotStarred);
+    });
+
+    // Direct star failure switches card to Mode::Web instead of auto-opening browser.
+    click("star-nag-star", cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let n = cx.global::<StarNag>();
+        assert_eq!(n.card, Card::Shown);
+        assert_eq!(n.mode, Mode::Web);
+        assert_eq!(n.repo_star, RepoStar::WebFallback);
+        assert!(!n.state.completed);
+    });
+
+    // Now test direct star success when Mode::Gh succeeds.
+    cx.update(|_, cx| {
+        let n = cx.global_mut::<StarNag>();
+        n.mode = Mode::Gh;
+        n.repo_star = RepoStar::NotStarred;
+        n.mock_gh = Some((Some(false), true));
+    });
+    click("star-nag-star", cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let n = cx.global::<StarNag>();
+        assert!(n.state.completed);
+        assert_eq!(n.repo_star, RepoStar::Starred);
+        assert_eq!(n.card, Card::Thanks);
+    });
+    cx.background_executor.advance_clock(THANKS_FOR);
+    cx.run_until_parked();
+    assert_eq!(nag(cx).1, Card::Hidden);
+}
+
+#[gpui::test]
+fn agent_value_moment_shows_once_per_version_after_quiet_delay(cx: &mut gpui::TestAppContext) {
+    let dir = temp_dir("value-moment");
+    cx.update(gpui_component::init);
+    cx.update(|cx| init(dir.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        cx.global_mut::<StarNag>().mock_gh = Some((Some(false), true));
+    });
+    let (_host, cx) = cx.add_window_view(|_, _| Host);
+
+    // Trigger value moment, then cancel by becoming active before delay finishes.
+    cx.update(|_, cx| observe_agent_activity(false, true, cx));
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.update(|_, cx| observe_agent_activity(true, false, cx));
+    cx.background_executor.advance_clock(VALUE_MOMENT_DELAY);
+    cx.run_until_parked();
+    assert_eq!(nag(cx).1, Card::Hidden);
+
+    // Trigger value moment and stay idle for 1200ms -> card shows once for this version.
+    cx.update(|_, cx| observe_agent_activity(false, true, cx));
+    cx.background_executor.advance_clock(VALUE_MOMENT_DELAY);
+    cx.run_until_parked();
+    let (state, shown) = nag(cx);
+    assert_eq!(shown, Card::Shown);
+    assert_eq!(
+        state.agent_value_moment_app_version,
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+struct SurfaceHost {
+    has_projects: bool,
+}
+impl Render for SurfaceHost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .size_full()
+            .children(landing_star_pill(self.has_projects, cx))
+            .child(settings_support_control(cx))
+    }
+}
+
+#[gpui::test]
+fn landing_pill_and_settings_support_share_star_state(cx: &mut gpui::TestAppContext) {
+    let dir = temp_dir("surfaces");
+    cx.update(gpui_component::init);
+    cx.update(|cx| init(dir.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        cx.global_mut::<StarNag>().mock_gh = Some((Some(false), true));
+        ensure_checked(cx);
+    });
+    let (host, cx) = cx.add_window_view(|_, _| SurfaceHost {
+        has_projects: false,
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("landing-star-pill").is_some());
+    assert!(cx.debug_bounds("settings-star-github").is_some());
+    assert!(cx.debug_bounds("settings-star-thanks").is_none());
+
+    // Clicking settings star button stars via gh and updates both settings and landing pill.
+    click("settings-star-github", cx);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-star-thanks").is_some());
+    assert!(cx.debug_bounds("landing-star-pill").is_some());
+    assert!(nag(cx).0.completed);
+
+    // Clicking starred landing pill opens Hide menu; clicking Hide dismisses the pill.
+    click("landing-star-pill", cx);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("landing-star-hide").is_some());
+    click("landing-star-hide", cx);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("landing-star-pill").is_none());
+
+    // When unhidden and has_projects is true while Starred, landing pill is hidden automatically.
+    cx.update(|_, cx| {
+        cx.global_mut::<StarNag>().landing_hidden = false;
+        host.update(cx, |h, cx| {
+            h.has_projects = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("landing-star-pill").is_none());
+}
