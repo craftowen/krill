@@ -940,6 +940,7 @@ impl SettingsView {
                     )
                     .child(qr_box),
             )
+            .child(home_guide(p))
             .child(actions)
             .children(self.mobile.error.clone().map(|error| {
                 crate::ui::error_banner(p, error)
@@ -1120,6 +1121,54 @@ impl SettingsView {
                 ),
             )
     }
+}
+
+/// 홈 화면 추가 안내. 모바일 웹은 standalone 매니페스트를 갖고 있어
+/// 홈 화면 아이콘으로 열면 주소창 없이 앱처럼 뜬다.
+fn home_guide(p: &crate::ui::Palette) -> gpui::Stateful<gpui::Div> {
+    let step = |label: &'static str| {
+        div()
+            .text_size(crate::ui::TEXT_XS)
+            .text_color(p.foreground)
+            .child(label)
+    };
+    div()
+        .id("mobile-page-home-guide")
+        .debug_selector(|| "mobile-page-home-guide".into())
+        .p_3()
+        .rounded(crate::ui::RADIUS_MD)
+        .border_1()
+        .border_color(p.border)
+        .bg(p.background)
+        .flex()
+        .gap_3()
+        .child(div().flex_none().pt_0p5().child(crate::ui::icons::svg_icon(
+            crate::ui::icons::SMARTPHONE_SVG,
+            crate::ui::ICON_LG,
+            p.muted_foreground,
+        )))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_SM)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(text::PAGE_HOME_TITLE.get()),
+                )
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::PAGE_HOME_DESC.get()),
+                )
+                .child(step(text::PAGE_HOME_IOS.get()))
+                .child(step(text::PAGE_HOME_ANDROID.get())),
+        )
 }
 
 /// 기기 행 상태 줄. 오프라인 표기는 `OFFLINE`을 쓰고(`PAIRED` 중복 금지),
