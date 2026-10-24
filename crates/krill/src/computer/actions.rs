@@ -9,27 +9,34 @@ use std::io::Read as _;
 use krill_proto::input::MAX_INPUT;
 
 use super::engine::{
-    ActionResultPayload, AppSummary, ClipboardMetadata, LiveAction, LiveActionOutcome, Point,
-    VerificationMetadata, WindowSummary, execute_live_action, index_and_render_tree, load_mock_env,
-    matches_app_selector, mutate_element_by_ref, mutate_focused_element, normalize_key_name,
-    normalize_modifier_name, parse_hotkey_chord, read_system_clipboard, save_mock_env,
-    write_system_clipboard,
+    ActionResultPayload, AppSummary, Cleanup, ClipboardMetadata, Delivery, LiveAction,
+    LiveActionOutcome, Point, VerificationMetadata, WindowSummary, execute_live_action,
+    index_and_render_tree, load_mock_env, matches_app_selector, mutate_element_by_ref,
+    normalize_key_name, normalize_modifier_name, parse_hotkey_chord, save_mock_env,
+    validate_mock_target,
 };
 use super::{
-    CliError, CommonWindowOpts, ensure_current_snapshot, parse_element_ref, parse_f64, parse_usize,
-    print_action_result, take_val, try_parse_common_opt,
+    CliError, CommonWindowOpts, ensure_current_snapshot, observe_after_action, parse_element_ref,
+    parse_f64, parse_usize, print_action_result, take_val, try_parse_common_opt,
 };
 
-fn verification_from_outcome(outcome: &LiveActionOutcome) -> VerificationMetadata {
+pub(super) fn verification_from_outcome(outcome: &LiveActionOutcome) -> VerificationMetadata {
     VerificationMetadata {
-        status: outcome.status.clone(),
+        status: if outcome.delivery == Delivery::Submitted && outcome.ok {
+            outcome.status.clone()
+        } else {
+            "unverified".to_owned()
+        },
         reason: outcome.reason.clone(),
         retried: false,
     }
 }
 
 pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut element: Option<usize> = None;
     let mut x: Option<f64> = None;
     let mut y: Option<f64> = None;
@@ -67,8 +74,10 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
             "--click-count" => {
                 let raw = take_val(args, &mut i, "--click-count")?;
                 click_count = parse_usize(&raw, "--click-count")?;
-                if click_count == 0 {
-                    return Err(CliError::Usage("--click-count must be >= 1".to_owned()));
+                if click_count == 0 || click_count > 16 {
+                    return Err(CliError::Usage(
+                        "--click-count must be between 1 and 16".to_owned(),
+                    ));
                 }
             }
             "--modifiers" => {
@@ -134,6 +143,11 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
             .window
             .as_ref()
             .is_some_and(|w| !w.bounds.contains(pt));
+        if out_of_bounds {
+            return Err(CliError::Runtime(
+                "target coordinates are outside original window bounds".to_owned(),
+            ));
+        }
         let out = record_mock_or_live_action(
             selector,
             Some(&before.app),
@@ -155,12 +169,12 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
         VerificationMetadata {
             status: "unverified".to_owned(),
             reason: Some("target coordinates are outside window bounds".to_owned()),
-            retried: true,
+            retried: false,
         }
     } else {
         verification_from_outcome(&outcome)
     };
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!("button={button} count={click_count}")];
     if let Some(note) = outcome.note {
         notes.push(note);
@@ -171,7 +185,11 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
         verification,
         target_reference_id: element,
         target_point,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -179,7 +197,10 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_secondary_action(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut element: Option<usize> = None;
     let mut action_name = "AXShowMenu".to_owned();
     let mut i = 0;
@@ -226,7 +247,7 @@ pub(super) fn cmd_secondary_action(args: &[String]) -> Result<(), CliError> {
             action_name: action_name.clone(),
         },
     )?;
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!("axAction={action_name}")];
     if let Some(note) = outcome.note.clone() {
         notes.push(note);
@@ -237,7 +258,11 @@ pub(super) fn cmd_secondary_action(args: &[String]) -> Result<(), CliError> {
         verification: verification_from_outcome(&outcome),
         target_reference_id: Some(ref_id),
         target_point: pt,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -245,7 +270,10 @@ pub(super) fn cmd_secondary_action(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut element: Option<usize> = None;
     let mut x: Option<f64> = None;
     let mut y: Option<f64> = None;
@@ -305,6 +333,11 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
             }
         }
     }
+    if delta_x.abs() > 10_000.0 || delta_y.abs() > 10_000.0 {
+        return Err(CliError::Usage(
+            "scroll delta must be within 10000 logical units per axis".to_owned(),
+        ));
+    }
     if delta_x == 0.0 && delta_y == 0.0 {
         return Err(CliError::Usage(
             "scroll requires non-zero --delta-x/--delta-y or --direction".to_owned(),
@@ -330,12 +363,13 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
         before.window.as_ref(),
         &format!("scroll:{delta_x:.1},{delta_y:.1}"),
         &LiveAction::Scroll {
+            target_ref: element,
             point: target_point,
             delta_x,
             delta_y,
         },
     )?;
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!("delta=({delta_x:.1}, {delta_y:.1})")];
     if let Some(note) = outcome.note.clone() {
         notes.push(note);
@@ -346,7 +380,11 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
         verification: verification_from_outcome(&outcome),
         target_reference_id: element,
         target_point,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -354,7 +392,10 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_drag(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut from_element: Option<usize> = None;
     let mut to_element: Option<usize> = None;
     let mut from_x: Option<f64> = None;
@@ -447,11 +488,13 @@ pub(super) fn cmd_drag(args: &[String]) -> Result<(), CliError> {
             start_pt.x, start_pt.y, end_pt.x, end_pt.y
         ),
         &LiveAction::Drag {
+            from_ref: from_element,
+            to_ref: to_element,
             from: start_pt,
             to: end_pt,
         },
     )?;
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!(
         "from=({:.1},{:.1}) to=({:.1},{:.1})",
         start_pt.x, start_pt.y, end_pt.x, end_pt.y
@@ -465,7 +508,11 @@ pub(super) fn cmd_drag(args: &[String]) -> Result<(), CliError> {
         verification: verification_from_outcome(&outcome),
         target_reference_id: to_element.or(from_element),
         target_point: Some(end_pt),
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -473,7 +520,10 @@ pub(super) fn cmd_drag(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_type_text(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut element: Option<usize> = None;
     let mut text: Option<String> = None;
     let mut text_stdin = false;
@@ -531,7 +581,7 @@ pub(super) fn cmd_type_text(args: &[String]) -> Result<(), CliError> {
             &live_action,
         )?
     };
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!("typed {} chars", text.chars().count())];
     if let Some(note) = outcome.note.clone() {
         notes.push(note);
@@ -542,7 +592,11 @@ pub(super) fn cmd_type_text(args: &[String]) -> Result<(), CliError> {
         verification: verification_from_outcome(&outcome),
         target_reference_id: target_ref,
         target_point: None,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -550,7 +604,10 @@ pub(super) fn cmd_type_text(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut key: Option<String> = None;
     let mut modifiers: Vec<String> = Vec::new();
     let mut repeat = 1usize;
@@ -580,8 +637,10 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
             "--repeat" => {
                 let raw = take_val(args, &mut i, "--repeat")?;
                 repeat = parse_usize(&raw, "--repeat")?;
-                if repeat == 0 {
-                    return Err(CliError::Usage("--repeat must be >= 1".to_owned()));
+                if repeat == 0 || repeat > 32 {
+                    return Err(CliError::Usage(
+                        "--repeat must be between 1 and 32".to_owned(),
+                    ));
                 }
             }
             other => return Err(CliError::Usage(format!("unknown flag: {other}"))),
@@ -590,6 +649,11 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
     }
     let raw_key = key.ok_or_else(|| CliError::Usage("press-key requires --key <name>".into()))?;
     let norm_key = normalize_key_name(&raw_key).map_err(CliError::Usage)?;
+    if modifiers.iter().any(|modifier| modifier == "fn") {
+        return Err(CliError::Usage(
+            "System Events key dispatch does not support the fn modifier".to_owned(),
+        ));
+    }
     let before = ensure_current_snapshot(&common)?;
     let selector = common.app.as_deref().unwrap_or(&before.app.name);
     let outcome = record_mock_or_live_action(
@@ -606,7 +670,7 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
             repeat,
         },
     )?;
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!(
         "key={norm_key} modifiers={modifiers:?} repeat={repeat}"
     )];
@@ -617,9 +681,13 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
         action: "pressKey".to_owned(),
         ok: outcome.ok,
         verification: verification_from_outcome(&outcome),
-        target_reference_id: after.focused_element_id,
+        target_reference_id: before.focused_element_id,
         target_point: None,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -627,7 +695,10 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_hotkey(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut keys: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -643,6 +714,11 @@ pub(super) fn cmd_hotkey(args: &[String]) -> Result<(), CliError> {
     }
     let raw_chord = keys.ok_or_else(|| CliError::Usage("hotkey requires --keys <chord>".into()))?;
     let (mods, key) = parse_hotkey_chord(&raw_chord).map_err(CliError::Usage)?;
+    if mods.iter().any(|modifier| modifier == "fn") {
+        return Err(CliError::Usage(
+            "System Events key dispatch does not support the fn modifier".to_owned(),
+        ));
+    }
     let before = ensure_current_snapshot(&common)?;
     let selector = common.app.as_deref().unwrap_or(&before.app.name);
     let outcome = record_mock_or_live_action(
@@ -655,7 +731,7 @@ pub(super) fn cmd_hotkey(args: &[String]) -> Result<(), CliError> {
             key: key.clone(),
         },
     )?;
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!("chord={}+{}", mods.join("+"), key)];
     if let Some(note) = outcome.note.clone() {
         notes.push(note);
@@ -664,9 +740,13 @@ pub(super) fn cmd_hotkey(args: &[String]) -> Result<(), CliError> {
         action: "hotkey".to_owned(),
         ok: outcome.ok,
         verification: verification_from_outcome(&outcome),
-        target_reference_id: after.focused_element_id,
+        target_reference_id: before.focused_element_id,
         target_point: None,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -674,7 +754,10 @@ pub(super) fn cmd_hotkey(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut element: Option<usize> = None;
     let mut text: Option<String> = None;
     let mut text_stdin = false;
@@ -706,7 +789,7 @@ pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
             .and_then(|e| e.bounds.map(super::model::Rect::center))
     });
     let selector = common.app.as_deref().unwrap_or(&before.app.name);
-    let (previous_clipboard, outcome) = execute_paste_with_clipboard_preservation(
+    let (clipboard, outcome) = execute_paste_with_clipboard_preservation(
         selector,
         Some(&before.app),
         before.window.as_ref(),
@@ -715,9 +798,9 @@ pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
         &text,
     )
     .map_err(CliError::Runtime)?;
-    let after = ensure_current_snapshot(&common)?;
+    let after = observe_after_action(&common, &before);
     let mut notes = vec![format!(
-        "pasted {} chars with clipboard restoration",
+        "paste requested for {} chars",
         text.chars().count()
     )];
     if let Some(note) = outcome.note.clone() {
@@ -729,19 +812,22 @@ pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
         verification: verification_from_outcome(&outcome),
         target_reference_id: target_ref,
         target_point: None,
-        app_state: Some(after),
-        clipboard: Some(ClipboardMetadata {
-            preserved: true,
-            restored: true,
-            previous_text: Some(previous_clipboard),
-        }),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
+        clipboard: Some(clipboard),
         notes,
     };
     print_action_result(&res, common.json)
 }
 
 pub(super) fn cmd_set_value(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut element: Option<usize> = None;
     let mut value: Option<String> = None;
     let mut value_stdin = false;
@@ -791,28 +877,8 @@ pub(super) fn cmd_set_value(args: &[String]) -> Result<(), CliError> {
             value: value.clone(),
         },
     )?;
-    let after = ensure_current_snapshot(&common)?;
-    let verified = outcome.ok
-        && after
-            .elements
-            .iter()
-            .find(|e| e.reference_id == ref_id)
-            .is_some_and(|e| e.value.as_deref() == Some(value.as_str()));
-    let verification = if !outcome.ok || outcome.status != "verified" {
-        verification_from_outcome(&outcome)
-    } else if verified {
-        VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        }
-    } else {
-        VerificationMetadata {
-            status: "unverified".to_owned(),
-            reason: Some("element value did not match requested value after set-value".to_owned()),
-            retried: true,
-        }
-    };
+    let after = observe_after_action(&common, &before);
+    let verification = verification_from_outcome(&outcome);
     let mut notes = vec![format!("set value on #{ref_id}")];
     if let Some(note) = outcome.note {
         notes.push(note);
@@ -823,7 +889,11 @@ pub(super) fn cmd_set_value(args: &[String]) -> Result<(), CliError> {
         verification,
         target_reference_id: Some(ref_id),
         target_point: None,
-        app_state: Some(after),
+        issued_units: outcome.issued_units,
+        delivery: outcome.delivery,
+        observation: after.metadata,
+        cleanup: outcome.cleanup,
+        app_state: after.snapshot,
         clipboard: None,
         notes,
     };
@@ -846,47 +916,49 @@ fn apply_mock_or_live_element_mutation(
     live_action: &LiveAction,
 ) -> Result<LiveActionOutcome, CliError> {
     if let Some(mut mock) = load_mock_env().map_err(CliError::Runtime)? {
-        mock.last_action = Some(action_record.to_owned());
-        let Some(app) = mock.apps.iter_mut().find(|a| {
-            resolved_app.is_some_and(|r| r.pid > 0 && a.pid == r.pid)
-                || matches_app_selector(&a.summary(), app_selector)
-        }) else {
-            return Err(CliError::Runtime(format!(
-                "application not found: {app_selector}"
-            )));
+        let app_index = mock
+            .apps
+            .iter()
+            .position(|a| {
+                resolved_app.map_or_else(
+                    || matches_app_selector(&a.summary(), app_selector),
+                    |resolved| resolved.pid == a.pid,
+                )
+            })
+            .ok_or_else(|| CliError::Runtime("original application exited".to_owned()))?;
+        let app = &mut mock.apps[app_index];
+        let window_index = app
+            .windows
+            .iter()
+            .position(|w| selected_window.is_some_and(|target| target.id == w.id))
+            .ok_or_else(|| {
+                CliError::Runtime("original window no longer exists; no index fallback".to_owned())
+            })?;
+        validate_mock_target(app, &app.windows[window_index], Some(target_ref))
+            .map_err(CliError::Runtime)?;
+        let win = &mut app.windows[window_index];
+        let _ = index_and_render_tree(&mut win.root);
+        let Some((_, true)) =
+            mutate_element_by_ref(&mut win.root, target_ref, new_value, append_text, focus)
+        else {
+            return Err(CliError::Runtime("target missing or disabled".to_owned()));
         };
-        let win_opt = if let Some(target_win) = selected_window {
-            let idx = target_win.index.saturating_sub(1);
-            if let Some(pos) = app.windows.iter().position(|w| w.id == target_win.id) {
-                app.windows.get_mut(pos)
+        let mut outcome = LiveActionOutcome::submitted();
+        if let Some(value) = new_value {
+            let path = super::model::element_path(&win.root, target_ref)
+                .ok_or_else(|| CliError::Runtime("target disappeared".to_owned()))?;
+            if super::model::node_at_path(&win.root, &path)
+                .is_some_and(|node| node.value.as_deref() == Some(value))
+            {
+                "verified".clone_into(&mut outcome.status);
+                outcome.reason = None;
             } else {
-                app.windows.get_mut(idx)
-            }
-        } else {
-            app.windows.first_mut()
-        };
-        if let Some(win) = win_opt {
-            let _ = index_and_render_tree(&mut win.root);
-            let Some((_, enabled)) =
-                mutate_element_by_ref(&mut win.root, target_ref, new_value, append_text, focus)
-            else {
-                return Err(CliError::Runtime(format!(
-                    "element #{target_ref} not found"
-                )));
-            };
-            if !enabled {
-                return Err(CliError::Runtime(format!(
-                    "element #{target_ref} is disabled"
-                )));
+                outcome.ok = false;
             }
         }
+        mock.last_action = Some(action_record.to_owned());
         save_mock_env(&mock).map_err(CliError::Runtime)?;
-        return Ok(LiveActionOutcome {
-            ok: true,
-            status: "verified".to_owned(),
-            reason: None,
-            note: None,
-        });
+        return Ok(outcome);
     }
     execute_live_action(app_selector, resolved_app, selected_window, live_action)
         .map_err(CliError::Runtime)
@@ -900,14 +972,20 @@ fn record_mock_or_live_action(
     live_action: &LiveAction,
 ) -> Result<LiveActionOutcome, CliError> {
     if let Some(mut mock) = load_mock_env().map_err(CliError::Runtime)? {
+        let app = mock
+            .apps
+            .iter()
+            .find(|a| resolved_app.is_some_and(|target| target.pid == a.pid))
+            .ok_or_else(|| CliError::Runtime("original application exited".to_owned()))?;
+        let win = app
+            .windows
+            .iter()
+            .find(|w| selected_window.is_some_and(|target| target.id == w.id))
+            .ok_or_else(|| CliError::Runtime("original window no longer exists".to_owned()))?;
+        validate_mock_target(app, win, None).map_err(CliError::Runtime)?;
         mock.last_action = Some(action_record.to_owned());
         save_mock_env(&mock).map_err(CliError::Runtime)?;
-        return Ok(LiveActionOutcome {
-            ok: true,
-            status: "verified".to_owned(),
-            reason: None,
-            note: None,
-        });
+        return Ok(LiveActionOutcome::submitted());
     }
     execute_live_action(app_selector, resolved_app, selected_window, live_action)
         .map_err(CliError::Runtime)
@@ -920,78 +998,72 @@ fn execute_paste_with_clipboard_preservation(
     target_ref: Option<usize>,
     focus_point: Option<Point>,
     text: &str,
-) -> Result<(String, LiveActionOutcome), String> {
+) -> Result<(ClipboardMetadata, LiveActionOutcome), String> {
     if let Some(mut mock) = load_mock_env()? {
-        let prev = mock.clipboard.clone();
-        text.clone_into(&mut mock.clipboard);
-        if let Some(app) = mock.apps.iter_mut().find(|a| {
-            resolved_app.is_some_and(|r| r.pid > 0 && a.pid == r.pid)
-                || matches_app_selector(&a.summary(), app_selector)
-        }) {
-            let win_opt = if let Some(target_win) = selected_window {
-                let idx = target_win.index.saturating_sub(1);
-                if let Some(pos) = app.windows.iter().position(|w| w.id == target_win.id) {
-                    app.windows.get_mut(pos)
-                } else {
-                    app.windows.get_mut(idx)
-                }
-            } else {
-                app.windows.first_mut()
-            };
-            if let Some(win) = win_opt {
-                let _ = index_and_render_tree(&mut win.root);
-                if let Some(ref_id) = target_ref {
-                    let _ = mutate_element_by_ref(&mut win.root, ref_id, None, Some(text), true);
-                } else {
-                    let _ = mutate_focused_element(&mut win.root, None, Some(text));
-                }
-            }
+        let app_index = mock
+            .apps
+            .iter()
+            .position(|a| resolved_app.is_some_and(|target| target.pid == a.pid))
+            .ok_or("original application exited")?;
+        let app = &mut mock.apps[app_index];
+        let window_index = app
+            .windows
+            .iter()
+            .position(|w| selected_window.is_some_and(|target| target.id == w.id))
+            .ok_or("original window no longer exists")?;
+        validate_mock_target(app, &app.windows[window_index], target_ref)?;
+        let win = &mut app.windows[window_index];
+        let _ = index_and_render_tree(&mut win.root);
+        let target = target_ref.ok_or("paste requires observed editable receiver")?;
+        let path = super::model::element_path(&win.root, target).ok_or("receiver missing")?;
+        let receiver = super::model::node_at_path(&win.root, &path).ok_or("receiver missing")?;
+        if !receiver.focused
+            || !matches!(
+                receiver.role.as_str(),
+                "AXTextField" | "AXTextArea" | "AXComboBox"
+            )
+        {
+            return Err("editable receiver focus changed".to_owned());
         }
-        mock.clipboard.clone_from(&prev);
+        let old = mock.clipboard.clone();
+        text.clone_into(&mut mock.clipboard);
+        let Some((_, true)) = mutate_element_by_ref(&mut win.root, target, None, Some(text), false)
+        else {
+            return Err("paste receiver unavailable".to_owned());
+        };
+        mock.clipboard = old;
         mock.clipboard_restore_count = mock.clipboard_restore_count.saturating_add(1);
         mock.last_action = Some(format!("paste-text:{text}"));
         save_mock_env(&mock)?;
+        let mut outcome = LiveActionOutcome::submitted();
+        "verified".clone_into(&mut outcome.status);
+        outcome.reason = None;
+        outcome.cleanup = Cleanup::Completed;
         return Ok((
-            prev,
-            LiveActionOutcome {
-                ok: true,
-                status: "verified".to_owned(),
-                reason: None,
-                note: None,
+            ClipboardMetadata {
+                preserved: true,
+                restored: true,
+                previous_text: None,
             },
+            outcome,
         ));
     }
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some()
-        && std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN").is_none()
-    {
-        return Ok((
-            String::new(),
-            LiveActionOutcome {
-                ok: false,
-                status: "unverified".to_owned(),
-                reason: Some(
-                    "live paste skipped because KRILL_TEST_OFFLINE is set without mock environment"
-                        .to_owned(),
-                ),
-                note: None,
-            },
-        ));
-    }
-    let prev = read_system_clipboard()?;
-    write_system_clipboard(text)?;
-    let paste_res = execute_live_action(
+    let outcome = execute_live_action(
         app_selector,
         resolved_app,
         selected_window,
         &LiveAction::PasteText {
+            text: text.to_owned(),
             target_ref,
             focus_point,
         },
-    );
-    let restore_res = write_system_clipboard(&prev);
-    let outcome = paste_res?;
-    restore_res?;
-    Ok((prev, outcome))
+    )?;
+    let clipboard = outcome.clipboard.clone().unwrap_or(ClipboardMetadata {
+        preserved: false,
+        restored: false,
+        previous_text: None,
+    });
+    Ok((clipboard, outcome))
 }
 
 pub(super) fn read_bounded_text(

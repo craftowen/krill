@@ -7,6 +7,8 @@
 
 mod actions;
 pub mod engine;
+mod lifecycle;
+mod mcp;
 pub mod model;
 #[cfg(test)]
 mod tests;
@@ -21,32 +23,37 @@ use actions::{
 use engine::{
     ActionResultPayload, AppStateSnapshot, PermissionId, PermissionsPayload,
     build_permission_capabilities, capabilities_payload, get_app_state, list_apps, list_windows,
-    load_cached_snapshot, load_mock_env, open_permission_settings, query_permissions,
-    verify_not_self_targeted,
+    open_permission_settings, query_permissions,
 };
 
 const COMPUTER_USAGE: &str = "\
 usage: krill computer <subcommand> [options]
 
 subcommands:
+  serve --experimental [--worker <absolute krill-app path>]  (MCP 2025-11-25 stdio, native experimental)
   capabilities [--json]
   permissions [--id <accessibility|screenshots>] [--json]
   list-apps [--json]
   list-windows --app <name|bundle|pid:N> [--json]
-  get-app-state --app <name|bundle|pid:N> [--window-id <id> | --window-index <n>] [--worktree <selector> | --session <id>] [--restore-window] [--no-screenshot] [--json]
-  click (--element <n> | --x <num> --y <num>) [--button <left|right|middle>] [--click-count <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  perform-secondary-action --element <n> [--action <AXShowMenu|AXPress>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  scroll [--element <n> | --x <num> --y <num>] [--delta-x <num>] [--delta-y <num>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  drag (--from-element <n> | --from-x <num> --from-y <num>) (--to-element <n> | --to-x <num> --to-y <num>) [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  type-text --text <string> [--element <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  press-key --key <name> [--modifiers <mod,mod>] [--repeat <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  hotkey --keys <chord> [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  paste-text --text <string> [--element <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]
-  set-value --element <n> --value <string> [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]";
+  get-app-state --app <name|bundle|pid:N> [--window-id <id> | --window-index <n>] [--worktree <selector> | --session <id>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  get-app-state --snapshot <token> [--offset <n>] [--limit <1..80>] [--format <compact|full>] [--json]
+  click (--element <n> | --x <num> --y <num>) [--button <left|right|middle>] [--click-count <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  perform-secondary-action --element <n> [--action <AXShowMenu|AXPress>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  scroll [--element <n> | --x <num> --y <num>] [--delta-x <num>] [--delta-y <num>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  drag (--from-element <n> | --from-x <num> --from-y <num>) (--to-element <n> | --to-x <num> --to-y <num>) [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  type-text --text <string> [--element <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  press-key --key <name> [--modifiers <mod,mod>] [--repeat <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  hotkey --keys <chord> [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  paste-text --text <string> [--element <n>] [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]
+  set-value --element <n> --value <string> [--app <name>] [--window-id <id> | --window-index <n>] [--restore-window] [--snapshot <token>] [--screenshot] [--no-screenshot] [--json]";
 
 #[derive(Debug, Default)]
 pub(super) struct CommonWindowOpts {
     pub(super) app: Option<String>,
+    pub(super) snapshot: Option<String>,
+    pub(super) format: Option<String>,
+    pub(super) limit: Option<usize>,
+    pub(super) offset: usize,
     pub(super) window_id: Option<String>,
     pub(super) window_index: Option<usize>,
     pub(super) worktree: Option<String>,
@@ -80,25 +87,32 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         println!("{COMPUTER_USAGE}");
         return ExitCode::SUCCESS;
     }
-    let result = match sub.as_str() {
-        "capabilities" => cmd_capabilities(rest),
-        "permissions" => cmd_permissions(rest),
-        "list-apps" => cmd_list_apps(rest),
-        "list-windows" => cmd_list_windows(rest),
-        "get-app-state" | "snapshot" => cmd_get_app_state(rest),
-        "click" => cmd_click(rest),
-        "perform-secondary-action" | "secondary-action" => cmd_secondary_action(rest),
-        "scroll" => cmd_scroll(rest),
-        "drag" => cmd_drag(rest),
-        "type-text" => cmd_type_text(rest),
-        "press-key" => cmd_press_key(rest),
-        "hotkey" => cmd_hotkey(rest),
-        "paste-text" => cmd_paste_text(rest),
-        "set-value" => cmd_set_value(rest),
-        other => {
-            eprintln!("unknown computer subcommand: {other}\n{COMPUTER_USAGE}");
-            return ExitCode::from(2);
-        }
+    // Persistent mode owns its worker and must never enter the legacy desktop executor.
+    let result = if sub == "serve" {
+        mcp::run(rest)
+    } else {
+        engine::with_execution(sub, rest, || match sub.as_str() {
+            "capabilities" => cmd_capabilities(rest),
+            "permissions" => cmd_permissions(rest),
+            "list-apps" => cmd_list_apps(rest),
+            "list-windows" => cmd_list_windows(rest),
+            "get-app-state" | "snapshot" => cmd_get_app_state(rest),
+            "click" => cmd_click(rest),
+            "perform-secondary-action" | "secondary-action" => cmd_secondary_action(rest),
+            "scroll" => cmd_scroll(rest),
+            "drag" => cmd_drag(rest),
+            "type-text" => cmd_type_text(rest),
+            "press-key" => cmd_press_key(rest),
+            "hotkey" => cmd_hotkey(rest),
+            "paste-text" => cmd_paste_text(rest),
+            "set-value" => cmd_set_value(rest),
+            other => {
+                eprintln!("unknown computer subcommand: {other}\n{COMPUTER_USAGE}");
+                Err(CliError::Usage(format!(
+                    "unknown computer subcommand: {other}"
+                )))
+            }
+        })
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -178,6 +192,32 @@ pub(super) fn try_parse_common_opt(
             }
             common.window_index = Some(n);
         }
+        "--format" => {
+            let format = take_val(args, idx, "--format")?;
+            if !matches!(format.as_str(), "compact" | "full") {
+                return Err(CliError::Usage(
+                    "--format must be compact or full".to_owned(),
+                ));
+            }
+            common.format = Some(format);
+        }
+        "--limit" => {
+            let limit = parse_usize(&take_val(args, idx, "--limit")?, "--limit")?;
+            if !(1..=80).contains(&limit) {
+                return Err(CliError::Usage(
+                    "--limit must be between 1 and 80".to_owned(),
+                ));
+            }
+            common.limit = Some(limit);
+        }
+        "--offset" => {
+            common.offset = parse_usize(&take_val(args, idx, "--offset")?, "--offset")?;
+            if common.offset > 160 {
+                return Err(CliError::Usage("--offset must be <= 160".to_owned()));
+            }
+        }
+        "--screenshot" => common.no_screenshot = false,
+        "--snapshot" => common.snapshot = Some(take_val(args, idx, "--snapshot")?),
         "--worktree" => common.worktree = Some(take_val(args, idx, "--worktree")?),
         "--session" => common.session = Some(take_val(args, idx, "--session")?),
         "--restore-window" => common.restore_window = true,
@@ -348,7 +388,10 @@ pub(super) fn context_note_from_opts(common: &CommonWindowOpts) -> Option<String
 }
 
 fn cmd_get_app_state(args: &[String]) -> Result<(), CliError> {
-    let mut common = CommonWindowOpts::default();
+    let mut common = CommonWindowOpts {
+        no_screenshot: true,
+        ..CommonWindowOpts::default()
+    };
     let mut i = 0;
     while i < args.len() {
         if !try_parse_common_opt(args, &mut i, &mut common)? {
@@ -356,21 +399,37 @@ fn cmd_get_app_state(args: &[String]) -> Result<(), CliError> {
         }
         i += 1;
     }
-    let app = common
-        .app
-        .clone()
-        .ok_or_else(|| CliError::Usage("--app is required".to_owned()))?;
-    let snapshot = get_app_state(
-        &app,
-        common.window_id.as_deref(),
-        common.window_index,
-        common.restore_window,
-        common.no_screenshot,
-        context_note_from_opts(&common),
-    )
-    .map_err(CliError::Runtime)?;
+    if common.offset > 0 && common.snapshot.is_none() {
+        return Err(CliError::Usage(
+            "paging requires --snapshot <snapshotId>; it never refreshes a page".to_owned(),
+        ));
+    }
+    let snapshot = if let Some(id) = common.snapshot.as_deref() {
+        if common.restore_window {
+            return Err(CliError::Usage(
+                "cached snapshot paging cannot restore a window".to_owned(),
+            ));
+        }
+        engine::load_snapshot(Some(id))
+            .map_err(CliError::Runtime)?
+            .ok_or_else(|| CliError::Runtime("snapshot absent or expired from cache".to_owned()))?
+    } else {
+        let app = common
+            .app
+            .as_deref()
+            .ok_or_else(|| CliError::Usage("--app is required".to_owned()))?;
+        get_app_state(
+            app,
+            common.window_id.as_deref(),
+            common.window_index,
+            common.restore_window,
+            common.no_screenshot,
+            context_note_from_opts(&common),
+        )
+        .map_err(CliError::Runtime)?
+    };
     if common.json {
-        return print_json(&snapshot);
+        return print_json(&snapshot_json(&snapshot, &common)?);
     }
     print_snapshot_human(&snapshot);
     Ok(())
@@ -389,6 +448,7 @@ pub(super) fn print_snapshot_human(snap: &AppStateSnapshot) {
             w.index, w.id, w.title, w.bounds.x, w.bounds.y, w.bounds.width, w.bounds.height
         );
     }
+    println!("snapshot   {}", snap.snapshot_id);
     println!(
         "elements   {} interactive / {} total (focused: {:?})",
         snap.interactive_count, snap.element_count, snap.focused_element_id
@@ -404,61 +464,123 @@ pub(super) fn print_snapshot_human(snap: &AppStateSnapshot) {
     }
 }
 
-fn resolve_target_app_name(common: &CommonWindowOpts) -> Result<String, CliError> {
-    if let Some(app) = &common.app {
-        return Ok(app.clone());
-    }
-    if let Some(cached) = load_cached_snapshot().map_err(CliError::Runtime)? {
-        if cached.app.pid > 0 {
-            return Ok(format!("pid:{}", cached.app.pid));
-        }
-        return Ok(cached.app.name);
-    }
-    if let Some(mock) = load_mock_env().map_err(CliError::Runtime)?
-        && let Some(first) = mock
-            .apps
-            .iter()
-            .find(|a| a.is_active)
-            .or_else(|| mock.apps.first())
-    {
-        return Ok(first.name.clone());
-    }
-    Err(CliError::Usage(
-        "target application unknown; pass --app <name> or run get-app-state first".to_owned(),
-    ))
-}
-
 pub(super) fn ensure_current_snapshot(
     common: &CommonWindowOpts,
 ) -> Result<AppStateSnapshot, CliError> {
-    let app_name = resolve_target_app_name(common)?;
-    let cached_win_id =
-        if common.app.is_none() && common.window_id.is_none() && common.window_index.is_none() {
-            load_cached_snapshot()
-                .ok()
-                .flatten()
-                .and_then(|s| s.window.map(|w| w.id))
-        } else {
-            None
-        };
-    let effective_window_id = common.window_id.as_deref().or(cached_win_id.as_deref());
-    let snap = get_app_state(
-        &app_name,
-        effective_window_id,
-        common.window_index,
+    let before = if common.snapshot.is_some() {
+        engine::load_snapshot(common.snapshot.as_deref())
+    } else {
+        engine::load_cached_snapshot()
+    }
+    .map_err(CliError::Runtime)?
+    .ok_or_else(|| {
+        CliError::Runtime(
+            "observe with get-app-state first; no caller-scoped snapshot exists".to_owned(),
+        )
+    })?;
+    engine::verify_target_app(&before.app).map_err(CliError::Runtime)?;
+    if before.captured_at_ms > engine::now_ms().saturating_add(1000)
+        || engine::now_ms().saturating_sub(before.captured_at_ms) > 120_000
+        || before.captured_at_ms == 0
+    {
+        return Err(CliError::Runtime(
+            "snapshot expired; observe again".to_owned(),
+        ));
+    }
+    if common
+        .app
+        .as_ref()
+        .is_some_and(|selector| !engine::matches_app_selector(&before.app, selector))
+        || common
+            .window_id
+            .as_ref()
+            .is_some_and(|id| before.window.as_ref().is_none_or(|win| &win.id != id))
+        || common
+            .window_index
+            .is_some_and(|index| before.window.as_ref().is_none_or(|win| win.index != index))
+    {
+        return Err(CliError::Runtime(
+            "target does not match original snapshot; observe the intended window first".to_owned(),
+        ));
+    }
+    // Restore is a mutation and is guarded and leased before this observation.
+    let fresh = engine::observe_app_state(
+        &format!("pid:{}", before.app.pid),
+        before.window.as_ref().map(|win| win.id.as_str()),
+        None,
         common.restore_window,
+        true,
+        None,
+    )
+    .map_err(CliError::Runtime)?;
+    engine::validate_snapshot_identity(&before, &fresh).map_err(CliError::Runtime)?;
+    if let (Some(original), Some(current)) = (&before.root, &fresh.root) {
+        engine::validate_structure(original, current).map_err(CliError::Runtime)?;
+    } else {
+        return Err(CliError::Runtime("AX observation unavailable".to_owned()));
+    }
+    engine::set_action_snapshot(before.clone());
+    Ok(before)
+}
+
+pub(super) struct ActionObservation {
+    pub(super) snapshot: Option<AppStateSnapshot>,
+    pub(super) metadata: engine::ObservationMetadata,
+}
+
+pub(super) fn observe_after_action(
+    common: &CommonWindowOpts,
+    before: &AppStateSnapshot,
+) -> ActionObservation {
+    let result = engine::observe_app_state(
+        &format!("pid:{}", before.app.pid),
+        before.window.as_ref().map(|w| w.id.as_str()),
+        None,
+        false,
         common.no_screenshot,
         context_note_from_opts(common),
     )
-    .map_err(CliError::Runtime)?;
-    verify_not_self_targeted(&snap.app.name, snap.app.bundle_id.as_deref())
-        .map_err(CliError::Runtime)?;
-    Ok(snap)
+    .and_then(|snapshot| {
+        if snapshot.app.pid != before.app.pid
+            || snapshot.app.bundle_id != before.app.bundle_id
+            || snapshot.process_start != before.process_start
+            || snapshot.window.as_ref().map(|w| &w.id) != before.window.as_ref().map(|w| &w.id)
+        {
+            return Err(
+                "post-action target instance changed; input delivery is retained separately"
+                    .to_owned(),
+            );
+        }
+        engine::save_cached_snapshot(&snapshot)?;
+        Ok(snapshot)
+    });
+    match result {
+        Ok(snapshot) => ActionObservation {
+            snapshot: Some(snapshot),
+            metadata: engine::ObservationMetadata {
+                status: "observed".to_owned(),
+                reason: None,
+            },
+        },
+        Err(error) => ActionObservation {
+            snapshot: None,
+            metadata: engine::ObservationMetadata {
+                status: "failed".to_owned(),
+                reason: Some(error),
+            },
+        },
+    }
 }
 
 pub(super) fn print_action_result(res: &ActionResultPayload, json: bool) -> Result<(), CliError> {
     if json {
-        return print_json(res);
+        let mut value = serde_json::to_value(res).map_err(|e| CliError::Runtime(e.to_string()))?;
+        value["contract"] = serde_json::json!("computer/2");
+        if let Some(snapshot) = &res.app_state {
+            value["appState"] = snapshot_json(snapshot, &CommonWindowOpts::default())?;
+        }
+        print_json(&value)?;
+        return action_exit(res);
     }
     println!(
         "action     {} ({}, verification: {})",
@@ -481,5 +603,51 @@ pub(super) fn print_action_result(res: &ActionResultPayload, json: bool) -> Resu
     if let Some(snap) = &res.app_state {
         print_snapshot_human(snap);
     }
+    action_exit(res)
+}
+
+fn action_exit(res: &ActionResultPayload) -> Result<(), CliError> {
+    if !res.ok
+        || matches!(
+            res.delivery,
+            engine::Delivery::NotDispatched | engine::Delivery::Unknown | engine::Delivery::Partial
+        )
+        || res.cleanup == engine::Cleanup::Incomplete
+        || res.observation.status == "failed"
+    {
+        return Err(CliError::Runtime(
+            "action failed or has an unknown/partial outcome; do not replay".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn snapshot_json(
+    snapshot: &AppStateSnapshot,
+    options: &CommonWindowOpts,
+) -> Result<serde_json::Value, CliError> {
+    let mut value = serde_json::to_value(snapshot).map_err(|e| CliError::Runtime(e.to_string()))?;
+    value["contract"] = serde_json::json!("computer/2");
+    let full = options.format.as_deref() == Some("full");
+    if !full && let Some(object) = value.as_object_mut() {
+        object.remove("root");
+        object.remove("treeText");
+    }
+    let page: Vec<_> = snapshot
+        .elements
+        .iter()
+        .skip(options.offset)
+        .take(options.limit.unwrap_or(40))
+        .collect();
+    let next = options.offset.saturating_add(page.len());
+    if !full {
+        value["elements"] =
+            serde_json::to_value(&page).map_err(|e| CliError::Runtime(e.to_string()))?;
+    }
+    value["coverage"] = serde_json::json!({"kind":"bounded", "truncated":snapshot.coverage_truncated,
+        "observedNodes":snapshot.element_count, "totalObservedElements":snapshot.elements.len(),
+        "returnedElements":if full { snapshot.elements.len() } else { page.len() },
+        "nextOffset":if !full && next < snapshot.elements.len() { Some(next) } else { None },
+        "snapshotPagingOnly":true});
+    Ok(value)
 }

@@ -46,6 +46,9 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     krill_proto::diag::install_panic_hook("krill-app");
+    if let Some(code) = krill_app::platform::computer::maybe_run_worker() {
+        return code;
+    }
     if std::env::args().any(|a| a == "--crash-test") {
         crash_test();
     }

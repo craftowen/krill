@@ -64,9 +64,20 @@ pub struct PermissionCapability {
     pub instructions: String,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "serialized independent computer operation capability flags"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilitiesPayload {
+    pub contract: String,
+    pub backend: String,
+    pub guide_hash: String,
+    pub batch_supported: bool,
+    pub request_dedup_supported: bool,
+    pub status_supported: bool,
+    pub cancel_supported: bool,
     pub platform: String,
     pub supported: bool,
     pub permissions: Vec<PermissionCapability>,
@@ -195,12 +206,22 @@ pub struct ScreenshotMetadata {
     pub height: u32,
     pub scale_factor: f64,
     pub window_id: Option<String>,
+    pub logical_bounds: Rect,
+    pub measured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStateSnapshot {
     pub snapshot_id: String,
+    #[serde(default)]
+    pub process_start: String,
+    #[serde(default)]
+    pub caller_scope: String,
+    #[serde(default)]
+    pub captured_at_ms: u64,
+    #[serde(default)]
+    pub coverage_truncated: bool,
     pub captured_at: String,
     pub app: AppSummary,
     pub window: Option<WindowSummary>,
@@ -231,12 +252,43 @@ pub struct ClipboardMetadata {
     pub preserved: bool,
     pub restored: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub previous_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    #[default]
+    Unknown,
+    NotDispatched,
+    Submitted,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cleanup {
+    #[default]
+    NotNeeded,
+    Completed,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationMetadata {
+    pub status: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionResultPayload {
+    pub issued_units: Option<u32>,
+    pub delivery: Delivery,
+    pub observation: ObservationMetadata,
+    pub cleanup: Cleanup,
     pub action: String,
     pub ok: bool,
     pub verification: VerificationMetadata,
@@ -480,9 +532,9 @@ fn visit_ax_node(
     out: &mut String,
 ) {
     *total_count += 1;
-    let interactive = is_interactive_node(node);
+    let interactive = depth > 0 && is_interactive_node(node);
     let ref_id = if interactive {
-        let assigned = node.reference_id.unwrap_or(*next_ref);
+        let assigned = *next_ref;
         *next_ref = assigned.saturating_add(1);
         node.reference_id = Some(assigned);
         if node.focused && focused_id.is_none() {
@@ -492,7 +544,10 @@ fn visit_ax_node(
             reference_id: assigned,
             role: node.role.clone(),
             label: node_label(node),
-            value: node.value.clone(),
+            value: node
+                .value
+                .as_ref()
+                .map(|value| value.chars().take(500).collect()),
             bounds: node.bounds,
             enabled: node.enabled,
             focused: node.focused,
@@ -514,7 +569,12 @@ fn visit_ax_node(
         write!(out, " \"{label}\"").ok();
     }
     if let Some(val) = node.value.as_deref().filter(|v| !v.is_empty()) {
-        write!(out, " value=\"{val}\"").ok();
+        write!(
+            out,
+            " value=\"{}\"",
+            val.chars().take(500).collect::<String>()
+        )
+        .ok();
     }
     if let Some(b) = node.bounds {
         write!(
@@ -615,6 +675,7 @@ pub fn mutate_element_by_ref(
     find_and_apply(node, target_ref, new_value, append_text, focus)
 }
 
+#[cfg(test)]
 pub fn mutate_focused_element(
     node: &mut ElementNode,
     new_value: Option<&str>,
@@ -663,11 +724,88 @@ pub fn matches_app_selector(app: &AppSummary, selector: &str) -> bool {
 pub fn verify_not_self_targeted(app_name: &str, bundle_id: Option<&str>) -> Result<(), String> {
     let lower = app_name.to_ascii_lowercase();
     let bundle_lower = bundle_id.unwrap_or_default().to_ascii_lowercase();
-    if lower == "krill" || bundle_lower == "dev.krill.app" || bundle_lower == "com.krill.app" {
+    if matches!(lower.as_str(), "krill" | "krill-app")
+        || bundle_lower == "dev.krill.app"
+        || bundle_lower == "com.krill.app"
+    {
         return Err(
             "self-targeting guard: krill computer refuses to drive the Krill host window itself"
                 .to_owned(),
         );
     }
     Ok(())
+}
+
+/// Structural identity deliberately excludes value/focus, which an action may change.
+/// A-prime refuses even a unique element when its original path/context changed.
+pub fn same_element_identity(left: &ElementNode, right: &ElementNode) -> bool {
+    left.role == right.role
+        && left.subrole == right.subrole
+        && left.title == right.title
+        && left.description == right.description
+        && left.bounds == right.bounds
+        && left.actions == right.actions
+}
+
+pub fn element_path(root: &ElementNode, target: usize) -> Option<Vec<usize>> {
+    if root.reference_id == Some(target) {
+        return Some(Vec::new());
+    }
+    root.children.iter().enumerate().find_map(|(index, child)| {
+        let mut path = element_path(child, target)?;
+        path.insert(0, index);
+        Some(path)
+    })
+}
+
+pub fn node_at_path<'a>(root: &'a ElementNode, path: &[usize]) -> Option<&'a ElementNode> {
+    path.iter()
+        .try_fold(root, |node, index| node.children.get(*index))
+}
+
+pub fn validate_reference<'a>(
+    original: &ElementNode,
+    fresh: &'a ElementNode,
+    target: usize,
+) -> Result<&'a ElementNode, String> {
+    fn count_matches(node: &ElementNode, wanted: &ElementNode) -> usize {
+        usize::from(same_element_identity(node, wanted))
+            + node
+                .children
+                .iter()
+                .map(|child| count_matches(child, wanted))
+                .sum::<usize>()
+    }
+    let path = element_path(original, target).ok_or("element absent from original snapshot")?;
+    let original_node = node_at_path(original, &path).ok_or("original element path invalid")?;
+    if count_matches(fresh, original_node) != 1 {
+        return Err("element identity is missing or ambiguous; observe again".to_owned());
+    }
+    validate_structure(original, fresh)?;
+    let node = node_at_path(fresh, &path).ok_or("element path changed")?;
+    if !node.enabled {
+        return Err("target element is disabled".to_owned());
+    }
+    if node.value != original_node.value {
+        return Err("target value changed since observation; possible semantic reuse".to_owned());
+    }
+    Ok(node)
+}
+
+/// Context revalidation does not require unrelated controls to be enabled or unique.
+pub fn validate_structure(original: &ElementNode, fresh: &ElementNode) -> Result<(), String> {
+    fn same_structure(left: &ElementNode, right: &ElementNode) -> bool {
+        same_element_identity(left, right)
+            && left.children.len() == right.children.len()
+            && left
+                .children
+                .iter()
+                .zip(&right.children)
+                .all(|(l, r)| same_structure(l, r))
+    }
+    if same_structure(original, fresh) {
+        Ok(())
+    } else {
+        Err("snapshot structure changed or elements reordered; observe again".to_owned())
+    }
 }
