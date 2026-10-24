@@ -215,6 +215,28 @@ fn git_dir(tree: &Path) -> PathBuf {
         .and_then(|s| s.strip_prefix("gitdir:").map(|p| tree.join(p.trim())))
         .unwrap_or(dot)
 }
+fn git_remote_slug(tree: &Path) -> Option<String> {
+    let config = String::from_utf8(read(&git_dir(tree).join("config"), 16384)?).ok()?;
+    for line in config.lines() {
+        let Some(url) = line.trim().strip_prefix("url") else {
+            continue;
+        };
+        let Some(url) = url.trim_start().strip_prefix('=').map(str::trim) else {
+            continue;
+        };
+        let url = url.trim_end_matches('/').trim_end_matches(".git");
+        let path = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('/').map(|(_, p)| p))
+            .or_else(|| url.split_once(':').map(|(_, p)| p.trim_start_matches('/')))?;
+        let mut parts = path.rsplit('/').take(2);
+        let (repo, owner) = (parts.next()?, parts.next()?);
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some(format!("{owner}/{repo}"));
+        }
+    }
+    None
+}
 fn main_worktree(tree: &Path) -> Option<PathBuf> {
     let dir = git_dir(tree);
     let common = String::from_utf8(read(&dir.join("commondir"), 4096)?).ok()?;
@@ -502,6 +524,7 @@ impl Catalog {
             .map(|r| {
                 let repo = path(&r.repo);
                 json!({"key":hex(&r.repo),"path":repo.to_string_lossy(),
+                "remote":git_remote_slug(&repo),
                 "label":self.repo_labels.get(&repo).cloned().unwrap_or_else(|| label(&repo)),
                 "icon":self.repo_icons.get(&repo).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
                 "badge_color":self.repo_badges.get(&repo).cloned().map_or(Value::Null, Value::String),
@@ -1349,6 +1372,40 @@ value = "🚀"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["label"], "이름");
         assert_eq!(rows[0]["depth"], 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repository_remote_slug_parses_https_and_ssh_origins() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-remote-{}", std::process::id()));
+        let https_repo = dir.join("krill");
+        let ssh_repo = dir.join("orca");
+        fs::create_dir_all(https_repo.join(".git")).unwrap();
+        fs::create_dir_all(ssh_repo.join(".git")).unwrap();
+        fs::write(
+            https_repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/craftowen/krill.git\n",
+        )
+        .unwrap();
+        fs::write(
+            ssh_repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:lovecast/orca.git\n",
+        )
+        .unwrap();
+        let repositories = vec![
+            RepositoryTrees {
+                repo: https_repo.to_string_lossy().into_owned().into_bytes(),
+                worktrees: vec![https_repo.to_string_lossy().into_owned().into_bytes()],
+            },
+            RepositoryTrees {
+                repo: ssh_repo.to_string_lossy().into_owned().into_bytes(),
+                worktrees: vec![ssh_repo.to_string_lossy().into_owned().into_bytes()],
+            },
+        ];
+        let catalog = Catalog::load(None, &repositories);
+        let json = catalog.repositories_json();
+        assert_eq!(json[0]["remote"], "craftowen/krill");
+        assert_eq!(json[1]["remote"], "lovecast/orca");
         fs::remove_dir_all(dir).unwrap();
     }
 }

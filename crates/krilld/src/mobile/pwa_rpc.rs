@@ -112,6 +112,8 @@ enum Action {
         #[serde(default)]
         base: Option<String>,
         #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
         setup_hash: Option<String>,
         #[serde(default)]
         skip_setup: bool,
@@ -327,9 +329,17 @@ impl Backend {
                 repository,
                 name,
                 base,
+                agent,
                 setup_hash,
                 skip_setup,
             } => {
+                let program = match agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    None => Program::Login,
+                    Some(id) if crate::agent::control::valid_session_id(id) => {
+                        Program::Agent { id: id.to_owned() }
+                    }
+                    Some(_) => return Err(invalid()),
+                };
                 let name = name.trim();
                 if name.is_empty()
                     || name.len() > 256
@@ -380,7 +390,7 @@ impl Backend {
                     }
                     Reply::WorktreeCreated(mut tree) => {
                         let session = match self.control(&Request::Create(Create {
-                            program: Program::Login,
+                            program,
                             cwd: tree.path.clone(),
                             cols: 80,
                             rows: 24,

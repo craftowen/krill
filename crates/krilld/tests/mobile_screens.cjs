@@ -108,7 +108,8 @@ async function desktopVisibility(){
  await f.find('.project-picker').action();await toggle('Other',true);
  const translations={navigator:{language:'ko'}};vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),translations);const tr=translations.KrillMobile.i18n.t;assert.equal(tr('Filter projects'),'프로젝트 필터');assert.equal(tr('Remove {0} filter','Other'),'Other 필터 제거');
  f.state.ui.search='idle';f.view.update();assert.deepEqual(shown(),['a-idle'],'search still reaches hidden workspaces');f.state.ui.search='';
- await toggle('All projects',true);assert.deepEqual(sent(),{action:'set_workspace_view',repos:[]});assert.deepEqual(sections(),['Shown','Other']);
+ await f.byText('Clear').action();await f.flush();assert.deepEqual(sent(),{action:'set_workspace_view',repos:[]});assert.deepEqual(sections(),['Shown','Other']);assert.equal(f.find('.project-picker').textContent,'ProjectsAll projects');
+ await toggle('Other',true);await toggle('All projects',true);assert.deepEqual(sent(),{action:'set_workspace_view',repos:[]});assert.deepEqual(sections(),['Shown','Other']);
  await f.byText('Status').action();await f.flush();assert.deepEqual(sent(),{action:'set_workspace_view',group_by:1});assert.deepEqual(sections(),['Todo','In Progress','Completed']);assert.deepEqual(shown(),['a-main','a-idle','a-busy','b-main']);assert.equal(f.byText('Status').getAttribute('aria-pressed'),'true');
  await f.byText('None').action();await f.flush();assert.deepEqual(sections(),[],'no grouping shows one list without headers');assert.deepEqual(shown(),['a-idle','a-busy','a-main','b-main'],'PC sort order across projects');assert(f.all().filter(n=>n.classList.contains('tree-node')).every(n=>n.dataset.depth==='0'));
  await f.byText('Name').action();await f.flush();assert.deepEqual(sent(),{action:'set_workspace_view',sort_by:2});assert.equal(f.byText('Name').getAttribute('aria-pressed'),'true');
@@ -132,6 +133,50 @@ async function projectFilters(){
  await f.byText('Search').action();const search=f.all().find(n=>n.tagName==='INPUT'&&n.type==='search');search.value='프로젝트';emit(search,'input');assert.deepEqual(shown(),[ga.key],'search reaches projects outside the filter by name');search.value='';emit(search,'input');
  f.state.snapshot.view={repos:[]};f.state.snapshot.repositories=f.state.snapshot.repositories.filter(r=>r.key!=='other');f.view.update();assert.equal(shown().length,3,'a project gone from the snapshot falls back to the folder list');f.abort.abort();
  console.log('PASS PC project filter keeps folder sessions, search reaches filtered projects, removed repositories');
+}
+async function createWorktreeSheet(){
+ let needsSetup=false;
+ const f=fixture('workspaces',{rpc:req=>{if(req.action==='create_workspace'){if(needsSetup&&!req.setup_hash&&!req.skip_setup)return {needs_setup:true,script:'npm ci',hash:'a'.repeat(64)};f.state.groups.set('wt-new',{key:'wt-new',repoKey:req.repository,label:req.name,path:'/repo/'+req.name,sessions:[{id:77}]});return {workspace:'wt-new',session:77,branch:req.name,path:'/repo/'+req.name};}return {};}});
+ f.state.snapshot.capabilities={worktree_create:true};
+ f.state.snapshot.agents=[{id:'claude',name:'Claude Code'},{id:'codex',name:'Codex'}];
+ f.state.snapshot.repositories=[{key:'krill',label:'krill',path:'/Users/macmini/Documents/wProject/krill',remote:'craftowen/krill',badge_color:'#3b82f6'},{key:'orca',label:'orca',path:'/Users/macmini/Documents/wProject/orca',remote:'lovecast/orca',icon:{kind:'emoji',value:'🐋'}},{key:'old',label:'old',removed:true}];
+ f.state.groups.set('g-1',{key:'g-1',repoKey:'krill',label:'otter',branch:'main',path:'/Users/macmini/Documents/wProject/krill',sessions:[]});
+ f.state.groups.set('g-2',{key:'g-2',repoKey:'krill',label:'feat',branch:'feat/mobile-ui',path:'/Users/macmini/Krill/worktrees/krill/feat',sessions:[]});
+ f.state.snapshot.view={repos:['orca']};f.view.update();
+ const fab=f.byText('New workspace');assert(fab.classList.contains('new-workspace-fab'));assert.equal(fab.disabled,false);
+ f.state.connection.phase='disconnected';f.view.update();assert.equal(fab.disabled,true);f.state.connection.phase='ready';f.view.update();assert.equal(fab.disabled,false);
+ await fab.action();assert.equal(f.sheets.at(-1)[0],'Create worktree');
+ const body=f.ctx.el('div');f.sheets.at(-1)[3](body);const form=body.querySelector('.worktree-composer');assert(form);
+ const projectBtn=form.querySelector('.worktree-project-button'),targetBtn=form.querySelector('.worktree-target-button'),agentBtn=form.querySelector('.worktree-agent-button'),nameInput=form.querySelector('.worktree-name-input'),advBtn=form.querySelector('.worktree-advanced-toggle'),advBody=form.querySelector('.worktree-advanced-body');
+ assert.equal(projectBtn.querySelector('.worktree-field-title').textContent,'orca','single filtered project is preselected');
+ assert.equal(projectBtn.querySelector('.worktree-field-detail').textContent,'lovecast/orca');
+ assert.equal(projectBtn.querySelector('.project-choice-dot').dataset.emoji,'🐋');
+ await projectBtn.action();const projectList=form.querySelector('.project-picker-list');assert.equal(projectList.hidden,false);assert.deepEqual(projectList.children.map(n=>n.dataset.repoKey),['krill','orca'],'removed repositories are excluded');
+ await projectList.children[0].action();assert.equal(projectList.hidden,true);
+ assert.equal(projectBtn.querySelector('.worktree-field-title').textContent,'krill');
+ assert.equal(projectBtn.querySelector('.worktree-field-detail').textContent,'craftowen/krill');
+ assert.equal(targetBtn.querySelector('.worktree-field-title').textContent,'Test desktop');
+ assert.equal(targetBtn.querySelector('.worktree-field-detail').textContent,'/Users/macmini/Documents/wProject/krill');
+ assert.equal(agentBtn.querySelector('.worktree-agent-name').textContent,'Claude');
+ assert.equal(nameInput.placeholder,'Type a name or search a source');
+ // Submitting with blank name auto-generates a unique creature name (skipping 'otter' which is already in state.groups).
+ emit(form,'submit');await f.flush();
+ assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))),{action:'create_workspace',repository:'krill',name:'falcon',agent:'claude'});
+ assert.equal(f.routes.at(-1),'/host/local/group/wt-new/s/77');
+ // Reopen, pick branch from source suggestions, switch agent to Codex, and test setup script review.
+ f.state.snapshot.view={repos:[]};f.view.update();await fab.action();const body2=f.ctx.el('div');f.sheets.at(-1)[3](body2);const form2=body2.querySelector('.worktree-composer');
+ const name2=form2.querySelector('.worktree-name-input'),sources2=form2.querySelector('.worktree-source-list'),agentBtn2=form2.querySelector('.worktree-agent-button'),agentList2=form2.querySelector('.agent-picker-list'),advBody2=form2.querySelector('.worktree-advanced-body');
+ emit(name2,'focus');assert.equal(sources2.hidden,false);assert.deepEqual(sources2.children.map(n=>n.querySelector('.worktree-source-branch').textContent),['main','feat/mobile-ui']);
+ await sources2.children[1].action();assert.equal(advBody2.hidden,false);assert.equal(advBody2.querySelector('input').value,'feat/mobile-ui');
+ name2.value='custom-wt';emit(name2,'input');
+ await agentBtn2.action();assert.equal(agentList2.hidden,false);await agentList2.children.find(n=>n.dataset.agentId==='codex').action();assert.equal(agentBtn2.querySelector('.worktree-agent-name').textContent,'Codex');
+ needsSetup=true;emit(form2,'submit');await f.flush();
+ assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))),{action:'create_workspace',repository:'krill',name:'custom-wt',base:'feat/mobile-ui',agent:'codex'});
+ assert.equal(f.sheets.at(-1)[0],'Run setup script?');
+ await f.sheets.at(-1)[1][0].action();await f.flush();
+ assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))),{action:'create_workspace',repository:'krill',name:'custom-wt',base:'feat/mobile-ui',agent:'codex',setup_hash:'a'.repeat(64)});
+ f.abort.abort();
+ console.log('PASS Orca Create worktree sheet: FAB, project/remote picker, Run on target, branch source suggestions, agent picker, auto-name and setup review');
 }
 async function home(){const f=fixture('home');assert.equal(f.find('.krill-logo').src,'icon.svg');assert(!f.root.textContent.includes('Welcome back'));assert(f.root.textContent.includes('Connect your desktop'));
  const first={id:'one',active:true,name:'First PC',endpoint:'Relay · aaaa',connection:{phase:'ready'},snapshot:{sessions:[{id:7,title:'First task',worktree_key:'same',state:'Working'}]}},second={id:'two',name:'Second PC',endpoint:'Relay · bbbb',connection:{phase:'ready'},snapshot:{sessions:[{id:7,title:'Second task',worktree_key:'same',state:'Waiting'}]}};f.ctx.connections=[first,second];f.view.update();assert.equal(f.find('.home-desktops').children.length,2);assert(f.root.textContent.includes('2/2'));assert(f.root.textContent.includes('Recent sessions'));assert.equal(f.calls.length,0,'Home does not poll every provider account');
@@ -202,5 +247,5 @@ async function mobileAuditPairingAndShell(){
  console.log('PASS M05/M10/M13: Korean copy/interpolation, unpaired Accounts scan/paste CTA, saved-host flow, offline logo inventory and gzip mirrors');
 }
 
-async function main(){await mobileAuditPairingAndShell();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await home();await homeResumeAndLogins();await git();await accounts();await settings();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function main(){await mobileAuditPairingAndShell();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

@@ -497,3 +497,39 @@ button.account-row:disabled{opacity:1}
 @media(prefers-reduced-motion:reduce){.status-dot.working{mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%227%22%3E%3Ccircle%20cx%3D%2212%22%20cy%3D%2212%22%20r%3D%228.5%22%2F%3E%3C%2Fsvg%3E") center/contain no-repeat;animation:none}}
 
 .activity-line>.agent-icon{vertical-align:middle;margin-right:4px}
+
+
+/* Orca Create worktree sheet & floating action button. */
+.workspaces.screen{position:relative}
+.new-workspace-fab{position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(20px,calc(env(safe-area-inset-bottom) + 16px));z-index:12;width:54px;height:54px;border-radius:27px;border:1px solid var(--border);background:var(--surface-raised);color:var(--foreground);box-shadow:0 8px 24px rgba(0,0,0,.38);display:grid;place-items:center;padding:0}
+.new-workspace-fab svg{width:24px;height:24px}
+.new-workspace-fab:disabled{opacity:.45}
+#sheet-content:has(.worktree-composer)>.sheet-cancel{display:none}
+#sheet-content:has(.worktree-composer)>h2{font-size:calc(18px * var(--ui-scale,1));font-weight:700;padding:4px 8px 8px}
+.worktree-composer{gap:14px;padding:4px 8px 8px}
+.worktree-field,.worktree-advanced-body{display:flex;flex-direction:column;gap:6px}
+.worktree-label-row{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.worktree-label{font-size:var(--font-meta);font-weight:600;color:var(--muted-foreground)}
+.worktree-label-hint{font-size:var(--font-meta);color:var(--text-muted)}
+.worktree-field-button,.worktree-picker-row{display:flex;align-items:center;gap:12px;width:100%;min-height:48px;padding:10px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface-raised);color:var(--foreground);text-align:left}
+.worktree-field-button>svg:last-child{width:16px;height:16px;flex:none;margin-left:auto;color:var(--muted-foreground);transition:transform 140ms ease}
+.worktree-field-button[aria-expanded=true]>svg:last-child{transform:rotate(180deg)}
+.worktree-field-copy{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}
+.worktree-field-title,.worktree-agent-name{font-size:var(--font-body);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.worktree-field-detail{font-size:var(--font-meta);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.worktree-target-icon,.worktree-agent-mark{display:grid;place-items:center;width:18px;height:18px;flex:none;color:var(--muted-foreground)}
+.worktree-target-icon svg,.worktree-agent-mark svg{width:18px;height:18px}
+.worktree-picker-list,.worktree-source-list{display:flex;flex-direction:column;gap:4px;padding:4px;border:1px solid var(--border);border-radius:12px;background:var(--surface-base);max-height:220px;overflow:auto}
+.worktree-picker-row{border:0;background:transparent;padding:8px 10px;border-radius:8px}
+.worktree-picker-row[aria-pressed=true]{background:var(--surface-raised)}
+.worktree-picker-row .picker-check{display:grid;place-items:center;width:16px;height:16px;flex:none;margin-left:auto;color:var(--foreground)}
+.worktree-picker-row .picker-check svg{width:16px;height:16px}
+.worktree-name-input,.worktree-advanced-body input{border-radius:12px;background:var(--surface-raised)}
+.worktree-source-row{display:flex;align-items:center;gap:8px;width:100%;min-height:40px;padding:6px 10px;border:0;border-radius:8px;background:transparent;text-align:left}
+.worktree-source-row svg{width:14px;height:14px;flex:none;color:var(--muted-foreground)}
+.worktree-source-branch{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--font-meta)}
+.worktree-advanced-toggle{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;min-height:36px!important;padding:4px 2px;background:transparent;color:var(--muted-foreground);font-size:var(--font-body);font-weight:600}
+.worktree-advanced-toggle svg{width:16px;height:16px;transition:transform 140ms ease}
+.worktree-advanced-toggle.open svg{transform:rotate(180deg)}
+.worktree-actions{display:flex;justify-content:flex-end;padding-top:4px}
+.worktree-submit{min-height:44px;padding:10px 18px;border-radius:12px;font-weight:600}
