@@ -12,7 +12,7 @@ Use the current JXA backend for visible macOS app windows. Native execution is e
 ## Observe, act, inspect
 
 1. Check `krill computer capabilities --json` and `krill computer permissions --json`. To open the relevant Settings page, explicitly use `permissions --id accessibility` or `permissions --id screenshots`.
-2. Discover the exact process/window with `list-apps --json` and `list-windows --app pid:123 --json`. Use a PID when names are ambiguous.
+2. Discover the exact process/window with `krill computer list-apps --json` and `krill computer list-windows --app pid:123 --json`. Use a PID when names are ambiguous.
 3. Observe with `krill computer get-app-state --app pid:123 --window-id 456 --json`.
 4. Select a reference from that result and bind the action explicitly: `krill computer click --snapshot <snapshotId> --element 2 --json`.
 5. Read all result axes and the returned observation before choosing another action. A fresh observation supplies its own snapshot ID. Never reuse a reference number from a different snapshot.
@@ -30,14 +30,14 @@ Snapshots expire for input after 120 seconds. They are private to the actual cal
 All actions accept `--snapshot <snapshotId>`, `--json`, and optional `--screenshot`. The default numeric reference resolves only against the caller's last returned snapshot. An `--app` or window selector must agree with that original observation.
 
 - `click --element 2` or `click --x 100 --y 200`; optional `--button left|right|middle`, `--click-count 1..16`, and `--modifiers cmd,shift`.
-- `perform-secondary-action --element 2 --action AXShowMenu`; the requested action must be advertised by the actual AX element.
-- `set-value --element 1 --value-stdin` (or `--value <text>`). Verification compares the full value on the same resolved object, not its preview.
-- `type-text --element 1 --text-stdin` (or `--text <text>`). Requires an already focused editable receiver; newline/tab sequences are refused. Prefer set-value or paste-text for such text.
-- `paste-text --element 1 --text-stdin` (or `--text <text>`). Requires a focused editable receiver and bounded preservation of all readable clipboard item types.
-- `press-key --key return --modifiers cmd --repeat 1`; repeat is bounded to 32.
-- `hotkey --keys cmd+shift+p`.
-- `scroll --element 3 --direction down --pages 1`, or a point and `--delta-x` / `--delta-y`.
-- `drag --from-element 2 --to-element 3`, or explicit `--from-x`, `--from-y`, `--to-x`, `--to-y`.
+- `krill computer perform-secondary-action --element 2 --action AXShowMenu`; the requested action must be advertised by the actual AX element.
+- `krill computer set-value --element 1 --value-stdin` (or `--value <text>`). Verification compares the full value on the same resolved object, not its preview.
+- `krill computer type-text --element 1 --text-stdin` (or `--text <text>`). Requires an already focused editable receiver; newline/tab sequences are refused. Prefer set-value or paste-text for such text.
+- `krill computer paste-text --element 1 --text-stdin` (or `--text <text>`). Requires a focused editable receiver and bounded preservation of all readable clipboard item types.
+- `krill computer press-key --key return --modifiers cmd --repeat 1`; repeat is bounded to 32.
+- `krill computer hotkey --keys cmd+shift+p`.
+- `krill computer scroll --element 3 --direction down --pages 1`, or a point and `--delta-x` / `--delta-y`.
+- `krill computer drag --from-element 2 --to-element 3`, or explicit `--from-x`, `--from-y`, `--to-x`, `--to-y`.
 
 The target app and window must already be foreground. Text input requires its observed receiver to remain focused. Unexpected foreground/window/receiver changes stop the action; do not force focus back after user intervention. `get-app-state --restore-window` explicitly allows guarded unminimization; it does not authorize targeting Krill itself. Coordinates use the observed desktop logical points, not screenshot pixels. A screenshot carries measured dimensions and capture bounds; changed geometry or occlusion requires a new observation.
 
