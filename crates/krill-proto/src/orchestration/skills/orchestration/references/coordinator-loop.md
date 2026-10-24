@@ -27,5 +27,5 @@ readiness or prompt injection. Read the receipt and inspect `worker-list`,
 that nothing ran. See [recovery-and-cleanup](recovery-and-cleanup.md).
 
 The current Run is shared per Krill state directory. Explicit `--run` and globally
-distinct worker names reduce accidental cross-run confusion. `check` currently
-has no Run filter; validate every message's run/task/dispatch before acting.
+distinct worker names reduce accidental cross-run confusion. Pass `--run <run-id>`
+to `check` as well, and validate every message's run/task/dispatch before acting.

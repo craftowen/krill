@@ -28,7 +28,7 @@ use krill_proto::screen::{self, Attach, Attached, Msg, Seq, Stream};
 
 use crate::remote::Target;
 
-const USAGE: &str = "usage: krill [--host <user@host>] ls [--worktree <path>] [--json] | krill new [--cwd <path>] [--worktree <name>] [--agent <profile> | -- <program> <args>...] [--account <id>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill fork [<id>] [--from <id>] [--cwd <path>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill send <id> [--enter] [--wait-submit] [--text <text>] [--stdin | -- <text>...]\n       krill read <id> [--lines N] | krill wait <id> [--for idle|waiting|blocked|pattern|quiet|exited|working|done|unknown] [--pattern <regex>] [--quiet-ms|--idle-ms N] [--timeout <seconds>]\n       krill kill <id> | krill attach <id> (Ctrl-] detaches; stdin EOF detaches)\n       remote (--host): SSH Unix-socket forwarding to the remote krilld; --cwd must be absolute on the remote host";
+const USAGE: &str = "usage: krill [--host <user@host>] ls [--worktree <path>] [--json] | krill new [--cwd <path>] [--worktree <name>] [--agent <profile> [--model <id>] [--effort <level>] | -- <program> <args>...] [--account <id>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill fork [<id>] [--from <id>] [--cwd <path>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill send <id> [--enter] [--wait-submit] [--text <text>] [--stdin | -- <text>...]\n       krill read <id> [--lines N] | krill wait <id> [--for idle|waiting|blocked|pattern|quiet|exited|working|done|unknown] [--pattern <regex>] [--quiet-ms|--idle-ms N] [--timeout <seconds>]\n       krill kill <id> | krill attach <id> (Ctrl-] detaches; stdin EOF detaches)\n       remote (--host): SSH Unix-socket forwarding to the remote krilld; --cwd must be absolute on the remote host";
 /// capture→attach 사이 세션 종료와 권한 거부를 구분할 수 없어 둘 다 이 문구로 나온다.
 /// "방금 kill한 세션에 send" 같은 레이스에서 권한 문제로 오인하지 않게 닫힘 가능성을 먼저 적는다(C5).
 const RAW_REFUSED_MSG: &str =
@@ -396,6 +396,7 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
     };
     let mut worktree = None;
     let mut prompt: Option<String> = None;
+    let mut overrides = krill_proto::agent::LaunchOverrides::default();
     let mut json = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -447,6 +448,24 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
                         .to_owned(),
                 );
             }
+            Some("--model") if overrides.model.is_none() => {
+                overrides.model = Some(
+                    args.next()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(usage)?
+                        .to_owned(),
+                );
+            }
+            Some("--effort") if overrides.effort.is_none() => {
+                overrides.effort = Some(
+                    args.next()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(usage)?
+                        .to_owned(),
+                );
+            }
             Some("--json") => json = true,
             Some("--agent") if c.program == Program::Login => {
                 c.program = Program::Agent {
@@ -468,6 +487,21 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
             }
             _ => return Err(usage()),
         }
+    }
+    if !overrides.is_empty() {
+        let Program::Agent { ref mut id } = c.program else {
+            return Err(usage());
+        };
+        if !target.is_remote()
+            && let Ok(agents) = load_local_agents(daemon::state_dir().as_deref())
+        {
+            let (canon, profile) = agents
+                .resolve(id)
+                .ok_or_else(|| fail(format!("unknown agent profile '{id}'")))?;
+            krill_proto::agent::validate_launch_overrides(canon, profile, &overrides)
+                .map_err(fail)?;
+        }
+        *id = krill_proto::agent::encode_agent_program_id(id, &overrides).map_err(fail)?;
     }
     if c.cols > screen::MAX_COLS || c.rows > screen::MAX_LINES {
         return Err(usage());
@@ -867,7 +901,7 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
     }
 }
 
-fn state_name(s: AgentState) -> &'static str {
+pub(crate) fn state_name(s: AgentState) -> &'static str {
     match s {
         AgentState::Working => "working",
         AgentState::Waiting => "waiting",
@@ -876,6 +910,67 @@ fn state_name(s: AgentState) -> &'static str {
         AgentState::Exited => "exited",
         AgentState::Unknown => "unknown",
     }
+}
+
+pub(crate) fn load_local_agents(
+    state_dir: Option<&std::path::Path>,
+) -> std::result::Result<krill_proto::agent::Agents, String> {
+    let file = state_dir.map(|d| d.join(krill_proto::agent::FILE_NAME));
+    let user = match file.as_deref().map(std::fs::read_to_string) {
+        Some(Ok(text)) => Some(text),
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e.to_string());
+        }
+        _ => None,
+    };
+    krill_proto::agent::Agents::load(user.as_deref()).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ObservedSession {
+    pub id: u64,
+    pub exit_code: Option<i32>,
+    pub agent_state: Option<AgentState>,
+}
+
+/// 데몬을 새로 띄우지 않고(`Target::dial`) 현재 세션 목록과 훅 상태를 조회한다.
+/// 소켓이 없거나 연결에 실패하면 `None`을 돌려준다.
+pub(crate) fn observe_sessions_on_target(target: &Target) -> Option<Vec<ObservedSession>> {
+    let mut c = target
+        .dial(&daemon::client_hello(ClientRole::Cli, "krill"), IO_TIMEOUT)
+        .ok()?;
+    if c.negotiated.features & FEAT_CONTROL == 0 {
+        return None;
+    }
+    c.stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
+    c.stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
+    let Reply::Sessions(sessions) = request(&mut c.stream, &Request::List).ok()? else {
+        return None;
+    };
+    let states = if c.negotiated.features & FEAT_HOOK != 0 {
+        match request(&mut c.stream, &Request::States) {
+            Ok(Reply::States(s)) => s,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Some(
+        sessions
+            .into_iter()
+            .map(|s| {
+                let agent_state = states
+                    .iter()
+                    .find(|v| v.session == s.session)
+                    .map(|v| v.status.state);
+                ObservedSession {
+                    id: s.session.0,
+                    exit_code: s.status,
+                    agent_state,
+                }
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn list_session_ids() -> std::result::Result<Vec<u64>, String> {
@@ -921,17 +1016,35 @@ pub(crate) fn spawn_agent_session_on_target(
     account: Option<String>,
     cwd: &std::path::Path,
 ) -> std::result::Result<u64, String> {
-    let mut conn = connect(target, FEAT_CONTROL).map_err(|e| e.text)?;
+    spawn_agent_session_with_overrides_on_target(
+        target,
+        agent,
+        &krill_proto::agent::LaunchOverrides::default(),
+        account,
+        cwd,
+    )
+}
+
+pub(crate) fn spawn_agent_session_with_overrides_on_target(
+    target: &Target,
+    agent: &str,
+    overrides: &krill_proto::agent::LaunchOverrides,
+    account: Option<String>,
+    cwd: &std::path::Path,
+) -> std::result::Result<u64, String> {
     let program = if agent.is_empty()
         || agent.eq_ignore_ascii_case("shell")
         || agent.eq_ignore_ascii_case("login")
     {
+        if !overrides.is_empty() {
+            return Err("--model/--effort requires an agent profile, not shell/login".to_owned());
+        }
         Program::Login
     } else {
-        Program::Agent {
-            id: agent.to_owned(),
-        }
+        let id = krill_proto::agent::encode_agent_program_id(agent, overrides)?;
+        Program::Agent { id }
     };
+    let mut conn = connect(target, FEAT_CONTROL).map_err(|e| e.text)?;
     let req = Request::Create(Create {
         account,
         program,

@@ -308,6 +308,271 @@ impl Agents {
     }
 }
 
+const LAUNCH_OVERRIDE_PREFIX: &str = "launch\x1f";
+
+/// 에이전트 세션 기동 시 프로필 기본값 위에 얹는 런타임 모델·추론 강도 오버라이드.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl LaunchOverrides {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none()
+    }
+}
+
+fn validate_model_syntax(raw: &str) -> Result<String, String> {
+    let model = raw.trim();
+    if model.is_empty() {
+        return Err("model must not be empty".to_owned());
+    }
+    if model.len() > 128 {
+        return Err("model exceeds 128 bytes".to_owned());
+    }
+    if model.starts_with('-') {
+        return Err(format!("model must not start with '-': {model}"));
+    }
+    if !model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
+    {
+        return Err(format!(
+            "model contains unsupported characters: {model} (allowed: ASCII alphanumeric, '.', '_', '-', ':', '/', '@')"
+        ));
+    }
+    Ok(model.to_owned())
+}
+
+fn validate_effort_syntax(raw: &str) -> Result<String, String> {
+    let effort = raw.trim().to_ascii_lowercase();
+    if effort.is_empty() {
+        return Err("effort must not be empty".to_owned());
+    }
+    if !matches!(
+        effort.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        return Err(format!(
+            "unsupported effort '{raw}'; expected one of: minimal, low, medium, high, xhigh, max"
+        ));
+    }
+    Ok(effort)
+}
+
+fn has_model_flag_in_args(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--model" || arg == "-m" || arg.starts_with("--model=") || arg.starts_with("-m=")
+    })
+}
+
+fn has_effort_flag_in_args(args: &[String]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--effort"
+            || arg.starts_with("--effort=")
+            || arg == "--thinking"
+            || arg.starts_with("--thinking=")
+            || arg.contains("model_reasoning_effort")
+        {
+            return true;
+        }
+        if (arg == "-c" || arg == "--config")
+            && iter
+                .next()
+                .is_some_and(|val| val.contains("model_reasoning_effort"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 에이전트 ID와 프로필에 대해 `overrides`가 문법·공급자·프로필 인자와 충돌하지 않는지 검증하고
+/// 정규화된 [`LaunchOverrides`]를 돌려준다.
+pub fn validate_launch_overrides(
+    agent_id: &str,
+    profile: &Profile,
+    overrides: &LaunchOverrides,
+) -> Result<LaunchOverrides, String> {
+    let canon = canonical_id(agent_id);
+    let model = match overrides.model.as_deref() {
+        Some(raw) => {
+            let valid = validate_model_syntax(raw)?;
+            if !matches!(
+                canon,
+                "claude" | "codex" | "agy" | "opencode" | "cursor" | "pi" | "kimi"
+            ) {
+                return Err(format!(
+                    "--model override is not supported for agent '{agent_id}'"
+                ));
+            }
+            if has_model_flag_in_args(&profile.launch) || has_model_flag_in_args(&profile.yolo_args)
+            {
+                return Err(format!(
+                    "agent profile '{agent_id}' already defines a model flag in launch/yolo_args"
+                ));
+            }
+            Some(valid)
+        }
+        None => None,
+    };
+
+    let effort = match overrides.effort.as_deref() {
+        Some(raw) => {
+            let valid = validate_effort_syntax(raw)?;
+            match canon {
+                "codex" => {
+                    if !matches!(
+                        valid.as_str(),
+                        "minimal" | "low" | "medium" | "high" | "xhigh"
+                    ) {
+                        return Err(format!(
+                            "agent '{agent_id}' supports effort: minimal, low, medium, high, xhigh (got '{valid}')"
+                        ));
+                    }
+                }
+                "claude" => {
+                    if !matches!(valid.as_str(), "low" | "medium" | "high" | "max") {
+                        return Err(format!(
+                            "agent '{agent_id}' supports effort: low, medium, high, max (got '{valid}')"
+                        ));
+                    }
+                }
+                "pi" => {
+                    if !matches!(
+                        valid.as_str(),
+                        "minimal" | "low" | "medium" | "high" | "xhigh"
+                    ) {
+                        return Err(format!(
+                            "agent '{agent_id}' supports effort: minimal, low, medium, high, xhigh (got '{valid}')"
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "--effort override is not supported for agent '{agent_id}' (supported: claude, codex, pi)"
+                    ));
+                }
+            }
+            if has_effort_flag_in_args(&profile.launch)
+                || has_effort_flag_in_args(&profile.yolo_args)
+            {
+                return Err(format!(
+                    "agent profile '{agent_id}' already defines an effort/thinking flag in launch/yolo_args"
+                ));
+            }
+            Some(valid)
+        }
+        None => None,
+    };
+
+    Ok(LaunchOverrides { model, effort })
+}
+
+/// 검증된 [`LaunchOverrides`]를 `profile.launch`에 반영한다.
+pub fn apply_launch_overrides(
+    agent_id: &str,
+    profile: &mut Profile,
+    overrides: &LaunchOverrides,
+) -> Result<(), String> {
+    let normalized = validate_launch_overrides(agent_id, profile, overrides)?;
+    let canon = canonical_id(agent_id);
+    if let Some(model) = normalized.model {
+        profile.launch.push("--model".to_owned());
+        profile.launch.push(model);
+    }
+    if let Some(effort) = normalized.effort {
+        match canon {
+            "codex" => {
+                profile.launch.push("-c".to_owned());
+                profile
+                    .launch
+                    .push(format!("model_reasoning_effort=\"{effort}\""));
+            }
+            "claude" => {
+                profile.launch.push("--effort".to_owned());
+                profile.launch.push(effort);
+            }
+            "pi" => {
+                profile.launch.push("--thinking".to_owned());
+                profile.launch.push(effort);
+            }
+            _ => {
+                return Err(format!(
+                    "--effort override is not supported for agent '{agent_id}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `Program::Agent { id }` 필드에 에이전트 ID와 [`LaunchOverrides`]를 인코딩한다.
+/// 오버라이드가 비어 있으면 기존 프로토콜과 100% 동일하게 `agent_id` 그대로 돌려준다.
+pub fn encode_agent_program_id(
+    agent_id: &str,
+    overrides: &LaunchOverrides,
+) -> Result<String, String> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() || agent_id.contains('\x1f') || agent_id.contains('\0') {
+        return Err("invalid agent id".to_owned());
+    }
+    if overrides.is_empty() {
+        return Ok(agent_id.to_owned());
+    }
+    let model = match overrides.model.as_deref() {
+        Some(raw) => validate_model_syntax(raw)?,
+        None => String::new(),
+    };
+    let effort = match overrides.effort.as_deref() {
+        Some(raw) => validate_effort_syntax(raw)?,
+        None => String::new(),
+    };
+    Ok(format!(
+        "{LAUNCH_OVERRIDE_PREFIX}{agent_id}\x1f{model}\x1f{effort}"
+    ))
+}
+
+/// [`encode_agent_program_id`]로 인코딩된 `Program::Agent { id }`를 `(agent_id, overrides)`로 복원한다.
+pub fn decode_agent_program_id(encoded: &str) -> Result<(&str, LaunchOverrides), String> {
+    let Some(rest) = encoded.strip_prefix(LAUNCH_OVERRIDE_PREFIX) else {
+        if encoded.is_empty() || encoded.contains('\x1f') || encoded.contains('\0') {
+            return Err("invalid agent id".to_owned());
+        }
+        return Ok((encoded, LaunchOverrides::default()));
+    };
+    let mut parts = rest.split('\x1f');
+    let agent_id = parts
+        .next()
+        .filter(|s| !s.is_empty() && !s.contains('\0'))
+        .ok_or_else(|| "invalid launch override encoding: missing agent id".to_owned())?;
+    let model_raw = parts
+        .next()
+        .ok_or_else(|| "invalid launch override encoding: missing model slot".to_owned())?;
+    let effort_raw = parts
+        .next()
+        .ok_or_else(|| "invalid launch override encoding: missing effort slot".to_owned())?;
+    if parts.next().is_some() {
+        return Err("invalid launch override encoding: unexpected extra fields".to_owned());
+    }
+    let model = if model_raw.is_empty() {
+        None
+    } else {
+        Some(validate_model_syntax(model_raw)?)
+    };
+    let effort = if effort_raw.is_empty() {
+        None
+    } else {
+        Some(validate_effort_syntax(effort_raw)?)
+    };
+    Ok((agent_id, LaunchOverrides { model, effort }))
+}
+
 /// `program`을 `path`(PATH 형식)에서 찾는다. 경로 구분자(`/`, Windows는 `\`도)가 들어 있으면 그 경로만 본다
 /// (셸 `command -v`와 같은 규칙).
 pub fn which(program: &str, path: &OsStr) -> Option<PathBuf> {
