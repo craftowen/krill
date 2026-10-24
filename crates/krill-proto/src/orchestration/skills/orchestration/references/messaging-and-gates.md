@@ -24,6 +24,16 @@ Worker questions use `ask`; timeout leaves a durable pending question. Re-wait
 with its message ID. Answer with `reply <message-id> --body "<answer>" --json`.
 Do not create a second gate merely to answer the same question.
 
+Questions to `coordinator` or another worker stay in the internal inbox. When
+human input is actually required, the coordinator may ask `--to user` (or
+`--to mobile`) with the owning `--run` and `--task`. These are the explicit
+human inbox addresses shown under **Confirmation requests** on mobile. Write a
+short question in the user's language and put the situation and consequences in
+the body; resolve worker coordination internally. Pending decision gates are
+also shown there. Completed/archived Runs, completed Tasks and ended Dispatches
+are excluded without deleting or acknowledging their stored history. Requests
+without an owner cannot be retired with its lifecycle, so always attach one.
+
 Use a decision gate for an actual user/coordinator decision:
 `gate-create --from <worker> --run <run-id> --task <task-id> --question "<decision>"
 --options "approve,reject" --json`. Resolve with

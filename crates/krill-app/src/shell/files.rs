@@ -18,6 +18,9 @@ use krill_app::terminal::path_link::{self, PathLink};
 
 use super::*;
 
+mod reload;
+use reload::{FileComparison, ReloadRecovery};
+
 /// 열린 파일의 디스크 지문을 보는 간격.
 // ponytail: stat 폴링(파일 수 × 1Hz). 탭이 수백 개가 되면 FSEvents 감시로.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
@@ -177,6 +180,8 @@ pub(super) struct Files {
     recent: Vec<PathBuf>,
     #[cfg(test)]
     next_io: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    link_next_io: Option<tokio::sync::oneshot::Receiver<()>>,
     /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·저장·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
     released: Vec<PathBuf>,
     /// 터미널 링크(OWE-663 4번, OWE-867): 디스크 확인 캐시, ⌘ 아래 링크(칸, 밑줄 범위), 열고 나서 옮길 (파일, 줄, 열).
@@ -194,7 +199,8 @@ pub(super) struct Files {
 #[derive(Clone, PartialEq)]
 struct LinkKey {
     pane: PaneId,
-    row: Vec<krill_proto::screen::Cell>,
+    input: path_link::Input,
+    session: Option<krill_proto::SessionId>,
     line: u16,
     column: u16,
     cwd: Option<PathBuf>,
@@ -202,6 +208,7 @@ struct LinkKey {
 struct LinkLookup {
     key: LinkKey,
     ready: bool,
+    checked_at: Option<std::time::Instant>,
     found: Option<PathLink>,
 }
 
@@ -228,6 +235,8 @@ impl Default for Files {
             recent: Vec::new(),
             #[cfg(test)]
             next_io: None,
+            #[cfg(test)]
+            link_next_io: None,
             released: Vec::new(),
             link_lookup: None,
             link_busy: false,
@@ -262,6 +271,8 @@ impl Files {
 }
 
 struct FileTab {
+    comparison: Option<FileComparison>,
+    recovery: Option<ReloadRecovery>,
     path: PathBuf,
     revision: u64,
     saving: bool,
@@ -392,6 +403,9 @@ impl FileTab {
 
     /// 키보드 포커스를 받을 에디터. 미리보기 중이면 숨은 에디터에 입력이 가지 않게 `None`.
     fn focus_editor(&self) -> Option<&gpui::Entity<EditorState>> {
+        if self.comparison.is_some() {
+            return None;
+        }
         match &self.body {
             Body::Text {
                 state, shown: None, ..
@@ -595,6 +609,9 @@ impl Shell {
         action: Option<terminal_menu::FileAction>,
         cx: &mut Context<Self>,
     ) -> Option<(u16, PathLink)> {
+        if self.layout.host(pane).is_remote() {
+            return None;
+        }
         let cwd = self.pane_cwd(pane, cx);
         let l = self.live.get(&pane)?;
         let screen = l.pane.shown();
@@ -602,10 +619,11 @@ impl Shell {
         if screen.link_at(line, column).is_some() {
             return None;
         }
-        let row = screen.rows.get(usize::from(line))?.clone();
+        let input = path_link::Input::at(&screen, line, column)?;
         let key = LinkKey {
             pane,
-            row,
+            input,
+            session: l.pane.session(),
             line,
             column,
             cwd,
@@ -614,24 +632,35 @@ impl Shell {
             if let Some(lookup) = &self.files.link_lookup
                 && lookup.key == key
                 && lookup.ready
+                && lookup
+                    .checked_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
             {
                 return lookup.found.clone().map(|link| (line, link));
             }
             self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
             let generation = self.files.link_open_generation;
             let session = l.pane.session();
-            let row = key.row;
-            let cwd = key.cwd;
+            let checked = key.clone();
+            #[cfg(test)]
+            let next_io = self.files.link_next_io.take();
             cx.spawn(async move |this, cx| {
+                #[cfg(test)]
+                if let Some(next_io) = next_io {
+                    next_io.await.ok();
+                }
                 let found = cx
                     .background_executor()
                     .spawn(async move {
-                        path_link::Cache::default().link_at(&row, column, cwd.as_deref())
+                        checked
+                            .input
+                            .resolve(&mut path_link::Cache::default(), checked.cwd.as_deref())
                     })
                     .await;
                 this.update(cx, |this, cx| {
                     if this.files.link_open_generation == generation
                         && this.layout.focused() == Some(pane)
+                        && this.path_link_key_matches(&key, cx)
                         && this
                             .live
                             .get(&pane)
@@ -648,6 +677,10 @@ impl Shell {
         }
         if let Some(lookup) = &mut self.files.link_lookup
             && lookup.key == key
+            && (!lookup.ready
+                || lookup
+                    .checked_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500)))
         {
             return lookup.found.clone().map(|link| (line, link));
         }
@@ -655,6 +688,7 @@ impl Shell {
         self.files.link_lookup = Some(LinkLookup {
             key,
             ready: false,
+            checked_at: None,
             found: None,
         });
         if self.files.link_busy {
@@ -683,9 +717,7 @@ impl Shell {
                         if cache.0.elapsed() >= Duration::from_millis(500) {
                             *cache = (std::time::Instant::now(), path_link::Cache::default());
                         }
-                        cache
-                            .1
-                            .link_at(&checked.row, checked.column, checked.cwd.as_deref())
+                        checked.input.resolve(&mut cache.1, checked.cwd.as_deref())
                     })
                     .await;
                 let pointer = this
@@ -707,16 +739,22 @@ impl Shell {
                             return true;
                         }
                         this.files.link_busy = false;
+                        if !this.path_link_key_matches(&key, cx) {
+                            this.files.link_lookup = None;
+                            if this.files.hover.is_some_and(|hover| hover.0 == key.pane) {
+                                this.files.hover = None;
+                                cx.notify();
+                            }
+                            return false;
+                        }
                         let Some(lookup) = &mut this.files.link_lookup else {
                             return false;
                         };
-                        let current_row = this.live.get(&key.pane).and_then(|live| {
-                            live.pane.shown().rows.get(usize::from(key.line)).cloned()
-                        });
-                        if lookup.key != key || current_row.as_ref() != Some(&key.row) {
+                        if lookup.key != key {
                             return false;
                         }
                         lookup.ready = true;
+                        lookup.checked_at = Some(std::time::Instant::now());
                         lookup.found.clone_from(&found);
                         if let Some(link) = found {
                             let under_pointer = pointer.is_some_and(|(position, command)| {
@@ -750,14 +788,27 @@ impl Shell {
         None
     }
 
+    fn path_link_key_matches(&self, key: &LinkKey, cx: &App) -> bool {
+        !self.layout.host(key.pane).is_remote()
+            && self.pane_cwd(key.pane, cx) == key.cwd
+            && self.live.get(&key.pane).is_some_and(|live| {
+                live.pane.session() == key.session && key.input.matches(&live.pane.shown())
+            })
+    }
+
     pub(super) fn open_terminal_file(
         &mut self,
         path: PathBuf,
+        position: Point<Pixels>,
         action: terminal_menu::FileAction,
         cx: &mut Context<Self>,
     ) {
         let focused = self.layout.focused();
+        if focused.is_some_and(|pane| self.layout.host(pane).is_remote()) {
+            return;
+        }
         let session = focused.and_then(|pane| self.live.get(&pane)?.pane.session());
+        let target = path.clone();
         self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
         let generation = self.files.link_open_generation;
         cx.spawn(async move |this, cx| {
@@ -769,7 +820,19 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if this.files.link_open_generation != generation
                     || this.layout.focused() != focused
+                    || focused.is_some_and(|pane| this.layout.host(pane).is_remote())
                     || focused.and_then(|pane| this.live.get(&pane)?.pane.session()) != session
+                    || !focused.is_some_and(|pane| {
+                        this.live.get(&pane).is_some_and(|live| {
+                            krill_app::terminal::file_link_target(
+                                &live.pane.shown(),
+                                &live.painted,
+                                position,
+                            )
+                            .as_ref()
+                                == Some(&target)
+                        })
+                    })
                 {
                     return;
                 }
@@ -794,20 +857,25 @@ impl Shell {
         .detach();
     }
 
-    /// ⌘ 없이 클릭해도 여는 평문 `http(s)://` URL. 프로그램이 마우스 보고를 켰으면 클릭은
-    /// 프로그램 것이고, OSC 8 링크는 보이는 글과 대상이 다를 수 있어 ⌘+클릭으로만 연다.
-    pub(super) fn plain_url_at(
+    /// ⌘ 없이 클릭하면 팝오버로 보여 줄 링크(OSC 8 `http(s)`·`mailto:`, 평문 `http(s)://` URL)와 밑줄 범위.
+    /// 프로그램이 마우스 보고를 켰으면 클릭은 프로그램 것이다. OSC 8은 보이는 글과 대상이 다를 수 있어
+    /// 바로 열지 않고 팝오버에 실제 대상을 보여 준다.
+    pub(super) fn click_link_at(
         &self,
         pane: PaneId,
         position: gpui::Point<Pixels>,
     ) -> Option<(Highlight, String)> {
         let l = self.live.get(&pane).filter(|l| !l.pane.modes().mouse())?;
         let screen = l.pane.shown();
+        if let Some(uri) = krill_app::terminal::link_target(&screen, &l.painted, position) {
+            let h = krill_app::terminal::osc_link_highlight(&screen, &l.painted, position)?;
+            return Some((h, uri.to_owned()));
+        }
         krill_app::terminal::url_link_target(&screen, &l.painted, position)
     }
 
     /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
-    /// ⌘ 없이도 맨 클릭으로 열리는 평문 URL에는 밑줄을 긋는다.
+    /// ⌘ 없이도 맨 클릭으로 팝오버가 뜨는 링크에는 밑줄을 긋는다.
     pub(super) fn update_path_hover(
         &mut self,
         pane: PaneId,
@@ -820,14 +888,17 @@ impl Shell {
             self.files.link_lookup = None;
         }
         let next = if cmd {
+            let remote = self.layout.host(pane).is_remote();
             let osc_or_url = self.live.get(&pane).and_then(|l| {
                 let screen = l.pane.shown();
-                krill_app::terminal::osc_link_highlight(&screen, &l.painted, position).or_else(
-                    || {
-                        krill_app::terminal::url_link_target(&screen, &l.painted, position)
-                            .map(|(h, _)| h)
-                    },
-                )
+                (!remote
+                    || krill_app::terminal::link_target(&screen, &l.painted, position).is_some())
+                .then(|| krill_app::terminal::osc_link_highlight(&screen, &l.painted, position))
+                .flatten()
+                .or_else(|| {
+                    krill_app::terminal::url_link_target(&screen, &l.painted, position)
+                        .map(|(h, _)| h)
+                })
             });
             if osc_or_url.is_some() {
                 self.files.link_generation = self.files.link_generation.wrapping_add(1);
@@ -844,7 +915,7 @@ impl Shell {
                 })
                 .map(|h| (pane, h))
         } else {
-            self.plain_url_at(pane, position).map(|(h, _)| (pane, h))
+            self.click_link_at(pane, position).map(|(h, _)| (pane, h))
         };
         if self.files.hover != next {
             self.files.hover = next;
@@ -905,7 +976,7 @@ impl Shell {
         let tab = self.files.tabs.get(&id);
         let dirty = tab.is_some_and(FileTab::is_dirty);
         let header = div()
-            .h(px(26.))
+            .min_h(krill_app::ui::PANE_HEADER_HEIGHT)
             .px_2()
             .flex_none()
             .flex()
@@ -916,7 +987,7 @@ impl Shell {
             .border_color(p.border)
             .child(
                 Icon::new(IconName::FileText)
-                    .size(px(12.))
+                    .with_size(krill_app::ui::ICON_XS)
                     .text_color(p.muted_foreground),
             )
             .child(
@@ -925,7 +996,7 @@ impl Shell {
                     .min_w_0()
                     .truncate()
                     .font_family(krill_app::ui::FONT_MONO)
-                    .text_size(krill_app::ui::TEXT_XS)
+                    .text_size(krill_app::ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     // OWE-849: 절대 경로 대신 워크트리 상대 경로(또는 `~` 축약)를 보인다.
                     .child(self.diff.read(cx).display_path(&path)),
@@ -991,11 +1062,11 @@ impl Shell {
                             .child(
                                 Button::new(("file-reload", id.get()))
                                     .debug_selector(|| "file-reload".into())
-                                    .label(etext::RELOAD.get())
+                                    .label(etext::COMPARE.get())
                                     .outline()
                                     .xsmall()
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.reload_file(id, window, cx);
+                                        this.compare_file(id, window, cx);
                                     })),
                             )
                             .child(
@@ -1030,29 +1101,33 @@ impl Shell {
                 .child(msg)
                 .into_any_element()
         };
-        let body = match tab.map(|t| &t.body) {
-            Some(Body::Text {
-                shown: Some(shown), ..
-            }) => match shown {
-                Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
-                Shown::Table(view) => view.clone().into_any_element(),
-                Shown::Notebook(Ok(nb)) => {
-                    fview::notebook(("file-ipynb", id.get()), nb.clone(), window, cx)
-                }
-                Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
-                Shown::Image(view) => view.clone().into_any_element(),
-            },
-            Some(Body::Text { state, .. }) => div()
-                .size_full()
-                .bg(p.editor_surface)
-                .child(Editor::new(state).bordered(false).h(gpui::relative(1.)))
-                .into_any_element(),
-            Some(Body::Image(view)) => view.clone().into_any_element(),
-            Some(Body::Table(view)) => view.clone().into_any_element(),
-            Some(Body::Placeholder(kind, len)) => fview::placeholder(&path, *kind, *len, cx),
-            Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
-            Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
-            None => notice(String::new()),
+        let body = if let Some(comparison) = tab.and_then(|tab| tab.comparison.as_ref()) {
+            self.render_file_comparison(id, comparison, cx)
+        } else {
+            match tab.map(|t| &t.body) {
+                Some(Body::Text {
+                    shown: Some(shown), ..
+                }) => match shown {
+                    Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
+                    Shown::Table(view) => view.clone().into_any_element(),
+                    Shown::Notebook(Ok(nb)) => {
+                        fview::notebook(("file-ipynb", id.get()), nb.clone(), window, cx)
+                    }
+                    Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
+                    Shown::Image(view) => view.clone().into_any_element(),
+                },
+                Some(Body::Text { state, .. }) => div()
+                    .size_full()
+                    .bg(p.editor_surface)
+                    .child(Editor::new(state).bordered(false).h(gpui::relative(1.)))
+                    .into_any_element(),
+                Some(Body::Image(view)) => view.clone().into_any_element(),
+                Some(Body::Table(view)) => view.clone().into_any_element(),
+                Some(Body::Placeholder(kind, len)) => fview::placeholder(&path, *kind, *len, cx),
+                Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
+                Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
+                None => notice(String::new()),
+            }
         };
         div()
             .id(ElementId::Name(format!("file-pane-{}", id.get()).into()))
@@ -1066,10 +1141,17 @@ impl Shell {
             .child(header)
             .children(disk_banner)
             .children(error)
+            .children(self.reload_recovery_banner(id, cx))
             .child(div().flex_1().min_h_0().child(body))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.change(true, cx, |l| l.focus(id))),
+                cx.listener(move |this, _, window, cx| {
+                    this.change(true, cx, |l| l.focus(id));
+                    if !this.is_editor_focused(window, cx) && !this.focus.is_focused(window) {
+                        this.files.refocus = true;
+                        cx.notify();
+                    }
+                }),
             )
             .into_any_element()
     }
@@ -1477,10 +1559,16 @@ impl Shell {
             self.files.watching = true;
             self.files.watch = Some(Self::watch_files(window, cx));
         }
-        // 팔레트·모달·검색 바가 떠 있으면 그쪽 포커스를 뺏지 않는다.
+        // 팔레트·모달이 떠 있거나 터미널 칸에서 검색 바 입력창에 포커스가 있으면 그쪽 포커스를 뺏지 않는다.
+        let search_focused = self.search.as_ref().is_some_and(|(bar, _)| {
+            self.layout
+                .focused()
+                .is_none_or(|p| self.layout.file(p).is_none())
+                && bar.read(cx).is_focused(window, cx)
+        });
         if self.jump.is_none()
             && self.dashboard.is_none()
-            && self.search.is_none()
+            && !search_focused
             && self.tab_rename.is_none()
             && self.files.quick_open.is_none()
             && std::mem::take(&mut self.files.refocus)
@@ -1557,6 +1645,8 @@ impl Shell {
                 || selected
                 || tab.is_dirty()
                 || tab.saving
+                || tab.recovery.is_some()
+                || tab.comparison.is_some()
                 || tab.error.is_some()
                 || self.files.loading.contains_key(&pane)
                 || self.files.comparing.contains(&pane)
@@ -1761,7 +1851,13 @@ impl Shell {
                     && (s.line != 0 || s.column != 0)
                 {
                     let at = gpui_component::input::Position::new(s.line, s.column);
+                    let prev_focus = window.focused(cx);
                     state.update(cx, |ed, cx| ed.set_cursor_position(at, window, cx));
+                    if shown.is_some()
+                        && let Some(prev) = prev_focus
+                    {
+                        window.focus(&prev, cx);
+                    }
                 }
                 let edits = cx.subscribe(&state, move |this, _, e: &InputEvent, cx| {
                     if matches!(e, InputEvent::Change) {
@@ -1780,6 +1876,8 @@ impl Shell {
                     this.sync_file_state(pane, cx);
                 });
                 return FileTab {
+                    comparison: None,
+                    recovery: None,
                     path: path.clone(),
                     revision: 0,
                     saving: false,
@@ -1808,6 +1906,8 @@ impl Shell {
             Err(e) => {
                 krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
                 return FileTab {
+                    comparison: None,
+                    recovery: None,
                     path: path.clone(),
                     revision: 0,
                     saving: false,
@@ -1821,6 +1921,8 @@ impl Shell {
         };
         // 텍스트가 아닌 탭도 디스크 지문을 들고 있어 바뀌면 다시 읽는다(편집이 없어 늘 깨끗하다).
         FileTab {
+            comparison: None,
+            recovery: None,
             path: path.clone(),
             revision: 0,
             saving: false,
@@ -1840,6 +1942,8 @@ impl Shell {
             return;
         };
         tab.revision = tab.revision.wrapping_add(1);
+        tab.recovery = None;
+        tab.comparison = None;
         doc.edited(false);
         cx.notify();
         if !self.files.comparing.insert(pane) {
@@ -2028,6 +2132,16 @@ impl Shell {
 
     /// Read and parse off-thread; refuse stale results after any edit, save or close.
     fn reload_file(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_file_checked(pane, None, window, cx);
+    }
+
+    fn reload_file_checked(
+        &mut self,
+        pane: PaneId,
+        expected: Option<reload::ComparedVersion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.files.tabs.get(&pane) else {
             return;
         };
@@ -2038,6 +2152,10 @@ impl Shell {
         let path = doc.path().to_owned();
         let before = doc.clone();
         let revision = tab.revision;
+        let state_id = match &tab.body {
+            Body::Text { state, .. } => Some(state.entity_id()),
+            _ => None,
+        };
         self.files.next_request = self.files.next_request.wrapping_add(1);
         let generation = self.files.next_request;
         self.files.loading.insert(pane, (generation, path.clone()));
@@ -2054,7 +2172,7 @@ impl Shell {
                     if let Some(gate) = gate {
                         gate.await.ok();
                     }
-                    read_file(&read_path, previewing)
+                    reload::read_current_file(&read_path, previewing, expected)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -2065,7 +2183,12 @@ impl Shell {
                 let Some(tab) = this.files.tabs.get_mut(&pane) else {
                     return;
                 };
-                if tab.revision != revision
+                let current_state_id = match &tab.body {
+                    Body::Text { state, .. } => Some(state.entity_id()),
+                    _ => None,
+                };
+                if current_state_id != state_id
+                    || tab.revision != revision
                     || tab.saving
                     || tab.doc.as_ref() != Some(&before)
                     || this.layout.file(pane) != Some(path.as_path())
@@ -2096,19 +2219,36 @@ impl Shell {
                     Ok((Opened::Text(_, text), stamp)) => {
                         let baseline =
                             baseline.unwrap_or_else(|| Doc::new(path.clone(), text.clone(), stamp));
+                        if let Some(recovery) = &mut tab.recovery {
+                            recovery.advance(tab.revision.wrapping_add(1));
+                        } else {
+                            tab.recovery = Some(ReloadRecovery::capture(
+                                state,
+                                tab.revision.wrapping_add(1),
+                                cx,
+                            ));
+                        }
+                        tab.comparison = None;
+                        let prev_focus = window.focused(cx);
+                        let next_shown = prepared.map(|p| build_preview(p, cx));
+                        let editor_focused =
+                            this.layout.focused() == Some(pane) && next_shown.is_none();
                         state.update(cx, |s, cx| {
                             let cursor = s.cursor_position();
                             s.set_value(text, window, cx);
                             s.set_cursor_position(cursor, window, cx);
                         });
-                        *shown = prepared.map(|p| build_preview(p, cx));
+                        if !editor_focused && let Some(prev) = prev_focus {
+                            window.focus(&prev, cx);
+                        }
+                        *shown = next_shown;
                         *doc = baseline;
+                        this.files.refocus = true;
                         this.files.cache_count = usize::MAX;
                         tab.revision = tab.revision.wrapping_add(1);
                         tab.error = None;
                     }
-                    Ok((other, stamp)) => {
-                        doc.keep_mine(Some(stamp));
+                    Ok((other, _)) => {
                         tab.error = Some(not_text(&other));
                     }
                     Err(e) => {
@@ -2470,6 +2610,12 @@ struct QuitObserved(std::rc::Rc<std::cell::Cell<bool>>);
 impl gpui::Global for QuitObserved {}
 
 fn quit_now(cx: &mut App) {
+    // A restart helper can time out while a save prompt or durable flush waits.
+    // Do not finish that update-triggered quit after its helper has failed.
+    let restart = cx
+        .try_global::<krill_app::updater::UpdateState>()
+        .filter(|state| state.restart.is_starting())
+        .and_then(|state| state.staged.clone());
     let dirty = cx
         .windows()
         .into_iter()
@@ -2510,6 +2656,9 @@ fn quit_now(cx: &mut App) {
                 snapshots.push((window, layout));
             }
             cx.update(|cx| {
+                if !restart_quit_is_current(restart.as_ref(), cx) {
+                    return;
+                }
                 if snapshots.iter().all(|(window, layout)| {
                     window.read(cx).is_ok_and(|shell| {
                         shell.layout == *layout && shell.dirty_files().is_empty()
@@ -2542,12 +2691,25 @@ fn quit_now(cx: &mut App) {
             cx.spawn(async move |_, cx| {
                 // 이 창을 저장했거나 버렸으면 다음 창을 본다.
                 if close.await {
-                    cx.update(quit_app);
+                    cx.update(|cx| {
+                        if restart_quit_is_current(restart.as_ref(), cx) {
+                            quit_app(cx);
+                        }
+                    });
                 }
             })
             .detach();
         })
         .ok();
+}
+
+fn restart_quit_is_current(staged: Option<&krill_app::updater::StagedUpdate>, cx: &App) -> bool {
+    staged.is_none_or(|staged| {
+        cx.try_global::<krill_app::updater::UpdateState>()
+            .is_some_and(|state| {
+                state.restart.is_starting() && state.staged.as_ref() == Some(staged)
+            })
+    })
 }
 
 /// 미저장 확인 대화상자(저장 · 저장 안 함 · 취소). 답은 버튼 순서.

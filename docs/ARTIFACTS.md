@@ -67,6 +67,7 @@ krill artifacts rm <slug> [--json]
 ### 동작 및 로컬 상태 파일
 
 - **지원 확장자·용량**: `.html`, `.htm`, `.md`, `.markdown` 단일 파일(최대 2 MiB, 빈 파일 거부). 상대 경로 로컬 에셋은 업로드하지 않으므로 단일 완결형 HTML이거나 절대 URL 에셋을 사용한다.
+- **자동 만료**: 마지막 발행·갱신부터 **30일** 뒤 만료한다. 단순 열람은 기간을 늘리지 않는다. 만료 즉시 목록·뷰어·원문·갱신에서 제외하고, 매시간 정리 작업이 R2 본문과 D1 메타데이터를 함께 삭제한다. 한 실행은 최대 500건을 처리하며 남은 자료는 다음 실행에서 이어서 정리한다. 저장소 삭제 실패 시 메타데이터를 남겨 재시도한다. 로컬 원본 파일은 삭제하지 않는다.
 - **기본 서버 주소**: `https://share.krill.page` (`--api-url <url>` 플래그 또는 `KRILL_ARTIFACTS_API_URL` 환경변수로 재정의 가능; HTTPS origin만, 로컬 개발 시에만 `http://127.0.0.1`·`http://localhost` 허용. 경로·자격증명(`user@`)·쿼리는 거부).
 - **계정 없는 로컬 인증 (0600 권한)**:
   - `<state_dir>/artifact-token`: 최초 실행 시 256-bit 무작위 소유자 토큰을 자동 생성해 보관한다(`KRILL_ARTIFACTS_AUTH_TOKEN`으로 재정의 가능).
@@ -85,8 +86,8 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 
 | 메서드 및 경로 | 인증 헤더 | 설명 |
 |---|---|---|
-| `POST /v1/artifacts` | `Authorization: Bearer <token>` (생략 시 임시 토큰 발급), 선택 `Idempotency-Key` | `{ content, contentType, fileName, title? }` 업로드. 90일 만료 설정 후 `{ change: "created", artifact, editToken, shareUrl }` 반환 |
-| `PUT /v1/artifacts/:slug` | `x-krill-edit-token` 또는 `x-orca-edit-token` (또는 소유자 Bearer 토큰) | 본문·제목·만료 시각(+90일) 갱신 후 `{ artifact, shareUrl }` 반환 |
+| `POST /v1/artifacts` | `Authorization: Bearer <token>` (생략 시 임시 토큰 발급), 선택 `Idempotency-Key` | `{ content, contentType, fileName, title? }` 업로드. 30일 만료 설정 후 `{ change: "created", artifact, editToken, shareUrl }` 반환 |
+| `PUT /v1/artifacts/:slug` | `x-krill-edit-token` 또는 `x-orca-edit-token` (또는 소유자 Bearer 토큰) | 본문·제목·만료 시각(+30일) 갱신 후 `{ artifact, shareUrl }` 반환 |
 | `DELETE /v1/artifacts/:slug` | 수정 토큰 또는 소유자 Bearer 토큰 | R2 객체 삭제 및 D1 `deleted_at` 마킹 후 `204 No Content` 반환 |
 | `GET /v1/artifacts?cursor=...` | `Authorization: Bearer <token>` | 해당 소유자 토큰 해시의 활성 아티팩트 페이지 조회 (`{ artifacts, nextCursor? }`) |
 
@@ -134,6 +135,7 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 
 # 2. 아티팩트 서버 D1 스키마 적용 및 배포 (share.krill.page)
 (cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=schema.sql)
+(cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=migrations/0001_retention_30_days.sql)
 (cd cloud/share && npx wrangler deploy)
 
 # 3. 아티팩트 서버 라이브 E2E 검증
@@ -141,4 +143,9 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 
 # 4. Rust CLI 테스트
 cargo nextest run -p krill artifacts
+
+# 5. 서버 만료·자동 정리 로컬 회귀 검사 (실제 원격 데이터에는 접근하지 않는다)
+(cd cloud/share && bun test tests)
 ```
+
+30일 정책으로 전환할 때는 마이그레이션도 적용한다. 기존 링크의 만료를 마지막 갱신부터 30일로 줄이며, 이미 더 짧은 만료일은 늘리지 않는다. 정리 스케줄(`0 * * * *`, UTC 매시)은 Worker 배포 시 등록된다. 소스 변경만으로 운영 서버의 보존 기간이나 스케줄이 바뀌지는 않는다.

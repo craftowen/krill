@@ -100,6 +100,7 @@ pub fn flush_file_io(cx: &mut App) -> Task<()> {
 
 struct Startup {
     state: PersistedSidebarState,
+    read_done: BTreeMap<(HostId, SessionId), ReadDoneEntry>,
     error: Option<String>,
     writable: bool,
     agents: Vec<AgentProfile>,
@@ -137,6 +138,7 @@ impl Startup {
         }
         Self {
             state,
+            read_done: load_read_done(path),
             error,
             writable,
             agents: sort_agents(
@@ -166,6 +168,24 @@ impl Startup {
         sidebar.parents = lin.parents;
         sidebar.collapsed_lineage = lin.collapsed_lineage;
         sidebar.sleeping_worktrees = lin.sleeping_worktrees;
+        if sidebar.read_done.is_empty() {
+            sidebar.read_done = self.read_done;
+        } else if !self.read_done.is_empty() {
+            let base = self.read_done.values().map(|e| e.seq).max().unwrap_or(0);
+            let mut merged = self.read_done;
+            for (k, mut entry) in std::mem::take(&mut sidebar.read_done) {
+                entry.seq = entry.seq.saturating_add(base);
+                merged.insert(k, entry);
+            }
+            sidebar.read_done = merged;
+        }
+        sidebar.next_read_done_seq = sidebar
+            .read_done
+            .values()
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0)
+            .max(sidebar.next_read_done_seq);
         if sidebar.agents.is_empty() {
             sidebar.agents = self.agents;
         }

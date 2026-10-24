@@ -505,12 +505,20 @@ pub fn read_profile_usage(
             if let Ok(s) = std::fs::read_to_string(&orca_path) {
                 let rows = parse_orca(&s);
                 let stamp = mtime_secs(&orca_path);
+                let dir_uuid = profile_dir.to_str().and_then(orca_uuid_from_profile_dir);
                 let found = rows
                     .iter()
                     .find(|r| {
-                        (!r.label.is_empty()
-                            && (r.label.eq_ignore_ascii_case(label)
-                                || email.is_some_and(|e| r.label.eq_ignore_ascii_case(e))))
+                        dir_uuid.is_some_and(|u| !r.id.is_empty() && r.id.eq_ignore_ascii_case(u))
+                            || (!r.label.is_empty()
+                                && (r.label.eq_ignore_ascii_case(label)
+                                    || email.is_some_and(|e| r.label.eq_ignore_ascii_case(e))))
+                            || r.email.as_deref().is_some_and(|re| {
+                                re.eq_ignore_ascii_case(label)
+                                    || email.is_some_and(|e| {
+                                        primary_email(re).eq_ignore_ascii_case(primary_email(e))
+                                    })
+                            })
                             || (host_default && r.host)
                     })
                     .or_else(|| {
@@ -684,6 +692,133 @@ fn primary_email(label: &str) -> &str {
         Some((head, _)) if head.contains('@') => head.trim(),
         _ => label.trim(),
     }
+}
+
+fn push_unique_hidden(hidden: &mut Vec<String>, marker: String) {
+    if !marker.is_empty() && !hidden.iter().any(|h| h.eq_ignore_ascii_case(&marker)) {
+        hidden.push(marker);
+    }
+}
+
+fn orca_row_is_hidden(hidden: &[String], idx: usize, row: &AccountUsage) -> bool {
+    let id = orca_detected_id(idx, row);
+    if hidden.iter().any(|h| {
+        h.eq_ignore_ascii_case(&id) || (!row.id.is_empty() && h.eq_ignore_ascii_case(&row.id))
+    }) {
+        return true;
+    }
+    let email_marker = row
+        .email
+        .as_deref()
+        .or_else(|| {
+            primary_email(&row.label)
+                .contains('@')
+                .then_some(row.label.as_str())
+        })
+        .map(primary_email)
+        .filter(|e| e.contains('@'))
+        .map(|e| format!("email:{}", e.to_ascii_lowercase()));
+    if let Some(marker) = email_marker
+        && hidden.iter().any(|h| h.eq_ignore_ascii_case(&marker))
+    {
+        return true;
+    }
+    let label_trimmed = row.label.trim();
+    if !label_trimmed.is_empty() {
+        let label_marker = format!("label:{}", label_trimmed.to_ascii_lowercase());
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(&label_marker)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn orca_row_matches_stored(row: &AccountUsage, stored: &StoredAccount) -> bool {
+    if let Some(dir_uuid) = orca_uuid_from_profile_dir(&stored.profile_dir)
+        && !row.id.is_empty()
+        && row.id.eq_ignore_ascii_case(dir_uuid)
+    {
+        return true;
+    }
+    if !row.label.is_empty() && row.label.eq_ignore_ascii_case(&stored.label) {
+        return true;
+    }
+    let stored_mail = stored.email.as_deref().unwrap_or(&stored.label);
+    let peer = row.email.as_deref().unwrap_or(row.label.as_str());
+    (primary_email(peer).contains('@')
+        && primary_email(peer).eq_ignore_ascii_case(primary_email(stored_mail)))
+        || stored
+            .email
+            .as_deref()
+            .is_some_and(|e| row.label.eq_ignore_ascii_case(e))
+}
+
+fn hide_removed_orca_markers(home: &Path, file: &mut AccountsFile, removed: &StoredAccount) {
+    if let Some(uuid) = orca_uuid_from_profile_dir(&removed.profile_dir) {
+        push_unique_hidden(
+            &mut file.hidden_accounts,
+            format!("claude-orca-{}", slugify(uuid)),
+        );
+    }
+    if removed.provider != ProviderKind::Claude.as_str() {
+        return;
+    }
+    let stored_mail = removed.email.as_deref().unwrap_or(&removed.label);
+    let mail = primary_email(stored_mail);
+    if mail.contains('@') {
+        push_unique_hidden(
+            &mut file.hidden_accounts,
+            format!("email:{}", mail.to_ascii_lowercase()),
+        );
+    }
+    let clean_label = removed.label.trim();
+    if !clean_label.is_empty() {
+        push_unique_hidden(
+            &mut file.hidden_accounts,
+            format!("label:{}", clean_label.to_ascii_lowercase()),
+        );
+    }
+    let orca_path = home.join(".claude").join(ORCA_CACHE);
+    if let Ok(s) = std::fs::read_to_string(&orca_path) {
+        for (idx, row) in parse_orca(&s).into_iter().enumerate() {
+            if !row.host && orca_row_matches_stored(&row, removed) {
+                push_unique_hidden(&mut file.hidden_accounts, orca_detected_id(idx, &row));
+            }
+        }
+    }
+}
+
+fn unhide_stored_orca_markers(home: &Path, file: &mut AccountsFile, stored: &StoredAccount) {
+    let dir_orca_id = orca_uuid_from_profile_dir(&stored.profile_dir)
+        .map(|uuid| format!("claude-orca-{}", slugify(uuid)));
+    let stored_mail = stored.email.as_deref().unwrap_or(&stored.label);
+    let mail_marker = primary_email(stored_mail)
+        .contains('@')
+        .then(|| format!("email:{}", primary_email(stored_mail).to_ascii_lowercase()));
+    let label_marker = (!stored.label.trim().is_empty())
+        .then(|| format!("label:{}", stored.label.trim().to_ascii_lowercase()));
+    let mut matched_ids = Vec::new();
+    let orca_path = home.join(".claude").join(ORCA_CACHE);
+    if let Ok(s) = std::fs::read_to_string(&orca_path) {
+        for (idx, row) in parse_orca(&s).into_iter().enumerate() {
+            if !row.host && orca_row_matches_stored(&row, stored) {
+                matched_ids.push(orca_detected_id(idx, &row));
+            }
+        }
+    }
+    file.hidden_accounts.retain(|h| {
+        !h.eq_ignore_ascii_case(&stored.id)
+            && !dir_orca_id
+                .as_deref()
+                .is_some_and(|id| h.eq_ignore_ascii_case(id))
+            && !mail_marker
+                .as_deref()
+                .is_some_and(|m| h.eq_ignore_ascii_case(m))
+            && !label_marker
+                .as_deref()
+                .is_some_and(|m| h.eq_ignore_ascii_case(m))
+            && !matched_ids.iter().any(|id| h.eq_ignore_ascii_case(id))
+    });
 }
 
 /// K-04: 비ASCII 라벨은 `slugify`가 모두 `"account"`로 만들어 id·프로필 디렉터리가 충돌한다.
@@ -897,14 +1032,18 @@ fn refresh_accounts_authenticated(
     if let Ok(s) = std::fs::read_to_string(&orca_path) {
         let orca_stamp = mtime_secs(&orca_path);
         for (idx, row) in parse_orca(&s).into_iter().enumerate() {
+            let row_email = row
+                .email
+                .clone()
+                .or_else(|| (!row.label.is_empty()).then(|| row.label.clone()));
             if row.host {
                 // 호스트 기본 계정의 라벨/사용량 보강.
                 if let Some(host_acc) = all
                     .iter_mut()
                     .find(|a| a.provider == ProviderKind::Claude && a.host_default)
                 {
-                    if !row.label.is_empty() {
-                        host_acc.email = Some(row.label.clone());
+                    if let Some(email) = row_email {
+                        host_acc.email = Some(email);
                     }
                     if host_acc.usage.is_empty() && !row.usage.is_empty() {
                         host_acc.usage = row.usage.to_proto();
@@ -923,10 +1062,10 @@ fn refresh_accounts_authenticated(
             }
             // OWE-696: 캐시 행 uuid로 안정 id를 만든다(순번이 바뀌어도 같은 계정). uuid가 없는
             // 구버전 캐시만 순번 id. Orca 프로필 폴더는 Krill이 모르므로 경로를 비워 실행 불가로 둔다.
-            let id = orca_detected_id(idx, &row);
-            if file.hidden_accounts.contains(&id) {
+            if orca_row_is_hidden(&file.hidden_accounts, idx, &row) {
                 continue;
             }
+            let id = orca_detected_id(idx, &row);
             if !row.id.is_empty() {
                 orca_uuids.insert(id.clone(), row.id.clone());
             }
@@ -947,7 +1086,7 @@ fn refresh_accounts_authenticated(
                 } else {
                     row.label.clone()
                 },
-                email: (!row.label.is_empty()).then_some(row.label),
+                email: row_email,
                 profile_dir,
                 active: false,
                 host_default: false,
@@ -1087,11 +1226,10 @@ fn refresh_accounts_authenticated(
         .map(|a| (a.id.clone(), super::meters::read(home, a)))
         .collect();
     let effective = |a: &AccountInfo, metric: AutoSwitchMetric, now: i64| {
-        if metric == AutoSwitchMetric::Max {
-            readings.get(&a.id).and_then(|m| m.effective_max(now))
-        } else {
-            metric.effective_percent(&a.usage, now)
-        }
+        readings
+            .get(&a.id)
+            .and_then(|m| m.effective_for_metric(a.provider, metric, &a.usage, now))
+            .or_else(|| metric.effective_percent(&a.usage, now))
     };
 
     for provider in ProviderKind::ALL {
@@ -1172,18 +1310,27 @@ fn refresh_accounts_authenticated(
                 // 지정 타깃이 동률이거나 더 차면 폴백도 막혀 왕복이 멈춘다.
                 // 어느 한 창이라도 소진(100%)이면 후보에서 제외한다(레이트리밋 계정으로 전환 금지).
                 // OWE-703 2단계 지시: 한도 기록 계정도 후보에서 제외한다(캐시 사용량과 무관).
+                let exhaustion_metric = match metric {
+                    AutoSwitchMetric::AntigravityClaudeGptMax
+                    | AutoSwitchMetric::AntigravityClaudeGptFiveHour
+                    | AutoSwitchMetric::AntigravityClaudeGptSevenDay => {
+                        AutoSwitchMetric::AntigravityClaudeGptMax
+                    }
+                    AutoSwitchMetric::AntigravityAllMax => AutoSwitchMetric::AntigravityAllMax,
+                    _ => AutoSwitchMetric::Max,
+                };
                 let better = |a: &&AccountInfo| -> Option<u8> {
                     if a.stale
                         || auth
                             .get(&(a.provider, PathBuf::from(&a.profile_dir)))
                             .is_some_and(|status| !status.logged_in)
-                        || effective(a, AutoSwitchMetric::Max, now).is_none()
+                        || effective(a, exhaustion_metric, now).is_none()
                         || !runnable(a)
                         || rate_limited_at(&limited, provider, &a.id).is_some()
                     {
                         return None;
                     }
-                    if effective(a, AutoSwitchMetric::Max, now).is_none_or(|max| max >= 100) {
+                    if effective(a, exhaustion_metric, now).is_none_or(|max| max >= 100) {
                         return None;
                     }
                     let v = effective(a, metric, now)?;
@@ -1641,6 +1788,7 @@ pub fn add_account(
             email: email.filter(|e| !e.trim().is_empty()),
             profile_dir: resolved_dir.display().to_string(),
         };
+        unhide_stored_orca_markers(home, &mut file, &stored);
         if let Some(existing) = file.accounts.iter_mut().find(|a| a.id == id) {
             *existing = stored;
         } else {
@@ -1673,14 +1821,14 @@ pub fn remove_account(
     {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
-        let before = file.accounts.len();
-        file.accounts.retain(|a| a.id != account_id);
-        if file.accounts.len() == before {
+        let Some(idx) = file.accounts.iter().position(|a| a.id == account_id) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("account not found: {account_id}"),
             ));
-        }
+        };
+        let removed = file.accounts.remove(idx);
+        hide_removed_orca_markers(home, &mut file, &removed);
         if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
             file.active.remove(provider.as_str());
         }
@@ -1761,10 +1909,12 @@ pub fn delete_account(
                 format!("account not found: {account_id}"),
             ));
         };
-        let dir = PathBuf::from(&file.accounts.remove(idx).profile_dir);
+        let removed = file.accounts.remove(idx);
+        let dir = PathBuf::from(&removed.profile_dir);
         if profile_in_use(&dir, in_use) {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
+        hide_removed_orca_markers(home, &mut file, &removed);
         if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
             file.active.remove(provider.as_str());
         }

@@ -145,6 +145,18 @@ pub(super) struct Catalog {
     sort_by: u32,
     updated_at: BTreeMap<PathBuf, u64>,
     unread: BTreeSet<PathBuf>,
+    /// PC 사이드바가 기억하는 워크트리·프로젝트 사실(잠재움·목록에서 제거·외부 워크트리 펼침).
+    /// 필터·묶음·정렬·접힘은 기기마다 따로 저장하므로 여기서 읽지 않는다.
+    view: SidebarView,
+    /// 워크트리 진행 상태(상태별 묶음용, `WorkspaceStatus::as_str`).
+    statuses: BTreeMap<PathBuf, &'static str>,
+}
+/// 데스크톱 `is_worktree_visible`이 옵션 말고 보는 사실들.
+#[derive(Default)]
+struct SidebarView {
+    sleeping: BTreeSet<PathBuf>,
+    removed: BTreeSet<PathBuf>,
+    shown_external: BTreeSet<PathBuf>,
 }
 
 fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -191,6 +203,28 @@ fn git_dir(tree: &Path) -> PathBuf {
         .and_then(|s| s.strip_prefix("gitdir:").map(|p| tree.join(p.trim())))
         .unwrap_or(dot)
 }
+fn git_remote_slug(tree: &Path) -> Option<String> {
+    let config = String::from_utf8(read(&git_dir(tree).join("config"), 16384)?).ok()?;
+    for line in config.lines() {
+        let Some(url) = line.trim().strip_prefix("url") else {
+            continue;
+        };
+        let Some(url) = url.trim_start().strip_prefix('=').map(str::trim) else {
+            continue;
+        };
+        let url = url.trim_end_matches('/').trim_end_matches(".git");
+        let path = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('/').map(|(_, p)| p))
+            .or_else(|| url.split_once(':').map(|(_, p)| p.trim_start_matches('/')))?;
+        let mut parts = path.rsplit('/').take(2);
+        let (repo, owner) = (parts.next()?, parts.next()?);
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some(format!("{owner}/{repo}"));
+        }
+    }
+    None
+}
 fn main_worktree(tree: &Path) -> Option<PathBuf> {
     let dir = git_dir(tree);
     let common = String::from_utf8(read(&dir.join("commondir"), 4096)?).ok()?;
@@ -211,6 +245,7 @@ impl Catalog {
             parents: bin_parents,
             order: project_order,
             sort_by,
+            view,
         } = dir
             .and_then(|d| read(&d.join("sidebar.bin"), 1024 * 1024))
             .and_then(|b| {
@@ -228,10 +263,17 @@ impl Catalog {
             .collect();
         let project_order: Vec<PathBuf> =
             project_order.into_iter().map(|p| normalize(&p)).collect();
+        let set = |paths: BTreeSet<PathBuf>| paths.iter().map(|p| normalize(p)).collect();
+        let view = SidebarView {
+            sleeping: set(view.sleeping),
+            removed: set(view.removed),
+            shown_external: set(view.shown_external),
+        };
         let mut catalog = Self {
             preferences,
             project_order,
             sort_by,
+            view,
             ..Self::default()
         };
         // 데스크톱 계보의 영속 원천(`worktree-comments.toml [parents]`)을 먼저 읽고,
@@ -256,6 +298,14 @@ impl Catalog {
                 .into_iter()
                 .filter(|(_, unread)| *unread)
                 .map(|(p, _)| normalize(Path::new(&p)))
+                .collect();
+            catalog.statuses = stored
+                .statuses
+                .into_iter()
+                .filter_map(|(p, v)| {
+                    let status = krill_proto::orchestration::WorkspaceStatus::parse(&v).ok()?;
+                    Some((normalize(Path::new(&p)), status.as_str()))
+                })
                 .collect();
         }
         for (child, parent) in bin_parents {
@@ -437,51 +487,126 @@ impl Catalog {
             .map(|r| {
                 let repo = path(&r.repo);
                 json!({"key":hex(&r.repo),"path":repo.to_string_lossy(),
+                "remote":git_remote_slug(&repo),
                 "label":self.repo_labels.get(&repo).cloned().unwrap_or_else(|| label(&repo)),
                 "icon":self.repo_icons.get(&repo).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
                 "badge_color":self.repo_badges.get(&repo).cloned().map_or(Value::Null, Value::String),
+                "removed":self.view.removed.contains(&repo),
                 "worktree_keys":r.worktrees.iter().map(|t| hex(t)).collect::<Vec<_>>()})
             })
             .collect()
     }
+    /// 데스크톱 `is_worktree_visible`이 보는 사실들. 숨길지는 폰이 그 기기의 옵션으로 정한다(옵션을 바꾸면 왕복 없이 바로 다시 그린다).
+    /// `awake`는 작업 중·대기·완료이거나 에이전트가 살아 있는 세션이 있는 워크트리다.
+    fn visibility(
+        &self,
+        repo: &Path,
+        tree: &Path,
+        count: usize,
+        awake: &BTreeSet<PathBuf>,
+    ) -> Value {
+        let lossy = tree.to_string_lossy();
+        let default_branch = tree == repo
+            || count <= 1
+            || self.branches.get(tree).is_some_and(|b| {
+                matches!(
+                    b.trim(),
+                    "main" | "master" | "trunk" | "develop" | "default"
+                )
+            });
+        let asleep = self.view.sleeping.contains(tree)
+            || !(self.preferences.get(tree).is_some_and(|p| p.pinned)
+                || self.unread.contains(tree)
+                || awake.contains(tree));
+        json!({"asleep":asleep,"default_branch":default_branch,
+            "automation":lossy.contains("/.orca/automations/") || lossy.contains("/automations/"),
+            // `.claude/worktrees` 외부 워크트리는 PC에서 펼치기 전까지 접혀 있다.
+            "external":tree != repo && is_claude_worktree(tree),
+            "external_shown":self.view.shown_external.contains(repo)})
+    }
     /// 데스크톱 사이드바와 같은 워크트리 순서·들여쓰기·아이콘을 낸다.
     /// `ranks`는 워크트리 경로별 스마트 순위(0 승인대기 최우선, 4 유휴)다.
+    /// PC 사이드바에서 숨는 워크트리도 데이터는 남긴다(세션 열기·검색용).
     pub fn workspaces_json(
         &self,
         auto_titles: &BTreeMap<PathBuf, String>,
         ranks: &BTreeMap<PathBuf, u8>,
+        awake: &BTreeSet<PathBuf>,
     ) -> Vec<Value> {
+        // 데스크톱 `sort_worktrees`와 같은 키: 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
+        // `sort_by`는 `SortBy` 변형 인덱스(0 스마트·1 최근·2 이름·3 생성순)다.
+        let sort_key = |t: &PathBuf, sort_by: u32| {
+            let rank = if sort_by == 0 {
+                let state = ranks.get(t).copied().unwrap_or(4);
+                if state != 0 && self.unread.contains(t) {
+                    1
+                } else {
+                    state
+                }
+            } else {
+                0
+            };
+            let recent = match sort_by {
+                0 | 1 => self.updated_at.get(t).copied().unwrap_or(0),
+                3 => created_ms(t).unwrap_or(0),
+                _ => 0,
+            };
+            (
+                !self.preferences.get(t).is_some_and(|v| v.pinned),
+                rank,
+                Reverse(recent),
+                worktree_sort_name(t, &self.preferences, &self.branches),
+                t.clone(),
+            )
+        };
+        // 폰은 기기별 정렬 기준으로 다시 줄 세운다. 기준마다 프로젝트를 가로지르는 순위를 낸다(`orders[sort_by]`).
+        let all: Vec<PathBuf> = self
+            .repositories
+            .iter()
+            .flat_map(|r| r.worktrees.iter().map(|t| path(t)))
+            .collect();
+        let mut orders: BTreeMap<&Path, [usize; 4]> = BTreeMap::new();
+        for (mode, sort_by) in [0u32, 1, 2, 3].into_iter().enumerate() {
+            let mut sorted: Vec<_> = all.iter().map(|t| (sort_key(t, sort_by), t)).collect();
+            sorted.sort();
+            for (i, (_, t)) in sorted.into_iter().enumerate() {
+                if let Some(slot) = orders.entry(t).or_default().get_mut(mode) {
+                    *slot = i;
+                }
+            }
+        }
+        let orders = &orders;
         self.repositories
             .iter()
             .flat_map(|r| {
                 let repo = path(&r.repo);
+                let count = r.worktrees.len();
                 let mut trees: Vec<PathBuf> = r.worktrees.iter().map(|t| path(t)).collect();
-                // 데스크톱 `sort_worktrees`와 같은 키: [기본] → 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
-                trees.sort_by_cached_key(|t| {
-                    let rank = if self.sort_by == 0 {
-                        let state = ranks.get(t).copied().unwrap_or(4);
-                        if state != 0 && self.unread.contains(t) { 1 } else { state }
-                    } else { 0 };
-                    let recent = match self.sort_by {
-                        0 | 1 => self.updated_at.get(t).copied().unwrap_or(0),
-                        3 => created_ms(t).unwrap_or(0),
-                        _ => 0,
-                    };
-                    (
-                        t != &repo,
-                        !self.preferences.get(t).is_some_and(|v| v.pinned),
-                        rank,
-                        Reverse(recent),
-                        worktree_sort_name(t, &self.preferences, &self.branches),
-                        t.clone(),
-                    )
-                });
+                // 프로젝트 안에서는 기본 체크아웃을 맨 위에 둔다. 기본 순서는 PC 정렬 기준이다.
+                trees.sort_by_cached_key(|t| (t != &repo, sort_key(t, self.sort_by)));
+                let group: BTreeSet<&Path> = trees.iter().map(PathBuf::as_path).collect();
+                let parents: BTreeMap<PathBuf, String> = trees
+                    .iter()
+                    .filter_map(|t| {
+                        let parent = effective_parent(t, &self.parents, &group)?;
+                        Some((t.clone(), hex(parent.as_os_str().as_bytes())))
+                    })
+                    .collect();
                 order_lineage(&trees, &self.parents)
                     .into_iter()
                     .map(move |(tree, depth)| {
                         let pref = self.preferences.get(&tree);
                         let branch = self.branches.get(&tree);
-                        let name = pref.map(|p| p.name.as_str()).filter(|s| !s.is_empty());
+                        let repo_label = self.repo_labels.get(&repo).map(String::as_str);
+                        let tree_label = label(&tree);
+                        let name = pref
+                            .map(|p| p.name.trim())
+                            .filter(|s| !s.is_empty())
+                            .filter(|n| {
+                                tree != repo
+                                    || (!n.eq_ignore_ascii_case(&tree_label)
+                                        && !repo_label.is_some_and(|r| n.eq_ignore_ascii_case(r)))
+                            });
                         let custom = name.filter(|n| {
                             !krill_proto::git::is_default_branch_or_worktree_name(n)
                         });
@@ -507,6 +632,10 @@ impl Catalog {
                         json!({"key":hex(&raw),"repo_key":hex(&r.repo),"path":tree.to_string_lossy(),
                     "label":title,
                     "pinned":pref.is_some_and(|p| p.pinned),"branch":branch,
+                    "visibility":self.visibility(&repo, &tree, count, awake),
+                    "orders":orders.get(tree.as_path()).copied().unwrap_or([usize::MAX; 4]),
+                    "parent":parents.get(&tree),
+                    "status":self.statuses.get(&tree).copied().unwrap_or("todo"),
                     "depth":depth,"primary":tree == repo,
                     "icon":self.repo_icons.get(&tree).or_else(|| self.repo_icons.get(&repo)).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
                     "badge_color":self.repo_badges.get(&tree).or_else(|| self.repo_badges.get(&repo)).cloned().map_or(Value::Null, Value::String)})
@@ -514,6 +643,18 @@ impl Catalog {
             })
             .collect()
     }
+}
+/// `<repo>/.claude/worktrees/` 아래 워크트리(데스크톱 `external::is_claude_worktree`와 동일).
+fn is_claude_worktree(path: &Path) -> bool {
+    let mut parts = path.components().peekable();
+    while let Some(part) = parts.next() {
+        if part.as_os_str() == ".claude"
+            && parts.peek().is_some_and(|n| n.as_os_str() == "worktrees")
+        {
+            return true;
+        }
+    }
+    false
 }
 /// 폴더 생성 시각(ms). 데스크톱 `async_state::created_secs`와 같은 원천.
 fn created_ms(path: &Path) -> Option<u64> {
@@ -534,7 +675,7 @@ fn worktree_sort_name(
         .or_else(|| branches.get(path).cloned())
         .unwrap_or_else(|| label(path))
 }
-/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준을 꺼낸다. 형식 불일치는 기본값으로 강등한다.
+/// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준·잠재움·숨긴 프로젝트를 꺼낸다. 형식 불일치는 기본값으로 강등한다.
 fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
     let mut tail = SidebarTail::default();
     let Ok((prefs, rest)) = postcard::take_from_bytes::<BTreeMap<PathBuf, Preference>>(body) else {
@@ -549,9 +690,12 @@ fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
         return tail;
     };
     tail.parents = lineage.parents;
-    let Ok((_, rest)) = postcard::take_from_bytes::<BinUi>(rest) else {
+    tail.view.sleeping = lineage.sleeping_worktrees;
+    let Ok((ui, rest)) = postcard::take_from_bytes::<BinUi>(rest) else {
         return tail;
     };
+    tail.view.removed = ui.removed_projects;
+    tail.view.shown_external = ui.shown_external;
     if let Ok((order, _)) = postcard::take_from_bytes::<Vec<PathBuf>>(rest) {
         tail.order = order;
     }
@@ -563,6 +707,7 @@ struct SidebarTail {
     parents: BTreeMap<PathBuf, PathBuf>,
     order: Vec<PathBuf>,
     sort_by: u32,
+    view: SidebarView,
 }
 /// PC와 같은 체크포인트 파일에서 계보·최근 활동·미확인을 읽는다. 모바일 전용 사본은 쓰지 않는다.
 #[derive(Default, Deserialize)]
@@ -571,6 +716,7 @@ struct StoredView {
     parents: BTreeMap<String, String>,
     updated_at: BTreeMap<String, u64>,
     unread: BTreeMap<String, bool>,
+    statuses: BTreeMap<String, String>,
 }
 fn store_view(dir: &Path) -> StoredView {
     read(&dir.join("worktree-comments.toml"), 512 * 1024)
@@ -712,8 +858,8 @@ branch = "task/my-feature"
         let mut bytes = vec![1];
         bytes.extend(postcard::to_allocvec(&prefs).unwrap());
         fs::write(dir.join("sidebar.bin"), &bytes).unwrap();
-        let catalog = Catalog::load(Some(&dir), &[]);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let mut catalog = Catalog::load(Some(&dir), &[]);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(rows.len(), 3);
         let feature = rows.iter().find(|w| w["path"] == "/repo/feature").unwrap();
         assert_eq!(feature["label"], "PC 이름");
@@ -724,6 +870,15 @@ branch = "task/my-feature"
         );
         assert_eq!(catalog.repositories.len(), 1);
         assert_eq!(catalog.repositories_json()[0]["label"], "프로젝트");
+        catalog
+            .branches
+            .insert(PathBuf::from("/repo"), "main".to_owned());
+        let primary = catalog
+            .workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new())
+            .into_iter()
+            .find(|w| w["path"] == "/repo")
+            .unwrap();
+        assert_eq!(primary["label"], "main");
         assert_eq!(
             catalog.cwd(feature["key"].as_str().unwrap()),
             Some(PathBuf::from("/repo/feature"))
@@ -737,8 +892,11 @@ branch = "task/my-feature"
         }
         // 파일을 바꾸면 스냅샷 갱신에서 즉시 반영하며, 손상된 설정은 이관 이름으로 강등한다.
         fs::write(dir.join("sidebar.bin"), [2, 0]).unwrap();
-        let rows =
-            Catalog::load(Some(&dir), &[]).workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = Catalog::load(Some(&dir), &[]).workspaces_json(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         let feature = rows.iter().find(|w| w["path"] == "/repo/feature").unwrap();
         assert_eq!(feature["label"], "이관 이름");
         assert_eq!(feature["pinned"], true);
@@ -849,7 +1007,7 @@ value = "🚀"
         assert_eq!(repos[1]["icon"]["kind"], "emoji");
         assert_eq!(repos[1]["icon"]["value"], "🚀");
         assert_eq!(repos[1]["badge_color"], "#ff0000");
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(rows.len(), 3);
         // 같은 저장소 안에서 [기본]이 먼저, 자식은 부모 바로 뒤에 깊이 1로 붙는다.
         let a: Vec<_> = rows
@@ -882,7 +1040,7 @@ value = "🚀"
             worktrees: vec![raw(&repo), raw(&old), raw(&new)],
         }];
         let catalog = Catalog::load(Some(&dir), &repositories);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         let paths: Vec<_> = rows
             .iter()
             .map(|w| w["path"].as_str().unwrap().to_owned())
@@ -905,7 +1063,7 @@ value = "🚀"
         }];
         let catalog = Catalog::load(Some(&dir), &repositories);
         let ranks = BTreeMap::from([(PathBuf::from("/r/urgent"), 0u8)]);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks, &BTreeSet::new());
         let paths: Vec<_> = rows
             .iter()
             .map(|w| w["path"].as_str().unwrap().to_owned())
@@ -933,8 +1091,11 @@ value = "🚀"
                 worktrees: vec![b"/s".to_vec(), b"/s/a".to_vec()],
             },
         ];
-        let rows = Catalog::load(Some(&dir), &repositories)
-            .workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = Catalog::load(Some(&dir), &repositories).workspaces_json(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         let depths: Vec<_> = rows
             .iter()
             .map(|w| (w["path"].as_str().unwrap(), w["depth"].as_u64().unwrap()))
@@ -942,6 +1103,18 @@ value = "🚀"
         assert_eq!(
             depths,
             vec![("/r", 0), ("/r/a", 0), ("/r/b", 1), ("/s", 0), ("/s/a", 0)]
+        );
+        // 폰이 기기별 정렬로 다시 펼칠 때 쓰는 부모 키(같은 프로젝트 안의 명시 부모만).
+        let parents: Vec<_> = rows.iter().map(|w| w["parent"].clone()).collect();
+        assert_eq!(
+            parents,
+            vec![
+                Value::Null,
+                Value::Null,
+                json!(hex(b"/r/a")),
+                Value::Null,
+                Value::Null
+            ]
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -988,7 +1161,7 @@ value = "🚀"
                 (PathBuf::from("/r/m-unread"), "middle/branch".to_owned()),
                 (PathBuf::from("/r/a-new"), "zeta/branch".to_owned()),
             ]);
-            let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks);
+            let rows = catalog.workspaces_json(&BTreeMap::new(), &ranks, &BTreeSet::new());
             let paths: Vec<_> = rows.iter().map(|w| w["path"].as_str().unwrap()).collect();
             assert_eq!(paths, expected, "desktop sort option {sort_by}");
         }
@@ -999,9 +1172,141 @@ value = "🚀"
         )
         .unwrap();
         write_sidebar_tail(&dir, &[], &BTreeMap::new(), 1);
-        let rows =
-            Catalog::load(Some(&dir), &repositories).workspaces_json(&BTreeMap::new(), &ranks);
+        let rows = Catalog::load(Some(&dir), &repositories).workspaces_json(
+            &BTreeMap::new(),
+            &ranks,
+            &BTreeSet::new(),
+        );
         assert_eq!(rows[1]["path"], "/r/z-old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pc_visibility_facts_and_per_sort_orders_reach_the_phone() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-view-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // PC 필터·접힘은 폰에 넘기지 않는다(기기별 저장). 목록에서 제거(/c)·잠재움(/a/slept)만 사실로 넘긴다.
+        let mut bytes = vec![1];
+        bytes.extend(postcard::to_allocvec(&BTreeMap::<PathBuf, (bool, String)>::new()).unwrap());
+        bytes.extend(
+            postcard::to_allocvec(&BinOptions {
+                group_by: 0,
+                sort_by: 2,
+                card_layout: 0,
+                card_properties: BinCardProperties {
+                    issue: true,
+                    pr: true,
+                    comment: true,
+                    ports: true,
+                    branch: true,
+                    host: true,
+                },
+                filters: BinFilters {
+                    hide_sleeping: true,
+                    always_show_default_branch: true,
+                    hide_automation: false,
+                    hide_cli: false,
+                    repos: BTreeSet::from([PathBuf::from("/a"), PathBuf::from("/c")]),
+                    hosts: BTreeSet::new(),
+                },
+            })
+            .unwrap(),
+        );
+        bytes.extend(
+            postcard::to_allocvec(&BinLineage {
+                parents: BTreeMap::new(),
+                collapsed_lineage: BTreeSet::new(),
+                sleeping_worktrees: BTreeSet::from([PathBuf::from("/a/slept")]),
+            })
+            .unwrap(),
+        );
+        bytes.extend(
+            postcard::to_allocvec(&BinUi {
+                collapsed: BTreeSet::from([PathBuf::from("/a")]),
+                collapsed_groups: Vec::new(),
+                collapsed_hosts: Vec::new(),
+                expanded_cards: BTreeSet::new(),
+                selected_worktree: None,
+                shown_external: BTreeSet::new(),
+                removed_projects: BTreeSet::from([PathBuf::from("/c")]),
+            })
+            .unwrap(),
+        );
+        fs::write(dir.join("sidebar.bin"), bytes).unwrap();
+        let tree = |p: &str| p.as_bytes().to_vec();
+        let repositories = vec![
+            RepositoryTrees {
+                repo: tree("/a"),
+                worktrees: [
+                    "/a",
+                    "/a/idle",
+                    "/a/busy",
+                    "/a/slept",
+                    "/a/.claude/worktrees/x",
+                ]
+                .map(tree)
+                .to_vec(),
+            },
+            RepositoryTrees {
+                repo: tree("/b"),
+                worktrees: vec![tree("/b")],
+            },
+            RepositoryTrees {
+                repo: tree("/c"),
+                worktrees: vec![tree("/c")],
+            },
+        ];
+        let catalog = Catalog::load(Some(&dir), &repositories);
+        let repos: Vec<_> = catalog
+            .repositories_json()
+            .iter()
+            .map(|r| {
+                let path = r["path"].as_str().unwrap().to_owned();
+                assert!(r.get("collapsed").is_none(), "folds are per device");
+                (path, r["removed"].as_bool().unwrap())
+            })
+            .collect();
+        let expected = [("/a", false), ("/b", false), ("/c", true)];
+        assert_eq!(repos, expected.map(|(p, r)| (p.to_owned(), r)));
+        // 작업 중 세션이 있어도 PC에서 잠재운 /a/slept는 잠든 것으로 본다. 기본 체크아웃은 기본 브랜치다.
+        let awake = BTreeSet::from([PathBuf::from("/a/busy"), PathBuf::from("/a/slept")]);
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &awake);
+        let facts: BTreeMap<_, _> = rows
+            .iter()
+            .map(|w| (w["path"].as_str().unwrap(), w["visibility"].clone()))
+            .collect();
+        assert_eq!(facts["/a"]["default_branch"], true);
+        assert_eq!(facts["/a/idle"]["asleep"], true);
+        assert_eq!(facts["/a/idle"]["default_branch"], false);
+        assert_eq!(facts["/a/busy"]["asleep"], false);
+        assert_eq!(facts["/a/slept"]["asleep"], true);
+        assert_eq!(facts["/a/.claude/worktrees/x"]["external"], true);
+        assert_eq!(facts["/a/.claude/worktrees/x"]["external_shown"], false);
+        assert_eq!(
+            rows.len(),
+            7,
+            "hidden rows stay in the payload for search and links"
+        );
+        // 폰은 정렬 기준마다 받은 순위로 다시 줄 세운다. 이름순(2)은 PC 정렬(이름순)과 같은 순서다.
+        let by_name: Vec<_> = {
+            let mut list: Vec<_> = rows
+                .iter()
+                .map(|w| {
+                    (
+                        w["orders"][2].as_u64().unwrap(),
+                        w["path"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            list.sort_unstable();
+            list.into_iter().map(|(_, p)| p).collect()
+        };
+        assert_eq!(by_name.len(), 7);
+        assert!(
+            rows.iter()
+                .all(|w| w["orders"].as_array().unwrap().len() == 4)
+        );
+        assert!(rows.iter().all(|w| w["parent"].is_null()));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1020,10 +1325,44 @@ value = "🚀"
             worktrees: vec![b"/r".to_vec()],
         }];
         let catalog = Catalog::load(Some(&dir), &repositories);
-        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["label"], "이름");
         assert_eq!(rows[0]["depth"], 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repository_remote_slug_parses_https_and_ssh_origins() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-remote-{}", std::process::id()));
+        let https_repo = dir.join("krill");
+        let ssh_repo = dir.join("orca");
+        fs::create_dir_all(https_repo.join(".git")).unwrap();
+        fs::create_dir_all(ssh_repo.join(".git")).unwrap();
+        fs::write(
+            https_repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/craftowen/krill.git\n",
+        )
+        .unwrap();
+        fs::write(
+            ssh_repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:lovecast/orca.git\n",
+        )
+        .unwrap();
+        let repositories = vec![
+            RepositoryTrees {
+                repo: https_repo.to_string_lossy().into_owned().into_bytes(),
+                worktrees: vec![https_repo.to_string_lossy().into_owned().into_bytes()],
+            },
+            RepositoryTrees {
+                repo: ssh_repo.to_string_lossy().into_owned().into_bytes(),
+                worktrees: vec![ssh_repo.to_string_lossy().into_owned().into_bytes()],
+            },
+        ];
+        let catalog = Catalog::load(None, &repositories);
+        let json = catalog.repositories_json();
+        assert_eq!(json[0]["remote"], "craftowen/krill");
+        assert_eq!(json[1]["remote"], "lovecast/orca");
         fs::remove_dir_all(dir).unwrap();
     }
 }

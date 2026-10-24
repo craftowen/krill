@@ -1194,6 +1194,7 @@ fn update_card_and_status_bar_badge_toggle_collapse_and_expand(cx: &mut TestAppC
             status: CheckStatus::Ready(staged.clone()),
             staged: Some(staged),
             card_collapsed: false,
+            ..Default::default()
         });
     });
     shell.update(cx, |_, cx| cx.notify());
@@ -1295,6 +1296,7 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
             status: CheckStatus::Ready(staged.clone()),
             staged: Some(staged),
             card_collapsed: true,
+            ..Default::default()
         });
     });
     shell.update(cx, |s, cx| {
@@ -1929,5 +1931,171 @@ fn status_pill_state_follows_orca_failure_rules() {
     assert_eq!(
         pill_state(Some(AccountStatus::RateLimited), false, false),
         PillState::Failed(settings_text::ACCOUNT_STATUS_LIMITED)
+    );
+}
+
+#[gpui::test]
+fn dashboard_done_lane_orders_unread_top_and_clicked_cards_move_to_bottom(cx: &mut TestAppContext) {
+    #[derive(Clone)]
+    struct DynamicLocal(Arc<std::sync::Mutex<sidebar::Snapshot>>);
+    impl sidebar::Source for DynamicLocal {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    let (main, main_window) = open(cx);
+    let source = DynamicLocal(Arc::new(std::sync::Mutex::new(sidebar::Snapshot {
+        sessions: vec![
+            sidebar::Session {
+                id: SessionId(1),
+                status: AgentStatus {
+                    agent: "claude".into(),
+                    state: AgentState::Done,
+                    since_unix_ns: 100,
+                    title: Some("done-older".into()),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: Some("/repo/one".into()),
+                cwd: Some("/repo/one".into()),
+                account: None,
+            },
+            sidebar::Session {
+                id: SessionId(2),
+                status: AgentStatus {
+                    agent: "codex".into(),
+                    state: AgentState::Done,
+                    since_unix_ns: 300,
+                    title: Some("done-newest".into()),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: Some("/repo/two".into()),
+                cwd: Some("/repo/two".into()),
+                account: None,
+            },
+            sidebar::Session {
+                id: SessionId(3),
+                status: AgentStatus {
+                    agent: "gemini".into(),
+                    state: AgentState::Exited,
+                    since_unix_ns: 200,
+                    title: Some("exited-mid".into()),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: Some("/repo/three".into()),
+                cwd: Some("/repo/three".into()),
+                account: None,
+            },
+        ],
+        trees: std::collections::BTreeMap::new(),
+    })));
+    cx.update(|cx| {
+        main.update(cx, |shell, cx| {
+            let pane_a = shell.layout.active_tab().focused;
+            shell.layout.set_session(pane_a, SessionId(1));
+            shell.sidebar.update(cx, |s, cx| {
+                s.connect_source(Arc::new(source.clone()), cx);
+            });
+            shell.dashboard(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let done_lane_ids = |cx: &mut TestAppContext| -> Vec<(SessionId, bool, Option<u64>)> {
+        main.read_with(cx, |shell, cx| {
+            let dash = shell.dashboard.as_ref().unwrap().read(cx);
+            dash.lanes[2]
+                .iter()
+                .map(|&idx| {
+                    let card = &dash.cards[idx];
+                    (card.session.id, card.unread, card.read_order)
+                })
+                .collect()
+        })
+    };
+
+    // 1. 초기 상태: 세 완료 카드 모두 안 읽음(unread = true)이며 최신 완료순(2 -> 3 -> 1)으로 상단에 정렬된다.
+    assert_eq!(
+        done_lane_ids(cx),
+        vec![
+            (SessionId(2), true, None),
+            (SessionId(3), true, None),
+            (SessionId(1), true, None),
+        ]
+    );
+
+    let mut visual = VisualTestContext::from_window(main_window, cx);
+    let y2 = visual.debug_bounds("dashboard-session-2").unwrap().origin.y;
+    let y3 = visual.debug_bounds("dashboard-session-3").unwrap().origin.y;
+    let y1 = visual.debug_bounds("dashboard-session-1").unwrap().origin.y;
+    assert!(
+        y2 < y3 && y3 < y1,
+        "안 읽은 완료 카드들이 최신순으로 위에서 아래로 배치된다"
+    );
+
+    // 2. 맨 위의 완료 카드(Session 2)를 클릭하면 즉시 읽음 처리되어 완료 레인 맨 아래로 내려간다.
+    let card_2 = visual.debug_bounds("dashboard-session-2").unwrap();
+    visual.simulate_click(card_2.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // 대시보드를 다시 열어 확인하면 안 읽은 카드(3, 1)가 상단에, 방금 클릭한 카드(2)가 하단에 위치한다.
+    cx.update(|cx| main.update(cx, super::super::Shell::dashboard));
+    cx.run_until_parked();
+    assert_eq!(
+        done_lane_ids(cx),
+        vec![
+            (SessionId(3), true, None),
+            (SessionId(1), true, None),
+            (SessionId(2), false, Some(1)),
+        ]
+    );
+    let mut visual = VisualTestContext::from_window(main_window, cx);
+    let y3 = visual.debug_bounds("dashboard-session-3").unwrap().origin.y;
+    let y1 = visual.debug_bounds("dashboard-session-1").unwrap().origin.y;
+    let y2 = visual.debug_bounds("dashboard-session-2").unwrap().origin.y;
+    assert!(
+        y3 < y1 && y1 < y2,
+        "클릭한 완료 카드는 안 읽은 카드들 아래(하단)로 내려간다"
+    );
+
+    // 3. 이어서 상단의 Session 3을 클릭하면 Session 1(안 읽음)이 맨 위, 읽은 카드들은 읽은 순서(2 -> 3)대로 하단에 쌓인다.
+    let card_3 = visual.debug_bounds("dashboard-session-3").unwrap();
+    visual.simulate_click(card_3.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|cx| main.update(cx, super::super::Shell::dashboard));
+    cx.run_until_parked();
+    assert_eq!(
+        done_lane_ids(cx),
+        vec![
+            (SessionId(1), true, None),
+            (SessionId(2), false, Some(1)),
+            (SessionId(3), false, Some(2)),
+        ]
+    );
+
+    // 4. 이미 읽은 Session 2가 다시 작업(Working) 후 새로운 시각에 완료(Done)되면 다시 안 읽음 상태가 되어 최상단으로 올라온다.
+    {
+        let mut snap = source.0.lock().unwrap();
+        snap.sessions[1].status.state = AgentState::Working;
+        snap.sessions[1].status.since_unix_ns = 400;
+    }
+    cx.executor().advance_clock(Duration::from_millis(501));
+    cx.run_until_parked();
+    {
+        let mut snap = source.0.lock().unwrap();
+        snap.sessions[1].status.state = AgentState::Done;
+        snap.sessions[1].status.since_unix_ns = 500;
+    }
+    cx.executor().advance_clock(Duration::from_millis(501));
+    cx.run_until_parked();
+
+    assert_eq!(
+        done_lane_ids(cx),
+        vec![
+            (SessionId(2), true, None),
+            (SessionId(1), true, None),
+            (SessionId(3), false, Some(2)),
+        ]
     );
 }

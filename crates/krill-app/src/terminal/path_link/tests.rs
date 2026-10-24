@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
 
-struct TempDir(PathBuf);
+pub(super) struct TempDir(pub(super) PathBuf);
 
 impl TempDir {
-    fn new(tag: &str) -> Self {
+    pub(super) fn new(tag: &str) -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "mk-path-link-{tag}-{}-{}",
@@ -27,7 +27,7 @@ impl Drop for TempDir {
 }
 
 /// 한 행. 2칸 글자(한글·전각)는 WIDE + SPACER 두 칸이다.
-fn row(text: &str) -> Vec<Cell> {
+pub(super) fn row(text: &str) -> Vec<Cell> {
     let mut out = Vec::new();
     for ch in text.chars() {
         let wide = is_cjk_or_hangul(ch) || is_fullwidth_punct(ch);

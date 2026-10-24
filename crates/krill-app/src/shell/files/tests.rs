@@ -535,7 +535,7 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
     };
     cx.simulate_mouse_move(at(10.), None, Modifiers::default());
     assert_eq!(hover(cx), Some(url), "평문 URL은 ⌘ 없이도 밑줄이 생긴다");
-    // 끌어서 선택하면 열지 않고, 끌지 않은 맨 클릭은 브라우저로 연다.
+    // 끌어서 선택하면 열지 않고, 끌지 않은 맨 클릭은 팝오버를 띄워 브라우저 열기를 고르게 한다.
     cx.simulate_mouse_down(at(10.), MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_move(at(20.), Some(MouseButton::Left), Modifiers::default());
     cx.simulate_mouse_up(at(20.), MouseButton::Left, Modifiers::default());
@@ -543,6 +543,14 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
     assert_eq!(cx.opened_url(), None, "끌어 선택한 것은 링크 열기가 아니다");
     cx.simulate_mouse_down(at(10.), MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(at(10.), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url(),
+        None,
+        "맨 클릭은 바로 열지 않고 팝오버를 띄운다"
+    );
+    let open = cx.debug_bounds("terminal-link-open").unwrap().center();
+    cx.simulate_click(open, Modifiers::default());
     cx.run_until_parked();
     assert_eq!(
         cx.opened_url().as_deref(),
@@ -1337,4 +1345,658 @@ fn quit_preflush_materializes_latest_layout_before_shutdown_waits(cx: &mut TestA
     view.read_with(visual, |shell, _| {
         assert_eq!(Layout::load(&path).unwrap(), shell.layout);
     });
+}
+
+/// A comparison never edits either version; Cancel and Escape return to the draft.
+#[gpui::test]
+fn reload_comparison_is_readonly_and_cancel_preserves_draft(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reload-compare-cancel");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "original").unwrap();
+    let (view, cx) = open(cx, state_path("reload-compare-cancel"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft ");
+    fs::write(&file, "external version").unwrap();
+    tick(cx);
+    let button = cx.debug_bounds("file-reload").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("file-comparison").is_some());
+    assert!(cx.debug_bounds("file-compare-draft").is_some());
+    assert!(cx.debug_bounds("file-compare-disk").is_some());
+    cx.simulate_input("must not change comparison");
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft original");
+    view.read_with(cx, |shell, cx| {
+        let comparison = shell.files.tabs[&pane].comparison.as_ref().unwrap();
+        assert_eq!(
+            comparison.draft.read(cx).text().to_string(),
+            "draft original"
+        );
+        assert_eq!(
+            comparison.disk.read(cx).text().to_string(),
+            "external version"
+        );
+    });
+    let cancel = cx.debug_bounds("file-compare-cancel").unwrap();
+    cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("file-comparison").is_none());
+    assert!(dirty(&view, pane, cx));
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.compare_file(pane, window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("file-comparison").is_none());
+    assert_eq!(fs::read_to_string(file).unwrap(), "external version");
+}
+
+/// Reload clears the native Undo history, so recovery is explicit and uses the new disk baseline.
+#[gpui::test]
+fn reload_restore_draft_keeps_disk_baseline_and_cursor(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reload-recovery-baseline");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "old saved content").unwrap();
+    let (view, cx) = open(cx, state_path("reload-recovery-baseline"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft ");
+    let cursor = view.read_with(cx, |shell, cx| {
+        shell.files.tabs[&pane]
+            .editor()
+            .unwrap()
+            .read(cx)
+            .cursor_position()
+    });
+    fs::write(&file, "new disk").unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.compare_file(pane, window, cx)));
+    cx.run_until_parked();
+    let apply = cx.debug_bounds("file-compare-apply").unwrap();
+    cx.simulate_click(apply.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "new disk");
+    assert!(!dirty(&view, pane, cx));
+    assert!(cx.debug_bounds("file-restore-draft").is_some());
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(
+        editor_text(&view, pane, cx),
+        "new disk",
+        "reload starts a fresh Undo history"
+    );
+    let restore = cx.debug_bounds("file-restore-draft").unwrap();
+    cx.simulate_click(restore.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft old saved content");
+    assert!(dirty(&view, pane, cx));
+    view.read_with(cx, |shell, cx| {
+        let tab = &shell.files.tabs[&pane];
+        assert_eq!(tab.doc.as_ref().unwrap().saved(), "new disk");
+        assert_eq!(tab.editor().unwrap().read(cx).cursor_position(), cursor);
+        assert!(tab.recovery.is_none());
+    });
+    assert_eq!(fs::read_to_string(&file).unwrap(), "new disk");
+    // Undoing this edit back to the restored draft must still be dirty.
+    cx.simulate_input("x");
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft old saved content");
+    assert!(dirty(&view, pane, cx));
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert_eq!(fs::read_to_string(file).unwrap(), "draft old saved content");
+    assert!(!dirty(&view, pane, cx));
+}
+
+#[gpui::test]
+fn reload_recovery_of_clean_buffer_is_dirty_and_new_edits_disable_restore(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reload-clean-recovery");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "old clean").unwrap();
+    let (view, cx) = open(cx, state_path("reload-clean-recovery"));
+    let pane = open_file(&view, &file, cx);
+    fs::write(&file, "new disk").unwrap();
+    tick(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| shell.restore_reload_draft(pane, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "old clean");
+    assert!(
+        dirty(&view, pane, cx),
+        "old clean content differs from current disk"
+    );
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.reload_file(pane, window, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("new edits ");
+    cx.run_until_parked();
+    let edited = editor_text(&view, pane, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| shell.restore_reload_draft(pane, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), edited);
+    assert!(cx.debug_bounds("file-restore-draft").is_none());
+}
+
+#[gpui::test]
+fn reload_comparison_rejects_rechanged_disk_and_io_failure(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reload-compare-stale");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("reload-compare-stale"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft ");
+    fs::write(&file, "external version").unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.compare_file(pane, window, cx)));
+    cx.run_until_parked();
+    fs::write(&file, "external changed again and longer").unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.apply_file_comparison(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft initial");
+    assert!(cx.debug_bounds("file-error").is_some());
+    view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs[&pane].recovery.is_none());
+    });
+    fs::remove_file(&file).unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.reload_file(pane, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft initial");
+    assert!(dirty(&view, pane, cx));
+}
+
+#[gpui::test]
+fn reload_comparison_read_races_preserve_new_edits_and_replaced_tabs(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reload-compare-races");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("reload-compare-races"));
+    let pane = open_file(&view, &file, cx);
+    let (release, gate) = tokio::sync::oneshot::channel();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.files.next_io = Some(gate);
+            shell.compare_file(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_input("new edit ");
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("file-comparison").is_none());
+    assert_eq!(editor_text(&view, pane, cx), "new edit initial");
+    // Recreate the same path with identical Doc/revision but a different editor entity.
+    let (release, gate) = tokio::sync::oneshot::channel();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let loaded = read_file(&file, false);
+            let fresh = Shell::load_file_tab(pane, file.clone(), None, window, cx, loaded);
+            shell.files.tabs.insert(pane, fresh);
+            shell.files.next_io = Some(gate);
+            shell.reload_file(pane, window, cx);
+            let loaded = read_file(&file, false);
+            let fresh = Shell::load_file_tab(pane, file.clone(), None, window, cx, loaded);
+            shell.files.tabs.insert(pane, fresh);
+        });
+    });
+    fs::write(&file, "late external read").unwrap();
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "initial");
+    view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs[&pane].recovery.is_none());
+    });
+    // A pending comparison must not resurrect a closed tab.
+    let (release, gate) = tokio::sync::oneshot::channel();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.files.next_io = Some(gate);
+            shell.compare_file(pane, window, cx);
+            shell.files.tabs.remove(&pane);
+            shell.change(true, cx, Layout::close_pane);
+        });
+    });
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.files.tabs.contains_key(&pane));
+    });
+}
+
+#[gpui::test]
+fn reload_comparison_cancel_pending_apply_and_repeated_reload_keep_first_draft(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("reload-compare-cancel-pending");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("reload-compare-cancel-pending"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft ");
+    fs::write(&file, "disk one").unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.compare_file(pane, window, cx)));
+    cx.run_until_parked();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.files.next_io = Some(gate);
+            shell.apply_file_comparison(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let cancel = cx.debug_bounds("file-compare-cancel").unwrap();
+    cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft initial");
+    assert!(dirty(&view, pane, cx));
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.reload_file(pane, window, cx)));
+    cx.run_until_parked();
+    fs::write(&file, "disk two, newer").unwrap();
+    tick(cx);
+    assert_eq!(editor_text(&view, pane, cx), "disk two, newer");
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| shell.restore_reload_draft(pane, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft initial");
+    assert!(dirty(&view, pane, cx));
+    view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.files.tabs[&pane].doc.as_ref().unwrap().saved(),
+            "disk two, newer"
+        );
+    });
+}
+
+fn show_wrapped_path(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    dir: &Path,
+) -> (PaneId, Point<Pixels>) {
+    use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+    let pane = layout_of(view, cx).active_tab().focused;
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    view.update(cx, |s, cx| {
+        s.layout.set_launch(
+            pane,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: dir.as_os_str().as_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        s.attach_test(pane, krill_proto::SessionId(121), ours, cx);
+        let mut head: Vec<_> = "src/long-name.rs"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        assert_eq!(head.len(), 16, "실제 마지막 칸에 WRAPLINE을 둔다");
+        head.last_mut().unwrap().flags |= Flags::WRAPLINE;
+        let ops = vec![
+            Op::Reset { cols: 16, lines: 4 },
+            Op::Line {
+                line: 0,
+                cells: head,
+            },
+            Op::Line {
+                line: 1,
+                cells: ":2:3"
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect(),
+            },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    (
+        pane,
+        point(
+            bounds.origin.x + cell.width * 2.5,
+            bounds.origin.y + cell.height * 1.5,
+        ),
+    )
+}
+
+#[gpui::test]
+fn wrapped_file_cmd_click_uses_full_location_and_rejects_changed_prefix(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-cmd");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/long-name.rs");
+    fs::write(&file, "first\nsecond\n").unwrap();
+    let (view, cx) = open(cx, state_path("wrapped-cmd"));
+    let (pane, at) = show_wrapped_path(&view, cx, &dir.0);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+        s.files.link_next_io = Some(rx);
+        s.path_link_at(pane, at, Some(terminal_menu::FileAction::Open), cx);
+        // 포인터 행은 두고 앞 행만 바꾼다.
+        let mut cells: Vec<_> = "src/wrong-na.rs"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        cells.resize(16, Cell::default());
+        cells.last_mut().unwrap().flags |= Flags::WRAPLINE;
+        let frame =
+            &encode_update(Revision(2), Seq(0), vec![Op::Line { line: 0, cells }]).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    tx.send(()).unwrap();
+    cx.run_until_parked();
+    assert!(
+        layout_of(&view, cx).file(pane).is_none(),
+        "늦은 결과로 옛 파일을 열지 않는다"
+    );
+    let (pane, at) = show_wrapped_path(&view, cx, &dir.0);
+    cx.simulate_mouse_move(
+        at,
+        None,
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        Some(Highlight {
+            line: 1,
+            column: 0,
+            cols: 4
+        })
+    );
+    cx.simulate_click(
+        at,
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    let cursor = cx.update(|_, cx| {
+        view.read(cx).files.tabs[&opened]
+            .editor()
+            .unwrap()
+            .read(cx)
+            .cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(1, 2));
+}
+
+#[gpui::test]
+fn wrapped_file_remote_guard_and_expired_negative_cache(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-cache");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let (view, cx) = open(cx, state_path("wrapped-cache"));
+    let (pane, at) = show_wrapped_path(&view, cx, &dir.0);
+    view.update(cx, |s, cx| {
+        s.path_link_at(pane, at, None, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| {
+        view.read(cx)
+            .files
+            .link_lookup
+            .as_ref()
+            .unwrap()
+            .found
+            .is_none()
+    }));
+    fs::write(dir.0.join("src/long-name.rs"), "first\nsecond\n").unwrap();
+    view.update(cx, |s, cx| {
+        s.files.link_lookup.as_mut().unwrap().checked_at =
+            std::time::Instant::now().checked_sub(Duration::from_secs(1));
+        // 내부 캐시도 같은 유효기간으로 만료시킨다.
+        s.files.link_cache.lock().unwrap().0 = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        s.path_link_at(pane, at, None, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| {
+        view.read(cx)
+            .files
+            .link_lookup
+            .as_ref()
+            .unwrap()
+            .found
+            .is_some()
+    }));
+    view.update(cx, |s, cx| {
+        s.layout
+            .set_host(pane, krill_app::hosts::HostId::Remote("other".into()));
+        assert!(
+            s.path_link_at(pane, at, Some(terminal_menu::FileAction::Open), cx)
+                .is_none()
+        );
+        s.update_path_hover(pane, at, true, cx);
+        assert!(s.path_hover(pane).is_none());
+        s.open_terminal_file(
+            dir.0.join("src/long-name.rs"),
+            at,
+            terminal_menu::FileAction::Open,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).file(pane).is_none());
+}
+
+/// Reviewed content is checked too, even when a writer preserves size and mtime.
+#[gpui::test]
+fn reload_comparison_rejects_different_content_with_identical_stamp(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reload-compare-content");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("reload-compare-content"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft ");
+    fs::write(&file, "disk one").unwrap();
+    let modified = fs::metadata(&file).unwrap().modified().unwrap();
+    let stamp = editor::stamp(&file).unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.compare_file(pane, window, cx)));
+    cx.run_until_parked();
+    fs::write(&file, "disk two").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(editor::stamp(&file).unwrap(), stamp);
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.apply_file_comparison(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "draft initial");
+    assert_eq!(fs::read_to_string(file).unwrap(), "disk two");
+    assert!(dirty(&view, pane, cx));
+    view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs[&pane].recovery.is_none());
+    });
+}
+
+#[gpui::test]
+fn restart_quit_stops_after_helper_failure_or_payload_replacement(cx: &mut TestAppContext) {
+    use krill_app::updater::{RestartStatus, StagedUpdate, UpdateState};
+    let staged = StagedUpdate {
+        state_dir: "/test/restart-quit".into(),
+        app_bundle: "/test/Krill.app".into(),
+        from_version: "0.1.0".into(),
+        to_version: "0.2.0".into(),
+        manifest_url: "https://example.test/latest.json".into(),
+        relaunched: false,
+    };
+    cx.update(|cx| {
+        cx.set_global(UpdateState {
+            staged: Some(staged.clone()),
+            restart: RestartStatus::Starting,
+            ..Default::default()
+        });
+        assert!(super::restart_quit_is_current(Some(&staged), cx));
+        let mut failed = cx.global::<UpdateState>().clone();
+        failed.restart = RestartStatus::Failed("helper exited".into());
+        cx.set_global(failed);
+        assert!(!super::restart_quit_is_current(Some(&staged), cx));
+        assert!(
+            super::restart_quit_is_current(None, cx),
+            "ordinary quit remains available"
+        );
+        let mut next = staged.clone();
+        next.to_version = "0.3.0".into();
+        cx.set_global(UpdateState {
+            staged: Some(next),
+            restart: RestartStatus::Starting,
+            ..Default::default()
+        });
+        assert!(!super::restart_quit_is_current(Some(&staged), cx));
+    });
+}
+
+#[gpui::test]
+fn restart_quit_does_not_exit_when_helper_fails_during_unsaved_prompt(cx: &mut TestAppContext) {
+    use krill_app::updater::{RestartStatus, StagedUpdate, UpdateState};
+    let dir = TempDir::new("restart-prompt-expired");
+    let file = dir.0.join("a.txt");
+    fs::write(&file, "saved").unwrap();
+    let (view, cx) = open(cx, state_path("restart-prompt-expired"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft ");
+    let quitting = std::rc::Rc::new(std::cell::Cell::new(false));
+    cx.update(|_, cx| {
+        cx.set_global(QuitObserved(quitting.clone()));
+        cx.set_global(UpdateState {
+            staged: Some(StagedUpdate {
+                state_dir: dir.0.clone(),
+                app_bundle: dir.0.join("Krill.app"),
+                from_version: "0.1.0".into(),
+                to_version: "0.2.0".into(),
+                manifest_url: "https://example.test/latest.json".into(),
+                relaunched: false,
+            }),
+            restart: RestartStatus::Starting,
+            ..Default::default()
+        });
+        quit_app(cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.update(|_, cx| {
+        let mut state = cx.global::<UpdateState>().clone();
+        state.restart = RestartStatus::Failed("helper timed out".into());
+        cx.set_global(state);
+    });
+    cx.simulate_prompt_answer(etext::DISCARD.get());
+    cx.run_until_parked();
+    assert!(!quitting.get());
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.files.tabs.contains_key(&pane));
+    });
+    assert!(cx.update(|_, cx| !cx.windows().is_empty()));
+}
+
+#[gpui::test]
+fn session_tab_keeps_focus_after_viewing_file_and_closing_or_reloading(cx: &mut TestAppContext) {
+    let dir = TempDir::new("session-focus-after-file");
+    let md = dir.0.join("REPORT.md");
+    fs::write(&md, "# Report\n\ninitial\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("session-focus-after-file"));
+    let session_pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "초기 세션 탭은 Shell 포커스를 가져야 한다"
+    );
+
+    // 1. 마크다운 파일(`REPORT.md`)을 조회한 뒤 편집 모드로 전환해 에디터가 포커스를 가져가게 한다.
+    let file_pane = open_file(&view, &md, cx);
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane)),
+        Some(true)
+    );
+    let toggle = cx.debug_bounds("file-preview-toggle").unwrap().center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)),
+        "편집 모드 전환 후에는 에디터가 포커스를 가져야 한다"
+    );
+
+    // 2. 마우스로 세션 탭(0번)을 클릭해 돌아온 뒤 비활성 파일 탭(1번)의 닫기 버튼(`close-tab-1`)을 눌러 닫아도
+    // 세션 탭의 키보드 포커스(`shell.focus`)가 끊기지 않아야 한다.
+    let tab0 = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_click(tab0, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.layout.focused()),
+        Some(session_pane)
+    );
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "세션 탭을 클릭해 돌아오면 Shell 포커스가 복원되어야 한다"
+    );
+
+    let tab1 = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_move(tab1, None, Modifiers::default());
+    cx.run_until_parked();
+    let close_file_tab = cx.debug_bounds("close-tab-1").unwrap().center();
+    cx.simulate_click(close_file_tab, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "비활성 파일 탭의 닫기 버튼을 눌러 닫은 뒤에도 세션 포커스가 유지되어야 한다"
+    );
+
+    // 3. 다시 파일을 열어 둔 상태에서 세션 탭으로 돌아오고(검색 바가 열려 있더라도),
+    // 백그라운드 감시가 디스크 변경을 자동 리로드할 때 숨겨진 에디터가 세션 포커스를 뺏지 않아야 한다.
+    let _file_pane2 = open_file(&view, &md, cx);
+    let toggle = cx.debug_bounds("file-preview-toggle").unwrap().center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            // 검색 바를 열어 둔 채 세션 탭으로 복귀
+            let bar = cx.new(|cx| krill_app::search::Bar::new(window, cx));
+            let sub = cx.subscribe_in(&bar, window, |_, _, _: &krill_app::search::Event, _, _| {});
+            shell.search = Some((bar, sub));
+            shell.change(true, cx, |l| l.activate(0));
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "검색 바가 열려 있어도 파일 탭에서 세션 탭으로 돌아오면 Shell 포커스가 복원되어야 한다"
+    );
+
+    fs::write(&md, "# Report\n\nupdated by agent in background\n").unwrap();
+    tick(cx);
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "백그라운드 파일 자동 리로드가 실행 중인 세션 탭의 포커스를 뺏으면 안 된다"
+    );
 }

@@ -37,6 +37,7 @@ fn connection() -> (UnixStream, Arc<Conn>) {
         Arc::new(Conn {
             out: Mutex::new(server),
             resync: AtomicBool::new(false),
+            echo: AtomicBool::new(false),
             gone: AtomicBool::new(false),
         }),
     )

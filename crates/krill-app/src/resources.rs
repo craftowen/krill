@@ -482,6 +482,8 @@ impl Render for Panel {
                 .p_3()
                 .rounded(crate::ui::RADIUS_MD)
                 .bg(p.popover)
+                .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_XS)
                 .text_color(p.popover_foreground)
                 .border_1()
                 .border_color(p.border)

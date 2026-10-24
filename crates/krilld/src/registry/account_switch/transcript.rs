@@ -15,6 +15,8 @@ use krill_proto::usage::{AccountInfo, ProviderKind};
 use crate::agent::control::{LaunchAccount, StoredLaunch, valid_session_id, valid_transcript_path};
 use crate::usage::accounts;
 
+mod agy;
+
 /// A bound ID (launch/resume/hook) is authoritative. A hook-bound file can also
 /// supply the ID, but cwd/mtime searches cannot prove which process owns a conversation.
 pub(super) fn session_id(provider: ProviderKind, stored: &StoredLaunch) -> io::Result<String> {
@@ -32,6 +34,12 @@ pub(super) fn session_id(provider: ProviderKind, stored: &StoredLaunch) -> io::R
         if !valid_transcript_path(path) {
             return Err(io::ErrorKind::InvalidData.into());
         }
+        if provider == ProviderKind::Antigravity
+            && let Some((_, id)) =
+                crate::agent_history::vault::agy_root_and_id_from_path(Path::new(path))
+        {
+            return Ok(id);
+        }
         return file_session_id(Path::new(path), provider);
     }
     Err(io::Error::new(
@@ -45,10 +53,20 @@ pub(super) struct PreparedTranscript {
     path: Option<PathBuf>,
     provider: ProviderKind,
     id: String,
+    /// Antigravity's SQLite conversation, published as an independent copy (see `agy`).
+    agy: Option<agy::Bridge>,
 }
 
 impl PreparedTranscript {
     pub(super) fn verify(&self) -> io::Result<()> {
+        if self.provider == ProviderKind::Antigravity {
+            // Only the conversation database makes an Antigravity conversation resumable.
+            return self
+                .agy
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
+                .verify();
+        }
         if let Some(path) = &self.path {
             if matches!(self.provider, ProviderKind::Claude | ProviderKind::Codex) {
                 if file_session_id(path, self.provider)? != self.id {
@@ -96,6 +114,7 @@ pub(super) fn prepare_bound(
             .ok()
             .zip(to.canonicalize().ok())
             .is_some_and(|(a, b)| a == b);
+    let mut agy_bridge = None;
     let path = match provider {
         ProviderKind::Claude | ProviderKind::Codex => {
             let base = if provider == ProviderKind::Claude {
@@ -148,28 +167,25 @@ pub(super) fn prepare_bound(
             } else {
                 to.join(".gemini/antigravity-cli")
             };
-            let mut path = None;
-            for root in crate::agent_history::vault::agy_candidate_dirs(&from, true) {
-                let brain = root.join("brain").join(id);
-                if brain.is_dir() {
-                    let destination = target_root.join("brain").join(id);
-                    if !same_profile {
-                        link_tree(&brain, &destination, &mut 4096)?;
-                    }
-                    path = Some(destination);
-                    break;
+            // A process-attributed transcript path names the home that actually holds the
+            // conversation. It must name this conversation; a different ID is a mismatch.
+            let bound_root = match bound_path
+                .and_then(|p| crate::agent_history::vault::agy_root_and_id_from_path(Path::new(p)))
+            {
+                Some((_, bound_id)) if bound_id != id => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bound transcript names a different conversation",
+                    ));
                 }
-                let session = root.join("sessions").join(format!("{id}.jsonl"));
-                if session.is_file() {
-                    let destination = target_root.join("sessions").join(format!("{id}.jsonl"));
-                    if !same_profile {
-                        link_file(&session, &destination)?;
-                    }
-                    path = Some(destination);
-                    break;
-                }
-            }
-            Some(path.ok_or(io::ErrorKind::NotFound)?)
+                Some((root, _)) => Some(root),
+                None => None,
+            };
+            let roots = crate::agent_history::vault::agy_candidate_dirs(&from, true);
+            let bridged = agy::prepare(bound_root.as_deref(), &roots, &target_root, id)?;
+            let path = bridged.target_db().to_path_buf();
+            agy_bridge = Some(bridged);
+            Some(path)
         }
         ProviderKind::OpenCode => {
             // Importing into the database it was exported from could duplicate the session.
@@ -184,13 +200,14 @@ pub(super) fn prepare_bound(
         path,
         provider,
         id: id.to_owned(),
+        agy: agy_bridge,
     };
     prepared.verify()?;
     Ok(prepared)
 }
 
 /// Read only provider identity metadata, never infer an ID from an arbitrary rollout filename.
-fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
+pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::ErrorKind::InvalidData.into());
     }
@@ -206,8 +223,10 @@ fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
                 if record.get("type").and_then(serde_json::Value::as_str)
                     == Some("session_meta") =>
             {
+                // A subagent rollout is a valid file, just never a parent conversation.
+                // `Unsupported` lets callers skip it without ignoring corrupt metadata.
                 if record.pointer("/payload/source/subagent").is_some() {
-                    return Err(io::ErrorKind::InvalidData.into());
+                    return Err(io::ErrorKind::Unsupported.into());
                 }
                 record.pointer("/payload/id")
             }
@@ -217,7 +236,7 @@ fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
                 {
-                    return Err(io::ErrorKind::InvalidData.into());
+                    return Err(io::ErrorKind::Unsupported.into());
                 }
                 record.get("sessionId")
             }
@@ -239,7 +258,11 @@ fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
     })
 }
 
-fn find_transcript(root: &Path, provider: ProviderKind, id: &str) -> io::Result<Option<PathBuf>> {
+pub(super) fn find_transcript(
+    root: &Path,
+    provider: ProviderKind,
+    id: &str,
+) -> io::Result<Option<PathBuf>> {
     let deadline = Instant::now() + Duration::from_secs(3);
     // Only search provider-owned transcript levels. Claude subagent/workflow trees
     // can exceed the whole search budget and cannot contain the parent conversation.
@@ -302,8 +325,13 @@ fn link_tree(from: &Path, to: &Path, budget: &mut usize) -> io::Result<()> {
     if fs::symlink_metadata(from)?.file_type().is_symlink() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    if to.exists() && fs::symlink_metadata(to)?.file_type().is_symlink() {
-        return Err(io::ErrorKind::AlreadyExists.into());
+    if to.exists() {
+        if same_file::is_same_file(from, to).unwrap_or(false) {
+            return Ok(());
+        }
+        if fs::symlink_metadata(to)?.file_type().is_symlink() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
     }
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
@@ -843,6 +871,39 @@ mod bound_path_tests {
         assert!(
             matches!(prepare_bound(ProviderKind::Codex, &root, &source, &target, "known", b"", foreign.to_str()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subagent_transcripts_are_unsupported_but_corrupt_metadata_stays_invalid() {
+        let root = std::env::temp_dir().join(format!("kas-subagent-kind-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("t.jsonl");
+        for (provider, body, kind) in [
+            (
+                ProviderKind::Codex,
+                r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{}}}}"#,
+                io::ErrorKind::Unsupported,
+            ),
+            (
+                ProviderKind::Claude,
+                r#"{"sessionId":"child","isSidechain":true}"#,
+                io::ErrorKind::Unsupported,
+            ),
+            (
+                ProviderKind::Claude,
+                "{\"sessionId\":\"one\"}\n{\"sessionId\":\"two\"}",
+                io::ErrorKind::InvalidData,
+            ),
+        ] {
+            fs::write(&path, body).unwrap();
+            assert_eq!(
+                file_session_id(&path, provider).unwrap_err().kind(),
+                kind,
+                "{body}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

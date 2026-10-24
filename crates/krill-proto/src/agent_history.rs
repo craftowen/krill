@@ -278,6 +278,10 @@ pub struct ChatItem {
     pub multi_select: bool,
     #[serde(default, deserialize_with = "question_options")]
     pub options: Vec<ChatQuestionOption>,
+    /// 원본 레코드 시각(RFC 3339 문자열 또는 epoch 밀리초). 모바일 JSON에만 따로 싣는다 —
+    /// postcard 와이어는 바뀌지 않아 버전이 다른 앱·데몬 사이에서도 그대로 읽힌다.
+    #[serde(skip)]
+    pub at: String,
 }
 
 /// Zero-State 증분 트랜스크립트 리더 응답(OWE-945 / MK-242).

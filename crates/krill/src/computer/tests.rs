@@ -134,7 +134,7 @@ fn permission_capabilities_and_self_target_guard_behave_as_expected() {
 
     assert!(verify_not_self_targeted("Krill", Some("dev.krill.app")).is_err());
     assert!(verify_not_self_targeted("krill-app", Some("dev.krill.app")).is_err());
-    assert!(verify_not_self_targeted("krill-app", None).is_ok());
+    assert!(verify_not_self_targeted("krill-app", None).is_err());
     assert!(verify_not_self_targeted("Calculator", Some("com.apple.calculator")).is_ok());
 
     let summary = AppSummary {
@@ -332,11 +332,10 @@ fn permission_probe_script_tolerates_missing_preflight_symbol() {
         PERMISSION_PROBE_JXA_SCRIPT.contains("typeof $.AXIsProcessTrusted"),
         "probe must check AXIsProcessTrusted availability before calling it"
     );
-    // 심볼이 없을 때: 화면 기록 확인은 생략하고 진행(기본 true),
-    // 손쉬운 사용은 실패 닫힘(기본 false).
+    // Missing symbols never count as permission grants.
     assert!(
-        PERMISSION_PROBE_JXA_SCRIPT.contains("let screenshots = true;"),
-        "probe must proceed without screenshot gating when the preflight symbol is missing"
+        PERMISSION_PROBE_JXA_SCRIPT.contains("let screenshots = false;"),
+        "missing screen capture preflight must not be reported as granted"
     );
     assert!(
         PERMISSION_PROBE_JXA_SCRIPT.contains("let accessibility = false;"),
@@ -366,31 +365,6 @@ fn permission_probe_output_parsing_handles_branches() {
 }
 
 #[test]
-fn jxa_scripts_preserve_pid_whose_specifier_without_array_evaluation() {
-    use super::engine::{LIVE_ACTION_JXA_SCRIPT, LIVE_WINDOW_AX_JXA_SCRIPT};
-
-    for script in [LIVE_WINDOW_AX_JXA_SCRIPT, LIVE_ACTION_JXA_SCRIPT] {
-        assert!(
-            script.contains("se.processes.whose({ unixId: targetPid }).first"),
-            "JXA script must use whose({{ unixId: targetPid }}).first to preserve PID filter specifier"
-        );
-        assert!(
-            !script.contains("whose({ unixId: targetPid })()")
-                && !script.contains("whose({ unixId: Number(req.pid) })()"),
-            "JXA script must not evaluate whose(...)() into an array that normalizes to byName"
-        );
-        assert!(
-            !script.contains("proc.windows()"),
-            "JXA script must pass proc.windows collection specifier without ()"
-        );
-        assert!(
-            !script.contains("parent.uiElements()"),
-            "JXA script must index parent.uiElements collection specifier without ()"
-        );
-    }
-}
-
-#[test]
 fn help_returns_zero_at_any_position() {
     assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
     assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
@@ -398,4 +372,254 @@ fn help_returns_zero_at_any_position() {
         run(&[OsString::from("capabilities"), OsString::from("--help")]),
         ExitCode::SUCCESS
     );
+}
+
+#[test]
+fn immutable_reference_refuses_reorder_ambiguity_and_replacement() {
+    use super::model::validate_reference;
+    let mut original = sample_ax_tree();
+    index_and_render_tree(&mut original);
+    let mut reordered = original.clone();
+    reordered.children.swap(0, 1);
+    index_and_render_tree(&mut reordered);
+    assert!(validate_reference(&original, &reordered, 1).is_err());
+    assert!(validate_reference(&original, &reordered, 2).is_err());
+    let mut duplicate = original.clone();
+    duplicate.children.push(original.children[0].clone());
+    assert!(
+        validate_reference(&original, &duplicate, 1)
+            .unwrap_err()
+            .contains("ambiguous")
+    );
+    let mut replacement = original.clone();
+    replacement.children[0].title = Some("Another account".to_owned());
+    assert!(validate_reference(&original, &replacement, 1).is_err());
+    assert!(validate_reference(&original, &original, 999).is_err());
+    assert!(validate_reference(&original, &original, 1).is_ok());
+}
+
+#[test]
+fn new_snapshot_never_reuses_injected_or_duplicate_local_refs() {
+    let mut tree = sample_ax_tree();
+    tree.children[0].reference_id = Some(99);
+    tree.children[1].reference_id = Some(99);
+    let (flat, _, _, _) = index_and_render_tree(&mut tree);
+    assert_eq!(
+        flat.iter()
+            .map(|node| node.reference_id)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+fn snapshot_fixture() -> super::engine::AppStateSnapshot {
+    let mut root = sample_ax_tree();
+    let (elements, focused_element_id, element_count, tree_text) = index_and_render_tree(&mut root);
+    super::engine::AppStateSnapshot {
+        snapshot_id: "snap-fixture-1".to_owned(),
+        process_start: "1792848000.123456".to_owned(),
+        caller_scope: "caller-fixture".to_owned(),
+        captured_at_ms: 123,
+        coverage_truncated: false,
+        captured_at: "123".to_owned(),
+        app: AppSummary {
+            name: "Fixture".to_owned(),
+            bundle_id: None,
+            pid: 7777,
+            is_active: true,
+            is_hidden: false,
+        },
+        window: Some(super::model::WindowSummary {
+            id: "43".to_owned(),
+            index: 1,
+            title: "Fixture".to_owned(),
+            app_name: "Fixture".to_owned(),
+            bundle_id: None,
+            pid: 7777,
+            bounds: root.bounds.unwrap(),
+            is_focused: true,
+            is_main: true,
+            is_minimized: false,
+        }),
+        focused_element_id,
+        element_count,
+        interactive_count: elements.len(),
+        tree_text,
+        elements,
+        root: Some(root),
+        screenshot: None,
+        notes: vec![],
+    }
+}
+
+#[test]
+fn equal_pid_with_different_start_or_window_identity_is_rejected() {
+    use super::engine::validate_snapshot_identity;
+    let before = snapshot_fixture();
+    let mut reused = before.clone();
+    reused.process_start = "1792848000.987654".to_owned();
+    assert!(validate_snapshot_identity(&before, &reused).is_err());
+    reused = before.clone();
+    reused.window.as_mut().unwrap().id = "44".to_owned();
+    assert!(validate_snapshot_identity(&before, &reused).is_err());
+    reused = before.clone();
+    reused.window.as_mut().unwrap().bounds.x += 1.0;
+    assert!(validate_snapshot_identity(&before, &reused).is_err());
+    assert!(validate_snapshot_identity(&before, &before).is_ok());
+}
+
+#[test]
+fn preview_is_bounded_but_full_value_remains_available_for_readback() {
+    let mut root = sample_ax_tree();
+    let long = format!("{}tail", "가".repeat(1200));
+    root.children[0].value = Some(long.clone());
+    let (elements, _, _, _) = index_and_render_tree(&mut root);
+    assert_eq!(elements[0].value.as_ref().unwrap().chars().count(), 500);
+    assert_eq!(root.children[0].value.as_deref(), Some(long.as_str()));
+}
+
+#[test]
+fn unknown_delivery_cannot_be_verified_and_observation_does_not_erase_delivery() {
+    use super::engine::{
+        ActionResultPayload, Cleanup, Delivery, LiveActionOutcome, ObservationMetadata,
+        VerificationMetadata,
+    };
+    let unknown = LiveActionOutcome {
+        status: "verified".to_owned(),
+        ok: true,
+        ..LiveActionOutcome::unknown("EOF after send".to_owned())
+    };
+    assert_eq!(
+        super::actions::verification_from_outcome(&unknown).status,
+        "unverified"
+    );
+    let result = ActionResultPayload {
+        issued_units: Some(1),
+        delivery: Delivery::Submitted,
+        observation: ObservationMetadata {
+            status: "failed".to_owned(),
+            reason: Some("AX unavailable".to_owned()),
+        },
+        cleanup: Cleanup::NotNeeded,
+        action: "click".to_owned(),
+        ok: true,
+        verification: VerificationMetadata {
+            status: "unverified".to_owned(),
+            reason: None,
+            retried: false,
+        },
+        target_reference_id: Some(1),
+        target_point: None,
+        app_state: None,
+        clipboard: None,
+        notes: vec![],
+    };
+    assert!(super::action_exit(&result).is_err());
+    assert_eq!(
+        serde_json::to_value(result).unwrap()["delivery"],
+        "submitted"
+    );
+}
+
+#[test]
+fn clipboard_metadata_never_serializes_previous_text() {
+    let metadata = super::model::ClipboardMetadata {
+        preserved: false,
+        restored: false,
+        previous_text: Some("private password from another app".to_owned()),
+    };
+    let json = serde_json::to_string(&metadata).unwrap();
+    assert!(!json.contains("previousText"));
+    assert!(!json.contains("password"));
+}
+
+#[test]
+fn screenshot_dimensions_are_read_from_png_not_a_hardcoded_scale() {
+    let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    bytes.extend_from_slice(&3200_u32.to_be_bytes());
+    bytes.extend_from_slice(&1800_u32.to_be_bytes());
+    assert_eq!(super::engine::png_dimensions(&bytes).unwrap(), (3200, 1800));
+    assert!(super::engine::png_dimensions(b"\x89PNG\r\n\x1a\n").is_err());
+    assert!(super::engine::png_dimensions(b"not a png").is_err());
+}
+
+#[test]
+fn compact_observation_and_paging_preserve_original_reference_numbers() {
+    let snapshot = snapshot_fixture();
+    let options = super::CommonWindowOpts {
+        limit: Some(1),
+        offset: 1,
+        ..Default::default()
+    };
+    let page = super::snapshot_json(&snapshot, &options).unwrap();
+    assert!(page.get("root").is_none());
+    assert!(page.get("treeText").is_none());
+    assert_eq!(page["snapshotId"], snapshot.snapshot_id);
+    assert_eq!(page["elements"][0]["referenceId"], 2);
+    assert_eq!(page["coverage"]["returnedElements"], 1);
+    assert!(page["coverage"]["nextOffset"].is_null());
+    let full = super::snapshot_json(
+        &snapshot,
+        &super::CommonWindowOpts {
+            format: Some("full".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(full.get("root").is_some());
+    assert!(full.get("treeText").is_some());
+}
+
+#[test]
+fn disabled_unrelated_controls_and_nonactionable_window_do_not_block_enabled_target() {
+    use super::model::{validate_reference, validate_structure};
+    let mut original = sample_ax_tree();
+    original.enabled = false;
+    original.actions = vec!["AXRaise".to_owned()];
+    original.children[1].enabled = false;
+    index_and_render_tree(&mut original);
+    assert_eq!(original.reference_id, None);
+    let mut fresh = original.clone();
+    fresh.children[1].enabled = true;
+    assert!(validate_structure(&original, &fresh).is_ok());
+    assert!(validate_reference(&original, &fresh, 1).is_ok());
+    fresh.children[0].enabled = false;
+    assert!(validate_reference(&original, &fresh, 1).is_err());
+}
+
+#[test]
+fn structurally_stable_element_with_reused_semantic_value_is_refused() {
+    let mut original = sample_ax_tree();
+    index_and_render_tree(&mut original);
+    let mut reused = original.clone();
+    reused.children[0].value = Some("different account in reused row".to_owned());
+    assert!(
+        super::model::validate_reference(&original, &reused, 1)
+            .unwrap_err()
+            .contains("semantic reuse")
+    );
+}
+
+#[test]
+fn observation_and_action_scripts_share_one_identity_prefix() {
+    use super::engine::{LIVE_ACTION_JXA_SCRIPT, LIVE_WINDOW_AX_JXA_SCRIPT};
+    // Behavior is exercised by the synthetic-bridge Node harness; this pins the
+    // contract so the two embedded copies cannot drift apart again.
+    let observe = include_str!("engine/scripts/common.js");
+    assert!(LIVE_WINDOW_AX_JXA_SCRIPT.starts_with(observe));
+    assert!(LIVE_ACTION_JXA_SCRIPT.starts_with(observe));
+    assert!(observe.contains("function validateTree"));
+    assert!(observe.contains("fresh.value!==target.value"));
+    assert!(observe.contains("refs.length && truncated"));
+    assert!(observe.contains("sameObservedWindow(proc,focused,win)"));
+    assert!(!observe.contains("equal(rect(focused),req.winBounds)"));
+}
+
+#[test]
+fn paste_consumption_requires_the_exact_expected_value() {
+    use super::engine::LIVE_ACTION_JXA_SCRIPT;
+    assert!(LIVE_ACTION_JXA_SCRIPT.contains("liveValue(el)===expected"));
+    assert!(LIVE_ACTION_JXA_SCRIPT.contains("AXSelectedTextRange"));
+    assert!(!LIVE_ACTION_JXA_SCRIPT.contains("indexOf(String(req.text))"));
+    assert!(!LIVE_ACTION_JXA_SCRIPT.contains("previousText"));
 }

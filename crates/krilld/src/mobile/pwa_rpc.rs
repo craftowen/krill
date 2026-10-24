@@ -12,7 +12,7 @@ use krill_proto::{
     control::{self, Create, Program, Reply, Request},
     input::{Input, InputAck, InputId, InputResult},
     ipc::{self, ClientRole, ServerHello},
-    orchestration::{GateStatus, MessageType, OrchestrationStore},
+    orchestration::OrchestrationStore,
     screen::{Attach, Msg, Seq, Stream},
     usage::{ProviderKind, UsageReply, UsageRequest},
 };
@@ -28,6 +28,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+mod requests;
 
 /// `create_terminal`이 받는 에이전트 프로필(`registry` create와 같은 출처) id·이름, 표준 순서. 설정을 못 읽으면 빈 목록.
 /// 미설치 CLI도 싣는다 — 띄우면 로그인 셸 preflight가 설치 안내를 보여 준다.
@@ -109,6 +111,8 @@ enum Action {
         name: String,
         #[serde(default)]
         base: Option<String>,
+        #[serde(default)]
+        agent: Option<String>,
         #[serde(default)]
         setup_hash: Option<String>,
         #[serde(default)]
@@ -201,6 +205,8 @@ fn chat_page_value(
     let identity = crate::agent_history::chat::generation(&snapshot);
     let generation = hex(ring::digest::digest(&ring::digest::SHA256, identity.as_bytes()).as_ref());
     let start = if snapshot.reset { 0 } else { offset };
+    // `at`은 postcard 와이어에서 빠지는 필드라 직렬화 뒤 같은 순서의 항목에 붙인다.
+    let times: Vec<String> = snapshot.items.iter().map(|item| item.at.clone()).collect();
     let mut value = to_value(snapshot)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("generation".into(), generation.into());
@@ -212,6 +218,9 @@ fn chat_page_value(
             for (index, item) in items.iter_mut().enumerate() {
                 if let Some(fields) = item.as_object_mut() {
                     fields.insert("id".into(), format!("{start}:{index}").into());
+                    if let Some(at) = times.get(index).filter(|at| !at.is_empty()) {
+                        fields.insert("at".into(), at.clone().into());
+                    }
                 }
             }
         }
@@ -297,9 +306,17 @@ impl Backend {
                 repository,
                 name,
                 base,
+                agent,
                 setup_hash,
                 skip_setup,
             } => {
+                let program = match agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    None => Program::Login,
+                    Some(id) if crate::agent::control::valid_session_id(id) => {
+                        Program::Agent { id: id.to_owned() }
+                    }
+                    Some(_) => return Err(invalid()),
+                };
                 let name = name.trim();
                 if name.is_empty()
                     || name.len() > 256
@@ -350,7 +367,7 @@ impl Backend {
                     }
                     Reply::WorktreeCreated(mut tree) => {
                         let session = match self.control(&Request::Create(Create {
-                            program: Program::Login,
+                            program,
                             cwd: tree.path.clone(),
                             cols: 80,
                             rows: 24,
@@ -505,6 +522,13 @@ impl Backend {
             Action::GateReply { id, decision } => {
                 let dir = self.dir.as_deref().ok_or_else(invalid)?;
                 to_value(OrchestrationStore::mutate(dir, |store| {
+                    if !store
+                        .gates
+                        .iter()
+                        .any(|g| g.id == id && requests::gate_pending(store, g))
+                    {
+                        return Err(io::Error::other("This request is no longer pending."));
+                    }
                     store.resolve_gate(&id, &decision, None, "mobile")
                 })?)
             }
@@ -514,6 +538,16 @@ impl Backend {
                 }
                 let dir = self.dir.as_deref().ok_or_else(invalid)?;
                 to_value(OrchestrationStore::mutate(dir, |store| {
+                    if body.trim().is_empty() {
+                        return Err(invalid());
+                    }
+                    if !store
+                        .messages
+                        .iter()
+                        .any(|m| m.id == id && requests::question_pending(store, m))
+                    {
+                        return Err(io::Error::other("This request is no longer pending."));
+                    }
                     store.reply_message(&id, "mobile", &body)
                 })?)
             }
@@ -874,10 +908,27 @@ impl Backend {
         let mut workspace_titles = std::collections::BTreeMap::new();
         // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
         let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
+        // 데스크톱 "잠든 작업 공간 숨기기"의 깨어 있음 판정: 작업 중·대기·완료이거나 에이전트가 살아 있는 세션.
+        let mut awake = std::collections::BTreeSet::new();
         for (info, _, group) in &rows {
             let Some(path) = group.path.as_deref() else {
                 continue;
             };
+            let status = states
+                .iter()
+                .find(|s| s.session == info.session)
+                .map(|s| &s.status);
+            if status.is_some_and(|s| {
+                matches!(
+                    s.state,
+                    control::AgentState::Working
+                        | control::AgentState::Waiting
+                        | control::AgentState::Blocked
+                        | control::AgentState::Done
+                ) || !s.agent.is_empty() && s.state != control::AgentState::Exited
+            }) {
+                awake.insert(PathBuf::from(path));
+            }
             let rank = states
                 .iter()
                 .find(|s| s.session == info.session)
@@ -945,7 +996,7 @@ impl Backend {
         }
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
-            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks),"truncated":truncated,
+            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
             "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true},
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
@@ -956,17 +1007,7 @@ impl Backend {
             .upgrade()
             .ok_or_else(invalid)?
             .orchestration_snapshot()?;
-        let questions: Vec<_> = store
-            .messages
-            .iter()
-            .filter(|m| m.msg_type == MessageType::Question && !m.acked)
-            .collect();
-        let gates: Vec<_> = store
-            .gates
-            .iter()
-            .filter(|g| g.status == GateStatus::Pending)
-            .collect();
-        Ok(json!({"runs":store.runs,"tasks":store.tasks,"gates":gates,"questions":questions}))
+        Ok(requests::snapshot(&store))
     }
     /// 카드용 git 요약을 cwd별로 모은다. 캐시에 없는 cwd는 큐에 전부 먼저 넣고 나서 받는다
     /// (큐 워커 [`crate::git::MAX_CONCURRENT`]개가 서로 다른 cwd를 동시에 돈다. 같은 키만 직렬).

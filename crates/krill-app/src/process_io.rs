@@ -97,15 +97,44 @@ fn nonblocking(pipe: &impl PipeHandle) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum Capture {
+    Head(usize),
+    Tail(usize),
+}
+
 pub(crate) fn read(
-    mut pipe: impl Read + PipeHandle + 'static,
+    pipe: impl Read + PipeHandle + 'static,
     limit: u64,
+    deadline: Instant,
+) -> io::Result<PipeTask<PipeRead>> {
+    read_captured(
+        pipe,
+        Capture::Head(usize::try_from(limit).unwrap_or(usize::MAX)),
+        deadline,
+    )
+}
+
+/// 파이프를 EOF까지 소비하되 메모리에는 마지막 limit 바이트만 남긴다.
+pub(crate) fn read_tail(
+    pipe: impl Read + PipeHandle + 'static,
+    limit: usize,
+    deadline: Instant,
+) -> io::Result<PipeTask<PipeRead>> {
+    read_captured(pipe, Capture::Tail(limit), deadline)
+}
+
+fn read_captured(
+    mut pipe: impl Read + PipeHandle + 'static,
+    capture: Capture,
     deadline: Instant,
 ) -> io::Result<PipeTask<PipeRead>> {
     #[cfg(unix)]
     nonblocking(&pipe)?;
     PipeTask::spawn_cancellable(move |cancelled| {
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let limit = match capture {
+            Capture::Head(limit) | Capture::Tail(limit) => limit,
+        };
         let mut bytes = Vec::new();
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -118,7 +147,10 @@ pub(crate) fn read(
                 });
             }
             let mut buffer = [0; 4096];
-            let count = buffer.len().min(limit.saturating_sub(bytes.len()));
+            let count = match capture {
+                Capture::Head(_) => buffer.len().min(limit.saturating_sub(bytes.len())),
+                Capture::Tail(_) => buffer.len(),
+            };
             if count == 0 {
                 return Ok(PipeRead {
                     bytes,
@@ -132,7 +164,12 @@ pub(crate) fn read(
                         timed_out: false,
                     });
                 }
-                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Ok(count) => {
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if matches!(capture, Capture::Tail(_)) && bytes.len() > limit {
+                        bytes.drain(..bytes.len() - limit);
+                    }
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(2));

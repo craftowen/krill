@@ -507,3 +507,49 @@ fn notebook_virtualizes_many_cells_and_outputs(cx: &mut gpui::TestAppContext) {
         "offscreen cells and outputs are not constructed"
     );
 }
+
+/// 맞춤 이미지는 칸 높이 안에 그린다. 퍼센트 높이가 풀리지 않아 이미지가 너비 비율로 키를 잡으면
+/// 가운데 정렬된 그림이 보이는 영역 밖으로 밀려 확대·축소 전까지 빈 화면이었다.
+#[gpui::test]
+fn fit_image_stays_inside_the_pane(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Entity, IntoElement, Render};
+    struct Host(Entity<view::ImageView>);
+    impl Render for Host {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
+    let path: std::path::PathBuf = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../krilld/src/mobile/assets/icon-512.png"
+    )
+    .into();
+    cx.update(gpui_component::init);
+    let (_host, cx) = cx.add_window_view(|_, cx| {
+        Host(cx.new(|_| {
+            view::ImageView::new(
+                path.clone(),
+                Some(Dimensions {
+                    width: 512,
+                    height: 512,
+                }),
+            )
+        }))
+    });
+    cx.run_until_parked();
+    let loaded = cx.update(|window, cx| {
+        window.get_asset::<gpui::ImgResourceLoader>(&gpui::Resource::Path(path.into()), cx)
+    });
+    assert!(matches!(loaded, Some(Ok(_))), "image decoded");
+    let pane = cx.debug_bounds("image-scroll").unwrap();
+    let image = cx.debug_bounds("image-fit").unwrap();
+    assert!(
+        image.size.height > gpui::px(0.) && image.bottom() <= pane.bottom(),
+        "fit image {image:?} must stay inside {pane:?}"
+    );
+    assert!(image.right() <= pane.right());
+}

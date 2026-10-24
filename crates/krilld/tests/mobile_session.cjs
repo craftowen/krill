@@ -17,14 +17,14 @@ class Element extends EventTarget {
 }
 const longPressCode=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes('function longPress('));
 function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot,tablet=false){
- const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],abort=new AbortController(),wide=new EventTarget();wide.matches=tablet;let clock=0,id=0;
+ const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],created=[],abort=new AbortController(),wide=new EventTarget();wide.matches=tablet;let clock=0,id=0;
  let resize;const sandbox={ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;},focus(){h.focused++;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
  vm.createContext(sandbox);vm.runInContext(longPressCode,sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
  const group={key:'g',label:'Workspace',sessions},state={groups:new Map([['g',group]]),sessions:new Map(sessions.map(s=>[s.id,s])),connection:{phase:'ready'},preferences:{},drafts:new Map(),snapshot};
- const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{}};
+ const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{},createSession(group,agent,request){calls.push(request);created.push([group.key,agent||'']);}};
  const root=el('main'),view=sandbox.KrillMobile.screens.session(root,ctx);
  function advance(ms){clock+=ms;for(const [key,t] of [...timers])if(t.at<=clock){timers.delete(key);t.fn();}}
- return {resize:width=>resize([{contentRect:{width}}]),view,state,ctx,abort,wide,root,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered};
+ return {resize:width=>resize([{contentRect:{width}}]),view,state,ctx,abort,wide,root,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered,created};
 }
 function testHostViewBudgets(){
  const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),hostViews=new Map(),state={drafts:new Map(),chatCache:new Map(),titles:new Map(),ui:{}},document={selected:false,querySelector(selector){return selector.includes('.chat-opt')&&document.selected?{}:null;}},context={hostViews,state,document,root:{contains:()=>true},productPending:0,terminalBusy:false,activeView:null,hostGeneration:0,tabletList:null,tabletAbort:null,tabletContext:null,tabletShell:null,screen:{cleanup(){}},abort:null,transport:null,pool:null,pendingRecent:null,deepLink:null,parameters:new URLSearchParams(),history:{replaceState(){}},location:{pathname:'/',hash:'#/'},sessionScope:()=> 'scope',credentials:null,endpoint:{selectHost:id=>({device_id:'device-'+id})},group(){},M:{terminal:{updateBusy:()=>context.terminalBusy},recentSession:{read:()=>null}}};vm.createContext(context);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),context);Object.assign(context.M,context.KrillMobile);const markers=['const viewKey=','const hostViewPins=','function hostViewPinned(','function hostViewWeight(','function pruneHostViews(','function rememberHostView(','function clearHost(','function activateEntry('];vm.runInContext(markers.map(marker=>source.find(line=>line.trim().startsWith(marker))).join('\n')+'\nglobalThis.H={rememberHostView,pruneHostViews,clearHost,activateEntry};',context);const H=context.H,key=(id,device='device-'+id)=>JSON.stringify([id,device]);
@@ -37,14 +37,41 @@ function testHostViewBudgets(){
  context.activeView={id:'final',device:'final-device'};state.drafts.set(7,'kept by clearHost');H.clearHost();assert.equal(hostViews.get(key('final','final-device')).drafts.get(7),'kept by clearHost');assert.equal(state.drafts.size,0);assert.equal(context.transport,null);
  console.log('PASS hostViews count/aggregate LRU budgets, draft/photo/sending/live/mount/selection/history pins, exact device restore and clearHost retention');
 }
+function testSessionBackSkipsSessionHistory(){
+ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),entries=['#/host/mac'],context={pendingRecent:null,renders:0,endpoint:{profiles:()=>[{id:'mac',active:true}]},render(){context.renders++;}};let index=0;
+ context.location={hash:entries[0],pathname:'/',search:''};
+ context.history={replaceState(_,__,url){entries[index]=url.slice(url.indexOf('#'));},back(){index--;context.hashchange();}};
+ vm.createContext(context);vm.runInContext(['let routeStack=','const hostRoute=','const sessionPath=','const go=','function backTo('].map(marker=>source.find(line=>line.trim().startsWith(marker))).join('\n')+`
+ globalThis.go=go;globalThis.backTo=backTo;globalThis.stack=()=>routeStack;globalThis.hashchange=()=>{const hash=location.hash||'#/';if(historyBack){routeStack.pop();historyBack=false;routeStack[routeStack.length-1]=hash;}else if(routeStack.at(-2)===hash)routeStack.pop();else if(routeStack.at(-1)!==hash)routeStack.push(hash);render();};`,context);
+ // A hash assignment pushes a browser entry and fires hashchange.
+ Object.defineProperty(context.location,'hash',{configurable:true,get(){return entries[index];},set(v){if(v===entries[index])return;entries.splice(index+1,Infinity,v);index++;context.hashchange();}});
+ const a='#/host/mac/group/g/s/1',b='#/host/mac/group/g/s/2',c='#/host/mac/group/h/s/3';
+ context.go(a.slice(1));context.go(b.slice(1));context.go(a.slice(1));context.go(c.slice(1));
+ assert.deepEqual(entries,['#/host/mac',c],'session-to-session moves replace the session entry instead of stacking');
+ context.backTo('/host/local');assert.equal(entries[index],'#/host/mac','Back from a session reached from other sessions lands on the project list');assert.equal(index,0);
+ context.go('/git/3');context.go(a.slice(1));assert.equal(entries.length,3,'non-session screens still push history');
+ console.log('PASS session Back goes straight to the project list even after moving between sessions');
+}
 function testImeDefersSnapshotUpdates(){
  const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),document=Object.assign(new EventTarget(),{hidden:false}),updates=[],context={document,routeKey:'#/s',location:{hash:'#/s'},screen:{update:()=>updates.push(document.value)},tabletMedia:null,state:{preferences:{}},tabletList:null};vm.createContext(context);vm.runInContext(['let imeComposing=','function update(){'].map(marker=>source.find(line=>line.trim().startsWith(marker))).join('\n')+'\nglobalThis.update=update;',context);
  const fire=type=>document.dispatchEvent(new Event(type));document.value='before';context.update();fire('compositionstart');document.value='ㅎ';context.update();document.value='하';context.update();assert.deepEqual(updates,['before'],'no screen update while an IME composition is open');fire('compositionend');assert.deepEqual(updates,['before','하'],'one catch-up update when composition ends');fire('compositionend');context.update();assert.equal(updates.length,3);
  fire('compositionstart');context.update();fire('focusout');assert.equal(updates.length,4,'blur without compositionend still releases the gate');fire('compositionstart');fire('compositionend');assert.equal(updates.length,4,'no update when nothing was missed');
  console.log('PASS IME composition defers snapshot screen updates and catches up once');
 }
+function testQuickActions(){
+ const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'}],undefined,true),seen=[];
+ const wire=h=>{let mode='direct';h.getInputMode=()=>mode;h.setInputMode=value=>{mode=value;seen.push([h.options.sessionId,value]);};h.loadHistory=value=>seen.push([h.options.sessionId,'history',value]);h.fitToPhone=value=>seen.push([h.options.sessionId,'fit',value]);};
+ const first=f.mounts[0];wire(first);first.options.onQuickActions();assert.equal(f.sheets.at(-1).title,'Quick actions');assert.equal(f.sheets.at(-1)[0].label,'Send prompt');assert(!f.sheets.at(-1).some(item=>item.danger));
+ f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();const second=f.mounts.at(-1);wire(second);
+ second.options.onQuickActions();f.sheets.at(-1).find(item=>item.label==='Load earlier output').action();
+ f.sheets.at(-1).find(item=>item.label==='Fit to Phone').action();f.sheets.at(-1).find(item=>item.label==='Switch to buffered input').action();
+ assert.deepEqual(seen,[[8,'history',true],[8,'fit',true],[8,'buffered']]);assert.equal(f.calls.length,0,'quick actions never send unchecked approvals or close a PTY');
+ second.options.onQuickActions();assert(f.sheets.at(-1).some(item=>item.label==='Switch to direct input'));f.sheets.at(-1).find(item=>item.label==='Edit terminal keys').action();assert.equal(f.routes.at(-1),'/settings/terminal');
+ f.view.cleanup();console.log('PASS fixed quick actions target only the active split terminal, retain mode labels and expose key settings');
+}
 async function main(){
- testHostViewBudgets();testImeDefersSnapshotUpdates();
+ testQuickActions();
+ testHostViewBudgets();testImeDefersSnapshotUpdates();testSessionBackSkipsSessionHistory();
  {const sessions=Array.from({length:64},(_,n)=>({id:n+7,agent:'codex',state:'Working'})),f=fixture(sessions);const initial=f.buttons.filter(b=>b.className==='session-tab'),marks=initial.map(b=>b.children[1]);for(let i=0;i<100;i++)f.view.update();assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,64);assert(initial.every((tab,i)=>tab.children[1]===marks[i]));const removed=sessions[63],down=new Event('pointerdown');down.button=0;initial[63].dispatchEvent(down);assert.equal(f.timers.size,1);f.state.groups.get('g').sessions=sessions.slice(0,63);f.state.sessions.delete(removed.id);f.view.update();assert.equal(f.timers.size,0,'removed tab cancels pending long press');f.view.cleanup();console.log('PASS 64 keyed tabs x100 updates: new buttons/icons 0, removed-tab handlers cleaned');}
 
  {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),M=f.sandbox.KrillMobile;
@@ -89,7 +116,7 @@ async function main(){
  console.log('PASS symmetric pane headers, active labels and tab replacement, duplicate PTY disabled and primary close preserves PTY');
  console.log('PASS split direction selection, current choice, persisted state, automatic threshold and minimum pane width');
  console.log('PASS tablet split excludes duplicate PTY, preserves active pane on folding, reconnects after main transport and closes only the view');
- let f=fixture();assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onStatus({phase:'disconnected'});for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
+ let f=fixture();let reconnected=0;f.ctx.transport.reconnect=()=>reconnected++;const summaryNode=f.root.descendants().find(n=>n.className==='session-summary');assert.equal(summaryNode.dataset.reconnectable,'true');summaryNode.dispatchEvent(new Event('click'));assert.equal(reconnected,1,'tapping summary while disconnected triggers transport.reconnect');assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});assert.equal(summaryNode.dataset.reconnectable,undefined);summaryNode.dispatchEvent(new Event('click'));assert.equal(reconnected,1,'tapping summary while connected does not reconnect');f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(summaryNode.dataset.reconnectable,'true');for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
  f=fixture();f.mounts[0].options.onStatus({phase:'disconnected'});f.state.connection.phase='disconnected';f.view.update();f.advance(60000);assert.equal(f.mounts.length,1);f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,2);f.view.cleanup();
  console.log('PASS terminal-only reconnect backoff, generation/cleanup and main connection cancellation');
  f=fixture();const actions=f.buttons.find(b=>b.textContent==='Terminal actions'),git=f.buttons.find(b=>b.textContent==='Git changes');assert(git.hidden);
@@ -103,10 +130,10 @@ async function main(){
  console.log('PASS approval sheet shows latest lines above actions; Load earlier output reveals history');
  f=fixture(undefined,{capabilities:{session_create:true}});f.ctx.rpc=async r=>{f.calls.push(r);return {session:42};};f.ctx.groupRoute=(_,id)=>`/s/${id}`;const add=f.buttons.find(b=>b.textContent==='Create Tab');await add.action();let sheet=f.sheets.at(-1),body=new Element('div');assert.equal(sheet.title,'New session');assert.equal(sheet.length,0);sheet.render(body);
  assert.deepEqual(body.children.map(b=>[b.textContent,b.className,b.children[0].attrs.class]),[['Claude Code','sheet-action provider','agent-icon claude'],['Codex','sheet-action provider','agent-icon codex'],['Terminal','sheet-action provider','agent-icon']]);
- await body.children[0].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7,"agent":"claude"}');assert.equal(f.routes.at(-1),'/s/42');assert.equal(add.disabled,false);
- await add.action();body=new Element('div');f.sheets.at(-1).render(body);await body.children[2].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7}');
+ await body.children[0].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7,"agent":"claude"}');assert.deepEqual(f.created.at(-1),['g','claude']);
+ await add.action();body=new Element('div');f.sheets.at(-1).render(body);await body.children[2].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7}');assert.deepEqual(f.created.at(-1),['g','']);
  f.buttons.find(b=>b.textContent==='Terminal actions').action();assert(!f.sheets.at(-1).some(e=>/^New .* session$/.test(e.label)));f.view.cleanup();
- console.log('PASS + opens provider sheet (old-daemon Claude/Codex fallback + Terminal), creates the picked agent and routes to its tab');
+ console.log('PASS + opens provider sheet (old-daemon Claude/Codex fallback + Terminal) and hands the picked agent to the shared instant create flow');
  f=fixture(undefined,{capabilities:{session_create:true},agents:[{id:'claude',name:'Claude Code'},{id:'opencode',name:'OpenCode'},{id:'my-bot',name:'My Bot'}]});f.ctx.rpc=async r=>{f.calls.push(r);return {session:43};};await f.buttons.find(b=>b.textContent==='Create Tab').action();body=new Element('div');f.sheets.at(-1).render(body);
  assert.deepEqual(body.children.map(b=>[b.textContent,b.children[0].attrs.class||b.children[0].className]),[['Claude Code','agent-icon claude'],['OpenCode','agent-icon opencode'],['My Bot','agent-icon custom'],['Terminal','agent-icon']]);
  await body.children[2].action();assert.equal(JSON.stringify(f.calls.at(-1)),'{"action":"create_terminal","cwd_session":7,"agent":"my-bot"}');f.view.cleanup();
@@ -142,7 +169,37 @@ async function main(){
  console.log('PASS tab provider mark/name, state dot, duplicate numbering and tab-strip scroll kept across updates');
  await testPromptDraftAndInactiveMenu();
  await testHybridChatToggleAndQuestionCards();
+ await testInstantCreate();
  console.log('PASS Hybrid Chat visibility, chat_poll cards, historical answers remain notes until Terminal review, and current diff modal');
+}
+// 새 세션은 누르는 즉시 /s/new로 옮기고, 응답이 오면 그 자리를 새 세션으로 바꾼다. 스냅샷을 기다리지 않고, 아직 스냅샷에 없는 새 세션 때문에 다른 세션으로 튀지 않는다.
+async function testInstantCreate(){
+ const lines=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),pick=marker=>{const i=lines.findIndex(l=>l.trim().startsWith(marker));assert(i>=0,marker);return lines[i];};
+ const create=lines.findIndex(l=>l.trim().startsWith('function createSession('));
+ const source=[pick('function parseRoute('),pick('const groupRoute='),pick('function group(data)'),pick('let creating=null;'),lines[create],lines[create+1]].join('\n')+'\nglobalThis.A={createSession,group,current:()=>creating};';
+ const routes=[],errors=[],backs=[],updates=[],refreshes=[],prewarms=[];let reply;
+ const location={hash:'#/host/local/group/g/s/7'},sandbox={location,M:{},hostGeneration:0,state:{expected:new Map()},hostRoute:()=>'/host/local',update:()=>updates.push(location.hash),error:e=>errors.push(e.message),back:fallback=>{backs.push(fallback);location.hash='#'+fallback;},
+  go:(path,replace=false)=>{routes.push([path,replace]);location.hash='#'+path;},transport:{rpc:request=>new Promise((resolve,reject)=>{reply={request,resolve,reject};}),refresh:()=>{refreshes.push(1);return Promise.resolve();},prewarmTerminal:()=>prewarms.push(1)}};
+ vm.createContext(sandbox);vm.runInContext(source,sandbox);const A=sandbox.A,flush=async()=>{for(let i=0;i<20;i++)await Promise.resolve();};
+ const snapshot={workspaces:[{key:'g',label:'Workspace',path:'/repo'}],sessions:[{id:7,worktree_key:'g',cwd:'/repo',branch:'main'}]};A.group(snapshot);
+ A.createSession(sandbox.state.groups.get('g'),'claude',{action:'create_terminal',cwd_session:7,agent:'claude'});
+ assert.deepEqual(routes.at(-1),['/host/local/group/g/s/new',false]);assert.equal(A.current().agent,'claude');assert.equal(reply.request.agent,'claude');assert.equal(prewarms.length,1,'the terminal socket opens alongside the create request');
+ reply.resolve({session:42});await flush();
+ assert.deepEqual(routes.at(-1),['/host/local/group/g/s/42',true],'the pending route is replaced in place, not pushed');assert.equal(A.current(),null);assert.equal(refreshes.length,1,'the snapshot refresh runs after navigation');
+ const fresh=sandbox.state.sessions.get(42);assert.equal(fresh.agent,'claude');assert.equal(fresh.groupKey,'g');assert.equal(fresh.branch,'main');assert.deepEqual([...sandbox.state.groups.get('g').sessions.map(s=>s.id)],[7,42]);
+ A.group(snapshot);assert(sandbox.state.sessions.has(42),'a snapshot without the new session keeps it');
+ A.group({...snapshot,sessions:[...snapshot.sessions,{id:42,worktree_key:'g',cwd:'/repo',agent:'claude',state:'Working'}]});assert.equal(sandbox.state.sessions.get(42).state,'Working');assert.equal(sandbox.state.expected.size,0);
+ // 응답 전에 다른 화면으로 가면 그 화면을 빼앗지 않는다.
+ A.createSession(sandbox.state.groups.get('g'),'',{action:'create_terminal',cwd_session:7});location.hash='#/host/local';reply.resolve({session:43});await flush();assert.deepEqual(routes.at(-1),['/host/local/group/g/s/new',false]);assert.equal(updates.at(-1),'#/host/local');assert(sandbox.state.sessions.has(43));
+ // 실패하면 이유를 보이고 이전 화면으로 돌아간다.
+ A.createSession(sandbox.state.groups.get('g'),'codex',{action:'create_terminal',cwd_session:7,agent:'codex'});reply.reject(Error('Unknown agent'));await flush();assert.deepEqual(errors,['Unknown agent']);assert.equal(backs.at(-1),'/host/local/group/g/s/7');assert.equal(A.current(),null);
+ console.log('PASS new session: instant pending route, in-place replace without waiting for the snapshot, no jump to another session, failure returns');
+ // /s/new 화면: 선택된 새 탭과 빈 터미널 면을 바로 그리고, 생성이 끝나면(작업 없음) 작업 공간으로 돌린다.
+ const f=fixture();f.view.cleanup();const job={group:f.state.groups.get('g'),agent:'codex'};let current=job;f.ctx.creating=()=>current;f.ctx.route={groupKey:'g',sessionId:'new'};f.ctx.groupRoute=(g,id)=>`/g/${g?.key}/${id??''}`;const root=new Element('main'),view=f.sandbox.KrillMobile.screens.session(root,f.ctx);
+ const tabs=root.descendants().filter(n=>n.className==='session-tab');assert.deepEqual(tabs.map(n=>[n.attrs['aria-label'],n.attrs['aria-selected']]),[['Shell','false'],['Codex','true']]);const again=new Element('main');f.sandbox.KrillMobile.screens.session(again,{...f.ctx,creating:()=>({...job,agent:''})}).cleanup();assert.deepEqual(again.descendants().filter(n=>n.className==='session-tab').map(n=>n.attrs['aria-label']),['Shell','Shell 2'],'pending tab uses the real tab numbering');assert(root.descendants().some(n=>n.className==='terminal-mount'));assert.equal(f.mounts.length,1,'no terminal attaches before the session exists');
+ const summary=root.descendants().find(n=>n.className==='session-summary').children[1];assert.equal(root.descendants().find(n=>n.className==='live-dot').dataset.live,'false');assert.equal(summary.textContent,'\u00a0','the summary line keeps its height without wording');f.advance(1000);assert.equal(summary.textContent,'Connecting…');
+ current=null;view.update();assert.equal(f.routes.at(-1),'/g/g/');view.cleanup();
+ console.log('PASS pending session screen: selected new tab and blank terminal surface at once, wording only after 1s');
 }
 async function testPromptDraftAndInactiveMenu(){
  const flush=async()=>{for(let i=0;i<12;i++)await Promise.resolve();},event=(el,type,props={})=>{const e=new Event(type,{cancelable:true});Object.assign(e,props);el.dispatchEvent(e);return e;};
@@ -191,6 +248,11 @@ async function testHybridChatToggleAndQuestionCards(){
  diffBtn.action();await flush();
  assert(calls.some(c=>c.action==='git'&&c.path==='src/lib.rs'));
  const rawBtn=buttons.find(b=>b.className?.includes('chat-raw-btn'));
+ buttons.find(b=>b.textContent==='Terminal actions').action();
+ const selectTextEntry=sheets.at(-1).entries.find(e=>e.label==='Select text');assert(selectTextEntry);
+ selectTextEntry.action();const textSheetBody=new Element('div');sheets.at(-1).render(textSheetBody);
+ const screenTextArea=textSheetBody.descendants().find(n=>n.className==='screen-text');assert(screenTextArea);
+ assert(screenTextArea.value.includes('Fix bug')&&screenTextArea.value.includes('Pick one'),'Chat mode Select text falls back to .chat-feed card texts');
  buttons.find(b=>b.textContent==='Terminal actions').action();assert.equal(sheets.at(-1).entries[0].label,'Switch to Terminal');sheets.at(-1).entries[0].action();
  assert.equal(toggleBtn.textContent,'Chat');assert.equal(mounts[0].visible,true);
  // [Chat | Term] 전환 시 TerminalAdapter를 언마운트하지 않고 그대로 유지해야 한다(0ms 전환).

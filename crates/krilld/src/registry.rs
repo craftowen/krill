@@ -965,15 +965,17 @@ impl Registry {
                 let st = lock(&self.state);
                 let entries: Vec<_> = st
                     .sessions
-                    .iter()
-                    .filter(|(id, _)| peer.scope.allows(**id, &st.roots))
-                    .map(|(&id, e)| {
-                        let live = !st.exited.contains_key(&id)
-                            && scope::session_of(e.pid, &st.roots) == Some(id);
-                        (id, e.pid, live.then(|| e.session.tap()))
-                    })
+                    .keys()
+                    .filter(|id| peer.scope.allows(**id, &st.roots))
+                    .copied()
                     .collect();
                 drop(st);
+                // Use the same fallback as session creation/resume. Windows cannot query another
+                // process's cwd, and a restored engine may not have received a shell report yet.
+                let entries: Vec<_> = entries
+                    .into_iter()
+                    .map(|id| (id, self.session_cwd(id)))
+                    .collect();
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
                     if peer.scope == Scope::Full {
                         sidebar::include_projects(&mut data);
@@ -1129,6 +1131,8 @@ impl Registry {
     }
 
     fn session_cwd(&self, id: SessionId) -> Option<PathBuf> {
+        use krill_proto::os::ffi::OsStrExt as _;
+
         let (pid, live, initial, tap) = {
             let st = lock(&self.state);
             let e = st.sessions.get(&id)?;
@@ -1137,6 +1141,22 @@ impl Registry {
             (e.pid, live, e.cwd.clone(), e.session.tap())
         };
         if live && let Some(dir) = tap.cwd(pid) {
+            return Some(krill_proto::os::canonicalize(&dir).unwrap_or(dir));
+        }
+        // Keep the last observed cwd when a session exits or its shell stops reporting.
+        if let Some(dir) = lock(&self.sidebar).directory(id) {
+            return Some(dir);
+        }
+        // A manually launched agent's hook records its workspace even when the shell does not
+        // emit OSC 7/9;9. This metadata also survives daemon replacement, unlike Entry::cwd.
+        if let Some(dir) = self
+            .agents
+            .stored(id)
+            .ok()
+            .flatten()
+            .map(|s| PathBuf::from(std::ffi::OsStr::from_bytes(&s.cwd)))
+            .filter(|p| p.is_absolute())
+        {
             return Some(krill_proto::os::canonicalize(&dir).unwrap_or(dir));
         }
         (!initial.as_os_str().is_empty())
@@ -1739,6 +1759,47 @@ impl Registry {
                             crate::sys::process_name(pid).ok()
                         });
                     status.title = tap.title();
+                    let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
+                        || status.agent.eq_ignore_ascii_case("antigravity")
+                        || status.foreground.as_deref().is_some_and(|fg| {
+                            fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
+                        });
+                    let stored = if is_agy_fg || (status.title.is_none() && status.agent.is_empty())
+                    {
+                        self.agents.stored(session).ok().flatten()
+                    } else {
+                        None
+                    };
+                    let is_agy_stored = stored.as_ref().is_some_and(|s| {
+                        s.profile.eq_ignore_ascii_case("agy")
+                            || s.profile.eq_ignore_ascii_case("antigravity")
+                    });
+                    if is_agy_fg || is_agy_stored {
+                        let (title, discovered) =
+                            crate::agent_history::vault::resolve_live_agy_title(
+                                session,
+                                root,
+                                tap.foreground(),
+                                exited,
+                                stored.as_ref(),
+                            );
+                        if discovered.is_some()
+                            && let Ok(Some(found)) = account_switch::identity::discover(
+                                krill_proto::usage::ProviderKind::Antigravity,
+                                root,
+                                tap.foreground(),
+                            )
+                        {
+                            self.agents.bind_discovered_session(
+                                session,
+                                &found.id,
+                                Some(&found.path),
+                            );
+                        }
+                        if title.is_some() || status.title.is_none() {
+                            status.title = title;
+                        }
+                    }
                     SessionStatus { session, status }
                 })
                 .collect(),
@@ -1824,6 +1885,9 @@ impl Registry {
         if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
+            if status.state == control::AgentState::Working {
+                self.agents.clear_rate_limited(id);
+            }
             if status.state == control::AgentState::Done
                 && let Some(tap) = tap
             {
@@ -1834,17 +1898,22 @@ impl Registry {
         // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
         // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
         // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
-        if (status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload))
-            && let Ok(Some(stored)) = self.agents.stored(id)
-            && let Some(launch) = stored.account
-            && let Some(provider) = krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
-        {
-            let account_id = if launch.id.is_empty() {
-                crate::usage::accounts::host_default_id(provider)
-            } else {
-                launch.id
-            };
-            crate::usage::accounts::record_rate_limited(provider, &account_id);
+        if status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload) {
+            if !is_subagent_or_foreign {
+                self.agents.mark_rate_limited(id);
+            }
+            if let Ok(Some(stored)) = self.agents.stored(id)
+                && let Some(launch) = stored.account
+                && let Some(provider) =
+                    krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
+            {
+                let account_id = if launch.id.is_empty() {
+                    crate::usage::accounts::host_default_id(provider)
+                } else {
+                    launch.id
+                };
+                crate::usage::accounts::record_rate_limited(provider, &account_id);
+            }
         }
         Ok(())
     }
@@ -2244,18 +2313,23 @@ impl Registry {
         offset: u64,
     ) -> krill_proto::agent_history::ChatPollSnapshot {
         use krill_proto::os::ffi::OsStrExt as _;
+        let (root_pid, fg_pid, exited) = {
+            let st = lock(&self.state);
+            if let Some(e) = st.sessions.get(&id) {
+                let ex = st.exited.contains_key(&id) || e.session.is_closed();
+                (e.pid, e.session.tap().foreground(), ex)
+            } else {
+                (0, None, true)
+            }
+        };
         let cwd = self
             .session_cwd(id)
             .map(|p| p.as_os_str().as_bytes().to_vec())
             .unwrap_or_default();
-        let stored = self.agents.stored(id).ok().flatten().or_else(|| {
+        let mut stored = self.agents.stored(id).ok().flatten().or_else(|| {
             let mut status_agent = self.status.get(id).agent;
             if status_agent.is_empty()
-                && let Some(fg_name) = lock(&self.state)
-                    .sessions
-                    .get(&id)
-                    .and_then(|e| e.session.tap().foreground())
-                    .and_then(|pid| crate::sys::process_name(pid).ok())
+                && let Some(fg_name) = fg_pid.and_then(|pid| crate::sys::process_name(pid).ok())
             {
                 status_agent = fg_name;
             }
@@ -2270,12 +2344,94 @@ impl Registry {
                 account: None,
             })
         });
-        crate::agent_history::chat::poll_session(
+
+        let provider = stored.as_ref().and_then(|s| {
+            use krill_proto::{agent_history::VaultAgent, usage::ProviderKind};
+            match VaultAgent::parse(&s.profile)? {
+                VaultAgent::Claude => Some(ProviderKind::Claude),
+                VaultAgent::Codex => Some(ProviderKind::Codex),
+                VaultAgent::Agy => Some(ProviderKind::Antigravity),
+                VaultAgent::OpenCode => None,
+            }
+        });
+        if let Some(provider) = provider
+            && !exited
+            && root_pid > 0
+            && stored
+                .as_ref()
+                .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
+        {
+            if let Ok(Some(found)) = account_switch::identity::discover(provider, root_pid, fg_pid)
+            {
+                // A process-owned file also covers external account homes that are
+                // absent from the daemon's configured transcript search roots.
+                // Never replace a launch/hook-bound conversation with another ID.
+                if stored
+                    .as_ref()
+                    .is_some_and(|s| s.session_id.as_deref().is_some_and(|id| id != found.id))
+                {
+                    return krill_proto::agent_history::ChatPollSnapshot {
+                        agent: stored
+                            .as_ref()
+                            .map_or_else(String::new, |s| s.profile.clone()),
+                        reset: offset > 0,
+                        ..Default::default()
+                    };
+                }
+                self.agents
+                    .bind_discovered_session(id, &found.id, Some(&found.path));
+                if let Some(s) = &mut stored {
+                    if s.session_id.is_none() {
+                        s.session_id = Some(found.id);
+                    }
+                    if s.transcript_path.is_none()
+                        && let Some(p) = found
+                            .path
+                            .to_str()
+                            .filter(|p| crate::agent::control::valid_transcript_path(p))
+                    {
+                        s.transcript_path = Some(p.to_owned());
+                    }
+                }
+            } else if provider == krill_proto::usage::ProviderKind::Antigravity
+                && stored
+                    .as_ref()
+                    .is_some_and(|s| s.session_id.is_none() && s.transcript_path.is_none())
+                && !crate::sys::open_vnode_paths(root_pid).is_empty()
+            {
+                return krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "agy".to_owned(),
+                    session_id: String::new(),
+                    transcript_path: String::new(),
+                    next_offset: 0,
+                    reset: offset > 0,
+                    bound: false,
+                    items: Vec::new(),
+                };
+            }
+        }
+
+        let launched_at = self.agents.launched_at(id);
+        let claimed = self.agents.claimed_transcripts(id);
+        let (snapshot, resolved) = crate::agent_history::chat::poll_session_bounded(
             self.state_dir().as_deref(),
             stored.as_ref(),
             &cwd,
             offset,
-        )
+            launched_at,
+            &claimed,
+        );
+        if let Some((path, sid)) = resolved
+            && stored.as_ref().is_some_and(|s| {
+                s.session_id.as_deref() == Some(&sid) && s.transcript_path.is_none()
+            })
+        {
+            // Cwd/recency fallback is for displaying history only. It must never become
+            // authority to replace a live conversation during an account switch.
+            self.agents
+                .bind_discovered_session(id, &sid, Some(path.as_path()));
+        }
+        snapshot
     }
 
     pub(crate) fn deliver_input_to_tap(tap: &Tap, bytes: &[u8], submit: bool) -> io::Result<()> {

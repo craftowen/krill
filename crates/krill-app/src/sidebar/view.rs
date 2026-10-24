@@ -504,30 +504,35 @@ impl Sidebar {
                         })),
                 )
                 .into_any_element()
-        } else if remote.status == HostStatus::Connected {
-            let host = host.clone();
-            badge
-                .child(
-                    div()
-                        .invisible()
-                        .group_hover(ROW_GROUP, Styled::visible)
-                        .child(
-                            Button::new(("project-disconnect", index))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .accessibility_label(text::HOST_DISCONNECT.get())
-                                .tooltip(text::HOST_DISCONNECT.get())
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    cx.stop_propagation();
-                                    s.disconnect_host(host.clone(), cx);
-                                })),
-                        ),
-                )
-                .into_any_element()
         } else {
             badge.into_any_element()
         }
+    }
+
+    /// 합쳐진 프로젝트 머리줄에, 다시 연결이 필요한 다른 PC의 상태·다시 연결 버튼을 단다.
+    /// 연결된 PC는 워크트리·세션 배지로 이미 보이므로 머리줄을 붐비게 하지 않는다.
+    fn merged_host_controls(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut hosts: Vec<&HostId> = Vec::new();
+        for (host, _) in self.merged_projects.get(&index).into_iter().flatten() {
+            let connected = host
+                .remote_id()
+                .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+                .is_none_or(|r| r.status == HostStatus::Connected);
+            if !connected && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        hosts
+            .into_iter()
+            .enumerate()
+            .map(|(slot, host)| {
+                div()
+                    .id(("merged-host", slot))
+                    .flex_none()
+                    .child(self.project_host_control(index, host, cx))
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// Rebuilt with the row model; lookup stays constant-time while scrolling a large card.
@@ -583,24 +588,15 @@ impl Sidebar {
         let p = ui::palette(cx);
         let active = self.worktree_card_active(parent, path);
         if self.options.card_layout == super::CardLayout::Detailed {
-            // 요약 바와 같은 안쪽 경계로 잇는다. 세션별 가상화는 유지하고
-            // 바깥 워크트리 표면과 안쪽 에이전트 패널을 각각 연속해서 그린다.
+            // 세션별 가상화와 정렬을 유지하고, 펼친 목록에는 별도 상자를 그리지 않는다.
             let session = element
                 .h(px(26.))
                 .mx_0()
                 .px_1p5()
-                .rounded_none()
+                .rounded(ui::RADIUS_XS)
                 .border_l_1()
                 .border_r_1()
-                .border_color(p.worktree_sidebar_border)
-                .when(self.cursor != Some(index), |d| {
-                    d.bg(if active {
-                        p.sidebar.opacity(0.75)
-                    } else {
-                        p.sidebar_accent.opacity(0.65)
-                    })
-                })
-                .when(last, |d| d.border_b_1().rounded_b(ui::RADIUS_XS));
+                .border_color(ui::TRANSPARENT);
             return div()
                 .id(("card-session-surface", index))
                 .debug_selector(move || format!("card-session-surface-{index}"))
@@ -871,24 +867,6 @@ impl Sidebar {
                             )
                         },
                     )
-                    .when(*status == HostStatus::Connected && host.is_remote(), |d| {
-                        let disconnect_host = host.clone();
-                        let disconnect_key = host.as_key().to_owned();
-                        d.child(
-                            Button::new(("host-disconnect", index))
-                                .debug_selector(move || format!("host-disconnect-{disconnect_key}"))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .label(text::HOST_DISCONNECT.get())
-                                .accessibility_label(text::HOST_DISCONNECT.get())
-                                .tooltip(text::HOST_DISCONNECT.get())
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    cx.stop_propagation();
-                                    s.disconnect_host(disconnect_host.clone(), cx);
-                                })),
-                        )
-                    })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.cursor = Some(index);
                         s.fold_host(&fold_host, None, cx);
@@ -963,9 +941,14 @@ impl Sidebar {
                 .child(Icon::new(IconName::Bell).xsmall())
                 .child(text::NEEDS_YOU.get()),
             Row::Loose => heading(base)
-                .aria_label(text::SESSIONS.get())
+                .debug_selector(|| "loose-header".into())
+                .aria_label(text::LOOSE_SESSIONS.get())
                 .child(Icon::new(IconName::SquareTerminal).xsmall())
-                .child(text::SESSIONS.get()),
+                .child(text::LOOSE_SESSIONS.get())
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new(text::LOOSE_SESSIONS_HINT.get())
+                        .build(window, cx)
+                }),
             Row::Repository(path) => {
                 let repo = path.clone();
                 let fold_btn = path.clone();
@@ -973,15 +956,24 @@ impl Sidebar {
                 let closed = self.collapsed.contains(path);
                 // OWE-900: 헤더에 워크트리 수를 표시한다(자기 자신 제외).
                 // 접힌 다량 유휴 프로젝트도 규모를 알 수 있다.
-                let wt_count = self
-                    .snapshot_for(&row_host)
-                    .trees
-                    .get(path)
-                    .map_or(0, |list| {
-                        list.iter()
-                            .filter(|t| t.as_path() != path.as_path())
-                            .count()
-                    });
+                // 다른 PC에서 합쳐진 같은 프로젝트의 워크트리도 센다.
+                let wt_count: usize = std::iter::once((&row_host, path))
+                    .chain(
+                        self.merged_projects
+                            .get(&index)
+                            .into_iter()
+                            .flatten()
+                            .map(|(host, alias)| (host, alias)),
+                    )
+                    .map(|(host, repo)| {
+                        self.snapshot_for(host).trees.get(repo).map_or(0, |list| {
+                            list.iter()
+                                .filter(|t| t.as_path() != repo.as_path())
+                                .count()
+                        })
+                    })
+                    .sum();
+                let merged_hosts = self.merged_host_controls(index, cx);
                 repo_heading(base)
                     .ml(px(4. + host_indent))
                     .debug_selector(move || format!("repo-header-{index}"))
@@ -1058,6 +1050,7 @@ impl Sidebar {
                         )
                     })
                     .child(self.project_host_control(index, &row_host, cx))
+                    .children(merged_hosts)
                     .when(row_host.is_local(), |d| {
                         d.child(
                             div()
@@ -1107,6 +1100,7 @@ impl Sidebar {
                 let (fold_btn, fold_row, fresh, fresh_host) =
                     (path.clone(), path.clone(), path.clone(), row_host.clone());
                 let closed = self.collapsed.contains(path);
+                let merged_hosts = self.merged_host_controls(index, cx);
                 repo_heading(base)
                     .ml(px(4. + host_indent))
                     .debug_selector(move || format!("folder-header-{index}"))
@@ -1162,6 +1156,7 @@ impl Sidebar {
                             }),
                     )
                     .child(self.project_host_control(index, &row_host, cx))
+                    .children(merged_hosts)
                     .child(
                         div()
                             .invisible()
@@ -1230,6 +1225,15 @@ impl Sidebar {
                     })
                     .flatten();
                 let inside_card = self.session_card_index(index).is_some();
+                // 프로젝트 기준 보기에서 카드 밖 원격 세션(폴더·작업 폴더 모르는 세션)은 PC 배지로 구분한다.
+                let host_label = (self.options.group_by == super::GroupBy::Repo && !inside_card)
+                    .then(|| {
+                        row_host
+                            .remote_id()
+                            .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+                            .map(|r| r.label.clone())
+                    })
+                    .flatten();
                 single_line(base)
                     .debug_selector(move || format!("sidebar-session-{index}"))
                     .h(px(if *nested { 26. } else { ROW_HEIGHT }))
@@ -1312,6 +1316,21 @@ impl Sidebar {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(name),
                     )
+                    .when_some(host_label, |d, label| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("session-host-{index}"))
+                                .flex_none()
+                                .max_w(px(100.))
+                                .truncate()
+                                .px_1()
+                                .rounded(ui::RADIUS_XS)
+                                .bg(p.worktree_sidebar_accent)
+                                .text_size(ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(label),
+                        )
+                    })
                     .when(session.status.since_unix_ns > 0, |d| {
                         d.child(
                             div()
@@ -1348,25 +1367,6 @@ impl Sidebar {
                             .debug_selector(move || format!("session-cache-timer-{index}"))
                             .flex_none()
                             .child(status::cache_timer_chip(secs, cx))
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                            })
-                    }))
-                    .children(account_label.map(|l| {
-                        let short = status::abbreviate_account_label(l);
-                        let full = l.to_owned();
-                        let tip = text::SESSION_ACCOUNT.format(&[("label", &full)]);
-                        div()
-                            .id(("account-badge", index))
-                            .aria_label(tip.clone())
-                            .debug_selector(move || format!("account-badge-{index}"))
-                            .flex_none()
-                            .px_1()
-                            .rounded(ui::RADIUS_XS)
-                            .bg(p.muted)
-                            .text_size(ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(short)
                             .tooltip(move |window, cx| {
                                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                             })
@@ -1609,18 +1609,17 @@ impl Sidebar {
         let closed = self.collapsed.contains(path);
         let card_expanded = self.session_card_index(index + 1) == Some(index)
             && self.card_list.contains_row(index + 1);
-        let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
+        let pinned = row_host.is_local() && self.prefs.get(path).is_some_and(|p| p.pinned);
         let name = self.name(path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
         let branch = self
             .branch_on(&row_host, path)
             .filter(|b| *b != name)
             .map(str::to_owned);
-        let custom_name = self
-            .prefs
-            .get(path)
-            .map(|v| v.name.as_str())
-            .filter(|s| !s.is_empty());
+        let custom_name = row_host
+            .is_local()
+            .then(|| self.custom_worktree_name(path))
+            .flatten();
         let raw_branch = self.branch_on(&row_host, path);
         let folder_name = basename(path);
         let auto_title = row_host
@@ -2411,20 +2410,30 @@ impl Sidebar {
                                         .h(px(22.))
                                         .px_1()
                                         .rounded(ui::RADIUS_XS)
-                                        .border_1()
-                                        .border_color(p.worktree_sidebar_border)
-                                        .when(card_expanded, |d| d.border_b_0().rounded_b_none())
-                                        .bg(if is_active_worktree {
-                                            p.sidebar.opacity(0.75)
-                                        } else {
-                                            p.sidebar_accent.opacity(0.65)
+                                        .when(!card_expanded, |d| {
+                                            d.border_1().border_color(p.worktree_sidebar_border).bg(
+                                                if is_active_worktree {
+                                                    p.sidebar.opacity(0.75)
+                                                } else {
+                                                    p.sidebar_accent.opacity(0.65)
+                                                },
+                                            )
                                         })
                                         .hover(|d| d.bg(p.sidebar_accent))
                                         .flex()
                                         .items_center()
                                         .justify_between()
                                         .cursor_pointer()
-                                        .child(if summary.groups.is_empty() {
+                                        .child(if card_expanded {
+                                            div()
+                                                .text_size(ui::TEXT_XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(text::SESSION_COUNT.format(&[(
+                                                    "n",
+                                                    &tree_session_count.to_string(),
+                                                )]))
+                                                .into_any_element()
+                                        } else if summary.groups.is_empty() {
                                             div()
                                                 .flex()
                                                 .items_center()
@@ -2780,6 +2789,8 @@ impl Sidebar {
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
@@ -2912,7 +2923,7 @@ impl Sidebar {
                         .rounded(ui::RADIUS_XS)
                         .bg(p.muted)
                         .font_family(ui::FONT_MONO)
-                        .text_size(ui::TEXT_2XS)
+                        .text_size(ui::TEXT_SM)
                         .truncate()
                         .child(script),
                 )
@@ -3050,6 +3061,8 @@ impl Render for Sidebar {
             .size_full()
             .flex()
             .flex_col()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.sidebar_foreground)
             .child(
                 div()

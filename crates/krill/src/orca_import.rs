@@ -1,3 +1,5 @@
+// Automation design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
+// Shared schedule/preset and automation control behavior; independently implemented for Krill.
 //! Orca 데이터 스캐너 & 원클릭 전체 이관 엔진 (MK-172 / OWE-726).
 //!
 //! `~/Library/Application Support/orca`의 활성 프로필(`orca-profile-index.json` →
@@ -1256,6 +1258,10 @@ fn import_accounts_domain_inner(
     if let Some(note) = detect_agy_import_note(opts, domains) {
         warnings.push(note);
     }
+    let hidden = load_hidden_accounts(&opts.home, &opts.state_dir);
+    if !hidden.is_empty() {
+        planned.retain(|cand| !planned_account_is_hidden(&hidden, cand));
+    }
     if planned.is_empty() {
         return summary;
     }
@@ -1653,6 +1659,59 @@ fn primary_email(label: &str) -> &str {
 
 fn emails_equal(left: &str, right: &str) -> bool {
     primary_email(left).eq_ignore_ascii_case(primary_email(right))
+}
+
+fn load_hidden_accounts(home: &Path, state_dir: &Path) -> Vec<String> {
+    for path in [
+        state_dir.join("accounts.toml"),
+        home.join(".config").join("krill").join("accounts.toml"),
+    ] {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
+            continue;
+        };
+        if let Some(arr) = doc.get("hidden_accounts").and_then(toml::Value::as_array) {
+            return arr
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect();
+        }
+        return Vec::new();
+    }
+    Vec::new()
+}
+
+fn planned_account_is_hidden(hidden: &[String], cand: &PlannedOrcaAccount) -> bool {
+    let orca_id = format!("claude-orca-{}", slugify(&cand.raw_id));
+    if hidden.iter().any(|h| {
+        h.eq_ignore_ascii_case(&cand.planned_id)
+            || h.eq_ignore_ascii_case(&cand.raw_id)
+            || (cand.provider == ProviderKind::Claude && h.eq_ignore_ascii_case(&orca_id))
+    }) {
+        return true;
+    }
+    if cand.provider != ProviderKind::Claude {
+        return false;
+    }
+    let cand_mail = cand.email.as_deref().unwrap_or(cand.label.as_str());
+    let mail = primary_email(cand_mail);
+    if mail.contains('@') {
+        let marker = format!("email:{}", mail.to_ascii_lowercase());
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(&marker)) {
+            return true;
+        }
+    }
+    let clean_label = cand.label.trim();
+    if !clean_label.is_empty() {
+        let marker = format!("label:{}", clean_label.to_ascii_lowercase());
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(&marker)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 기존 프로필의 조직과 후보 조직이 충돌하지 않는지 확인한다.
@@ -3388,17 +3447,35 @@ struct OrcaAutomation {
     prompt: String,
     agent_id: Option<String>,
     rrule: Option<String>,
-    dtstart: Option<String>,
+    dtstart: Option<Json>,
     timezone: Option<String>,
     enabled: Option<bool>,
     project_id: Option<String>,
     workspace_id: Option<String>,
     run_context: Option<OrcaRunContext>,
+    precheck: Option<OrcaAutomationPrecheck>,
+    workspace_mode: Option<String>,
+    base_branch: Option<String>,
+    reuse_session: Option<bool>,
+    extra_agent_args: Option<String>,
+    missed_run_grace_minutes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OrcaAutomationPrecheck {
+    Command(String),
+    Detailed {
+        command: String,
+        #[serde(rename = "timeoutSeconds")]
+        timeout_seconds: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct OrcaRunContext {
+    path: Option<String>,
     worktree_path: Option<String>,
     cwd: Option<String>,
 }
@@ -3956,10 +4033,21 @@ fn import_automations(
     let Some(arr) = raw_automations else {
         return Ok(0);
     };
-    let automations: Vec<OrcaAutomation> = match serde_json::from_value(arr.clone()) {
-        Ok(list) => list,
-        Err(_) => return Ok(0),
+    let Some(rows) = arr.as_array() else {
+        return Ok(0);
     };
+    let automations = rows
+        .iter()
+        .filter_map(
+            |row| match serde_json::from_value::<OrcaAutomation>(row.clone()) {
+                Ok(auto) => Some(auto),
+                Err(err) => {
+                    warnings.push(format!("skipping malformed automation: {err}"));
+                    None
+                }
+            },
+        )
+        .collect::<Vec<_>>();
     if automations.is_empty() {
         return Ok(0);
     }
@@ -3975,9 +4063,6 @@ fn import_automations(
     let mut merged = 0usize;
 
     for auto in automations {
-        if auto.enabled == Some(false) {
-            continue;
-        }
         let prompt = auto.prompt.trim().to_owned();
         if prompt.is_empty() {
             continue;
@@ -3991,21 +4076,68 @@ fn import_automations(
         if id.len() > 64 {
             id.truncate(64);
         }
-        let cron = rrule_to_utc_cron(auto.rrule.as_deref(), auto.dtstart.as_deref());
+        let cron = auto
+            .rrule
+            .as_deref()
+            .and_then(|expr| schedule::parse_schedule_to_cron(expr).ok())
+            .unwrap_or_else(|| {
+                rrule_to_utc_cron(
+                    auto.rrule.as_deref(),
+                    auto.dtstart.as_ref().and_then(Json::as_str),
+                )
+            });
         let cwd = resolve_automation_cwd(&opts.home, &auto, &projects);
         let command = resolve_automation_command(auto.agent_id.as_deref());
         let existing_entry = schedules.schedule.iter().find(|s| s.id == id);
-
+        let workspace_mode = auto.workspace_mode.as_deref().map_or_else(
+            || existing_entry.map_or_else(schedule::WorkspaceMode::default, |s| s.workspace_mode),
+            |mode| {
+                if mode == "new_per_run" {
+                    schedule::WorkspaceMode::Isolate
+                } else {
+                    schedule::WorkspaceMode::Reuse
+                }
+            },
+        );
+        let (precheck, precheck_timeout_secs) = match &auto.precheck {
+            Some(OrcaAutomationPrecheck::Command(cmd)) => (Some(cmd.clone()), None),
+            Some(OrcaAutomationPrecheck::Detailed {
+                command,
+                timeout_seconds,
+            }) => (Some(command.clone()), *timeout_seconds),
+            None => (
+                existing_entry.and_then(|s| s.precheck.clone()),
+                existing_entry.and_then(|s| s.precheck_timeout_secs),
+            ),
+        };
+        let extra_agent_args = auto
+            .extra_agent_args
+            .clone()
+            .filter(|s| !s.trim().is_empty());
         let candidate = Schedule {
             id: id.clone(),
+            name: (!auto.name.trim().is_empty()).then(|| auto.name.clone()),
             cron,
             cwd,
             command,
             prompt,
-            precheck: existing_entry.and_then(|s| s.precheck.clone()),
-            workspace_mode: existing_entry
-                .map_or_else(schedule::WorkspaceMode::default, |s| s.workspace_mode),
-            enabled: existing_entry.is_none_or(|s| s.enabled),
+            agent: auto
+                .agent_id
+                .as_deref()
+                .and_then(map_orca_agent_id)
+                .map(str::to_owned),
+            precheck: precheck.filter(|s| !s.trim().is_empty()),
+            precheck_timeout_secs,
+            workspace_mode,
+            reuse_session: auto.reuse_session.unwrap_or(false)
+                && workspace_mode == schedule::WorkspaceMode::Reuse
+                && extra_agent_args.is_none(),
+            extra_agent_args,
+            base_branch: auto.base_branch.clone().filter(|s| !s.trim().is_empty()),
+            missed_run_grace_minutes: auto.missed_run_grace_minutes,
+            enabled: auto
+                .enabled
+                .unwrap_or_else(|| existing_entry.is_none_or(|s| s.enabled)),
         };
 
         if let Err(reason) = validate_schedule_candidate(&candidate, &mut seen_ids) {
@@ -4017,16 +4149,9 @@ fn import_automations(
             let Some(existing) = schedules.schedule.get_mut(idx) else {
                 continue;
             };
-            if existing.cron != candidate.cron
-                || existing.cwd != candidate.cwd
-                || existing.command != candidate.command
-                || existing.prompt != candidate.prompt
-            {
+            if *existing != candidate {
                 let prev = existing.clone();
-                existing.cron = candidate.cron;
-                existing.cwd = candidate.cwd;
-                existing.command = candidate.command;
-                existing.prompt = candidate.prompt;
+                *existing = candidate;
                 if toml::to_string(&schedules)
                     .ok()
                     .and_then(|text| Schedules::parse(&text).ok())
@@ -4108,6 +4233,9 @@ fn validate_schedule_candidate(
     {
         return Err("invalid schedule cwd, command or prompt");
     }
+    if entry.validate().is_err() {
+        return Err("invalid schedule settings");
+    }
     if !seen_ids.insert(entry.id.clone()) {
         return Err("schedule IDs must be unique ASCII letters, digits, _ or -");
     }
@@ -4117,8 +4245,9 @@ fn validate_schedule_candidate(
 fn resolve_automation_cwd(home: &Path, auto: &OrcaAutomation, projects: &ProjectsStore) -> String {
     if let Some(ctx) = &auto.run_context
         && let Some(p) = ctx
-            .worktree_path
+            .path
             .as_deref()
+            .or(ctx.worktree_path.as_deref())
             .or(ctx.cwd.as_deref())
             .map(str::trim)
             .filter(|s| Path::new(s).is_absolute())
@@ -4150,14 +4279,12 @@ fn resolve_automation_cwd(home: &Path, auto: &OrcaAutomation, projects: &Project
 }
 
 fn resolve_automation_command(agent_id: Option<&str>) -> Vec<String> {
-    match agent_id.and_then(map_orca_agent_id).unwrap_or("claude") {
-        "codex" => vec!["codex".to_owned(), "exec".to_owned()],
-        "agy" => vec!["agy".to_owned(), "-p".to_owned()],
-        "gemini" => vec!["gemini".to_owned(), "-p".to_owned()],
-        "opencode" => vec!["opencode".to_owned(), "run".to_owned()],
-        "cursor" => vec!["cursor-agent".to_owned(), "-p".to_owned()],
-        _ => vec!["claude".to_owned(), "-p".to_owned()],
-    }
+    vec![
+        agent_id
+            .and_then(map_orca_agent_id)
+            .unwrap_or("claude")
+            .to_owned(),
+    ]
 }
 
 /// RFC 5545 RRULE(`FREQ=DAILY;BYHOUR=9;BYMINUTE=30` 등)을 Krill 5-필드 UTC cron으로 변환한다.
@@ -5286,6 +5413,75 @@ mod tests {
     }
 
     #[test]
+    fn current_orca_automations_import_numeric_dates_paths_disabled_and_options() {
+        let root = std::env::temp_dir().join(format!("r504-import-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: root.join("state"),
+            orca_dir: root.join("orca"),
+            domains: vec![ImportDomain::Settings],
+            dry_run: false,
+        };
+        fs::create_dir_all(&opts.home).unwrap();
+        fs::create_dir_all(&opts.state_dir).unwrap();
+        let domains = BTreeMap::from([(
+            "automations".to_owned(),
+            serde_json::json!([
+                { "id": "current", "name": "Current Job", "prompt": "audit", "agentId": "codex", "rrule": "15 3 * * 1-5", "dtstart": 1_792_850_000_123_u64, "enabled": false,
+                  "runContext": { "path": "/tmp/current" }, "precheck": { "command": "git diff --quiet", "timeoutSeconds": 120 }, "workspaceMode": "new_per_run", "baseBranch": "dev", "reuseSession": true, "extraAgentArgs": "--model gpt", "missedRunGraceMinutes": 720 },
+                { "id": "float-date", "name": "Float", "prompt": "review", "dtstart": 1.5, "rrule": "FREQ=HOURLY;BYMINUTE=5", "precheck": "exit 0", "reuseSession": true },
+                { "id": "malformed", "prompt": 99 },
+                { "id": "null-date", "prompt": "null date", "dtstart": null, "rrule": "FREQ=DAILY;BYHOUR=10" },
+                { "id": "string-date", "prompt": "legacy", "dtstart": "2026-10-01T08:15:00", "rrule": "FREQ=MONTHLY;BYMONTHDAY=2" }
+            ]),
+        )]);
+        let mut warnings = Vec::new();
+        assert_eq!(
+            import_automations(&opts, &domains, &serde_json::json!({}), &mut warnings).unwrap(),
+            4
+        );
+        assert_eq!(warnings.len(), 1);
+        let schedules = Schedules::load(&opts.state_dir).unwrap();
+        let entry = schedules
+            .schedule
+            .iter()
+            .find(|s| s.id == "orca-current")
+            .unwrap();
+        assert_eq!(entry.name.as_deref(), Some("Current Job"));
+        assert!(!entry.enabled);
+        assert_eq!(entry.cron, "15 3 * * 1-5");
+        assert_eq!(entry.cwd, "/tmp/current");
+        assert_eq!(entry.agent.as_deref(), Some("codex"));
+        assert_eq!(entry.command, ["codex"]);
+        assert_eq!(entry.precheck.as_deref(), Some("git diff --quiet"));
+        assert_eq!(entry.precheck_timeout_secs, Some(120));
+        assert_eq!(entry.workspace_mode, schedule::WorkspaceMode::Isolate);
+        assert_eq!(entry.base_branch.as_deref(), Some("dev"));
+        assert!(!entry.reuse_session);
+        assert_eq!(entry.extra_agent_args.as_deref(), Some("--model gpt"));
+        assert_eq!(entry.missed_run_grace_minutes, Some(720));
+        assert!(
+            schedules
+                .schedule
+                .iter()
+                .find(|s| s.id == "orca-float-date")
+                .unwrap()
+                .reuse_session
+        );
+        assert_eq!(
+            schedules
+                .schedule
+                .iter()
+                .find(|s| s.id == "orca-string-date")
+                .unwrap()
+                .cron,
+            "15 8 2 * *"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn automations_import_respects_edit_lock_preserves_precheck_and_workspace_mode_and_skips_invalid_items()
      {
         let root = std::env::temp_dir().join(format!("owe749-auto-{}", std::process::id()));
@@ -5407,7 +5603,7 @@ mod tests {
             .unwrap();
         assert_eq!(nightly.prompt, "Updated prompt from Orca");
         assert_eq!(nightly.cron, "15 8 * * *");
-        assert_eq!(nightly.command, vec!["codex".to_owned(), "exec".to_owned()]);
+        assert_eq!(nightly.command, vec!["codex".to_owned()]);
         assert_eq!(nightly.precheck.as_deref(), Some("git diff --quiet"));
         assert_eq!(nightly.workspace_mode, schedule::WorkspaceMode::Isolate);
 

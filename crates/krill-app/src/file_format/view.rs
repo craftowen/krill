@@ -186,17 +186,37 @@ impl Render for ImageView {
                     .child(image.flex_none().w(px(w)).h(px(h)))
             }
             // 맞춤: 작은 이미지는 키우지 않는다(Orca `getZoomedImageLayoutSize`의 min(1, …)).
+            // 칸을 절대 위치로 채워 높이를 확정한다 — 퍼센트 높이만 주면 이미지가 너비÷비율로 키를 잡아
+            // 칸보다 커지고, 가운데 정렬된 그림이 보이는 영역 밖에 그려져 확대·축소 전까지 비어 보였다.
             _ => div()
                 .id("image-scroll")
+                .debug_selector(|| "image-scroll".into())
                 .size_full()
-                .p(crate::ui::SPACE_4)
-                .child(image.size_full().object_fit(ObjectFit::ScaleDown)),
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .top(crate::ui::SPACE_4)
+                        .bottom(crate::ui::SPACE_4)
+                        .left(crate::ui::SPACE_4)
+                        .right(crate::ui::SPACE_4)
+                        .child(
+                            image
+                                .absolute()
+                                .size_full()
+                                .object_fit(ObjectFit::ScaleDown)
+                                .debug_selector(|| "image-fit".into()),
+                        ),
+                ),
         };
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(pal.editor_surface)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_SM)
+            .text_color(pal.foreground)
             .child(toolbar)
             .child(div().flex_1().min_h_0().child(body))
     }
@@ -239,6 +259,8 @@ pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>, cx: &
         .size_full()
         .overflow_y_scroll()
         .p(crate::ui::SPACE_4)
+        .font_family(crate::ui::FONT_UI)
+        .text_size(crate::ui::TEXT_MD)
         .bg(pal.editor_surface)
         .text_color(pal.foreground)
         .child(TextView::markdown(id, source))
@@ -354,6 +376,7 @@ impl Render for CsvView {
                 .flex_none()
                 .px_2()
                 .py_1()
+                .font_family(crate::ui::FONT_UI)
                 .text_size(crate::ui::TEXT_XS)
                 .text_color(pal.muted_foreground)
                 .child(text::CSV_TRUNCATED.format(&[("rows", &self.table.rows.len().to_string())]))
@@ -363,6 +386,7 @@ impl Render for CsvView {
             .flex()
             .flex_col()
             .bg(pal.editor_surface)
+            .text_color(pal.foreground)
             .text_size(crate::ui::TEXT_SM)
             .font_family(crate::ui::FONT_MONO)
             .children(notice)
@@ -594,6 +618,9 @@ pub fn notebook(
     div()
         .id(id)
         .size_full()
+        .font_family(crate::ui::FONT_UI)
+        .text_size(crate::ui::TEXT_MD)
+        .text_color(pal.foreground)
         .bg(pal.editor_surface)
         .when(count == 0, |view| {
             view.text_color(pal.muted_foreground)
@@ -648,9 +675,16 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
         .items_center()
         .justify_center()
         .gap_2()
+        .font_family(crate::ui::FONT_UI)
+        .text_size(crate::ui::TEXT_SM)
         .bg(pal.editor_surface)
         .text_color(pal.foreground)
-        .child(div().text_size(crate::ui::TEXT_LG).child(name))
+        .child(
+            div()
+                .font_family(crate::ui::FONT_MONO)
+                .text_size(crate::ui::TEXT_SM)
+                .child(name),
+        )
         .child(
             div()
                 .text_size(crate::ui::TEXT_SM)

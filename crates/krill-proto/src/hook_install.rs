@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 pub use codex::Record as CodexRecord;
 use store::error;
 
+/// Whether verified Krill session hooks may replace older Codex trust hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexTrust {
+    Preserve,
+    /// Used when the user has enabled automatic status-hook installation.
+    Refresh,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetAgent {
     Claude,
@@ -117,6 +125,29 @@ impl Plan {
         exe: &Path,
         search: Option<&OsStr>,
     ) -> io::Result<Option<Self>> {
+        Self::prepare_with_trust(
+            action,
+            agent,
+            path,
+            state,
+            exe,
+            search,
+            CodexTrust::Preserve,
+        )
+    }
+
+    /// Like `prepare_with_path`, with an explicit policy for existing Codex session trust.
+    /// Refreshed hashes come from Codex itself for the exact Krill command; previous
+    /// values are recorded and restored on uninstall if they have not changed again.
+    pub fn prepare_with_trust(
+        action: Action,
+        agent: TargetAgent,
+        path: &Path,
+        state: &Path,
+        exe: &Path,
+        search: Option<&OsStr>,
+        trust: CodexTrust,
+    ) -> io::Result<Option<Self>> {
         let receipt_path = match agent {
             TargetAgent::Claude => state.join("hooks/claude.json"),
             TargetAgent::Other(a) => hooks::receipt(state, a),
@@ -156,7 +187,7 @@ impl Plan {
         let receipt = if action == Action::Install {
             let changes = if agent == TargetAgent::Other(Agent::Codex) {
                 let codex_home = path.parent().ok_or_else(|| error("missing Codex home"))?;
-                codex_plan = Some(codex::Plan::install(codex_home, &command, search)?);
+                codex_plan = Some(codex::Plan::install(codex_home, &command, search, trust)?);
                 Vec::new()
             } else {
                 let path = path.to_path_buf();
@@ -338,6 +369,20 @@ pub fn install_hooks(
     Plan::prepare(Action::Install, agent, path, state, executable)?
         .map(Plan::apply)
         .transpose()
+}
+
+/// Trust the exact Krill session-hook `command` in another Codex home, e.g. an account profile.
+/// Codex trusts session hooks per `CODEX_HOME`, so that home's Codex computes the hashes and
+/// persists them through its version-checked writer; stale hashes under the same keys are
+/// replaced. Returns whether it wrote. Callers pass a completed receipt's command (consent)
+/// and a symlink-free `home`; no receipt is written, so the installer's rollback is unchanged.
+pub fn refresh_codex_trust(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<bool> {
+    let mut plan = codex::Plan::install(home, command, search, CodexTrust::Refresh)?;
+    if plan.record.added.is_empty() {
+        return Ok(false);
+    }
+    plan.apply()?;
+    Ok(true)
 }
 
 fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<String> {

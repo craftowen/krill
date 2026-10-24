@@ -621,6 +621,7 @@ impl Panel {
                     .flex()
                     .items_center()
                     .gap_1p5()
+                    .text_size(crate::ui::TEXT_MD)
                     .child(crate::ui::icons::agent_brand_icon(
                         hit.agent.profile(),
                         crate::ui::ICON_SM,
@@ -639,6 +640,7 @@ impl Panel {
             div()
                 .truncate()
                 .font_family(crate::ui::FONT_MONO)
+                .text_size(crate::ui::TEXT_SM)
                 .text_color(p.muted_foreground)
                 .child(hit.cwd.clone()),
         );
@@ -869,6 +871,7 @@ impl Render for Panel {
                 .flex_col()
                 .p_2()
                 .bg(p.sidebar)
+                .font_family(crate::ui::FONT_UI)
                 .text_color(p.sidebar_foreground)
                 .text_size(crate::ui::TEXT_XS)
                 .child(

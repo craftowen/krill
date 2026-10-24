@@ -27,14 +27,15 @@ pub const BUILTIN: &str = r#"
 name = "Claude Code"
 launch = ["claude"]
 yolo_args = ["--dangerously-skip-permissions"]
-install = "curl -fsSL https://claude.ai/install.sh | bash"
-install_windows = "irm https://claude.ai/install.ps1 | iex"
+install = "curl -fsSL https://claude.ai/install.sh | bash -s -- latest"
+install_windows = '& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) latest'
 
 [agent.codex]
 name = "Codex"
 launch = ["codex"]
 yolo_args = ["--dangerously-bypass-approvals-and-sandbox"]
-install = "npm install -g @openai/codex"
+install = "npm install -g @openai/codex@latest"
+install_windows = "npm.cmd install -g @openai/codex@latest"
 
 [agent.opencode]
 name = "OpenCode"
@@ -54,7 +55,8 @@ install_windows = "irm 'https://cursor.com/install?win32=true' | iex"
 name = "Antigravity"
 launch = ["agy"]
 yolo_args = ["--dangerously-skip-permissions"]
-install = "agy install"
+install = 'if command -v agy >/dev/null 2>&1; then agy update; elif [ -x "$HOME/.local/bin/agy" ]; then "$HOME/.local/bin/agy" update; else curl -fsSL https://antigravity.google/cli/install.sh | bash; fi'
+install_windows = 'if (Get-Command agy -ErrorAction SilentlyContinue) { agy update } elseif (Test-Path "$env:LOCALAPPDATA/agy/bin/agy.exe") { & "$env:LOCALAPPDATA/agy/bin/agy.exe" update } else { irm https://antigravity.google/cli/install.ps1 | iex }'
 "#;
 
 /// 추가 에이전트 생태계 프리셋(MK-229). `Agents::load(None)`의 기본 5종([`BUILTIN`])은 그대로 두고,

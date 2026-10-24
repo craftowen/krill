@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::{App, Global, SharedString, SystemNotification};
 
-use super::{FixOutcome, atext, perm, publish};
+use super::{FixNeeds, FixOutcome, atext, dismiss_need, perm, publish};
 
 #[derive(Default)]
 struct NotificationGate {
@@ -15,6 +15,12 @@ struct NotificationGate {
     granted: bool,
 }
 impl Global for NotificationGate {}
+
+#[derive(Default)]
+struct PermissionWatch {
+    running: bool,
+}
+impl Global for PermissionWatch {}
 
 /// 알림이 실제로 필요한 시점의 진입점. 허용 전 알림을 버리지 않고 요청 결과 뒤 발송한다.
 pub fn show_notification(notification: SystemNotification, cx: &mut App) {
@@ -54,6 +60,7 @@ fn deliver_with(
             let pending = std::mem::take(&mut gate.pending);
             match result {
                 Ok(()) => {
+                    dismiss_need(perm::NOTIFICATIONS_ID, cx);
                     for (_, notification) in pending {
                         cx.show_system_notification(notification);
                     }
@@ -61,6 +68,56 @@ fn deliver_with(
                 Err(error) => publish(perm::NOTIFICATIONS_ID, error, cx),
             }
         });
+    })
+    .detach();
+}
+
+/// 시스템 설정이 앞에 있어도 허용된 알림 안내를 내린다. 안내가 없으면 조회를 멈춘다.
+pub(super) fn watch_permission(cx: &mut App) {
+    // 테스트 플랫폼에는 OS 권한이 없다. 테스트에서는 조회 함수를 주입한다.
+    if !cx.background_executor().is_test() {
+        watch_permission_with(
+            || perm::query_notification_status(Duration::from_secs(2)),
+            cx,
+        );
+    }
+}
+
+fn watch_permission_with(
+    query: impl Fn() -> Option<perm::NotificationStatus> + Send + Sync + 'static,
+    cx: &mut App,
+) {
+    let watch = cx.default_global::<PermissionWatch>();
+    if watch.running {
+        return;
+    }
+    watch.running = true;
+    let query = std::sync::Arc::new(query);
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let visible = cx.update(|cx| {
+                cx.try_global::<FixNeeds>().is_some_and(|needs| {
+                    needs
+                        .items
+                        .iter()
+                        .any(|need| need.check_id == perm::NOTIFICATIONS_ID)
+                })
+            });
+            if !visible {
+                break;
+            }
+            let query = query.clone();
+            let status = cx.background_executor().spawn(async move { query() }).await;
+            if matches!(
+                status,
+                Some(perm::NotificationStatus::Authorized | perm::NotificationStatus::Ephemeral)
+            ) {
+                cx.update(|cx| dismiss_need(perm::NOTIFICATIONS_ID, cx));
+                break;
+            }
+        }
+        cx.update(|cx| cx.default_global::<PermissionWatch>().running = false);
     })
     .detach();
 }
@@ -118,6 +175,77 @@ pub fn dismiss_notification(tag: &SharedString, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[gpui::test]
+    fn settings_permission_change_clears_only_notification_need(cx: &mut gpui::TestAppContext) {
+        let status = Arc::new(AtomicUsize::new(1));
+        let queries = Arc::new(AtomicUsize::new(0));
+        cx.update(|cx| {
+            publish(perm::NOTIFICATIONS_ID, "notifications denied".into(), cx);
+            publish(perm::FOLDERS_ID, "folder access denied".into(), cx);
+            let status = status.clone();
+            let queries = queries.clone();
+            watch_permission_with(
+                move || {
+                    queries.fetch_add(1, Ordering::SeqCst);
+                    match status.load(Ordering::SeqCst) {
+                        1 => Some(perm::NotificationStatus::Denied),
+                        2 => Some(perm::NotificationStatus::Authorized),
+                        3 => Some(perm::NotificationStatus::Provisional),
+                        _ => None,
+                    }
+                },
+                cx,
+            );
+            watch_permission_with(|| panic!("duplicate watcher"), cx);
+        });
+        cx.run_until_parked();
+        for value in [1, 0, 3] {
+            status.store(value, Ordering::SeqCst);
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            cx.update(|cx| assert_eq!(cx.global::<FixNeeds>().items.len(), 2));
+        }
+        status.store(2, Ordering::SeqCst);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(cx.global::<FixNeeds>().items.len(), 1);
+            assert_eq!(cx.global::<FixNeeds>().items[0].check_id, perm::FOLDERS_ID);
+            assert!(!cx.global::<PermissionWatch>().running);
+        });
+        assert_eq!(queries.load(Ordering::SeqCst), 4);
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert_eq!(queries.load(Ordering::SeqCst), 4);
+    }
+
+    #[gpui::test]
+    fn closing_permission_notice_stops_checks_and_can_watch_again(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            publish(perm::NOTIFICATIONS_ID, "notifications denied".into(), cx);
+            watch_permission_with(|| panic!("closed notice must not query the OS"), cx);
+            dismiss_need(perm::NOTIFICATIONS_ID, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!cx.global::<PermissionWatch>().running);
+            publish(
+                perm::NOTIFICATIONS_ID,
+                "notifications denied again".into(),
+                cx,
+            );
+            watch_permission_with(|| Some(perm::NotificationStatus::Ephemeral), cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| assert!(cx.global::<FixNeeds>().items.is_empty()));
+    }
 
     #[test]
     fn permission_is_requested_once_and_only_if_not_determined() {
@@ -151,6 +279,7 @@ mod tests {
     fn first_notification_waits_for_permission_and_then_delivers(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             cx.set_app_identity(krill_proto::daemon::BUNDLE_ID, "Krill");
+            publish(perm::NOTIFICATIONS_ID, "previous denial".into(), cx);
             deliver_with(
                 SystemNotification {
                     tag: "first".into(),
@@ -163,7 +292,10 @@ mod tests {
             );
         });
         cx.run_until_parked();
-        cx.update(|cx| assert!(cx.global::<NotificationGate>().granted));
+        cx.update(|cx| {
+            assert!(cx.global::<NotificationGate>().granted);
+            assert!(cx.global::<FixNeeds>().items.is_empty());
+        });
         assert_eq!(cx.delivered_system_notifications().len(), 1);
     }
     #[gpui::test]

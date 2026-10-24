@@ -22,6 +22,12 @@ pub(super) struct Cache {
     last: BTreeMap<PathBuf, RepositoryTrees>,
 }
 
+impl Cache {
+    pub(super) fn directory(&self, session: SessionId) -> Option<PathBuf> {
+        self.directories.get(&session).cloned()
+    }
+}
+
 /// 한 사이드바 요청이 저장소 조회를 기다리는 최대 시간. 앱 읽기 시한(5초)보다 충분히 짧아야 한다.
 /// 파일 열기가 멈춰도(예: macOS 개인정보 보호 확인 지연) 응답은 이 안에 나간다.
 const LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
@@ -42,22 +48,17 @@ struct Discovery {
 
 pub(super) fn snapshot(
     cache: &Arc<Mutex<Cache>>,
-    entries: &[(SessionId, u32, Option<crate::session::Tap>)],
+    entries: &[(SessionId, Option<PathBuf>)],
 ) -> Result<SidebarData, Failure> {
     let deadline = Instant::now() + LOOKUP_BUDGET;
     let mut sessions = Vec::new();
     let mut repositories = BTreeMap::new();
     let mut bytes = 0usize;
-    for (session, pid, live) in entries {
-        // OS cwd and Git IO never run under the shared metadata cache lock.
-        let observed = live.as_ref().and_then(|tap| tap.cwd(*pid));
-        // Windows cwd is the shell's report (`C:/x`, `c:\x\`); match canonical worktree paths.
-        #[cfg(windows)]
-        let observed = observed.map(|path| krill_proto::os::canonicalize(&path).unwrap_or(path));
+    for (session, observed) in entries {
         let path = {
             let mut cache = lock(cache);
             if let Some(path) = observed {
-                cache.directories.insert(*session, path);
+                cache.directories.insert(*session, path.clone());
             }
             cache.directories.get(session).cloned()
         };
@@ -82,7 +83,7 @@ pub(super) fn snapshot(
     if cache.directories.len() > krill_proto::holder::MAX_SESSIONS {
         cache
             .directories
-            .retain(|id, _| entries.iter().any(|(s, _, _)| s == id));
+            .retain(|id, _| entries.iter().any(|(s, _)| s == id));
     }
     cache
         .trees
@@ -433,7 +434,7 @@ mod tests {
         lock(&cache)
             .directories
             .insert(SessionId(2), PathBuf::from("/does-not-exist/two"));
-        let snapshot = snapshot(&cache, &[(SessionId(1), 0, None)]).unwrap();
+        let snapshot = snapshot(&cache, &[(SessionId(1), None)]).unwrap();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].session, SessionId(1));
         assert!(snapshot.repositories.is_empty());

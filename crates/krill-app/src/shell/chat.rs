@@ -23,9 +23,15 @@ use krill_proto::SessionId;
 use krill_proto::agent_history::{Action, ChatItem, ChatItemKind, ChatPollSnapshot, Response};
 use krill_proto::control::{Reply, Request};
 use krill_proto::screen::Cell;
-use krill_term::ime::Output;
 
 use super::Shell;
+
+mod actions;
+use actions::{RequestIdentity, Submission};
+#[cfg(test)]
+mod action_tests;
+#[cfg(test)]
+mod poll_tests;
 
 #[derive(Default)]
 pub(crate) struct SessionChatLog {
@@ -36,6 +42,10 @@ pub(crate) struct SessionChatLog {
     pub items: Vec<Arc<ChatItem>>,
     pub revision: u64,
     pub answered: BTreeSet<String>,
+    binding: (String, String),
+    host: Option<krill_app::hosts::HostId>,
+    epoch: u64,
+    submissions: BTreeMap<String, Submission>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
 }
 
@@ -53,45 +63,130 @@ pub(crate) struct ChatState {
     pub inputs: BTreeMap<SessionId, (gpui::Entity<InputState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
+    poll_timer: Option<Task<()>>,
+    poll_failed: BTreeSet<SessionId>,
     pub poll_generation: u64,
     #[cfg(test)]
     pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
     pub poll_call: Option<krill_app::agent_history::Call>,
-    pub keystroke_task: Option<Task<()>>,
+    request_tasks: BTreeMap<SessionId, Task<()>>,
+    prompt_failed: BTreeSet<SessionId>,
+    #[cfg(test)]
+    send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
 }
 
-/// TUI 화면 버퍼에서 질문 옵션 목록의 현재 선택 커서(`❯`, `>`, `›`, `●`, `*`) 인덱스를 찾는다.
-/// 찾지 못하면 기본 시작 인덱스 `0`을 반환한다.
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct QuestionOptionRow {
+    cursor: bool,
+    checked: Option<bool>,
+}
+
+fn strip_option_number(text: &str) -> Option<&str> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let suffix = text.get(digits..)?;
+    [". ", ") ", ": "]
+        .iter()
+        .find_map(|prefix| suffix.strip_prefix(prefix))
+        .map(str::trim_start)
+}
+
+fn strip_option_checkbox(text: &str) -> Option<(&str, bool)> {
+    [
+        ("[✓]", true),
+        ("[x]", true),
+        ("☑", true),
+        ("[ ]", false),
+        ("☐", false),
+    ]
+    .into_iter()
+    .find_map(|(prefix, checked)| {
+        text.strip_prefix(prefix)
+            .map(|rest| (rest.trim_start(), checked))
+    })
+}
+
+fn option_label_matches(text: &str, label: &str) -> bool {
+    text.strip_prefix(label).is_some_and(|suffix| {
+        suffix.is_empty()
+            || [" — ", " – ", " - ", ": "]
+                .iter()
+                .any(|sep| suffix.starts_with(sep))
+            || (suffix.starts_with(" (") && suffix.ends_with(')'))
+    })
+}
+
+/// Match whole labels after known TUI decorations, with optional delimited
+/// descriptions. A row must identify one option, and an option at most one row.
+/// Keep both numbered and literal interpretations so ambiguous labels fail shut.
+fn question_option_rows(
+    rows: &[Vec<Cell>],
+    labels: &[String],
+) -> Option<Vec<Option<QuestionOptionRow>>> {
+    let labels: Vec<_> = labels.iter().map(|label| normalized(label)).collect();
+    let unique: BTreeSet<_> = labels.iter().collect();
+    if labels.is_empty() || labels.iter().any(String::is_empty) || unique.len() != labels.len() {
+        return None;
+    }
+    let mut matched = vec![None; labels.len()];
+    for row in rows {
+        let line = normalized(&row.iter().map(|cell| cell.ch).collect::<String>());
+        let body = line.strip_prefix(['❯', '>', '›', '●', '*', '→']);
+        let cursor = body.is_some();
+        let body = body.unwrap_or(&line).trim_start();
+        let mut variants = vec![(body, None)];
+        if let Some(numbered) = strip_option_number(body) {
+            variants.push((numbered, None));
+        }
+        for index in 0..variants.len() {
+            if let Some((text, checked)) = strip_option_checkbox(variants[index].0) {
+                variants.push((text, Some(checked)));
+                if let Some(numbered) = strip_option_number(text) {
+                    variants.push((numbered, Some(checked)));
+                }
+            }
+        }
+        let mut candidate = None;
+        for (index, label) in labels.iter().enumerate() {
+            for &(text, checked) in &variants {
+                if option_label_matches(text, label) {
+                    let found = (index, QuestionOptionRow { cursor, checked });
+                    if candidate.is_some_and(|previous| previous != found) {
+                        return None;
+                    }
+                    candidate = Some(found);
+                }
+            }
+        }
+        if let Some((index, row)) = candidate {
+            if matched[index].is_some() {
+                return None;
+            }
+            matched[index] = Some(row);
+        }
+    }
+    Some(matched)
+}
+
+/// Return the unique option with a visible TUI cursor; ambiguous prompts require Term.
 pub(crate) fn detect_question_cursor_index(
     rows: &[Vec<Cell>],
     options: &[String],
 ) -> Option<usize> {
-    if options.is_empty() {
-        return None;
-    }
-    for row in rows.iter().rev() {
-        let line: String = row.iter().map(|c| c.ch).collect();
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let has_cursor_marker = trimmed.starts_with('❯')
-            || trimmed.starts_with('>')
-            || trimmed.starts_with('›')
-            || trimmed.starts_with('●')
-            || trimmed.starts_with('*')
-            || trimmed.starts_with('→');
-        if !has_cursor_marker {
-            continue;
-        }
-        for (idx, opt) in options.iter().enumerate() {
-            if !opt.is_empty() && trimmed.contains(opt.as_str()) {
-                return Some(idx);
-            }
-        }
-    }
-    None
+    let matched = question_option_rows(rows, options)?;
+    let mut cursors = matched
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.is_some_and(|row| row.cursor).then_some(index));
+    let cursor = cursors.next()?;
+    cursors.next().is_none().then_some(cursor)
 }
 
 fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
@@ -135,6 +230,23 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn toggle_chat_view_with_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_chat_view(cx);
+        if let Some(session) = self
+            .active_session_id()
+            .filter(|id| self.chat.active_sessions.contains(id))
+        {
+            let input = self.ensure_chat_input(session, window, cx);
+            input.update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            window.focus(&self.focus, cx);
+        }
+    }
+
     pub(super) fn maybe_poll_active_chat(&mut self, cx: &mut Context<Self>) {
         if !self.is_active_chat_view() {
             return;
@@ -148,6 +260,37 @@ impl Shell {
             return;
         }
         self.poll_active_chat(cx);
+    }
+
+    // Transcript flushes and hook binding can happen after the final PTY redraw.
+    // Keep retrying while Chat is visible, with at most one request in flight.
+    fn ensure_chat_poll_timer(&mut self, cx: &mut Context<Self>) {
+        if self.chat.poll_timer.is_some() {
+            return;
+        }
+        self.chat.poll_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(800))
+                    .await;
+                let keep_polling = this
+                    .update(cx, |this, cx| {
+                        if this.page_open()
+                            || this.dashboard.is_some()
+                            || !this.is_active_chat_view()
+                        {
+                            this.chat.poll_timer = None;
+                            return false;
+                        }
+                        this.poll_active_chat(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_polling {
+                    break;
+                }
+            }
+        }));
     }
 
     /// 데몬에 `Action::ChatPoll`을 요청해 활성 세션의 증분 트랜스크립트를 가져온다.
@@ -170,8 +313,12 @@ impl Shell {
         if self.chat.task.is_some() || !self.chat.active_sessions.contains(&session) {
             return;
         }
+        self.ensure_chat_poll_timer(cx);
         let host = self.layout.host(pane).clone();
         let Some(target) = self.target_for_host(&host) else {
+            if self.chat.poll_failed.insert(session) {
+                cx.notify();
+            }
             return;
         };
         let call = krill_app::agent_history::daemon_call_for(Some(target));
@@ -203,9 +350,13 @@ impl Shell {
                     && this.layout.session(pane) == Some(session)
                     && this.chat.active_sessions.contains(&session)
                     && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
-                    && let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply
                 {
-                    this.apply_chat_poll(session, snapshot);
+                    if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
+                        this.chat.poll_failed.remove(&session);
+                        this.apply_chat_poll_for_host(session, host, snapshot);
+                    } else {
+                        this.chat.poll_failed.insert(session);
+                    }
                     cx.notify();
                 }
                 if this
@@ -219,64 +370,143 @@ impl Shell {
         }));
     }
 
+    #[cfg(test)]
     pub(super) fn apply_chat_poll(&mut self, session: SessionId, snap: ChatPollSnapshot) {
+        let host = self
+            .layout
+            .visible()
+            .into_iter()
+            .find(|&pane| self.layout.session(pane) == Some(session))
+            .map(|pane| self.layout.host(pane).clone());
+        let Some(host) = host else {
+            return;
+        };
+        self.apply_chat_poll_for_host(session, host, snap);
+    }
+
+    fn apply_chat_poll_for_host(
+        &mut self,
+        session: SessionId,
+        host: krill_app::hosts::HostId,
+        snap: ChatPollSnapshot,
+    ) {
+        let host = Some(host);
         let log = self.chat.logs.entry(session).or_default();
+        let binding = (snap.session_id.clone(), snap.transcript_path.clone());
+        let reset = snap.reset || log.binding != binding || log.host != host || !snap.bound;
         if !snap.agent.is_empty() {
             log.agent = snap.agent;
         }
         log.bound = snap.bound;
-        if snap.reset || !snap.items.is_empty() {
+        if reset || !snap.items.is_empty() {
             log.revision = log.revision.wrapping_add(1);
         }
-        if snap.reset {
+        if reset {
+            log.epoch = log.epoch.wrapping_add(1);
             log.items.clear();
             log.base_index = 0;
             log.answered.clear();
             log.multi_selected.clear();
+            log.submissions.clear();
+            self.chat.request_tasks.remove(&session);
         }
+        log.binding = binding;
+        log.host = host;
         if !snap.items.is_empty() {
             log.items.extend(snap.items.into_iter().map(Arc::new));
             if log.items.len() > 250 {
                 let excess = log.items.len() - 250;
                 log.items.drain(0..excess);
                 log.base_index = log.base_index.saturating_add(excess);
+                let retained: BTreeSet<_> = log
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| format!("{}:{}", item.tool_id, log.base_index + index))
+                    .collect();
+                log.answered.retain(|key| retained.contains(key));
+                log.multi_selected.retain(|key, _| retained.contains(key));
+                log.submissions.retain(|key, _| retained.contains(key));
             }
         }
         log.offset = snap.next_offset;
+        // A matching transcript result is evidence of a response; queue delivery is not.
+        let resolved: Vec<_> = log
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission)
+                    && !item.tool_id.is_empty()
+                    && log.items.iter().skip(index + 1).any(|later| {
+                        later.kind == ChatItemKind::ToolResult && later.tool_id == item.tool_id
+                    })
+            })
+            .map(|(index, item)| format!("{}:{}", item.tool_id, log.base_index + index))
+            .collect();
+        for key in resolved {
+            log.answered.insert(key.clone());
+            log.submissions.insert(key, Submission::Confirmed);
+        }
     }
 
     fn send_to_session(
         &mut self,
         session: SessionId,
-        bytes: Vec<u8>,
+        bytes: &[u8],
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.active_session_id() == Some(session) {
-            return self.send(
-                &Output {
-                    pty: bytes,
-                    discard_ime: false,
-                },
-                None,
-                cx,
-            );
-        }
-        let Some(pane) =
-            self.layout.visible().into_iter().find(|&p| {
-                self.layout.file(p).is_none() && self.layout.session(p) == Some(session)
+        let pane = self
+            .layout
+            .focused()
+            .filter(|&pane| self.layout.session(pane) == Some(session))
+            .or_else(|| {
+                self.layout
+                    .visible()
+                    .into_iter()
+                    .find(|&pane| self.layout.session(pane) == Some(session))
+            });
+        pane.is_some_and(|pane| self.send_to_chat_pane(pane, session, bytes, cx))
+    }
+
+    fn send_to_chat_pane(
+        &mut self,
+        pane: super::PaneId,
+        session: SessionId,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Pane::input also returns None when disconnected: preflight the exact
+        // pane before interpreting its queue result. This is not an agent ACK.
+        if self.paste_queue.has_pending_for(pane)
+            || self.layout.file(pane).is_some()
+            || self.layout.session(pane) != Some(session)
+            || self.live.get(&pane).is_none_or(|live| {
+                live.target.as_ref().is_none_or(|target| {
+                    target.host() != self.layout.host(pane) || !target.is_current()
+                }) || live.pane.session() != Some(session)
+                    || !live.pane.is_linked()
+                    || live.pane.is_closed()
+                    || live.pane.is_cold()
+                    || live.pane.account_switching()
+                    || live.suspended
             })
-        else {
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(send) = self.chat.send_input.as_mut() {
+            return send(bytes.to_vec());
+        }
+        let Some(live) = self.live.get_mut(&pane) else {
             return false;
         };
-        let Some(l) = self.live.get_mut(&pane) else {
-            return false;
-        };
-        l.clear_selection();
-        l.echo.key_sent(std::time::Instant::now());
-        let n = l.pane.input(&bytes, super::Now::get());
-        self.show(n.as_ref(), cx);
+        live.clear_selection();
+        live.echo.key_sent(std::time::Instant::now());
+        let notice = live.pane.input(bytes, super::Now::get());
+        self.show(notice.as_ref(), cx);
         cx.notify();
-        n.is_none()
+        notice.is_none()
     }
 
     fn ensure_chat_input(
@@ -323,101 +553,52 @@ impl Shell {
         if text.trim().is_empty() {
             return;
         }
-        input.update(cx, |s, cx| {
-            s.set_value(String::new(), window, cx);
-        });
-        let mut bytes = text.into_bytes();
+        let mut bytes = text.as_bytes().to_vec();
         bytes.push(b'\r');
-        self.send_to_session(session, bytes, cx);
+        if self.send_to_session(session, &bytes, cx) {
+            Self::clear_sent_chat_draft(&input, &text, window, cx);
+            self.chat.prompt_failed.remove(&session);
+        } else {
+            self.chat.prompt_failed.insert(session);
+        }
         cx.notify();
     }
 
-    pub(super) fn toggle_chat_multi_option(
+    fn clear_sent_chat_draft(
+        input: &gpui::Entity<InputState>,
+        sent: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if input.read(cx).value().as_ref() == sent {
+            input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        }
+    }
+
+    fn toggle_chat_multi_option(
         &mut self,
-        session: SessionId,
-        answer_key: String,
+        request: &RequestIdentity,
         opt_idx: usize,
         cx: &mut Context<Self>,
     ) {
-        let log = self.chat.logs.entry(session).or_default();
+        if !self.chat_request_is_current(request, cx) || opt_idx >= request.item.options.len() {
+            return;
+        }
+        let answer_key = request.key.clone();
+        let Some(log) = self.chat.logs.get_mut(&request.session) else {
+            return;
+        };
+        if log
+            .submissions
+            .get(&answer_key)
+            .is_some_and(Submission::blocks_input)
+        {
+            return;
+        }
         let set = log.multi_selected.entry(answer_key).or_default();
         if !set.remove(&opt_idx) {
             set.insert(opt_idx);
         }
-        cx.notify();
-    }
-
-    fn current_question_cursor(&self, session: SessionId, options: &[String]) -> usize {
-        let pane =
-            self.layout.visible().into_iter().find(|&p| {
-                self.layout.file(p).is_none() && self.layout.session(p) == Some(session)
-            });
-        pane.and_then(|p| self.live.get(&p))
-            .and_then(|l| detect_question_cursor_index(&l.pane.screen().rows, options))
-            .unwrap_or(0)
-    }
-
-    /// 인터랙티브 질문 카드 선택지를 60ms 간격 키스트로크 시퀀스로 해당 세션 PTY에 주입한다(OWE-946).
-    pub(super) fn answer_chat_question(
-        &mut self,
-        session: SessionId,
-        answer_key: String,
-        option_labels: &[String],
-        selected: Vec<usize>,
-        multi_select: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(log) = self.chat.logs.get_mut(&session) {
-            log.answered.insert(answer_key);
-        }
-        let mut cursor = self.current_question_cursor(session, option_labels);
-        let mut steps: Vec<Vec<u8>> = Vec::new();
-        if multi_select {
-            let mut sorted: Vec<usize> = selected.into_iter().filter(|&idx| idx < 16).collect();
-            sorted.sort_unstable();
-            sorted.dedup();
-            for target in sorted {
-                step_cursor(&mut steps, &mut cursor, target);
-                steps.push(b" ".to_vec());
-            }
-            steps.push(b"\r".to_vec());
-        } else if let Some(&choice_idx) = selected.first() {
-            let target = choice_idx.min(16);
-            step_cursor(&mut steps, &mut cursor, target);
-            steps.push(b"\r".to_vec());
-        } else {
-            return;
-        }
-        self.chat.keystroke_task = Some(cx.spawn(async move |this, cx| {
-            for (idx, bytes) in steps.into_iter().enumerate() {
-                if idx > 0 {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(60))
-                        .await;
-                }
-                let ok = this
-                    .update(cx, |this, cx| this.send_to_session(session, bytes, cx))
-                    .unwrap_or(false);
-                if !ok {
-                    break;
-                }
-            }
-        }));
-        cx.notify();
-    }
-
-    pub(super) fn approve_chat_permission(
-        &mut self,
-        session: SessionId,
-        yes: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let bytes = if yes {
-            b"y\r".to_vec()
-        } else {
-            b"n\r".to_vec()
-        };
-        self.send_to_session(session, bytes, cx);
         cx.notify();
     }
 
@@ -515,13 +696,38 @@ impl Shell {
                     .child(item.text.clone()),
             );
 
+        let request = self.chat_request_identity(pane, session, abs_idx, item);
+        let answer_key = request.key.clone();
+        let submission = self
+            .chat
+            .logs
+            .get(&session)
+            .and_then(|log| log.submissions.get(&answer_key));
+        let current = self.chat_request_is_current(&request, cx);
+        let disabled = !current || submission.is_some_and(Submission::blocks_input);
+        if matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission) {
+            let status = if !current
+                && !matches!(
+                    submission,
+                    Some(Submission::Confirmed | Submission::ReviewRequired)
+                ) {
+                ctext::REQUEST_UNVERIFIED.get()
+            } else {
+                submission.map_or(ctext::REQUEST_READY.get(), Submission::label)
+            };
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-request-status-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-request-status".into())
+                    .text_size(ui::TEXT_XS)
+                    .text_color(muted_fg)
+                    .child(status),
+            );
+        }
         if item.kind == ChatItemKind::Question && !item.options.is_empty() {
-            let answer_key = format!("{}:{abs_idx}", item.tool_id);
-            let answered = self
-                .chat
-                .logs
-                .get(&session)
-                .is_some_and(|l| l.answered.contains(&answer_key));
             let multi_select = item.multi_select;
             let selected_set = self
                 .chat
@@ -530,14 +736,14 @@ impl Shell {
                 .and_then(|l| l.multi_selected.get(&answer_key))
                 .cloned()
                 .unwrap_or_default();
-            let option_labels: Vec<String> = item.options.iter().map(|o| o.label.clone()).collect();
             let mut opts_row = div().flex().flex_wrap().gap_1p5();
             for (opt_idx, opt) in item.options.iter().enumerate() {
-                let key_clone = answer_key.clone();
-                let labels_clone = option_labels.clone();
+                let request_clone = request.clone();
                 let is_checked = selected_set.contains(&opt_idx);
                 let prefix = if multi_select {
                     if is_checked { "[✓] " } else { "[ ] " }
+                } else if is_checked {
+                    "✓ "
                 } else {
                     ""
                 };
@@ -551,18 +757,17 @@ impl Shell {
                         "chat-q-{}-{abs_idx}-{opt_idx}",
                         pane.get()
                     )))
+                    .debug_selector(|| "chat-question-option".into())
                     .label(label)
                     .small()
                     .ghost()
-                    .disabled(answered)
+                    .disabled(disabled)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if multi_select {
-                            this.toggle_chat_multi_option(session, key_clone.clone(), opt_idx, cx);
+                            this.toggle_chat_multi_option(&request_clone, opt_idx, cx);
                         } else {
                             this.answer_chat_question(
-                                session,
-                                key_clone.clone(),
-                                &labels_clone,
+                                request_clone.clone(),
                                 vec![opt_idx],
                                 false,
                                 cx,
@@ -572,32 +777,26 @@ impl Shell {
                 );
             }
             if multi_select {
-                let key_submit = answer_key.clone();
-                let labels_submit = option_labels;
+                let request_submit = request.clone();
                 let picks: Vec<usize> = selected_set.into_iter().collect();
                 opts_row = opts_row.child(
                     Button::new(SharedString::from(format!(
                         "chat-q-submit-{}-{abs_idx}",
                         pane.get()
                     )))
-                    .label(format!("{} ({})", ctext::SUBMIT.get(), picks.len()))
+                    .debug_selector(|| "chat-question-submit".into())
+                    .label(ctext::SUBMIT.format(&[("n", &picks.len().to_string())]))
                     .small()
                     .primary()
-                    .disabled(answered || picks.is_empty())
+                    .disabled(disabled || picks.is_empty())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.answer_chat_question(
-                            session,
-                            key_submit.clone(),
-                            &labels_submit,
-                            picks.clone(),
-                            true,
-                            cx,
-                        );
+                        this.answer_chat_question(request_submit.clone(), picks.clone(), true, cx);
                     })),
                 );
             }
             card = card.child(opts_row);
         } else if item.kind == ChatItemKind::Permission {
+            let yes_request = request.clone();
             card = card.child(
                 div()
                     .flex()
@@ -608,11 +807,13 @@ impl Shell {
                             "chat-perm-yes-{}-{abs_idx}",
                             pane.get()
                         )))
+                        .debug_selector(|| "chat-permission-approve".into())
+                        .disabled(disabled)
                         .label(ctext::APPROVE.get())
                         .small()
                         .primary()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.approve_chat_permission(session, true, cx);
+                            this.approve_chat_permission(yes_request.clone(), true, cx);
                         })),
                     )
                     .child(
@@ -620,11 +821,13 @@ impl Shell {
                             "chat-perm-no-{}-{abs_idx}",
                             pane.get()
                         )))
+                        .debug_selector(|| "chat-permission-deny".into())
+                        .disabled(disabled)
                         .label(ctext::DENY.get())
                         .small()
                         .ghost()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.approve_chat_permission(session, false, cx);
+                            this.approve_chat_permission(request.clone(), false, cx);
                         })),
                     ),
             );
@@ -646,6 +849,7 @@ impl Shell {
         if !self.chat.active_sessions.contains(&session) {
             return None;
         }
+        self.ensure_chat_poll_timer(cx);
         let input_state = self.ensure_chat_input(session, window, cx);
         let theme = cx.theme();
         let bg = theme.background;
@@ -815,13 +1019,17 @@ impl Shell {
                             "desktop-chat-switch-term-{}",
                             pane.get()
                         )))
+                        .debug_selector(|| "chat-switch-terminal".into())
                         .label(ctext::TERM.get())
                         .ghost()
                         .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chat.active_sessions.remove(&session);
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.chat.active_sessions.remove(&session);
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            },
+                        )),
                     ),
             );
 
@@ -837,10 +1045,40 @@ impl Shell {
                 .left_0()
                 .size_full()
                 .occlude()
+                // Consume bubbling events before the enclosing terminal pane can
+                // interpret chat clicks, selections, or scrolling as PTY input.
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.layout.focused() != Some(pane) {
+                            this.change(true, cx, |layout| {
+                                layout.focus(pane);
+                            });
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(gpui::MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(gpui::MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .flex()
                 .flex_col()
                 .bg(bg)
                 .child(feed)
+                .children(self.chat.poll_failed.contains(&session).then(|| {
+                    ui::error_banner(ui::palette(cx), ctext::POLL_FAILED.get())
+                        .id("chat-poll-error")
+                        .debug_selector(|| "chat-poll-error".into())
+                }))
+                .children(self.chat.prompt_failed.contains(&session).then(|| {
+                    ui::error_banner(ui::palette(cx), ctext::PROMPT_FAILED.get())
+                        .id("chat-prompt-error")
+                        .debug_selector(|| "chat-prompt-error".into())
+                }))
                 .child(composer)
                 .child(strip)
                 .into_any_element(),

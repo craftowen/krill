@@ -58,7 +58,7 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
             continue;
         }
         let mut stamp: Stamp = [
-            "",
+            "antigravity-oauth-token",
             ".claude.json",
             "auth.json",
             ".credentials.json",
@@ -93,6 +93,42 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                     );
                 }
                 status
+            }
+            _ if provider == ProviderKind::Antigravity => {
+                let status = super::super::direct::antigravity_auth(&dir, false);
+                if !host || status.as_ref().is_some_and(|s| s.logged_in) {
+                    lock(&STATES).insert(
+                        key.clone(),
+                        status.as_ref().map_or(ConnectionStatus::CheckFailed, |s| {
+                            if s.logged_in {
+                                ConnectionStatus::Connected
+                            } else {
+                                ConnectionStatus::NeedsLogin
+                            }
+                        }),
+                    );
+                    lock(&CACHE).insert(key.clone(), (Instant::now(), stamp, status.clone()));
+                    if !host {
+                        super::super::provision::provision_if_enabled(
+                            home,
+                            state,
+                            provider,
+                            &dir.to_string_lossy(),
+                        );
+                    }
+                    status
+                } else {
+                    lock(&STATES).insert(key.clone(), ConnectionStatus::Checking);
+                    spawn_probe(
+                        exe,
+                        &key,
+                        stamp,
+                        host,
+                        home.to_path_buf(),
+                        state.map(Path::to_path_buf),
+                    );
+                    None
+                }
             }
             // 처음이거나 파일이 바뀌었다(로그인·로그아웃): 새 결과가 올 때까지 모름.
             _ => {
@@ -166,7 +202,7 @@ fn spawn_probe(
                 }),
             );
             let mut cache = lock(&CACHE);
-            cache.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(60));
+            cache.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(300));
             cache.insert(job.clone(), (Instant::now(), stamp, status));
             drop(cache);
             // 기록 이행은 별도 작업으로 보낸다. 사용 중이던 프로필도 종료 후 다음 조회에서 재시도한다.
@@ -277,6 +313,19 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        // cli.log 등 비자격증명 파일 생성으로 디렉터리 mtime이 바뀌어도 Connected 캐시가 Checking으로 흔들리지 않아야 한다.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join("cli.log"), "runtime log churn\n").unwrap();
+        let after_log = statuses(&home, Some(&state));
+        assert!(
+            after_log
+                .get(&(ProviderKind::Claude, dir.clone()))
+                .is_some_and(|s| s.logged_in)
+        );
+        assert_eq!(
+            connection(ProviderKind::Claude, &dir),
+            ConnectionStatus::Connected
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

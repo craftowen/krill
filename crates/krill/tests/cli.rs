@@ -1285,661 +1285,262 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     ignore = "macOS 전용: krill computer(접근성 API)"
 )]
 fn computer_cli_subcommands_and_skill_work_offline() {
-    let dir = std::env::temp_dir().join(format!("mk187-computer-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("m13-computer-contract-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).unwrap();
-
-    // 공유 CARGO_TARGET_DIR 환경에서 다른 워커가 debug/krill을 덮어써도
-    // 현재 워크트리의 deps/krill-* 바이너리를 고정 복사해 사용한다.
-    let bin_path = {
-        let candidate_supports_computer = |p: &Path| -> bool {
-            Command::new(p)
-                .args(["computer", "capabilities", "--json"])
-                .env("KRILL_STATE_DIR", &dir)
-                .env("KRILL_TEST_OFFLINE", "1")
-                .output()
-                .is_ok_and(|out| {
-                    out.status.success()
-                        && String::from_utf8_lossy(&out.stdout)
-                            .contains("\"performSecondaryAction\"")
-                })
-        };
-        let mk_path = PathBuf::from(MK);
-        let chosen = if candidate_supports_computer(&mk_path) {
-            mk_path
-        } else {
-            let deps = mk_path.parent().unwrap().join("deps");
-            let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&deps)
-                .unwrap()
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("krill-") && !n.contains('.'))
-                })
-                .filter_map(|p| {
-                    let mtime = p.metadata().ok()?.modified().ok()?;
-                    Some((mtime, p))
-                })
-                .collect();
-            candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
-            candidates
-                .into_iter()
-                .map(|(_, p)| p)
-                .find(|p| candidate_supports_computer(p))
-                .unwrap_or(mk_path)
-        };
-        let pinned = dir.join("krill-bin");
-        fs::copy(&chosen, &pinned).unwrap();
-        pinned
-    };
-
-    let run_cli = |args: &[&str]| -> Output {
-        Command::new(&bin_path)
+    let bin = dir.join("krill-bin");
+    fs::copy(MK, &bin).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(&bin)
             .args(args)
             .env("KRILL_STATE_DIR", &dir)
-            .env("HOME", &dir)
             .env("KRILL_TEST_OFFLINE", "1")
             .output()
             .unwrap()
     };
-    let ok_cli = |args: &[&str]| -> String {
-        let out = run_cli(args);
+    let ok = |args: &[&str]| {
+        let out = run(args);
         assert!(
             out.status.success(),
             "{args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8(out.stdout).unwrap()
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
     };
-
-    // 1. computer-use built-in skill list/get/install
-    let skills_json: serde_json::Value =
-        serde_json::from_str(&ok_cli(&["skills", "list", "--json"])).unwrap();
+    let tree = serde_json::json!({"role":"AXWindow","title":"Fixture","bounds":{"x":0,"y":0,"width":400,"height":300},
+    "children":[
+        {"role":"AXTextField","title":"Input","value":"initial","focused":true,
+         "bounds":{"x":10,"y":20,"width":200,"height":30},"actions":["AXConfirm"]},
+        {"role":"AXButton","title":"Save","bounds":{"x":220,"y":20,"width":60,"height":30},"actions":["AXPress"]}
+    ]});
+    let initial = serde_json::json!({"clipboard":"private clipboard secret","clipboardRestoreCount":0,
+        "apps":[{"name":"Fixture","pid":7777,"isActive":true,"windows":[{
+            "id":"101","title":"Fixture","bounds":{"x":0,"y":0,"width":400,"height":300},"root":tree}]}]});
+    let path = dir.join("computer-mock.json");
+    let save =
+        |value: &serde_json::Value| fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+    save(&initial);
     assert!(
-        skills_json
+        !run(&[
+            "computer",
+            "click",
+            "--app",
+            "Fixture",
+            "--element",
+            "1",
+            "--json"
+        ])
+        .status
+        .success()
+    );
+    let skill = run(&["skills", "get", "computer-use"]);
+    assert!(skill.status.success());
+    assert!(String::from_utf8_lossy(&skill.stdout).contains("get-app-state"));
+    let capabilities = ok(&["computer", "capabilities", "--json"]);
+    assert_eq!(capabilities["contract"], "computer/2");
+    assert_eq!(capabilities["batchSupported"], false);
+    assert!(
+        capabilities["guideHash"]
+            .as_str()
+            .unwrap()
+            .starts_with("fnv1a64:")
+    );
+    let permissions = ok(&["computer", "permissions", "--json"]);
+    assert!(permissions["supported"].as_bool().unwrap());
+    let apps = ok(&["computer", "list-apps", "--json"]);
+    assert!(
+        apps["apps"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["name"] == "computer-use")
+            .any(|app| app["pid"] == 7777)
     );
-    let skill_md = ok_cli(&["skills", "get", "computer-use"]);
-    assert!(skill_md.contains("krill computer get-app-state"));
-    assert!(skill_md.contains("krill computer paste-text"));
-
-    // 2. Write mock environment for deterministic offline testing of all 14 subcommands
-    fs::write(
-        dir.join("computer-mock.json"),
-        r#"{
-  "accessibilityGranted": true,
-  "screenshotsGranted": true,
-  "clipboard": "original-clipboard-value",
-  "clipboardRestoreCount": 0,
-  "apps": [
-    {
-      "name": "Calculator",
-      "bundleId": "com.apple.calculator",
-      "pid": 4242,
-      "isActive": true,
-      "isHidden": false,
-      "windows": [
-        {
-          "id": "101",
-          "title": "Calculator",
-          "bounds": { "x": 100.0, "y": 100.0, "width": 400.0, "height": 300.0 },
-          "isFocused": true,
-          "isMain": true,
-          "isMinimized": false,
-          "root": {
-            "role": "AXWindow",
-            "title": "Calculator",
-            "bounds": { "x": 100.0, "y": 100.0, "width": 400.0, "height": 300.0 },
-            "enabled": true,
-            "focused": false,
-            "selected": false,
-            "actions": [],
-            "children": [
-              {
-                "role": "AXTextField",
-                "title": "Input",
-                "value": "0",
-                "bounds": { "x": 120.0, "y": 130.0, "width": 200.0, "height": 30.0 },
-                "enabled": true,
-                "focused": true,
-                "selected": false,
-                "actions": ["AXConfirm"],
-                "children": []
-              },
-              {
-                "role": "AXButton",
-                "title": "Equals",
-                "bounds": { "x": 340.0, "y": 130.0, "width": 50.0, "height": 30.0 },
-                "enabled": true,
-                "focused": false,
-                "selected": false,
-                "actions": ["AXPress", "AXShowMenu"],
-                "children": []
-              }
-            ]
-          }
-        }
-      ]
-    }
-  ]
-}"#,
-    )
-    .unwrap();
-
-    let caps: serde_json::Value =
-        serde_json::from_str(&ok_cli(&["computer", "capabilities", "--json"])).unwrap();
-    assert_eq!(caps["supported"], true);
-    assert_eq!(caps["actions"].as_array().unwrap().len(), 12);
-
-    let perms: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "permissions",
-        "--id",
-        "accessibility",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(perms["allGranted"], true);
-    assert_eq!(perms["permissions"][0]["id"], "accessibility");
-
-    let apps: serde_json::Value =
-        serde_json::from_str(&ok_cli(&["computer", "list-apps", "--json"])).unwrap();
-    assert_eq!(apps["apps"][0]["name"], "Calculator");
-
-    let wins: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "list-windows",
-        "--app",
-        "Calculator",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(wins["windows"][0]["id"], "101");
-
-    let state: serde_json::Value = serde_json::from_str(&ok_cli(&[
+    let windows = ok(&["computer", "list-windows", "--app", "Fixture", "--json"]);
+    assert_eq!(windows["windows"][0]["id"], "101");
+    let snapshot = ok(&[
         "computer",
         "get-app-state",
         "--app",
-        "Calculator",
+        "Fixture",
+        "--no-screenshot",
         "--json",
-    ]))
-    .unwrap();
-    assert_eq!(state["interactiveCount"], 2);
-    assert_eq!(state["focusedElementId"], 1);
-    assert!(
-        state["treeText"]
-            .as_str()
-            .unwrap()
-            .contains("[#1] AXTextField")
-    );
-
-    let set_val: serde_json::Value = serde_json::from_str(&ok_cli(&[
+    ]);
+    let id = snapshot["snapshotId"].as_str().unwrap();
+    let snapshot_again = ok(&[
+        "computer",
+        "get-app-state",
+        "--app",
+        "Fixture",
+        "--no-screenshot",
+        "--json",
+    ]);
+    assert_ne!(snapshot["snapshotId"], snapshot_again["snapshotId"]);
+    let long = format!("{}tail", "가".repeat(900));
+    let set = ok(&[
         "computer",
         "set-value",
+        "--snapshot",
+        id,
         "--element",
         "1",
         "--value",
-        "123",
+        &long,
+        "--no-screenshot",
         "--json",
-    ]))
-    .unwrap();
-    assert_eq!(set_val["verification"]["status"], "verified");
-    assert_eq!(set_val["appState"]["elements"][0]["value"], "123");
-
-    let typed: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "type-text",
-        "--element",
-        "1",
-        "--text",
-        "+45",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(typed["appState"]["elements"][0]["value"], "123+45");
-
-    let pasted: serde_json::Value = serde_json::from_str(&ok_cli(&[
+    ]);
+    assert_eq!(set["verification"]["status"], "verified");
+    assert_eq!(set["delivery"], "submitted");
+    assert_eq!(set["observation"]["status"], "observed");
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        stored["apps"][0]["windows"][0]["root"]["children"][0]["value"],
+        long
+    );
+    let paste = ok(&[
         "computer",
         "paste-text",
         "--element",
         "1",
         "--text",
-        "+6",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(pasted["clipboard"]["preserved"], true);
-    assert_eq!(pasted["clipboard"]["restored"], true);
-    assert_eq!(
-        pasted["clipboard"]["previousText"],
-        "original-clipboard-value"
-    );
-    assert_eq!(pasted["appState"]["elements"][0]["value"], "123+45+6");
-
-    let clicked: serde_json::Value =
-        serde_json::from_str(&ok_cli(&["computer", "click", "--element", "2", "--json"])).unwrap();
-    assert_eq!(clicked["verification"]["status"], "verified");
-    assert_eq!(clicked["appState"]["focusedElementId"], 2);
-
-    let secondary: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "perform-secondary-action",
-        "--element",
-        "2",
-        "--action",
-        "AXShowMenu",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(secondary["action"], "performSecondaryAction");
-
-    let scrolled: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "scroll",
-        "--element",
-        "1",
-        "--delta-y",
-        "-120",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(scrolled["action"], "scroll");
-
-    let dragged: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "drag",
-        "--from-element",
-        "1",
-        "--to-element",
-        "2",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(dragged["action"], "drag");
-
-    let key_res: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "press-key",
-        "--key",
-        "Return",
-        "--modifiers",
-        "shift",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(key_res["action"], "pressKey");
-
-    let hotkey_res: serde_json::Value = serde_json::from_str(&ok_cli(&[
-        "computer",
-        "hotkey",
-        "--keys",
-        "Command+Shift+P",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(hotkey_res["action"], "hotkey");
-
-    // 3. Live mode verification (without computer-mock.json) using fake osascript binary (OWE-746)
-    fs::remove_file(dir.join("computer-mock.json")).unwrap();
-    fs::remove_file(dir.join("computer-state.json")).ok();
-
-    let fake_osascript = dir.join("fake-osascript.sh");
-    let action_log = dir.join("jxa-actions.jsonl");
-    let value_file = dir.join("live-value.txt");
-    fs::write(&value_file, "initial-doc2").unwrap();
-    fs::write(
-        &fake_osascript,
-        format!(
-            r#"#!/bin/sh
-SCRIPT="$4"
-shift 4
-case "$SCRIPT" in
-  *"runningApplications"*)
-    printf '[{{"name":"TextEdit","bundleId":"com.apple.TextEdit","pid":7777,"isActive":true,"isHidden":false}}]\n'
-    ;;
-  *"CGWindowListCopyWindowInfo"*)
-    printf '[{{"id":"501","index":1,"title":"Doc 1","appName":"TextEdit","bundleId":"com.apple.TextEdit","pid":7777,"bounds":{{"x":10.0,"y":10.0,"width":500.0,"height":400.0}},"isFocused":true,"isMain":true,"isMinimized":false}},{{"id":"502","index":2,"title":"Doc 2","appName":"TextEdit","bundleId":"com.apple.TextEdit","pid":7777,"bounds":{{"x":600.0,"y":10.0,"width":500.0,"height":400.0}},"isFocused":false,"isMain":false,"isMinimized":false}}]\n'
-    ;;
-  *"selectTargetWindow"* )
-    case "$SCRIPT" in
-      *"executeRequest"*)
-        REQ="$1"
-        printf '%s\n' "$REQ" >> "{log}"
-        case "$REQ" in
-          *'"kind":"setValue"'*)
-            printf 'abc' > "{val}"
-            ;;
-        esac
-        if [ -n "$FAKE_JXA_FAIL" ]; then
-          printf '{{"ok":false,"status":"unverified","reason":"simulated live failure","note":null}}\n'
-        else
-          printf '{{"ok":true,"status":"verified","reason":null,"note":"simulated live dispatch"}}\n'
-        fi
-        ;;
-      *)
-        WIN_ID="$4"
-        WIN_IDX="$5"
-        WIN_TITLE="$6"
-        CUR_VAL="$(cat "{val}")"
-        if [ "$WIN_IDX" = "2" ] || [ "$WIN_ID" = "502" ]; then
-          printf '{{"role":"AXWindow","title":"%s","bounds":{{"x":600.0,"y":10.0,"width":500.0,"height":400.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXTextArea","title":"SecondWindowEditor","value":"%s","bounds":{{"x":620.0,"y":40.0,"width":400.0,"height":300.0}},"enabled":true,"focused":true,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n' "$WIN_TITLE" "$CUR_VAL"
-        else
-          printf '{{"role":"AXWindow","title":"Doc 1","bounds":{{"x":10.0,"y":10.0,"width":500.0,"height":400.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXTextArea","title":"FirstWindowEditor","value":"%s","bounds":{{"x":20.0,"y":40.0,"width":400.0,"height":300.0}},"enabled":true,"focused":true,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n' "$CUR_VAL"
-        fi
-        ;;
-    esac
-    ;;
-esac
-"#,
-            log = action_log.display(),
-            val = value_file.display(),
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake_osascript, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let ok_live = |args: &[&str]| -> serde_json::Value {
-        let out = Command::new(&bin_path)
-            .args(args)
-            .env("KRILL_STATE_DIR", &dir)
-            .env("HOME", &dir)
-            .env("KRILL_TEST_OFFLINE", "1")
-            .env("KRILL_COMPUTER_OSASCRIPT_BIN", &fake_osascript)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap()
-    };
-
-    // Scenario 2: snapshot --window-index 2 queries Window 2's AX tree instead of wins[0]
-    let snap2 = ok_live(&[
-        "computer",
-        "snapshot",
-        "--app",
-        "TextEdit",
-        "--window-index",
-        "2",
+        " pasted",
+        "--no-screenshot",
         "--json",
     ]);
-    assert_eq!(snap2["window"]["id"], "502");
-    assert_eq!(snap2["window"]["index"], 2);
-    assert_eq!(snap2["elements"][0]["label"], "SecondWindowEditor");
-
-    // Scenario 1 & 3: live actions with --ref @e1, --dy, and --app pid:<PID>
-    let live_click = ok_live(&[
-        "computer", "click", "--app", "TextEdit", "--ref", "@e1", "--json",
-    ]);
-    assert_eq!(live_click["ok"], true);
-    assert_eq!(live_click["verification"]["status"], "verified");
-
-    let live_pid_click = ok_live(&[
-        "computer", "click", "--app", "pid:7777", "--x", "100", "--y", "100", "--json",
-    ]);
-    assert_eq!(live_pid_click["ok"], true);
-    assert_eq!(live_pid_click["appState"]["app"]["name"], "TextEdit");
-
-    let live_type = ok_live(&[
-        "computer",
-        "type-text",
-        "--app",
-        "TextEdit",
-        "--text",
-        "hello",
-        "--json",
-    ]);
-    assert_eq!(live_type["ok"], true);
-
-    let live_key = ok_live(&[
-        "computer",
-        "press-key",
-        "--app",
-        "TextEdit",
-        "--key",
-        "Return",
-        "--json",
-    ]);
-    assert_eq!(live_key["ok"], true);
-
-    let live_hotkey = ok_live(&[
-        "computer", "hotkey", "--app", "TextEdit", "--keys", "cmd+a", "--json",
-    ]);
-    assert_eq!(live_hotkey["ok"], true);
-
-    let live_scroll = ok_live(&[
-        "computer", "scroll", "--app", "TextEdit", "--dy", "-120", "--json",
-    ]);
-    assert_eq!(live_scroll["ok"], true);
-
-    let live_drag = ok_live(&[
-        "computer", "drag", "--app", "TextEdit", "--from-x", "10", "--from-y", "10", "--to-x",
-        "50", "--to-y", "50", "--json",
-    ]);
-    assert_eq!(live_drag["ok"], true);
-
-    let live_set = ok_live(&[
-        "computer",
-        "set-value",
-        "--app",
-        "TextEdit",
-        "--ref",
-        "@e1",
-        "--value",
-        "abc",
-        "--json",
-    ]);
-    assert_eq!(live_set["ok"], true);
-    assert_eq!(live_set["verification"]["status"], "verified");
-
-    // Verify logged JXA payloads resolved pid:7777 -> appName "TextEdit" & pid 7777
-    let logged = fs::read_to_string(&action_log).unwrap();
-    let payloads: Vec<serde_json::Value> = logged
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(payloads.len(), 8);
+    assert_eq!(paste["clipboard"]["preserved"], true);
+    assert_eq!(paste["clipboard"]["restored"], true);
+    assert_eq!(paste["cleanup"], "completed");
+    assert!(paste["clipboard"].get("previousText").is_none());
     assert!(
-        payloads
-            .iter()
-            .all(|p| p["appName"] == "TextEdit" && p["pid"] == 7777)
-    );
-    assert_eq!(payloads[0]["kind"], "click");
-    assert_eq!(payloads[0]["targetRef"], 1);
-    assert_eq!(payloads[1]["kind"], "click");
-    assert_eq!(payloads[2]["kind"], "typeText");
-    assert_eq!(payloads[3]["kind"], "pressKey");
-    assert_eq!(payloads[4]["kind"], "hotkey");
-    assert_eq!(payloads[5]["kind"], "scroll");
-    assert_eq!(payloads[6]["kind"], "drag");
-    assert_eq!(payloads[7]["kind"], "setValue");
-
-    // Verify failed/unverified live JXA outcome is reported honestly as ok: false, status: "unverified"
-    let fail_out = Command::new(&bin_path)
-        .args([
-            "computer", "click", "--app", "TextEdit", "--ref", "@e1", "--json",
-        ])
-        .env("KRILL_STATE_DIR", &dir)
-        .env("HOME", &dir)
-        .env("KRILL_TEST_OFFLINE", "1")
-        .env("KRILL_COMPUTER_OSASCRIPT_BIN", &fake_osascript)
-        .env("FAKE_JXA_FAIL", "1")
-        .output()
-        .unwrap();
-    assert!(fail_out.status.success());
-    let fail_json: serde_json::Value = serde_json::from_slice(&fail_out.stdout).unwrap();
-    assert_eq!(fail_json["ok"], false);
-    assert_eq!(fail_json["verification"]["status"], "unverified");
-
-    // Scenario 4: oversized --text-stdin stream (> 65536 bytes) is rejected
-    let mut child = Command::new(&bin_path)
-        .args([
-            "computer",
-            "type-text",
-            "--app",
-            "TextEdit",
-            "--text-stdin",
-            "--json",
-        ])
-        .env("KRILL_STATE_DIR", &dir)
-        .env("HOME", &dir)
-        .env("KRILL_TEST_OFFLINE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    {
-        use std::io::Write as _;
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(&vec![b'a'; 70_000]).ok();
-    }
-    let big_out = child.wait_with_output().unwrap();
-    assert_eq!(big_out.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&big_out.stderr).contains("exceeds maximum length"),
-        "{}",
-        String::from_utf8_lossy(&big_out.stderr)
-    );
-
-    // Scenario 5 (OWE-775 / OWE-804): duplicate process names with --app pid:<N> and real /usr/bin/osascript JXA execution
-    let dup_osascript = dir.join("dup-osascript.sh");
-    let dup_log = dir.join("dup-jxa-actions.jsonl");
-    fs::write(
-        &dup_osascript,
-        format!(
-            r#"#!/bin/sh
-SCRIPT="$4"
-shift 4
-case "$SCRIPT" in
-  *"runningApplications"*)
-    printf '[{{"name":"krill-app","bundleId":null,"pid":69917,"isActive":false,"isHidden":false}},{{"name":"krill-app","bundleId":null,"pid":37140,"isActive":true,"isHidden":false}}]\n'
-    ;;
-  *"CGWindowListCopyWindowInfo"*)
-    if [ "$1" = "37140" ]; then
-      printf '[{{"id":"2747","index":1,"title":"Krill","appName":"krill-app","bundleId":null,"pid":37140,"bounds":{{"x":680.0,"y":310.0,"width":1200.0,"height":760.0}},"isFocused":true,"isMain":true,"isMinimized":false}}]\n'
-    else
-      printf '[{{"id":"1001","index":1,"title":"Krill","appName":"krill-app","bundleId":null,"pid":69917,"bounds":{{"x":0.0,"y":30.0,"width":2560.0,"height":1319.0}},"isFocused":true,"isMain":true,"isMinimized":false}}]\n'
-    fi
-    ;;
-  *"selectTargetWindow"*)
-    case "$SCRIPT" in
-      *"executeRequest"*)
-        printf '%s\n' "$1" >> "{dup_log}"
-        printf '{{"ok":true,"status":"verified","reason":null,"note":"performed AXPress"}}\n'
-        ;;
-      *)
-        if [ "$1" = "37140" ]; then
-          printf '{{"role":"AXWindow","title":"Krill","bounds":{{"x":680.0,"y":310.0,"width":1200.0,"height":760.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXButton","title":"IsolatedButton","value":null,"bounds":{{"x":700.0,"y":350.0,"width":80.0,"height":24.0}},"enabled":true,"focused":false,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n'
-        else
-          printf '{{"role":"AXWindow","title":"Krill","bounds":{{"x":0.0,"y":30.0,"width":2560.0,"height":1319.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXButton","title":"PrimaryButton","value":null,"bounds":{{"x":20.0,"y":60.0,"width":80.0,"height":24.0}},"enabled":true,"focused":false,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n'
-        fi
-        ;;
-    esac
-    ;;
-esac
-"#,
-            dup_log = dup_log.display(),
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dup_osascript, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let ok_dup = |args: &[&str]| -> serde_json::Value {
-        let out = Command::new(&bin_path)
-            .args(args)
-            .env("KRILL_STATE_DIR", &dir)
-            .env("HOME", &dir)
-            .env("KRILL_TEST_OFFLINE", "1")
-            .env("KRILL_COMPUTER_OSASCRIPT_BIN", &dup_osascript)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice(&out.stdout).unwrap()
-    };
-
-    let dup_state = ok_dup(&["computer", "get-app-state", "--app", "pid:37140", "--json"]);
-    assert_eq!(dup_state["app"]["pid"], 37140);
-    assert_eq!(dup_state["window"]["id"], "2747");
-    assert_eq!(dup_state["window"]["bounds"]["width"], 1200.0);
-    assert_eq!(dup_state["window"]["bounds"]["height"], 760.0);
-    assert!(
-        dup_state["treeText"].as_str().unwrap().contains("1200x760"),
-        "expected isolated window bounds in treeText, got: {}",
-        dup_state["treeText"]
-    );
-    assert_eq!(dup_state["elements"][0]["label"], "IsolatedButton");
-
-    // Subsequent action without --app must preserve cached pid:37140 instead of falling back to first krill-app (pid:69917)
-    let dup_click = ok_dup(&["computer", "click", "--element", "1", "--json"]);
-    assert_eq!(dup_click["ok"], true);
-    assert_eq!(dup_click["appState"]["app"]["pid"], 37140);
-    assert_eq!(dup_click["appState"]["window"]["id"], "2747");
-    let dup_logged: serde_json::Value = serde_json::from_str(
-        fs::read_to_string(&dup_log)
+        !serde_json::to_string(&paste)
             .unwrap()
-            .lines()
-            .next()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(dup_logged["pid"], 37140);
-    assert_eq!(dup_logged["winId"], "2747");
+            .contains("private clipboard secret")
+    );
+    let click = ok(&[
+        "computer",
+        "click",
+        "--element",
+        "2",
+        "--no-screenshot",
+        "--json",
+    ]);
+    assert_eq!(click["verification"]["status"], "unverified");
+    assert_eq!(click["verification"]["retried"], false);
+    assert_eq!(click["delivery"], "submitted");
+    assert!(
+        !run(&["computer", "click", "--x", "999", "--y", "999", "--json"])
+            .status
+            .success()
+    );
 
-    if cfg!(target_os = "macos") && Path::new("/usr/bin/osascript").exists() {
-        let apps_out = Command::new(&bin_path)
-            .args(["computer", "list-apps", "--json"])
-            .env("KRILL_STATE_DIR", &dir)
-            .env("HOME", &dir)
-            .env("KRILL_TEST_OFFLINE", "1")
-            .env_remove("KRILL_COMPUTER_OSASCRIPT_BIN")
-            .output()
-            .unwrap();
-        assert!(
-            apps_out.status.success(),
-            "real list-apps failed: {}",
-            String::from_utf8_lossy(&apps_out.stderr)
-        );
-        let apps_json: serde_json::Value = serde_json::from_slice(&apps_out.stdout).unwrap();
-        let apps_arr = apps_json["apps"].as_array().unwrap();
-        if let Some(first_app) = apps_arr.first() {
-            let pid = first_app["pid"].as_u64().unwrap();
-            let pid_sel = format!("pid:{pid}");
-            let wins_out = Command::new(&bin_path)
-                .args(["computer", "list-windows", "--app", &pid_sel, "--json"])
-                .env("KRILL_STATE_DIR", &dir)
-                .env("HOME", &dir)
-                .env("KRILL_TEST_OFFLINE", "1")
-                .env_remove("KRILL_COMPUTER_OSASCRIPT_BIN")
-                .output()
-                .unwrap();
-            assert!(
-                wins_out.status.success(),
-                "real list-windows --app {pid_sel} failed: {}",
-                String::from_utf8_lossy(&wins_out.stderr)
-            );
-            let wins_json: serde_json::Value = serde_json::from_slice(&wins_out.stdout).unwrap();
-            assert!(wins_json["windows"].is_array());
-        }
+    // Keep the legacy public actions and aliases executable through the real CLI.
+    // Each command gets fresh immutable evidence, so this is not stale-index reuse.
+    for action in [
+        vec![
+            "perform-secondary-action",
+            "--element-index",
+            "1",
+            "--action",
+            "AXConfirm",
+        ],
+        vec!["type-text", "--element-index", "1", "--text", "typed"],
+        vec!["press-key", "--key", "return", "--repeat", "2"],
+        vec!["hotkey", "--key", "cmd+shift+p"],
+        vec![
+            "scroll",
+            "--element-index",
+            "2",
+            "--direction",
+            "down",
+            "--pages",
+            "1",
+        ],
+        vec![
+            "drag",
+            "--from-element-index",
+            "1",
+            "--to-element-index",
+            "2",
+        ],
+        vec!["click", "--x", "250", "--y", "35", "--mouse-button", "left"],
+    ] {
+        save(&initial);
+        ok(&[
+            "computer",
+            "get-app-state",
+            "--app",
+            "Fixture",
+            "--format",
+            "full",
+            "--json",
+        ]);
+        let mut arguments = vec!["computer"];
+        arguments.extend(action);
+        arguments.extend(["--no-screenshot", "--json"]);
+        let result = ok(&arguments);
+        assert_eq!(result["delivery"], "submitted", "{arguments:?}: {result}");
+        assert_eq!(result["verification"]["status"], "unverified");
+        assert_eq!(result["verification"]["retried"], false);
     }
 
+    // Each rejected stale/ambiguous ref must leave the effect journal untouched.
+    for adversary in ["reorder", "ambiguous", "window_replaced", "disabled"] {
+        save(&initial);
+        let before = ok(&[
+            "computer",
+            "get-app-state",
+            "--app",
+            "Fixture",
+            "--no-screenshot",
+            "--json",
+        ]);
+        let token = before["snapshotId"].as_str().unwrap();
+        let mut changed = initial.clone();
+        let children = changed["apps"][0]["windows"][0]["root"]["children"]
+            .as_array_mut()
+            .unwrap();
+        match adversary {
+            "reorder" => children.swap(0, 1),
+            "ambiguous" => children.push(children[0].clone()),
+            "disabled" => children[0]["enabled"] = serde_json::json!(false),
+            _ => changed["apps"][0]["windows"][0]["id"] = serde_json::json!("102"),
+        }
+        save(&changed);
+        let out = run(&[
+            "computer",
+            "click",
+            "--snapshot",
+            token,
+            "--element",
+            "1",
+            "--no-screenshot",
+            "--json",
+        ]);
+        assert!(
+            !out.status.success(),
+            "{adversary}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(after["lastAction"].is_null(), "{adversary} mutated target");
+    }
+    let mut host = initial.clone();
+    host["apps"][0]["name"] = serde_json::json!("krill-app");
+    host["apps"][0]["isHidden"] = serde_json::json!(true);
+    save(&host);
+    assert!(
+        !run(&[
+            "computer",
+            "get-app-state",
+            "--app",
+            "krill-app",
+            "--restore-window",
+            "--json"
+        ])
+        .status
+        .success()
+    );
+    let host_after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(host_after["apps"][0]["isHidden"], true);
     fs::remove_dir_all(&dir).ok();
 }
 

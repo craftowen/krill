@@ -206,20 +206,167 @@ fn codex_hooks_follow_complete_receipt_only() {
             "codex": {"path": "/x/config.toml", "command": "fixed 'cmd'", "added": {}}});
         std::fs::write(hooks::receipt(&dir, Agent::Codex), r.to_string()).unwrap();
     };
-    assert!(codex_hooks(codex, Some(&dir)).is_none(), "no receipt");
+    assert!(
+        codex_hooks(codex, Some(&dir), &[]).unwrap().is_none(),
+        "no receipt"
+    );
     receipt(false);
     assert!(
-        codex_hooks(codex, Some(&dir)).is_none(),
+        codex_hooks(codex, Some(&dir), &[]).unwrap().is_none(),
         "interrupted install"
     );
     receipt(true);
-    let hooked = codex_hooks(codex, Some(&dir)).unwrap();
+    let hooked = codex_hooks(codex, Some(&dir), &[]).unwrap().unwrap();
     let mut want = vec!["codex".to_owned()];
     want.extend(hooks::codex_args("fixed 'cmd'"));
     want.extend(codex.launch[1..].iter().cloned());
     assert_eq!(hooked.launch, want);
-    assert!(codex_hooks(&agents.profiles["claude"], Some(&dir)).is_none());
+    assert!(
+        codex_hooks(&agents.profiles["claude"], Some(&dir), &[])
+            .unwrap()
+            .is_none()
+    );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Codex trust는 `CODEX_HOME`마다 따로다. 실행 env가 PREFLIGHT처럼 가리키는 홈만 갱신 대상이다.
+#[test]
+fn codex_trust_home_follows_launch_env_like_preflight() {
+    let env = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| kv(k, v)).collect::<Vec<_>>();
+    // 선택 계정 프로필이 상속된 CODEX_HOME을 대신한다.
+    assert_eq!(
+        codex::launch_home(&env(&[
+            ("CODEX_HOME", "/inherited"),
+            ("KRILL_ACCOUNT_PROVIDER", "codex"),
+            ("KRILL_ACCOUNT_DIR", "/account")
+        ])),
+        Some(PathBuf::from("/account"))
+    );
+    // 호스트 기본 계정은 PREFLIGHT가 CODEX_HOME을 지우므로 설치기 몫이다.
+    assert_eq!(
+        codex::launch_home(&env(&[
+            ("CODEX_HOME", "/inherited"),
+            ("KRILL_ACCOUNT_PROVIDER", "codex"),
+            ("KRILL_ACCOUNT_DIR", "")
+        ])),
+        None
+    );
+    // 계정이 Codex를 맡지 않으면 프로필 env의 홈을 쓴다.
+    assert_eq!(
+        codex::launch_home(&env(&[("CODEX_HOME", "/custom")])),
+        Some(PathBuf::from("/custom"))
+    );
+    assert_eq!(codex::launch_home(&[]), None);
+    // 실제 재개 실행 env도 선택 계정 홈을 가리킨다.
+    let state = std::env::temp_dir().join(format!("kd-codex-home-{}", std::process::id()));
+    std::fs::create_dir_all(&state).unwrap();
+    let agents = Agents::load(None).unwrap();
+    let pinned = LaunchAccount {
+        id: "codex-selected".into(),
+        env_key: "CODEX_HOME".into(),
+        dir: "/selected/codex".into(),
+    };
+    let (launch, _, _) = resume_in(
+        &agents.profiles["codex"],
+        Permission::Manual,
+        krill_proto::SessionId(31),
+        Some(&state),
+        Some("codex-sid"),
+        Some(&pinned),
+    )
+    .unwrap();
+    assert_eq!(
+        codex::launch_home(&launch.env),
+        Some(PathBuf::from("/selected/codex"))
+    );
+    // 프로필 env는 계정 적용 때 이미 들어가 있고, 계정이 Codex를 맡으면 PREFLIGHT처럼 계정 홈이 이긴다.
+    let mut custom = profile(&["codex"]);
+    custom
+        .env
+        .insert("CODEX_HOME".into(), "/profile/custom".into());
+    let (launch, _, _) = resume_in(
+        &custom,
+        Permission::Manual,
+        krill_proto::SessionId(32),
+        Some(&state),
+        Some("codex-sid"),
+        Some(&pinned),
+    )
+    .unwrap();
+    assert_eq!(
+        codex::launch_home(&launch.env),
+        Some(PathBuf::from("/selected/codex"))
+    );
+    std::fs::remove_dir_all(state).ok();
+}
+
+/// 계정 홈은 그 홈의 Codex가 receipt 명령으로 계산한 해시를 받는다. receipt 홈·호스트는 쓰지 않고,
+/// 확인한 홈은 `config.toml`이 바뀔 때만 다시 묻는다.
+#[test]
+fn codex_trust_refreshes_selected_home_only_and_rechecks_after_config_changes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("kd-codex-trust-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let bin = root.join("bin");
+    let host = root.join("home/.codex");
+    let account = root.join("account");
+    for dir in [&bin, &host, &account] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let fake = include_str!("../../../krill/tests/fixtures/mk413-codex.py");
+    let codex_exe = bin.join("codex");
+    let install = || {
+        std::fs::write(&codex_exe, fake).unwrap();
+        std::fs::set_permissions(&codex_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    install();
+    let receipt_config = host.join("config.toml");
+    std::fs::write(&receipt_config, "# installer owned\n").unwrap();
+    let command = "fixed 'cmd'";
+    let search = Some(bin.as_os_str());
+    let refresh =
+        |home: &Path| codex::ensure_trust_in(home, &host, Some(&receipt_config), command, search);
+
+    assert!(
+        !refresh(&host).unwrap(),
+        "receipt home belongs to the installer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&receipt_config).unwrap(),
+        "# installer owned\n"
+    );
+    assert!(refresh(&account).unwrap());
+    let config = account.join("config.toml");
+    let trusted = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(
+        trusted.matches("[hooks.state.").count(),
+        Agent::Codex.events().len()
+    );
+    // 확인한 홈은 Codex 프로세스 없이 넘어간다.
+    std::fs::remove_file(&codex_exe).unwrap();
+    assert!(!refresh(&account).unwrap());
+    // 설정이 바뀌면 다시 묻는다. 실패는 잠깐만 기억하고, 설정이 그대로여도 곧 다시 묻는다.
+    std::fs::write(&config, "model = 'user edit'\n").unwrap();
+    assert_eq!(
+        refresh(&account).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        refresh(&account).unwrap_err().raw_os_error(),
+        Some(libc::EBUSY)
+    );
+    install();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(refresh(&account).unwrap());
+    let value: toml::Value = toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(value["model"].as_str(), Some("user edit"));
+    assert_eq!(
+        value["hooks"]["state"].as_table().unwrap().len(),
+        Agent::Codex.events().len()
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1366,6 +1513,209 @@ fn trust_preset_default_off_preserves_key_order_and_aborts_on_concurrent_modific
         std::fs::read_to_string(&race_codex_toml).unwrap(),
         concurrent_toml
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sync_agy_profile_hooks_copies_krill_bundle_while_preserving_existing_hooks() {
+    let dir = std::env::temp_dir().join(format!("krill-agy-hook-sync-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let host_home = dir.join("host");
+    let account_dir = dir.join("account");
+    let host_hooks = host_home.join(".gemini/config/hooks.json");
+    let account_hooks = account_dir.join(".gemini/config/hooks.json");
+    std::fs::create_dir_all(host_hooks.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(account_hooks.parent().unwrap()).unwrap();
+
+    std::fs::write(
+        &host_hooks,
+        "{\n  \"krill\": {\n    \"hooks\": {\n      \"PreInvocation\": [\n        {\n          \"hooks\": [\n            {\n              \"command\": \"'/usr/local/bin/krill' hook agy user-prompt-submit\",\n              \"type\": \"command\"\n            }\n          ]\n        }\n      ]\n    }\n  }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &account_hooks,
+        "{\n  \"userCustom\": {\n    \"enabled\": true\n  }\n}\n",
+    )
+    .unwrap();
+
+    assert!(super::sync_agy_profile_hooks_in(&host_home, &account_dir).unwrap());
+    // 두 번째 호출은 멱등(변경 없음 -> false)이어야 한다.
+    assert!(!super::sync_agy_profile_hooks_in(&host_home, &account_dir).unwrap());
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&account_hooks).unwrap()).unwrap();
+    assert_eq!(
+        parsed
+            .pointer("/userCustom/enabled")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/krill/hooks/PreInvocation/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str),
+        Some("'/usr/local/bin/krill' hook agy user-prompt-submit")
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn account_for_stored_in_prefers_transcript_path_and_detects_agy_conversations_db() {
+    let dir = std::env::temp_dir().join(format!("krill-agy-stored-acc-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let home = dir.join("home");
+    let state = dir.join("state");
+    let host_agy = home.join(".gemini/antigravity-cli");
+    let prof_dir = state.join("profiles/agy/antigravity-profile-2");
+    let sid = "d559a535-297c-41f1-a1d6-6c826192f913";
+
+    std::fs::create_dir_all(host_agy.join("conversations")).unwrap();
+    std::fs::write(
+        host_agy.join("conversations").join(format!("{sid}.db")),
+        b"SQLite format 3\0host",
+    )
+    .unwrap();
+    let prof_sessions = prof_dir.join(".gemini/antigravity-cli/sessions");
+    std::fs::create_dir_all(&prof_sessions).unwrap();
+    let tp = prof_sessions.join(format!("{sid}.jsonl"));
+    std::fs::write(&tp, b"{}\n").unwrap();
+
+    let mut file = accounts::AccountsFile::default();
+    file.accounts.push(accounts::StoredAccount {
+        id: "agy-2".into(),
+        provider: "antigravity".into(),
+        label: "Profile 2".into(),
+        email: Some("two@example.com".into()),
+        profile_dir: prof_dir.display().to_string(),
+    });
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+
+    let agy = profile(&["agy"]);
+    // 호스트에도 bridged 대화가 있을 때 transcript_path가 격리 프로필을 가리키면 격리 프로필을 선택해야 한다.
+    let stored_in_profile = control::StoredLaunch {
+        profile: "agy".into(),
+        permission: Permission::Yolo,
+        session_id: Some(sid.into()),
+        transcript_path: Some(tp.display().to_string()),
+        cwd: Vec::new(),
+        hibernation_blocked: false,
+        account: None,
+    };
+    let resolved = super::account_for_stored_in(&home, &agy, Some(&state), &stored_in_profile)
+        .expect("resolved from transcript_path");
+    assert_eq!(resolved.id, "agy-2");
+    assert_eq!(resolved.dir, prof_dir.display().to_string());
+
+    // transcript_path가 호스트 기본 경로를 가리키면 agy-host를 반환한다.
+    let host_tp = host_agy.join("sessions").join(format!("{sid}.jsonl"));
+    let stored_in_host = control::StoredLaunch {
+        transcript_path: Some(host_tp.display().to_string()),
+        ..stored_in_profile.clone()
+    };
+    let resolved_host =
+        super::account_for_stored_in(&home, &agy, Some(&state), &stored_in_host).unwrap();
+    assert_eq!(resolved_host.id, "agy-host");
+    assert_eq!(resolved_host.dir, "");
+
+    // transcript_path가 없을 때도 conversations/<id>.db 만으로 볼트 탐색이 동작해야 한다.
+    let db_only_sid = "eeeeeeee-1111-4222-8333-444444444444";
+    let prof_convs = prof_dir.join(".gemini/antigravity-cli/conversations");
+    std::fs::create_dir_all(&prof_convs).unwrap();
+    std::fs::write(
+        prof_convs.join(format!("{db_only_sid}.db")),
+        b"SQLite format 3\0prof",
+    )
+    .unwrap();
+    let stored_db_only = control::StoredLaunch {
+        session_id: Some(db_only_sid.into()),
+        transcript_path: None,
+        ..stored_in_profile
+    };
+    let resolved_db =
+        super::account_for_stored_in(&home, &agy, Some(&state), &stored_db_only).unwrap();
+    assert_eq!(resolved_db.id, "agy-2");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn codex_no_daemon_probe_and_zsh_wrapper_isolate_sessions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-codex-nodaemon-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let supported_exe = dir.join("codex-modern");
+    std::fs::write(
+        &supported_exe,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  printf 'Usage: codex [--no-daemon]\\n'\n  exit 0\nfi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&supported_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(super::codex::no_daemon_supported_with(&supported_exe));
+
+    let legacy_exe = dir.join("codex-legacy");
+    std::fs::write(
+        &legacy_exe,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  printf 'Usage: codex [PROMPT]\\n'\n  exit 0\nfi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&legacy_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!super::codex::no_daemon_supported_with(&legacy_exe));
+
+    assert!(
+        super::ZSH_ACCOUNT_SYNC_ENV.contains("command codex --no-daemon \"$@\""),
+        "ZSH_ACCOUNT_SYNC_ENV must define codex() wrapper with --no-daemon"
+    );
+
+    // 심볼릭 링크된 sessions 디렉터리(예: ~/.krill/p/codex/i-*/sessions -> orca/codex-accounts/*/home/sessions)도
+    // account_for_stored_in이 계정을 역추적해야 한다.
+    let home = dir.join("home");
+    let state = dir.join("state");
+    let real_sessions = dir.join("orca-codex/home/sessions/2026/10/25");
+    std::fs::create_dir_all(&real_sessions).unwrap();
+    let prof_dir = home.join(".krill/p/codex/i-12345678");
+    std::fs::create_dir_all(&prof_dir).unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("orca-codex/home/sessions"),
+        prof_dir.join("sessions"),
+    )
+    .unwrap();
+    let sid = "0199f5ea-dd58-7cf2-a0e1-034fa939619b";
+    let real_rollout = real_sessions.join(format!("rollout-2026-10-25-{sid}.jsonl"));
+    std::fs::write(
+        &real_rollout,
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+    )
+    .unwrap();
+
+    let mut file = accounts::AccountsFile::default();
+    file.accounts.push(accounts::StoredAccount {
+        id: "codex-imported".into(),
+        provider: "codex".into(),
+        label: "Imported".into(),
+        email: Some("imported@example.com".into()),
+        profile_dir: prof_dir.display().to_string(),
+    });
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+
+    let codex_prof = profile(&["codex"]);
+    let stored = control::StoredLaunch {
+        profile: "codex".into(),
+        permission: Permission::Yolo,
+        session_id: Some(sid.into()),
+        transcript_path: Some(real_rollout.display().to_string()),
+        cwd: Vec::new(),
+        hibernation_blocked: false,
+        account: None,
+    };
+    let resolved = super::account_for_stored_in(&home, &codex_prof, Some(&state), &stored)
+        .expect("resolved symlinked codex sessions dir");
+    assert_eq!(resolved.id, "codex-imported");
+    assert_eq!(resolved.dir, prof_dir.display().to_string());
 
     std::fs::remove_dir_all(&dir).ok();
 }

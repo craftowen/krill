@@ -16,6 +16,7 @@
 //! ⌘V·파일 드롭은 `krill_term::paste`로 bracketed paste·셸 이스케이프를 거쳐 입력으로 간다. 우클릭 메뉴(복사·붙여넣기)는
 //! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
 
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
 mod chat;
 mod close;
 mod commands;
@@ -538,7 +539,6 @@ pub struct Shell {
     _sidebar_close_session: Subscription,
     _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
-    _sidebar_disconnect: Subscription,
     _sidebar_relisted: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
@@ -831,20 +831,6 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
-        let sidebar_disconnect =
-            cx.subscribe(&sidebar, |this, _, e: &sidebar::DisconnectHost, cx| {
-                if let Some(id) = e.0.remote_id() {
-                    if let Some(raw) = id.strip_prefix("iroh:")
-                        && let Some(service) = &this.link_hosts
-                    {
-                        service.disconnect(raw);
-                    }
-                    this.host_manager.disconnect_now(id);
-                }
-                this.sync_hosts(cx);
-                this.sync(cx);
-                cx.notify();
-            });
         let sidebar_relisted = cx.subscribe(&sidebar, |this, _, e: &sidebar::Relisted, cx| {
             this.show_reconnected(e.0, cx);
         });
@@ -989,11 +975,21 @@ impl Shell {
             panel.set_history(history.clone(), cx);
             panel
         });
-        cx.observe(&diff, |this, diff, cx| {
-            let tab = diff.read(cx).active_tab();
+        let mut had_center_diff = diff.read(cx).has_center_diff();
+        cx.observe(&diff, move |this, diff, cx| {
+            let d = diff.read(cx);
+            let tab = d.active_tab();
+            let has_center = d.has_center_diff();
             if this.layout.set_panel_tab(tab) {
                 this.save();
             }
+            if had_center_diff && !has_center {
+                this.files.refocus = true;
+                cx.notify();
+            } else if !had_center_diff && has_center {
+                cx.notify();
+            }
+            had_center_diff = has_center;
         })
         .detach();
         let diff_send = Self::subscribe_diff(&diff, cx);
@@ -1080,7 +1076,6 @@ impl Shell {
             _sidebar_close_session: close_session,
             _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
-            _sidebar_disconnect: sidebar_disconnect,
             _sidebar_relisted: sidebar_relisted,
             _sidebar_tabs: sidebar_tabs,
             layout,
@@ -1676,6 +1671,7 @@ impl Shell {
         let view = if let Some(existing) = &self.settings {
             existing.update(cx, |v, cx| {
                 v.set_mobile_page(false, cx);
+                v.set_automations_page(false, cx);
                 v.set_tab(tab, cx);
             });
             existing.clone()
@@ -1704,7 +1700,24 @@ impl Shell {
         cx.notify();
     }
 
-    /// 사이드바 'Krill 모바일': 사이드바를 둔 채 본문에 모바일 페어링 페이지를 연다.
+    /// 사이드바를 둔 채 본문에 자동화 페이지를 연다.
+    pub(super) fn open_automations_page(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(krill_app::settings::AdminTab::Workflows, window, cx);
+        if let Some(settings) = &self.settings {
+            settings.update(cx, |v, cx| v.set_automations_page(true, cx));
+        }
+    }
+
+    pub(super) fn automations_page_open(&self, cx: &App) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|s| s.read(cx).automations_page())
+    }
+
     pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.open_settings(krill_app::settings::AdminTab::Mobile, window, cx);
         if let Some(settings) = &self.settings {
@@ -2442,6 +2455,10 @@ impl Shell {
     }
 
     fn on_config_changed(&mut self, cx: &mut Context<Self>) {
+        // 터미널 테마만 바뀌면 앱 Theme는 그대로라 전역 테마 관찰자가 호출되지 않는다.
+        if self.terminal_theme != krill_app::ui::terminal_theme(cx) {
+            self.push_appearance(cx);
+        }
         self.refresh_local_state(cx);
         self.sidebar
             .update(cx, krill_app::sidebar::Sidebar::reload_external);
@@ -2755,16 +2772,9 @@ impl Shell {
                             krill_app::settings::current(cx).auto_restart_update
                         })
                         .unwrap_or(false);
-                    let relaunch = staged.clone();
-                    let relaunched = staged.relaunched
-                        || (automatic
-                            && cx
-                                .background_executor()
-                                .spawn(async move { relaunch.spawn_relauncher().is_ok() })
-                                .await);
                     let keep_going = this
                         .update(cx, |_, cx| {
-                            if relaunched {
+                            if staged.relaunched {
                                 files::quit_app(cx);
                                 return;
                             }
@@ -2772,12 +2782,21 @@ impl Shell {
                                 .try_global::<krill_app::updater::UpdateState>()
                                 .cloned()
                                 .unwrap_or_default();
+                            if u.restart.is_starting() {
+                                return;
+                            }
+                            if u.staged.as_ref() != Some(&staged) {
+                                u.restart = krill_app::updater::RestartStatus::Idle;
+                            }
                             u.staged = Some(staged.clone());
-                            u.status = krill_app::updater::CheckStatus::Ready(staged);
+                            u.status = krill_app::updater::CheckStatus::Ready(staged.clone());
                             u.card_collapsed = false;
                             cx.set_global(u);
                             cx.refresh_windows();
                             cx.notify();
+                            if automatic {
+                                krill_app::updater::restart_staged_update(staged, cx);
+                            }
                         })
                         .is_ok();
                     if !keep_going {
@@ -3711,6 +3730,7 @@ impl Shell {
                 self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
+                self.reconcile_workspace_sessions(cx);
             }
             linked.map(|l| (session, l, fresh))
         });
@@ -3847,7 +3867,9 @@ impl Shell {
             l.started = Some(Instant::now());
         }
         l.exited_early = false;
-        if let Some(launch) = &linked.launch {
+        if let Some(launch) = &linked.launch
+            && self.layout.host(pane).is_local()
+        {
             krill_app::onboarding::actions::note_agent_session(&launch.profile, cx);
         }
         l.launch = linked.launch;
@@ -4068,6 +4090,10 @@ impl Shell {
         // OWE-870: 이름 변경 대화상자가 열려 있으면 Esc로 닫는다(Enter 저장은 입력창 구독이 맡는다).
         if self.tab_rename.is_some() && e.keystroke.key == "escape" {
             self.cancel_tab_rename(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if e.keystroke.key == "escape" && self.close_link_menu(cx) {
             cx.stop_propagation();
             return;
         }
@@ -4547,6 +4573,9 @@ impl Shell {
             }
             self.diff
                 .update(cx, krill_app::diff::Panel::clear_selection);
+        } else if self.layout != before {
+            // 비활성 탭 닫기 버튼(close-tab-{i}) 등 레이아웃 변경 시 버튼으로 빠져나간 포커스를 활성 칸으로 되돌린다.
+            self.files.refocus = true;
         }
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
@@ -4825,6 +4854,7 @@ impl Shell {
         }
         self.sidebar_collapsed = !self.sidebar_collapsed;
         self.layout.sidebar_collapsed = self.sidebar_collapsed;
+        self.files.refocus = true;
         self.save();
         self.sync_sidebar_visibility(cx);
         cx.notify();
@@ -4858,6 +4888,7 @@ impl Shell {
         }
         self.panel_collapsed = !self.panel_collapsed;
         self.layout.panel_collapsed = self.panel_collapsed;
+        self.files.refocus = true;
         self.save();
         let visible = !self.panel_collapsed && self.security.is_window_active();
         self.diff.update(cx, |d, cx| d.set_visible(visible, cx));
@@ -5301,6 +5332,8 @@ impl Shell {
         // 아래 배너와 겹치지 않게 한다. 탭 바의 제목은 중복하지 않는다.
         let pane_header = div()
             .debug_selector(move || format!("pane-header-{}", id.get()))
+            .font_family(krill_app::ui::FONT_UI)
+            .text_size(krill_app::ui::TEXT_XS)
             .when(!ended, |d| d.absolute().top(px(4.)).right(px(4.)))
             .when(ended, |d| d.self_end().mb_2())
             .flex_none()
@@ -5331,6 +5364,7 @@ impl Shell {
                 )
                 .child(krill_app::ui::button_with_tooltip(
                     krill_app::ui::ghost(("pane-unzoom", id.get()), text::PANE_UNZOOM.get())
+                        .xsmall()
                         .debug_selector(move || format!("pane-unzoom-{}", id.get()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -5564,13 +5598,12 @@ impl Shell {
                     )
                     .children(self.render_pane_chat_overlay(id, window, cx)),
             )
-            .children(self.render_pane_security(id, cx))
             .when(self.files.hover.as_ref().is_some_and(|h| h.0 == id), |d| {
                 d.cursor_pointer()
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                     if e.modifiers.platform {
                         this.change(true, cx, |l| l.focus(id));
                         let action = if e.modifiers.alt {
@@ -5599,7 +5632,7 @@ impl Shell {
                         } else {
                             // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
                             match file {
-                                Some(path) => this.open_terminal_file(path, action, cx),
+                                Some(path) => this.open_terminal_file(path, e.position, action, cx),
                                 None => {
                                     if let Some((_, link)) =
                                         this.path_link_at(id, e.position, Some(action), cx)
@@ -5609,10 +5642,20 @@ impl Shell {
                                 }
                             }
                         }
+                        if this.layout.focused() == Some(id) {
+                            this.files.refocus = true;
+                            if !this.focus.is_focused(window) {
+                                window.focus(&this.focus, cx);
+                            }
+                        }
                         cx.stop_propagation();
                         return;
                     }
                     this.change(true, cx, |l| l.focus(id));
+                    this.files.refocus = true;
+                    if !this.focus.is_focused(window) {
+                        window.focus(&this.focus, cx);
+                    }
                     if this.selects(id, e.modifiers) {
                         this.select_begin(id, e.position, e.click_count, e.modifiers.shift, cx);
                     } else {
@@ -5628,22 +5671,31 @@ impl Shell {
             )
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    this.change(true, cx, |l| l.focus(id));
+                    this.files.refocus = true;
+                    if !this.focus.is_focused(window) {
+                        window.focus(&this.focus, cx);
+                    }
                     this.mouse_input(id, keys::tui::Mouse::Press(1), e.position, e.modifiers, cx);
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                     // 우클릭 메뉴의 복사·붙여넣기가 이 칸에 가도록 포커스를 옮긴다.
                     this.change(true, cx, |l| l.focus(id));
+                    this.files.refocus = true;
+                    if !this.focus.is_focused(window) {
+                        window.focus(&this.focus, cx);
+                    }
                     this.mouse_input(id, keys::tui::Mouse::Press(2), e.position, e.modifiers, cx);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
-                    // 끌지 않은 맨 클릭이 평문 URL 위면 브라우저로 연다(⌘ 없이도).
+                    // 끌지 않은 맨 클릭이 링크 위면 대상 URL·복사·열기 팝오버를 띄운다(⌘ 없이도).
                     let clicked = !e.modifiers.modified()
                         && this.live.get(&id).is_some_and(|l| {
                             l.selecting
@@ -5651,8 +5703,8 @@ impl Shell {
                                 && l.selection.is_some_and(|s| s.anchor == s.head)
                         });
                     if this.select_end(id, cx) {
-                        if clicked && let Some((_, uri)) = this.plain_url_at(id, e.position) {
-                            cx.open_url(&uri);
+                        if clicked && let Some((_, uri)) = this.click_link_at(id, e.position) {
+                            this.open_link_menu(id, uri, e.position, cx);
                             return;
                         }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
@@ -5695,7 +5747,6 @@ impl Shell {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
-                this.update_hover_link(id, e.position, cx);
                 this.update_path_hover(id, e.position, e.modifiers.platform, cx);
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
@@ -5840,7 +5891,9 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings.is_some() && !self.mobile_page_open(cx) {
+            if self.settings.is_some()
+                && !(self.mobile_page_open(cx) || self.automations_page_open(cx))
+            {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
                 window.set_window_title(&self.main_window_title(cx));
@@ -5951,8 +6004,8 @@ impl Render for Shell {
             window.is_window_active() && !self.page_open() && self.dashboard.is_none();
         self.resources
             .update(cx, |view, cx| view.set_visible(resources_visible, cx));
-        let mobile_page = self.mobile_page_open(cx);
-        let (settings_view, mobile_view) = if mobile_page {
+        let sub_page = self.mobile_page_open(cx) || self.automations_page_open(cx);
+        let (settings_view, mobile_view) = if sub_page {
             (None, self.settings.clone())
         } else {
             (self.settings.clone(), None)
@@ -6467,19 +6520,9 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .bg(bg)
-                            .when(artifacts_view.is_none() && !mobile_page, |d| {
+                            .when(artifacts_view.is_none() && !sub_page, |d| {
                                 d.child(self.render_tab_bar(window, cx))
                             })
-                            .children(self.failed_account_input().map(|session| {
-                                div().id("account-input-recovery").debug_selector(|| "account-input-recovery".into()).flex().flex_wrap().items_center().gap_2()
-                                    .px_3().py_1p5().bg(p.warning).text_color(p.warning_foreground)
-                                    .text_size(krill_app::ui::TEXT_XS)
-                                    .child(krill_app::i18n::catalog::settings::ACCOUNT_INPUT_HELD.get())
-                                    .child(krill_app::ui::secondary("account-continue-original", krill_app::i18n::catalog::settings::ACCOUNT_CONTINUE_ORIGINAL.get())
-                                        .debug_selector(|| "account-continue-original".into())
-                                        .disabled(self.account_cancel.is_some())
-                                        .on_click(cx.listener(move |this, _, _, cx| this.continue_original_account(session, cx))))
-                            }))
                             .child(
                                 div()
                                     .flex_1()
@@ -6500,26 +6543,29 @@ impl Render for Shell {
                                     .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
                             ),
                     )
-                    .when(!self.panel_collapsed && artifacts_view.is_none() && !mobile_page, |d| {
-                        d.child(divider(
-                            "divider-panel".into(),
-                            Drag::Panel,
-                            Axis::Horizontal,
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .id("panel-column")
-                                .debug_selector(|| "panel-column".into())
-                                .flex_none()
-                                .w(px(self.layout.panel_width))
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .bg(sidebar_bg)
-                                .child(div().flex_1().min_h_0().child(self.diff.clone())),
-                        )
-                    })
+                    .when(
+                        !self.panel_collapsed && artifacts_view.is_none() && !sub_page,
+                        |d| {
+                            d.child(divider(
+                                "divider-panel".into(),
+                                Drag::Panel,
+                                Axis::Horizontal,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .id("panel-column")
+                                    .debug_selector(|| "panel-column".into())
+                                    .flex_none()
+                                    .w(px(self.layout.panel_width))
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .bg(sidebar_bg)
+                                    .child(div().flex_1().min_h_0().child(self.diff.clone())),
+                            )
+                        },
+                    )
             })
             .child(self.render_status_bar(window, cx))
             .children(self.jump.as_ref().map(|(palette, _)| palette.clone()))
@@ -6534,6 +6580,7 @@ impl Render for Shell {
             .children(self.dashboard.clone())
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
+            .children(self.render_link_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
             .children(self.render_running_close_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
@@ -6681,7 +6728,18 @@ impl Shell {
         }
         let staged = state.staged?;
         let p = krill_app::ui::palette(cx);
-        let title = utext::CARD_READY_TITLE.get();
+        let starting = state.restart.is_starting();
+        let restart_error = state.restart.error().map(str::to_owned);
+        let title = if restart_error.is_some() {
+            utext::CARD_RESTART_FAILED_TITLE.get()
+        } else {
+            utext::CARD_READY_TITLE.get()
+        };
+        let restart_label = if restart_error.is_some() {
+            utext::CARD_RETRY_BTN.get()
+        } else {
+            utext::CARD_RESTART_BTN.get()
+        };
         let body = utext::CARD_READY_BODY.format(&[("version", &staged.to_version)]);
         let subtitle = utext::CARD_READY_SUBTITLE.get();
         let release_notes_url = staged.release_notes_url();
@@ -6775,27 +6833,32 @@ impl Shell {
                             )
                         })),
                 )
+                .children(restart_error.map(|error| {
+                    krill_app::ui::error_banner(p, error)
+                        .debug_selector(|| "update-card-restart-error".into())
+                }))
                 .child(
                     div().w_full().child(
-                        Button::new("update-card-restart")
-                            .label(utext::CARD_RESTART_BTN.get())
-                            .debug_selector(|| "update-card-restart".into())
-                            .primary()
-                            .small()
-                            .w_full()
-                            .on_click(move |_, _, cx| {
-                                let staged = staged.clone();
-                                cx.spawn(async move |cx| {
-                                    let launched = cx
-                                        .background_executor()
-                                        .spawn(async move { staged.spawn_relauncher().is_ok() })
-                                        .await;
-                                    if launched {
-                                        cx.update(files::quit_app);
-                                    }
-                                })
-                                .detach();
-                            }),
+                        krill_app::ui::button_with_reserved_label(
+                            "update-card-restart",
+                            restart_label,
+                            utext::CARD_RESTARTING_BTN.get(),
+                            starting,
+                        )
+                        .debug_selector(|| "update-card-restart".into())
+                        .primary()
+                        .small()
+                        .disabled(
+                            starting
+                                || matches!(
+                                    state.status,
+                                    krill_app::updater::CheckStatus::Checking
+                                ),
+                        )
+                        .w_full()
+                        .on_click(move |_, _, cx| {
+                            krill_app::updater::restart_staged_update(staged.clone(), cx);
+                        }),
                     ),
                 ),
         )
@@ -7020,3 +7083,6 @@ fn start_error_text(err: &std::io::Error) -> String {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod update_tests;

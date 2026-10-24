@@ -511,6 +511,7 @@ fn pr_checks_tab_displays_failed_logs_and_sends_combined_fix_prompt_to_active_ag
 
         fn inspect_pr(&self, _: &Path, branch: &str) -> io::Result<PrInspection> {
             Ok(PrInspection {
+                metadata: None,
                 status: Status::Open,
                 number: Some(739),
                 title: format!("feat({branch}): PR CI checks"),

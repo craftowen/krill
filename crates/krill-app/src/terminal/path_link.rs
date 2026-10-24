@@ -4,11 +4,14 @@
 //! 동작(존재하는 파일만, URL 제외, 상대 경로는 세션 cwd 기준, git `a/`·`b/` 접두사)은 Orca의 터미널 파일 링크
 //! (`.ref/orca/src/renderer/src/components/terminal-pane/terminal-file-link-*.ts`, MIT)를 참고했다. 코드 차용 없음.
 //!
-//! 비용: 포인터 아래 행 하나만 본다. 공백을 포함한 경로 후보는 최대 64개이며 디스크 확인은 호출자의 백그라운드 작업에서 한다.
+//! 비용: 화면 기반 조회는 제한된 이웃 행을 모은다. 공백을 포함한 경로 후보는 최대 64개이며 디스크 확인은 호출자의 백그라운드 작업에서 한다.
 
 use std::path::{Path, PathBuf};
 
 use krill_proto::screen::{Cell, Flags, is_bidi_control};
+
+mod input;
+pub use input::Input;
 
 /// ⌘ 아래에서 찾은 파일 링크. `column`부터 `cols`칸에 밑줄을 긋는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,10 +138,26 @@ fn trim_url_end(slice: &[(u16, char, u16)]) -> usize {
 
 /// (시작 칸, 글자, 폭). 2칸 글자의 둘째 칸(SPACER)은 앞 글자에 붙인다.
 fn row_chars(row: &[Cell]) -> Vec<(u16, char, u16)> {
+    if row
+        .iter()
+        .try_fold(0usize, |count, cell| {
+            count
+                .checked_add(1 + cell.zerowidth.len())
+                .filter(|count| *count <= 16_384)
+        })
+        .is_none()
+    {
+        return Vec::new();
+    }
     let mut chars: Vec<(u16, char, u16)> = Vec::with_capacity(row.len());
     for (col, cell) in (0u16..).zip(row) {
         if cell.flags.contains(Flags::SPACER) {
-            if let Some(last) = chars.last_mut() {
+            if col > 0
+                && row
+                    .get(usize::from(col - 1))
+                    .is_some_and(|c| c.flags.contains(Flags::WIDE))
+                && let Some(last) = chars.iter_mut().rev().find(|t| t.0 == col - 1 && t.2 > 0)
+            {
                 last.2 = last.2.saturating_add(1);
             }
             continue;
@@ -149,6 +168,13 @@ fn row_chars(row: &[Cell]) -> Vec<(u16, char, u16)> {
             cell.ch
         };
         chars.push((col, ch, 1));
+        for &ch in cell
+            .zerowidth
+            .iter()
+            .filter(|_| !cell.flags.contains(Flags::HIDDEN))
+        {
+            chars.push((col, ch, 0));
+        }
     }
     chars
 }
@@ -237,7 +263,11 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
         let Some(&(last_col, _, last_w)) = token.last() else {
             continue;
         };
-        let end_col = last_col.saturating_add(last_w);
+        let end_col = token
+            .iter()
+            .map(|&(col, _, w)| col.saturating_add(w))
+            .max()
+            .unwrap_or(last_col.saturating_add(last_w));
         if !(start_col..end_col).contains(&column) {
             continue;
         }
@@ -295,7 +325,7 @@ fn candidate_at(chars: &[(u16, char, u16)], column: u16) -> Option<Candidate> {
 }
 
 fn candidate(token: &[(u16, char, u16)]) -> Option<Candidate> {
-    let end = token.last().map(|&(c, _, w)| c.saturating_add(w))?;
+    let end = token.iter().map(|&(c, _, w)| c.saturating_add(w)).max()?;
     Some(Candidate {
         chars: token.iter().map(|t| t.1).collect(),
         starts: token.iter().map(|t| t.0).collect(),
@@ -483,7 +513,6 @@ struct Cached {
 
 impl Cache {
     /// `row`의 `column` 칸을 덮는 파일 링크. 존재하는 일반 파일만(디렉터리 제외).
-    // ponytail: 자동 줄바꿈으로 두 행에 걸친 경로는 포인터 쪽 행 조각만 본다. 긴 경로가 잘리면 WRAPLINE으로 잇는다.
     pub fn link_at(&mut self, row: &[Cell], column: u16, cwd: Option<&Path>) -> Option<PathLink> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         self.link_at_with_home(row, column, cwd, home.as_deref())
@@ -496,7 +525,41 @@ impl Cache {
         cwd: Option<&Path>,
         home: Option<&Path>,
     ) -> Option<PathLink> {
-        let candidates = candidates_at(row, column);
+        self.lookup(candidates_at(row, column), column, cwd, home, &mut 256)
+    }
+
+    fn bounded(
+        &mut self,
+        row: &[Cell],
+        column: u16,
+        cwd: Option<&Path>,
+        cap: usize,
+        budget: &mut usize,
+        crossing: Option<(u16, u16)>,
+    ) -> Option<PathLink> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut candidates = candidates_at(row, column);
+        if let Some((first_end, last_start)) = crossing {
+            candidates.retain(|candidate| {
+                candidate
+                    .starts
+                    .first()
+                    .is_some_and(|&start| start < first_end)
+                    && candidate.end > last_start
+            });
+        }
+        candidates.truncate(cap);
+        self.lookup(candidates, column, cwd, home.as_deref(), budget)
+    }
+
+    fn lookup(
+        &mut self,
+        candidates: Vec<Candidate>,
+        column: u16,
+        cwd: Option<&Path>,
+        home: Option<&Path>,
+        budget: &mut usize,
+    ) -> Option<PathLink> {
         if self.last.as_ref().is_none_or(|last| {
             last.candidates != candidates
                 || last.cwd.as_deref() != cwd
@@ -506,21 +569,31 @@ impl Cache {
                         !(link.column..link.column.saturating_add(link.cols)).contains(&column)
                     }))
         }) {
+            let mut is_file = |path: &PathBuf| {
+                if *budget == 0 {
+                    return false;
+                }
+                *budget -= 1;
+                path.is_file()
+            };
             let found = candidates.iter().find_map(|cand| {
                 let literal: String = cand.chars.iter().collect();
-                let exact = resolve(&literal, cwd, home)
-                    .into_iter()
-                    .find(|p| p.is_file());
+                let exact = resolve(&literal, cwd, home).into_iter().find(&mut is_file);
                 let (path, line, col, used) = if let Some(path) = exact {
                     (path, None, None, cand.chars.len())
                 } else {
                     let (path, line, col, used) = split_location(&cand.chars);
-                    let found = resolve(&path, cwd, home)
-                        .into_iter()
-                        .find(|p| p.is_file())?;
+                    let found = resolve(&path, cwd, home).into_iter().find(&mut is_file)?;
                     (found, line, col, used)
                 };
-                let end = cand.starts.get(used).copied().unwrap_or(cand.end);
+                let end = cand.starts.get(used).copied().map_or(cand.end, |next| {
+                    let last = cand
+                        .starts
+                        .get(used.saturating_sub(1))
+                        .copied()
+                        .unwrap_or(next);
+                    next.max(last.saturating_add(1))
+                });
                 let start = *cand.starts.first()?;
                 if !(start..end).contains(&column) {
                     return None;

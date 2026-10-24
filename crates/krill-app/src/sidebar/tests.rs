@@ -45,8 +45,13 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("host-header-local").is_none());
+    // A connected device without projects needs no row in project navigation.
+    assert!(vcx.debug_bounds("host-header-iroh:studio").is_none());
+    view.update(vcx, |sidebar, cx| sidebar.set_group_by(GroupBy::None, cx));
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("host-header-iroh:studio").is_some());
     assert!(vcx.debug_bounds("host-route-iroh:studio").is_some());
+    view.update(vcx, |sidebar, cx| sidebar.set_group_by(GroupBy::Repo, cx));
     manager.sync_external_hosts(vec![registration(true)]);
     view.update(vcx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
     vcx.run_until_parked();
@@ -372,7 +377,7 @@ fn rows_expose_voiceover_names_roles_and_press(cx: &mut TestAppContext) {
         [
             "저장소 repo 1",
             "워크트리 a, 입력 대기",
-            "세션",
+            "작업 폴더 미확인 세션",
             "세션 3, 작업 중",
         ]
     );
@@ -1715,8 +1720,9 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
                 .collect::<Vec<_>>()
         })
     };
-    // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘은 숨는다.
-    assert_eq!(headers(cx), ["oci", "kak"]);
+    // 세션이 남은 끊긴 호스트(kak)는 다시 연결하도록 보이고, 세션 없는 끊긴 호스트 둘과
+    // 프로젝트 없이 연결만 된 호스트(oci, 관리는 설정)는 프로젝트 목록에 띄우지 않는다.
+    assert_eq!(headers(cx), ["kak"]);
 
     assert_eq!(
         super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
@@ -1736,16 +1742,17 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
     );
 }
 
-/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 끊기지 않고 이어지며, 프로젝트 없는 호스트와
-/// 작업 폴더 없는 세션 묶음은 모든 프로젝트 뒤에 온다.
+/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 맨 위 단계다. 다른 PC의 같은 프로젝트는 한 머리줄로
+/// 합쳐지고, 연결된 PC의 상태 줄은 사라지며, 다시 연결이 필요한 프로젝트 없는 PC와
+/// 작업 폴더 모르는 세션(모든 PC 것을 한 묶음)만 프로젝트 뒤에 온다.
 #[gpui::test]
-fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext) {
+fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
-    let remote = |id: &str, snapshot: Snapshot| RemoteHost {
+    let remote = |id: &str, status, snapshot: Snapshot| RemoteHost {
         id: id.into(),
         label: id.into(),
-        status: HostStatus::Connected,
+        status,
         snapshot,
         meta: Meta::new(),
         source: None,
@@ -1757,26 +1764,49 @@ fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext)
             trees: BTreeMap::from([("/local".into(), vec!["/local/a".into()])]),
         };
         s.remote_hosts = vec![
-            remote("oci", Snapshot::default()),
+            remote("oci", HostStatus::Connected, Snapshot::default()),
             remote(
                 "win",
+                HostStatus::Connected,
                 Snapshot {
                     sessions: vec![session(2, AgentState::Done, None)],
                     trees: BTreeMap::from([("/tax".into(), vec!["/tax".into()])]),
                 },
             ),
             remote(
+                "mbp",
+                HostStatus::Connected,
+                Snapshot {
+                    sessions: Vec::new(),
+                    trees: BTreeMap::from([(
+                        "/Users/x/LOCAL".into(),
+                        vec!["/Users/x/LOCAL".into(), "/Users/x/LOCAL-wt".into()],
+                    )]),
+                },
+            ),
+            remote(
                 "seol",
+                HostStatus::Connected,
                 Snapshot {
                     sessions: Vec::new(),
                     trees: BTreeMap::from([("/seol".into(), vec!["/seol".into()])]),
                 },
             ),
+            remote(
+                "off",
+                HostStatus::Disconnected,
+                Snapshot {
+                    sessions: vec![session(3, AgentState::Done, None)],
+                    trees: BTreeMap::new(),
+                },
+            ),
         ];
         s.rebuild(cx);
     });
-    let rows = cx.update(|_, cx| {
-        view.read(cx)
+    let mbp = HostId::Remote("mbp".into());
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let rows = s
             .rows
             .iter()
             .filter_map(|r| match r {
@@ -1785,12 +1815,45 @@ fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext)
                 Row::Loose => Some("loose".into()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["/local", "/tax", "/seol", "host:off", "loose"]);
+        // The other PC's worktree sits inside the local project, before the next project.
+        let merged = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Worktree(p) if p == Path::new("/Users/x/LOCAL-wt")))
+            .unwrap();
+        let tax = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/tax")))
+            .unwrap();
+        assert!(merged < tax);
+        assert_eq!(s.row_host(merged), &mbp);
+        assert_eq!(
+            s.merged_projects.get(&0).map(Vec::as_slice),
+            Some(&[(mbp.clone(), PathBuf::from("/Users/x/LOCAL"))][..])
+        );
+        assert_eq!(
+            s.host_badge_for(&mbp, Path::new("/Users/x/LOCAL-wt")),
+            Some("mbp".into())
+        );
+        let loose = s.rows.iter().position(|r| matches!(r, Row::Loose)).unwrap();
+        let loose_hosts = (loose + 1..s.rows.len())
+            .map(|i| s.row_host(i).as_key().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(loose_hosts, ["win", "off"]);
     });
-    assert_eq!(
-        rows,
-        ["/local", "/tax", "/seol", "host:oci", "host:win", "loose"]
-    );
+    // Folding the merged header folds the other PC's part too.
+    view.update(cx, |s, cx| s.fold(Path::new("/local"), Some(false), cx));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            !s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Worktree(p) if p == Path::new("/Users/x/LOCAL-wt")))
+        );
+    });
 }
 
 /// Projects remain the root even with remote hosts; session IDs and selection stay host-scoped.
@@ -1843,7 +1906,19 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         );
         assert_eq!(
             s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
-            None
+            Some("Studio".into())
+        );
+        // The same project on another PC merges into the one project header.
+        assert_eq!(
+            s.rows
+                .iter()
+                .filter(|r| matches!(r, Row::Repository(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.merged_projects.get(&0).map(Vec::as_slice),
+            Some(&[(remote.clone(), PathBuf::from("/repo"))][..])
         );
         let find = |host: &HostId, repo| {
             s.rows
@@ -1861,12 +1936,13 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         };
         (
             find(&HostId::Local, false),
-            find(&remote, true),
+            find(&HostId::Local, true),
             find(&remote, false),
         )
     });
     let sel = |prefix: &str, index| -> &'static str { format!("{prefix}-{index}").leak() };
-    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_some());
+    // A connected PC shows on its cards, not as another badge on the merged header.
+    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
     let bounds = cx.debug_bounds(sel("card-session", remote_tree)).unwrap();
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
@@ -2088,12 +2164,12 @@ fn virtualized_worktree_sessions_share_summary_panel_edges(cx: &mut TestAppConte
     assert_eq!(
         summary.bottom_left().y,
         first.origin.y,
-        "summary border must continue into the session list without a gap"
+        "expanded summary and session list must stay aligned without a gap"
     );
     assert_eq!(
         first.bottom_left().y,
         second.origin.y,
-        "session borders must continue without a gap"
+        "expanded session rows must continue without a gap"
     );
 }
 
@@ -2112,7 +2188,23 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
                 trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
             };
             s.rebuild(cx);
-            assert_eq!(s.agent_counts(), (1, 1));
+            assert_eq!(s.agent_counts(), (0, 1, 1));
+            s.set_remote_snapshot_for_test(
+                "iroh:remote",
+                HostStatus::Connected,
+                Snapshot {
+                    sessions: vec![
+                        session(3, AgentState::Waiting, Some("/repo/a")),
+                        session(4, AgentState::Done, Some("/repo/a")),
+                        session(5, AgentState::Unknown, Some("/repo/a")),
+                    ],
+                    trees: BTreeMap::new(),
+                },
+                cx,
+            );
+            assert_eq!(s.agent_counts(), (1, 1, 2));
+            s.remote_hosts.clear();
+            s.rebuild(cx);
             assert!(!s.expanded_cards.contains(Path::new("/repo/a")));
         });
     });
@@ -3452,6 +3544,20 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
         properties_summary,
     };
 
+    use gpui::{ParentElement as _, Styled as _};
+    struct MenuHost(gpui::Entity<Sidebar>);
+    impl gpui::Render for MenuHost {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+                .size_full()
+                .child(gpui::div().w(gpui::px(420.)).h_full().child(self.0.clone()))
+        }
+    }
+
     assert_eq!(format_filter_badge_count(1), "1");
     assert_eq!(format_filter_badge_count(9), "9");
     assert_eq!(format_filter_badge_count(10), "9+");
@@ -3462,8 +3568,11 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     let sidebar_bin = dir.join("sidebar.bin");
 
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
-    vcx.simulate_resize(gpui::size(gpui::px(420.), gpui::px(900.)));
+    let (host, vcx) = cx.add_window_view(|_, cx| {
+        MenuHost(cx.new(|_| Sidebar::new_loaded(Some(sidebar_bin.clone()))))
+    });
+    let view = vcx.update(|_, cx| host.read(cx).0.clone());
+    vcx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(900.)));
 
     let repo_a = PathBuf::from("/repo-alpha");
     let repo_b = PathBuf::from("/repo-beta");
@@ -3518,7 +3627,13 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     let hosts_trigger = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
     vcx.simulate_click(hosts_trigger.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("sidebar-hosts-panel").is_some());
+    let hosts_panel = vcx.debug_bounds("sidebar-hosts-panel").unwrap();
+    let hosts_row = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
+    assert!(
+        hosts_panel.origin.x >= hosts_row.right(),
+        "host choices must open to the right"
+    );
+    assert!((hosts_panel.origin.y - hosts_row.origin.y).abs() < gpui::px(12.));
     let host_studio = vcx.debug_bounds("sidebar-host-item-studio").unwrap();
     vcx.simulate_click(host_studio.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
@@ -3532,7 +3647,16 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     vcx.simulate_click(projects_trigger.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("sidebar-hosts-panel").is_none());
-    assert!(vcx.debug_bounds("sidebar-projects-panel").is_some());
+    let projects_panel = vcx.debug_bounds("sidebar-projects-panel").unwrap();
+    let projects_row = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    assert!(
+        projects_panel.origin.x >= projects_row.right(),
+        "project choices must open to the right"
+    );
+    assert_eq!(
+        projects_trigger, projects_row,
+        "opening a panel must not move its parent row"
+    );
     let proj_alpha = vcx.debug_bounds("sidebar-project-item-repo-alpha").unwrap();
     vcx.simulate_click(proj_alpha.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
@@ -3614,9 +3738,9 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     vcx.run_until_parked();
     assert!(!vcx.update(|_, cx| view.read(cx).options().card_properties.ports));
 
-    // 서브메뉴를 다시 닫아 필터 행들이 뷰포트 안에 오도록 한다.
-    let props_trigger = vcx.debug_bounds("sidebar-submenu-card-properties").unwrap();
-    vcx.simulate_click(props_trigger.center(), gpui::Modifiers::default());
+    // 부모 메뉴의 그룹화로 돌아오면 서브패널만 닫힌다.
+    let group = vcx.debug_bounds("sidebar-group-by-status").unwrap();
+    vcx.simulate_click(group.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
 
     // 5. 가시성 필터 스위치 토글 행(`FilterToggleRow`)과 조건부 들여쓰기(`always_show_default_branch`), 배지·초기화 버튼 검증
@@ -3686,6 +3810,41 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     assert!(vcx.debug_bounds("sidebar-options-badge").is_none());
     assert!(vcx.debug_bounds("sidebar-filter-reset").is_none());
 
+    // 오른쪽 패널을 연 채 Esc로 전체 메뉴를 닫고, 재진입 후 바깥 클릭으로도 닫는다.
+    let projects = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    vcx.simulate_click(projects.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_some());
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-options-menu").is_none());
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_none());
+    let button = vcx.debug_bounds("sidebar-options").unwrap();
+    vcx.simulate_click(button.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let projects = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    vcx.simulate_click(projects.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.simulate_click(
+        gpui::point(gpui::px(1050.), gpui::px(850.)),
+        gpui::Modifiers::default(),
+    );
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-options-menu").is_none());
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_none());
+    // 좁은 창에서 부모와 겹쳐 보이더라도 서브패널의 선택을 받아야 한다.
+    vcx.simulate_resize(gpui::size(gpui::px(420.), gpui::px(900.)));
+    let button = vcx.debug_bounds("sidebar-options").unwrap();
+    vcx.simulate_click(button.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let hosts = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
+    vcx.simulate_click(hosts.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let studio = vcx.debug_bounds("sidebar-host-item-studio").unwrap();
+    assert!(studio.origin.x >= gpui::px(0.) && studio.right() <= gpui::px(420.));
+    vcx.simulate_click(studio.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| view.read(cx).options().filters.hosts.contains("studio")));
     fs::remove_dir_all(dir).ok();
 }
 
@@ -5136,7 +5295,7 @@ fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestApp
             let local = s.local_rows();
             assert!(local.contains(&Row::Repository(selected.clone())));
             assert!(!local.contains(&Row::Repository(hidden_local.clone())));
-            let remote = s.remote_rows(&s.remote_hosts[0]);
+            let remote = s.remote_rows(&s.remote_hosts[0], &s.collapsed);
             assert!(remote.contains(&Row::Repository(remote_repo.clone())));
             assert!(remote.contains(&Row::Worktree(remote_repo.clone())));
             assert!(remote.contains(&Row::Repository(hidden_local.clone())));
@@ -5407,4 +5566,137 @@ fn status_summary_reuses_snapshot_until_sidebar_changes(cx: &mut TestAppContext)
     assert_eq!(first.0, 1);
     assert_eq!(*first.1, vec![AgentState::Waiting, AgentState::Working]);
     assert!(Arc::ptr_eq(&first.1, &second.1));
+}
+
+/// 기본 워크트리에 프로젝트 표시 이름·폴더 이름이 `prefs`(`projects.toml` 동기화분 포함)로 들어 있어도
+/// 프로젝트 머리줄과 중복 표기하지 않고 브랜치 이름을 제목으로 쓰며, 사용자가 다른 이름으로 직접 바꾼 경우만 유지한다.
+#[gpui::test]
+fn default_worktree_ignores_redundant_project_name_in_prefs(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo = PathBuf::from("/Users/test/gwiinsaju");
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([(repo.clone(), vec![repo.clone()])]),
+            };
+            s.meta.insert(
+                repo.clone(),
+                Tree {
+                    branch: Some("main".into()),
+                    dirty: None,
+                },
+            );
+            s.prefs.insert(
+                repo.clone(),
+                Preference {
+                    pinned: false,
+                    name: "gwiinsaju".into(),
+                },
+            );
+            s.rebuild(cx);
+            assert_eq!(s.name(&repo), "main");
+        });
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("worktree-branch-1").is_none(),
+        "default worktree card title must resolve to 'main' (matching branch_subtitle) instead of repeating 'gwiinsaju'"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            s.prefs.entry(repo.clone()).or_default().name = "직접 정한 기본 워크트리".into();
+            assert_eq!(s.name(&repo), "직접 정한 기본 워크트리");
+        });
+    });
+}
+
+#[gpui::test]
+fn dashboard_read_order_persists_and_resets_on_recompletion(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-dashboard-read-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+
+    let mut s1 = session(1, AgentState::Done, Some("/repo/a"));
+    s1.status.since_unix_ns = 100;
+    let mut s2 = session(2, AgentState::Done, Some("/repo/b"));
+    s2.status.since_unix_ns = 200;
+
+    let sidebar = cx.new(|_| Sidebar::new_loaded(Some(sidebar_bin.clone())));
+    sidebar.update(cx, |s, cx| {
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2.clone()],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(s.is_dashboard_unread(&HostId::Local, &s1));
+        assert!(s.is_dashboard_unread(&HostId::Local, &s2));
+
+        assert!(s.mark_session_read(&HostId::Local, SessionId(2), cx));
+        assert!(s.mark_session_read(&HostId::Local, SessionId(1), cx));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s2), Some(1));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
+    });
+    cx.run_until_parked();
+
+    // 재시작 후에도 dashboard-read.json에서 읽음 순서가 복원된다.
+    let reloaded = cx.new(|_| Sidebar::new_loaded(Some(sidebar_bin.clone())));
+    reloaded.update(cx, |s, cx| {
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2.clone()],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s2), Some(1));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
+
+        // s2가 다시 Working 후 새 시각으로 Done이 되면 읽음 기록이 해제되어 다시 미확인(None)이 된다.
+        let mut s2_working = s2.clone();
+        s2_working.status.state = AgentState::Working;
+        s2_working.status.since_unix_ns = 300;
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2_working],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        let mut s2_done_again = s2.clone();
+        s2_done_again.status.since_unix_ns = 400;
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![s1.clone(), s2_done_again.clone()],
+                    trees: BTreeMap::new(),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s2_done_again), None);
+        assert!(s.is_dashboard_unread(&HostId::Local, &s2_done_again));
+        assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
+    });
+    fs::remove_dir_all(&dir).ok();
 }

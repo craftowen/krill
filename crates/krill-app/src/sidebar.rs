@@ -382,6 +382,69 @@ fn rows(snapshot: &Snapshot, prefs: &Preferences, collapsed: &BTreeSet<PathBuf>)
 
 const FORMAT_VERSION: u8 = 1;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const DASHBOARD_READ_FILE: &str = "dashboard-read.json";
+
+/// 에이전트 대시보드의 완료(`Done | Exited`) 카드 읽음 상태 및 읽은 순서.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadDoneEntry {
+    pub since_unix_ns: u64,
+    pub seq: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedReadDone {
+    #[serde(default)]
+    entries: Vec<(HostId, SessionId, ReadDoneEntry)>,
+}
+
+pub(super) fn load_read_done(path: Option<&Path>) -> BTreeMap<(HostId, SessionId), ReadDoneEntry> {
+    let Some(dir) = path
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return BTreeMap::new();
+    };
+    let file = dir.join(DASHBOARD_READ_FILE);
+    let Ok(bytes) = fs::read(file) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_slice::<PersistedReadDone>(&bytes)
+        .map(|p| {
+            p.entries
+                .into_iter()
+                .map(|(host, id, entry)| ((host, id), entry))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_read_done(
+    dir: &Path,
+    read_done: &BTreeMap<(HostId, SessionId), ReadDoneEntry>,
+) -> io::Result<()> {
+    krill_proto::os::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+        .create(dir)?;
+    let path = dir.join(DASHBOARD_READ_FILE);
+    let temp = path.with_extension("json.tmp");
+    let payload = PersistedReadDone {
+        entries: read_done
+            .iter()
+            .map(|((host, id), entry)| (host.clone(), *id, *entry))
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, &path)?;
+    crate::layout::sync_parent(&path)
+}
 
 /// 사이드바 접힘/펼침·제거 UI 상태 및 마지막 선택 워크트리(`sidebar.bin` 4번째 구간, OWE-842·OWE-845).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,11 +664,6 @@ pub struct RenameSession(pub SessionId);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectHost(pub HostId);
 
-/// 연결된 원격 호스트 섹션에서 '연결 해제'를 눌렀을 때 내보내는 이벤트.
-/// 셸이 터널·링크 자식을 내리고 수동 끊김으로 고정한다(`reconnect`로만 복구).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisconnectHost(pub HostId);
-
 /// 로컬 데몬 재연결 뒤 처음 받은 로컬 세션 목록의 세션 수.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relisted(pub usize);
@@ -639,6 +697,8 @@ pub struct Sidebar {
     pr_task: Option<Task<()>>,
     pr_service: Option<Arc<crate::pull_request::Service>>,
     rows: Vec<Row>,
+    /// 프로젝트 기준 보기에서 다른 PC의 같은 프로젝트를 합친 머리줄 행 → 합쳐진 (호스트, 경로).
+    merged_projects: BTreeMap<usize, Vec<(HostId, PathBuf)>>,
     /// 논리 세션 행 → 카드 머리줄. 렌더 중 계보를 매번 역탐색하지 않는다.
     card_parents: Vec<Option<usize>>,
     prefs: Preferences,
@@ -706,6 +766,10 @@ pub struct Sidebar {
     focused: Option<SessionId>,
     /// 보지 않은 사이 완료·대기로 바뀐 세션(OWE-662).
     unread: BTreeSet<SessionId>,
+    /// 에이전트 대시보드에서 사용자가 클릭해 확인한 완료(`Done | Exited`) 세션과 읽은 순서.
+    read_done: BTreeMap<(HostId, SessionId), ReadDoneEntry>,
+    /// 다음 완료 카드 읽음 처리에 부여할 단조 증가 순번.
+    next_read_done_seq: u64,
     /// 워크트리 행 메뉴·단축키에서 띄울 에이전트 프로필 목록.
     agents: Vec<AgentProfile>,
     /// 사이드바 열이 펼쳐져 있는지.
@@ -736,7 +800,6 @@ impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
-impl EventEmitter<DisconnectHost> for Sidebar {}
 impl EventEmitter<Relisted> for Sidebar {}
 
 impl std::fmt::Debug for Sidebar {
@@ -755,6 +818,149 @@ fn split_loose(rows: &mut Vec<Row>) -> Vec<Row> {
         .position(|r| matches!(r, Row::Loose))
         .map(|i| rows.split_off(i))
         .unwrap_or_default()
+}
+
+/// 프로젝트 기준 보기에서 호스트별 행 목록을 프로젝트 단위로 합친다([`Sidebar::rebuild_by_project`]).
+#[derive(Default)]
+struct ProjectMerge {
+    chunks: Vec<ProjectChunk>,
+    /// 프로젝트 열쇠 → (묶음 번호, 머리줄 경로).
+    owners: BTreeMap<(bool, String), (usize, PathBuf)>,
+    loose: Vec<(HostId, Row)>,
+}
+
+/// 머리줄 하나와 그 아래 행들. 다른 PC에서 합쳐진 프로젝트 경로는 `aliases`에 남는다.
+struct ProjectChunk {
+    rows: Vec<(HostId, Row)>,
+    aliases: Vec<(HostId, PathBuf)>,
+}
+
+/// PC 사이에는 공통 프로젝트 ID가 없어 종류(git 저장소/폴더)와 폴더 이름(대소문자 무시)으로 맞춘다.
+fn project_key(row: &Row) -> Option<((bool, String), &PathBuf)> {
+    match row {
+        Row::Repository(p) => Some(((true, basename(p).to_lowercase()), p)),
+        Row::Folder(p) => Some(((false, basename(p).to_lowercase()), p)),
+        _ => None,
+    }
+}
+
+impl ProjectMerge {
+    /// 합쳐질 원격 머리줄은 화면에 없으므로 접힘 상태를 주인 머리줄 것으로 맞춘다.
+    fn aligned_collapsed<'a>(
+        &self,
+        collapsed: &'a BTreeSet<PathBuf>,
+        snapshot: &Snapshot,
+    ) -> std::borrow::Cow<'a, BTreeSet<PathBuf>> {
+        let mut out = std::borrow::Cow::Borrowed(collapsed);
+        let repos = snapshot.trees.keys().map(|p| (true, p));
+        let folders = snapshot
+            .sessions
+            .iter()
+            .filter(|s| s.worktree.is_none())
+            .filter_map(|s| s.cwd.as_ref())
+            .map(|p| (false, p));
+        for (repo, path) in repos.chain(folders) {
+            let Some((_, owner)) = self.owners.get(&(repo, basename(path).to_lowercase())) else {
+                continue;
+            };
+            let closed = collapsed.contains(owner);
+            if closed != out.contains(path) {
+                if closed {
+                    out.to_mut().insert(path.clone());
+                } else {
+                    out.to_mut().remove(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// 한 호스트의 행을 받아 이미 있는 프로젝트는 그 묶음 끝에 붙인다. 프로젝트가 있었으면 참.
+    fn absorb(&mut self, host: &HostId, mut rows: Vec<Row>) -> bool {
+        // `Row::Loose` 머리줄은 모든 호스트를 합쳐 한 번만 둔다.
+        let loose = split_loose(&mut rows);
+        self.loose
+            .extend(loose.into_iter().skip(1).map(|r| (host.clone(), r)));
+        let mut projects = false;
+        let mut rows = rows.into_iter().peekable();
+        while let Some(head) = rows.next() {
+            let mut body = Vec::new();
+            while let Some(row) = rows.next_if(|r| !starts_chunk(r)) {
+                body.push((host.clone(), row));
+            }
+            let Some((key, path)) = project_key(&head) else {
+                body.insert(0, (host.clone(), head));
+                self.chunks.push(ProjectChunk {
+                    rows: body,
+                    aliases: Vec::new(),
+                });
+                continue;
+            };
+            projects = true;
+            let owner = self.owners.get(&key).map(|(i, _)| *i);
+            if let Some(chunk) = owner.and_then(|i| self.chunks.get_mut(i)) {
+                chunk.aliases.push((host.clone(), path.clone()));
+                chunk.rows.extend(body);
+            } else {
+                self.owners.insert(key, (self.chunks.len(), path.clone()));
+                body.insert(0, (host.clone(), head));
+                self.chunks.push(ProjectChunk {
+                    rows: body,
+                    aliases: Vec::new(),
+                });
+            }
+        }
+        projects
+    }
+
+    /// 프로젝트 → 프로젝트 없는 호스트 상태 줄 → 작업 폴더 모르는 세션 순으로 편다.
+    #[expect(
+        clippy::type_complexity,
+        reason = "rows, row hosts and merged headers are built together"
+    )]
+    fn finish(
+        self,
+        idle: Vec<(HostId, Row)>,
+    ) -> (
+        Vec<Row>,
+        Vec<HostId>,
+        BTreeMap<usize, Vec<(HostId, PathBuf)>>,
+    ) {
+        let mut rows = Vec::new();
+        let mut hosts = Vec::new();
+        let mut merged = BTreeMap::new();
+        let mut push = |(host, row): (HostId, Row)| {
+            hosts.push(host);
+            rows.push(row);
+        };
+        let mut start = 0;
+        for chunk in self.chunks {
+            if !chunk.aliases.is_empty() {
+                merged.insert(start, chunk.aliases);
+            }
+            start += chunk.rows.len();
+            chunk.rows.into_iter().for_each(&mut push);
+        }
+        idle.into_iter().for_each(&mut push);
+        if !self.loose.is_empty() {
+            push((HostId::Local, Row::Loose));
+            self.loose.into_iter().for_each(&mut push);
+        }
+        (rows, hosts, merged)
+    }
+}
+
+/// 프로젝트 기준 보기에서 새 묶음을 여는 행.
+fn starts_chunk(row: &Row) -> bool {
+    matches!(
+        row,
+        Row::Repository(_)
+            | Row::Folder(_)
+            | Row::GroupHeader { .. }
+            | Row::Loose
+            | Row::HostHeader { .. }
+            | Row::NeedsYou
+    )
 }
 
 fn sort_agents(mut list: Vec<AgentProfile>) -> Vec<AgentProfile> {
@@ -803,6 +1009,7 @@ impl Sidebar {
             pr_task: None,
             pr_service: None,
             rows: Vec::new(),
+            merged_projects: BTreeMap::new(),
             card_parents: Vec::new(),
             prefs,
             options,
@@ -850,6 +1057,8 @@ impl Sidebar {
             now_override_ns: None,
             focused: None,
             unread: BTreeSet::new(),
+            read_done: BTreeMap::new(),
+            next_read_done_seq: 0,
             agents: Vec::new(),
             disk: async_state::State::default(),
             visible: true,
@@ -1188,6 +1397,7 @@ impl Sidebar {
                 error: None,
             });
         }
+        self.prune_read_done_for_host(&HostId::Remote(id.to_owned()), cx);
         self.rebuild(cx);
     }
 
@@ -1226,20 +1436,6 @@ impl Sidebar {
             self.collapsed_hosts.insert(host.clone());
         }
         self.persist(cx);
-    }
-
-    /// 연결된 원격 호스트의 '연결 해제' 버튼을 눌렀을 때 상태를 `Disconnected`로 바꾸고 해제를 요청한다.
-    /// 터널·링크 자식은 셸(`DisconnectHost` 구독)이 내리며, `reconnect_host`로만 다시 붙는다.
-    pub fn disconnect_host(&mut self, host: HostId, cx: &mut Context<Self>) {
-        if let HostId::Remote(id) = &host
-            && let Some(r) = self.remote_hosts.iter_mut().find(|r| r.id == *id)
-        {
-            r.status = HostStatus::Disconnected;
-        }
-        self.rebuild(cx);
-        cx.emit(DisconnectHost(host));
-        self.remote_task = None;
-        self.start_remote_polling(cx);
     }
 
     /// 끊긴 원격 호스트의 '다시 연결' 버튼을 눌렀을 때 상태를 `Connecting`으로 바꾸고 재연결을 요청한다.
@@ -1487,6 +1683,8 @@ impl Sidebar {
                                     entry.meta = meta;
                                     changed = true;
                                 }
+                                let host_id = HostId::Remote(id.clone());
+                                s.prune_read_done_for_host(&host_id, cx);
                             } else {
                                 let status = s
                                     .remote_info
@@ -1622,29 +1820,125 @@ impl Sidebar {
         }
     }
 
-    /// 사이드바 상단 '에이전트 대시보드' 행에 표시할 `(작업 중·대기 수, 완료 수)`.
+    /// 사이드바 상단 '에이전트 대시보드' 행에 표시할 `(확인 필요 수, 작업 중 수, 완료 수)`.
+    /// 대시보드 모달(`dashboard_sessions`)과 동일한 호스트 필터 및 상태 분류 기준을 따른다.
     #[must_use]
-    pub fn agent_counts(&self) -> (usize, usize) {
+    pub fn agent_counts(&self) -> (usize, usize, usize) {
+        let mut waiting = 0usize;
         let mut working = 0usize;
         let mut done = 0usize;
-        for s in &self.snapshot.sessions {
+        for (_, s) in self.dashboard_sessions() {
             match s.status.state {
-                AgentState::Working | AgentState::Waiting | AgentState::Blocked => working += 1,
-                AgentState::Done => done += 1,
-                AgentState::Exited | AgentState::Unknown => {
-                    if !s.status.agent.is_empty() {
-                        done += 1;
-                    }
-                }
+                AgentState::Waiting | AgentState::Blocked => waiting += 1,
+                AgentState::Working => working += 1,
+                AgentState::Done | AgentState::Exited => done += 1,
+                AgentState::Unknown => {}
             }
         }
-        (working, done)
+        (waiting, working, done)
     }
 
     /// OWE-662: 보지 않은 사이 완료·대기로 바뀐 세션인지.
     #[must_use]
     pub fn is_unread(&self, id: SessionId) -> bool {
         self.unread.contains(&id)
+    }
+
+    /// 에이전트 대시보드에서 완료(`Done | Exited`) 카드가 이미 읽음 처리된 상태면 읽은 순번(`Some(seq)`)을 돌려준다.
+    /// 아직 확인하지 않은 완료 카드이거나 새로 완료된 카드면 `None`이다.
+    #[must_use]
+    pub fn dashboard_read_order(&self, host: &HostId, session: &Session) -> Option<u64> {
+        if !matches!(session.status.state, AgentState::Done | AgentState::Exited) {
+            return None;
+        }
+        if host.is_local() && self.unread.contains(&session.id) {
+            return None;
+        }
+        let entry = self.read_done.get(&(host.clone(), session.id))?;
+        (entry.since_unix_ns == session.status.since_unix_ns || session.status.since_unix_ns == 0)
+            .then_some(entry.seq)
+    }
+
+    /// 에이전트 대시보드 기준 미확인(안 읽음) 카드인지.
+    #[must_use]
+    pub fn is_dashboard_unread(&self, host: &HostId, session: &Session) -> bool {
+        if matches!(session.status.state, AgentState::Done | AgentState::Exited) {
+            self.dashboard_read_order(host, session).is_none()
+        } else {
+            host.is_local() && self.is_unread(session.id)
+        }
+    }
+
+    /// 세션을 사용자가 열어 확인했을 때 미확인 표시를 끄고, 완료(`Done | Exited`) 세션이면
+    /// 대시보드 읽음 순서(`read_done`)에 기록한다.
+    pub fn mark_session_read(
+        &mut self,
+        host: &HostId,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = host.is_local() && self.unread.remove(&id);
+        if let Some(session) = self.session_on(host, id)
+            && matches!(session.status.state, AgentState::Done | AgentState::Exited)
+        {
+            let since_unix_ns = session.status.since_unix_ns;
+            let key = (host.clone(), id);
+            let already_read = self
+                .read_done
+                .get(&key)
+                .is_some_and(|entry| entry.since_unix_ns == since_unix_ns || since_unix_ns == 0);
+            if !already_read {
+                self.next_read_done_seq = self.next_read_done_seq.saturating_add(1);
+                let seq = self.next_read_done_seq;
+                self.read_done
+                    .insert(key, ReadDoneEntry { since_unix_ns, seq });
+                self.write_read_done(cx);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    pub(super) fn write_read_done(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.state_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        let snapshot = self.read_done.clone();
+        self.enqueue_disk_write(move || save_read_done(&dir, &snapshot), cx);
+    }
+
+    pub(super) fn prune_read_done_for_host(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        let before_len = self.read_done.len();
+        let sessions: &[Session] = match host {
+            HostId::Local => &self.snapshot.sessions,
+            HostId::Remote(id) => self
+                .remote_hosts
+                .iter()
+                .find(|r| r.id == *id)
+                .map_or(&[], |r| &r.snapshot.sessions),
+        };
+        let is_local = host.is_local();
+        let unread = &self.unread;
+        self.read_done.retain(|(h, id), entry| {
+            if h != host {
+                return true;
+            }
+            if is_local && unread.contains(id) {
+                return false;
+            }
+            let Some(session) = sessions.iter().find(|s| s.id == *id) else {
+                return false;
+            };
+            matches!(session.status.state, AgentState::Done | AgentState::Exited)
+                && (entry.since_unix_ns == session.status.since_unix_ns
+                    || session.status.since_unix_ns == 0)
+        });
+        if self.read_done.len() != before_len {
+            self.write_read_done(cx);
+        }
     }
 
     pub(crate) fn mark_workspace_read(
@@ -1664,7 +1958,7 @@ impl Sidebar {
             .map(|s| s.id)
             .collect();
         for id in ids {
-            self.unread.remove(&id);
+            self.mark_session_read(host, id, cx);
         }
         self.rebuild(cx);
     }
@@ -1976,6 +2270,51 @@ impl Sidebar {
             .map_or_else(|| basename(path), str::to_owned)
     }
 
+    /// 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
+    /// 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
+    fn live_remote_hosts(&self) -> impl Iterator<Item = &RemoteHost> {
+        self.remote_hosts.iter().filter(|r| {
+            self.options
+                .filters
+                .contains_host(&HostId::Remote(r.id.clone()))
+                && (r.status == HostStatus::Connected
+                    || !r.snapshot.sessions.is_empty()
+                    || !r.snapshot.trees.is_empty()
+                    || self.remote_info.contains_key(&r.id))
+        })
+    }
+
+    /// Orca처럼 프로젝트가 맨 위 단계다. 여러 PC에 같은 프로젝트가 있으면 한 머리줄 아래로 합치고
+    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. PC별 상태 줄은 다시 연결이 필요한
+    /// 프로젝트 없는 호스트에만 남기고, 작업 폴더를 모르는 세션은 모든 PC 것을 끝에 한 묶음으로 둔다.
+    fn rebuild_by_project(&mut self) {
+        let mut merge = ProjectMerge::default();
+        if self.options.filters.contains_host(&HostId::Local) {
+            merge.absorb(&HostId::Local, self.local_rows());
+        }
+        let mut idle = Vec::new();
+        for remote in self.live_remote_hosts() {
+            let host = HostId::Remote(remote.id.clone());
+            let collapsed = merge.aligned_collapsed(&self.collapsed, &remote.snapshot);
+            let projects = merge.absorb(&host, self.remote_rows(remote, &collapsed));
+            if !projects && remote.status != HostStatus::Connected {
+                idle.push((
+                    host.clone(),
+                    Row::HostHeader {
+                        host,
+                        label: remote.label.clone(),
+                        status: remote.status,
+                        sessions: remote.snapshot.sessions.len(),
+                    },
+                ));
+            }
+        }
+        let (rows, row_hosts, merged) = merge.finish(idle);
+        self.rows = rows;
+        self.row_hosts = row_hosts;
+        self.merged_projects = merged;
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let cursor_item = self.cursor.and_then(|i| {
             self.rows
@@ -1997,6 +2336,7 @@ impl Sidebar {
             ),
         );
         self.ensure_external_polling(cx);
+        self.merged_projects.clear();
         if self.remote_hosts.is_empty() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
                 self.local_rows()
@@ -2004,94 +2344,43 @@ impl Sidebar {
                 Vec::new()
             };
             self.row_hosts = vec![HostId::Local; self.rows.len()];
+        } else if self.options.group_by == GroupBy::Repo {
+            self.rebuild_by_project();
         } else {
             let mut rows = Vec::new();
             let mut row_hosts = Vec::new();
-            // Orca처럼 프로젝트 목록을 끊지 않도록, 프로젝트 기준 보기에서는 호스트 행과
-            // 작업 폴더 없는 세션을 모든 프로젝트 뒤에 모은다.
-            let mut tail = Vec::new();
-            let mut tail_hosts = Vec::new();
             if self.options.filters.contains_host(&HostId::Local) {
-                if self.options.group_by != GroupBy::Repo {
-                    rows.push(Row::HostHeader {
-                        host: HostId::Local,
-                        label: text::HOST_LOCAL
-                            .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
-                            .get()
-                            .to_owned(),
-                        status: self.local_status,
-                        sessions: self.snapshot.sessions.len(),
-                    });
-                    row_hosts.push(HostId::Local);
-                }
-                if self.options.group_by == GroupBy::Repo
-                    || !self.collapsed_hosts.contains(&HostId::Local)
-                {
-                    let mut local_rows = self.local_rows();
-                    if self.options.group_by == GroupBy::Repo {
-                        let loose = split_loose(&mut local_rows);
-                        tail_hosts.extend(std::iter::repeat_n(HostId::Local, loose.len()));
-                        tail.extend(loose);
-                    }
+                rows.push(Row::HostHeader {
+                    host: HostId::Local,
+                    label: text::HOST_LOCAL
+                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                        .get()
+                        .to_owned(),
+                    status: self.local_status,
+                    sessions: self.snapshot.sessions.len(),
+                });
+                row_hosts.push(HostId::Local);
+                if !self.collapsed_hosts.contains(&HostId::Local) {
+                    let local_rows = self.local_rows();
                     row_hosts.extend(std::iter::repeat_n(HostId::Local, local_rows.len()));
                     rows.extend(local_rows);
                 }
             }
-            // 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
-            // 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
-            let live_hosts = self.remote_hosts.iter().filter(|r| {
-                self.options
-                    .filters
-                    .contains_host(&HostId::Remote(r.id.clone()))
-                    && (r.status == HostStatus::Connected
-                        || !r.snapshot.sessions.is_empty()
-                        || !r.snapshot.trees.is_empty()
-                        || self.remote_info.contains_key(&r.id))
-            });
-            for remote in live_hosts {
+            for remote in self.live_remote_hosts() {
                 let host = HostId::Remote(remote.id.clone());
-                let mut r_rows = self.remote_rows(remote);
-                // Projects are the root navigation. A remote connection without any
-                // projects still needs a reachable status/reconnect surface.
-                let by_repo = self.options.group_by == GroupBy::Repo;
-                let loose = if by_repo {
-                    split_loose(&mut r_rows)
-                } else {
-                    Vec::new()
-                };
-                let project_roots = by_repo
-                    && r_rows
-                        .iter()
-                        .any(|r| matches!(r, Row::Repository(_) | Row::Folder(_)));
-                if project_roots {
-                    row_hosts.extend(std::iter::repeat_n(host.clone(), r_rows.len()));
-                    rows.extend(r_rows);
-                    r_rows = Vec::new();
-                }
-                let (out, out_hosts) = if by_repo {
-                    r_rows.extend(loose);
-                    if r_rows.is_empty() && project_roots {
-                        continue;
-                    }
-                    (&mut tail, &mut tail_hosts)
-                } else {
-                    (&mut rows, &mut row_hosts)
-                };
-                out.push(Row::HostHeader {
+                rows.push(Row::HostHeader {
                     host: host.clone(),
                     label: remote.label.clone(),
                     status: remote.status,
                     sessions: remote.snapshot.sessions.len(),
                 });
-                out_hosts.push(host.clone());
-                // 프로젝트가 있는 호스트의 세션 묶음은 예전 호스트 접힘 상태에 가려지지 않는다.
-                if project_roots || !self.collapsed_hosts.contains(&host) {
-                    out_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
-                    out.extend(r_rows);
+                row_hosts.push(host.clone());
+                if !self.collapsed_hosts.contains(&host) {
+                    let r_rows = self.remote_rows(remote, &self.collapsed);
+                    row_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
+                    rows.extend(r_rows);
                 }
             }
-            rows.append(&mut tail);
-            row_hosts.append(&mut tail_hosts);
             self.rows = rows;
             self.row_hosts = row_hosts;
         }
@@ -2203,6 +2492,7 @@ impl Sidebar {
                         self.focused,
                     );
                     self.snapshot = snapshot;
+                    self.prune_read_done_for_host(&HostId::Local, cx);
                     self.meta = meta;
                     self.comments = comments;
                     self.auto_titles = auto_titles;
@@ -2536,6 +2826,7 @@ impl Sidebar {
     ) {
         self.cursor = Some(index);
         self.sync_viewport();
+        self.mark_session_read(&host, id, cx);
         if let Some(wt) = self.folder_on(&host, id).map(Path::to_path_buf)
             && self.selected_worktree.as_ref() != Some(&wt)
         {
@@ -2698,7 +2989,9 @@ impl Sidebar {
                 self.fold(&path, None, cx);
             }
             Some(Row::Session(session, _)) => {
-                self.action_host = Some(self.row_host(cursor).clone());
+                let host = self.row_host(cursor).clone();
+                self.mark_session_read(&host, session.id, cx);
+                self.action_host = Some(host);
                 cx.emit(Selected(session.id));
                 self.leave(window, cx);
             }
@@ -3248,15 +3541,16 @@ impl Sidebar {
 
     /// 바꾼 이름 → 브랜치 → 첫 프롬프트 자동 제목 → 폴더 이름.
     fn name(&self, path: &Path) -> String {
-        let pref_name = self
-            .prefs
-            .get(path)
-            .filter(|v| !v.name.is_empty())
-            .map(|v| v.name.as_str());
+        let pref_name = self.custom_worktree_name(path);
         if let Some(custom) =
             pref_name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n))
         {
             return custom.to_owned();
+        }
+        if self.snapshot.trees.contains_key(path) {
+            return self
+                .branch(path)
+                .map_or_else(|| basename(path), str::to_owned);
         }
         if let Some(branch) = self.branch(path) {
             if !krill_proto::git::is_default_branch_or_worktree_name(branch) {
@@ -3273,6 +3567,24 @@ impl Sidebar {
             return auto.to_owned();
         }
         pref_name.map_or_else(|| basename(path), str::to_owned)
+    }
+
+    /// 워크트리에 직접 지정한 이름. 기본 워크트리(`trees` 루트)에 프로젝트 표시 이름·폴더 이름이
+    /// 그대로 들어 있는 경우(`projects.toml` 동기화분 포함)는 프로젝트 머리줄과 중복이므로 제외한다.
+    pub(super) fn custom_worktree_name(&self, path: &Path) -> Option<&str> {
+        let name = self
+            .prefs
+            .get(path)
+            .map(|v| v.name.trim())
+            .filter(|s| !s.is_empty())?;
+        if self.snapshot.trees.contains_key(path) {
+            let folder = basename(path);
+            let header = self.project_header_name(path);
+            if name.eq_ignore_ascii_case(&folder) || name.eq_ignore_ascii_case(&header) {
+                return None;
+            }
+        }
+        Some(name)
     }
 
     pub(super) fn worktree_auto_title(&self, path: &Path) -> Option<&str> {

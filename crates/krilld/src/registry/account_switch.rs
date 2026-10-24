@@ -3,6 +3,7 @@
 //! src/renderer/src/store/terminals/terminal-restart-state.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
+pub(super) mod identity;
 #[cfg(all(test, unix))]
 mod tests;
 mod transcript;
@@ -96,13 +97,9 @@ impl Registry {
             .map(|p| p.into_os_string().as_encoded_bytes().to_vec())
             .filter(|c| !c.is_empty())
             .unwrap_or(entry_cwd);
-        let permission = self
-            .agents
-            .agents()
-            .map_or(krill_proto::agent::Permission::Yolo, |a| a.permission);
         Some(crate::agent::control::StoredLaunch {
             profile: agent.profile().to_owned(),
-            permission,
+            permission: krill_proto::agent::Permission::Manual,
             session_id: None,
             transcript_path: None,
             cwd,
@@ -118,6 +115,8 @@ impl Registry {
             provider,
             crate::usage::accounts::switch_work::SwitchTarget {
                 account_id: account_id.into(),
+                prepared: true,
+                not_before: None,
             },
         );
         self.account_work.wake.notify_one();
@@ -158,7 +157,13 @@ impl Registry {
             {
                 continue;
             }
-            if stored.account.as_ref().is_some_and(|a| a.id == account_id) {
+            let current = crate::agent::account_for_stored_in(
+                &accounts::default_home(),
+                profile,
+                self.state_dir().as_deref(),
+                &stored,
+            );
+            if current.as_ref().is_some_and(|a| a.id == account_id) {
                 let mut handoffs = lock(&self.account_handoffs);
                 if handoffs.get(&from).is_some_and(|h| h.to.is_none()) {
                     handoffs.remove(&from);
@@ -281,11 +286,21 @@ impl Registry {
             return;
         }
         let pending = lock(&self.account_work.pending);
-        if pending.is_empty() {
+        let wait = pending
+            .values()
+            .map(|target| {
+                target.not_before.map_or(Duration::ZERO, |at| {
+                    at.saturating_duration_since(Instant::now())
+                })
+            })
+            .min()
+            .unwrap_or(timeout)
+            .min(timeout);
+        if !wait.is_zero() {
             drop(
                 self.account_work
                     .wake
-                    .wait_timeout(pending, timeout)
+                    .wait_timeout(pending, wait)
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
         }
@@ -303,10 +318,21 @@ impl Registry {
         self.recover_account_work(home);
         let pending = {
             let mut pending = lock(&self.account_work.pending);
-            for (provider, target) in pending.iter() {
-                self.prepare_account_switch(*provider, &target.account_id);
+            let ready: Vec<_> = pending
+                .iter()
+                .filter(|(_, target)| target.not_before.is_none_or(|at| Instant::now() >= at))
+                .map(|(provider, _)| *provider)
+                .collect();
+            let mut work = BTreeMap::new();
+            for provider in ready {
+                if let Some(target) = pending.remove(&provider) {
+                    if !target.prepared {
+                        self.prepare_account_switch(provider, &target.account_id);
+                    }
+                    work.insert(provider, target);
+                }
             }
-            std::mem::take(&mut *pending)
+            work
         };
         let peer = Peer {
             pid: None,
@@ -330,8 +356,30 @@ impl Registry {
                     self.handoff_account(&peer, old, provider, &account_id, home)
                 }))
                 .unwrap_or(Err(Failure::BadRequest));
+                if result == Err(Failure::Os(libc::EBUSY)) {
+                    // SQLite is still writing the original conversation. Keep the handoff
+                    // pending and retry after it closes; a later selection always wins.
+                    lock(&self.account_work.pending)
+                        .entry(provider)
+                        .or_insert_with(|| crate::usage::accounts::switch_work::SwitchTarget {
+                            account_id: account_id.clone(),
+                            prepared: true,
+                            not_before: Some(Instant::now() + Duration::from_millis(500)),
+                        });
+                    continue;
+                }
+                let superseded = lock(&self.account_work.pending)
+                    .get(&provider)
+                    .is_some_and(|target| target.account_id != account_id);
                 let mut handoffs = lock(&self.account_handoffs);
-                if let Some(handoff) = handoffs
+                if superseded && result.is_err() {
+                    if handoffs
+                        .get(&old)
+                        .is_some_and(|h| h.account_id == account_id && h.to.is_none())
+                    {
+                        handoffs.remove(&old);
+                    }
+                } else if let Some(handoff) = handoffs
                     .get_mut(&old)
                     .filter(|h| h.account_id == account_id)
                 {
@@ -340,7 +388,7 @@ impl Registry {
                         Err(error) => {
                             let reason = match error {
                                 Failure::Denied => "selected account login or credential scope could not be verified".into(),
-                                Failure::Os(libc::EAGAIN) => "conversation identity is not bound; wait for the original agent's session-start hook before retrying".into(),
+                                Failure::Os(libc::EAGAIN) => "the running conversation could not be identified from its hooks or open transcript".into(),
                                 Failure::Os(libc::ENOENT) => "conversation transcript is missing; original conversation was not replaced".into(),
                                 Failure::Os(libc::EILSEQ) => "conversation transcript identity is mismatched or ambiguous".into(),
                                 Failure::Os(libc::EEXIST) => "selected profile contains a separate or conflicting conversation copy; reconcile its history before retrying".into(),
@@ -437,6 +485,8 @@ impl Registry {
                     .entry(account.provider)
                     .or_insert_with(|| crate::usage::accounts::switch_work::SwitchTarget {
                         account_id: account.id.clone(),
+                        prepared: true,
+                        not_before: None,
                     });
             } else {
                 handoff.error =
@@ -544,7 +594,7 @@ impl Registry {
     ) -> Result<SessionId, Failure> {
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
-        let stored = self
+        let mut stored = self
             .live_agent_for_switch(old)
             .ok_or(Failure::UnknownAgent)?;
         let state_dir = self.state_dir();
@@ -587,7 +637,12 @@ impl Registry {
                 target.profile_dir.clone()
             },
         });
-        let (cwd, size): (Vec<u8>, krill_proto::holder::WinSize) = {
+        let (cwd, size, old_pid, old_fg): (
+            Vec<u8>,
+            krill_proto::holder::WinSize,
+            u32,
+            Option<u32>,
+        ) = {
             let state = lock(&self.state);
             if state.exited.contains_key(&old) {
                 return Err(Failure::NoSession);
@@ -601,22 +656,101 @@ impl Registry {
             (
                 cwd,
                 entry.session.tap().size().unwrap_or(super::FALLBACK_SIZE),
+                entry.pid,
+                entry.session.tap().foreground(),
             )
         };
-        // A project path never identifies a conversation. Only launch/resume/hook bindings do.
+        // Initial hooks can arrive while login validation or a first prompt is running.
+        // Recover from the exact file held by this pane when hook trust was missing.
+        let mut claude_homes: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.provider == ProviderKind::Claude)
+            .map(|a| std::path::PathBuf::from(&a.profile_dir))
+            .collect();
+        claude_homes.push(accounts::host_default_dir(home, ProviderKind::Claude));
+        if let Some(account) = stored.account.as_ref().filter(|a| !a.dir.is_empty()) {
+            claude_homes.push(std::path::PathBuf::from(&account.dir));
+        }
+        claude_homes.sort();
+        claude_homes.dedup();
+        let binding_deadline = Instant::now() + Duration::from_secs(2);
+        let mut transcript_home = None;
+        loop {
+            if let Some(current) = self.agents.stored(old).map_err(|e| super::os(&e))? {
+                stored = current;
+            }
+            let foreground = lock(&self.state)
+                .sessions
+                .get(&old)
+                .and_then(|e| e.session.tap().foreground())
+                .or(old_fg);
+            let mut observed = identity::discover(provider, old_pid, foreground)
+                .map_err(|e| prepare_failure("process_identity", &e))?;
+            if observed.is_none() && provider == ProviderKind::Claude {
+                observed = identity::discover_claude(&claude_homes, old_pid, foreground)
+                    .map_err(|e| prepare_failure("process_identity", &e))?;
+            }
+            if let Some(found) = observed {
+                // Old versions could persist a display-only cwd guess. A live process
+                // observation must agree even when a record already contains an ID.
+                if (stored.session_id.is_some() || stored.transcript_path.is_some())
+                    && transcript::session_id(provider, &stored)
+                        .map_err(|e| prepare_failure("process_identity", &e))?
+                        != found.id
+                {
+                    return Err(Failure::Os(libc::EILSEQ));
+                }
+                stored.session_id = Some(found.id);
+                stored.transcript_path = found.path.to_str().map(str::to_owned);
+                transcript_home = Some(found.home);
+                break;
+            }
+            if stored.session_id.is_some() || stored.transcript_path.is_some() {
+                break;
+            }
+            if self.account_original_ended(old) {
+                return Err(Failure::NoSession);
+            }
+            if Instant::now() >= binding_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A project path never identifies a conversation. Only launch/resume/hooks or
+        // files held by this process can supply the identity used for retirement.
         let session_id = transcript::session_id(provider, &stored)
             .map_err(|error| prepare_failure("transcript_preparation", &error))?;
-        let source = crate::agent::resume_account(
-            profile,
-            state_dir.as_deref(),
-            stored.account.as_ref(),
-            Some(&session_id),
-        )
-        .unwrap_or_else(|| crate::agent::control::LaunchAccount {
-            id: accounts::host_default_id(provider),
-            env_key: provider.env_var().into(),
-            dir: String::new(),
-        });
+        stored.session_id = Some(session_id.clone());
+        let bound_path = stored.transcript_path.clone();
+        stored = self
+            .agents
+            .bind_switch_identity(old, &stored)
+            .map_err(|e| prepare_failure("identity_binding", &e))?;
+        let source = transcript_home
+            .map(|home| crate::agent::control::LaunchAccount {
+                id: String::new(),
+                env_key: provider.env_var().into(),
+                dir: home.to_string_lossy().into_owned(),
+            })
+            .or_else(|| {
+                crate::agent::account_for_stored_in(home, profile, state_dir.as_deref(), &stored)
+            })
+            .unwrap_or_else(|| crate::agent::control::LaunchAccount {
+                id: accounts::host_default_id(provider),
+                env_key: provider.env_var().into(),
+                dir: String::new(),
+            });
+        if !target.host_default && matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+            // Establish a new profile's shared history before bridging a file would
+            // create a private history directory and force a later migration.
+            crate::usage::provision::provision_if_enabled(
+                home,
+                state_dir.as_deref(),
+                provider,
+                &target.profile_dir,
+            );
+        }
         let prepared_transcript = transcript::prepare_bound(
             provider,
             home,
@@ -624,7 +758,7 @@ impl Registry {
             target,
             &session_id,
             &cwd,
-            stored.transcript_path.as_deref(),
+            bound_path.as_deref(),
         )
         .map_err(|error| prepare_failure("transcript_preparation", &error))?;
         let new = self.next_id();
@@ -683,18 +817,54 @@ impl Registry {
             size.rows,
         )?;
         // Give the local CLI preflight a chance to report an immediate spawn/auth failure.
-        let tap = lock(&self.state)
-            .sessions
-            .get(&new)
-            .ok_or(Failure::NoSession)?
-            .session
-            .tap();
+        let (tap, new_pid) = {
+            let state = lock(&self.state);
+            let entry = state.sessions.get(&new).ok_or(Failure::NoSession)?;
+            (entry.session.tap(), entry.pid)
+        };
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut ready = false;
+        let mut next_identity_probe = Instant::now();
         while Instant::now() < deadline {
             if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
                 self.close(peer, new).ok();
                 return Err(Failure::BadRequest);
+            }
+            if !self.agents.account_resume_observed(new, &session_id)
+                && Instant::now() >= next_identity_probe
+            {
+                next_identity_probe = Instant::now() + Duration::from_millis(200);
+                let mut observed = identity::discover(provider, new_pid, tap.foreground())
+                    .map_err(|e| prepare_failure("resume_identity", &e))?;
+                if observed.is_none() && provider == ProviderKind::Claude {
+                    observed = identity::discover_claude(&claude_homes, new_pid, tap.foreground())
+                        .map_err(|e| prepare_failure("resume_identity", &e))?;
+                }
+                let observed = observed
+                    .filter(|found| {
+                        if provider != ProviderKind::Antigravity {
+                            return true;
+                        }
+                        let expected = if target.host_default {
+                            std::path::PathBuf::from(&target.profile_dir)
+                        } else {
+                            Path::new(&target.profile_dir).join(".gemini/antigravity-cli")
+                        };
+                        found
+                            .home
+                            .canonicalize()
+                            .ok()
+                            .zip(expected.canonicalize().ok())
+                            .is_some_and(|(actual, expected)| actual == expected)
+                    })
+                    .map(|found| (found.id, Some(found.path)));
+                if let Some((sid, path)) = observed
+                    && sid == session_id
+                {
+                    self.agents
+                        .bind_discovered_session(new, &sid, path.as_deref());
+                    self.agents.observe_account_resume(new, &session_id);
+                }
             }
             if self.agents.account_resume_observed(new, &session_id)
                 && tap.pulse().end > 0
@@ -751,6 +921,11 @@ impl Registry {
             self.close(peer, new).ok();
             return Err(super::os(&error));
         }
+        let should_continue = self.agents.take_rate_limited(old) || {
+            let st = self.status.get(old);
+            st.state == krill_proto::control::AgentState::Working
+                && st.source == Some(krill_proto::control::Source::Hook)
+        };
         if !self.account_original_ended(old)
             && let Err(error) = self.close(peer, old)
         {
@@ -785,6 +960,17 @@ impl Registry {
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
         drop(replacement);
+        if should_continue
+            && let Err(error) =
+                Self::deliver_input_to_tap(&tap, b"Continue from where you left off.", true)
+        {
+            tracing::warn!(
+                session = new.0,
+                from = old.0,
+                error = %error,
+                "failed to send continuation prompt after account switch"
+            );
+        }
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
         let later = lock(&self.account_work.pending)
@@ -844,7 +1030,7 @@ fn prepare_failure(stage: &'static str, error: &std::io::Error) -> Failure {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
         ErrorKind::NotFound => libc::ENOENT,
         ErrorKind::WouldBlock => libc::EAGAIN,
-        ErrorKind::InvalidData => libc::EILSEQ,
+        ErrorKind::InvalidData | ErrorKind::Unsupported => libc::EILSEQ,
         ErrorKind::InvalidInput => libc::EINVAL,
         ErrorKind::AlreadyExists => libc::EEXIST,
         ErrorKind::FileTooLarge => libc::EFBIG,

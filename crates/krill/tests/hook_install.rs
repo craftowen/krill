@@ -423,6 +423,63 @@ fn codex_rpc_uses_the_caller_supplied_search_path() {
 }
 
 #[test]
+fn automatic_codex_setup_refreshes_verified_trust_and_restores_previous_values() {
+    use krill_proto::hook_install::{Action, CodexTrust, Plan, TargetAgent};
+    use std::path::Path;
+    let h = Home::new();
+    let key = "/<session-flags>/config.toml:stop:0:0";
+    h.write("codex", &format!(
+        "# user config\n[hooks.state.\"user-key\"]\ntrusted_hash = 'user-hash'\n[hooks.state.\"{key}\"]\ntrusted_hash = 'old-install-hash'\n"
+    ));
+    let original = h.read("codex");
+    let bin = h.fake_codex();
+    let plan = Plan::prepare_with_trust(
+        Action::Install,
+        TargetAgent::Other(Agent::Codex),
+        &h.config("codex"),
+        &h.0.join("state"),
+        Path::new(MK),
+        Some(bin.as_os_str()),
+        CodexTrust::Refresh,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(h.read("codex"), original, "preparation must not write");
+    let receipt = plan.apply().unwrap();
+    assert!(receipt.complete);
+    assert_eq!(
+        receipt.codex.unwrap().replaced[key]["trusted_hash"],
+        "old-install-hash"
+    );
+    let installed: toml::Value = toml::from_str(&h.read("codex")).unwrap();
+    assert_ne!(
+        installed["hooks"]["state"][key]["trusted_hash"].as_str(),
+        Some("old-install-hash")
+    );
+    // A subsequent user edit must survive rollback, including in refreshed mode.
+    let edited = "/<session-flags>/config.toml:permission_request:0:0";
+    let hash = installed["hooks"]["state"][edited]["trusted_hash"]
+        .as_str()
+        .unwrap();
+    h.write("codex", &h.read("codex").replace(hash, "later-user-hash"));
+    success(&h.codex("uninstall", &["--yes"]));
+    let restored: toml::Value = toml::from_str(&h.read("codex")).unwrap();
+    assert_eq!(
+        restored["hooks"]["state"][key]["trusted_hash"].as_str(),
+        Some("old-install-hash")
+    );
+    assert_eq!(
+        restored["hooks"]["state"][edited]["trusted_hash"].as_str(),
+        Some("later-user-hash")
+    );
+    assert_eq!(
+        restored["hooks"]["state"]["user-key"]["trusted_hash"].as_str(),
+        Some("user-hash")
+    );
+    assert_eq!(restored["hooks"]["state"].as_table().unwrap().len(), 3);
+}
+
+#[test]
 fn codex_trust_conflicts_are_rejected_and_user_modified_hash_is_preserved() {
     let h = Home::new();
     let key = "/<session-flags>/config.toml:stop:0:0";

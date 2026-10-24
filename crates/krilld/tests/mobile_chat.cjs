@@ -2,7 +2,7 @@
 'use strict';
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 class Element extends EventTarget{
- constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.scrollTop=0;this.clientHeight=100;this.value='';}
+ constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollTop=0;this.clientHeight=100;this.value='';}
  append(...nodes){for(const n of nodes){n.remove();n.parentElement=this;this.children.push(n);}}
  insertBefore(node,next){node.remove();const i=this.children.indexOf(next);node.parentElement=this;if(i<0)this.children.push(node);else this.children.splice(i,0,node);}
  replaceChildren(...nodes){for(const n of this.children)n.parentElement=null;this.children=[];this.append(...nodes);}
@@ -17,8 +17,9 @@ const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve
 const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 function fixture(options={}){
  const buttons=[],calls=[],sheets=[],errors=[],tasks=[],timers=new Map();let id=0,term=0;
- const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible'});
- const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
+ const copied=[];
+ const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible',body:new Element('body'),execCommand:()=>true});
+ const sandbox={Event,document:doc,isSecureContext:true,navigator:{clipboard:{writeText:async text=>{copied.push(text);}}},Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
  const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:options.phase||'ready'},drafts:new Map()};
  const root=new Element('root'),el=(...args)=>new Element(...args);
@@ -27,7 +28,7 @@ function fixture(options={}){
  const ctx={el,state,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},rpc:async request=>{calls.push(request);return handler(request);},photo:(...args)=>prepare(...args),act(fn){const p=Promise.resolve().then(fn).catch(e=>errors.push(e));tasks.push(p);return p;},refresh:async()=>{},sheet(title,_,__,render){const body=el('body');render(body);sheets.push({title,body});}};
  let view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,visible:options.visible,onSwitchTerm:()=>term++});
  const find=cls=>root.descendants().find(n=>n.className===cls),button=label=>root.descendants().find(n=>n.tag==='button'&&n.textContent===label);
- return {root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
+ return {root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,copied,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
 }
 function unitServer(f){let total=0;const page=q=>{const start=q.offset,end=Math.min(total,start+128,q.end_offset??Infinity);return {generation:'g1',items:Array.from({length:end-start},(_,i)=>({id:start+':'+i,kind:'assistant',text:'Message '+(start+i)})),next_offset:end,bound:true};};f.handler=async q=>page(q);return {page,set total(n){total=n;}};}
 async function historyRace(){
@@ -82,7 +83,49 @@ async function hiddenPrefetchAndOldDaemon(){
  let fails=0;const flaky=fixture({visible:false,handler:async()=>{fails++;throw Error('busy');}});await flush();for(let i=0;i<5;i++){flaky.update();await flush();}assert.equal(fails,2,'hidden Chat stops retrying after two failures');flaky.dispose();
  console.log('PASS hidden Chat prefetches once after connecting; chat_tail-less daemon rejection falls back to offset polling');
 }
+async function orcaComposerAndMeta(){
+ const f=fixture();await flush();await f.poll({generation:'g1',agent:'claude',bound:true,items:[{id:'0:0',kind:'user',text:'hi',at:'2026-10-24T03:48:10.000Z'},{id:'0:1',kind:'assistant',text:'done'}],next_offset:10});
+ const metas=f.root.descendants().filter(n=>n.className==='chat-meta');assert.equal(metas.length,2,'user and agent messages carry a meta row');
+ assert.equal(metas[0].children[0].className,'icon-button chat-copy');assert.equal(metas[0].children[1].className,'chat-time');assert.equal(metas[0].children[1].attrs.datetime,'2026-10-24T03:48:10.000Z');
+ assert.equal(metas[1].children.length,1,'a message without a record time shows only the copy button');
+ assert.equal(f.find('chat-input').placeholder,'Message {0}','a known agent gets the per-agent placeholder (this fixture has no translator)');
+ const entries=[];f.ctx.sheet=(title,items)=>entries.push(...items);
+ const model=f.buttons.find(b=>b.className==='composer-pill');assert.equal(model.hidden,false);model.action();
+ assert.deepEqual(Array.from(entries,e=>e.label),['Default (recommended)','Opus','Sonnet','Haiku']);
+ entries[2].action();await flush();assert.deepEqual({...f.calls.at(-1)},{action:'prompt',session:7,text:'/model sonnet'});f.dispose();
+ const codex=fixture();await flush();await codex.poll({generation:'g1',agent:'codex',bound:true,items:[],next_offset:0});
+ codex.buttons.find(b=>b.className==='composer-pill').action();await flush();
+ assert.deepEqual({...codex.calls.at(-1)},{action:'prompt',session:7,text:'/model'});assert.equal(codex.term,1,'Codex picks its model in the terminal picker');codex.dispose();
+ const other=fixture();await flush();await other.poll({generation:'g1',agent:'agy',bound:true,items:[],next_offset:0});
+ assert.equal(other.buttons.find(b=>b.className==='composer-pill').hidden,true,'agents without a known /model command get no Model button');other.dispose();
+ console.log('PASS Orca composer: copy/time under messages, Model sends /model to Claude or opens the Codex picker in Term');
+}
+async function markdownFormatting(){
+ const f=fixture();await flush();
+ const text='**실패 지점은 확인했지만, 복구는 아직 못 했습니다.**\n\n- `pwd`뿐 아니라 **셸을 쓰지 않는 자바스크립트 한 줄**도 실패합니다.\n1. 첫 번째 단계\n2. **두 번째** 단계\n> 인용 첫 줄\n> 인용 `코드` 둘째 줄\n| 항목 | 상태 |\n| --- | :---: |\n| `build` | **통과** |\n### **확인 결과**\n[공식 문서](https://example.com/docs)와 *강조*, snake_case, \\*그대로\\*\n```js\nconst raw = "**그대로** <img src=x onerror=alert(1)>";\n```\n<img src=x onerror=alert(1)> [차단](javascript:alert)';
+ await f.poll({generation:'g1',agent:'codex',bound:true,next_offset:1,items:[{id:'markdown',kind:'assistant',text}]});
+ const nodes=f.find('chat-md').descendants(),byTag=tag=>nodes.filter(n=>n.tag===tag);
+ assert.deepEqual(byTag('strong').map(n=>n.children.map(c=>c.textContent).join('')),['실패 지점은 확인했지만, 복구는 아직 못 했습니다.','셸을 쓰지 않는 자바스크립트 한 줄','두 번째','통과','확인 결과']);
+ assert.equal(byTag('code')[0].textContent,'pwd');
+ assert.equal(byTag('ol').length,1);assert.equal(byTag('ol')[0].className,'chat-ol');assert.equal(byTag('li').length,2);
+ assert.equal(byTag('blockquote').length,1);assert.equal(byTag('blockquote')[0].className,'chat-quote');assert(byTag('blockquote')[0].descendants().some(n=>n.tag==='code'&&n.textContent==='코드'));
+ assert.equal(byTag('table').length,1);assert.equal(byTag('table')[0].className,'chat-table');assert.equal(byTag('th').length,2);assert.equal(byTag('td').length,2);
+ assert.equal(byTag('em').length,1);
+ assert.equal(byTag('a').length,1,'only safe links become anchors');
+ assert.equal(byTag('a')[0].attrs.href,'https://example.com/docs');
+ assert.equal(byTag('pre')[0].children[0].textContent,'const raw = "**그대로** <img src=x onerror=alert(1)>";','code blocks retain literal Markdown and HTML');
+ assert.equal(byTag('img').length,0,'message HTML is displayed as text');
+ assert(nodes.some(n=>n.textContent?.includes('snake_case')));
+ assert.equal(byTag('strong').some(n=>n.textContent?.includes('그대로')),false);
+ const chatInput=f.find('chat-input');Object.defineProperty(chatInput,'scrollHeight',{configurable:true,get:()=>200});
+ f.input('long multiline');assert.equal(chatInput.style.height,'140px','sizeInput clamps to 140px max');
+ Object.defineProperty(chatInput,'scrollHeight',{configurable:true,get:()=>18});
+ f.input('short');assert.equal(chatInput.style.height,'28px','sizeInput clamps to 28px min');
+ f.dispose();console.log('PASS mobile Markdown: Korean bold, inline code, ol/blockquote/table, headings, emphasis, safe links, literal code/HTML and sizeInput');
+}
 async function main(){
+ await markdownFormatting();
+ await orcaComposerAndMeta();
  await hiddenPrefetchAndOldDaemon();
  await tailFollow();
  await renderBudgets();
@@ -135,21 +178,24 @@ async function main(){
  const q={id:'q',kind:'question',text:'Choose',multi_select:true,options:[{label:'Safe'},{label:'Fast'}]},reason={id:'r',kind:'reasoning',text:'Thought'},permission={id:'p',kind:'permission',text:'Approve?'};
  await f.poll({generation:'g1',items:[q,reason,permission],next_offset:10,bound:true});
  const card=f.find('chat-card chat-question'),custom=card.children.find(n=>n.tag==='input'),details=f.find('chat-reasoning');
- f.button('Safe').action();custom.value='keep notes';details.open=true;
+ f.button('Safe').action();custom.value='keep notes';custom.dispatchEvent(new Event('input'));details.open=true;
+ assert.equal(f.button('Copy answer').hidden,false);f.button('Copy answer').action();await flush();assert.equal(f.copied.at(-1),'Safe, keep notes');
  await f.poll({generation:'g1',items:[{id:'a',kind:'assistant',text:'delta'}],next_offset:20,bound:true});
  assert.equal(f.find('chat-card chat-question'),card);assert.equal(custom.value,'keep notes');assert.equal(details.open,true);assert.equal(f.button('Safe').attrs['aria-pressed'],'true');
  f.button('Confirm in Term').action();assert.equal(f.term,1);assert(!f.calls.some(c=>['approve','answer_question'].includes(c.action)));
  await f.poll({generation:'g1',items:[],next_offset:3,reset:true,bound:false});assert.equal(f.root.descendants().filter(n=>n.tag==='article').length,0);assert.equal(f.entry.items.length,0);assert.equal(f.entry.bound,false);assert.equal(f.entry.agent,'');f.dispose();
- console.log('PASS TR-A01/06/07 historical cards direct to Term, DOM notes/selection/expansion survive, empty reset clears immediately');
- f=fixture();await flush();f.handler=async()=>{throw new Error('history unavailable');};f.update();await flush();const status=f.root.descendants().find(n=>n.attrs.role==='status'&&n.children.some(c=>c.textContent==='Retry'));assert.equal(status.hidden,false);assert.match(status.children[0].textContent,/history unavailable/);
+ console.log('PASS TR-A01/06/07 historical cards direct to Term, Copy answer copies draft, DOM notes/selection/expansion survive, empty reset clears immediately');
+ f=fixture();await flush();f.handler=async()=>{throw new Error('history unavailable');};f.update();await flush();const status=f.root.descendants().find(n=>n.attrs.role==='status'&&n.children.some(c=>c.textContent==='Retry'));assert.equal(status.hidden,false);assert.match(status.children[0].textContent,/history unavailable/);assert.match(status.children[0].textContent,/\d\d:\d\d:\d\d/);
  f.handler=async req=>({generation:'g1',items:[],next_offset:req.offset,bound:true});f.button('Retry').action();await flush();assert.equal(status.hidden,true);f.dispose();
- console.log('PASS TR-A08 poll failure includes last update, explicit retry recovers');
+ console.log('PASS TR-A08 poll failure includes 24h HH:MM:SS last update, explicit retry recovers');
  // Photo picker uses ctx.el, so intercept just its file input to dispatch the actual change callback.
  f=fixture();await flush();let picker;const oldEl=f.ctx.el;f.ctx.el=(...args)=>{const n=oldEl(...args);if(n.tag==='input')picker=n;return n;};
  // mount captures el, so remount after installing instrumentation.
  f.remount();await flush();const photo1=deferred();f.prepare=()=>photo1.promise;f.button('Photo').action();picker.files=[{name:'first.jpg'}];picker.dispatchEvent(new Event('change'));await flush();assert.equal(f.entry.photo.status,'pending');f.input('with image');f.submit();await flush();assert(!f.calls.some(c=>c.action==='prompt'));
  photo1.reject(new Error('compression failed'));await flush();assert.equal(f.entry.photo.status,'error');assert(f.button('Retry photo'));f.submit();await flush();assert(!f.calls.some(c=>c.action==='prompt'));
- f.prepare=async()=>({mime:'image/jpeg',data:'image1'});f.button('Retry photo').action();await flush();assert.equal(f.entry.photo.status,'ready');f.submit();await flush();const sent=f.calls.find(c=>c.action==='prompt');assert.equal(sent.text,'with image');assert.equal(sent.photo.data,'image1');assert.equal(f.entry.photo,null);assert(!f.calls.some(c=>c.action==='photo'));assert.equal(f.find('chat-input').value,'');
+ f.prepare=async()=>({mime:'image/jpeg',data:'image1'});f.button('Retry photo').action();await flush();assert.equal(f.entry.photo.status,'ready');
+ const thumb=f.find('chat-photo-thumb');assert(thumb);assert.equal(thumb.attrs.src,'data:image/jpeg;base64,image1');
+ f.submit();await flush();const sent=f.calls.find(c=>c.action==='prompt');assert.equal(sent.text,'with image');assert.equal(sent.photo.data,'image1');assert.equal(f.entry.photo,null);assert(!f.calls.some(c=>c.action==='photo'));assert.equal(f.find('chat-input').value,'');
  const stale=deferred();f.prepare=()=>stale.promise;f.button('Photo').action();picker.files=[{name:'stale.jpg'}];picker.dispatchEvent(new Event('change'));await flush();f.button('Remove photo').action();stale.resolve({mime:'image/jpeg',data:'stale'});await flush();assert.equal(f.entry.photo,null);
  // Submit rejection must retain both draft and prepared photo for retry.
  f.prepare=async()=>({mime:'image/jpeg',data:'retry-image'});f.button('Photo').action();picker.files=[{name:'retry.jpg'}];picker.dispatchEvent(new Event('change'));await flush();f.handler=async req=>{if(req.action==='prompt')throw new Error('send failed');return {generation:'g1',items:[],next_offset:req.offset};};f.input('retry draft');f.submit();await flush();assert.equal(f.state.drafts.get(7),'retry draft');assert.equal(f.entry.photo.prepared.data,'retry-image');f.dispose();

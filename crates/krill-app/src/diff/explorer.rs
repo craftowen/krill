@@ -1795,6 +1795,8 @@ impl Panel {
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
@@ -1988,7 +1990,8 @@ impl Panel {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(ui::TEXT_XS)
+                                .font_family(ui::FONT_MONO)
+                                .text_size(ui::TEXT_SM)
                                 .text_color(row_fg)
                                 .when(is_selected, |d| d.font_weight(FontWeight::MEDIUM))
                                 .child(row.name.clone()),

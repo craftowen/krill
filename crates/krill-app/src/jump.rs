@@ -1564,19 +1564,7 @@ fn render_location_chip(
 }
 
 fn render_shortcut_combo(index: usize, pal: &crate::ui::Palette) -> gpui::Div {
-    let cap = |k: String| {
-        div()
-            .px_1()
-            .py(px(1.))
-            .rounded(crate::ui::RADIUS_XS)
-            .border_1()
-            .border_color(pal.border)
-            .bg(pal.background.opacity(0.45))
-            .font_family(crate::ui::FONT_MONO)
-            .text_size(crate::ui::TEXT_2XS)
-            .text_color(pal.muted_foreground)
-            .child(k)
-    };
+    let cap = |k: String| crate::ui::keycap(pal, k).text_color(pal.muted_foreground);
     div()
         .flex_none()
         .flex()
@@ -1595,17 +1583,7 @@ fn render_sliders_glyph(color: Hsla) -> gpui::Div {
 }
 
 fn render_footer_key(label: &'static str, pal: &crate::ui::Palette) -> gpui::Div {
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_full()
-        .border_1()
-        .border_color(pal.border)
-        .bg(pal.muted.opacity(0.45))
-        .text_size(crate::ui::TEXT_2XS)
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(pal.popover_foreground.opacity(0.85))
-        .child(label)
+    crate::ui::keycap(pal, label).text_color(pal.popover_foreground)
 }
 
 fn render_section_header(label: &str, pal: &crate::ui::Palette) -> gpui::Div {
@@ -2026,7 +2004,7 @@ impl Render for Palette {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(crate::ui::TEXT_LG)
+                            .text_size(crate::ui::TEXT_MD)
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(fg)
                             .child(self.mode.empty_text()),
@@ -2125,9 +2103,13 @@ impl Render for Palette {
 
                     let title_el = div()
                         .truncate()
-                        .text_size(crate::ui::TEXT_LG)
+                        .text_size(crate::ui::TEXT_MD)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg)
+                        .when(item.is_file, |d| {
+                            d.font_family(crate::ui::FONT_MONO)
+                                .text_size(crate::ui::TEXT_SM)
+                        })
                         .child(item.title.clone());
                     let primary_line = if item.age.is_empty()
                         && !item.is_current_tab
@@ -2234,7 +2216,7 @@ impl Render for Palette {
                         .items_center()
                         .gap_2()
                         .overflow_hidden()
-                        .text_size(crate::ui::TEXT_LG)
+                        .text_size(crate::ui::TEXT_MD)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg)
                         .child(render_vault_highlight(&title, &self.query, pal));
@@ -2446,7 +2428,7 @@ impl Render for Palette {
                     .child(
                         div()
                             .truncate()
-                            .text_size(crate::ui::TEXT_LG)
+                            .text_size(crate::ui::TEXT_MD)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(fg)
                             .child(wt.name.clone()),
@@ -2637,6 +2619,8 @@ impl Render for Palette {
             .flex_col()
             .overflow_hidden()
             .bg(bg)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_MD)
             .text_color(fg)
             .border_1()
             .border_color(border)

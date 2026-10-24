@@ -275,16 +275,7 @@ pub fn url_link_target(
     if screen.link_at(line, column).is_some() {
         return None;
     }
-    let row = screen.rows.get(usize::from(line))?;
-    let u = path_link::url_at(row, column)?;
-    Some((
-        Highlight {
-            line,
-            column: u.column,
-            cols: u.cols,
-        },
-        u.uri,
-    ))
+    url_link::at(screen, line, column)
 }
 
 /// IME 조합 중 글자(커서 칸 `origin`부터 `columns`칸).
@@ -708,6 +699,7 @@ impl Element for TerminalElement {
 
 pub mod path_link;
 mod row_cache;
+mod url_link;
 pub use row_cache::RowPlanCache;
 
 #[cfg(test)]

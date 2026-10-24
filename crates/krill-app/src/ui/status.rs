@@ -19,7 +19,7 @@ use krill_proto::control::AgentState;
 
 use super::{
     FONT_MONO, RADIUS_XS, STATE_DOT, TEXT_2XS, TEXT_XS, agent_state_color, icons, palette,
-    theme::{AGENT_UNREAD, STATUS_GROUP_ICON, STATUS_GROUP_OVERLAP},
+    theme::{AGENT_UNREAD, STATUS_GROUP_GAP, STATUS_GROUP_ICON},
 };
 
 /// 작업 중 스피너: 120° 간격 3분절 아크(크릴 등갑 모티프, 분절마다 80° + 틈 40°). 선 굵기는 6px 링에서 읽히게 굵게 잡았다.
@@ -38,7 +38,7 @@ const SWARM_DOT: f32 = 3.;
 const SWARM_GAP: f32 = 2.;
 const SWARM_MORE_WIDTH: f32 = 22.;
 
-/// 워크트리 행에 보이는 상태 묶음 수와 묶음마다 겹쳐 그리는 에이전트 아이콘 수.
+/// 워크트리 행에 보이는 상태 묶음 수와 묶음마다 나란히 그리는 에이전트 아이콘 수.
 pub const MAX_GROUPS: usize = 3;
 pub const MAX_GROUP_ICONS: usize = 3;
 
@@ -332,7 +332,7 @@ fn known_agent(agent: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group<'a> {
     pub state: AgentState,
-    /// 겹쳐 그릴 서로 다른 에이전트(많은 순, 같으면 먼저 나온 순, 최대 [`MAX_GROUP_ICONS`]).
+    /// 나란히 그릴 서로 다른 에이전트(많은 순, 같으면 먼저 나온 순, 최대 [`MAX_GROUP_ICONS`]).
     pub icons: Vec<&'a str>,
     /// 아이콘으로 못 그린 세션 수(`+N`).
     pub more: usize,
@@ -391,7 +391,7 @@ pub fn summarize<'a>(sessions: &[(AgentState, &'a str)]) -> Summary<'a> {
     summary
 }
 
-/// 워크트리 행의 상태 묶음: [글리프][겹친 에이전트 아이콘][+N] … [+N].
+/// 워크트리 행의 상태 묶음: [글리프][에이전트 아이콘][+N] … [+N].
 /// `slots`는 [`status_glyph_slot`]과 같다.
 pub fn summary_element(summary: &Summary<'_>, slots: Option<&SpinnerSlots>, cx: &App) -> gpui::Div {
     let p = palette(cx);
@@ -408,7 +408,7 @@ pub fn summary_element(summary: &Summary<'_>, slots: Option<&SpinnerSlots>, cx: 
         .flex()
         .items_center()
         .gap_1()
-        .children(summary.groups.iter().map(|g| {
+        .children(summary.groups.iter().enumerate().map(|(group_index, g)| {
             div()
                 .flex_none()
                 .flex()
@@ -419,22 +419,20 @@ pub fn summary_element(summary: &Summary<'_>, slots: Option<&SpinnerSlots>, cx: 
                 .rounded(RADIUS_XS)
                 .bg(p.worktree_sidebar_accent.opacity(0.65))
                 .child(glyph_frame(g.state, false, Size::Sm, slots, cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .children(g.icons.iter().enumerate().map(|(i, a)| {
-                            div()
-                                .size(STATUS_GROUP_ICON)
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .when(i > 0, |d| d.ml(STATUS_GROUP_OVERLAP).bg(p.worktree_sidebar))
-                                .child(agent_icon(a, super::ICON_SM, p.muted_foreground))
-                        })),
-                )
+                .child(div().flex().items_center().gap(STATUS_GROUP_GAP).children(
+                    g.icons.iter().enumerate().map(|(i, a)| {
+                        div()
+                            .debug_selector(move || {
+                                format!("status-summary-icon-{group_index}-{i}")
+                            })
+                            .size(STATUS_GROUP_ICON)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(agent_icon(a, super::ICON_SM, p.muted_foreground))
+                    }),
+                ))
                 .when(g.more > 0, |d| d.child(more(g.more)))
         }))
         .when(summary.hidden > 0, |d| d.child(more(summary.hidden)))
@@ -742,6 +740,40 @@ mod tests {
         let (dots, more) = swarm_dots(&many, 99);
         assert_eq!((dots.len(), more), (SWARM_MAX, 3));
         assert_eq!(swarm_dots(&[], 12), (Vec::new(), 0));
+    }
+
+    #[gpui::test]
+    fn summary_provider_icons_have_space_between_them(cx: &mut gpui::TestAppContext) {
+        struct SummaryView;
+        impl gpui::Render for SummaryView {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let summary = summarize(&[
+                    (AgentState::Working, "claude"),
+                    (AgentState::Working, "codex"),
+                    (AgentState::Working, "agy"),
+                    (AgentState::Done, "claude"),
+                    (AgentState::Done, "codex"),
+                ]);
+                div().child(summary_element(&summary, None, cx))
+            }
+        }
+        let window = cx.add_window(|_, _| SummaryView);
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        for (previous, current) in [
+            ("status-summary-icon-0-0", "status-summary-icon-0-1"),
+            ("status-summary-icon-0-1", "status-summary-icon-0-2"),
+            ("status-summary-icon-1-0", "status-summary-icon-1-1"),
+        ] {
+            let previous = cx.debug_bounds(previous).unwrap();
+            let current = cx.debug_bounds(current).unwrap();
+            assert_eq!(previous.size.width, STATUS_GROUP_ICON);
+            assert_eq!(current.origin.x - previous.right(), STATUS_GROUP_GAP);
+        }
     }
 
     #[gpui::test]

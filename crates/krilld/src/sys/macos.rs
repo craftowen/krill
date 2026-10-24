@@ -281,6 +281,93 @@ pub fn start_us(pid: u32) -> io::Result<u64> {
         .saturating_add(info.pbi_start_tvusec))
 }
 
+/// `sys/proc_info.h`의 `struct proc_fileinfo`와 `struct vnode_fdinfowithpath`(`PROC_PIDFDVNODEPATHINFO = 2`).
+#[repr(C)]
+struct ProcFileInfo {
+    openflags: u32,
+    status: u32,
+    offset: libc::off_t,
+    kind: i32,
+    guardflags: u32,
+}
+
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    pfi: ProcFileInfo,
+    pvip: libc::vnode_info_path,
+}
+
+const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+
+/// `pid`가 열어 둔 일반 파일·디렉터리(vnode) 경로 목록(`PROC_PIDLISTFDS` + `PROC_PIDFDVNODEPATHINFO`).
+pub(crate) fn open_vnode_paths(pid: u32) -> Vec<PathBuf> {
+    let Ok(pid_c) = c_int::try_from(pid) else {
+        return Vec::new();
+    };
+    let mut fds = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        512
+    ];
+    let Ok(bytes) = c_int::try_from(fds.len().saturating_mul(size_of::<libc::proc_fdinfo>()))
+    else {
+        return Vec::new();
+    };
+    // SAFETY: `fds`는 `bytes` 바이트짜리 쓰기 가능한 버퍼다.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid_c,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast::<c_void>(),
+            bytes,
+        )
+    };
+    let Ok(n) = usize::try_from(n) else {
+        return Vec::new();
+    };
+    let count = (n / size_of::<libc::proc_fdinfo>()).min(fds.len());
+    let Ok(vsize) = c_int::try_from(size_of::<VnodeFdInfoWithPath>()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for fd in fds.into_iter().take(count) {
+        if fd.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+            continue;
+        }
+        let mut vinfo = MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+        // SAFETY: `vinfo`는 `vsize` 바이트짜리 쓰기 가능한 버퍼다.
+        let vn = unsafe {
+            libc::proc_pidfdinfo(
+                pid_c,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                vinfo.as_mut_ptr().cast::<c_void>(),
+                vsize,
+            )
+        };
+        if vn != vsize {
+            continue;
+        }
+        // SAFETY: 0으로 초기화했고 `proc_pidfdinfo`가 구조체 전체를 채웠다.
+        let vinfo = unsafe { vinfo.assume_init() };
+        let path_bytes: Vec<u8> = vinfo
+            .pvip
+            .vip_path
+            .iter()
+            .flatten()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c.to_ne_bytes()[0])
+            .collect();
+        if !path_bytes.is_empty() {
+            out.push(PathBuf::from(std::ffi::OsString::from_vec(path_bytes)));
+        }
+    }
+    out
+}
+
 /// `proc_pidinfo(pid, flavor)`가 `T`를 꽉 채워야 성공. 없는 PID·권한 없음이면 오류.
 ///
 /// # Safety

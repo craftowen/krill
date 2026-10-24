@@ -8,6 +8,43 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Theme `mono_font_size` is already zoomed; Diff must not apply the window rem scale again.
+#[gpui::test]
+fn diff_font_scales_once_with_ui_zoom(cx: &mut gpui::TestAppContext) {
+    use gpui_component::diff::{Diff, DiffFile, DiffState};
+
+    struct FontProbe(Entity<DiffState>);
+    impl Render for FontProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Diff::new(&self.0).size_full()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        let files =
+            DiffFile::parse("--- a/review.txt\n+++ b/review.txt\n@@ -1 +1 @@\n-old\n+new\n")
+                .unwrap();
+        FontProbe(cx.new(|cx| DiffState::new(files, cx)))
+    });
+    for zoom in [0.75, 1., 1.5, 2.] {
+        cx.update(|window, cx| {
+            window.set_rem_size(px(16. * zoom));
+            gpui_component::Theme::update(cx, |theme| theme.mono_font_size = px(12. * zoom));
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("diff-code-line-0-Original-0")
+            .expect("rendered code row");
+        let expected = 12. * zoom * 1.6;
+        assert!(
+            (f32::from(row.size.height) - expected).abs() < 1.,
+            "Diff code row at {zoom}: {row:?}"
+        );
+    }
+}
+
 struct Repo(PathBuf);
 impl Repo {
     fn new() -> Self {
@@ -1832,6 +1869,7 @@ fn right_panel_icon_only_tabs_switch_on_click_show_tooltips_and_fit_default_widt
 
         fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
             Ok(PrInspection {
+                metadata: None,
                 status: Status::Open,
                 number: Some(787),
                 title: "Icon-only right panel tabs".into(),

@@ -666,7 +666,7 @@ impl SettingsView {
                     .child(
                         div()
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .truncate()
                             .child(wt.path.display().to_string()),
@@ -833,7 +833,6 @@ impl SettingsView {
                 div()
                     .id("admin-cleanup-summary")
                     .debug_selector(|| "admin-cleanup-summary".into())
-                    .font_family(crate::ui::FONT_MONO)
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::CLEANUP_CANDIDATES_SUMMARY.format(&[

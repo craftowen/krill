@@ -333,6 +333,7 @@ impl Render for View {
                 div()
                     .id("artifacts-empty")
                     .p_6()
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(if self.items.is_empty() {
                         text::EMPTY.get()
@@ -357,6 +358,8 @@ impl Render for View {
             .gap_3()
             .p_4()
             .bg(p.background)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.foreground)
             .child(
                 div()
@@ -373,6 +376,7 @@ impl Render for View {
                         div()
                             .flex_1()
                             .text_size(ui::TEXT_LG)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(text::TITLE.get()),
                     )
                     .child(

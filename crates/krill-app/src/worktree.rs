@@ -797,7 +797,7 @@ impl Render for Dialog {
                                                 .py_1()
                                                 .rounded(crate::ui::RADIUS_XS)
                                                 .font_family(crate::ui::FONT_MONO)
-                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_size(crate::ui::TEXT_SM)
                                                 .text_color(if is_active {
                                                     p.accent_foreground
                                                 } else {
@@ -895,7 +895,7 @@ impl Render for Dialog {
                             .id("worktree-symlinks-preview")
                             .debug_selector(|| "worktree-symlinks-preview".into())
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(muted)
                             .child(text::SYMLINKS_PREVIEW.format(&[("paths", &paths)])),
                     )
@@ -906,7 +906,7 @@ impl Render for Dialog {
                             .id("worktree-setup-preview")
                             .debug_selector(|| "worktree-setup-preview".into())
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(muted)
                             .child(text::SETUP_PREVIEW.format(&[("script", &visible(&script))])),
                     )
@@ -917,7 +917,7 @@ impl Render for Dialog {
                             .id("worktree-archive-preview")
                             .debug_selector(|| "worktree-archive-preview".into())
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(muted)
                             .child(text::ARCHIVE_PREVIEW.format(&[("script", &visible(&script))])),
                     )
@@ -960,7 +960,7 @@ impl Render for Dialog {
                         .rounded(crate::ui::RADIUS_XS)
                         .bg(p.muted)
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .child(visible(script)),
                 )
                 .child(
@@ -1002,7 +1002,7 @@ impl Render for Dialog {
                 .child(
                     div()
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .text_color(muted)
                         .child(
                             PathBuf::from(std::ffi::OsStr::from_bytes(&w.path))
@@ -1013,7 +1013,7 @@ impl Render for Dialog {
                 .child(
                     div()
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .child(format!("{} ← {}", w.branch, w.base)),
                 )
                 .children(w.setup.map(|id| format!("{} {}", text::SETUP.get(), id.0)))
@@ -1033,6 +1033,8 @@ impl Render for Dialog {
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)

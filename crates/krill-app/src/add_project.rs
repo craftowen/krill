@@ -584,6 +584,8 @@ impl Render for Dialog {
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_MD)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)

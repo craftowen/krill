@@ -267,6 +267,7 @@ impl Panel {
                         .min_w_0()
                         .truncate()
                         .font_family(crate::ui::FONT_MONO)
+                        .text_size(crate::ui::TEXT_SM)
                         .child(location),
                 )
                 .child(Textarea::new(input).h(crate::ui::SPACE_4 * 4.))
@@ -309,9 +310,17 @@ impl Panel {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .flex()
+                            .gap_1()
                             .truncate()
-                            .font_family(crate::ui::FONT_MONO)
-                            .child(format!("{}: {}", c.location(), c.body)),
+                            .text_size(crate::ui::TEXT_SM)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(crate::ui::FONT_MONO)
+                                    .child(format!("{}:", c.location())),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(c.body.clone())),
                     )
                     .child(
                         Button::new(("comment-remove", i))

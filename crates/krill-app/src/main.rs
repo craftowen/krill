@@ -40,7 +40,15 @@ struct OpeningWindow {
 impl gpui::Global for OpeningWindow {}
 
 fn main() -> std::process::ExitCode {
+    // 테스트 실행 파일 탐색이 일반 앱 산출물을 골라도 운영 데몬에 붙지 않는다.
+    if std::env::args_os().skip(1).any(|arg| arg == "--list") {
+        eprintln!("krill-app: --list requires a test executable");
+        return std::process::ExitCode::FAILURE;
+    }
     krill_proto::diag::install_panic_hook("krill-app");
+    if let Some(code) = krill_app::platform::computer::maybe_run_worker() {
+        return code;
+    }
     if std::env::args().any(|a| a == "--crash-test") {
         crash_test();
     }

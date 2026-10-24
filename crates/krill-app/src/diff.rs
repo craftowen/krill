@@ -1613,7 +1613,7 @@ impl Panel {
             .gap_1p5()
             .overflow_hidden()
             .cursor_pointer()
-            .text_size(crate::ui::TEXT_XS)
+            .text_size(crate::ui::TEXT_SM)
             .text_color(if selected {
                 p.sidebar_accent_foreground
             } else {
@@ -1666,7 +1666,7 @@ impl Panel {
                             .min_w_0()
                             .truncate()
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(hint)
                     })),
@@ -1894,7 +1894,7 @@ impl Panel {
                     .min_w_0()
                     .truncate()
                     .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .text_color(if center {
                         p.foreground
                     } else {
@@ -2129,6 +2129,7 @@ impl Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.background)
                 .text_color(p.foreground)
                 .child(body)
@@ -2162,6 +2163,8 @@ impl Render for Panel {
                 .flex()
                 .flex_col()
                 .bg(p.sidebar)
+                .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
                 .child(div().flex_1().min_h_0().children(self.history.clone()));
@@ -2176,6 +2179,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2191,6 +2195,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2205,6 +2210,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2236,6 +2242,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2262,6 +2269,7 @@ impl Render for Panel {
                 .min_w_0()
                 .min_h_0()
                 .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
                 .bg(p.sidebar)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
@@ -2342,6 +2350,7 @@ impl Render for Panel {
             .min_w_0()
             .min_h_0()
             .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_SM)
             .bg(p.sidebar)
             .text_color(p.sidebar_foreground)
             .child(top_bar)

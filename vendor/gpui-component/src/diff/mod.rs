@@ -1,6 +1,7 @@
 //! Readonly, virtualized patch display inspired by Diffs from Pierre.
 //! Parse an externally supplied patch into [`DiffFile`]s, retain one
 //! [`DiffState`] for all of them in the owner, and build [`Diff`] during rendering.
+//! Krill patch: theme mono_font_size already includes UI zoom; do not scale it twice.
 mod conflict;
 mod document;
 mod parser;
@@ -453,7 +454,7 @@ fn render_diff(
     state.set_window(window.window_handle().window_id());
     state.ensure_presentation(cx);
     let rem = window.rem_size();
-    let font_size = rem * (f32::from(cx.theme().mono_font_size) / 16.);
+    let font_size = cx.theme().mono_font_size;
     let font_family = cx.theme().mono_font_family.clone();
     let row_height = font_size * 1.6;
     let digits = state
@@ -1662,6 +1663,7 @@ fn code_line(
         add_annotation_button(file, side, ix, gutters_width + code.rem / 2., &code, cx);
     h_flex()
         .id("line-row")
+        .debug_selector(move || format!("diff-code-line-{file}-{side:?}-{ix}"))
         .group("diff-line")
         .relative()
         .w_full()

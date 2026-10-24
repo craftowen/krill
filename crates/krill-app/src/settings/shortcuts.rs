@@ -715,7 +715,9 @@ impl SettingsView {
         let id = format!("sc-{action}-{}", old.as_deref().unwrap_or("add"));
         let selector = id.clone();
         let old_for_key = old.clone();
-        let cap = layout::keycap(p, label.clone());
+        let cap = layout::keycap(p, label.clone()).when(recording || old.is_none(), |cap| {
+            cap.font_family(crate::ui::FONT_UI)
+        });
         let cap = if recording {
             cap.border_color(p.primary).text_color(p.primary)
         } else {

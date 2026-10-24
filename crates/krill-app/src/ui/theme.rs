@@ -108,10 +108,10 @@ pub const PANEL_ROW_HEIGHT: Pixels = px(26.);
 pub const PANEL_TAB_HEIGHT: Pixels = px(24.);
 /// 분할 창 헤더 높이(26px).
 pub const PANE_HEADER_HEIGHT: Pixels = px(26.);
-/// 워크트리 상태 요약 겹친 에이전트 아이콘 타일 크기(15px, `ui::status::summary_element` 전용).
+/// 워크트리 상태 요약 에이전트 아이콘 타일 크기(15px, `ui::status::summary_element` 전용).
 pub const STATUS_GROUP_ICON: Pixels = px(15.);
-/// 상태 요약 타일 겹침 음수 마진(-3px, 두 번째 이후 타일).
-pub const STATUS_GROUP_OVERLAP: Pixels = px(-3.);
+/// 상태 요약 에이전트 아이콘 사이 간격(2px).
+pub const STATUS_GROUP_GAP: Pixels = px(2.);
 /// 창 가운데 모달 대화상자 기본 너비(Orca `DialogContent` `sm:max-w-lg` = 512px).
 pub const DIALOG_WIDTH: Pixels = px(512.);
 /// 설정 내 넓은 모달 대화상자 너비(공간 관리 정리 미리보기 등, 640px).
@@ -893,6 +893,37 @@ pub const AGENT_HISTORY_MAX_HEIGHT: Pixels = px(360.);
 mod tests {
     use super::*;
 
+    /// Widget-internal styles must not override Krill's scale with GPUI's 12/14/16px defaults.
+    #[test]
+    fn component_control_typography_matches_tokens_at_every_zoom() {
+        use gpui::{Styled as _, div};
+        use gpui_component::{Size, StyleSized as _};
+
+        for (size, token) in [
+            (Size::XSmall, TEXT_XS),
+            (Size::Small, TEXT_SM),
+            (Size::Medium, TEXT_SM),
+            (Size::Large, TEXT_LG),
+        ] {
+            for mut control in [
+                div().button_text_size(size),
+                div().input_text_size(size),
+                div().list_size(size),
+                div().table_cell_size(size),
+            ] {
+                let actual = control.style().text.font_size.expect("control font size");
+                for zoom in [0.75, 1., 1.25, 1.5, 2.] {
+                    let rem = px(16. * zoom);
+                    assert_eq!(
+                        actual.to_pixels(rem),
+                        token.to_pixels(rem),
+                        "{size:?} at {zoom}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn hex_conversion_matches_gpui_rgb() {
         for raw in [
@@ -985,7 +1016,7 @@ mod tests {
         assert_eq!(PANEL_TAB_HEIGHT, px(24.));
         assert_eq!(PANE_HEADER_HEIGHT, px(26.));
         assert_eq!(STATUS_GROUP_ICON, px(15.));
-        assert_eq!(STATUS_GROUP_OVERLAP, px(-3.));
+        assert_eq!(STATUS_GROUP_GAP, px(2.));
         assert!((TRANSPARENT.a - 0.0).abs() < f32::EPSILON);
         assert_eq!(transparent(), TRANSPARENT);
     }
@@ -1490,7 +1521,7 @@ mod tests {
             "PANEL_TAB_HEIGHT",
             "PANE_HEADER_HEIGHT",
             "STATUS_GROUP_ICON",
-            "STATUS_GROUP_OVERLAP",
+            "STATUS_GROUP_GAP",
             "ui::card",
             "ui::row",
             "ui::label",

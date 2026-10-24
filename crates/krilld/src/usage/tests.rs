@@ -1985,3 +1985,216 @@ fn orca_imported_accounts_are_immediately_runnable_and_switchable() {
     fs::remove_dir_all(&home).ok();
     fs::remove_dir_all(&state).ok();
 }
+
+#[test]
+fn delete_registered_orca_account_hides_orca_cache_ghost_and_readd_unhides_it() {
+    use krill_proto::usage::ProviderKind;
+
+    let home = dir("orca-registered-delete-home");
+    let state = dir("orca-registered-delete-state");
+    let orca = home.join("Library/Application Support/orca");
+    let uuid = "26015f11-6f96-4bc5-835d-ab10baa7fa74";
+    let profile_dir = orca.join("claude-profiles").join(uuid).join("home");
+    fs::create_dir_all(&profile_dir).unwrap();
+
+    let host_claude = home.join(".claude");
+    fs::create_dir_all(&host_claude).unwrap();
+    fs::write(
+        host_claude.join(ORCA_CACHE),
+        format!(
+            r#"{{"accounts":[{{"id":"{uuid}","name":"My Org","email":"member@example.com","five_hour":{{"utilization":20}}}}]}}"#
+        ),
+    )
+    .unwrap();
+
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "member@example.com (My Org)",
+        Some("member@example.com".to_owned()),
+        &profile_dir.display().to_string(),
+    )
+    .unwrap();
+    let registered_id = snap
+        .accounts
+        .iter()
+        .find(|a| !a.host_default && a.provider == ProviderKind::Claude)
+        .unwrap()
+        .id
+        .clone();
+    assert!(
+        !snap
+            .accounts
+            .iter()
+            .any(|a| a.id.starts_with("claude-orca-")),
+        "registered Orca account should merge with cache row rather than duplicating it"
+    );
+
+    let after_delete = accounts::delete_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        &registered_id,
+        &[],
+    )
+    .unwrap();
+    assert!(
+        !after_delete
+            .accounts
+            .iter()
+            .any(|a| a.id == registered_id || a.id.starts_with("claude-orca-")),
+        "deleted registered account must not reappear as an Orca-only ghost: {:?}",
+        after_delete.accounts
+    );
+    let refreshed = accounts::refresh_accounts(&home, Some(&state));
+    assert!(
+        !refreshed
+            .accounts
+            .iter()
+            .any(|a| a.id == registered_id || a.id.starts_with("claude-orca-"))
+    );
+
+    let readded = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "member@example.com (My Org)",
+        Some("member@example.com".to_owned()),
+        &profile_dir.display().to_string(),
+    )
+    .unwrap();
+    assert!(
+        readded
+            .accounts
+            .iter()
+            .any(|a| a.profile_dir == profile_dir.display().to_string())
+    );
+
+    fs::remove_dir_all(&home).ok();
+    fs::remove_dir_all(&state).ok();
+}
+
+#[test]
+fn antigravity_auto_switch_ignores_exhausted_claude_gpt_pool_by_default_and_respects_provider_metrics()
+ {
+    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
+
+    let home = dir("agy-gemini-vs-claude-home");
+    let state = dir("agy-gemini-vs-claude-state");
+    let p1 = home.join("agy-p1");
+    let p2 = home.join("agy-p2");
+    fs::create_dir_all(&p1).unwrap();
+    fs::create_dir_all(&p2).unwrap();
+
+    // p1: Gemini 5% (plenty left), Claude/GPT 100% (exhausted).
+    fs::write(
+        p1.join("usage.json"),
+        r#"{
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {"id": "5h", "window": "5h", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"},
+                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.95, "reset_time": "2099-01-01T00:00:00Z"}
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": "2099-01-01T00:00:00Z"}
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    // p2: Gemini 1%, Claude/GPT 10%.
+    fs::write(
+        p2.join("usage.json"),
+        r#"{
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {"id": "5h", "window": "5h", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"},
+                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"}
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.90, "reset_time": "2099-01-01T00:00:00Z"}
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let mut file = accounts::AccountsFile::default();
+    file.auto_switch.enabled = true;
+    file.auto_switch.threshold_percent = 80;
+    file.auto_switch.switch_on_rate_limit = true;
+    file.accounts.push(accounts::StoredAccount {
+        id: "agy-1".into(),
+        provider: "agy".into(),
+        label: "Profile 1".into(),
+        email: None,
+        profile_dir: p1.display().to_string(),
+    });
+    file.accounts.push(accounts::StoredAccount {
+        id: "agy-2".into(),
+        provider: "agy".into(),
+        label: "Profile 2".into(),
+        email: None,
+        profile_dir: p2.display().to_string(),
+    });
+    file.active.insert("agy".into(), "agy-1".into());
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+
+    // Default metric (Max -> Gemini Max on Antigravity) must NOT switch when only Claude/GPT is at 100%.
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    assert!(
+        snap.switched.is_empty(),
+        "Gemini quota is at 5%, so exhausted Claude/GPT quota must not trigger auto-switch: {:?}",
+        snap.switched
+    );
+    let active = snap
+        .accounts
+        .iter()
+        .find(|a| a.provider == ProviderKind::Antigravity && a.active)
+        .unwrap();
+    assert_eq!(active.id, "agy-1");
+
+    // When the user explicitly selects Claude/GPT 7d as the auto-switch metric, it switches to agy-2.
+    let mut file = accounts::load_file(&home, Some(&state));
+    file.auto_switch.rules = vec![AutoSwitchRule {
+        provider: ProviderKind::Antigravity,
+        from_account_id: "agy-1".into(),
+        enabled: true,
+        threshold_percent: 80,
+        metric: AutoSwitchMetric::AntigravityClaudeGptSevenDay,
+        target_account_id: Some("agy-2".into()),
+    }];
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    assert_eq!(snap.switched.len(), 1);
+    assert_eq!(snap.switched[0].from_id, "agy-1");
+    assert_eq!(snap.switched[0].to_id, "agy-2");
+
+    fs::remove_dir_all(&home).ok();
+    fs::remove_dir_all(&state).ok();
+}

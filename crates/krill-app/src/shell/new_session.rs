@@ -1,8 +1,9 @@
 //! OWE-576: 사이드바 위 "+ 새 세션" 드롭다운(터미널·에이전트·권한 Manual/YOLO·폴더 열기).
 
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
 use gpui::{App, Context, actions, div, prelude::*};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{IconName, Sizable as _};
 use krill_app::link::Link;
 use krill_proto::agent::Permission;
@@ -93,10 +94,10 @@ impl Shell {
             .justify_between()
             .gap_1p5()
             .text_size(krill_app::ui::TEXT_MD)
-            .text_color(p.sidebar_foreground.opacity(0.45))
+            .text_color(p.muted_foreground)
             .hover(|d| {
                 d.bg(p.sidebar_accent)
-                    .text_color(p.sidebar_foreground.opacity(0.75))
+                    .text_color(p.sidebar_accent_foreground)
             })
             .child(
                 div()
@@ -107,7 +108,7 @@ impl Shell {
                     .child(
                         gpui_component::Icon::new(IconName::Search)
                             .with_size(krill_app::ui::ICON_MD)
-                            .text_color(p.sidebar_foreground.opacity(0.38)),
+                            .text_color(p.muted_foreground),
                     )
                     .child(div().truncate().child(sb_text::SEARCH_SHORT.get())),
             )
@@ -121,10 +122,10 @@ impl Shell {
                         div()
                             .invisible()
                             .group_hover("sidebar-search-row", gpui::Styled::visible)
-                            .font_family(krill_app::ui::FONT_MONO)
-                            .text_size(krill_app::ui::TEXT_2XS)
-                            .text_color(p.sidebar_foreground.opacity(0.4))
-                            .child(krill_app::i18n::catalog::general::JUMP_SHORTCUT.get()),
+                            .child(krill_app::ui::keycap(
+                                p,
+                                krill_app::i18n::catalog::general::JUMP_SHORTCUT.get(),
+                            )),
                     )
                     .when(yolo, |d| {
                         d.child(
@@ -171,8 +172,8 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         use krill_app::ui::icons;
 
-        let nav_icon_color = p.sidebar_foreground.opacity(0.4);
-        let nav_text_color = p.sidebar_foreground.opacity(0.68);
+        let nav_icon_color = p.muted_foreground;
+        let nav_text_color = p.muted_foreground;
         let nav_hover_bg = p.sidebar_accent.opacity(0.6);
         div()
             .id(id)
@@ -298,6 +299,7 @@ impl Shell {
         use krill_app::ui::icons;
 
         let p = krill_app::ui::palette(cx);
+        let show_automations = krill_app::settings::current(cx).show_automations_button;
         let settings = self.agents.clone();
         let accounts = self.accounts_snapshot.clone();
         let permission = settings.as_ref().map(|a| a.permission).unwrap_or_default();
@@ -305,7 +307,7 @@ impl Shell {
         let locations = self.execution_locations(cx);
         let launch_host = self.launch_host.clone();
         let (this, focus) = (cx.weak_entity(), self.focus.clone());
-        let (working_count, done_count) = self.sidebar.read(cx).agent_counts();
+        let (waiting_count, working_count, done_count) = self.sidebar.read(cx).agent_counts();
         let menu = krill_app::ui::button_with_tooltip(
             Button::new("new-session")
                 .icon(IconName::Plus)
@@ -456,6 +458,35 @@ impl Shell {
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.open_artifacts(Some(window), cx))),
             )
+            .when(show_automations, |d| {
+                d.child(
+                    Self::nav_row(
+                        p,
+                        "nav-automations",
+                        icons::CALENDAR_CLOCK_SVG,
+                        sb_text::NAV_AUTOMATIONS.get(),
+                    )
+                    .debug_selector(|| "nav-automations".into())
+                    .when(self.automations_page_open(cx), |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_automations_page(Some(window), cx);
+                    }))
+                    .context_menu(|menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::new(sb_text::HIDE_FROM_SIDEBAR.get()).on_click(
+                                |_, _, cx| {
+                                    krill_app::settings::edit(cx, |s| {
+                                        s.show_automations_button = false;
+                                    });
+                                },
+                            ),
+                        )
+                    }),
+                )
+            })
             .child(
                 Self::nav_row(
                     p,
@@ -467,57 +498,80 @@ impl Shell {
                     d.bg(p.sidebar_accent)
                         .text_color(p.sidebar_accent_foreground)
                 })
-                .when(working_count > 0 || done_count > 0, |d| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(krill_app::ui::TEXT_XS)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .when(working_count > 0, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_color(p.sidebar_foreground.opacity(0.6))
-                                        .child(
-                                            div()
-                                                .size(krill_app::ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(p.warning),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family(krill_app::ui::FONT_MONO)
-                                                .child(working_count.to_string()),
-                                        ),
-                                )
-                            })
-                            .when(done_count > 0, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_color(p.sidebar_foreground.opacity(0.6))
-                                        .child(
-                                            div()
-                                                .size(krill_app::ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(p.success),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family(krill_app::ui::FONT_MONO)
-                                                .child(done_count.to_string()),
-                                        ),
-                                )
-                            }),
-                    )
-                })
+                .when(
+                    waiting_count > 0 || working_count > 0 || done_count > 0,
+                    |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(krill_app::ui::TEXT_XS)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .when(waiting_count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_color(p.muted_foreground)
+                                            .child(
+                                                div()
+                                                    .size(krill_app::ui::STATE_DOT)
+                                                    .rounded_full()
+                                                    .bg(p.agent_question),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(krill_app::ui::FONT_MONO)
+                                                    .child(waiting_count.to_string()),
+                                            ),
+                                    )
+                                })
+                                .when(working_count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_color(p.muted_foreground)
+                                            .child(
+                                                div()
+                                                    .size(krill_app::ui::STATE_DOT)
+                                                    .rounded_full()
+                                                    .bg(p.warning),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(krill_app::ui::FONT_MONO)
+                                                    .child(working_count.to_string()),
+                                            ),
+                                    )
+                                })
+                                .when(done_count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_color(p.muted_foreground)
+                                            .child(
+                                                div()
+                                                    .size(krill_app::ui::STATE_DOT)
+                                                    .rounded_full()
+                                                    .bg(p.success),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(krill_app::ui::FONT_MONO)
+                                                    .child(done_count.to_string()),
+                                            ),
+                                    )
+                                }),
+                        )
+                    },
+                )
                 .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
             )
             .child(

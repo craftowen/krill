@@ -87,6 +87,17 @@ pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// `pid`가 열어 둔 파일 경로 목록(`/proc/<pid>/fd/*`).
+pub(crate) fn open_vnode_paths(pid: u32) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    entries
+        .take(512)
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .collect()
+}
+
 /// 프로세스 이름. 명령줄을 읽지 않고 커널의 짧은 실행 이름(`/proc/<pid>/comm`)만 사용한다.
 pub(crate) fn process_name(pid: u32) -> io::Result<String> {
     let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))?;

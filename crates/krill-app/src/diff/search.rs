@@ -2508,7 +2508,7 @@ impl Panel {
                                                 .flex_none()
                                                 .min_w_0()
                                                 .truncate()
-                                                .text_size(ui::TEXT_XS)
+                                                .text_size(ui::TEXT_SM)
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .font_family(ui::FONT_MONO)
                                                 .text_color(if is_selected {
@@ -2525,7 +2525,7 @@ impl Panel {
                                                     .min_w_0()
                                                     .truncate()
                                                     .font_family(ui::FONT_MONO)
-                                                    .text_size(ui::TEXT_2XS)
+                                                    .text_size(ui::TEXT_SM)
                                                     .text_color(muted)
                                                     .child(dir_path),
                                             )
@@ -2624,7 +2624,7 @@ impl Panel {
                                         .items_center()
                                         .overflow_hidden()
                                         .font_family(ui::FONT_MONO)
-                                        .text_size(ui::TEXT_XS)
+                                        .text_size(ui::TEXT_SM)
                                         .text_color(if is_selected {
                                             p.sidebar_accent_foreground
                                         } else {

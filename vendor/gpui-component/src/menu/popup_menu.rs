@@ -1,3 +1,4 @@
+// Krill modification: custom submenu labels and viewport-aware anchored placement for narrow windows.
 use crate::ThemeStyled as _;
 use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::actions::{SelectLeft, SelectRight};
@@ -61,6 +62,7 @@ pub enum PopupMenuItem {
         label: SharedString,
         disabled: bool,
         menu: Entity<PopupMenu>,
+        render: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     },
 }
 
@@ -105,7 +107,22 @@ impl PopupMenuItem {
             label: label.into(),
             disabled: false,
             menu,
+            render: None,
         }
+    }
+
+    /// Customize the label of a submenu, preserving its accessible name and arrow.
+    pub fn submenu_label<F, E>(mut self, builder: F) -> Self
+    where
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+        E: IntoElement,
+    {
+        if let Self::Submenu { render, .. } = &mut self {
+            *render = Some(Box::new(move |window, cx| {
+                builder(window, cx).into_any_element()
+            }));
+        }
+        self
     }
 
     /// Create a separator menu item.
@@ -1188,16 +1205,19 @@ impl PopupMenu {
     }
 
     /// Calculate the anchor corner and left offset for child submenu
-    fn update_submenu_menu_anchor(&mut self, window: &Window) {
+    fn update_submenu_menu_anchor(&mut self, window: &Window, cx: &App) {
         let bounds = self.bounds;
-        let max_width = self.max_width();
-        let (anchor, left) = if max_width + bounds.origin.x > window.bounds().size.width {
+        let submenu_width = self
+            .active_submenu()
+            .map_or(self.max_width(), |menu| menu.read(cx).max_width());
+        let viewport = window.viewport_size();
+        let (anchor, left) = if bounds.right() + submenu_width > viewport.width {
             (Anchor::TopRight, -px(16.))
         } else {
             (Anchor::TopLeft, bounds.size.width - px(8.))
         };
 
-        let is_bottom_pos = bounds.origin.y + bounds.size.height > window.bounds().size.height;
+        let is_bottom_pos = bounds.bottom() > viewport.height;
         self.submenu_anchor = if is_bottom_pos {
             (anchor.other_side_along(gpui::Axis::Vertical), left)
         } else {
@@ -1375,6 +1395,7 @@ impl PopupMenu {
                 label,
                 menu,
                 disabled,
+                render,
             } => this
                 .selected(selected)
                 .disabled(*disabled)
@@ -1398,7 +1419,11 @@ impl PopupMenu {
                                 .gap_2()
                                 .items_center()
                                 .justify_between()
-                                .child(label.clone())
+                                .child(if let Some(render) = render {
+                                    render(window, cx)
+                                } else {
+                                    label.clone().into_any_element()
+                                })
                                 .child(
                                     Icon::new(IconName::ChevronRight)
                                         .xsmall()
@@ -1414,14 +1439,15 @@ impl PopupMenu {
                         deferred(
                             anchored()
                                 .anchor(anchor)
+                                .offset(gpui::point(
+                                    left,
+                                    if is_bottom_pos { px(0.) } else { -px(4.) },
+                                ))
                                 .child(
                                     div()
                                         .id("submenu")
                                         .test_support()
                                         .occlude()
-                                        .when(is_bottom_pos, |this| this.bottom_0())
-                                        .when(!is_bottom_pos, |this| this.top_neg_1())
-                                        .left(left)
                                         .child(menu.clone()),
                                 )
                                 .snap_to_window_with_margin(Edges::all(EDGE_PADDING)),
@@ -1450,7 +1476,7 @@ struct RenderOptions {
 
 impl Render for PopupMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_submenu_menu_anchor(window);
+        self.update_submenu_menu_anchor(window, cx);
 
         // Submenus attached via the public `item()` + `PopupMenuItem::submenu()`
         // path (from contexts that only have the menu value, e.g. a table

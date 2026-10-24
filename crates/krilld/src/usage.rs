@@ -69,6 +69,8 @@ pub struct AccountUsage {
     /// Orca 캐시 행 `id`(uuid). 없으면 빈 문자열(구버전 캐시).
     pub id: String,
     pub label: String,
+    /// Orca 캐시 행 `email`. `label`과 별도로 적혔을 때 병합·숨김 대조에 쓴다.
+    pub email: Option<String>,
     pub host: bool,
     pub stale: bool,
     pub usage: Usage,
@@ -176,6 +178,7 @@ pub fn parse_orca(s: &str) -> Vec<AccountUsage> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            email: non_empty_str(a.get("email")),
             host: a
                 .get("host")
                 .and_then(serde_json::Value::as_bool)

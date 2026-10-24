@@ -13,6 +13,66 @@ fn settle(cx: &mut gpui::VisualTestContext) {
 }
 
 #[gpui::test]
+fn account_recovery_stays_in_toast_without_resizing_or_releasing_input(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("toast-account-recovery"));
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    let session = SessionId(91);
+    let pane = view.read_with(cx, |s, _| s.layout.active_tab().focused);
+    view.update(cx, |s, cx| {
+        s.attach_test(pane, session, ours, cx);
+        s.layout.set_session(pane, session);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let before = cx.debug_bounds("terminal-surface").unwrap();
+    view.update(cx, |s, cx| {
+        let mut failed = AccountsSnapshot::default();
+        failed.details.supported = true;
+        failed.details.handoffs.push(SessionHandoff {
+            from: session,
+            to: None,
+            account_id: "selected".into(),
+            error: Some("fixture failure".into()),
+        });
+        s.apply_accounts_snapshot(failed, cx);
+        s.notice = None;
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert_eq!(cx.debug_bounds("terminal-surface").unwrap(), before);
+    let recovery = cx.debug_bounds("account-input-recovery").unwrap();
+    cx.update(|window, cx| {
+        assert!(recovery.origin.x > window.viewport_size().width / 2.);
+        assert!(recovery.origin.y > window.viewport_size().height / 2.);
+        assert!(view.read(cx).focus.is_focused(window));
+    });
+    assert!(cx.debug_bounds("account-continue-original").is_some());
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("account-continue-original").is_some());
+    // Closing the card must neither send held input nor recreate the top strip.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.notifications.notes[&Kind::AccountInput]
+                .clone()
+                .update(cx, |note, cx| note.dismiss(window, cx));
+        });
+    });
+    settle(cx);
+    view.update(cx, |s, cx| {
+        s.apply_accounts_snapshot((*s.accounts_snapshot).clone(), cx);
+        assert!(s.live[&pane].pane.account_switching());
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("account-input-recovery").is_none());
+    assert_eq!(cx.debug_bounds("terminal-surface").unwrap(), before);
+}
+
+#[gpui::test]
 fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut TestAppContext) {
     // GPUI's visual animation uses wall time; timers below use the test clock.
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -191,4 +251,31 @@ fn safety_and_hook_actions_remain_available_in_toasts(cx: &mut TestAppContext) {
     settle(cx);
     assert!(cx.debug_bounds("fix-banner").is_none());
     assert!(cx.update(|_, cx| cx.global::<FixNeeds>().items.is_empty()));
+}
+
+#[gpui::test]
+fn hook_setup_hint_expires_without_reappearing_on_render(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("toast-hook-timeout"));
+    cx.update(|_, cx| {
+        cx.set_global(FixNeeds {
+            items: vec![FixNeed {
+                check_id: "hook.codex".into(),
+                message: "Codex hook setup is available".into(),
+            }],
+        });
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("fix-banner-fix").is_some());
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("fix-banner").is_none());
+    assert!(cx.update(|_, cx| cx.global::<FixNeeds>().items.is_empty()));
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("fix-banner").is_none());
+    assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
 }

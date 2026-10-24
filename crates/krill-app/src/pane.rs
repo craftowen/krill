@@ -167,7 +167,16 @@ pub fn ensure_session(
     )
 }
 
-/// [`ensure_session`]과 같되 새 세션은 지정한 폴더·프로그램으로 만든다. git 저장소 여부는 묻지 않는다.
+// Runs on the existing pane IO worker before opening a control connection.
+fn prepare_status_hook(target: &HostTarget, program: &Program) {
+    if target.host().is_local()
+        && let Program::Agent { id } = program
+    {
+        crate::onboarding::actions::ensure_current(id, target.socket());
+    }
+}
+
+/// [`ensure_session`]과 같되 새 세션은 지정한 폴더·프로그램으로 만든다. 로컬 상태 훅을 먼저 준비한다.
 ///
 /// # Errors
 /// krilld에 붙지 못했거나 세션을 만들지 못했다(`Failure` 문구).
@@ -177,6 +186,7 @@ pub fn ensure_session_in(
     create: &Create,
 ) -> io::Result<Found> {
     let target = target.into();
+    prepare_status_hook(&target, &create.program);
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT))?;
     let mut call = |req: &Request| -> io::Result<Reply> {
@@ -304,6 +314,7 @@ pub fn resume_session_in(
     create: &Create,
 ) -> io::Result<SessionId> {
     let target = target.into();
+    prepare_status_hook(&target, &create.program);
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT))?;
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {

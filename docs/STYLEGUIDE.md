@@ -171,7 +171,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - 사이드바 상단(헤더 바로 아래)에 검색·아티팩트·에이전트 대시보드(작업 중·완료 개수)·Krill 모바일 진입 행을 라벨이 있는 전체 폭 행으로 둔다. 그 아래가 프로젝트 목록이다.
   - 프로젝트 기준 보기에서는 Orca처럼 프로젝트(저장소·폴더) 행을 끊지 않고 이어 배치한다. 원격 프로젝트의 호스트·연결 상태는 프로젝트 헤더 배지로 보이고, 프로젝트가 없는 연결 호스트와 작업 폴더 없는 세션 묶음은 모든 프로젝트 뒤에 둔다. 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정). 같은 저장소의 연결 워크트리는 형제 행이며 명시적으로 저장한 부모 관계만 중첩한다(모바일 목록도 같다).
   - 사이드바 들여쓰기: 호스트 아래 프로젝트 8px, 프로젝트 아래 카드 12px. 루트 행의 상태 칸은 그대로 두고, 하위 세션 상태 글리프는 부모 카드 상태 칸에서 한 단계(12px) 들여써 계층을 보인다. 호스트·워크트리 계보 여백은 한 번만 적용하고 계보 깊이는 유지한다. 상세·컴팩트 카드와 대량 목록은 같은 가상화 경로와 들여쓰기를 쓴다.
-  - 상태 요약 겹친 아이콘: `STATUS_GROUP_ICON = 15px`, 겹침 음수 마진 `STATUS_GROUP_OVERLAP = -3px` (`ui::status::summary_element` 전용)
+  - 상태 요약 아이콘: `STATUS_GROUP_ICON = 15px`, 아이콘 사이 간격 `STATUS_GROUP_GAP = 2px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
@@ -239,7 +239,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
   - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 12스텝)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전한다.
   - 작업 중 스피너 모양은 Orca 3/4 링 대신 **120° 간격 3분절 아크**(크릴 등갑 모티프, `RING_SVG`)다.
   - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 분절 아크가 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
-- **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 겹쳐 그리고 나머지는 `+N`으로 축약한다.
+- **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 간격을 두고 나란히 그리고 나머지는 `+N`으로 축약한다. 세션 목록을 펼치면 요약 바는 세션 개수와 접기 화살표로 바뀌고, 요약 바·목록의 별도 배경과 테두리는 없앤다. 행 호버·선택과 활성 워크트리 표면은 유지한다.
 - **떼(swarm) 미터 (`ui::status::swarm_meter(states, max, cx)`)**: 세션마다 3px 상태색 점(`agent_state_color`, 유휴는 50% 투명)을 요약과 같은 우선순위로 최대 `SWARM_MAX`(12)개 그리고, 넘치면 `+N`(`TEXT_XS`, `muted_foreground`)을 붙인다. 점 `max`개 칸과 `+N` 칸을 늘 예약해 세션 수가 바뀌어도 폭이 흔들리지 않는다(§7.3). 순서·넘침 계산은 `ui::status::swarm_dots`.
 
 ### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)

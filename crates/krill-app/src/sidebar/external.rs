@@ -136,14 +136,18 @@ pub fn checkpoint_badge_element(parts: &CheckpointParts, p: &crate::ui::Palette)
         .px_1()
         .rounded(crate::ui::RADIUS_XS)
         .bg(p.worktree_sidebar_accent)
-        .font_family(crate::ui::FONT_MONO)
+        .font_family(crate::ui::FONT_UI)
         .text_size(crate::ui::TEXT_2XS)
         .text_color(p.muted_foreground);
     if parts.unread {
         row = row.child(crate::ui::status::unread_dot());
     }
     row = row.children(parts.status.iter().map(|st| div().child(st.clone())));
-    row = row.children(parts.pr.map(|n| div().child(format!("#{n}"))));
+    row = row.children(parts.pr.map(|n| {
+        div()
+            .font_family(crate::ui::FONT_MONO)
+            .child(format!("#{n}"))
+    }));
     row = row.children(parts.issue.iter().map(|iss| div().child(iss.clone())));
     if parts.refs_len > 0 {
         row = row.child(
@@ -156,7 +160,11 @@ pub fn checkpoint_badge_element(parts: &CheckpointParts, p: &crate::ui::Palette)
                         .with_size(crate::ui::ICON_XS)
                         .text_color(p.muted_foreground),
                 )
-                .child(parts.refs_len.to_string()),
+                .child(
+                    div()
+                        .font_family(crate::ui::FONT_MONO)
+                        .child(parts.refs_len.to_string()),
+                ),
         );
     }
     row
@@ -1783,7 +1791,20 @@ fn resolve_explicit_repo_icon(
     }
 }
 
-/// 명시된 아이콘 또는 자동 감지(파일 → package.json/Cargo.toml 홈페이지 → GitHub 아바타).
+// 이전 Orca 이관은 자동 GitHub 아바타의 source를 보존하지 않았다. 이 URL 형태는
+// 서비스 아이콘이 없을 때만 쓰는 폴백으로 취급한다.
+fn is_imported_github_avatar(spec: &ImportedRepoIcon) -> bool {
+    spec.kind.trim() == "image"
+        && spec
+            .value
+            .trim()
+            .strip_prefix("https://github.com/")
+            .and_then(|path| path.split('?').next())
+            .and_then(|path| path.strip_suffix(".png"))
+            .is_some_and(is_valid_github_slug)
+}
+
+/// 지정 아이콘을 우선하되, 이관된 GitHub 아바타보다 서비스 파비콘을 우선한다.
 #[must_use]
 pub fn resolve_project_icon(
     repo_path: &Path,
@@ -1792,6 +1813,7 @@ pub fn resolve_project_icon(
     explicit: Option<&ImportedRepoIcon>,
 ) -> Option<crate::ui::icons::ProjectIcon> {
     if let Some(spec) = explicit
+        && !is_imported_github_avatar(spec)
         && let Some(resolved) = resolve_explicit_repo_icon(spec, repo_path, cache_dir)
     {
         return Some(resolved);
@@ -1799,7 +1821,9 @@ pub fn resolve_project_icon(
     match probe_project_icon_source(repo_path, is_git) {
         CachedIconOutcome::LocalFile(path) => Some(crate::ui::icons::ProjectIcon::Image(path)),
         CachedIconOutcome::RemoteUrl(url) => resolve_or_fetch_remote_icon(&url, cache_dir?),
-        CachedIconOutcome::None => None,
+        CachedIconOutcome::None => {
+            explicit.and_then(|spec| resolve_explicit_repo_icon(spec, repo_path, cache_dir))
+        }
     }
 }
 

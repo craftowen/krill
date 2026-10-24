@@ -1,8 +1,8 @@
-//! 터미널의 파일 경로·OSC 8 링크 우클릭 동작. 파일 확인과 기본 앱 실행은 UI 밖에서 처리한다.
+//! 터미널의 URL·파일 경로·OSC 8 링크 우클릭 동작. 파일 확인과 기본 앱 실행은 UI 밖에서 처리한다.
 
 use gpui::WeakEntity;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use krill_app::i18n::catalog::{diff as dtext, file_format as ftext};
+use krill_app::i18n::catalog::{diff as dtext, file_format as ftext, security as stext};
 use krill_app::terminal::path_link::{Cache, PathLink};
 
 use super::*;
@@ -50,8 +50,30 @@ impl MenuState {
         mut menu: PopupMenu,
         shell: &WeakEntity<Shell>,
         link: Option<&PathLink>,
+        uri: Option<&str>,
     ) -> PopupMenu {
         menu = menu.action_context(self.focus.clone());
+        if let Some(uri) = uri {
+            for (id, label, open) in [
+                ("terminal-url-copy", stext::LINK_COPY.get(), false),
+                ("terminal-url-open", stext::LINK_OPEN.get(), true),
+            ] {
+                let uri = uri.to_owned();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        div().id(id).debug_selector(move || id.into()).child(label)
+                    })
+                    .on_click(move |_, _, cx| {
+                        if open {
+                            cx.open_url(&uri);
+                        } else {
+                            cx.write_to_clipboard(ClipboardItem::new_string(uri.clone()));
+                        }
+                    }),
+                );
+            }
+            menu = menu.separator();
+        }
         if let Some(link) = link {
             for (id, label, action) in [
                 (
@@ -122,8 +144,7 @@ impl MenuState {
 enum Target {
     File(PathBuf),
     Text {
-        row: Vec<krill_proto::screen::Cell>,
-        column: u16,
+        input: krill_app::terminal::path_link::Input,
         cwd: Option<PathBuf>,
     },
 }
@@ -138,9 +159,7 @@ impl Target {
                 line: None,
                 col: None,
             }),
-            Self::Text { row, column, cwd } => {
-                Cache::default().link_at(&row, column, cwd.as_deref())
-            }
+            Self::Text { input, cwd } => input.resolve(&mut Cache::default(), cwd.as_deref()),
         }
     }
 }
@@ -164,6 +183,9 @@ pub(super) fn build(
             .then(|| s.can_fork_pane(pane, cx)),
         can_continue: s.can_continue_pane(pane),
     };
+    if let Some((_, uri)) = s.click_link_at(pane, window.mouse_position()) {
+        return state.fill(menu, shell, None, Some(&uri));
+    }
     let target = (!s.layout.host(pane).is_remote())
         .then(|| {
             let live = s.live.get(&pane)?;
@@ -174,8 +196,7 @@ pub(super) fn build(
                 Some(Target::File(path))
             } else if screen.link_at(line, column).is_none() {
                 Some(Target::Text {
-                    row: screen.rows.get(usize::from(line))?.clone(),
-                    column,
+                    input: krill_app::terminal::path_link::Input::at(&screen, line, column)?,
                     cwd: s.pane_cwd(pane, cx),
                 })
             } else {
@@ -185,6 +206,14 @@ pub(super) fn build(
         .flatten();
     if let Some(target) = target {
         let shell = shell.clone();
+        let live = s.live.get(&pane);
+        let session = live.and_then(|l| l.pane.session());
+        let shown = live.map(|l| l.pane.shown());
+        let input = match &target {
+            Target::Text { input, .. } => Some(input.clone()),
+            Target::File(_) => None,
+        };
+        let cwd = s.pane_cwd(pane, cx);
         // 확인 중인 메뉴에 행을 끼워 넣으면 포인터 아래 동작이 바뀐다. 항목을 확정한 뒤 한 번에 연다.
         cx.spawn_in(window, async move |menu, cx| {
             let found = cx
@@ -192,8 +221,20 @@ pub(super) fn build(
                 .spawn(async move { target.resolve() })
                 .await;
             menu.update_in(cx, |menu, window, cx| {
+                let valid = shell.upgrade().is_some_and(|shell| {
+                    let s = shell.read(cx);
+                    !s.layout.host(pane).is_remote()
+                        && s.pane_cwd(pane, cx) == cwd
+                        && s.live.get(&pane).is_some_and(|l| {
+                            l.pane.session() == session
+                                && input.as_ref().map_or_else(
+                                    || shown.as_ref().is_some_and(|old| **old == *l.pane.shown()),
+                                    |input| input.matches(&l.pane.shown()),
+                                )
+                        })
+                });
                 menu.rebuild(window, cx, |menu, _, _| {
-                    state.fill(menu, &shell, found.as_ref())
+                    state.fill(menu, &shell, found.as_ref().filter(|_| valid), None)
                 });
                 window.refresh();
             })
@@ -202,7 +243,7 @@ pub(super) fn build(
         .detach();
         menu
     } else {
-        state.fill(menu, shell, None)
+        state.fill(menu, shell, None, None)
     }
 }
 

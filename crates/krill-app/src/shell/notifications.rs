@@ -19,6 +19,7 @@ enum Kind {
     Away,
     Notice,
     Stalled,
+    AccountInput,
     Fix(String),
     Paste,
 }
@@ -31,6 +32,7 @@ impl Kind {
             Self::Away => "away-summary".into(),
             Self::Notice => "notice".into(),
             Self::Stalled => "stalled".into(),
+            Self::AccountInput => "account-input-recovery".into(),
             Self::Fix(id) => format!("fix-{id}").into(),
             Self::Paste => "multiline-paste-warning".into(),
         }
@@ -42,6 +44,10 @@ enum Value {
     Text(String),
     Fix(FixNeed),
     Paste(krill_app::security::PendingPaste),
+    AccountInput {
+        session: krill_proto::SessionId,
+        cancelling: bool,
+    },
 }
 
 #[derive(Default)]
@@ -78,6 +84,15 @@ impl Shell {
         }
         if let Some(pending) = self.security.pending_paste() {
             current.push((Kind::Paste, Value::Paste(pending.clone())));
+        }
+        if let Some(session) = self.failed_account_input() {
+            current.push((
+                Kind::AccountInput,
+                Value::AccountInput {
+                    session,
+                    cancelling: self.account_cancel.is_some(),
+                },
+            ));
         }
         if current.is_empty() && self.notifications.list.is_none() {
             return;
@@ -175,7 +190,7 @@ impl Shell {
                 Value::Fix(need) => {
                     let need = need.clone();
                     Notification::new()
-                        .autohide(false)
+                        .autohide(need.check_id.starts_with("hook."))
                         .content(move |_, _, cx| {
                             krill_app::onboarding::banner::render_need(need.clone(), cx)
                         })
@@ -186,6 +201,44 @@ impl Shell {
                         .autohide(false)
                         .content(move |_, _, cx| {
                             Self::render_security_notice(&pending, shell.clone(), cx)
+                        })
+                }
+                Value::AccountInput {
+                    session,
+                    cancelling,
+                } => {
+                    let session = *session;
+                    let cancelling = *cancelling;
+                    Notification::new()
+                        .with_type(NotificationType::Warning)
+                        .autohide(false)
+                        .content(move |_, _, _| {
+                            let shell = shell.clone();
+                            div()
+                                .debug_selector(|| "account-input-recovery".into())
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .w_full()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .child(krill_app::i18n::catalog::settings::ACCOUNT_INPUT_HELD.get())
+                                .child(
+                                    ui::secondary(
+                                        "account-continue-original",
+                                        krill_app::i18n::catalog::settings::ACCOUNT_CONTINUE_ORIGINAL.get(),
+                                    )
+                                    .debug_selector(|| "account-continue-original".into())
+                                    .disabled(cancelling)
+                                    .on_click(move |_, _, cx| {
+                                        shell
+                                            .update(cx, |this, cx| {
+                                                this.continue_original_account(session, cx);
+                                            })
+                                            .ok();
+                                    }),
+                                )
+                                .into_any_element()
                         })
                 }
             }

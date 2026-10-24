@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, Entity, FontWeight, SharedString, div, prelude::*, px};
+use gpui::{Context, FontWeight, SharedString, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::{Icon, IconName, Sizable as _};
@@ -1123,7 +1123,11 @@ impl Sidebar {
         )
     }
 
-    pub(super) fn remote_rows(&self, remote: &super::RemoteHost) -> Vec<Row> {
+    pub(super) fn remote_rows(
+        &self,
+        remote: &super::RemoteHost,
+        collapsed: &BTreeSet<PathBuf>,
+    ) -> Vec<Row> {
         // The project selector is populated from self.snapshot (local projects).
         // Applying its paths to another PC hides valid daemon-owned projects,
         // including when both machines happen to use the same absolute paths.
@@ -1148,7 +1152,7 @@ impl Sidebar {
         rows_with_options(
             &remote.snapshot,
             &self.prefs,
-            &self.collapsed,
+            collapsed,
             &self.collapsed_groups,
             &self.shown_external,
             &options,
@@ -1397,7 +1401,8 @@ impl Sidebar {
         if let Some(custom) = self.worktree_hosts.get(path) {
             return Some(custom.clone());
         }
-        if self.options.group_by == GroupBy::Repo {
+        // 프로젝트 기준 보기에는 PC 단계가 없으니 원격 PC 것만 배지로 구분한다.
+        if self.options.group_by == GroupBy::Repo && host.is_local() {
             return None;
         }
         match host {
@@ -1436,7 +1441,7 @@ impl Sidebar {
             .icon(Icon::default().data(ui::icons::SLIDERS_HORIZONTAL_SVG))
             .accessibility_label(tooltip_label.clone())
             .tooltip(tooltip_label)
-            .dropdown_menu(move |menu, _, cx| build_options_menu(menu, &this, cx));
+            .dropdown_menu(move |menu, window, cx| build_options_menu(menu, &this, window, cx));
 
         div()
             .id("sidebar-options-wrap")
@@ -1557,192 +1562,226 @@ pub(super) fn properties_summary(options: &WorkspaceOptions) -> String {
     }
 }
 
+/// 서브메뉴 배치·포커스·바깥 클릭 처리는 `PopupMenu`가 맡는다.
 fn build_options_menu(
     menu: PopupMenu,
     this: &gpui::WeakEntity<Sidebar>,
+    window: &mut gpui::Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let menu_weak = cx.weak_entity();
-    let submenu_state = cx.new(|_| Option::<OptionsSubmenu>::None);
-    let sidebar_weak = this.clone();
-    menu.min_w(px(284.))
+    if let Some(sidebar) = this.upgrade() {
+        cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+    }
+    let has_hosts = this
+        .upgrade()
+        .is_some_and(|s| !s.read(cx).remote_hosts.is_empty());
+    let has_projects = this
+        .upgrade()
+        .is_some_and(|s| s.read(cx).snapshot.trees.len() > 1);
+    let mut menu = menu
+        .min_w(px(284.))
         .max_w(px(296.))
         .scrollable(true)
         .max_h(px(540.))
         .item(
+            PopupMenuItem::element(|_, cx| {
+                div()
+                    .id("sidebar-options-menu")
+                    .debug_selector(|| "sidebar-options-menu".into())
+                    .w(px(272.))
+                    .child(
+                        div()
+                            .id("sidebar-options-header")
+                            .debug_selector(|| "sidebar-options-header".into())
+                            .py_1()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ui::palette(cx).popover_foreground)
+                            .child(text::WORKSPACE_OPTIONS.get()),
+                    )
+            })
+            .disabled(true),
+        );
+    if has_hosts || has_projects {
+        menu = menu.item(
+            PopupMenuItem::element(|_, cx| {
+                section_label(text::SHOW_SECTION.get(), ui::palette(cx))
+            })
+            .disabled(true),
+        );
+        if has_hosts {
+            menu = add_options_submenu(menu, OptionsSubmenu::Hosts, this, window, cx);
+        }
+        if has_projects {
+            menu = add_options_submenu(menu, OptionsSubmenu::Projects, this, window, cx);
+        }
+        menu = menu.separator();
+    }
+    let sb = this.clone();
+    let mn = menu_weak.clone();
+    menu = menu
+        .item(
             PopupMenuItem::element(move |_, cx| {
-                render_options_menu_panel(&sidebar_weak, &menu_weak, &submenu_state, cx)
+                let group = sb
+                    .upgrade()
+                    .map_or(GroupBy::default(), |s| s.read(cx).options.group_by);
+                render_group_by_section(&sb, &mn, group, ui::palette(cx))
             })
             .disabled(true),
         )
+        .separator();
+    for target in [
+        OptionsSubmenu::SortBy,
+        OptionsSubmenu::CardLayout,
+        OptionsSubmenu::CardProperties,
+    ] {
+        menu = add_options_submenu(menu, target, this, window, cx);
+    }
+    let sb = this.clone();
+    menu.separator().item(
+        PopupMenuItem::element(move |_, cx| {
+            let options = sb
+                .upgrade()
+                .map_or_else(WorkspaceOptions::default, |s| s.read(cx).options.clone());
+            render_filter_section(&sb, &menu_weak, &options, ui::palette(cx))
+        })
+        .disabled(true),
+    )
 }
 
-fn render_options_menu_panel(
-    sidebar_weak: &gpui::WeakEntity<Sidebar>,
-    menu_weak: &gpui::WeakEntity<PopupMenu>,
-    submenu_state: &Entity<Option<OptionsSubmenu>>,
+fn add_options_submenu(
+    menu: PopupMenu,
+    target: OptionsSubmenu,
+    sidebar: &gpui::WeakEntity<Sidebar>,
+    window: &mut gpui::Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let sb = sidebar.clone();
+    let submenu = PopupMenu::build(window, cx, move |menu, _, cx| {
+        if let Some(sidebar) = sb.upgrade() {
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+        }
+        let mn = cx.weak_entity();
+        let sb = sb.clone();
+        menu.min_w(px(260.))
+            .max_w(px(296.))
+            .scrollable(true)
+            .max_h(px(360.))
+            .item(
+                PopupMenuItem::element(move |_, cx| render_options_submenu(target, &sb, &mn, cx))
+                    .disabled(true),
+            )
+    });
+    let sb = sidebar.clone();
+    menu.item(
+        PopupMenuItem::submenu(target.label(), submenu).submenu_label(move |_, cx| {
+            let summary = sb.upgrade().map_or_else(String::new, |sidebar| {
+                let sidebar = sidebar.read(cx);
+                match target {
+                    OptionsSubmenu::Hosts => {
+                        let hosts = std::iter::once((
+                            HostId::Local,
+                            text::HOST_LOCAL
+                                .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                                .get()
+                                .to_owned(),
+                        ))
+                        .chain(
+                            sidebar
+                                .remote_hosts
+                                .iter()
+                                .map(|h| (HostId::Remote(h.id.clone()), h.label.clone())),
+                        )
+                        .collect::<Vec<_>>();
+                        host_visibility_summary(&sidebar.options.filters, &hosts)
+                    }
+                    OptionsSubmenu::Projects => project_visibility_summary(
+                        &sidebar.options.filters,
+                        &sidebar.snapshot.trees.keys().cloned().collect::<Vec<_>>(),
+                    ),
+                    OptionsSubmenu::SortBy => sidebar.options.sort_by.short_label().to_owned(),
+                    OptionsSubmenu::CardLayout => {
+                        sidebar.options.card_layout.short_label().to_owned()
+                    }
+                    OptionsSubmenu::CardProperties => properties_summary(&sidebar.options),
+                }
+            });
+            render_submenu_label(target, summary, ui::palette(cx))
+        }),
+    )
+}
+
+impl OptionsSubmenu {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hosts => text::HOSTS_ROW.get(),
+            Self::Projects => text::PROJECTS.get(),
+            Self::SortBy => text::SORT_BY.get(),
+            Self::CardLayout => text::CARD_LAYOUT.get(),
+            Self::CardProperties => text::CARD_PROPERTIES.get(),
+        }
+    }
+
+    const fn selectors(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Hosts => ("sidebar-submenu-hosts", "sidebar-hosts-summary"),
+            Self::Projects => ("sidebar-submenu-projects", "sidebar-projects-summary"),
+            Self::SortBy => ("sidebar-submenu-sort", "sidebar-sort-summary"),
+            Self::CardLayout => ("sidebar-submenu-card-layout", "sidebar-card-layout-summary"),
+            Self::CardProperties => (
+                "sidebar-submenu-card-properties",
+                "sidebar-card-properties-summary",
+            ),
+        }
+    }
+}
+
+fn render_options_submenu(
+    target: OptionsSubmenu,
+    sidebar: &gpui::WeakEntity<Sidebar>,
+    menu: &gpui::WeakEntity<PopupMenu>,
     cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
     let p = ui::palette(cx);
-    let (options, repos, hosts, visuals) = sidebar_weak.upgrade().map_or_else(
-        || {
-            (
-                WorkspaceOptions::default(),
-                Vec::new(),
-                Vec::new(),
-                BTreeMap::new(),
-            )
-        },
-        |entity| {
-            let s = entity.read(cx);
-            let repos: Vec<PathBuf> = s.snapshot.trees.keys().cloned().collect();
-            let hosts: Vec<HostMenuEntry> = if s.remote_hosts.is_empty() {
-                Vec::new()
-            } else {
-                std::iter::once(HostMenuEntry {
-                    id: HostId::Local,
-                    label: text::HOST_LOCAL
-                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
-                        .get()
-                        .to_owned(),
-                    status_label: host_status_label(s.local_status),
-                })
-                .chain(s.remote_hosts.iter().map(|r| HostMenuEntry {
-                    id: HostId::Remote(r.id.clone()),
-                    label: r.label.clone(),
-                    status_label: host_status_label(r.status),
-                }))
-                .collect()
-            };
-            (s.options.clone(), repos, hosts, s.project_visuals.clone())
-        },
-    );
-    let open_submenu = *submenu_state.read(cx);
-    let has_show_section = !hosts.is_empty() || repos.len() > 1;
-
-    div()
-        .id("sidebar-options-menu")
-        .debug_selector(|| "sidebar-options-menu".into())
-        .mx(px(-4.))
-        .w(px(272.))
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(
-            div()
-                .id("sidebar-options-header")
-                .debug_selector(|| "sidebar-options-header".into())
-                .px_2()
-                .py_1()
-                .text_size(ui::TEXT_XS)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(p.popover_foreground)
-                .child(text::WORKSPACE_OPTIONS.get()),
-        )
-        .when(has_show_section, |d| {
-            d.child(render_show_section(
-                sidebar_weak,
-                menu_weak,
-                submenu_state,
-                open_submenu,
-                &options,
-                (&repos, &visuals),
-                &hosts,
-                p,
-            ))
-            .child(menu_separator(p))
-        })
-        .child(render_group_by_section(
-            sidebar_weak,
-            menu_weak,
-            options.group_by,
-            p,
-        ))
-        .child(menu_separator(p))
-        .child(render_sort_and_display_section(
-            sidebar_weak,
-            menu_weak,
-            submenu_state,
-            open_submenu,
-            &options,
-            p,
-        ))
-        .child(menu_separator(p))
-        .child(render_filter_section(sidebar_weak, menu_weak, &options, p))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "show section needs entity handles, submenu state, options, repos, hosts, and palette"
-)]
-fn render_show_section(
-    sidebar_weak: &gpui::WeakEntity<Sidebar>,
-    menu_weak: &gpui::WeakEntity<PopupMenu>,
-    submenu_state: &Entity<Option<OptionsSubmenu>>,
-    open_submenu: Option<OptionsSubmenu>,
-    options: &WorkspaceOptions,
-    (repos, visuals): (&[PathBuf], &ProjectVisuals),
-    hosts: &[HostMenuEntry],
-    p: &'static ui::Palette,
-) -> gpui::Div {
-    let host_pairs: Vec<(HostId, String)> = hosts
-        .iter()
-        .map(|h| (h.id.clone(), h.label.clone()))
-        .collect();
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(section_label(text::SHOW_SECTION.get(), p))
-        .when(!hosts.is_empty(), |d| {
-            let summary = host_visibility_summary(&options.filters, &host_pairs);
-            let is_open = open_submenu == Some(OptionsSubmenu::Hosts);
-            d.child(render_submenu_trigger(
-                "sidebar-submenu-hosts",
-                text::HOSTS_ROW.get(),
-                "sidebar-hosts-summary",
-                &summary,
-                is_open,
-                OptionsSubmenu::Hosts,
-                submenu_state,
-                menu_weak,
-                p,
-            ))
-            .when(is_open, |d| {
-                d.child(render_hosts_panel(
-                    sidebar_weak,
-                    menu_weak,
-                    &options.filters,
-                    hosts,
-                    p,
-                ))
+    let Some(sidebar_entity) = sidebar.upgrade() else {
+        return div().id("sidebar-options-unavailable");
+    };
+    let s = sidebar_entity.read(cx);
+    match target {
+        OptionsSubmenu::Hosts => {
+            let hosts = std::iter::once(HostMenuEntry {
+                id: HostId::Local,
+                label: text::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned(),
+                status_label: host_status_label(s.local_status),
             })
-        })
-        .when(repos.len() > 1, |d| {
-            let summary = project_visibility_summary(&options.filters, repos);
-            let is_open = open_submenu == Some(OptionsSubmenu::Projects);
-            d.child(render_submenu_trigger(
-                "sidebar-submenu-projects",
-                text::PROJECTS.get(),
-                "sidebar-projects-summary",
-                &summary,
-                is_open,
-                OptionsSubmenu::Projects,
-                submenu_state,
-                menu_weak,
-                p,
-            ))
-            .when(is_open, |d| {
-                d.child(render_projects_panel(
-                    sidebar_weak,
-                    menu_weak,
-                    &options.filters,
-                    repos,
-                    visuals,
-                    p,
-                ))
-            })
-        })
+            .chain(s.remote_hosts.iter().map(|h| HostMenuEntry {
+                id: HostId::Remote(h.id.clone()),
+                label: h.label.clone(),
+                status_label: host_status_label(h.status),
+            }))
+            .collect::<Vec<_>>();
+            render_hosts_panel(sidebar, menu, &s.options.filters, &hosts, p)
+        }
+        OptionsSubmenu::Projects => render_projects_panel(
+            sidebar,
+            menu,
+            &s.options.filters,
+            &s.snapshot.trees.keys().cloned().collect::<Vec<_>>(),
+            &s.project_visuals,
+            p,
+        ),
+        OptionsSubmenu::SortBy => render_sort_panel(sidebar, menu, s.options.sort_by, p),
+        OptionsSubmenu::CardLayout => {
+            render_card_layout_panel(sidebar, menu, s.options.card_layout, p)
+        }
+        OptionsSubmenu::CardProperties => {
+            render_card_properties_panel(sidebar, menu, &s.options, p)
+        }
+    }
 }
 
 fn render_hosts_panel(
@@ -1872,7 +1911,7 @@ fn render_projects_panel(
                 .gap_2()
                 .child(
                     div()
-                        .text_size(ui::TEXT_2XS)
+                        .text_size(ui::TEXT_XS)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.muted_foreground)
                         .child(text::PROJECTS.get()),
@@ -1885,7 +1924,7 @@ fn render_projects_panel(
                         .py_0p5()
                         .rounded(ui::RADIUS_XS)
                         .cursor_pointer()
-                        .text_size(ui::TEXT_2XS)
+                        .text_size(ui::TEXT_XS)
                         .text_color(p.muted_foreground)
                         .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                         .on_click(move |_, _, cx| {
@@ -1979,82 +2018,6 @@ fn render_group_by_section(
                     }),
                 )),
         )
-}
-
-fn render_sort_and_display_section(
-    sidebar_weak: &gpui::WeakEntity<Sidebar>,
-    menu_weak: &gpui::WeakEntity<PopupMenu>,
-    submenu_state: &Entity<Option<OptionsSubmenu>>,
-    open_submenu: Option<OptionsSubmenu>,
-    options: &WorkspaceOptions,
-    p: &'static ui::Palette,
-) -> gpui::Div {
-    let sort_open = open_submenu == Some(OptionsSubmenu::SortBy);
-    let layout_open = open_submenu == Some(OptionsSubmenu::CardLayout);
-    let props_open = open_submenu == Some(OptionsSubmenu::CardProperties);
-    let props_summary = properties_summary(options);
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(render_submenu_trigger(
-            "sidebar-submenu-sort",
-            text::SORT_BY.get(),
-            "sidebar-sort-summary",
-            options.sort_by.short_label(),
-            sort_open,
-            OptionsSubmenu::SortBy,
-            submenu_state,
-            menu_weak,
-            p,
-        ))
-        .when(sort_open, |d| {
-            d.child(render_sort_panel(
-                sidebar_weak,
-                menu_weak,
-                options.sort_by,
-                p,
-            ))
-        })
-        .child(render_submenu_trigger(
-            "sidebar-submenu-card-layout",
-            text::CARD_LAYOUT.get(),
-            "sidebar-card-layout-summary",
-            options.card_layout.short_label(),
-            layout_open,
-            OptionsSubmenu::CardLayout,
-            submenu_state,
-            menu_weak,
-            p,
-        ))
-        .when(layout_open, |d| {
-            d.child(render_card_layout_panel(
-                sidebar_weak,
-                menu_weak,
-                options.card_layout,
-                p,
-            ))
-        })
-        .child(render_submenu_trigger(
-            "sidebar-submenu-card-properties",
-            text::CARD_PROPERTIES.get(),
-            "sidebar-card-properties-summary",
-            &props_summary,
-            props_open,
-            OptionsSubmenu::CardProperties,
-            submenu_state,
-            menu_weak,
-            p,
-        ))
-        .when(props_open, |d| {
-            d.child(render_card_properties_panel(
-                sidebar_weak,
-                menu_weak,
-                options,
-                p,
-            ))
-        })
 }
 
 fn render_sort_panel(
@@ -2152,7 +2115,7 @@ fn render_card_properties_panel(
                     .debug_selector(|| "sidebar-card-properties-hover-hint".into())
                     .px_2()
                     .py_0p5()
-                    .text_size(ui::TEXT_2XS)
+                    .text_size(ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::COMPACT_HOVER_HINT.get()),
             )
@@ -2352,79 +2315,32 @@ fn render_filter_toggle_row(
         .child(switch_face(checked, p))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "submenu trigger row takes row id, label, summary id/text, open state, target submenu, state handle, menu handle, and palette"
-)]
-fn render_submenu_trigger(
-    id: &'static str,
-    label: &'static str,
-    summary_id: &'static str,
-    summary: &str,
-    is_open: bool,
+fn render_submenu_label(
     target: OptionsSubmenu,
-    submenu_state: &Entity<Option<OptionsSubmenu>>,
-    menu_weak: &gpui::WeakEntity<PopupMenu>,
+    summary: String,
     p: &'static ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
-    let state_handle = submenu_state.clone();
-    let mn = menu_weak.clone();
-    let summary_text = summary.to_owned();
-    let chevron = if is_open {
-        IconName::ChevronDown
-    } else {
-        IconName::ChevronRight
-    };
+    let (id, summary_id) = target.selectors();
     div()
         .id(id)
         .debug_selector(move || id.into())
-        .px_2()
-        .py_1p5()
-        .rounded(ui::RADIUS_SM)
-        .cursor_pointer()
+        .min_w_0()
+        .flex_1()
         .flex()
         .items_center()
         .justify_between()
         .gap_2()
-        .when(is_open, |d| d.bg(p.accent.opacity(0.6)))
-        .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
-        .on_click(move |_, _, cx| {
-            state_handle.update(cx, |s, cx| {
-                *s = if *s == Some(target) {
-                    None
-                } else {
-                    Some(target)
-                };
-                cx.notify();
-            });
-            mn.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .child(
-            div()
-                .text_size(ui::TEXT_XS)
-                .text_color(p.popover_foreground)
-                .child(label),
-        )
+        .text_size(ui::TEXT_XS)
+        .text_color(p.popover_foreground)
+        .child(target.label())
         .child(
             div()
                 .id(summary_id)
                 .debug_selector(move || summary_id.into())
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .max_w(px(140.))
-                        .truncate()
-                        .text_size(ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(summary_text),
-                )
-                .child(
-                    Icon::new(chevron)
-                        .with_size(ui::ICON_XS)
-                        .text_color(p.muted_foreground),
-                ),
+                .max_w(px(140.))
+                .truncate()
+                .text_color(p.muted_foreground)
+                .child(summary),
         )
 }
 
@@ -2476,13 +2392,11 @@ fn submenu_panel_frame(id: &'static str, p: &'static ui::Palette) -> gpui::State
     div()
         .id(id)
         .debug_selector(move || id.into())
-        .mx_1()
-        .my_0p5()
-        .p_1()
-        .rounded(ui::RADIUS_SM)
-        .border_1()
-        .border_color(p.border)
-        .bg(p.muted.opacity(0.4))
+        .mx(px(-4.))
+        .w(px(248.))
+        .font_family(ui::FONT_UI)
+        .text_size(ui::TEXT_XS)
+        .text_color(p.popover_foreground)
         .flex()
         .flex_col()
         .gap_0p5()
@@ -2493,7 +2407,7 @@ fn section_label(label: &'static str, p: &'static ui::Palette) -> gpui::Div {
         .px_2()
         .pt_1()
         .pb_0p5()
-        .text_size(ui::TEXT_2XS)
+        .text_size(ui::TEXT_XS)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.muted_foreground)
         .child(label)

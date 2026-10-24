@@ -4,6 +4,7 @@
 //!
 //! 라이트/다크는 터미널 팔레트도 바꾸며 셸이 krilld에 전달한다(OWE-590). 줌은 rem 기반 UI 크기에 적용한다.
 
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
 use krill_proto::os::fs::OpenOptionsExt as _;
 use std::io::Write as _;
 #[cfg(unix)]
@@ -186,6 +187,9 @@ pub struct Settings {
     /// false면 라이트 모드에서도 다크 모드 테마를 쓴다.
     #[serde(default = "default_true")]
     pub terminal_use_separate_light_theme: bool,
+    /// 사이드바 자동화 진입점 표시. Workflows 설정에서 다시 켤 수 있다.
+    #[serde(default = "default_true")]
+    pub show_automations_button: bool,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
     /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -301,6 +305,7 @@ impl Default for Settings {
             terminal_theme_dark: default_terminal_theme_dark(),
             terminal_theme_light: default_terminal_theme_light(),
             terminal_use_separate_light_theme: true,
+            show_automations_button: true,
             terminal_custom_themes: Vec::new(),
         }
     }
@@ -593,6 +598,7 @@ impl Global for Config {}
 
 fn own_bindings() -> Vec<KeyBinding> {
     vec![
+        crate::keys::bind("cmd-,", OpenSettings, None),
         crate::keys::bind("cmd-=", ZoomIn, None),
         crate::keys::bind("cmd-+", ZoomIn, None),
         crate::keys::bind("cmd--", ZoomOut, None),
@@ -1326,7 +1332,7 @@ pub fn notification_sound(cx: &App) -> bool {
 pub fn trigger_manual_update_check(cx: &mut App) {
     use crate::updater::{CheckStatus, UpdateState, check_and_stage_current_app};
     let mut state = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
-    if matches!(state.status, CheckStatus::Checking) {
+    if matches!(state.status, CheckStatus::Checking) || state.restart.is_starting() {
         return;
     }
     state.status = CheckStatus::Checking;
@@ -1346,14 +1352,20 @@ pub fn trigger_manual_update_check(cx: &mut App) {
         let res = work.await;
         cx.update(|cx| {
             let mut next = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
+            if next.restart.is_starting() {
+                return;
+            }
+            let automatic = current(cx).auto_restart_update;
+            let mut restart = None;
             match res {
                 Ok(CheckStatus::Ready(staged)) => {
-                    if current(cx).auto_restart_update {
-                        restart_staged_update(staged.clone(), cx);
-                    }
+                    next.restart = crate::updater::RestartStatus::Idle;
                     next.staged = Some(staged.clone());
                     next.status = CheckStatus::Ready(staged);
                     next.card_collapsed = false;
+                    if automatic {
+                        restart.clone_from(&next.staged);
+                    }
                 }
                 Ok(status) => {
                     next.status = status;
@@ -1365,6 +1377,9 @@ pub fn trigger_manual_update_check(cx: &mut App) {
             }
             cx.set_global(next);
             cx.refresh_windows();
+            if let Some(staged) = restart {
+                restart_staged_update(staged, cx);
+            }
         });
     })
     .detach();
@@ -1372,40 +1387,7 @@ pub fn trigger_manual_update_check(cx: &mut App) {
 
 /// Prepare the relauncher off the event loop, then use the application's durable quit action.
 fn restart_staged_update(staged: crate::updater::StagedUpdate, cx: &mut App) {
-    #[derive(Default)]
-    struct RestartPending(bool);
-    impl Global for RestartPending {}
-    if cx
-        .try_global::<RestartPending>()
-        .is_some_and(|pending| pending.0)
-    {
-        return;
-    }
-    cx.set_global(RestartPending(true));
-    let work = background_file_io(cx, move || staged.spawn_relauncher());
-    cx.spawn(async move |cx| {
-        let result = work.await;
-        cx.update(|cx| {
-            cx.set_global(RestartPending(false));
-            match result {
-                Ok(()) => {
-                    if let Ok(quit) = cx.build_action("shell::Quit", None) {
-                        cx.dispatch_action(quit.as_ref());
-                    }
-                }
-                Err(error) => {
-                    let mut state = cx
-                        .try_global::<crate::updater::UpdateState>()
-                        .cloned()
-                        .unwrap_or_default();
-                    state.status = crate::updater::CheckStatus::Error(error.user_message());
-                    cx.set_global(state);
-                    cx.refresh_windows();
-                }
-            }
-        });
-    })
-    .detach();
+    crate::updater::restart_staged_update(staged, cx);
 }
 
 /// 동면 opt-in 표식 파일명(krilld `hibernate_idle`이 존재 여부로 읽는다).
@@ -1540,7 +1522,7 @@ fn apply(cx: &mut App) {
 /// 설정을 고쳐 바로 적용하고 `settings.toml`에 쓴다. 디스크의 유효한 최신 파일을
 /// 바탕으로 변경을 적용해 1초 폴링 전 외부 편집이 메모리 설정으로 덮어쓰기되지 않게 한다.
 /// 디스크 파일이 손상됐거나 읽을 수 없으면 쓰지 않고 오류만 남긴다.
-pub(crate) fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
+pub fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
     let c = cx.global::<Config>();
     let Some(dir) = c.dir.clone() else {
         cx.global_mut::<Config>().error = Some(text::NO_STATE_DIR.get().into());
@@ -1946,6 +1928,8 @@ pub enum AdminTab {
     Terminal,
     Accounts,
     Agents,
+    /// 프론티어 CLI·개발 도구 원클릭 설치 및 에일리어스 설정.
+    Install,
     Ssh,
     RemoteKrill,
     Workflows,
@@ -1955,14 +1939,15 @@ pub enum AdminTab {
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
-gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor]);
+gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor, Package]);
 
 impl AdminTab {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::General,
         Self::Terminal,
         Self::Accounts,
         Self::Agents,
+        Self::Install,
         Self::Ssh,
         Self::RemoteKrill,
         Self::Workflows,
@@ -1977,6 +1962,7 @@ impl AdminTab {
             Self::Terminal => "admin-tab-terminal",
             Self::Accounts => "admin-tab-accounts",
             Self::Agents => "admin-tab-agents",
+            Self::Install => "admin-tab-install",
             Self::Ssh => "admin-tab-ssh",
             Self::RemoteKrill => "admin-tab-remote-krill",
             Self::Workflows => "admin-tab-workflows",
@@ -1992,6 +1978,7 @@ impl AdminTab {
             Self::Terminal => text::TAB_TERMINAL.get(),
             Self::Accounts => text::TAB_ACCOUNTS.get(),
             Self::Agents => text::TAB_AGENTS.get(),
+            Self::Install => text::TAB_INSTALL.get(),
             Self::Ssh => text::TAB_SSH.get(),
             Self::RemoteKrill => text::TAB_REMOTE_KRILL.get(),
             Self::Workflows => text::TAB_WORKFLOWS.get(),
@@ -2007,6 +1994,7 @@ impl AdminTab {
             Self::Terminal => text::TAB_TERMINAL_DESC,
             Self::Accounts => text::TAB_ACCOUNTS_DESC,
             Self::Agents => text::AGENTS_DESC,
+            Self::Install => text::TAB_INSTALL_DESC,
             Self::Ssh => text::TAB_SSH_DESC,
             Self::RemoteKrill => text::TAB_REMOTE_KRILL_DESC,
             Self::Workflows => text::TAB_WORKFLOWS_DESC,
@@ -2028,6 +2016,7 @@ impl AdminTab {
             Self::Terminal => IconName::SquareTerminal,
             Self::Accounts => IconName::User,
             Self::Agents => IconName::Bot,
+            Self::Install => IconName::Package,
             Self::Ssh => IconName::Server,
             Self::RemoteKrill => IconName::Monitor,
             Self::Workflows => IconName::Cpu,
@@ -2167,11 +2156,7 @@ pub fn rule_summary(
         || text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
         |id| account_label(accounts, rule, id),
     );
-    let metric = if rule.metric == krill_proto::usage::AutoSwitchMetric::Max {
-        "Max"
-    } else {
-        rule.metric.label()
-    };
+    let metric = rule.metric.short_label_for(rule.provider);
     let mut out = format!("{metric} ≥ {}% → {target}", rule.threshold_percent);
     if !rule.enabled {
         out.push_str(" · ");
@@ -2556,6 +2541,8 @@ pub struct SettingsView {
     mobile: mobile::Panel,
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
     mobile_page: bool,
+    automations_page: bool,
+    automations: schedules::SchedulesState,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
     accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     account_error: Option<SharedString>,
@@ -2645,6 +2632,8 @@ pub struct SettingsView {
     workflow_form: Option<WorkflowRepoForm>,
     /// 워크스페이스 디스크 용량 분석(Space) 및 워크트리 일괄 클린업 패널(MK-175·OWE-729).
     space: space::Panel,
+    /// 프론티어 CLI·개발 도구 설치 및 에일리어스 패널.
+    install: install::Panel,
     /// 스케줄 추가/편집 모달 상태(OWE-740).
     schedule_modal: Option<schedules::ScheduleModal>,
     schedule_form_generation: u64,
@@ -2687,6 +2676,8 @@ struct ServiceCache {
     aliases: std::collections::BTreeMap<String, String>,
     schedules: Vec<krill_proto::schedule::Schedule>,
     runs: Vec<krill_proto::schedule::ScheduleRun>,
+    schedules_error: Option<String>,
+    runs_error: Option<String>,
 }
 
 impl ServiceCache {
@@ -2979,6 +2970,8 @@ impl SettingsView {
             account_file_stamp: Vec::new(),
             mobile: mobile::Panel::default(),
             mobile_page: false,
+            automations_page: false,
+            automations: schedules::SchedulesState::default(),
             remote_krill: None,
             accounts_snapshot: krill_proto::usage::AccountsSnapshot::default(),
             account_error: None,
@@ -3034,6 +3027,7 @@ impl SettingsView {
             shortcuts: shortcuts::Recorder::default(),
             workflow_form: None,
             space: space::Panel::default(),
+            install: install::Panel::default(),
             schedule_modal: None,
             schedule_form_generation: 0,
             schedule_log_generation: 0,
@@ -3232,6 +3226,10 @@ impl SettingsView {
                     if previous_stamp.as_ref() == Some(&stamp) && known_repo {
                         return (Some(stamp), None);
                     }
+                    let schedules = krill_proto::schedule::Schedules::load(&dir);
+                    let runs = krill_proto::schedule::load_coalesced_runs(&dir);
+                    let schedules_error = schedules.as_ref().err().map(ToString::to_string);
+                    let runs_error = runs.as_ref().err().map(ToString::to_string);
                     (
                         Some(stamp),
                         Some(ServiceCache {
@@ -3250,11 +3248,10 @@ impl SettingsView {
                                     (raw, canonical)
                                 })
                                 .collect(),
-                            schedules: krill_proto::schedule::Schedules::load(&dir)
-                                .unwrap_or_default()
-                                .schedule,
-                            runs: krill_proto::schedule::load_coalesced_runs(&dir)
-                                .unwrap_or_default(),
+                            schedules: schedules.unwrap_or_default().schedule,
+                            runs: runs.unwrap_or_default(),
+                            schedules_error,
+                            runs_error,
                         }),
                     )
                 })
@@ -3298,6 +3295,22 @@ impl SettingsView {
 
     pub fn tab(&self) -> AdminTab {
         self.tab
+    }
+
+    pub fn automations_page(&self) -> bool {
+        self.automations_page
+    }
+
+    pub fn set_automations_page(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.automations_page == on {
+            return;
+        }
+        self.automations_page = on;
+        if on {
+            self.mobile_page = false;
+            self.refresh_service_cache(cx);
+        }
+        cx.notify();
     }
 
     pub fn mobile_page(&self) -> bool {
@@ -5626,26 +5639,34 @@ impl SettingsView {
         let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
         let update_state = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
         let is_checking = matches!(update_state.status, CheckStatus::Checking);
-        let status_label = match &update_state.status {
-            CheckStatus::Idle => match &update_state.staged {
-                Some(staged) => text::UPDATES_READY.format(&[("version", &staged.to_version)]),
-                None => format!("v{}", env!("CARGO_PKG_VERSION")),
-            },
-            CheckStatus::Checking => text::UPDATES_CHECKING.get().to_owned(),
-            CheckStatus::UpToDate { version } => {
-                text::UPDATES_UP_TO_DATE.format(&[("version", version)])
+        let status_label = if update_state.restart.is_starting() {
+            crate::i18n::catalog::updater_relaunch::CARD_RESTARTING_BTN
+                .get()
+                .to_owned()
+        } else if let Some(error) = update_state.restart.error() {
+            error.to_owned()
+        } else {
+            match &update_state.status {
+                CheckStatus::Idle => match &update_state.staged {
+                    Some(staged) => text::UPDATES_READY.format(&[("version", &staged.to_version)]),
+                    None => format!("v{}", env!("CARGO_PKG_VERSION")),
+                },
+                CheckStatus::Checking => text::UPDATES_CHECKING.get().to_owned(),
+                CheckStatus::UpToDate { version } => {
+                    text::UPDATES_UP_TO_DATE.format(&[("version", version)])
+                }
+                CheckStatus::ChannelMismatch {
+                    configured,
+                    offered,
+                } => text::UPDATES_CHANNEL_MISMATCH.format(&[
+                    ("configured", configured.as_str()),
+                    ("offered", offered.as_str()),
+                ]),
+                CheckStatus::Ready(staged) => {
+                    text::UPDATES_READY.format(&[("version", &staged.to_version)])
+                }
+                CheckStatus::Error(err) => err.clone(),
             }
-            CheckStatus::ChannelMismatch {
-                configured,
-                offered,
-            } => text::UPDATES_CHANNEL_MISMATCH.format(&[
-                ("configured", configured.as_str()),
-                ("offered", offered.as_str()),
-            ]),
-            CheckStatus::Ready(staged) => {
-                text::UPDATES_READY.format(&[("version", &staged.to_version)])
-            }
-            CheckStatus::Error(err) => err.clone(),
         };
         let staged_for_btn = update_state.staged.clone().or_else(|| {
             if let CheckStatus::Ready(staged) = &update_state.status {
@@ -5662,6 +5683,7 @@ impl SettingsView {
         )
         .small()
         .outline()
+        .disabled(update_state.restart.is_starting() || is_checking)
         .debug_selector(|| "settings-update-check".into())
         .on_click(|_, _, cx| {
             trigger_manual_update_check(cx);
@@ -5674,13 +5696,27 @@ impl SettingsView {
                 .child(status_label),
         );
         if let Some(staged) = staged_for_btn {
-            let restart_label = text::UPDATES_RESTART.format(&[("version", &staged.to_version)]);
+            let restart_label = if update_state.restart.error().is_some() {
+                crate::i18n::catalog::updater_relaunch::CARD_RETRY_BTN
+                    .get()
+                    .to_owned()
+            } else {
+                text::UPDATES_RESTART.format(&[("version", &staged.to_version)])
+            };
             controls = controls.child(
-                layout::primary("settings-update-restart", restart_label)
-                    .debug_selector(|| "settings-update-restart".into())
-                    .on_click(move |_, _, cx| {
-                        restart_staged_update(staged.clone(), cx);
-                    }),
+                crate::ui::button_with_reserved_label(
+                    "settings-update-restart",
+                    restart_label,
+                    crate::i18n::catalog::updater_relaunch::CARD_RESTARTING_BTN.get(),
+                    update_state.restart.is_starting(),
+                )
+                .small()
+                .primary()
+                .disabled(update_state.restart.is_starting() || is_checking)
+                .debug_selector(|| "settings-update-restart".into())
+                .on_click(move |_, _, cx| {
+                    restart_staged_update(staged.clone(), cx);
+                }),
             );
         }
         controls = controls.child(check_btn);
@@ -5955,7 +5991,6 @@ impl SettingsView {
                             .debug_selector(|| "terminal-theme-active-label".into())
                             .truncate()
                             .text_size(crate::ui::TEXT_2XS)
-                            .font_family(crate::ui::FONT_MONO)
                             .text_color(p.foreground)
                             .child(active_label.to_owned()),
                     ),
@@ -5966,7 +6001,7 @@ impl SettingsView {
                     .bg(bg)
                     .text_color(fg)
                     .font_family(s.terminal_font_family.clone())
-                    .text_size(crate::ui::TEXT_XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .flex()
                     .flex_col()
                     .gap_1p5()
@@ -6141,7 +6176,7 @@ impl SettingsView {
                 div()
                     .px_2()
                     .pt_1()
-                    .text_size(crate::ui::TEXT_2XS)
+                    .text_size(crate::ui::TEXT_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(p.muted_foreground)
                     .child(text::TERMINAL_THEME_IMPORTED.get()),
@@ -6210,7 +6245,7 @@ impl SettingsView {
                                         .min_w_0()
                                         .flex_1()
                                         .truncate()
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .text_color(p.foreground)
                                         .child(ct.name.clone()),
                                 )
@@ -6252,7 +6287,7 @@ impl SettingsView {
                 div()
                     .px_2()
                     .pt_1()
-                    .text_size(crate::ui::TEXT_2XS)
+                    .text_size(crate::ui::TEXT_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(p.muted_foreground)
                     .child(text::TERMINAL_THEME_BUILTIN.get()),
@@ -6295,7 +6330,7 @@ impl SettingsView {
                                 .min_w_0()
                                 .flex_1()
                                 .truncate()
-                                .text_size(crate::ui::TEXT_XS)
+                                .text_size(crate::ui::TEXT_SM)
                                 .text_color(p.foreground)
                                 .child(theme_name),
                         ),
@@ -6833,10 +6868,13 @@ impl SettingsView {
         let p = crate::ui::palette(cx);
         let snap = &self.accounts_snapshot;
         let existing_rule = snap.auto_switch.rule_for(acct.provider, &acct.id).cloned();
+        let enabled = existing_rule
+            .as_ref()
+            .map_or(snap.auto_switch.enabled, |r| r.enabled);
         let rule = existing_rule.clone().unwrap_or_else(|| AutoSwitchRule {
             provider: acct.provider,
             from_account_id: acct.id.clone(),
-            enabled: true,
+            enabled,
             threshold_percent: snap.auto_switch.threshold_percent,
             metric: AutoSwitchMetric::Max,
             target_account_id: None,
@@ -6850,7 +6888,6 @@ impl SettingsView {
                         this.set_account_rule(next.clone(), cx);
                     }))
             };
-        let enabled = existing_rule.as_ref().is_some_and(|r| r.enabled);
         // OWE-719: 규칙 편집기는 프로바이더 섹션의 "고급" 하나 아래에만 있다. 계정마다 이름과 현재 규칙 요약을 머리로 둔다.
         let summary = existing_rule.as_ref().map_or_else(
             || text::ACCOUNTS_RULE_NONE.get().to_owned(),
@@ -6865,7 +6902,7 @@ impl SettingsView {
             .child(
                 div()
                     .flex_none()
-                    .text_size(crate::ui::TEXT_XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(account_heading(acct).0),
             )
@@ -6913,27 +6950,20 @@ impl SettingsView {
                     },
                 )),
         );
-        let metric_btns = [
-            AutoSwitchMetric::Max,
-            AutoSwitchMetric::FiveHour,
-            AutoSwitchMetric::SevenDay,
-        ]
-        .into_iter()
-        .map(|metric| {
-            let mut next = rule.clone();
-            next.metric = metric;
-            rule_button(
-                format!("admin-rule-metric-{}-{}", acct.id, metric.short_code()),
-                if metric == AutoSwitchMetric::Max {
-                    "Max"
-                } else {
-                    metric.label()
-                }
-                .into(),
-                rule.metric == metric,
-                next,
-            )
-        });
+        let provider = acct.provider;
+        let metric_btns = AutoSwitchMetric::for_provider(provider)
+            .iter()
+            .copied()
+            .map(|metric| {
+                let mut next = rule.clone();
+                next.metric = metric;
+                rule_button(
+                    format!("admin-rule-metric-{}-{}", acct.id, metric.short_code()),
+                    metric.short_label_for(provider).into(),
+                    rule.metric == metric,
+                    next,
+                )
+            });
         let metrics = div()
             .flex()
             .items_center()
@@ -7920,7 +7950,7 @@ impl SettingsView {
                         ))
                         .child(
                             div()
-                                .text_size(crate::ui::TEXT_MD)
+                                .text_size(crate::ui::TEXT_SM)
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .child(title),
                         )
@@ -8226,7 +8256,7 @@ impl SettingsView {
                     .children(self.orphan_profiles.iter().map(|o| {
                         div()
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .truncate()
                             .child(o.dir.clone())
@@ -8888,7 +8918,7 @@ impl SettingsView {
                             .border_1()
                             .border_color(p.border)
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(text::WORKSPACE_TRUST_PRESET_CONFIRM_DIFF.get()),
                     )
@@ -9302,7 +9332,7 @@ impl SettingsView {
                                             .min_w_0()
                                             .truncate()
                                             .font_family(crate::ui::FONT_MONO)
-                                            .text_size(crate::ui::TEXT_2XS)
+                                            .text_size(crate::ui::TEXT_SM)
                                             .text_color(p.muted_foreground)
                                             .child(summary_text),
                                     ),
@@ -9587,7 +9617,7 @@ impl SettingsView {
                                         .min_w_0()
                                         .truncate()
                                         .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .text_color(p.muted_foreground)
                                         .child(addr_detail),
                                 ),
@@ -9791,12 +9821,7 @@ impl SettingsView {
                 .bg(p.card)
                 .border_1()
                 .border_color(p.border)
-                .child(
-                    div()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
-                        .child(status.clone()),
-                );
+                .child(div().text_size(crate::ui::TEXT_XS).child(status.clone()));
             if let Some(failed_host) = &self.ssh_auth_failed_host {
                 let host_for_reg = failed_host.clone();
                 status_box = status_box.child(
@@ -10114,7 +10139,7 @@ impl SettingsView {
                                                 .min_w_0()
                                                 .truncate()
                                                 .font_family(crate::ui::FONT_MONO)
-                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_size(crate::ui::TEXT_SM)
                                                 .text_color(p.muted_foreground)
                                                 .child(host.format_summary()),
                                         )
@@ -10125,7 +10150,7 @@ impl SettingsView {
                                                 .min_w_0()
                                                 .truncate()
                                                 .font_family(crate::ui::FONT_MONO)
-                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_size(crate::ui::TEXT_SM)
                                                 .text_color(if remote_is_error {
                                                     p.destructive
                                                 } else {
@@ -10697,7 +10722,6 @@ impl SettingsView {
                 .child(
                     layout::label(p, text::ORCH_TITLE.get(), Some(text::ORCH_DESC.get())).child(
                         div()
-                            .font_family(crate::ui::FONT_MONO)
                             .text_size(crate::ui::TEXT_XS)
                             .text_color(p.muted_foreground)
                             .child(orch_summary),
@@ -10713,12 +10737,7 @@ impl SettingsView {
                 task.status,
                 &task.deps,
             );
-            orch_card = orch_card.child(
-                div()
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(line),
-            );
+            orch_card = orch_card.child(div().text_size(crate::ui::TEXT_SM).child(line));
         }
         let lines_btns = [50u16, 100, 250, 500].into_iter().map(|lines| {
             let id = format!("admin-context-lines-{lines}");
@@ -10840,7 +10859,7 @@ impl SettingsView {
                                 .flex_1()
                                 .min_w_0()
                                 .font_family(crate::ui::FONT_MONO)
-                                .text_size(crate::ui::TEXT_XS)
+                                .text_size(crate::ui::TEXT_SM)
                                 .truncate()
                                 .child(summary),
                         )
@@ -11022,8 +11041,7 @@ impl SettingsView {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .child(kind_label),
                                 ),
                         )
@@ -11334,7 +11352,7 @@ impl SettingsView {
                             .child(
                                 div()
                                     .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_size(crate::ui::TEXT_SM)
                                     .text_color(p.foreground)
                                     .child(rel_path),
                             )
@@ -11464,7 +11482,7 @@ impl SettingsView {
                         .hover(|d| d.bg(p.accent))
                         .active(|d| d.bg(p.sidebar_accent))
                         .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .truncate()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.load_repo_hooks_for(&repo_for_click, window, cx);
@@ -11622,7 +11640,7 @@ impl SettingsView {
                     .border_1()
                     .border_color(p.border)
                     .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
+                    .text_size(crate::ui::TEXT_SM)
                     .child(status.clone()),
             );
         }
@@ -11638,7 +11656,6 @@ impl SettingsView {
                     .bg(p.card)
                     .border_1()
                     .border_color(p.border)
-                    .font_family(crate::ui::FONT_MONO)
                     .text_size(crate::ui::TEXT_XS)
                     .child(status.clone()),
             );
@@ -11655,7 +11672,6 @@ impl SettingsView {
                     .bg(p.card)
                     .border_1()
                     .border_color(p.border)
-                    .font_family(crate::ui::FONT_MONO)
                     .text_size(crate::ui::TEXT_XS)
                     .child(status.clone()),
             );
@@ -11752,6 +11768,9 @@ impl Render for SettingsView {
         if self.mobile_page {
             return self.render_mobile_page(cx).into_any_element();
         }
+        if self.automations_page {
+            return self.render_automations_page(window, cx).into_any_element();
+        }
         window.set_window_title(text::TITLE.get());
         let (s, error) = cx.try_global::<Config>().map_or_else(
             || (Settings::default(), None),
@@ -11790,6 +11809,7 @@ impl Render for SettingsView {
                 &[
                     AdminTab::General,
                     AdminTab::Terminal,
+                    AdminTab::Install,
                     AdminTab::Shortcuts,
                     AdminTab::Ssh,
                     AdminTab::RemoteKrill,
@@ -11913,7 +11933,7 @@ impl Render for SettingsView {
                 div()
                     .px_2()
                     .pt_1()
-                    .text_size(crate::ui::TEXT_2XS)
+                    .text_size(crate::ui::TEXT_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(p.muted_foreground)
                     .child(group_label),
@@ -11941,7 +11961,7 @@ impl Render for SettingsView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .text_size(crate::ui::TEXT_XS)
+                        .text_size(crate::ui::TEXT_SM)
                         .text_color(if selected {
                             p.foreground
                         } else {
@@ -12057,6 +12077,7 @@ impl Render for SettingsView {
                 AdminTab::Terminal => self.render_terminal_tab(&s, window, cx),
                 AdminTab::Accounts => self.render_accounts_tab(window, cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
+                AdminTab::Install => self.render_install_tab(window, cx),
                 AdminTab::Ssh => self.render_ssh_tab(window, cx),
                 AdminTab::RemoteKrill => self.render_remote_krill_tab(window, cx),
                 AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
@@ -12110,6 +12131,7 @@ impl Render for SettingsView {
                 }
                 if this.schedule_modal.is_some() && ev.keystroke.key == "escape" {
                     this.close_schedule_modal(cx);
+                    window.focus(&this.focus, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -12208,6 +12230,7 @@ impl Render for SettingsView {
 }
 
 pub(crate) mod child;
+pub mod install;
 pub(crate) mod layout;
 mod mobile;
 pub mod schedules;

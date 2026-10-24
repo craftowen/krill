@@ -692,7 +692,7 @@ impl ServerPanel {
                                         .border_1()
                                         .border_color(p.border)
                                         .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_size(crate::ui::TEXT_SM)
                                         .child(invite.link.clone()),
                                 )
                                 .child(
@@ -1062,7 +1062,7 @@ impl Render for ServerPanel {
                             .gap_0p5()
                             .child(
                                 div()
-                                    .text_size(crate::ui::TEXT_MD)
+                                    .text_size(crate::ui::TEXT_SM)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(text::SERVER_TITLE.get()),
                             )
@@ -1605,7 +1605,7 @@ impl Render for ClientDialog {
                     .gap_0p5()
                     .child(
                         div()
-                            .text_size(crate::ui::TEXT_MD)
+                            .text_size(crate::ui::TEXT_SM)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(text::CLIENT_TITLE.get()),
                     )

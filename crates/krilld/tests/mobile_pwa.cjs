@@ -33,7 +33,7 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  assert.equal(A.accountView({id:'h',provider:'Codex',label:'Host (.codex)',email:null,profile_dir:'/x',active:false,host_default:true,stale:false,usage:{five_hour:null,seven_day:null}},data,now).hidden,true);
  const v=A.accountView({id:'w',provider:'Claude',label:'Work',email:'w@example.com',profile_dir:'',active:false,host_default:false,stale:false,usage:{five_hour:{percent:5,resets_at:null},seven_day:null}},data,now);
  assert.equal(v.title,'w@example.com');assert.equal(v.switchable,false);assert.equal(v.error,'Run claude login');assert.match(v.meta,/Usage only · Sign-in required/);assert.equal(v.windows[0][1].text,'5%');assert.equal(v.windows[1][1].text,'—');assert.equal(v.windows[1][1].percent,null);}
-{const sessions=new Map([[1,{id:1,state:'Blocked'}],[2,{id:2,state:'Waiting'}],[3,{id:3,state:'Waiting',exited:1}],[4,{id:4,state:'Working'}]]),need=sandbox.KrillMobile.needsYou({sessions,snapshot:{orchestration:{gates:[{}],questions:[{},{}]}}});assert.equal(need.total,5);assert.deepEqual([...need.sessions.map(s=>s.id)],[2,1]);}
+{const sessions=new Map([[1,{id:1,state:'Blocked'}],[2,{id:2,state:'Waiting'}],[3,{id:3,state:'Waiting',exited:1}],[4,{id:4,state:'Working'}]]),need=sandbox.KrillMobile.needsYou({sessions,snapshot:{orchestration:{gates:[{status:'pending'}],questions:[{to:'user'},{to:'mobile'},{to:'coordinator'}]}}});assert.equal(need.total,5);assert.deepEqual([...need.sessions.map(s=>s.id)],[2,1]);}
 {const L=sandbox.KrillMobile.connectionLog;assert.equal(L.elapsed(1234),'+1.23s');assert.equal(L.elapsed(12345),'+12.3s');assert.equal(L.elapsed(123456),'+123s');assert.match(L.clock(0),/^\d\d:\d\d:\d\d$/);}
 {const lines=fs.readFileSync(path.join(assets,'app.js'),'utf8').split('\n'),timers=[],notice=new EventTarget();notice.hidden=true;notice.textContent='';
  const context=vm.createContext({notice,t:s=>s,URLSearchParams,setTimeout:fn=>timers.push({fn}),clearTimeout:id=>{if(timers[id-1])timers[id-1].fn=()=>{};}});
@@ -170,7 +170,8 @@ async function connect(url,credential){
   const session=Number(cli(['new','--cwd',repo,'--','/bin/sh','-c',shell]));await until(()=>cli(['read',String(session)]).includes('READY'));
   const run=jsonCli(['orchestration','run-create','--title','Mobile run']);const runId=run.id||run.run_id||run.run?.id;assert(runId,JSON.stringify(run));
   const task=jsonCli(['orchestration','task-create','--run',runId,'--title','Mobile task']);
-  const question=jsonCli(['orchestration','ask','--from','mobile-worker','--to','coordinator','--question','Proceed with fixture?']);
+  const question=jsonCli(['orchestration','ask','--from','mobile-worker','--to','user','--run',runId,'--question','Proceed with fixture?']);
+  const internalQuestion=jsonCli(['orchestration','ask','--from','mobile-worker','--to','coordinator','--run',runId,'--question','Internal fixture question']);
   const gate=jsonCli(['orchestration','gate-create','--from','test-worker','--question','Deploy fixture?','--options','Approve,Deny','--run',runId]);const gateId=gate.id||gate.gate_id;assert(gateId,JSON.stringify(gate));
   const offer=jsonCli(['mobile','pair','--address',keep?(process.env.M9_BROWSER_ADDRESS||'127.0.0.1:0'):'127.0.0.1:0']);const url=offer.PairingOffer.url,base=new URL(url).origin;
   for(const name of ['/','/app.js','/app.css','/i18n.js','/qr.js','/sw.js','/crypto.js','/client.js','/terminal.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg','/icon-192.png','/icon-512.png','/icon-maskable-512.png','/apple-touch-icon.png']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert.deepEqual(Buffer.from(await response.arrayBuffer()),process.env.M9_SERVED_ASSET_REV?execFileSync('git',['show',`${process.env.M9_SERVED_ASSET_REV}:crates/krilld/src/mobile/assets/${name==='/'?'index.html':name.slice(1)}`]):fs.readFileSync(path.join(assets,name==='/'?'index.html':name.slice(1))));}
@@ -186,7 +187,7 @@ async function connect(url,credential){
     for(let i=0;i<7;i++)cli(['new','--cwd',repo,'--','/bin/sh','-c',"printf 'IDLE\\n'; exec /bin/cat"]);
     await until(()=>cli(['read',String(terminalSession)]).includes('LIVE RED'));
   }clearTimeout(deadline);fs.writeFileSync(metadata,JSON.stringify({dir,repo,url,session,terminalSession,extraSessions,base,daemon,gateId,profile}));console.log('Browser fixture ready');await new Promise(r=>process.once('SIGTERM',r));return;}
-  phone=await connect(url);let data=await phone.rpc({action:'snapshot'});const same=await phone.rpc({action:'snapshot',since:data.etag});assert.deepEqual(same,{unchanged:true,etag:data.etag});const card=data.sessions.find(s=>s.id===session);assert(card);assert.equal(card.state,'Waiting');assert.equal(card.branch,'mobile-test');assert.equal(card.added,1);assert(card.lines.some(l=>l.includes('READY')));assert(data.orchestration.gates.some(g=>g.id===gateId));assert(data.orchestration.tasks.length>=1);assert(data.orchestration.questions.some(q=>q.id===question.id));
+  phone=await connect(url);let data=await phone.rpc({action:'snapshot'});const same=await phone.rpc({action:'snapshot',since:data.etag});assert.deepEqual(same,{unchanged:true,etag:data.etag});const card=data.sessions.find(s=>s.id===session);assert(card);assert.equal(card.state,'Waiting');assert.equal(card.branch,'mobile-test');assert.equal(card.added,1);assert(card.lines.some(l=>l.includes('READY')));assert(data.orchestration.gates.some(g=>g.id===gateId));assert(data.orchestration.tasks.length>=1);assert(data.orchestration.questions.some(q=>q.id===question.id));assert(!data.orchestration.questions.some(q=>q.id===internalQuestion.id));
   const latestChat=await phone.rpc({action:'chat_poll',session,latest:true});
   assert.equal(latestChat.items.at(-1).text,'MOBILE CHAT 1049');assert(latestChat.page_start>0);assert.equal(latestChat.has_earlier,true);
   const earlierChat=await phone.rpc({action:'chat_poll',session,latest:true,end_offset:latestChat.page_start});
@@ -196,14 +197,14 @@ async function connect(url,credential){
   console.log('PASS real mobile chat: first reply contains latest of 1050 messages, earlier cursor has no gap, stable replay IDs and incremental polling');
   // Mobile workspace creation uses registered repository keys and the desktop git/setup path.
   assert.equal(data.capabilities.worktree_create,true);const repository=data.repositories.find(r=>r.worktree_keys.includes(card.worktree_key))?.key;assert(repository);
-  for(const request of [{repository:'/tmp/forged',name:'bad'},{repository,name:' '},{repository,name:'bad',cwd:'/tmp'},{repository,name:'bad',setup_hash:'한'.repeat(64)},{repository,name:'bad',setup_hash:'aa'.repeat(32),skip_setup:true}])await assert.rejects(phone.rpc({action:'create_workspace',...request}));
+  for(const request of [{repository:'/tmp/forged',name:'bad'},{repository,name:' '},{repository,name:'bad',cwd:'/tmp'},{repository,name:'bad',agent:'../bad'},{repository,name:'bad',setup_hash:'한'.repeat(64)},{repository,name:'bad',setup_hash:'aa'.repeat(32),skip_setup:true}])await assert.rejects(phone.rpc({action:'create_workspace',...request}));
   fs.writeFileSync(path.join(repo,'krill.toml'),'[worktree]\nsetup = "printf MOBILE_SETUP_OK"\n');
   const draft={action:'create_workspace',repository,name:'phone-workspace',base:'mobile-test'},review=await phone.rpc(draft);assert.equal(review.needs_setup,true);assert.equal(review.script,'printf MOBILE_SETUP_OK');assert.equal(review.hash.length,64);
   fs.writeFileSync(path.join(repo,'krill.toml'),'[worktree]\nsetup = "printf UPDATED_SETUP_OK"\n');
   const changed=await phone.rpc({...draft,setup_hash:review.hash});assert.equal(changed.needs_setup,true);assert.notEqual(changed.hash,review.hash);
   const created=await phone.rpc({...draft,setup_hash:changed.hash});assert.equal(created.branch,'phone-workspace');assert(created.session);assert(fs.existsSync(path.join(created.path,'.git')));await until(()=>cli(['read',String(created.setup_session)]).includes('UPDATED_SETUP_OK'));
   await until(async()=>{const snapshot=await phone.rpc({action:'snapshot'});return snapshot.sessions.some(s=>s.id===created.session&&s.worktree_key===created.workspace);});
-  const skipped=await phone.rpc({...draft,name:'phone-skip-setup',skip_setup:true});assert.equal(skipped.branch,'phone-skip-setup');assert(skipped.session);assert(fs.existsSync(path.join(skipped.path,'.git')));
+  const skipped=await phone.rpc({...draft,name:'phone-skip-setup',agent:'codex',skip_setup:true});assert.equal(skipped.branch,'phone-skip-setup');assert(skipped.session);assert(fs.existsSync(path.join(skipped.path,'.git')));await until(()=>cli(['read',String(skipped.session)]).includes('mock-agent-ready'));
   await phone.rpc({action:'close_terminal',session:skipped.session});fs.unlinkSync(path.join(repo,'krill.toml'));
   console.log('PASS mobile workspaces: real worktree creation, registered key validation, changed setup hash review, approved setup, skip and terminal snapshot');
   await assert.rejects(phone.rpc({action:'approve',session,value:'y'}),/historical request.*Confirm in Term/);assert(!cli(['read',String(session)]).includes('got:y'));
@@ -213,6 +214,15 @@ async function connect(url,credential){
   const accounts=await phone.rpc({action:'accounts'});assert(accounts.accounts.some(a=>a.id==='mobile-test-account'));const switched=await phone.rpc({action:'switch_account',provider:'claude',account_id:'mobile-test-account'});assert(switched.accounts.some(a=>a.id==='mobile-test-account'&&a.active));assert(fs.readFileSync(path.join(dir,'active-accounts.env'),'utf8').includes(profile));
   await phone.rpc({action:'gate_reply',id:gateId,decision:'Approve'});assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'orchestration.json'))).gates.find(g=>g.id===gateId).status,'resolved');
   await phone.rpc({action:'question_reply',id:question.id,body:'Proceed from mobile'});assert(JSON.parse(fs.readFileSync(path.join(dir,'orchestration.json'))).messages.some(m=>m.reply_to===question.id&&m.body==='Proceed from mobile'));
+  await assert.rejects(phone.rpc({action:'question_reply',id:internalQuestion.id,body:'Do not intercept worker mail'}),/no longer pending/);
+  await assert.rejects(phone.rpc({action:'question_reply',id:question.id,body:'Duplicate reply'}),/no longer pending/);
+  const staleQuestion=jsonCli(['orchestration','ask','--from','coordinator','--to','user','--run',runId,'--task',task.id,'--question','Obsolete review?']);
+  const staleGate=jsonCli(['orchestration','gate-create','--from','coordinator','--run',runId,'--task',task.id,'--question','Obsolete approval?']);
+  cli(['orchestration','task-update',task.id,'--status','completed']);
+  const retired=await phone.rpc({action:'orchestration'});assert(!retired.questions.some(q=>q.id===staleQuestion.id));assert(!retired.gates.some(g=>g.id===staleGate.id));
+  await assert.rejects(phone.rpc({action:'question_reply',id:staleQuestion.id,body:'Too late'}),/no longer pending/);
+  await assert.rejects(phone.rpc({action:'gate_reply',id:staleGate.id,decision:'Approve'}),/no longer pending/);
+  const history=JSON.parse(fs.readFileSync(path.join(dir,'orchestration.json')));assert(!history.messages.find(m=>m.id===internalQuestion.id).acked);assert(!history.messages.find(m=>m.id===staleQuestion.id).acked);assert.equal(history.gates.find(g=>g.id===staleGate.id).status,'pending');
   const diff=await phone.rpc({action:'git',session,path:'example.txt'});assert(diff.patch.includes('+after'));const outside=await phone.rpc({action:'git',session,path:'../../secrets'});assert.equal(outside.diff_status,'outside_scope');assert.equal(outside.patch,'');
   const handoff=await phone.rpc({action:'handoff',session,agent:'codex'});assert(handoff.to_session);await until(()=>cli(['read',String(handoff.to_session)]).includes('MK HANDOFF'));
   const saved={device_id:phone.authenticated.device_id,credential:phone.authenticated.credential};phone.socket.close();await new Promise(r=>setTimeout(r,80));

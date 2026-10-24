@@ -5,13 +5,15 @@
 //! `krill computer` 스냅샷 상태 캐시, 모의 환경, macOS 실행 백엔드.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use krill_proto::daemon;
 
 pub use super::model::*;
+
+mod retention;
 
 const MOCK_FILE_NAME: &str = "computer-mock.json";
 const SNAPSHOT_CACHE_FILE_NAME: &str = "computer-state.json";
@@ -20,8 +22,68 @@ pub fn mock_file_path() -> Option<PathBuf> {
     daemon::state_dir().map(|dir| dir.join(MOCK_FILE_NAME))
 }
 
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn unique_token() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        now_ms(),
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Scope is derived from the actual parent process, never --session or environment claims.
+pub fn caller_scope() -> String {
+    static SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCOPE.get_or_init(compute_caller_scope).clone()
+}
+
+fn compute_caller_scope() -> String {
+    use std::hash::{Hash, Hasher};
+    #[cfg(unix)]
+    let parent = rustix::process::Pid::as_raw(rustix::process::getppid());
+    #[cfg(not(unix))]
+    let parent = std::process::id();
+    let mut command = Command::new("/bin/ps");
+    command.args(["-p", &parent.to_string(), "-o", "lstart="]);
+    let witness = run_managed(command)
+        .ok()
+        .filter(|out| matches!(out.end, super::lifecycle::End::Exited(status) if status.success()))
+        .map(|out| out.stdout.bytes);
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    parent.hash(&mut hash);
+    witness.hash(&mut hash);
+    format!("caller-{:016x}", hash.finish())
+}
+
+fn snapshot_dir() -> Option<PathBuf> {
+    daemon::state_dir().map(|dir| dir.join("computer-snapshots").join(caller_scope()))
+}
+
 pub fn snapshot_cache_path() -> Option<PathBuf> {
-    daemon::state_dir().map(|dir| dir.join(SNAPSHOT_CACHE_FILE_NAME))
+    snapshot_dir().map(|dir| dir.join(SNAPSHOT_CACHE_FILE_NAME))
+}
+
+fn write_private_new(path: &std::path::Path, body: &[u8]) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    file.write_all(body)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())
 }
 
 pub fn load_mock_env() -> Result<Option<MockEnvironment>, String> {
@@ -49,27 +111,57 @@ pub fn save_mock_env(env: &MockEnvironment) -> Result<(), String> {
 }
 
 pub fn save_cached_snapshot(snapshot: &AppStateSnapshot) -> Result<(), String> {
-    let Some(path) = snapshot_cache_path() else {
-        return Ok(());
+    let Some(dir) = snapshot_dir() else {
+        return Err("cannot resolve snapshot cache".to_owned());
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
+    write_private_new(&dir.join(format!("{}.json", snapshot.snapshot_id)), &body)?;
+    let temporary = dir.join(format!("latest-{}.tmp", unique_token()));
+    write_private_new(&temporary, &body)?;
+    fs::rename(&temporary, dir.join(SNAPSHOT_CACHE_FILE_NAME)).map_err(|e| e.to_string())?;
+    // Expired immutable observations cannot be used for input. Bound retained history.
+    let mut entries: Vec<_> = fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("snap-"))
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let remove_count = entries.len().saturating_sub(128);
+    for entry in entries.into_iter().take(remove_count) {
+        fs::remove_file(entry.path()).ok();
     }
-    let body = serde_json::to_string_pretty(snapshot).map_err(|e| e.to_string())?;
-    fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+    Ok(())
 }
 
-pub fn load_cached_snapshot() -> Result<Option<AppStateSnapshot>, String> {
-    let Some(path) = snapshot_cache_path() else {
+pub fn load_snapshot(id: Option<&str>) -> Result<Option<AppStateSnapshot>, String> {
+    let path = if let Some(id) = id {
+        if !id.starts_with("snap-") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err("invalid snapshot token".to_owned());
+        }
+        snapshot_dir().map(|dir| dir.join(format!("{id}.json")))
+    } else {
+        snapshot_cache_path()
+    };
+    let Some(path) = path else {
         return Ok(None);
     };
     match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|e| format!("parse {}: {e}", path.display())),
+        Ok(raw) => {
+            let snapshot: AppStateSnapshot =
+                serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if snapshot.caller_scope != caller_scope() {
+                return Err("snapshot caller scope mismatch".to_owned());
+            }
+            Ok(Some(snapshot))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(format!("read {}: {err}", path.display())),
     }
+}
+
+pub fn load_cached_snapshot() -> Result<Option<AppStateSnapshot>, String> {
+    load_snapshot(None)
 }
 
 pub fn build_permission_capabilities(
@@ -121,16 +213,8 @@ pub fn build_permission_capabilities(
     ]
 }
 
-/// `krill computer` 권한 프로브용 JXA 스크립트.
-///
-/// macOS 26.6 이후 일부 환경에서는 JXA `ObjC` 브리지에
-/// `CGPreflightScreenCaptureAccess` 심볼이 노출되지 않아 호출 시
-/// `TypeError: $.CGPreflightScreenCaptureAccess is not a function (-2700)`으로
-/// 프로브 전체가 실패한다(OWE-902). 호출 전 `typeof`로 존재 여부를 확인하고,
-/// 심볼이 없으면 화면 기록 권한 확인을 생략(허용으로 간주하고 진행)한다.
-/// 스크린샷 실패는 호출 측에서 무시하므로(`get_app_state`의 `.ok()`),
-/// 생략하고 진행해도 안전하다. 손쉬운 사용 프로브가 불가능한 경우는
-/// 실패 닫힘(거부)으로 보고한다.
+/// Missing JXA preflight symbols cannot prove a permission grant. Fail closed;
+/// an actual capture failure is separately reported in observation notes.
 pub const PERMISSION_PROBE_JXA_SCRIPT: &str = r#"
 ObjC.import("ApplicationServices");
 ObjC.import("CoreGraphics");
@@ -140,8 +224,13 @@ try {
     accessibility = Boolean($.AXIsProcessTrusted());
   }
 } catch (_) {}
-let screenshots = true;
+let screenshots = false;
 try {
+  // BridgeSupport omits this newer symbol on some macOS versions. Bind its
+  // documented no-prompt signature instead of mistaking missing metadata for denial.
+  if (typeof $.CGPreflightScreenCaptureAccess !== "function") {
+    ObjC.bindFunction("CGPreflightScreenCaptureAccess", ["bool", []]);
+  }
   if (typeof $.CGPreflightScreenCaptureAccess === "function") {
     screenshots = Boolean($.CGPreflightScreenCaptureAccess());
   }
@@ -173,24 +262,35 @@ pub fn open_permission_settings(id: PermissionId) -> Result<(), String> {
     if load_mock_env()?.is_some() || std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
         return Ok(());
     }
-    let status = Command::new("/usr/bin/open")
-        .arg(id.settings_url())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("open {}: {e}", id.settings_url()))?;
-    if status.success() {
+    let mut cmd = Command::new("/usr/bin/open");
+    cmd.arg(id.settings_url());
+    let finished = run_managed(cmd)?;
+    if matches!(finished.end, super::lifecycle::End::Exited(status) if status.success()) {
         Ok(())
     } else {
-        Err(format!("open {} exited with {status}", id.settings_url()))
+        Err(format!(
+            "open {} failed: {:?}",
+            id.settings_url(),
+            finished.end
+        ))
     }
 }
 
 pub fn capabilities_payload() -> Result<CapabilitiesPayload, String> {
     let (ax, sc) = query_permissions()?;
     let supported = cfg!(target_os = "macos");
+    let guide = krill_proto::orchestration::builtin_skills()
+        .iter()
+        .find(|skill| skill.name == "computer-use")
+        .map_or("", |skill| skill.content);
+    // Version freshness only, not an authentication/signature primitive.
+    let hash = guide.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
     Ok(CapabilitiesPayload {
+        contract: "computer/2".to_owned(), backend: "jxa".to_owned(),
+        guide_hash: format!("fnv1a64:{hash:016x}"), batch_supported: false,
+        request_dedup_supported: false, status_supported: false, cancel_supported: false,
         platform: if supported {
             "darwin".to_owned()
         } else {
@@ -214,7 +314,10 @@ pub fn capabilities_payload() -> Result<CapabilitiesPayload, String> {
         ],
         notes: vec![
             "Prefer semantic element references (--element <N>) from get-app-state before falling back to coordinates.".to_owned(),
-            "paste-text preserves and restores existing clipboard contents.".to_owned(),
+            "References are immutable: pass --snapshot <snapshotId>; input never retries an uncertain mutation.".to_owned(),
+            "Paste refuses when full clipboard preservation or receiver confirmation is unavailable.".to_owned(),
+            "Experimental persistent MCP: krill computer serve --experimental (MCP 2025-11-25); native features are reported by computer_session, not these JXA flags.".to_owned(),
+            format!("Completed captures are immutable private artifacts, pruned to {} files / {} bytes / {} seconds; an evicted image must be captured again.", retention::MAX_IMAGES, retention::MAX_BYTES, retention::MAX_AGE.as_secs()),
         ],
     })
 }
@@ -296,30 +399,38 @@ pub fn list_windows(app_selector: &str) -> Result<Vec<WindowSummary>, String> {
             .collect());
     }
     let app = resolve_live_app(app_selector)?;
-    list_windows_for_app(&app)
+    list_windows_for_app(&app, false)
 }
 
 pub fn resolve_live_app(app_selector: &str) -> Result<AppSummary, String> {
     let apps = list_apps()?;
-    if let Some(app) = apps
+    let mut matches = apps
         .into_iter()
-        .find(|a| matches_app_selector(a, app_selector))
-    {
-        return Ok(app);
+        .filter(|app| matches_app_selector(app, app_selector));
+    let app = matches
+        .next()
+        .ok_or_else(|| format!("application not found: {app_selector}"))?;
+    if matches.next().is_some() {
+        return Err("application selector is ambiguous; use pid:N".to_owned());
     }
-    Err(format!("application not found: {app_selector}"))
+    Ok(app)
 }
 
-fn list_windows_for_app(app: &AppSummary) -> Result<Vec<WindowSummary>, String> {
+/// `include_offscreen` (restore only) lists hidden/minimized windows so they can be restored.
+fn list_windows_for_app(
+    app: &AppSummary,
+    include_offscreen: bool,
+) -> Result<Vec<WindowSummary>, String> {
     let script = r#"
 ObjC.import("CoreGraphics");
 function run(argv) {
   const targetPid = Number(argv[0] || 0);
   const targetName = String(argv[1] || "");
   const targetBundle = argv[2] ? String(argv[2]) : null;
+  const option = argv[3] === "all" ? 0 : 1;
   let list = [];
   try {
-    const rawRef = $.CGWindowListCopyWindowInfo(1, 0);
+    const rawRef = $.CGWindowListCopyWindowInfo(option, 0);
     if (rawRef) {
       const unwrapped = ObjC.deepUnwrap(ObjC.castRefToObject(rawRef));
       if (Array.isArray(unwrapped)) list = unwrapped;
@@ -335,7 +446,7 @@ function run(argv) {
     rows.push({
       id: String(w.kCGWindowNumber || idx),
       index: idx,
-      title: String(w.kCGWindowName || targetName),
+      title: String(w.kCGWindowName || ""),
       appName: targetName,
       bundleId: targetBundle,
       pid: targetPid,
@@ -360,12 +471,33 @@ function run(argv) {
             &app.pid.to_string(),
             &app.name,
             app.bundle_id.as_deref().unwrap_or(""),
+            if include_offscreen { "all" } else { "onscreen" },
         ],
     )?;
     serde_json::from_str(&out).map_err(|e| format!("parse list-windows output: {e}"))
 }
 
 pub fn get_app_state(
+    app_selector: &str,
+    window_id: Option<&str>,
+    window_index: Option<usize>,
+    restore_window: bool,
+    no_screenshot: bool,
+    context_note: Option<String>,
+) -> Result<AppStateSnapshot, String> {
+    let snapshot = observe_app_state(
+        app_selector,
+        window_id,
+        window_index,
+        restore_window,
+        no_screenshot,
+        context_note,
+    )?;
+    save_cached_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+pub fn observe_app_state(
     app_selector: &str,
     window_id: Option<&str>,
     window_index: Option<usize>,
@@ -394,6 +526,9 @@ pub fn get_app_state(
             return Err(format!("application not found: {app_selector}"));
         };
         let app_entry = &mut mock.apps[app_idx];
+        if restore_window {
+            verify_target_app(&app_entry.summary())?;
+        }
         if restore_window {
             app_entry.is_hidden = false;
             for w in &mut app_entry.windows {
@@ -464,6 +599,8 @@ pub fn get_app_state(
                         height: clamp_pixel_dim(win.bounds.height),
                         scale_factor: 2.0,
                         window_id: Some(win.id.clone()),
+                        logical_bounds: win.bounds,
+                        measured: false,
                     })
                 };
                 (
@@ -482,8 +619,12 @@ pub fn get_app_state(
 
         save_mock_env(&mock)?;
         let snapshot = AppStateSnapshot {
-            snapshot_id: format!("snap-{}", app_summary.pid),
-            captured_at: "2026-10-17T00:00:00Z".to_owned(),
+            snapshot_id: format!("snap-{}", unique_token()),
+            process_start: format!("mock:{}", app_summary.pid),
+            caller_scope: caller_scope(),
+            captured_at_ms: now_ms(),
+            coverage_truncated: false,
+            captured_at: now_ms().to_string(),
             app: app_summary,
             window: window_summary,
             focused_element_id: focused_id,
@@ -495,7 +636,6 @@ pub fn get_app_state(
             screenshot,
             notes,
         };
-        save_cached_snapshot(&snapshot)?;
         return Ok(snapshot);
     }
 
@@ -506,7 +646,7 @@ pub fn get_app_state(
         ));
     }
     let app = resolve_live_app(app_selector)?;
-    let windows = list_windows_for_app(&app)?;
+    let windows = list_windows_for_app(&app, restore_window)?;
     let selected_window = if let Some(id) = window_id {
         Some(
             windows
@@ -525,22 +665,44 @@ pub fn get_app_state(
         windows.into_iter().next()
     };
 
-    let mut root = query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
+    if restore_window {
+        verify_target_app(&app)?;
+    }
+    let (mut root, process_start, coverage_truncated) =
+        query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
     let (flat, focused_id, total_count, tree_text) = index_and_render_tree(&mut root);
     let mut notes = Vec::new();
+    if coverage_truncated {
+        notes.push(
+            "AX coverage is partial; absent elements are not proof of disappearance".to_owned(),
+        );
+    }
     if let Some(note) = context_note {
         notes.push(note);
     }
     let screenshot = if no_screenshot || !sc {
+        if !no_screenshot && !sc {
+            notes.push("screenshot permission was not confirmed; capture skipped".to_owned());
+        }
         None
     } else if let Some(win) = &selected_window {
-        capture_live_window_screenshot(win).ok()
+        match capture_live_window_screenshot(win) {
+            Ok(shot) => Some(shot),
+            Err(error) => {
+                notes.push(format!("screenshot failed: {error}"));
+                None
+            }
+        }
     } else {
         None
     };
     let snapshot = AppStateSnapshot {
-        snapshot_id: format!("snap-{}", app.pid),
-        captured_at: "live".to_owned(),
+        snapshot_id: format!("snap-{}", unique_token()),
+        process_start,
+        caller_scope: caller_scope(),
+        captured_at_ms: now_ms(),
+        coverage_truncated,
+        captured_at: now_ms().to_string(),
         app,
         window: selected_window,
         focused_element_id: focused_id,
@@ -552,7 +714,6 @@ pub fn get_app_state(
         screenshot,
         notes,
     };
-    save_cached_snapshot(&snapshot)?;
     Ok(snapshot)
 }
 
@@ -566,12 +727,36 @@ fn clamp_pixel_dim(v: f64) -> u32 {
 }
 
 fn write_mock_screenshot(window_id: &str) -> Result<PathBuf, String> {
-    let dir = daemon::state_dir().ok_or_else(|| "cannot resolve KRILL_STATE_DIR".to_owned())?;
-    let shots = dir.join("screenshots");
-    fs::create_dir_all(&shots).map_err(|e| format!("create {}: {e}", shots.display()))?;
-    let path = shots.join(format!("window-{window_id}.png"));
-    fs::write(&path, b"\x89PNG\r\n\x1a\n").map_err(|e| format!("write {}: {e}", path.display()))?;
+    let shots = capture_directory()?;
+    let path = shots.join(format!("window-{window_id}-{}.png", unique_token()));
+    write_private_new(&path, b"\x89PNG\r\n\x1a\n")?;
+    retention::prune(&shots, &path).map_err(|e| format!("capture retention: {e}"))?;
     Ok(path)
+}
+
+fn capture_directory() -> Result<PathBuf, String> {
+    let dir = daemon::state_dir().ok_or("cannot resolve private capture state directory")?;
+    let shots = dir.join("computer-captures-v2");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(&shots).map_err(|e| e.to_string())?;
+    let metadata = fs::symlink_metadata(&shots).map_err(|e| e.to_string())?;
+    if !metadata.is_dir() {
+        return Err("capture directory is not a real directory".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            return Err("capture directory must be private and owned by this user".to_owned());
+        }
+    }
+    Ok(shots)
 }
 
 fn capture_live_window_screenshot(win: &WindowSummary) -> Result<ScreenshotMetadata, String> {
@@ -583,250 +768,102 @@ fn capture_live_window_screenshot(win: &WindowSummary) -> Result<ScreenshotMetad
             height: clamp_pixel_dim(win.bounds.height),
             scale_factor: 2.0,
             window_id: Some(win.id.clone()),
+            logical_bounds: win.bounds,
+            measured: false,
         });
     }
-    let dir = daemon::state_dir().unwrap_or_else(std::env::temp_dir);
-    let shots = dir.join("screenshots");
-    fs::create_dir_all(&shots).map_err(|e| format!("create {}: {e}", shots.display()))?;
-    let path = shots.join(format!("window-{}.png", win.id));
-    let status = Command::new("/usr/sbin/screencapture")
-        .args(["-x", "-o", "-l", &win.id])
-        .arg(&path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("screencapture: {e}"))?;
-    if !status.success() {
-        return Err(format!("screencapture exited with {status}"));
+    let shots = capture_directory()?;
+    let path = shots.join(format!("window-{}-{}.png", win.id, unique_token()));
+    let mut cmd = Command::new("/usr/sbin/screencapture");
+    cmd.args(["-x", "-o", "-l", &win.id]).arg(&path);
+    let finished = run_managed(cmd)?;
+    if !matches!(finished.end, super::lifecycle::End::Exited(status) if status.success())
+        || !finished.reaped
+    {
+        if finished.reaped {
+            fs::remove_file(&path).ok();
+            retention::prune(&shots, &path).ok();
+        }
+        return Err(format!(
+            "screencapture failed: {:?}; reaped={}",
+            finished.end, finished.reaped
+        ));
     }
-    Ok(ScreenshotMetadata {
-        path: path.display().to_string(),
-        width: clamp_pixel_dim(win.bounds.width),
-        height: clamp_pixel_dim(win.bounds.height),
-        scale_factor: 2.0,
-        window_id: Some(win.id.clone()),
-    })
+    let capture = (|| -> Result<ScreenshotMetadata, String> {
+        let mut file = fs::File::open(&path).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        // Dimensions need only the PNG signature and IHDR, never the full pixel file.
+        let mut header = [0_u8; 24];
+        file.read_exact(&mut header).map_err(|e| e.to_string())?;
+        let (width, height) = png_dimensions(&header)?;
+        let scale = f64::from(width) / win.bounds.width;
+        if !scale.is_finite()
+            || scale <= 0.0
+            || (f64::from(height) / win.bounds.height - scale).abs() > 0.05
+        {
+            return Err("screenshot transform is not a uniform measured window crop".to_owned());
+        }
+        retention::prune(&shots, &path).map_err(|e| format!("capture retention: {e}"))?;
+        Ok(ScreenshotMetadata {
+            path: path.display().to_string(),
+            width,
+            height,
+            scale_factor: scale,
+            window_id: Some(win.id.clone()),
+            logical_bounds: win.bounds,
+            measured: true,
+        })
+    })();
+    if capture.is_err() {
+        fs::remove_file(&path).ok();
+        retention::prune(&shots, &path).ok();
+    }
+    capture
 }
 
-pub const LIVE_WINDOW_AX_JXA_SCRIPT: &str = r#"
-function run(argv) {
-  const targetPid = Number(argv[0] || 0);
-  const targetName = String(argv[1] || "");
-  const restore = String(argv[2] || "0") === "1";
-  const targetWinId = String(argv[3] || "");
-  const targetWinIndex = Number(argv[4] || "0");
-  const targetWinTitle = String(argv[5] || "");
-
-  const se = Application("System Events");
-  let proc = null;
-  if (targetPid > 0) {
-    try {
-      const byPid = se.processes.whose({ unixId: targetPid });
-      if (byPid && byPid.length > 0) proc = se.processes.whose({ unixId: targetPid }).first;
-    } catch (_) {}
-  }
-  if (!proc) {
-    proc = se.processes.byName(targetName);
-  }
-  if (restore) {
-    try { proc.visible = true; } catch (_) {}
-  }
-
-  function selectTargetWindow(wins, winId, winIndex, winTitle) {
-    let winCount = 0;
-    try { winCount = Number(wins ? wins.length : 0); } catch (_) { return null; }
-    if (!winCount || winCount <= 0) return null;
-    if (winId) {
-      for (let i = 0; i < winCount; i++) {
-        const cand = wins[i];
-        try {
-          const axNum = cand.attributes.byName("AXWindowNumber").value();
-          if (axNum !== null && axNum !== undefined && String(axNum) === winId) return cand;
-        } catch (_) {}
-        try {
-          if (String(cand.id()) === winId) return cand;
-        } catch (_) {}
-      }
-    }
-    if (winIndex >= 1 && winIndex <= winCount) {
-      const byIdx = wins[winIndex - 1];
-      if (!winTitle) return byIdx;
-      try {
-        if (String(byIdx.name() || "") === winTitle) return byIdx;
-      } catch (_) {}
-      for (let i = 0; i < winCount; i++) {
-        const cand = wins[i];
-        try {
-          if (String(cand.name() || "") === winTitle) return cand;
-        } catch (_) {}
-      }
-      return byIdx;
-    }
-    if (winTitle) {
-      for (let i = 0; i < winCount; i++) {
-        const cand = wins[i];
-        try {
-          if (String(cand.name() || "") === winTitle) return cand;
-        } catch (_) {}
-      }
-    }
-    return wins[0];
-  }
-
-  const INTERACTIVE_ROLES = {
-    AXButton: true,
-    AXTextField: true,
-    AXTextArea: true,
-    AXCheckBox: true,
-    AXRadioButton: true,
-    AXPopUpButton: true,
-    AXComboBox: true,
-    AXMenuItem: true,
-    AXLink: true,
-    AXTab: true,
-    AXSlider: true,
-    AXRow: true,
-    AXCell: true,
-  };
-
-  let budget = 160;
-  function readChildren(parent, depth) {
-    if (depth >= 4 || budget <= 0) return [];
-    const elems = parent.uiElements;
-    let roles = [];
-    try { roles = elems.role(); } catch (_) { return []; }
-    const count = Math.min(Array.isArray(roles) ? roles.length : 0, 40);
-    if (count === 0) return [];
-    let subroles = [], titles = [], descs = [], vals = [], positions = [], sizes = [], enableds = [], focuseds = [];
-    try { subroles = elems.subrole(); } catch (_) {}
-    try { titles = elems.title(); } catch (_) {}
-    try { descs = elems.description(); } catch (_) {}
-    try { vals = elems.value(); } catch (_) {}
-    try { positions = elems.position(); } catch (_) {}
-    try { sizes = elems.size(); } catch (_) {}
-    try { enableds = elems.enabled(); } catch (_) {}
-    try { focuseds = elems.focused(); } catch (_) {}
-    const out = [];
-    for (let i = 0; i < count && budget > 0; i++) {
-      budget -= 1;
-      const el = elems[i];
-      const role = roles[i] ? String(roles[i]) : "AXGroup";
-      const subrole = subroles[i] ? String(subroles[i]) : null;
-      const title = titles[i] ? String(titles[i]) : null;
-      const description = descs[i] ? String(descs[i]) : null;
-      const rawVal = vals[i];
-      const val = (rawVal !== null && rawVal !== undefined && (typeof rawVal === "string" || typeof rawVal === "number" || typeof rawVal === "boolean"))
-        ? String(rawVal).slice(0, 500)
-        : null;
-      const p = positions[i];
-      const s = sizes[i];
-      const b = (Array.isArray(p) && Array.isArray(s))
-        ? { x: Number(p[0] || 0), y: Number(p[1] || 0), width: Number(s[0] || 0), height: Number(s[1] || 0) }
-        : null;
-      const enabled = enableds[i] !== undefined ? Boolean(enableds[i]) : true;
-      const focused = Boolean(focuseds[i]);
-      const actions = INTERACTIVE_ROLES[role] ? ["AXPress"] : [];
-      const children = readChildren(el, depth + 1);
-      out.push({
-        role,
-        subrole,
-        title,
-        description,
-        value: val,
-        bounds: b,
-        enabled,
-        focused,
-        selected: false,
-        actions,
-        children,
-      });
-    }
-    return out;
-  }
-
-  let winTitle = targetWinTitle || targetName;
-  let winBounds = null;
-  let children = [];
-  try {
-    const wins = proc.windows;
-    const w = selectTargetWindow(wins, targetWinId, targetWinIndex, targetWinTitle);
-    if (w) {
-      if (restore) {
-        try { w.attributes.byName("AXMinimized").value = false; } catch (_) {}
-      }
-      try {
-        const nm = w.name();
-        if (nm && (!targetWinTitle || targetWinTitle === targetName)) winTitle = String(nm);
-      } catch (_) {}
-      try {
-        const pos = w.position();
-        const sz = w.size();
-        winBounds = {
-          x: Number(pos[0] || 0),
-          y: Number(pos[1] || 0),
-          width: Number(sz[0] || 800),
-          height: Number(sz[1] || 600),
-        };
-      } catch (_) {}
-      children = readChildren(w, 0);
-    }
-  } catch (_) {}
-  return JSON.stringify({
-    role: "AXWindow",
-    title: winTitle,
-    bounds: winBounds,
-    enabled: true,
-    focused: true,
-    selected: false,
-    actions: [],
-    children,
-  });
-}
-"#;
+/// Read-only unless `restore` is set; then restore is a leased, postcondition-checked mutation.
+pub const LIVE_WINDOW_AX_JXA_SCRIPT: &str = concat!(
+    include_str!("engine/scripts/common.js"),
+    include_str!("engine/scripts/observe.js")
+);
 
 fn query_live_window_ax_tree(
     app: &AppSummary,
     win: Option<&WindowSummary>,
     restore_window: bool,
-) -> Result<ElementNode, String> {
-    let pid_str = app.pid.to_string();
-    let effective_restore = restore_window
-        && (std::env::var_os("KRILL_TEST_OFFLINE").is_none()
-            || std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN").is_some());
-    let restore_str = if effective_restore { "1" } else { "0" };
-    let win_id_str = win.map_or("", |w| w.id.as_str());
-    let win_idx_str = win.map_or(0usize, |w| w.index).to_string();
-    let win_title_str = win.map_or("", |w| w.title.as_str());
-    let out = run_jxa(
-        LIVE_WINDOW_AX_JXA_SCRIPT,
-        &[
-            &pid_str,
-            &app.name,
-            restore_str,
-            win_id_str,
-            &win_idx_str,
-            win_title_str,
-        ],
-    )?;
-    let mut node: ElementNode =
-        serde_json::from_str(&out).map_err(|e| format!("parse AX tree: {e}"))?;
-    if let Some(w) = win {
-        if node.title.as_deref().unwrap_or("").is_empty() {
-            node.title = Some(w.title.clone());
-        }
-        if node.bounds.is_none() {
-            node.bounds = Some(w.bounds);
-        }
-    } else if node.bounds.is_none() {
-        node.bounds = Some(Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
-        });
-    }
-    Ok(node)
+) -> Result<(ElementNode, String, bool), String> {
+    let win = win.ok_or("application has no observed window")?;
+    let payload = serde_json::json!({"pid":app.pid,"bundleId":app.bundle_id,"winId":win.id,
+        "winTitle":win.title,"winBounds":win.bounds,"restore":restore_window});
+    let raw = run_jxa(LIVE_WINDOW_AX_JXA_SCRIPT, &[&payload.to_string()])?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse AX observation: {e}"))?;
+    let node: ElementNode = serde_json::from_value(
+        value
+            .get("root")
+            .cloned()
+            .ok_or("AX observation missing root")?,
+    )
+    .map_err(|e| format!("parse AX root: {e}"))?;
+    let start = value
+        .get("processStart")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("process start witness unavailable")?
+        .to_owned();
+    Ok((
+        node,
+        start,
+        value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -844,11 +881,14 @@ pub enum LiveAction {
         action_name: String,
     },
     Scroll {
+        target_ref: Option<usize>,
         point: Option<Point>,
         delta_x: f64,
         delta_y: f64,
     },
     Drag {
+        from_ref: Option<usize>,
+        to_ref: Option<usize>,
         from: Point,
         to: Point,
     },
@@ -872,6 +912,7 @@ pub enum LiveAction {
         value: String,
     },
     PasteText {
+        text: String,
         target_ref: Option<usize>,
         focus_point: Option<Point>,
     },
@@ -880,6 +921,14 @@ pub enum LiveAction {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveActionOutcome {
+    #[serde(default)]
+    pub issued_units: Option<u32>,
+    #[serde(default)]
+    pub delivery: Delivery,
+    #[serde(default)]
+    pub cleanup: Cleanup,
+    #[serde(default)]
+    pub clipboard: Option<ClipboardMetadata>,
     pub ok: bool,
     pub status: String,
     #[serde(default)]
@@ -935,11 +984,13 @@ pub fn build_live_action_payload(
             "actionName": action_name,
         }),
         LiveAction::Scroll {
+            target_ref,
             point,
             delta_x,
             delta_y,
         } => serde_json::json!({
             "kind": "scroll",
+            "targetRefs": target_ref.iter().collect::<Vec<_>>(),
             "pid": app.pid,
             "appName": app.name,
             "bundleId": app.bundle_id,
@@ -950,8 +1001,14 @@ pub fn build_live_action_payload(
             "deltaX": delta_x,
             "deltaY": delta_y,
         }),
-        LiveAction::Drag { from, to } => serde_json::json!({
+        LiveAction::Drag {
+            from_ref,
+            to_ref,
+            from,
+            to,
+        } => serde_json::json!({
             "kind": "drag",
+            "targetRefs": ([from_ref, to_ref].into_iter().flatten().collect::<Vec<_>>()),
             "pid": app.pid,
             "appName": app.name,
             "bundleId": app.bundle_id,
@@ -1040,6 +1097,7 @@ pub fn build_live_action_payload(
             "value": value,
         }),
         LiveAction::PasteText {
+            text: _,
             target_ref,
             focus_point,
         } => serde_json::json!({
@@ -1056,415 +1114,18 @@ pub fn build_live_action_payload(
     }
 }
 
-pub const LIVE_ACTION_JXA_SCRIPT: &str = r#"
-ObjC.import("AppKit");
-ObjC.import("CoreGraphics");
-ObjC.import("Foundation");
+/// Shares `common.js` with observation so identity/value validation cannot drift.
+pub const LIVE_ACTION_JXA_SCRIPT: &str = concat!(
+    include_str!("engine/scripts/common.js"),
+    include_str!("engine/scripts/action.js")
+);
 
-function run(argv) {
-const req = JSON.parse(String(argv[0] || "{}"));
-const se = Application("System Events");
-
-function getProcess() {
-  if (req.pid && Number(req.pid) > 0) {
-    try {
-      const targetPid = Number(req.pid);
-      const byPid = se.processes.whose({ unixId: targetPid });
-      if (byPid && byPid.length > 0) return se.processes.whose({ unixId: targetPid }).first;
-    } catch (_) {}
-  }
-  return se.processes.byName(String(req.appName || ""));
+fn focused_receiver(node: &ElementNode) -> Option<&ElementNode> {
+    node.children
+        .iter()
+        .find_map(focused_receiver)
+        .or_else(|| node.focused.then_some(node))
 }
-
-function activateTargetApp() {
-  let activated = false;
-  if (req.pid && Number(req.pid) > 0) {
-    try {
-      const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(req.pid));
-      if (running && !running.isNil()) {
-        activated = Boolean(running.activateWithOptions(3));
-        if (!activated) {
-          try {
-            getProcess().frontmost = true;
-            activated = true;
-          } catch (_) {}
-        }
-        return activated;
-      }
-    } catch (_) {}
-  }
-  if (!activated && req.bundleId) {
-    try {
-      const app = Application(String(req.bundleId));
-      app.activate();
-      activated = true;
-    } catch (_) {}
-  }
-  if (!activated && req.appName) {
-    try {
-      const app = Application(String(req.appName));
-      app.activate();
-      activated = true;
-    } catch (_) {}
-  }
-  return activated;
-}
-
-function selectTargetWindow(wins, winId, winIndex, winTitle) {
-  let winCount = 0;
-  try { winCount = Number(wins ? wins.length : 0); } catch (_) { return null; }
-  if (!winCount || winCount <= 0) return null;
-  const idStr = winId ? String(winId) : "";
-  const idxNum = Number(winIndex || 0);
-  const titleStr = winTitle ? String(winTitle) : "";
-  if (idStr) {
-    for (let i = 0; i < winCount; i++) {
-      const cand = wins[i];
-      try {
-        const axNum = cand.attributes.byName("AXWindowNumber").value();
-        if (axNum !== null && axNum !== undefined && String(axNum) === idStr) return cand;
-      } catch (_) {}
-      try {
-        if (String(cand.id()) === idStr) return cand;
-      } catch (_) {}
-    }
-  }
-  if (idxNum >= 1 && idxNum <= winCount) {
-    const byIdx = wins[idxNum - 1];
-    if (!titleStr) return byIdx;
-    try {
-      if (String(byIdx.name() || "") === titleStr) return byIdx;
-    } catch (_) {}
-    for (let i = 0; i < winCount; i++) {
-      const cand = wins[i];
-      try {
-        if (String(cand.name() || "") === titleStr) return cand;
-      } catch (_) {}
-    }
-    return byIdx;
-  }
-  if (titleStr) {
-    for (let i = 0; i < winCount; i++) {
-      const cand = wins[i];
-      try {
-        if (String(cand.name() || "") === titleStr) return cand;
-      } catch (_) {}
-    }
-  }
-  return wins[0];
-}
-
-const INTERACTIVE_ROLES = {
-  AXButton: true,
-  AXTextField: true,
-  AXTextArea: true,
-  AXCheckBox: true,
-  AXRadioButton: true,
-  AXPopUpButton: true,
-  AXComboBox: true,
-  AXMenuItem: true,
-  AXLink: true,
-  AXTab: true,
-  AXSlider: true,
-  AXRow: true,
-  AXCell: true,
-};
-
-function findInteractiveElementByRef(win, targetRef) {
-  if (!win || !targetRef || targetRef < 1) return null;
-  let budget = 160;
-  let nextRef = 1;
-  function visitChildren(parent, depth) {
-    if (depth >= 4 || budget <= 0) return null;
-    const elems = parent.uiElements;
-    let roles = [];
-    try { roles = elems.role(); } catch (_) { return null; }
-    const count = Math.min(Array.isArray(roles) ? roles.length : 0, 40);
-    if (count === 0) return null;
-    for (let i = 0; i < count && budget > 0; i++) {
-      budget -= 1;
-      const el = elems[i];
-      const role = roles[i] ? String(roles[i]) : "AXGroup";
-      if (INTERACTIVE_ROLES[role]) {
-        const assigned = nextRef;
-        nextRef += 1;
-        if (assigned === targetRef) return el;
-      }
-      const found = visitChildren(el, depth + 1);
-      if (found) return found;
-    }
-    return null;
-  }
-  return visitChildren(win, 0);
-}
-
-function postMouseClick(pt, button, clickCount, cgFlags) {
-  if (!pt) return false;
-  const loc = { x: Number(pt.x), y: Number(pt.y) };
-  let downType = 1;
-  let upType = 2;
-  let mouseBtn = 0;
-  if (button === "right") {
-    downType = 3;
-    upType = 4;
-    mouseBtn = 1;
-  } else if (button === "middle") {
-    downType = 25;
-    upType = 26;
-    mouseBtn = 2;
-  }
-  const count = Math.max(1, Number(clickCount || 1));
-  const flags = Number(cgFlags || 0);
-  for (let i = 1; i <= count; i++) {
-    const downEv = $.CGEventCreateMouseEvent(null, downType, loc, mouseBtn);
-    const upEv = $.CGEventCreateMouseEvent(null, upType, loc, mouseBtn);
-    if (!downEv || !upEv) return false;
-    $.CGEventSetIntegerValueField(downEv, 1, i);
-    $.CGEventSetIntegerValueField(upEv, 1, i);
-    if (flags > 0) {
-      $.CGEventSetFlags(downEv, flags);
-      $.CGEventSetFlags(upEv, flags);
-    }
-    $.CGEventPost(0, downEv);
-    $.CGEventPost(0, upEv);
-  }
-  return true;
-}
-
-function focusTargetElementIfAny() {
-  if (!req.targetRef) return true;
-  try {
-    const proc = getProcess();
-    const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
-    const el = findInteractiveElementByRef(w, Number(req.targetRef));
-    if (el) {
-      try {
-        el.focused = true;
-        return true;
-      } catch (_) {}
-    }
-  } catch (_) {}
-  if (req.point) {
-    return postMouseClick(req.point, "left", 1, 0);
-  }
-  return false;
-}
-
-function executeRequest() {
-  activateTargetApp();
-  const kind = String(req.kind || "");
-
-  if (kind === "click") {
-    const isSimpleLeft = (!req.button || req.button === "left") &&
-      Number(req.clickCount || 1) === 1 &&
-      (!req.modifiers || req.modifiers.length === 0);
-    if (req.targetRef && isSimpleLeft) {
-      try {
-        const proc = getProcess();
-        const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
-        const el = findInteractiveElementByRef(w, Number(req.targetRef));
-        if (el) {
-          try { el.focused = true; } catch (_) {}
-          try {
-            el.actions.byName("AXPress").perform();
-            return { ok: true, status: "verified", reason: null, note: "performed AXPress" };
-          } catch (_) {}
-        }
-      } catch (_) {}
-    }
-    if (req.point && postMouseClick(req.point, req.button || "left", req.clickCount || 1, req.cgFlags || 0)) {
-      return { ok: true, status: "verified", reason: null, note: "posted CGEvent click" };
-    }
-    return {
-      ok: false,
-      status: "unverified",
-      reason: "target element could not be clicked via AXPress or CGEvent coordinates",
-      note: null,
-    };
-  }
-
-  if (kind === "secondaryAction") {
-    const actionName = String(req.actionName || "AXShowMenu");
-    try {
-      const proc = getProcess();
-      const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
-      const el = findInteractiveElementByRef(w, Number(req.targetRef));
-      if (el) {
-        try { el.focused = true; } catch (_) {}
-        el.actions.byName(actionName).perform();
-        return { ok: true, status: "verified", reason: null, note: "performed " + actionName };
-      }
-    } catch (_) {}
-    if (actionName === "AXShowMenu" && req.point && postMouseClick(req.point, "right", 1, 0)) {
-      return { ok: true, status: "verified", reason: null, note: "fallback right-click for AXShowMenu" };
-    }
-    return {
-      ok: false,
-      status: "unverified",
-      reason: "failed to perform secondary AX action " + actionName + " on element #" + req.targetRef,
-      note: null,
-    };
-  }
-
-  if (kind === "scroll") {
-    if (req.point) {
-      const moveEv = $.CGEventCreateMouseEvent(null, 5, { x: Number(req.point.x), y: Number(req.point.y) }, 0);
-      if (moveEv) $.CGEventPost(0, moveEv);
-    }
-    const dy = Math.round(Number(req.deltaY || 0));
-    const dx = Math.round(Number(req.deltaX || 0));
-    const scrollEv = $.CGEventCreateScrollWheelEvent(null, 0, 2, dy, dx);
-    if (!scrollEv) {
-      return { ok: false, status: "unverified", reason: "failed to create CGEvent scroll event", note: null };
-    }
-    $.CGEventPost(0, scrollEv);
-    return { ok: true, status: "verified", reason: null, note: "posted CGEvent scroll" };
-  }
-
-  if (kind === "drag") {
-    const fromPt = { x: Number(req.from.x), y: Number(req.from.y) };
-    const toPt = { x: Number(req.to.x), y: Number(req.to.y) };
-    const moveEv = $.CGEventCreateMouseEvent(null, 5, fromPt, 0);
-    const downEv = $.CGEventCreateMouseEvent(null, 1, fromPt, 0);
-    if (!moveEv || !downEv) {
-      return { ok: false, status: "unverified", reason: "failed to create CGEvent drag start", note: null };
-    }
-    $.CGEventPost(0, moveEv);
-    $.CGEventPost(0, downEv);
-    const steps = 5;
-    for (let s = 1; s <= steps; s++) {
-      const ratio = s / steps;
-      const stepPt = {
-        x: fromPt.x + (toPt.x - fromPt.x) * ratio,
-        y: fromPt.y + (toPt.y - fromPt.y) * ratio,
-      };
-      const dragEv = $.CGEventCreateMouseEvent(null, 6, stepPt, 0);
-      if (dragEv) $.CGEventPost(0, dragEv);
-      $.NSThread.sleepForTimeInterval(0.01);
-    }
-    const upEv = $.CGEventCreateMouseEvent(null, 2, toPt, 0);
-    if (!upEv) {
-      return { ok: false, status: "unverified", reason: "failed to create CGEvent drag end", note: null };
-    }
-    $.CGEventPost(0, upEv);
-    return { ok: true, status: "verified", reason: null, note: "posted CGEvent drag" };
-  }
-
-  if (kind === "typeText") {
-    if (req.targetRef && !focusTargetElementIfAny()) {
-      return {
-        ok: false,
-        status: "unverified",
-        reason: "could not focus target element #" + req.targetRef + " before typing",
-        note: null,
-      };
-    }
-    try {
-      const text = String(req.text || "");
-      const lines = text.split(/\r?\n/);
-      for (let li = 0; li < lines.length; li++) {
-        if (li > 0) se.keyCode(36);
-        const tabs = lines[li].split("\t");
-        for (let ti = 0; ti < tabs.length; ti++) {
-          if (ti > 0) se.keyCode(48);
-          if (tabs[ti].length > 0) se.keystroke(tabs[ti]);
-        }
-      }
-      return { ok: true, status: "verified", reason: null, note: "typed text via System Events" };
-    } catch (err) {
-      return { ok: false, status: "unverified", reason: "System Events keystroke failed: " + String(err), note: null };
-    }
-  }
-
-  if (kind === "pressKey" || kind === "hotkey") {
-    try {
-      const repeat = Math.max(1, Number(req.repeat || 1));
-      const usingMods = Array.isArray(req.usingMods) ? req.usingMods : [];
-      const opts = usingMods.length > 0 ? { using: usingMods } : undefined;
-      for (let r = 0; r < repeat; r++) {
-        if (req.keyCode !== null && req.keyCode !== undefined) {
-          if (opts) {
-            se.keyCode(Number(req.keyCode), opts);
-          } else {
-            se.keyCode(Number(req.keyCode));
-          }
-        } else {
-          if (opts) {
-            se.keystroke(String(req.key), opts);
-          } else {
-            se.keystroke(String(req.key));
-          }
-        }
-      }
-      return { ok: true, status: "verified", reason: null, note: "dispatched key event via System Events" };
-    } catch (err) {
-      return { ok: false, status: "unverified", reason: "System Events key dispatch failed: " + String(err), note: null };
-    }
-  }
-
-  if (kind === "setValue") {
-    try {
-      const proc = getProcess();
-      const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
-      const el = findInteractiveElementByRef(w, Number(req.targetRef));
-      if (!el) {
-        return {
-          ok: false,
-          status: "unverified",
-          reason: "element #" + req.targetRef + " not found in live window AX tree",
-          note: null,
-        };
-      }
-      try { el.focused = true; } catch (_) {}
-      let updated = false;
-      try {
-        el.value = String(req.value);
-        updated = true;
-      } catch (_) {}
-      if (!updated) {
-        try {
-          el.attributes.byName("AXValue").value = String(req.value);
-          updated = true;
-        } catch (_) {}
-      }
-      if (!updated) {
-        return {
-          ok: false,
-          status: "unverified",
-          reason: "AXValue attribute is not writable on element #" + req.targetRef,
-          note: null,
-        };
-      }
-      return { ok: true, status: "verified", reason: null, note: "updated AXValue" };
-    } catch (err) {
-      return { ok: false, status: "unverified", reason: "setValue failed: " + String(err), note: null };
-    }
-  }
-
-  if (kind === "pasteText") {
-    if (req.targetRef && !focusTargetElementIfAny()) {
-      return {
-        ok: false,
-        status: "unverified",
-        reason: "could not focus target element #" + req.targetRef + " before paste",
-        note: null,
-      };
-    }
-    try {
-      se.keystroke("v", { using: "command down" });
-      $.NSThread.sleepForTimeInterval(0.05);
-      return { ok: true, status: "verified", reason: null, note: "pasted via Cmd+V" };
-    } catch (err) {
-      return { ok: false, status: "unverified", reason: "paste keystroke failed: " + String(err), note: null };
-    }
-  }
-
-  return { ok: false, status: "unverified", reason: "unsupported live action kind: " + kind, note: null };
-}
-
-return JSON.stringify(executeRequest());
-}
-"#;
 
 pub fn execute_live_action(
     app_selector: &str,
@@ -1476,6 +1137,10 @@ pub fn execute_live_action(
         && std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN").is_none()
     {
         return Ok(LiveActionOutcome {
+            issued_units: Some(0),
+            delivery: Delivery::NotDispatched,
+            cleanup: Cleanup::NotNeeded,
+            clipboard: None,
             ok: false,
             status: "unverified".to_owned(),
             reason: Some(
@@ -1492,56 +1157,80 @@ pub fn execute_live_action(
         owned_app = resolve_live_app(app_selector)?;
         &owned_app
     };
-    let payload = build_live_action_payload(app, win, action);
+    verify_target_app(app)?;
+    let base = action_snapshot().ok_or("no immutable action snapshot")?;
+    let mut payload = build_live_action_payload(app, win, action);
+    payload["processStart"] = serde_json::json!(base.process_start);
+    payload["receiver"] = serde_json::json!(base.root.as_ref().and_then(focused_receiver));
+    payload["baseRoot"] = serde_json::json!(base.root);
+    payload["winBounds"] = serde_json::json!(win.map(|w| w.bounds));
+    if let LiveAction::PasteText { text, .. } = action {
+        payload["text"] = serde_json::json!(text);
+    }
     let payload_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    let raw = run_jxa(LIVE_ACTION_JXA_SCRIPT, &[&payload_str])?;
-    serde_json::from_str(&raw).map_err(|e| format!("parse live action outcome: {e}"))
+    let raw = match run_private_action(LIVE_ACTION_JXA_SCRIPT, &payload_str) {
+        Ok(raw) => raw,
+        Err(error) => return Ok(LiveActionOutcome::unknown(error)),
+    };
+    let mut outcome: LiveActionOutcome = match serde_json::from_str(&raw) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Ok(LiveActionOutcome::unknown(format!(
+                "action started but response invalid: {error}"
+            )));
+        }
+    };
+    if outcome.delivery != Delivery::Submitted {
+        outcome.ok = false;
+        "unverified".clone_into(&mut outcome.status);
+    }
+    if !matches!(
+        action,
+        LiveAction::SetValue { .. } | LiveAction::PasteText { .. }
+    ) && outcome.status == "verified"
+    {
+        "unverified".clone_into(&mut outcome.status);
+        outcome.reason = Some("dispatch is not a verified business predicate".to_owned());
+    }
+    Ok(outcome)
 }
 
-pub fn read_system_clipboard() -> Result<String, String> {
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
-        let Some(dir) = daemon::state_dir() else {
-            return Ok(String::new());
-        };
-        let path = dir.join("computer-clipboard.txt");
-        return match fs::read_to_string(path) {
-            Ok(s) => Ok(s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(format!("read offline clipboard: {e}")),
-        };
+/// Input text and private AX values never appear in child argv, even for *-stdin flags.
+fn run_private_action(script: &str, payload: &str) -> Result<String, String> {
+    if payload.len() > 4 * 1024 * 1024 {
+        return Err("not_dispatched: action payload exceeds bound".to_owned());
     }
-    let out = Command::new("/usr/bin/pbpaste")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("pbpaste: {e}"))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-pub fn write_system_clipboard(text: &str) -> Result<(), String> {
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
-        let Some(dir) = daemon::state_dir() else {
-            return Ok(());
-        };
-        fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        return fs::write(dir.join("computer-clipboard.txt"), text)
-            .map_err(|e| format!("write offline clipboard: {e}"));
+    let dir = snapshot_dir()
+        .ok_or("cannot resolve private operation directory")?
+        .join("operations");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
     }
-    let mut child = Command::new("/usr/bin/pbcopy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("pbcopy: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("pbcopy write: {e}"))?;
-    }
-    let status = child.wait().map_err(|e| format!("pbcopy wait: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("pbcopy exited with {status}"))
+    builder.create(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("operation-{}.json", unique_token()));
+    write_private_new(&path, payload.as_bytes())?;
+    let bin = std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN")
+        .map_or_else(|| PathBuf::from("/usr/bin/osascript"), PathBuf::from);
+    let mut command = Command::new(bin);
+    command
+        .args(["-l", "JavaScript", "-e", script, "--request-file"])
+        .arg(&path);
+    match run_managed(command) {
+        Err(error) => {
+            fs::remove_file(&path).ok();
+            Err(error)
+        }
+        Ok(finished) => {
+            // Do not erase an operation file while an un-reaped child may still need it.
+            if finished.reaped {
+                fs::remove_file(&path).ok();
+            }
+            decode_jxa(finished)
+        }
     }
 }
 
@@ -1549,16 +1238,180 @@ pub fn run_jxa(script: &str, args: &[&str]) -> Result<String, String> {
     let bin = std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN")
         .map_or_else(|| PathBuf::from("/usr/bin/osascript"), PathBuf::from);
     let mut cmd = Command::new(bin);
-    cmd.args(["-l", "JavaScript", "-e", script]);
-    for arg in args {
-        cmd.arg(arg);
+    cmd.args(["-l", "JavaScript", "-e", script]).args(args);
+    decode_jxa(run_managed(cmd)?)
+}
+
+fn decode_jxa(finished: super::lifecycle::Finished) -> Result<String, String> {
+    match finished.end {
+        super::lifecycle::End::Exited(status)
+            if status.success() && !finished.stdout.truncated && finished.reaped =>
+        {
+            Ok(String::from_utf8_lossy(&finished.stdout.bytes)
+                .trim()
+                .to_owned())
+        }
+        end => Err(format!(
+            "executor ended {end:?}; outputTruncated={}; outcome unknown; do not replay: {}",
+            finished.stdout.truncated,
+            String::from_utf8_lossy(&finished.stderr.bytes)
+        )),
     }
-    let out = cmd
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("osascript: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+}
+
+struct Execution {
+    lease: Option<super::lifecycle::InputLease>,
+    deadline: std::time::Instant,
+}
+
+thread_local! {
+    static EXECUTION: std::cell::RefCell<Option<Execution>> = const { std::cell::RefCell::new(None) };
+    static ACTION_SNAPSHOT: std::cell::RefCell<Option<AppStateSnapshot>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_execution(
+    sub: &str,
+    args: &[String],
+    f: impl FnOnce() -> Result<(), super::CliError>,
+) -> Result<(), super::CliError> {
+    use super::lifecycle::{Access, InputLease, access_for, default_lease_path};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let lease = if access_for(sub, args) == Access::Mutate {
+        Some(
+            InputLease::acquire(&default_lease_path(), deadline, None)
+                .map_err(|e| super::CliError::Runtime(format!("not_dispatched: {e}")))?,
+        )
+    } else {
+        None
+    };
+    EXECUTION.with_borrow_mut(|slot| *slot = Some(Execution { lease, deadline }));
+    let result = f();
+    ACTION_SNAPSHOT.with_borrow_mut(|slot| *slot = None);
+    EXECUTION.with_borrow_mut(|slot| *slot = None);
+    result
+}
+
+fn run_managed(cmd: Command) -> Result<super::lifecycle::Finished, String> {
+    use super::lifecycle::{self, LeaseSlot, RunOpts};
+    EXECUTION.with_borrow(|context| {
+        let opts = RunOpts {
+            lease: context
+                .as_ref()
+                .and_then(|ctx| ctx.lease.as_ref())
+                .map(|lease| (lease, LeaseSlot::Stdin)),
+            stdin: None,
+            deadline: context.as_ref().map_or_else(
+                || std::time::Instant::now() + std::time::Duration::from_secs(5),
+                |ctx| ctx.deadline,
+            ),
+            cancel: None,
+            max_output: 4 * 1024 * 1024,
+        };
+        lifecycle::run(cmd, &opts).map_err(|e| format!("not_dispatched: {e}"))
+    })
+}
+
+pub fn set_action_snapshot(snapshot: AppStateSnapshot) {
+    ACTION_SNAPSHOT.with_borrow_mut(|slot| *slot = Some(snapshot));
+}
+
+fn action_snapshot() -> Option<AppStateSnapshot> {
+    ACTION_SNAPSHOT.with_borrow(Clone::clone)
+}
+
+pub fn validate_snapshot_identity(
+    before: &AppStateSnapshot,
+    fresh: &AppStateSnapshot,
+) -> Result<(), String> {
+    if before.app.pid != fresh.app.pid
+        || before.app.bundle_id != fresh.app.bundle_id
+        || before.process_start.is_empty()
+        || before.process_start != fresh.process_start
+    {
+        return Err("process instance changed; observe again".to_owned());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    match (&before.window, &fresh.window) {
+        (Some(old), Some(new))
+            if old.id == new.id && old.bounds == new.bounds && old.title == new.title => {}
+        _ => return Err("window identity or geometry changed; observe again".to_owned()),
+    }
+    Ok(())
+}
+
+pub fn validate_mock_target(
+    app: &MockApp,
+    win: &MockWindow,
+    target: Option<usize>,
+) -> Result<(), String> {
+    let base = action_snapshot().ok_or("no original snapshot")?;
+    verify_target_app(&app.summary())?;
+    if !app.is_active || !win.is_focused {
+        return Err("foreground receiver changed".to_owned());
+    }
+    if base.app.pid != app.pid
+        || base
+            .window
+            .as_ref()
+            .is_none_or(|w| w.id != win.id || w.bounds != win.bounds)
+    {
+        return Err("original window no longer exists".to_owned());
+    }
+    if let Some(target) = target {
+        let original = base.root.as_ref().ok_or("original AX root unavailable")?;
+        validate_reference(original, &win.root, target)?;
+    }
+    Ok(())
+}
+
+impl LiveActionOutcome {
+    pub fn unknown(reason: String) -> Self {
+        Self {
+            ok: false,
+            status: "unverified".to_owned(),
+            reason: Some(reason),
+            note: None,
+            issued_units: None,
+            delivery: Delivery::Unknown,
+            cleanup: Cleanup::Incomplete,
+            clipboard: None,
+        }
+    }
+    pub fn submitted() -> Self {
+        Self {
+            ok: true,
+            status: "unverified".to_owned(),
+            reason: Some("submitted; no predicate requested".to_owned()),
+            note: None,
+            issued_units: Some(1),
+            delivery: Delivery::Submitted,
+            cleanup: Cleanup::NotNeeded,
+            clipboard: None,
+        }
+    }
+}
+
+pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
+        return Err("capture did not produce a PNG with an IHDR".to_owned());
+    }
+    let width = bytes
+        .get(16..20)
+        .and_then(|v| v.try_into().ok())
+        .map(u32::from_be_bytes);
+    let height = bytes
+        .get(20..24)
+        .and_then(|v| v.try_into().ok())
+        .map(u32::from_be_bytes);
+    match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Ok((w, h)),
+        _ => Err("invalid PNG dimensions".to_owned()),
+    }
+}
+
+pub fn verify_target_app(app: &AppSummary) -> Result<(), String> {
+    verify_not_self_targeted(&app.name, app.bundle_id.as_deref())?;
+    if app.pid == 0 || app.pid == std::process::id() {
+        return Err("self-targeting guard: invalid or executor PID".to_owned());
+    }
+    Ok(())
 }

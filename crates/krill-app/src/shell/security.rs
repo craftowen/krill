@@ -1,15 +1,14 @@
-//! MK-076 보안 강화 UI 연결(OSC 8 URL 미리보기, 제목 제어문자 필터, 여러 줄 붙여넣기 경고, Secure Keyboard Entry).
+//! MK-076 보안 강화 UI 연결(링크 팝오버, 제목 제어문자 필터, 여러 줄 붙여넣기 경고, Secure Keyboard Entry).
 //! `shell.rs` 병합 충돌을 줄이려고 동작·그리기를 이 모듈에 둔다.
 
 use std::time::Duration;
 
-use gpui::{AnyElement, App, Context, Pixels, Point, Window, actions, div, prelude::*};
+use gpui::{AnyElement, App, Context, Pixels, Point, Window, actions, div, prelude::*, px};
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use krill_app::keys;
 use krill_app::layout::PaneId;
-use krill_app::security::{PastePlan, format_link_preview, plan_paste, text as sec_text};
-use krill_app::terminal::link_target;
+use krill_app::security::{LinkMenu, PastePlan, plan_paste, text as sec_text};
 use krill_proto::input::Now;
 
 use super::Shell;
@@ -20,6 +19,9 @@ pub(super) fn bind_keys(cx: &mut App) {
     crate::set_menus(&krill_app::security::State::default(), cx);
 }
 
+/// 링크 팝오버 최대 폭. 긴 URL은 한 줄로 줄여 보이고 복사·열기는 전체 URL을 쓴다.
+const LINK_MENU_WIDTH: Pixels = px(420.);
+
 /// Bound clipboard-owner stalls, image conversion and filesystem preparation together.
 const PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -28,6 +30,12 @@ pub(super) struct PasteQueue {
     next: u64,
     entries: std::collections::VecDeque<QueuedInput>,
 }
+impl PasteQueue {
+    pub(super) fn has_pending_for(&self, pane: PaneId) -> bool {
+        self.entries.iter().any(|entry| entry.pane == pane)
+    }
+}
+
 struct QueuedInput {
     pane: PaneId,
     session: krill_proto::SessionId,
@@ -59,6 +67,10 @@ impl Shell {
     }
 
     pub(super) fn on_window_active_changed(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active {
+            // 같은 데몬에 붙은 다른 앱이 색을 바꿨을 수 있다. 보이는 창의 팔레트로 다시 맞춘다.
+            self.push_appearance(cx);
+        }
         if !active {
             self.layout.cancel_mru();
             if let Some(pane) = self.layout.focused() {
@@ -372,54 +384,158 @@ impl Shell {
         cx.notify();
     }
 
-    /// 마우스가 가리키는 칸의 OSC 8·평문 URL 링크 미리보기를 갱신한다.
-    pub(super) fn update_hover_link(
+    /// 맨 클릭한 링크의 팝오버를 클릭한 자리에 연다.
+    pub(super) fn open_link_menu(
         &mut self,
         pane: PaneId,
+        uri: String,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let next = self.live.get(&pane).and_then(|l| {
-            let screen = l.pane.shown();
-            link_target(&screen, &l.painted, position)
-                .map(|u| (pane, u.to_owned()))
-                .or_else(|| {
-                    krill_app::terminal::url_link_target(&screen, &l.painted, position)
-                        .map(|(_, u)| (pane, u))
-                })
-        });
-        if self.security.set_hover_link(next) {
+        if self.security.set_link_menu(Some(LinkMenu {
+            pane,
+            uri,
+            position,
+        })) {
             cx.notify();
         }
     }
 
-    /// 칸 안의 OSC 8 URL 미리보기 툴팁 바(UI-1 디자인 토큰 적용).
-    /// 터미널 위 오버레이라 나타나고 사라져도 칸 크기(행 수)를 바꾸지 않는다.
-    pub(super) fn render_pane_security(&self, id: PaneId, cx: &App) -> Option<AnyElement> {
-        let uri = self.security.hover_uri(id)?;
+    /// 링크 팝오버를 닫는다. 열려 있었으면 `true`.
+    pub(super) fn close_link_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.security.set_link_menu(None);
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
+    /// 팝오버의 대상 URL을 클립보드로 복사하고 닫는다.
+    pub(super) fn copy_link_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.security.link_menu() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(menu.uri.clone()));
+        }
+        self.close_link_menu(cx);
+    }
+
+    /// 팝오버의 대상 URL을 브라우저로 열고 닫는다.
+    pub(super) fn open_link_menu_in_browser(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.security.link_menu() {
+            cx.open_url(&menu.uri);
+        }
+        self.close_link_menu(cx);
+    }
+
+    /// 링크 팝오버(Orca식): 실제 대상 URL과 복사·브라우저 열기. 바깥 클릭·Esc로 닫는다.
+    /// 클릭한 줄 바로 아래에 띄우고, 아래 공간이 모자라면 위로 올린다.
+    pub(super) fn render_link_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Deferred> {
+        let menu = self.security.link_menu()?;
         let p = krill_app::ui::palette(cx);
+        let viewport = window.viewport_size();
+        let gap = px(14.);
+        let height = px(76.);
+        let width = LINK_MENU_WIDTH.min(viewport.width - px(16.)).max(px(160.));
+        let x = menu
+            .position
+            .x
+            .min((viewport.width - width - px(8.)).max(px(8.)))
+            .max(px(8.));
+        let below = menu.position.y + gap;
+        let y = if below + height + px(8.) <= viewport.height {
+            below
+        } else {
+            (menu.position.y - gap - height).max(px(8.))
+        };
+        let card = div()
+            .id("terminal-link-menu")
+            .debug_selector(|| "terminal-link-menu".into())
+            .occlude()
+            .absolute()
+            .left(x)
+            .top(y)
+            .w(width)
+            .p_2()
+            .rounded(krill_app::ui::RADIUS_MD)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .font_family(krill_app::ui::FONT_UI)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .debug_selector(|| "terminal-link-menu-url".into())
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(krill_app::ui::FONT_MONO)
+                    .text_size(krill_app::ui::TEXT_SM)
+                    .child(menu.display_uri()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        krill_app::ui::secondary("terminal-link-copy", sec_text::LINK_COPY.get())
+                            .xsmall()
+                            .debug_selector(|| "terminal-link-copy".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_link_menu(cx))),
+                    )
+                    .child(
+                        krill_app::ui::primary("terminal-link-open", sec_text::LINK_OPEN.get())
+                            .xsmall()
+                            .debug_selector(|| "terminal-link-open".into())
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.open_link_menu_in_browser(cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_right()
+                            .text_size(krill_app::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(sec_text::LINK_HINT.get()),
+                    ),
+            );
         Some(
-            div()
-                .debug_selector(|| "osc8-preview".into())
-                .absolute()
-                .left_2()
-                .bottom_2()
-                .max_w(gpui::relative(0.9))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .px_2()
-                .py_0p5()
-                .rounded(krill_app::ui::RADIUS_XS)
-                .bg(p.popover)
-                .text_color(p.popover_foreground)
-                .border_1()
-                .border_color(p.border)
-                .shadow_lg()
-                .font_family(krill_app::ui::FONT_MONO)
-                .text_size(krill_app::ui::TEXT_XS)
-                .child(format_link_preview(uri))
-                .into_any_element(),
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(px(0.), px(0.)))
+                    .child(
+                        div()
+                            .id("terminal-link-menu-backdrop")
+                            .occlude()
+                            .w(viewport.width)
+                            .h(viewport.height)
+                            .relative()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_link_menu(cx);
+                                }),
+                            )
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_link_menu(cx);
+                                }),
+                            )
+                            .child(card),
+                    ),
+            )
+            .with_priority(2),
         )
     }
 
