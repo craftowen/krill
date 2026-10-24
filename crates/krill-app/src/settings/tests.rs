@@ -1,6 +1,6 @@
 use std::fs;
 
-use gpui::{Action as _, TestAppContext};
+use gpui::{Action as _, Focusable as _, TestAppContext};
 use gpui_component::ActiveTheme as _;
 
 use super::*;
@@ -823,7 +823,24 @@ fn account_rule_controls_toggle_threshold_metric_target_and_reset(cx: &mut TestA
             );
         });
     }
-    click(vcx, "admin-rule-target-claude-work-claude-backup");
+    let backup_index = vcx.update(|_, cx| {
+        view.read(cx)
+            .accounts()
+            .accounts
+            .iter()
+            .filter(|account| {
+                account.provider == ProviderKind::Claude && account.id != "claude-work"
+            })
+            .position(|account| account.id == "claude-backup")
+            .expect("eligible backup account")
+            + 1 // Auto precedes eligible accounts, including the host default.
+    });
+    click(vcx, "admin-rule-target-claude-work");
+    for _ in 0..=backup_index {
+        vcx.simulate_keystrokes("down");
+    }
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
     vcx.update(|_, cx| {
         assert_eq!(
             view.read(cx)
@@ -836,7 +853,9 @@ fn account_rule_controls_toggle_threshold_metric_target_and_reset(cx: &mut TestA
             Some("claude-backup")
         );
     });
-    click(vcx, "admin-rule-target-auto-claude-work");
+    click(vcx, "admin-rule-target-claude-work");
+    vcx.simulate_keystrokes("down enter");
+    vcx.run_until_parked();
     vcx.update(|_, cx| {
         assert!(
             view.read(cx)
@@ -1076,6 +1095,32 @@ fn owe897_managed_remote_card_shows_probe_and_confirmed_remove(cx: &mut TestAppC
     });
 
     fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn windows_remote_card_shows_version_without_install() {
+    use krill_hosts::managed::{RemoteArch, RemoteInfo, RemoteOs, RemotePlatform, RemoteVersion};
+
+    let state = RemoteCardState {
+        probe: RemoteProbeState::Ready(RemoteInfo {
+            platform: RemotePlatform {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+                kernel: "windows".into(),
+            },
+            home: String::new(),
+            version: RemoteVersion::Known("0.1.44+abc".into()),
+            socket_bundle: None,
+        }),
+        install: RemoteInstallState::Idle,
+    };
+    let (line, is_error) = remote_line_text(Some(&state));
+    assert!(!is_error);
+    assert!(line.contains("Windows x86_64"), "{line}");
+    assert!(
+        line.contains("krill 0.1.44") && !line.contains("+abc"),
+        "{line}"
+    );
 }
 
 #[gpui::test]
@@ -2414,7 +2459,7 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
         "admin-rule-toggle-claude-work",
         "admin-rule-threshold-claude-work-95",
         "admin-rule-metric-claude-work-5h",
-        "admin-rule-target-auto-claude-work",
+        "admin-rule-target-claude-work",
         "admin-rule-clear-claude-work",
     ] {
         let bounds = vcx
@@ -4366,6 +4411,17 @@ fn account_remove_needs_confirm_and_rename_keeps_id(cx: &mut TestAppContext) {
     let start_remove = |vcx: &mut gpui::VisualTestContext| {
         vcx.update(|_, cx| view.update(cx, |v, cx| v.start_remove("claude-work".into(), cx)));
         vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let state = view.read(cx);
+            assert!(
+                state.modal_dismiss_focus.is_focused(window),
+                "cancel receives focus"
+            );
+            assert!(
+                state.modal_focus.contains_focused(window, cx),
+                "cancel belongs to modal scope"
+            );
+        });
     };
     start_remove(vcx);
     assert!(
@@ -5109,6 +5165,23 @@ fn owe880_mobile_enter_revoke_confirm_and_copy_feedback(cx: &mut TestAppContext)
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("mobile-revoke-all").is_some());
+
+    // Individual revoke follows the same confirmation contract and Escape preserves devices.
+    click(vcx, "mobile-revoke-0");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).armed.as_deref(), Some("mobile-revoke-0")));
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MobileRequest::RevokeDevice { .. }))
+    );
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).armed.is_none());
+        assert_eq!(view.read(cx).mobile.devices.len(), 1);
+    });
 
     // 2. 전체 해제는 2단계 확인: 첫 클릭은 무장만 하고 Revoke를 보내지 않는다.
     click(vcx, "mobile-revoke-all");
@@ -6151,6 +6224,10 @@ fn opencode_go_api_key_card_saves_and_clears_override(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| {
             let input = v.ensure_opencode_api_key_input(window, cx);
             input.update(cx, |s, cx| s.set_value("  test-key-123  ", window, cx));
+            assert!(
+                input.read(cx).presentation().is_masked(),
+                "API keys must stay masked"
+            );
         });
     });
     vcx.run_until_parked();
@@ -7394,6 +7471,24 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
     // 개별 기기 해제 및 전체 해제 버튼 동작 확인
     // (OWE-880: 전체 해제는 2단계 확인이라 두 번 눌러야 실행된다.)
     click(vcx, "mobile-revoke-0");
+    assert!(
+        !requests.lock().unwrap().iter().any(|r| matches!(
+            r,
+            MobileRequest::RevokeDevice {
+                device_id: Some(_),
+                all: false
+            }
+        )),
+        "first click only arms individual revoke"
+    );
+    click(vcx, "mobile-revoke-0");
+    assert!(
+        requests.lock().unwrap().iter().any(|r| matches!(
+            r,
+            MobileRequest::RevokeDevice { device_id: Some(id), all: false } if id == "dev-iphone"
+        )),
+        "second click revokes the selected device before revoke-all"
+    );
     click(vcx, "mobile-revoke-all");
     click(vcx, "mobile-revoke-all");
     {
@@ -8636,22 +8731,31 @@ fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
 
 /// 앱 테마 선택: 누르면 바로 팔레트가 바뀌고 저장되며, 짝 터미널 테마는 사용자가 바꾸지 않았을 때만 따라 바뀐다.
 #[gpui::test]
-fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
+fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
     let d = dir("ui-theme");
     fs::write(d.join(SETTINGS_FILE), "theme = 'dark'\n").unwrap();
     init(cx, &d);
     let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));
     vcx.run_until_parked();
-    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+    let choose = |vcx: &mut gpui::VisualTestContext, selector: &'static str, index: usize| {
         let b = vcx
-            .debug_bounds(s)
-            .unwrap_or_else(|| panic!("missing selector {s}"));
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing selector {selector}"));
         vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        for _ in 0..=index {
+            vcx.simulate_keystrokes("down");
+        }
+        vcx.simulate_keystrokes("enter");
         vcx.run_until_parked();
     };
 
-    click(vcx, "ui-theme-glow");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::Trench);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::TRENCH);
+    });
+    choose(vcx, "ui-theme-dark", 9);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Glow);
@@ -8668,7 +8772,7 @@ fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut Te
     // 사용자가 고른 터미널 테마는 앱 테마를 바꿔도 그대로 둔다.
     vcx.update(|_, cx| edit(cx, |s| s.terminal_theme_dark = "Dracula".to_owned()));
     vcx.run_until_parked();
-    click(vcx, "ui-theme-abyss");
+    choose(vcx, "ui-theme-dark", 7);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Abyss);
@@ -8678,7 +8782,7 @@ fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut Te
 
     vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
     vcx.run_until_parked();
-    click(vcx, "ui-theme-paper");
+    choose(vcx, "ui-theme-light", 1);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
@@ -8692,15 +8796,53 @@ fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut Te
     fs::remove_dir_all(&d).ok();
 }
 
-/// 앱 테마 키가 없는 예전 설정 파일은 기본 테마(심해·기본)로 읽는다.
+/// 앱 테마 키가 없으면 새 기본값 해구·기본을 쓰고, 저장된 선택값은 계속 읽는다.
 #[test]
 fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("theme = \"light\"").unwrap();
-    assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Trench);
     assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
     let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
     assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+    assert_eq!(
+        s.terminal_theme_dark,
+        crate::ui::terminal_themes::KRILL_TIDEPOOL
+    );
+    assert_eq!(
+        s.terminal_theme_light,
+        crate::ui::terminal_themes::KRILL_PAPER
+    );
+    let s = Settings::parse("ui_theme_dark = 'deep'\nterminal_theme_dark = 'Krill Deep'").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
+    assert_eq!(s.terminal_theme_dark, "Krill Deep");
+}
+
+/// 새 테마 선택값이 저장·재시작을 거쳐 보존되고, 앱과 짝 터미널이 함께 바뀐다.
+#[test]
+fn all_ui_theme_choices_roundtrip_and_preserve_custom_terminal_selection() {
+    for theme in DarkUiTheme::ALL {
+        let mut s = Settings::default();
+        s.set_ui_theme_dark(theme);
+        assert_eq!(s.terminal_theme_dark, theme.terminal_theme_name());
+        let parsed = Settings::parse(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(parsed.ui_theme_dark, theme);
+        assert_eq!(parsed.terminal_theme_dark, theme.terminal_theme_name());
+        s.terminal_theme_dark = "custom:my-terminal".to_owned();
+        s.set_ui_theme_dark(DarkUiTheme::Trench);
+        assert_eq!(s.terminal_theme_dark, "custom:my-terminal");
+    }
+    for theme in LightUiTheme::ALL {
+        let mut s = Settings::default();
+        s.set_ui_theme_light(theme);
+        assert_eq!(s.terminal_theme_light, theme.terminal_theme_name());
+        let parsed = Settings::parse(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(parsed.ui_theme_light, theme);
+        assert_eq!(parsed.terminal_theme_light, theme.terminal_theme_name());
+        s.terminal_theme_light = "custom:my-terminal".to_owned();
+        s.set_ui_theme_light(LightUiTheme::Classic);
+        assert_eq!(s.terminal_theme_light, "custom:my-terminal");
+    }
 }
 
 /// 워크플로 탭 프로젝트 선택 후보에는 실제 절대 경로만 들어가고
@@ -9109,6 +9251,183 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
     });
 
     fs::remove_dir_all(d).ok();
+}
+
+/// Settings audit: short viewports must retain the schedule actions and restore editing focus.
+#[gpui::test]
+fn ui_audit_settings_modal_bounds_focus_and_escape(cx: &mut TestAppContext) {
+    let d = dir("ui-audit-modal");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(900.), px(440.)));
+    vcx.update(|window, cx| {
+        window.set_rem_size(px(24.));
+        view.update(cx, |v, cx| {
+            window.focus(&v.focus, cx);
+            v.open_schedule_modal(None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let modal = vcx
+        .debug_bounds("admin-schedule-modal")
+        .expect("schedule modal");
+    let save = vcx.debug_bounds("admin-schedule-modal-save").expect("save");
+    let body = vcx
+        .debug_bounds("admin-schedule-modal-body")
+        .expect("scrolling fields");
+    assert!(modal.origin.y >= px(0.) && modal.bottom() <= px(440.));
+    assert!(save.origin.y >= modal.origin.y && save.bottom() <= modal.bottom());
+    assert!(body.size.height < modal.size.height);
+    vcx.update(|window, cx| {
+        let input = &view.read(cx).schedule_modal.as_ref().unwrap().name;
+        assert!(input.read(cx).focus_handle(cx).is_focused(window));
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(view.read(cx).schedule_modal.is_none());
+        assert!(view.read(cx).focus.is_focused(window));
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn ui_audit_settings_rename_focus_and_escape_preserve_account(cx: &mut TestAppContext) {
+    let d = dir("ui-audit-rename");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            window.focus(&v.focus, cx);
+            v.start_rename("fixture-account".into(), "Original".into(), window, cx);
+            assert!(
+                v.rename
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    });
+    // Root Escape handles pending inline edits even if a stale account disappeared from the list.
+    vcx.update(|window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(view.read(cx).rename.is_none()));
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn ui_audit_settings_theme_picker_stacks_in_narrow_content(cx: &mut TestAppContext) {
+    let d = dir("ui-audit-theme");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(800.), px(700.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx)));
+    vcx.run_until_parked();
+    let picker = vcx
+        .debug_bounds("terminal-theme-picker-card")
+        .expect("picker");
+    let preview = vcx
+        .debug_bounds("terminal-theme-preview-card")
+        .expect("preview");
+    assert!(preview.origin.x >= picker.origin.x && preview.right() <= picker.right());
+    assert!(preview.size.width <= picker.size.width);
+    fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn ui_audit_unverified_provider_and_environment_values_stay_private() {
+    use krill_proto::usage::ConnectionStatus;
+    assert_eq!(
+        provider_connection_badge(None),
+        (crate::ui::BadgeTone::Muted, text::CONNECTION_CHECKING.get())
+    );
+    assert_eq!(
+        provider_connection_badge(Some(ConnectionStatus::Connected)).0,
+        crate::ui::BadgeTone::Success
+    );
+    let mut profile = krill_proto::agent::Agents::load(None).unwrap().profiles["codex"].clone();
+    profile
+        .env
+        .insert("API_TOKEN".into(), "fixture-secret-token".into());
+    profile.env.insert("LANG".into(), "fixture-locale".into());
+    let summary = agent_environment_summary(Some(&profile));
+    assert!(summary.contains("API_TOKEN") && summary.contains("LANG"));
+    assert!(!summary.contains("fixture-secret-token") && !summary.contains("fixture-locale"));
+}
+
+#[gpui::test]
+fn ui_audit_settings_default_agent_accepts_keyboard_activation(cx: &mut TestAppContext) {
+    let d = dir("ui-audit-agent-keyboard");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(900.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx)));
+    vcx.run_until_parked();
+    let button = vcx
+        .debug_bounds("admin-default-agent-codex")
+        .expect("Codex choice");
+    vcx.simulate_click(button.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| edit(cx, |s| s.default_agent = "claude".into()));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("space");
+    vcx.simulate_event(gpui::KeyUpEvent {
+        keystroke: Keystroke::parse("space").unwrap(),
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(cx.global::<Config>().settings.default_agent, "codex"));
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn ui_audit_closed_import_modal_render_does_not_notify_global_observers(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    struct Probe;
+    impl gpui::Render for Probe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().children(crate::orca_import::render_modal(window, cx))
+        }
+    }
+    let notifications = Rc::new(Cell::new(0));
+    cx.update(crate::orca_import::ensure_state);
+    let observed = notifications.clone();
+    let _observer = cx.update(|cx| {
+        cx.observe_global::<crate::orca_import::OrcaImportState>(move |_| {
+            observed.set(observed.get() + 1);
+        })
+    });
+    let (_probe, vcx) = cx.add_window_view(|_, _| Probe);
+    for _ in 0..3 {
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        notifications.get(),
+        0,
+        "a closed dialog render must not invalidate settings observers"
+    );
+}
+
+#[gpui::test]
+fn settings_navigation_exposes_selected_tab_metadata(_cx: &mut TestAppContext) {
+    use gpui::Element as _;
+    for tab in AdminTab::ALL {
+        for selected in [false, true] {
+            let element = settings_nav_tab(tab, selected);
+            let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+            element.write_a11y_info(&mut node);
+            assert_eq!(element.a11y_role(), Some(gpui::Role::Tab));
+            assert_eq!(node.label(), Some(tab.label()));
+            assert_eq!(node.is_selected(), Some(selected));
+        }
+    }
 }
 
 #[gpui::test]

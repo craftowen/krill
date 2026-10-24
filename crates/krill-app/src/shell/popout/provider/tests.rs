@@ -165,7 +165,7 @@ fn model_pools_get_real_columns_instead_of_invented_five_hour_windows() {
 }
 
 #[gpui::test]
-fn comparison_aligns_columns_and_details_does_not_switch_or_close_menu(
+fn comparison_opens_side_details_on_hover_and_click_without_switching(
     cx: &mut gpui::TestAppContext,
 ) {
     use gpui::VisualTestContext;
@@ -181,10 +181,31 @@ fn comparison_aligns_columns_and_details_does_not_switch_or_close_menu(
         saved.label = "Saved workspace profile".into();
         std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
             vec![host, saved, profile("other", Some("other@example.com"))];
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot)
+            .details
+            .accounts
+            .push(AccountMeters {
+                account_id: "host".into(),
+                plan: Some("Plus".into()),
+                meters: ["5h", "7d", "model-pool"]
+                    .into_iter()
+                    .map(|key| UsageMeter {
+                        key: key.into(),
+                        label: key.into(),
+                        value: None,
+                        window: Some(UsageWindow {
+                            percent: 20,
+                            resets_at: None,
+                        }),
+                    })
+                    .collect(),
+            });
         cx.notify();
     });
     cx.run_until_parked();
     let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(gpui::px(890.), gpui::px(700.)));
+    visual.run_until_parked();
     let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
     visual.simulate_click(pill.center(), gpui::Modifiers::default());
     visual.run_until_parked();
@@ -212,24 +233,82 @@ fn comparison_aligns_columns_and_details_does_not_switch_or_close_menu(
     assert_eq!(first.size.width, second.size.width);
     assert!(first.right() <= weekly.origin.x);
     assert!(weekly.right() <= header.right());
-    let toggle = visual
-        .debug_bounds("status-provider-account-codex-host-details-toggle")
+    let row = visual
+        .debug_bounds("status-provider-account-codex-host")
         .unwrap();
-    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
-    visual.run_until_parked();
+    let other = visual
+        .debug_bounds("status-provider-account-codex-other")
+        .unwrap();
+    assert!(
+        row.bottom() < other.origin.y,
+        "계정 영역 사이에 간격이 있다"
+    );
     assert!(
         visual
-            .debug_bounds("status-provider-table-header")
-            .is_some(),
-        "상세 클릭은 팝업을 닫지 않는다"
+            .debug_bounds("status-provider-details-host")
+            .is_none()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-account-codex-host-details-toggle")
+            .is_none(),
+        "별도의 상세 버튼을 표시하지 않는다"
+    );
+    visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    let panel = visual.debug_bounds("status-provider-details-host").unwrap();
+    assert!(
+        panel.origin.x > row.right(),
+        "상세는 행 오른쪽 패널에 열린다"
+    );
+    assert!(
+        panel.right() <= gpui::px(890.),
+        "상세 패널이 창 안에 들어간다"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-account-codex-host"),
+        Some(row)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-account-codex-other"),
+        Some(other)
     );
     assert!(
         visual
             .debug_bounds("status-provider-profile-saved")
-            .is_some(),
-        "다른 프로필을 숨겨 버리지 않는다"
+            .is_some()
     );
-    assert!(visual.debug_bounds("status-provider-use-saved").is_some());
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-host-model-pool")
+            .is_some()
+    );
+    let saved = visual.debug_bounds("status-provider-use-saved").unwrap();
+    visual.simulate_mouse_move(saved.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-host")
+            .is_some(),
+        "행에서 상세 패널로 이동해도 패널이 유지된다"
+    );
+    visual.simulate_click(other.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-host")
+            .is_none()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-other")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-table-header")
+            .is_some()
+    );
     shell.read_with(visual, |s, _| {
         assert!(
             s.accounts_snapshot
@@ -241,22 +320,54 @@ fn comparison_aligns_columns_and_details_does_not_switch_or_close_menu(
         );
         assert!(
             s.notice.is_none(),
-            "상세 클릭은 계정 전환 IPC를 보내지 않는다"
+            "계정 행 클릭은 전환 IPC를 보내지 않는다"
         );
     });
-    let toggle = visual
-        .debug_bounds("status-provider-account-codex-host-details-toggle")
-        .unwrap();
-    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
+    visual.simulate_keystrokes("right");
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
     visual.run_until_parked();
     assert!(
         visual
-            .debug_bounds("status-provider-profile-saved")
+            .debug_bounds("status-provider-details-other")
             .is_none()
     );
     assert!(
         visual
             .debug_bounds("status-provider-table-header")
-            .is_some()
+            .is_none()
     );
+
+    // 사용 버튼은 여전히 전환을 요청하고 팝업을 닫는다. 실제 계정 파일 대신 실패하는 IPC를 쓴다.
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let row = visual
+        .debug_bounds("status-provider-account-codex-host")
+        .unwrap();
+    visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    let saved = visual.debug_bounds("status-provider-use-saved").unwrap();
+    shell.update(visual, |s, _| {
+        let root = std::env::temp_dir().join("krill-provider-details-missing-socket");
+        s.paths = Some(krill_proto::daemon::Paths {
+            socket: root.join("krilld.sock"),
+            holder: root.join("holder"),
+            krilld: root.join("krilld"),
+        });
+        s.link = super::super::super::Link::Up;
+    });
+    visual.simulate_click(saved.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    visual
+        .executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-table-header")
+            .is_none()
+    );
+    shell.read_with(visual, |s, _| {
+        assert!(s.notice.is_some(), "사용 버튼은 전환 IPC를 요청한다");
+    });
 }

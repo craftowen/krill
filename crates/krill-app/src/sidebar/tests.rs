@@ -1183,6 +1183,32 @@ fn jump_items_fall_back_to_worktree_and_session_names() {
     }
 }
 
+#[test]
+fn jump_provider_uses_foreground_when_session_has_a_custom_title() {
+    let mut sidebar = Sidebar::new_loaded(None);
+    sidebar.snapshot.sessions = vec![Session {
+        id: SessionId(1),
+        status: AgentStatus {
+            agent: "zsh".into(),
+            foreground: Some("/opt/bin/codex".into()),
+            title: Some("Renamed task".into()),
+            ..AgentStatus::UNKNOWN
+        },
+        worktree: None,
+        cwd: None,
+        account: None,
+    }];
+    assert_eq!(sidebar.jump_items()[0].agent, "codex");
+    sidebar
+        .custom_titles
+        .insert(SessionId(1), "Codex alias".into());
+    sidebar.snapshot.sessions[0].status.foreground = None;
+    sidebar.snapshot.sessions[0].status.title = Some("Claude task".into());
+    let item = &sidebar.jump_items()[0];
+    assert_eq!(item.title, "Codex alias");
+    assert_eq!(item.agent, "claude");
+}
+
 #[gpui::test]
 fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAppContext) {
     use crate::pull_request::Status;
@@ -5699,4 +5725,65 @@ fn dashboard_read_order_persists_and_resets_on_recompletion(cx: &mut TestAppCont
         assert_eq!(s.dashboard_read_order(&HostId::Local, &s1), Some(2));
     });
     fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn worktree_delete_enters_cancel_focus_and_restores_background_on_escape(cx: &mut TestAppContext) {
+    struct DeleteProbe(std::sync::atomic::AtomicUsize);
+    impl Source for DeleteProbe {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(Snapshot::default())
+        }
+        fn remove_worktree(&self, _: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let source = Arc::new(DeleteProbe(std::sync::atomic::AtomicUsize::new(0)));
+    let selected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = selected.clone();
+    let previous = cx.update(|window, cx| {
+        cx.subscribe(&view, move |_, _: &Selected, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .detach();
+        view.update(cx, |s, cx| {
+            s.connect_source(source.clone(), cx);
+            let focus = cx.focus_handle();
+            s.focus = Some(focus.clone());
+            focus.focus(window, cx);
+            s.request_delete_worktree(PathBuf::from("/repo/ui-delete-probe"), false, cx);
+            focus
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(
+            view.read(cx)
+                .delete_cancel_focus
+                .as_ref()
+                .unwrap()
+                .is_focused(window)
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).delete_confirm.is_none());
+        assert!(previous.is_focused(window));
+        view.update(cx, |s, cx| {
+            s.request_delete_worktree(PathBuf::from("/repo/ui-delete-probe"), false, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).delete_confirm.is_none());
+        assert!(previous.is_focused(window));
+    });
+    assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(selected.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

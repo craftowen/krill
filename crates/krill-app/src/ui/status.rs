@@ -280,7 +280,7 @@ pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
     }
 }
 
-/// Hooks identify the agent first; foreground process survives renamed session titles.
+/// Hooks identify the agent first; foreground and original titles survive user aliases.
 #[must_use]
 pub fn infer_agent_from_status<'a>(
     status: &'a krill_proto::control::AgentStatus,
@@ -290,6 +290,12 @@ pub fn infer_agent_from_status<'a>(
         && let Some(agent) = status.foreground.as_deref().and_then(known_agent)
     {
         return agent;
+    }
+    if let Some(original_title) = status.title.as_deref() {
+        let original = infer_agent_from_title(&status.agent, original_title);
+        if !is_shell_agent(original) {
+            return original;
+        }
     }
     infer_agent_from_title(&status.agent, title)
 }
@@ -668,6 +674,10 @@ mod tests {
         assert_eq!(infer_agent_from_status(&status, "Codex task"), "claude");
         status.agent.clear();
         status.foreground = None;
+        status.title = Some("Claude task".into());
+        assert_eq!(infer_agent_from_status(&status, "Renamed task"), "claude");
+        assert_eq!(infer_agent_from_status(&status, "Codex task"), "claude");
+        status.title = Some("zsh".into());
         assert_eq!(
             infer_agent_from_status(&status, "OpenCode task"),
             "opencode"

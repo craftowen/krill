@@ -144,6 +144,7 @@ Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.so
 | FEAT_HIBERNATION | `1 << 51` | `krill_proto::control` (자동 종료 세션 재개 `Request::Hibernation`/`Reply::Hibernation`, MK-081·OWE-446 지휘자 배정) |
 | FEAT_WORKTREE_PREPARE | `1 << 52` | `krill_proto::control` (`Request::PrepareWorktree`/`Reply::WorktreePreparation`, MK-095·OWE-460 지휘자 배정; enum 끝에 추가) |
 | FEAT_USAGE_AGY | `1 << 53` | `krill_proto::usage` (Antigravity 계정 enum 확장; 미협상 피어 응답에서 해당 계정·전환 이벤트 제외) |
+| FEAT_USAGE_PROVIDER_METRICS | `1 << 26` | `krill_proto::usage` (제공자별 자동전환 기준 확장. 미협상 피어에는 해당 규칙을 응답에서 제외하고 변경 요청 전송을 거부한다. v0.1.44 배정) |
 | FEAT_USAGE_RULES | `1 << 54` | `krill_proto::usage` (계정별 자동전환 규칙 요청 및 응답 꼬리 확장) |
 | FEAT_HISTORY_PAUSE | `1 << 55` | `krill_proto::history` (기록 일시중지·재개 요청/ACK; 세션·PTY·라이브 화면 유지) |
 | FEAT_MOBILE | `1 << 56` | `krill_proto::mobile` (M9 기기·페어링·게이트웨이, OWE-678) |
@@ -205,7 +206,7 @@ OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisionin
 
 Resource Manager(MK-071)는 control에 `Request::Resources(Action)`·`Reply::Resources` 한 쌍만 더한다(페이로드 `krill_proto::resources`, `FEAT_RESOURCES`를 협상했을 때만 보낸다 — 앱은 미지원 데몬이면 '데몬 업데이트 필요'를 보이고 요청하지 않는다). 메모리는 krilld가 `proc_pid_rusage`로 읽은 `phys_footprint`(요청자·krilld·holder·세션 루트와 ppid 후손 합), 디스크는 상태 디렉터리의 할당 블록 합이다. `RestartDaemon`은 전체 범위 interactive만, 확인 대화상자는 앱이 띄우고, krilld는 holder `UpgradeKrilld`(MK-068과 같은 경로) 승인 뒤 답을 보내고 끝난다. 세션 kill은 기존 `Close`.
 
-**예약 번호 범위**: 기능 비트 `1 << 26`~`1 << 29`, kind 클라→데몬 `0x1A`~`0x1F`·데몬→클라 `0x2E`~`0x2F`. (`control` Request/Reply enum은 postcard 순차 인덱스라 끝에만 추가하며 현재 Request 0..=26, Reply 0..=30까지 배정됨).
+**예약 번호 범위**: 기능 비트 `1 << 27`~`1 << 29`, kind 클라→데몬 `0x1A`~`0x1F`·데몬→클라 `0x2E`~`0x2F`. (`control` Request/Reply enum은 postcard 순차 인덱스라 끝에만 추가하며 현재 Request 0..=26, Reply 0..=30까지 배정됨).
 
 **kind 확장 범위(2026-10-15)**: `0x10`~`0x1F`·`0x20`~`0x2F`가 차서 새 전용 kind는 클라→데몬 `0x40`~, 데몬→클라 `0x60`~를 배정한다. control enum에 빈 번호를 채우는 예약 변형(`#[serde(skip)]`)은 금지 — 직렬화·역직렬화 변형 번호가 어긋날 수 있다.
 

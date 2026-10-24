@@ -244,3 +244,34 @@ fn clearing_query_is_immediate_and_cancels_pending_search(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(*events.borrow(), [Event::Query(String::new())]);
 }
+
+#[gpui::test]
+fn terminal_find_wraps_controls_inside_narrow_viewport(cx: &mut TestAppContext) {
+    struct SearchViewport(Entity<Bar>);
+    impl Render for SearchViewport {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(self.0.clone())
+        }
+    }
+    cx.update(gpui_component::init);
+    let (host, cx) =
+        cx.add_window_view(|window, cx| SearchViewport(cx.new(|cx| Bar::new(window, cx))));
+    let view = cx.update(|_, cx| host.read(cx).0.clone());
+    view.update(cx, |bar, cx| {
+        bar.set_options_supported(true);
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(px(240.), px(300.)));
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    cx.run_until_parked();
+    let bar = cx.debug_bounds("search-bar").unwrap();
+    let close = cx.debug_bounds("search-close").unwrap();
+    assert!(bar.left() >= px(16.) && bar.right() <= px(224.), "{bar:?}");
+    assert!(
+        close.left() >= bar.left()
+            && close.right() <= bar.right()
+            && close.top() >= bar.top()
+            && close.bottom() <= bar.bottom(),
+        "{close:?} outside {bar:?}"
+    );
+}

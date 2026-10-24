@@ -802,7 +802,8 @@ impl SettingsView {
                     this.set_cleanup_exclude_dirty(next, cx);
                 });
             },
-        );
+        )
+        .aria_label(text::CLEANUP_EXCLUDE_DIRTY.get());
         let safety_row = div()
             .flex()
             .items_center()
@@ -995,6 +996,9 @@ impl SettingsView {
             .debug_selector(|| "admin-cleanup-modal".into())
             .occlude()
             .role(gpui::Role::Dialog)
+            .aria_label(text::CLEANUP_MODAL_TITLE.get())
+            .max_h(window.viewport_size().height - crate::ui::SPACE_4 * 2.)
+            .overflow_hidden()
             .w(crate::ui::SETTINGS_MODAL_WIDTH)
             .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
             .p_6()
@@ -1030,38 +1034,51 @@ impl SettingsView {
             )
             .child(
                 div()
-                    .w_full()
-                    .min_w_0()
-                    .pb_3()
-                    .border_b_1()
-                    .border_color(p.border)
+                    .id("admin-cleanup-modal-body")
+                    .debug_selector(|| "admin-cleanup-modal-body".into())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap_2p5()
-                    .child(pr_row)
-                    .child(idle_row)
-                    .child(safety_row),
+                    .gap_4()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .pb_3()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .flex()
+                            .flex_col()
+                            .gap_2p5()
+                            .child(pr_row)
+                            .child(idle_row)
+                            .child(safety_row),
+                    )
+                    .child(list)
+                    .children(self.space.last_summary.as_ref().map(|sum| {
+                        div()
+                            .id("admin-cleanup-status")
+                            .debug_selector(|| "admin-cleanup-status".into())
+                            .p_2()
+                            .rounded(crate::ui::RADIUS_SM)
+                            .bg(p.card)
+                            .border_1()
+                            .border_color(p.border)
+                            .text_size(crate::ui::TEXT_XS)
+                            .child(text::CLEANUP_RESULT_SUMMARY.format(&[
+                                ("removed", &sum.removed_count.to_string()),
+                                ("size", &format_bytes(sum.freed_bytes)),
+                                ("deleted", &sum.branches_deleted.to_string()),
+                                ("preserved", &sum.branches_preserved.to_string()),
+                            ]))
+                    })),
             )
-            .child(list)
-            .children(self.space.last_summary.as_ref().map(|sum| {
-                div()
-                    .id("admin-cleanup-status")
-                    .debug_selector(|| "admin-cleanup-status".into())
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.border)
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(text::CLEANUP_RESULT_SUMMARY.format(&[
-                        ("removed", &sum.removed_count.to_string()),
-                        ("size", &format_bytes(sum.freed_bytes)),
-                        ("deleted", &sum.branches_deleted.to_string()),
-                        ("preserved", &sum.branches_preserved.to_string()),
-                    ]))
-            }))
             .child(
                 div()
+                    .flex_none()
+                    .flex_wrap()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1080,11 +1097,30 @@ impl SettingsView {
                             .items_center()
                             .gap_2()
                             .child(
-                                layout::ghost("admin-cleanup-cancel", text::CLEANUP_CLOSE.get())
-                                    .debug_selector(|| "admin-cleanup-cancel".into())
+                                div()
+                                    .id("admin-cleanup-cancel-focus")
+                                    .track_focus(&self.modal_dismiss_focus)
+                                    .tab_index(0)
+                                    .role(gpui::Role::Button)
+                                    .aria_label(text::CLEANUP_CLOSE.get())
+                                    .focus_visible(|style| style.bg(p.accent))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.close_cleanup_modal(cx);
-                                    })),
+                                    }))
+                                    .child(
+                                        layout::ghost(
+                                            "admin-cleanup-cancel",
+                                            text::CLEANUP_CLOSE.get(),
+                                        )
+                                        .debug_selector(|| "admin-cleanup-cancel".into())
+                                        .tab_stop(false)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.close_cleanup_modal(cx);
+                                            }),
+                                        ),
+                                    ),
                             )
                             .child(
                                 crate::ui::button_with_reserved_label(
@@ -1106,6 +1142,9 @@ impl SettingsView {
                     ),
             );
 
-        Some(crate::ui::modal_backdrop(window.viewport_size(), card))
+        Some(crate::ui::modal_backdrop(
+            window.viewport_size(),
+            crate::ui::modal_focus_scope(card, &self.modal_focus),
+        ))
     }
 }

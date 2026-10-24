@@ -171,6 +171,8 @@ struct Live {
     /// 연결을 끊을 때 쓰는 소켓 사본(IO 태스크가 읽는 소켓과 같다).
     sock: Option<UnixStream>,
     ime: Ime,
+    /// 출력이 멈춰도 확정 에코 대기 표시를 만료시킨다.
+    ime_expiry: Option<(Instant, Task<()>)>,
     echo: EchoDraw,
     /// 마지막으로 그린 자리와 칸 크기(IME 후보창).
     painted: Painted,
@@ -216,6 +218,7 @@ impl Live {
             suspended: false,
             sock: None,
             ime: Ime::default(),
+            ime_expiry: None,
             echo: EchoDraw::default(),
             painted: Rc::default(),
             row_cache: krill_app::terminal::RowPlanCache::default(),
@@ -696,8 +699,14 @@ pub struct Shell {
     pending_focus: PendingFocus,
     /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 인덱스, 클릭 위치)`.
     pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
+    tab_menu_focus: FocusHandle,
+    tab_menu_previous_focus: Option<FocusHandle>,
     /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
     pub(super) confirm_close_tab: Option<usize>,
+    recent_tab_scroll: gpui::ScrollHandle,
+    tab_dialog_focus: FocusHandle,
+    tab_dialog_was_open: bool,
+    tab_dialog_previous_focus: Option<FocusHandle>,
     /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
     pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
     /// OWE-870: 탭 이름 인라인 편집.
@@ -1181,7 +1190,13 @@ impl Shell {
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
+            tab_menu_focus: cx.focus_handle(),
+            tab_menu_previous_focus: None,
             confirm_close_tab: None,
+            recent_tab_scroll: gpui::ScrollHandle::new(),
+            tab_dialog_focus: cx.focus_handle(),
+            tab_dialog_was_open: false,
+            tab_dialog_previous_focus: None,
             pending_running_close: None,
             tab_rename: None,
             nav_history: NavHistory::default(),
@@ -4024,6 +4039,34 @@ impl Shell {
         self.send_inner(out, false, window, cx)
     }
 
+    fn sync_ime_expiry(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let Some(at) = l.ime.pending_at() else {
+            l.ime_expiry = None;
+            return;
+        };
+        if l.ime_expiry.as_ref().is_some_and(|(armed, _)| *armed == at) {
+            return;
+        }
+        let delay = krill_term::ime::PENDING_TTL.saturating_sub(at.elapsed());
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |s, cx| {
+                if let Some(l) = s.live.get_mut(&pane)
+                    && l.ime.pending_at() == Some(at)
+                {
+                    l.ime.clear_pending();
+                    l.ime_expiry = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        l.ime_expiry = Some((at, task));
+    }
+
     fn send_inner(
         &mut self,
         out: &Output,
@@ -4040,6 +4083,7 @@ impl Shell {
         let Some(pane) = self.layout.focused() else {
             return false;
         };
+        self.sync_ime_expiry(pane, cx);
         if out.pty.is_empty() {
             cx.notify();
             return false;
@@ -4186,6 +4230,9 @@ impl Shell {
         // `doCommandBySelector:`가 오지 않아 여기까지 오지 않는다. 여기 온 키는 IME가 처리하지
         // 않은 키라 조합을 먼저 확정하고 보낸다. `discardMarkedText`는 재진입이라 부르지 않는다.
         let mut out = l.ime.commit();
+        // 삭제·이동·전송 뒤 내용은 예측할 수 없다. 확정 글자를 계속 덧그리면
+        // PTY에서는 지운 글자가 화면에 남으므로 이후에는 실제 그리드를 따른다.
+        l.ime.clear_pending();
         out.pty = keys::tui::text(&out.pty, l.pane.modes());
         out.pty.extend(bytes);
         self.send_in_key(&out, Some(window), cx);
@@ -5235,6 +5282,8 @@ impl Shell {
                 .text_color(p.muted_foreground)
                 .text_size(krill_app::ui::TEXT_2XS)
                 .font_weight(gpui::FontWeight::MEDIUM)
+                .max_w(relative(0.4))
+                .truncate()
                 .child(host_name),
         )
     }
@@ -5334,6 +5383,9 @@ impl Shell {
             .debug_selector(move || format!("pane-header-{}", id.get()))
             .font_family(krill_app::ui::FONT_UI)
             .text_size(krill_app::ui::TEXT_XS)
+            .max_w(relative(1.))
+            .flex_wrap()
+            .justify_end()
             .when(!ended, |d| d.absolute().top(px(4.)).right(px(4.)))
             .when(ended, |d| d.self_end().mb_2())
             .flex_none()
@@ -5882,6 +5934,31 @@ impl Render for Shell {
             window,
             cx.theme().mode == gpui_component::ThemeMode::Dark,
         );
+        if self.tab_context_menu.is_some() && self.tab_menu_previous_focus.is_none() {
+            self.tab_menu_previous_focus = Some(
+                window
+                    .focused(cx)
+                    .unwrap_or_else(|| self.focus_handle().clone()),
+            );
+            self.tab_menu_focus.focus(window, cx);
+        } else if self.tab_context_menu.is_none()
+            && let Some(previous) = self.tab_menu_previous_focus.take()
+            && self.tab_menu_focus.contains_focused(window, cx)
+        {
+            previous.focus(window, cx);
+        }
+        let tab_dialog_open =
+            self.confirm_close_tab.is_some() || self.pending_running_close.is_some();
+        if tab_dialog_open && !self.tab_dialog_was_open {
+            self.tab_dialog_previous_focus = window.focused(cx);
+            self.tab_dialog_focus.focus(window, cx);
+        } else if !tab_dialog_open
+            && self.tab_dialog_was_open
+            && let Some(focus) = self.tab_dialog_previous_focus.take()
+        {
+            focus.focus(window, cx);
+        }
+        self.tab_dialog_was_open = tab_dialog_open;
         self.window = Some(window.window_handle());
         self.sync_notifications(window, cx);
         // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
@@ -6591,7 +6668,7 @@ impl Render for Shell {
             .children(
                 (self.role == WindowRole::Main && !self.has_notifications(cx))
                     .then(|| {
-                        Self::render_update_card(cx)
+                        Self::render_update_card(window, cx)
                             .map(IntoElement::into_any_element)
                             .or_else(|| krill_app::star_nag::card(cx))
                     })
@@ -6717,7 +6794,10 @@ impl Shell {
 
     // Design adapted from Orca (.ref/orca/src/renderer/src/components/UpdateCard.tsx,
     // UpdateDownloadCardContent.tsx), MIT License — Copyright (c) 2026 Orca Contributors.
-    fn render_update_card(cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+    fn render_update_card(
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         use gpui_component::button::{Button, ButtonVariants as _};
         use krill_app::i18n::catalog::updater_relaunch as utext;
         use krill_app::updater::UpdateState;
@@ -6753,6 +6833,9 @@ impl Shell {
                 .bottom(px(34.))
                 .right(px(12.))
                 .w(px(300.))
+                .max_w((window.viewport_size().width - krill_app::ui::SPACE_4 * 2.).max(px(0.)))
+                .max_h((window.viewport_size().height - px(50.)).max(px(0.)))
+                .overflow_y_scroll()
                 .p_3()
                 .rounded(krill_app::ui::RADIUS_MD)
                 .border_1()

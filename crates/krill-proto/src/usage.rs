@@ -28,6 +28,9 @@ pub use connections::{AccountConnection, ConnectionStatus, ConnectionsSnapshot};
 pub const FEAT_USAGE_AGY: u64 = 1 << 53;
 /// Account-specific auto-switch rule requests and reply extension.
 pub const FEAT_USAGE_RULES: u64 = 1 << 54;
+/// Provider-specific auto-switch metrics appended after the three legacy metric variants.
+/// Peers without this capability must neither receive these rules nor be sent their mutations.
+pub const FEAT_USAGE_PROVIDER_METRICS: u64 = 1 << 26;
 /// Per-account usage status tail (`AccountStatusInfo`, OWE-703 1단계).
 /// `AccountsSnapshot` 꼬리의 rules 뒤에 붙는다.
 pub const FEAT_USAGE_STATUS: u64 = 1 << 57;
@@ -478,6 +481,11 @@ pub enum AutoSwitchMetric {
 
 impl AutoSwitchMetric {
     #[must_use]
+    pub const fn requires_provider_metrics(self) -> bool {
+        !matches!(self, Self::Max | Self::FiveHour | Self::SevenDay)
+    }
+
+    #[must_use]
     pub const fn for_provider(provider: ProviderKind) -> &'static [Self] {
         match provider {
             ProviderKind::Claude => &[
@@ -873,6 +881,17 @@ impl UsageRequest {
 
     pub fn required_features(&self) -> u64 {
         let mut features = FEAT_USAGE;
+        let extended = match self {
+            Self::UpsertAutoSwitchRule(rule) => rule.metric.requires_provider_metrics(),
+            Self::SetAutoSwitch(policy) => policy
+                .rules
+                .iter()
+                .any(|rule| rule.metric.requires_provider_metrics()),
+            _ => false,
+        };
+        if extended {
+            features |= FEAT_USAGE_PROVIDER_METRICS;
+        }
         let provider = match self {
             Self::CancelAccountSwitch { .. } => {
                 features |= FEAT_ACCOUNT_CANCEL;
@@ -982,7 +1001,17 @@ impl UsageReply {
             // 소진 결과를 모르는 피어에는 스냅샷만 남긴다(요청 자체가 새 비트를 요구한다).
             self = Self::Accounts(snapshot);
         }
-        if let Self::Accounts(snapshot) = &mut self {
+        let snapshot = match &mut self {
+            Self::Accounts(snapshot) | Self::ResetConsumed { snapshot, .. } => Some(snapshot),
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            if features & FEAT_USAGE_PROVIDER_METRICS == 0 {
+                snapshot
+                    .auto_switch
+                    .rules
+                    .retain(|rule| !rule.metric.requires_provider_metrics());
+            }
             if features & FEAT_PROVIDER_DETAILS == 0 {
                 *snapshot.details = ProviderDetails::default();
             }

@@ -129,7 +129,7 @@ function mountChat(root,opts){
  box.append(input,bar);composer.append(attachment,box);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
  // 모델 전환은 에이전트 자체의 /model 명령으로 보낸다. Claude는 별칭으로 바로 바꾸고, Codex·Gemini는 터미널의 선택 화면에서 고른다.
  const modelChoices={claude:[['default','Default (recommended)'],['opus','Opus'],['sonnet','Sonnet'],['haiku','Haiku']]},modelPicker=new Set(['codex','gemini']);
- function chatAgent(){return entry.agent||M.sessionAgent?.(state.sessions?.get(sessionId)||{})||'';}
+ function chatAgent(){return M.sessionAgent?.({...state.sessions?.get(sessionId),...(entry.agent?{agent:entry.agent}:{})})||entry.agent||'';}
  function chooseModel(){
   const agent=chatAgent(),choices=modelChoices[agent];
   if(choices){ctx.sheet(t('Model'),choices.map(([id,label])=>({label:t(label),action:()=>run(()=>ctx.rpc({action:'prompt',session:sessionId,text:`/model ${id}`}))})),t('Sends /model to {0}.',agentName(agent)));return;}
@@ -249,7 +249,7 @@ function mountChat(root,opts){
  function lazyDetails(details,build){if(details.open)build();else details.addEventListener('toggle',()=>{if(details.open&&!details.dataset.loaded){details.dataset.loaded='true';build();}});if(details.open)details.dataset.loaded='true';}
  function renderCard(item,key){
   const kind=item.kind||'assistant',card=el('article',undefined,`chat-card chat-${kind}`);
-  if(kind==='user'||kind==='assistant'){const role=el('header',kind==='user'?t('My request'):t('{0} reply',agentName(entry.agent)||t('Agent')),'chat-role');if(kind==='assistant'&&entry.agent&&agentIcon)role.prepend(agentIcon(entry.agent));card.append(role,renderRichText(el,item.text),messageMeta(item));}
+  if(kind==='user'||kind==='assistant'){const role=el('header',kind==='user'?t('My request'):t('{0} reply',agentName(chatAgent())||t('Agent')),'chat-role');if(kind==='assistant'&&chatAgent()&&agentIcon)role.prepend(agentIcon(chatAgent()));card.append(role,renderRichText(el,item.text),messageMeta(item));}
   else if(kind==='reasoning'||kind==='tool_result'){
    const details=el('details',undefined,kind==='reasoning'?'chat-reasoning':'chat-tool-result');
    rememberDetails(details,key);details.append(el('summary',t(kind==='reasoning'?'Reasoning':item.is_error?'Tool error':'Tool output')));lazyDetails(details,()=>details.append(kind==='reasoning'?renderRichText(el,item.text):el('pre',item.text,'chat-code')));card.append(details);

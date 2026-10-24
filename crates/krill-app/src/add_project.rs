@@ -287,7 +287,7 @@ impl Dialog {
                     self.show_start(window, cx);
                 }
             }
-            "up" if self.step == Step::Start => {
+            "up" if self.step == Step::Start && self.focus.is_focused(window) => {
                 cx.stop_propagation();
                 self.selected = match self.selected {
                     0 => 2,
@@ -295,7 +295,7 @@ impl Dialog {
                 };
                 cx.notify();
             }
-            "down" if self.step == Step::Start => {
+            "down" if self.step == Step::Start && self.focus.is_focused(window) => {
                 cx.stop_propagation();
                 self.selected = match self.selected {
                     0 | 1 => self.selected + 1,
@@ -303,7 +303,7 @@ impl Dialog {
                 };
                 cx.notify();
             }
-            "enter" if self.step == Step::Start => {
+            "enter" if self.step == Step::Start && self.focus.is_focused(window) => {
                 cx.stop_propagation();
                 self.activate_selected(window, cx);
             }
@@ -333,6 +333,8 @@ impl Dialog {
                     .id(SharedString::from(format!("add-project-host-{key}")))
                     .debug_selector(move || format!("add-project-host-{debug_key}"))
                     .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .focus_visible(|d| d.border_1().border_color(p.ring))
                     .aria_label(chip_label.clone())
                     .px_3()
                     .py_1p5()
@@ -378,6 +380,8 @@ fn action(
         .id(id)
         .debug_selector(move || id.into())
         .role(gpui::Role::Button)
+        .tab_index(0)
+        .focus_visible(|d| d.border_1().border_color(p.ring))
         .aria_label(title)
         .flex()
         .items_center()
@@ -428,7 +432,14 @@ impl Render for Dialog {
             Step::RemotePath(RemoteMode::Create) => text::CREATE.get(),
         };
         let host_selector = self.host_selector(p, cx);
-        let body = div().flex().flex_col().gap_3();
+        let body = div()
+            .id("add-project-body")
+            .debug_selector(|| "add-project-body".into())
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_3();
         let body = match self.step {
             Step::Start => {
                 let selected = self.selected;
@@ -510,35 +521,8 @@ impl Render for Dialog {
                         )
                     })
                     .children(self.error.map(|e| ui::error_banner(p, e)))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("add-project-back")
-                                    .ghost()
-                                    .label(text::BACK.get())
-                                    .on_click(cx.listener(|d, _, window, cx| {
-                                        d.step = Step::Start;
-                                        d.error = None;
-                                        d.focus.focus(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("add-project-clone-submit")
-                                    .primary()
-                                    .label(if remote {
-                                        text::CLONE_SUBMIT_REMOTE.get()
-                                    } else {
-                                        text::CLONE_SUBMIT.get()
-                                    })
-                                    .on_click(cx.listener(|d, _, _, cx| d.submit_clone(cx))),
-                            ),
-                    )
             }
-            Step::RemotePath(mode) => body
+            Step::RemotePath(_) => body
                 .child(
                     div()
                         .flex()
@@ -547,40 +531,61 @@ impl Render for Dialog {
                         .child(ui::field_label(text::REMOTE_PATH.get(), None, p))
                         .child(Input::new(&self.remote_path)),
                 )
-                .children(self.error.map(|e| ui::error_banner(p, e)))
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("add-project-back")
-                                .ghost()
-                                .label(text::BACK.get())
-                                .on_click(cx.listener(|d, _, window, cx| {
-                                    d.step = Step::Start;
-                                    d.error = None;
-                                    d.focus.focus(window, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("add-project-remote-submit")
-                                .primary()
-                                .label(match mode {
-                                    RemoteMode::Browse => text::OPEN_SUBMIT.get(),
-                                    RemoteMode::Create => text::CREATE_SUBMIT.get(),
-                                })
-                                .on_click(cx.listener(|d, _, _, cx| d.submit_remote_path(cx))),
-                        ),
+                .children(self.error.map(|e| ui::error_banner(p, e))),
+        };
+        let back = || {
+            Button::new("add-project-back")
+                .ghost()
+                .label(text::BACK.get())
+                .on_click(cx.listener(|d, _, window, cx| d.show_start(window, cx)))
+        };
+        let footer = || {
+            div()
+                .id("add-project-actions")
+                .debug_selector(|| "add-project-actions".into())
+                .flex_none()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+        };
+        let actions = match self.step {
+            Step::Start => None,
+            Step::Clone => Some(
+                footer().child(back()).child(
+                    Button::new("add-project-clone-submit")
+                        .primary()
+                        .label(if self.host.is_remote() {
+                            text::CLONE_SUBMIT_REMOTE.get()
+                        } else {
+                            text::CLONE_SUBMIT.get()
+                        })
+                        .debug_selector(|| "add-project-clone-submit".into())
+                        .on_click(cx.listener(|d, _, _, cx| d.submit_clone(cx))),
                 ),
+            ),
+            Step::RemotePath(mode) => Some(
+                footer().child(back()).child(
+                    Button::new("add-project-remote-submit")
+                        .primary()
+                        .label(match mode {
+                            RemoteMode::Browse => text::OPEN_SUBMIT.get(),
+                            RemoteMode::Create => text::CREATE_SUBMIT.get(),
+                        })
+                        .on_click(cx.listener(|d, _, _, cx| d.submit_remote_path(cx))),
+                ),
+            ),
         };
         let card = div()
             .id("add-project-dialog")
+            .debug_selector(|| "add-project-dialog".into())
             .track_focus(&self.focus)
             .occlude()
             .w(ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .role(gpui::Role::Dialog)
+            .aria_label(title)
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
@@ -599,6 +604,7 @@ impl Render for Dialog {
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -617,8 +623,12 @@ impl Render for Dialog {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
                     ),
             )
-            .child(body);
-        ui::modal_backdrop(window.viewport_size(), card)
+            .child(body)
+            .children(actions);
+        ui::modal_backdrop(
+            window.viewport_size(),
+            ui::modal_focus_scope(card, &self.focus),
+        )
     }
 }
 

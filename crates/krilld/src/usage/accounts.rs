@@ -754,14 +754,14 @@ fn orca_row_matches_stored(row: &AccountUsage, stored: &StoredAccount) -> bool {
 }
 
 fn hide_removed_orca_markers(home: &Path, file: &mut AccountsFile, removed: &StoredAccount) {
+    if removed.provider != ProviderKind::Claude.as_str() {
+        return;
+    }
     if let Some(uuid) = orca_uuid_from_profile_dir(&removed.profile_dir) {
         push_unique_hidden(
             &mut file.hidden_accounts,
             format!("claude-orca-{}", slugify(uuid)),
         );
-    }
-    if removed.provider != ProviderKind::Claude.as_str() {
-        return;
     }
     let stored_mail = removed.email.as_deref().unwrap_or(&removed.label);
     let mail = primary_email(stored_mail);
@@ -789,6 +789,11 @@ fn hide_removed_orca_markers(home: &Path, file: &mut AccountsFile, removed: &Sto
 }
 
 fn unhide_stored_orca_markers(home: &Path, file: &mut AccountsFile, stored: &StoredAccount) {
+    if stored.provider != ProviderKind::Claude.as_str() {
+        file.hidden_accounts
+            .retain(|h| !h.eq_ignore_ascii_case(&stored.id));
+        return;
+    }
     let dir_orca_id = orca_uuid_from_profile_dir(&stored.profile_dir)
         .map(|uuid| format!("claude-orca-{}", slugify(uuid)));
     let stored_mail = stored.email.as_deref().unwrap_or(&stored.label);
@@ -2435,6 +2440,52 @@ mod removal_alias_tests {
             home.join(".Trash/krill-claude-work/partial-login")
                 .is_file()
         );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod orca_identity_regressions {
+    use super::*;
+
+    #[test]
+    fn removal_hides_cache_aliases_and_reregistration_restores_them() {
+        let home = std::env::temp_dir().join(format!("krill-orca-identity-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let uuid = "96f8c826-8b89-4470-a327-f4918efb8177";
+        let raw = format!(
+            r#"{{"accounts":[{{"id":"{uuid}","label":"Personal","email":"USER@example.com"}}]}}"#
+        );
+        std::fs::write(home.join(".claude").join(ORCA_CACHE), &raw).unwrap();
+        let mut stored = StoredAccount {
+            id: "claude-work".into(),
+            provider: "claude".into(),
+            label: "Work".into(),
+            email: Some("user@example.com (Team)".into()),
+            profile_dir: home
+                .join("claude-profiles")
+                .join(uuid)
+                .join("home")
+                .display()
+                .to_string(),
+        };
+        let mut file = AccountsFile::default();
+        hide_removed_orca_markers(&home, &mut file, &stored);
+        let rows = parse_orca(&raw);
+        assert!(orca_row_is_hidden(&file.hidden_accounts, 0, &rows[0]));
+        // Cache refresh may assign a new UUID; the email marker must still hide it.
+        let refreshed = parse_orca(&raw.replace(uuid, "432d5922-d39e-4df0-9255-6de3443b3df0"));
+        assert!(orca_row_is_hidden(&file.hidden_accounts, 0, &refreshed[0]));
+        let before = file.hidden_accounts.clone();
+        stored.provider = "codex".into();
+        unhide_stored_orca_markers(&home, &mut file, &stored);
+        hide_removed_orca_markers(&home, &mut file, &stored);
+        assert_eq!(file.hidden_accounts, before);
+        stored.provider = "claude".into();
+        unhide_stored_orca_markers(&home, &mut file, &stored);
+        assert!(!orca_row_is_hidden(&file.hidden_accounts, 0, &rows[0]));
+        assert!(!orca_row_is_hidden(&file.hidden_accounts, 0, &refreshed[0]));
+        assert!(orca_uuid_from_profile_dir("/custom/claude-profiles/not-a-uuid/home").is_none());
         std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -662,13 +662,20 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_size(ui::TEXT_XS).text_color(muted_fg).child(
-                        if item.title.is_empty() {
-                            SharedString::from(role_label)
-                        } else {
-                            SharedString::from(format!("{role_label} • {}", item.title))
-                        },
-                    ))
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(muted_fg)
+                            .child(if item.title.is_empty() {
+                                SharedString::from(role_label)
+                            } else {
+                                SharedString::from(format!("{role_label} • {}", item.title))
+                            }),
+                    )
                     .children((!item.file_path.is_empty()).then(|| {
                         let raw_path = std::path::PathBuf::from(&item.file_path);
                         let path = if raw_path.is_relative() {
@@ -681,7 +688,18 @@ impl Shell {
                             "chat-open-file-{}-{abs_idx}",
                             pane.get()
                         )))
-                        .label(item.file_path.clone())
+                        .label(
+                            std::path::Path::new(&item.file_path)
+                                .file_name()
+                                .map_or_else(
+                                    || item.file_path.clone(),
+                                    |name| name.to_string_lossy().into_owned(),
+                                ),
+                        )
+                        .max_w(gpui::relative(0.45))
+                        .overflow_hidden()
+                        .tooltip(item.file_path.clone())
+                        .accessibility_label(item.file_path.clone())
                         .ghost()
                         .xsmall()
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -994,7 +1012,9 @@ impl Shell {
                 div()
                     .text_size(ui::TEXT_XS)
                     .text_color(muted_fg)
-                    .overflow_hidden()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .child(strip_label),
             )
             .child(
@@ -1002,6 +1022,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_1p5()
+                    .flex_none()
                     .child(
                         Button::new(SharedString::from(format!(
                             "desktop-chat-refresh-{}",

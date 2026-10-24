@@ -276,7 +276,9 @@ impl Render for View {
                     .id(id)
                     .debug_selector(move || selector.clone())
                     .w_full()
+                    .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_3()
                     .px_3()
@@ -286,7 +288,8 @@ impl Render for View {
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(gpui::px(160.))
+                            .max_w(gpui::relative(1.))
                             .child(
                                 div()
                                     .text_size(ui::TEXT_SM)

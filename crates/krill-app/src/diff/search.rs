@@ -2186,10 +2186,11 @@ impl Panel {
             .pt_1p5()
             .pb_1()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .child(
-                div().flex_1().min_w_0().child(
+                div().flex_1().min_w(px(112.)).child(
                     Input::new(&query_input)
                         .xsmall()
                         .prefix(Icon::new(IconName::Search).xsmall())

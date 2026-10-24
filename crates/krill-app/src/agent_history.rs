@@ -751,31 +751,34 @@ impl Render for Panel {
                     })
             };
 
-            let scope_bar = div().py_1().child(crate::ui::segmented_control(
-                p,
-                [
-                    ("vault-scope-all", VaultScope::All, text::SCOPE_ALL.get()),
-                    (
-                        "vault-scope-project",
-                        VaultScope::Project,
-                        text::SCOPE_PROJECT.get(),
-                    ),
-                    (
-                        "vault-scope-workspace",
-                        VaultScope::Workspace,
-                        text::SCOPE_WORKSPACE.get(),
-                    ),
-                ]
-                .into_iter()
-                .map(|(id, scope, label)| {
-                    let active = self.scope == scope;
-                    crate::ui::segment(p, id, label, active)
-                        .debug_selector(move || id.into())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_scope(scope, cx);
-                        }))
-                }),
-            ));
+            let scope_bar = div().py_1().child(
+                crate::ui::segmented_control(
+                    p,
+                    [
+                        ("vault-scope-all", VaultScope::All, text::SCOPE_ALL.get()),
+                        (
+                            "vault-scope-project",
+                            VaultScope::Project,
+                            text::SCOPE_PROJECT.get(),
+                        ),
+                        (
+                            "vault-scope-workspace",
+                            VaultScope::Workspace,
+                            text::SCOPE_WORKSPACE.get(),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(id, scope, label)| {
+                        let active = self.scope == scope;
+                        crate::ui::segment(p, id, label, active)
+                            .debug_selector(move || id.into())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_scope(scope, cx);
+                            }))
+                    }),
+                )
+                .flex_wrap(),
+            );
 
             let agent_bar = div().flex().flex_wrap().gap_1().pb_1().children(
                 [

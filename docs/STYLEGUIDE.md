@@ -42,7 +42,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 
 ### 3.1 `Palette` 시맨틱 토큰 표 (`crate::ui::palette(cx)`)
 
-| 토큰 필드 | Light (`LIGHT`) | Dark (`DARK`) | 용도 (Use it for) | 금지 용도 (Don't use it for) |
+| 토큰 필드 | Light (`LIGHT`) | Dark (`DARK`, 기존 심해) | 용도 (Use it for) | 금지 용도 (Don't use it for) |
 |---|---|---|---|---|
 | `background` / `foreground` | `#ffffff` / `#0a0a0a` | `#0b0d13` / `#fafafa` | 앱 기본 캔버스, 기본 본문 텍스트, 활성 탭 배경 | 카드, 팝오버, 사이드바(전용 토큰 사용) |
 | `editor_surface` | `#ffffff` | `#1e1e1e` | 코드 에디터·마크다운 편집기 표면(다크 모드에서 캔버스보다 살짝 밝은 VS Code식 표면) | 일반 앱 크롬 |
@@ -108,19 +108,37 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 
 ### 3.4 터미널 팔레트와 테마 카탈로그 (`TERMINAL_DARK` / `TERMINAL_LIGHT` / `BUILTIN_TERMINAL_THEMES`)
 
-- 다크 모드 기본: `TERMINAL_DARK` = **`Krill Deep`** (`DEFAULT_TERMINAL_THEME_DARK`, 배경 `#10131b`, 전경 `#ffffff`, 커서 코랄 `#ff5238`, ANSI 16색은 Orca `Ghostty Default Style Dark` 그대로). 데몬이 앱 테마를 받기 전 색 질의(OSC 10/11/12/4)에 답하는 `krill_proto::theme::DEFAULT`와 같은 값이다 — 두 값이 어긋나면 에이전트가 실제와 다른 배경을 보고 색을 고른다. 배경이 어두워 OSC 11 응답은 계속 다크로 판정된다.
+- 다크 모드 기본: `TERMINAL_DARK` = **`Krill Trench`** (`DEFAULT_TERMINAL_THEME_DARK`, 배경 `#061620`, 전경 `#dfedf2`, 커서 `#d3e5ee`, 해구 전용 ANSI 16색). 데몬이 앱 테마를 받기 전 색 질의(OSC 10/11/12/4)에 답하는 `krill_proto::theme::DEFAULT`와 같은 값이다 — 두 값이 어긋나면 에이전트가 실제와 다른 배경을 보고 색을 고른다. 배경이 어두워 OSC 11 응답은 계속 다크로 판정된다.
+- 기존 심해는 `TERMINAL_DEEP` / `Krill Deep`으로 계속 선택할 수 있다(배경 `#10131b`, 전경 `#ffffff`, 코랄 커서 `#ff5238`). 저장된 테마 이름과 색은 유지한다.
 - `TERMINAL_GHOSTTY_DARK`: Orca `Ghostty Default Style Dark`(배경 `#282c34`, 전경·커서 `#ffffff`). 내장 카탈로그에 선택지로 남긴다.
 - 라이트 모드 기본: `TERMINAL_LIGHT` (`DEFAULT_TERMINAL_THEME_LIGHT` = Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
-- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 고유 `Krill Deep` + Orca 내장 30종 + 앱 테마 짝 `Krill Abyss`·`Krill Tidepool`·`Krill Glow`·`Krill Paper`)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
+- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 15종(해구 기본값·기존 5종·새 테마 나머지 9종) + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
 - 설정 화면의 테마 스와치·미리보기처럼 터미널 `Rgb` 색을 UI 요소에 입힐 때는 생 색상 대신 `ui::terminal_rgb_hsla(rgb)`를 쓴다.
 - 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
 
 ### 3.5 앱 테마 (`DarkUiTheme` / `LightUiTheme`)
 
 - 앱 색 조합은 다크·라이트 모드마다 하나씩 고른다(설정 > 일반 > 모양 · 인터페이스의 `다크 테마`·`라이트 테마`, 설정 키 `ui_theme_dark`·`ui_theme_light`). 모드 선택(다크·라이트·시스템)은 그대로 `theme`이 맡는다.
-- 다크: `심해`(`DARK`, 기본) · `심연`(`ABYSS`, OLED 순수 검정·무채색 크롬) · `조수`(`TIDEPOOL`, 대비를 낮춘 청회색) · `발광`(`GLOW`, 검은 남색 + 시안). 라이트: `기본`(`LIGHT`) · `종이`(`PAPER`, 따뜻한 미색).
+- 다크 기본은 **해구**(`TRENCH`)다. 다크 목록: 해구 · 흑연 · 해송 · 자수정 · 이탄 · 황혼 · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 기본(`LIGHT`, 기본값 유지) · 종이(`PAPER`) · 월광 · 석회 · 청자 · 빙하.
+- 선택지가 4개를 넘는 테마 목록은 `DropdownMenu` / `PopupMenuItem`으로 표시하며 현재 항목에 체크하고 트리거에는 드롭다운 화살표를 둔다. 모드(다크·라이트·시스템)는 기존 세그먼트 컨트롤을 유지한다.
+- 새 팔레트는 [`ui/app_themes.rs`](../crates/krill-app/src/ui/app_themes.rs)에 둔다. 공통 `Palette`의 의미·치수는 그대로다.
+
+| 테마 | 상수 | 앱 배경 | 사이드바 | 짝 터미널 |
+|---|---|---|---|---|
+| 흑연 | `GRAPHITE` | `#1b1b1c` | `#222224` | `Krill Graphite` |
+| 해구 | `TRENCH` | `#071923` | `#0c2230` | `Krill Trench` |
+| 해송 | `PINE` | `#111d18` | `#172820` | `Krill Pine` |
+| 자수정 | `AMETHYST` | `#201828` | `#291f33` | `Krill Amethyst` |
+| 이탄 | `PEAT` | `#231e19` | `#2c261f` | `Krill Peat` |
+| 월광 | `MOONLIGHT` | `#f6f6f8` | `#eeeef1` | `Krill Moonlight` |
+| 석회 | `LIMESTONE` | `#f3f2ec` | `#e9e8df` | `Krill Limestone` |
+| 청자 | `CELADON` | `#f0f6f1` | `#e4eee7` | `Krill Celadon` |
+| 빙하 | `GLACIER` | `#f0f5f9` | `#e3edf4` | `Krill Glacier` |
+| 황혼 | `DUSK` | `#211d27` | `#292330` | `Krill Dusk` |
+
 - 테마는 `Palette` 값만 바꾼다. 반경·간격·글자 크기 상수는 모든 테마가 같다. 새 테마도 `Palette` 상수 하나와 짝 터미널 테마 하나로 추가하고, `text_tokens_meet_wcag_aa_on_every_surface` 목록에 넣어 대비를 고정한다.
-- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`DARK`·`LIGHT`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
+- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`TRENCH`·`LIGHT`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
+- 앱 테마 키가 없으면 새 기본값을 쓰고, 명시적으로 저장된 기존 앱·터미널 선택은 유지한다. 터미널 테마 키가 없으면 선택된 앱 테마의 짝을 쓴다.
 - 앱 테마를 바꿀 때 그 모드의 터미널 테마가 이전 앱 테마의 짝이면 새 짝으로 함께 바꾸고, 사용자가 다른 터미널 테마를 골라 두었으면 그대로 둔다(`Settings::set_ui_theme_dark`·`set_ui_theme_light`).
 
 ---
@@ -178,7 +196,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`
   - 세션 기록은 우측 패널의 탭으로 열며 `PANEL_DEFAULT_WIDTH`와 사용자가 조절한 패널 폭을 따른다. 목록은 남은 높이 전체를 스크롤 영역으로 사용하고, 바깥 클릭으로 닫지 않는다.
-  - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`, 대시보드 `DASHBOARD_SIZE = 960×600`
+  - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`. 인앱 대시보드는 창 가장자리 16px 여백 안에서 `DASHBOARD_SIZE = 1800×1100`까지 확장한다. 레인은 `DASHBOARD_LANE_MIN_WIDTH = 240px` 이상을 유지하고, 좁은 창에서는 가로로 스크롤하며 각 레인의 카드는 세로로 스크롤한다.
 
 ### 5.4 입체감과 그림자 (Elevation & Shadows)
 
@@ -252,7 +270,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
    - **Antigravity**: `ANTIGRAVITY_BLUE` (`#4285F4`) + `ANTIGRAVITY_CORAL` (`#EA4335`, 2레이어 A-링)
    - **OpenCode**: `OPENCODE_COLOR` (`#06B6D4`, 시안 프레임) + `OPENCODE_CORE_COLOR` (`#67E8F9`, 코어 블록)
    - **Cursor**: `CURSOR_COLOR` (`#6366F1`, 인디고 큐브) + `CURSOR_HIGHLIGHT_COLOR` (`#A5B4FC`, 상단 면 하이라이트)
-   - **커스텀 / 미분류 에이전트**: `CUSTOM_AGENT_COLOR` (`#F59E0B`, 앰버 봇 폴백)
+   - **커스텀 / 미분류 에이전트**: `CUSTOM_AGENT_COLOR` (`#F59E0B`, 일반 요소는 앰버 문자, 메뉴는 중립 봇 `CUSTOM_AGENT_SVG` 폴백)
 2. **아이콘 크기 토큰 (`crate::ui::ICON_*`)**:
    - `ICON_XS` (`12px`): 고밀도 인라인 배지 — 사이드바 세션 행(`session_row`), 관리자 계정 행 프로바이더 배지, AI Vault / Jump 에이전트 필터 칩
    - `ICON_SM` (`13px`): 기본 행·탭 아이콘 — 상단 탭 바 탭, 워크트리 카드 하단 에이전트 알약 및 요약 칩(`summary_element`), 다른 계정으로 이어가기 모달, Jump 팔레트 세션/Vault 행, AI Vault 검색 결과 행, 온보딩 점검 행(`agent.*`, `hook.*`)
@@ -295,6 +313,8 @@ Krill은 Linear처럼 **어떤 동작이든 누르는 순간 끝난 것처럼 �
 - **프로세스 이름은 정확히**: PTY와 세션은 **krill-holder**가 소유하고, **krilld**는 세션 데몬(질의 응답·저장·상태)이다. "세션은 krilld에서 실행됩니다"처럼 쓰지 않는다. 사용자 문구에서는 프로세스 이름을 빼고 "세션은 계속 실행됩니다"로 쓰거나, 구조 설명이 필요할 때만 "세션은 krill-holder가 보관합니다"라고 쓴다.
 
 ### 7.2 인앱 페이지 전환 vs 모달 대화상자
+
+모달은 `ui::modal_focus_scope`로 Tab/Shift-Tab을 내부에 가두고, 열기·닫기 때 입력 포커스를 옮기고 복구한다. 이 공용 범위는 `gpui_component::Root`가 없는 메인 셸에서도 동작하며 원래 Dialog 역할·이름을 유지한다. `ui::modal_backdrop`은 뒤쪽 화면으로 마우스 클릭이 통과하지 않게 막는다. `ui::switch`는 Switch 역할·토글 상태·포커스 링과 Enter/Space 활성화를 제공하고, 호출부는 현지화된 `aria_label`을 지정한다.
 
 - **관리자·설정 페이지는 인앱 전환**: `⌘,` 또는 사이드바 설정 버튼을 누르면 새 창을 띄우지 않고 메인 창 안에서 페이지가 전환되어야 한다.
 - **모달은 짧은 결정·생성에만**: 새 워크트리 생성이나 파괴적 충돌 확인처럼 현재 맥락 위에서 즉시 입력/결정하고 닫는 흐름만 `ui::modal_backdrop` 중앙 모달을 쓴다.
@@ -350,4 +370,4 @@ UI 화면·스크린샷·PR을 검토할 때 아래 기준으로 판단한다.
 2. **문서-코드 토큰 동기화 검증 (`styleguide_doc_stays_in_sync_with_palette_and_tokens`)**: `Palette`의 모든 시맨틱 색 필드와 타이포그래피·반경·간격·프리미티브 식별자가 이 문서(`docs/STYLEGUIDE.md`)에 빠짐없이 문서화되어 있는지 검사한다.
 3. **Orca 패리티 토큰 회귀 검사 (`orca_parity_tokens`, `palettes_distinguish_light_and_dark_surfaces`)**: 라이트·다크 대비와 주요 치수 상수가 흔들리지 않도록 보장한다.
 4. **대비 회귀 검사 (`text_tokens_meet_wcag_aa_on_every_surface`)**: §3.1.1의 글자·표면 조합이 WCAG 4.5:1 미만으로 떨어지면 실패한다.
-5. **터미널 기본 테마 일치 (`krill_deep_terminal_matches_daemon_default`)**: 앱 `TERMINAL_DARK`와 데몬 `krill_proto::theme::DEFAULT`가 어긋나면 실패한다.
+5. **터미널 기본 테마 일치 (`krill_trench_terminal_matches_daemon_default`)**: 앱 `TERMINAL_DARK`와 데몬 `krill_proto::theme::DEFAULT`가 어긋나면 실패한다.

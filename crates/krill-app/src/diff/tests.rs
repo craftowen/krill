@@ -2755,3 +2755,48 @@ fn hiding_same_file_refresh_keeps_matching_patch(cx: &mut gpui::TestAppContext) 
     assert!(cx.debug_bounds("diff-viewer").is_some());
     assert!(cx.debug_bounds("diff-patch-loading").is_none());
 }
+
+#[gpui::test]
+fn panel_tab_arrows_move_focus_and_native_space_keeps_selection(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        Panel::unconnected(PathBuf::from("/tmp/krill-panel-tab-probe"), cx)
+    });
+    view.update(cx, |p, cx| {
+        p.explorer.loaded_root = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let focus = view.read(cx).tab_focus[0].clone();
+        focus.focus(window, cx);
+    });
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(view.read(cx).tab, PanelTab::Files);
+        assert!(view.read(cx).tab_focus[1].is_focused(window));
+    });
+    cx.simulate_keystrokes("space");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("space").unwrap(),
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(view.read(cx).tab, PanelTab::Files);
+        assert!(view.read(cx).tab_focus[1].is_focused(window));
+        view.update(cx, |p, cx| {
+            p.tab = PanelTab::Checks;
+            cx.notify();
+        });
+        let focus = view.read(cx).tab_focus[4].clone();
+        focus.focus(window, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(view.read(cx).tab, PanelTab::Changes);
+        assert!(view.read(cx).tab_focus[0].is_focused(window));
+    });
+}

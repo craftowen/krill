@@ -504,3 +504,19 @@ pub(crate) fn clone_file(src: &std::path::Path, dst: &std::path::Path) -> io::Re
         Err(io::Error::last_os_error())
     }
 }
+
+#[cfg(test)]
+mod vnode_path_tests {
+    use super::*;
+
+    #[test]
+    fn open_vnode_paths_finds_an_open_file_in_this_process() {
+        let path = std::env::temp_dir().join(format!("krill-open-vnode-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        assert!(open_vnode_paths(std::process::id()).contains(&canonical));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert!(open_vnode_paths(u32::MAX).is_empty());
+    }
+}

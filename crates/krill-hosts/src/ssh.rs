@@ -316,36 +316,39 @@ fn query_remote_home_with_program(
     ssh_bin: &std::ffi::OsStr,
 ) -> io::Result<String> {
     opts.validate()?;
-    #[cfg(windows)]
-    let out = windows::stdio::output(
-        ssh_bin,
-        &opts.remote_home_args(),
-        None,
-        Duration::from_secs(30),
-    )?;
-    #[cfg(unix)]
-    let out = crate::managed::run_piped_ssh_with_timeout(
-        ssh_bin,
-        &opts.remote_home_args(),
-        None,
-        Duration::from_secs(30),
-    )?;
+    let out = run_ssh_output(ssh_bin, &opts.remote_home_args(), Duration::from_secs(30))?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let detail = stderr.trim();
-        return Err(io::Error::other(if detail.is_empty() {
-            format!(
-                "ssh remote HOME query to {} failed ({})",
-                opts.destination, out.status
-            )
-        } else {
-            format!(
-                "ssh remote HOME query to {} failed: {detail}",
-                opts.destination
-            )
-        }));
+        return Err(home_query_failed(opts, &out));
     }
     String::from_utf8(out.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn home_query_failed(opts: &SshOptions, out: &std::process::Output) -> io::Error {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let detail = stderr.trim();
+    io::Error::other(if detail.is_empty() {
+        format!(
+            "ssh remote HOME query to {} failed ({})",
+            opts.destination, out.status
+        )
+    } else {
+        format!(
+            "ssh remote HOME query to {} failed: {detail}",
+            opts.destination
+        )
+    })
+}
+
+/// stdin 없이 `ssh`를 한 번 실행해 출력을 모은다(시간 상한 포함).
+pub(crate) fn run_ssh_output(
+    ssh_bin: &std::ffi::OsStr,
+    args: &[String],
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    #[cfg(windows)]
+    return windows::stdio::output(ssh_bin, args, None, timeout);
+    #[cfg(unix)]
+    crate::managed::run_piped_ssh_with_timeout(ssh_bin, args, None, timeout)
 }
 
 /// 원격 krilld 소켓 경로 결정:
@@ -361,6 +364,42 @@ pub fn resolve_remote_socket_with_program(
     opts: &SshOptions,
     ssh_bin: &std::ffi::OsStr,
 ) -> io::Result<PathBuf> {
+    if let Some(sock) = explicit_remote_socket(opts)? {
+        return Ok(sock);
+    }
+    let remote_home = query_remote_home_with_program(opts, ssh_bin)?;
+    remote_socket_for_home(&remote_home)
+}
+
+/// 원격 krilld에 닿는 방법을 정한다. 소켓 경로를 정할 수 있으면 [`RemoteEndpoint::Socket`]이다.
+/// 원격까지 닿았는데 POSIX 질의가 실패하면(Windows의 cmd.exe 등) `krill __bridge --probe`로 중계 가능 여부를 묻는다.
+pub fn resolve_remote_endpoint(opts: &SshOptions) -> io::Result<RemoteEndpoint> {
+    resolve_remote_endpoint_with_program(opts, &ssh_program())
+}
+
+/// [`resolve_remote_endpoint`]를 주어진 ssh 실행 파일로 수행한다.
+pub fn resolve_remote_endpoint_with_program(
+    opts: &SshOptions,
+    ssh_bin: &std::ffi::OsStr,
+) -> io::Result<RemoteEndpoint> {
+    if let Some(sock) = explicit_remote_socket(opts)? {
+        return Ok(RemoteEndpoint::Socket(sock));
+    }
+    opts.validate()?;
+    let out = run_ssh_output(ssh_bin, &opts.remote_home_args(), Duration::from_secs(30))?;
+    if out.status.success() {
+        let home = String::from_utf8(out.stdout)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        return remote_socket_for_home(&home).map(RemoteEndpoint::Socket);
+    }
+    if bridge::reached_remote(out.status) && bridge::probe(opts, ssh_bin)?.is_some() {
+        return Ok(RemoteEndpoint::Bridge);
+    }
+    Err(home_query_failed(opts, &out))
+}
+
+/// `KRILL_REMOTE_SOCK` 또는 `hosts.toml`의 `remote_socket`으로 명시한 원격 소켓.
+fn explicit_remote_socket(opts: &SshOptions) -> io::Result<Option<PathBuf>> {
     if let Some(sock) = std::env::var_os("KRILL_REMOTE_SOCK") {
         let Some(s) = sock.to_str().filter(|s| !s.is_empty()) else {
             return Err(io::Error::new(
@@ -374,7 +413,7 @@ pub fn resolve_remote_socket_with_program(
                 format!("invalid KRILL_REMOTE_SOCK: {s}"),
             ));
         }
-        return Ok(PathBuf::from(s));
+        return Ok(Some(PathBuf::from(s)));
     }
     if let Some(sock) = opts
         .remote_socket
@@ -388,10 +427,9 @@ pub fn resolve_remote_socket_with_program(
                 format!("invalid remote_socket: {sock}"),
             ));
         }
-        return Ok(PathBuf::from(sock));
+        return Ok(Some(PathBuf::from(sock)));
     }
-    let remote_home = query_remote_home_with_program(opts, ssh_bin)?;
-    remote_socket_for_home(&remote_home)
+    Ok(None)
 }
 
 /// [`machine_key`] 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
@@ -599,6 +637,8 @@ pub fn extract_host(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)
 pub struct Tunnel {
     child: Child,
     socket: PathBuf,
+    /// Windows 원격 중계([`RemoteEndpoint::Bridge`])일 때만 있다.
+    relay: Option<bridge::Relay>,
 }
 
 impl Tunnel {
@@ -610,9 +650,28 @@ impl Tunnel {
 
     pub fn start_with_options(opts: &SshOptions) -> io::Result<Self> {
         opts.validate()?;
-        let remote = resolve_remote_socket(opts)?;
+        let remote = resolve_remote_endpoint(opts)?;
         let local = local_socket(&opts.destination)?;
-        Self::start_at(opts, local, &remote)
+        Self::start_endpoint_with_program(opts, local, &remote, &ssh_program())
+    }
+
+    /// [`resolve_remote_endpoint`] 결과대로 소켓 포워딩 또는 원격 중계 터널을 연다.
+    pub fn start_endpoint_with_program(
+        opts: &SshOptions,
+        local: PathBuf,
+        remote: &RemoteEndpoint,
+        ssh_bin: &std::ffi::OsStr,
+    ) -> io::Result<Self> {
+        match remote {
+            RemoteEndpoint::Socket(path) => Self::start_at_with_program(opts, local, path, ssh_bin),
+            #[cfg(unix)]
+            RemoteEndpoint::Bridge => Self::start_bridge_with_program(opts, local, ssh_bin),
+            #[cfg(windows)]
+            RemoteEndpoint::Bridge => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "connecting to a Windows remote host from Windows is not supported yet",
+            )),
+        }
     }
 
     pub fn start_at(opts: &SshOptions, local: PathBuf, remote: &Path) -> io::Result<Self> {
@@ -630,14 +689,7 @@ impl Tunnel {
         ssh_bin: &std::ffi::OsStr,
     ) -> io::Result<Self> {
         opts.validate()?;
-        if let Some(dir) = local.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
-            sweep_stale_forwards(dir, STALE_FORWARD_AGE);
-        }
-        std::fs::remove_file(&local).ok();
+        prepare_local(&local)?;
         let host = &opts.destination;
         // stdin 파이프의 쓰기 쪽은 `child`가 쥔다. 이 프로세스가 죽으면 닫혀 원격 `cat`과 ssh가 끝난다.
         let mut child = Command::new(ssh_bin)
@@ -658,6 +710,7 @@ impl Tunnel {
                 return Ok(Self {
                     child,
                     socket: local,
+                    relay: None,
                 });
             }
             if let Some(status) = child.try_wait()? {
@@ -679,6 +732,29 @@ impl Tunnel {
         }
     }
 
+    /// 원격 중계 터널: 로컬 소켓 연결마다 원격 `krill __bridge`를 실행한다([`RemoteEndpoint::Bridge`]).
+    pub fn start_bridge_with_program(
+        opts: &SshOptions,
+        local: PathBuf,
+        ssh_bin: &std::ffi::OsStr,
+    ) -> io::Result<Self> {
+        opts.validate()?;
+        prepare_local(&local)?;
+        let listener = UnixListener::bind(&local)?;
+        let control = bridge::control_path(&local);
+        match bridge::Relay::start(opts, listener, control, ssh_bin) {
+            Ok((child, relay)) => Ok(Self {
+                child,
+                socket: local,
+                relay: Some(relay),
+            }),
+            Err(e) => {
+                std::fs::remove_file(&local).ok();
+                Err(e)
+            }
+        }
+    }
+
     pub fn socket(&self) -> &Path {
         &self.socket
     }
@@ -687,15 +763,32 @@ impl Tunnel {
         self.child.id()
     }
 
-    /// 자식 포워더 프로세스가 아직 살아 있는지 확인한다.
+    /// 자식 포워더 프로세스(중계면 accept 스레드도)가 아직 살아 있는지 확인한다.
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+            && self.relay.as_ref().is_none_or(bridge::Relay::is_alive)
     }
+}
+
+/// 로컬 포워딩 소켓 자리를 비운다(디렉터리 0700 생성, 죽은 터널 소켓 정리).
+#[cfg(unix)]
+fn prepare_local(local: &Path) -> io::Result<()> {
+    if let Some(dir) = local.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        sweep_stale_forwards(dir, STALE_FORWARD_AGE);
+    }
+    std::fs::remove_file(local).ok();
+    Ok(())
 }
 
 #[cfg(unix)]
 impl Drop for Tunnel {
     fn drop(&mut self) {
+        // 연결별 중계 ssh를 먼저 끝내고 ControlMaster(keepalive)를 끝낸다.
+        self.relay.take();
         self.child.kill().ok();
         self.child.wait().ok();
         std::fs::remove_file(&self.socket).ok();
@@ -849,6 +942,9 @@ fn proxy(down: UnixStream, up: UnixStream) {
     to.shutdown(std::net::Shutdown::Write).ok();
     one.join().ok();
 }
+
+pub(crate) mod bridge;
+pub use bridge::{Probe, RemoteEndpoint, bridge_main};
 
 #[cfg(windows)]
 mod windows;

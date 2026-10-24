@@ -259,3 +259,26 @@ fn hidden_resource_panel_pauses_measurement_and_catches_up_on_return(cx: &mut Te
     cx.run_until_parked();
     assert_eq!(log.lock().unwrap().len(), 2);
 }
+
+#[gpui::test]
+fn ui_audit_resources_many_sessions_stay_in_viewport(cx: &mut TestAppContext) {
+    let (call, _) = fake();
+    let (panel, vcx) = open(cx, call);
+    vcx.simulate_resize(gpui::size(gpui::px(640.), gpui::px(420.)));
+    panel.update(vcx, |p, cx| {
+        let mut data = sample();
+        data.sessions = (1..=100)
+            .map(|id| SessionUsage {
+                session: SessionId(id),
+                footprint: 1024,
+                processes: 1,
+            })
+            .collect();
+        p.data = Some(data);
+        p.open = true;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let popover = vcx.debug_bounds("resources-popover").expect("popover");
+    assert!(popover.size.height <= gpui::px(420.) - crate::ui::SPACE_4 * 3.);
+}

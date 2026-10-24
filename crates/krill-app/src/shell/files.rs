@@ -977,6 +977,7 @@ impl Shell {
         let dirty = tab.is_some_and(FileTab::is_dirty);
         let header = div()
             .min_h(krill_app::ui::PANE_HEADER_HEIGHT)
+            .flex_wrap()
             .px_2()
             .flex_none()
             .flex()
@@ -1018,6 +1019,7 @@ impl Shell {
                         .ghost()
                         .xsmall()
                         .tooltip(text::CLOSE_PANE.get())
+                        .accessibility_label(text::CLOSE_PANE.get())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.change(true, cx, |l| {
@@ -1183,6 +1185,9 @@ impl Shell {
             .ghost()
             .xsmall()
             .disabled(busy)
+            .max_w(gpui::relative(1.))
+            .overflow_hidden()
+            .accessibility_label(atext::SHARE_TOOLTIP.get())
             .tooltip(atext::SHARE_TOOLTIP.get())
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
@@ -1282,7 +1287,9 @@ impl Shell {
                     segment_button("file-edit", edit_label, false),
                 ],
             )
-            .debug_selector(|| "file-preview-toggle".into()),
+            .debug_selector(|| "file-preview-toggle".into())
+            .max_w(gpui::relative(1.))
+            .flex_wrap(),
         )
     }
 

@@ -1814,6 +1814,7 @@ fn daemon_usage_request(
     hello.features = FEAT_USAGE
         | FEAT_USAGE_AGY
         | FEAT_USAGE_RULES
+        | krill_proto::usage::FEAT_USAGE_PROVIDER_METRICS
         | FEAT_USAGE_STATUS
         | FEAT_USAGE_RATELIMIT
         | FEAT_USAGE_MANAGE

@@ -1,8 +1,10 @@
 use super::*;
 
-/// [`DEFAULT`]의 디스크 바이트. 바뀌면 호환 위반이거나 기본 테마가 바뀐 것이다(그때는 MK-008 근거를 다시 본다).
-/// 2026-10-19: 기본 테마를 `Krill Deep`으로 바꿨다(배경 `#10131B`, 커서 `#FF5238`). 배치는 그대로라 호환은 유지된다.
-const DEFAULT_V1: &str = "ffffff10131bff52381d1f21cc6666b5bd68f0c67481a2beb294bb8abeb7c5c8c6666666d54e53b9ca4ae7c5477aa6dac397d870c0b1eaeaea";
+/// 이전 심해 기본값의 고정 바이트. 해구로 기본값을 바꿔도 기존 저장 파일을 읽을 수 있어야 한다.
+const DEEP_V1: &str = "ffffff10131bff52381d1f21cc6666b5bd68f0c67481a2beb294bb8abeb7c5c8c6666666d54e53b9ca4ae7c5477aa6dac397d870c0b1eaeaea";
+
+/// 2026-10-24: 기본값을 해구로 변경. 필드 배치와 57바이트 길이는 그대로다.
+const DEFAULT_V1: &str = "dfedf2061620d3e5ee6f8b9ce57a8b8fc7acd4c77d82b6e1b49fd783c3cec8dce694aebcf79aa8a9e1c3eddfa0a4d0f3cdb9eda3dce4edf6fa";
 
 fn hex(b: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -18,6 +20,22 @@ fn default_fixture_roundtrip() {
     assert_eq!(bytes.len(), 57);
     assert_eq!(hex(&bytes), DEFAULT_V1);
     assert_eq!(Theme::decode(&bytes).unwrap(), DEFAULT);
+}
+
+#[test]
+fn previous_deep_fixture_still_roundtrips() {
+    let bytes: Vec<u8> = DEEP_V1
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let theme = Theme::decode(&bytes).unwrap();
+    assert_eq!(theme.foreground, rgb(0xff, 0xff, 0xff));
+    assert_eq!(theme.background, rgb(0x10, 0x13, 0x1b));
+    assert_eq!(theme.cursor, rgb(0xff, 0x52, 0x38));
+    assert_eq!(theme.encode().unwrap(), bytes);
 }
 
 /// 기본 배경은 어두워야 한다(OSC 11 응답으로 에이전트가 다크 판정, krilld `is_dark`와 같은 BT.601 가중치).

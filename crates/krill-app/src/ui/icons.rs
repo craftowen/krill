@@ -29,6 +29,9 @@ pub const OPENCODE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns
 /// `OpenCode` 내부 코어 블록 레이어 SVG (`viewBox="0 0 512 512"`).
 pub const OPENCODE_CORE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M320 224V352H192V224H320Z" fill="currentColor"/></svg>"#;
 
+/// 커스텀 에이전트 메뉴용 중립 봇 마크. 특정 프로바이더 로고로 오인하지 않게 한다.
+pub const CUSTOM_AGENT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5M23 12v5M9 17h6"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>"#;
+
 /// Pi 공식 π 마크. Orca `src/renderer/src/lib/agent-icon-glyphs.tsx`의 `PiIcon`
 /// (Copyright (c) 2026 Lovecast Inc., MIT License, 원본 `pi.dev/favicon.svg`).
 /// 공식 단색 마크이므로 호출자의 테마 전경색으로 그린다.
@@ -189,7 +192,8 @@ pub fn agent_svg_bytes(agent_id: &str) -> &'static [u8] {
         "agy" => ANTIGRAVITY_SVG,
         "pi" => PI_SVG,
         "cursor" | "cursor-agent" => CURSOR_SVG,
-        _ => OPENCODE_SVG,
+        "opencode" => OPENCODE_SVG,
+        _ => CUSTOM_AGENT_SVG,
     }
 }
 
@@ -544,6 +548,15 @@ mod tests {
         let svg = std::str::from_utf8(PI_SVG).expect("Pi SVG");
         assert!(svg.contains("fill-rule=\"evenodd\""));
         assert!(svg.contains("M517.36 400 H634.72 V634.72 H517.36 Z"));
+    }
+
+    #[test]
+    fn custom_menu_icon_does_not_impersonate_opencode() {
+        assert_eq!(agent_svg_bytes("opencode"), OPENCODE_SVG);
+        for id in ["custom-agent", "gemini", ""] {
+            assert_eq!(agent_svg_bytes(id), CUSTOM_AGENT_SVG);
+            assert_ne!(agent_svg_bytes(id), OPENCODE_SVG);
+        }
     }
 
     #[test]

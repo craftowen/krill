@@ -178,6 +178,13 @@ impl Panel {
             return;
         }
         self.tab = tab;
+        self.tab_scroll.scroll_to_item(match tab {
+            PanelTab::Changes => 0,
+            PanelTab::Files => 1,
+            PanelTab::Search => 2,
+            PanelTab::History => 3,
+            PanelTab::Checks => 4,
+        });
         self.sync_history(cx);
         if tab == PanelTab::Files {
             self.ensure_explorer_loaded_async(cx);

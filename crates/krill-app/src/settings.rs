@@ -13,12 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, Global, KeyBinding, KeyDownEvent, Keystroke, Render,
-    SharedString, Subscription, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
-    size,
+    App, AppContext as _, Bounds, Context, Global, KeyBinding, Keystroke, Render, SharedString,
+    Subscription, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, ThemeMode};
+use gpui_component::{Disableable as _, Sizable as _, ThemeMode};
 use serde::{Deserialize, Serialize};
 
 use crate::ui::{DarkUiTheme, LightUiTheme};
@@ -177,7 +176,7 @@ pub struct Settings {
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub workspace_trust_preset_enabled: bool,
-    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Deep"`, OWE-956).
+    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Trench"`, OWE-956).
     #[serde(default = "default_terminal_theme_dark")]
     pub terminal_theme_dark: String,
     /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Builtin Tango Light"`, OWE-956).
@@ -267,7 +266,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::System,
-            ui_theme_dark: crate::ui::DarkUiTheme::Deep,
+            ui_theme_dark: crate::ui::DarkUiTheme::default(),
             ui_theme_light: crate::ui::LightUiTheme::Classic,
             language: locale::system_language(),
             zoom: 1.0,
@@ -361,6 +360,18 @@ impl Settings {
             parsed.terminal_theme_light = default_terminal_theme_light();
         }
         let table: toml::Table = toml::from_str(s)?;
+        if !table.contains_key("terminal_theme_dark") {
+            parsed
+                .ui_theme_dark
+                .terminal_theme_name()
+                .clone_into(&mut parsed.terminal_theme_dark);
+        }
+        if !table.contains_key("terminal_theme_light") {
+            parsed
+                .ui_theme_light
+                .terminal_theme_name()
+                .clone_into(&mut parsed.terminal_theme_light);
+        }
         if !table.contains_key("language") {
             parsed.language = default_language;
         }
@@ -829,10 +840,21 @@ fn remote_line_text(state: Option<&RemoteCardState>) -> (String, bool) {
         ),
         RemoteProbeState::Ready(info) => {
             let os = info.platform.describe();
+            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
+            // Windows 원격은 원격 krill 중계로 붙는다. Mac 바이너리를 보낼 수 없어 설치·업데이트는 그 PC에서 한다.
+            if info.platform.os == krill_hosts::managed::RemoteOs::Windows {
+                let version = match &info.version {
+                    RemoteVersion::Known(v) => format!("krill {}", short(v)),
+                    _ => text::SSH_REMOTE_UNKNOWN_VERSION.get().to_owned(),
+                };
+                return (
+                    text::SSH_REMOTE_WINDOWS.format(&[("os", &os), ("version", &version)]),
+                    false,
+                );
+            }
             if !info.platform.is_supported() {
                 return (text::SSH_REMOTE_UNSUPPORTED.format(&[("os", &os)]), false);
             }
-            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
             match &info.version {
                 RemoteVersion::Missing => (
                     format!("{os} · {}", text::SSH_REMOTE_NOT_INSTALLED.get()),
@@ -1941,6 +1963,17 @@ pub enum AdminTab {
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
 gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor, Package]);
 
+fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> {
+    let selector = tab.selector();
+    div()
+        .id(selector)
+        .debug_selector(move || selector.into())
+        .role(gpui::Role::Tab)
+        .aria_label(tab.label())
+        .aria_selected(selected)
+        .tab_index(0)
+}
+
 impl AdminTab {
     pub const ALL: [Self; 11] = [
         Self::General,
@@ -2316,6 +2349,42 @@ pub fn setup_all_agents_and_skills_at(home: &Path, state: &Path) -> Vec<String> 
 }
 
 /// 에이전트 기본 설치 명령(`BUILTIN` 프로필의 `install`).
+/// Only a confirmed active connection receives a success badge.
+fn provider_connection_badge(
+    connection: Option<krill_proto::usage::ConnectionStatus>,
+) -> (crate::ui::BadgeTone, &'static str) {
+    use krill_proto::usage::ConnectionStatus;
+    match connection {
+        Some(ConnectionStatus::NeedsLogin) => (
+            crate::ui::BadgeTone::Warning,
+            text::ACCOUNT_LOGIN_REQUIRED.get(),
+        ),
+        Some(ConnectionStatus::CheckFailed) => (
+            crate::ui::BadgeTone::Warning,
+            text::CONNECTION_CHECK_FAILED.get(),
+        ),
+        Some(ConnectionStatus::Checking) => {
+            (crate::ui::BadgeTone::Muted, text::CONNECTION_CHECKING.get())
+        }
+        Some(ConnectionStatus::NotInstalled) => (
+            crate::ui::BadgeTone::Muted,
+            text::CONNECTION_NOT_INSTALLED.get(),
+        ),
+        None => (crate::ui::BadgeTone::Muted, text::CONNECTION_CHECKING.get()),
+        Some(ConnectionStatus::Connected) => (
+            crate::ui::BadgeTone::Success,
+            text::CONNECTION_CONNECTED.get(),
+        ),
+    }
+}
+
+/// Collapsed summaries expose variable names; values remain in the explicit editor.
+fn agent_environment_summary(profile: Option<&krill_proto::agent::Profile>) -> String {
+    profile
+        .map(|profile| profile.env.keys().cloned().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
 #[must_use]
 pub fn agent_install_command(agent_id: &str) -> Option<String> {
     let id = krill_proto::agent::canonical_id(agent_id);
@@ -2667,6 +2736,10 @@ pub struct SettingsView {
     services_checked: Option<std::time::Instant>,
     services_poll: Option<gpui::Task<()>>,
     focus: gpui::FocusHandle,
+    modal_focus: gpui::FocusHandle,
+    modal_dismiss_focus: gpui::FocusHandle,
+    modal_return_focus: Option<gpui::FocusHandle>,
+    rename_return_focus: Option<gpui::FocusHandle>,
 }
 
 #[derive(Clone, Default)]
@@ -3045,6 +3118,10 @@ impl SettingsView {
             services_checked: None,
             services_poll: None,
             focus: cx.focus_handle(),
+            modal_focus: cx.focus_handle(),
+            modal_dismiss_focus: cx.focus_handle().tab_stop(true),
+            modal_return_focus: None,
+            rename_return_focus: None,
         };
         view.services_poll = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -4243,6 +4320,7 @@ impl SettingsView {
         let input = cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::OPENCODE_APIKEY_PLACEHOLDER.get())
+                .masked(true)
         });
         self.opencode_api_key_input = Some(input.clone());
         input
@@ -5246,6 +5324,7 @@ impl SettingsView {
     }
 
     fn render_general_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let p = crate::ui::palette(cx);
         let theme_button = |id: &'static str, label: &'static str, choice: ThemeChoice| {
             layout::segment(p, id, label, s.theme == choice)
@@ -5254,20 +5333,38 @@ impl SettingsView {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
-        let dark_theme_button = |id: &'static str, label: &'static str, theme: DarkUiTheme| {
-            layout::segment(p, id, label, s.ui_theme_dark == theme)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.set_ui_theme_dark(theme));
-                })
-        };
-        let light_theme_button = |id: &'static str, label: &'static str, theme: LightUiTheme| {
-            layout::segment(p, id, label, s.ui_theme_light == theme)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.set_ui_theme_light(theme));
-                })
-        };
+        let selected_dark = s.ui_theme_dark;
+        let dark_themes = layout::secondary("ui-theme-dark", selected_dark.label())
+            .dropdown_caret(true)
+            .debug_selector(|| "ui-theme-dark".into())
+            .dropdown_menu(move |mut menu, _, _| {
+                for theme in DarkUiTheme::ALL {
+                    menu = menu.item(
+                        PopupMenuItem::new(theme.label())
+                            .checked(selected_dark == theme)
+                            .on_click(move |_, _, cx| {
+                                edit(cx, move |s| s.set_ui_theme_dark(theme));
+                            }),
+                    );
+                }
+                menu
+            });
+        let selected_light = s.ui_theme_light;
+        let light_themes = layout::secondary("ui-theme-light", selected_light.label())
+            .dropdown_caret(true)
+            .debug_selector(|| "ui-theme-light".into())
+            .dropdown_menu(move |mut menu, _, _| {
+                for theme in LightUiTheme::ALL {
+                    menu = menu.item(
+                        PopupMenuItem::new(theme.label())
+                            .checked(selected_light == theme)
+                            .on_click(move |_, _, cx| {
+                                edit(cx, move |s| s.set_ui_theme_light(theme));
+                            }),
+                    );
+                }
+                menu
+            });
         let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
             layout::segment(p, id, label, s.keep_awake == mode)
                 .debug_selector(move || id.into())
@@ -5341,58 +5438,12 @@ impl SettingsView {
             .child(
                 row()
                     .child(label(text::DARK_THEME.get(), text::DARK_THEME_DESC.get()))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                (
-                                    "ui-theme-deep",
-                                    text::UI_THEME_DEEP.get(),
-                                    DarkUiTheme::Deep,
-                                ),
-                                (
-                                    "ui-theme-abyss",
-                                    text::UI_THEME_ABYSS.get(),
-                                    DarkUiTheme::Abyss,
-                                ),
-                                (
-                                    "ui-theme-tidepool",
-                                    text::UI_THEME_TIDEPOOL.get(),
-                                    DarkUiTheme::Tidepool,
-                                ),
-                                (
-                                    "ui-theme-glow",
-                                    text::UI_THEME_GLOW.get(),
-                                    DarkUiTheme::Glow,
-                                ),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, theme)| dark_theme_button(id, l, theme)),
-                        )),
-                    ),
+                    .child(layout::controls().child(dark_themes)),
             )
             .child(
                 row()
                     .child(label(text::LIGHT_THEME.get(), text::LIGHT_THEME_DESC.get()))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                (
-                                    "ui-theme-classic",
-                                    text::UI_THEME_CLASSIC.get(),
-                                    LightUiTheme::Classic,
-                                ),
-                                (
-                                    "ui-theme-paper",
-                                    text::UI_THEME_PAPER.get(),
-                                    LightUiTheme::Paper,
-                                ),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, theme)| light_theme_button(id, l, theme)),
-                        )),
-                    ),
+                    .child(layout::controls().child(light_themes)),
             )
             .child(
                 row()
@@ -5452,13 +5503,18 @@ impl SettingsView {
                             .mac_or(crate::i18n::catalog::other_os::NOTIFICATIONS_DESC)
                             .get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "notif-toggle",
-                        s.notifications,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.notifications = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "notif-toggle",
+                                s.notifications,
+                                false,
+                                |next, _, cx| edit(cx, move |s| s.notifications = next),
+                            )
+                            .aria_label(text::NOTIFICATIONS.get()),
+                        ),
+                    ),
             )
             .child(
                 sub_notif_row("notify-input-row")
@@ -5466,46 +5522,66 @@ impl SettingsView {
                         text::NOTIFY_INPUT.get(),
                         text::NOTIFY_INPUT_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "notify-input-toggle",
-                        s.notify_on_input,
-                        notif_disabled,
-                        |next, _, cx| edit(cx, move |s| s.notify_on_input = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "notify-input-toggle",
+                                s.notify_on_input,
+                                notif_disabled,
+                                |next, _, cx| edit(cx, move |s| s.notify_on_input = next),
+                            )
+                            .aria_label(text::NOTIFY_INPUT.get()),
+                        ),
+                    ),
             )
             .child(
                 sub_notif_row("notify-done-row")
                     .child(label(text::NOTIFY_DONE.get(), text::NOTIFY_DONE_DESC.get()))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "notify-done-toggle",
-                        s.notify_on_done,
-                        notif_disabled,
-                        |next, _, cx| edit(cx, move |s| s.notify_on_done = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "notify-done-toggle",
+                                s.notify_on_done,
+                                notif_disabled,
+                                |next, _, cx| edit(cx, move |s| s.notify_on_done = next),
+                            )
+                            .aria_label(text::NOTIFY_DONE.get()),
+                        ),
+                    ),
             )
             .child(
                 sub_notif_row("notify-bell-row")
                     .child(label(text::NOTIFY_BELL.get(), text::NOTIFY_BELL_DESC.get()))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "notify-bell-toggle",
-                        s.notify_on_bell,
-                        notif_disabled,
-                        |next, _, cx| edit(cx, move |s| s.notify_on_bell = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "notify-bell-toggle",
+                                s.notify_on_bell,
+                                notif_disabled,
+                                |next, _, cx| edit(cx, move |s| s.notify_on_bell = next),
+                            )
+                            .aria_label(text::NOTIFY_BELL.get()),
+                        ),
+                    ),
             )
             .child(
                 sub_notif_row("notify-sound-row")
                     .child(label(text::ALERT_SOUND.get(), text::ALERT_SOUND_DESC.get()))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "sound-toggle",
-                        s.notification_sound,
-                        notif_disabled,
-                        |next, _, cx| edit(cx, move |s| s.notification_sound = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "sound-toggle",
+                                s.notification_sound,
+                                notif_disabled,
+                                |next, _, cx| edit(cx, move |s| s.notification_sound = next),
+                            )
+                            .aria_label(text::ALERT_SOUND.get()),
+                        ),
+                    ),
             )
             .child(
                 sub_notif_row("notify-inactive-row")
@@ -5513,13 +5589,18 @@ impl SettingsView {
                         text::INACTIVE_ONLY.get(),
                         text::INACTIVE_ONLY_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "notify-inactive-toggle",
-                        s.notify_only_inactive,
-                        notif_disabled,
-                        |next, _, cx| edit(cx, move |s| s.notify_only_inactive = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "notify-inactive-toggle",
+                                s.notify_only_inactive,
+                                notif_disabled,
+                                |next, _, cx| edit(cx, move |s| s.notify_only_inactive = next),
+                            )
+                            .aria_label(text::INACTIVE_ONLY.get()),
+                        ),
+                    ),
             )
             .child(
                 sub_notif_row("notify-test-row")
@@ -5688,13 +5769,13 @@ impl SettingsView {
         .on_click(|_, _, cx| {
             trigger_manual_update_check(cx);
         });
-        let mut controls = layout::controls().child(
-            div()
-                .text_size(crate::ui::TEXT_SM)
-                .text_color(p.muted_foreground)
-                .debug_selector(|| "settings-update-status".into())
-                .child(status_label),
-        );
+        let status = div()
+            .min_w_0()
+            .text_size(crate::ui::TEXT_SM)
+            .text_color(p.muted_foreground)
+            .debug_selector(|| "settings-update-status".into())
+            .child(status_label);
+        let mut controls = layout::controls().flex_wrap().flex_shrink_1();
         if let Some(staged) = staged_for_btn {
             let restart_label = if update_state.restart.error().is_some() {
                 crate::i18n::catalog::updater_relaunch::CARD_RETRY_BTN
@@ -5723,20 +5804,28 @@ impl SettingsView {
 
         [
             row()
+                .flex_col()
+                .items_start()
                 .child(label(text::UPDATES_TITLE.get(), text::UPDATES_DESC.get()))
+                .child(status)
                 .child(controls),
             row()
                 .child(label(
                     text::UPDATES_AUTO_RESTART.get(),
                     text::UPDATES_AUTO_RESTART_DESC.get(),
                 ))
-                .child(layout::controls().child(layout::switch(
-                    p,
-                    "update-auto-restart-toggle",
-                    s.auto_restart_update,
-                    false,
-                    |next, _, cx| edit(cx, move |s| s.auto_restart_update = next),
-                ))),
+                .child(
+                    layout::controls().child(
+                        layout::switch(
+                            p,
+                            "update-auto-restart-toggle",
+                            s.auto_restart_update,
+                            false,
+                            |next, _, cx| edit(cx, move |s| s.auto_restart_update = next),
+                        )
+                        .aria_label(text::UPDATES_AUTO_RESTART.get()),
+                    ),
+                ),
         ]
     }
     fn terminal_theme_search_input(
@@ -5950,7 +6039,8 @@ impl SettingsView {
             .id("terminal-theme-preview-card")
             .debug_selector(|| "terminal-theme-preview-card".into())
             .flex_1()
-            .min_w(px(260.))
+            .min_w_0()
+            .w_full()
             .rounded(crate::ui::RADIUS_MD)
             .border_1()
             .border_color(p.border)
@@ -6208,6 +6298,15 @@ impl SettingsView {
                     div()
                         .id(row_id)
                         .debug_selector(move || row_sel.to_string())
+                        .role(gpui::Role::RadioButton)
+                        .aria_label(ct.name.clone())
+                        .aria_toggled(if selected {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_color(p.ring))
                         .px_2()
                         .py_1p5()
                         .rounded(crate::ui::RADIUS_SM)
@@ -6302,6 +6401,15 @@ impl SettingsView {
                     div()
                         .id(row_id)
                         .debug_selector(move || row_sel.to_string())
+                        .role(gpui::Role::RadioButton)
+                        .aria_label(theme_name)
+                        .aria_toggled(if selected {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_color(p.ring))
                         .px_2()
                         .py_1p5()
                         .rounded(crate::ui::RADIUS_SM)
@@ -6339,7 +6447,8 @@ impl SettingsView {
         }
 
         let picker_col = div()
-            .w(px(300.))
+            .w_full()
+            .min_w_0()
             .flex_none()
             .flex()
             .flex_col()
@@ -6413,17 +6522,22 @@ impl SettingsView {
                         text::TERMINAL_THEME_MATCH_DARK.get(),
                         Some(text::TERMINAL_THEME_MATCH_DARK_DESC.get()),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "terminal-theme-match-dark-toggle",
-                        !s.terminal_use_separate_light_theme,
-                        false,
-                        |match_dark_next, _, cx| {
-                            edit(cx, move |s| {
-                                s.terminal_use_separate_light_theme = !match_dark_next;
-                            });
-                        },
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "terminal-theme-match-dark-toggle",
+                                !s.terminal_use_separate_light_theme,
+                                false,
+                                |match_dark_next, _, cx| {
+                                    edit(cx, move |s| {
+                                        s.terminal_use_separate_light_theme = !match_dark_next;
+                                    });
+                                },
+                            )
+                            .aria_label(text::TERMINAL_THEME_MATCH_DARK.get()),
+                        ),
+                    ),
             );
         }
 
@@ -6431,8 +6545,9 @@ impl SettingsView {
             layout::card(p)
                 .id("terminal-theme-picker-card")
                 .debug_selector(|| "terminal-theme-picker-card".into())
+                .min_w_0()
                 .flex()
-                .flex_row()
+                .flex_col()
                 .items_start()
                 .gap_3()
                 .child(picker_col)
@@ -6574,49 +6689,62 @@ impl SettingsView {
                         text::EDITOR_FONT_SIZE_DESC.get(),
                     ))
                     .child(
-                        Button::new("editor-font-dec")
-                            .accessibility_label(
-                                text::STEP_DEC.format(&[("name", text::EDITOR_FONT_SIZE.get())]),
+                        layout::controls()
+                            .child(
+                                Button::new("editor-font-dec")
+                                    .accessibility_label(
+                                        text::STEP_DEC
+                                            .format(&[("name", text::EDITOR_FONT_SIZE.get())]),
+                                    )
+                                    .label("−")
+                                    .disabled(s.editor_font_size_step(-1) == s.editor_font_size)
+                                    .debug_selector(|| "editor-font-dec".into())
+                                    .ghost()
+                                    .small()
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| {
+                                            s.editor_font_size = s.editor_font_size_step(-1);
+                                        });
+                                    }),
                             )
-                            .label("−")
-                            .debug_selector(|| "editor-font-dec".into())
-                            .ghost()
-                            .on_click(|_, _, cx| {
-                                edit(cx, move |s| {
-                                    s.editor_font_size = s.editor_font_size_step(-1);
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w_12()
-                            .font_family(crate::ui::FONT_UI)
-                            .text_size(crate::ui::TEXT_SM)
-                            .child(editor_font_pt),
-                    )
-                    .child(
-                        Button::new("editor-font-inc")
-                            .accessibility_label(
-                                text::STEP_INC.format(&[("name", text::EDITOR_FONT_SIZE.get())]),
+                            .child(
+                                div()
+                                    .w_12()
+                                    .font_family(crate::ui::FONT_MONO)
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .child(editor_font_pt),
                             )
-                            .label("+")
-                            .debug_selector(|| "editor-font-inc".into())
-                            .ghost()
-                            .on_click(|_, _, cx| {
-                                edit(cx, move |s| {
-                                    s.editor_font_size = s.editor_font_size_step(1);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("editor-font-reset")
-                            .label(text::RESET.get())
-                            .tooltip(text::EDITOR_FONT_RESET.get())
-                            .debug_selector(|| "editor-font-reset".into())
-                            .ghost()
-                            .on_click(|_, _, cx| {
-                                edit(cx, move |s| s.editor_font_size = default_editor_font_size());
-                            }),
+                            .child(
+                                Button::new("editor-font-inc")
+                                    .accessibility_label(
+                                        text::STEP_INC
+                                            .format(&[("name", text::EDITOR_FONT_SIZE.get())]),
+                                    )
+                                    .label("+")
+                                    .disabled(s.editor_font_size_step(1) == s.editor_font_size)
+                                    .debug_selector(|| "editor-font-inc".into())
+                                    .ghost()
+                                    .small()
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| {
+                                            s.editor_font_size = s.editor_font_size_step(1);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("editor-font-reset")
+                                    .label(text::RESET.get())
+                                    .tooltip(text::EDITOR_FONT_RESET.get())
+                                    .disabled(s.editor_font_size == default_editor_font_size())
+                                    .debug_selector(|| "editor-font-reset".into())
+                                    .ghost()
+                                    .small()
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| {
+                                            s.editor_font_size = default_editor_font_size();
+                                        });
+                                    }),
+                            ),
                     ),
             )
             .child(
@@ -6714,13 +6842,18 @@ impl SettingsView {
                         text::CURSOR_BLINK.get(),
                         text::CURSOR_BLINK_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "cursor-blink-toggle",
-                        s.terminal_cursor_blink,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.terminal_cursor_blink = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "cursor-blink-toggle",
+                                s.terminal_cursor_blink,
+                                false,
+                                |next, _, cx| edit(cx, move |s| s.terminal_cursor_blink = next),
+                            )
+                            .aria_label(text::CURSOR_BLINK.get()),
+                        ),
+                    ),
             )
             .child(layout::section_title(
                 p,
@@ -6733,18 +6866,23 @@ impl SettingsView {
                         text::OPTION_AS_META.get(),
                         text::OPTION_AS_META_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "option-meta-toggle",
-                        s.option_as_meta,
-                        false,
-                        |next, _, cx| {
-                            edit(cx, move |s| {
-                                s.option_as_meta = next;
-                                s.option_as_meta_auto = false;
-                            });
-                        },
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "option-meta-toggle",
+                                s.option_as_meta,
+                                false,
+                                |next, _, cx| {
+                                    edit(cx, move |s| {
+                                        s.option_as_meta = next;
+                                        s.option_as_meta_auto = false;
+                                    });
+                                },
+                            )
+                            .aria_label(text::OPTION_AS_META.get()),
+                        ),
+                    ),
             )
             .child(
                 row()
@@ -6752,20 +6890,25 @@ impl SettingsView {
                         text::OPTION_META_AUTO.get(),
                         text::OPTION_META_AUTO_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "option-meta-auto",
-                        s.option_as_meta_auto,
-                        false,
-                        |next, _, cx| {
-                            edit(cx, move |s| {
-                                s.option_as_meta_auto = next;
-                                if next {
-                                    s.option_as_meta = false;
-                                }
-                            });
-                        },
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "option-meta-auto",
+                                s.option_as_meta_auto,
+                                false,
+                                |next, _, cx| {
+                                    edit(cx, move |s| {
+                                        s.option_as_meta_auto = next;
+                                        if next {
+                                            s.option_as_meta = false;
+                                        }
+                                    });
+                                },
+                            )
+                            .aria_label(text::OPTION_META_AUTO.get()),
+                        ),
+                    ),
             )
             .child(
                 row()
@@ -6773,13 +6916,18 @@ impl SettingsView {
                         text::COPY_ON_SELECT.get(),
                         text::COPY_ON_SELECT_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "copy-select-toggle",
-                        s.copy_on_select,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.copy_on_select = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "copy-select-toggle",
+                                s.copy_on_select,
+                                false,
+                                |next, _, cx| edit(cx, move |s| s.copy_on_select = next),
+                            )
+                            .aria_label(text::COPY_ON_SELECT.get()),
+                        ),
+                    ),
             )
             .child(
                 row()
@@ -6787,13 +6935,18 @@ impl SettingsView {
                         text::CONFIRM_RUNNING_CLOSE.get(),
                         text::CONFIRM_RUNNING_CLOSE_DESC.get(),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "confirm-running-close-toggle",
-                        s.confirm_running_close,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.confirm_running_close = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "confirm-running-close-toggle",
+                                s.confirm_running_close,
+                                false,
+                                |next, _, cx| edit(cx, move |s| s.confirm_running_close = next),
+                            )
+                            .aria_label(text::CONFIRM_RUNNING_CLOSE.get()),
+                        ),
+                    ),
             )
     }
 
@@ -6863,6 +7016,7 @@ impl SettingsView {
         acct: &krill_proto::usage::AccountInfo,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        use gpui_component::menu::DropdownMenu as _;
         use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule};
 
         let p = crate::ui::palette(cx);
@@ -6938,17 +7092,24 @@ impl SettingsView {
                         .text_color(p.muted_foreground)
                         .child(text::ACCOUNTS_RULE_ENABLED.get()),
                 )
-                .child(layout::switch(
-                    p,
-                    format!("admin-rule-toggle-{}", acct.id),
-                    enabled,
-                    self.account_rule_pending,
-                    move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.set_account_rule(toggled.clone(), cx);
-                        });
-                    },
-                )),
+                .child(
+                    layout::switch(
+                        p,
+                        format!("admin-rule-toggle-{}", acct.id),
+                        enabled,
+                        self.account_rule_pending,
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.set_account_rule(toggled.clone(), cx);
+                            });
+                        },
+                    )
+                    .aria_label(format!(
+                        "{} · {}",
+                        text::ACCOUNTS_RULE_ENABLED.get(),
+                        acct.label
+                    )),
+                ),
         );
         let provider = acct.provider;
         let metric_btns = AutoSwitchMetric::for_provider(provider)
@@ -7002,41 +7163,72 @@ impl SettingsView {
             )
             .child(layout::segmented_control(p, threshold_btns));
         controls = controls.child(thresholds);
-        let mut automatic = rule.clone();
-        automatic.target_account_id = None;
-        let mut target_btns = vec![rule_button(
-            format!("admin-rule-target-auto-{}", acct.id),
-            text::ACCOUNTS_RULE_TARGET_AUTO.get().into(),
-            rule.target_account_id.is_none(),
-            automatic,
-        )];
-        for other in snap
+        let target_accounts: Vec<_> = snap
             .accounts
             .iter()
             .filter(|other| other.provider == acct.provider && other.id != acct.id)
-        {
-            let mut next = rule.clone();
-            next.target_account_id = Some(other.id.clone());
-            target_btns.push(rule_button(
-                format!("admin-rule-target-{}-{}", acct.id, other.id),
-                format!("→ {}", other.label).into(),
-                rule.target_account_id.as_deref() == Some(other.id.as_str()),
-                next,
-            ));
-        }
-        let targets = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .flex_wrap()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(crate::i18n::catalog::status::PROVIDER_RULE_TARGET.get()),
-            )
-            .child(layout::segmented_control(p, target_btns));
-        controls = controls.child(targets);
+            .map(|other| (other.id.clone(), other.label.clone()))
+            .collect();
+        let target_label = target_accounts
+            .iter()
+            .find(|(id, _)| rule.target_account_id.as_ref() == Some(id))
+            .map_or_else(
+                || text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
+                |(_, label)| label.clone(),
+            );
+        let weak = cx.weak_entity();
+        let current_rule = rule.clone();
+        let target_selector = format!("admin-rule-target-{}", acct.id);
+        controls = controls.child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(layout::label(
+                    p,
+                    crate::i18n::catalog::status::PROVIDER_RULE_TARGET.get(),
+                    None,
+                ))
+                .child(
+                    layout::secondary(
+                        SharedString::from(format!("admin-rule-target-{}", acct.id)),
+                        target_label,
+                    )
+                    .max_w(crate::ui::SETTINGS_NAV_WIDTH)
+                    .disabled(self.account_rule_pending)
+                    .debug_selector(move || target_selector.clone())
+                    .dropdown_menu(move |mut menu, _, _| {
+                        menu = menu.scrollable(true).max_h(px(360.));
+                        let options = std::iter::once((
+                            None,
+                            text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
+                        ))
+                        .chain(
+                            target_accounts
+                                .iter()
+                                .map(|(id, label)| (Some(id.clone()), label.clone())),
+                        );
+                        for (target, label) in options {
+                            let weak = weak.clone();
+                            let mut next = current_rule.clone();
+                            next.target_account_id.clone_from(&target);
+                            menu = menu.item(
+                                gpui_component::menu::PopupMenuItem::new(label)
+                                    .checked(current_rule.target_account_id == target)
+                                    .on_click(move |_, _, cx| {
+                                        weak.update(cx, |this, cx| {
+                                            this.set_account_rule(next.clone(), cx);
+                                        })
+                                        .ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+                ),
+        );
+
         if existing_rule.is_some() {
             let id = format!("admin-rule-clear-{}", acct.id);
             let provider = acct.provider;
@@ -7063,18 +7255,57 @@ impl SettingsView {
         acc: &krill_proto::usage::AccountInfo,
         input: &gpui::Entity<gpui_component::input::InputState>,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         use gpui_component::Sizable as _;
         let save_id = format!("admin-rename-save-{}", acc.id);
         let cancel_id = format!("admin-rename-cancel-{}", acc.id);
         let (provider, account_id, state) = (acc.provider, acc.id.clone(), input.clone());
+        let enter_id = account_id.clone();
+        let enter_state = state.clone();
         div()
+            .id("admin-account-rename-row")
+            .capture_action(cx.listener(
+                move |this, _: &gpui_component::input::Enter, window, cx| {
+                    cx.stop_propagation();
+                    let label = enter_state.read(cx).value().trim().to_owned();
+                    this.rename = None;
+                    if let Some(focus) = this.rename_return_focus.take() {
+                        window.focus(&focus, cx);
+                    }
+                    if !label.is_empty() {
+                        this.apply_account_request(
+                            krill_proto::usage::UsageRequest::RenameAccount {
+                                provider,
+                                account_id: enter_id.clone(),
+                                label,
+                                email: None,
+                            },
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                },
+            ))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    cx.stop_propagation();
+                    this.rename = None;
+                    if let Some(focus) = this.rename_return_focus.take() {
+                        window.focus(&focus, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .min_w_0()
+            .flex_1()
+            .flex_wrap()
             .flex()
             .items_center()
             .gap_1()
             .child(
                 div()
-                    .w(px(220.))
+                    .flex_1()
+                    .min_w_0()
                     .child(gpui_component::input::Input::new(input).small()),
             )
             .child(
@@ -7083,9 +7314,12 @@ impl SettingsView {
                     text::ACCOUNT_RENAME_SAVE.get(),
                 )
                 .debug_selector(move || save_id.clone())
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     let label = state.read(cx).value().trim().to_owned();
                     this.rename = None;
+                    if let Some(focus) = this.rename_return_focus.take() {
+                        window.focus(&focus, cx);
+                    }
                     if !label.is_empty() {
                         this.apply_account_request(
                             krill_proto::usage::UsageRequest::RenameAccount {
@@ -7106,8 +7340,11 @@ impl SettingsView {
                     text::ACCOUNT_RENAME_CANCEL.get(),
                 )
                 .debug_selector(move || cancel_id.clone())
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.rename = None;
+                    if let Some(focus) = this.rename_return_focus.take() {
+                        window.focus(&focus, cx);
+                    }
                     cx.notify();
                 })),
             )
@@ -7151,6 +7388,8 @@ impl SettingsView {
         let input =
             cx.new(|cx| gpui_component::input::InputState::new(window, cx).default_value(label));
         self.removing = None;
+        self.rename_return_focus = window.focused(cx);
+        input.update(cx, |input, cx| input.focus(window, cx));
         self.rename = Some((id, input));
         cx.notify();
     }
@@ -7212,10 +7451,11 @@ impl SettingsView {
                     .items_center()
                     .gap_2()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(gpui_component::input::Input::new(&input).small()),
+                        div().flex_1().min_w_0().child(
+                            gpui_component::input::Input::new(&input)
+                                .content_type(gpui_component::input::InputContentType::Password)
+                                .small(),
+                        ),
                     )
                     .child(
                         layout::controls()
@@ -7752,6 +7992,23 @@ impl SettingsView {
             .debug_selector(move || confirm_id.clone())
             .occlude()
             .role(gpui::Role::AlertDialog)
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, _, cx| {
+                    this.removing = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .capture_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.removing = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .aria_label(text::ACCOUNT_REMOVE_TITLE.format(&[("name", &account_heading(acc).0)]))
+            .max_h(window.viewport_size().height - crate::ui::SPACE_4 * 2.)
+            .overflow_y_scroll()
             .w(crate::ui::DIALOG_WIDTH)
             .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
             .p_6()
@@ -7792,12 +8049,28 @@ impl SettingsView {
                     .justify_end()
                     .gap_2()
                     .child(
-                        layout::ghost(
-                            gpui::ElementId::Name(cancel_id.clone().into()),
-                            text::ACCOUNT_RENAME_CANCEL.get(),
-                        )
-                        .debug_selector(move || cancel_id.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
+                        div()
+                            .id("admin-remove-cancel-focus")
+                            .track_focus(&self.modal_dismiss_focus)
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label(text::ACCOUNT_RENAME_CANCEL.get())
+                            .focus_visible(|style| style.bg(p.accent))
+                            .on_click(cx.listener(move |this, _, _, cx| close(this, cx)))
+                            .child(
+                                layout::ghost(
+                                    gpui::ElementId::Name(cancel_id.clone().into()),
+                                    text::ACCOUNT_RENAME_CANCEL.get(),
+                                )
+                                .debug_selector(move || cancel_id.clone())
+                                .tab_stop(false)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        close(this, cx);
+                                    },
+                                )),
+                            ),
                     )
                     .child(
                         Button::new(gpui::ElementId::Name(rm_id.clone().into()))
@@ -7818,12 +8091,15 @@ impl SettingsView {
                             })),
                     ),
             );
-        Some(crate::ui::modal_backdrop(window.viewport_size(), card))
+        Some(crate::ui::modal_backdrop(
+            window.viewport_size(),
+            crate::ui::modal_focus_scope(card, &self.modal_focus),
+        ))
     }
 
     fn render_accounts_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::IconName;
-        use krill_proto::usage::{ConnectionStatus, ProviderKind, UsageRequest};
+        use krill_proto::usage::{ProviderKind, UsageRequest};
         let p = crate::ui::palette(cx);
         let policy = self.accounts_snapshot.auto_switch.clone();
 
@@ -7905,27 +8181,7 @@ impl SettingsView {
                 crate::accounts::display::connection(&self.accounts_snapshot, acc, &usage)
             });
             let (status_tone, status_label) = if provider_installed {
-                match active_conn {
-                    Some(ConnectionStatus::NeedsLogin) => (
-                        crate::ui::BadgeTone::Warning,
-                        text::ACCOUNT_LOGIN_REQUIRED.get(),
-                    ),
-                    Some(ConnectionStatus::CheckFailed) => (
-                        crate::ui::BadgeTone::Warning,
-                        text::CONNECTION_CHECK_FAILED.get(),
-                    ),
-                    Some(ConnectionStatus::Checking) => {
-                        (crate::ui::BadgeTone::Muted, text::CONNECTION_CHECKING.get())
-                    }
-                    Some(ConnectionStatus::NotInstalled) => (
-                        crate::ui::BadgeTone::Muted,
-                        text::CONNECTION_NOT_INSTALLED.get(),
-                    ),
-                    Some(ConnectionStatus::Connected) | None => (
-                        crate::ui::BadgeTone::Success,
-                        text::CONNECTION_CONNECTED.get(),
-                    ),
-                }
+                provider_connection_badge(active_conn)
             } else {
                 (
                     crate::ui::BadgeTone::Muted,
@@ -8279,7 +8535,8 @@ impl SettingsView {
                     }
                 });
             },
-        );
+        )
+        .aria_label(text::AUTO_SWITCH_TITLE.get());
         let view = cx.entity();
         let rl_switch = layout::switch(
             p,
@@ -8295,7 +8552,8 @@ impl SettingsView {
                     }
                 });
             },
-        );
+        )
+        .aria_label(text::AUTO_SWITCH_RATE_LIMIT.get());
         let rate_limit_row = div()
             .flex()
             .items_center()
@@ -8350,22 +8608,27 @@ impl SettingsView {
                         text::ACCOUNTS_DIRECT_USAGE.get(),
                         Some(text::ACCOUNTS_DIRECT_USAGE_DESC.get()),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "admin-direct-usage-toggle",
-                        direct_usage,
-                        false,
-                        move |on, _, cx| {
-                            view.update(cx, |this, cx| {
-                                if this.accounts_snapshot.connections.direct_usage != on {
-                                    this.apply_account_request(
-                                        UsageRequest::SetDirectUsage(on),
-                                        cx,
-                                    );
-                                }
-                            });
-                        },
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "admin-direct-usage-toggle",
+                                direct_usage,
+                                false,
+                                move |on, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        if this.accounts_snapshot.connections.direct_usage != on {
+                                            this.apply_account_request(
+                                                UsageRequest::SetDirectUsage(on),
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                },
+                            )
+                            .aria_label(text::ACCOUNTS_DIRECT_USAGE.get()),
+                        ),
+                    ),
             );
         }
 
@@ -8406,7 +8669,8 @@ impl SettingsView {
                         }
                     });
                 },
-            );
+            )
+            .aria_label(crate::i18n::catalog::shell::ACCOUNT_PREDICT.get());
             let view_reset = cx.entity();
             let reset_switch = layout::switch(
                 p,
@@ -8422,7 +8686,8 @@ impl SettingsView {
                         }
                     });
                 },
-            );
+            )
+            .aria_label(crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get());
             let cooldown_btns = [0_u64, 5, 15, 30].into_iter().map(|mins| {
                 let secs = mins * 60;
                 let id_str = format!("admin-cooldown-{mins}m");
@@ -8547,6 +8812,15 @@ impl SettingsView {
             div()
                 .id(gpui::ElementId::Name(btn_id.clone().into()))
                 .debug_selector(move || btn_id.clone())
+                .role(gpui::Role::RadioButton)
+                .aria_label(label)
+                .aria_toggled(if selected {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                })
+                .tab_index(0)
+                .focus_visible(|style| style.border_color(p.ring))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -8659,13 +8933,18 @@ impl SettingsView {
                 text::HIBERNATION_TITLE.get(),
                 Some(text::HIBERNATION_DESC.get()),
             ))
-            .child(layout::controls().child(layout::switch(
-                p,
-                "hib-toggle",
-                s.hibernation_enabled,
-                false,
-                |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
-            )));
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "hib-toggle",
+                        s.hibernation_enabled,
+                        false,
+                        |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
+                    )
+                    .aria_label(text::HIBERNATION_TITLE.get()),
+                ),
+            );
 
         // 끄면 Krill이 설치한 훅을 되돌리고, 다시 켜면 설치된 에이전트에 바로 설치한다.
         let hooks_row = layout::row(p)
@@ -8674,21 +8953,27 @@ impl SettingsView {
                 text::AGENT_HOOKS_TITLE.get(),
                 Some(text::AGENT_HOOKS_DESC.get()),
             ))
-            .child(layout::controls().child(layout::switch(
-                p,
-                "agent-hooks-toggle",
-                s.agent_status_hooks,
-                false,
-                |next, _, cx| {
-                    edit(cx, move |s| s.agent_status_hooks = next);
-                    if let Some(env) = (!cfg!(test))
-                        .then(crate::onboarding::Env::current)
-                        .flatten()
-                    {
-                        crate::onboarding::actions::apply_hook_preference(env, next, cx).detach();
-                    }
-                },
-            )));
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "agent-hooks-toggle",
+                        s.agent_status_hooks,
+                        false,
+                        |next, _, cx| {
+                            edit(cx, move |s| s.agent_status_hooks = next);
+                            if let Some(env) = (!cfg!(test))
+                                .then(crate::onboarding::Env::current)
+                                .flatten()
+                            {
+                                crate::onboarding::actions::apply_hook_preference(env, next, cx)
+                                    .detach();
+                            }
+                        },
+                    )
+                    .aria_label(text::AGENT_HOOKS_TITLE.get()),
+                ),
+            );
 
         let auto_setup_row = layout::row(p)
             .child(layout::label(
@@ -8755,12 +9040,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::AGENTS_DESC.get()),
-            )
             .child(default_agent_row)
             .child(yolo_row)
             .child(hib_row)
@@ -8799,13 +9078,18 @@ impl SettingsView {
                 text::AUTO_RENAME_BRANCH.get(),
                 Some(text::AUTO_RENAME_BRANCH_DESC.get()),
             ))
-            .child(layout::controls().child(layout::switch(
-                p,
-                "auto-rename-branch-toggle",
-                s.auto_rename_branch_from_work,
-                false,
-                |next, _, cx| edit(cx, move |s| s.auto_rename_branch_from_work = next),
-            )));
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "auto-rename-branch-toggle",
+                        s.auto_rename_branch_from_work,
+                        false,
+                        |next, _, cx| edit(cx, move |s| s.auto_rename_branch_from_work = next),
+                    )
+                    .aria_label(text::AUTO_RENAME_BRANCH.get()),
+                ),
+            );
 
         let is_1h = s.prompt_cache_ttl_secs >= 3_600;
         let ttl_5m = layout::segment(p, "prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
@@ -8832,13 +9116,20 @@ impl SettingsView {
                         text::PROMPT_CACHE_TIMER.get(),
                         Some(text::PROMPT_CACHE_TIMER_DESC.get()),
                     ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "prompt-cache-timer-toggle",
-                        s.prompt_cache_timer_enabled,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.prompt_cache_timer_enabled = next),
-                    ))),
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "prompt-cache-timer-toggle",
+                                s.prompt_cache_timer_enabled,
+                                false,
+                                |next, _, cx| {
+                                    edit(cx, move |s| s.prompt_cache_timer_enabled = next);
+                                },
+                            )
+                            .aria_label(text::PROMPT_CACHE_TIMER.get()),
+                        ),
+                    ),
             )
             .when(s.prompt_cache_timer_enabled, |d| {
                 d.child(
@@ -8875,26 +9166,31 @@ impl SettingsView {
                     text::WORKSPACE_TRUST_PRESET.get(),
                     Some(text::WORKSPACE_TRUST_PRESET_DESC.get()),
                 ))
-                .child(layout::controls().child(layout::switch(
-                    p,
-                    "workspace-trust-preset-toggle",
-                    s.workspace_trust_preset_enabled,
-                    false,
-                    move |next, _, cx| {
-                        view.update(cx, |this, cx| {
-                            if next {
-                                if !current(cx).workspace_trust_preset_enabled {
-                                    this.workspace_trust_confirm_pending = true;
-                                    cx.notify();
-                                }
-                            } else {
-                                this.workspace_trust_confirm_pending = false;
-                                edit(cx, move |s| s.workspace_trust_preset_enabled = false);
-                                cx.notify();
-                            }
-                        });
-                    },
-                ))),
+                .child(
+                    layout::controls().child(
+                        layout::switch(
+                            p,
+                            "workspace-trust-preset-toggle",
+                            s.workspace_trust_preset_enabled,
+                            false,
+                            move |next, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    if next {
+                                        if !current(cx).workspace_trust_preset_enabled {
+                                            this.workspace_trust_confirm_pending = true;
+                                            cx.notify();
+                                        }
+                                    } else {
+                                        this.workspace_trust_confirm_pending = false;
+                                        edit(cx, move |s| s.workspace_trust_preset_enabled = false);
+                                        cx.notify();
+                                    }
+                                });
+                            },
+                        )
+                        .aria_label(text::WORKSPACE_TRUST_PRESET.get()),
+                    ),
+                ),
         );
         if self.workspace_trust_confirm_pending && !s.workspace_trust_preset_enabled {
             workspace_trust_section = workspace_trust_section.child(
@@ -8939,7 +9235,7 @@ impl SettingsView {
                                 )),
                             )
                             .child(
-                                layout::secondary(
+                                layout::ghost(
                                     "workspace-trust-preset-confirm-cancel",
                                     text::WORKSPACE_TRUST_PRESET_CANCEL.get(),
                                 )
@@ -9100,15 +9396,7 @@ impl SettingsView {
         let eff_args = eff_prof
             .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
             .unwrap_or_default();
-        let eff_env = eff_prof
-            .map(|p| {
-                p.env
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
+        let eff_env = agent_environment_summary(eff_prof);
         let mut launch_summary = cmd_name.to_owned();
         if !eff_args.is_empty() {
             launch_summary.push(' ');
@@ -10005,6 +10293,9 @@ impl SettingsView {
                 };
 
                 let mut controls = layout::controls()
+                    .w_full()
+                    .flex_wrap()
+                    .flex_shrink_1()
                     .child(connect_or_disconnect_btn)
                     .child({
                         let testing = self.is_ssh_test_pending(&host.id);
@@ -10075,6 +10366,8 @@ impl SettingsView {
                     layout::row(p)
                         .id(gpui::ElementId::Name(card_id.clone().into()))
                         .debug_selector(move || card_id.clone())
+                        .flex_col()
+                        .items_start()
                         .child(
                             div()
                                 .flex_1()
@@ -11172,8 +11465,18 @@ impl SettingsView {
             let dropdown_active = active_repo.clone();
             let repo_dropdown = layout::secondary(
                 "admin-workflow-repo-select",
-                format!("{active_repo_display} \u{25BE}"),
+                format!(
+                    "{}{} \u{25BE}",
+                    active_repo_display.chars().take(28).collect::<String>(),
+                    if active_repo_display.chars().count() > 28 {
+                        "…"
+                    } else {
+                        ""
+                    }
+                ),
             )
+            .tooltip(active_repo.clone().unwrap_or_default())
+            .max_w(crate::ui::SETTINGS_NAV_WIDTH)
             .debug_selector(|| "admin-workflow-repo-select".into())
             .dropdown_menu(move |mut menu, _, _| {
                 menu = menu.scrollable(true).max_h(px(360.));
@@ -11354,10 +11657,18 @@ impl SettingsView {
                                     .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_SM)
                                     .text_color(p.foreground)
-                                    .child(rel_path),
+                                    .child(rel_path.clone()),
                             )
                             .child(
-                                layout::ghost(gpui::ElementId::Name(rm_id.clone().into()), "×")
+                                Button::new(gpui::ElementId::Name(rm_id.clone().into()))
+                                    .ghost()
+                                    .icon(gpui_component::IconName::Close)
+                                    .accessibility_label(format!(
+                                        "{} · {}",
+                                        text::SSH_REMOVE.get(),
+                                        rel_path
+                                    ))
+                                    .tooltip(format!("{} · {}", text::SSH_REMOVE.get(), rel_path))
                                     .xsmall()
                                     .debug_selector(move || rm_id.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -11540,17 +11851,20 @@ impl SettingsView {
             )
         } else {
             let view = cx.entity();
-            layout::controls().child(layout::switch(
-                p,
-                "admin-recording-paused",
-                !s.recording_paused,
-                false,
-                move |active, _, cx| {
-                    view.update(cx, |this, cx| {
-                        this.set_recording_paused(!active, cx);
-                    });
-                },
-            ))
+            layout::controls().child(
+                layout::switch(
+                    p,
+                    "admin-recording-paused",
+                    !s.recording_paused,
+                    false,
+                    move |active, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.set_recording_paused(!active, cx);
+                        });
+                    },
+                )
+                .aria_label(text::RECORDING_TITLE.get()),
+            )
         };
 
         let clear = self
@@ -11602,16 +11916,21 @@ impl SettingsView {
                             crate::security::text::SECURE_KEYBOARD_MENU.get(),
                             text::SECURE_KB_DESC.get(),
                         ))
-                        .child(layout::controls().child(layout::switch(
-                            p,
-                            "admin-secure-kb-toggle",
-                            s.secure_keyboard_entry,
-                            false,
-                            |next, _, cx| {
-                                edit(cx, move |s| s.secure_keyboard_entry = next);
-                                crate::platform::set_secure_event_input(next);
-                            },
-                        ))),
+                        .child(
+                            layout::controls().child(
+                                layout::switch(
+                                    p,
+                                    "admin-secure-kb-toggle",
+                                    s.secure_keyboard_entry,
+                                    false,
+                                    |next, _, cx| {
+                                        edit(cx, move |s| s.secure_keyboard_entry = next);
+                                        crate::platform::set_secure_event_input(next);
+                                    },
+                                )
+                                .aria_label(crate::security::text::SECURE_KEYBOARD_MENU.get()),
+                            ),
+                        ),
                 )
             })
             .child(
@@ -11768,6 +12087,24 @@ impl Render for SettingsView {
         if self.mobile_page {
             return self.render_mobile_page(cx).into_any_element();
         }
+        let has_modal =
+            self.removing.is_some() || self.schedule_modal.is_some() || self.space.cleanup_open;
+        if has_modal && self.modal_return_focus.is_none() {
+            self.modal_return_focus =
+                Some(window.focused(cx).unwrap_or_else(|| self.focus.clone()));
+            if let Some(modal) = &self.schedule_modal {
+                let input = if modal.editing_id.is_some() {
+                    &modal.cron
+                } else {
+                    &modal.id
+                };
+                input.update(cx, |input, cx| input.focus(window, cx));
+            } else {
+                window.focus(&self.modal_dismiss_focus, cx);
+            }
+        } else if !has_modal && let Some(focus) = self.modal_return_focus.take() {
+            window.focus(&focus, cx);
+        }
         if self.automations_page {
             return self.render_automations_page(window, cx).into_any_element();
         }
@@ -11827,6 +12164,8 @@ impl Render for SettingsView {
             .tab_group()
             .w(crate::ui::SETTINGS_NAV_WIDTH)
             .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex_none()
             .px_2p5()
             .py_3()
@@ -11929,7 +12268,7 @@ impl Render for SettingsView {
             if tabs.is_empty() {
                 continue;
             }
-            let mut group_col = div().flex().flex_col().gap_1().child(
+            let mut group_col = div().flex_none().flex().flex_col().gap_1().child(
                 div()
                     .px_2()
                     .pt_1()
@@ -11939,22 +12278,13 @@ impl Render for SettingsView {
                     .child(group_label),
             );
             for tab in tabs {
-                let sel = tab.selector();
                 let selected = tab == current_tab;
                 group_col = group_col.child(
-                    div()
-                        .id(sel)
-                        .debug_selector(move || sel.into())
-                        // OWE-860: 좌측 탭을 키보드 Tab·접근성 트리에 노출한다. Enter로도 탭을 전환한다.
-                        .role(gpui::Role::Tab)
-                        .aria_label(tab.label())
-                        .tab_index(0)
-                        .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
-                            if e.keystroke.key == "enter" {
-                                this.set_tab(tab, cx);
-                            }
-                        }))
-                        .h(px(30.))
+                    settings_nav_tab(tab, selected)
+                        .focus_visible(|style| style.border_color(p.ring))
+                        .min_h(px(30.))
+                        .flex_none()
+                        .py_1()
                         .px_2()
                         .rounded(crate::ui::RADIUS_SM)
                         .cursor_pointer()
@@ -12117,15 +12447,101 @@ impl Render for SettingsView {
             .id("admin-center")
             .debug_selector(|| "admin-center".into())
             .key_context(SEARCH_CONTEXT)
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    if crate::orca_import::state(cx).is_some_and(|st| st.modal_open) {
+                        crate::orca_import::close_modal(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.schedule_modal.is_some() {
+                        this.close_schedule_modal(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.removing.take().is_some() {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if this.space.cleanup_open {
+                        this.close_cleanup_modal(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.armed.is_some() {
+                        this.disarm(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    let handled = if this.rename.take().is_some() {
+                        if let Some(focus) = this.rename_return_focus.take() {
+                            window.focus(&focus, cx);
+                        }
+                        true
+                    } else if this.cancel_shortcut_conflict(window, cx) {
+                        true
+                    } else if this.ssh_keygen_confirm_host.take().is_some() {
+                        window.focus(&this.focus, cx);
+                        true
+                    } else if this.editing_ssh_host_id().is_some() {
+                        this.cancel_edit_ssh_host(window, cx);
+                        window.focus(&this.focus, cx);
+                        true
+                    } else {
+                        false
+                    };
+                    if handled {
+                        cx.stop_propagation();
+                        cx.notify();
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.focus_search(window, cx);
             }))
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "escape" {
+                    if this.rename.take().is_some() {
+                        if let Some(focus) = this.rename_return_focus.take() {
+                            window.focus(&focus, cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if this.cancel_shortcut_conflict(window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.ssh_keygen_confirm_host.take().is_some() {
+                        window.focus(&this.focus, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if this.editing_ssh_host_id().is_some() {
+                        this.cancel_edit_ssh_host(window, cx);
+                        window.focus(&this.focus, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.workspace_trust_confirm_pending {
+                        this.workspace_trust_confirm_pending = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 if ev.keystroke.key == "escape"
                     && crate::orca_import::state(cx).is_some_and(|st| st.modal_open)
                 {
-                    crate::orca_import::close_modal(cx);
+                    if !crate::orca_import::state(cx).is_some_and(|st| st.importing) {
+                        crate::orca_import::close_modal(cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }

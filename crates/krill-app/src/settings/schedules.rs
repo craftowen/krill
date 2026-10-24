@@ -300,6 +300,10 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.modal_return_focus.is_none() {
+            self.modal_return_focus =
+                Some(window.focused(cx).unwrap_or_else(|| self.focus.clone()));
+        }
         self.schedule_form_generation = self.schedule_form_generation.wrapping_add(1);
         let editing_id = existing.map(|s| s.id.clone());
         let init_id = existing.map_or("", |s| s.id.as_str()).to_owned();
@@ -1090,6 +1094,11 @@ impl SettingsView {
                                             });
                                         },
                                     )
+                                    .aria_label(format!(
+                                        "{} · {}",
+                                        text::SCHEDULES_TITLE.get(),
+                                        sched.id
+                                    ))
                                     .debug_selector(move || toggle_id.clone()),
                                 )
                                 .child(
@@ -1311,6 +1320,10 @@ impl SettingsView {
                 div()
                     .id("admin-schedule-log-content")
                     .debug_selector(|| "admin-schedule-log-content".into())
+                    .max_h(gpui::px(280.))
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .whitespace_normal()
                     .p_2()
                     .rounded(crate::ui::RADIUS_XS)
                     .bg(p.card)
@@ -1318,7 +1331,11 @@ impl SettingsView {
                     .border_color(p.border)
                     .font_family(crate::ui::FONT_MONO)
                     .text_size(crate::ui::TEXT_SM)
-                    .child(log.output.clone()),
+                    .children(
+                        log.output
+                            .lines()
+                            .map(|line| div().min_h(crate::ui::TEXT_SM).child(line.to_owned())),
+                    ),
             );
             card = card.child(log_box);
         }

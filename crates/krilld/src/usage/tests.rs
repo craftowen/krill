@@ -2002,7 +2002,7 @@ fn delete_registered_orca_account_hides_orca_cache_ghost_and_readd_unhides_it() 
     fs::write(
         host_claude.join(ORCA_CACHE),
         format!(
-            r#"{{"accounts":[{{"id":"{uuid}","name":"My Org","email":"member@example.com","five_hour":{{"utilization":20}}}}]}}"#
+            r#"{{"accounts":[{{"id":"{uuid}","name":"My Org","email":"fixture-1@example.com","five_hour":{{"utilization":20}}}}]}}"#
         ),
     )
     .unwrap();
@@ -2011,8 +2011,8 @@ fn delete_registered_orca_account_hides_orca_cache_ghost_and_readd_unhides_it() 
         &home,
         Some(&state),
         ProviderKind::Claude,
-        "member@example.com (My Org)",
-        Some("member@example.com".to_owned()),
+        "fixture-1@example.com (My Org)",
+        Some("fixture-1@example.com".to_owned()),
         &profile_dir.display().to_string(),
     )
     .unwrap();
@@ -2059,8 +2059,8 @@ fn delete_registered_orca_account_hides_orca_cache_ghost_and_readd_unhides_it() 
         &home,
         Some(&state),
         ProviderKind::Claude,
-        "member@example.com (My Org)",
-        Some("member@example.com".to_owned()),
+        "fixture-1@example.com (My Org)",
+        Some("fixture-1@example.com".to_owned()),
         &profile_dir.display().to_string(),
     )
     .unwrap();

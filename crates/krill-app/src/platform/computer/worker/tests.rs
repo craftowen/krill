@@ -333,19 +333,27 @@ impl Harness {
         .is_err()
     }
 
-    /// The same question from another process (`lockf(1)` takes a BSD `flock`, `-k` keeps the file).
+    /// Independently probe the BSD file lock from another process.
+    /// macOS 14 runners provide Python, without requiring the lockf executable.
     fn lock_held_by_process(&self) -> bool {
-        let status = std::process::Command::new("/usr/bin/lockf")
-            .args(["-k", "-s", "-t", "0"])
+        let status = std::process::Command::new("python3")
+            .args([
+                "-c",
+                r"import fcntl, sys
+with open(sys.argv[1], 'r+') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(75)
+",
+            ])
             .arg(&self.lock_path)
-            .arg("/usr/bin/true")
             .status()
             .unwrap();
-        // 75 = EX_TEMPFAIL: the lock is taken.
         match status.code() {
             Some(0) => false,
             Some(75) => true,
-            other => panic!("lockf exited {other:?}"),
+            other => panic!("lock probe exited {other:?}"),
         }
     }
 
@@ -865,6 +873,10 @@ fn batch_holds_one_lock_across_fresh_prepares_and_sums_units() {
     assert_eq!(result["data"]["issuedSteps"], 3);
     assert_eq!(result["data"]["steps"][1]["delivery"]["issuedUnits"], 6);
     assert!(!h.lock_held(), "lock released after a clean batch");
+    assert!(
+        !h.lock_held_by_process(),
+        "cross-process lock released after a clean batch"
+    );
     h.no_more_events();
     h.finish();
 }

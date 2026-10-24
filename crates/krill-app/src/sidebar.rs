@@ -678,6 +678,12 @@ enum Relink {
     AwaitingList,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeleteFocus {
+    Pending,
+    Focused,
+}
+
 pub struct Sidebar {
     snapshot: Snapshot,
     meta: Meta,
@@ -733,6 +739,10 @@ pub struct Sidebar {
     setup_prompt: hooks::SetupPrompt,
     /// 워크트리 삭제 확인 모달 상태(OWE-847). `Some`일 때 모달을 띄운다.
     delete_confirm: Option<DeleteConfirm>,
+    delete_scope_focus: Option<gpui::FocusHandle>,
+    delete_cancel_focus: Option<gpui::FocusHandle>,
+    delete_previous_focus: Option<gpui::FocusHandle>,
+    delete_focus: DeleteFocus,
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
@@ -1035,6 +1045,10 @@ impl Sidebar {
             project_visuals: BTreeMap::new(),
             setup_prompt: hooks::SetupPrompt::default(),
             delete_confirm: None,
+            delete_scope_focus: None,
+            delete_cancel_focus: None,
+            delete_previous_focus: None,
+            delete_focus: DeleteFocus::Focused,
             path,
             error: None,
             poll_error: None,
@@ -3146,7 +3160,7 @@ impl Sidebar {
             .map(|s| {
                 let (title, detail) = self.session_label(s);
                 let agent =
-                    crate::ui::status::infer_agent_from_title(&s.status.agent, &title).to_owned();
+                    crate::ui::status::infer_agent_from_status(&s.status, &title).to_owned();
                 let folder_path = s.worktree.as_deref().or(s.cwd.as_deref());
                 let (repo_name, worktree_name) = if let Some(wt) = s.worktree.as_deref() {
                     let repo_path = self
@@ -3501,6 +3515,7 @@ impl Sidebar {
             .get(&path)
             .and_then(|m| m.dirty)
             .unwrap_or(0);
+        self.delete_focus = DeleteFocus::Pending;
         self.delete_confirm = Some(DeleteConfirm {
             path,
             with_descendants,

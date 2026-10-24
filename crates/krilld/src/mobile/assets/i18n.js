@@ -2,6 +2,12 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Clear": "비우기",
+ "Filter projects": "프로젝트 필터",
+ "Filter projects...": "프로젝트 검색...",
+ "Add project...": "프로젝트 추가...",
+ "No projects match": "일치하는 프로젝트가 없습니다",
+ "Remove {0} filter": "{0} 필터 제거",
  "{0} projects": "프로젝트 {0}개",
  "No terminals": "터미널 없음",
  "Split direction": "분할 방향",
@@ -364,7 +370,21 @@
  "Skip setup and create": "설정 건너뛰고 만들기",
  "Review the setup script before running it on this desktop.": "이 컴퓨터에서 실행할 설정 스크립트를 확인하세요.",
  "Add a Git repository in Krill desktop first.": "먼저 컴퓨터의 Krill에 Git 저장소를 추가하세요.",
- "Reconnect to a desktop that supports workspace creation.": "작업 공간 생성을 지원하는 컴퓨터에 다시 연결하세요."
+ "Reconnect to a desktop that supports workspace creation.": "작업 공간 생성을 지원하는 컴퓨터에 다시 연결하세요.",
+ "Reading photo…": "사진을 읽는 중…",
+ "No QR code found. Take the photo closer, with the whole code in view.": "QR 코드를 찾지 못했습니다. 코드 전체가 보이도록 더 가까이 촬영하세요.",
+ "Take a photo of the QR code in desktop Settings → Mobile.": "컴퓨터의 설정 → 모바일에 표시된 QR 코드를 촬영하세요.",
+ "Camera is unavailable. Take a photo of the QR code instead.": "카메라를 사용할 수 없습니다. QR 코드 사진을 선택하세요.",
+ "Terminal #{0} will be stopped.": "터미널 #{0}이 종료됩니다.",
+ "Write a prompt…": "프롬프트를 입력하세요…",
+ "Prompt": "프롬프트",
+ "Touch and hold to select and copy.": "길게 눌러 텍스트를 선택하고 복사하세요.",
+ "Latest terminal output": "최근 터미널 출력",
+ "Choose photo": "사진 선택",
+ "Choose image file": "이미지 파일 선택",
+ "Terminal direct input": "터미널 직접 입력",
+ "Terminal text": "터미널 텍스트",
+ "No decision options provided. Review this request on desktop.": "선택지가 없습니다. 컴퓨터에서 이 요청을 확인하세요."
 };
  function t(text,...values){let out=language==='ko'?(ko[text]||text):text;values.forEach((v,i)=>{out=out.replaceAll(`{${i}}`,String(v));});return out;}
  function configure(value){language=value==='ko'||value==='en'?value:/^ko\b/i.test(globalThis.navigator?.language||'')?'ko':'en';if(globalThis.document?.documentElement)document.documentElement.lang=language;return language;}

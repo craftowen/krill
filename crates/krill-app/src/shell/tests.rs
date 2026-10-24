@@ -3050,6 +3050,81 @@ fn ime_pending_survives_pre_echo_frame_and_shifts_preedit(cx: &mut TestAppContex
     });
 }
 
+/// 에코보다 삭제·이동·전송 키가 먼저 오면 지운 글자를 계속 덧그리지 않는다.
+#[gpui::test]
+fn ime_pending_clears_on_edit_keys_before_echo(cx: &mut TestAppContext) {
+    use krill_proto::input::Input;
+    use krill_proto::screen::Msg as _;
+
+    let (view, cx) = open(cx, state_path("ime-pending-edit"));
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.attach_test(pane, SessionId(3), ours, cx));
+    });
+    cx.run_until_parked();
+    for key in [
+        "backspace",
+        "delete",
+        "ctrl-u",
+        "cmd-backspace",
+        "left",
+        "enter",
+    ] {
+        cx.simulate_input("한");
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).live[&pane].ime.pending().unwrap().text, "한");
+        });
+        cx.simulate_keystrokes(key);
+        cx.update(|_, cx| {
+            let l = &view.read(cx).live[&pane];
+            assert_eq!(l.ime.pending(), None, "{key} 뒤 잔상 없음");
+            assert!(l.ime_expiry.is_none());
+        });
+        let (kind, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+        assert_eq!(Input::decode(kind, &body).unwrap().bytes, "한".as_bytes());
+        let (kind, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+        assert!(!Input::decode(kind, &body).unwrap().bytes.is_empty());
+    }
+}
+
+/// 추가 IPC 프레임이 없어도 만료되며, 이전 타이머가 새 입력을 지우지 않는다.
+#[gpui::test]
+fn ime_pending_expires_without_output_and_rearms_for_new_input(cx: &mut TestAppContext) {
+    use krill_term::ime::PENDING_TTL;
+
+    let (view, cx) = open(cx, state_path("ime-pending-expiry"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.attach_test(pane, SessionId(3), ours, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_input("한");
+    cx.run_until_parked();
+    cx.executor().advance_clock(PENDING_TTL / 2);
+    cx.simulate_input("글");
+    cx.run_until_parked();
+    cx.executor().advance_clock(PENDING_TTL / 2);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).live[&pane].ime.pending().unwrap().text,
+            "한글"
+        );
+    });
+    cx.executor().advance_clock(PENDING_TTL / 2);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let l = &view.read(cx).live[&pane];
+        assert_eq!(l.ime.pending(), None, "출력이 멈춰도 잔상 만료");
+        assert!(l.ime_expiry.is_none());
+    });
+}
+
 /// 숨은 입력 캐럿도 IPC 프레임에서 IME 오버레이·후보창·확정 에코로 전달된다.
 #[gpui::test]
 fn ime_hidden_caret_frames_follow_prompt_and_confirm_echo(cx: &mut TestAppContext) {
@@ -9153,5 +9228,67 @@ fn persistence_burst_builds_one_snapshot_after_last_ui_request(cx: &mut TestAppC
         assert_eq!(shell.layout.window_bounds(), Some(bounds));
         assert_eq!(shell.layout.sidebar_width.to_bits(), 299_f32.to_bits());
         assert_eq!(shell.layout.panel_width.to_bits(), 379_f32.to_bits());
+    });
+}
+
+#[gpui::test]
+fn recent_tabs_reveal_last_selection_in_small_viewport(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("mru-viewport"));
+    for _ in 0..34 {
+        cx.simulate_keystrokes("cmd-t");
+    }
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    for _ in 0..34 {
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+    }
+    let selected = view.read_with(cx, |s, _| {
+        s.layout.mru_order()[s.layout.mru_cursor().unwrap()]
+    });
+    let card = cx.debug_bounds("recent-tab-switcher").unwrap();
+    let list = cx.debug_bounds("recent-tab-list").unwrap();
+    assert_eq!(selected, 0, "34 MRU moves must select the oldest tab");
+    let row = cx.debug_bounds("recent-tab-item-0").unwrap();
+    assert!(
+        card.size.width <= px(608.) && card.size.height <= px(448.),
+        "{card:?}"
+    );
+    assert!(
+        row.left() >= list.left()
+            && row.right() <= list.right()
+            && row.top() >= list.top()
+            && row.bottom() <= list.bottom(),
+        "selected {row:?} outside {card:?}"
+    );
+    assert!(view.read_with(cx, |s, _| s.recent_tab_scroll.offset().y) < px(0.));
+}
+
+#[gpui::test]
+fn tab_close_modals_enter_scope_and_restore_terminal_focus(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-close-focus"));
+    view.update(cx, |s, cx| {
+        s.confirm_close_tab = Some(0);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(view.read(cx).tab_dialog_focus.is_focused(window)));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).confirm_close_tab.is_none());
+        assert!(view.read(cx).focus.is_focused(window));
+    });
+    view.update(cx, |s, cx| {
+        s.pending_running_close = Some((PendingRunningClose::Tab(0), false));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(view.read(cx).tab_dialog_focus.is_focused(window)));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).pending_running_close.is_none());
+        assert!(view.read(cx).focus.is_focused(window));
     });
 }

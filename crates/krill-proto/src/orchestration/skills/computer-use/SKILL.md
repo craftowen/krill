@@ -21,7 +21,7 @@ JSON is compact by default and screenshots are **off by default**. Use `--screen
 
 Completed screenshot files have separate bounded retention: at most 32 images and 64 MiB per capture directory. When another capture completes, older captures beyond 300 seconds and files exceeding those count/byte limits are removed; a single oversized capture is refused. A previously returned image path may therefore expire independently of snapshot history. Capture fresh evidence when the file is gone or the scene has changed; an old screenshot never refreshes a target reference.
 
-For additional elements already captured in the same immutable observation, use `get-app-state --snapshot <snapshotId> --offset 40 --limit 40 --json`. Follow `coverage.nextOffset`. Paging never refreshes the desktop or expands an unobserved subtree. Reference actions are refused when the fresh bounded census is incomplete: a partial tree cannot prove target uniqueness. Paging the saved prefix does not repair that missing coverage. Use a fresh observation or a different supported tool.
+For additional elements already captured in the same immutable observation, use `krill computer get-app-state --snapshot <snapshotId> --offset 40 --limit 40 --json`. Follow `coverage.nextOffset`. Paging never refreshes the desktop or expands an unobserved subtree. Reference actions are refused when the fresh bounded census is incomplete: a partial tree cannot prove target uniqueness. Paging the saved prefix does not repair that missing coverage. Use a fresh observation or a different supported tool.
 
 Snapshots expire for input after 120 seconds. They are private to the actual calling process context; `--session`, `--worktree`, and environment claims do not grant access to another caller. The parent-process cache namespace is a convenience boundary within one OS user, not authenticated session authorization. Separate invocations must share a long-lived parent process to reuse this namespace; independent shell wrappers may not share it. Use one persistent caller or the experimental MCP session below. Missing, stale, reordered, ambiguous, disabled, or replaced targets are refused. Observe again and reassess; do not substitute a new index for an old target automatically.
 
@@ -29,7 +29,7 @@ Snapshots expire for input after 120 seconds. They are private to the actual cal
 
 All actions accept `--snapshot <snapshotId>`, `--json`, and optional `--screenshot`. The default numeric reference resolves only against the caller's last returned snapshot. An `--app` or window selector must agree with that original observation.
 
-- `krill computer click --element 2` or `click --x 100 --y 200`; optional `--button left|right|middle`, `--click-count 1..16`, and `--modifiers cmd,shift`.
+- `krill computer click --element 2` or `krill computer click --x 100 --y 200`; optional `--button left|right|middle`, `--click-count 1..16`, and `--modifiers cmd,shift`.
 - `krill computer perform-secondary-action --element 2 --action AXShowMenu`; the requested action must be advertised by the actual AX element.
 - `krill computer set-value --element 1 --value-stdin` (or `--value <text>`). Verification compares the full value on the same resolved object, not its preview.
 - `krill computer type-text --element 1 --text-stdin` (or `--text <text>`). Requires an already focused editable receiver; newline/tab sequences are refused. Prefer set-value or paste-text for such text.

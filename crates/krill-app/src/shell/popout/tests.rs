@@ -449,6 +449,149 @@ impl sidebar::Source for Fixed {
     }
 }
 
+#[test]
+fn dashboard_provider_uses_status_foreground_and_original_title_after_rename() {
+    let mut card = SidebarCard {
+        host: krill_app::hosts::HostId::Local,
+        session: sidebar::Session {
+            id: SessionId(1),
+            status: AgentStatus {
+                agent: "zsh".into(),
+                foreground: Some("/opt/bin/codex".into()),
+                title: Some("Claude task".into()),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        },
+        name: "Renamed task".into(),
+        detail: String::new(),
+        unread: false,
+        read_order: None,
+    };
+    assert_eq!(card.agent(), "codex");
+    card.session.status.foreground = None;
+    assert_eq!(card.agent(), "claude");
+    card.session.status.agent = "pi".into();
+    assert_eq!(card.agent(), "pi");
+    card.session.status.agent = "custom-agent".into();
+    assert_eq!(card.agent(), "custom-agent");
+    card.session.status.agent.clear();
+    card.session.status.title = None;
+    assert_eq!(card.agent(), "");
+}
+
+#[gpui::test]
+fn dashboard_expands_and_keeps_readable_lanes_in_small_windows(cx: &mut TestAppContext) {
+    let (main, window) = open(cx);
+    cx.simulate_keystrokes(window, "alt-cmd-shift-a");
+    cx.run_until_parked();
+    let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
+    dashboard.update(cx, |d, cx| {
+        d.sidebar
+            .update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx));
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(window, cx);
+    for (width, height, rem) in [
+        (2560., 1319., 16.),
+        (1440., 900., 24.),
+        (900., 600., 32.),
+        (640., 480., 32.),
+    ] {
+        visual.simulate_resize(gpui::size(px(width), px(height)));
+        visual.update(|window, _| window.set_rem_size(px(rem)));
+        visual.run_until_parked();
+        let modal = visual.debug_bounds("dashboard-modal").unwrap();
+        assert_eq!(
+            modal.size.width,
+            ui::DASHBOARD_SIZE.width.min(px(width - 32.))
+        );
+        assert_eq!(
+            modal.size.height,
+            ui::DASHBOARD_SIZE.height.min(px(height - 32.))
+        );
+        let close = visual.debug_bounds("dashboard-close").unwrap();
+        assert!(close.left() >= modal.left() && close.right() <= modal.right());
+        assert!(close.top() >= modal.top() && close.bottom() <= modal.bottom());
+        for selector in [
+            "dashboard-lane-0",
+            "dashboard-lane-1",
+            "dashboard-lane-2",
+            "dashboard-lane-3",
+        ] {
+            let lane = visual.debug_bounds(selector).unwrap();
+            assert!(lane.size.width >= ui::DASHBOARD_LANE_MIN_WIDTH);
+        }
+    }
+    // 마지막 레인까지 실제로 스크롤한 뒤 카드를 눌러 세션으로 이동할 수 있다.
+    let lanes = visual.debug_bounds("dashboard-lanes").unwrap();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: lanes.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(-1000.), px(0.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let last = visual.debug_bounds("dashboard-session-5").unwrap();
+    assert!(
+        last.left() >= lanes.left() && last.right() <= lanes.right(),
+        "last lane must be reachable"
+    );
+    visual.simulate_click(last.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert_eq!(
+        main.read_with(cx, |s, _| s.layout.session(s.layout.active_tab().focused)),
+        Some(SessionId(5))
+    );
+}
+
+#[gpui::test]
+fn dashboard_many_cards_scroll_to_last_at_large_zoom(cx: &mut TestAppContext) {
+    struct Many;
+    impl sidebar::Source for Many {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            let mut snapshot = Fixed.fetch()?;
+            let template = snapshot.sessions[3].clone();
+            snapshot.sessions = (0..40)
+                .map(|id| sidebar::Session {
+                    id: SessionId(id),
+                    status: AgentStatus {
+                        title: Some(format!("Session {id:02}")),
+                        ..template.status.clone()
+                    },
+                    ..template.clone()
+                })
+                .collect();
+            Ok(snapshot)
+        }
+    }
+    let (_, window) = open(cx);
+    cx.simulate_keystrokes(window, "alt-cmd-shift-a");
+    let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
+    dashboard.update(cx, |d, cx| {
+        d.sidebar
+            .update(cx, |s, cx| s.connect_source(Arc::new(Many), cx));
+    });
+    let visual = &mut VisualTestContext::from_window(window, cx);
+    visual.simulate_resize(gpui::size(px(1200.), px(480.)));
+    visual.update(|window, _| window.set_rem_size(px(32.)));
+    visual.run_until_parked();
+    let list = visual.debug_bounds("dashboard-cards-2").unwrap();
+    let last = visual.debug_bounds("dashboard-session-39").unwrap();
+    assert!(last.bottom() > list.bottom());
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: list.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let last = visual.debug_bounds("dashboard-session-39").unwrap();
+    assert!(last.top() >= list.top() && last.bottom() <= list.bottom());
+}
+
 #[gpui::test]
 fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     let (main, main_window) = open(cx);

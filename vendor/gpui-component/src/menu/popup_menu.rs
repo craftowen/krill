@@ -60,6 +60,7 @@ pub enum PopupMenuItem {
     Submenu {
         icon: Option<Icon>,
         label: SharedString,
+        render_row: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
         disabled: bool,
         menu: Entity<PopupMenu>,
         render: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
@@ -105,6 +106,30 @@ impl PopupMenuItem {
         PopupMenuItem::Submenu {
             icon: None,
             label: label.into(),
+            render_row: None,
+            disabled: false,
+            menu,
+            render: None,
+        }
+    }
+
+    /// Render a custom submenu row, preserving its accessible label and navigation.
+    /// The builder supplies the whole row, including any disclosure indicator.
+    pub fn submenu_element<F, E>(
+        label: impl Into<SharedString>,
+        menu: Entity<PopupMenu>,
+        builder: F,
+    ) -> Self
+    where
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+        E: IntoElement,
+    {
+        PopupMenuItem::Submenu {
+            icon: None,
+            label: label.into(),
+            render_row: Some(Box::new(move |window, cx| {
+                builder(window, cx).into_any_element()
+            })),
             disabled: false,
             menu,
             render: None,
@@ -1393,12 +1418,19 @@ impl PopupMenu {
             PopupMenuItem::Submenu {
                 icon,
                 label,
+                render_row,
                 menu,
                 disabled,
                 render,
             } => this
                 .selected(selected)
                 .disabled(*disabled)
+                .when(!disabled, |this| {
+                    this.on_click(cx.listener(move |this, _, window, cx| {
+                        this.on_click(ix, window, cx);
+                        cx.notify();
+                    }))
+                })
                 .items_start()
                 .child(
                     h_flex()
@@ -1413,7 +1445,9 @@ impl PopupMenu {
                             window,
                             cx,
                         ))
-                        .child(
+                        .child(if let Some(render) = render_row {
+                            render(window, cx)
+                        } else {
                             h_flex()
                                 .flex_1()
                                 .gap_2()
@@ -1428,8 +1462,9 @@ impl PopupMenu {
                                     Icon::new(IconName::ChevronRight)
                                         .xsmall()
                                         .text_color(cx.theme().muted_foreground),
-                                ),
-                        ),
+                                )
+                                .into_any_element()
+                        }),
                 )
                 .when(selected, |this| {
                     this.child({

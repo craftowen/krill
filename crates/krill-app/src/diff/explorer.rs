@@ -125,6 +125,7 @@ pub struct PendingDelete {
     pub name: String,
     pub is_dir: bool,
     pub cancel_focus: gpui::FocusHandle,
+    scope_focus: gpui::FocusHandle,
 }
 
 /// 파일 탐색기 상태.
@@ -1417,13 +1418,14 @@ impl Panel {
         let name = target
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let cancel_focus = cx.focus_handle();
+        let cancel_focus = cx.focus_handle().tab_stop(true);
         window.focus(&cancel_focus, cx);
         self.explorer.pending_delete = Some(PendingDelete {
             path: target.to_path_buf(),
             name,
             is_dir,
             cancel_focus,
+            scope_focus: cx.focus_handle(),
         });
         self.explorer.error = None;
         cx.notify();
@@ -1557,12 +1559,13 @@ impl Panel {
             .px_2()
             .py_1()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .border_b_1()
             .border_color(p.sidebar_border)
             .child(
-                div().flex_1().min_w_0().child(
+                div().flex_1().min_w(px(112.)).child(
                     Input::new(&filter_input)
                         .xsmall()
                         .prefix(Icon::new(IconName::Search).xsmall())
@@ -1787,11 +1790,18 @@ impl Panel {
         let cancel_focus = pending.cancel_focus.clone();
         let card = div()
             .id("explorer-delete-dialog")
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.cancel_explorer_delete(cx);
+                }
+            }))
             .debug_selector(|| "explorer-delete-dialog".into())
             .occlude()
             .role(gpui::Role::AlertDialog)
             .w(ui::DIALOG_WIDTH)
             .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(gpui::px(0.)))
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
@@ -1809,24 +1819,33 @@ impl Panel {
             }))
             .child(
                 div()
+                    .id("explorer-delete-dialog-body")
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap_1p5()
+                    .gap_3()
                     .child(
                         div()
-                            .id("explorer-delete-dialog-title")
-                            .debug_selector(|| "explorer-delete-dialog-title".into())
-                            .text_size(ui::TEXT_LG)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .id("explorer-delete-dialog-desc")
-                            .debug_selector(|| "explorer-delete-dialog-desc".into())
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(desc),
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .id("explorer-delete-dialog-title")
+                                    .debug_selector(|| "explorer-delete-dialog-title".into())
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("explorer-delete-dialog-desc")
+                                    .debug_selector(|| "explorer-delete-dialog-desc".into())
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(desc),
+                            ),
                     ),
             )
             .child(
@@ -1846,6 +1865,7 @@ impl Panel {
                             }))
                             .child(
                                 Button::new("explorer-delete-cancel")
+                                    .tab_stop(false)
                                     .debug_selector(|| "explorer-delete-cancel".into())
                                     .ghost()
                                     .label(text::EXPLORER_CANCEL.get())
@@ -1864,7 +1884,10 @@ impl Panel {
                             })),
                     ),
             );
-        Some(ui::modal_backdrop(window.viewport_size(), card))
+        Some(ui::modal_backdrop(
+            window.viewport_size(),
+            ui::modal_focus_scope(card, &pending.scope_focus),
+        ))
     }
 
     fn render_explorer_rows(

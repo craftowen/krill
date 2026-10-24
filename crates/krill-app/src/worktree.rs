@@ -15,9 +15,9 @@ use gpui::{
     App, Context, Entity, EventEmitter, Focusable as _, Subscription, Task, Window, div,
     prelude::*, px,
 };
-use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
 use krill_proto::control::{
     NewWorktree, PrepareWorktree, Reply, Setup, Worktree, WorktreePreparation,
 };
@@ -50,12 +50,14 @@ pub const FAN_OUT_AGENTS: &[(&str, &str)] = &[
     ("codex", "Codex"),
     ("agy", "Antigravity"),
     ("opencode", "OpenCode"),
-    ("gemini", "Gemini"),
+    ("cursor", "Cursor"),
+    ("pi", "Pi"),
     ("aider", "Aider"),
 ];
 
 pub struct Dialog {
     language: crate::i18n::Language,
+    focus: gpui::FocusHandle,
     repo: PathBuf,
     parent: Option<PathBuf>,
     name: Entity<InputState>,
@@ -262,6 +264,7 @@ impl Dialog {
             base,
             initial_prompt,
             selected_agents: Vec::new(),
+            focus: cx.focus_handle(),
             pending_fan_out: 0,
             last_created_agent: None,
             last_created_prompt: None,
@@ -734,12 +737,20 @@ impl Render for Dialog {
         let p = crate::ui::palette(cx);
         let (warning, muted) = (p.warning, p.muted_foreground);
         let close = Button::new("worktree-close")
+            .disabled(matches!(self.phase, Phase::Creating))
             .ghost()
             .label(text::CLOSE.get())
             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close)));
-        let footer = || div().flex().flex_wrap().justify_end().gap_2();
+        let footer = || div().flex_none().flex().flex_wrap().justify_end().gap_2();
         let repo_hooks = &self.hooks;
-        let body = div().flex().flex_col().gap_4();
+        let body = div()
+            .id("worktree-dialog-body")
+            .debug_selector(|| "worktree-dialog-body".into())
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_4();
         let filtered = match &self.phase {
             Phase::Edit(_) => self.filtered_bases(cx),
             _ => Vec::new(),
@@ -863,9 +874,11 @@ impl Render for Dialog {
                                             selected_agents.iter().any(|a| a == agent_id);
                                         let btn = Button::new(("worktree-agent", idx))
                                             .xsmall()
-                                            .label(label);
-                                        let btn =
-                                            if selected { btn.primary() } else { btn.ghost() };
+                                            .icon(crate::ui::icons::agent_menu_icon(agent_id))
+                                            .label(label)
+                                            .selected(selected)
+                                            .toggled(selected);
+                                        let btn = btn.ghost();
                                         btn.on_click(cx.listener(move |d, _, _, cx| {
                                             d.toggle_agent(agent_id, cx);
                                         }))
@@ -926,26 +939,15 @@ impl Render for Dialog {
                     error
                         .clone()
                         .map(|e| crate::ui::error_banner(p, crate::i18n::cached_notice(&e))),
-                )
-                .child(
-                    footer().child(close).child(
-                        Button::new("worktree-create")
-                            .primary()
-                            .label(text::CREATE.get())
-                            .on_click(cx.listener(|d, _, _, cx| d.submit(Setup::Ask, cx))),
-                    ),
                 ),
-            Phase::Creating => body
+            Phase::Creating => body.child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(muted)
+                    .child(text::CREATING.get()),
+            ),
+            Phase::Untrusted { script, hash } => body
                 .child(
-                    div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(muted)
-                        .child(text::CREATING.get()),
-                )
-                .child(footer().child(close)),
-            Phase::Untrusted { script, hash } => {
-                let approve = hash.clone();
-                body.child(
                     div()
                         .text_size(crate::ui::TEXT_XS)
                         .text_color(warning)
@@ -972,26 +974,7 @@ impl Render for Dialog {
                             crate::i18n::catalog::general::HASH
                                 .format(&[("hash", &hex_string(hash))]),
                         ),
-                )
-                .child(
-                    footer()
-                        .child(close)
-                        .child(
-                            Button::new("setup-skip")
-                                .ghost()
-                                .label(text::SKIP.get())
-                                .on_click(cx.listener(|d, _, _, cx| d.submit(Setup::Skip, cx))),
-                        )
-                        .child(
-                            Button::new("setup-approve")
-                                .danger()
-                                .label(text::APPROVE.get())
-                                .on_click(cx.listener(move |d, _, _, cx| {
-                                    d.submit(Setup::Approve(approve.clone()), cx);
-                                })),
-                        ),
-                )
-            }
+                ),
             Phase::Done(w) => body
                 .child(
                     div()
@@ -1022,14 +1005,46 @@ impl Render for Dialog {
                         .text_size(crate::ui::TEXT_XS)
                         .text_color(warning)
                         .child(e.clone())
-                }))
-                .child(footer().child(close)),
+                })),
+        };
+        let actions = match &self.phase {
+            Phase::Edit(_) => footer().child(close).child(
+                Button::new("worktree-create")
+                    .debug_selector(|| "worktree-create".into())
+                    .primary()
+                    .label(text::CREATE.get())
+                    .on_click(cx.listener(|d, _, _, cx| d.submit(Setup::Ask, cx))),
+            ),
+            Phase::Untrusted { hash, .. } => {
+                let approve = hash.clone();
+                footer()
+                    .child(close)
+                    .child(
+                        Button::new("setup-skip")
+                            .ghost()
+                            .label(text::SKIP.get())
+                            .on_click(cx.listener(|d, _, _, cx| d.submit(Setup::Skip, cx))),
+                    )
+                    .child(
+                        Button::new("setup-approve")
+                            .danger()
+                            .label(text::APPROVE.get())
+                            .on_click(cx.listener(move |d, _, _, cx| {
+                                d.submit(Setup::Approve(approve.clone()), cx);
+                            })),
+                    )
+            }
+            Phase::Creating | Phase::Done(_) => footer().child(close),
         };
         let card = div()
             .id("worktree-dialog")
+            .debug_selector(|| "worktree-dialog".into())
             .occlude()
             .w(crate::ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - crate::ui::SPACE_4 * 2.).max(px(0.)))
+            .max_h((window.viewport_size().height - crate::ui::SPACE_4 * 2.).max(px(0.)))
+            .role(gpui::Role::Dialog)
+            .aria_label(text::TITLE.get())
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
             .bg(p.popover)
@@ -1049,12 +1064,19 @@ impl Render for Dialog {
                 }
                 if e.keystroke.key == "escape" {
                     cx.stop_propagation();
+                    if !matches!(d.phase, Phase::Creating) {
+                        cx.emit(Event::Close);
+                    }
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|d, _, _, cx| {
+                if !matches!(d.phase, Phase::Creating) {
                     cx.emit(Event::Close);
                 }
             }))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1089,8 +1111,12 @@ impl Render for Dialog {
                         )
                     }),
             )
-            .child(body);
-        crate::ui::modal_backdrop(window.viewport_size(), card)
+            .child(body)
+            .child(actions);
+        crate::ui::modal_backdrop(
+            window.viewport_size(),
+            crate::ui::modal_focus_scope(card, &self.focus),
+        )
     }
 }
 

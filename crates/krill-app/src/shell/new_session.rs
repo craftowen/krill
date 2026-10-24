@@ -79,6 +79,8 @@ impl Shell {
             .id("sidebar-jump")
             .group("sidebar-search-row")
             .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|d| d.border_1().border_color(p.ring))
             .aria_label(sb_text::SEARCH_SHORT.get())
             .w_full()
             .h(gpui::px(30.))
@@ -104,6 +106,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .flex_1()
                     .min_w_0()
                     .child(
                         gpui_component::Icon::new(IconName::Search)
@@ -155,8 +158,6 @@ impl Shell {
                         div()
                             .id("new-session-wrap")
                             .debug_selector(|| "new-session".into())
-                            .invisible()
-                            .group_hover("sidebar-search-row", gpui::Styled::visible)
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .child(menu),
                     ),
@@ -179,6 +180,8 @@ impl Shell {
             .id(id)
             .debug_selector(move || id.into())
             .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|d| d.border_1().border_color(p.ring))
             .aria_label(label)
             .w_full()
             .h(gpui::px(28.))

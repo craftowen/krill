@@ -19,10 +19,10 @@ use krill_proto::SessionId;
 use krill_proto::control::{AgentProfile, Program};
 
 use super::{
-    Activate, CHILD_INDENT, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2,
-    NewAgent3, NewAgent4, OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP,
-    ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin, basename,
-    state_text, text,
+    Activate, CHILD_INDENT, Collapse, DeleteFocus, Dismiss, Expand, KEY_CONTEXT, NewAgent1,
+    NewAgent2, NewAgent3, NewAgent4, OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed,
+    ROW_GROUP, ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin,
+    basename, state_text, text,
 };
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
@@ -2769,6 +2769,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let confirm = self.delete_confirm.clone()?;
+        let scope_focus = self.delete_scope_focus.as_ref()?;
+        let cancel_focus = self.delete_cancel_focus.as_ref()?;
         let p = ui::palette(cx);
         let name = self.name(&confirm.path);
         let desc = if confirm.with_descendants {
@@ -2785,7 +2787,8 @@ impl Sidebar {
             .occlude()
             .role(gpui::Role::AlertDialog)
             .w(ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(gpui::px(0.)))
             .p_6()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
@@ -2814,44 +2817,71 @@ impl Sidebar {
             )
             .child(
                 div()
-                    .debug_selector(|| "delete-worktree-desc".into())
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(desc),
-            )
-            .when(confirm.dirty > 0, |d| {
-                d.child(
-                    div()
-                        .debug_selector(|| "delete-worktree-dirty".into())
-                        .text_size(ui::TEXT_XS)
-                        .text_color(p.warning)
-                        .child(text::DELETE_DIRTY.format(&[("n", &confirm.dirty.to_string())])),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "delete-worktree-force".into())
+                    .id("delete-worktree-dialog-body")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .debug_selector(|| "delete-worktree-desc".into())
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(desc),
+                    )
+                    .when(confirm.dirty > 0, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "delete-worktree-dirty".into())
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.warning)
+                                .child(
+                                    text::DELETE_DIRTY.format(&[("n", &confirm.dirty.to_string())]),
+                                ),
+                        )
                         .child(
-                            Checkbox::new("delete-worktree-force")
-                                .label(text::DELETE_FORCE.get())
-                                .checked(confirm.force)
-                                .on_click(cx.listener(|s, _checked: &bool, _, cx| {
-                                    s.toggle_delete_force(cx);
-                                })),
-                        ),
-                )
-            })
+                            div()
+                                .debug_selector(|| "delete-worktree-force".into())
+                                .child(
+                                    Checkbox::new("delete-worktree-force")
+                                        .label(text::DELETE_FORCE.get())
+                                        .checked(confirm.force)
+                                        .on_click(cx.listener(|s, _checked: &bool, _, cx| {
+                                            s.toggle_delete_force(cx);
+                                        })),
+                                ),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .flex_wrap()
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("delete-worktree-cancel")
-                            .ghost()
-                            .debug_selector(|| "delete-worktree-cancel".into())
-                            .label(text::CANCEL.get())
-                            .on_click(cx.listener(|s, _, _, cx| s.cancel_delete(cx))),
+                        div()
+                            .id("delete-worktree-cancel-focus")
+                            .track_focus(cancel_focus)
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label(text::CANCEL.get())
+                            .on_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                                    cx.stop_propagation();
+                                    s.cancel_delete(cx);
+                                }
+                            }))
+                            .child(
+                                Button::new("delete-worktree-cancel")
+                                    .tab_stop(false)
+                                    .ghost()
+                                    .debug_selector(|| "delete-worktree-cancel".into())
+                                    .label(text::CANCEL.get())
+                                    .on_click(cx.listener(|s, _, _, cx| s.cancel_delete(cx))),
+                            ),
                     )
                     .child(
                         Button::new("delete-worktree-confirm")
@@ -2861,7 +2891,13 @@ impl Sidebar {
                             .on_click(cx.listener(|s, _, _, cx| s.confirm_delete(cx))),
                     ),
             );
-        Some(ui::modal_backdrop(window.viewport_size(), card).into_any_element())
+        Some(
+            ui::modal_backdrop(
+                window.viewport_size(),
+                ui::modal_focus_scope(card, scope_focus),
+            )
+            .into_any_element(),
+        )
     }
 
     /// MK-174: Setup 스크립트 감지 인앱 프롬프트 카드(`SetupScriptPromptCard`).
@@ -2983,6 +3019,23 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.delete_confirm.is_some() && self.delete_focus == DeleteFocus::Pending {
+            self.delete_previous_focus = window.focused(cx);
+            self.delete_scope_focus
+                .get_or_insert_with(|| cx.focus_handle());
+            let cancel_focus = self
+                .delete_cancel_focus
+                .get_or_insert_with(|| cx.focus_handle().tab_stop(true))
+                .clone();
+            cancel_focus.focus(window, cx);
+            self.delete_focus = DeleteFocus::Focused;
+        } else if self.delete_confirm.is_none() {
+            self.delete_focus = DeleteFocus::Focused;
+            if let Some(focus) = self.delete_previous_focus.take() {
+                focus.focus(window, cx);
+            }
+        }
+
         self.ensure_external_polling(cx);
         self.ensure_setup_prompt_polling(cx);
         if self.orca_import_subscription.is_none() {

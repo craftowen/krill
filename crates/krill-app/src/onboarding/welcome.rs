@@ -1245,7 +1245,7 @@ impl Render for Wizard {
             .shadow_lg()
             .on_action(cx.listener(|_, _: &CloseWizard, _, cx| Self::close(cx)))
             .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
-                if !matches!(e.keystroke.key.as_str(), "escape" | "enter") {
+                if e.keystroke.key != "escape" {
                     return;
                 }
                 Self::close(cx);

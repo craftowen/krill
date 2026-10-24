@@ -133,3 +133,35 @@ fn new_with_hosts_selects_initial_or_falls_back_to_local(cx: &mut TestAppContext
         HostId::Local
     );
 }
+
+#[gpui::test]
+fn add_project_clone_actions_stay_inside_small_viewport_at_large_zoom(cx: &mut TestAppContext) {
+    let (dialog, _, cx) = open(cx);
+    cx.update(|window, cx| dialog.update(cx, |d, cx| d.show_clone(window, cx)));
+    cx.simulate_resize(gpui::size(gpui::px(640.), gpui::px(480.)));
+    cx.update(|window, _| window.set_rem_size(gpui::px(32.)));
+    cx.run_until_parked();
+    let card = cx.debug_bounds("add-project-dialog").unwrap();
+    let actions = cx.debug_bounds("add-project-actions").unwrap();
+    let body = cx.debug_bounds("add-project-body").unwrap();
+    assert!(body.size.height > gpui::px(0.) && body.bottom() <= actions.top());
+    let submit = cx.debug_bounds("add-project-clone-submit").unwrap();
+    assert!(
+        card.size.width <= gpui::px(608.) && card.size.height <= gpui::px(448.),
+        "{card:?}"
+    );
+    assert!(
+        actions.left() >= card.left()
+            && actions.right() <= card.right()
+            && actions.top() >= card.top()
+            && actions.bottom() <= card.bottom(),
+        "{actions:?} outside {card:?}"
+    );
+    assert!(
+        submit.left() >= card.left()
+            && submit.right() <= card.right()
+            && submit.top() >= card.top()
+            && submit.bottom() <= card.bottom(),
+        "{submit:?} outside {card:?}"
+    );
+}

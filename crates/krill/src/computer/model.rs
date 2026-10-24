@@ -64,12 +64,12 @@ pub struct PermissionCapability {
     pub instructions: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "independent wire capability flags, not mutually exclusive states"
+    reason = "serialized independent computer operation capability flags"
 )]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CapabilitiesPayload {
     pub contract: String,
     pub backend: String,

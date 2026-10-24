@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Deferred, Div, FontWeight, InteractiveElement as _, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div,
 };
 use gpui_component::button::ButtonVariants as _;
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{Disableable as _, Sizable as _};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::catalog::orca_import as text;
@@ -508,6 +508,8 @@ pub struct OrcaImportState {
     pub last_result: Option<OrcaImportReport>,
     pub selected: BTreeSet<ImportDomain>,
     pub modal_open: bool,
+    modal_focus: Option<gpui::FocusHandle>,
+    modal_return_focus: Option<gpui::FocusHandle>,
     pub scanning: bool,
     pub importing: bool,
     pub error: Option<String>,
@@ -531,6 +533,8 @@ impl Default for OrcaImportState {
             last_result: None,
             selected: ImportDomain::ALL.into_iter().collect(),
             modal_open: false,
+            modal_focus: None,
+            modal_return_focus: None,
             scanning: false,
             importing: false,
             error: None,
@@ -1028,6 +1032,9 @@ pub fn open_modal(cx: &mut App) {
 pub fn close_modal(cx: &mut App) {
     ensure_state(cx);
     let st = cx.global_mut::<OrcaImportState>();
+    if st.importing {
+        return;
+    }
     st.modal_open = false;
     cx.refresh_windows();
 }
@@ -1301,11 +1308,31 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
 
 /// 카테고리별 체크박스 선택 모달(`accounts`, `ssh`, `projects`, `settings`).
 #[must_use]
-pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
-    let st = state(cx)?;
-    if !st.modal_open {
+pub fn render_modal(window: &mut Window, cx: &mut App) -> Option<Deferred> {
+    let open = state(cx)?.modal_open;
+    if !open {
+        // global_mut notifies observers even when assigning the same value. A closed
+        // modal must remain read-only or SettingsView invalidates itself every frame.
+        if state(cx).is_some_and(|st| st.modal_focus.is_some() || st.modal_return_focus.is_some()) {
+            let st = cx.global_mut::<OrcaImportState>();
+            st.modal_focus = None;
+            let focus = st.modal_return_focus.take();
+            if let Some(focus) = focus {
+                window.focus(&focus, cx);
+            }
+        }
         return None;
     }
+    if state(cx)?.modal_focus.is_none() {
+        let previous = window.focused(cx);
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let st = cx.global_mut::<OrcaImportState>();
+        st.modal_focus = Some(focus);
+        st.modal_return_focus = previous;
+    }
+    let st = state(cx)?;
+    let focus = st.modal_focus.clone()?;
     let p = ui::palette(cx);
     let report = st.preview.as_ref().or(st.last_result.as_ref());
     let daemon_ok = daemon_available(cx);
@@ -1327,12 +1354,16 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
             ImportDomain::Sessions => !daemon_ok,
             _ => false,
         };
-        render_domain_row(domain, checked, needs_daemon_badge, report, p)
+        render_domain_row(domain, checked, needs_daemon_badge, report, p, importing)
     });
 
     let panel = div()
         .id("orca-import-modal")
         .debug_selector(|| "orca-import-modal".into())
+        .role(gpui::Role::Dialog)
+        .aria_label(text::MODAL_TITLE.get())
+        .max_h(window.viewport_size().height - SPACE_4 * 2.)
+        .overflow_hidden()
         .w(DIALOG_WIDTH)
         .max_w(window.viewport_size().width - SPACE_4 * 2.)
         .p_5()
@@ -1371,31 +1402,44 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
                         .child(text::MODAL_SUBTITLE.get()),
                 ),
         )
-        .child(div().flex().flex_col().gap_2().children(rows))
-        .when(
-            (!daemon_ok && st.selected.contains(&ImportDomain::Accounts))
-                || skipped_reason.is_some(),
-            |d| {
-                let reason = skipped_reason
-                    .as_deref()
-                    .unwrap_or_else(|| text::DAEMON_REQUIRED_BADGE.get());
-                d.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .rounded(RADIUS_SM)
-                        .border_1()
-                        .border_color(p.warning.opacity(0.35))
-                        .bg(p.warning.opacity(0.10))
-                        .text_size(TEXT_XS)
-                        .text_color(p.warning)
-                        .child(text::DAEMON_REQUIRED_NOTE.format(&[("reason", reason)])),
-                )
-            },
-        )
-        .children(error.map(|e| ui::error_banner(p, e)))
         .child(
             div()
+                .id("orca-import-modal-body")
+                .debug_selector(|| "orca-import-modal-body".into())
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(rows)
+                .when(
+                    (!daemon_ok && st.selected.contains(&ImportDomain::Accounts))
+                        || skipped_reason.is_some(),
+                    |d| {
+                        let reason = skipped_reason
+                            .as_deref()
+                            .unwrap_or_else(|| text::DAEMON_REQUIRED_BADGE.get());
+                        d.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded(RADIUS_SM)
+                                .border_1()
+                                .border_color(p.warning.opacity(0.35))
+                                .bg(p.warning.opacity(0.10))
+                                .text_size(TEXT_XS)
+                                .text_color(p.warning)
+                                .child(text::DAEMON_REQUIRED_NOTE.format(&[("reason", reason)])),
+                        )
+                    },
+                )
+                .children(error.map(|e| ui::error_banner(p, e))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex_wrap()
                 .pt_2()
                 .border_t_1()
                 .border_color(p.border)
@@ -1434,7 +1478,10 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
                 ),
         );
 
-    Some(ui::modal_backdrop(window.viewport_size(), panel))
+    Some(ui::modal_backdrop(
+        window.viewport_size(),
+        ui::modal_focus_scope(panel, &focus),
+    ))
 }
 
 fn render_domain_row(
@@ -1443,6 +1490,7 @@ fn render_domain_row(
     needs_daemon_badge: bool,
     report: Option<&OrcaImportReport>,
     p: &Palette,
+    disabled: bool,
 ) -> Stateful<Div> {
     let row_id: SharedString = format!("orca-domain-{}", domain.as_str()).into();
     let border_col = if checked {
@@ -1450,8 +1498,6 @@ fn render_domain_row(
     } else {
         p.border
     };
-    let box_bg = if checked { p.foreground } else { p.background };
-    let box_fg = if checked { p.background } else { p.foreground };
 
     ui::card(p)
         .id(row_id.clone())
@@ -1462,7 +1508,11 @@ fn render_domain_row(
         .items_center()
         .justify_between()
         .gap_3()
-        .on_click(move |_, _, cx| toggle_domain(domain, cx))
+        .on_click(move |_, _, cx| {
+            if !disabled {
+                toggle_domain(domain, cx);
+            }
+        })
         .child(
             div()
                 .flex_1()
@@ -1471,22 +1521,17 @@ fn render_domain_row(
                 .items_start()
                 .gap_2p5()
                 .child(
-                    div()
-                        .w(px(16.))
-                        .h(px(16.))
-                        .mt(px(2.))
-                        .rounded(RADIUS_SM)
-                        .border_1()
-                        .border_color(border_col)
-                        .bg(box_bg)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .children(checked.then(|| {
-                            Icon::new(IconName::Check)
-                                .with_size(ui::ICON_XS)
-                                .text_color(box_fg)
-                        })),
+                    gpui_component::checkbox::Checkbox::new(SharedString::from(format!(
+                        "orca-domain-check-{}",
+                        domain.as_str()
+                    )))
+                    .label(domain.title())
+                    .checked(checked)
+                    .disabled(disabled)
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        toggle_domain(domain, cx);
+                    }),
                 )
                 .child(
                     div()
@@ -1495,27 +1540,16 @@ fn render_domain_row(
                         .flex()
                         .flex_col()
                         .gap_0p5()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .flex_wrap()
-                                .child(
-                                    div()
-                                        .text_size(TEXT_SM)
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(p.foreground)
-                                        .child(domain.title()),
-                                )
-                                .when(needs_daemon_badge, |d| {
-                                    d.child(ui::badge(
-                                        p,
-                                        BadgeTone::Warning,
-                                        text::DAEMON_REQUIRED_BADGE.get(),
-                                    ))
-                                }),
-                        )
+                        .child(div().flex().items_center().gap_2().flex_wrap().when(
+                            needs_daemon_badge,
+                            |d| {
+                                d.child(ui::badge(
+                                    p,
+                                    BadgeTone::Warning,
+                                    text::DAEMON_REQUIRED_BADGE.get(),
+                                ))
+                            },
+                        ))
                         .child(
                             div()
                                 .text_size(TEXT_XS)

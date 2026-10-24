@@ -833,3 +833,76 @@ fn hidden_server_panel_clock_pauses_without_canceling_active_invite(cx: &mut Tes
         assert!(panel.read(cx).invite.is_some());
     });
 }
+
+#[gpui::test]
+fn ui_audit_remote_confirmation_expires_and_clears_on_hide(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mock = Arc::new(MockLinkBackend::new());
+    let device = PairedDevice {
+        id: "audit-device".into(),
+        name: "Fixture Mac".into(),
+        added_at: 1,
+        last_seen_at: None,
+    };
+    mock.set_devices(vec![device.clone()]);
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(mock.clone(), cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            p.request_revoke(device.clone(), cx);
+            p.set_visible(false, cx);
+            assert!(p.confirm_revoke.is_none());
+            p.set_visible(true, cx);
+        });
+    });
+    // Showing the panel starts a refresh; wait for its busy guard before arming.
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            assert!(!p.busy);
+            p.request_revoke(device.clone(), cx);
+            p.confirmation_deadline =
+                std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+            p.confirm_revoke_now(cx);
+            assert!(p.confirm_revoke.is_none());
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        mock.devices().unwrap().len(),
+        1,
+        "expired confirmation cannot revoke"
+    );
+}
+
+#[gpui::test]
+fn remote_rename_all_closures_restore_initiating_focus(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mock = Arc::new(MockLinkBackend::new());
+    let host = PairedHost {
+        id: "focus-fixture".into(),
+        name: "Fixture Mac".into(),
+        status: krill_hosts::HostStatus::Disconnected,
+    };
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(mock.clone(), cx));
+    vcx.run_until_parked();
+    for save in [false, true] {
+        vcx.update(|window, cx| {
+            panel.update(cx, |p, cx| {
+                window.focus(&p.focus, cx);
+                p.remote_hosts = vec![host.clone()];
+                p.start_rename(&host, window, cx);
+                assert!(p.rename_return_focus.is_some());
+                if save {
+                    p.save_rename(window, cx);
+                } else {
+                    p.cancel_rename(window, cx);
+                }
+                assert!(p.renaming.is_none());
+                assert!(p.rename_return_focus.is_none());
+                assert!(p.focus.is_focused(window));
+            });
+        });
+        vcx.run_until_parked();
+    }
+}

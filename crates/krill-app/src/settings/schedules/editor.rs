@@ -387,9 +387,10 @@ impl SettingsView {
         right = right.child(grace);
         let body = div()
             .id("admin-schedule-modal-scroll")
+            .debug_selector(|| "admin-schedule-modal-body".into())
+            .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .max_h((window.viewport_size().height - gpui::px(240.)).max(gpui::px(160.)))
             .child(
                 div()
                     .flex()
@@ -424,11 +425,12 @@ impl SettingsView {
             .gap_3()
             .child(
                 div()
+                    .flex_none()
                     .text_size(ui::TEXT_LG)
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(heading),
             )
-            .child(templates)
+            .child(templates.flex_none())
             .child(body)
             .children(modal.error.as_ref().map(|err| {
                 ui::error_banner(p, err.clone())
@@ -437,6 +439,7 @@ impl SettingsView {
             }))
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .justify_end()
                     .gap_2()
