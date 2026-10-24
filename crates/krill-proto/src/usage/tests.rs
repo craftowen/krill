@@ -1299,3 +1299,86 @@ fn antigravity_snapshot_prefers_gemini_group_and_provider_metrics_evaluate_targe
         }
     }
 }
+
+#[test]
+fn provider_metric_rules_require_negotiation_and_stay_off_legacy_wire() {
+    #[derive(Debug, Deserialize)]
+    enum LegacyMetric {
+        Max,
+        FiveHour,
+        SevenDay,
+    }
+    #[derive(Debug, Deserialize)]
+    struct LegacyRule {
+        provider: ProviderKind,
+        from_account_id: String,
+        enabled: bool,
+        threshold_percent: u8,
+        metric: LegacyMetric,
+        target_account_id: Option<String>,
+    }
+    let legacy = AutoSwitchRule {
+        provider: ProviderKind::Claude,
+        from_account_id: "legacy".into(),
+        enabled: true,
+        threshold_percent: 90,
+        metric: AutoSwitchMetric::SevenDay,
+        target_account_id: None,
+    };
+    let mut snapshot = AccountsSnapshot::default();
+    snapshot.auto_switch.rules.push(legacy.clone());
+    for provider in ProviderKind::ALL {
+        for &metric in AutoSwitchMetric::for_provider(provider) {
+            let rule = AutoSwitchRule {
+                provider,
+                metric,
+                ..legacy.clone()
+            };
+            let required = UsageRequest::UpsertAutoSwitchRule(rule.clone()).required_features();
+            assert_eq!(
+                required & FEAT_USAGE_PROVIDER_METRICS != 0,
+                metric.requires_provider_metrics()
+            );
+            if metric.requires_provider_metrics() {
+                snapshot.auto_switch.rules.push(rule);
+            }
+        }
+    }
+    assert_ne!(
+        UsageRequest::SetAutoSwitch(snapshot.auto_switch.clone()).required_features()
+            & FEAT_USAGE_PROVIDER_METRICS,
+        0
+    );
+    let legacy_features = ipc::FEATURES & !FEAT_USAGE_PROVIDER_METRICS;
+    for reply in [
+        UsageReply::Accounts(snapshot.clone()),
+        UsageReply::ResetConsumed {
+            snapshot: snapshot.clone(),
+            outcome: ResetConsumeOutcome::NoCredit,
+            windows_reset: 0,
+        },
+    ] {
+        let supported = reply.clone().for_features(ipc::FEATURES);
+        assert_eq!(supported, reply);
+        let gated = reply.for_features(legacy_features);
+        let rules = match &gated {
+            UsageReply::Accounts(s) | UsageReply::ResetConsumed { snapshot: s, .. } => {
+                &s.auto_switch.rules
+            }
+            _ => panic!("account snapshot expected"),
+        };
+        let decoded: Vec<LegacyRule> =
+            postcard::from_bytes(&postcard::to_stdvec(rules).unwrap()).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let rule = &decoded[0];
+        assert_eq!(rule.provider, legacy.provider);
+        assert_eq!(rule.from_account_id, legacy.from_account_id);
+        assert_eq!(rule.enabled, legacy.enabled);
+        assert_eq!(rule.threshold_percent, legacy.threshold_percent);
+        assert!(matches!(rule.metric, LegacyMetric::SevenDay));
+        assert_eq!(rule.target_account_id, legacy.target_account_id);
+        let frame = gated.encode().unwrap();
+        let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(UsageReply::decode(kind, &body).unwrap(), gated);
+    }
+}

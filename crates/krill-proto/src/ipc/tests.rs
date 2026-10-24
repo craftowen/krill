@@ -286,6 +286,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ),
         ("FEAT_USAGE", crate::usage::FEAT_USAGE, 17),
         (
+            "FEAT_USAGE_PROVIDER_METRICS",
+            crate::usage::FEAT_USAGE_PROVIDER_METRICS,
+            26,
+        ),
+        (
             "FEAT_PROVIDER_DETAILS",
             crate::usage::FEAT_PROVIDER_DETAILS,
             15,

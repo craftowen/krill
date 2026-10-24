@@ -535,6 +535,7 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_PROVIDER_DETAILS
         | krill_proto::usage::FEAT_USAGE_AGY
         | krill_proto::usage::FEAT_USAGE_RULES
+        | krill_proto::usage::FEAT_USAGE_PROVIDER_METRICS
         | krill_proto::usage::FEAT_USAGE_STATUS
         | krill_proto::usage::FEAT_USAGE_RATELIMIT
         | krill_proto::usage::FEAT_USAGE_MANAGE
