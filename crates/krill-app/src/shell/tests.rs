@@ -3444,9 +3444,9 @@ fn history_resume_opens_new_tab_without_replacing_existing_session(cx: &mut Test
     );
 }
 
-/// OWE-586: 보낸 입력의 ack 없이 PROBE이 지나면 멈춘 칸 배너가 보이고, ack가 오면 사라진다.
+/// One missed ACK probe stays suspect and quiet; a subsequent ACK restores healthy input.
 #[gpui::test]
-fn stalled_pane_shows_banner_until_ack(cx: &mut TestAppContext) {
+fn liveness_suspect_pane_recovers_on_ack_without_banner(cx: &mut TestAppContext) {
     use std::os::unix::net::UnixStream;
 
     use krill_proto::input::{Input, InputAck, InputResult, PROBE};
@@ -3460,16 +3460,26 @@ fn stalled_pane_shows_banner_until_ack(cx: &mut TestAppContext) {
         .unwrap();
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
+            let shutdown = ours.try_clone().unwrap();
             s.attach_test(pane, krill_proto::SessionId(3), ours, cx);
+            s.live.get_mut(&pane).unwrap().sock = Some(shutdown);
         });
     });
     cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| view.read(cx).stalled_banner()), None);
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
-    // ack 없이 PROBE이 지나면 멈춤 배너가 보인다(데몬 SIGSTOP 상황).
     std::thread::sleep(PROBE + std::time::Duration::from_millis(200));
-    assert!(cx.update(|_, cx| view.read(cx).stalled_banner()).is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.recover_stalled_panes(Now::get(), cx);
+            assert_eq!(s.stalled_banner(), None);
+            assert!(
+                s.live[&pane].sock.is_some(),
+                "first missed probe must preserve the connection"
+            );
+        });
+    });
     // ack가 오면 배너가 사라진다(SIGCONT 뒤 복구).
     let id = loop {
         let (kind, body) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();

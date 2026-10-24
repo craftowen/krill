@@ -571,6 +571,7 @@ pub struct Shell {
     /// 보이는 칸의 세션 연결(OWE-490).
     live: HashMap<PaneId, Live>,
     pane_liveness: Option<Task<()>>,
+    liveness_monitor: liveness::LivenessMonitor,
     creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
     restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
     /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
@@ -1111,6 +1112,7 @@ impl Shell {
             update_ready: None,
             live: HashMap::new(),
             pane_liveness: None,
+            liveness_monitor: liveness::LivenessMonitor::default(),
             creations: HashMap::new(),
             restoring_sessions: std::collections::HashSet::new(),
             titles: HashMap::new(),
@@ -4004,19 +4006,6 @@ impl Shell {
             self.notice = Some(notice_text(n));
             cx.notify();
         }
-    }
-
-    /// 보이는 칸 중 보낸 입력의 ack가 PROBE 넘게 오지 않은 칸이 있으면 배너 문구(OWE-586).
-    /// ack·재연결이 오면 다음 그리기에서 사라진다.
-    fn stalled_banner(&self) -> Option<String> {
-        let now = Now::get();
-        let any = self
-            .layout
-            .visible()
-            .iter()
-            .filter_map(|p| self.live.get(p))
-            .any(|l| l.pane.stalled(now));
-        krill_app::link::stalled_banner(any)
     }
 
     /// 포커스 칸에 PTY 바이트를 보낸다(IME 결과). 조합을 끊었으면 플랫폼 IME 쪽 조합도 버린다.
