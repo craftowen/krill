@@ -20,9 +20,15 @@ pub(crate) fn from_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Ide
             data.pointer("/tokens/id_token")
                 .or_else(|| data.pointer("/tokens/idToken"))?
         }
-        ProviderKind::Antigravity => data
-            .get("id_token")
-            .or_else(|| data.pointer("/token/id_token"))?,
+        ProviderKind::Antigravity => {
+            match data
+                .get("id_token")
+                .or_else(|| data.pointer("/token/id_token"))
+            {
+                Some(token) => token,
+                None => return agy_identity_fields(&data),
+            }
+        }
         _ => return None,
     }
     .as_str()?;
@@ -51,6 +57,53 @@ pub(crate) fn from_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Ide
         email: email.to_owned(),
         org_id: None,
         org_name: None,
+    })
+}
+
+/// agy 1.4.7+ stores display identity beside OAuth tokens. Never use these fields
+/// to rescue a present but invalid JWT, or mix an email with another object's ID.
+fn agy_identity_fields(data: &Value) -> Option<Identity> {
+    [
+        Some(data),
+        data.get("token"),
+        data.get("account"),
+        data.get("user"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|object| {
+        let valid_text = |value: &Value| {
+            value.as_str().is_some_and(|s| {
+                !s.trim().is_empty() && s.len() <= 320 && !s.chars().any(char::is_control)
+            })
+        };
+        if !["sub", "account_id"]
+            .iter()
+            .any(|key| object.get(key).is_some_and(valid_text))
+            || object
+                .get("email_verified")
+                .is_some_and(|v| v != &Value::Bool(true))
+        {
+            return None;
+        }
+        ["id_token_email", "email", "account_email"]
+            .iter()
+            .find_map(|key| {
+                let email = object.get(key).filter(|v| valid_text(v))?.as_str()?.trim();
+                let (local, domain) = email.split_once('@')?;
+                if local.is_empty()
+                    || domain.is_empty()
+                    || domain.contains('@')
+                    || email.chars().any(char::is_whitespace)
+                {
+                    return None;
+                }
+                Some(Identity {
+                    email: email.to_owned(),
+                    org_id: None,
+                    org_name: None,
+                })
+            })
     })
 }
 
@@ -155,6 +208,60 @@ mod tests {
             "profile@example.test"
         );
     }
+    #[test]
+    fn agy_identity_supports_new_token_schema_without_weakening_jwt_checks() {
+        for key in ["id_token_email", "email", "account_email"] {
+            for scope in [None, Some("token"), Some("account"), Some("user")] {
+                for id in ["sub", "account_id"] {
+                    let mut fields = serde_json::json!({id:"user", key:" agy@example.test "});
+                    if let Some(scope) = scope {
+                        fields = serde_json::json!({scope: fields});
+                    }
+                    let raw = serde_json::to_vec(&fields).unwrap();
+                    assert_eq!(
+                        from_credentials(ProviderKind::Antigravity, &raw)
+                            .unwrap()
+                            .email,
+                        "agy@example.test"
+                    );
+                    assert!(from_credentials(ProviderKind::Codex, &raw).is_none());
+                }
+            }
+        }
+        for fields in [
+            serde_json::json!({"email":"a@b"}),
+            serde_json::json!({"sub":"", "email":"a@b"}),
+            serde_json::json!({"sub":"u", "email":"a\n@b"}),
+            serde_json::json!({"sub":"u", "email":"a b@c"}),
+            serde_json::json!({"sub":"u", "email":"invalid"}),
+            serde_json::json!({"sub":"u", "email":"a@b", "email_verified":false}),
+            serde_json::json!({"sub":"u", "email":"a@b", "id_token":"invalid"}),
+            serde_json::json!({"sub":"u", "email":"a@b", "token":{"id_token":"invalid"}}),
+            serde_json::json!({"sub":"u", "account":{"email":"a@b"}}),
+            serde_json::json!({"sub":"u", "email":format!("{}@b", "a".repeat(321))}),
+        ] {
+            assert!(
+                from_credentials(
+                    ProviderKind::Antigravity,
+                    &serde_json::to_vec(&fields).unwrap()
+                )
+                .is_none(),
+                "{fields}"
+            );
+        }
+        let mut raw: Value = serde_json::from_slice(&credentials(ProviderKind::Antigravity,
+            &serde_json::json!({"iss":"untrusted", "sub":"u", "email_verified":true, "email":"jwt@b"}))).unwrap();
+        raw["sub"] = serde_json::json!("u");
+        raw["email"] = serde_json::json!("fallback@b");
+        assert!(
+            from_credentials(
+                ProviderKind::Antigravity,
+                &serde_json::to_vec(&raw).unwrap()
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn malformed_identity_is_unknown() {
         for raw in [

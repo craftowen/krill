@@ -456,6 +456,10 @@ fn hook_config_path(agent: TargetAgent, env: &Env) -> Result<PathBuf, String> {
         }
         TargetAgent::Other(Agent::Cursor) => env.home.join(".cursor/hooks.json"),
         TargetAgent::Other(Agent::Agy) => env.home.join(".gemini/config/hooks.json"),
+        TargetAgent::Other(Agent::Pi) => krill_proto::agent::hooks::pi_extension_path(&directory(
+            "PI_CODING_AGENT_DIR",
+            env.home.join(".pi/agent"),
+        )),
         TargetAgent::Other(Agent::OpenCode) => krill_proto::user_dirs::opencode_plugin(&directory(
             "OPENCODE_CONFIG_DIR",
             directory("XDG_CONFIG_HOME", env.home.join(".config")).join("opencode"),

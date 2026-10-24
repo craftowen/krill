@@ -514,9 +514,10 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
         Reply::Created { session, pid } => {
             if let Some(prompt_text) = prompt.filter(|s| !s.is_empty()) {
                 if is_agent {
-                    wait_for_spawned_agent_ready(target, session.0, BOOT_TIMEOUT).map_err(fail)?;
+                    send_initial_agent_prompt(target, session.0, &prompt_text).map_err(fail)?;
+                } else {
+                    send_session_line(target, session.0, &prompt_text).map_err(fail)?;
                 }
-                send_session_line(target, session.0, &prompt_text).map_err(fail)?;
             }
             if json {
                 let out = serde_json::to_string_pretty(&serde_json::json!({
@@ -655,8 +656,7 @@ fn fork(target: &Target, args: &[OsString]) -> Result<()> {
     let (session, pid) = fork_on_stream(conn.negotiated.features, &mut conn.stream, &parsed)?;
     drop(conn);
     if let Some(prompt) = parsed.prompt.filter(|s| !s.is_empty()) {
-        wait_for_spawned_agent_ready(target, session.0, BOOT_TIMEOUT).map_err(fail)?;
-        send_session_line(target, session.0, &prompt).map_err(fail)?;
+        send_initial_agent_prompt(target, session.0, &prompt).map_err(fail)?;
     }
     if parsed.json {
         let out = serde_json::to_string_pretty(&serde_json::json!({
@@ -947,37 +947,122 @@ pub(crate) fn spawn_agent_session_on_target(
 
 /// 새로 띄운 에이전트 세션이 셸 초기화(`/bin/zsh -l -i -c ...`)를 마치고 프롬프트 대기 상태에 도달할 때까지 기다린다.
 /// 부팅 중 종료(실행 파일 없음 등)하거나 trust·권한 메뉴에 멈추면 오류다 — 그 위에 프롬프트를 치면 메뉴 입력이 된다.
-// ponytail: 시간 초과면 계속 진행한다(스피너만 도는 TUI도 입력은 받는다). 잃는 사례가 나오면 오류로 바꾼다.
 pub(crate) fn wait_for_spawned_agent_ready(
     target: &Target,
     session_id: u64,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let Ok(mut conn) = connect(
+    wait_for_agent_prompt_ready(target, session_id, timeout)
+}
+
+fn wait_for_agent_prompt_ready(
+    target: &Target,
+    session_id: u64,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let mut conn = connect(
         target,
         FEAT_CONTROL | FEAT_CLI | krill_proto::control::FEAT_WAIT_STATUS,
-    ) else {
-        std::thread::sleep(Duration::from_millis(1500));
-        return Ok(());
-    };
+    )
+    .map_err(|e| e.text)?;
     let rules = krill_proto::agent::rules::ScreenRules::default();
     let start = std::time::Instant::now();
     let sid = SessionId(session_id);
     while start.elapsed() < timeout {
-        if let Ok(Reply::WaitStatus { state, quiet_ms }) =
-            request(&mut conn.stream, &Request::WaitStatus { session: sid })
-        {
-            let screen = capture(&mut conn.stream, sid, CaptureFormat::Plain)
-                .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default();
-            if let Some(verdict) = boot_verdict(state, &screen, quiet_ms, start.elapsed(), &rules) {
-                std::thread::sleep(Duration::from_millis(150));
-                return verdict.map_err(|e| format!("agent session {session_id} {e}"));
-            }
+        let remaining = timeout.saturating_sub(start.elapsed()).min(IO_TIMEOUT);
+        conn.stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| e.to_string())?;
+        let Reply::WaitStatus { state, quiet_ms } =
+            request(&mut conn.stream, &Request::WaitStatus { session: sid }).map_err(|e| e.text)?
+        else {
+            return Err("unexpected agent readiness reply; prompt was not sent".to_owned());
+        };
+        let remaining = timeout.saturating_sub(start.elapsed()).min(IO_TIMEOUT);
+        if remaining.is_zero() {
+            break;
         }
-        std::thread::sleep(Duration::from_millis(150));
+        conn.stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| e.to_string())?;
+        let (_, bytes) =
+            capture(&mut conn.stream, sid, CaptureFormat::Plain).map_err(|e| e.text)?;
+        let screen = String::from_utf8_lossy(&bytes);
+        if let Some(verdict) = boot_verdict(state, &screen, quiet_ms, start.elapsed(), &rules) {
+            return verdict.map_err(|e| format!("agent session {session_id} {e}"));
+        }
+        std::thread::sleep(Duration::from_millis(150).min(timeout.saturating_sub(start.elapsed())));
     }
-    Ok(())
+    Err(format!(
+        "agent session {session_id} did not become ready; prompt was not sent"
+    ))
+}
+
+/// Send once, then observe a new turn. Lost acknowledgements and absent turn
+/// evidence are uncertain delivery, never a reason to submit the same text twice.
+fn send_initial_agent_prompt(
+    target: &Target,
+    session_id: u64,
+    prompt: &str,
+) -> std::result::Result<(), String> {
+    wait_for_agent_prompt_ready(target, session_id, BOOT_TIMEOUT)?;
+    let mut conn = connect(target, FEAT_CONTROL | FEAT_HOOK).map_err(|e| e.text)?;
+    let before = agent_status(&mut conn.stream, session_id)?;
+    if !matches!(before.state, AgentState::Done | AgentState::Unknown) {
+        return Err(format!(
+            "agent session {session_id} changed state before submission; prompt was not sent"
+        ));
+    }
+    let args = session_line_args(session_id, prompt, true);
+    send(target, &args).map_err(|e| uncertain_prompt_delivery(session_id, &e.text))?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < IO_TIMEOUT {
+        let status = agent_status(&mut conn.stream, session_id)
+            .map_err(|e| uncertain_prompt_delivery(session_id, &e))?;
+        if turn_started(&before, &status) {
+            return Ok(());
+        }
+        if matches!(
+            status.state,
+            AgentState::Exited | AgentState::Blocked | AgentState::Waiting
+        ) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(uncertain_prompt_delivery(
+        session_id,
+        "no new agent turn was observed",
+    ))
+}
+
+fn agent_status(
+    stream: &mut UnixStream,
+    session_id: u64,
+) -> std::result::Result<krill_proto::control::AgentStatus, String> {
+    let Reply::States(states) = request(stream, &Request::States).map_err(|e| e.text)? else {
+        return Err("unexpected agent state reply".to_owned());
+    };
+    states
+        .into_iter()
+        .find(|s| s.session.0 == session_id)
+        .map(|s| s.status)
+        .ok_or_else(|| "agent session disappeared".to_owned())
+}
+
+fn turn_started(
+    before: &krill_proto::control::AgentStatus,
+    after: &krill_proto::control::AgentStatus,
+) -> bool {
+    after.source == Some(krill_proto::control::Source::Hook)
+        && after.since_unix_ns > before.since_unix_ns
+        && matches!(after.state, AgentState::Working | AgentState::Done)
+}
+
+fn uncertain_prompt_delivery(session_id: u64, reason: &str) -> String {
+    format!(
+        "agent session {session_id}: {reason}; prompt delivery uncertain, inspect the session before retrying; do not automatically resend"
+    )
 }
 
 /// 부팅 대기 한 번의 판정. `None`이면 계속 기다린다.
@@ -992,11 +1077,10 @@ fn boot_verdict(
         "is blocked on a trust/permission prompt; answer it, then resend the prompt";
     match state {
         AgentState::Exited => return Some(Err("exited during startup")),
-        AgentState::Blocked => return Some(Err(BLOCKED)),
-        AgentState::Done | AgentState::Waiting => return Some(Ok(())),
-        AgentState::Working | AgentState::Unknown => {}
+        AgentState::Blocked | AgentState::Waiting => return Some(Err(BLOCKED)),
+        AgentState::Done | AgentState::Working | AgentState::Unknown => {}
     }
-    if rules.menu_hit(screen) == Some(krill_proto::agent::rules::MenuHit::Blocked) {
+    if rules.menu_hit(screen).is_some() {
         return Some(Err(BLOCKED));
     }
     let non_empty: Vec<&str> = screen
@@ -1004,8 +1088,14 @@ fn boot_verdict(
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let ready = non_empty.iter().rev().take(4).any(|l| rules.is_prompt(l))
-        || (!non_empty.is_empty() && quiet_ms >= 1200 && elapsed >= Duration::from_millis(1500));
+    if state == AgentState::Working {
+        return None;
+    }
+    let ready = !non_empty.is_empty()
+        && (state == AgentState::Done
+            || non_empty.iter().rev().take(4).any(|l| rules.is_prompt(l)))
+        && quiet_ms >= 150
+        && elapsed >= Duration::from_millis(150);
     ready.then_some(Ok(()))
 }
 
@@ -1014,20 +1104,22 @@ pub(crate) fn send_session_line(
     session_id: u64,
     line: &str,
 ) -> std::result::Result<(), String> {
-    if line.is_empty() {
-        let enter_args = [
-            OsString::from(session_id.to_string()),
-            OsString::from("--enter"),
-        ];
-        return send(target, &enter_args).map_err(|e| e.text);
-    }
-    let args = [
+    send(target, &session_line_args(session_id, line, false)).map_err(|e| e.text)
+}
+
+fn session_line_args(session_id: u64, line: &str, wait_submit: bool) -> Vec<OsString> {
+    let mut args = vec![
         OsString::from(session_id.to_string()),
         OsString::from("--enter"),
-        OsString::from("--"),
-        OsString::from(line),
     ];
-    send(target, &args).map_err(|e| e.text)
+    if wait_submit {
+        args.push(OsString::from("--wait-submit"));
+    }
+    if !line.is_empty() {
+        args.push(OsString::from("--"));
+        args.push(OsString::from(line));
+    }
+    args
 }
 
 pub(crate) fn close_session(session_id: u64) -> std::result::Result<(), String> {
@@ -1177,10 +1269,15 @@ mod tests {
             None
         );
         assert_eq!(
-            verdict(AgentState::Unknown, "Antigravity CLI\n>\n", 0, early),
+            verdict(
+                AgentState::Unknown,
+                "Antigravity CLI\n>\n",
+                150,
+                Duration::from_millis(150)
+            ),
             Some(true)
         );
-        assert_eq!(verdict(AgentState::Done, "", 0, early), Some(true));
+        assert_eq!(verdict(AgentState::Done, "", 0, early), None);
         assert_eq!(verdict(AgentState::Exited, "", 0, early), Some(false));
         assert_eq!(verdict(AgentState::Blocked, "", 0, early), Some(false));
         assert_eq!(
@@ -1192,7 +1289,7 @@ mod tests {
             ),
             Some(false)
         );
-        // 프롬프트 모양을 몰라도 화면이 조용해지면 준비된 것으로 본다.
+        // A quiet banner is insufficient, especially while a turn is working.
         assert_eq!(
             verdict(
                 AgentState::Working,
@@ -1200,7 +1297,110 @@ mod tests {
                 1200,
                 Duration::from_millis(1500)
             ),
-            Some(true)
+            None
+        );
+    }
+
+    #[test]
+    fn boot_verdict_never_sends_initial_prompt_into_an_active_turn_or_menu() {
+        let rules = ScreenRules::default();
+        let elapsed = Duration::from_secs(12);
+        for state in [
+            AgentState::Done,
+            AgentState::Waiting,
+            AgentState::Unknown,
+            AgentState::Working,
+        ] {
+            assert!(
+                boot_verdict(
+                    state,
+                    "Do you trust the contents of this project?\n> Yes, I trust this folder",
+                    5000,
+                    elapsed,
+                    &rules
+                )
+                .unwrap()
+                .is_err()
+            );
+        }
+        assert!(
+            boot_verdict(AgentState::Waiting, ">", 5000, elapsed, &rules)
+                .unwrap()
+                .is_err()
+        );
+        assert!(boot_verdict(AgentState::Working, ">", 5000, elapsed, &rules).is_none());
+        assert!(boot_verdict(AgentState::Unknown, "Loading...", 5000, elapsed, &rules).is_none());
+        assert!(boot_verdict(AgentState::Unknown, ">", 0, Duration::ZERO, &rules).is_none());
+    }
+
+    #[test]
+    fn initial_prompt_requires_new_turn_evidence_and_never_builds_a_retry() {
+        use krill_proto::control::AgentStatus;
+        let before = AgentStatus {
+            state: AgentState::Done,
+            since_unix_ns: 10,
+            ..AgentStatus::UNKNOWN
+        };
+        for state in [AgentState::Working, AgentState::Done] {
+            let mut after = AgentStatus {
+                state,
+                source: Some(krill_proto::control::Source::Hook),
+                since_unix_ns: 10,
+                ..AgentStatus::UNKNOWN
+            };
+            assert!(!turn_started(&before, &after));
+            after.since_unix_ns = 11;
+            assert!(turn_started(&before, &after));
+        }
+        for source in [
+            None,
+            Some(krill_proto::control::Source::Process),
+            Some(krill_proto::control::Source::Screen),
+            Some(krill_proto::control::Source::Title),
+        ] {
+            assert!(!turn_started(
+                &before,
+                &AgentStatus {
+                    state: AgentState::Working,
+                    source,
+                    since_unix_ns: 11,
+                    ..AgentStatus::UNKNOWN
+                }
+            ));
+        }
+        for state in [
+            AgentState::Unknown,
+            AgentState::Waiting,
+            AgentState::Blocked,
+            AgentState::Exited,
+        ] {
+            assert!(!turn_started(
+                &before,
+                &AgentStatus {
+                    state,
+                    since_unix_ns: 11,
+                    ..AgentStatus::UNKNOWN
+                }
+            ));
+        }
+        let args = session_line_args(7, "--wait-submit\nuser text", true);
+        assert_eq!(
+            args,
+            [
+                "7",
+                "--enter",
+                "--wait-submit",
+                "--",
+                "--wait-submit\nuser text"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            session_line_args(7, "", false),
+            ["7", "--enter"].map(OsString::from)
+        );
+        assert!(
+            uncertain_prompt_delivery(7, "disconnected").contains("do not automatically resend")
         );
     }
 

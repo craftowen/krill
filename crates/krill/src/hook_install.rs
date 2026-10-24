@@ -10,7 +10,7 @@ use krill_proto::daemon;
 use krill_proto::hook_install::{Action, Plan, TargetAgent};
 
 const USAGE: &str =
-    "usage: krill hook install|uninstall <claude|codex|agy|cursor|opencode> [--dry-run] [--yes]";
+    "usage: krill hook install|uninstall <claude|codex|agy|cursor|opencode|pi> [--dry-run] [--yes]";
 const CONSENT: &str = "Apply the changes shown above? [y/N] ";
 
 pub fn run(action: &str, args: &[&str]) -> ExitCode {
@@ -170,6 +170,9 @@ fn config_path(agent: TargetAgent, home: &Path) -> io::Result<PathBuf> {
                 xdg.join("opencode"),
             )?)
         }
+        TargetAgent::Other(Agent::Pi) => krill_proto::agent::hooks::pi_extension_path(
+            &directory_override("PI_CODING_AGENT_DIR", home.join(".pi/agent"))?,
+        ),
         TargetAgent::Other(Agent::Codex) => return Err(io::Error::other("Codex uses RPC trust")),
     })
 }
@@ -177,6 +180,62 @@ fn config_path(agent: TargetAgent, home: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pi_hook_install_uninstall_and_user_edits_use_receipts() {
+        use krill_proto::agent::hooks;
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("krill-pi-hooks-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let root = canonicalize(&root).unwrap();
+        let path = hooks::pi_extension_path(&root.join("agent"));
+        let state = root.join("state");
+        let exe = root.join("krill with ' quotes");
+        let agent = TargetAgent::parse("pi").unwrap();
+        assert_eq!(agent, TargetAgent::Other(Agent::Pi));
+        assert!(USAGE.contains("|pi>"));
+        let plan = Plan::prepare(Action::Install, agent, &path, &state, &exe)
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists(), "preparation and preview never write");
+        let mut diff = Vec::new();
+        plan.write_diff(&mut diff).unwrap();
+        assert!(String::from_utf8(diff).unwrap().contains("session_start"));
+        let receipt = plan.apply().unwrap();
+        assert!(receipt.complete);
+        assert_eq!(receipt.agent, "pi");
+        let installed = fs::read_to_string(&path).unwrap();
+        assert_eq!(installed, hooks::pi_extension(&exe).unwrap());
+        assert!(
+            Plan::prepare(Action::Install, agent, &path, &state, &exe)
+                .unwrap()
+                .is_none()
+        );
+        Plan::prepare(Action::Uninstall, agent, &path, &state, &exe)
+            .unwrap()
+            .unwrap()
+            .apply()
+            .unwrap();
+        assert!(!path.exists());
+        assert!(!hooks::receipt(&state, Agent::Pi).exists());
+        Plan::prepare(Action::Install, agent, &path, &state, &exe)
+            .unwrap()
+            .unwrap()
+            .apply()
+            .unwrap();
+        let edited = installed + "// user edit\n";
+        fs::write(&path, &edited).unwrap();
+        Plan::prepare(Action::Uninstall, agent, &path, &state, &exe)
+            .unwrap()
+            .unwrap()
+            .apply()
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert!(Plan::prepare(Action::Install, agent, &path, &state, &exe).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn help_returns_zero() {
         assert_eq!(run("install", &["--help"]), ExitCode::SUCCESS);
