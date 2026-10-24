@@ -76,57 +76,89 @@ impl Shell {
 
         div()
             .id("sidebar-jump")
-            .debug_selector(|| "sidebar-jump".into())
             .group("sidebar-search-row")
             .role(gpui::Role::Button)
             .aria_label(sb_text::SEARCH_SHORT.get())
-            .h(krill_app::ui::SIDEBAR_HEADER_HEIGHT)
+            .w_full()
+            .h(gpui::px(30.))
+            .mb_1()
+            .px_2p5()
+            .rounded(krill_app::ui::RADIUS_SM)
+            .border_1()
+            .border_color(p.sidebar_border)
+            .bg(p.sidebar_accent.opacity(0.65))
+            .cursor_pointer()
             .flex()
             .items_center()
-            .gap_1()
-            .text_color(p.muted_foreground)
-            .child(
-                div()
-                    .id("sidebar-search-control")
-                    .size_7()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(krill_app::ui::RADIUS_SM)
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.sidebar_accent).text_color(p.sidebar_foreground))
-                    .child(
-                        gpui_component::Icon::new(IconName::Search)
-                            .with_size(krill_app::ui::ICON_MD),
-                    )
-                    .tooltip(|window, cx| {
-                        krill_app::ui::tooltip_view(
-                            "sidebar-search",
-                            sb_text::SEARCH_SHORT.get(),
-                            window,
-                            cx,
-                        )
-                    }),
-            )
-            .when(yolo, |d| {
-                d.child(
-                    div()
-                        .id("yolo-global")
-                        .debug_selector(|| "yolo-global".into())
-                        .px_1()
-                        .rounded(krill_app::ui::RADIUS_XS)
-                        .bg(p.warning)
-                        .text_color(p.warning_foreground)
-                        .text_size(krill_app::ui::TEXT_2XS)
-                        .child(krill_app::i18n::catalog::general::YOLO.get()),
-                )
+            .justify_between()
+            .gap_1p5()
+            .text_size(krill_app::ui::TEXT_MD)
+            .text_color(p.sidebar_foreground.opacity(0.45))
+            .hover(|d| {
+                d.bg(p.sidebar_accent)
+                    .text_color(p.sidebar_foreground.opacity(0.75))
             })
             .child(
                 div()
-                    .id("new-session-wrap")
-                    .debug_selector(|| "new-session".into())
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(menu),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        gpui_component::Icon::new(IconName::Search)
+                            .with_size(krill_app::ui::ICON_MD)
+                            .text_color(p.sidebar_foreground.opacity(0.38)),
+                    )
+                    .child(div().truncate().child(sb_text::SEARCH_SHORT.get())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover("sidebar-search-row", gpui::Styled::visible)
+                            .font_family(krill_app::ui::FONT_MONO)
+                            .text_size(krill_app::ui::TEXT_2XS)
+                            .text_color(p.sidebar_foreground.opacity(0.4))
+                            .child(krill_app::i18n::catalog::general::JUMP_SHORTCUT.get()),
+                    )
+                    .when(yolo, |d| {
+                        d.child(
+                            div()
+                                .id("yolo-global")
+                                .debug_selector(|| "yolo-global".into())
+                                .invisible()
+                                .group_hover("sidebar-search-row", gpui::Styled::visible)
+                                .px_1()
+                                .rounded(krill_app::ui::RADIUS_XS)
+                                .bg(p.warning)
+                                .text_color(p.warning_foreground)
+                                .text_size(krill_app::ui::TEXT_2XS)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(krill_app::i18n::catalog::general::YOLO.get())
+                                .tooltip(|window, cx| {
+                                    krill_app::ui::tooltip_view(
+                                        "yolo-global",
+                                        text::YOLO_TOGGLE.get(),
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("new-session-wrap")
+                            .debug_selector(|| "new-session".into())
+                            .invisible()
+                            .group_hover("sidebar-search-row", gpui::Styled::visible)
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(menu),
+                    ),
             )
     }
 
@@ -147,18 +179,20 @@ impl Shell {
             .debug_selector(move || id.into())
             .role(gpui::Role::Button)
             .aria_label(label)
-            .size_7()
+            .w_full()
+            .h(gpui::px(28.))
+            .px_2()
             .rounded(krill_app::ui::RADIUS_SM)
             .cursor_pointer()
             .flex()
             .items_center()
-            .justify_center()
+            .gap_2p5()
             .text_size(krill_app::ui::TEXT_MD)
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(nav_text_color)
             .hover(|d| d.bg(nav_hover_bg).text_color(p.sidebar_foreground))
             .child(icons::svg_icon(svg, krill_app::ui::ICON_SM, nav_icon_color))
-            .tooltip(move |window, cx| krill_app::ui::tooltip_view(id, label, window, cx))
+            .child(div().flex_1().min_w_0().truncate().child(label))
     }
     pub(super) fn new_agent_with_account(
         &mut self,
@@ -271,6 +305,7 @@ impl Shell {
         let locations = self.execution_locations(cx);
         let launch_host = self.launch_host.clone();
         let (this, focus) = (cx.weak_entity(), self.focus.clone());
+        let (working_count, done_count) = self.sidebar.read(cx).agent_counts();
         let menu = krill_app::ui::button_with_tooltip(
             Button::new("new-session")
                 .icon(IconName::Plus)
@@ -279,8 +314,6 @@ impl Shell {
             "new-session",
             text::NEW_SESSION.get(),
         )
-        // This trigger lives in the footer. Opening above it keeps the initial
-        // pointer outside the menu, so hover cannot change keyboard selection.
         .dropdown_menu(move |mut menu, window, cx| {
             menu = menu
                 .action_context(focus.clone())
@@ -394,19 +427,18 @@ impl Shell {
                         this.update(cx, |_, cx| Self::choose_folder(cx)).ok();
                     }),
             )
-        })
-        .anchor(gpui::Anchor::BottomLeft);
+        });
 
         div()
             .id("agents")
             .role(gpui::Role::Group)
             .aria_label(text::AGENTS.get())
             .px_2()
-            .h(krill_app::ui::SIDEBAR_HEADER_HEIGHT)
-            .flex_none()
+            .pt_2()
+            .pb_2()
             .flex()
-            .items_center()
-            .gap_1()
+            .flex_col()
+            .gap_0p5()
             .child(
                 Self::jump_row(p, permission == Permission::Yolo, menu)
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_jump(window, cx))),
@@ -434,6 +466,57 @@ impl Shell {
                 .when(self.dashboard.is_some(), |d| {
                     d.bg(p.sidebar_accent)
                         .text_color(p.sidebar_accent_foreground)
+                })
+                .when(working_count > 0 || done_count > 0, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(krill_app::ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .when(working_count > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_color(p.sidebar_foreground.opacity(0.6))
+                                        .child(
+                                            div()
+                                                .size(krill_app::ui::STATE_DOT)
+                                                .rounded_full()
+                                                .bg(p.warning),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(krill_app::ui::FONT_MONO)
+                                                .child(working_count.to_string()),
+                                        ),
+                                )
+                            })
+                            .when(done_count > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_color(p.sidebar_foreground.opacity(0.6))
+                                        .child(
+                                            div()
+                                                .size(krill_app::ui::STATE_DOT)
+                                                .rounded_full()
+                                                .bg(p.success),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(krill_app::ui::FONT_MONO)
+                                                .child(done_count.to_string()),
+                                        ),
+                                )
+                            }),
+                    )
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
             )

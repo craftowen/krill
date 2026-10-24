@@ -1674,10 +1674,10 @@ fn unread_clears_when_session_is_focused(cx: &mut TestAppContext) {
     });
 }
 
-/// 연결 안 됐고 세션도 없는 원격 호스트는 Orca처럼 맨 아래 한 줄('연결 안 된 호스트 N개')로 묶이고,
-/// 누르면 펼쳐지며, 끊긴 이유(꺼짐·인증 거부·Krill 없음)가 상태 자리에 보인다.
+/// 연결 안 됐고 세션도 없는 원격 호스트는 목록에 띄우지 않고, 끊긴 이유(꺼짐·인증 거부·Krill 없음)는
+/// 보이는 호스트의 상태 자리에 쓴다.
 #[gpui::test]
-fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppContext) {
+fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
     let remote = |id: &str, status, sessions: Vec<Session>, error: Option<&str>| RemoteHost {
@@ -1710,16 +1710,13 @@ fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppC
                 .iter()
                 .filter_map(|r| match r {
                     Row::HostHeader { host, .. } => Some(host.as_key().to_owned()),
-                    Row::OfflineHosts(n) => Some(format!("offline:{n}")),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         })
     };
-    // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘만 묶인다.
-    assert_eq!(headers(cx), ["oci", "kak", "offline:2"]);
-    cx.update(|_, cx| view.update(cx, |s, cx| s.toggle_offline_hosts(None, cx)));
-    assert_eq!(headers(cx), ["oci", "kak", "offline:2", "mbp", "seol"]);
+    // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘은 숨는다.
+    assert_eq!(headers(cx), ["oci", "kak"]);
 
     assert_eq!(
         super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
@@ -1736,6 +1733,63 @@ fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppC
     assert_eq!(
         super::view::disconnect_reason("weird"),
         text::HOST_DISCONNECTED.get()
+    );
+}
+
+/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 끊기지 않고 이어지며, 프로젝트 없는 호스트와
+/// 작업 폴더 없는 세션 묶음은 모든 프로젝트 뒤에 온다.
+#[gpui::test]
+fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let remote = |id: &str, snapshot: Snapshot| RemoteHost {
+        id: id.into(),
+        label: id.into(),
+        status: HostStatus::Connected,
+        snapshot,
+        meta: Meta::new(),
+        source: None,
+        error: None,
+    };
+    view.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![session(1, AgentState::Working, Some("/local/a"))],
+            trees: BTreeMap::from([("/local".into(), vec!["/local/a".into()])]),
+        };
+        s.remote_hosts = vec![
+            remote("oci", Snapshot::default()),
+            remote(
+                "win",
+                Snapshot {
+                    sessions: vec![session(2, AgentState::Done, None)],
+                    trees: BTreeMap::from([("/tax".into(), vec!["/tax".into()])]),
+                },
+            ),
+            remote(
+                "seol",
+                Snapshot {
+                    sessions: Vec::new(),
+                    trees: BTreeMap::from([("/seol".into(), vec!["/seol".into()])]),
+                },
+            ),
+        ];
+        s.rebuild(cx);
+    });
+    let rows = cx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Repository(p) | Row::Folder(p) => Some(p.display().to_string()),
+                Row::HostHeader { host, .. } => Some(format!("host:{}", host.as_key())),
+                Row::Loose => Some("loose".into()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        rows,
+        ["/local", "/tax", "/seol", "host:oci", "host:win", "loose"]
     );
 }
 
@@ -3716,7 +3770,7 @@ fn owe900_imported_idle_worktrees_render_as_cards_and_all_projects_visible(
     }
     // 저장소 헤더와 워크트리 수 배지가 보인다(rows[0] = 첫 프로젝트, 워크트리 8개).
     assert!(cx.debug_bounds("repo-header-0").is_some());
-    assert!(cx.debug_bounds("repo-count-0").is_none());
+    assert!(cx.debug_bounds("repo-count-0").is_some());
 }
 
 /// OWE-900: 세션 없는 워크트리가 10개를 넘는 프로젝트는 접힌 상태로 시작한다.
@@ -3939,8 +3993,8 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
 
     // row 1: 핀 고정된 기본 워크트리(`repo`, `main`), row 2: `wt_feature`
     assert!(
-        vcx.debug_bounds("worktree-branch-1").is_some(),
-        "the default workspace uses its folder name and keeps the actual branch on row 2"
+        vcx.debug_bounds("worktree-branch-1").is_none(),
+        "default branch card where card_title == branch_subtitle ('main') must not duplicate branch on row 2"
     );
     let default_badge = vcx
         .debug_bounds("worktree-default-badge-1")
@@ -4010,8 +4064,8 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     let feature_pin = selector("worktree-pin", feature_idx);
     let repo_rename = selector("worktree-rename", repo_idx);
     assert!(
-        vcx.debug_bounds(repo_branch).is_some(),
-        "compact layout keeps the branch separate from the default workspace name"
+        vcx.debug_bounds(repo_branch).is_none(),
+        "compact layout must also suppress duplicate branch when card_title == branch_subtitle"
     );
     assert!(
         vcx.debug_bounds(feature_branch).is_some(),

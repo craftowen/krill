@@ -592,11 +592,14 @@ catalog! {
         HOST_RECONNECTING => ("다시 연결하는 중", "Reconnecting"),
         HOST_RECONNECT => ("다시 연결", "Reconnect"),
         HOST_DISCONNECT => ("연결 해제", "Disconnect"),
-        HOST_OFFLINE_GROUP => ("연결 안 된 호스트 {n}개", "{n} unconnected hosts"),
         HOST_REASON_OFFLINE => ("꺼져 있음", "Offline"),
         HOST_REASON_AUTH => ("인증 거부", "Auth rejected"),
         HOST_REASON_REFUSED => ("원격 로그인 꺼짐", "Remote Login off"),
         HOST_REASON_NO_KRILL => ("Krill 없음", "Krill not running"),
+        DAEMON_SLOW => (
+            "Krill 데몬 응답이 늦어 다시 시도하는 중입니다",
+            "The Krill daemon is slow to respond. Retrying…"
+        ),
         SESSION_ACCOUNT => ("계정 {label}", "Account {label}"),
         INFERRED_STATUS_TOOLTIP => ("터미널 제목이나 화면에서 추정한 상태입니다. 실제 상태와 다를 수 있습니다.", "Status inferred from the terminal title or screen. It may differ from the actual state."),
         COORD_BADGE => ("지휘자", "coord"),

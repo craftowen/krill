@@ -233,8 +233,6 @@ enum Row {
     Folder(PathBuf),
     /// 작업 디렉터리를 모르는 세션.
     Loose,
-    /// 연결되지 않았고 세션도 없는 원격 호스트 묶음(개수). 누르면 그 호스트들을 펼친다.
-    OfflineHosts(usize),
 }
 
 /// 사이드바에 표시되는 원격 호스트 섹션 상태.
@@ -622,10 +620,6 @@ enum Relink {
     AwaitingList,
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "서로 무관한 화면 상태 플래그(표시·폴링·펼침)라 상태 기계로 합칠 수 없다"
-)]
 pub struct Sidebar {
     snapshot: Snapshot,
     meta: Meta,
@@ -636,8 +630,6 @@ pub struct Sidebar {
     remote_manager: Option<HostManager>,
     remote_info: BTreeMap<String, krill_hosts::HostConnectionInfo>,
     collapsed_hosts: BTreeSet<HostId>,
-    /// '연결 안 된 호스트' 묶음을 펼쳤는지(앱을 다시 켜면 접힌다).
-    show_offline_hosts: bool,
     /// 사용자가 끌어다 놓아 정한 프로젝트(저장소) 순서(`sidebar.bin` 5번째 구간).
     project_order: Vec<PathBuf>,
     row_hosts: Vec<HostId>,
@@ -757,6 +749,14 @@ impl std::fmt::Debug for Sidebar {
     }
 }
 
+/// 작업 폴더 없는 세션 묶음(`Row::Loose`와 그 세션 행, 항상 목록 끝)을 떼어 낸다.
+fn split_loose(rows: &mut Vec<Row>) -> Vec<Row> {
+    rows.iter()
+        .position(|r| matches!(r, Row::Loose))
+        .map(|i| rows.split_off(i))
+        .unwrap_or_default()
+}
+
 fn sort_agents(mut list: Vec<AgentProfile>) -> Vec<AgentProfile> {
     list.sort_by(|a, b| {
         krill_proto::agent::profile_rank(&a.id)
@@ -795,7 +795,6 @@ impl Sidebar {
             remote_manager: None,
             remote_info: BTreeMap::new(),
             collapsed_hosts: ui.collapsed_hosts,
-            show_offline_hosts: false,
             project_order: Vec::new(),
             row_hosts: Vec::new(),
             action_host: None,
@@ -1997,6 +1996,10 @@ impl Sidebar {
         } else {
             let mut rows = Vec::new();
             let mut row_hosts = Vec::new();
+            // Orca처럼 프로젝트 목록을 끊지 않도록, 프로젝트 기준 보기에서는 호스트 행과
+            // 작업 폴더 없는 세션을 모든 프로젝트 뒤에 모은다.
+            let mut tail = Vec::new();
+            let mut tail_hosts = Vec::new();
             if self.options.filters.contains_host(&HostId::Local) {
                 if self.options.group_by != GroupBy::Repo {
                     rows.push(Row::HostHeader {
@@ -2013,57 +2016,71 @@ impl Sidebar {
                 if self.options.group_by == GroupBy::Repo
                     || !self.collapsed_hosts.contains(&HostId::Local)
                 {
-                    let local_rows = self.local_rows();
+                    let mut local_rows = self.local_rows();
+                    if self.options.group_by == GroupBy::Repo {
+                        let loose = split_loose(&mut local_rows);
+                        tail_hosts.extend(std::iter::repeat_n(HostId::Local, loose.len()));
+                        tail.extend(loose);
+                    }
                     row_hosts.extend(std::iter::repeat_n(HostId::Local, local_rows.len()));
                     rows.extend(local_rows);
                 }
             }
-            // Orca처럼 쓰는 호스트만 펼쳐 두고, 연결 안 됐고 세션도 없는 호스트는 맨 아래 한 줄로 묶는다.
-            let (idle_hosts, live_hosts): (Vec<&RemoteHost>, Vec<&RemoteHost>) = self
-                .remote_hosts
-                .iter()
-                .filter(|r| {
-                    self.options
-                        .filters
-                        .contains_host(&HostId::Remote(r.id.clone()))
-                })
-                // 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
-                .partition(|r| {
-                    r.status != HostStatus::Connected
-                        && r.snapshot.sessions.is_empty()
-                        && r.snapshot.trees.is_empty()
-                        && !self.remote_info.contains_key(&r.id)
-                });
-            for (i, remote) in live_hosts.iter().chain(&idle_hosts).enumerate() {
+            // 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
+            // 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
+            let live_hosts = self.remote_hosts.iter().filter(|r| {
+                self.options
+                    .filters
+                    .contains_host(&HostId::Remote(r.id.clone()))
+                    && (r.status == HostStatus::Connected
+                        || !r.snapshot.sessions.is_empty()
+                        || !r.snapshot.trees.is_empty()
+                        || self.remote_info.contains_key(&r.id))
+            });
+            for remote in live_hosts {
                 let host = HostId::Remote(remote.id.clone());
-                if i == live_hosts.len() {
-                    rows.push(Row::OfflineHosts(idle_hosts.len()));
-                    row_hosts.push(HostId::Local);
-                    if !self.show_offline_hosts {
-                        break;
-                    }
-                }
-                let r_rows = self.remote_rows(remote);
+                let mut r_rows = self.remote_rows(remote);
                 // Projects are the root navigation. A remote connection without any
                 // projects still needs a reachable status/reconnect surface.
-                let project_roots = self.options.group_by == GroupBy::Repo
+                let by_repo = self.options.group_by == GroupBy::Repo;
+                let loose = if by_repo {
+                    split_loose(&mut r_rows)
+                } else {
+                    Vec::new()
+                };
+                let project_roots = by_repo
                     && r_rows
                         .iter()
                         .any(|r| matches!(r, Row::Repository(_) | Row::Folder(_)));
-                if !project_roots {
-                    rows.push(Row::HostHeader {
-                        host: host.clone(),
-                        label: remote.label.clone(),
-                        status: remote.status,
-                        sessions: remote.snapshot.sessions.len(),
-                    });
-                    row_hosts.push(host.clone());
-                }
-                if project_roots || !self.collapsed_hosts.contains(&host) {
-                    row_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
+                if project_roots {
+                    row_hosts.extend(std::iter::repeat_n(host.clone(), r_rows.len()));
                     rows.extend(r_rows);
+                    r_rows = Vec::new();
+                }
+                let (out, out_hosts) = if by_repo {
+                    r_rows.extend(loose);
+                    if r_rows.is_empty() && project_roots {
+                        continue;
+                    }
+                    (&mut tail, &mut tail_hosts)
+                } else {
+                    (&mut rows, &mut row_hosts)
+                };
+                out.push(Row::HostHeader {
+                    host: host.clone(),
+                    label: remote.label.clone(),
+                    status: remote.status,
+                    sessions: remote.snapshot.sessions.len(),
+                });
+                out_hosts.push(host.clone());
+                // 프로젝트가 있는 호스트의 세션 묶음은 예전 호스트 접힘 상태에 가려지지 않는다.
+                if project_roots || !self.collapsed_hosts.contains(&host) {
+                    out_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
+                    out.extend(r_rows);
                 }
             }
+            rows.append(&mut tail);
+            row_hosts.append(&mut tail_hosts);
             self.rows = rows;
             self.row_hosts = row_hosts;
         }
@@ -2219,7 +2236,15 @@ impl Sidebar {
                 crate::alert::disconnected(cx);
                 let status_changed = self.local_status != HostStatus::Disconnected;
                 self.local_status = HostStatus::Disconnected;
-                let msg = e.to_string();
+                // 읽기 시한 만료(macOS는 EAGAIN, os error 35)는 날것의 OS 문구 대신 재시도 안내로 보인다.
+                let msg = if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) {
+                    text::DAEMON_SLOW.get().to_owned()
+                } else {
+                    e.to_string()
+                };
                 if self.poll_error.as_ref() != Some(&msg) || status_changed {
                     self.poll_error = Some(msg);
                     if status_changed && !self.remote_hosts.is_empty() {
@@ -2264,7 +2289,7 @@ impl Sidebar {
                     return;
                 };
                 let sp = sidebar_path.clone();
-                let (result, comments, auto_titles) = bg
+                let (result, comments, auto_titles, fallback) = bg
                     .spawn(async move {
                         let mut comments = source.comments();
                         if comments.is_empty() {
@@ -2288,12 +2313,35 @@ impl Sidebar {
                             }
                             (snapshot, meta)
                         });
-                        (result, comments, auto_titles)
+                        // 데몬이 응답하지 않아도 등록된 로컬 프로젝트는 목록에 남긴다.
+                        let fallback = if result.is_err()
+                            && let Some(ref dir) = state_dir
+                        {
+                            let mut snapshot = Snapshot::default();
+                            let mut meta = Meta::default();
+                            external::include_imported_projects(
+                                dir,
+                                &mut snapshot.trees,
+                                &mut meta,
+                            );
+                            Some((snapshot.trees, meta))
+                        } else {
+                            None
+                        };
+                        (result, comments, auto_titles, fallback)
                     })
                     .await;
                 let next_delay = this.update(cx, |s, cx| {
                     if s.disk.poll_generation != generation || (!s.is_visible() && !forced) {
                         return None;
+                    }
+                    if let Some((trees, meta)) = fallback
+                        && s.snapshot.trees.is_empty()
+                        && !trees.is_empty()
+                    {
+                        s.snapshot.trees = trees;
+                        s.meta.extend(meta);
+                        s.rebuild(cx);
                     }
                     s.apply_with_auto_titles(result, comments, auto_titles, cx);
                     s.is_visible().then(|| s.poll_interval())
@@ -2649,7 +2697,6 @@ impl Sidebar {
                 self.leave(window, cx);
             }
             Some(Row::HiddenWorktrees(repo, _, _)) => self.toggle_external(&repo, cx),
-            Some(Row::OfflineHosts(_)) => self.toggle_offline_hosts(None, cx),
             _ => {}
         }
     }
@@ -2686,12 +2733,6 @@ impl Sidebar {
         self.persist(cx);
     }
 
-    /// '연결 안 된 호스트' 묶음을 펼치거나 접는다(`None`이면 뒤집는다).
-    pub fn toggle_offline_hosts(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
-        self.show_offline_hosts = open.unwrap_or(!self.show_offline_hosts);
-        self.rebuild(cx);
-    }
-
     /// `open`: `None`이면 뒤집고, `Some(true)`면 펼치고, `Some(false)`면 접는다.
     /// 저장소·폴더·워크트리의 접힘은 `UiExpansionState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub fn fold(&mut self, path: &Path, open: Option<bool>, cx: &mut Context<Self>) {
@@ -2718,7 +2759,6 @@ impl Sidebar {
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, Some(open), cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, Some(open), cx),
-            Some(Row::OfflineHosts(_)) => self.toggle_offline_hosts(Some(open), cx),
             Some(Row::Worktree(path) | Row::Folder(path) | Row::Repository(path)) => {
                 self.fold(&path, Some(open), cx);
             }

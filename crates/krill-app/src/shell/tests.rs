@@ -4766,10 +4766,6 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
 
     // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트가 아직 없는 원격 호스트는
     // 상태 확인·재연결 동작을 위해 헤더를 유지한다.
-    cx.update(|_, cx| {
-        let sidebar = view.read(cx).sidebar.clone();
-        sidebar.update(cx, |s, cx| s.toggle_offline_hosts(Some(true), cx));
-    });
     cx.run_until_parked();
     assert!(cx.debug_bounds("host-header-local").is_none());
     assert!(cx.debug_bounds("host-header-studio-mac").is_some());
@@ -6984,7 +6980,7 @@ fn new_session_menu_keeps_shortcut_with_single_account_and_applies_launch_host_f
     cx.run_until_parked();
 
     // 1. 계정이 1개일 때 '+' 메뉴를 열면 하위 메뉴로 대체되지 않고 ⌥⌘1 단축키가 바로 표시된다.
-    // 하단 '+' 메뉴는 버튼 위로 열려 초기 포인터가 항목을 덮지 않아야 한다.
+    // '+' 버튼은 검색 행 호버 때만 보이므로(hover-reveal) 먼저 행 위로 마우스를 올린다.
     // 트리거에 마우스를 둔 채 키보드로 이동해도 첫 두 항목 순서가 유지되는지 확인한다.
     // 참고: 팝업 컨테이너의 "popup-menu" id는 이 gpui 버전의 debug_bounds에 잡히지 않아
     // 메뉴가 열렸음은 항목의 kbd 힌트("kbd:alt-cmd-1" 등)로 확인한다.
