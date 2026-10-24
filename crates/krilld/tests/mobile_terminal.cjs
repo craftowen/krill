@@ -12,6 +12,7 @@ class Element extends EventTarget {
  setAttribute(k,v){this.attrs[k]=v;}
  getAttribute(k){return this.attrs[k];}
  remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}
+ replaceWith(node){const p=this.parent;if(!p)return;p.children[p.children.indexOf(this)]=node;node.parent=p;}
  focus(){this.dispatchEvent(new Event('focus'));}
  blur(){this.dispatchEvent(new Event('blur'));}
  getContext(){const calls=this.calls={fillText:0,font:0,draws:0};return new Proxy({},{get:(_,k)=>k==='fillText'?t=>{calls.fillText++;calls.texts?.push(t);}:k==='setTransform'?()=>{calls.draws++;}:()=>{},set:(_,k)=>{if(k==='font')calls.font++;return true;}});}
@@ -176,7 +177,19 @@ async function main(){
  await testScrollAnchor();
  await testEmptyHistoryHidden();
  await testFailurePaths();
+ await testTextLayer();
  console.log('All terminal adapter regression checks passed.');
+}
+async function testTextLayer(){
+ // 캔버스 위 투명 글자 층: 셀 폭 정렬, 바뀐 행 반영, 선택 중에는 고정했다가 선택이 풀리면 반영.
+ const {root,socket,handle}=await mount(1951);await advance(16);const layer=find(root,'terminal-text'),canvas=find(root,'terminal-grid');
+ assert.equal(layer.getAttribute('aria-hidden'),'true');assert.equal(layer.children.length,24);assert.match(layer.children[0].textContent,/^Krill · live terminal/);
+ assert.equal(layer.style.width,canvas.style.width);assert.equal(layer.style.marginTop,`-${canvas.style.height}`);assert.equal(layer.style.fontSize,find(root,'terminal-history').style.fontSize);
+ const row=layer.children[0];socket.screen('first edit');await advance(16);assert.match(layer.children[0].textContent,/^first edit/);assert.notEqual(layer.children[0],row);assert.equal(layer.children.length,24);
+ let selected=true;context.getSelection=()=>({isCollapsed:!selected,containsNode:node=>node===layer});
+ socket.screen('while selecting');await advance(16);assert.match(layer.children[0].textContent,/^first edit/,'selected rows stay put');
+ selected=false;context.document.dispatchEvent(new Event('selectionchange'));assert.match(layer.children[0].textContent,/^while selecting/,'released selection catches up');
+ delete context.getSelection;handle.unmount();console.log('PASS canvas text layer aligns with cells, patches dirty rows, holds while selected');
 }
 async function testHistoryPrefetch(){
  const {root,handle,socket}=await mount(1300),port=find(root,'terminal-scroll');port.clientHeight=400;port.scrollHeight=20000;port.scrollTop=19600;event(port,'scroll');
@@ -243,6 +256,7 @@ async function testFailurePaths(){
  let {root,handle,socket}=await mount(701,{preferences:{inputMode:'direct'},onPhoto:()=>{}});socket.autoAck=true;handle.focus();let capture=find(root,'live-capture');
  const hello=socket.sent.find(a=>a[4]===2),hr=T.reader(hello.slice(5));hr.n();hr.n();assert(hr.u()&8192n);
  const photo=find(root,'photo-attach'),accessory=find(root,'accessory-row');assert.equal(photo.parent,accessory,'Direct mode exposes the photo action outside its hidden buffered form');assert.equal(accessory.hidden,undefined);assert.equal(find(root,'buffered-command').hidden,true);let picked=0;find(root,'photo-picker').click=()=>picked++;event(photo,'click');assert.equal(picked,1,'Direct photo action opens its existing image picker without sending input');assert.equal(inputs(socket).length,0);assert.equal(find(root,'photo-picker').accept,'image/*');assert.equal(find(root,'file-picker').accept,'image/*');
+ assert.equal(find(root,'photo-attach').parent,find(root,'accessory-row'));assert.equal(!find(root,'accessory-row').hidden,true);handle.setInputMode('buffered');assert.equal(find(root,'photo-attach').parent,find(root,'buffered-command'));assert.equal(find(root,'buffered-command').hidden,false);handle.setInputMode('direct');assert.equal(find(root,'photo-attach').parent,find(root,'accessory-row'));handle.focus();
  socket.frame(0x2b,Uint8Array.of(0),T.v(32));event(capture,'paste',{clipboardData:{getData:()=>'one\r\ntwo\x1b[201~'}});await flush();assert.deepEqual(inputs(socket),['\x1b[200~one\ntwo[201~\x1b[201~']);
  capture.value='fallback\npaste';event(capture,'input',{inputType:'insertFromPaste'});await flush();assert.equal(inputs(socket).at(-1),'\x1b[200~fallback\npaste\x1b[201~');
  socket.frame(0x2b,Uint8Array.of(0),T.v(0));capture.value='review\nsecond';event(capture,'input',{inputType:'insertFromPaste'});await flush();const review=root.children.at(-1).children.at(-1),editor=review.children[0].children[0];assert.equal(editor.tagName,'textarea');assert.equal(editor.value,'review\nsecond');const before=inputs(socket).length;assert.equal(before,2);
