@@ -2,7 +2,7 @@
 'use strict';
 const assert=require('node:assert/strict'),{getEventListeners}=require('node:events'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 class Element extends EventTarget {
- constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollLeft=0;this.classList={toggle:()=>{},remove:()=>{}};}
+ constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollLeft=0;this.scrollTop=0;const classes=new Set((cls||'').split(/\s+/));this.classList={toggle:(name,on)=>{if(on)classes.add(name);else classes.delete(name);},remove:name=>classes.delete(name),contains:name=>classes.has(name)};}
  append(...nodes){for(const n of nodes){n.parentElement=this;this.children.push(n);}}
  insertBefore(node,before){if(node===before)return;node.remove();const index=before?this.children.indexOf(before):-1;node.parentElement=this;if(index<0)this.children.push(node);else this.children.splice(index,0,node);}
  prepend(...nodes){for(const n of nodes)n.parentElement=this;this.children.unshift(...nodes);}
@@ -12,15 +12,16 @@ class Element extends EventTarget {
  get nextSibling(){const nodes=this.parentElement?.children||[];return nodes[nodes.indexOf(this)+1]||null;}
  querySelector(selector){return this.children.flatMap(n=>[n,...n.descendants()]).find(n=>selector==='h1'?n.tag==='h1':selector==='[aria-selected=true]'&&n.attrs['aria-selected']==='true');}
  descendants(){return this.children.flatMap(n=>[n,...n.descendants()]);}
+ contains(node){return node===this||this.descendants().includes(node);}
  scrollIntoView(){}
  remove(){if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(n=>n!==this);}
 }
 const longPressCode=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes('function longPress('));
-function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot,tablet=false){
- const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],created=[],abort=new AbortController(),wide=new EventTarget();wide.matches=tablet;let clock=0,id=0;
- let resize;const sandbox={ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;},focus(){h.focused++;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
+function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot,tablet=false,preferences={}){
+ const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],created=[],abort=new AbortController(),wide=new EventTarget(),viewport=new EventTarget(),windowEvents=new EventTarget();wide.matches=tablet;let clock=0,id=0;
+ let resize;const sandbox={addEventListener:windowEvents.addEventListener.bind(windowEvents),removeEventListener:windowEvents.removeEventListener.bind(windowEvents),dispatchEvent:windowEvents.dispatchEvent.bind(windowEvents),visualViewport:viewport,ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const port=new Element('div',undefined,'terminal-port'),capture=new Element('textarea');capture.tagName='TEXTAREA';port.append(capture);root.append(port);const h={root,port,capture,options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;if(!active&&sandbox.document.activeElement===capture)sandbox.document.activeElement=null;},focus(){h.focused++;sandbox.document.activeElement=capture;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
  vm.createContext(sandbox);vm.runInContext(longPressCode,sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
- const group={key:'g',label:'Workspace',sessions},state={groups:new Map([['g',group]]),sessions:new Map(sessions.map(s=>[s.id,s])),connection:{phase:'ready'},preferences:{},drafts:new Map(),snapshot};
+ const group={key:'g',label:'Workspace',sessions},state={groups:new Map([['g',group]]),sessions:new Map(sessions.map(s=>[s.id,s])),connection:{phase:'ready'},preferences,drafts:new Map(),snapshot};
  const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{},createSession(group,agent,request){calls.push(request);created.push([group.key,agent||'']);}};
  const root=el('main'),view=sandbox.KrillMobile.screens.session(root,ctx);
  function advance(ms){clock+=ms;for(const [key,t] of [...timers])if(t.at<=clock){timers.delete(key);t.fn();}}
@@ -69,8 +70,53 @@ function testQuickActions(){
  second.options.onQuickActions();assert(f.sheets.at(-1).some(item=>item.label==='Switch to direct input'));f.sheets.at(-1).find(item=>item.label==='Edit terminal keys').action();assert.equal(f.routes.at(-1),'/settings/terminal');
  f.view.cleanup();console.log('PASS fixed quick actions target only the active split terminal, retain mode labels and expose key settings');
 }
+function testSplitContinuity(){
+ for(const direction of ['auto','columns','rows'])for(const active of [0,1]){
+  const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'}],undefined,true),M=f.sandbox.KrillMobile;
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const panels=f.root.descendants().find(n=>n.className==='session-panels'),panes=panels.children,control=f.buttons.find(b=>b.className==='ghost split-direction');
+  control.action();const choices=new Element('div');f.sheets.at(-1).render(choices);choices.descendants().find(n=>n.dataset.direction===direction).action();
+  panes[active].dispatchEvent(new Event('pointerdown'));const handles=[...f.mounts];handles[active].focus();
+  handles.forEach((h,i)=>{h.port.scrollTop=120+i*80;h.port.scrollLeft=15+i*10;});
+  const tabScroll=f.root.descendants().find(n=>n.className==='tab-scroll');tabScroll.scrollLeft=73;
+  const saved=JSON.stringify(f.state.preferences.tabletSplits.tabletSplit),focused=f.sandbox.document.activeElement;
+  for(const [width,wide] of [[1100,true],[390,false],[720,false],[799,false],[800,false],[1200,true]]){
+   f.wide.matches=wide;f.wide.dispatchEvent(new Event('change'));f.resize(width);
+   f.sandbox.dispatchEvent(new Event('orientationchange'));f.sandbox.dispatchEvent(new Event('resize'));f.sandbox.visualViewport.dispatchEvent(new Event('resize'));f.view.update();
+   assert.equal(f.mounts.length,2,`${direction}/${active}: resize retains both connections`);
+   assert(handles.every(h=>!h.unmounted));assert.equal(M.activeTerminal,handles[active]);assert.equal(f.sandbox.document.activeElement,focused);
+   assert.equal(panels.classList.contains('is-split'),true);assert(panes.every(p=>p.hidden===false));assert.equal(control.parentElement.hidden,false);
+   assert.equal(panels.dataset.layout,direction==='rows'||width<(direction==='columns'?721:800)?'rows':'columns');
+   handles.forEach((h,i)=>{assert.equal(h.root.children[0],h.port);assert.equal(h.port.scrollTop,120+i*80);assert.equal(h.port.scrollLeft,15+i*10);assert.equal(h.inputActive,i===active);});
+   assert.equal(tabScroll.scrollLeft,73);assert.equal(JSON.stringify(f.state.preferences.tabletSplits.tabletSplit),saved);assert.equal(f.timers.size,0);assert.equal(f.routes.length,0);assert.equal(f.calls.length,0);
+  }
+  f.view.cleanup();assert(handles.every(h=>h.unmounted));assert.equal(getEventListeners(f.wide,'change').length,0);
+ }
+ // A split restored while narrow retains its chosen pane and both mounts too.
+ const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,false,{tabletSplits:{tabletSplit:{session:8,active:1,direction:'rows'}}});
+ assert.equal(f.mounts.length,2);assert.equal(f.sandbox.KrillMobile.activeTerminal.options.sessionId,8);f.view.cleanup();
+ console.log('PASS auto/columns/rows keep both mounts, focused input, pane selection and scroll across rotation, keyboard and fold widths');
+}
+function testSplitTabReplacement(){
+ for(const active of [0,1]){
+  const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'},{id:9,state:'Done'}],undefined,true),M=f.sandbox.KrillMobile;
+  f.ctx.sessionKey=id=>'host:'+id; // Replacement preferences use the selected session's scoped key.
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const panels=f.root.descendants().find(n=>n.className==='session-panels'),panes=panels.children,handles=[...f.mounts],inactive=handles[1-active],old=handles[active],tabs=()=>f.root.descendants().filter(n=>n.className==='session-tab');
+  panes[active].dispatchEvent(new Event('pointerdown'));inactive.port.scrollTop=456;inactive.port.scrollLeft=35;old.options.onStatus({phase:'disconnected'});
+  tabs().find(n=>n.dataset.session===9).action();const replacement=f.mounts.at(-1);
+  assert.equal(f.mounts.length,3);assert.equal(replacement.options.sessionId,9);assert.equal(replacement.options.stateKey,'host:9');assert(old.unmounted);assert(!inactive.unmounted);
+  assert.equal(M.activeTerminal,replacement);assert.equal(replacement.inputActive,true);assert.equal(inactive.inputActive,false);assert.equal(panes[active].dataset.session,9);assert.equal(panes[1-active].dataset.session,inactive.options.sessionId);
+  assert.equal(inactive.root.children[0],inactive.port);assert.equal(inactive.port.scrollTop,456);assert.equal(inactive.port.scrollLeft,35);assert.equal(tabs().find(n=>n.dataset.session===9).attrs['aria-selected'],'true');assert.equal(tabs().find(n=>n.dataset.session===inactive.options.sessionId).disabled,true);
+  const inputChange=replacement.options.onPreferenceChange;inputChange({inputMode:'buffered'});assert.equal(f.state.preferences.terminalInputModes['host:9'],'buffered');
+  old.options.onTitle('stale title');old.options.onStatus({phase:'disconnected'});assert(!f.state.titles.has(9));f.advance(65000);f.view.update();assert.equal(f.mounts.length,3);assert.equal(f.timers.size,0);assert.equal(f.routes.length,0);assert.equal(f.calls.length,0);
+  // The displaced session can be selected again without disturbing the other pane.
+  tabs().find(n=>n.dataset.session===old.options.sessionId).action();assert(replacement.unmounted);assert.equal(M.activeTerminal.options.sessionId,old.options.sessionId);assert(!inactive.unmounted);assert.equal(f.routes.length,0);f.view.cleanup();
+ }
+ console.log('PASS third tab replaces either active pane in place, cancels stale retries and preserves the inactive terminal and scroll');
+}
 async function main(){
- testQuickActions();
+ testQuickActions();testSplitContinuity();testSplitTabReplacement();
  testHostViewBudgets();testImeDefersSnapshotUpdates();testSessionBackSkipsSessionHistory();
  {const sessions=Array.from({length:64},(_,n)=>({id:n+7,agent:'codex',state:'Working'})),f=fixture(sessions);const initial=f.buttons.filter(b=>b.className==='session-tab'),marks=initial.map(b=>b.children[1]);for(let i=0;i<100;i++)f.view.update();assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,64);assert(initial.every((tab,i)=>tab.children[1]===marks[i]));const removed=sessions[63],down=new Event('pointerdown');down.button=0;initial[63].dispatchEvent(down);assert.equal(f.timers.size,1);f.state.groups.get('g').sessions=sessions.slice(0,63);f.state.sessions.delete(removed.id);f.view.update();assert.equal(f.timers.size,0,'removed tab cancels pending long press');f.view.cleanup();console.log('PASS 64 keyed tabs x100 updates: new buttons/icons 0, removed-tab handlers cleaned');}
 
@@ -79,10 +125,10 @@ async function main(){
   const first=f.mounts[0];first.options.onStatus({phase:'ready'});
   f.buttons.find(b=>b.textContent==='Split terminal').action();assert.equal(f.sheets.at(-1).length,1);assert(f.sheets.at(-1)[0].label.endsWith('#8'));f.sheets.at(-1)[0].action();
   const second=f.mounts[1];assert.equal(M.activeTerminal,second);assert.equal(second.options.preferences.fitToPhone,true);assert.equal(first.inputActive,false);assert.equal(second.inputActive,true);
-  width(false);assert(first.unmounted);assert(!second.unmounted);assert.equal(f.timers.size,0);assert.equal(M.activeTerminal,second);
-  width(true);const restored=f.mounts[2];assert.equal(restored.options.sessionId,7);assert.equal(M.activeTerminal,second);
+  width(false);assert(!first.unmounted);assert(!second.unmounted);assert.equal(f.timers.size,0);assert.equal(M.activeTerminal,second);
+  width(true);const restored=f.mounts[0];assert.equal(f.mounts.length,2);assert.equal(restored.options.sessionId,7);assert.equal(M.activeTerminal,second);
   f.root.descendants().find(n=>n.className==='terminal-pane primary-pane').dispatchEvent(new Event('pointerdown'));
-  width(false);assert(!restored.unmounted);assert(second.unmounted);assert.equal(M.activeTerminal,restored);
+  width(false);assert(!restored.unmounted);assert(!second.unmounted);assert.equal(M.activeTerminal,restored);
   width(true);const next=f.mounts.at(-1);next.options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,1);
   f.state.connection.phase='disconnected';f.view.update();f.advance(1000);const count=f.mounts.length;assert(next.unmounted);assert.equal(f.timers.size,0);
   f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,count+1);assert.equal(f.mounts.at(-1).options.sessionId,8);
@@ -106,8 +152,8 @@ async function main(){
   assert.equal(tabs().find(n=>n.dataset.session===7).disabled,true);tabs().find(n=>n.dataset.session===9).action();
   assert.equal(f.mounts.at(-1).options.sessionId,9);assert.equal(pane('secondary-pane').dataset.session,9);assert.equal(f.routes.length,0);
   pane('primary-pane').descendants().find(n=>n.className==='ghost pane-title').action();assert.equal(f.sandbox.KrillMobile.activeTerminal.options.sessionId,7);
-  assert.equal(tabs().find(n=>n.dataset.session===9).disabled,true);tabs().find(n=>n.dataset.session===8).action();assert.equal(f.routes.length,1);
-  pane('primary-pane').descendants().find(n=>n.textContent==='Close pane').action();assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,2);f.view.cleanup();
+  assert.equal(tabs().find(n=>n.dataset.session===9).disabled,true);tabs().find(n=>n.dataset.session===8).action();assert.equal(f.routes.length,0);assert.equal(pane('primary-pane').dataset.session,8);
+  pane('primary-pane').descendants().find(n=>n.textContent==='Close pane').action();assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,1);f.view.cleanup();
  }
  {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);f.sandbox.KrillMobile.chat={mount(){return {};}};
   f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();f.buttons.find(b=>b.className==='ghost small mode-toggle').action();
