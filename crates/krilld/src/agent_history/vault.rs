@@ -688,6 +688,10 @@ pub(crate) fn normalize_path(path: &str) -> String {
 }
 
 fn one_line(s: &str) -> String {
+    normalized_line(s, MAX_TEXT)
+}
+
+fn normalized_line(s: &str, limit: usize) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_TEXT));
     let mut last_space = false;
     for ch in s.chars() {
@@ -707,7 +711,7 @@ fn one_line(s: &str) -> String {
             out.push(ch);
             last_space = false;
         }
-        if out.len() >= MAX_TEXT {
+        if out.len() >= limit {
             break;
         }
     }
@@ -736,28 +740,47 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn extract_snippet(text: &str, terms: &[String]) -> String {
-    let clean = one_line(text);
+    // Search before applying the display cap: a hit may be beyond MAX_TEXT.
+    let clean = normalized_line(text, usize::MAX);
     let chars: Vec<char> = clean.chars().collect();
     if chars.len() <= SNIPPET_CHARS {
         return clean;
     }
     let lower = clean.to_lowercase();
-    let match_char_pos = terms
+    let hit = terms
         .iter()
+        .filter(|term| !term.is_empty())
         .filter_map(|term| {
             lower
                 .find(term.as_str())
-                .and_then(|byte_idx| lower.get(..byte_idx))
-                .map(|prefix| prefix.chars().count())
+                .map(|start| (start, start + term.len()))
         })
-        .min()
-        .unwrap_or(0);
-
-    let half = SNIPPET_CHARS / 3;
-    let start = match_char_pos
-        .saturating_sub(half)
-        .min(chars.len().saturating_sub(SNIPPET_CHARS));
-    let end = (start + SNIPPET_CHARS).min(chars.len());
+        .min_by_key(|&(start, _)| start);
+    // Unicode lowercasing can expand one source character (İ -> i + combining dot).
+    // Map the lowercase byte range back to the original character range.
+    let (match_start, match_end) = hit.map_or((0, 0), |(start, end)| {
+        let mut offset = 0;
+        let mut first = None;
+        let mut last = 0;
+        for (i, ch) in chars.iter().enumerate() {
+            let next = offset + ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            if next > start && offset < end {
+                first.get_or_insert(i);
+                last = i + 1;
+            }
+            offset = next;
+            if offset >= end {
+                break;
+            }
+        }
+        (first.unwrap_or(0), last)
+    });
+    let width = SNIPPET_CHARS.max(match_end.saturating_sub(match_start));
+    let context = width.saturating_sub(match_end.saturating_sub(match_start)) / 2;
+    let start = match_start
+        .saturating_sub(context)
+        .min(chars.len().saturating_sub(width));
+    let end = start.saturating_add(width).min(chars.len());
     let mut out = String::new();
     if start > 0 {
         out.push('…');
@@ -2680,5 +2703,36 @@ mod agy_title_tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod excerpt_window_tests {
+    use super::*;
+
+    #[test]
+    fn vault_excerpt_preserves_late_hit_and_balances_context() {
+        let text = format!("{}needle{}", "앞".repeat(MAX_TEXT), "뒤".repeat(500));
+        let snippet = extract_snippet(&text, &["needle".to_owned()]);
+        assert!(snippet.contains("needle"));
+        assert!(snippet.starts_with('…') && snippet.ends_with('…'));
+        let prefix = snippet
+            .split("needle")
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count();
+        assert!((60..80).contains(&prefix));
+    }
+
+    #[test]
+    fn vault_excerpt_unicode_lowercase_expansion_and_long_hit() {
+        let text = format!("{}TARGET{}", "İ".repeat(500), "한".repeat(500));
+        assert!(extract_snippet(&text, &["target".to_owned()]).contains("TARGET"));
+        let term = "검색".repeat(SNIPPET_CHARS);
+        let text = format!("{}{}{}", "앞".repeat(200), term, "뒤".repeat(200));
+        assert!(extract_snippet(&text, std::slice::from_ref(&term)).contains(&term));
+        assert_eq!(extract_snippet("짧은 문장", &[]), "짧은 문장");
+        assert!(extract_snippet(&"끝".repeat(300), &[]).ends_with('…'));
     }
 }

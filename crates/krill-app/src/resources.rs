@@ -81,6 +81,45 @@ pub fn mb(bytes: u64) -> String {
     format!("{}.{} MB", tenths / 10, tenths % 10)
 }
 
+/// Workspace recency is the newest session activity, keeping its PTYs together.
+fn session_order(
+    sessions: &[krill_proto::resources::SessionUsage],
+    mut metadata: impl FnMut(SessionId) -> (Option<krill_hosts::ssh::HostPath>, u64),
+) -> Vec<usize> {
+    use std::cmp::Reverse;
+    use std::collections::BTreeMap;
+    let metadata: Vec<_> = sessions.iter().map(|s| metadata(s.session)).collect();
+    let mut activity = BTreeMap::new();
+    for (workspace, timestamp) in &metadata {
+        if let Some(workspace) = workspace {
+            let latest = activity.entry(workspace).or_insert(0);
+            *latest = (*latest).max(*timestamp);
+        }
+    }
+    let mut order: Vec<_> = (0..sessions.len()).collect();
+    order.sort_by_key(|&i| {
+        let (workspace, timestamp) = &metadata[i];
+        (
+            workspace.is_none(),
+            Reverse(
+                workspace
+                    .as_ref()
+                    .and_then(|w| activity.get(w))
+                    .copied()
+                    .unwrap_or(0),
+            ),
+            workspace,
+            Reverse(*timestamp),
+            sessions[i].session,
+        )
+    });
+    order
+}
+
+fn popover_height(available: f32) -> f32 {
+    available.clamp(0., f32::from(crate::ui::DIALOG_WIDTH))
+}
+
 pub struct Panel {
     call: Call,
     open: bool,
@@ -382,94 +421,120 @@ impl Render for Panel {
         let p = crate::ui::palette(cx);
         let header = self.render_toggle(cx);
         let popover = self.open.then(|| {
-            let content = match &self.data {
-                None => {
-                    let why = if self.outdated {
-                        text::OUTDATED.get()
-                    } else {
-                        text::FAILED.get()
-                    };
-                    div()
-                        .py_1()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(why)
-                }
-                Some(r) => {
-                    let daemon = r.daemon.saturating_add(r.holder.unwrap_or(0));
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(row(
-                            text::APP.get(),
-                            r.client.map_or_else(|| "-".to_owned(), mb),
-                            p,
-                        ))
-                        .child(row(text::DAEMON.get(), mb(daemon), p))
-                        .children(r.sessions.iter().map(|s| {
-                            let id = s.session;
-                            let value = if s.processes == 0 {
-                                text::EXITED.get().to_owned()
-                            } else {
-                                mb(s.footprint)
+            let content =
+                match &self.data {
+                    None => {
+                        let why = if self.outdated {
+                            text::OUTDATED.get()
+                        } else {
+                            text::FAILED.get()
+                        };
+                        div()
+                            .py_1()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(why)
+                    }
+                    Some(r) => {
+                        let daemon = r.daemon.saturating_add(r.holder.unwrap_or(0));
+                        let sidebar = self.sidebar.as_ref().and_then(WeakEntity::upgrade);
+                        let order = session_order(&r.sessions, |id| {
+                            let Some(sidebar) = &sidebar else {
+                                return (None, 0);
                             };
-                            // OWE-851: `세션 N` 대신 워크트리·에이전트 이름을 보이고,
-                            // 클릭하면 메인 창 해당 세션으로 이동한다.
-                            div()
-                                .id(("resources-session", id.0))
-                                .debug_selector(move || format!("resources-session-{}", id.0))
-                                .role(gpui::Role::Button)
-                                .aria_label(self.session_name(cx, id))
-                                .tab_index(0)
-                                .cursor_pointer()
-                                .rounded(crate::ui::RADIUS_XS)
-                                .hover(|d| d.bg(p.accent))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.close(cx);
-                                    cx.emit(Open(id));
-                                }))
-                                .child(
-                                    row(self.session_name(cx, id), value, p).child(
-                                        div()
-                                            .ml_2()
-                                            .pl_2()
-                                            .border_l_1()
-                                            .border_color(p.border)
-                                            .child(
-                                                crate::ui::button_with_tooltip(
-                                                    Button::new(("resources-kill", id.0))
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .icon(IconName::Close),
-                                                    format!("resources-kill-{}", id.0),
-                                                    text::KILL_CONFIRM.get(),
-                                                )
-                                                .debug_selector(move || {
-                                                    format!("resources-kill-{}", id.0)
-                                                })
-                                                .accessibility_label(text::KILL_CONFIRM.get())
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.confirm_kill(id, window, cx);
-                                                    },
-                                                )),
+                            let sidebar = sidebar.read(cx);
+                            let host = crate::hosts::HostId::Local;
+                            let Some(session) = sidebar.session_on(&host, id) else {
+                                return (None, 0);
+                            };
+                            let folder = session.worktree.as_deref().or(session.cwd.as_deref());
+                            let workspace = folder.map(|folder| {
+                                let root = sidebar
+                                    .workspace_for_path_on(&host, folder)
+                                    .unwrap_or_else(|| folder.to_owned());
+                                krill_hosts::ssh::HostPath::new(host, root)
+                            });
+                            (workspace, session.status.since_unix_ns)
+                        });
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(row(
+                                text::APP.get(),
+                                r.client.map_or_else(|| "-".to_owned(), mb),
+                                p,
+                            ))
+                            .child(row(text::DAEMON.get(), mb(daemon), p))
+                            .children(order.into_iter().filter_map(|i| r.sessions.get(i)).map(
+                                |s| {
+                                    let id = s.session;
+                                    let value = if s.processes == 0 {
+                                        text::EXITED.get().to_owned()
+                                    } else {
+                                        mb(s.footprint)
+                                    };
+                                    // OWE-851: `세션 N` 대신 워크트리·에이전트 이름을 보이고,
+                                    // 클릭하면 메인 창 해당 세션으로 이동한다.
+                                    div()
+                                        .id(("resources-session", id.0))
+                                        .debug_selector(move || {
+                                            format!("resources-session-{}", id.0)
+                                        })
+                                        .role(gpui::Role::Button)
+                                        .aria_label(self.session_name(cx, id))
+                                        .tab_index(0)
+                                        .cursor_pointer()
+                                        .rounded(crate::ui::RADIUS_XS)
+                                        .hover(|d| d.bg(p.accent))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.close(cx);
+                                            cx.emit(Open(id));
+                                        }))
+                                        .child(
+                                            row(self.session_name(cx, id), value, p).child(
+                                                div()
+                                                    .ml_2()
+                                                    .pl_2()
+                                                    .border_l_1()
+                                                    .border_color(p.border)
+                                                    .child(
+                                                        crate::ui::button_with_tooltip(
+                                                            Button::new(("resources-kill", id.0))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .icon(IconName::Close),
+                                                            format!("resources-kill-{}", id.0),
+                                                            text::KILL_CONFIRM.get(),
+                                                        )
+                                                        .debug_selector(move || {
+                                                            format!("resources-kill-{}", id.0)
+                                                        })
+                                                        .accessibility_label(
+                                                            text::KILL_CONFIRM.get(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.confirm_kill(id, window, cx);
+                                                            },
+                                                        )),
+                                                    ),
                                             ),
-                                    ),
-                                )
-                        }))
-                        .child(row(text::DISK.get(), mb(r.disk), p))
-                        .child(
-                            div()
-                                .mt_1()
-                                .pt_1()
-                                .border_t_1()
-                                .border_color(p.border)
-                                .child(row(text::TOTAL.get(), mb(r.total()), p)),
-                        )
-                }
-            };
+                                        )
+                                },
+                            ))
+                            .child(row(text::DISK.get(), mb(r.disk), p))
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .pt_1()
+                                    .border_t_1()
+                                    .border_color(p.border)
+                                    .child(row(text::TOTAL.get(), mb(r.total()), p)),
+                            )
+                    }
+                };
             let restart = (!self.outdated).then(|| {
                 crate::ui::secondary("resources-restart", text::RESTART.get())
                     .debug_selector(|| "resources-restart".into())
@@ -483,8 +548,10 @@ impl Render for Panel {
                 .bottom(gpui::px(26.))
                 .right(gpui::px(0.))
                 .w(gpui::px(260.))
-                .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
-                .max_h(window.viewport_size().height - crate::ui::SPACE_4 * 3.)
+                .max_w((window.viewport_size().width - crate::ui::SPACE_4 * 2.).max(gpui::px(0.)))
+                .max_h(gpui::px(popover_height(f32::from(
+                    window.viewport_size().height - crate::ui::SPACE_4 * 3.,
+                ))))
                 .overflow_y_scroll()
                 .p_3()
                 .rounded(crate::ui::RADIUS_MD)
@@ -499,7 +566,7 @@ impl Render for Panel {
                 .flex_col()
                 // OWE-652: 바깥 클릭·다른 팝오버가 열리면 닫는다.
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.on_outside_down(cx)))
-                .child(content)
+                .child(content.flex_none())
                 .children(restart)
                 .children(self.note.clone().map(|n| {
                     div()
@@ -520,3 +587,33 @@ impl Render for Panel {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use crate::hosts::HostId;
+    use krill_hosts::ssh::HostPath;
+    use krill_proto::resources::SessionUsage;
+
+    #[test]
+    fn resources_group_ptys_by_workspace_recency_with_stable_unknowns() {
+        let sessions: Vec<_> = (1..=5)
+            .map(|id| SessionUsage {
+                session: SessionId(id),
+                footprint: 0,
+                processes: 1,
+            })
+            .collect();
+        let order = session_order(&sessions, |id| match id.0 {
+            1 => (Some(HostPath::new(HostId::Local, "/a")), 2),
+            2 => (Some(HostPath::new(HostId::Local, "/b")), 50),
+            3 => (Some(HostPath::new(HostId::Local, "/a")), 100),
+            _ => (None, 0),
+        });
+        assert_eq!(order, vec![2, 0, 1, 3, 4]);
+        assert_eq!(session_order(&[], |_| (None, 0)), Vec::<usize>::new());
+        assert!(popover_height(-40.).abs() < f32::EPSILON);
+        assert!((popover_height(100.) - 100.).abs() < f32::EPSILON);
+        assert!(popover_height(10000.) < 10000.);
+    }
+}
