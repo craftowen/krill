@@ -190,7 +190,21 @@ button.account-row:disabled{opacity:1}
 .option-block{padding:8px 16px}
 .option-block>.setting-row,.project-choices>.setting-row{padding:10px 0;min-height:var(--touch-target)}
 .project-picker{width:100%;padding:12px 16px;text-align:left}
-.project-choices{padding:0 16px}
+.project-filter-panel{display:flex;flex-direction:column;gap:8px;padding:4px 16px 8px;border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.project-filter-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.project-filter-title{font-size:var(--font-meta);font-weight:600;color:var(--muted-foreground)}
+.project-filter-clear{margin:0;padding:4px 8px;min-height:32px}
+.project-pills{display:flex;flex-wrap:wrap;gap:6px}
+.project-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;background:var(--surface-raised);font-size:var(--font-meta);max-width:100%}
+.project-pill-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.project-pill-remove{color:var(--muted-foreground);font-weight:600;line-height:1}
+.project-filter-search{width:100%;min-height:40px;padding:8px 10px}
+.project-choices{padding:0}
+.project-choice-label{display:flex;align-items:center;gap:8px;min-width:0;flex:1}
+.project-choice-dot{width:10px;height:10px;border-radius:50%;flex:none;display:inline-grid;place-items:center}
+.project-choice-dot[data-emoji]{width:16px;height:16px;border-radius:0;font-size:var(--font-body)}
+.project-choice-dot[data-emoji]::before{content:attr(data-emoji)}
+.project-filter-empty{padding:12px 0;font-size:var(--font-meta)}
 .project-picker>svg{flex:none;margin-left:auto;transition:transform .15s}.project-picker[aria-expanded=true]>svg{transform:rotate(90deg)}
 .workspaces .workspace-list{padding-inline:var(--space-sm)}
 /* Project-first mobile list. Ordering/depth come from the desktop snapshot;

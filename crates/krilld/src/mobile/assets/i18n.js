@@ -2,6 +2,12 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Clear": "비우기",
+ "Filter projects": "프로젝트 필터",
+ "Filter projects...": "프로젝트 검색...",
+ "Add project...": "프로젝트 추가...",
+ "No projects match": "일치하는 프로젝트가 없습니다",
+ "Remove {0} filter": "{0} 필터 제거",
  "{0} projects": "프로젝트 {0}개",
  "No terminals": "터미널 없음",
  "Split direction": "분할 방향",
