@@ -7,7 +7,7 @@ use super::schema::{CONTRACT, Hello, VERSION, is_error, tool_result, unknown};
 use super::transport::{MAX_FRAME, encode, read_line};
 use super::{options, request_key};
 
-fn hello() -> Value {
+pub(super) fn hello() -> Value {
     json!({"type":"hello","contract":CONTRACT,"supported":true,"pid":123,
         "epoch":"E","context":"C","capabilities":["capabilities","permissions","apps","observe","action","set_value","click","type_text"],
         "unsupported":["batch","clipboard","screenshot"],
@@ -457,17 +457,18 @@ fn known_partial_batch_is_error_but_unknown_or_incomplete_cleanup_closes_session
 
 #[test]
 fn compact_observation_is_default_and_format_is_part_of_sequence_payload() {
-    use super::schema::full_format;
+    use super::delta::{Format, format};
+    let hello = Hello::parse(hello()).unwrap();
     let base = json!({"seq":1,"deadlineMs":5000,"op":{"kind":"observe","pid":7}});
-    assert!(!full_format(&base).unwrap());
+    assert_eq!(format(&base, &hello).unwrap(), Format::Compact);
     let mut full = base.clone();
     full["format"] = json!("full");
-    assert!(full_format(&full).unwrap());
+    assert_eq!(format(&full, &hello).unwrap(), Format::Full);
     assert_ne!(base, full);
     full["format"] = json!("compact");
-    assert!(!full_format(&full).unwrap());
-    for format in [Value::Null, json!(true), json!(1), json!("json")] {
-        full["format"] = format;
-        assert!(full_format(&full).is_err());
+    assert_eq!(format(&full, &hello).unwrap(), Format::Compact);
+    for invalid in [Value::Null, json!(true), json!(1), json!("json")] {
+        full["format"] = invalid;
+        assert!(format(&full, &hello).is_err());
     }
 }

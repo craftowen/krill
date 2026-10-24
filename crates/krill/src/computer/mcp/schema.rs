@@ -242,11 +242,21 @@ impl Hello {
                 json!(["kind", "steps"]),
             ));
         }
+        let mut execute = object(
+            json!({"seq":seq,"deadlineMs":{"type":"integer","minimum":1,"maximum":self.max_deadline},
+            "op":{"oneOf":ops},"format":{"type":"string","enum":["compact","full","delta"],"default":"compact"},
+            "baseSnapshot":{"type":"string","minLength":5,"maxLength":280}}),
+            json!(["seq", "deadlineMs", "op"]),
+        );
+        execute["oneOf"] = json!([
+            {"properties":{"format":{"enum":["compact","full"]}},"not":{"required":["baseSnapshot"]}},
+            {"properties":{"format":{"const":"delta"},"op":{"properties":{"kind":{"const":"observe"}}}},"required":["format","baseSnapshot"]}
+        ]);
         json!({"tools":[
             {"name":"computer_session","description":"Experimental native session hello: epoch, context, actual capabilities and limits. No desktop input.",
                 "inputSchema":object(json!({}),json!([])),"annotations":{"readOnlyHint":true}},
             {"name":"computer_execute","description":"Execute one native operation. Supply a positive monotonic seq; retain it on retries. Mutations require this session's native snapshot target. Submitted is not verified; Unknown closes the session. No automatic retry or fallback.",
-                "inputSchema":object(json!({"seq":seq,"deadlineMs":{"type":"integer","minimum":1,"maximum":self.max_deadline},"op":{"oneOf":ops},"format":{"type":"string","enum":["compact","full"],"default":"compact"}}),json!(["seq","deadlineMs","op"]))},
+                "inputSchema":execute},
             {"name":"computer_status","description":"Query the original native seq without issuing desktop input. A missing result never permits replay.",
                 "inputSchema":object(json!({"seq":seq}),json!(["seq"])),"annotations":{"readOnlyHint":true}},
             {"name":"computer_cancel","description":"Best effort cancellation before native dispatch. too_late does not undo posted input.",
@@ -257,15 +267,6 @@ impl Hello {
 
 fn mutation_kind(kind: &str) -> bool {
     matches!(kind, "action" | "click" | "set_value" | "type_text")
-}
-
-pub(super) fn full_format(args: &Value) -> Result<bool, String> {
-    match args.get("format") {
-        None => Ok(false),
-        Some(Value::String(format)) if format == "compact" => Ok(false),
-        Some(Value::String(format)) if format == "full" => Ok(true),
-        _ => Err("format must be compact or full".into()),
-    }
 }
 
 fn string_list(value: &Value) -> Result<Vec<String>, String> {

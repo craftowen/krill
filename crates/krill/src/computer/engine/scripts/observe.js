@@ -34,7 +34,12 @@ function run(argv) {
   const proc = getProcess();
   const win = selectTargetWindow(proc);
   if(req.restore) restoreWindow(proc, win);
+  let geometryBefore=null, geometryAfter=null, geometryError=null;
+  try { geometryBefore=captureGeometryFacts(req.pid,req.winId); }
+  catch (_) { geometryError="display/window facts unavailable before AX observation"; }
   const root = readNode(win,0,true);
+  try { geometryAfter=captureGeometryFacts(req.pid,req.winId); }
+  catch (_) { geometryError="display/window facts unavailable after AX observation"; }
   if(root.role!=="AXWindow") throw Error("AX window not ready");
-  return JSON.stringify({root,processStart:start,truncated});
+  return JSON.stringify({root,processStart:start,truncated,geometryBefore,geometryAfter,geometryError});
 }

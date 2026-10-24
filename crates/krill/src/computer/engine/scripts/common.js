@@ -124,13 +124,19 @@ function liveValue(el) {
   try { raw=el.value(); } catch (_) {}
   return scalarValue(raw);
 }
+function observedValueSettable(el) {
+  try {
+    const capability=el.attributes.byName("AXValue").settable();
+    return typeof capability === "boolean" ? capability : null;
+  } catch (_) { return null; }
+}
 function readNode(el, depth, isRoot) {
   function read(f, fallback) { try { const v=f(); return v === undefined ? fallback : v; } catch (_) { return fallback; } }
   const role=String(read(()=>el.role(),isRoot ? "AXWindow" : "AXGroup"));
   const actions=read(()=>el.actions.name(),[]).map(String);
   const value=liveValue(el);
   if (value !== null && value.length > 65536) throw Error("AX value exceeds bounded full observation; no lossy identity witness");
-  const node={referenceId:null,role,subrole:read(()=>el.subrole(),null),title:read(()=>el.title(),null),description:read(()=>el.description(),null),value,
+  const node={referenceId:null,role,subrole:read(()=>el.subrole(),null),title:read(()=>el.title(),null),description:read(()=>el.description(),null),value,valueSettable:observedValueSettable(el),
     bounds:read(()=>rect(el),null),enabled:Boolean(read(()=>el.enabled(),false)),focused:Boolean(read(()=>el.focused(),false)),selected:false,actions,children:[]};
   nodeHandles.set(node,el);
   if (!isRoot && (rolesInteractive[role] || actions.length)) {node.referenceId=nextRef++;entries[node.referenceId]=el;}

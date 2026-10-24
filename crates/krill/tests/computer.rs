@@ -31,7 +31,7 @@ fn production_jxa_contract_under_synthetic_bridge() {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["failed"], 0, "{report}");
-    assert_eq!(report["total"], 43);
+    assert_eq!(report["total"], 46);
 }
 
 fn fixture_executor(dir: &Path) -> std::path::PathBuf {

@@ -7,6 +7,7 @@
 //! This is deliberately the legacy initialize handshake, not latest-version support.
 //! No desktop work occurs here; all native operations stay in the child krill-app.
 
+mod delta;
 mod retention;
 mod schema;
 #[cfg(test)]
@@ -25,7 +26,7 @@ use super::CliError;
 use retention::{
     MAX_CACHE_BYTES, MAX_INPUT_BYTES, MAX_REQUESTS, MAX_SEQUENCES, Recorded, Retention, Sequence,
 };
-use schema::{Hello, VERSION, fields, full_format, must_close, tool_result, unknown};
+use schema::{Hello, VERSION, fields, must_close, tool_result, unknown};
 use transport::{Event, STALL, Transport, encode, worker_path};
 
 const MAX_PENDING: usize = 16;
@@ -82,6 +83,7 @@ struct Session {
     initialized: bool,
     ready: bool,
     retention: Retention,
+    bases: delta::Bases,
     statuses: Controls,
     cancels: Controls,
     queued_output: usize,
@@ -96,6 +98,7 @@ impl Session {
             initialized: false,
             ready: false,
             retention: Retention::default(),
+            bases: delta::Bases::default(),
             statuses: BTreeMap::new(),
             cancels: BTreeMap::new(),
             queued_output: 0,
@@ -322,7 +325,9 @@ impl Session {
                 "retainedSequences":MAX_SEQUENCES,"maxInputBytes":MAX_INPUT_BYTES,
                 "maxRetainedResultBytes":MAX_CACHE_BYTES,"outputQueueFrames":transport::OUTPUT_QUEUE,
                 "maxFrameBytes":transport::MAX_FRAME,"readQueueFrames":transport::QUEUE,
-                "defaultObservationFormat":"compact","observationFormats":["compact","full"],
+                "defaultObservationFormat":"compact","observationFormats":["compact","full","delta"],
+                "maxObservationBases":delta::MAX_BASES,"maxObservationBaseBytes":delta::MAX_BASE_BYTES,
+                "deltaRequiresFreshObservation":true,"observerSupported":false,
                 "cachePolicy":"rolling_completed_only","expiredSequenceReplay":"never"});
             return self.reply(key, &tool_result(hello));
         }
@@ -333,7 +338,7 @@ impl Session {
             return self.error(key, -32602, "unknown tool");
         }
         let allowed: &[&str] = if name == "computer_execute" {
-            &["seq", "deadlineMs", "op", "format"]
+            &["seq", "deadlineMs", "op", "format", "baseSnapshot"]
         } else {
             &["seq"]
         };
@@ -361,7 +366,7 @@ impl Session {
     }
 
     fn execute(&mut self, key: &str, seq: u64, args: Value) -> Result<(), String> {
-        if let Err(error) = full_format(&args) {
+        if let Err(error) = delta::format(&args, &self.hello) {
             return self.error(key, -32602, &error);
         }
         let Some(deadline) = args["deadlineMs"]
@@ -507,12 +512,15 @@ impl Session {
                     return Err("worker repeated a terminal result".into());
                 }
                 let closing = must_close(&value);
-                let full = self
+                let args = self
                     .retention
                     .sequences
                     .get(&seq)
-                    .is_some_and(|state| full_format(&state.args).unwrap_or(false));
-                self.complete(seq, &tool_result(view::render(value, full)))?;
+                    .ok_or("native result has unknown seq")?
+                    .args
+                    .clone();
+                let rendered = self.bases.render(value, &args, &self.hello)?;
+                self.complete(seq, &tool_result(rendered))?;
                 if closing {
                     return Err(
                         "native outcome unknown/quiescing; worker will be terminated, no replay"
