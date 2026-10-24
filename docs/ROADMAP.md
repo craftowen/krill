@@ -18,6 +18,7 @@
 | M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer` | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
 | M11 Windows 포팅 | Windows(주 타깃 `x86_64-pc-windows-msvc`) 지원: 공통 컴파일 계층(Mac에서 Windows 타깃 `cargo check` 0) → GCP Windows VM 네이티브 ConPTY 실기 스파이크(S-W1~S-W5) → 합격 시 네이티브 본구현·배포. WSL2·앱만 원격은 보류(PRD 플랫폼 절) | 미정 | MK-205 Windows check 0, 스파이크 결과표로 본구현 여부 결정, 본구현 시 MK-217 Windows 생존 e2e 손실 0, macOS `scripts/check.sh` 0 유지 |
 | M12 Orca 심층 패리티 | 서브모듈·심링크·`.worktreeinclude` 글롭·Codex `SUN_LEN` 격리·훅 서브에이전트 보호·재귀 자식 워크트리 안전 삭제·스케줄 실행 상세/취소·오케스트레이션 `--question-id`/`--preamble`·AI Vault 증분 인덱싱·멀티 에이전트 Fan-Out 생성·Hunk/Line 스테이징·인앱 PR 머지 | 2026-10-19 | MK-223~229 전부 통과, `scripts/check.sh` 0 |
+| M13 Computer-use 신뢰성·격리·효율 | 대상 동일성·실행 결과·전역 입력 잠금·데드라인/취소·격리 네이티브 실행기·압축 관찰·짧은 배치 | 미정 | MK-244~251 관련 자동 테스트·실제 macOS 검증, 네이티브 TCC/장애 격리/메모리/지연 게이트 판정, 미통과 시 개선 JXA 유지 |
 
 ## 이슈 (우선순위 → 선행 순으로 진행)
 
@@ -223,6 +224,14 @@
 | MK-227 | 오케스트레이션 `ask --question-id` 멱등 재대기·`worker start --preamble` 3모드·스킬 공유 `--include- untracked` | M12 | P1 | `question_id` 중복 생성 방지·재대기, `preamble` 모드별 시스템 지시문 제어, untracked 스킬 동기화 테스트 통과 | MK-114, MK-115 | Orca 감사 | OWE-922 |
 | MK-228 | AI History Vault 대용량 JSONL(≤ 64 MiB) Head+Tail 분할 스캔·증분 mtime 캐시·최신순 정렬 | M12 | P1 | 8 MiB 초과 JSONL Head+Tail 파싱 및 `(path, mtime_ns, size)` 증분 캐시 재사용 테스트 통과 | MK-181 | Orca 감사 | OWE-923 |
 | MK-229 | 멀티 에이전트 Fan-Out 워크트리 생성 & 초기 프롬프트·Git Hunk/Line 스테이징·Unified/Split Diff·인앱 PR 머지 | M12 | P1 | 다중 에이전트 동시 워크트리 스폰·초기 프롬프트 주입, Hunk/Line stage/unstage/discard, PR Squash/Rebase/Merge 및 Draft 전환 테스트 통과 | MK-042, MK-054, MK-085, MK-185 | Orca 감사 | OWE-924 |
+| MK-244 | Computer-use 실행 결과·클립보드 계약 | M13 | P0 | 전송·관찰·검증·정리 분리, 불명 결과 재시도 금지, 변이 뒤 대체 입력 제거, 클립보드 원문 비노출·보존·충돌 테스트 | MK-187 | M13 Computer-use | OWE-1030 |
+| MK-245 | 스냅샷·대상 동일성 및 호출자 문맥 | M13 | P0 | 스냅샷·앱·창·요소 동일성, 순서 변경·모호성·소멸·문맥 교차 참조 거부, 원자 캐시 테스트 | MK-244 | M13 Computer-use | OWE-1031 |
+| MK-246 | GUI 입력 전역 잠금·데드라인·취소 | M13 | P0 | 상태 디렉터리와 무관한 잠금, CLI 사망 뒤 실행기 잠금 유지, 제한 파이프·데드라인·취소·kill/reap 테스트 | MK-244 | M13 Computer-use | OWE-1032 |
+| MK-247 | 격리 네이티브 computer 실행기 스파이크 | M13 | P1 | 실제 AX/입력 경로·요청 예약·Status/Cancel, TCC·hang·업데이트·메모리 측정으로 채택 여부 판정 | MK-245, MK-246 | M13 Computer-use | OWE-1033 |
+| MK-248 | 압축 관찰·스크린샷 좌표·스킬 버전 | M13 | P1 | 압축 표현·coverage/페이지·실제 동작, 실제 픽셀 좌표·창 변경 검증·불변 캡처, 스킬 버전/기능/해시 일치 | MK-245 | M13 Computer-use | OWE-1034 |
+| MK-249 | 짧은 배치·요청 예약·결과 조회 | M13 | P1 | 상한 있는 선형 배치·오류/불명/모달/전환 중단, 문맥별 seq 예약·중복 거부·축출 결과 Expired 테스트 | MK-245, MK-246 | M13 Computer-use | OWE-1035 |
+| MK-250 | 네이티브 실행기 조건부 전환·호환 | M13 | P1 | 동일 태스크 기준선/네이티브 실측, TCC·시작·업데이트·장애·합산 메모리 게이트 및 기존 CLI 호환 검증 | MK-247~249 | M13 Computer-use | OWE-1036 |
+| MK-251 | 관찰 이벤트·델타 최적화 및 회귀 검증 | M13 | P2 | 관찰 힌트·델타가 동일성·검증을 약화하지 않음, 반복 측정·회귀 검증으로 최적화 판정 | MK-250 | M13 Computer-use | OWE-1037 |
 | MK-240 | [Epic] Krill 하이브리드 채팅 UI (`krill-holder` PTY 영속 + Zero-State 트랜스크립트 투영 + `[Chat \| Term]` 1-탭 전환) | M12 | P1 | 하위 MK-241~243 전부 완료, `scripts/check.sh` 0 | MK-125, MK-184 | M12 Hybrid Chat | OWE-943 |
 | MK-241 | [Phase 1] 하이브리드 채팅 기반: 세션 바인딩(`transcript_path`·로그인 셸 자동 귀속) & 안전 입력 파이프라인(`Bracketed Paste` + 60ms 분리 `\r`) | M12 | P1 | `StoredLaunch::transcript_path` 기록, 로그인 셸 수동 실행 에이전트 첫 훅 자동 귀속, `Action::Prompt`/`Action::Photo` Bracketed Paste + 60ms 분리 `\r`, `Action::CreateTerminal { cwd_session, agent }` 단위 테스트 통과 | MK-125 | M12 Phase 1 | OWE-944 |
 | MK-242 | [Phase 2] Zero-State 증분 `ChatItem` 리더(`Action::ChatPoll`) & 모바일 PWA 채팅 뷰(`screens/chat.js` + `[Chat \| Term]` 토글 + 인라인 Diff 모달) | M12 | P1 | 4대 에이전트(`claude`·`codex`·`agy`·`opencode`) 오프셋 기반 증분 `ChatItem` 정규화, 모바일 `[Chat \| Term]` 1-탭 토글, Live Activity Strip, `Action::Git` 인라인 Diff 모달 테스트 통과 | MK-241 | M12 Phase 2 | OWE-945 |
