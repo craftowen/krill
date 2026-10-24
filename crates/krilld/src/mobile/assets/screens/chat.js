@@ -1,8 +1,27 @@
 // Orca mobile conversation/tool disclosure reference: MIT, Copyright (c) 2026 Lovecast Inc.
 (()=>{const M=globalThis.KrillMobile||={};M.screens||={};
+// Build inline formatting with text nodes/elements only; transcript HTML never becomes markup.
+function renderInline(el,parent,text,depth=0){
+ if(depth>=8){parent.append(el('span',text));return;}
+ const tokens=/\\([\\`*_[\]])|(`+)(.*?)\2(?!`)|(\*\*|__|\*)(?=\S)(.+?\S|\S)\4|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+ let end=0;
+ for(const match of text.matchAll(tokens)){
+  if(match.index>end)parent.append(el('span',text.slice(end,match.index)));
+  const [,escaped,ticks,code,mark,body,label,href]=match;
+  if(escaped)parent.append(el('span',escaped));
+  else if(ticks)parent.append(el('code',code,'chat-inline-code'));
+  else if(mark){const node=el(mark.length===2?'strong':'em');renderInline(el,node,body,depth+1);parent.append(node);}
+  else if(/^(https?:\/\/|mailto:)/i.test(href)){
+   const node=el('a');node.setAttribute('href',href);node.setAttribute('target','_blank');node.setAttribute('rel','noopener noreferrer');renderInline(el,node,label,depth+1);parent.append(node);
+  }else parent.append(el('span',match[0]));
+  end=match.index+match[0].length;
+ }
+ if(end<text.length)parent.append(el('span',text.slice(end)));
+}
 function renderRichText(el,text){
  const wrap=el('div',undefined,'chat-md');
  const blocks=String(text||'').split(/```/);
+ const splitCells=s=>s.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>c.trim());
  for(let i=0;i<blocks.length;i++){
   const part=blocks[i];
   if(i%2===1){
@@ -11,14 +30,42 @@ function renderRichText(el,text){
    const pre=el('pre',undefined,'chat-code'),code=el('code',codeText.replace(/\n$/,''));
    pre.append(code);wrap.append(pre);
   }else{
-   for(const rawLine of part.split('\n')){
-    const line=rawLine.trimEnd();
-    if(!line.trim())continue;
-    if(line.startsWith('### '))wrap.append(el('h4',line.slice(4),'chat-h'));
-    else if(line.startsWith('## '))wrap.append(el('h3',line.slice(3),'chat-h'));
-    else if(line.startsWith('# '))wrap.append(el('h2',line.slice(2),'chat-h'));
-    else if(/^[-*]\s+/.test(line.trim()))wrap.append(el('p','• '+line.trim().slice(2),'chat-li'));
-    else wrap.append(el('p',line,'chat-p'));
+   const lines=part.split('\n');
+   for(let j=0;j<lines.length;j++){
+    const line=lines[j].trimEnd(),trimmed=line.trim();
+    if(!trimmed)continue;
+    if(trimmed.startsWith('|')&&trimmed.endsWith('|')&&/^\|?[\s:|-]+\|[\s:|-]*$/.test(lines[j+1]?.trim()||'')&&lines[j+1].includes('-')){
+     const table=el('table',undefined,'chat-table'),thead=el('thead'),trHead=el('tr'),tbody=el('tbody');
+     for(const c of splitCells(trimmed)){const th=el('th');renderInline(el,th,c);trHead.append(th);}
+     thead.append(trHead);table.append(thead,tbody);j+=2;
+     while(j<lines.length&&lines[j].trim().startsWith('|')&&lines[j].trim().endsWith('|')){
+      const tr=el('tr');
+      for(const c of splitCells(lines[j])){const td=el('td');renderInline(el,td,c);tr.append(td);}
+      tbody.append(tr);j++;
+     }
+     j--;wrap.append(table);continue;
+    }
+    if(/^>\s?/.test(trimmed)){
+     const quote=el('blockquote',undefined,'chat-quote'),qLines=[trimmed.replace(/^>\s?/,'')];
+     while(j+1<lines.length&&/^>\s?/.test(lines[j+1].trim()))qLines.push(lines[++j].trim().replace(/^>\s?/,''));
+     renderInline(el,quote,qLines.join('\n'));wrap.append(quote);continue;
+    }
+    if(/^\d+\.\s+/.test(trimmed)){
+     const ol=el('ol',undefined,'chat-ol');
+     for(;;){
+      const li=el('li');renderInline(el,li,lines[j].trim().replace(/^\d+\.\s+/,''));ol.append(li);
+      if(j+1>=lines.length||!/^\d+\.\s+/.test(lines[j+1].trim()))break;
+      j++;
+     }
+     wrap.append(ol);continue;
+    }
+    let node,content=line;
+    if(line.startsWith('### ')){node=el('h4',undefined,'chat-h');content=line.slice(4);}
+    else if(line.startsWith('## ')){node=el('h3',undefined,'chat-h');content=line.slice(3);}
+    else if(line.startsWith('# ')){node=el('h2',undefined,'chat-h');content=line.slice(2);}
+    else if(/^[-*]\s+/.test(trimmed)){node=el('p',undefined,'chat-li');content='• '+trimmed.slice(2);}
+    else node=el('p',undefined,'chat-p');
+    renderInline(el,node,content);wrap.append(node);
    }
   }
  }
@@ -54,7 +101,8 @@ function mountChat(root,opts){
  pollStatus.setAttribute('role','status');
  const retryBtn=button(t('Retry'),()=>pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
  const input=el('textarea',undefined,'chat-input');input.rows=1;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
- input.value=drafts.get(sessionId)||'';
+ function sizeInput(){if(!input.style)return;input.style.height='auto';if(input.scrollHeight)input.style.height=Math.min(140,Math.max(28,input.scrollHeight))+'px';}
+ input.value=drafts.get(sessionId)||'';sizeInput();
  let composing=false,disposed=false,pollTimer=null,inFlight=false,retryWithoutTail=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
@@ -65,7 +113,7 @@ function mountChat(root,opts){
  // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
  const resize=globalThis.ResizeObserver?new ResizeObserver(()=>pinLatest()):null;resize?.observe(feed);
  const cards=new Map(),toolRuns=new Map();let tailRun=null,renderedCount=0,renderedItems=null;
- input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);});
+ input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);sizeInput();});
  input.addEventListener('compositionstart',()=>composing=true);
  input.addEventListener('compositionend',()=>composing=false);
  const attachment=el('div',undefined,'chat-actions');attachment.setAttribute('role','status');
@@ -93,8 +141,14 @@ function mountChat(root,opts){
    // 클립보드 권한이 거부되면(일부 웹뷰) 선택 복사로 한 번 더 시도한다.
    let copied=false;if(globalThis.isSecureContext&&navigator.clipboard)copied=await navigator.clipboard.writeText(text).then(()=>true,()=>false);
    if(!copied){const area=el('textarea');area.value=text;area.setAttribute('readonly','');area.className='copy-buffer';document.body.append(area);area.select();const ok=document.execCommand('copy');area.remove();if(!ok)throw Error(t('Copy is not available in this browser'));}
-   node.replaceChildren(ctx.icon('check'));node.setAttribute('aria-label',t('Copied'));node.dataset.copied='true';
-   setTimeout(()=>{node.replaceChildren(ctx.icon('copy'));node.setAttribute('aria-label',t('Copy'));delete node.dataset.copied;},1500);
+   if(!node)return;
+   if(ctx.icon&&String(node.className||'').includes('chat-copy')){
+    node.replaceChildren(ctx.icon('check'));node.setAttribute('aria-label',t('Copied'));node.dataset.copied='true';
+    setTimeout(()=>{node.replaceChildren(ctx.icon('copy'));node.setAttribute('aria-label',t('Copy'));delete node.dataset.copied;},1500);
+   }else{
+    const prev=node.textContent;node.textContent=t('Copied');node.dataset.copied='true';
+    setTimeout(()=>{node.textContent=prev;delete node.dataset.copied;},1500);
+   }
   });
  }
  // 오늘은 시각만, 다른 날은 날짜와 시각을 보인다(Orca 메시지 아래 표기).
@@ -113,10 +167,16 @@ function mountChat(root,opts){
  function updateComposer(sent){
   // Completion belongs to the shared draft version, including a newly mounted composer.
   if(sent&&(entry.draftVersion||0)===sent.version&&input.value===sent.text)input.value='';
+  sizeInput();
   sendBtn.disabled=entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error';
   attachBtn.disabled=entry.sending||!!entry.photo;
   attachment.replaceChildren();
   const photo=entry.photo;if(!photo)return;
+  if(photo.status==='ready'&&photo.prepared?.data){
+   const img=el('img',undefined,'chat-photo-thumb'),src=`data:${photo.prepared.mime||'image/jpeg'};base64,${photo.prepared.data}`;
+   img.alt='';img.src=src;img.setAttribute('alt','');img.setAttribute('src',src);
+   attachment.append(img);
+  }
   const text=photo.status==='pending'?t('Preparing photo…'):photo.status==='error'?t('Photo preparation failed. Retry or remove it.'):t('Photo ready. It will be sent with this message.');
   attachment.append(el('span',`${photo.name}: ${text}`,photo.status==='error'?'danger':'muted'));
   if(photo.status==='error')attachment.append(button(t('Retry photo'),()=>preparePhoto(photo.file),'ghost small'));
@@ -206,16 +266,21 @@ function mountChat(root,opts){
  function renderQuestionCard(card,item){
   card.append(el('header',item.title?`${t('Question')} • ${item.title}`:t('Question'),'chat-role'),el('p',item.text,'chat-p'));
   const list=el('div',undefined,'chat-question-options'),selected=new Set(),buttons=[];
+  const custom=el('input');custom.type='text';custom.value='';custom.placeholder=t('Other (write-in)…');custom.setAttribute('aria-label',t('Other answer notes'));
+  const draftAnswer=()=>[...[...selected].map(i=>item.options?.[i]?.label).filter(Boolean),String(custom.value||'').trim()].filter(Boolean).join(', ');
+  const copyBtn=button(t('Copy answer'),()=>{const ans=draftAnswer();if(ans)copyText(ans,copyBtn);},'secondary small');
+  const syncAnswer=()=>{const has=Boolean(draftAnswer());copyBtn.hidden=!has;copyBtn.disabled=!has;};
   for(const [index,opt] of (item.options||[]).entries()){
    const b=button(opt.description?`${opt.label} — ${opt.description}`:opt.label,()=>{
     if(!item.multi_select)selected.clear();
     if(selected.has(index))selected.delete(index);else selected.add(index);
     buttons.forEach((b,i)=>{b.className=`${selected.has(i)?'primary':'ghost'} small chat-opt`;b.setAttribute('aria-pressed',String(selected.has(i)));});
+    syncAnswer();
    },'ghost small chat-opt');b.setAttribute('aria-pressed','false');buttons.push(b);list.append(b);
   }
-  card.append(list);
-  const custom=el('input');custom.type='text';custom.placeholder=t('Other (write-in)…');custom.setAttribute('aria-label',t('Other answer notes'));
-  card.append(custom,el('p',t('These are answer notes only. Confirm the current question and enter your answer in Term.'),'muted'),button(t('Confirm in Term'),()=>onSwitchTerm?.(),'ghost small'));
+  custom.addEventListener('input',syncAnswer);syncAnswer();
+  const actions=el('div',undefined,'chat-actions');actions.append(button(t('Confirm in Term'),()=>onSwitchTerm?.(),'ghost small'),copyBtn);
+  card.append(list,custom,el('p',t('These are answer notes only. Confirm the current question and enter your answer in Term.'),'muted'),actions);
  }
  function openDiff(filePath){
   run(async()=>{
@@ -252,8 +317,16 @@ function mountChat(root,opts){
  }
  function showPollError(error){
   failures++;pollStatus.hidden=false;
-  const when=lastSuccess?new Date(lastSuccess).toLocaleTimeString():t('never');
+  const when=lastSuccess?new Date(lastSuccess).toTimeString().slice(0,8):t('never');
   pollText.textContent=`${t('Chat history update failed')} (${failures}). ${t('Last updated')}: ${when}. ${t('Retry or check Term.')} ${String(error?.message||error||'')}`;
+ }
+ function sameItem(a,b){
+  if(!a||!b)return false;
+  if((b.id!==undefined&&a.id!==b.id)||a.kind!==b.kind||a.text!==b.text||a.title!==b.title||a.tool_name!==b.tool_name||a.tool_id!==b.tool_id||a.file_path!==b.file_path||a.is_error!==b.is_error||a.status!==b.status||a.multi_select!==b.multi_select)return false;
+  const ao=a.options,bo=b.options;
+  if(!!ao!==!!bo)return false;
+  if(ao){if(ao.length!==bo.length)return false;for(let i=0;i<ao.length;i++)if(ao[i]?.label!==bo[i]?.label||ao[i]?.description!==bo[i]?.description)return false;}
+  return true;
  }
  async function pollNow(initial=false){
   // 숨은 Chat도 첫 내용을 받을 때까지는 받아 둔다(실패 2회까지). 연결 전에 마운트돼 첫 프리페치를 놓쳐도 ready 뒤 update()가 다시 받아, Chat을 누른 첫 프레임에 내용이 있다.
@@ -271,7 +344,7 @@ function mountChat(root,opts){
     if(disposed||earlierPending||entry.live||!res)return;
     latest=true;changed=true;
    }
-   const sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===(res.items||[]).length&&(res.items||[]).every((item,index)=>Object.entries(item).every(([key,value])=>JSON.stringify(entry.items[index][key])===JSON.stringify(value)));
+   const rItems=res.items||[],sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
    const reset=latest&&!sameTail||res.reset||changed,metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
    const hadItems=entry.items.length,wasLoaded=entry.loaded;
    if(reset){clearTranscript();following=true;}

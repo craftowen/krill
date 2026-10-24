@@ -1371,25 +1371,6 @@ impl Sidebar {
                                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                             })
                     }))
-                    .children(account_label.map(|l| {
-                        let short = status::abbreviate_account_label(l);
-                        let full = l.to_owned();
-                        let tip = text::SESSION_ACCOUNT.format(&[("label", &full)]);
-                        div()
-                            .id(("account-badge", index))
-                            .aria_label(tip.clone())
-                            .debug_selector(move || format!("account-badge-{index}"))
-                            .flex_none()
-                            .px_1()
-                            .rounded(ui::RADIUS_XS)
-                            .bg(p.muted)
-                            .text_size(ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(short)
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                            })
-                    }))
                     .on_click(cx.listener(move |s, _, _, cx| {
                         cx.stop_propagation();
                         s.select_session(index, id, cx);

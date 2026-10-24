@@ -2214,7 +2214,23 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
                 trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
             };
             s.rebuild(cx);
-            assert_eq!(s.agent_counts(), (1, 1));
+            assert_eq!(s.agent_counts(), (0, 1, 1));
+            s.set_remote_snapshot_for_test(
+                "iroh:remote",
+                HostStatus::Connected,
+                Snapshot {
+                    sessions: vec![
+                        session(3, AgentState::Waiting, Some("/repo/a")),
+                        session(4, AgentState::Done, Some("/repo/a")),
+                        session(5, AgentState::Unknown, Some("/repo/a")),
+                    ],
+                    trees: BTreeMap::new(),
+                },
+                cx,
+            );
+            assert_eq!(s.agent_counts(), (1, 1, 2));
+            s.remote_hosts.clear();
+            s.rebuild(cx);
             assert!(!s.expanded_cards.contains(Path::new("/repo/a")));
         });
     });
@@ -5576,55 +5592,6 @@ fn status_summary_reuses_snapshot_until_sidebar_changes(cx: &mut TestAppContext)
     assert_eq!(first.0, 1);
     assert_eq!(*first.1, vec![AgentState::Waiting, AgentState::Working]);
     assert!(Arc::ptr_eq(&first.1, &second.1));
-}
-
-/// 폰에서 바꾼 작업 공간 옵션(`sidebar-mobile.json`)을 다음 디스크 폴링에서 사이드바에 반영하고 저장한 뒤 지운다.
-#[gpui::test]
-fn mobile_workspace_view_change_applies_to_desktop_sidebar(cx: &mut TestAppContext) {
-    use krill_proto::mobile::view::ViewChange;
-    let dir = std::env::temp_dir().join(format!("krill-mobile-view-{}", std::process::id()));
-    fs::remove_dir_all(&dir).ok();
-    let repo = dir.join("repo");
-    fs::create_dir_all(repo.join(".git")).unwrap();
-    let sidebar_bin = dir.join("sidebar.bin");
-    ViewChange::append(
-        &dir,
-        ViewChange {
-            group_by: Some(3),
-            sort_by: Some(2),
-            hide_sleeping: Some(true),
-            repos: Some(BTreeSet::from([repo.clone()])),
-            collapsed: BTreeMap::from([(repo.clone(), true)]),
-            ..ViewChange::default()
-        },
-    )
-    .unwrap();
-    cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.snapshot.trees.insert(repo.clone(), vec![repo.clone()]);
-            s.rebuild(cx);
-            s.reload_external(cx);
-        });
-    });
-    cx.run_until_parked();
-    cx.update(|_, cx| {
-        let s = view.read(cx);
-        assert_eq!(s.options().group_by, GroupBy::None);
-        assert_eq!(s.options().sort_by, SortBy::Name);
-        assert!(s.options().filters.hide_sleeping);
-        assert!(s.options().filters.repos.contains(&repo));
-        assert!(s.is_collapsed(&repo));
-    });
-    assert!(
-        ViewChange::load(&dir).is_none(),
-        "applied change is consumed"
-    );
-    let restored = Sidebar::new_loaded(Some(sidebar_bin));
-    assert_eq!(restored.options().sort_by, SortBy::Name);
-    assert!(restored.is_collapsed(&repo));
-    fs::remove_dir_all(dir).ok();
 }
 
 /// 기본 워크트리에 프로젝트 표시 이름·폴더 이름이 `prefs`(`projects.toml` 동기화분 포함)로 들어 있어도

@@ -1762,23 +1762,22 @@ impl Sidebar {
         }
     }
 
-    /// 사이드바 상단 '에이전트 대시보드' 행에 표시할 `(작업 중·대기 수, 완료 수)`.
+    /// 사이드바 상단 '에이전트 대시보드' 행에 표시할 `(확인 필요 수, 작업 중 수, 완료 수)`.
+    /// 대시보드 모달(`dashboard_sessions`)과 동일한 호스트 필터 및 상태 분류 기준을 따른다.
     #[must_use]
-    pub fn agent_counts(&self) -> (usize, usize) {
+    pub fn agent_counts(&self) -> (usize, usize, usize) {
+        let mut waiting = 0usize;
         let mut working = 0usize;
         let mut done = 0usize;
-        for s in &self.snapshot.sessions {
+        for (_, s) in self.dashboard_sessions() {
             match s.status.state {
-                AgentState::Working | AgentState::Waiting | AgentState::Blocked => working += 1,
-                AgentState::Done => done += 1,
-                AgentState::Exited | AgentState::Unknown => {
-                    if !s.status.agent.is_empty() {
-                        done += 1;
-                    }
-                }
+                AgentState::Waiting | AgentState::Blocked => waiting += 1,
+                AgentState::Working => working += 1,
+                AgentState::Done | AgentState::Exited => done += 1,
+                AgentState::Unknown => {}
             }
         }
-        (working, done)
+        (waiting, working, done)
     }
 
     /// OWE-662: 보지 않은 사이 완료·대기로 바뀐 세션인지.
