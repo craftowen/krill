@@ -370,3 +370,20 @@ button.account-row:disabled{opacity:1}
    Focused rows stay fully laid out, including text selection and IME in descendants. */
 .large-workspace-list .tree-node{content-visibility:auto;contain-intrinsic-block-size:auto calc(3 * var(--space-xl))}
 .large-workspace-list .tree-node:focus-within{content-visibility:visible}
+
+/* Session chrome stays compact so the terminal body keeps the most rows: 40px header, 34px tabs and keys,
+   a short buffered input row and a trimmed home-indicator gap. Long-press on the dock opens no iOS callout. */
+#mobile-app .session.screen>.page-header{min-height:40px;padding-top:0;padding-bottom:0}
+#mobile-app .session.screen>.page-header button{min-height:36px;min-width:36px}
+#mobile-app .session.screen>.page-header .icon-button{width:36px;height:36px}
+.session.screen .header-copy h1{line-height:1.2}.session.screen .session-summary{margin-top:0;font-size:calc(11px * var(--ui-scale,1));line-height:1.2}
+#mobile-app .session-tabs{min-height:34px}
+#mobile-app .session-tabs :is(.session-tab,.tab-add){min-height:34px;height:34px;padding-top:4px;padding-bottom:4px}
+#mobile-app .session .command-dock :is(.accessory-key,.dismiss-keyboard,.photo-attach,.command-send){min-height:34px;height:34px;min-width:36px}
+#mobile-app .session .command-dock .command-send{width:36px}
+#mobile-app .session .buffered-command>.command-input{min-height:34px;height:34px;padding-top:5px;padding-bottom:5px}
+.session .keybar{padding-top:2px;padding-bottom:2px}.session .dismiss-keyboard{margin-top:2px;margin-bottom:2px}
+.session .input-row{min-height:0;padding-top:3px;padding-bottom:3px}
+.session .command-dock{padding-bottom:max(4px,calc(env(safe-area-inset-bottom) - 14px));-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.session .command-dock textarea{-webkit-user-select:text;user-select:text}
+.session .terminal-mount[data-keyboard-open=true] .command-dock{padding-bottom:0}

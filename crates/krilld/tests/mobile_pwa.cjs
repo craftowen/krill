@@ -123,7 +123,7 @@ assert.equal(model.cols,80);assert.equal(model.lines,24);assert.equal(model.rows
 const historyFixture=T.history(Buffer.from('100000002609e807030a02010178000000000000','hex').subarray(5));assert.equal(historyFixture.total,1000);assert.equal(historyFixture.pages,3);assert.equal(historyFixture.rows[0][0].ch,'x');
 const before=model.rows[3];T.update(Buffer.concat([v(301),v(70000),v(1),v(1),v(1),v(2)]),model);assert.equal(model.rows[2],before);
 for(let n=0;n<128;n++){const bytes=crypto.randomBytes(n);try{T.update(bytes,{cols:80,lines:24,rows:Array.from({length:24},()=>[])});}catch{}try{T.history(bytes);}catch{}}
-assert.equal(sandbox.KrillMobile.terminal.keys.length,20);
+assert.equal(sandbox.KrillMobile.terminal.keys.length,24);
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
 const env={...process.env,KRILL_STATE_DIR:dir,HOME:home,TMPDIR:path.join(dir,'paste')};
