@@ -176,7 +176,7 @@ pub struct Settings {
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub workspace_trust_preset_enabled: bool,
-    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Deep"`, OWE-956).
+    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Trench"`, OWE-956).
     #[serde(default = "default_terminal_theme_dark")]
     pub terminal_theme_dark: String,
     /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Builtin Tango Light"`, OWE-956).
@@ -263,7 +263,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::System,
-            ui_theme_dark: crate::ui::DarkUiTheme::Deep,
+            ui_theme_dark: crate::ui::DarkUiTheme::default(),
             ui_theme_light: crate::ui::LightUiTheme::Classic,
             language: locale::system_language(),
             zoom: 1.0,
@@ -356,6 +356,18 @@ impl Settings {
             parsed.terminal_theme_light = default_terminal_theme_light();
         }
         let table: toml::Table = toml::from_str(s)?;
+        if !table.contains_key("terminal_theme_dark") {
+            parsed
+                .ui_theme_dark
+                .terminal_theme_name()
+                .clone_into(&mut parsed.terminal_theme_dark);
+        }
+        if !table.contains_key("terminal_theme_light") {
+            parsed
+                .ui_theme_light
+                .terminal_theme_name()
+                .clone_into(&mut parsed.terminal_theme_light);
+        }
         if !table.contains_key("language") {
             parsed.language = default_language;
         }
@@ -5230,6 +5242,7 @@ impl SettingsView {
     }
 
     fn render_general_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let p = crate::ui::palette(cx);
         let theme_button = |id: &'static str, label: &'static str, choice: ThemeChoice| {
             layout::segment(p, id, label, s.theme == choice)
@@ -5238,20 +5251,38 @@ impl SettingsView {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
-        let dark_theme_button = |id: &'static str, label: &'static str, theme: DarkUiTheme| {
-            layout::segment(p, id, label, s.ui_theme_dark == theme)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.set_ui_theme_dark(theme));
-                })
-        };
-        let light_theme_button = |id: &'static str, label: &'static str, theme: LightUiTheme| {
-            layout::segment(p, id, label, s.ui_theme_light == theme)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.set_ui_theme_light(theme));
-                })
-        };
+        let selected_dark = s.ui_theme_dark;
+        let dark_themes = layout::secondary("ui-theme-dark", selected_dark.label())
+            .dropdown_caret(true)
+            .debug_selector(|| "ui-theme-dark".into())
+            .dropdown_menu(move |mut menu, _, _| {
+                for theme in DarkUiTheme::ALL {
+                    menu = menu.item(
+                        PopupMenuItem::new(theme.label())
+                            .checked(selected_dark == theme)
+                            .on_click(move |_, _, cx| {
+                                edit(cx, move |s| s.set_ui_theme_dark(theme));
+                            }),
+                    );
+                }
+                menu
+            });
+        let selected_light = s.ui_theme_light;
+        let light_themes = layout::secondary("ui-theme-light", selected_light.label())
+            .dropdown_caret(true)
+            .debug_selector(|| "ui-theme-light".into())
+            .dropdown_menu(move |mut menu, _, _| {
+                for theme in LightUiTheme::ALL {
+                    menu = menu.item(
+                        PopupMenuItem::new(theme.label())
+                            .checked(selected_light == theme)
+                            .on_click(move |_, _, cx| {
+                                edit(cx, move |s| s.set_ui_theme_light(theme));
+                            }),
+                    );
+                }
+                menu
+            });
         let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
             layout::segment(p, id, label, s.keep_awake == mode)
                 .debug_selector(move || id.into())
@@ -5325,58 +5356,12 @@ impl SettingsView {
             .child(
                 row()
                     .child(label(text::DARK_THEME.get(), text::DARK_THEME_DESC.get()))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                (
-                                    "ui-theme-deep",
-                                    text::UI_THEME_DEEP.get(),
-                                    DarkUiTheme::Deep,
-                                ),
-                                (
-                                    "ui-theme-abyss",
-                                    text::UI_THEME_ABYSS.get(),
-                                    DarkUiTheme::Abyss,
-                                ),
-                                (
-                                    "ui-theme-tidepool",
-                                    text::UI_THEME_TIDEPOOL.get(),
-                                    DarkUiTheme::Tidepool,
-                                ),
-                                (
-                                    "ui-theme-glow",
-                                    text::UI_THEME_GLOW.get(),
-                                    DarkUiTheme::Glow,
-                                ),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, theme)| dark_theme_button(id, l, theme)),
-                        )),
-                    ),
+                    .child(layout::controls().child(dark_themes)),
             )
             .child(
                 row()
                     .child(label(text::LIGHT_THEME.get(), text::LIGHT_THEME_DESC.get()))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                (
-                                    "ui-theme-classic",
-                                    text::UI_THEME_CLASSIC.get(),
-                                    LightUiTheme::Classic,
-                                ),
-                                (
-                                    "ui-theme-paper",
-                                    text::UI_THEME_PAPER.get(),
-                                    LightUiTheme::Paper,
-                                ),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, theme)| light_theme_button(id, l, theme)),
-                        )),
-                    ),
+                    .child(layout::controls().child(light_themes)),
             )
             .child(
                 row()

@@ -45,8 +45,13 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("host-header-local").is_none());
+    // A connected device without projects needs no row in project navigation.
+    assert!(vcx.debug_bounds("host-header-iroh:studio").is_none());
+    view.update(vcx, |sidebar, cx| sidebar.set_group_by(GroupBy::None, cx));
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("host-header-iroh:studio").is_some());
     assert!(vcx.debug_bounds("host-route-iroh:studio").is_some());
+    view.update(vcx, |sidebar, cx| sidebar.set_group_by(GroupBy::Repo, cx));
     manager.sync_external_hosts(vec![registration(true)]);
     view.update(vcx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
     vcx.run_until_parked();
@@ -372,7 +377,7 @@ fn rows_expose_voiceover_names_roles_and_press(cx: &mut TestAppContext) {
         [
             "저장소 repo 1",
             "워크트리 a, 입력 대기",
-            "세션",
+            "작업 폴더 미확인 세션",
             "세션 3, 작업 중",
         ]
     );
@@ -1715,8 +1720,9 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
                 .collect::<Vec<_>>()
         })
     };
-    // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘은 숨는다.
-    assert_eq!(headers(cx), ["oci", "kak"]);
+    // 세션이 남은 끊긴 호스트(kak)는 다시 연결하도록 보이고, 세션 없는 끊긴 호스트 둘과
+    // 프로젝트 없이 연결만 된 호스트(oci, 관리는 설정)는 프로젝트 목록에 띄우지 않는다.
+    assert_eq!(headers(cx), ["kak"]);
 
     assert_eq!(
         super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
@@ -1736,16 +1742,17 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
     );
 }
 
-/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 끊기지 않고 이어지며, 프로젝트 없는 호스트와
-/// 작업 폴더 없는 세션 묶음은 모든 프로젝트 뒤에 온다.
+/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 맨 위 단계다. 다른 PC의 같은 프로젝트는 한 머리줄로
+/// 합쳐지고, 연결된 PC의 상태 줄은 사라지며, 다시 연결이 필요한 프로젝트 없는 PC와
+/// 작업 폴더 모르는 세션(모든 PC 것을 한 묶음)만 프로젝트 뒤에 온다.
 #[gpui::test]
-fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext) {
+fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
-    let remote = |id: &str, snapshot: Snapshot| RemoteHost {
+    let remote = |id: &str, status, snapshot: Snapshot| RemoteHost {
         id: id.into(),
         label: id.into(),
-        status: HostStatus::Connected,
+        status,
         snapshot,
         meta: Meta::new(),
         source: None,
@@ -1757,26 +1764,49 @@ fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext)
             trees: BTreeMap::from([("/local".into(), vec!["/local/a".into()])]),
         };
         s.remote_hosts = vec![
-            remote("oci", Snapshot::default()),
+            remote("oci", HostStatus::Connected, Snapshot::default()),
             remote(
                 "win",
+                HostStatus::Connected,
                 Snapshot {
                     sessions: vec![session(2, AgentState::Done, None)],
                     trees: BTreeMap::from([("/tax".into(), vec!["/tax".into()])]),
                 },
             ),
             remote(
+                "mbp",
+                HostStatus::Connected,
+                Snapshot {
+                    sessions: Vec::new(),
+                    trees: BTreeMap::from([(
+                        "/Users/x/LOCAL".into(),
+                        vec!["/Users/x/LOCAL".into(), "/Users/x/LOCAL-wt".into()],
+                    )]),
+                },
+            ),
+            remote(
                 "seol",
+                HostStatus::Connected,
                 Snapshot {
                     sessions: Vec::new(),
                     trees: BTreeMap::from([("/seol".into(), vec!["/seol".into()])]),
                 },
             ),
+            remote(
+                "off",
+                HostStatus::Disconnected,
+                Snapshot {
+                    sessions: vec![session(3, AgentState::Done, None)],
+                    trees: BTreeMap::new(),
+                },
+            ),
         ];
         s.rebuild(cx);
     });
-    let rows = cx.update(|_, cx| {
-        view.read(cx)
+    let mbp = HostId::Remote("mbp".into());
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let rows = s
             .rows
             .iter()
             .filter_map(|r| match r {
@@ -1785,12 +1815,45 @@ fn project_rows_are_contiguous_and_host_sections_follow(cx: &mut TestAppContext)
                 Row::Loose => Some("loose".into()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["/local", "/tax", "/seol", "host:off", "loose"]);
+        // The other PC's worktree sits inside the local project, before the next project.
+        let merged = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Worktree(p) if p == Path::new("/Users/x/LOCAL-wt")))
+            .unwrap();
+        let tax = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/tax")))
+            .unwrap();
+        assert!(merged < tax);
+        assert_eq!(s.row_host(merged), &mbp);
+        assert_eq!(
+            s.merged_projects.get(&0).map(Vec::as_slice),
+            Some(&[(mbp.clone(), PathBuf::from("/Users/x/LOCAL"))][..])
+        );
+        assert_eq!(
+            s.host_badge_for(&mbp, Path::new("/Users/x/LOCAL-wt")),
+            Some("mbp".into())
+        );
+        let loose = s.rows.iter().position(|r| matches!(r, Row::Loose)).unwrap();
+        let loose_hosts = (loose + 1..s.rows.len())
+            .map(|i| s.row_host(i).as_key().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(loose_hosts, ["win", "off"]);
     });
-    assert_eq!(
-        rows,
-        ["/local", "/tax", "/seol", "host:oci", "host:win", "loose"]
-    );
+    // Folding the merged header folds the other PC's part too.
+    view.update(cx, |s, cx| s.fold(Path::new("/local"), Some(false), cx));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            !s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Worktree(p) if p == Path::new("/Users/x/LOCAL-wt")))
+        );
+    });
 }
 
 /// Projects remain the root even with remote hosts; session IDs and selection stay host-scoped.
@@ -1843,7 +1906,19 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         );
         assert_eq!(
             s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
-            None
+            Some("Studio".into())
+        );
+        // The same project on another PC merges into the one project header.
+        assert_eq!(
+            s.rows
+                .iter()
+                .filter(|r| matches!(r, Row::Repository(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.merged_projects.get(&0).map(Vec::as_slice),
+            Some(&[(remote.clone(), PathBuf::from("/repo"))][..])
         );
         let find = |host: &HostId, repo| {
             s.rows
@@ -1861,12 +1936,13 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         };
         (
             find(&HostId::Local, false),
-            find(&remote, true),
+            find(&HostId::Local, true),
             find(&remote, false),
         )
     });
     let sel = |prefix: &str, index| -> &'static str { format!("{prefix}-{index}").leak() };
-    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_some());
+    // A connected PC shows on its cards, not as another badge on the merged header.
+    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
     let bounds = cx.debug_bounds(sel("card-session", remote_tree)).unwrap();
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
@@ -5136,7 +5212,7 @@ fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestApp
             let local = s.local_rows();
             assert!(local.contains(&Row::Repository(selected.clone())));
             assert!(!local.contains(&Row::Repository(hidden_local.clone())));
-            let remote = s.remote_rows(&s.remote_hosts[0]);
+            let remote = s.remote_rows(&s.remote_hosts[0], &s.collapsed);
             assert!(remote.contains(&Row::Repository(remote_repo.clone())));
             assert!(remote.contains(&Row::Worktree(remote_repo.clone())));
             assert!(remote.contains(&Row::Repository(hidden_local.clone())));

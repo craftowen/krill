@@ -639,6 +639,8 @@ pub struct Sidebar {
     pr_task: Option<Task<()>>,
     pr_service: Option<Arc<crate::pull_request::Service>>,
     rows: Vec<Row>,
+    /// 프로젝트 기준 보기에서 다른 PC의 같은 프로젝트를 합친 머리줄 행 → 합쳐진 (호스트, 경로).
+    merged_projects: BTreeMap<usize, Vec<(HostId, PathBuf)>>,
     /// 논리 세션 행 → 카드 머리줄. 렌더 중 계보를 매번 역탐색하지 않는다.
     card_parents: Vec<Option<usize>>,
     prefs: Preferences,
@@ -757,6 +759,149 @@ fn split_loose(rows: &mut Vec<Row>) -> Vec<Row> {
         .unwrap_or_default()
 }
 
+/// 프로젝트 기준 보기에서 호스트별 행 목록을 프로젝트 단위로 합친다([`Sidebar::rebuild_by_project`]).
+#[derive(Default)]
+struct ProjectMerge {
+    chunks: Vec<ProjectChunk>,
+    /// 프로젝트 열쇠 → (묶음 번호, 머리줄 경로).
+    owners: BTreeMap<(bool, String), (usize, PathBuf)>,
+    loose: Vec<(HostId, Row)>,
+}
+
+/// 머리줄 하나와 그 아래 행들. 다른 PC에서 합쳐진 프로젝트 경로는 `aliases`에 남는다.
+struct ProjectChunk {
+    rows: Vec<(HostId, Row)>,
+    aliases: Vec<(HostId, PathBuf)>,
+}
+
+/// PC 사이에는 공통 프로젝트 ID가 없어 종류(git 저장소/폴더)와 폴더 이름(대소문자 무시)으로 맞춘다.
+fn project_key(row: &Row) -> Option<((bool, String), &PathBuf)> {
+    match row {
+        Row::Repository(p) => Some(((true, basename(p).to_lowercase()), p)),
+        Row::Folder(p) => Some(((false, basename(p).to_lowercase()), p)),
+        _ => None,
+    }
+}
+
+impl ProjectMerge {
+    /// 합쳐질 원격 머리줄은 화면에 없으므로 접힘 상태를 주인 머리줄 것으로 맞춘다.
+    fn aligned_collapsed<'a>(
+        &self,
+        collapsed: &'a BTreeSet<PathBuf>,
+        snapshot: &Snapshot,
+    ) -> std::borrow::Cow<'a, BTreeSet<PathBuf>> {
+        let mut out = std::borrow::Cow::Borrowed(collapsed);
+        let repos = snapshot.trees.keys().map(|p| (true, p));
+        let folders = snapshot
+            .sessions
+            .iter()
+            .filter(|s| s.worktree.is_none())
+            .filter_map(|s| s.cwd.as_ref())
+            .map(|p| (false, p));
+        for (repo, path) in repos.chain(folders) {
+            let Some((_, owner)) = self.owners.get(&(repo, basename(path).to_lowercase())) else {
+                continue;
+            };
+            let closed = collapsed.contains(owner);
+            if closed != out.contains(path) {
+                if closed {
+                    out.to_mut().insert(path.clone());
+                } else {
+                    out.to_mut().remove(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// 한 호스트의 행을 받아 이미 있는 프로젝트는 그 묶음 끝에 붙인다. 프로젝트가 있었으면 참.
+    fn absorb(&mut self, host: &HostId, mut rows: Vec<Row>) -> bool {
+        // `Row::Loose` 머리줄은 모든 호스트를 합쳐 한 번만 둔다.
+        let loose = split_loose(&mut rows);
+        self.loose
+            .extend(loose.into_iter().skip(1).map(|r| (host.clone(), r)));
+        let mut projects = false;
+        let mut rows = rows.into_iter().peekable();
+        while let Some(head) = rows.next() {
+            let mut body = Vec::new();
+            while let Some(row) = rows.next_if(|r| !starts_chunk(r)) {
+                body.push((host.clone(), row));
+            }
+            let Some((key, path)) = project_key(&head) else {
+                body.insert(0, (host.clone(), head));
+                self.chunks.push(ProjectChunk {
+                    rows: body,
+                    aliases: Vec::new(),
+                });
+                continue;
+            };
+            projects = true;
+            let owner = self.owners.get(&key).map(|(i, _)| *i);
+            if let Some(chunk) = owner.and_then(|i| self.chunks.get_mut(i)) {
+                chunk.aliases.push((host.clone(), path.clone()));
+                chunk.rows.extend(body);
+            } else {
+                self.owners.insert(key, (self.chunks.len(), path.clone()));
+                body.insert(0, (host.clone(), head));
+                self.chunks.push(ProjectChunk {
+                    rows: body,
+                    aliases: Vec::new(),
+                });
+            }
+        }
+        projects
+    }
+
+    /// 프로젝트 → 프로젝트 없는 호스트 상태 줄 → 작업 폴더 모르는 세션 순으로 편다.
+    #[expect(
+        clippy::type_complexity,
+        reason = "rows, row hosts and merged headers are built together"
+    )]
+    fn finish(
+        self,
+        idle: Vec<(HostId, Row)>,
+    ) -> (
+        Vec<Row>,
+        Vec<HostId>,
+        BTreeMap<usize, Vec<(HostId, PathBuf)>>,
+    ) {
+        let mut rows = Vec::new();
+        let mut hosts = Vec::new();
+        let mut merged = BTreeMap::new();
+        let mut push = |(host, row): (HostId, Row)| {
+            hosts.push(host);
+            rows.push(row);
+        };
+        let mut start = 0;
+        for chunk in self.chunks {
+            if !chunk.aliases.is_empty() {
+                merged.insert(start, chunk.aliases);
+            }
+            start += chunk.rows.len();
+            chunk.rows.into_iter().for_each(&mut push);
+        }
+        idle.into_iter().for_each(&mut push);
+        if !self.loose.is_empty() {
+            push((HostId::Local, Row::Loose));
+            self.loose.into_iter().for_each(&mut push);
+        }
+        (rows, hosts, merged)
+    }
+}
+
+/// 프로젝트 기준 보기에서 새 묶음을 여는 행.
+fn starts_chunk(row: &Row) -> bool {
+    matches!(
+        row,
+        Row::Repository(_)
+            | Row::Folder(_)
+            | Row::GroupHeader { .. }
+            | Row::Loose
+            | Row::HostHeader { .. }
+            | Row::NeedsYou
+    )
+}
+
 fn sort_agents(mut list: Vec<AgentProfile>) -> Vec<AgentProfile> {
     list.sort_by(|a, b| {
         krill_proto::agent::profile_rank(&a.id)
@@ -803,6 +948,7 @@ impl Sidebar {
             pr_task: None,
             pr_service: None,
             rows: Vec::new(),
+            merged_projects: BTreeMap::new(),
             card_parents: Vec::new(),
             prefs,
             options,
@@ -1965,6 +2111,51 @@ impl Sidebar {
             .map_or_else(|| basename(path), str::to_owned)
     }
 
+    /// 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
+    /// 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
+    fn live_remote_hosts(&self) -> impl Iterator<Item = &RemoteHost> {
+        self.remote_hosts.iter().filter(|r| {
+            self.options
+                .filters
+                .contains_host(&HostId::Remote(r.id.clone()))
+                && (r.status == HostStatus::Connected
+                    || !r.snapshot.sessions.is_empty()
+                    || !r.snapshot.trees.is_empty()
+                    || self.remote_info.contains_key(&r.id))
+        })
+    }
+
+    /// Orca처럼 프로젝트가 맨 위 단계다. 여러 PC에 같은 프로젝트가 있으면 한 머리줄 아래로 합치고
+    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. PC별 상태 줄은 다시 연결이 필요한
+    /// 프로젝트 없는 호스트에만 남기고, 작업 폴더를 모르는 세션은 모든 PC 것을 끝에 한 묶음으로 둔다.
+    fn rebuild_by_project(&mut self) {
+        let mut merge = ProjectMerge::default();
+        if self.options.filters.contains_host(&HostId::Local) {
+            merge.absorb(&HostId::Local, self.local_rows());
+        }
+        let mut idle = Vec::new();
+        for remote in self.live_remote_hosts() {
+            let host = HostId::Remote(remote.id.clone());
+            let collapsed = merge.aligned_collapsed(&self.collapsed, &remote.snapshot);
+            let projects = merge.absorb(&host, self.remote_rows(remote, &collapsed));
+            if !projects && remote.status != HostStatus::Connected {
+                idle.push((
+                    host.clone(),
+                    Row::HostHeader {
+                        host,
+                        label: remote.label.clone(),
+                        status: remote.status,
+                        sessions: remote.snapshot.sessions.len(),
+                    },
+                ));
+            }
+        }
+        let (rows, row_hosts, merged) = merge.finish(idle);
+        self.rows = rows;
+        self.row_hosts = row_hosts;
+        self.merged_projects = merged;
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let cursor_item = self.cursor.and_then(|i| {
             self.rows
@@ -1986,6 +2177,7 @@ impl Sidebar {
             ),
         );
         self.ensure_external_polling(cx);
+        self.merged_projects.clear();
         if self.remote_hosts.is_empty() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
                 self.local_rows()
@@ -1993,94 +2185,43 @@ impl Sidebar {
                 Vec::new()
             };
             self.row_hosts = vec![HostId::Local; self.rows.len()];
+        } else if self.options.group_by == GroupBy::Repo {
+            self.rebuild_by_project();
         } else {
             let mut rows = Vec::new();
             let mut row_hosts = Vec::new();
-            // Orca처럼 프로젝트 목록을 끊지 않도록, 프로젝트 기준 보기에서는 호스트 행과
-            // 작업 폴더 없는 세션을 모든 프로젝트 뒤에 모은다.
-            let mut tail = Vec::new();
-            let mut tail_hosts = Vec::new();
             if self.options.filters.contains_host(&HostId::Local) {
-                if self.options.group_by != GroupBy::Repo {
-                    rows.push(Row::HostHeader {
-                        host: HostId::Local,
-                        label: text::HOST_LOCAL
-                            .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
-                            .get()
-                            .to_owned(),
-                        status: self.local_status,
-                        sessions: self.snapshot.sessions.len(),
-                    });
-                    row_hosts.push(HostId::Local);
-                }
-                if self.options.group_by == GroupBy::Repo
-                    || !self.collapsed_hosts.contains(&HostId::Local)
-                {
-                    let mut local_rows = self.local_rows();
-                    if self.options.group_by == GroupBy::Repo {
-                        let loose = split_loose(&mut local_rows);
-                        tail_hosts.extend(std::iter::repeat_n(HostId::Local, loose.len()));
-                        tail.extend(loose);
-                    }
+                rows.push(Row::HostHeader {
+                    host: HostId::Local,
+                    label: text::HOST_LOCAL
+                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                        .get()
+                        .to_owned(),
+                    status: self.local_status,
+                    sessions: self.snapshot.sessions.len(),
+                });
+                row_hosts.push(HostId::Local);
+                if !self.collapsed_hosts.contains(&HostId::Local) {
+                    let local_rows = self.local_rows();
                     row_hosts.extend(std::iter::repeat_n(HostId::Local, local_rows.len()));
                     rows.extend(local_rows);
                 }
             }
-            // 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
-            // 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
-            let live_hosts = self.remote_hosts.iter().filter(|r| {
-                self.options
-                    .filters
-                    .contains_host(&HostId::Remote(r.id.clone()))
-                    && (r.status == HostStatus::Connected
-                        || !r.snapshot.sessions.is_empty()
-                        || !r.snapshot.trees.is_empty()
-                        || self.remote_info.contains_key(&r.id))
-            });
-            for remote in live_hosts {
+            for remote in self.live_remote_hosts() {
                 let host = HostId::Remote(remote.id.clone());
-                let mut r_rows = self.remote_rows(remote);
-                // Projects are the root navigation. A remote connection without any
-                // projects still needs a reachable status/reconnect surface.
-                let by_repo = self.options.group_by == GroupBy::Repo;
-                let loose = if by_repo {
-                    split_loose(&mut r_rows)
-                } else {
-                    Vec::new()
-                };
-                let project_roots = by_repo
-                    && r_rows
-                        .iter()
-                        .any(|r| matches!(r, Row::Repository(_) | Row::Folder(_)));
-                if project_roots {
-                    row_hosts.extend(std::iter::repeat_n(host.clone(), r_rows.len()));
-                    rows.extend(r_rows);
-                    r_rows = Vec::new();
-                }
-                let (out, out_hosts) = if by_repo {
-                    r_rows.extend(loose);
-                    if r_rows.is_empty() && project_roots {
-                        continue;
-                    }
-                    (&mut tail, &mut tail_hosts)
-                } else {
-                    (&mut rows, &mut row_hosts)
-                };
-                out.push(Row::HostHeader {
+                rows.push(Row::HostHeader {
                     host: host.clone(),
                     label: remote.label.clone(),
                     status: remote.status,
                     sessions: remote.snapshot.sessions.len(),
                 });
-                out_hosts.push(host.clone());
-                // 프로젝트가 있는 호스트의 세션 묶음은 예전 호스트 접힘 상태에 가려지지 않는다.
-                if project_roots || !self.collapsed_hosts.contains(&host) {
-                    out_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
-                    out.extend(r_rows);
+                row_hosts.push(host.clone());
+                if !self.collapsed_hosts.contains(&host) {
+                    let r_rows = self.remote_rows(remote, &self.collapsed);
+                    row_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
+                    rows.extend(r_rows);
                 }
             }
-            rows.append(&mut tail);
-            row_hosts.append(&mut tail_hosts);
             self.rows = rows;
             self.row_hosts = row_hosts;
         }

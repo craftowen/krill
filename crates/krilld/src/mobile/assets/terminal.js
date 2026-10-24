@@ -59,12 +59,16 @@ globalThis.MkTerminalCodec=(()=>{
  const KEYS=Object.freeze([
   ['escape','Esc','\x1b'],['tab','Tab','\t'],['enter','Enter','\r'],['shiftTab','Shift+Tab','\x1b[Z'],['space','Space',' '],
   ['backspace','⌫','\x7f',true],['delete','Del','\x1b[3~',true],['arrowUp','↑','\x1b[A',true],['arrowDown','↓','\x1b[B',true],
-  ['arrowLeft','←','\x1b[D',true],['arrowRight','→','\x1b[C',true],['ctrlC','Ctrl+C','\x03'],['ctrlD','Ctrl+D','\x04'],
+  ['arrowLeft','←','\x1b[D',true],['arrowRight','→','\x1b[C',true],
+  ['home','Home','\x1b[H'],['end','End','\x1b[F'],['pageUp','PgUp','\x1b[5~',true],['pageDown','PgDn','\x1b[6~',true],['ctrlC','Ctrl+C','\x03'],['ctrlD','Ctrl+D','\x04'],
   ['ctrlL','Ctrl+L','\x0c'],['ctrlZ','Ctrl+Z','\x1a'],['ctrlR','Ctrl+R','\x12'],['ctrlA','Ctrl+A','\x01'],
   ['ctrlE','Ctrl+E','\x05'],['ctrlW','Ctrl+W','\x17'],['ctrlU','Ctrl+U','\x15']
  ].map(([id,label,bytes,repeatable=false])=>Object.freeze({id,label,bytes,repeatable})));
- // Physical and accessory keys share the same Shift encoding.
- function encodeKey(bytes,shift=false){if(!shift)return bytes;if(bytes==='\t')return '\x1b[Z';if(bytes==='\r')return '\x1b[13;2u';const m=/^\x1b\[([ABCD])$/.exec(bytes);return m?`\x1b[1;2${m[1]}`:bytes;}
+ // Physical and accessory keys share one modifier encoding (xterm: 1 + Shift 1 + Alt 2 + Ctrl 4). A bare Shift keeps the old forms.
+ function encodeKey(bytes,mods=false){const {shift=false,alt=false,ctrl=false}=typeof mods==='boolean'?{shift:mods}:mods;if(!shift&&!alt&&!ctrl)return bytes;const n=1+(shift?1:0)+(alt?2:0)+(ctrl?4:0),letter=/^\x1b\[([ABCDHF])$/.exec(bytes),tilde=/^\x1b\[(\d+)~$/.exec(bytes);
+  if(letter)return `\x1b[1;${n}${letter[1]}`;if(tilde)return `\x1b[${tilde[1]};${n}~`;if(bytes==='\t'&&shift)return (alt?'\x1b':'')+'\x1b[Z';if(bytes==='\r'&&shift)return `\x1b[13;${n}u`;if(bytes==='\x7f'&&ctrl)return (alt?'\x1b':'')+'\x08';return (alt?'\x1b':'')+bytes;}
+ // Ctrl+글자는 C0 제어 문자로 바꾼다(Ctrl+@…_ , Ctrl+Space=NUL, Ctrl+?=DEL). 바꿀 수 없는 글자는 그대로 둔다.
+ function controlChar(ch){if(ch===' '||ch==='@'||ch==='2')return '\x00';if(ch==='?')return '\x7f';const code=ch.toUpperCase().charCodeAt(0);return ch.length===1&&code>=64&&code<=95?String.fromCharCode(code-64):ch;}
  const icons={"monitor":[["rect",{"width":"20","height":"14","x":"2","y":"3","rx":"2"}],["line",{"x1":"8","x2":"16","y1":"21","y2":"21"}],["line",{"x1":"12","x2":"12","y1":"17","y2":"21"}]],"smartphone":[["rect",{"width":"14","height":"20","x":"5","y":"2","rx":"2","ry":"2"}],["path",{"d":"M12 18h.01"}]],"keyboard":[["path",{"d":"M10 8h.01"}],["path",{"d":"M12 12h.01"}],["path",{"d":"M14 8h.01"}],["path",{"d":"M16 12h.01"}],["path",{"d":"M18 8h.01"}],["path",{"d":"M6 8h.01"}],["path",{"d":"M7 16h10"}],["path",{"d":"M8 12h.01"}],["rect",{"width":"20","height":"16","x":"2","y":"4","rx":"2"}]],"dismiss":[["path",{"d":"M 20 4 A2 2 0 0 1 22 6"}],["path",{"d":"M 22 6 L 22 16.41"}],["path",{"d":"M 7 16 L 16 16"}],["path",{"d":"M 9.69 4 L 20 4"}],["path",{"d":"M14 8h.01"}],["path",{"d":"M18 8h.01"}],["path",{"d":"m2 2 20 20"}],["path",{"d":"M20 20H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2"}],["path",{"d":"M6 8h.01"}],["path",{"d":"M8 12h.01"}]],"send":[["path",{"d":"m5 12 7-7 7 7"}],["path",{"d":"M12 19V5"}]],"photo":[["rect",{"width":"18","height":"18","x":"3","y":"3","rx":"2","ry":"2"}],["circle",{"cx":"9","cy":"9","r":"2"}],["path",{"d":"m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"}]]};
  icons.edit=[['path',{d:'M10 5H3M12 19H3M14 3v4M16 17v4M21 12h-9M21 19h-5M21 5h-7M8 10v4M8 12H3'}]];
  const make=(tag,cls,text)=>{const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;};
@@ -84,7 +88,7 @@ globalThis.MkTerminalCodec=(()=>{
    this.dirty=new Set();this.full=true;this.inputId=0;this.historyId=0;this.pendingInputs=new Map();this.pendingRoles=[];this.deferredKeys=[];this.phase='connecting';
    this.contextBlocked=uncertainInputs.has(this.stateKey);
    const stored=settings().terminalInputModes?.[this.stateKey],initial=options.preferences?.inputMode||modes.get(this.stateKey)||stored;
-   this.inputMode=initial==='buffered'||!initial&&phoneLike()?'buffered':'direct';modes.set(this.stateKey,this.inputMode);
+   this.inputMode=initial==='buffered'?'buffered':'direct';modes.set(this.stateKey,this.inputMode);
    this.build();this.resetHistory();this.bindInput();this.bindViewport();this.setFontScale(this.fontScale,false);this.updateMode();this.status('connecting','Connecting…');
    this.open();
   }
@@ -100,7 +104,10 @@ globalThis.MkTerminalCodec=(()=>{
    // 이전 출력 컨트롤은 스크롤 내용 맨 위에 두고 처음 불러올 때까지 숨긴다. 터미널 아래 상시 한 줄을 먹지 않게 한다(맨 위에서 끌어내리거나 액션 시트로 첫 로드).
    const controls=this.historyControls=make('div','terminal-history-controls');this.historyButton=button('load-history','Load earlier output');this.historyStatus=make('span','history-status');this.historyStatus.setAttribute('role','status');controls.append(this.historyButton,this.historyStatus);this.port.append(controls,this.historyElement,this.canvas);this.latestButton=button('terminal-latest','Latest output');this.latestButton.hidden=true;this.listen(this.latestButton,'pointerdown',e=>e.preventDefault());this.listen(this.latestButton,'click',()=>this.returnToLive());this.frame.append(this.port,this.latestButton,this.statusEl,this.recoverButton);
    this.dock=make('footer','command-dock');const accessory=make('div','accessory-row');this.dismiss=button('dismiss-keyboard','Dismiss keyboard','dismiss');this.dismiss.hidden=true;
-   const keybar=make('div','keybar');keybar.setAttribute('role','toolbar');keybar.setAttribute('aria-label','Terminal keys');this.fitButton=button('accessory-key display-mode','Fit to Phone','monitor');this.fitButton.setAttribute('aria-pressed','false');this.directButton=button('accessory-key direct-toggle','Direct input');this.shiftButton=button('accessory-key shift-toggle','Shift');this.shiftButton.dataset.keyId='shift';this.shiftButton.dataset.testid='terminal-key-shift';this.shiftButton.setAttribute('aria-pressed','false');keybar.append(this.fitButton,this.directButton,this.shiftButton);
+   const keybar=make('div','keybar');keybar.setAttribute('role','toolbar');keybar.setAttribute('aria-label','Terminal keys');this.fitButton=button('accessory-key display-mode','Fit to Phone','monitor');this.fitButton.setAttribute('aria-pressed','false');this.directButton=button('accessory-key direct-toggle','Direct input');this.shiftButton=button('accessory-key shift-toggle','Shift');this.shiftButton.dataset.keyId='shift';this.shiftButton.dataset.testid='terminal-key-shift';this.shiftButton.setAttribute('aria-pressed','false');
+   // Ctrl·Alt는 Shift처럼 다음 입력 한 번에만 붙는 고정 수정자다. 키보드로 친 글자와 키 줄 키 모두에 적용된다.
+   this.modifierButtons={shift:this.shiftButton};for(const [name,label] of [['ctrl','Ctrl'],['alt','Alt']]){const b=this.modifierButtons[name]=button(`accessory-key ${name}-toggle`,label);b.dataset.keyId=name;b.dataset.testid=`terminal-key-${name}`;b.setAttribute('aria-pressed','false');this.listen(b,'pointerdown',e=>e.preventDefault());this.listen(b,'click',()=>this.toggleModifier(name));}
+   keybar.append(this.fitButton,this.directButton,this.shiftButton,this.modifierButtons.ctrl,this.modifierButtons.alt);
    const ordered=this.options.preferences?.orderedKeyIds||[],visible=this.options.preferences?.visibleKeyIds;
    const ids=[...new Set([...ordered,...KEYS.map(k=>k.id)])];for(const id of ids){const key=KEYS.find(k=>k.id===id);if(!key||visible&&!visible.includes(id))continue;const b=button('accessory-key',key.label);b.dataset.keyId=id;b.dataset.testid=`terminal-key-${id}`;keybar.append(b);this.bindKey(b,key);}
    // 직접 입력의 키보드 열기는 키 줄 왼쪽 고정 버튼이다(열리면 Dismiss로 바뀜). 별도 입력 줄은 buffered에서만 보여 터미널 행을 더 쓴다.
@@ -118,8 +125,7 @@ globalThis.MkTerminalCodec=(()=>{
    for(const b of [this.fitButton,this.directButton,this.shiftButton,this.historyButton])this.listen(b,'pointerdown',e=>e.preventDefault());this.listen(this.shiftButton,'click',()=>this.toggleShift());
    this.listen(this.fitButton,'click',()=>this.guard(()=>this.fitToPhone()));this.listen(this.directButton,'click',()=>this.setInputMode(this.inputMode==='direct'?'buffered':'direct'));
    this.listen(this.dismiss,'click',()=>{this.capture.blur();this.command.blur();});this.listen(this.live,'click',()=>this.focus());
-   // 탭 판정은 10px 안의 손 떨림을 허용한다. 모든 pointermove를 이동으로 보면 실제 터치 탭이 거의 다 무시된다.
-   let tap;this.listen(this.port,'pointerdown',e=>{tap={x:e.clientX,y:e.clientY,moved:false};});this.listen(this.port,'pointermove',e=>{if(tap&&Math.hypot(e.clientX-tap.x,e.clientY-tap.y)>10)tap.moved=true;});this.listen(this.port,'pointercancel',()=>{if(tap)tap.moved=true;});this.listen(this.port,'click',()=>{if(!tap?.moved&&!this.pinching&&this.inputMode==='direct')this.focus();tap=null;});
+   // 터미널을 탭하거나 스크롤해도 키보드를 열지 않는다(Orca). 키보드는 키 줄 왼쪽 키보드 버튼으로만 연다.
    // 가로는 네이티브 스크롤을 막고(CSS overflow-x:hidden·pan-y) 한 손가락 제스처를 한 축에 고정해 손가락만큼만 옮긴다. 관성·바운스가 없어 세로로 쓸 때 좌우로 흔들리지 않는다.
    let pan;this.listen(this.port,'wheel',e=>{if(e.deltaY<0&&(this.atBottom()&&this.historyLoadedVersion!==this.historyVersion||this.port.scrollTop<this.historyThreshold()))this.guard(()=>this.loadHistory(false,this.atBottom()&&this.historyLoadedVersion!==this.historyVersion));if(Math.abs(e.deltaX)>Math.abs(e.deltaY)){e.preventDefault();this.port.scrollLeft+=e.deltaX;}},{passive:false});
    let pinch;const distance=touches=>Math.hypot(touches[0].clientX-touches[1].clientX,touches[0].clientY-touches[1].clientY);
@@ -166,7 +172,7 @@ globalThis.MkTerminalCodec=(()=>{
   setInputMode(mode){if(this.disposed||!['direct','buffered'].includes(mode)||mode===this.inputMode)return;const typing=[this.capture,this.command].includes(globalThis.document?.activeElement);this.invalidateInput();this.inputMode=mode;modes.set(this.stateKey,mode);const value=settings();value.terminalInputModes={...value.terminalInputModes,[this.stateKey]:mode};try{localStorage.setItem(UI_KEY,JSON.stringify(value));}catch{}this.options.onPreferenceChange?.({inputMode:mode,sessionId:this.session});this.updateMode();if(typing)this.focus();}
   getInputMode(){return this.inputMode;}
   resetCapture(){this.capture.value='';this.sent='';}
-  syncCapture(pasted=false){const before=[...this.sent||''],now=this.capture.value,after=[...now];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;const added=after.slice(same).join(''),removed='\x7f'.repeat(before.length-same);if(pasted||/[\r\n]/.test(added)){this.resetCapture();this.paste(added,removed);return;}this.sent=now;const bytes=removed+(added?this.consumeShift(added,false):'');if(bytes){const generation=this.inputGeneration;this.guard(async()=>{try{await this.input(bytes);}catch(error){if(generation===this.inputGeneration){this.contextBlocked=true;this.invalidateInput();this.recoverButton.hidden=false;}throw error;}});}}
+  syncCapture(pasted=false){const before=[...this.sent||''],now=this.capture.value,after=[...now];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;const added=after.slice(same).join(''),removed='\x7f'.repeat(before.length-same);if(pasted||/[\r\n]/.test(added)){this.resetCapture();this.paste(added,removed);return;}if(added&&(this.modifiers?.ctrl||this.modifiers?.alt)){this.resetCapture();const bytes=removed+this.consumeShift(added,false);this.guard(()=>this.input(bytes));return;}this.sent=now;const bytes=removed+(added?this.consumeShift(added,false):'');if(bytes){const generation=this.inputGeneration;this.guard(async()=>{try{await this.input(bytes);}catch(error){if(generation===this.inputGeneration){this.contextBlocked=true;this.invalidateInput();this.recoverButton.hidden=false;}throw error;}});}}
   paste(text,prefix=''){
    // Remove control sequences, including embedded bracketed-paste terminators.
    const clean=text.replace(/\r\n?/g,'\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'');if(!clean&&!prefix)return;
@@ -186,9 +192,10 @@ globalThis.MkTerminalCodec=(()=>{
    this.capture.blur();if(this.composing){const before=[...this.sent||''],after=[...this.capture.value];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;const text=after.slice(same).join(''),prefix=this.command.value;this.bufferedVersion=(this.bufferedVersion||0)+1;this.inactiveComposition={prefix,text,version:this.bufferedVersion};this.command.value=prefix+text;this.command.value?drafts.set(this.stateKey,this.command.value):drafts.delete(this.stateKey);this.setInputMode('buffered');}else this.invalidateInput();this.bufferedComposing=false;
   }this.inputActive=active;}
   invalidateInput(){this.inputGeneration++;this.inputArmed=false;this.composing=false;this.cancelPaste();this.resetCapture();this.capture.blur();this.command.blur();this.stopRepeat();this.deferredKeys.splice(0).forEach(p=>p.reject(Error('Input target changed')));}
-  // Shift 토글은 다음 한 번만 적용한다: 글자는 첫 글자를 대문자로, Tab·Enter·화살표는 Shift 변형 시퀀스로 보낸다.
-  toggleShift(force){this.shiftArmed=typeof force==='boolean'?force:!this.shiftArmed;this.shiftButton.setAttribute('aria-pressed',String(!!this.shiftArmed));return !!this.shiftArmed;}
-  consumeShift(bytes,isKey=false){if(!this.shiftArmed)return bytes;this.toggleShift(false);return isKey?encodeKey(bytes,true):bytes.replace(/^[a-z]/,c=>c.toUpperCase());}
+  // Shift·Ctrl·Alt 토글은 다음 한 번만 적용한다: 글자는 첫 글자에(Shift 대문자·Ctrl 제어 문자·Alt ESC 접두), 키 줄 키는 수정자 변형 시퀀스로 보낸다.
+  toggleModifier(name,force){const mods=this.modifiers||={};mods[name]=typeof force==='boolean'?force:!mods[name];if(name==='shift')this.shiftArmed=mods.shift;this.modifierButtons?.[name]?.setAttribute('aria-pressed',String(!!mods[name]));return !!mods[name];}
+  toggleShift(force){return this.toggleModifier('shift',force);}
+  consumeShift(bytes,isKey=false){const mods={...this.modifiers};if(!mods.shift&&!mods.ctrl&&!mods.alt)return bytes;for(const name of ['shift','ctrl','alt'])if(mods[name])this.toggleModifier(name,false);if(isKey)return encodeKey(bytes,mods);const [first='',...rest]=[...bytes];let head=mods.shift?first.toUpperCase():first;if(mods.ctrl)head=controlChar(head);return (mods.alt?'\x1b':'')+head+rest.join('');}
   sendKey(id){const key=KEYS.find(k=>k.id===id);if(!key)return Promise.reject(Error('Unknown terminal key'));if(this.disposed)return Promise.reject(Error('Input target changed'));const bytes=this.consumeShift(key.bytes,true);if(this.composing)return new Promise((resolve,reject)=>this.deferredKeys.push({bytes,resolve,reject}));return this.controlInput(bytes);}
   bindViewport(){
    // 키보드 높이는 MkKeyboard가 프레임당 한 번 재서 셸을 줄인다. 여기서는 쓰기만 한다(측정·스크롤 보정 없음).

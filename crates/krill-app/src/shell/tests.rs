@@ -2985,6 +2985,81 @@ fn ime_pending_survives_pre_echo_frame_and_shifts_preedit(cx: &mut TestAppContex
     });
 }
 
+/// 에코보다 삭제·이동·전송 키가 먼저 오면 지운 글자를 계속 덧그리지 않는다.
+#[gpui::test]
+fn ime_pending_clears_on_edit_keys_before_echo(cx: &mut TestAppContext) {
+    use krill_proto::input::Input;
+    use krill_proto::screen::Msg as _;
+
+    let (view, cx) = open(cx, state_path("ime-pending-edit"));
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.attach_test(pane, SessionId(3), ours, cx));
+    });
+    cx.run_until_parked();
+    for key in [
+        "backspace",
+        "delete",
+        "ctrl-u",
+        "cmd-backspace",
+        "left",
+        "enter",
+    ] {
+        cx.simulate_input("한");
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).live[&pane].ime.pending().unwrap().text, "한");
+        });
+        cx.simulate_keystrokes(key);
+        cx.update(|_, cx| {
+            let l = &view.read(cx).live[&pane];
+            assert_eq!(l.ime.pending(), None, "{key} 뒤 잔상 없음");
+            assert!(l.ime_expiry.is_none());
+        });
+        let (kind, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+        assert_eq!(Input::decode(kind, &body).unwrap().bytes, "한".as_bytes());
+        let (kind, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+        assert!(!Input::decode(kind, &body).unwrap().bytes.is_empty());
+    }
+}
+
+/// 추가 IPC 프레임이 없어도 만료되며, 이전 타이머가 새 입력을 지우지 않는다.
+#[gpui::test]
+fn ime_pending_expires_without_output_and_rearms_for_new_input(cx: &mut TestAppContext) {
+    use krill_term::ime::PENDING_TTL;
+
+    let (view, cx) = open(cx, state_path("ime-pending-expiry"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.attach_test(pane, SessionId(3), ours, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_input("한");
+    cx.run_until_parked();
+    cx.executor().advance_clock(PENDING_TTL / 2);
+    cx.simulate_input("글");
+    cx.run_until_parked();
+    cx.executor().advance_clock(PENDING_TTL / 2);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).live[&pane].ime.pending().unwrap().text,
+            "한글"
+        );
+    });
+    cx.executor().advance_clock(PENDING_TTL / 2);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let l = &view.read(cx).live[&pane];
+        assert_eq!(l.ime.pending(), None, "출력이 멈춰도 잔상 만료");
+        assert!(l.ime_expiry.is_none());
+    });
+}
+
 /// 숨은 입력 캐럿도 IPC 프레임에서 IME 오버레이·후보창·확정 에코로 전달된다.
 #[gpui::test]
 fn ime_hidden_caret_frames_follow_prompt_and_confirm_echo(cx: &mut TestAppContext) {
@@ -4764,11 +4839,11 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         );
     });
 
-    // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트가 아직 없는 원격 호스트는
-    // 상태 확인·재연결 동작을 위해 헤더를 유지한다.
+    // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트 없이 연결만 된 원격 호스트도
+    // 프로젝트 목록에 줄을 만들지 않는다(실행 위치 선택·설정에서 다룬다).
     cx.run_until_parked();
     assert!(cx.debug_bounds("host-header-local").is_none());
-    assert!(cx.debug_bounds("host-header-studio-mac").is_some());
+    assert!(cx.debug_bounds("host-header-studio-mac").is_none());
 
     // 로컬 탭에는 호스트 배지가 없고, 원격 탭과 원격 패인 헤더에는 호스트 배지가 표시된다.
     assert_eq!(local_pane.get(), 0);

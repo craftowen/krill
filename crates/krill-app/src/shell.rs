@@ -170,6 +170,8 @@ struct Live {
     /// 연결을 끊을 때 쓰는 소켓 사본(IO 태스크가 읽는 소켓과 같다).
     sock: Option<UnixStream>,
     ime: Ime,
+    /// 출력이 멈춰도 확정 에코 대기 표시를 만료시킨다.
+    ime_expiry: Option<(Instant, Task<()>)>,
     echo: EchoDraw,
     /// 마지막으로 그린 자리와 칸 크기(IME 후보창).
     painted: Painted,
@@ -215,6 +217,7 @@ impl Live {
             suspended: false,
             sock: None,
             ime: Ime::default(),
+            ime_expiry: None,
             echo: EchoDraw::default(),
             painted: Rc::default(),
             row_cache: krill_app::terminal::RowPlanCache::default(),
@@ -4002,6 +4005,34 @@ impl Shell {
         self.send_inner(out, false, window, cx)
     }
 
+    fn sync_ime_expiry(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let Some(at) = l.ime.pending_at() else {
+            l.ime_expiry = None;
+            return;
+        };
+        if l.ime_expiry.as_ref().is_some_and(|(armed, _)| *armed == at) {
+            return;
+        }
+        let delay = krill_term::ime::PENDING_TTL.saturating_sub(at.elapsed());
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |s, cx| {
+                if let Some(l) = s.live.get_mut(&pane)
+                    && l.ime.pending_at() == Some(at)
+                {
+                    l.ime.clear_pending();
+                    l.ime_expiry = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        l.ime_expiry = Some((at, task));
+    }
+
     fn send_inner(
         &mut self,
         out: &Output,
@@ -4018,6 +4049,7 @@ impl Shell {
         let Some(pane) = self.layout.focused() else {
             return false;
         };
+        self.sync_ime_expiry(pane, cx);
         if out.pty.is_empty() {
             cx.notify();
             return false;
@@ -4160,6 +4192,9 @@ impl Shell {
         // `doCommandBySelector:`가 오지 않아 여기까지 오지 않는다. 여기 온 키는 IME가 처리하지
         // 않은 키라 조합을 먼저 확정하고 보낸다. `discardMarkedText`는 재진입이라 부르지 않는다.
         let mut out = l.ime.commit();
+        // 삭제·이동·전송 뒤 내용은 예측할 수 없다. 확정 글자를 계속 덧그리면
+        // PTY에서는 지운 글자가 화면에 남으므로 이후에는 실제 그리드를 따른다.
+        l.ime.clear_pending();
         out.pty = keys::tui::text(&out.pty, l.pane.modes());
         out.pty.extend(bytes);
         self.send_in_key(&out, Some(window), cx);

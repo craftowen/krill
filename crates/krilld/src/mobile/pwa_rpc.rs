@@ -201,6 +201,8 @@ fn chat_page_value(
     let identity = crate::agent_history::chat::generation(&snapshot);
     let generation = hex(ring::digest::digest(&ring::digest::SHA256, identity.as_bytes()).as_ref());
     let start = if snapshot.reset { 0 } else { offset };
+    // `at`은 postcard 와이어에서 빠지는 필드라 직렬화 뒤 같은 순서의 항목에 붙인다.
+    let times: Vec<String> = snapshot.items.iter().map(|item| item.at.clone()).collect();
     let mut value = to_value(snapshot)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("generation".into(), generation.into());
@@ -212,6 +214,9 @@ fn chat_page_value(
             for (index, item) in items.iter_mut().enumerate() {
                 if let Some(fields) = item.as_object_mut() {
                     fields.insert("id".into(), format!("{start}:{index}").into());
+                    if let Some(at) = times.get(index).filter(|at| !at.is_empty()) {
+                        fields.insert("at".into(), at.clone().into());
+                    }
                 }
             }
         }
@@ -946,7 +951,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true},
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
     }

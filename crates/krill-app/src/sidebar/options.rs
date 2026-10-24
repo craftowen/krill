@@ -1123,7 +1123,11 @@ impl Sidebar {
         )
     }
 
-    pub(super) fn remote_rows(&self, remote: &super::RemoteHost) -> Vec<Row> {
+    pub(super) fn remote_rows(
+        &self,
+        remote: &super::RemoteHost,
+        collapsed: &BTreeSet<PathBuf>,
+    ) -> Vec<Row> {
         // The project selector is populated from self.snapshot (local projects).
         // Applying its paths to another PC hides valid daemon-owned projects,
         // including when both machines happen to use the same absolute paths.
@@ -1148,7 +1152,7 @@ impl Sidebar {
         rows_with_options(
             &remote.snapshot,
             &self.prefs,
-            &self.collapsed,
+            collapsed,
             &self.collapsed_groups,
             &self.shown_external,
             &options,
@@ -1397,7 +1401,8 @@ impl Sidebar {
         if let Some(custom) = self.worktree_hosts.get(path) {
             return Some(custom.clone());
         }
-        if self.options.group_by == GroupBy::Repo {
+        // 프로젝트 기준 보기에는 PC 단계가 없으니 원격 PC 것만 배지로 구분한다.
+        if self.options.group_by == GroupBy::Repo && host.is_local() {
             return None;
         }
         match host {

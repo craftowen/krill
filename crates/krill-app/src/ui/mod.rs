@@ -5,6 +5,10 @@
 //! 터미널 테마 카탈로그·가져오기는 [`terminal_themes`]에 모은다.
 //! 모든 UI/UX 작업은 [docs/STYLEGUIDE.md] 규범과 이 모듈의 토큰·프리미티브를 따른다.
 
+mod app_themes;
+
+pub use app_themes::TRENCH;
+
 pub mod icons;
 pub mod primitives;
 pub mod status;

@@ -172,11 +172,27 @@ fn vault_search_and_resume_roundtrip_and_agent_parsing() {
                 label: "Fast".into(),
                 description: "Low latency".into(),
             }],
+            at: String::new(),
         }],
     }));
     let bytes = poll_resp.encode().unwrap();
     let (kind, body) = crate::ipc::read_frame(&mut &bytes[..]).unwrap().unwrap();
     assert_eq!(Reply::decode(kind, &body).unwrap(), poll_resp);
+
+    // 모바일 전용 시각은 postcard 와이어에 실리지 않는다(버전이 다른 앱·데몬 호환).
+    let item = ChatItem {
+        kind: ChatItemKind::User,
+        text: "hi".into(),
+        ..ChatItem::default()
+    };
+    let timed = ChatItem {
+        at: "2026-10-24T03:48:10.000Z".into(),
+        ..item.clone()
+    };
+    assert_eq!(
+        postcard::to_allocvec(&timed).unwrap(),
+        postcard::to_allocvec(&item).unwrap()
+    );
 }
 
 proptest::proptest! {

@@ -20,7 +20,7 @@ function fixture(options={}){
  const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible'});
  const sandbox={Event,document:doc,Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
- const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:'ready'},drafts:new Map()};
+ const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:options.phase||'ready'},drafts:new Map()};
  const root=new Element('root'),el=(...args)=>new Element(...args);
  let handler=options.handler|| (async request=>request.action==='chat_poll'?{generation:'g1',agent:'claude',bound:true,items:[],next_offset:request.offset}:{sent:true});
  let prepare=async()=>({mime:'image/jpeg',data:'encoded'});
@@ -67,7 +67,41 @@ async function tailFollow(){
  f.dispose();assert.equal(ro.targets.size,0,'unmount disconnects the observer');
  console.log('PASS chat tail: cached first render at bottom, ResizeObserver re-pin while following, scrolled-up reader kept in place, bottom resumes');
 }
+// 연결 전에 숨은 채 마운트돼도 ready 뒤 첫 페이지를 받아, Chat을 누른 프레임에 내용이 있다. 구버전 데몬이 latest를 거부하면 처음부터 읽는다.
+async function hiddenPrefetchAndOldDaemon(){
+ const page={generation:'g1',agent:'claude',bound:true,page_start:0,items:[{id:'a',kind:'assistant',text:'hello'}],next_offset:10};
+ const f=fixture({visible:false,phase:'connecting',handler:async()=>page});
+ await flush();assert.equal(f.calls.length,0);
+ f.state.connection.phase='ready';f.update();await flush();assert.equal(f.calls.length,1);assert.equal(f.calls[0].latest,true);
+ f.update();await flush();assert.equal(f.calls.length,1,'hidden Chat stops polling after the first page');
+ f.setVisible(true);assert(f.root.descendants().some(n=>n.tag==='article'),'tapping Chat shows the prefetched page in the same frame');f.dispose();
+ const old=fixture({visible:true,handler:async r=>{if(r.latest)throw Error('invalid mobile authentication or frame');return {...page,items:[{id:'b',kind:'assistant',text:'old'}],next_offset:5};}});old.state.snapshot={capabilities:{hybrid_chat:true}};old.remount();
+ await flush();assert.equal(old.calls.length,3);assert.equal(old.calls[2].latest,undefined);assert.equal(old.calls[2].offset,0);assert(old.root.descendants().some(n=>n.tag==='article'),'old daemon still shows the transcript');old.dispose();
+ const current=fixture({visible:true,handler:async()=>{throw Error('invalid mobile authentication or frame');}});current.state.snapshot={capabilities:{chat_tail:true}};current.remount();
+ await flush();assert(current.calls.length>0&&current.calls.every(c=>c.latest),'a chat_tail daemon never drops the tail request');current.dispose();
+ let fails=0;const flaky=fixture({visible:false,handler:async()=>{fails++;throw Error('busy');}});await flush();for(let i=0;i<5;i++){flaky.update();await flush();}assert.equal(fails,2,'hidden Chat stops retrying after two failures');flaky.dispose();
+ console.log('PASS hidden Chat prefetches once after connecting; chat_tail-less daemon rejection falls back to offset polling');
+}
+async function orcaComposerAndMeta(){
+ const f=fixture();await flush();await f.poll({generation:'g1',agent:'claude',bound:true,items:[{id:'0:0',kind:'user',text:'hi',at:'2026-10-24T03:48:10.000Z'},{id:'0:1',kind:'assistant',text:'done'}],next_offset:10});
+ const metas=f.root.descendants().filter(n=>n.className==='chat-meta');assert.equal(metas.length,2,'user and agent messages carry a meta row');
+ assert.equal(metas[0].children[0].className,'icon-button chat-copy');assert.equal(metas[0].children[1].className,'chat-time');assert.equal(metas[0].children[1].attrs.datetime,'2026-10-24T03:48:10.000Z');
+ assert.equal(metas[1].children.length,1,'a message without a record time shows only the copy button');
+ assert.equal(f.find('chat-input').placeholder,'Message {0}','a known agent gets the per-agent placeholder (this fixture has no translator)');
+ const entries=[];f.ctx.sheet=(title,items)=>entries.push(...items);
+ const model=f.buttons.find(b=>b.className==='composer-pill');assert.equal(model.hidden,false);model.action();
+ assert.deepEqual(Array.from(entries,e=>e.label),['Default (recommended)','Opus','Sonnet','Haiku']);
+ entries[2].action();await flush();assert.deepEqual({...f.calls.at(-1)},{action:'prompt',session:7,text:'/model sonnet'});f.dispose();
+ const codex=fixture();await flush();await codex.poll({generation:'g1',agent:'codex',bound:true,items:[],next_offset:0});
+ codex.buttons.find(b=>b.className==='composer-pill').action();await flush();
+ assert.deepEqual({...codex.calls.at(-1)},{action:'prompt',session:7,text:'/model'});assert.equal(codex.term,1,'Codex picks its model in the terminal picker');codex.dispose();
+ const other=fixture();await flush();await other.poll({generation:'g1',agent:'agy',bound:true,items:[],next_offset:0});
+ assert.equal(other.buttons.find(b=>b.className==='composer-pill').hidden,true,'agents without a known /model command get no Model button');other.dispose();
+ console.log('PASS Orca composer: copy/time under messages, Model sends /model to Claude or opens the Codex picker in Term');
+}
 async function main(){
+ await orcaComposerAndMeta();
+ await hiddenPrefetchAndOldDaemon();
  await tailFollow();
  await renderBudgets();
  const cold=deferred(),recent=Array.from({length:128},(_,i)=>({id:`872:${i}`,kind:'assistant',text:`Message ${872+i}`}));
