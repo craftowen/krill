@@ -57,10 +57,23 @@ pub(super) struct Notifications {
     /// an unchanged daemon snapshot must not restart the toast timeout.
     seen: HashMap<Kind, Value>,
     notes: HashMap<Kind, Entity<Notification>>,
+    /// Per-session failed handoffs whose recovery card was explicitly closed.
+    dismissed_account_input: HashMap<krill_proto::SessionId, (String, Option<String>)>,
 }
 
 impl Shell {
     pub(super) fn sync_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.notifications
+            .dismissed_account_input
+            .retain(|session, (account_id, error)| {
+                self.accounts_snapshot.details.handoffs.iter().any(|h| {
+                    h.from == *session
+                        && h.to.is_none()
+                        && h.error.is_some()
+                        && &h.account_id == account_id
+                        && &h.error == error
+                })
+            });
         let mut current = Vec::new();
         for (kind, message) in [
             (Kind::Link, self.link.banner()),
@@ -86,13 +99,27 @@ impl Shell {
             current.push((Kind::Paste, Value::Paste(pending.clone())));
         }
         if let Some(session) = self.failed_account_input() {
-            current.push((
-                Kind::AccountInput,
-                Value::AccountInput {
-                    session,
-                    cancelling: self.account_cancel.is_some(),
-                },
-            ));
+            let dismissed = self
+                .notifications
+                .dismissed_account_input
+                .get(&session)
+                .is_some_and(|(account_id, error)| {
+                    self.accounts_snapshot.details.handoffs.iter().any(|h| {
+                        h.from == session
+                            && h.to.is_none()
+                            && &h.account_id == account_id
+                            && &h.error == error
+                    })
+                });
+            if !dismissed {
+                current.push((
+                    Kind::AccountInput,
+                    Value::AccountInput {
+                        session,
+                        cancelling: self.account_cancel.is_some(),
+                    },
+                ));
+            }
         }
         if current.is_empty() && self.notifications.list.is_none() {
             return;
@@ -274,6 +301,26 @@ impl Shell {
                                     .is_some_and(|needs| needs.items.contains(need)) =>
                             {
                                 krill_app::onboarding::actions::dismiss_need(id, cx);
+                            }
+                            (Kind::AccountInput, Value::AccountInput { session, .. })
+                                if this.notifications.seen.get(&Kind::AccountInput)
+                                    == Some(&closed_value)
+                                    && this.failed_account_input() == Some(*session) =>
+                            {
+                                if let Some(handoff) = this
+                                    .accounts_snapshot
+                                    .details
+                                    .handoffs
+                                    .iter()
+                                    .find(|h| h.from == *session && h.to.is_none() && h.error.is_some())
+                                {
+                                    this.notifications.dismissed_account_input.insert(
+                                        *session,
+                                        (handoff.account_id.clone(), handoff.error.clone()),
+                                    );
+                                }
+                                this.notifications.seen.remove(&Kind::AccountInput);
+                                this.notifications.notes.remove(&Kind::AccountInput);
                             }
                             _ => {}
                         }

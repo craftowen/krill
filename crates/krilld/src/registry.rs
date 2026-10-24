@@ -151,6 +151,7 @@ pub struct Registry {
     account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
     account_recovered: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
+    account_switch_opt_out: Mutex<std::collections::BTreeSet<SessionId>>,
     /// main에 프로세스 종료를 알린다(업그레이드 답을 보낸 뒤).
     exit: OnceLock<Sender<()>>,
     /// 디스크 사용량을 잴 상태 디렉터리(MK-071).
@@ -184,6 +185,9 @@ impl Registry {
         {
             tracing::warn!(kind = ?error.kind(), "Codex account home migration failed");
         }
+        if let Some(d) = dir {
+            crate::agent::refresh_zsh_sync_env(d);
+        }
         let at = |name: &str| dir.map_or_else(PathBuf::new, |d| d.join(name));
         // 기록 저장소를 열지 못해도 세션은 띄운다. 조용히 넘기지 않고 경고를 남겨 `krill doctor`가 보인다.
         let store = dir.and_then(|d| match Store::open(d, Limits::default()) {
@@ -215,6 +219,7 @@ impl Registry {
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
             account_replacements: Mutex::default(),
+            account_switch_opt_out: Mutex::default(),
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
@@ -2044,6 +2049,7 @@ impl Registry {
         drop(st);
         self.status.remove(id);
         self.clear_sleeping(id);
+        self.forget_failed_account_handoff(id);
     }
 
     #[cfg(all(test, unix))]
