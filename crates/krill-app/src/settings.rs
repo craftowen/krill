@@ -2967,6 +2967,7 @@ impl SettingsView {
     /// 계정·호스트는 UI 스레드에서 읽지 않는다(AS-06·OWE-697). 첫 스냅샷은 백그라운드 갱신이 채운다.
     pub fn new(cx: &mut Context<Self>) -> Self {
         crate::orca_import::ensure_scanned(cx);
+        crate::star_nag::ensure_checked(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
                 this.refresh_accounts_if_changed(cx);
@@ -3069,6 +3070,8 @@ impl SettingsView {
         view.refresh_accounts_async(cx);
         // 점검 스냅샷이 바뀌면 일반 탭 요약도 다시 그린다(구독은 앱 수명 동안 둔다).
         cx.observe_global::<crate::onboarding::ChecksSnapshot>(|_, cx| cx.notify())
+            .detach();
+        cx.observe_global::<crate::star_nag::StarNag>(|_, cx| cx.notify())
             .detach();
         cx.observe_global::<crate::accounts::installed::Installed>(|_, cx| cx.notify())
             .detach();
@@ -5597,6 +5600,21 @@ impl SettingsView {
             .when(cfg!(target_os = "macos"), |el| {
                 el.children(Self::render_update_rows(s, cx))
             })
+            .child(layout::section_title(
+                p,
+                "general-section-support",
+                text::SECTION_SUPPORT.get(),
+            ))
+            .child(
+                row()
+                    .id("settings-support-star-row")
+                    .debug_selector(|| "settings-support-star-row".into())
+                    .child(label(
+                        text::SUPPORT_STAR_TITLE.get(),
+                        text::SUPPORT_STAR_DESC.get(),
+                    ))
+                    .child(layout::controls().child(crate::star_nag::settings_support_control(cx))),
+            )
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {

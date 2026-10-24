@@ -1097,6 +1097,17 @@ impl Sidebar {
         self.expanded_cards.contains(path)
     }
 
+    /// 열린 프로젝트(저장소·폴더)나 세션이 하나라도 있는지.
+    #[must_use]
+    pub fn has_projects(&self) -> bool {
+        !self.snapshot.trees.is_empty()
+            || !self.snapshot.sessions.is_empty()
+            || self
+                .remote_hosts
+                .iter()
+                .any(|r| !r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
+    }
+
     /// 마지막으로 선택·활성화된 워크트리/폴더 경로.
     #[must_use]
     pub fn selected_worktree(&self) -> Option<&Path> {
