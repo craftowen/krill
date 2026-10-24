@@ -1739,6 +1739,38 @@ impl Registry {
                             crate::sys::process_name(pid).ok()
                         });
                     status.title = tap.title();
+                    if status.title.is_none() {
+                        let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
+                            || status.agent.eq_ignore_ascii_case("antigravity")
+                            || status.foreground.as_deref().is_some_and(|fg| {
+                                fg.eq_ignore_ascii_case("agy")
+                                    || fg.eq_ignore_ascii_case("antigravity")
+                            });
+                        let stored = if is_agy_fg || status.agent.is_empty() {
+                            self.agents.stored(session).ok().flatten()
+                        } else {
+                            None
+                        };
+                        let is_agy_stored = stored.as_ref().is_some_and(|s| {
+                            s.profile.eq_ignore_ascii_case("agy")
+                                || s.profile.eq_ignore_ascii_case("antigravity")
+                        });
+                        if is_agy_fg || is_agy_stored {
+                            let (title, discovered) =
+                                crate::agent_history::vault::resolve_live_agy_title(
+                                    session,
+                                    root,
+                                    tap.foreground(),
+                                    exited,
+                                    stored.as_ref(),
+                                );
+                            if let Some((sid, tp)) = discovered {
+                                self.agents
+                                    .bind_discovered_session(session, &sid, tp.as_deref());
+                            }
+                            status.title = title;
+                        }
+                    }
                     SessionStatus { session, status }
                 })
                 .collect(),

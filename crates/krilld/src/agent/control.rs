@@ -459,6 +459,40 @@ impl Control {
         is_subagent_or_foreign
     }
 
+    /// 실행 중인 에이전트 프로세스(`presence/<id>.lock` 등)에서 발견한 대화 ID·트랜스크립트 경로를
+    /// 아직 `session_id`가 비어 있는 기존 `StoredLaunch`에 기록한다.
+    pub fn bind_discovered_session(
+        &self,
+        session: SessionId,
+        session_id: &str,
+        transcript_path: Option<&Path>,
+    ) {
+        if !valid_session_id(session_id) {
+            return;
+        }
+        let _guard = lock(&self.config);
+        let Ok(Some(mut stored)) = self.read_stored(session) else {
+            return;
+        };
+        if stored.session_id.is_some() {
+            return;
+        }
+        stored.session_id = Some(session_id.to_owned());
+        if stored.transcript_path.is_none()
+            && let Some(tp) = transcript_path
+                .and_then(Path::to_str)
+                .map(str::trim)
+                .filter(|p| valid_transcript_path(p))
+        {
+            stored.transcript_path = Some(tp.to_owned());
+        }
+        if let Ok(path) = self.launch_path(session)
+            && let Ok(bytes) = serde_json::to_vec(&stored)
+        {
+            save(&path, &bytes).ok();
+        }
+    }
+
     pub fn block_hibernation(&self, session: SessionId) {
         lock(&self.veto).insert(session);
     }

@@ -291,12 +291,95 @@ pub fn sanitize_branch_slug(raw: &str) -> Option<String> {
     Some(final_slug)
 }
 
+/// 프롬프트 원문에서 `<USER_REQUEST>` 래퍼, `[Image #N]`·`[Pasted ...]` 마커, 선행 붙여넣기 파일 경로를 걷어낸다.
+#[must_use]
+pub fn clean_user_prompt(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(start) = s.find("<USER_REQUEST>") {
+        let after = start.saturating_add("<USER_REQUEST>".len());
+        if let Some(tail) = s.get(after..) {
+            s = if let Some(end) = tail.find("</USER_REQUEST>") {
+                tail.get(..end).unwrap_or(tail).trim()
+            } else {
+                tail.trim()
+            };
+        }
+    }
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = strip_leading_bracket_marker(s) {
+            s = rest;
+            continue;
+        }
+        if let Some(rest) = strip_leading_paste_path(s) {
+            s = rest;
+            continue;
+        }
+        break;
+    }
+    s.trim().to_owned()
+}
+
+fn strip_leading_bracket_marker(s: &str) -> Option<&str> {
+    let (inner, rest) = s.strip_prefix('[')?.split_once(']')?;
+    let lower = inner.trim().to_ascii_lowercase();
+    if lower.starts_with("image #")
+        || lower.starts_with("pasted content")
+        || lower.starts_with("pasted text")
+    {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn is_paste_or_media_path(path: &str) -> bool {
+    if !path.starts_with('/') || path.len() < 4 {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("/var/folders/")
+        || lower.starts_with("/private/var/folders/")
+        || lower.starts_with("/tmp/")
+        || lower.starts_with("/private/tmp/")
+        || lower.contains("/krill-paste/")
+        || [
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".svg", ".pdf",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+fn strip_leading_paste_path(s: &str) -> Option<&str> {
+    for quote in ['\'', '"'] {
+        if let Some(after_open) = s.strip_prefix(quote)
+            && let Some((candidate, rest)) = after_open.split_once(quote)
+            && is_paste_or_media_path(candidate)
+        {
+            return Some(rest);
+        }
+    }
+    if s.starts_with('/') {
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        let candidate = s.get(..end)?;
+        if is_paste_or_media_path(candidate) {
+            return s.get(end..);
+        }
+    }
+    None
+}
+
 /// 첫 프롬프트 원문에서 의미 있는 첫 줄을 골라 브랜치·세션 슬러그를 만든다(OWE-737).
 ///
 /// 참고: `.ref/orca/src/shared/branch-name-from-work.ts`
 /// (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
 #[must_use]
 pub fn prompt_branch_slug(prompt: &str) -> Option<String> {
+    let cleaned_prompt = clean_user_prompt(prompt);
+    let prompt = cleaned_prompt.as_str();
+    if prompt.is_empty() {
+        return None;
+    }
     let mut in_fence = false;
     let mut candidate_line = None;
     for line in prompt.lines() {
@@ -351,7 +434,7 @@ pub fn humanize_branch_slug(slug: &str) -> String {
         .join(" ")
 }
 
-/// hook payload(JSON)에서 사용자 첫 프롬프트 원문을 꺼낸다(`UserPromptSubmit`, `beforeSubmitPrompt`, `BeforeAgent`).
+/// hook payload(JSON)에서 사용자 첫 프롬프트 원문을 꺼낸다(`UserPromptSubmit`, `beforeSubmitPrompt`, `BeforeAgent`, `PreInvocation`).
 #[must_use]
 pub fn extract_prompt_from_hook_payload(payload: &[u8]) -> Option<String> {
     let val: serde_json::Value = serde_json::from_slice(payload).ok()?;
@@ -363,7 +446,7 @@ pub fn extract_prompt_from_hook_payload(payload: &[u8]) -> Option<String> {
         .and_then(serde_json::Value::as_str)?;
     if !matches!(
         event,
-        "UserPromptSubmit" | "beforeSubmitPrompt" | "BeforeAgent"
+        "UserPromptSubmit" | "beforeSubmitPrompt" | "BeforeAgent" | "PreInvocation"
     ) {
         return None;
     }
@@ -371,14 +454,16 @@ pub fn extract_prompt_from_hook_payload(payload: &[u8]) -> Option<String> {
         "prompt",
         "user_prompt",
         "userPrompt",
+        "lastUserInput",
+        "last_user_input",
         "message",
         "input",
         "text",
     ] {
         if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_owned());
+            let cleaned = clean_user_prompt(s);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
             }
         }
     }
@@ -533,6 +618,22 @@ mod slug_tests {
         let slug = prompt_branch_slug(&prompt).unwrap();
         assert_eq!(slug, "fix-cache-timer-countdown");
         assert_eq!(humanize_branch_slug(&slug), "fix cache timer countdown");
+
+        let agy_payload = r#"{"hook_event_name":"PreInvocation","lastUserInput":"<USER_REQUEST>\n'/var/folders/nm/jz7t2dm539597y551gd3tzw40000gn/T/krill-paste/mobile-123.jpg' 안티그래비티 제목 요약 표시\n</USER_REQUEST>"}"#.as_bytes();
+        let agy_prompt = extract_prompt_from_hook_payload(agy_payload).unwrap();
+        assert_eq!(agy_prompt, "안티그래비티 제목 요약 표시");
+        assert_eq!(
+            prompt_branch_slug(&agy_prompt).as_deref(),
+            Some("안티그래비티-제목-요약-표시")
+        );
+        assert_eq!(
+            prompt_branch_slug("[Image #1] UI 밀리는 거 수정").as_deref(),
+            Some("ui-밀리는-거-수정")
+        );
+        assert_eq!(
+            prompt_branch_slug("'/var/folders/nm/foo/T/krill-paste/img.png'"),
+            None
+        );
 
         let dir = std::env::temp_dir().join(format!("owe737-titles-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();

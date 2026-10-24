@@ -1369,3 +1369,47 @@ fn trust_preset_default_off_preserves_key_order_and_aborts_on_concurrent_modific
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn sync_agy_profile_hooks_copies_krill_bundle_while_preserving_existing_hooks() {
+    let dir = std::env::temp_dir().join(format!("krill-agy-hook-sync-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let host_home = dir.join("host");
+    let account_dir = dir.join("account");
+    let host_hooks = host_home.join(".gemini/config/hooks.json");
+    let account_hooks = account_dir.join(".gemini/config/hooks.json");
+    std::fs::create_dir_all(host_hooks.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(account_hooks.parent().unwrap()).unwrap();
+
+    std::fs::write(
+        &host_hooks,
+        "{\n  \"krill\": {\n    \"hooks\": {\n      \"PreInvocation\": [\n        {\n          \"hooks\": [\n            {\n              \"command\": \"'/usr/local/bin/krill' hook agy user-prompt-submit\",\n              \"type\": \"command\"\n            }\n          ]\n        }\n      ]\n    }\n  }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &account_hooks,
+        "{\n  \"userCustom\": {\n    \"enabled\": true\n  }\n}\n",
+    )
+    .unwrap();
+
+    assert!(super::sync_agy_profile_hooks_in(&host_home, &account_dir).unwrap());
+    // 두 번째 호출은 멱등(변경 없음 -> false)이어야 한다.
+    assert!(!super::sync_agy_profile_hooks_in(&host_home, &account_dir).unwrap());
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&account_hooks).unwrap()).unwrap();
+    assert_eq!(
+        parsed
+            .pointer("/userCustom/enabled")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/krill/hooks/PreInvocation/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str),
+        Some("'/usr/local/bin/krill' hook agy user-prompt-submit")
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

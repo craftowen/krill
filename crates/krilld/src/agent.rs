@@ -152,6 +152,11 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         if dir.is_empty() {
             continue;
         }
+        if provider == ProviderKind::Antigravity
+            && let Some(host_home) = trust_home_for_runtime()
+        {
+            sync_agy_profile_hooks_in(&host_home, Path::new(dir)).ok();
+        }
         login.env.retain(|(key, _)| {
             !provider
                 .credential_overrides()
@@ -572,6 +577,11 @@ pub(crate) fn pre_trust_workspace(profile: &Profile, cwd: &[u8], account: Option
         PathBuf::from(std::ffi::OsStr::from_bytes(cwd))
     };
     if agy {
+        if let (Some(host_home), Some(acc_home)) =
+            (trust_home_for_runtime(), account_dir.as_deref())
+        {
+            sync_agy_profile_hooks_in(&host_home, acc_home).ok();
+        }
         // 계정 프로필이 있으면 그 폴더가 agy의 home이다(OWE-706).
         let Some(home) = account_dir.or_else(trust_home_for_runtime) else {
             return;
@@ -1415,6 +1425,60 @@ pub(crate) fn pre_trust_workspace_in(home: &Path, cwd: &Path) -> io::Result<()> 
     write_trust_file_cas(&settings_path, orig_bytes.as_deref(), next.as_bytes(), None).map(|_| ())
 }
 
+/// 호스트 `~/.gemini/config/hooks.json`에 `"krill"` 훅 번들이 설치돼 있으면
+/// 격리된 Antigravity 계정 프로필(`<account_home>/.gemini/config/hooks.json`)에도 `"krill"` 항목만 동기화한다.
+pub(crate) fn sync_agy_profile_hooks_in(host_home: &Path, account_home: &Path) -> io::Result<bool> {
+    if host_home.as_os_str().is_empty()
+        || account_home.as_os_str().is_empty()
+        || host_home == account_home
+    {
+        return Ok(false);
+    }
+    let host_canon = std::fs::canonicalize(host_home).unwrap_or_else(|_| host_home.to_path_buf());
+    let acc_canon =
+        std::fs::canonicalize(account_home).unwrap_or_else(|_| account_home.to_path_buf());
+    if host_canon == acc_canon {
+        return Ok(false);
+    }
+    let host_hooks_path = host_home.join(".gemini/config/hooks.json");
+    let Ok(Some(host_bytes)) = read_trust_file_snapshot(&host_hooks_path) else {
+        return Ok(false);
+    };
+    let Ok(host_val) = serde_json::from_slice::<serde_json::Value>(&host_bytes) else {
+        return Ok(false);
+    };
+    let Some(krill_bundle) = host_val
+        .as_object()
+        .and_then(|o| o.get("krill"))
+        .filter(|v| v.is_object())
+    else {
+        return Ok(false);
+    };
+    let _guard = crate::session::lock(&TRUST_LOCK);
+    let target = account_home.join(".gemini/config/hooks.json");
+    let Ok(orig_bytes) = read_trust_file_snapshot(&target) else {
+        return Ok(false);
+    };
+    let mut target_val = match orig_bytes.as_deref() {
+        Some(b) if !b.iter().all(u8::is_ascii_whitespace) => {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) else {
+                return Ok(false);
+            };
+            v
+        }
+        _ => serde_json::json!({}),
+    };
+    let Some(target_obj) = target_val.as_object_mut() else {
+        return Ok(false);
+    };
+    if target_obj.get("krill") == Some(krill_bundle) {
+        return Ok(false);
+    }
+    target_obj.insert("krill".to_owned(), krill_bundle.clone());
+    let next = krill_proto::agent::hooks::encode_hook_json(&target_val)?;
+    write_trust_file_cas(&target, orig_bytes.as_deref(), next.as_bytes(), None)
+}
+
 /// 계정 프로필 env를 넣고 넣은 계정을 돌려준다(실행 기록에 남긴다, OWE-698).
 /// `pinned`가 있으면 그 계정, 없으면 지금 활성 계정이다.
 fn apply_account_env(
@@ -1440,6 +1504,12 @@ fn apply_account_env(
         });
     }
     if let Some(account) = &account {
+        if (is(profile, "agy") || is(profile, "antigravity"))
+            && !account.dir.is_empty()
+            && let Some(host_home) = trust_home_for_runtime()
+        {
+            sync_agy_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
+        }
         if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
             login
                 .env

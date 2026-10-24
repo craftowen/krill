@@ -10,8 +10,10 @@ use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(all(test, unix))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use crate::session::lock;
 
 use krill_proto::agent_history::{
     MAX_ENTRIES, MAX_TEXT, SearchQuery, SearchSnapshot, VaultAgent, VaultHit, VaultTarget,
@@ -959,7 +961,7 @@ impl Indexer {
                 if self.exhausted() {
                     break;
                 }
-                self.parse_agy_file(&transcript, Some(&conv_id), &history);
+                self.parse_agy_file(root, &transcript, Some(&conv_id), &history);
             }
         }
         if sessions.is_dir() {
@@ -968,7 +970,7 @@ impl Indexer {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                this.parse_agy_file(path, Some(&stem), &history);
+                this.parse_agy_file(root, path, Some(&stem), &history);
             });
         }
     }
@@ -1494,6 +1496,7 @@ impl Indexer {
 
     fn parse_agy_file(
         &mut self,
+        agy_root: &Path,
         path: &Path,
         fallback_id: Option<&str>,
         history: &BTreeMap<String, (String, String)>,
@@ -1503,11 +1506,14 @@ impl Indexer {
             && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
         {
             let mut doc = cached.doc;
-            if !cached.has_primary_title
-                && let Some((_, hist_display)) = history.get(&doc.id)
-                && !hist_display.is_empty()
-            {
-                doc.title.clone_from(hist_display);
+            if !cached.has_primary_title {
+                if let Some(ann_title) = read_agy_annotation_title(agy_root, &doc.id) {
+                    doc.title = ann_title;
+                } else if let Some((_, hist_display)) = history.get(&doc.id)
+                    && !hist_display.is_empty()
+                {
+                    doc.title.clone_from(hist_display);
+                }
             }
             self.insert(doc);
             return;
@@ -1578,7 +1584,9 @@ impl Indexer {
                 let req = extract_agy_user_request(content);
                 if !req.is_empty() {
                     if first_user.is_empty() {
-                        first_user = truncate_chars(&one_line(&req), TITLE_CHARS);
+                        let cleaned = krill_proto::git::clean_user_prompt(&req);
+                        let candidate = if cleaned.is_empty() { &req } else { &cleaned };
+                        first_user = truncate_chars(&one_line(candidate), TITLE_CHARS);
                     }
                     messages.push(("user".to_owned(), req));
                 }
@@ -1601,6 +1609,11 @@ impl Indexer {
             self.skipped = true;
             return;
         };
+        if title.is_empty()
+            && let Some(ann_title) = read_agy_annotation_title(agy_root, &id)
+        {
+            title = ann_title;
+        }
         let has_primary_title = !title.is_empty();
         if let Some((hist_cwd, hist_display)) = history.get(&id) {
             if cwd.is_empty() {
@@ -2043,6 +2056,424 @@ pub(super) fn extract_agy_user_request(content: &str) -> String {
     content.trim().to_owned()
 }
 
+/// Protobuf text-format 문자열 리터럴(`"..."`)의 C/octal/hex 이스케이프를 UTF-8로 복원한다.
+fn unescape_pbtxt_string(quoted: &str) -> String {
+    let inner = quoted
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(quoted);
+    let mut iter = inner.bytes().peekable();
+    let mut out = Vec::with_capacity(inner.len());
+    while let Some(b) = iter.next() {
+        if b == b'\\'
+            && let Some(esc) = iter.next()
+        {
+            match esc {
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'\\' | b'"' | b'\'' => out.push(esc),
+                b'0'..=b'7' => {
+                    let mut val = u32::from(esc.saturating_sub(b'0'));
+                    for _ in 0..2 {
+                        if let Some(&next) = iter.peek()
+                            && (b'0'..=b'7').contains(&next)
+                        {
+                            iter.next();
+                            val = val
+                                .saturating_mul(8)
+                                .saturating_add(u32::from(next.saturating_sub(b'0')));
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(decoded) = u8::try_from(val) {
+                        out.push(decoded);
+                    }
+                }
+                b'x' | b'X' => {
+                    let h1 = iter.peek().copied().and_then(|c| (c as char).to_digit(16));
+                    if let Some(d1) = h1 {
+                        iter.next();
+                        if let Some(d2) =
+                            iter.peek().copied().and_then(|c| (c as char).to_digit(16))
+                        {
+                            iter.next();
+                            if let Ok(decoded) =
+                                u8::try_from(d1.saturating_mul(16).saturating_add(d2))
+                            {
+                                out.push(decoded);
+                            }
+                        } else if let Ok(decoded) = u8::try_from(d1) {
+                            out.push(decoded);
+                        }
+                    } else {
+                        out.push(esc);
+                    }
+                }
+                other => out.push(other),
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Antigravity `annotations/<id>.pbtxt`의 `title:"..."` 줄을 파싱한다.
+pub(crate) fn parse_pbtxt_title(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("title:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if !rest.starts_with('"') || !rest.ends_with('"') || rest.len() < 2 {
+            continue;
+        }
+        let decoded =
+            serde_json::from_str::<String>(rest).unwrap_or_else(|_| unescape_pbtxt_string(rest));
+        let cleaned = krill_proto::git::clean_user_prompt(&decoded);
+        let candidate = if cleaned.is_empty() {
+            decoded.as_str()
+        } else {
+            cleaned.as_str()
+        };
+        let single = one_line(candidate);
+        if single.chars().any(char::is_alphanumeric) && !single.starts_with('{') {
+            return Some(truncate_chars(&single, TITLE_CHARS));
+        }
+    }
+    None
+}
+
+pub(crate) fn read_agy_annotation_title(agy_root: &Path, conv_id: &str) -> Option<String> {
+    if !crate::agent::control::valid_session_id(conv_id) {
+        return None;
+    }
+    for cand in agy_candidate_dirs(agy_root, true) {
+        let path = cand.join("annotations").join(format!("{conv_id}.pbtxt"));
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut buf = Vec::with_capacity(256);
+        if file.take(4096).read_to_end(&mut buf).is_ok()
+            && let Some(title) = parse_pbtxt_title(&buf)
+        {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn agy_root_and_id_from_path(path: &Path) -> Option<(PathBuf, String)> {
+    if path.extension().and_then(|e| e.to_str()) == Some("lock")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("presence")
+    {
+        let conv_id = path.file_stem()?.to_str()?;
+        if crate::agent::control::valid_session_id(conv_id) {
+            return Some((path.parent()?.parent()?.to_path_buf(), conv_id.to_owned()));
+        }
+    }
+    for ancestor in path.ancestors() {
+        if ancestor
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("brain")
+        {
+            let conv_id = ancestor.file_name()?.to_str()?;
+            if crate::agent::control::valid_session_id(conv_id) {
+                return Some((
+                    ancestor.parent()?.parent()?.to_path_buf(),
+                    conv_id.to_owned(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn agy_root_and_id_from_vnodes(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
+    for p in paths {
+        if p.extension().and_then(|e| e.to_str()) == Some("lock")
+            && let Some(found) = agy_root_and_id_from_path(p)
+        {
+            return Some(found);
+        }
+    }
+    for p in paths {
+        if let Some(found) = agy_root_and_id_from_path(p) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf, String)> {
+    let mut cur = fg_pid.unwrap_or(root_pid);
+    for _ in 0..8 {
+        if cur <= 1 {
+            break;
+        }
+        let paths = crate::sys::open_vnode_paths(cur);
+        if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
+            return Some(found);
+        }
+        if cur == root_pid {
+            break;
+        }
+        let Ok(parent) = crate::sys::parent_pid(cur) else {
+            break;
+        };
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    if fg_pid.is_none_or(|fg| fg == root_pid)
+        && let Ok(pids) = crate::sys::all_pids()
+    {
+        for pid in pids {
+            if pid != root_pid && crate::sys::parent_pid(pid).ok() == Some(root_pid) {
+                let paths = crate::sys::open_vnode_paths(pid);
+                if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_agy_first_user_prompt(agy_root: &Path, conv_id: &str) -> Option<String> {
+    if !crate::agent::control::valid_session_id(conv_id) {
+        return None;
+    }
+    for cand in agy_candidate_dirs(agy_root, true) {
+        let conv_dir = cand.join("brain").join(conv_id);
+        let logs = conv_dir.join(".system_generated/logs");
+        for file_path in [
+            logs.join("transcript.jsonl"),
+            logs.join("transcript_full.jsonl"),
+            conv_dir.join("transcript.jsonl"),
+        ] {
+            let Ok(file) = File::open(&file_path) else {
+                continue;
+            };
+            let mut reader = BufReader::with_capacity(8192, file.take(64 * 1024));
+            let mut line = Vec::new();
+            for _ in 0..64 {
+                line.clear();
+                let Ok(n) = reader.read_until(b'\n', &mut line) else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+                    continue;
+                };
+                let source = v.get("source").and_then(Value::as_str).unwrap_or("");
+                let rec_type = v.get("type").and_then(Value::as_str).unwrap_or("");
+                let role = v.get("role").and_then(Value::as_str).unwrap_or("");
+                if matches!(source, "USER_EXPLICIT" | "USER")
+                    || matches!(rec_type, "USER_INPUT" | "REQUEST")
+                    || role == "user"
+                {
+                    let content = v
+                        .get("content")
+                        .or_else(|| v.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let req = extract_agy_user_request(content);
+                    let cleaned = krill_proto::git::clean_user_prompt(&req);
+                    let candidate = if cleaned.is_empty() {
+                        req.as_str()
+                    } else {
+                        cleaned.as_str()
+                    };
+                    let single = one_line(candidate);
+                    if !single.is_empty() {
+                        return Some(truncate_chars(&single, TITLE_CHARS));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+struct AgyLiveTitleEntry {
+    agy_root: Option<PathBuf>,
+    conv_id: Option<String>,
+    title: Option<String>,
+    pbtxt_mtime_ns: u128,
+    checked_at: Instant,
+}
+
+static AGY_LIVE_TITLE_CACHE: OnceLock<Mutex<BTreeMap<u64, AgyLiveTitleEntry>>> = OnceLock::new();
+
+/// 실행 중인 Antigravity(`agy`) 세션의 대화 제목·요약을 조회한다.
+/// OSC 0/2 터미널 타이틀을 내보내지 않는 `agy`를 위해 `annotations/<id>.pbtxt`와 트랜스크립트 첫 프롬프트를 읽는다.
+pub(crate) fn resolve_live_agy_title(
+    session: krill_proto::SessionId,
+    root_pid: u32,
+    fg_pid: Option<u32>,
+    exited: bool,
+    stored: Option<&crate::agent::control::StoredLaunch>,
+) -> (Option<String>, Option<(String, Option<PathBuf>)>) {
+    let cache_mutex = AGY_LIVE_TITLE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let cached_snapshot = {
+        let cache = lock(cache_mutex);
+        if let Some(entry) = cache.get(&session.0) {
+            if entry.checked_at.elapsed() < Duration::from_secs(2) && entry.title.is_some() {
+                return (entry.title.clone(), None);
+            }
+            if entry.checked_at.elapsed() < Duration::from_secs(1) {
+                return (None, None);
+            }
+            Some((
+                entry.agy_root.clone(),
+                entry.conv_id.clone(),
+                entry.title.clone(),
+                entry.pbtxt_mtime_ns,
+            ))
+        } else {
+            None
+        }
+    };
+
+    let mut resolved_pair: Option<(PathBuf, String)> = None;
+    let mut discovered_for_store: Option<(String, Option<PathBuf>)> = None;
+
+    if let Some(s) = stored {
+        if let Some(tp) = s.transcript_path.as_deref() {
+            resolved_pair = agy_root_and_id_from_path(Path::new(tp));
+        }
+        if resolved_pair.is_none()
+            && let Some(sid) = s
+                .session_id
+                .as_deref()
+                .filter(|id| crate::agent::control::valid_session_id(id))
+        {
+            let mut bases = Vec::new();
+            if let Some(acc) = &s.account
+                && !acc.dir.is_empty()
+            {
+                bases.push(PathBuf::from(&acc.dir));
+            }
+            bases.push(crate::usage::accounts::default_home());
+            'search: for base in bases {
+                for cand in agy_candidate_dirs(&base, true) {
+                    if cand
+                        .join("annotations")
+                        .join(format!("{sid}.pbtxt"))
+                        .is_file()
+                        || cand.join("brain").join(sid).is_dir()
+                        || cand.join("presence").join(format!("{sid}.lock")).is_file()
+                    {
+                        resolved_pair = Some((cand, sid.to_owned()));
+                        break 'search;
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved_pair.is_none()
+        && !exited
+        && let Some((agy_root, conv_id)) = discover_agy_from_pids(root_pid, fg_pid)
+    {
+        if stored.is_some_and(|s| s.session_id.is_none()) {
+            let logs = agy_root
+                .join("brain")
+                .join(&conv_id)
+                .join(".system_generated/logs");
+            let tp = [
+                logs.join("transcript.jsonl"),
+                logs.join("transcript_full.jsonl"),
+            ]
+            .into_iter()
+            .find(|p| p.is_file());
+            discovered_for_store = Some((conv_id.clone(), tp));
+        }
+        resolved_pair = Some((agy_root, conv_id));
+    }
+
+    if resolved_pair.is_none()
+        && let Some((Some(prev_root), Some(prev_id), _, _)) = &cached_snapshot
+    {
+        resolved_pair = Some((prev_root.clone(), prev_id.clone()));
+    }
+
+    let Some((agy_root, conv_id)) = resolved_pair else {
+        let mut cache = lock(cache_mutex);
+        if cache.len() >= 128 && !cache.contains_key(&session.0) {
+            cache.pop_first();
+        }
+        cache.insert(
+            session.0,
+            AgyLiveTitleEntry {
+                agy_root: None,
+                conv_id: None,
+                title: None,
+                pbtxt_mtime_ns: 0,
+                checked_at: Instant::now(),
+            },
+        );
+        return (None, None);
+    };
+
+    let pbtxt_path = agy_root
+        .join("annotations")
+        .join(format!("{conv_id}.pbtxt"));
+    let mtime_ns = file_mtime_ns(&pbtxt_path);
+    if mtime_ns > 0
+        && let Some((_, Some(prev_id), Some(prev_title), prev_mtime)) = &cached_snapshot
+        && prev_id == &conv_id
+        && *prev_mtime == mtime_ns
+    {
+        let mut cache = lock(cache_mutex);
+        if let Some(entry) = cache.get_mut(&session.0) {
+            entry.checked_at = Instant::now();
+        }
+        return (Some(prev_title.clone()), discovered_for_store);
+    }
+
+    let title = if mtime_ns > 0 {
+        read_agy_annotation_title(&agy_root, &conv_id)
+    } else {
+        None
+    }
+    .or_else(|| read_agy_first_user_prompt(&agy_root, &conv_id));
+
+    let recorded_mtime = if mtime_ns > 0 && title.is_some() {
+        mtime_ns
+    } else {
+        0
+    };
+    let mut cache = lock(cache_mutex);
+    if cache.len() >= 128 && !cache.contains_key(&session.0) {
+        cache.pop_first();
+    }
+    cache.insert(
+        session.0,
+        AgyLiveTitleEntry {
+            agy_root: Some(agy_root),
+            conv_id: Some(conv_id),
+            title: title.clone(),
+            pbtxt_mtime_ns: recorded_mtime,
+            checked_at: Instant::now(),
+        },
+    );
+    (title, discovered_for_store)
+}
+
 fn extract_agy_workspace_from_text(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
@@ -2092,4 +2523,72 @@ pub(super) fn extract_agy_workspace_from_record(v: &Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod agy_title_tests {
+    use super::*;
+
+    #[test]
+    fn parse_pbtxt_title_decodes_utf8_and_octal_escapes() {
+        let raw = "last_user_view_time {\n  seconds: 1776937878\n}\ntitle: \"Fix \\354\\225\\210\\355\\213\\260\\352\\267\\270\\353\\236\\230\\353\\271\\204\\355\\213\\260 Title & \\\"Photo\\\"\"\n";
+        assert_eq!(
+            parse_pbtxt_title(raw.as_bytes()).as_deref(),
+            Some("Fix 안티그래비티 Title & \"Photo\"")
+        );
+    }
+
+    #[test]
+    fn resolve_live_agy_title_reads_annotations_and_falls_back_to_cleaned_prompt() {
+        let root = std::env::temp_dir().join(format!("krill-agy-title-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let agy_root = root.join(".gemini/antigravity-cli");
+        let conv_id = "c28a49fb-6183-4c21-b219-2d9e17531a04";
+        let log_dir = agy_root
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let transcript = log_dir.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\n'/var/folders/nm/jz7t2dm539597y551gd3tzw40000gn/T/krill-paste/mobile-f14066a1.jpg' 안티그래비티도 제목인지 내용 요약 뜨게하고\\n</USER_REQUEST>\"}\n",
+        )
+        .unwrap();
+
+        let stored = crate::agent::control::StoredLaunch {
+            profile: "agy".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: Some(conv_id.into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+
+        let (fallback_title, discovered) =
+            resolve_live_agy_title(krill_proto::SessionId(9001), 0, None, false, Some(&stored));
+        assert!(discovered.is_none());
+        assert_eq!(
+            fallback_title.as_deref(),
+            Some("안티그래비티도 제목인지 내용 요약 뜨게하고")
+        );
+
+        let ann_dir = agy_root.join("annotations");
+        fs::create_dir_all(&ann_dir).unwrap();
+        fs::write(
+            ann_dir.join(format!("{conv_id}.pbtxt")),
+            "title: \"Fix Antigravity Session Titles & Mobile Photo Button\"\n",
+        )
+        .unwrap();
+
+        let (ann_title, _) =
+            resolve_live_agy_title(krill_proto::SessionId(9002), 0, None, false, Some(&stored));
+        assert_eq!(
+            ann_title.as_deref(),
+            Some("Fix Antigravity Session Titles & Mobile Photo Button")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
 }

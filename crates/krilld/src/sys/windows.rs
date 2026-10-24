@@ -79,6 +79,10 @@ fn unsupported<T>() -> io::Result<T> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+pub(crate) fn open_vnode_paths(_pid: u32) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// 실패하면 null을 돌려주는 핸들 생성 함수의 결과를 소유한다.
 fn owned(raw: HANDLE) -> io::Result<OwnedHandle> {
     if raw.is_null() || raw == INVALID_HANDLE_VALUE {
