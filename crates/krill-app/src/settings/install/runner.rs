@@ -33,7 +33,7 @@ pub(super) fn version_command(exe: &Path, args: &[&str]) -> Command {
                 || s.eq_ignore_ascii_case("ps1")
         })
     {
-        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let quote = |s: &str| format!("'{}'", s.replace('\u{27}', "''"));
         let exe = quote(&exe.to_string_lossy());
         let args = args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ");
         powershell_command(&format!("& {exe} {args}; exit $LASTEXITCODE"))
