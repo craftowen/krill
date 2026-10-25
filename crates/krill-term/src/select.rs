@@ -453,11 +453,28 @@ fn leading_spaces(s: &str) -> usize {
     s.bytes().take_while(|&b| b == b' ').count()
 }
 
+fn parse_bullet_prefix(line: &str) -> Option<&str> {
+    let lead = leading_spaces(line);
+    let trimmed = line.get(lead..)?;
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if !matches!(first, '•' | '◦' | '▪' | '▸' | '‣' | '⏺' | '⎿') {
+        return None;
+    }
+    let rest = chars.as_str();
+    let spaces_after = leading_spaces(rest);
+    if spaces_after == 0 {
+        return None;
+    }
+    let body = rest.get(spaces_after..)?;
+    Some(body)
+}
+
 fn should_join_without_space(cur: &str, next: &str, max_w: usize) -> bool {
     if cur.is_empty() || next.is_empty() {
         return true;
     }
-    if max_w >= 45 && str_display_width(cur) + 1 >= max_w {
+    if max_w >= 55 && str_display_width(cur) >= max_w {
         return true;
     }
     if cur.ends_with(['=', '/', '(', '[', '{', '@'])
@@ -480,22 +497,46 @@ fn should_join_without_space(cur: &str, next: &str, max_w: usize) -> bool {
     false
 }
 
-/// TUI 출력에서 복사한 문자열의 박스/인용 기호(`| `, `│ `)와 강제 줄바꿈·들여쓰기를 정리한다.
-#[must_use]
-pub fn clean_text(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::new();
+fn join_wrapped_lines(stripped: &[&str]) -> String {
+    let max_w = stripped
+        .iter()
+        .map(|l| str_display_width(l))
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (idx, &line) in stripped.iter().enumerate() {
+        if idx == 0 {
+            out.push_str(line);
+            continue;
+        }
+        let prev = stripped[idx - 1];
+        if let Some(before_bs) = out.strip_suffix('\\') {
+            let trimmed_len = before_bs.trim_end_matches(' ').len();
+            out.truncate(trimmed_len);
+            out.push(' ');
+            out.push_str(line);
+        } else if should_join_without_space(prev, line, max_w) {
+            out.push_str(line);
+        } else {
+            out.push(' ');
+            out.push_str(line);
+        }
     }
-    let raw_lines: Vec<&str> = raw.split('\n').collect();
-    let (mut lines, had_gutter) = strip_gutters(raw_lines);
+    out
+}
+
+fn clean_block(mut lines: Vec<&str>, had_gutter: bool) -> String {
     if lines.is_empty() {
         return String::new();
     }
     if lines.len() == 1 {
+        if let Some(body) = parse_bullet_prefix(lines[0]) {
+            return body.to_owned();
+        }
         return lines[0].to_owned();
     }
 
-    // 공통 앞 공백 또는 행잉 인덴트(첫 줄 0칸, 2번째 줄부터 균일한 2~12칸 공백)를 계산한다.
+    // 공통 앞 공백 또는 행잉 인덴트(첫 줄 0칸, 2번째 줄부터 균일한 1~12칸 공백)를 계산한다.
     let non_empty_indents: Vec<usize> = lines
         .iter()
         .filter(|l| !l.trim().is_empty())
@@ -510,6 +551,23 @@ pub fn clean_text(raw: &str) -> String {
         }
     }
 
+    // 불릿 항목(`• `, `⏺ `, `⎿ ` 등)으로 시작하면 불릿 단위로 묶어 이어 붙인다.
+    if parse_bullet_prefix(lines[0]).is_some() {
+        let mut groups: Vec<Vec<&str>> = Vec::new();
+        for line in &lines {
+            if let Some(body) = parse_bullet_prefix(line) {
+                groups.push(vec![body]);
+            } else if let Some(last) = groups.last_mut() {
+                last.push(line.trim_start_matches(' '));
+            }
+        }
+        return groups
+            .into_iter()
+            .map(|g| join_wrapped_lines(&g))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
     let has_empty = lines.iter().any(|l| l.trim().is_empty());
     let tail_indents: Vec<usize> = lines[1..]
         .iter()
@@ -519,7 +577,7 @@ pub fn clean_text(raw: &str) -> String {
     let uniform_hanging =
         !has_empty && leading_spaces(lines[0]) == 0 && !tail_indents.is_empty() && {
             let first = tail_indents[0];
-            (2..=12).contains(&first) && tail_indents.iter().all(|&n| n == first)
+            (1..=12).contains(&first) && tail_indents.iter().all(|&n| n == first)
         };
     let uniform_flat =
         !has_empty && (min_all > 0 || had_gutter) && tail_indents.iter().all(|&n| n == 0);
@@ -547,32 +605,25 @@ pub fn clean_text(raw: &str) -> String {
             }
         }
         let first_ends_block = stripped[0].trim_end().ends_with([':', '{', '}', ';']);
-        let looks_wrapped = open_breaks > 0 || (!first_ends_block && max_w >= 50);
+        let looks_wrapped = open_breaks > 0
+            || (!first_ends_block && (uniform_hanging || !had_gutter || max_w >= 55));
         if looks_wrapped {
-            let mut out = String::new();
-            for (idx, &line) in stripped.iter().enumerate() {
-                if idx == 0 {
-                    out.push_str(line);
-                    continue;
-                }
-                let prev = stripped[idx - 1];
-                if let Some(before_bs) = out.strip_suffix('\\') {
-                    let trimmed_len = before_bs.trim_end_matches(' ').len();
-                    out.truncate(trimmed_len);
-                    out.push(' ');
-                    out.push_str(line);
-                } else if should_join_without_space(prev, line, max_w) {
-                    out.push_str(line);
-                } else {
-                    out.push(' ');
-                    out.push_str(line);
-                }
-            }
-            return out;
+            return join_wrapped_lines(&stripped);
         }
     }
 
     lines.join("\n")
+}
+
+/// TUI 출력에서 복사한 문자열의 박스/인용 기호(`| `, `│ `), 불릿(`• `)과 강제 줄바꿈·들여쓰기를 정리한다.
+#[must_use]
+pub fn clean_text(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let raw_lines: Vec<&str> = raw.split('\n').collect();
+    let (lines, had_gutter) = strip_gutters(raw_lines);
+    clean_block(lines, had_gutter)
 }
 
 #[cfg(test)]
@@ -821,6 +872,16 @@ mod tests {
         assert_eq!(rect.text(&s), "hello\nworld\nfoo");
         // 반대 대각선(우하단 -> 좌상단)으로 끌어도 같은 열 구간이다.
         assert_eq!(block_sel((2, 6), (0, 2)).text(&s), "hello\nworld\nfoo");
+    }
+
+    #[test]
+    fn clean_text_unwraps_each_bullet_without_merging_items() {
+        assert_eq!(
+            clean_text("• first item\n  continues here\n• second item"),
+            "first item continues here\nsecond item"
+        );
+        assert_eq!(clean_text("⏺ ready"), "ready");
+        assert_eq!(clean_text("▸filename"), "▸filename");
     }
 
     #[test]
