@@ -5,7 +5,7 @@
 //! `krill computer` 스냅샷 상태 캐시, 모의 환경, macOS 실행 백엔드.
 
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -13,6 +13,7 @@ use krill_proto::daemon;
 
 pub use super::model::*;
 
+mod capture;
 mod retention;
 
 const MOCK_FILE_NAME: &str = "computer-mock.json";
@@ -592,16 +593,7 @@ pub fn observe_app_state(
                     }
                     None
                 } else {
-                    let shot_path = write_mock_screenshot(&win.id)?;
-                    Some(ScreenshotMetadata {
-                        path: shot_path.display().to_string(),
-                        width: clamp_pixel_dim(win.bounds.width),
-                        height: clamp_pixel_dim(win.bounds.height),
-                        scale_factor: 2.0,
-                        window_id: Some(win.id.clone()),
-                        logical_bounds: win.bounds,
-                        measured: false,
-                    })
+                    Some(capture::mock_screenshot(&summary)?)
                 };
                 (
                     Some(summary),
@@ -625,6 +617,8 @@ pub fn observe_app_state(
             captured_at_ms: now_ms(),
             coverage_truncated: false,
             captured_at: now_ms().to_string(),
+            ax_observation_timing: None,
+            geometry: None,
             app: app_summary,
             window: window_summary,
             focused_element_id: focused_id,
@@ -668,8 +662,16 @@ pub fn observe_app_state(
     if restore_window {
         verify_target_app(&app)?;
     }
-    let (mut root, process_start, coverage_truncated) =
-        query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
+    let ax_started = capture::clock();
+    let observation = query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
+    let ax_observation_timing = Some(capture::timing(ax_started));
+    let LiveObservation {
+        mut root,
+        process_start,
+        coverage_truncated,
+        geometry,
+        geometry_error,
+    } = observation;
     let (flat, focused_id, total_count, tree_text) = index_and_render_tree(&mut root);
     let mut notes = Vec::new();
     if coverage_truncated {
@@ -680,13 +682,18 @@ pub fn observe_app_state(
     if let Some(note) = context_note {
         notes.push(note);
     }
+    if let Some(error) = geometry_error {
+        notes.push(format!(
+            "geometry witness unavailable: {error}; image mapping unavailable"
+        ));
+    }
     let screenshot = if no_screenshot || !sc {
         if !no_screenshot && !sc {
             notes.push("screenshot permission was not confirmed; capture skipped".to_owned());
         }
         None
-    } else if let Some(win) = &selected_window {
-        match capture_live_window_screenshot(win) {
+    } else if let (Some(win), Some(geometry)) = (&selected_window, &geometry) {
+        match capture::live_screenshot(win, geometry) {
             Ok(shot) => Some(shot),
             Err(error) => {
                 notes.push(format!("screenshot failed: {error}"));
@@ -703,6 +710,8 @@ pub fn observe_app_state(
         captured_at_ms: now_ms(),
         coverage_truncated,
         captured_at: now_ms().to_string(),
+        ax_observation_timing,
+        geometry,
         app,
         window: selected_window,
         focused_element_id: focused_id,
@@ -717,126 +726,26 @@ pub fn observe_app_state(
     Ok(snapshot)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "window bounds dimensions are clamped to >= 1.0 before converting to u32 pixels"
-)]
-fn clamp_pixel_dim(v: f64) -> u32 {
-    v.max(1.0) as u32
-}
-
-fn write_mock_screenshot(window_id: &str) -> Result<PathBuf, String> {
-    let shots = capture_directory()?;
-    let path = shots.join(format!("window-{window_id}-{}.png", unique_token()));
-    write_private_new(&path, b"\x89PNG\r\n\x1a\n")?;
-    retention::prune(&shots, &path).map_err(|e| format!("capture retention: {e}"))?;
-    Ok(path)
-}
-
-fn capture_directory() -> Result<PathBuf, String> {
-    let dir = daemon::state_dir().ok_or("cannot resolve private capture state directory")?;
-    let shots = dir.join("computer-captures-v2");
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(&shots).map_err(|e| e.to_string())?;
-    let metadata = fs::symlink_metadata(&shots).map_err(|e| e.to_string())?;
-    if !metadata.is_dir() {
-        return Err("capture directory is not a real directory".to_owned());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
-            return Err("capture directory must be private and owned by this user".to_owned());
-        }
-    }
-    Ok(shots)
-}
-
-fn capture_live_window_screenshot(win: &WindowSummary) -> Result<ScreenshotMetadata, String> {
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
-        let path = write_mock_screenshot(&win.id)?;
-        return Ok(ScreenshotMetadata {
-            path: path.display().to_string(),
-            width: clamp_pixel_dim(win.bounds.width),
-            height: clamp_pixel_dim(win.bounds.height),
-            scale_factor: 2.0,
-            window_id: Some(win.id.clone()),
-            logical_bounds: win.bounds,
-            measured: false,
-        });
-    }
-    let shots = capture_directory()?;
-    let path = shots.join(format!("window-{}-{}.png", win.id, unique_token()));
-    let mut cmd = Command::new("/usr/sbin/screencapture");
-    cmd.args(["-x", "-o", "-l", &win.id]).arg(&path);
-    let finished = run_managed(cmd)?;
-    if !matches!(finished.end, super::lifecycle::End::Exited(status) if status.success())
-        || !finished.reaped
-    {
-        if finished.reaped {
-            fs::remove_file(&path).ok();
-            retention::prune(&shots, &path).ok();
-        }
-        return Err(format!(
-            "screencapture failed: {:?}; reaped={}",
-            finished.end, finished.reaped
-        ));
-    }
-    let capture = (|| -> Result<ScreenshotMetadata, String> {
-        let mut file = fs::File::open(&path).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-        }
-        // Dimensions need only the PNG signature and IHDR, never the full pixel file.
-        let mut header = [0_u8; 24];
-        file.read_exact(&mut header).map_err(|e| e.to_string())?;
-        let (width, height) = png_dimensions(&header)?;
-        let scale = f64::from(width) / win.bounds.width;
-        if !scale.is_finite()
-            || scale <= 0.0
-            || (f64::from(height) / win.bounds.height - scale).abs() > 0.05
-        {
-            return Err("screenshot transform is not a uniform measured window crop".to_owned());
-        }
-        retention::prune(&shots, &path).map_err(|e| format!("capture retention: {e}"))?;
-        Ok(ScreenshotMetadata {
-            path: path.display().to_string(),
-            width,
-            height,
-            scale_factor: scale,
-            window_id: Some(win.id.clone()),
-            logical_bounds: win.bounds,
-            measured: true,
-        })
-    })();
-    if capture.is_err() {
-        fs::remove_file(&path).ok();
-        retention::prune(&shots, &path).ok();
-    }
-    capture
-}
-
 /// Read-only unless `restore` is set; then restore is a leased, postcondition-checked mutation.
 pub const LIVE_WINDOW_AX_JXA_SCRIPT: &str = concat!(
     include_str!("engine/scripts/common.js"),
+    include_str!("engine/capture/geometry.js"),
     include_str!("engine/scripts/observe.js")
 );
+
+struct LiveObservation {
+    root: ElementNode,
+    process_start: String,
+    coverage_truncated: bool,
+    geometry: Option<GeometryWitness>,
+    geometry_error: Option<String>,
+}
 
 fn query_live_window_ax_tree(
     app: &AppSummary,
     win: Option<&WindowSummary>,
     restore_window: bool,
-) -> Result<(ElementNode, String, bool), String> {
+) -> Result<LiveObservation, String> {
     let win = win.ok_or("application has no observed window")?;
     let payload = serde_json::json!({"pid":app.pid,"bundleId":app.bundle_id,"winId":win.id,
         "winTitle":win.title,"winBounds":win.bounds,"restore":restore_window});
@@ -856,14 +765,20 @@ fn query_live_window_ax_tree(
         .filter(|s| !s.is_empty())
         .ok_or("process start witness unavailable")?
         .to_owned();
-    Ok((
-        node,
-        start,
-        value
+    let (geometry, geometry_error) = match capture::observation_geometry(&value, win) {
+        Ok(geometry) => (Some(geometry), None),
+        Err(error) => (None, Some(error)),
+    };
+    Ok(LiveObservation {
+        root: node,
+        process_start: start,
+        coverage_truncated: value
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
-    ))
+        geometry,
+        geometry_error,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1330,6 +1245,15 @@ pub fn validate_snapshot_identity(
     {
         return Err("process instance changed; observe again".to_owned());
     }
+    // A previously measured topology must be positively re-observed. Compare full
+    // facts as well as the diagnostic revision; the revision is not authority.
+    if let Some(original) = &before.geometry
+        && fresh.geometry.as_ref() != Some(original)
+    {
+        return Err(
+            "display topology or geometry witness changed/unavailable; observe again".to_owned(),
+        );
+    }
     match (&before.window, &fresh.window) {
         (Some(old), Some(new))
             if old.id == new.id && old.bounds == new.bounds && old.title == new.title => {}
@@ -1391,7 +1315,10 @@ impl LiveActionOutcome {
 }
 
 pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
-    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
+    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n")
+        || bytes.get(8..12) != Some(&13_u32.to_be_bytes())
+        || bytes.get(12..16) != Some(b"IHDR")
+    {
         return Err("capture did not produce a PNG with an IHDR".to_owned());
     }
     let width = bytes

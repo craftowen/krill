@@ -17,6 +17,7 @@ fn sample_ax_tree() -> ElementNode {
         title: Some("Calculator".to_owned()),
         description: None,
         value: None,
+        value_settable: None,
         bounds: Some(Rect {
             x: 100.0,
             y: 100.0,
@@ -35,6 +36,7 @@ fn sample_ax_tree() -> ElementNode {
                 title: Some("Query".to_owned()),
                 description: None,
                 value: Some("initial".to_owned()),
+                value_settable: Some(true),
                 bounds: Some(Rect {
                     x: 120.0,
                     y: 130.0,
@@ -54,6 +56,7 @@ fn sample_ax_tree() -> ElementNode {
                 title: Some("Submit".to_owned()),
                 description: None,
                 value: None,
+                value_settable: None,
                 bounds: Some(Rect {
                     x: 330.0,
                     y: 130.0,
@@ -422,6 +425,8 @@ fn snapshot_fixture() -> super::engine::AppStateSnapshot {
         captured_at_ms: 123,
         coverage_truncated: false,
         captured_at: "123".to_owned(),
+        ax_observation_timing: None,
+        geometry: None,
         app: AppSummary {
             name: "Fixture".to_owned(),
             bundle_id: None,
@@ -622,4 +627,70 @@ fn paste_consumption_requires_the_exact_expected_value() {
     assert!(LIVE_ACTION_JXA_SCRIPT.contains("AXSelectedTextRange"));
     assert!(!LIVE_ACTION_JXA_SCRIPT.contains("indexOf(String(req.text))"));
     assert!(!LIVE_ACTION_JXA_SCRIPT.contains("previousText"));
+}
+
+#[test]
+fn input_identity_rechecks_full_display_witness_and_refuses_unavailable_metadata() {
+    let mut before = snapshot_fixture();
+    before.geometry = Some(super::model::GeometryWitness {
+        revision: "fixture-revision".to_owned(),
+        coordinate_space: "desktop_logical_top_left".to_owned(),
+        window_id: before.window.as_ref().unwrap().id.clone(),
+        window_bounds: before.window.as_ref().unwrap().bounds,
+        displays: vec![super::model::DisplayGeometry {
+            id: 1,
+            logical_bounds: super::model::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            },
+            pixel_width: 2880,
+            pixel_height: 1800,
+            backing_scale_factor: 2.0,
+            rotation_degrees: 0.0,
+        }],
+    });
+    assert!(super::engine::validate_snapshot_identity(&before, &before).is_ok());
+    let mut fresh = before.clone();
+    fresh.geometry = None;
+    assert!(super::engine::validate_snapshot_identity(&before, &fresh).is_err());
+    fresh = before.clone();
+    // An unchanged revision string cannot authorize changed underlying facts.
+    fresh.geometry.as_mut().unwrap().displays[0].backing_scale_factor = 1.0;
+    assert!(super::engine::validate_snapshot_identity(&before, &fresh).is_err());
+    fresh = before.clone();
+    fresh.window.as_mut().unwrap().bounds.x += 1.0;
+    assert!(super::engine::validate_snapshot_identity(&before, &fresh).is_err());
+}
+
+#[test]
+fn ax_value_settable_capability_survives_compact_rows_and_old_json_stays_unknown() {
+    for capability in [None, Some(false), Some(true)] {
+        let mut tree = sample_ax_tree();
+        tree.children[0].value_settable = capability;
+        let (flat, _, _, _) = index_and_render_tree(&mut tree);
+        assert_eq!(flat[0].value_settable, capability);
+        let mut snapshot = snapshot_fixture();
+        snapshot.root = Some(tree);
+        snapshot.elements = flat;
+        let compact = super::snapshot_json(&snapshot, &super::CommonWindowOpts::default()).unwrap();
+        assert_eq!(
+            compact["elements"][0]["valueSettable"],
+            serde_json::to_value(capability).unwrap()
+        );
+    }
+    let mut old = serde_json::to_value(sample_ax_tree()).unwrap();
+    old.as_object_mut().unwrap().remove("valueSettable");
+    old["children"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("valueSettable");
+    let old: ElementNode = serde_json::from_value(old).unwrap();
+    assert_eq!(old.value_settable, None);
+    assert_eq!(old.children[0].value_settable, None);
+    let mut old_row = serde_json::to_value(snapshot_fixture().elements[0].clone()).unwrap();
+    old_row.as_object_mut().unwrap().remove("valueSettable");
+    let old_row: super::model::FlatElement = serde_json::from_value(old_row).unwrap();
+    assert_eq!(old_row.value_settable, None);
 }

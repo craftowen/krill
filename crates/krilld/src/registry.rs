@@ -151,6 +151,7 @@ pub struct Registry {
     account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
     account_recovered: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
+    account_switch_opt_out: Mutex<std::collections::BTreeSet<SessionId>>,
     /// main에 프로세스 종료를 알린다(업그레이드 답을 보낸 뒤).
     exit: OnceLock<Sender<()>>,
     /// 디스크 사용량을 잴 상태 디렉터리(MK-071).
@@ -184,6 +185,9 @@ impl Registry {
         {
             tracing::warn!(kind = ?error.kind(), "Codex account home migration failed");
         }
+        if let Some(d) = dir {
+            crate::agent::refresh_zsh_sync_env(d);
+        }
         let at = |name: &str| dir.map_or_else(PathBuf::new, |d| d.join(name));
         // 기록 저장소를 열지 못해도 세션은 띄운다. 조용히 넘기지 않고 경고를 남겨 `krill doctor`가 보인다.
         let store = dir.and_then(|d| match Store::open(d, Limits::default()) {
@@ -215,6 +219,7 @@ impl Registry {
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
             account_replacements: Mutex::default(),
+            account_switch_opt_out: Mutex::default(),
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
@@ -1263,17 +1268,25 @@ impl Registry {
             Program::Login => crate::agent::login_in(state.as_deref()),
             Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
             Program::Agent { id } => {
+                let (base_id, overrides) = krill_proto::agent::decode_agent_program_id(&id)
+                    .map_err(|_| Failure::BadRequest)?;
                 let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
-                let (canonical, profile) = agents.resolve(&id).ok_or(Failure::UnknownAgent)?;
+                let (canonical, base_profile) =
+                    agents.resolve(base_id).ok_or(Failure::UnknownAgent)?;
+                let mut profile = base_profile.clone();
+                if !overrides.is_empty() {
+                    krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)
+                        .map_err(|_| Failure::BadRequest)?;
+                }
                 let (launch, session_id, account) = crate::agent::launch_selected_in(
-                    profile,
+                    &profile,
                     agents.permission,
                     session,
                     state.as_deref(),
                     c.account.as_deref(),
                 )
                 .map_err(|e| os(&e))?;
-                crate::agent::pre_trust_workspace(profile, &c.cwd, account.as_ref());
+                crate::agent::pre_trust_workspace(&profile, &c.cwd, account.as_ref());
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
                     permission: agents.permission,
@@ -2036,6 +2049,7 @@ impl Registry {
         drop(st);
         self.status.remove(id);
         self.clear_sleeping(id);
+        self.forget_failed_account_handoff(id);
     }
 
     #[cfg(all(test, unix))]
@@ -2594,6 +2608,76 @@ impl Registry {
         cvar.notify_all();
     }
 
+    fn check_messages_wait(
+        &self,
+        dir: &Path,
+        scope: (Option<&str>, Option<&str>),
+        types: &[krill_proto::orchestration::MessageType],
+        unread_only: bool,
+        ack: bool,
+        wait_ms: u64,
+    ) -> io::Result<krill_proto::orchestration::OrchResponse> {
+        use krill_proto::orchestration::{MAX_CHECK_WAIT_MS, OrchResponse, OrchestrationStore};
+        let (recipient, run_id) = scope;
+        let deadline = Instant::now() + Duration::from_millis(wait_ms.min(MAX_CHECK_WAIT_MS));
+        let mut waited = false;
+        loop {
+            let seen_gen = *lock(&self.orch_signal.0);
+            let preview = self.orchestration_snapshot()?.check_messages_filtered(
+                recipient,
+                run_id,
+                types,
+                unread_only,
+                false,
+            );
+            if !preview.is_empty() {
+                if waited {
+                    let coalesce = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50));
+                    if !coalesce.is_zero() {
+                        std::thread::sleep(coalesce);
+                    }
+                }
+                if ack {
+                    let claimed = OrchestrationStore::mutate(dir, |s| {
+                        Ok(s.check_messages_filtered(recipient, run_id, types, unread_only, true))
+                    })?;
+                    if !claimed.is_empty() {
+                        self.notify_orch();
+                        return Ok(OrchResponse::Messages(claimed));
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(OrchResponse::Messages(Vec::new()));
+                    }
+                    continue;
+                }
+                let msgs = if waited {
+                    self.orchestration_snapshot()?.check_messages_filtered(
+                        recipient,
+                        run_id,
+                        types,
+                        unread_only,
+                        false,
+                    )
+                } else {
+                    preview
+                };
+                return Ok(OrchResponse::Messages(msgs));
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return Ok(OrchResponse::Messages(Vec::new()));
+            }
+            let (lock_gen, cvar) = &self.orch_signal;
+            let g = lock(lock_gen);
+            if *g == seen_gen {
+                drop(cvar.wait_timeout(g, rem.min(Duration::from_millis(250))));
+            }
+            waited = true;
+        }
+    }
+
     fn orchestration(
         &self,
         peer: &Peer,
@@ -2681,38 +2765,48 @@ impl Registry {
                 unread_only,
                 ack,
                 wait_ms,
-            } => {
-                let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
-                loop {
-                    let seen_gen = *lock(&self.orch_signal.0);
-                    let checked = if ack {
-                        OrchestrationStore::mutate(&dir, |s| {
-                            Ok(s.check_messages(recipient.as_deref(), &types, unread_only, true))
-                        })
-                    } else {
-                        self.orchestration_snapshot().map(|mut s| {
-                            s.check_messages(recipient.as_deref(), &types, unread_only, false)
-                        })
-                    };
-                    match checked {
-                        Ok(msgs) if !msgs.is_empty() || Instant::now() >= deadline => {
-                            break Ok(OrchResponse::Messages(msgs));
-                        }
-                        Ok(_) => {
-                            let rem = deadline.saturating_duration_since(Instant::now());
-                            if rem.is_zero() {
-                                break Ok(OrchResponse::Messages(Vec::new()));
-                            }
-                            let (lock_gen, cvar) = &self.orch_signal;
-                            let g = lock(lock_gen);
-                            if *g == seen_gen {
-                                drop(cvar.wait_timeout(g, rem.min(Duration::from_millis(250))));
-                            }
-                        }
-                        Err(e) => break Err(e),
-                    }
-                }
-            }
+            } => self.check_messages_wait(
+                &dir,
+                (recipient.as_deref(), None),
+                &types,
+                unread_only,
+                ack,
+                wait_ms,
+            ),
+            OrchAction::CheckMessagesFiltered {
+                recipient,
+                run_id,
+                types,
+                unread_only,
+                ack,
+                wait_ms,
+            } => self.check_messages_wait(
+                &dir,
+                (recipient.as_deref(), run_id.as_deref()),
+                &types,
+                unread_only,
+                ack,
+                wait_ms,
+            ),
+            OrchAction::AckMessageIds {
+                recipient,
+                run_id,
+                types,
+                unread_only,
+                ack_ids,
+            } => OrchestrationStore::mutate(&dir, |s| {
+                s.ack_message_ids(
+                    recipient.as_deref(),
+                    run_id.as_deref(),
+                    &types,
+                    unread_only,
+                    &ack_ids,
+                )
+            })
+            .map(|msgs| {
+                self.notify_orch();
+                OrchResponse::Messages(msgs)
+            }),
             OrchAction::WaitAnswer {
                 question_id,
                 wait_ms,
@@ -2863,6 +2957,10 @@ fn read_only(req: &Request) -> bool {
             | Request::Orchestration(
                 krill_proto::orchestration::OrchAction::Snapshot
                     | krill_proto::orchestration::OrchAction::CheckMessages { ack: false, .. }
+                    | krill_proto::orchestration::OrchAction::CheckMessagesFiltered {
+                        ack: false,
+                        ..
+                    }
             )
     )
 }

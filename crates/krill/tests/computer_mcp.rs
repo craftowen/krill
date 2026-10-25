@@ -78,6 +78,20 @@ for line in sys.stdin:
               'observation':{'state':'not_requested'},'verification':{'state':'not_requested'},'cleanup':{'state':'completed'},
               'error':{'code':'batch_stopped','message':'known first step issued, second refused'},'data':{'issuedSteps':1}})
         continue
+    if value['op'].get('kind')=='observe':
+        pid=value['op']['pid']; snapshot='E/C/'+str(seq)
+        elements=[{'key':'e0','role':'AXWindow','title':'Fixture'}]
+        if seq%2: elements.append({'key':'e1','role':'AXTextField','value':'old'})
+        else: elements.append({'key':'e2','role':'AXTextField','value':'new','focused':True})
+        if value['op'].get('limit') in (64,65):
+            generation=1 if seq==1 else 2
+            elements=[{'key':'e'+str(i),'role':'AXTextField','value':('generation-'+str(generation)+':'+str(i))*32} for i in range(64)]
+            if value['op']['limit']==65: elements[0]['value']='next value'
+        send({'type':'result','seq':seq,'state':'completed','delivery':{'state':'read_only'},
+              'observation':{'state':'observed','snapshot':snapshot,'coverage':{'nodes':len(elements),'truncated':pid==43,'reasons':['nodes'] if pid==43 else []}},
+              'verification':{'state':'not_requested'},'cleanup':{'state':'not_needed'},
+              'data':{'snapshot':snapshot,'app':{'pid':pid,'startWitness':'1.000000'},'window':{'index':0},'elements':elements}})
+        continue
     delivery={'state':'unknown','reason':'reply_lost'} if text=='unknown' else {'state':'read_only'}
     send({'type':'result','seq':seq,'state':'unknown' if text=='unknown' else 'completed','delivery':delivery,
           'observation':{'state':'not_requested'},'verification':{'state':'not_requested'},'cleanup':{'state':'not_needed'},
@@ -380,5 +394,128 @@ fn mcp_known_partial_batch_is_an_error_but_does_not_poison_the_session() {
             .filter(|event| event["kind"] == "request")
             .count(),
         2
+    );
+}
+
+#[test]
+fn mcp_delta_is_one_fresh_observe_with_stable_replay_and_explicit_fallbacks() {
+    let mut peer = Peer::start();
+    peer.initialize();
+    let execute = |seq, format: &str, base: Option<&str>, pid| {
+        let mut arguments = json!({"seq":seq,"deadlineMs":5000,"format":format,
+            "op":{"kind":"observe","pid":pid,"window":0}});
+        if let Some(base) = base {
+            arguments["baseSnapshot"] = json!(base);
+        }
+        json!({"name":"computer_execute","arguments":arguments})
+    };
+    let full = peer.rpc(2, "tools/call", &execute(1, "full", None, 42));
+    assert!(full["result"]["structuredContent"]["data"]["elements"].is_array());
+    let payload = execute(2, "delta", Some("E/C/1"), 42);
+    let delta = peer.rpc(3, "tools/call", &payload);
+    let data = &delta["result"]["structuredContent"]["data"];
+    assert_eq!(data["format"], "delta", "{delta}");
+    assert_eq!(data["snapshot"], "E/C/2");
+    assert_eq!(data["baseSnapshot"], "E/C/1");
+    assert_eq!(data["order"], json!(["e0", "e2"]));
+    assert_eq!(data["removed"], json!(["e1"]));
+    assert_eq!(
+        data["upsert"],
+        json!([{"key":"e2","role":"AXTextField","value":"new","focused":true}])
+    );
+    assert_eq!(
+        peer.rpc(4, "tools/call", &payload)["result"],
+        delta["result"]
+    );
+    let changed_base = peer.rpc(5, "tools/call", &execute(2, "delta", Some("E/C/2"), 42));
+    assert_eq!(changed_base["error"]["code"], -32602);
+    let changed_format = peer.rpc(6, "tools/call", &execute(2, "full", None, 42));
+    assert_eq!(changed_format["error"]["code"], -32602);
+    let invalid = peer.rpc(
+        7,
+        "tools/call",
+        &execute(3, "delta", Some("foreign/C/1"), 42),
+    );
+    assert_eq!(invalid["error"]["code"], -32602);
+    for (id, args) in [
+        (8, execute(3, "delta", None, 42)),
+        (9, execute(3, "full", Some("E/C/1"), 42)),
+    ] {
+        assert_eq!(peer.rpc(id, "tools/call", &args)["error"]["code"], -32602);
+    }
+    for seq in 3..=6 {
+        peer.rpc(seq + 10, "tools/call", &execute(seq, "full", None, 42));
+    }
+    // The base has rolled out, but the completed seq keeps its original delta bytes.
+    assert_eq!(
+        peer.rpc(20, "tools/call", &payload)["result"],
+        delta["result"]
+    );
+    let missing = peer.rpc(21, "tools/call", &execute(7, "delta", Some("E/C/1"), 42));
+    assert_eq!(
+        missing["result"]["structuredContent"]["data"]["deltaFallback"]["reason"],
+        "base_missing_or_evicted"
+    );
+    let partial = peer.rpc(22, "tools/call", &execute(8, "full", None, 43));
+    assert_eq!(
+        partial["result"]["structuredContent"]["observation"]["coverage"]["truncated"],
+        true
+    );
+    let partial_base = peer.rpc(23, "tools/call", &execute(9, "delta", Some("E/C/8"), 43));
+    let fallback = &partial_base["result"]["structuredContent"]["data"];
+    assert_eq!(fallback["format"], "compact");
+    assert_eq!(fallback["deltaFallback"]["reason"], "base_partial");
+    assert!(fallback.get("removed").is_none());
+    let log = peer.log();
+    assert_eq!(log.iter().filter(|e| e["kind"] == "launch").count(), 1);
+    let requests: Vec<_> = log.iter().filter(|e| e["kind"] == "request").collect();
+    assert_eq!(requests.len(), 9);
+    assert!(requests.iter().all(|e| e["op"]["kind"] == "observe"));
+    assert!(
+        requests
+            .iter()
+            .all(|e| e["op"].get("baseSnapshot").is_none())
+    );
+}
+
+#[test]
+fn mcp_adaptive_full_is_a_replayable_base_without_an_extra_observe() {
+    let mut peer = Peer::start();
+    peer.initialize();
+    let execute = |seq, format: &str, base: Option<&str>, limit| {
+        let mut arguments = json!({"seq":seq,"deadlineMs":5000,"format":format,
+            "op":{"kind":"observe","pid":42,"window":0,"limit":limit}});
+        if let Some(base) = base {
+            arguments["baseSnapshot"] = json!(base);
+        }
+        json!({"name":"computer_execute","arguments":arguments})
+    };
+    peer.rpc(2, "tools/call", &execute(1, "full", None, 64));
+    let request = execute(2, "delta", Some("E/C/1"), 64);
+    let full = peer.rpc(3, "tools/call", &request);
+    let data = &full["result"]["structuredContent"]["data"];
+    assert_eq!(data["format"], "full");
+    assert_eq!(data["snapshot"], "E/C/2");
+    assert_eq!(
+        data["deltaFallback"]["reason"],
+        "delta_not_smaller_than_full"
+    );
+    assert_eq!(data["elements"].as_array().unwrap().len(), 64);
+    assert!(data.get("upsert").is_none());
+    assert_eq!(
+        peer.rpc(4, "tools/call", &request)["result"],
+        full["result"]
+    );
+    let next = peer.rpc(5, "tools/call", &execute(3, "delta", Some("E/C/2"), 65));
+    let delta = &next["result"]["structuredContent"]["data"];
+    assert_eq!(delta["format"], "delta");
+    assert_eq!(
+        delta["upsert"],
+        json!([{"key":"e0","role":"AXTextField","value":"next value"}])
+    );
+    assert_eq!(delta["order"].as_array().unwrap().len(), 64);
+    assert_eq!(
+        peer.log().iter().filter(|e| e["kind"] == "request").count(),
+        3
     );
 }

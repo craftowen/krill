@@ -233,38 +233,43 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         .first()
         .and_then(|a| Path::new(std::ffi::OsStr::from_bytes(a)).file_name())
         .is_some_and(|n| n == "zsh");
-    if is_zsh {
-        let zdotdir = state.join("shell").join("zsh");
-        let zshenv = zdotdir.join(".zshenv");
-        let ok = {
-            use krill_proto::os::fs::DirBuilderExt as _;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&zdotdir)
-                .and_then(|()| {
-                    accounts::write_atomic_0600(&zshenv, ZSH_ACCOUNT_SYNC_ENV.as_bytes())
-                })
-                .is_ok()
-        };
-        if ok {
-            let orig = login
-                .env
-                .iter()
-                .find(|(k, _)| k.as_slice() == b"ZDOTDIR")
-                .map_or_else(Vec::new, |(_, v)| v.clone());
-            login.env.retain(|(k, _)| {
-                k.as_slice() != b"ZDOTDIR" && k.as_slice() != b"KRILL_ORIG_ZDOTDIR"
-            });
-            login.env.push((b"KRILL_ORIG_ZDOTDIR".to_vec(), orig));
-            login.env.push((
-                b"ZDOTDIR".to_vec(),
-                zdotdir.into_os_string().as_encoded_bytes().to_vec(),
-            ));
-        }
+    if is_zsh && let Some(zdotdir) = write_zsh_sync_env(state) {
+        let orig = login
+            .env
+            .iter()
+            .find(|(k, _)| k.as_slice() == b"ZDOTDIR")
+            .map_or_else(Vec::new, |(_, v)| v.clone());
+        login
+            .env
+            .retain(|(k, _)| k.as_slice() != b"ZDOTDIR" && k.as_slice() != b"KRILL_ORIG_ZDOTDIR");
+        login.env.push((b"KRILL_ORIG_ZDOTDIR".to_vec(), orig));
+        login.env.push((
+            b"ZDOTDIR".to_vec(),
+            zdotdir.into_os_string().as_encoded_bytes().to_vec(),
+        ));
     }
     skills::prepare(None, &login, None);
     login
+}
+
+fn write_zsh_sync_env(state: &Path) -> Option<PathBuf> {
+    use krill_proto::os::fs::DirBuilderExt as _;
+    let zdotdir = state.join("shell").join("zsh");
+    let zshenv = zdotdir.join(".zshenv");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&zdotdir)
+        .and_then(|()| accounts::write_atomic_0600(&zshenv, ZSH_ACCOUNT_SYNC_ENV.as_bytes()))
+        .ok()
+        .map(|()| zdotdir)
+}
+
+/// 기동 시 기존 zsh 동기화 스크립트가 있으면 최신 버전으로 갱신한다.
+pub(crate) fn refresh_zsh_sync_env(state: &Path) {
+    if state.join("shell").join("zsh").join(".zshenv").exists() {
+        write_zsh_sync_env(state);
+    }
 }
 
 /// OWE-712: 새 세션 하나에만 선택 계정을 적용한다. 전역 활성 계정은 바꾸지 않는다.

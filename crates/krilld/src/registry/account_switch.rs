@@ -39,25 +39,134 @@ pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
         .collect()
 }
 
+fn is_prunable_failed_handoff(handoff: &SessionHandoff) -> bool {
+    handoff.to.is_none()
+        && handoff
+            .error
+            .as_deref()
+            .is_some_and(|e| !e.contains("retained"))
+}
+
+fn foreground_vault_agent(
+    root_pid: u32,
+    fg_pid: Option<u32>,
+) -> Option<(u32, krill_proto::agent_history::VaultAgent)> {
+    let mut cur = fg_pid.filter(|&pid| pid > 0 && pid != root_pid)?;
+    for _ in 0..16 {
+        if let Ok(name) = crate::sys::process_name(cur)
+            && let Some(parsed) = krill_proto::agent_history::VaultAgent::parse(name.trim())
+        {
+            return Some((cur, parsed));
+        }
+        let Ok(parent) = crate::sys::parent_pid(cur) else {
+            break;
+        };
+        if parent <= 1 || parent == cur || parent == root_pid {
+            break;
+        }
+        cur = parent;
+    }
+    None
+}
+
 impl Registry {
-    fn live_agent_for_switch(
+    fn provider_for_profile(&self, profile_id: &str) -> Option<ProviderKind> {
+        let agents = self.agents.agents().ok()?;
+        let (_, profile) = agents.resolve(profile_id)?;
+        profile
+            .program()
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .and_then(ProviderKind::parse)
+    }
+
+    fn discover_live_identity(
+        &self,
+        provider: ProviderKind,
+        home: &Path,
+        stored: Option<&crate::agent::control::StoredLaunch>,
+        root_pid: u32,
+        fg_pid: Option<u32>,
+    ) -> std::io::Result<Option<identity::Identity>> {
+        let mut observed = identity::discover(provider, root_pid, fg_pid)?;
+        if observed.is_none() && provider == ProviderKind::Claude {
+            let state_dir = self.state_dir();
+            let file = accounts::load_file(home, state_dir.as_deref());
+            let mut claude_homes: Vec<_> = file
+                .accounts
+                .iter()
+                .filter(|a| ProviderKind::parse(&a.provider) == Some(ProviderKind::Claude))
+                .map(|a| a.config_dir().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+            claude_homes.push(accounts::host_default_dir(home, ProviderKind::Claude));
+            if let Some(account) = stored
+                .and_then(|s| s.account.as_ref())
+                .filter(|a| !a.dir.is_empty())
+            {
+                claude_homes.push(std::path::PathBuf::from(&account.dir));
+            }
+            claude_homes.sort();
+            claude_homes.dedup();
+            observed = identity::discover_claude(&claude_homes, root_pid, fg_pid)?;
+        }
+        Ok(observed)
+    }
+
+    fn live_agent_for_switch_in(
         &self,
         session: SessionId,
+        home: &Path,
     ) -> Option<crate::agent::control::StoredLaunch> {
-        if let Some(stored) = self.agents.stored(session).ok().flatten() {
+        if let Some(mut stored) = self.agents.stored(session).ok().flatten() {
+            let mut use_stored = true;
             if stored.account.is_none() && stored.hibernation_blocked {
-                let idle_shell = {
+                let proc_state = {
                     let state = lock(&self.state);
                     state
                         .sessions
                         .get(&session)
-                        .is_some_and(|e| e.session.tap().foreground() == Some(e.pid))
+                        .map(|e| (e.pid, e.session.tap().foreground()))
                 };
-                if idle_shell {
-                    return None;
+                if let Some((root_pid, Some(fg))) = proc_state {
+                    let root_is_agent = crate::sys::process_name(root_pid)
+                        .ok()
+                        .and_then(|n| krill_proto::agent_history::VaultAgent::parse(n.trim()))
+                        .is_some();
+                    if !root_is_agent {
+                        if fg == root_pid {
+                            return None;
+                        }
+                        match foreground_vault_agent(root_pid, Some(fg)) {
+                            Some((_, live_agent)) if live_agent.profile() != stored.profile => {
+                                use_stored = false;
+                            }
+                            Some(_) => {
+                                if let Some(provider) = self.provider_for_profile(&stored.profile)
+                                    && let Ok(Some(found)) = self.discover_live_identity(
+                                        provider,
+                                        home,
+                                        Some(&stored),
+                                        root_pid,
+                                        Some(fg),
+                                    )
+                                    && stored.session_id.as_deref() != Some(found.id.as_str())
+                                {
+                                    stored.session_id = Some(found.id);
+                                    stored.transcript_path = found.path.to_str().map(str::to_owned);
+                                }
+                            }
+                            None if crate::sys::process_name(fg).is_ok() => {
+                                return None;
+                            }
+                            None => {}
+                        }
+                    }
                 }
             }
-            return Some(stored);
+            if use_stored {
+                return Some(stored);
+            }
         }
         let (root_pid, fg_pid, entry_cwd) = {
             let state = lock(&self.state);
@@ -68,40 +177,38 @@ impl Registry {
                 entry.cwd.as_os_str().as_bytes().to_vec(),
             )
         };
-        let mut agent_pid = None;
-        let mut agent = None;
-        if let Some(mut cur) = fg_pid.filter(|&pid| pid > 0 && pid != root_pid) {
-            for _ in 0..16 {
-                if let Ok(name) = crate::sys::process_name(cur)
-                    && let Some(parsed) = krill_proto::agent_history::VaultAgent::parse(name.trim())
-                {
-                    agent_pid = Some(cur);
-                    agent = Some(parsed);
-                    break;
-                }
-                let Ok(parent) = crate::sys::parent_pid(cur) else {
-                    break;
-                };
-                if parent <= 1 || parent == cur || parent == root_pid {
-                    break;
-                }
-                cur = parent;
-            }
+        let root_agent = crate::sys::process_name(root_pid)
+            .ok()
+            .and_then(|n| krill_proto::agent_history::VaultAgent::parse(n.trim()))
+            .map(|a| (root_pid, a));
+        if fg_pid == Some(root_pid) && root_agent.is_none() {
+            return None;
         }
-        let agent = agent.or_else(|| {
+        let fg_agent = foreground_vault_agent(root_pid, fg_pid).or(root_agent);
+        if let Some(fg) = fg_pid
+            && fg_agent.is_none()
+            && crate::sys::process_name(fg).is_ok()
+        {
+            return None;
+        }
+        let agent = fg_agent.map(|(_, a)| a).or_else(|| {
             let status_agent = self.status.get(session).agent;
             krill_proto::agent_history::VaultAgent::parse(&status_agent)
         })?;
-        let cwd = agent_pid
-            .and_then(|pid| crate::sys::current_directory(pid).ok())
+        let provider = self.provider_for_profile(agent.profile())?;
+        let found = self
+            .discover_live_identity(provider, home, None, root_pid, fg_pid)
+            .ok()??;
+        let cwd = fg_agent
+            .and_then(|(pid, _)| crate::sys::current_directory(pid).ok())
             .map(|p| p.into_os_string().as_encoded_bytes().to_vec())
             .filter(|c| !c.is_empty())
             .unwrap_or(entry_cwd);
         Some(crate::agent::control::StoredLaunch {
             profile: agent.profile().to_owned(),
             permission: krill_proto::agent::Permission::Manual,
-            session_id: None,
-            transcript_path: None,
+            session_id: Some(found.id),
+            transcript_path: found.path.to_str().map(str::to_owned),
             cwd,
             hibernation_blocked: true,
             account: None,
@@ -110,7 +217,7 @@ impl Registry {
 
     pub(super) fn queue_account_switch(&self, provider: ProviderKind, account_id: &str) {
         let mut pending = lock(&self.account_work.pending);
-        self.prepare_account_switch(provider, account_id);
+        self.prepare_account_switch_in(provider, account_id, &accounts::default_home(), false);
         pending.insert(
             provider,
             crate::usage::accounts::switch_work::SwitchTarget {
@@ -122,27 +229,34 @@ impl Registry {
         self.account_work.wake.notify_one();
     }
 
-    fn prepare_account_switch(&self, provider: ProviderKind, account_id: &str) {
+    fn prepare_account_switch_in(
+        &self,
+        provider: ProviderKind,
+        account_id: &str,
+        home: &Path,
+        automatic: bool,
+    ) {
         let sessions: Vec<_> = {
             let state = lock(&self.state);
             state
                 .sessions
-                .keys()
-                .filter(|id| !state.exited.contains_key(id) && !state.closing.contains(id))
-                .copied()
+                .iter()
+                .filter(|(id, _)| !state.exited.contains_key(id) && !state.closing.contains(id))
+                .map(|(id, entry)| (*id, entry.pid, entry.session.tap().foreground()))
                 .collect()
         };
+        let Ok(agents) = self.agents.agents() else {
+            return;
+        };
+        let state_dir = self.state_dir();
         let mut found = false;
         let mut cancelled = false;
-        for from in sessions {
+        for (from, root_pid, fg_pid) in sessions {
             // A later click must not enqueue a replacement that is still being prepared.
             if lock(&self.account_replacements).contains(&from) {
                 continue;
             }
-            let Some(stored) = self.live_agent_for_switch(from) else {
-                continue;
-            };
-            let Ok(agents) = self.agents.agents() else {
+            let Some(stored) = self.live_agent_for_switch_in(from, home) else {
                 continue;
             };
             let Some((_, profile)) = agents.resolve(&stored.profile) else {
@@ -157,12 +271,8 @@ impl Registry {
             {
                 continue;
             }
-            let current = crate::agent::account_for_stored_in(
-                &accounts::default_home(),
-                profile,
-                self.state_dir().as_deref(),
-                &stored,
-            );
+            let current =
+                crate::agent::account_for_stored_in(home, profile, state_dir.as_deref(), &stored);
             if current.as_ref().is_some_and(|a| a.id == account_id) {
                 let mut handoffs = lock(&self.account_handoffs);
                 if handoffs.get(&from).is_some_and(|h| h.to.is_none()) {
@@ -170,6 +280,33 @@ impl Registry {
                     cancelled = true;
                 }
                 continue;
+            }
+            if stored.session_id.is_some() || stored.transcript_path.is_some() {
+                lock(&self.account_switch_opt_out).remove(&from);
+            } else {
+                let opted_out = lock(&self.account_switch_opt_out).contains(&from);
+                if opted_out || automatic {
+                    let has_live_identity = self
+                        .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if has_live_identity {
+                        lock(&self.account_switch_opt_out).remove(&from);
+                    } else if opted_out {
+                        continue;
+                    } else {
+                        let recently_launched =
+                            self.agents.launched_at(from).is_some_and(|launched| {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .is_ok_and(|d| d.as_secs().saturating_sub(launched) < 5)
+                            });
+                        if !recently_launched {
+                            continue;
+                        }
+                    }
+                }
             }
             lock(&self.account_handoffs).insert(
                 from,
@@ -183,6 +320,25 @@ impl Registry {
             found = true;
         }
         if found || cancelled {
+            self.save_account_handoffs().ok();
+        }
+    }
+
+    pub(super) fn forget_failed_account_handoff(&self, session: SessionId) {
+        lock(&self.account_switch_opt_out).remove(&session);
+        let removed = {
+            let mut handoffs = lock(&self.account_handoffs);
+            if handoffs
+                .get(&session)
+                .is_some_and(is_prunable_failed_handoff)
+            {
+                handoffs.remove(&session);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
             self.save_account_handoffs().ok();
         }
     }
@@ -211,6 +367,16 @@ impl Registry {
             handoffs.insert(session, handoff);
             return Err(super::os(&error));
         }
+        drop(handoffs);
+        if self
+            .agents
+            .stored(session)
+            .ok()
+            .flatten()
+            .is_none_or(|s| s.session_id.is_none() && s.transcript_path.is_none())
+        {
+            lock(&self.account_switch_opt_out).insert(session);
+        }
         Ok(())
     }
 
@@ -218,8 +384,15 @@ impl Registry {
         let handoffs = lock(&self.account_handoffs);
         let replacements = lock(&self.account_replacements);
         let state = lock(&self.state);
+        let has_holder = self.holder.is_some();
         snapshot.details.handoffs = handoffs
             .values()
+            .filter(|handoff| {
+                !has_holder
+                    || !is_prunable_failed_handoff(handoff)
+                    || (state.sessions.contains_key(&handoff.from)
+                        && !state.exited.contains_key(&handoff.from))
+            })
             .cloned()
             .map(|mut handoff| {
                 // The durable recovery alias precedes retirement. Keep clients on the original
@@ -327,7 +500,7 @@ impl Registry {
             for provider in ready {
                 if let Some(target) = pending.remove(&provider) {
                     if !target.prepared {
-                        self.prepare_account_switch(provider, &target.account_id);
+                        self.prepare_account_switch_in(provider, &target.account_id, home, true);
                     }
                     work.insert(provider, target);
                 }
@@ -447,7 +620,9 @@ impl Registry {
                 (live(&handoff.from), handoff.to.is_some_and(|id| live(&id)))
             };
             if !old_live {
-                if handoff.to.is_none() && handoff.error.is_none() {
+                if is_prunable_failed_handoff(&handoff) {
+                    lock(&self.account_handoffs).remove(&handoff.from);
+                } else if handoff.to.is_none() && handoff.error.is_none() {
                     handoff.error =
                         Some("Original session has ended; automatic resume cancelled".into());
                     lock(&self.account_handoffs).insert(handoff.from, handoff);
@@ -455,6 +630,11 @@ impl Registry {
                 continue;
             }
             if handoff.error.is_some() {
+                if is_prunable_failed_handoff(&handoff)
+                    && self.live_agent_for_switch_in(handoff.from, home).is_none()
+                {
+                    lock(&self.account_handoffs).remove(&handoff.from);
+                }
                 continue;
             }
             if let Some(new) = handoff.to {
@@ -595,7 +775,7 @@ impl Registry {
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let mut stored = self
-            .live_agent_for_switch(old)
+            .live_agent_for_switch_in(old, home)
             .ok_or(Failure::UnknownAgent)?;
         let state_dir = self.state_dir();
         let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);

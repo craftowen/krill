@@ -1052,6 +1052,412 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
     }
 }
 
+#[test]
+fn unmanaged_shell_skips_unidentifiable_daemon_agent_and_switches_open_transcript_agent() {
+    use krill_proto::hook::{EventId, HookEvent, Input};
+
+    let root = Path::new("/tmp").join(format!("kas-unmanaged-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("from");
+    let to = root.join("to");
+    fs::create_dir_all(state.join("shell/zsh")).unwrap();
+    fs::write(state.join("shell/zsh/.zshenv"), "# stale zshenv\n").unwrap();
+    fs::create_dir_all(from.join("sessions/2026/10/25")).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    fs::write(from.join("auth.json"), "from fixture credentials").unwrap();
+    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+
+    let snap_from = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Origin",
+        None,
+        from.to_str().unwrap(),
+    )
+    .unwrap();
+    let origin_id = snap_from
+        .accounts
+        .iter()
+        .find(|a| a.label == "Origin")
+        .unwrap()
+        .id
+        .clone();
+    let snap_to = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target_id = snap_to
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+
+    let sid = "cccccccc-dddd-eeee-ffff-111111111111";
+    let transcript = from.join(format!("sessions/2026/10/25/rollout-date-{sid}.jsonl"));
+    fs::write(
+        &transcript,
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+    )
+    .unwrap();
+
+    let unidentifiable_proc = IdleChild::new();
+    let open_transcript_proc = FileHolder::new(&transcript);
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master_454, _proc_454) = UnixStream::pair().unwrap();
+    let (master_455, _proc_455) = UnixStream::pair().unwrap();
+    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![
+                Kept {
+                    id: SessionId(454),
+                    pid: unidentifiable_proc.0.id(),
+                    status: None,
+                    master: OwnedFd::from(master_454),
+                },
+                Kept {
+                    id: SessionId(455),
+                    pid: open_transcript_proc.0.id(),
+                    status: None,
+                    master: OwnedFd::from(master_455),
+                },
+            ],
+        )),
+        Some(&state),
+    ));
+    let refreshed_zshenv = fs::read_to_string(state.join("shell/zsh/.zshenv")).unwrap();
+    assert!(
+        refreshed_zshenv.contains("--no-daemon"),
+        "Registry::new should refresh existing zsh sync script on startup"
+    );
+
+    // Neither session has a StoredLaunch (`agent-launches/*.json`), simulating login-shell runs.
+    for (session, pid) in [
+        (SessionId(454), unidentifiable_proc.0.id()),
+        (SessionId(455), open_transcript_proc.0.id()),
+    ] {
+        let ev = HookEvent {
+            id: EventId { pid, unix_ns: 1 },
+            ppid: pid,
+            agent: "codex".into(),
+            input: Input::Complete,
+            payload: b"{\"hook_event_name\":\"Stop\"}".to_vec(),
+        };
+        reg.status.hook(&[(session, &ev)]).unwrap();
+    }
+    assert!(reg.agents.stored(SessionId(454)).unwrap().is_none());
+    assert!(reg.agents.stored(SessionId(455)).unwrap().is_none());
+
+    // Selecting the account Session 455 is already using skips both 454 and 455.
+    reg.queue_account_switch(ProviderKind::Codex, &origin_id);
+    assert!(lock(&reg.account_handoffs).is_empty());
+
+    let reader = Arc::clone(&reg);
+    let reader_worker =
+        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+    let hook_reg = Arc::clone(&reg);
+    let expected_transcript = to
+        .join("sessions/2026/10/25")
+        .join(transcript.file_name().unwrap());
+    let mock = std::thread::spawn(move || {
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
+        else {
+            panic!("expected replacement spawn for Session 455");
+        };
+        assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
+        let replacement_proc = FileHolder::new(&expected_transcript);
+        let (master, mut process) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req,
+                    id,
+                    pid: replacement_proc.0.id(),
+                }
+                .encode()
+                .unwrap(),
+                &[master.as_fd()],
+            )
+            .unwrap();
+        process.write_all(b"resumed unmanaged session\r\n").unwrap();
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap() else {
+            panic!("expected old process retirement for Session 455");
+        };
+        assert_eq!(old, SessionId(455));
+        holder_link
+            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+            .unwrap();
+        lock(&hook_reg.state).exited.insert(old, 0);
+        (id, process, replacement_proc)
+    });
+
+    reg.queue_account_switch(ProviderKind::Codex, &target_id);
+    assert!(
+        !lock(&reg.account_handoffs).contains_key(&SessionId(454)),
+        "unidentifiable unmanaged shell session must never be queued"
+    );
+    assert!(lock(&reg.account_handoffs).contains_key(&SessionId(455)));
+    reg.process_account_work_in(&home);
+
+    let saved = load(Some(&state));
+    assert!(!saved.contains_key(&SessionId(454)));
+    let switched = saved.get(&SessionId(455)).unwrap();
+    assert!(switched.error.is_none());
+    assert!(switched.to.is_some());
+
+    drop(mock.join().unwrap());
+    reader_worker.join().unwrap();
+    drop(unidentifiable_proc);
+    drop(open_transcript_proc);
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prunes_dead_failures() {
+    let root = Path::new("/tmp").join(format!("kas-optout-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("from");
+    let to = root.join("to");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&from).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+
+    // Seed a stale failed handoff for dead Session 99 and an ineligible unmanaged Session 52.
+    fs::write(
+        state.join(FILE),
+        serde_json::to_vec(&vec![
+            SessionHandoff {
+                from: SessionId(99),
+                to: None,
+                account_id: target.clone(),
+                error: Some(
+                    "Session 99: could not resume with selected account (missing); original session preserved"
+                        .into(),
+                ),
+            },
+            SessionHandoff {
+                from: SessionId(52),
+                to: None,
+                account_id: target.clone(),
+                error: Some(
+                    "Session 52: could not resume with selected account (missing); original session preserved"
+                        .into(),
+                ),
+            },
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master_51, _proc_51) = UnixStream::pair().unwrap();
+    let (master_52, _proc_52) = UnixStream::pair().unwrap();
+    let (holder, _link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(
+        Some((
+            holder,
+            vec![
+                Kept {
+                    id: SessionId(51),
+                    pid: 951,
+                    status: None,
+                    master: OwnedFd::from(master_51),
+                },
+                Kept {
+                    id: SessionId(52),
+                    pid: 952,
+                    status: None,
+                    master: OwnedFd::from(master_52),
+                },
+            ],
+        )),
+        Some(&state),
+    );
+    reg.agents
+        .remember_session(
+            SessionId(51),
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Yolo,
+            },
+            None,
+            root.as_os_str().as_encoded_bytes().to_vec(),
+            Some(LaunchAccount {
+                id: "codex-old".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: from.display().to_string(),
+            }),
+        )
+        .unwrap();
+    // Backdate Session 51's launch record so it is not treated as mid-startup (< 5s).
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::FileTimesExt as _;
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(30);
+        let times = fs::FileTimes::new()
+            .set_created(old_time)
+            .set_modified(old_time);
+        fs::File::options()
+            .write(true)
+            .open(state.join("agent-launches/51.json"))
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Dead Session 99 is immediately hidden from snapshots before recovery even runs.
+    let mut snap_before = AccountsSnapshot::default();
+    reg.account_switch_snapshot(&mut snap_before);
+    assert!(
+        !snap_before
+            .details
+            .handoffs
+            .iter()
+            .any(|h| h.from == SessionId(99))
+    );
+
+    // Automatic background switch (`prepared: false`) prunes 99 & 52 and skips unbound 51.
+    lock(&reg.account_work.pending).insert(
+        ProviderKind::Codex,
+        crate::usage::accounts::switch_work::SwitchTarget {
+            account_id: target.clone(),
+            prepared: false,
+            not_before: None,
+        },
+    );
+    reg.process_account_work_in(&home);
+    assert!(
+        load(Some(&state)).is_empty(),
+        "dead/ineligible failures should be pruned and unbound session skipped on auto-switch"
+    );
+
+    // Explicit manual switch still reports failure once on unbound Session 51.
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    reg.process_account_work_in(&home);
+    assert!(load(Some(&state))[&SessionId(51)].error.is_some());
+
+    // Continuing on the original account opts Session 51 out of repeated failures while unbound.
+    reg.cancel_failed_account_switch(SessionId(51)).unwrap();
+    assert!(load(Some(&state)).is_empty());
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    assert!(
+        lock(&reg.account_handoffs).is_empty(),
+        "opted-out unbound session must not re-fail on subsequent switches"
+    );
+
+    // Once a hook binds a conversation ID, opt-out clears and manual switch enqueues again.
+    reg.agents.record_hook_session(
+        SessionId(51),
+        b"{\"hook_event_name\":\"SessionStart\",\"session_id\":\"bound-after-optout\"}",
+    );
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    assert!(lock(&reg.account_handoffs).contains_key(&SessionId(51)));
+
+    // Closing a session with a non-retained failed handoff prunes its saved record.
+    lock(&reg.account_handoffs).insert(
+        SessionId(51),
+        SessionHandoff {
+            from: SessionId(51),
+            to: None,
+            account_id: target,
+            error: Some("Session 51: could not resume; original session preserved".into()),
+        },
+    );
+    reg.save_account_handoffs().unwrap();
+    reg.remove(SessionId(51));
+    assert!(load(Some(&state)).is_empty());
+
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+struct IdleChild(std::process::Child);
+
+impl IdleChild {
+    #[expect(clippy::unwrap_used, reason = "real-process test fixture")]
+    fn new() -> Self {
+        use std::io::BufRead as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf 'ready\n'; read -r line"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        Self(child)
+    }
+}
+
+impl Drop for IdleChild {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
 // A real process holds the conversation file so tests exercise the kernel lookup too.
 struct FileHolder(std::process::Child);
 
