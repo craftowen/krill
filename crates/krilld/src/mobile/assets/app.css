@@ -354,13 +354,13 @@ button.account-row:disabled{opacity:1}
 }
 
 .session-panels,.terminal-pane{display:flex;flex:1;min-height:0;min-width:0;overflow:hidden}
-.terminal-pane{flex-direction:column;position:relative}.split-toggle{display:none}.pane-header{display:flex;flex:none;align-items:center;min-height:var(--touch-target);border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.terminal-pane{flex-direction:column;position:relative}.split-toggle{display:block}.pane-header{display:flex;flex:none;align-items:center;min-height:var(--touch-target);border-bottom:1px solid var(--border);background:var(--surface-panel)}
 .pane-title{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-inline:var(--space-sm);font-size:var(--font-meta)}
 .session-panels.is-split{flex-direction:column;gap:1px;background:var(--border)}
 .is-split>.terminal-pane{background:var(--surface-base);box-shadow:inset 0 0 0 1px var(--border)}
 .is-split>.terminal-pane[data-active=true]{box-shadow:inset 0 0 0 2px var(--accent)}
 .is-split>.terminal-pane[data-active=false] .command-dock{display:none}
-@media(min-width:1000px){.split-toggle{display:block}.session-panels.is-split[data-layout=columns]{flex-direction:row}}
+.session-panels.is-split[data-layout=columns]{flex-direction:row}
 
 .tablet-body h1:focus{outline:none}
 .is-split>.terminal-pane[data-active=true]::after{content:"";position:absolute;inset:0;border:2px solid var(--accent);pointer-events:none;z-index:1}
@@ -372,7 +372,6 @@ button.account-row:disabled{opacity:1}
 .split-direction-choices{display:flex;flex-direction:column;gap:var(--space-xs)}
 .split-direction-choice{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);text-align:left}
 .split-direction-choice[aria-pressed=true]{color:var(--accent);background:var(--surface-raised);box-shadow:inset 2px 0 var(--accent)}
-@media(max-width:999px){.split-controls{display:none}}
 
 /* Matching pane headers make the active tab strip's target explicit. */
 .pane-title{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target)}
