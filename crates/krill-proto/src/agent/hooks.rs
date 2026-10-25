@@ -14,6 +14,7 @@ pub enum Agent {
     OpenCode,
     Cursor,
     Agy,
+    Pi,
 }
 
 impl Agent {
@@ -22,6 +23,7 @@ impl Agent {
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::OpenCode),
             "cursor" => Some(Self::Cursor),
+            "pi" => Some(Self::Pi),
             "agy" | "antigravity" => Some(Self::Agy),
             _ => None,
         }
@@ -33,6 +35,7 @@ impl Agent {
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor",
             Self::Agy => "agy",
+            Self::Pi => "pi",
         }
     }
 
@@ -61,7 +64,7 @@ impl Agent {
                 "PreToolUse",
                 "PostToolUse",
             ],
-            Self::OpenCode => &[],
+            Self::OpenCode | Self::Pi => &[],
         }
     }
 }
@@ -150,6 +153,44 @@ export const KrillHook = async () => {{
     ))
 }
 
+/// Pi discovers user extensions in `$PI_CODING_AGENT_DIR/extensions`.
+pub fn pi_extension_path(root: &Path) -> std::path::PathBuf {
+    root.join("extensions/krill.ts")
+}
+
+/// Observational Pi extension. Spawn directly with JSON stdin, never through a
+/// shell. Missing hooks cannot block Pi or answer its permission questions.
+pub fn pi_extension(exe: &Path) -> Option<String> {
+    let exe = serde_json::Value::String(exe.to_str()?.to_owned()).to_string();
+    Some(format!(
+        r#"// Krill managed Pi extension.
+import {{ spawn }} from "node:child_process";
+export default function (pi) {{
+  if (!process.env.MK_PANE_ID) return;
+  const events = {{ session_start: "SessionStart", agent_start: "UserPromptSubmit",
+    agent_settled: "Stop", session_shutdown: "SessionEnd" }};
+  for (const [event, name] of Object.entries(events)) {{
+    pi.on(event, async (_event, ctx) => {{
+      if (!process.env.MK_PANE_ID) return;
+      try {{
+        await new Promise((resolve) => {{
+          const child = spawn({exe}, ["hook", "pi"], {{
+            stdio: ["pipe", "ignore", "ignore"], timeout: 1000, killSignal: "SIGKILL", windowsHide: true
+          }});
+          child.on("error", () => resolve());
+          child.on("close", () => resolve());
+          child.stdin.on("error", () => {{}});
+          child.stdin.end(JSON.stringify({{ hook_event_name: name,
+            session_id: ctx.sessionManager.getSessionId() }}));
+        }});
+      }} catch {{}}
+    }});
+  }}
+}}
+"#
+    ))
+}
+
 /// CLI(`krill hook install`)와 GUI(관리자 에이전트 탭)가 공유하는 JSON 머지. 같은 입력이면
 /// 바이트 단위로 같은 결과를 낸다(`serde_json` 맵은 키 정렬). 파일 읽기·백업·원자 쓰기는
 /// 호출자가 한다. 파싱 실패·비객체·예상 밖 타입은 오류로 돌려주고 호출자는 쓰지 않는다.
@@ -221,6 +262,9 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
 /// Claude 외 에이전트 머지. Antigravity는 `krill` 묶음 키 아래에
 /// `agy_event_command` 완성 명령(`hook agy <event>` 포함)을 넣는다.
 pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> io::Result<String> {
+    if agent == Agent::Pi {
+        return Err(merge_error("this agent uses an extension, not JSON hooks"));
+    }
     let mut value = parse_hook_json(before)?;
     let root = value
         .as_object_mut()
@@ -285,6 +329,34 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_hook_extension_is_observational_and_uses_direct_spawn() {
+        let pi = Agent::parse("pi").unwrap();
+        assert_eq!(pi.id(), "pi");
+        assert!(pi.events().is_empty());
+        assert_eq!(
+            pi_extension_path(Path::new("agent")),
+            Path::new("agent/extensions/krill.ts")
+        );
+        let extension = pi_extension(Path::new("/a path/'krill'")).unwrap();
+        for event in [
+            "session_start",
+            "agent_start",
+            "agent_settled",
+            "session_shutdown",
+        ] {
+            assert!(extension.contains(event));
+        }
+        assert!(extension.contains("MK_PANE_ID"));
+        assert!(extension.contains("timeout: 1000"));
+        assert!(extension.contains(r#"["hook", "pi"]"#));
+        assert!(extension.contains("child.stdin.end(JSON.stringify"));
+        assert!(extension.contains("/a path/'krill'"));
+        assert!(!extension.contains("shell: true"));
+        assert!(!extension.contains("tool_call:"));
+        assert!(install_agent_json(None, Agent::Pi, "krill").is_err());
+    }
 
     #[test]
     fn codex_overrides_parse_as_toml_and_do_not_contain_pane_identity() {

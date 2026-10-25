@@ -56,22 +56,25 @@ pub fn remove_with_state(
         "not a git repository",
     )?;
     let _transaction = transaction(q, &top)?;
-    let entries = entries(q, &top)?;
-    let main = entries.first().ok_or("repository has no worktrees")?;
+    let initial_entries = entries(q, &top)?;
+    let main = initial_entries
+        .first()
+        .ok_or("repository has no worktrees")?;
     let path = fs::canonicalize(Path::new(OsStr::from_bytes(&req.path)))
         .map_err(|e| format!("cannot resolve worktree: {e}"))?;
-    let target = entries
-        .iter()
-        .find(|e| e.path == path)
-        .ok_or("path is not a registered worktree of this repository")?;
-    if target.path == main.path {
+    if path == main.path {
         return Err("cannot remove the main worktree".to_owned());
     }
-    if target.locked {
+    reject_nested_worktrees(&initial_entries, &path)?;
+    let target = initial_entries.iter().find(|e| e.path == path);
+    if target.is_some_and(|e| e.locked) {
         return Err("worktree is locked; unlock it explicitly before removal".to_owned());
     }
-    // 주 워크트리에서 실행해 삭제 대상에서 보낸 요청도 후속 git 호출을 할 수 있다.
+    // Work from the main tree even when the request originated inside the removed tree.
     let repo = &main.path;
+    if target.is_none() {
+        verify_git_link(q, repo, &path)?;
+    }
     let config = super::compat::read_config_with_state(repo, state_dir)?;
     let status = git(
         q,
@@ -87,7 +90,15 @@ pub fn remove_with_state(
         ],
     )?;
     let dirty = is_dirty_ignoring_symlinks(&status.stdout, &path, &config.worktree.symlinks);
-    text(status, "cannot check worktree status")?;
+    // Missing metadata makes status unknowable. Only explicit --force can discard
+    // files in an ownership-verified orphan; a normal removal stays fail-closed.
+    if !req.force || target.is_some() {
+        text(status, "cannot check worktree status").map_err(|e| {
+            format!(
+                "cannot check worktree status: {e}; use --force only to discard an orphan's files"
+            )
+        })?;
+    }
     if !req.force && dirty {
         return Err("worktree is dirty; use --force to discard its files".to_owned());
     }
@@ -111,33 +122,57 @@ pub fn remove_with_state(
             }
         }
     }
+    reject_nested_worktrees(&entries(q, repo)?, &path)?;
     unlink_symlinks(&path, &config.worktree.symlinks);
-    let path_os = path.into_os_string();
-    let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
-    if req.force {
-        args.push("--force".into());
-    }
-    args.push("--".into());
-    args.push(path_os.clone());
-    if let Err(first_err) = text(git(q, repo, args)?, "git worktree remove failed") {
-        // !target.locked 및 !dirty 검증을 이미 통과한 클린 워크트리라도 서브모듈이 초기화되어 있으면
-        // git worktree remove가 단일 --force 없이는 거부한다(#28164). 단일 --force로 1회 재시도한다.
+    if target.is_none() {
+        remove_orphan(q, repo, &path)?;
+    } else {
+        let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
         if req.force {
-            return Err(first_err);
+            args.push("--force".into());
         }
-        let retry_args: Vec<OsString> = [
-            OsString::from("worktree"),
-            OsString::from("remove"),
-            OsString::from("--force"),
-            OsString::from("--"),
-            path_os,
-        ]
-        .into();
-        text(git(q, repo, retry_args)?, &first_err)?;
+        args.push("--".into());
+        args.push(path.as_os_str().to_owned());
+        if let Err(first_err) =
+            git(q, repo, args).and_then(|out| text(out, "git worktree remove failed"))
+        {
+            if registered(q, repo, &path)? {
+                // A clean tree with initialized submodules needs a single --force.
+                if req.force {
+                    return Err(first_err);
+                }
+                let retry_args = [
+                    OsString::from("worktree"),
+                    OsString::from("remove"),
+                    OsString::from("--force"),
+                    OsString::from("--"),
+                    path.as_os_str().to_owned(),
+                ];
+                if let Err(retry_err) =
+                    git(q, repo, retry_args).and_then(|out| text(out, &first_err))
+                {
+                    if registered(q, repo, &path)? {
+                        return Err(retry_err);
+                    }
+                    remove_orphan(q, repo, &path)?;
+                }
+            } else {
+                remove_orphan(q, repo, &path)?;
+            }
+        }
+        // Even a successful Git exit is insufficient if a directory survived.
+        if !directory_absent(&path)? {
+            remove_orphan(q, repo, &path)?;
+        }
+    }
+    if !directory_absent(&path)? {
+        return Err(
+            "worktree directory remains; preserving branch and registration metadata".to_owned(),
+        );
     }
 
     let mut result = RemovedWorktree {
-        branch: target.branch.clone(),
+        branch: target.and_then(|e| e.branch.clone()),
         branch_deleted: false,
         warnings,
     };
@@ -156,6 +191,122 @@ pub fn remove_with_state(
         result.warnings.push(format!("worktree prune failed: {e}"));
     }
     Ok(result)
+}
+
+fn directory_absent(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(e) => Err(format!("cannot verify worktree directory removal: {e}")),
+    }
+}
+
+fn reject_nested_worktrees(entries: &[Entry], path: &Path) -> Result<(), String> {
+    if entries
+        .iter()
+        .any(|e| e.path != path && e.path.starts_with(path))
+    {
+        return Err("worktree contains another registered worktree; remove it first".to_owned());
+    }
+    Ok(())
+}
+
+fn registered(q: &GitQueue, repo: &Path, path: &Path) -> Result<bool, String> {
+    Ok(entries(q, repo)?.iter().any(|e| e.path == path))
+}
+
+/// A stale .git *file* is the only evidence permitting deletion outside Git's list.
+/// Resolve the existing parent, never require the deleted per-worktree metadata.
+fn verify_git_link(q: &GitQueue, repo: &Path, path: &Path) -> Result<(), String> {
+    let invalid =
+        || "path is not an ownership-verified orphan worktree of this repository".to_owned();
+    let link = path.join(".git");
+    let meta = fs::symlink_metadata(&link).map_err(|_| invalid())?;
+    if !meta.is_file() || meta.len() > 16384 {
+        return Err(invalid());
+    }
+    let bytes = fs::read(&link).map_err(|_| invalid())?;
+    let raw = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let gitdir = raw
+        .strip_prefix(b"gitdir: ")
+        .filter(|p| !p.is_empty())
+        .ok_or_else(invalid)?;
+    if gitdir.iter().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
+        return Err(invalid());
+    }
+    let gitdir = path.join(OsStr::from_bytes(gitdir));
+    // Reject traversal before canonicalization, including a missing tail after `..`.
+    if gitdir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(invalid());
+    }
+    let common = output_path(
+        git(
+            q,
+            repo,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?,
+        "cannot resolve repository common directory",
+    )?;
+    let common = fs::canonicalize(common).map_err(|_| invalid())?;
+    let parent = gitdir.parent().ok_or_else(invalid)?;
+    // `worktrees` can also have been pruned away. Canonicalize CommonDir and
+    // reject symlinks in either remaining component rather than following them.
+    let resolved_parent = match fs::canonicalize(parent) {
+        Ok(real) => real,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let ancestor = parent.parent().ok_or_else(invalid)?;
+            fs::canonicalize(ancestor)
+                .map_err(|_| invalid())?
+                .join(parent.file_name().ok_or_else(invalid)?)
+        }
+        Err(_) => return Err(invalid()),
+    };
+    if resolved_parent != common.join("worktrees") || gitdir.file_name().is_none() {
+        return Err(invalid());
+    }
+    for dir in [parent, gitdir.as_path()] {
+        match fs::symlink_metadata(dir) {
+            Ok(m) if !m.is_dir() || m.file_type().is_symlink() => return Err(invalid()),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(invalid()),
+            _ => {}
+        }
+    }
+    match fs::read(gitdir.join("gitdir")) {
+        Ok(backlink) => {
+            let backlink = backlink.strip_suffix(b"\n").unwrap_or(&backlink);
+            if fs::canonicalize(Path::new(OsStr::from_bytes(backlink))).map_err(|_| invalid())?
+                != link
+            {
+                return Err(invalid());
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(invalid()),
+    }
+    // A stale locked metadata directory still requires explicit unlocking.
+    if gitdir.join("locked").exists() {
+        return Err("worktree is locked; unlock it explicitly before removal".to_owned());
+    }
+    Ok(())
+}
+
+fn remove_orphan(q: &GitQueue, repo: &Path, path: &Path) -> Result<(), String> {
+    let current = entries(q, repo)?;
+    if current.iter().any(|e| e.path == path) {
+        return Err("worktree is still registered; refusing filesystem recovery".to_owned());
+    }
+    reject_nested_worktrees(&current, path)?;
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        _ => return Err("cannot inspect orphan worktree directory".to_owned()),
+    }
+    verify_git_link(q, repo, path)?;
+    fs::remove_dir_all(path).map_err(|e| format!("cannot remove orphan worktree directory: {e}"))
 }
 
 fn is_valid_worktree_symlink(wt_real: &Path, raw: &str) -> bool {
@@ -438,7 +589,15 @@ fn entries(q: &GitQueue, repo: &Path) -> Result<Vec<Entry>, String> {
     if !out.status.success() {
         return text(out, "git worktree list failed").map(|_| Vec::new());
     }
-    parse_entries(&out.stdout)
+    let mut listed = parse_entries(&out.stdout)?;
+    for entry in &mut listed {
+        match fs::canonicalize(&entry.path) {
+            Ok(real) => entry.path = real,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot resolve registered worktree: {e}")),
+        }
+    }
+    Ok(listed)
 }
 
 fn parse_entries(bytes: &[u8]) -> Result<Vec<Entry>, String> {
@@ -470,6 +629,214 @@ mod tests {
     use krill_proto::control::Request;
     use krill_proto::screen::Msg;
     use proptest::prelude::*;
+
+    #[cfg(unix)]
+    fn fixture_worktree(tag: &str) -> (super::super::tests::Fixture, PathBuf, RemoveWorktree) {
+        let f = super::super::tests::Fixture::new(tag, "");
+        let wt = f.root.join("child");
+        fs::create_dir_all(&f.root).unwrap();
+        f.git(&["worktree", "add", "-b", "child", wt.to_str().unwrap()]);
+        let wt = fs::canonicalize(wt).unwrap();
+        let req = RemoveWorktree {
+            repo: f.repo.as_os_str().as_bytes().to_vec(),
+            path: wt.as_os_str().as_bytes().to_vec(),
+            force: true,
+        };
+        (f, wt, req)
+    }
+
+    #[cfg(unix)]
+    fn orphan_metadata(wt: &Path) -> PathBuf {
+        PathBuf::from(
+            fs::read_to_string(wt.join(".git"))
+                .unwrap()
+                .trim()
+                .strip_prefix("gitdir: ")
+                .unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_orphan_recovery_requires_force_when_status_cannot_be_checked() {
+        let (f, wt, mut req) = fixture_worktree("orphan-status");
+        fs::remove_dir_all(orphan_metadata(&wt)).unwrap();
+        fs::write(wt.join("untracked"), "preserve unless forced").unwrap();
+        req.force = false;
+        assert!(
+            remove_with_state(&f.queue, &req, None)
+                .unwrap_err()
+                .contains("cannot check worktree status")
+        );
+        assert!(wt.join("untracked").exists());
+        req.force = true;
+        let result = remove_with_state(&f.queue, &req, None).unwrap();
+        assert!(!wt.exists());
+        assert_eq!(result.branch, None); // No reliable branch identity after metadata loss.
+        assert!(f.git(&["branch", "--list", "child"]).contains("child"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_unlisted_but_checkable_tree_still_requires_clean_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let (f, wt, mut req) = fixture_worktree("unlisted-clean");
+        req.force = false;
+        let script = f.dir.join("git-wrapper");
+        let repo = fs::canonicalize(&f.repo).unwrap();
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+case " $* " in
+  *" worktree list "*) printf 'worktree %s\000\000' {}; exit 0 ;;
+esac
+exec git "$@"
+"#,
+                krill_proto::agent::hooks::shell_quote(repo.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let queue = GitQueue::with_program(script, 1).unwrap();
+        fs::write(wt.join("untracked"), "keep").unwrap();
+        assert!(
+            remove_with_state(&queue, &req, None)
+                .unwrap_err()
+                .contains("dirty")
+        );
+        assert!(wt.join("untracked").exists());
+        fs::remove_file(wt.join("untracked")).unwrap();
+        assert!(remove_with_state(&queue, &req, None).is_ok());
+        assert!(!wt.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_orphan_never_deletes_unregistered_folders_or_foreign_links() {
+        let (f, wt, req) = fixture_worktree("orphan-unowned");
+        let metadata = orphan_metadata(&wt);
+        fs::remove_dir_all(&metadata).unwrap();
+        fs::remove_file(wt.join(".git")).unwrap();
+        assert!(remove_with_state(&f.queue, &req, None).is_err());
+        fs::create_dir(wt.join(".git")).unwrap();
+        assert!(remove_with_state(&f.queue, &req, None).is_err());
+        fs::remove_dir(wt.join(".git")).unwrap();
+        for bad in [
+            format!(
+                "gitdir: {}\n",
+                f.dir.join("foreign/.git/worktrees/child").display()
+            ),
+            format!("gitdir: {}\n", metadata.join("nested").display()),
+            format!("gitdir: {}/../child\n", metadata.display()),
+            format!("gitdir: {}\nextra\n", metadata.display()),
+        ] {
+            fs::write(wt.join(".git"), bad).unwrap();
+            assert!(remove_with_state(&f.queue, &req, None).is_err());
+            assert!(wt.exists());
+        }
+        let outside = f.dir.join("link-file");
+        fs::write(&outside, format!("gitdir: {}\n", metadata.display())).unwrap();
+        fs::remove_file(wt.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join(".git")).unwrap();
+        assert!(remove_with_state(&f.queue, &req, None).is_err());
+        assert!(outside.exists());
+        assert!(wt.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_recovery_rejects_registered_nested_worktree_even_with_force() {
+        let (f, wt, req) = fixture_worktree("orphan-nested");
+        let nested = wt.join("nested");
+        f.git(&["worktree", "add", "-b", "nested", nested.to_str().unwrap()]);
+        assert!(
+            remove_with_state(&f.queue, &req, None)
+                .unwrap_err()
+                .contains("another registered worktree")
+        );
+        fs::remove_dir_all(orphan_metadata(&wt)).unwrap();
+        assert!(
+            remove_with_state(&f.queue, &req, None)
+                .unwrap_err()
+                .contains("another registered worktree")
+        );
+        assert!(nested.join(".git").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_same_call_partial_failure_recovers_before_prune_and_branch_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        for force in [false, true] {
+            let (f, wt, mut req) = fixture_worktree(if force {
+                "partial-force"
+            } else {
+                "partial-clean"
+            });
+            req.force = force;
+            let metadata = orphan_metadata(&wt);
+            let script = f.dir.join("git-wrapper");
+            let quoted = |p: &Path| krill_proto::agent::hooks::shell_quote(p.to_str().unwrap());
+            // Simulate Git unregistering the tree before failing to remove its directory.
+            // Assert that later cleanup commands cannot run while the directory exists.
+            fs::write(
+                &script,
+                format!(
+                    r#"#!/bin/sh
+case " $* " in
+  *" worktree remove "*) rm -rf -- {}; exit 1 ;;
+  *" worktree prune "*|*" branch -d "*) test ! -e {} || exit 99 ;;
+esac
+exec git "$@"
+"#,
+                    quoted(&metadata),
+                    quoted(&wt)
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            let queue = GitQueue::with_program(script, 1).unwrap();
+            let result = remove_with_state(&queue, &req, None).unwrap();
+            assert!(!wt.exists());
+            assert!(result.branch_deleted, "{result:?}");
+            assert!(result.warnings.is_empty(), "{result:?}");
+            assert!(f.git(&["branch", "--list", "child"]).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_failed_recovery_preserves_branch_and_skips_prune() {
+        use std::os::unix::fs::PermissionsExt;
+        let (f, wt, req) = fixture_worktree("partial-no-link");
+        let metadata = orphan_metadata(&wt);
+        let script = f.dir.join("git-wrapper");
+        let marker = f.dir.join("premature-cleanup");
+        let quoted = |p: &Path| krill_proto::agent::hooks::shell_quote(p.to_str().unwrap());
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+case " $* " in
+  *" worktree remove "*) rm -rf -- {}; rm -- {}; exit 1 ;;
+  *" worktree prune "*|*" branch -d "*) touch {}; exit 99 ;;
+esac
+exec git "$@"
+"#,
+                quoted(&metadata),
+                quoted(&wt.join(".git")),
+                quoted(&marker)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let queue = GitQueue::with_program(script, 1).unwrap();
+        assert!(remove_with_state(&queue, &req, None).is_err());
+        assert!(wt.exists());
+        assert!(!marker.exists());
+        assert!(f.git(&["branch", "--list", "child"]).contains("child"));
+    }
 
     proptest! {
         #[test]

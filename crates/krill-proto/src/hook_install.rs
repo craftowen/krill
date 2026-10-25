@@ -193,15 +193,19 @@ impl Plan {
                 let path = path.to_path_buf();
                 let before = store::read(&path)?;
                 let after = match agent {
-                    TargetAgent::Other(Agent::OpenCode) => {
+                    TargetAgent::Other(Agent::OpenCode | Agent::Pi) => {
                         if before.is_some() {
                             return Err(io::Error::new(
                                 io::ErrorKind::AlreadyExists,
-                                "OpenCode plugin path already exists; refusing to overwrite",
+                                "agent extension path already exists; refusing to overwrite",
                             ));
                         }
-                        hooks::opencode_plugin(exe)
-                            .ok_or_else(|| error("krill executable path is not UTF-8"))?
+                        if agent == TargetAgent::Other(Agent::Pi) {
+                            hooks::pi_extension(exe)
+                        } else {
+                            hooks::opencode_plugin(exe)
+                        }
+                        .ok_or_else(|| error("krill executable path is not UTF-8"))?
                     }
                     TargetAgent::Claude => install_claude_json(before.as_deref(), &command)?,
                     TargetAgent::Other(a) => json::install(before.as_deref(), a, &command)?,
@@ -240,9 +244,10 @@ impl Plan {
                 current.clone()
             } else if current.as_deref() == Some(&change.after) {
                 change.before.clone()
-            } else if agent == TargetAgent::Other(Agent::OpenCode) {
+            } else if matches!(agent, TargetAgent::Other(Agent::OpenCode | Agent::Pi)) {
                 eprintln!(
-                    "preserved modified OpenCode plugin: {}",
+                    "preserved modified {} extension: {}",
+                    agent.id(),
                     change.path.display()
                 );
                 current.clone()
