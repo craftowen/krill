@@ -311,8 +311,8 @@ fn in_flight_preparation_promotes_matching_base_and_cancels_mismatched_base() {
     f.git(&["checkout", "-q", "main"]);
 
     let pool = pool(&f);
-    // 1. 같은 base("dev")로 선행 체크아웃을 시작하자마자(완료 대기 없이) 생성 요청을 보내도
-    //    트랜잭션 잠금 해제 전 ready 기록 덕분에 재체크아웃 없이 즉시 promote(Skipped)된다.
+    // 1. 선행 작업이 트랜잭션을 잡은 뒤에는 완료를 기다리지 않고 생성해도 promote된다.
+    //    스레드가 시작되기 전에 생성이 먼저 잠금을 잡으면 일반 체크아웃도 올바른 동작이다.
     let same_prep = PrepareWorktree {
         token: 41,
         repo: f.repo.as_os_str().as_bytes().to_vec(),
@@ -320,6 +320,14 @@ fn in_flight_preparation_promotes_matching_base_and_cancels_mismatched_base() {
         cancel: false,
     };
     assert_eq!(pool.request(&same_prep), Status::Preparing);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pool.dir.join(MARKER).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "preparation worker did not start"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
     let Outcome::Created { worktree, .. } = create_with_pool(
         &f.queue,
         &NewWorktree {

@@ -137,17 +137,15 @@ fn timer_sends_terminate_only_for_safe_group_and_preserves_resume_marker() {
             input: krill_proto::hook::Input::Complete,
             payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
         };
-        let st = lock(&reg.state);
-        reg.apply_agent_hook(
-            id,
-            &e,
-            st.sessions.get(&id).map(|entry| entry.cwd.as_path()),
-            st.sessions
-                .get(&id)
-                .map(|entry| entry.session.tap())
-                .as_ref(),
-        )
-        .unwrap();
+        // Match the production hook entry point: identity reconciliation also
+        // reads registry state, so release its lock before applying the hook.
+        let (cwd, tap) = {
+            let st = lock(&reg.state);
+            let entry = st.sessions.get(&id).unwrap();
+            (entry.cwd.clone(), entry.session.tap())
+        };
+        reg.apply_agent_hook(id, &e, Some(&cwd), Some(&tap))
+            .unwrap();
     }
     let taps: Vec<_> = {
         let st = lock(&reg.state);
