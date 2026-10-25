@@ -111,6 +111,13 @@ class PublishGuardTests(unittest.TestCase):
         self.assert_blocked(self.publish("--preflight", FAKE_MOBILE="404"),
                             "mobile PWA 0123456789abcdef is not deployed")
 
+    def test_broken_mobile_connection_verification_blocks(self):
+        cloud = self.work.parent / "cloud-mobile"
+        cloud.mkdir(parents=True, exist_ok=True)
+        (cloud / "verify-connection.mjs").write_text("process.exit(1);\n")
+        self.assert_blocked(self.publish("--preflight", KRILL_MOBILE_CLOUD_DIR=str(cloud)),
+                            "mobile connection verification failed for 0123456789abcdef")
+
     def test_existing_release_blocks(self):
         self.assert_blocked(self.publish("--preflight", FAKE_RELEASE="1"),
                             "GitHub release v0.1.0 already exists")
