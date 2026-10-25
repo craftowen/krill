@@ -512,13 +512,19 @@ fn remote_new_rejects_relative_cwd_and_preserves_sessions_on_worktree_error() {
 #[test]
 fn remote_fork_with_prompt_delivers_to_remote_and_never_touches_local() {
     let r = Remote::new("f");
+    let hook_input = r.daemon_dir.join("fork-turn.json");
+    fs::write(&hook_input, r#"{"hook_event_name":"UserPromptSubmit"}"#).unwrap();
+    let script = format!(
+        r#"stty -echo; printf 'fork-probe-ready\n> '; IFS= read -r line; printf 'fork-probe-got:%s\n' "$line"; {} hook claude < {}; exec sleep 60"#,
+        krill_proto::agent::hooks::shell_quote(MK),
+        krill_proto::agent::hooks::shell_quote(hook_input.to_str().unwrap()),
+    );
     fs::write(
         r.daemon_dir.join("agents.toml"),
-        r#"
-[agent.fork_probe]
-name = "Fork probe"
-launch = ["/bin/sh", "-c", "stty -echo; printf 'fork-probe-ready\n> '; IFS= read -r line; printf 'fork-probe-got:%s\n' \"$line\"; exec sleep 60"]
-"#,
+        format!(
+            "[agent.fork_probe]\nname = \"Fork probe\"\nlaunch = [\"/bin/sh\", \"-c\", {}]\n",
+            serde_json::to_string(&script).unwrap()
+        ),
     )
     .unwrap();
     let orig = r.ok(&[
@@ -557,6 +563,12 @@ launch = ["/bin/sh", "-c", "stty -echo; printf 'fork-probe-ready\n> '; IFS= read
     assert!(
         forked_screen.contains("fork-probe-got:이어서 진행해"),
         "{forked_screen}"
+    );
+    assert_eq!(
+        forked_screen
+            .matches("fork-probe-got:이어서 진행해")
+            .count(),
+        1
     );
     let orig_screen = r.ok(&["--host", HOST, "read", orig]);
     assert!(

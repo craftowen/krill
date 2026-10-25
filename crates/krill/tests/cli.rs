@@ -856,6 +856,55 @@ fn session_checkpoint_references_and_release_preserve_the_selected_worktree_and_
         "--summary",
         "Result summary",
     ]);
+    let rejected = d.run(&["orchestration", "worker-release", dispatch]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("borrowed"));
+    assert!(ls_has_session(&d.ok(&["ls"]), id));
+    let borrowed_id = id.to_owned();
+    let script = "stty -echo; printf 'archive-marker\\n> '; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done";
+    fs::write(d.dir.join("agents.toml"), format!(
+        "[agent.archive_fixture]\nname = \"Archive fixture\"\nlaunch = [\"/bin/sh\", \"-c\", {}]\n",
+        serde_json::to_string(script).unwrap(),
+    )).unwrap();
+    let owned_run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Owned archive",
+        "--json",
+    ]))
+    .unwrap();
+    let owned: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        owned_run["id"].as_str().unwrap(),
+        "--worker",
+        "owned-archive",
+        "--agent",
+        "archive_fixture",
+        "--cwd",
+        sub.to_str().unwrap(),
+        "--prompt",
+        "Work",
+        "--json",
+    ]))
+    .unwrap();
+    let dispatch = owned["id"].as_str().unwrap();
+    let owned_id = owned["session_id"].as_u64().unwrap().to_string();
+    let id = owned_id.as_str();
+    d.ok(&[
+        "orchestration",
+        "send",
+        "--from",
+        "owned-archive",
+        "--type",
+        "worker_done",
+        "--dispatch",
+        dispatch,
+        "--summary",
+        "Result summary",
+    ]);
     let released: serde_json::Value =
         serde_json::from_str(&d.ok(&["orchestration", "worker-release", dispatch, "--json"]))
             .unwrap();
@@ -876,6 +925,12 @@ fn session_checkpoint_references_and_release_preserve_the_selected_worktree_and_
             .contains("archive-marker")
     );
     d.ok(&["orchestration", "worker-release", dispatch]);
+    assert!(ls_has_session(&d.ok(&["ls"]), &borrowed_id));
+    assert_eq!(
+        fs::read(d.dir.join("worktree-comments.toml")).unwrap(),
+        before
+    );
+    d.ok(&["kill", &borrowed_id]);
 }
 
 #[test]
@@ -957,16 +1012,24 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         "--prompt",
         "Work",
     ]);
-    assert_eq!(spawn.status.code(), Some(1));
+    assert_eq!(spawn.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&spawn.stderr)
             .contains("spawn missing-preflight-agent worker session")
     );
     assert_eq!(d.ok(&["ls", "--json"]), before_sessions);
-    assert_eq!(
-        fs::read(d.dir.join("orchestration.json")).unwrap(),
-        before_store
+    // A validated start is recorded before launch so its failure stays inspectable.
+    let failed: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-show", "spawn-failure", "--json"]))
+            .unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["summary"]
+            .as_str()
+            .unwrap()
+            .contains("unknown agent profile")
     );
+    let after_failed_start = fs::read(d.dir.join("orchestration.json")).unwrap();
 
     // 존재하지 않는 세션을 지정하면 고스트 Active dispatch를 남기지 않고 시작 전에 거부한다(C1).
     // 예전에는 dispatch를 Active로 기록한 뒤 전송 실패로 끝내 stop/release가 영구 실패하는 쐐기가 됐다.
@@ -996,7 +1059,7 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
     );
     assert_eq!(
         fs::read(d.dir.join("orchestration.json")).unwrap(),
-        before_store
+        after_failed_start
     );
 }
 

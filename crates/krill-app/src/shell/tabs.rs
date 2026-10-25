@@ -1828,10 +1828,7 @@ impl Shell {
                     .child(text::RECENT_TABS_TITLE.get())
                     .child(
                         Checkbox::new("recent-all-workspaces")
-                            .label(match krill_app::i18n::language() {
-                                krill_app::i18n::Language::Ko => "모든 워크스페이스",
-                                krill_app::i18n::Language::En => "All workspaces",
-                            })
+                            .label(text::RECENT_ALL_WORKSPACES.get())
                             .checked(all)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.layout.toggle_mru_scope();

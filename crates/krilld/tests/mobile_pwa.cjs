@@ -151,7 +151,7 @@ async function connect(url,credential){
  const authenticated=JSON.parse(new TextDecoder().decode(channel.open(await next()))),hello=Buffer.from(channel.open(await next())),r=reader(hello.subarray(5));r.u();r.u();const features=r.u();r.text();daemon=Number(r.u());
  socket.send(channel.seal(frame(2,Buffer.concat([v(1),v(1),v(features),v(0),string('pure-js-e2e')]))));
  let serial=Promise.resolve();
- return{socket,authenticated,async rpc(request){const operation=serial.then(async()=>{socket.send(channel.seal(frame(0x45,Buffer.concat([v(7),string(JSON.stringify(request))]))));const bytes=Buffer.from(channel.open(await next()));assert.equal(bytes[4],0x65);const r=reader(bytes.subarray(5));assert.equal(r.u(),6n);const response=JSON.parse(r.text());if(!response.ok)throw Error(response.error);return response.data;});serial=operation.catch(()=>{});return operation;}};
+ return{socket,authenticated,async rpc(request){const operation=serial.then(async()=>{socket.send(channel.seal(frame(0x45,Buffer.concat([v(7),string(JSON.stringify(request))]))));const bytes=Buffer.from(channel.open(await next()));assert.equal(bytes[4],0x65);const r=reader(bytes.subarray(5));assert.equal(r.u(),6n);const response=JSON.parse(r.text());if(!response.ok)throw Error(`${request.action}: ${response.error}`);return response.data;});serial=operation.catch(()=>{});return operation;}};
 }
 (async()=>{
  try {
@@ -160,7 +160,10 @@ async function connect(url,credential){
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');
   fs.writeFileSync(path.join(profile,'statusline_cache.json'),JSON.stringify({five_hour:{utilization:23,resets_at:new Date(Date.now()+5*3600000+600000).toISOString()},seven_day:{utilization:47,resets_at:new Date(Date.now()+7*86400000+3600000).toISOString()}}));
   fs.writeFileSync(path.join(dir,'accounts.toml'),`direct_usage = false\n[active]\nclaude = "claude-host"\n[[accounts]]\nid = "mobile-test-account"\nprovider = "claude"\nlabel = "Mobile fixture"\nprofile_dir = ${JSON.stringify(profile)}\n`);
-  fs.writeFileSync(path.join(dir,'agents.toml'),'[agent.codex]\nname = "Mock Codex"\nlaunch = ["/bin/sh", "-c", "printf \'mock-agent-ready\\\\n\'; exec /bin/cat"]\n[agent.claude]\nname = "Mock Claude"\nlaunch = ["/bin/sh", "-c", "printf \'mock-agent-ready\\\\n\'; exec /bin/cat"]\n');
+  const turnHook=path.join(dir,'agent-turn.json');fs.writeFileSync(turnHook,JSON.stringify({hook_event_name:'UserPromptSubmit'}));
+  const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
+  const mockAgent=`stty -echo; printf 'mock-agent-ready\\n> '; while IFS= read -r line; do printf '%s\\n' "$line"; ${quote(mk)} hook claude < ${quote(turnHook)}; done`;
+  fs.writeFileSync(path.join(dir,'agents.toml'),['codex','claude'].map(agent=>`[agent.${agent}]\nname = "Mock ${agent}"\nlaunch = ["/bin/sh", "-c", ${JSON.stringify(mockAgent)}]\n`).join(''));
   const chatTranscript=path.join(dir,'mobile-chat.jsonl');
   fs.writeFileSync(chatTranscript,Array.from({length:1050},(_,i)=>JSON.stringify({type:'assistant',message:{role:'assistant',content:`MOBILE CHAT ${i}`}})+'\n').join(''));
   fs.writeFileSync(path.join(dir,'waiting.json'),JSON.stringify({hook_event_name:'PermissionRequest',session_id:'mobile-chat',transcript_path:chatTranscript}));

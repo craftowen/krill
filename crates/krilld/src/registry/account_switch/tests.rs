@@ -1025,11 +1025,12 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
             process
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut buf = [0_u8; 128];
-            let n = process
-                .read(&mut buf)
+            // A stream may split the text and its submission CR across reads.
+            let mut buf = vec![0_u8; "Continue from where you left off.".len() + 1];
+            process
+                .read_exact(&mut buf)
                 .expect("expected continuation prompt on new PTY");
-            let received = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let received = String::from_utf8_lossy(&buf).into_owned();
             (id, received, process)
         });
 

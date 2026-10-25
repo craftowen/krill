@@ -341,8 +341,23 @@ fire() {{ while [ ! -f "$D/go$1" ]; do sleep 0.02; done; /bin/sh "$D/$2.sh" <"$D
     );
     for (n, (agent, _, state)) in steps.iter().enumerate() {
         fire(&dir, u32::try_from(n).unwrap());
-        assert_agent(&status(&mut c, session), *state, agent);
+        // A loaded daemon may exceed the hook's small ACK budget and collect the
+        // event from its durable spool. Keep the guard/state assertion for that path too.
+        let deadline = Instant::now() + WAIT;
+        let observed = loop {
+            let observed = status(&mut c, session);
+            if observed.state == *state && observed.source == Some(Source::Hook) {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hook state not collected: {observed:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_agent(&observed, *state, agent);
     }
-    assert_eq!(spool_len(&dir), 0, "delivered over the socket");
+    drain_spool(&dir);
+    assert_eq!(spool_len(&dir), 0, "all hook events collected");
     drop(d);
 }

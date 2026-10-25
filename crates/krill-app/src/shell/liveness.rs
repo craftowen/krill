@@ -138,12 +138,7 @@ impl Shell {
         for (host, notices) in notices {
             if monitor.should_notify(&host) {
                 let notice = if notices.is_empty() {
-                    match krill_app::i18n::language() {
-                        krill_app::i18n::Language::Ko => {
-                            format!("{host}: 세션에 다시 연결하는 중…")
-                        }
-                        krill_app::i18n::Language::En => format!("{host}: Reconnecting sessions…"),
-                    }
+                    text::HOST_SESSIONS_RECONNECTING.format(&[("host", &host.to_string())])
                 } else {
                     notices
                         .iter()

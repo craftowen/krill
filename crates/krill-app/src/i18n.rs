@@ -507,6 +507,8 @@ catalog! {
         PINNED_CLOSE_CONFIRM => ("탭 닫기", "Close Tab"),
         PINNED_CLOSE_CANCEL => ("취소", "Cancel"),
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
+        RECENT_ALL_WORKSPACES => ("모든 워크스페이스", "All workspaces"),
+        HOST_SESSIONS_RECONNECTING => ("{host}: 세션에 다시 연결하는 중…", "{host}: Reconnecting sessions…"),
         EMPTY_NEW_AGENT => ("새 에이전트", "New agent"),
         AWAY_SUMMARY => ("Krill을 닫아 둔 {duration} 동안 {counts}", "While Krill was closed ({duration}): {counts}"),
         AWAY_DONE => ("{n}개 완료", "{n} done"),
