@@ -9,9 +9,9 @@ assigned Run/Task/Dispatch and send to the coordinator, never to a group.
 without acknowledging (plain `--wait` defaults to 60s, max 300s).
 JSON checks return a `delivery` receipt and `messages` array. Match
 each returned message to the owned Run and authoritative dispatch before deciding
-what to do. Group addresses such as `@all`, `@active`, and `@agy` currently span
-matching dispatches in the store; they are not safe Run-scoped broadcasts. Prefer
-explicit recipients.
+what to do. Group addresses such as `@all`, `@active`, and `@agy` are scoped by
+the supplied Run and exclude ended workers. Always supply `--run` for a group
+message; without one, matching workers across Runs can be selected. Prefer explicit recipients.
 
 Inspect with `check --unread --wait` first and acknowledge the returned immutable
 batch with `check --to <name> --run <run-id> --ack <delivery-id> --json` after handling
