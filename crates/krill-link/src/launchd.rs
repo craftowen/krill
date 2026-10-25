@@ -7,6 +7,7 @@
 //! launchd가 띄운 `serve`가 실제 상태 디렉터리(`link-ctl.sock`)에 붙지 않는다(OWE-669).
 
 use krill_proto::os::ffi::OsStrExt as _;
+use std::fmt::Write as _;
 #[cfg(target_os = "macos")]
 use std::fs;
 use std::io;
@@ -15,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use krill_proto::daemon::BUNDLE_ID;
+
+#[cfg(target_os = "macos")]
+pub mod lifecycle;
 
 use crate::Error;
 use crate::store::encode_hex;
@@ -58,6 +62,14 @@ const NOFILE: u32 = 10_240;
 /// - `launchd`가 띄우므로 `--detach`나 자체 `setsid`를 쓰지 않는다(CONVENTIONS A1).
 /// - 격리 상태 디렉터리면 라벨을 바꾸고 `EnvironmentVariables`에 `KRILL_STATE_DIR`을 넣는다.
 pub fn link_plist(krill_link_exe: &str, isolated: Option<&str>) -> String {
+    render_link_plist(krill_link_exe, isolated, None)
+}
+
+fn render_link_plist(
+    krill_link_exe: &str,
+    isolated: Option<&str>,
+    agent: Option<(&str, &str)>,
+) -> String {
     let mut args = String::new();
     for a in [krill_link_exe, "serve"] {
         args.push_str("\t\t<string>");
@@ -65,13 +77,29 @@ pub fn link_plist(krill_link_exe: &str, isolated: Option<&str>) -> String {
         args.push_str("</string>\n");
     }
     let label = link_label(isolated.map(Path::new));
-    let env = isolated.map_or_else(String::new, |dir| {
-        format!(
-            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>{}</key>\n\t\t<string>{}</string>\n\t</dict>\n",
-            "KRILL_STATE_DIR",
-            escape_xml(dir)
-        )
-    });
+    let mut variables = Vec::new();
+    if let Some(dir) = isolated {
+        variables.push(("KRILL_STATE_DIR", dir.to_owned()));
+    }
+    if let Some((state, plist)) = agent {
+        // launchd의 HOME이 호출 앱의 HOME과 달라도 같은 상태 디렉터리를 쓴다.
+        variables.retain(|(key, _)| *key != "KRILL_STATE_DIR");
+        variables.push(("KRILL_STATE_DIR", state.to_owned()));
+        variables.push(("KRILL_LINK_AGENT_PLIST", plist.to_owned()));
+    }
+    let mut env = String::new();
+    if !variables.is_empty() {
+        env.push_str("\t<key>EnvironmentVariables</key>\n\t<dict>\n");
+        for (key, value) in variables {
+            write!(
+                env,
+                "\t\t<key>{key}</key>\n\t\t<string>{}</string>\n",
+                escape_xml(&value)
+            )
+            .ok();
+        }
+        env.push_str("\t</dict>\n");
+    }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -131,6 +159,12 @@ pub fn launch_agent_plist_path(label: &str) -> Result<PathBuf, Error> {
         .join(format!("{label}.plist")))
 }
 
+/// 단위 테스트와 자식 프로세스 테스트 훅은 실제 사용자 도메인에 접근하지 않는다.
+#[cfg(target_os = "macos")]
+pub(crate) fn launchctl_allowed() -> bool {
+    !cfg!(test) && std::env::var_os("KRILL_LINK_SKIP_LAUNCHCTL").is_none()
+}
+
 /// `state_dir`용 `LaunchAgent` plist를 설치하고 `launchctl bootstrap gui/<uid>`로 활성화한다.
 #[cfg(target_os = "macos")]
 pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<PathBuf, Error> {
@@ -145,10 +179,22 @@ pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<Pa
     let exe_str = krill_link_exe.to_str().ok_or_else(|| {
         Error::InvalidConfig("krill-link executable path is not valid UTF-8".to_owned())
     })?;
-    let plist_xml = link_plist(exe_str, isolated);
+    if !state_dir.is_absolute() || !plist_path.is_absolute() {
+        return Err(Error::InvalidConfig(
+            "launch agent paths must be absolute".to_owned(),
+        ));
+    }
+    // plist 경로를 손실 없이 자식 환경에 넣는다.
+    let plist_str = plist_path
+        .to_str()
+        .ok_or_else(|| Error::InvalidConfig("launch agent path is not valid UTF-8".to_owned()))?;
+    let state_str = state_dir.to_str().ok_or_else(|| {
+        Error::InvalidConfig("state directory path is not valid UTF-8".to_owned())
+    })?;
+    let plist_xml = render_link_plist(exe_str, isolated, Some((state_str, plist_str)));
     write_atomic_0600(&plist_path, plist_xml.as_bytes()).map_err(Error::Io)?;
 
-    if std::env::var_os("KRILL_LINK_SKIP_LAUNCHCTL").is_none() {
+    if launchctl_allowed() {
         let uid = rustix::process::getuid().as_raw();
         let domain = format!("gui/{uid}");
         let target = format!("{domain}/{label}");
@@ -178,7 +224,7 @@ pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<Pa
 pub fn disable_launch_agent(state_dir: &Path) -> Result<PathBuf, Error> {
     let label = link_label(isolated_state_dir(state_dir));
     let plist_path = launch_agent_plist_path(&label)?;
-    if std::env::var_os("KRILL_LINK_SKIP_LAUNCHCTL").is_none() {
+    if launchctl_allowed() {
         let uid = rustix::process::getuid().as_raw();
         let target = format!("gui/{uid}/{label}");
         Command::new("/bin/launchctl")
@@ -231,6 +277,29 @@ mod tests {
         assert!(generated.contains("<key>KeepAlive</key>\n\t<true/>"));
         assert!(!generated.contains("--detach"));
         assert!(!generated.contains("EnvironmentVariables"));
+    }
+
+    #[test]
+    fn managed_plist_snapshots_self_cleanup_paths_and_keeps_run_at_load() {
+        let generated = render_link_plist(
+            "/Applications/Krill.app/Contents/Helpers/krill-link",
+            None,
+            Some((
+                "/Users/u/Library/Application Support/dev.krill.app",
+                "/Users/u/Library/LaunchAgents/dev.krill.app.link.plist",
+            )),
+        );
+        assert_eq!(generated, include_str!("launchd/managed.plist"));
+        assert!(generated.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        assert!(generated.contains("<key>KeepAlive</key>\n\t<true/>"));
+        let isolated = render_link_plist(
+            "/x/krill-link",
+            Some("/tmp/R&D"),
+            Some(("/tmp/R&D", "/tmp/a&b/agent.plist")),
+        );
+        assert!(isolated.contains("<string>/tmp/R&amp;D</string>"));
+        assert!(isolated.contains("<string>/tmp/a&amp;b/agent.plist</string>"));
+        assert_eq!(isolated.matches("<key>KRILL_STATE_DIR</key>").count(), 1);
     }
 
     /// OWE-669: 격리 상태 디렉터리는 실제 라벨과 겹치지 않는 라벨 + `KRILL_STATE_DIR` 환경으로 띄운다.

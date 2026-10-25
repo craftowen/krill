@@ -32,6 +32,17 @@ impl Fixture {
         Self { dir, child: None }
     }
 
+    fn disable(&self) {
+        let result = Command::new(env!("CARGO_BIN_EXE_krill-link"))
+            .args(["disable", "--state-dir"])
+            .arg(&self.dir)
+            .env("KRILL_LINK_SKIP_LAUNCHCTL", "1")
+            .env("KRILL_LINK_LAUNCH_AGENTS_DIR", self.dir.join("agents"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+    }
+
     fn start(&mut self) {
         #[cfg(windows)]
         {
@@ -77,6 +88,20 @@ impl Drop for Fixture {
 
 #[test]
 fn disabling_exits_serve_process_and_keeps_local_socket_alive() {
+    // 라이브러리의 자동 시작에는 배경 고아 정리도 포함되므로 테스트 전체에 훅을 강제한다.
+    if std::env::var_os("KRILL_LINK_SKIP_LAUNCHCTL").is_none() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "disabling_exits_serve_process_and_keeps_local_socket_alive",
+                "--nocapture",
+            ])
+            .env("KRILL_LINK_SKIP_LAUNCHCTL", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
     let mut fixture = Fixture::new("stop");
     let local_path = fixture.dir.join("run/krilld.sock");
     fs::create_dir_all(local_path.parent().unwrap()).unwrap();
@@ -95,12 +120,7 @@ fn disabling_exits_serve_process_and_keeps_local_socket_alive() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(is_serve_running(&fixture.dir));
-    let result = Command::new(env!("CARGO_BIN_EXE_krill-link"))
-        .args(["disable", "--state-dir"])
-        .arg(&fixture.dir)
-        .output()
-        .unwrap();
-    assert!(result.status.success(), "{result:?}");
+    fixture.disable();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = fixture.child.as_mut().unwrap().try_wait().unwrap() {
@@ -170,7 +190,7 @@ fn incoming_server_pairs_and_forwards_to_local_socket() {
         .await
         .unwrap();
     });
-    krill_link::service::disable_server(&fixture.dir).unwrap();
+    fixture.disable();
     assert!(!is_serve_running(&fixture.dir));
 }
 
@@ -195,4 +215,236 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
     krill_link::service::enable_server(executable, &fixture.dir).unwrap();
     assert!(is_serve_running(&fixture.dir));
     krill_link::service::disable_server(&fixture.dir).unwrap();
+}
+
+/// 실제 사용자 도메인에 접근할 수 없도록 훅을 강제한 자식에서 앱의 자동 시작 경로를 검사한다.
+#[cfg(target_os = "macos")]
+#[test]
+fn temporary_home_prevents_default_autostart_even_without_state_override() {
+    const CHILD: &str = "KRILL_LINK_TEST_TEMP_HOME";
+    if std::env::var_os(CHILD).is_some() {
+        let state = krill_link::resolve_state_dir(None).unwrap();
+        let executable = std::path::Path::new(env!("CARGO_BIN_EXE_krill-link"));
+        krill_link::service::ensure_default_server(executable, &state).unwrap();
+        assert!(
+            !state.exists(),
+            "temporary HOME must not even create service state"
+        );
+        assert!(
+            !std::path::Path::new(&std::env::var_os("HOME").unwrap())
+                .join("Library/LaunchAgents")
+                .exists()
+        );
+        return;
+    }
+    let fixture = Fixture::new("temp-home");
+    for isolated in [false, true] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "temporary_home_prevents_default_autostart_even_without_state_override",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", &fixture.dir)
+            .env_remove("KRILL_STATE_DIR")
+            .env_remove("KRILL_LINK_LAUNCH_AGENTS_DIR")
+            .env("KRILL_LINK_SKIP_LAUNCHCTL", "1");
+        if isolated {
+            command.env("KRILL_STATE_DIR", fixture.dir.join("isolated"));
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+}
+
+/// 실제 HOME의 격리 상태 디렉터리는 자동 시작을 유지한다. plist 쓰기만 허용하고 launchctl은 막는다.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_home_keeps_default_autostart_for_custom_state_directory() {
+    const CHILD: &str = "KRILL_LINK_TEST_REAL_HOME";
+    if std::env::var_os(CHILD).is_some() {
+        let state = krill_link::resolve_state_dir(None).unwrap();
+        let executable = std::path::Path::new(env!("CARGO_BIN_EXE_krill-link"));
+        krill_link::service::ensure_default_server(executable, &state).unwrap();
+        let label = krill_link::link_label(Some(&state));
+        let plist = krill_link::launch_agent_plist_path(&label).unwrap();
+        let xml = fs::read_to_string(plist).unwrap();
+        assert!(xml.contains("<key>KRILL_LINK_AGENT_PLIST</key>"));
+        assert!(xml.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        assert!(xml.contains("<key>KeepAlive</key>\n\t<true/>"));
+        return;
+    }
+    let fixture = Fixture::new("real-home");
+    let account = Command::new("/usr/bin/dscacheutil")
+        .args(["-q", "user", "-a", "uid"])
+        .arg(rustix::process::getuid().as_raw().to_string())
+        .output()
+        .unwrap();
+    assert!(account.status.success());
+    let home = String::from_utf8(account.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("dir: ").map(str::to_owned))
+        .unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "real_home_keeps_default_autostart_for_custom_state_directory",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("HOME", home)
+        .env("KRILL_STATE_DIR", &fixture.dir)
+        .env("KRILL_LINK_LAUNCH_AGENTS_DIR", fixture.dir.join("agents"))
+        .env("KRILL_LINK_SKIP_LAUNCHCTL", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// debug 전용 실행기 + skip 훅을 함께 써서 실제 launchd 없이 `cmd_serve` 전체를 검사한다.
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod managed_agent {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    fn start(fixture: &mut Fixture, state: &Path, plist: &Path) {
+        let executor = fixture.dir.join("fake-launchctl");
+        fs::write(
+            &executor,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$KRILL_LINK_TEST_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executor, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.child = Some(
+            Command::new(env!("CARGO_BIN_EXE_krill-link"))
+                .args(["serve", "--state-dir"])
+                .arg(state)
+                .env("KRILL_LINK_SKIP_LAUNCHCTL", "1")
+                .env("KRILL_LINK_TEST_LAUNCHCTL", executor)
+                .env("KRILL_LINK_TEST_LOG", fixture.dir.join("calls"))
+                .env("XPC_SERVICE_NAME", krill_link::link_label(Some(state)))
+                .env("KRILL_LINK_AGENT_PLIST", plist)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+    }
+
+    fn wait_for_exit(fixture: &mut Fixture) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = fixture.child.as_mut().unwrap().try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "managed serve did not exit");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn assert_bootout(fixture: &Fixture, state: &Path) {
+        let target = format!(
+            "bootout gui/{}/{}\n",
+            rustix::process::getuid().as_raw(),
+            krill_link::link_label(Some(state))
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("calls")).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn missing_state_is_retired_before_serve_can_recreate_it() {
+        let mut fixture = Fixture::new("managed-before");
+        let state = fixture.dir.join("gone");
+        let plist = fixture
+            .dir
+            .join(format!("{}.plist", krill_link::link_label(Some(&state))));
+        fs::write(&plist, "plist").unwrap();
+        start(&mut fixture, &state, &plist);
+        assert!(wait_for_exit(&mut fixture).success());
+        assert!(!state.exists(), "preflight must not recreate deleted state");
+        assert_bootout(&fixture, &state);
+        // D2: 자동 정리는 사용자 plist를 삭제하지 않는 보수적 정책을 유지한다.
+        assert!(plist.exists());
+    }
+
+    #[test]
+    fn unmounted_state_exits_unsuccessfully_without_bootout_or_directory_creation() {
+        let mut fixture = Fixture::new("managed-volume");
+        let state = PathBuf::from(format!(
+            "/Volumes/krill-test-unmounted-{}/state",
+            std::process::id()
+        ));
+        assert!(!state.exists());
+        let plist = fixture
+            .dir
+            .join(format!("{}.plist", krill_link::link_label(Some(&state))));
+        fs::write(&plist, "plist").unwrap();
+        start(&mut fixture, &state, &plist);
+        assert!(!wait_for_exit(&mut fixture).success());
+        assert!(!fixture.dir.join("calls").exists());
+        assert!(!state.exists());
+        assert!(plist.exists());
+    }
+
+    #[test]
+    fn live_serve_stops_through_self_monitor_when_plist_disappears() {
+        let mut fixture = Fixture::new("managed-live");
+        let state = fixture.dir.clone();
+        let plist = fixture
+            .dir
+            .join(format!("{}.plist", krill_link::link_label(Some(&state))));
+        fs::write(&plist, "plist").unwrap();
+        start(&mut fixture, &state, &plist);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !is_serve_running(&state) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(is_serve_running(&state));
+        fs::remove_file(&plist).unwrap();
+        let removed_at = Instant::now();
+        assert!(wait_for_exit(&mut fixture).success());
+        assert!(removed_at.elapsed() >= Duration::from_secs(2));
+        assert!(
+            !is_serve_running(&state),
+            "select must shut down the server"
+        );
+        assert_bootout(&fixture, &state);
+    }
+
+    #[test]
+    fn broken_injected_executor_never_falls_back_to_launchctl() {
+        let fixture = Fixture::new("managed-broken");
+        let state = fixture.dir.join("gone");
+        let label = krill_link::link_label(Some(&state));
+        let plist = fixture.dir.join(format!("{label}.plist"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_krill-link"))
+            .args(["serve", "--state-dir"])
+            .arg(&state)
+            .env("KRILL_LINK_SKIP_LAUNCHCTL", "1")
+            .env(
+                "KRILL_LINK_TEST_LAUNCHCTL",
+                fixture.dir.join("missing-executor"),
+            )
+            .env("XPC_SERVICE_NAME", label)
+            .env("KRILL_LINK_AGENT_PLIST", plist)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // bootout 호출이 실패하므로 두 번째 관측 뒤에도 살아 있어야 한다.
+        thread::sleep(Duration::from_millis(2500));
+        let status = child.try_wait().unwrap();
+        child.kill().ok();
+        child.wait().unwrap();
+        assert!(status.is_none());
+        assert!(!state.exists());
+    }
 }
