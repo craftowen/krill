@@ -2215,6 +2215,24 @@ fn unescape_pbtxt_string(quoted: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn truncate_live_title(s: &str) -> Option<String> {
+    const ELLIPSIS: char = '…';
+    let max_bytes = krill_proto::control::MAX_TITLE_TEXT;
+    if s.len() <= max_bytes && s.chars().take(TITLE_CHARS + 1).count() <= TITLE_CHARS {
+        return krill_proto::control::display_title(s);
+    }
+    let body_budget = max_bytes.saturating_sub(ELLIPSIS.len_utf8());
+    let mut out = String::with_capacity(max_bytes);
+    for (i, ch) in s.chars().enumerate() {
+        if i >= TITLE_CHARS || out.len().saturating_add(ch.len_utf8()) > body_budget {
+            out.push(ELLIPSIS);
+            break;
+        }
+        out.push(ch);
+    }
+    krill_proto::control::display_title(&out)
+}
+
 /// Antigravity `annotations/<id>.pbtxt`의 `title:"..."` 줄을 파싱한다.
 pub(crate) fn parse_pbtxt_title(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -2236,7 +2254,7 @@ pub(crate) fn parse_pbtxt_title(bytes: &[u8]) -> Option<String> {
         };
         let single = one_line(candidate);
         if single.chars().any(char::is_alphanumeric) && !single.starts_with('{') {
-            return Some(truncate_chars(&single, TITLE_CHARS));
+            return truncate_live_title(&single);
         }
     }
     None
@@ -2468,7 +2486,7 @@ fn read_agy_first_user_prompt(agy_root: &Path, conv_id: &str) -> Option<String> 
                     };
                     let single = one_line(candidate);
                     if !single.is_empty() {
-                        return Some(truncate_chars(&single, TITLE_CHARS));
+                        return truncate_live_title(&single);
                     }
                 }
             }
@@ -2773,6 +2791,62 @@ mod agy_title_tests {
             prompt_title.as_deref(),
             Some("안티그래비티도 제목인지 내용 요약 뜨게하고")
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_live_agy_title_caps_multibyte_utf8_within_control_max_title_text() {
+        use krill_proto::screen::Msg as _;
+
+        let root =
+            std::env::temp_dir().join(format!("krill-agy-title-utf8-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let agy_root = root.join(".gemini/antigravity-cli");
+        let conv_id = "d3462946-8e91-41c8-a596-f077854ed0ac";
+        let log_dir = agy_root
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let transcript = log_dir.join("transcript.jsonl");
+        let long_korean = "우리 서비스 광고 10만원 돌렸는데 매출이 0이야. ".repeat(8);
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\n{long_korean}\\n</USER_REQUEST>\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let stored = crate::agent::control::StoredLaunch {
+            profile: "agy".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: Some(conv_id.into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+
+        let (title, _) =
+            resolve_live_agy_title(krill_proto::SessionId(9003), 0, None, false, Some(&stored));
+        let title = title.expect("title resolved");
+        assert!(title.len() <= krill_proto::control::MAX_TITLE_TEXT);
+        assert!(title.ends_with('…'));
+
+        let mut status = krill_proto::control::AgentStatus::UNKNOWN;
+        status.title = Some(title);
+        let reply =
+            krill_proto::control::Reply::States(vec![krill_proto::control::SessionStatus {
+                session: krill_proto::SessionId(9003),
+                status,
+            }]);
+        let frame = reply.encode().expect("encode States");
+        let decoded =
+            krill_proto::control::Reply::decode(frame[4], frame.get(5..).expect("ipc body"))
+                .expect("decode States must succeed for multibyte agy title");
+        assert_eq!(decoded, reply);
 
         fs::remove_dir_all(&root).ok();
     }

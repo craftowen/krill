@@ -1837,6 +1837,9 @@ impl Registry {
                         {
                             status.state = control::AgentState::Done;
                         }
+                        let title = title
+                            .as_deref()
+                            .and_then(krill_proto::control::display_title);
                         if title.is_some() || status.title.is_none() {
                             status.title = title;
                         }
