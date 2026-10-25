@@ -72,7 +72,8 @@ class PublishGuardTests(unittest.TestCase):
         (bin_dir / "curl").write_text('#!/bin/bash\nprintf %s "${FAKE_MOBILE:-200}"\n')
         (bin_dir / "curl").chmod(0o755)
         # 실제 게시 락(/tmp/krill-publish.lock)은 건드리지 않는다.
-        self.env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", KRILL_PUBLISH_LOCKED="1")
+        self.env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", KRILL_PUBLISH_LOCKED="1",
+                        KRILL_MOBILE_CLOUD_DIR=str(root / "cloud-mobile"))
         self.env.pop("KRILL_PUBLISH_FORCE", None)
 
     def commit(self, message):
