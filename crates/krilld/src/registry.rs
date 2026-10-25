@@ -1040,16 +1040,22 @@ impl Registry {
             Request::NewWorktree(w) => {
                 if self.authorize_cwd(peer, "worktree-new", &w.repo) {
                     let size = self.request_size(peer);
-                    Ok(crate::git::worktree::serve(&w, size, |c| {
-                        self.create(peer, c)
-                    }))
+                    let reply = crate::git::worktree::serve(&w, size, |c| self.create(peer, c));
+                    if matches!(reply, Reply::WorktreeCreated(_)) {
+                        lock(&self.sidebar).invalidate();
+                    }
+                    Ok(reply)
                 } else {
                     Err(Failure::Denied)
                 }
             }
             Request::RemoveWorktree(w) => {
                 if self.authorize_cwd(peer, "worktree-rm", &w.path) {
-                    Ok(crate::git::worktree::serve_remove(&w))
+                    let reply = crate::git::worktree::serve_remove(&w);
+                    if matches!(reply, Reply::WorktreeRemoved(_)) {
+                        lock(&self.sidebar).invalidate();
+                    }
+                    Ok(reply)
                 } else {
                     Err(Failure::Denied)
                 }

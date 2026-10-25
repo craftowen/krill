@@ -34,11 +34,16 @@ const CARD_SESSION_INSET: f32 = 8.;
 /// 폴더 행의 아이콘 아래에 세션 상태를 정렬한다(이름 아래로 중복 들여쓰지 않는다).
 const FOLDER_SESSION_INSET: f32 = 34.;
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "menu metadata flags for pin, primary worktree, remote capability, and sleep state"
+)]
 #[derive(Clone)]
 struct TreeMenuMeta {
     path: PathBuf,
     pinned: bool,
     is_primary: bool,
+    can_manage_worktrees: bool,
     current_parent: Option<PathBuf>,
     parent_candidates: Vec<(PathBuf, String)>,
     descendant_count: usize,
@@ -267,21 +272,26 @@ fn row_menu(
                     }),
             );
 
-        let (child_this, child_host, child_parent) =
-            (this.clone(), host.clone(), meta.path.clone());
-        menu = menu.separator().item(
-            PopupMenuItem::new(text::CREATE_CHILD_WORKTREE.get())
-                .icon(IconName::Plus)
-                .on_click(move |_, window, cx| {
-                    child_this
-                        .update(cx, |s, cx| {
-                            s.new_child_worktree_on(&child_host, child_parent.clone(), window, cx);
-                        })
-                        .ok();
-                }),
-        );
+        if meta.can_manage_worktrees {
+            let (child_this, child_host, child_parent) =
+                (this.clone(), host.clone(), meta.path.clone());
+            menu = menu.separator().item(
+                PopupMenuItem::new(text::CREATE_CHILD_WORKTREE.get())
+                    .icon(IconName::Plus)
+                    .on_click(move |_, window, cx| {
+                        child_this
+                            .update(cx, |s, cx| {
+                                s.new_child_worktree_on(
+                                    &child_host,
+                                    child_parent.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    }),
+            );
 
-        if host.is_local() {
             if !meta.parent_candidates.is_empty() {
                 let (sub_this, sub_path, candidates, cur_parent) = (
                     this.clone(),
@@ -330,59 +340,68 @@ fn row_menu(
                 ));
             }
 
-            menu = menu.separator();
-            if meta.sleeping {
-                let (wake_this, wake_path) = (this.clone(), meta.path.clone());
-                menu = menu.item(PopupMenuItem::new(text::WAKE_WORKTREE.get()).on_click(
-                    move |_, _, cx| {
-                        wake_this
-                            .update(cx, |s, cx| s.wake_worktree(&wake_path, cx))
-                            .ok();
-                    },
-                ));
-            } else {
-                let (sleep_this, sleep_path) = (this.clone(), meta.path.clone());
-                menu = menu.item(PopupMenuItem::new(text::SLEEP_WORKTREE.get()).on_click(
-                    move |_, _, cx| {
-                        sleep_this
-                            .update(cx, |s, cx| s.sleep_worktree(sleep_path.clone(), cx))
-                            .ok();
-                    },
-                ));
-            }
+            if host.is_local() {
+                menu = menu.separator();
+                if meta.sleeping {
+                    let (wake_this, wake_path) = (this.clone(), meta.path.clone());
+                    menu = menu.item(PopupMenuItem::new(text::WAKE_WORKTREE.get()).on_click(
+                        move |_, _, cx| {
+                            wake_this
+                                .update(cx, |s, cx| s.wake_worktree(&wake_path, cx))
+                                .ok();
+                        },
+                    ));
+                } else {
+                    let (sleep_this, sleep_path) = (this.clone(), meta.path.clone());
+                    menu = menu.item(PopupMenuItem::new(text::SLEEP_WORKTREE.get()).on_click(
+                        move |_, _, cx| {
+                            sleep_this
+                                .update(cx, |s, cx| s.sleep_worktree(sleep_path.clone(), cx))
+                                .ok();
+                        },
+                    ));
+                }
 
-            if meta.descendant_count > 0 {
-                let (sleep_all_this, sleep_all_path) = (this.clone(), meta.path.clone());
-                let label = text::SLEEP_WITH_DESCENDANTS
-                    .format(&[("n", &meta.descendant_count.to_string())]);
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    sleep_all_this
-                        .update(cx, |s, cx| {
-                            s.sleep_with_descendants(sleep_all_path.clone(), cx);
-                        })
-                        .ok();
-                }));
+                if meta.descendant_count > 0 {
+                    let (sleep_all_this, sleep_all_path) = (this.clone(), meta.path.clone());
+                    let label = text::SLEEP_WITH_DESCENDANTS
+                        .format(&[("n", &meta.descendant_count.to_string())]);
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        sleep_all_this
+                            .update(cx, |s, cx| {
+                                s.sleep_with_descendants(sleep_all_path.clone(), cx);
+                            })
+                            .ok();
+                    }));
+                }
             }
 
             if !meta.is_primary || meta.descendant_count > 0 {
                 menu = menu.separator();
                 if !meta.is_primary {
                     // OWE-847: 즉시 삭제하지 않고 확인 모달을 연다.
-                    let (confirm_this, confirm_path) = (this.clone(), meta.path.clone());
+                    let (confirm_this, confirm_host, confirm_path) =
+                        (this.clone(), host.clone(), meta.path.clone());
                     menu = menu.item(
                         PopupMenuItem::new(text::DELETE_WORKTREE.get())
                             .icon(Icon::default().data(ui::icons::TRASH_SVG))
                             .on_click(move |_, _, cx| {
                                 confirm_this
                                     .update(cx, |s, cx| {
-                                        s.request_delete_worktree(confirm_path.clone(), false, cx);
+                                        s.request_delete_worktree_on(
+                                            confirm_host.clone(),
+                                            confirm_path.clone(),
+                                            false,
+                                            cx,
+                                        );
                                     })
                                     .ok();
                             }),
                     );
                 }
                 if meta.descendant_count > 0 {
-                    let (del_all_this, del_all_path) = (this.clone(), meta.path.clone());
+                    let (del_all_this, del_all_host, del_all_path) =
+                        (this.clone(), host.clone(), meta.path.clone());
                     let label = text::DELETE_WITH_DESCENDANTS
                         .format(&[("n", &meta.descendant_count.to_string())]);
                     menu = menu.item(
@@ -391,7 +410,12 @@ fn row_menu(
                             .on_click(move |_, _, cx| {
                                 del_all_this
                                     .update(cx, |s, cx| {
-                                        s.request_delete_worktree(del_all_path.clone(), true, cx);
+                                        s.request_delete_worktree_on(
+                                            del_all_host.clone(),
+                                            del_all_path.clone(),
+                                            true,
+                                            cx,
+                                        );
                                     })
                                     .ok();
                             }),
@@ -1075,6 +1099,9 @@ impl Sidebar {
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Plus)
+                                        .debug_selector(move || {
+                                            format!("repo-new-worktree-{index}")
+                                        })
                                         .accessibility_label(text::NEW_WORKTREE.get())
                                         .tooltip(text::NEW_WORKTREE.get())
                                         .on_click(cx.listener(move |s, _, window, cx| {
@@ -2722,21 +2749,23 @@ impl Sidebar {
                             let pinned = s.prefs.get(path).is_some_and(|p| p.pinned);
                             let is_primary =
                                 super::options::is_primary_worktree(s.snapshot_for(&host), path);
-                            let current_parent =
-                                host.is_local().then(|| s.worktree_parent(path)).flatten();
-                            let parent_candidates = if host.is_local() {
-                                s.eligible_parent_worktrees(path)
+                            let can_manage_worktrees = s.can_create_worktree_on(&host);
+                            let current_parent = can_manage_worktrees
+                                .then(|| s.worktree_parent(path))
+                                .flatten();
+                            let parent_candidates = if can_manage_worktrees {
+                                s.eligible_parent_worktrees_on(&host, path)
                                     .into_iter()
                                     .map(|cand| {
-                                        let label = s.name(&cand);
+                                        let label = s.name_on(&host, &cand);
                                         (cand, label)
                                     })
                                     .collect()
                             } else {
                                 Vec::new()
                             };
-                            let descendant_count = if host.is_local() {
-                                s.lineage_descendants(path).len()
+                            let descendant_count = if can_manage_worktrees {
+                                s.lineage_descendants_on(&host, path).len()
                             } else {
                                 0
                             };
@@ -2748,6 +2777,7 @@ impl Sidebar {
                                     path: path.clone(),
                                     pinned,
                                     is_primary,
+                                    can_manage_worktrees,
                                     current_parent,
                                     parent_candidates,
                                     descendant_count,
@@ -2921,7 +2951,7 @@ impl Sidebar {
         let scope_focus = self.delete_scope_focus.as_ref()?;
         let cancel_focus = self.delete_cancel_focus.as_ref()?;
         let p = ui::palette(cx);
-        let name = self.name(&confirm.path);
+        let name = self.name_on(&confirm.host, &confirm.path);
         let desc = if confirm.with_descendants {
             text::DELETE_DESC_WITH_DESCENDANTS.format(&[
                 ("name", &name),
@@ -3342,6 +3372,7 @@ impl Render for Sidebar {
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Plus)
+                                        .debug_selector(|| "sidebar-new-worktree".into())
                                         .accessibility_label(text::NEW_WORKTREE.get())
                                         .tooltip(text::NEW_WORKTREE.get())
                                         .dropdown_menu(move |mut menu, _, _| {

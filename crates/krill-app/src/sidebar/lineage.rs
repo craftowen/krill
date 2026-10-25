@@ -205,8 +205,11 @@ impl Sidebar {
         if path == parent {
             return false;
         }
-        if let (Some(r1), Some(r2)) = (self.repo_for_worktree(path), self.repo_for_worktree(parent))
-            && r1 != r2
+        let host = self.resolve_worktree_host(path);
+        if let (Some(r1), Some(r2)) = (
+            self.repo_for_worktree_on(&host, path),
+            self.repo_for_worktree_on(&host, parent),
+        ) && r1 != r2
         {
             return false;
         }
@@ -319,13 +322,39 @@ impl Sidebar {
             .map(|(repo, _)| repo.clone())
     }
 
+    pub(super) fn resolve_worktree_host(&self, path: &Path) -> crate::hosts::HostId {
+        if self
+            .repo_for_worktree_on(&crate::hosts::HostId::Local, path)
+            .is_some()
+        {
+            return crate::hosts::HostId::Local;
+        }
+        for remote in &self.remote_hosts {
+            let host = crate::hosts::HostId::Remote(remote.id.clone());
+            if self.repo_for_worktree_on(&host, path).is_some() {
+                return host;
+            }
+        }
+        crate::hosts::HostId::Local
+    }
+
     /// 같은 저장소 안에서 `path`의 부모가 될 수 있는 후보 워크트리 목록.
     #[must_use]
     pub fn eligible_parent_worktrees(&self, path: &Path) -> Vec<PathBuf> {
-        let Some(repo) = self.repo_for_worktree(path) else {
+        let host = self.resolve_worktree_host(path);
+        self.eligible_parent_worktrees_on(&host, path)
+    }
+
+    #[must_use]
+    pub fn eligible_parent_worktrees_on(
+        &self,
+        host: &crate::hosts::HostId,
+        path: &Path,
+    ) -> Vec<PathBuf> {
+        let Some(repo) = self.repo_for_worktree_on(host, path) else {
             return Vec::new();
         };
-        let Some(trees) = self.snapshot.trees.get(&repo) else {
+        let Some(trees) = self.snapshot_for(host).trees.get(&repo) else {
             return Vec::new();
         };
         // Every candidate is already in the same repository. Validate ancestry
@@ -342,9 +371,15 @@ impl Sidebar {
     /// `path`의 직계 자식 워크트리 목록(현재 스냅샷에 존재하는 워크트리만).
     #[must_use]
     pub fn lineage_children(&self, path: &Path) -> Vec<PathBuf> {
+        let host = self.resolve_worktree_host(path);
+        self.lineage_children_on(&host, path)
+    }
+
+    #[must_use]
+    pub fn lineage_children_on(&self, host: &crate::hosts::HostId, path: &Path) -> Vec<PathBuf> {
         let parents = &self.parents;
         let known: BTreeSet<&Path> = self
-            .snapshot
+            .snapshot_for(host)
             .trees
             .values()
             .flatten()
@@ -362,9 +397,15 @@ impl Sidebar {
     /// `path`의 모든 자손 워크트리 목록(부모 → 자식 BFS/DFS 순서, 사이클 안전).
     #[must_use]
     pub fn lineage_descendants(&self, path: &Path) -> Vec<PathBuf> {
+        let host = self.resolve_worktree_host(path);
+        self.lineage_descendants_on(&host, path)
+    }
+
+    #[must_use]
+    pub fn lineage_descendants_on(&self, host: &crate::hosts::HostId, path: &Path) -> Vec<PathBuf> {
         let parents = &self.parents;
         let known: BTreeSet<&Path> = self
-            .snapshot
+            .snapshot_for(host)
             .trees
             .values()
             .flatten()
@@ -400,18 +441,24 @@ impl Sidebar {
     /// 현재 표시 기준에서 `path`의 계보 들여쓰기 깊이(`0..=MAX_LINEAGE_DEPTH`).
     #[must_use]
     pub fn lineage_depth(&self, path: &Path) -> usize {
+        let host = self.resolve_worktree_host(path);
+        self.lineage_depth_on(&host, path)
+    }
+
+    #[must_use]
+    pub fn lineage_depth_on(&self, host: &crate::hosts::HostId, path: &Path) -> usize {
         let parents = &self.parents;
         if parents.is_empty() {
             return 0;
         }
+        let snap = self.snapshot_for(host);
         let scope: BTreeSet<&Path> = match self.options.group_by {
             super::GroupBy::Repo => self
-                .repo_for_worktree(path)
-                .and_then(|r| self.snapshot.trees.get(&r))
+                .repo_for_worktree_on(host, path)
+                .and_then(|r| snap.trees.get(&r))
                 .map(|list| list.iter().map(PathBuf::as_path).collect())
                 .unwrap_or_default(),
-            _ => self
-                .snapshot
+            _ => snap
                 .trees
                 .values()
                 .flatten()
@@ -837,32 +884,54 @@ impl Sidebar {
                             d.has_pending_fan_out(),
                         )
                     };
-                    if created_host.is_local() {
-                        let trees = s.snapshot.trees.entry(created_repo.clone()).or_default();
-                        if !trees.contains(&created_path) {
-                            trees.push(created_path.clone());
+                    match &created_host {
+                        crate::hosts::HostId::Local => {
+                            let trees = s.snapshot.trees.entry(created_repo.clone()).or_default();
+                            if !trees.contains(&created_path) {
+                                trees.push(created_path.clone());
+                            }
+                            s.meta.entry(created_path.clone()).or_insert_with(|| Tree {
+                                branch: Some(w.branch.clone()),
+                                dirty: None,
+                            });
                         }
-                        s.meta.entry(created_path.clone()).or_insert_with(|| Tree {
-                            branch: Some(w.branch.clone()),
-                            dirty: None,
-                        });
-                        s.removed_projects.remove(&created_repo);
-                        s.sleeping_worktrees.remove(&created_path);
-                        s.recently_created_worktrees.insert(created_path.clone());
-                        s.pending_reveal_worktree = Some(created_path.clone());
-                        s.collapsed.remove(&created_repo);
-                        s.collapsed.remove(&created_path);
-                        if !s.options.filters.repos.is_empty() {
-                            s.options.filters.repos.insert(created_repo.clone());
+                        crate::hosts::HostId::Remote(id) => {
+                            if let Some(remote) = s.remote_hosts.iter_mut().find(|r| r.id == *id) {
+                                let trees = remote
+                                    .snapshot
+                                    .trees
+                                    .entry(created_repo.clone())
+                                    .or_default();
+                                if !trees.contains(&created_path) {
+                                    trees.push(created_path.clone());
+                                }
+                                remote
+                                    .meta
+                                    .entry(created_path.clone())
+                                    .or_insert_with(|| Tree {
+                                        branch: Some(w.branch.clone()),
+                                        dirty: None,
+                                    });
+                            }
                         }
-                        if external::is_claude_worktree(&created_path) {
-                            s.shown_external.insert(created_repo.clone());
-                        }
-                        if let Some(parent_path) = &parent_path {
-                            s.collapsed_lineage.remove(parent_path);
-                            s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
-                            s.expand_lineage_ancestors(&created_path);
-                        }
+                    }
+                    s.removed_projects.remove(&created_repo);
+                    s.sleeping_worktrees.remove(&created_path);
+                    s.recently_created_worktrees.insert(created_path.clone());
+                    s.pending_reveal_worktree = Some(created_path.clone());
+                    s.collapsed.remove(&created_repo);
+                    s.collapsed.remove(&created_path);
+                    s.collapsed_hosts.remove(&created_host);
+                    if !s.options.filters.repos.is_empty() {
+                        s.options.filters.repos.insert(created_repo.clone());
+                    }
+                    if external::is_claude_worktree(&created_path) {
+                        s.shown_external.insert(created_repo.clone());
+                    }
+                    if let Some(parent_path) = &parent_path {
+                        s.collapsed_lineage.remove(parent_path);
+                        s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
+                        s.expand_lineage_ancestors(&created_path);
                     }
                     if let Some(prompt_text) = &prompt {
                         s.queue_initial_prompt(created_path.clone(), prompt_text);
@@ -1004,34 +1073,55 @@ impl Sidebar {
 
     /// 단일 워크트리를 삭제하고 계보 연결을 정리한다.
     pub fn delete_worktree(&mut self, path: PathBuf, force: bool, cx: &mut Context<Self>) {
-        self.delete_worktrees_batch(vec![path], force, cx);
+        self.delete_worktree_on(crate::hosts::HostId::Local, path, force, cx);
+    }
+
+    pub fn delete_worktree_on(
+        &mut self,
+        host: crate::hosts::HostId,
+        path: PathBuf,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_worktrees_batch_on(host, vec![path], force, cx);
     }
 
     /// 워크트리와 모든 자손 워크트리를 리프(하위 자손)부터 순서대로 삭제한다.
     pub fn delete_with_descendants(&mut self, path: PathBuf, force: bool, cx: &mut Context<Self>) {
-        let mut targets = self.lineage_descendants(&path);
-        targets.reverse();
-        targets.push(path);
-        self.delete_worktrees_batch(targets, force, cx);
+        self.delete_with_descendants_on(crate::hosts::HostId::Local, path, force, cx);
     }
 
-    fn delete_worktrees_batch(
+    pub fn delete_with_descendants_on(
         &mut self,
+        host: crate::hosts::HostId,
+        path: PathBuf,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut targets = self.lineage_descendants_on(&host, &path);
+        targets.reverse();
+        targets.push(path);
+        self.delete_worktrees_batch_on(host, targets, force, cx);
+    }
+
+    fn delete_worktrees_batch_on(
+        &mut self,
+        host: crate::hosts::HostId,
         targets: Vec<PathBuf>,
         force: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(source) = self.source.clone() else {
+        let Some(source) = self.source_for(&host) else {
             return;
         };
         let parents = self.parents.clone();
         let mut ipc_targets = Vec::new();
         for target in targets {
-            if self.snapshot.trees.contains_key(&target) {
+            if self.snapshot_for(&host).trees.contains_key(&target) {
                 continue;
             }
             let repo = self
-                .repo_for_worktree(&target)
+                .repo_for_worktree_on(&host, &target)
                 .unwrap_or_else(|| target.clone());
             ipc_targets.push((repo, target));
         }
@@ -1089,13 +1179,32 @@ impl Sidebar {
                 } else {
                     for removed in &removed_paths {
                         s.remove_worktree_lineage_local(removed, cx);
-                        for list in s.snapshot.trees.values_mut() {
-                            list.retain(|t| t != removed);
+                        match &host {
+                            crate::hosts::HostId::Local => {
+                                for list in s.snapshot.trees.values_mut() {
+                                    list.retain(|t| t != removed);
+                                }
+                            }
+                            crate::hosts::HostId::Remote(id) => {
+                                if let Some(remote) =
+                                    s.remote_hosts.iter_mut().find(|r| r.id == *id)
+                                {
+                                    for list in remote.snapshot.trees.values_mut() {
+                                        list.retain(|t| t != removed);
+                                    }
+                                    remote.meta.remove(removed);
+                                }
+                            }
                         }
                     }
                     s.persist(cx);
-                    if s.task.is_some() {
-                        s.refresh(cx);
+                    if host.is_local() {
+                        if s.task.is_some() {
+                            s.refresh(cx);
+                        }
+                    } else if s.remote_task.is_some() {
+                        s.remote_task = None;
+                        s.spawn_remote_polling(true, cx);
                     }
                 }
             })

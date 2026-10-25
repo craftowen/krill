@@ -6024,3 +6024,224 @@ fn worktree_creation_and_deferred_session_focus_keep_sidebar_selection_synced(
         assert!(!s.is_session_focused(s3_idx, SessionId(3)));
     });
 }
+
+#[gpui::test]
+fn remote_host_worktree_creation_and_child_lineage(cx: &mut TestAppContext) {
+    use krill_proto::control::{RemoveWorktree, RemovedWorktree, Worktree};
+    use std::sync::Mutex;
+
+    struct RemoteSource {
+        created: Arc<Mutex<Vec<NewWorktree>>>,
+        removed: Arc<Mutex<Vec<RemoveWorktree>>>,
+    }
+    impl Source for RemoteSource {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            let mut list = vec![
+                PathBuf::from("/remote/repo"),
+                PathBuf::from("/remote/repo/feat-parent"),
+            ];
+            for req in self.created.lock().expect("lock").iter() {
+                list.push(PathBuf::from(format!("/remote/repo/{}", req.name)));
+            }
+            let removed: Vec<PathBuf> = self
+                .removed
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|r| PathBuf::from(String::from_utf8_lossy(&r.path).into_owned()))
+                .collect();
+            list.retain(|p| !removed.contains(p));
+            Ok(Snapshot {
+                sessions: vec![],
+                trees: BTreeMap::from([(PathBuf::from("/remote/repo"), list)]),
+            })
+        }
+        fn new_worktree(&self, req: NewWorktree) -> io::Result<Reply> {
+            let repo_str = String::from_utf8_lossy(&req.repo);
+            let path = format!("{repo_str}/{}", req.name).into_bytes();
+            let branch = req.name.clone();
+            let base = req.base.clone().unwrap_or_else(|| "main".into());
+            self.created.lock().expect("lock").push(req);
+            Ok(Reply::WorktreeCreated(Worktree {
+                path,
+                branch,
+                base,
+                copied: Vec::new(),
+                warnings: Vec::new(),
+                setup: None,
+            }))
+        }
+        fn remove_worktree(&self, req: RemoveWorktree) -> io::Result<Reply> {
+            self.removed.lock().expect("lock").push(req);
+            Ok(Reply::WorktreeRemoved(RemovedWorktree {
+                branch: Some("child-wt".into()),
+                branch_deleted: true,
+                warnings: Vec::new(),
+            }))
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let removed = Arc::new(Mutex::new(Vec::new()));
+    let remote_src: Arc<dyn Source> = Arc::new(RemoteSource {
+        created: Arc::clone(&created),
+        removed: Arc::clone(&removed),
+    });
+    let remote_host = HostId::Remote("mac-mini".into());
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.remote_hosts = vec![RemoteHost {
+                id: "mac-mini".into(),
+                label: "Mac mini".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/remote/repo"),
+                        vec![
+                            PathBuf::from("/remote/repo"),
+                            PathBuf::from("/remote/repo/feat-parent"),
+                        ],
+                    )]),
+                },
+                meta: BTreeMap::from([
+                    (
+                        PathBuf::from("/remote/repo"),
+                        Tree {
+                            branch: Some("main".into()),
+                            dirty: Some(0),
+                        },
+                    ),
+                    (
+                        PathBuf::from("/remote/repo/feat-parent"),
+                        Tree {
+                            branch: Some("feat-parent".into()),
+                            dirty: Some(0),
+                        },
+                    ),
+                ]),
+                source: Some(remote_src),
+                error: None,
+            }];
+            s.rebuild(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    // 1. 연결된 원격 저장소 헤더에 마우스를 올리면 새 워크트리(+) 버튼이 노출되고,
+    //    사이드바 상단에도 새 워크트리 드롭다운 버튼이 노출된다.
+    let repo_idx = vcx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .position(|r| *r == Row::Repository(PathBuf::from("/remote/repo")))
+            .expect("remote repository row")
+    });
+    let repo_hdr = vcx
+        .debug_bounds(format!("repo-header-{repo_idx}").leak())
+        .expect("remote repository header bounds");
+    vcx.simulate_mouse_move(repo_hdr.center(), None, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        vcx.debug_bounds(format!("repo-new-worktree-{repo_idx}").leak())
+            .is_some(),
+        "connected remote repository header should expose the new-worktree button"
+    );
+    assert!(
+        vcx.debug_bounds("sidebar-new-worktree").is_some(),
+        "sidebar header should expose the new-worktree dropdown when a remote repo is connected"
+    );
+
+    // 2. 원격 워크트리에서 자식 워크트리 만들기를 실행하면 원격 소스로 생성되고 부모 계보가 연결된다.
+    let remote_host_for_child = remote_host.clone();
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.new_child_worktree_on(
+                &remote_host_for_child,
+                PathBuf::from("/remote/repo/feat-parent"),
+                window,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("child-wt");
+    vcx.simulate_keystrokes("cmd-enter");
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(10));
+        vcx.run_until_parked();
+        let done = vcx.update(|_, cx| view.read(cx).creating.is_none());
+        if done {
+            break;
+        }
+    }
+
+    vcx.update(|_, cx| {
+        let s = view.read(cx);
+        let remote = s
+            .remote_hosts
+            .iter()
+            .find(|h| h.id == "mac-mini")
+            .expect("remote entry");
+        let list = remote
+            .snapshot
+            .trees
+            .get(Path::new("/remote/repo"))
+            .expect("remote repo trees");
+        assert!(
+            list.contains(&PathBuf::from("/remote/repo/child-wt")),
+            "created remote worktree should be optimistically added to remote snapshot"
+        );
+        assert_eq!(
+            s.worktree_parent(Path::new("/remote/repo/child-wt")),
+            Some(PathBuf::from("/remote/repo/feat-parent")),
+            "remote child worktree should record its parent lineage"
+        );
+        assert_eq!(
+            s.eligible_parent_worktrees_on(&remote_host, Path::new("/remote/repo/feat-parent")),
+            vec![PathBuf::from("/remote/repo")],
+            "remote parent candidates should exclude self and descendants within the remote repo"
+        );
+    });
+
+    let sent = created.lock().expect("lock").clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].repo, b"/remote/repo".to_vec());
+    assert_eq!(sent[0].name, "child-wt");
+    assert_eq!(sent[0].base.as_deref(), Some("feat-parent"));
+
+    // 3. 원격 워크트리 삭제 확인 및 실행 시 원격 소스로 RemoveWorktree가 전달되고 스냅샷에서 제거된다.
+    let remote_host_for_del = remote_host.clone();
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.request_delete_worktree_on(
+                remote_host_for_del.clone(),
+                PathBuf::from("/remote/repo/child-wt"),
+                false,
+                cx,
+            );
+            assert_eq!(
+                s.delete_confirm.as_ref().map(|c| &c.host),
+                Some(&remote_host_for_del)
+            );
+            s.confirm_delete(cx);
+        });
+    });
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(10));
+        vcx.run_until_parked();
+        if !removed.lock().expect("lock").is_empty() {
+            break;
+        }
+    }
+    vcx.run_until_parked();
+    let del_sent = removed.lock().expect("lock").clone();
+    assert_eq!(del_sent.len(), 1);
+    assert_eq!(del_sent[0].repo, b"/remote/repo".to_vec());
+    assert_eq!(del_sent[0].path, b"/remote/repo/child-wt".to_vec());
+}
