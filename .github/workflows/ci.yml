@@ -60,6 +60,7 @@ jobs:
       - name: Release pipeline regressions
         run: |
           python3 packaging/test_ci_evidence.py
+          python3 packaging/test_cgu_compare.py
           python3 packaging/test_release_check.py
           python3 packaging/test_release_verify.py
           python3 packaging/test_nightly.py

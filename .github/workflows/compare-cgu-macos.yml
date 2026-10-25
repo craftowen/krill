@@ -1,0 +1,118 @@
+# Isolated measurements only; this workflow is not release validation evidence.
+name: Compare macOS test CGU
+run-name: Compare app test CGU · ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['experiment/cgu-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compare-cgu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    name: cgu-${{ matrix.cgu }} (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        cgu: [default, '32', '64']
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_PROFILE_TEST_OPT_LEVEL: 2
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CGU_CASE: ${{ matrix.cgu }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust 1.98 + clippy
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: '1.98'
+          components: rustfmt, clippy
+      - name: nextest tools
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: cargo-nextest,cargo-deny
+      - name: Restore the same dependency cache without saving
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: ci-macos-14
+          cache-bin: 'false'
+          save-if: 'false'
+      - name: Record source, machine and restored cache
+        env:
+          RESTORED_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: python3 packaging/cgu_compare.py prepare --directory "$RUNNER_TEMP/cgu-evidence" --case "$CGU_CASE"
+      - name: fmt, supply chain and notices
+        run: |
+          cargo fmt --all --check
+          cargo deny --locked check --hide-inclusion-graph
+          python3 docs/licensing/generate_notices.py --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        timeout-minutes: 60
+      - name: nextest
+        shell: bash
+        run: |
+          cgu_args=()
+          if [ "$CGU_CASE" != default ]; then
+            cgu_args=(--config "profile.test.package.krill-app.codegen-units=$CGU_CASE")
+          fi
+          cargo nextest run --cargo-verbose --cargo-verbose --profile ci --workspace --locked \
+            --no-tests=pass --cargo-profile test --timings "${cgu_args[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/cgu-evidence/nextest.log"
+        timeout-minutes: 120
+      - name: doctest
+        shell: bash
+        run: |
+          cgu_args=()
+          if [ "$CGU_CASE" != default ]; then
+            cgu_args=(--config "profile.test.package.krill-app.codegen-units=$CGU_CASE")
+          fi
+          cargo test --workspace --doc --locked -q "${cgu_args[@]}"
+        timeout-minutes: 30
+      - name: Collect evidence
+        if: always()
+        run: python3 packaging/cgu_compare.py collect --directory "$RUNNER_TEMP/cgu-evidence"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cgu-${{ matrix.cgu }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cgu-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  compare:
+    name: Compare measurements
+    needs: measure
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: cgu-*-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cgu-results
+      - name: Compare matching measurements
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS: ${{ runner.temp }}/cgu-results
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$RUNNER_TEMP/cgu-jobs.json"
+          python3 packaging/cgu_compare.py compare --directory "$RESULTS" --jobs "$RUNNER_TEMP/cgu-jobs.json" >> "$GITHUB_STEP_SUMMARY"
