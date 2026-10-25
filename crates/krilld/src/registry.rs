@@ -1770,14 +1770,6 @@ impl Registry {
                 .into_iter()
                 .map(|(session, root, exited, tap)| {
                     let mut status = self.status.get(session);
-                    // Pi has no hook identity. Its executable may be reported as `node`,
-                    // and its terminal title can be renamed. Keep the explicit launch identity.
-                    if status.agent.is_empty()
-                        && let Ok(Some(launch)) = self.agents.launch(session)
-                        && launch.profile == "pi"
-                    {
-                        status.agent = launch.profile;
-                    }
                     status.foreground =
                         status::foreground_process(root, tap.foreground(), exited, |pid| {
                             crate::sys::process_name(pid).ok()
@@ -1788,17 +1780,26 @@ impl Registry {
                         || status.foreground.as_deref().is_some_and(|fg| {
                             fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
                         });
-                    let stored = if is_agy_fg || (status.title.is_none() && status.agent.is_empty())
-                    {
+                    let stored = if is_agy_fg || status.agent.is_empty() {
                         self.agents.stored(session).ok().flatten()
                     } else {
                         None
                     };
+                    // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
+                    if status.agent.is_empty()
+                        && let Some(s) = &stored
+                        && !s.profile.is_empty()
+                    {
+                        krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
+                    }
                     let is_agy_stored = stored.as_ref().is_some_and(|s| {
                         s.profile.eq_ignore_ascii_case("agy")
                             || s.profile.eq_ignore_ascii_case("antigravity")
                     });
                     if is_agy_fg || is_agy_stored {
+                        if status.agent.is_empty() {
+                            "agy".clone_into(&mut status.agent);
+                        }
                         let (title, discovered) =
                             crate::agent_history::vault::resolve_live_agy_title(
                                 session,
@@ -1807,18 +1808,32 @@ impl Registry {
                                 exited,
                                 stored.as_ref(),
                             );
-                        if discovered.is_some()
-                            && let Ok(Some(found)) = account_switch::identity::discover(
+                        if let Some((ref conv_id, ref tp)) = discovered {
+                            if tp.is_some() {
+                                self.agents.bind_discovered_session(
+                                    session,
+                                    conv_id,
+                                    tp.as_deref(),
+                                );
+                            } else if let Ok(Some(found)) = account_switch::identity::discover(
                                 krill_proto::usage::ProviderKind::Antigravity,
                                 root,
                                 tap.foreground(),
-                            )
+                            ) {
+                                self.agents.bind_discovered_session(
+                                    session,
+                                    &found.id,
+                                    Some(&found.path),
+                                );
+                            }
+                        }
+                        if !exited
+                            && status.state == control::AgentState::Unknown
+                            && (title.is_some()
+                                || discovered.is_some()
+                                || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
                         {
-                            self.agents.bind_discovered_session(
-                                session,
-                                &found.id,
-                                Some(&found.path),
-                            );
+                            status.state = control::AgentState::Done;
                         }
                         if title.is_some() || status.title.is_none() {
                             status.title = title;

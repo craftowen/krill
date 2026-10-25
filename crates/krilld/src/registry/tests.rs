@@ -1608,6 +1608,44 @@ fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
         "claude",
         "hook identity takes precedence over a launch hint"
     );
+
+    let agy_id = SessionId(2);
+    let (agy_master, _agy_output) = UnixStream::pair().unwrap();
+    let agy_session = Session::start(
+        agy_id,
+        OwnedFd::from(agy_master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        agy_id,
+        Entry {
+            session: agy_session,
+            pid: 0,
+            cwd: dir.clone(),
+        },
+    );
+    reg.agents
+        .remember_session(
+            agy_id,
+            &control::AgentLaunch {
+                profile: "agy".into(),
+                permission: Permission::Manual,
+            },
+            Some("c93bbb42-1866-4949-bc9a-493495f6cc94".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    let Reply::States(states) = reg.states(&full) else {
+        panic!("states reply")
+    };
+    let agy_status = &states.iter().find(|s| s.session == agy_id).unwrap().status;
+    assert_eq!(agy_status.agent, "agy");
+    assert_eq!(agy_status.state, control::AgentState::Done);
+
     drop(reg);
     fs::remove_dir_all(dir).unwrap();
 }

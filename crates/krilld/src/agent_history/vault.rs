@@ -2546,10 +2546,9 @@ pub(crate) fn resolve_live_agy_title(
         .join("annotations")
         .join(format!("{conv_id}.pbtxt"));
     let mtime_ns = file_mtime_ns(&pbtxt_path);
-    if mtime_ns > 0
-        && let Some((_, Some(prev_id), Some(prev_title), prev_mtime)) = &cached_snapshot
+    if let Some((_, Some(prev_id), Some(prev_title), prev_mtime)) = &cached_snapshot
         && prev_id == &conv_id
-        && *prev_mtime == mtime_ns
+        && (*prev_mtime == u128::MAX || (mtime_ns > 0 && *prev_mtime == mtime_ns))
     {
         let mut cache = lock(cache_mutex);
         if let Some(entry) = cache.get_mut(&session.0) {
@@ -2558,18 +2557,22 @@ pub(crate) fn resolve_live_agy_title(
         return (Some(prev_title.clone()), discovered_for_store);
     }
 
-    let title = if mtime_ns > 0 {
-        read_agy_annotation_title(&agy_root, &conv_id)
+    // Antigravity의 `annotations/<id>.pbtxt`는 한국어 대화도 항상 영어로 요약하므로
+    // 사용자가 입력한 첫 프롬프트(첨부 경로·태그 제거본)를 우선 표시하고, 없을 때만 `.pbtxt`로 폴백한다.
+    let prompt_title = read_agy_first_user_prompt(&agy_root, &conv_id);
+    let recorded_mtime = if prompt_title.is_some() {
+        u128::MAX
     } else {
-        None
-    }
-    .or_else(|| read_agy_first_user_prompt(&agy_root, &conv_id));
-
-    let recorded_mtime = if mtime_ns > 0 && title.is_some() {
         mtime_ns
-    } else {
-        0
     };
+    let title = prompt_title.or_else(|| {
+        if mtime_ns > 0 {
+            read_agy_annotation_title(&agy_root, &conv_id)
+        } else {
+            None
+        }
+    });
+    let recorded_mtime = if title.is_some() { recorded_mtime } else { 0 };
     let mut cache = lock(cache_mutex);
     if cache.len() >= 128 && !cache.contains_key(&session.0) {
         cache.pop_first();
@@ -2652,7 +2655,7 @@ mod agy_title_tests {
     }
 
     #[test]
-    fn resolve_live_agy_title_reads_annotations_and_falls_back_to_cleaned_prompt() {
+    fn resolve_live_agy_title_prefers_cleaned_prompt_over_english_annotations_and_falls_back() {
         let root = std::env::temp_dir().join(format!("krill-agy-title-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();
         let agy_root = root.join(".gemini/antigravity-cli");
@@ -2663,11 +2666,6 @@ mod agy_title_tests {
             .join(".system_generated/logs");
         fs::create_dir_all(&log_dir).unwrap();
         let transcript = log_dir.join("transcript.jsonl");
-        fs::write(
-            &transcript,
-            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\n'/var/folders/nm/jz7t2dm539597y551gd3tzw40000gn/T/krill-paste/mobile-f14066a1.jpg' 안티그래비티도 제목인지 내용 요약 뜨게하고\\n</USER_REQUEST>\"}\n",
-        )
-        .unwrap();
 
         let stored = crate::agent::control::StoredLaunch {
             profile: "agy".into(),
@@ -2679,14 +2677,6 @@ mod agy_title_tests {
             account: None,
         };
 
-        let (fallback_title, discovered) =
-            resolve_live_agy_title(krill_proto::SessionId(9001), 0, None, false, Some(&stored));
-        assert!(discovered.is_none());
-        assert_eq!(
-            fallback_title.as_deref(),
-            Some("안티그래비티도 제목인지 내용 요약 뜨게하고")
-        );
-
         let ann_dir = agy_root.join("annotations");
         fs::create_dir_all(&ann_dir).unwrap();
         fs::write(
@@ -2695,11 +2685,25 @@ mod agy_title_tests {
         )
         .unwrap();
 
-        let (ann_title, _) =
+        let (ann_fallback, discovered) =
+            resolve_live_agy_title(krill_proto::SessionId(9001), 0, None, false, Some(&stored));
+        assert!(discovered.is_none());
+        assert_eq!(
+            ann_fallback.as_deref(),
+            Some("Fix Antigravity Session Titles & Mobile Photo Button")
+        );
+
+        fs::write(
+            &transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\n'/var/folders/nm/jz7t2dm539597y551gd3tzw40000gn/T/krill-paste/mobile-f14066a1.jpg' 안티그래비티도 제목인지 내용 요약 뜨게하고\\n</USER_REQUEST>\"}\n",
+        )
+        .unwrap();
+
+        let (prompt_title, _) =
             resolve_live_agy_title(krill_proto::SessionId(9002), 0, None, false, Some(&stored));
         assert_eq!(
-            ann_title.as_deref(),
-            Some("Fix Antigravity Session Titles & Mobile Photo Button")
+            prompt_title.as_deref(),
+            Some("안티그래비티도 제목인지 내용 요약 뜨게하고")
         );
 
         fs::remove_dir_all(&root).ok();
