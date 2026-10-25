@@ -107,7 +107,7 @@ async function markdownFormatting(){
  const nodes=f.find('chat-md').descendants(),byTag=tag=>nodes.filter(n=>n.tag===tag);
  assert.deepEqual(byTag('strong').map(n=>n.children.map(c=>c.textContent).join('')),['실패 지점은 확인했지만, 복구는 아직 못 했습니다.','셸을 쓰지 않는 자바스크립트 한 줄','두 번째','통과','확인 결과']);
  assert.equal(byTag('code')[0].textContent,'pwd');
- assert.equal(byTag('ol').length,1);assert.equal(byTag('ol')[0].className,'chat-ol');assert.equal(byTag('li').length,2);
+ assert.equal(byTag('ol').length,1);assert.equal(byTag('ol')[0].className,'chat-ol');assert.equal(byTag('ul').length,1);assert.equal(byTag('li').length,3);assert.equal(byTag('ol')[0].children.filter(n=>n.tag==='li').length,2);
  assert.equal(byTag('blockquote').length,1);assert.equal(byTag('blockquote')[0].className,'chat-quote');assert(byTag('blockquote')[0].descendants().some(n=>n.tag==='code'&&n.textContent==='코드'));
  assert.equal(byTag('table').length,1);assert.equal(byTag('table')[0].className,'chat-table');assert.equal(byTag('th').length,2);assert.equal(byTag('td').length,2);
  assert.equal(byTag('em').length,1);

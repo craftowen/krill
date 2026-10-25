@@ -425,7 +425,15 @@ impl Backend {
                             rows: 24,
                             account: None,
                         })) {
-                            Ok(Reply::Created { session, .. }) => Some(session.0),
+                            Ok(Reply::Created { session, .. }) => {
+                                if let Some(dir) = self.dir.as_deref()
+                                    && !krill_proto::git::is_default_branch_or_worktree_name(name)
+                                {
+                                    krill_proto::git::record_session_auto_title(dir, session, name)
+                                        .ok();
+                                }
+                                Some(session.0)
+                            }
                             other => {
                                 tree.warnings.push(format!(
                                     "Workspace created; terminal unavailable: {other:?}"
@@ -763,7 +771,7 @@ impl Backend {
             .sessions
             .into_iter()
             .find(|s| s.session.0 == session)
-            .ok_or_else(invalid)?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Session not found"))?;
         if directory.cwd.is_empty() {
             return Err(io::Error::other("session working directory unavailable"));
         }
@@ -1175,8 +1183,7 @@ impl Backend {
             let deadline = Instant::now() + Duration::from_millis(80);
             for (cwd, rx) in pending {
                 let Some(rx) = rx else {
-                    crate::session::lock(&self.git_cache)
-                        .insert(cwd.clone(), (Instant::now(), Value::Null));
+                    cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
                     crate::session::lock(&self.git_inflight).remove(&cwd);
                     continue;
                 };
@@ -1186,8 +1193,7 @@ impl Backend {
                             let (added, deleted) = totals(&changes);
                             json!({"branch":branch,"added":added,"deleted":deleted})
                         });
-                        crate::session::lock(&self.git_cache)
-                            .insert(cwd.clone(), (Instant::now(), value.clone()));
+                        cache_git_summary(&self.git_cache, cwd.clone(), value.clone());
                         crate::session::lock(&self.git_inflight).remove(&cwd);
                         found.insert(cwd, value);
                     }
@@ -1195,8 +1201,7 @@ impl Backend {
                         deferred.push((cwd, Some(rx)));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        crate::session::lock(&self.git_cache)
-                            .insert(cwd.clone(), (Instant::now(), Value::Null));
+                        cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
                         crate::session::lock(&self.git_inflight).remove(&cwd);
                     }
                 }
@@ -1231,7 +1236,7 @@ impl Backend {
                                 let (added, deleted) = totals(&changes);
                                 json!({"branch":branch,"added":added,"deleted":deleted})
                             });
-                        crate::session::lock(&cache).insert(cwd.clone(), (Instant::now(), value));
+                        cache_git_summary(&cache, cwd.clone(), value);
                         crate::session::lock(&inflight).remove(&cwd);
                         revision.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1284,14 +1289,14 @@ impl Backend {
                     let (added, deleted) = totals(&changes);
                     json!({"branch":branch,"added":added,"deleted":deleted})
                 });
-            crate::session::lock(&self.git_cache)
-                .insert(cwd.clone(), (Instant::now(), value.clone()));
+            cache_git_summary(&self.git_cache, cwd.clone(), value.clone());
             found.insert(cwd, value);
         }
         found
     }
     fn git(&self, session: u64, path: Option<&str>) -> io::Result<Value> {
         let cwd = self.cwd(session)?;
+        let root = git_root(&cwd)?;
         let queue = crate::git::queue().map_err(io::Error::other)?;
         let (changes, branch) = crate::git::changes::query_with_branch(
             queue,
@@ -1308,25 +1313,23 @@ impl Backend {
             .map(|file| String::from_utf8_lossy(&file.path).into_owned())
             .collect();
         let patch = if let Some(raw_path) = path {
-            let rel_path = Path::new(raw_path)
-                .strip_prefix(&cwd)
-                .ok()
-                .and_then(|p| p.to_str())
-                .unwrap_or(raw_path);
-            if Path::new(rel_path)
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return Ok(json!({"diff_status":"outside_scope","patch":"","files":files}));
+            let Some(rel_path) = git_relative_path(&root, &cwd, raw_path, &files) else {
+                return Ok(
+                    json!({"diff_status":"outside_scope","patch":"","files":files,"limited":changes.limited}),
+                );
+            };
+            if !changes.limited && !files.iter().any(|p| p == &rel_path) {
+                return Ok(
+                    json!({"diff_status":"no_current_diff","patch":"","files":files,"limited":changes.limited}),
+                );
             }
-            if !files.iter().any(|p| p == rel_path) {
-                return Ok(json!({"diff_status":"no_current_diff","patch":"","files":files}));
-            }
-            read_patch(&cwd, rel_path)?
+            read_patch(&root, &rel_path)?
         } else {
             String::new()
         };
-        Ok(json!({"branch":branch,"added":added,"deleted":deleted,"files":files,"patch":patch}))
+        Ok(
+            json!({"branch":branch,"added":added,"deleted":deleted,"files":files,"patch":patch,"limited":changes.limited}),
+        )
     }
 }
 /// 표시용 lossy UTF-8과 분리해 OS 경로 바이트를 그대로 식별한다.
@@ -1509,7 +1512,27 @@ fn decode_base64(data: &str) -> io::Result<Vec<u8>> {
     }
     Ok(out)
 }
-fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
+fn cache_git_summary(
+    cache: &Mutex<HashMap<PathBuf, (Instant, Value)>>,
+    cwd: PathBuf,
+    value: Value,
+) {
+    let mut cache = crate::session::lock(cache);
+    cache.insert(cwd, (Instant::now(), value));
+    while cache.len() > 64 {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(path, _)| path.clone());
+        if let Some(path) = oldest {
+            cache.remove(&path);
+        } else {
+            break;
+        }
+    }
+}
+
+fn mobile_git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
@@ -1524,24 +1547,172 @@ fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
     ] {
         command.env_remove(key);
     }
-    command.args([
-        "--literal-pathspecs",
-        "-c",
-        "diff.maxFiles=1",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "HEAD",
-        "--",
-        path,
-    ]);
-    Ok(String::from_utf8_lossy(&bounded_command(
-        &mut command,
+    command.arg("--literal-pathspecs");
+    command
+}
+
+fn git_root(cwd: &Path) -> io::Result<PathBuf> {
+    let bytes = bounded_command(
+        mobile_git_command(cwd).args(["rev-parse", "--show-toplevel"]),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .map_err(|_| io::Error::other("Not a Git repository"))?;
+    // Git terminates this path with a newline; spaces in a repository name are significant.
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    fs::canonicalize(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+fn canonical_missing(path: &Path) -> Option<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Some(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let name = path.file_name()?;
+            Some(canonical_missing(path.parent()?)?.join(name))
+        }
+        Err(_) => None,
+    }
+}
+
+fn git_relative_path(root: &Path, cwd: &Path, raw: &str, files: &[String]) -> Option<String> {
+    use std::path::Component;
+    let input = Path::new(raw);
+    let normalize = |path: &Path| {
+        let mut out = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => (),
+                Component::ParentDir => {
+                    if !out.pop() {
+                        return None;
+                    }
+                }
+                other => out.push(other.as_os_str()),
+            }
+        }
+        Some(out)
+    };
+    let normalized = normalize(input)?;
+    let candidate = if input.is_absolute() {
+        normalized
+    } else if files.iter().any(|p| Path::new(p) == normalized) {
+        root.join(normalized)
+    } else {
+        let local = normalize(&cwd.join(input))?;
+        if local.exists() || !root.join(&normalized).exists() {
+            local
+        } else {
+            root.join(normalized)
+        }
+    };
+    // Resolve parent aliases without following a final symlink: Git diffs the link
+    // itself, and untracked_patch must still be able to reject that link.
+    let canonical = canonical_missing(candidate.parent()?)?.join(candidate.file_name()?);
+    let relative = canonical.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    relative.to_str().map(str::to_owned)
+}
+
+fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
+    let has_head = bounded_command(
+        mobile_git_command(cwd).args(["rev-parse", "--verify", "HEAD"]),
+        Duration::from_secs(5),
+        1024,
+    )
+    .is_ok();
+    let base = if has_head {
+        "HEAD"
+    } else {
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    };
+    let patch = bounded_command(
+        mobile_git_command(cwd).args([
+            "-c",
+            "diff.maxFiles=1",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            base,
+            "--",
+            path,
+        ]),
         Duration::from_secs(5),
         128 * 1024,
-    )?)
-    .into_owned())
+    )?;
+    if !patch.is_empty() {
+        return Ok(String::from_utf8_lossy(&patch).into_owned());
+    }
+    if bounded_command(
+        mobile_git_command(cwd).args(["ls-files", "--error-unmatch", "--", path]),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .is_ok()
+    {
+        return Ok(String::new());
+    }
+    untracked_patch(cwd, path)
+}
+
+fn untracked_patch(root: &Path, path: &str) -> io::Result<String> {
+    const LIMIT: u64 = 128 * 1024;
+    let target = root.join(path);
+    let meta = match fs::symlink_metadata(&target) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Ok(String::new());
+    }
+    if meta.len() > LIMIT {
+        return Err(io::Error::other("File exceeds 128 KiB diff limit"));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    if !fs::canonicalize(&target)?.starts_with(&canonical_root) {
+        return Err(io::Error::other("File is outside the repository"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(&target)?;
+    if !file.metadata()?.is_file() {
+        return Ok(String::new());
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(io::Error::other("File exceeds 128 KiB diff limit"));
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(format!("Binary files /dev/null and b/{path} differ\n"));
+    };
+    if bytes.contains(&0) {
+        return Ok(format!("Binary files /dev/null and b/{path} differ\n"));
+    }
+    let lines = text.split_inclusive('\n').count();
+    let filename = format!("b/{path}");
+    let filename = if path.chars().any(char::is_control) {
+        serde_json::to_string(&filename).map_err(io::Error::other)?
+    } else {
+        filename
+    };
+    let mut patch = format!("--- /dev/null\n+++ {filename}\n@@ -0,0 +1,{lines} @@\n");
+    for line in text.split_inclusive('\n') {
+        patch.push('+');
+        patch.push_str(line);
+        if !line.ends_with('\n') {
+            patch.push_str("\n\\ No newline at end of file\n");
+        }
+    }
+    if u64::try_from(patch.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(io::Error::other("mobile command output exceeds limit"));
+    }
+    Ok(patch)
 }
 fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Vec<u8>> {
     let mut child = command
@@ -2280,6 +2451,140 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn mobile_git_paths_untracked_and_unborn_head_have_real_patches() {
+        let dir = std::env::temp_dir().join(format!("mk-mobile-git-audit-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let root = fs::canonicalize(&dir).unwrap();
+        let cwd = root.join("sub");
+        assert_eq!(
+            git_root(&cwd).unwrap_err().to_string(),
+            "Not a Git repository"
+        );
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(cwd.join("a.txt"), "one\ntwo").unwrap();
+        assert_eq!(git_root(&cwd).unwrap(), root);
+        let files = vec!["sub/a.txt".to_owned()];
+        for raw in [
+            "sub/a.txt".to_owned(),
+            "a.txt".into(),
+            "./a.txt".into(),
+            cwd.join("a.txt").to_string_lossy().into_owned(),
+            dir.join("sub/a.txt").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                git_relative_path(&root, &cwd, &raw, &files).as_deref(),
+                Some("sub/a.txt"),
+                "{raw}"
+            );
+        }
+        assert!(git_relative_path(&root, &cwd, "../../escape", &files).is_none());
+        // A truncated status list still permits a valid cwd-relative path.
+        assert_eq!(
+            git_relative_path(&root, &cwd, "./a.txt", &[]).as_deref(),
+            Some("sub/a.txt")
+        );
+        let patch = read_patch(&root, "sub/a.txt").unwrap();
+        assert!(
+            patch.starts_with("--- /dev/null\n+++ b/sub/a.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n"),
+            "{patch}"
+        );
+        assert!(patch.contains("\\ No newline at end of file"));
+        assert!(
+            Command::new("git")
+                .args(["add", "sub/a.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let staged = read_patch(&root, "sub/a.txt").unwrap();
+        assert!(staged.contains("+one"), "{staged}");
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "user.name=Fixture",
+                    "commit",
+                    "-qm",
+                    "fixture"
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+        assert!(read_patch(&root, "sub/a.txt").unwrap().contains("+changed"));
+        fs::remove_file(cwd.join("a.txt")).unwrap();
+        assert_eq!(
+            git_relative_path(&root, &cwd, "./a.txt", &files).as_deref(),
+            Some("sub/a.txt")
+        );
+        assert!(
+            read_patch(&root, "sub/a.txt")
+                .unwrap()
+                .contains("--- a/sub/a.txt")
+        );
+        fs::write(root.join("binary"), b"a\0b").unwrap();
+        assert!(
+            read_patch(&root, "binary")
+                .unwrap()
+                .contains("Binary files")
+        );
+        fs::write(root.join("large"), vec![b'x'; 128 * 1024 + 1]).unwrap();
+        assert!(read_patch(&root, "large").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("binary"), root.join("link")).unwrap();
+            assert_eq!(
+                git_relative_path(&root, &cwd, root.join("link").to_str().unwrap(), &[]).as_deref(),
+                Some("link")
+            );
+            assert!(read_patch(&root, "link").unwrap().is_empty());
+            std::os::unix::fs::symlink(&root, dir.with_extension("alias")).unwrap();
+            assert_eq!(
+                git_relative_path(
+                    &root,
+                    &cwd,
+                    dir.with_extension("alias")
+                        .join("sub/a.txt")
+                        .to_str()
+                        .unwrap(),
+                    &files
+                )
+                .as_deref(),
+                Some("sub/a.txt")
+            );
+            fs::remove_file(dir.with_extension("alias")).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn mobile_git_cache_stays_bounded_even_for_late_background_results() {
+        let backend = test_backend();
+        for i in 0..100 {
+            cache_git_summary(
+                &backend.git_cache,
+                PathBuf::from(format!("/fixture/{i}")),
+                json!(i),
+            );
+        }
+        let cache = crate::session::lock(&backend.git_cache);
+        assert_eq!(cache.len(), 64);
+        assert!(cache.contains_key(Path::new("/fixture/99")));
+        assert!(!cache.contains_key(Path::new("/fixture/0")));
+    }
     fn test_backend() -> Backend {
         Backend::new(
             Weak::new(),
@@ -2482,6 +2787,109 @@ mod tests {
             let reply: Value = serde_json::from_str(&backend.request(request)).unwrap();
             assert_eq!(reply["ok"], false, "{request}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_workspace_on_non_git_folder_project_spawns_session_and_records_title() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-folder-ws-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let state_dir = dir.join("state");
+        let folder = dir.join("구글드라이브").join("내 드라이브");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        let canonical_folder = fs::canonicalize(&folder).unwrap();
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"gdrive\"\nname = \"구글드라이브\"\npath = {:?}\nkind = \"folder\"\n",
+                canonical_folder.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, cwd, .. } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected Spawn");
+            };
+            let (master, _pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: std::process::id(),
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            cwd
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_folder.as_os_str().as_bytes());
+        let request = json!({
+            "action": "create_workspace",
+            "repository": repo_key,
+            "name": "보험",
+        })
+        .to_string();
+        let reply: Value = serde_json::from_str(&backend.request(&request)).unwrap();
+        let spawned_cwd = holder_worker.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["data"]["workspace"], repo_key);
+        assert_eq!(
+            reply["data"]["path"],
+            canonical_folder.to_string_lossy().as_ref()
+        );
+        assert_eq!(reply["data"]["branch"], "보험");
+        assert_eq!(spawned_cwd, canonical_folder.as_os_str().as_bytes());
+        let session_id = reply["data"]["session"].as_u64().expect("session spawned");
+        let titles = krill_proto::git::load_session_auto_titles(&state_dir);
+        assert_eq!(
+            titles.get(&SessionId(session_id)).map(String::as_str),
+            Some("보험")
+        );
+
+        drop(backend);
+        drop(registry);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

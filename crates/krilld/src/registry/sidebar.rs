@@ -60,7 +60,7 @@ pub(super) fn snapshot(
 ) -> Result<SidebarData, Failure> {
     let deadline = Instant::now() + LOOKUP_BUDGET;
     let mut sessions = Vec::new();
-    let mut repositories = BTreeMap::new();
+    let mut repositories: BTreeMap<Vec<u8>, RepositoryTrees> = BTreeMap::new();
     let mut bytes = 0usize;
     for (session, observed) in entries {
         let path = {
@@ -78,8 +78,14 @@ pub(super) fn snapshot(
         });
         if let Some(path) = path
             && let Some(trees) = lookup(cache, &path, deadline)
-            && !repositories.contains_key(&trees.repo)
         {
+            if let Some(previous) = repositories.get(&trees.repo) {
+                if previous.worktrees.len() > trees.worktrees.len() {
+                    continue;
+                }
+                bytes -=
+                    previous.repo.len() + previous.worktrees.iter().map(Vec::len).sum::<usize>();
+            }
             bytes += trees.repo.len() + trees.worktrees.iter().map(Vec::len).sum::<usize>();
             if bytes > 512 * 1024 {
                 return Err(Failure::BadRequest);
@@ -440,6 +446,35 @@ fn parse(bytes: &[u8]) -> Option<RepositoryTrees> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_keeps_larger_worktree_discovery_from_later_sessions() {
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let repo = b"/krill-sidebar-cache-race".to_vec();
+        let first = PathBuf::from("/krill-sidebar-cache-race/first");
+        let second = PathBuf::from("/krill-sidebar-cache-race/second");
+        {
+            let mut state = lock(&cache);
+            for (id, path, count) in [(1, &first, 1), (2, &second, 2)] {
+                state.directories.insert(SessionId(id), path.clone());
+                state
+                    .lookups
+                    .insert(path.clone(), Arc::new(Discovery::default()));
+                state.last.insert(
+                    path.clone(),
+                    RepositoryTrees {
+                        repo: repo.clone(),
+                        worktrees: vec![repo.clone(); count],
+                    },
+                );
+            }
+        }
+        let data = snapshot(&cache, &[(SessionId(1), None), (SessionId(2), None)]).unwrap();
+        assert_eq!(data.repositories.len(), 1);
+        assert_eq!(data.repositories[0].worktrees.len(), 2);
+        let reversed = snapshot(&cache, &[(SessionId(2), None), (SessionId(1), None)]).unwrap();
+        assert_eq!(reversed.repositories[0].worktrees.len(), 2);
+    }
 
     #[test]
     fn registered_projects_join_without_duplicates() {

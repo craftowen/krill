@@ -819,3 +819,61 @@ fn worktreeinclude_doublestar_matches_root_and_nested_env_files() {
         "NESTED=2\n"
     );
 }
+
+#[test]
+fn non_git_folder_project_creates_workspace_at_folder_path() {
+    let dir = std::env::temp_dir().join(format!("mkwt-folder-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let folder = dir.join("구글드라이브").join("내 드라이브");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join(CONFIG), "[worktree]\nsetup = \"echo ready\"\n").unwrap();
+    let root = dir.join("worktrees");
+    let trust = dir.join("state").join(TRUST_FILE);
+    let queue = GitQueue::new().unwrap();
+
+    let req = |name: &str, base: Option<&str>, setup: Setup| NewWorktree {
+        repo: folder.as_os_str().as_bytes().to_vec(),
+        name: name.to_owned(),
+        base: base.map(str::to_owned),
+        setup,
+    };
+
+    // Non-Git folder rejects explicit base ref.
+    assert!(
+        create(
+            &queue,
+            &req("보험", Some("main"), Setup::Skip),
+            &root,
+            &trust
+        )
+        .is_err()
+    );
+    // Invalid names are still rejected.
+    assert!(create(&queue, &req("../bad", None, Setup::Skip), &root, &trust).is_err());
+
+    // Setup script requires approval first.
+    let Ok(Outcome::Untrusted { script, hash }) =
+        create(&queue, &req("보험", None, Setup::Ask), &root, &trust)
+    else {
+        panic!("untrusted setup script must ask first");
+    };
+    assert_eq!(script, "echo ready");
+
+    // Approved setup succeeds and returns the canonicalized folder path directly.
+    let Ok(Outcome::Created { worktree, setup }) = create(
+        &queue,
+        &req("보험", None, Setup::Approve(hash)),
+        &root,
+        &trust,
+    ) else {
+        panic!("approved folder workspace creation must succeed");
+    };
+    let canonical_folder = fs::canonicalize(&folder).unwrap();
+    assert_eq!(path(&worktree), canonical_folder);
+    assert_eq!(worktree.branch, "보험");
+    assert_eq!(worktree.base, "");
+    assert_eq!(setup.as_deref(), Some("echo ready"));
+    assert!(!root.exists(), "must not create a git worktree checkout");
+
+    fs::remove_dir_all(&dir).ok();
+}

@@ -228,7 +228,7 @@ impl From<&Entry> for VaultTarget {
     }
 }
 
-/// Hybrid Chat 한 번의 증분 폴링이 반환하는 최대 항목 수(OWE-945 / MK-242).
+/// Hybrid Chat 일반 페이지 목표 항목 수. 단일 JSONL 레코드는 유실 방지를 위해 초과할 수 있다.
 pub const MAX_CHAT_ITEMS: usize = 128;
 /// Hybrid Chat 개별 카드 본문 바이트 상한.
 pub const MAX_CHAT_TEXT: usize = 16_384;
@@ -366,7 +366,9 @@ fn vault_agents<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<VaultAgent
 }
 
 fn chat_items<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ChatItem>, D::Error> {
-    crate::control::bounded::<D, ChatItem, MAX_CHAT_ITEMS>(d)
+    // A record is indivisible: 128 is the page target, not a wire rejection limit.
+    // The IPC frame still bounds bytes; at least one byte is needed per encoded item.
+    crate::control::bounded::<D, ChatItem, { crate::ipc::MAX_FRAME }>(d)
 }
 
 fn question_options<'de, D: serde::Deserializer<'de>>(
@@ -392,3 +394,29 @@ fn filter_paths<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod chat_record_tests {
+    use super::*;
+    use crate::screen::Msg as _;
+    #[test]
+    fn oversized_single_chat_record_roundtrips_through_control() {
+        let snapshot = ChatPollSnapshot {
+            bound: true,
+            items: vec![
+                ChatItem {
+                    text: "record part".into(),
+                    ..ChatItem::default()
+                };
+                140
+            ],
+            ..ChatPollSnapshot::default()
+        };
+        let reply = crate::control::Reply::AgentHistory(Response::ChatPolled(snapshot));
+        let encoded = reply.encode().unwrap();
+        let (kind, body) = crate::ipc::read_frame(&mut encoded.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::control::Reply::decode(kind, &body).unwrap(), reply);
+    }
+}
