@@ -360,7 +360,7 @@ mod managed_agent {
     }
 
     #[test]
-    fn missing_state_is_retired_before_serve_can_recreate_it() {
+    fn missing_state_with_plist_retries_without_bootout_or_recreating_state() {
         let mut fixture = Fixture::new("managed-before");
         let state = fixture.dir.join("gone");
         let plist = fixture
@@ -368,9 +368,9 @@ mod managed_agent {
             .join(format!("{}.plist", krill_link::link_label(Some(&state))));
         fs::write(&plist, "plist").unwrap();
         start(&mut fixture, &state, &plist);
-        assert!(wait_for_exit(&mut fixture).success());
+        assert!(!wait_for_exit(&mut fixture).success());
         assert!(!state.exists(), "preflight must not recreate deleted state");
-        assert_bootout(&fixture, &state);
+        assert!(!fixture.dir.join("calls").exists());
         // D2: 자동 정리는 사용자 plist를 삭제하지 않는 보수적 정책을 유지한다.
         assert!(plist.exists());
     }
