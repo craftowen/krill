@@ -1772,9 +1772,9 @@ fn titlebar_collapse_toggles_and_status_bar(cx: &mut TestAppContext) {
     assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
 }
 
-/// MK-032·MK-052: 콜드 복원 화면과 종료된 라이브 세션(`CLOSED`) 모두 Restart 칩을 띄우고 누르면 세션을 비운다.
+/// 종료된 라이브 세션은 칸을 정리하고, 보존된 콜드 화면은 Restart로 새 세션을 시작한다.
 #[gpui::test]
-fn cold_and_closed_pane_show_restart_chip(cx: &mut TestAppContext) {
+fn closed_pane_is_removed_and_cold_pane_can_restart(cx: &mut TestAppContext) {
     use krill_proto::control::Cold;
     use krill_proto::screen::{Closed, Msg as _, Op, Seq};
 
@@ -1799,13 +1799,18 @@ fn cold_and_closed_pane_show_restart_chip(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    let chip = cx
-        .debug_bounds("restart-0")
-        .expect("closed pane shows restart chip");
-    cx.simulate_mouse_down(chip.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(chip.center(), MouseButton::Left, Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(layout_of(&view, cx).session(pane), None);
+    view.read_with(cx, |s, _| {
+        assert!(!s.layout.pane_exists(pane));
+        assert!(
+            s.workspace_closing
+                .contains(&(krill_app::hosts::HostId::Local, krill_proto::SessionId(11)))
+        );
+    });
+    assert!(cx.debug_bounds("restart-0").is_none());
+    let pane = view.update(cx, |s, cx| {
+        s.change(true, cx, Layout::new_tab);
+        s.layout.active_tab().focused
+    });
 
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
@@ -1823,8 +1828,9 @@ fn cold_and_closed_pane_show_restart_chip(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    assert_eq!(pane.get(), 1);
     let chip = cx
-        .debug_bounds("restart-0")
+        .debug_bounds("restart-1")
         .expect("cold pane shows restart chip");
     cx.simulate_mouse_down(chip.center(), MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(chip.center(), MouseButton::Left, Modifiers::default());

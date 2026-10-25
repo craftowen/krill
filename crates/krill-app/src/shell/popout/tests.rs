@@ -2141,9 +2141,9 @@ fn dashboard_done_lane_orders_unread_top_and_clicked_cards_move_to_bottom(cx: &m
                 id: SessionId(3),
                 status: AgentStatus {
                     agent: "gemini".into(),
-                    state: AgentState::Exited,
+                    state: AgentState::Done,
                     since_unix_ns: 200,
-                    title: Some("exited-mid".into()),
+                    title: Some("done-mid".into()),
                     ..AgentStatus::UNKNOWN
                 },
                 worktree: Some("/repo/three".into()),
@@ -2269,6 +2269,14 @@ fn status_bar_provider_visibility_toggle_hides_and_restores_pill(cx: &mut TestAp
     use krill_proto::usage::{AccountInfo, Snapshot, Window};
     let (shell, handle) = open(cx);
     shell.update(cx, |s, cx| {
+        // Keep the seeded daemon snapshot when Config changes request a refresh.
+        s.link = Link::Up;
+        s.paths = Some(krill_proto::daemon::Paths {
+            socket: std::env::temp_dir()
+                .join(format!("provider-toggle-{}.sock", std::process::id())),
+            holder: "/unused/provider-toggle-holder".into(),
+            krilld: "/unused/provider-toggle-daemon".into(),
+        });
         cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
             ProviderKind::Claude,
             ProviderKind::OpenCode,
@@ -2337,18 +2345,10 @@ fn status_bar_provider_visibility_toggle_hides_and_restores_pill(cx: &mut TestAp
     let restore = vcx
         .debug_bounds("status-bar-menu-provider-opencode")
         .unwrap();
-    eprintln!(
-        "DEBUG bar={:?} restore={:?} visible_before={}",
-        bar,
-        restore,
-        vcx.read(|cx| krill_app::settings::status_provider_visible(ProviderKind::OpenCode, cx))
-    );
     vcx.simulate_click(restore.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    eprintln!(
-        "DEBUG visible_after={}",
+    assert!(
         vcx.read(|cx| krill_app::settings::status_provider_visible(ProviderKind::OpenCode, cx))
     );
-
     assert!(vcx.debug_bounds("status-provider-pill-opencode").is_some());
 }
