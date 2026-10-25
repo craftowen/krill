@@ -214,6 +214,7 @@ pub(super) struct DeleteConfirm {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingWorktree {
+    pub host: HostId,
     pub id: u64,
     pub dialog_id: u64,
     pub repo: PathBuf,

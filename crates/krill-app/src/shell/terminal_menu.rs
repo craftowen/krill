@@ -118,6 +118,11 @@ impl MenuState {
         }
         menu = menu
             .menu_with_disabled(text::COPY.get(), Box::new(Copy), !self.has_selection)
+            .menu_with_disabled(
+                text::COPY_CLEAN.get(),
+                Box::new(CopyClean),
+                !self.has_selection,
+            )
             .menu(text::PASTE.get(), Box::new(Paste))
             .separator()
             .menu(text::PANE_SELECT_ALL.get(), Box::new(SelectAll))

@@ -114,6 +114,7 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::FindNext", text::SC_FIND_NEXT),
     ("shell::FindPrev", text::SC_FIND_PREV),
     ("shell::Copy", text::SC_COPY),
+    ("shell::CopyClean", text::SC_COPY_CLEAN),
     ("shell::Paste", text::SC_PASTE),
     ("shell::ToggleSidebar", text::SC_SIDEBAR),
     ("shell::FocusSidebar", text::SC_FOCUS_SIDEBAR),
@@ -174,6 +175,7 @@ pub(super) fn action_category(action: &str) -> Category {
         | "shell::SelectAll"
         | "shell::Find"
         | "shell::Copy"
+        | "shell::CopyClean"
         | "shell::Paste"
         | "popout::FloatTerminal" => Category::Terminal,
         "shell::NewAgentTab" | "shell::NewAgent1" | "shell::NewAgent2" | "shell::NewAgent3"

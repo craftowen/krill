@@ -22,9 +22,35 @@ use krill_proto::control::{
     NewWorktree, PrepareWorktree, Reply, Setup, Worktree, WorktreePreparation,
 };
 
+use crate::hosts::HostId;
 use crate::sidebar::Source;
 
 use crate::i18n::catalog::worktree as text;
+
+#[derive(Debug, Clone)]
+pub struct WorktreeRepoOption {
+    pub path: PathBuf,
+    pub label: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct WorktreeHostOption {
+    pub host: HostId,
+    pub label: String,
+    pub source: Arc<dyn Source>,
+    pub repos: Vec<WorktreeRepoOption>,
+}
+
+impl std::fmt::Debug for WorktreeHostOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorktreeHostOption")
+            .field("host", &self.host)
+            .field("label", &self.label)
+            .field("repos", &self.repos)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -66,6 +92,8 @@ pub const FAN_OUT_AGENTS: &[(&str, &str)] = &[
 pub struct Dialog {
     language: crate::i18n::Language,
     focus: gpui::FocusHandle,
+    host: HostId,
+    host_options: Vec<WorktreeHostOption>,
     repo: PathBuf,
     parent: Option<PathBuf>,
     name: Entity<InputState>,
@@ -284,6 +312,8 @@ impl Dialog {
         })];
         let mut dialog = Self {
             language: crate::i18n::language(),
+            host: HostId::Local,
+            host_options: Vec::new(),
             repo,
             parent,
             name,
@@ -309,9 +339,142 @@ impl Dialog {
         if !candidates.is_empty() {
             dialog.set_branch_candidates(candidates, cx);
         }
-        let repo = dialog.repo.clone();
+        dialog.refresh_repo_hooks(cx);
+        dialog.prepare(cx);
+        dialog
+    }
+
+    #[must_use]
+    pub fn host(&self) -> &HostId {
+        &self.host
+    }
+
+    #[must_use]
+    pub fn repo(&self) -> &std::path::Path {
+        &self.repo
+    }
+
+    pub fn set_host_options(
+        &mut self,
+        host: HostId,
+        options: Vec<WorktreeHostOption>,
+        cx: &mut Context<Self>,
+    ) {
+        self.host_options = options;
+        let host_changed = self.host != host;
+        self.host = host;
+        if let Some(opt) = self
+            .host_options
+            .iter()
+            .find(|opt| opt.host == self.host)
+            .cloned()
+        {
+            self.source = opt.source;
+            if !opt.repos.iter().any(|r| r.path == self.repo)
+                && let Some(first) = opt.repos.first()
+            {
+                self.repo = first.path.clone();
+            }
+        }
+        if host_changed {
+            self.refresh_repo_hooks(cx);
+            self.prepare(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn select_host(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host == host {
+            return;
+        }
+        let Some(opt) = self.host_options.iter().find(|o| o.host == host).cloned() else {
+            return;
+        };
+        self.host = host;
+        self.source = opt.source;
+        self.parent = None;
+        let next_repo = opt
+            .repos
+            .iter()
+            .find(|r| r.path == self.repo)
+            .or_else(|| opt.repos.first())
+            .cloned();
+        if let Some(repo_opt) = next_repo {
+            self.repo.clone_from(&repo_opt.path);
+            self.apply_repo_branch_options(repo_opt.branch.as_deref(), window, cx);
+        } else {
+            self.apply_repo_branch_options(None, window, cx);
+        }
+        self.refresh_repo_hooks(cx);
+        self.prepare(cx);
+        cx.notify();
+    }
+
+    pub fn select_repo(&mut self, repo: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo == repo {
+            return;
+        }
+        self.parent = None;
+        let repo_branch = self
+            .host_options
+            .iter()
+            .find(|o| o.host == self.host)
+            .and_then(|o| o.repos.iter().find(|r| r.path == repo))
+            .and_then(|r| r.branch.clone());
+        self.repo = repo;
+        self.apply_repo_branch_options(repo_branch.as_deref(), window, cx);
+        self.refresh_repo_hooks(cx);
+        self.prepare(cx);
+        cx.notify();
+    }
+
+    fn apply_repo_branch_options(
+        &mut self,
+        repo_branch: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (default_base, initial_candidates) = branch_suggestions(None, repo_branch, &[]);
+        self.set_branch_candidates(initial_candidates, cx);
+        let default_str = default_base.unwrap_or_default();
+        self.base.update(cx, |input, cx| {
+            input.set_value(&default_str, window, cx);
+        });
+        if self.host.is_local() {
+            let refs_repo = self.repo.clone();
+            let repo_branch = repo_branch.map(str::to_owned);
+            let target_host = self.host.clone();
+            let target_repo = self.repo.clone();
+            let weak_dialog = cx.weak_entity();
+            cx.spawn_in(window, async move |_, cx| {
+                let refs = cx
+                    .background_executor()
+                    .spawn(async move { list_git_refs(&refs_repo) })
+                    .await;
+                let (base, candidates) = branch_suggestions(None, repo_branch.as_deref(), &refs);
+                weak_dialog
+                    .update_in(cx, |dialog, window, cx| {
+                        if dialog.host == target_host && dialog.repo == target_repo {
+                            dialog.set_branch_candidates(candidates, cx);
+                            dialog.set_base_default(base, window, cx);
+                        }
+                    })
+                    .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn refresh_repo_hooks(&mut self, cx: &mut Context<Self>) {
+        if !self.host.is_local() {
+            self.hooks = krill_proto::orchestration::RepoHookSummary::default();
+            self.hooks_task = None;
+            return;
+        }
+        let repo = self.repo.clone();
         let state_dir = crate::settings::state_dir(cx);
-        dialog.hooks_task = Some(cx.spawn(async move |this, cx| {
+        self.hooks_task = Some(cx.spawn(async move |this, cx| {
+            let check_repo = repo.clone();
             let hooks = cx
                 .background_executor()
                 .spawn(async move {
@@ -319,14 +482,14 @@ impl Dialog {
                 })
                 .await;
             this.update(cx, |dialog, cx| {
-                dialog.hooks = hooks;
+                if dialog.host.is_local() && dialog.repo == check_repo {
+                    dialog.hooks = hooks;
+                }
                 dialog.hooks_task = None;
                 cx.notify();
             })
             .ok();
         }));
-        dialog.prepare(cx);
-        dialog
     }
 
     /// 백그라운드 생성 중이거나 생성 완료된 상태인지(`true`이면 모달을 가리고 사이드바 대기 행으로 표시한다).
@@ -830,8 +993,95 @@ impl Render for Dialog {
         let highlight = self.highlight;
         let base_candidates = filtered.clone();
         let selected_agents = self.selected_agents.clone();
+        let current_host = self.host.clone();
+        let current_repo = self.repo.clone();
+        let host_options = self.host_options.clone();
+        let current_host_repos = host_options
+            .iter()
+            .find(|o| o.host == current_host)
+            .map(|o| o.repos.clone())
+            .unwrap_or_default();
+        let host_label = host_options
+            .iter()
+            .find(|o| o.host == current_host)
+            .map(|o| o.label.clone());
+        let repo_name = current_repo
+            .file_name()
+            .unwrap_or(current_repo.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let subtitle = match host_label {
+            Some(ref hl) if !current_host.is_local() || host_options.len() > 1 => {
+                format!("{hl} · {repo_name}")
+            }
+            _ => repo_name,
+        };
         let body = match &self.phase {
             Phase::Edit(error) => body
+                .when(host_options.len() > 1, |d| {
+                    let current = current_host.clone();
+                    d.child(
+                        div()
+                            .id("worktree-host-selector")
+                            .debug_selector(|| "worktree-host-selector".into())
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(crate::ui::field_label(text::HOST_LABEL.get(), None, p))
+                            .child(div().flex().flex_wrap().gap_1().children(
+                                host_options.iter().enumerate().map(|(idx, opt)| {
+                                    let selected = opt.host == current;
+                                    let next = opt.host.clone();
+                                    let key = opt.host.as_key().to_owned();
+                                    Button::new(("worktree-host", idx))
+                                        .debug_selector(move || format!("worktree-host-{key}"))
+                                        .xsmall()
+                                        .label(opt.label.clone())
+                                        .selected(selected)
+                                        .toggled(selected)
+                                        .ghost()
+                                        .on_click(cx.listener(move |d, _, window, cx| {
+                                            d.select_host(next.clone(), window, cx);
+                                        }))
+                                }),
+                            )),
+                    )
+                })
+                .when(current_host_repos.len() > 1, |d| {
+                    let current = current_repo.clone();
+                    d.child(
+                        div()
+                            .id("worktree-repo-selector")
+                            .debug_selector(|| "worktree-repo-selector".into())
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(crate::ui::field_label(text::REPO_LABEL.get(), None, p))
+                            .child(
+                                div().flex().flex_wrap().gap_1().children(
+                                    current_host_repos
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, repo_opt)| {
+                                            let selected = repo_opt.path == current;
+                                            let next = repo_opt.path.clone();
+                                            Button::new(("worktree-repo", idx))
+                                                .debug_selector(move || {
+                                                    format!("worktree-repo-{idx}")
+                                                })
+                                                .xsmall()
+                                                .label(repo_opt.label.clone())
+                                                .selected(selected)
+                                                .toggled(selected)
+                                                .ghost()
+                                                .on_click(cx.listener(move |d, _, window, cx| {
+                                                    d.select_repo(next.clone(), window, cx);
+                                                }))
+                                        }),
+                                ),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -1159,13 +1409,10 @@ impl Render for Dialog {
                             .child(text::TITLE.get()),
                     )
                     .child(
-                        div().text_size(crate::ui::TEXT_XS).text_color(muted).child(
-                            self.repo
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned(),
-                        ),
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(muted)
+                            .child(subtitle),
                     )
                     .when_some(self.parent.as_ref(), |d, parent| {
                         let parent_name = parent

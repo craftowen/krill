@@ -741,3 +741,112 @@ fn submit_immediately_hides_modal_and_renders_pending_row_until_created(cx: &mut
         Some(PathBuf::from("/repo/즉각-반응"))
     );
 }
+
+#[gpui::test]
+fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut TestAppContext) {
+    use crate::hosts::{HostId, HostStatus};
+    use crate::sidebar::NewSession;
+    use std::collections::BTreeMap;
+
+    let local_fake = Arc::new(Fake::default());
+    local_fake.snapshot.lock().unwrap().trees = BTreeMap::from([(
+        PathBuf::from("/local/repo"),
+        vec![PathBuf::from("/local/repo")],
+    )]);
+
+    let remote_fake = Arc::new(Fake::default());
+    remote_fake.snapshot.lock().unwrap().trees = BTreeMap::from([
+        (
+            PathBuf::from("/remote/repo-a"),
+            vec![PathBuf::from("/remote/repo-a")],
+        ),
+        (
+            PathBuf::from("/remote/repo-b"),
+            vec![PathBuf::from("/remote/repo-b")],
+        ),
+    ]);
+    remote_fake
+        .replies
+        .lock()
+        .unwrap()
+        .push_back(Reply::WorktreeCreated(Worktree {
+            path: b"/remote/repo-b/wt-remote".to_vec(),
+            branch: "wt-remote".into(),
+            base: "origin/main".into(),
+            copied: Vec::new(),
+            warnings: Vec::new(),
+            setup: None,
+        }));
+
+    cx.update(gpui_component::init);
+    let (sidebar, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    cx.simulate_resize(gpui::size(px(900.), px(800.)));
+
+    let spawned = Arc::new(Mutex::new(Vec::<(Option<HostId>, NewSession)>::new()));
+    let spawned_sink = spawned.clone();
+    let sidebar_for_sub = sidebar.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&sidebar_for_sub, move |s, e: &NewSession, cx| {
+            spawned_sink
+                .lock()
+                .unwrap()
+                .push((s.update(cx, |s, _| s.take_action_host()), e.clone()));
+        })
+        .detach();
+    });
+
+    let local_source: Arc<dyn Source> = local_fake.clone();
+    let remote_source: Arc<dyn Source> = remote_fake.clone();
+    cx.update(|window, cx| {
+        sidebar.update(cx, |s, cx| {
+            s.connect_source(local_source, cx);
+            s.set_remote_host_source("mini", "Mac mini", HostStatus::Connected, remote_source, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        sidebar.update(cx, |s, cx| {
+            s.new_worktree("/local/repo".into(), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("worktree-host-selector").is_some());
+    assert!(cx.debug_bounds("worktree-host-local").is_some());
+    assert!(cx.debug_bounds("worktree-host-mini").is_some());
+
+    let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
+    assert_eq!(
+        cx.update(|_, cx| dialog.read(cx).host().clone()),
+        HostId::Local
+    );
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.select_host(HostId::Remote("mini".into()), window, cx);
+            d.select_repo(PathBuf::from("/remote/repo-b"), window, cx);
+            d.name.update(cx, |input, cx| {
+                input.set_value("wt-remote", window, cx);
+            });
+            d.submit(Setup::Ask, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        local_fake.requests.lock().unwrap().is_empty(),
+        "local daemon must not receive remote worktree request"
+    );
+    let remote_reqs = remote_fake.requests.lock().unwrap().clone();
+    assert_eq!(remote_reqs.len(), 1);
+    assert_eq!(remote_reqs[0].repo, b"/remote/repo-b");
+    assert_eq!(remote_reqs[0].name, "wt-remote");
+
+    let events = spawned.lock().unwrap().clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, Some(HostId::Remote("mini".into())));
+    assert_eq!(events[0].1.cwd, PathBuf::from("/remote/repo-b/wt-remote"));
+}

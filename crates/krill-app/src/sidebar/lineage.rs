@@ -305,6 +305,29 @@ impl Sidebar {
             .map(|(repo, _)| repo.clone())
     }
 
+    /// 지정한 호스트 스냅샷에서 워크트리(또는 하위 디렉터리)가 속한 저장소 루트 경로를 찾는다.
+    #[must_use]
+    pub fn repo_for_worktree_on(
+        &self,
+        host: &crate::hosts::HostId,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        let snapshot = self.snapshot_for(host);
+        if let Some((repo, _)) = snapshot
+            .trees
+            .iter()
+            .find(|&(repo, list)| repo == path || list.iter().any(|t| t == path))
+        {
+            return Some(repo.clone());
+        }
+        snapshot
+            .trees
+            .keys()
+            .filter(|repo| !repo.as_os_str().is_empty() && super::path_within(path, repo))
+            .max_by_key(|repo| repo.as_os_str().len())
+            .cloned()
+    }
+
     /// 같은 저장소 안에서 `path`의 부모가 될 수 있는 후보 워크트리 목록.
     #[must_use]
     pub fn eligible_parent_worktrees(&self, path: &Path) -> Vec<PathBuf> {
@@ -502,10 +525,115 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_child_worktree_on(crate::hosts::HostId::Local, parent, window, cx);
+    }
+
+    pub fn new_child_worktree_on(
+        &mut self,
+        host: crate::hosts::HostId,
+        parent: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let repo = self
-            .repo_for_worktree(&parent)
+            .repo_for_worktree_on(&host, &parent)
             .unwrap_or_else(|| parent.clone());
-        self.open_worktree_dialog(repo, Some(parent), window, cx);
+        self.open_worktree_dialog_on(host, repo, Some(parent), window, cx);
+    }
+
+    pub fn new_worktree_on(
+        &mut self,
+        host: crate::hosts::HostId,
+        repo: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repo = self.repo_for_worktree_on(&host, &repo).unwrap_or(repo);
+        self.open_worktree_dialog_on(host, repo, None, window, cx);
+    }
+
+    pub(super) fn worktree_host_options(
+        &self,
+        initial_host: &crate::hosts::HostId,
+        initial_repo: &Path,
+    ) -> Vec<worktree::WorktreeHostOption> {
+        let mut out = Vec::new();
+        if let Some(local_source) = self.source.clone() {
+            let mut repos: Vec<worktree::WorktreeRepoOption> = self
+                .snapshot
+                .trees
+                .keys()
+                .filter(|r| !self.removed_projects.contains(*r))
+                .map(|r| worktree::WorktreeRepoOption {
+                    path: r.clone(),
+                    label: self.project_header_name(r),
+                    branch: self.meta.get(r).and_then(|t| t.branch.clone()),
+                })
+                .collect();
+            if initial_host.is_local()
+                && !initial_repo.as_os_str().is_empty()
+                && !repos.iter().any(|r| r.path == initial_repo)
+            {
+                repos.insert(
+                    0,
+                    worktree::WorktreeRepoOption {
+                        path: initial_repo.to_path_buf(),
+                        label: self.project_header_name(initial_repo),
+                        branch: self.meta.get(initial_repo).and_then(|t| t.branch.clone()),
+                    },
+                );
+            }
+            out.push(worktree::WorktreeHostOption {
+                host: crate::hosts::HostId::Local,
+                label: super::text::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned(),
+                source: local_source,
+                repos,
+            });
+        }
+        for remote in &self.remote_hosts {
+            let r_host = crate::hosts::HostId::Remote(remote.id.clone());
+            if remote.status != crate::hosts::HostStatus::Connected && &r_host != initial_host {
+                continue;
+            }
+            let Some(r_source) = remote.source.clone() else {
+                continue;
+            };
+            let mut repos: Vec<worktree::WorktreeRepoOption> = remote
+                .snapshot
+                .trees
+                .keys()
+                .map(|r| worktree::WorktreeRepoOption {
+                    path: r.clone(),
+                    label: super::basename(r),
+                    branch: remote.meta.get(r).and_then(|t| t.branch.clone()),
+                })
+                .collect();
+            if &r_host == initial_host
+                && !initial_repo.as_os_str().is_empty()
+                && !repos.iter().any(|r| r.path == initial_repo)
+            {
+                repos.insert(
+                    0,
+                    worktree::WorktreeRepoOption {
+                        path: initial_repo.to_path_buf(),
+                        label: super::basename(initial_repo),
+                        branch: remote.meta.get(initial_repo).and_then(|t| t.branch.clone()),
+                    },
+                );
+            }
+            if !repos.is_empty() {
+                out.push(worktree::WorktreeHostOption {
+                    host: r_host,
+                    label: remote.label.clone(),
+                    source: r_source,
+                    repos,
+                });
+            }
+        }
+        out
     }
 
     pub(super) fn open_worktree_dialog(
@@ -515,8 +643,39 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(source) = self.source.clone() else {
-            return;
+        self.open_worktree_dialog_on(crate::hosts::HostId::Local, repo, parent, window, cx);
+    }
+
+    pub(super) fn open_worktree_dialog_on(
+        &mut self,
+        host: crate::hosts::HostId,
+        repo: PathBuf,
+        parent: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host_options = self.worktree_host_options(&host, &repo);
+        let selected_opt = host_options
+            .iter()
+            .find(|o| o.host == host)
+            .or_else(|| host_options.first())
+            .cloned();
+        let (target_host, source, target_repo) = if let Some(opt) = selected_opt {
+            let target_repo = opt
+                .repos
+                .iter()
+                .find(|r| r.path == repo)
+                .or_else(|| opt.repos.first())
+                .map_or_else(|| repo.clone(), |r| r.path.clone());
+            (opt.host, opt.source, target_repo)
+        } else {
+            if !host.is_local() {
+                return;
+            }
+            let Some(source) = self.source.clone() else {
+                return;
+            };
+            (host, source, repo)
         };
         if let Some((old_dialog, old_sub)) = self.creating.take()
             && old_dialog.read(cx).is_background()
@@ -528,51 +687,62 @@ impl Sidebar {
         self.next_creating_id = self.next_creating_id.wrapping_add(1);
         self.creating_dialog_id = dialog_id;
 
-        let repo_for_event = repo.clone();
-        let parent_for_event = parent.clone();
+        let meta = self.meta_for(&target_host);
         // OWE-853: 호출한 워크트리(부모 우선, 없으면 레포)의 현재 브랜치를 기본값으로 쓴다.
         let parent_branch = parent
             .as_ref()
-            .and_then(|p| self.meta.get(p).and_then(|t| t.branch.clone()));
-        let repo_branch = self.meta.get(&repo).and_then(|t| t.branch.clone());
+            .and_then(|p| meta.get(p).and_then(|t| t.branch.clone()));
+        let repo_branch = meta.get(&target_repo).and_then(|t| t.branch.clone());
         // OWE-853: 로컬 git refs를 읽어 후보를 풍부하게 한다(새 IPC 없이, 실패 시 폴백만).
         let git_refs = Vec::new();
-        let refs_repo = repo.clone();
+        let refs_repo = target_repo.clone();
+        let refs_host = target_host.clone();
         let (default_base, initial_candidates) = worktree::branch_suggestions(
             parent_branch.as_deref(),
             repo_branch.as_deref(),
             &git_refs,
         );
         let dialog = cx.new(|cx| {
-            worktree::Dialog::new_with_options(
-                repo,
+            let mut dialog = worktree::Dialog::new_with_options(
+                target_repo,
                 parent,
                 default_base.as_deref(),
-                initial_candidates,
+                initial_candidates.clone(),
                 source,
                 window,
                 cx,
-            )
-        });
-        let weak_dialog = dialog.downgrade();
-        cx.spawn_in(window, async move |_, cx| {
-            let refs = cx
-                .background_executor()
-                .spawn(async move { worktree::list_git_refs(&refs_repo) })
-                .await;
-            let (base, candidates) = worktree::branch_suggestions(
-                parent_branch.as_deref(),
-                repo_branch.as_deref(),
-                &refs,
             );
-            weak_dialog
-                .update_in(cx, |dialog, window, cx| {
-                    dialog.set_branch_candidates(candidates, cx);
-                    dialog.set_base_default(base, window, cx);
-                })
-                .ok();
-        })
-        .detach();
+            dialog.set_host_options(target_host, host_options, cx);
+            dialog.set_branch_candidates(initial_candidates, cx);
+            if let Some(ref base) = default_base {
+                dialog.set_base_default(Some(base.clone()), window, cx);
+            }
+            dialog
+        });
+        if refs_host.is_local() {
+            let weak_dialog = dialog.downgrade();
+            let check_repo = refs_repo.clone();
+            cx.spawn_in(window, async move |_, cx| {
+                let refs = cx
+                    .background_executor()
+                    .spawn(async move { worktree::list_git_refs(&refs_repo) })
+                    .await;
+                let (base, candidates) = worktree::branch_suggestions(
+                    parent_branch.as_deref(),
+                    repo_branch.as_deref(),
+                    &refs,
+                );
+                weak_dialog
+                    .update_in(cx, |dialog, window, cx| {
+                        if dialog.host().is_local() && dialog.repo() == check_repo.as_path() {
+                            dialog.set_branch_candidates(candidates, cx);
+                            dialog.set_base_default(base, window, cx);
+                        }
+                    })
+                    .ok();
+            })
+            .detach();
+        }
         let events = cx.subscribe_in(
             &dialog,
             window,
@@ -582,6 +752,7 @@ impl Sidebar {
                     parent,
                     names,
                 } => {
+                    let submitting_host = dialog_entity.read(cx).host().clone();
                     s.pending_worktrees.retain(|p| p.dialog_id != dialog_id);
                     s.removed_projects.remove(repo);
                     s.collapsed.remove(repo);
@@ -600,6 +771,7 @@ impl Sidebar {
                             first_pending_id = Some(id);
                         }
                         s.pending_worktrees.push(PendingWorktree {
+                            host: submitting_host.clone(),
                             id,
                             dialog_id,
                             repo: repo.clone(),
@@ -610,7 +782,7 @@ impl Sidebar {
                     s.rebuild(cx);
                     if let Some(target_id) = first_pending_id
                         && let Some(idx) = s.rows.iter().enumerate().position(|(i, r)| {
-                            s.row_host(i).is_local()
+                            s.row_host(i) == &submitting_host
                                 && matches!(r, Row::PendingWorktree { id, .. } if *id == target_id)
                         })
                     {
@@ -657,38 +829,43 @@ impl Sidebar {
                         s.pending_worktrees.remove(pos);
                     }
                     let created_path = PathBuf::from(std::ffi::OsStr::from_bytes(&w.path));
-                    let (agent, prompt, has_more) = {
+                    let (created_host, created_repo, parent_path, agent, prompt, has_more) = {
                         let d = dialog_entity.read(cx);
                         (
+                            d.host().clone(),
+                            d.repo().to_path_buf(),
+                            d.parent().map(Path::to_path_buf),
                             d.last_created_agent().map(str::to_owned),
                             d.last_created_prompt().map(str::to_owned),
                             d.has_pending_fan_out(),
                         )
                     };
-                    let trees = s.snapshot.trees.entry(repo_for_event.clone()).or_default();
-                    if !trees.contains(&created_path) {
-                        trees.push(created_path.clone());
-                    }
-                    s.meta.entry(created_path.clone()).or_insert_with(|| Tree {
-                        branch: Some(w.branch.clone()),
-                        dirty: None,
-                    });
-                    s.removed_projects.remove(&repo_for_event);
-                    s.sleeping_worktrees.remove(&created_path);
-                    s.recently_created_worktrees.insert(created_path.clone());
-                    s.pending_reveal_worktree = Some(created_path.clone());
-                    s.collapsed.remove(&repo_for_event);
-                    s.collapsed.remove(&created_path);
-                    if !s.options.filters.repos.is_empty() {
-                        s.options.filters.repos.insert(repo_for_event.clone());
-                    }
-                    if external::is_claude_worktree(&created_path) {
-                        s.shown_external.insert(repo_for_event.clone());
-                    }
-                    if let Some(parent_path) = &parent_for_event {
-                        s.collapsed_lineage.remove(parent_path);
-                        s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
-                        s.expand_lineage_ancestors(&created_path);
+                    if created_host.is_local() {
+                        let trees = s.snapshot.trees.entry(created_repo.clone()).or_default();
+                        if !trees.contains(&created_path) {
+                            trees.push(created_path.clone());
+                        }
+                        s.meta.entry(created_path.clone()).or_insert_with(|| Tree {
+                            branch: Some(w.branch.clone()),
+                            dirty: None,
+                        });
+                        s.removed_projects.remove(&created_repo);
+                        s.sleeping_worktrees.remove(&created_path);
+                        s.recently_created_worktrees.insert(created_path.clone());
+                        s.pending_reveal_worktree = Some(created_path.clone());
+                        s.collapsed.remove(&created_repo);
+                        s.collapsed.remove(&created_path);
+                        if !s.options.filters.repos.is_empty() {
+                            s.options.filters.repos.insert(created_repo.clone());
+                        }
+                        if external::is_claude_worktree(&created_path) {
+                            s.shown_external.insert(created_repo.clone());
+                        }
+                        if let Some(parent_path) = &parent_path {
+                            s.collapsed_lineage.remove(parent_path);
+                            s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
+                            s.expand_lineage_ancestors(&created_path);
+                        }
                     }
                     if let Some(prompt_text) = &prompt {
                         s.queue_initial_prompt(created_path.clone(), prompt_text);
@@ -702,7 +879,7 @@ impl Sidebar {
                     s.selected_worktree = Some(created_path.clone());
                     s.rebuild(cx);
                     if let Some(idx) = s.rows.iter().enumerate().position(|(i, r)| {
-                        s.row_host(i).is_local()
+                        s.row_host(i) == &created_host
                             && matches!(r, Row::Worktree(p) if p == &created_path)
                     }) {
                         s.cursor = Some(idx);
@@ -710,6 +887,7 @@ impl Sidebar {
                         s.scroll_row_into_view(idx, ScrollStrategy::Nearest);
                     }
                     s.write_state(cx);
+                    s.action_host = Some(created_host);
                     if let Some(agent_id) = agent {
                         cx.emit(NewSession {
                             cwd: created_path,

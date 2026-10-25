@@ -490,6 +490,10 @@ fn refresh_menus(cx: &mut App) {
                 shell::Copy,
                 gpui::OsAction::Copy,
             ),
+            MenuItem::action(
+                krill_app::i18n::catalog::shell::COPY_CLEAN.get(),
+                shell::CopyClean,
+            ),
             MenuItem::os_action(
                 krill_app::i18n::catalog::general::PASTE_ITEM.get(),
                 shell::Paste,

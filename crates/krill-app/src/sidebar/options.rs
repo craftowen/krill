@@ -1203,6 +1203,12 @@ impl Sidebar {
         let mut derived = self.local_rows_cache.borrow_mut();
         derived.refresh(self);
         let parents = self.merged_parents();
+        let pending: Vec<_> = self
+            .pending_worktrees
+            .iter()
+            .filter(|p| p.host.is_local())
+            .cloned()
+            .collect();
         let ctx = WorktreeContext {
             meta: Some(&self.meta),
             prs: Some(&self.prs),
@@ -1220,7 +1226,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             recently_created: Some(&self.recently_created_worktrees),
-            pending_worktrees: &self.pending_worktrees,
+            pending_worktrees: &pending,
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
         };
@@ -1274,7 +1280,14 @@ impl Sidebar {
         remote: &super::RemoteHost,
         collapsed: &BTreeSet<PathBuf>,
     ) -> Vec<Row> {
+        let pending: Vec<_> = self
+            .pending_worktrees
+            .iter()
+            .filter(|p| p.host == HostId::Remote(remote.id.clone()))
+            .cloned()
+            .collect();
         let ctx = WorktreeContext {
+            pending_worktrees: &pending,
             meta: Some(&remote.meta),
             prs: Some(&self.prs),
             statuses: Some(&self.worktree_statuses),

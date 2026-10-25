@@ -242,6 +242,71 @@ fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
     }
 }
 
+enum ChatBodySegment {
+    Text(String),
+    Code { lang: String, code: String },
+}
+
+fn parse_chat_segments(text: &str) -> Vec<ChatBodySegment> {
+    if !text.contains("```") {
+        return vec![ChatBodySegment::Text(text.to_owned())];
+    }
+    let mut segments = Vec::new();
+    let mut text_buf = String::new();
+    let mut code_buf = String::new();
+    let mut in_code: Option<String> = None;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            if let Some(lang) = in_code.take() {
+                segments.push(ChatBodySegment::Code {
+                    lang,
+                    code: code_buf.trim_end_matches('\n').to_owned(),
+                });
+                code_buf.clear();
+            } else {
+                let prose = text_buf.trim_matches('\n');
+                if !prose.is_empty() {
+                    segments.push(ChatBodySegment::Text(prose.to_owned()));
+                }
+                text_buf.clear();
+                in_code = Some(rest.trim().to_owned());
+            }
+            continue;
+        }
+        if in_code.is_some() {
+            if !code_buf.is_empty() {
+                code_buf.push('\n');
+            }
+            code_buf.push_str(line);
+        } else {
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(line);
+        }
+    }
+    if let Some(lang) = in_code {
+        if !code_buf.is_empty() {
+            segments.push(ChatBodySegment::Code {
+                lang,
+                code: code_buf,
+            });
+        }
+    } else {
+        let prose = text_buf.trim_matches('\n');
+        if !prose.is_empty() {
+            segments.push(ChatBodySegment::Text(prose.to_owned()));
+        }
+    }
+    if segments.is_empty() {
+        vec![ChatBodySegment::Text(text.to_owned())]
+    } else {
+        segments
+    }
+}
+
 impl Shell {
     pub(super) fn is_session_chat_view(&self, session: SessionId, cx: &gpui::App) -> bool {
         self.chat
@@ -736,6 +801,89 @@ impl Shell {
         )
     }
 
+    fn render_chat_body(
+        pane: super::PaneId,
+        abs_idx: usize,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = ui::palette(cx);
+        let mut body = div().flex().flex_col().gap_2();
+        let mut code_idx = 0usize;
+        for segment in parse_chat_segments(text) {
+            match segment {
+                ChatBodySegment::Text(text) => {
+                    body = body.child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.foreground)
+                            .child(text),
+                    );
+                }
+                ChatBodySegment::Code { lang, code } => {
+                    let current_code_idx = code_idx;
+                    code_idx += 1;
+                    let code_for_copy = code.clone();
+                    let lang_label = if lang.is_empty() {
+                        SharedString::from("code")
+                    } else {
+                        SharedString::from(lang)
+                    };
+                    body =
+                        body.child(
+                            div()
+                                .p_2()
+                                .rounded(ui::RADIUS_SM)
+                                .border_1()
+                                .border_color(p.border)
+                                .bg(p.background)
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_size(ui::TEXT_XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(lang_label),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "chat-copy-code-{}-{abs_idx}-{current_code_idx}",
+                                                pane.get()
+                                            )))
+                                            .debug_selector(|| "chat-copy-code".into())
+                                            .label(ctext::COPY_CODE.get())
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(
+                                                        code_for_copy.clone(),
+                                                    ),
+                                                );
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(p.foreground)
+                                        .child(code),
+                                ),
+                        );
+                }
+            }
+        }
+
+        body
+    }
+
     fn render_chat_item(
         &mut self,
         pane: super::PaneId,
@@ -750,7 +898,22 @@ impl Shell {
         let wrapper = div()
             .id(SharedString::from(item_selector))
             .debug_selector(move || debug_selector.clone())
-            .pb_3();
+            .pb_3()
+            .children((!item.text.trim().is_empty()).then(|| {
+                let copy_text = krill_term::select::clean_text(&item.text);
+                Button::new(SharedString::from(format!(
+                    "chat-copy-{}-{abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-copy-item".into())
+                .label(ctext::COPY.get())
+                .ghost()
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                })
+            }));
 
         match item.kind {
             ChatItemKind::User => {
@@ -764,7 +927,7 @@ impl Shell {
                     .border_color(p.ring.opacity(0.45))
                     .text_size(ui::TEXT_MD)
                     .text_color(p.accent_foreground)
-                    .child(item.text.clone());
+                    .child(Self::render_chat_body(pane, abs_idx, &item.text, cx));
 
                 wrapper
                     .flex()
@@ -840,7 +1003,7 @@ impl Shell {
                             .pl_5()
                             .text_size(ui::TEXT_MD)
                             .text_color(p.foreground)
-                            .child(item.text.clone()),
+                            .child(Self::render_chat_body(pane, abs_idx, &item.text, cx)),
                     )
                     .into_any_element()
             }
@@ -963,7 +1126,8 @@ impl Shell {
                     if is_mono {
                         body = body.font_family(ui::FONT_MONO);
                     }
-                    card = card.child(body.child(item.text.clone()));
+                    card = card
+                        .child(body.child(Self::render_chat_body(pane, abs_idx, &item.text, cx)));
                 }
 
                 wrapper.child(card).into_any_element()
@@ -1016,7 +1180,7 @@ impl Shell {
                         div()
                             .text_size(ui::TEXT_SM)
                             .text_color(p.foreground)
-                            .child(item.text.clone()),
+                            .child(Self::render_chat_body(pane, abs_idx, &item.text, cx)),
                     );
 
                 let request = self.chat_request_identity(pane, session, abs_idx, item);
@@ -1736,5 +1900,50 @@ mod tests {
             assert!(!this.is_active_chat_view_in(cx));
         });
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[gpui::test]
+    fn chat_card_copy_and_code_block_copy_write_clean_clipboard(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+        cx.run_until_parked();
+        shell.update(cx, |this, cx| {
+            let pane = this.layout.focused().unwrap();
+            this.layout.set_session(pane, SessionId(42));
+            this.toggle_chat_view(cx);
+            this.apply_chat_poll(
+                SessionId(42),
+                ChatPollSnapshot {
+                    agent: "claude".into(),
+                    bound: true,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "실행하세요:\n```sh\npython3 -c 'print(123)'\n```".into(),
+                        ..ChatItem::default()
+                    }],
+                    ..ChatPollSnapshot::default()
+                },
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let code_btn = cx
+            .debug_bounds("chat-copy-code")
+            .expect("code copy button should render");
+        cx.simulate_click(code_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("python3 -c 'print(123)'")
+        );
+
+        let item_btn = cx
+            .debug_bounds("chat-copy-item")
+            .expect("item copy button should render");
+        cx.simulate_click(item_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("실행하세요:\n```sh\npython3 -c 'print(123)'\n```")
+        );
     }
 }

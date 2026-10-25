@@ -267,20 +267,26 @@ fn row_menu(
                     }),
             );
 
-        if host.is_local() {
-            let (child_this, child_parent) = (this.clone(), meta.path.clone());
-            menu = menu.separator().item(
-                PopupMenuItem::new(text::CREATE_CHILD_WORKTREE.get())
-                    .icon(IconName::Plus)
-                    .on_click(move |_, window, cx| {
-                        child_this
-                            .update(cx, |s, cx| {
-                                s.new_child_worktree(child_parent.clone(), window, cx);
-                            })
-                            .ok();
-                    }),
-            );
+        let (child_this, child_host, child_parent) =
+            (this.clone(), host.clone(), meta.path.clone());
+        menu = menu.separator().item(
+            PopupMenuItem::new(text::CREATE_CHILD_WORKTREE.get())
+                .icon(IconName::Plus)
+                .on_click(move |_, window, cx| {
+                    child_this
+                        .update(cx, |s, cx| {
+                            s.new_child_worktree_on(
+                                child_host.clone(),
+                                child_parent.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }),
+        );
 
+        if host.is_local() {
             if !meta.parent_candidates.is_empty() {
                 let (sub_this, sub_path, candidates, cur_parent) = (
                     this.clone(),
@@ -403,39 +409,43 @@ fn row_menu(
     if let Some(header) = header {
         menu = menu.separator();
         if header.repo {
-            let (wt_this, wt_repo) = (this.clone(), header.path.clone());
+            let (wt_this, wt_host, wt_repo) = (this.clone(), host.clone(), header.path.clone());
             menu = menu.item(
                 PopupMenuItem::new(text::NEW_WORKTREE.get())
                     .icon(IconName::Plus)
                     .on_click(move |_, window, cx| {
                         wt_this
-                            .update(cx, |s, cx| s.new_worktree(wt_repo.clone(), window, cx))
+                            .update(cx, |s, cx| {
+                                s.new_worktree_on(wt_host.clone(), wt_repo.clone(), window, cx);
+                            })
                             .ok();
                     }),
             );
         }
-        let (remove_this, remove_path) = (this.clone(), header.path.clone());
-        menu = menu.item(
-            PopupMenuItem::new(text::REMOVE_PROJECT.get())
-                .icon(Icon::default().data(ui::icons::TRASH_SVG))
-                .on_click(move |_, window, cx| {
-                    let answer = window.prompt(
-                        gpui::PromptLevel::Warning,
-                        text::REMOVE_PROJECT.get(),
-                        Some(text::REMOVE_PROJECT_CONFIRM.get()),
-                        &[text::REMOVE_PROJECT.get(), text::CANCEL.get()],
-                        cx,
-                    );
-                    let sidebar = remove_this.clone();
-                    let path = remove_path.clone();
-                    cx.spawn(async move |cx| {
-                        if answer.await == Ok(0) {
-                            sidebar.update(cx, |s, cx| s.remove_project(path, cx)).ok();
-                        }
-                    })
-                    .detach();
-                }),
-        );
+        if host.is_local() {
+            let (remove_this, remove_path) = (this.clone(), header.path.clone());
+            menu = menu.item(
+                PopupMenuItem::new(text::REMOVE_PROJECT.get())
+                    .icon(Icon::default().data(ui::icons::TRASH_SVG))
+                    .on_click(move |_, window, cx| {
+                        let answer = window.prompt(
+                            gpui::PromptLevel::Warning,
+                            text::REMOVE_PROJECT.get(),
+                            Some(text::REMOVE_PROJECT_CONFIRM.get()),
+                            &[text::REMOVE_PROJECT.get(), text::CANCEL.get()],
+                            cx,
+                        );
+                        let sidebar = remove_this.clone();
+                        let path = remove_path.clone();
+                        cx.spawn(async move |cx| {
+                            if answer.await == Ok(0) {
+                                sidebar.update(cx, |s, cx| s.remove_project(path, cx)).ok();
+                            }
+                        })
+                        .detach();
+                    }),
+            );
+        }
     }
     menu
 }
@@ -1059,7 +1069,8 @@ impl Sidebar {
                     })
                     .child(self.project_host_control(index, &row_host, cx))
                     .children(merged_hosts)
-                    .when(row_host.is_local(), |d| {
+                    .when(!dimmed, |d| {
+                        let new_wt_host = row_host.clone();
                         d.child(
                             div()
                                 .invisible()
@@ -1073,7 +1084,12 @@ impl Sidebar {
                                         .tooltip(text::NEW_WORKTREE.get())
                                         .on_click(cx.listener(move |s, _, window, cx| {
                                             cx.stop_propagation();
-                                            s.new_worktree(repo.clone(), window, cx);
+                                            s.new_worktree_on(
+                                                new_wt_host.clone(),
+                                                repo.clone(),
+                                                window,
+                                                cx,
+                                            );
                                         })),
                                 ),
                         )
@@ -2755,9 +2771,11 @@ impl Sidebar {
                             Some(path.clone()),
                             None,
                             None,
-                            Some(HeaderMenuMeta {
-                                path: path.clone(),
-                                repo: matches!(row, Row::Repository(_)) && host.is_local(),
+                            (host.is_local() || matches!(row, Row::Repository(_))).then(|| {
+                                HeaderMenuMeta {
+                                    path: path.clone(),
+                                    repo: matches!(row, Row::Repository(_)),
+                                }
                             }),
                         ),
                         _ => (None, None, None, None),
@@ -3200,13 +3218,25 @@ impl Render for Sidebar {
             .as_ref()
             .filter(|(dialog, _)| !dialog.read(cx).is_background())
             .map(|(dialog, _)| dialog.clone());
-        let projects: Vec<_> = self
+        let mut projects: Vec<(HostId, PathBuf, String)> = self
             .snapshot
             .trees
             .keys()
             .filter(|repo| !self.removed_projects.contains(*repo))
-            .map(|repo| (repo.clone(), self.project_header_name(repo)))
+            .map(|repo| (HostId::Local, repo.clone(), self.project_header_name(repo)))
             .collect();
+        for remote in &self.remote_hosts {
+            if remote.status == HostStatus::Connected && remote.source.is_some() {
+                let r_host = HostId::Remote(remote.id.clone());
+                for repo in remote.snapshot.trees.keys() {
+                    projects.push((
+                        r_host.clone(),
+                        repo.clone(),
+                        format!("{} · {}", basename(repo), remote.label),
+                    ));
+                }
+            }
+        }
         let unread = self
             .snapshot
             .sessions
@@ -3320,8 +3350,9 @@ impl Render for Sidebar {
                                         .accessibility_label(text::NEW_WORKTREE.get())
                                         .tooltip(text::NEW_WORKTREE.get())
                                         .dropdown_menu(move |mut menu, _, _| {
-                                            for (repo, name) in &projects {
+                                            for (host, repo, name) in &projects {
                                                 let sidebar = sidebar.clone();
+                                                let host = host.clone();
                                                 let repo = repo.clone();
                                                 menu = menu.item(
                                                     PopupMenuItem::new(name.clone())
@@ -3329,7 +3360,8 @@ impl Render for Sidebar {
                                                         .on_click(move |_, window, cx| {
                                                             sidebar
                                                                 .update(cx, |s, cx| {
-                                                                    s.new_worktree(
+                                                                    s.new_worktree_on(
+                                                                        host.clone(),
                                                                         repo.clone(),
                                                                         window,
                                                                         cx,

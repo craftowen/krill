@@ -331,6 +331,7 @@ actions!(
         FindNext,
         FindPrev,
         Copy,
+        CopyClean,
         Paste,
         ForkSession,
         ContinueInNewSession
@@ -486,6 +487,7 @@ pub fn bind_keys(cx: &mut App) {
         // OWE-868: ⇧⌘G는 검색 바가 열려 있을 때만 이전 찾기다. 바깥에서는 기존 TogglePanel(우측 패널)을 유지한다.
         krill_app::keys::bind("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
         krill_app::keys::bind("cmd-c", Copy, ctx),
+        krill_app::keys::bind("cmd-shift-c", CopyClean, ctx),
         krill_app::keys::bind("cmd-v", Paste, ctx),
     ]);
     // macOS gpui는 ⇧+[ / ⇧+]를 { / }로 정규화하며 Shift 플래그를 지운다.
@@ -3626,12 +3628,21 @@ impl Shell {
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
-        let repo = self.folder();
+        let (host, repo) =
+            if let Some((sel_host, sel_folder)) = self.sidebar.read(cx).selected_workspace() {
+                (sel_host, sel_folder)
+            } else {
+                let host = self
+                    .layout
+                    .focused()
+                    .map_or_else(|| self.launch_host.clone(), |p| self.layout.host(p).clone());
+                (host, self.folder())
+            };
         if self.sidebar_collapsed {
             self.toggle_sidebar(cx);
         }
         self.sidebar
-            .update(cx, |s, cx| s.new_worktree(repo, window, cx));
+            .update(cx, |s, cx| s.new_worktree_on(host, repo, window, cx));
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -4676,7 +4687,7 @@ impl Shell {
     }
 
     /// 왼쪽 버튼 누름(OWE-866): Shift+클릭은 기존 anchor를 유지한 채 head만 옮기고,
-    /// 더블클릭은 단어, 트리플클릭은 줄을 선택한다. 그리드 밖이면 그대로.
+    /// 더블클릭은 단어, 트리플클릭은 줄, ⌥(Alt)+클릭은 사각형(열 구간)을 선택한다. 그리드 밖이면 그대로.
     fn select_begin(
         &mut self,
         pane: PaneId,
@@ -4832,6 +4843,18 @@ impl Shell {
         let Some(l) = self.focused_live() else { return };
         let Some(sel) = l.selection else { return };
         let text = sel.text(&l.pane.shown());
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn copy_clean(&mut self, cx: &mut Context<Self>) {
+        if self.page_open() || self.dashboard.is_some() {
+            return;
+        }
+        let Some(l) = self.focused_live() else { return };
+        let Some(sel) = l.selection else { return };
+        let text = sel.clean_text(&l.pane.shown());
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -6834,6 +6857,7 @@ impl Render for Shell {
                 this.step_search(krill_proto::search::Direction::Previous, cx);
             }))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &CopyClean, _, cx| this.copy_clean(cx)))
             .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste(window, cx)))
             .on_action(cx.listener(|this, _: &ForkSession, _, cx| {
                 if let Some(pane) = this.layout.focused() {

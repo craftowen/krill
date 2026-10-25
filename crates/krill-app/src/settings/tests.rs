@@ -2852,7 +2852,7 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
 fn owe799_category_mapping_and_search_matching() {
     use shortcuts::{ACTIONS, Category, action_category, is_modified, matches_query};
 
-    assert_eq!(ACTIONS.len(), 58);
+    assert_eq!(ACTIONS.len(), 59);
     for &cat in Category::ALL {
         let count = ACTIONS
             .iter()

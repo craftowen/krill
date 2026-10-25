@@ -466,6 +466,7 @@ catalog! {
         LAYOUT_UNREADABLE => ("레이아웃을 읽거나 보존하지 못했습니다. 원본 보호를 위해 레이아웃 저장을 중단했습니다", "Could not read or preserve layout. Saving is paused to protect the original."),
         RESTART => ("다시 시작", "Restart"),
         COPY => ("복사", "Copy"),
+        COPY_CLEAN => ("깔끔하게 복사", "Smart Copy"),
         PASTE => ("붙여넣기", "Paste"),
         FORK_SESSION => ("에이전트 세션 포크", "Fork agent session"),
         CONTINUE_IN_NEW_SESSION => ("새 세션에 이어하기…", "Continue in new session…"),
@@ -782,6 +783,8 @@ catalog! {
     }
     worktree {
         TITLE => ("워크트리 만들기", "Create worktree"),
+        HOST_LABEL => ("호스트", "Host"),
+        REPO_LABEL => ("저장소", "Repository"),
         NAME_LABEL => ("이름", "Name"),
         BASE_LABEL => ("기준 ref", "Base ref"),
         OPTIONAL => ("[선택]", "[Optional]"),
@@ -1412,6 +1415,7 @@ catalog! {
         SC_FIND_NEXT => ("다음 찾기", "Find next"),
         SC_FIND_PREV => ("이전 찾기", "Find previous"),
         SC_COPY => ("복사", "Copy"),
+        SC_COPY_CLEAN => ("깔끔하게 복사 (줄바꿈·기호 정리)", "Smart copy (clean wrap & borders)"),
         SC_PASTE => ("붙여넣기", "Paste"),
         SC_SIDEBAR => ("사이드바 전환", "Toggle sidebar"),
         SC_FOCUS_SIDEBAR => ("사이드바로 이동", "Focus sidebar"),
@@ -1779,6 +1783,8 @@ catalog! {
         DENY => ("거부 (n)", "Deny (n)"),
         REFRESH => ("새로고침", "Refresh"),
         TERM => ("Term →", "Term →"),
+        COPY => ("복사", "Copy"),
+        COPY_CODE => ("코드 복사", "Copy code"),
     }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),

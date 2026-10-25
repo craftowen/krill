@@ -9440,3 +9440,78 @@ fn settled_fresh_local_session_immediately_refreshes_and_focuses_sidebar(cx: &mu
         Some(PathBuf::from("/repo/new"))
     );
 }
+
+#[gpui::test]
+fn alt_drag_block_selection_and_copy_clean_strip_tui_decorations(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Cell, Op, Revision, Seq, encode_update};
+    let (view, cx) = open(cx, state_path("block-and-clean-copy"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let row = |t: &str| {
+        t.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect::<Vec<_>>()
+    };
+    view.update(cx, |s, cx| {
+        s.attach_test(pane, krill_proto::SessionId(77), ours, cx);
+        let ops = vec![
+            Op::Reset { cols: 20, lines: 4 },
+            Op::Line {
+                line: 0,
+                cells: row("| hello"),
+            },
+            Op::Line {
+                line: 1,
+                cells: row("| world"),
+            },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (k, b) = krill_proto::ipc::read_frame(&mut &frame[..])
+            .unwrap()
+            .unwrap();
+        assert!(s.on_frame(pane, k, &b, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+
+    // 1) ⌥(Alt) + 드래그로 열 2..=6 사각형만 선택 후 일반 복사(⌘C).
+    let start = point(
+        bounds.origin.x + cell.width * 2.5,
+        bounds.origin.y + cell.height * 0.5,
+    );
+    let end = point(
+        bounds.origin.x + cell.width * 6.5,
+        bounds.origin.y + cell.height * 1.5,
+    );
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    cx.simulate_mouse_down(start, MouseButton::Left, alt);
+    cx.simulate_mouse_move(end, MouseButton::Left, alt);
+    cx.simulate_mouse_up(end, MouseButton::Left, alt);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("hello\nworld")
+    );
+
+    // 2) 전체 줄(0열부터)을 일반 드래그로 선택한 뒤 ⇧⌘C(CopyClean)로 깔끔하게 복사.
+    let line0_start = point(
+        bounds.origin.x + cell.width * 0.5,
+        bounds.origin.y + cell.height * 0.5,
+    );
+    cx.simulate_mouse_down(line0_start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("hello\nworld")
+    );
+}

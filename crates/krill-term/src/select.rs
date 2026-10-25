@@ -317,11 +317,14 @@ fn parse_gutter_prefix(line: &str) -> Option<(char, &str)> {
         return None;
     }
     let rest = chars.as_str();
-    match rest.chars().next() {
-        None => Some((first, "")),
-        Some(' ') => Some((first, rest.strip_prefix(' ').unwrap_or(rest))),
-        Some(_) if matches!(first, '│' | '┃' | '丨') => Some((first, rest)),
-        Some(_) => None,
+    if rest.is_empty() {
+        Some((first, ""))
+    } else if let Some(after_space) = rest.strip_prefix(' ') {
+        Some((first, after_space))
+    } else if matches!(first, '│' | '┃' | '丨') {
+        Some((first, rest))
+    } else {
+        None
     }
 }
 
@@ -610,6 +613,13 @@ mod tests {
         }
     }
 
+    fn block_sel(a: (u16, u16), b: (u16, u16)) -> Selection {
+        Selection {
+            block: true,
+            ..sel(a, b)
+        }
+    }
+
     #[test]
     fn rectangular_selection_keeps_columns_and_row_breaks_in_both_directions() {
         let mut screen = screen(&["abcd", "efgh"], 4);
@@ -798,5 +808,54 @@ mod tests {
             let word = Selection::word_at(&s, Point { line: 0, column });
             assert_eq!(word.text(&s), "한", "column {column}");
         }
+    }
+
+    #[test]
+    fn block_selection_selects_rectangular_columns() {
+        let s = screen(&["| hello  ", "| world  ", "| foo    "], 10);
+        // 열 2..=6 사각형만 선택하면 앞쪽 `| `가 제외된다.
+        let rect = block_sel((0, 2), (2, 6));
+        assert_eq!(rect.span(0, 10), Some((2, 5)));
+        assert_eq!(rect.span(1, 10), Some((2, 5)));
+        assert_eq!(rect.span(2, 10), Some((2, 5)));
+        assert_eq!(rect.text(&s), "hello\nworld\nfoo");
+        // 반대 대각선(우하단 -> 좌상단)으로 끌어도 같은 열 구간이다.
+        assert_eq!(block_sel((2, 6), (0, 2)).text(&s), "hello\nworld\nfoo");
+    }
+
+    #[test]
+    fn clean_text_strips_tui_gutters_and_boxes() {
+        assert_eq!(
+            clean_text("| 안녕하세요\n| ㅋㅋ예시입니다."),
+            "안녕하세요\nㅋㅋ예시입니다."
+        );
+        // 첫 줄은 `| ` 뒤부터 드래그해 2번째 줄부터만 `| `가 붙은 경우.
+        assert_eq!(
+            clean_text("안녕하세요\n| ㅋㅋ예시입니다."),
+            "안녕하세요\nㅋㅋ예시입니다."
+        );
+        // 유니코드 박스 테두리 제거.
+        let boxed =
+            "╭────────────────╮\n│ 안녕하세요     │\n│ ㅋㅋ예시입니다 │\n╰────────────────╯";
+        assert_eq!(clean_text(boxed), "안녕하세요\nㅋㅋ예시입니다");
+    }
+
+    #[test]
+    fn clean_text_unwraps_tui_hard_wrapped_oneliner_and_preserves_code_blocks() {
+        let wrapped = "\
+IFS=,;a='shortcuts,run';python3,-c,'import
+    Vision,Quartz,pathlib;u=Quartz.CFURLCreateWithFileSystemPath(None,\"/Users/macm
+    ini/Library/Application
+    Support/com.raycast.macos/clipboard/file-eaab871d237b31ea53c234c3af2d8b12.png\"
+    ,0,False);h=Vision.VNImageRequestHandler.alloc().initWithURL_options_(u,{});r=
+    Vision.VNRecognizeTextRequest.alloc().init();r.setRecognitionLanguages_([\"ko-K
+    R\",\"en-US\"]);h.performRequests_error_([r],None);print(\"\\n\".join(o.topCandidate
+    s_(1)[0].string()for o in r.results()))";
+        let expected = "IFS=,;a='shortcuts,run';python3,-c,'import Vision,Quartz,pathlib;u=Quartz.CFURLCreateWithFileSystemPath(None,\"/Users/macmini/Library/Application Support/com.raycast.macos/clipboard/file-eaab871d237b31ea53c234c3af2d8b12.png\",0,False);h=Vision.VNImageRequestHandler.alloc().initWithURL_options_(u,{});r=Vision.VNRecognizeTextRequest.alloc().init();r.setRecognitionLanguages_([\"ko-KR\",\"en-US\"]);h.performRequests_error_([r],None);print(\"\\n\".join(o.topCandidates_(1)[0].string()for o in r.results()))";
+        assert_eq!(clean_text(wrapped), expected);
+
+        // 일반 들여쓰기 코드 블록은 줄바꿈과 들여쓰기를 유지한다.
+        let py = "def hello():\n    print(\"world\")\n    return 42";
+        assert_eq!(clean_text(py), py);
     }
 }
