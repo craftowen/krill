@@ -932,12 +932,55 @@ impl Shell {
             return;
         }
         self.tab_context_menu = None;
-        let tabs = self.workspace_tabs(cx);
-        self.layout.cycle_mru_in(delta, &tabs);
-        if let Some(cursor) = self.layout.mru_cursor() {
-            self.recent_tab_scroll.scroll_to_item(cursor);
+        let panes = self.recent_panes(cx);
+        self.layout.cycle_pane_mru_in(delta, &panes);
+        if let Some(cursor) = self.layout.pane_mru_cursor() {
+            let order = self.layout.pane_mru_order();
+            let row = order
+                .iter()
+                .take(cursor)
+                .filter(|p| panes.contains(p))
+                .count();
+            self.recent_tab_scroll.scroll_to_item(row);
         }
         cx.notify();
+    }
+
+    fn recent_pane_workspace(&self, pane: PaneId, cx: &App) -> krill_hosts::ssh::HostPath {
+        let host = self.layout.host(pane);
+        let folder = self
+            .layout
+            .launch(pane)
+            .map(|launch| PathBuf::from(std::ffi::OsString::from_vec(launch.cwd.clone())))
+            .or_else(|| {
+                self.layout
+                    .session(pane)
+                    .and_then(|id| self.sidebar.read(cx).folder_on(host, id))
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| {
+                PathBuf::from(std::ffi::OsString::from_vec(self.launch_for(pane).cwd))
+            });
+        let folder = self
+            .sidebar
+            .read(cx)
+            .workspace_for_path_on(host, &folder)
+            .unwrap_or(folder);
+        krill_hosts::ssh::HostPath::new(host.clone(), folder)
+    }
+
+    fn recent_panes(&self, cx: &App) -> Vec<PaneId> {
+        let workspace = self
+            .tab_workspace(self.layout.active(), cx)
+            .map(|workspace| krill_hosts::ssh::HostPath::new(workspace.host, workspace.folder));
+        self.layout
+            .pane_mru_order()
+            .into_iter()
+            .filter(|&pane| {
+                self.layout.mru_scope() == krill_app::layout::MruScope::AllWorkspaces
+                    || workspace.as_ref() == Some(&self.recent_pane_workspace(pane, cx))
+            })
+            .collect()
     }
 
     /// OWE-734: `Ctrl` 키를 떼거나 스위처를 닫을 때 MRU 순서를 확정한다.
@@ -1647,27 +1690,44 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Deferred> {
-        let cursor = self.layout.mru_cursor()?;
+        let cursor = self.layout.pane_mru_cursor()?;
         let p = ui::palette(cx);
-        let labels = self.workspace_tab_labels(cx);
-
+        let panes = self.recent_panes(cx);
+        let all = self.layout.mru_scope() == krill_app::layout::MruScope::AllWorkspaces;
         let rows = self
             .layout
-            .mru_order()
+            .pane_mru_order()
             .iter()
             .copied()
             .enumerate()
-            .filter_map(|(pos, tab_idx)| {
+            .filter_map(|(pos, pane)| {
+                if !panes.contains(&pane) {
+                    return None;
+                }
+                let tab_idx = (0..self.layout.tabs().len())
+                    .find(|&i| self.layout.tab_panes(i).contains(&pane))?;
                 let tab = self.layout.tabs().get(tab_idx)?;
-                let label = labels.iter().find(|(i, _)| *i == tab_idx)?.1.clone();
+                let mut label = if self.layout.tab_panes(tab_idx).len() == 1 {
+                    self.tab_display_label(tab_idx, cx)
+                } else {
+                    self.pane_label(pane, cx)
+                };
+                if all {
+                    let workspace = self.recent_pane_workspace(pane, cx);
+                    label = format!(
+                        "{label} · {} · {}",
+                        workspace.host,
+                        workspace.path.display()
+                    );
+                }
                 let selected = pos == cursor;
-                let is_file = self.layout.file(tab.focused).is_some();
-                let host = self.layout.host(tab.focused);
+                let is_file = self.layout.file(pane).is_some();
+                let host = self.layout.host(pane);
                 let session = self
                     .layout
-                    .session(tab.focused)
+                    .session(pane)
                     .and_then(|id| self.sidebar.read(cx).session_on(host, id));
-                let launch_agent = match self.layout.launch(tab.focused).map(|l| &l.program) {
+                let launch_agent = match self.layout.launch(pane).map(|l| &l.program) {
                     Some(Program::Agent { id }) => launch_agent_id(id),
                     _ => "",
                 };
@@ -1684,8 +1744,8 @@ impl Shell {
                 );
                 Some(
                     div()
-                        .id(("recent-tab-item", tab_idx))
-                        .debug_selector(move || format!("recent-tab-item-{tab_idx}"))
+                        .id(("recent-tab-item", pane.get()))
+                        .debug_selector(move || format!("recent-tab-item-{}", pane.get()))
                         .role(gpui::Role::ListBoxOption)
                         .aria_selected(selected)
                         .when(
@@ -1726,7 +1786,10 @@ impl Shell {
                         })
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.change(true, cx, |l| l.activate(tab_idx));
+                            this.change(true, cx, |l| {
+                                l.activate(tab_idx);
+                                l.focus(pane);
+                            });
                         })),
                 )
             })
@@ -1759,7 +1822,22 @@ impl Shell {
                     .text_size(ui::TEXT_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(p.muted_foreground)
-                    .child(text::RECENT_TABS_TITLE.get()),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(text::RECENT_TABS_TITLE.get())
+                    .child(
+                        Checkbox::new("recent-all-workspaces")
+                            .label(match krill_app::i18n::language() {
+                                krill_app::i18n::Language::Ko => "모든 워크스페이스",
+                                krill_app::i18n::Language::En => "All workspaces",
+                            })
+                            .checked(all)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.layout.toggle_mru_scope();
+                                this.on_recent_tab(0, cx);
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -1797,6 +1875,45 @@ fn color_label(color: krill_app::layout::TabColor) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn tabs_leaf_switcher_scope_keeps_remote_workspace_separate(cx: &mut gpui::TestAppContext) {
+        use crate::shell::tests::{open, state_path};
+        use krill_app::hosts::HostId;
+        let (view, cx) = open(cx, state_path("leaf-switcher"));
+        cx.update(|_, cx| {
+            view.update(cx, |shell, cx| {
+                let first = shell.layout.focused().unwrap();
+                shell.layout.split(Axis::Horizontal);
+                let second = shell.layout.focused().unwrap();
+                shell.layout.new_tab();
+                let remote = shell.layout.focused().unwrap();
+                shell.layout.set_host(remote, HostId::Remote("peer".into()));
+                shell.layout.activate(0);
+                assert_eq!(shell.layout.focused(), Some(second));
+                let local = shell.recent_panes(cx);
+                assert!(local.contains(&first) && local.contains(&second));
+                assert!(!local.contains(&remote));
+                shell.on_recent_tab(1, cx);
+                assert_eq!(
+                    shell.layout.pane_mru_order()[shell.layout.pane_mru_cursor().unwrap()],
+                    first
+                );
+                shell.layout.toggle_mru_scope();
+                shell.on_recent_tab(1, cx);
+                let all = shell.recent_panes(cx);
+                assert!(all.contains(&remote));
+                assert_eq!(
+                    shell.layout.pane_mru_order()[shell.layout.pane_mru_cursor().unwrap()],
+                    remote
+                );
+                shell.layout.commit_mru();
+                assert_eq!(shell.layout.focused(), Some(remote));
+                assert_eq!(shell.layout.host(remote), &HostId::Remote("peer".into()));
+            });
+        });
+    }
 
     /// OWE-886: 탭·패인 헤더 에이전트 아이콘은 브랜드 SVG(`agent_svg_bytes`)로 통일하며,
     /// 핀 고정 아이콘(`PIN_SVG`)과 겹치지 않아야 한다.

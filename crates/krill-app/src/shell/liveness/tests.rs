@@ -70,6 +70,14 @@ fn stalled_stream_recovers_without_render_or_replaying_uncertain_input(
     cx.executor().advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
     cx.update(|_, cx| {
+        assert!(
+            view.read(cx).live[&pane].sock.is_some(),
+            "one missed probe is suspect"
+        );
+    });
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
         view.update(cx, |shell, _cx| {
             assert_eq!(shell.link, Link::Up);
             assert_eq!(shell.layout.session(pane), Some(krill_proto::SessionId(91)));

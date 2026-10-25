@@ -19,6 +19,49 @@ use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::net::{UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
 
+/// A path belongs to one host namespace. Never canonicalize remote paths locally.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostPath {
+    pub host: crate::HostId,
+    pub path: PathBuf,
+}
+
+impl HostPath {
+    pub fn new(host: crate::HostId, path: impl Into<PathBuf>) -> Self {
+        Self {
+            host,
+            path: path.into(),
+        }
+    }
+
+    /// Preflight an operation requiring two endpoint transports before doing IO.
+    pub fn validate_transfer_to(&self, destination: &Self) -> io::Result<()> {
+        reject_double_remote(&self.host, &destination.host)
+    }
+
+    /// Operations backed by the local filesystem must refuse remote paths up front.
+    pub fn local_path(&self) -> io::Result<&Path> {
+        if self.host.is_remote() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this operation requires a local workspace",
+            ));
+        }
+        Ok(&self.path)
+    }
+}
+
+/// Two remote endpoints need a relay protocol that is not implemented yet.
+pub fn reject_double_remote(origin: &crate::HostId, destination: &crate::HostId) -> io::Result<()> {
+    if origin.is_remote() && destination.is_remote() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operations between two remote hosts are not supported",
+        ));
+    }
+    Ok(())
+}
+
 /// 포워더(ssh 또는 `KRILL_SSH_BIN`)가 local 소켓을 열 때까지 기다리는 상한.
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -836,6 +879,15 @@ impl Target {
     /// # Errors
     /// 원격 터널 기동 실패(ssh 오류·타임아웃·소켓 경로 오류).
     pub fn establish(host: Option<String>) -> io::Result<Self> {
+        Self::establish_from(&crate::HostId::Local, host)
+    }
+
+    /// Preflight nested remote work before resolving a host or starting SSH.
+    pub fn establish_from(origin: &crate::HostId, host: Option<String>) -> io::Result<Self> {
+        let destination = host
+            .as_ref()
+            .map_or(crate::HostId::Local, |id| crate::HostId::Remote(id.clone()));
+        reject_double_remote(origin, &destination)?;
         let tunnel = host.as_deref().map(Tunnel::start).transpose()?;
         Ok(Self { host, tunnel })
     }
@@ -955,3 +1007,34 @@ pub(crate) use windows::stdio::output as windows_output;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::HostId;
+
+    #[test]
+    fn ssh_host_path_namespaces_and_preflight() {
+        let local = HostPath::new(HostId::Local, "/same/path");
+        let a = HostPath::new(HostId::Remote("a".into()), "/same/path");
+        let b = HostPath::new(HostId::Remote("b".into()), "/same/path");
+        assert_ne!(local, a);
+        assert_ne!(a, b);
+        assert_eq!(a, HostPath::new(a.host.clone(), "/same/path"));
+        assert!(local.validate_transfer_to(&a).is_ok());
+        assert!(a.validate_transfer_to(&local).is_ok());
+        assert_eq!(
+            a.validate_transfer_to(&b).err().map(|e| e.kind()),
+            Some(io::ErrorKind::Unsupported)
+        );
+        assert!(a.local_path().is_err());
+        assert_eq!(local.local_path().ok(), Some(Path::new("/same/path")));
+        // Invalid destination proves the unsupported route is refused before SSH validation/IO.
+        assert_eq!(
+            Target::establish_from(&a.host, Some("-invalid".into()))
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::Unsupported)
+        );
+    }
+}

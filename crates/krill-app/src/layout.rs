@@ -243,6 +243,17 @@ impl Tab {
 struct MruState {
     order: Vec<usize>,
     cursor: Option<usize>,
+    panes: Vec<PaneId>,
+    pane_cursor: Option<usize>,
+    scope: MruScope,
+}
+
+/// Runtime switcher scope. Workspace membership is supplied by the shell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MruScope {
+    #[default]
+    Workspace,
+    AllWorkspaces,
 }
 
 impl PartialEq for MruState {
@@ -576,6 +587,7 @@ impl Default for Layout {
             mru: MruState {
                 order: vec![0],
                 cursor: None,
+                ..MruState::default()
             },
             zoomed: Vec::new(),
         }
@@ -597,6 +609,7 @@ impl Layout {
 
     /// 보이는 탭 없이 빈 화면을 띄운다. 다른 워크스페이스의 탭은 그대로 남는다(Orca 패리티).
     pub fn deactivate(&mut self) {
+        self.mru.pane_cursor = None;
         self.active = self.tabs.len();
         self.mru.cursor = None;
     }
@@ -1019,6 +1032,7 @@ impl Layout {
     }
 
     fn record_mru(&mut self, index: usize) {
+        self.record_pane_mru();
         self.mru.cursor = None;
         if self.tabs.is_empty() {
             self.mru.order.clear();
@@ -1029,6 +1043,75 @@ impl Layout {
             self.mru.order.retain(|&i| i != index);
             self.mru.order.insert(0, index);
         }
+    }
+
+    fn record_pane_mru(&mut self) {
+        self.mru.pane_cursor = None;
+        if let Some(pane) = self.focused() {
+            let existing = self.panes();
+            self.mru
+                .panes
+                .retain(|&p| p != pane && existing.contains(&p));
+            self.mru.panes.insert(0, pane);
+        }
+    }
+
+    pub fn mru_scope(&self) -> MruScope {
+        self.mru.scope
+    }
+
+    pub fn toggle_mru_scope(&mut self) {
+        self.mru.scope = match self.mru.scope {
+            MruScope::Workspace => MruScope::AllWorkspaces,
+            MruScope::AllWorkspaces => MruScope::Workspace,
+        };
+        self.mru.pane_cursor = None;
+    }
+
+    /// Stable leaf IDs survive tab reordering; closed leaves are omitted.
+    pub fn pane_mru_order(&self) -> Vec<PaneId> {
+        let mut order = Vec::new();
+        if self.mru.pane_cursor.is_none() {
+            order.extend(self.focused());
+        }
+        let fallback = self
+            .mru_order()
+            .into_iter()
+            .flat_map(|tab| self.tab_panes(tab));
+        for pane in self.mru.panes.iter().copied().chain(fallback) {
+            if self.pane_exists(pane) && !order.contains(&pane) {
+                order.push(pane);
+            }
+        }
+        order
+    }
+
+    pub fn pane_mru_cursor(&self) -> Option<usize> {
+        self.mru.pane_cursor
+    }
+
+    /// Preview leaf MRU without changing focus or MRU order until commit.
+    pub fn cycle_pane_mru_in(&mut self, step: isize, panes: &[PaneId]) {
+        let order = self.pane_mru_order();
+        let eligible: Vec<_> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| panes.contains(p).then_some(i))
+            .collect();
+        if eligible.is_empty() {
+            self.mru.pane_cursor = None;
+            return;
+        }
+        self.mru.panes = order;
+        let current = self
+            .mru
+            .pane_cursor
+            .and_then(|i| eligible.iter().position(|&p| p == i))
+            .unwrap_or(0);
+        let next = (current.cast_signed() + step.rem_euclid(eligible.len().cast_signed()))
+            .rem_euclid(eligible.len().cast_signed())
+            .cast_unsigned();
+        self.mru.pane_cursor = eligible.get(next).copied();
     }
 
     /// 현재 MRU 순서(0번째가 가장 최근 포커스된 탭 인덱스).
@@ -1053,11 +1136,15 @@ impl Layout {
 
     /// `Ctrl+Tab` 최근 탭 스위처가 열려 있으면 현재 가리키는 `mru_order` 내 인덱스.
     pub fn mru_cursor(&self) -> Option<usize> {
-        self.mru.cursor
+        self.mru.cursor.or_else(|| {
+            let pane = self.mru.panes.get(self.mru.pane_cursor?)?;
+            let tab = self.tab_with(*pane)?;
+            self.mru_order().iter().position(|&index| index == tab)
+        })
     }
 
     pub fn mru_switching(&self) -> bool {
-        self.mru.cursor.is_some()
+        self.mru.cursor.is_some() || self.mru.pane_cursor.is_some()
     }
 
     /// `Ctrl+Tab` / `Ctrl+Shift+Tab`: 최근 사용한 탭 순서(MRU)대로 활성 탭을 옮긴다.
@@ -1105,6 +1192,16 @@ impl Layout {
 
     /// `Ctrl` 키를 놓거나 스위처 선택을 확정할 때 현재 활성 탭을 MRU 맨 앞으로 올린다.
     pub fn commit_mru(&mut self) -> bool {
+        if let Some(cursor) = self.mru.pane_cursor.take() {
+            if let Some(pane) = self.mru.panes.get(cursor).copied()
+                && let Some(tab) = self.tab_with(pane)
+            {
+                self.activate(tab);
+                self.focus(pane);
+                return true;
+            }
+            return false;
+        }
         if let Some(cursor) = self.mru.cursor.take() {
             self.active = self.mru.order[cursor];
             self.record_mru(self.active);
@@ -1116,6 +1213,7 @@ impl Layout {
 
     /// 미리보기 취소는 활성 탭과 MRU 순서를 바꾸지 않는다.
     pub fn cancel_mru(&mut self) {
+        self.mru.pane_cursor = None;
         self.mru.cursor = None;
     }
 
@@ -1313,6 +1411,7 @@ impl Layout {
             if !host.is_local() {
                 self.hosts.insert(new, host);
             }
+            self.record_pane_mru();
         }
     }
 
@@ -1326,6 +1425,7 @@ impl Layout {
             None => self.close_tab(self.active),
         }
         self.prune();
+        self.record_pane_mru();
     }
 
     pub fn focus(&mut self, pane: PaneId) {
@@ -1336,6 +1436,7 @@ impl Layout {
         tab.root.leaves(&mut leaves);
         if leaves.contains(&pane) {
             tab.focused = pane;
+            self.record_pane_mru();
         }
     }
 
@@ -1351,7 +1452,7 @@ impl Layout {
             .unwrap_or(0);
         let len = leaves.len().cast_signed();
         let next = (cur.cast_signed() + step).rem_euclid(len).cast_unsigned();
-        self.tabs[self.active].focused = leaves[next];
+        self.focus(leaves[next]);
     }
 
     /// OWE-871: 활성 탭 안에서 `dir` 쪽에 가장 가까운 칸으로 포커스를 옮긴다.
@@ -1391,7 +1492,7 @@ impl Layout {
             }
         }
         if let Some((pane, _)) = best {
-            self.tabs[self.active].focused = pane;
+            self.focus(pane);
         }
     }
 
@@ -1699,3 +1800,54 @@ pub fn clamp_column(width: f32, total: f32, other: f32) -> f32 {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod leaf_mru_tests {
+    use super::*;
+
+    #[test]
+    fn layout_leaf_mru_previews_commits_and_prunes() {
+        let mut layout = Layout::default();
+        let first = layout.focused();
+        layout.split(Axis::Horizontal);
+        let second = layout.focused();
+        layout.new_tab();
+        let third = layout.focused();
+        let order = layout.pane_mru_order();
+        assert_eq!(
+            order,
+            [third, second, first]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        );
+        layout.cycle_pane_mru_in(1, &order);
+        assert_eq!(layout.focused(), third);
+        assert!(layout.commit_mru());
+        assert_eq!(layout.focused(), second);
+        layout.cycle_pane_mru_in(1, &order);
+        layout.cancel_mru();
+        assert_eq!(layout.focused(), second);
+        layout.close_pane();
+        assert!(!layout.pane_mru_order().iter().any(|p| Some(*p) == second));
+    }
+
+    #[test]
+    fn layout_leaf_mru_scope_reverse_and_reorder() {
+        let mut layout = Layout::default();
+        layout.split(Axis::Horizontal);
+        let local = layout.visible();
+        layout.new_tab();
+        layout.activate(0);
+        layout.cycle_pane_mru_in(-1, &local);
+        assert!(layout.commit_mru());
+        assert_eq!(layout.focused(), local.first().copied());
+        layout.toggle_mru_scope();
+        assert_eq!(layout.mru_scope(), MruScope::AllWorkspaces);
+        let before = layout.pane_mru_order();
+        layout.reorder_tab(0, 1);
+        assert_eq!(layout.pane_mru_order(), before);
+        layout.toggle_mru_scope();
+        assert_eq!(layout.mru_scope(), MruScope::Workspace);
+    }
+}
