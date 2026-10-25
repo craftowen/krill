@@ -205,6 +205,7 @@ type Preferences = BTreeMap<PathBuf, Preference>;
 /// 이 상태로 모달을 띄운 뒤, 확인 버튼에서 `force` 플래그와 함께 삭제한다.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DeleteConfirm {
+    pub host: HostId,
     pub path: PathBuf,
     pub with_descendants: bool,
     pub descendant_count: usize,
@@ -1731,7 +1732,17 @@ impl Sidebar {
                             }
                             let mut changed = false;
                             let mut probe_repos = Vec::new();
-                            if let Ok((snap, meta)) = res {
+                            if let Ok((snap, mut meta)) = res {
+                                for path in snap.trees.values().flatten() {
+                                    if let Some(prev_branch) =
+                                        entry.meta.get(path).and_then(|m| m.branch.clone())
+                                    {
+                                        let tree_meta = meta.entry(path.clone()).or_default();
+                                        if tree_meta.branch.is_none() {
+                                            tree_meta.branch = Some(prev_branch);
+                                        }
+                                    }
+                                }
                                 if entry.status != HostStatus::Connected
                                     || entry.snapshot != snap
                                     || entry.meta != meta
@@ -1908,6 +1919,28 @@ impl Sidebar {
                 .iter()
                 .find(|r| r.id == *id)
                 .map_or(&EMPTY_META, |r| &r.meta),
+        }
+    }
+
+    pub(super) fn source_for(&self, host: &HostId) -> Option<Arc<dyn Source>> {
+        match host {
+            HostId::Local => self.source.clone(),
+            HostId::Remote(id) => self
+                .remote_hosts
+                .iter()
+                .find(|r| r.id == *id)
+                .and_then(|r| r.source.clone()),
+        }
+    }
+
+    #[must_use]
+    pub fn can_create_worktree_on(&self, host: &HostId) -> bool {
+        match host {
+            HostId::Local => self.source.is_some(),
+            HostId::Remote(id) => self
+                .remote_hosts
+                .iter()
+                .any(|r| r.id == *id && r.status == HostStatus::Connected && r.source.is_some()),
         }
     }
 
@@ -3752,15 +3785,26 @@ impl Sidebar {
     }
 
     /// 워크트리 삭제 확인 모달을 연다(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않는다.
+    #[cfg(test)]
     pub(super) fn request_delete_worktree(
         &mut self,
         path: PathBuf,
         with_descendants: bool,
         cx: &mut Context<Self>,
     ) {
-        let host = HostId::Local;
+        self.request_delete_worktree_on(HostId::Local, path, with_descendants, cx);
+    }
+
+    /// 워크트리 삭제 확인 모달을 연다(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않는다.
+    pub(super) fn request_delete_worktree_on(
+        &mut self,
+        host: HostId,
+        path: PathBuf,
+        with_descendants: bool,
+        cx: &mut Context<Self>,
+    ) {
         let descendant_count = if with_descendants {
-            self.lineage_descendants(&path).len()
+            self.lineage_descendants_on(&host, &path).len()
         } else {
             0
         };
@@ -3771,6 +3815,7 @@ impl Sidebar {
             .unwrap_or(0);
         self.delete_focus = DeleteFocus::Pending;
         self.delete_confirm = Some(DeleteConfirm {
+            host,
             path,
             with_descendants,
             descendant_count,
@@ -3802,37 +3847,47 @@ impl Sidebar {
         };
         cx.notify();
         if confirm.with_descendants {
-            self.delete_with_descendants(confirm.path, confirm.force, cx);
+            self.delete_with_descendants_on(confirm.host, confirm.path, confirm.force, cx);
         } else {
-            self.delete_worktree(confirm.path, confirm.force, cx);
+            self.delete_worktree_on(confirm.host, confirm.path, confirm.force, cx);
         }
     }
 
     /// 바꾼 이름 → 브랜치 → 첫 프롬프트 자동 제목 → 폴더 이름.
     fn name(&self, path: &Path) -> String {
+        self.name_on(&HostId::Local, path)
+    }
+
+    pub(super) fn name_on(&self, host: &HostId, path: &Path) -> String {
         let pref_name = self.custom_worktree_name(path);
         if let Some(custom) =
             pref_name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n))
         {
             return custom.to_owned();
         }
-        if self.snapshot.trees.contains_key(path) {
-            return self
-                .branch(path)
-                .map_or_else(|| basename(path), str::to_owned);
+        let branch = self
+            .meta_for(host)
+            .get(path)
+            .and_then(|t| t.branch.as_deref());
+        if self.snapshot_for(host).trees.contains_key(path) {
+            return branch.map_or_else(|| basename(path), str::to_owned);
         }
-        if let Some(branch) = self.branch(path) {
+        if let Some(branch) = branch {
             if !krill_proto::git::is_default_branch_or_worktree_name(branch) {
                 return branch.to_owned();
             }
-            if let Some(auto) = self.worktree_auto_title(path) {
+            if host.is_local()
+                && let Some(auto) = self.worktree_auto_title(path)
+            {
                 return auto.to_owned();
             }
             if pref_name.is_none() {
                 return branch.to_owned();
             }
         }
-        if let Some(auto) = self.worktree_auto_title(path) {
+        if host.is_local()
+            && let Some(auto) = self.worktree_auto_title(path)
+        {
             return auto.to_owned();
         }
         pref_name.map_or_else(|| basename(path), str::to_owned)

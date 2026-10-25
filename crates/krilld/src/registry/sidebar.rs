@@ -26,6 +26,14 @@ impl Cache {
     pub(super) fn directory(&self, session: SessionId) -> Option<PathBuf> {
         self.directories.get(&session).cloned()
     }
+
+    pub(super) fn invalidate(&mut self) {
+        self.trees.clear();
+        self.repositories.clear();
+        self.inflight.clear();
+        self.lookups.clear();
+        self.last.clear();
+    }
 }
 
 /// 한 사이드바 요청이 저장소 조회를 기다리는 최대 시간. 앱 읽기 시한(5초)보다 충분히 짧아야 한다.
