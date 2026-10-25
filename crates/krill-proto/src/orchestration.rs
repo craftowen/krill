@@ -861,9 +861,13 @@ impl OrchestrationStore {
         fs::create_dir_all(state_dir)?;
         let _guard = LockGuard::acquire(&state_dir.join(ORCH_LOCK))?;
         let mut store = Self::load(state_dir)?;
+        // 구조 비교로 직렬화·해시 충돌 없이 실제 변경만 저장한다. 정리로 바뀐 값도 포함한다.
+        let before = store.clone();
         let out = f(&mut store)?;
         store.prune_if_needed()?;
-        store.save(state_dir)?;
+        if store != before {
+            store.save(state_dir)?;
+        }
         Ok(out)
     }
 
@@ -3512,6 +3516,45 @@ fn not_found(msg: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutate_skips_unchanged_save_but_persists_pruning() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-orch-noop-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        OrchestrationStore::mutate(&dir, |_| Ok(()))?;
+        assert!(!dir.join(ORCH_FILE).exists());
+        OrchestrationStore::mutate(&dir, |s| s.create_run("keep", None))?;
+        let path = dir.join(ORCH_FILE);
+        let before = fs::metadata(&path)?;
+        // 클로저가 변경을 되돌렸다면 최종 값이 같으므로 저장하지 않는다.
+        OrchestrationStore::mutate(&dir, |s| {
+            let title = s.runs.first_mut().unwrap();
+            title.title.push('x');
+            title.title.pop();
+            Ok(())
+        })?;
+        let after = fs::metadata(&path)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(before.ino(), after.ino());
+        }
+        let mut store = OrchestrationStore::load(&dir)?;
+        store
+            .idle_mail_notified
+            .insert(42, ["missing".into()].into_iter().collect());
+        store.save(&dir)?;
+        // 클로저가 아무것도 하지 않아도 prune의 변경은 저장한다.
+        OrchestrationStore::mutate(&dir, |_| Ok(()))?;
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .idle_mail_notified
+                .is_empty()
+        );
+        assert_eq!(OrchestrationStore::load(&dir)?.runs, store.runs);
+        fs::remove_dir_all(dir)
+    }
 
     #[test]
     fn check_messages_filters_unread_and_acks_only_matching_messages() -> io::Result<()> {
