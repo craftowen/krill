@@ -2687,11 +2687,67 @@ pub fn validate_symlink_path(raw: &str) -> io::Result<String> {
     Ok(parts.join("/"))
 }
 
+fn is_uuid_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, c) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *c != b'-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Orca의 가상 작업 공간 접미사(`::workspace:<uuid>`)는 파일 시스템 경로가 아니다.
+/// 일반 파일명의 `::`나 `::workspace:literal`은 보존한다.
+#[must_use]
+pub fn strip_workspace_instance(raw: &str) -> Option<&str> {
+    let (path, id) = raw.trim().rsplit_once("::workspace:")?;
+    is_uuid_shape(id).then_some(path.trim())
+}
+
+/// `::workspace:<uuid>` 가상 접미사가 붙은 경로가 실제로 존재하지 않으면 기본 폴더 경로로 되돌린다.
+#[must_use]
+pub fn clean_workspace_path_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(base) = strip_workspace_instance(trimmed)
+        && !Path::new(trimmed).exists()
+    {
+        return base.to_owned();
+    }
+    trimmed.to_owned()
+}
+
+fn sanitize_workspace_map<V>(map: &mut BTreeMap<String, V>) -> bool {
+    let mut changed = false;
+    let mut next = BTreeMap::new();
+    for (k, v) in std::mem::take(map) {
+        let cleaned = clean_workspace_path_str(&k);
+        if cleaned != k {
+            changed = true;
+        }
+        next.entry(cleaned).or_insert(v);
+    }
+    *map = next;
+    changed
+}
+
 /// Normalizes `cwd` to its canonical git worktree/repository root if `cwd` is inside a git
 /// repository (walking `ancestors()` for a `.git` directory or file) so subdirectory calls
 /// share the same `WorktreeStore` key as the repo root.
 #[must_use]
 pub fn worktree_key(cwd: &Path) -> String {
+    let cleaned = cwd
+        .to_str()
+        .and_then(|s| strip_workspace_instance(s).filter(|_| !cwd.exists()))
+        .map(PathBuf::from);
+    let cwd = cleaned.as_deref().unwrap_or(cwd);
     let path = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let root = path
         .ancestors()
@@ -2701,7 +2757,7 @@ pub fn worktree_key(cwd: &Path) -> String {
 }
 
 fn normalize_store_key(key: &str) -> String {
-    worktree_key(Path::new(key))
+    worktree_key(Path::new(&clean_workspace_path_str(key)))
 }
 
 type WorktreeStoreCacheEntry = (
@@ -2759,7 +2815,41 @@ impl WorktreeStore {
         let Ok(raw) = std::str::from_utf8(&bytes) else {
             return corrupt_comments_store(&path, "worktree-comments.toml is not UTF-8");
         };
-        toml::from_str(raw).or_else(|e| corrupt_comments_store(&path, &e.to_string()))
+        let mut store: Self =
+            toml::from_str(raw).or_else(|e| corrupt_comments_store(&path, &e.to_string()))?;
+        store.sanitize_workspace_keys();
+        Ok(store)
+    }
+
+    pub fn sanitize_workspace_keys(&mut self) -> bool {
+        let mut changed = false;
+        changed |= sanitize_workspace_map(&mut self.comments);
+        changed |= sanitize_workspace_map(&mut self.updated_at);
+        changed |= sanitize_workspace_map(&mut self.statuses);
+        changed |= sanitize_workspace_map(&mut self.unread);
+        changed |= sanitize_workspace_map(&mut self.prs);
+        changed |= sanitize_workspace_map(&mut self.issues);
+        changed |= sanitize_workspace_map(&mut self.references);
+        changed |= sanitize_workspace_map(&mut self.symlinks);
+        changed |= sanitize_workspace_map(&mut self.setup_scripts);
+        changed |= sanitize_workspace_map(&mut self.archive_scripts);
+        changed |= sanitize_workspace_map(&mut self.setup_prompt_dismissed);
+        changed |= sanitize_workspace_map(&mut self.pr_states);
+        let mut parents = BTreeMap::new();
+        for (child, parent) in std::mem::take(&mut self.parents) {
+            let c = clean_workspace_path_str(&child);
+            let p = clean_workspace_path_str(&parent);
+            if c != child || p != parent {
+                changed = true;
+            }
+            if !c.is_empty() && !p.is_empty() && c != p {
+                parents.entry(c).or_insert(p);
+            } else {
+                changed = true;
+            }
+        }
+        self.parents = parents;
+        changed
     }
 
     pub fn save(&self, state_dir: &Path) -> io::Result<()> {

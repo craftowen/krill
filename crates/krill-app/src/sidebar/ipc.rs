@@ -187,6 +187,7 @@ struct Shared {
     target: HostTarget,
     conn: Mutex<Option<Conn>>,
     watches: Mutex<WatchCache>,
+    branches: Mutex<BTreeMap<PathBuf, String>>,
     external: Mutex<ExternalCache>,
     snapshot: Arc<SharedSnapshot>,
 }
@@ -209,6 +210,7 @@ impl Socket {
                 snapshot,
                 conn: Mutex::new(None),
                 watches: Mutex::new(WatchCache::default()),
+                branches: Mutex::new(BTreeMap::new()),
                 external: Mutex::new(ExternalCache::default()),
             }),
             worker: Mutex::new(None),
@@ -387,7 +389,10 @@ impl Shared {
             |stream| fetch_from(stream, &external, is_local),
         );
         match result {
-            Ok(snapshot) => {
+            Ok((snapshot, branches)) => {
+                if let Ok(mut guard) = self.branches.lock() {
+                    *guard = branches;
+                }
                 let snapshot = Arc::new(snapshot);
                 *cached = Some((Instant::now(), snapshot.clone()));
                 Ok(snapshot)
@@ -402,12 +407,16 @@ impl Shared {
     fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
         let is_local = self.target.allow_local_launch();
         let dirty = self.dirty(trees);
+        let known = self.branches.lock().map(|g| g.clone()).unwrap_or_default();
         trees
             .values()
             .flatten()
             .map(|tree| {
                 let meta = Tree {
-                    branch: is_local.then(|| branch(tree)).flatten(),
+                    branch: is_local
+                        .then(|| branch(tree))
+                        .flatten()
+                        .or_else(|| known.get(tree).cloned()),
                     dirty: dirty.get(tree).copied(),
                 };
                 (tree.clone(), meta)
@@ -757,7 +766,7 @@ fn fetch_from(
     stream: &mut UnixStream,
     external: &BTreeMap<PathBuf, super::external::ExternalHit>,
     is_local: bool,
-) -> io::Result<Snapshot> {
+) -> io::Result<(Snapshot, BTreeMap<PathBuf, String>)> {
     use krill_proto::ipc;
     let mut call = |request: Request| -> io::Result<Reply> {
         stream.write_all(&request.encode()?)?;
@@ -780,6 +789,11 @@ fn fetch_from(
         Ok(_) | Err(_) => BTreeMap::new(),
     };
     let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(strip_verbatim(bytes)));
+    let branches: BTreeMap<PathBuf, String> = data
+        .branches
+        .into_iter()
+        .map(|(wt, branch)| (path(wt), branch))
+        .collect();
     let mut trees: BTreeMap<_, _> = data
         .repositories
         .into_iter()
@@ -819,6 +833,7 @@ fn fetch_from(
             let mut status = states.remove(&s.session).unwrap_or(AgentStatus::UNKNOWN);
             if s.status.is_some() {
                 status.state = AgentState::Exited;
+                status.source = Some(krill_proto::control::Source::Process);
                 status.foreground = None;
             } else if status.state == AgentState::Unknown
                 && let Some(cwd) = dirs.get(&s.session)
@@ -851,7 +866,7 @@ fn fetch_from(
         })
         .collect();
     sessions.sort_by_key(|s| s.id);
-    Ok(Snapshot { sessions, trees })
+    Ok((Snapshot { sessions, trees }, branches))
 }
 
 #[cfg(test)]

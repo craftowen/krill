@@ -915,6 +915,19 @@ IFS=,;a='shortcuts,run';python3,-c,'import
         let expected = "IFS=,;a='shortcuts,run';python3,-c,'import Vision,Quartz,pathlib;u=Quartz.CFURLCreateWithFileSystemPath(None,\"/Users/macmini/Library/Application Support/com.raycast.macos/clipboard/file-eaab871d237b31ea53c234c3af2d8b12.png\",0,False);h=Vision.VNImageRequestHandler.alloc().initWithURL_options_(u,{});r=Vision.VNRecognizeTextRequest.alloc().init();r.setRecognitionLanguages_([\"ko-KR\",\"en-US\"]);h.performRequests_error_([r],None);print(\"\\n\".join(o.topCandidates_(1)[0].string()for o in r.results()))";
         assert_eq!(clean_text(wrapped), expected);
 
+        // 불릿(`• `) 뒤 줄바꿈과 짧은 행잉 인덴트 문구도 한 줄로 정리한다.
+        let bullet_wrapped = "• cargo nextest run -p krill-term 통과\n  (block_selection_selects_rectangular_columns,";
+        assert_eq!(
+            clean_text(bullet_wrapped),
+            "cargo nextest run -p krill-term 통과 (block_selection_selects_rectangular_columns,"
+        );
+        let hanging_short =
+            "cargo nextest run -p krill-term 통과\n  (block_selection_selects_rectangular_columns,";
+        assert_eq!(
+            clean_text(hanging_short),
+            "cargo nextest run -p krill-term 통과 (block_selection_selects_rectangular_columns,"
+        );
+
         // 일반 들여쓰기 코드 블록은 줄바꿈과 들여쓰기를 유지한다.
         let py = "def hello():\n    print(\"world\")\n    return 42";
         assert_eq!(clean_text(py), py);

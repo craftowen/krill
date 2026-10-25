@@ -199,3 +199,103 @@ fn resolves_krill_packaged_favicon() {
         Some("https://www.google.com/s2/favicons?domain=krill.page&sz=64")
     );
 }
+
+#[test]
+fn svg_and_monorepo_project_icon_detection() {
+    let repo = fixture("svg-monorepo");
+    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- brand mark -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14"/></svg>"#;
+    assert!(has_valid_icon_bytes(svg));
+    assert!(!has_valid_icon_bytes(
+        b"<!DOCTYPE html><html><body><svg></svg></body></html>"
+    ));
+
+    let monorepo_svg = repo.join("apps/web/public/favicon.svg");
+    fs::create_dir_all(monorepo_svg.parent().unwrap()).unwrap();
+    fs::write(&monorepo_svg, svg).unwrap();
+    assert_eq!(detect_local_file_icon(&repo), Some(monorepo_svg.clone()));
+    fs::remove_file(&monorepo_svg).unwrap();
+
+    let nested_ico = repo.join("public/favicon/favicon.ico");
+    fs::create_dir_all(nested_ico.parent().unwrap()).unwrap();
+    fs::write(&nested_ico, ICO).unwrap();
+    assert_eq!(detect_local_file_icon(&repo), Some(nested_ico.clone()));
+    fs::remove_file(&nested_ico).unwrap();
+
+    let linked_svg = repo.join("apps/web/public/brand/mark.svg");
+    fs::create_dir_all(linked_svg.parent().unwrap()).unwrap();
+    fs::write(&linked_svg, svg).unwrap();
+    fs::write(
+        repo.join("apps/web/index.html"),
+        r#"<link rel="icon" type="image/svg+xml" href="/brand/mark.svg">"#,
+    )
+    .unwrap();
+    assert_eq!(detect_local_file_icon(&repo), Some(linked_svg));
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn remote_repo_icon_probe_prioritizes_repo_favicon_over_github_avatar() {
+    use crate::ui::icons::ProjectIcon;
+
+    let root = fixture("remote-probe");
+    let repo = root.join("remote-repo");
+    let cache = root.join("cache");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(
+        repo.join(".git/config"),
+        "[remote \"origin\"]\n\turl = https://github.com/craftowen/demo.git\n",
+    )
+    .unwrap();
+    let avatar_url = "https://github.com/craftowen.png?size=64";
+    let cached_avatar = cached_icon_path_for_url(&cache, avatar_url);
+    write_cached_icon_bytes(&cached_avatar, ICO).unwrap();
+
+    let probe_fn =
+        |(): &mut (), cwd: &Path, candidates: &[String]| -> Option<Vec<Option<PathBuf>>> {
+            Some(
+                candidates
+                    .iter()
+                    .map(|rel| {
+                        let p = cwd.join(rel);
+                        p.is_file().then_some(p)
+                    })
+                    .collect(),
+            )
+        };
+    let read_fn = |(): &mut (), path: &Path, max_bytes: usize| -> Option<Vec<u8>> {
+        let bytes = fs::read(path).ok()?;
+        (bytes.len() <= max_bytes).then_some(bytes)
+    };
+
+    // 1. 파비콘 파일이 없을 때는 GitHub 아바타로 폴백한다.
+    assert_eq!(
+        probe_single_remote_repo_icon(&repo, &cache, &mut (), probe_fn, read_fn),
+        Some(ProjectIcon::Image(cached_avatar.clone()))
+    );
+
+    // 2. 원격 저장소에 SVG 파비콘이 있으면 GitHub 아바타보다 최우선으로 선택·캐시한다.
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24"/></svg>"#;
+    let remote_svg = repo.join("apps/web/public/favicon.svg");
+    fs::create_dir_all(remote_svg.parent().unwrap()).unwrap();
+    fs::write(&remote_svg, svg).unwrap();
+
+    let resolved =
+        probe_single_remote_repo_icon(&repo, &cache, &mut (), probe_fn, read_fn).unwrap();
+    let ProjectIcon::Image(cached_remote_svg) = resolved else {
+        panic!("expected cached image icon");
+    };
+    assert_ne!(cached_remote_svg, cached_avatar);
+    assert_eq!(
+        cached_remote_svg.extension().and_then(|e| e.to_str()),
+        Some("svg")
+    );
+    assert!(
+        cached_remote_svg
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("remote-"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}

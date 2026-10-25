@@ -11,19 +11,22 @@ use krill_proto::theme::{Rgb, Theme as TerminalTheme};
 use serde::{Deserialize, Serialize};
 
 use super::theme::{
-    TERMINAL_DARK, TERMINAL_DEEP, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, rgba_bytes, term_rgb,
+    TERMINAL_DARK, TERMINAL_DEEP, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, TERMINAL_TANGO_LIGHT,
+    rgba_bytes, term_rgb,
 };
 
 /// 기본 다크 터미널 테마 이름(Krill 고유 [`TERMINAL_DARK`], 데몬 기본 테마와 같다).
 pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Krill Trench";
 pub const KRILL_DEEP: &str = "Krill Deep";
-/// 기본 라이트 터미널 테마 이름(Orca `DEFAULT_TERMINAL_THEME_LIGHT`).
-pub const DEFAULT_TERMINAL_THEME_LIGHT: &str = "Builtin Tango Light";
+/// 기본 라이트 터미널 테마 이름(Krill 고유 [`TERMINAL_LIGHT`]).
+pub const DEFAULT_TERMINAL_THEME_LIGHT: &str = "Krill Paper";
+/// Orca 라이트 터미널 테마 이름(`Builtin Tango Light`). 앱 테마 `기본`의 짝이다.
+pub const BUILTIN_TANGO_LIGHT: &str = "Builtin Tango Light";
 /// 앱 테마 `심연`·`조수`·`발광`·`종이`와 짝인 Krill 고유 터미널 테마 이름.
 pub const KRILL_ABYSS: &str = "Krill Abyss";
 pub const KRILL_TIDEPOOL: &str = "Krill Tidepool";
 pub const KRILL_GLOW: &str = "Krill Glow";
-pub const KRILL_PAPER: &str = "Krill Paper";
+pub const KRILL_PAPER: &str = DEFAULT_TERMINAL_THEME_LIGHT;
 pub const KRILL_GRAPHITE: &str = "Krill Graphite";
 pub const KRILL_PINE: &str = "Krill Pine";
 pub const KRILL_AMETHYST: &str = "Krill Amethyst";
@@ -113,9 +116,9 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
         theme: TERMINAL_GHOSTTY_DARK,
     },
     BuiltinTerminalTheme {
-        name: DEFAULT_TERMINAL_THEME_LIGHT,
+        name: BUILTIN_TANGO_LIGHT,
         is_dark: false,
-        theme: TERMINAL_LIGHT,
+        theme: TERMINAL_TANGO_LIGHT,
     },
     // popular-dark-core.ts
     builtin(
@@ -897,31 +900,11 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
             0x00f2_faff,
         ],
     ),
-    builtin(
-        KRILL_PAPER,
-        false,
-        0x00fb_f9f4,
-        0x0024_211d,
-        0x00e5_482f,
-        [
-            0x0024_211d,
-            0x00c6_2828,
-            0x003f_7d20,
-            0x009a_6a00,
-            0x001f_5fae,
-            0x007b_3fa8,
-            0x000e_7c86,
-            0x00bf_b8a8,
-            0x0077_715f,
-            0x00e5_3935,
-            0x004e_9a2a,
-            0x00b0_7d00,
-            0x002f_74c9,
-            0x0095_50c2,
-            0x0015_97a0,
-            0x00ec_e6da,
-        ],
-    ),
+    BuiltinTerminalTheme {
+        name: KRILL_PAPER,
+        is_dark: false,
+        theme: TERMINAL_LIGHT,
+    },
     builtin(
         KRILL_GRAPHITE,
         true,
@@ -1298,7 +1281,7 @@ pub fn canonical_terminal_theme_name(name: &str) -> &str {
     if trimmed.eq_ignore_ascii_case("Ghostty Default StyleLight")
         || trimmed.eq_ignore_ascii_case("Ghostty Default Style Light")
     {
-        return DEFAULT_TERMINAL_THEME_LIGHT;
+        return BUILTIN_TANGO_LIGHT;
     }
     if let Some(found) = BUILTIN_TERMINAL_THEMES
         .iter()
@@ -2222,6 +2205,10 @@ mod tests {
             builtin_terminal_theme(DEFAULT_TERMINAL_THEME_LIGHT).map(|b| b.theme),
             Some(TERMINAL_LIGHT)
         );
+        assert_eq!(
+            builtin_terminal_theme(BUILTIN_TANGO_LIGHT).map(|b| b.theme),
+            Some(TERMINAL_TANGO_LIGHT)
+        );
 
         let mut names = std::collections::BTreeSet::new();
         for entry in BUILTIN_TERMINAL_THEMES {
@@ -2239,7 +2226,7 @@ mod tests {
         // Legacy Orca aliases resolve cleanly.
         assert_eq!(
             builtin_terminal_theme("Ghostty Default StyleLight").map(|b| b.theme),
-            Some(TERMINAL_LIGHT)
+            Some(TERMINAL_TANGO_LIGHT)
         );
         assert_eq!(
             builtin_terminal_theme("Builtin Solarized Dark").map(|b| b.name),

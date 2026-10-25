@@ -1,4 +1,7 @@
-use super::{LoginFailReason, LoginOutcome, authorize_url, run_browser_login, take_login_outcome};
+use super::{
+    LoginFailReason, LoginOutcome, authorize_url, login_url, run_browser_login,
+    run_browser_login_with_mode, take_login_outcome,
+};
 use krill_proto::usage::ProviderKind;
 use std::path::Path;
 
@@ -256,5 +259,65 @@ fn agy_terminal_login_preserves_literal_profile_and_never_uses_login_subcommand(
     );
     account.host_default = true;
     assert_eq!(super::terminal_login_command(&account), "agy");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_link_mode_captures_authorize_url_without_opening_browser() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let root = std::env::temp_dir().join(format!("krill-copy-link-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let paths = krill_proto::daemon::Paths {
+        socket: root.join("no-daemon.sock"),
+        holder: root.join("unused-holder"),
+        krilld: root.join("unused-daemon"),
+    };
+    let account = krill_proto::usage::AccountInfo {
+        id: "codex-copy-link".into(),
+        provider: ProviderKind::Codex,
+        label: "CopyLink".into(),
+        email: None,
+        profile_dir: root.join("profile").display().to_string(),
+        active: false,
+        host_default: false,
+        stale: false,
+        usage: krill_proto::usage::Snapshot::default(),
+    };
+    std::fs::create_dir_all(&account.profile_dir).unwrap();
+    let expected = "https://auth.openai.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=copy-test";
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_bg = cancel.clone();
+    let paths_bg = paths.clone();
+    let account_bg = account.clone();
+    let handle = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", &format!("printf '%s\\n' '{expected}' >&2; sleep 30")]);
+        run_browser_login_with_mode(&paths_bg, &account_bg, false, command, &cancel_bg, false);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let captured = loop {
+        if let Some(url) = login_url(&account.id) {
+            break Some(url);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(captured.as_deref(), Some(expected));
+    cancel.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+    assert_eq!(
+        take_login_outcome(&account.id),
+        Some(LoginOutcome::Cancelled)
+    );
+    assert_eq!(
+        login_url(&account.id),
+        None,
+        "taking the outcome must clear the cached login URL"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

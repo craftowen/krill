@@ -5,10 +5,12 @@ use krill_proto::os::ffi::OsStrExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -169,6 +171,13 @@ fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
     (u64::try_from(bytes.len()).ok()? <= limit).then_some(bytes)
 }
 fn normalize(path: &Path) -> PathBuf {
+    let cleaned = path
+        .to_str()
+        .and_then(|s| {
+            krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !path.exists())
+        })
+        .map(PathBuf::from);
+    let path = cleaned.as_deref().unwrap_or(path);
     // 데스크톱 이관 경로와 동일한 macOS /tmp·/var·/etc 별칭 처리.
     if ["/tmp", "/var", "/etc", "/private"]
         .iter()
@@ -204,7 +213,23 @@ fn git_dir(tree: &Path) -> PathBuf {
         .unwrap_or(dot)
 }
 fn git_remote_slug(tree: &Path) -> Option<String> {
-    let config = String::from_utf8(read(&git_dir(tree).join("config"), 16384)?).ok()?;
+    type RemoteCache = HashMap<PathBuf, (Option<SystemTime>, Option<String>)>;
+    static CACHE: LazyLock<Mutex<RemoteCache>> = LazyLock::new(Mutex::default);
+    let config = git_dir(tree).join("config");
+    let modified = fs::metadata(&config).and_then(|m| m.modified()).ok();
+    let mut cache = crate::session::lock(&CACHE);
+    if let Some((stamp, slug)) = cache.get(&config)
+        && *stamp == modified
+    {
+        return slug.clone();
+    }
+    let slug = read(&config, 16384)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| remote_slug(&text));
+    cache.insert(config, (modified, slug.clone()));
+    slug
+}
+fn remote_slug(config: &str) -> Option<String> {
     for line in config.lines() {
         let Some(url) = line.trim().strip_prefix("url") else {
             continue;
@@ -336,11 +361,20 @@ impl Catalog {
             let repo = main_worktree(&tree)
                 .or_else(|| catalog.repo_for(&tree))
                 .unwrap_or_else(|| tree.clone());
+            if repo != tree
+                && repo.is_dir()
+                && fs::metadata(&tree).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             catalog.insert(&repo, &tree);
-            if !project.display_name.trim().is_empty() {
+            let dn = project.display_name.trim();
+            let clean_dn = krill_proto::orchestration::strip_workspace_instance(dn).is_none();
+            if !dn.is_empty() && clean_dn {
                 catalog
                     .repo_labels
-                    .insert(repo.clone(), project.display_name.trim().to_owned());
+                    .entry(repo.clone())
+                    .or_insert_with(|| dn.to_owned());
             }
             if let Some(icon) = project.repo_icon.as_ref()
                 && !icon.value.trim().is_empty()
@@ -361,13 +395,17 @@ impl Catalog {
                     .entry(repo.clone())
                     .or_insert_with(|| color.trim().to_owned());
             }
-            if !project.display_name.trim().is_empty() || project.pinned {
+            if (!dn.is_empty() && clean_dn) || project.pinned {
                 catalog
                     .preferences
                     .entry(tree)
                     .or_insert_with(|| Preference {
                         pinned: project.pinned,
-                        name: project.display_name.trim().to_owned(),
+                        name: if clean_dn {
+                            dn.to_owned()
+                        } else {
+                            String::new()
+                        },
                     });
             }
         }
@@ -392,6 +430,12 @@ impl Catalog {
                 .map(|r| catalog.repo_for(&r).unwrap_or(r))
                 .or_else(|| catalog.repo_for(&tree))
                 .unwrap_or_else(|| tree.clone());
+            if repo != tree
+                && repo.is_dir()
+                && fs::metadata(&tree).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             catalog.insert(&repo, &tree);
             let name = meta.display_name.as_deref().unwrap_or_default().trim();
             if !name.is_empty() || meta.pinned {
@@ -418,6 +462,12 @@ impl Catalog {
                 .map(|r| catalog.repo_for(&r).unwrap_or(r))
                 .or_else(|| catalog.repo_for(&tree))
                 .unwrap_or_else(|| tree.clone());
+            if repo != tree
+                && repo.is_dir()
+                && fs::metadata(&tree).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             catalog.insert(&repo, &tree);
             if let Some(branch) = &meta.branch {
                 catalog.branches.insert(tree, branch.clone());
@@ -1329,6 +1379,38 @@ value = "🚀"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["label"], "이름");
         assert_eq!(rows[0]["depth"], 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repository_remote_slug_cache_observes_config_creation_edit_and_removal() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-ws-remote-cache-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        let config = dir.join(".git/config");
+        fs::remove_file(&config).ok();
+        assert_eq!(git_remote_slug(&dir), None);
+        fs::write(
+            &config,
+            "[remote \"origin\"]\nurl = https://github.com/first/repo.git\n",
+        )
+        .unwrap();
+        assert_eq!(git_remote_slug(&dir).as_deref(), Some("first/repo"));
+        let modified = fs::metadata(&config).unwrap().modified().unwrap();
+        fs::write(
+            &config,
+            "[remote \"origin\"]\nurl = git@github.com:second/repo.git\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(git_remote_slug(&dir).as_deref(), Some("second/repo"));
+        fs::remove_file(&config).unwrap();
+        assert_eq!(git_remote_slug(&dir), None);
         fs::remove_dir_all(dir).unwrap();
     }
 

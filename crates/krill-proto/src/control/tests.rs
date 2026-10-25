@@ -367,7 +367,8 @@ fn sidebar_fixtures_and_shared_badge() {
     assert_eq!(
         roundtrip(&Reply::Sidebar(SidebarData {
             sessions: vec![],
-            repositories: vec![]
+            repositories: vec![],
+            branches: vec![],
         })),
         "04000000310e0000"
     );
@@ -381,9 +382,19 @@ fn sidebar_fixtures_and_shared_badge() {
                 repo: b"/a".to_vec(),
                 worktrees: vec![b"/a".to_vec()]
             }],
+            branches: vec![],
         })),
         "0f000000310e0101022f6101022f6101022f61"
     );
+    let with_branches = Reply::Sidebar(SidebarData {
+        sessions: vec![],
+        repositories: vec![RepositoryTrees {
+            repo: b"/a".to_vec(),
+            worktrees: vec![b"/a".to_vec()],
+        }],
+        branches: vec![(b"/a".to_vec(), "main".into())],
+    });
+    let _ = roundtrip(&with_branches);
     let mut status = AgentStatus::UNKNOWN;
     for (source, badge) in [
         (Source::Hook, None),
@@ -400,11 +411,27 @@ fn sidebar_fixtures_and_shared_badge() {
 fn sidebar_metadata_rejects_oversized_paths_and_collections() {
     let cases = [
         SidebarData {
+            sessions: vec![],
+            repositories: vec![],
+            branches: vec![(vec![b'x'; 4097], "main".into())],
+        },
+        SidebarData {
+            sessions: vec![],
+            repositories: vec![],
+            branches: vec![(b"/a".to_vec(), "x".repeat(MAX_TITLE_TEXT + 1))],
+        },
+        SidebarData {
+            sessions: vec![],
+            repositories: vec![],
+            branches: vec![(b"/a".to_vec(), "main".into()); 513],
+        },
+        SidebarData {
             sessions: vec![SessionDirectory {
                 session: SessionId(1),
                 cwd: vec![b'x'; 4097],
             }],
             repositories: vec![],
+            branches: vec![],
         },
         SidebarData {
             sessions: vec![
@@ -415,6 +442,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
                 257
             ],
             repositories: vec![],
+            branches: vec![],
         },
         SidebarData {
             sessions: vec![],
@@ -422,6 +450,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
                 repo: vec![],
                 worktrees: vec![vec![]; 513],
             }],
+            branches: vec![],
         },
     ];
     for data in cases {

@@ -111,15 +111,15 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - 다크 모드 기본: `TERMINAL_DARK` = **`Krill Trench`** (`DEFAULT_TERMINAL_THEME_DARK`, 배경 `#061620`, 전경 `#dfedf2`, 커서 `#d3e5ee`, 해구 전용 ANSI 16색). 데몬이 앱 테마를 받기 전 색 질의(OSC 10/11/12/4)에 답하는 `krill_proto::theme::DEFAULT`와 같은 값이다 — 두 값이 어긋나면 에이전트가 실제와 다른 배경을 보고 색을 고른다. 배경이 어두워 OSC 11 응답은 계속 다크로 판정된다.
 - 기존 심해는 `TERMINAL_DEEP` / `Krill Deep`으로 계속 선택할 수 있다(배경 `#10131b`, 전경 `#ffffff`, 코랄 커서 `#ff5238`). 저장된 테마 이름과 색은 유지한다.
 - `TERMINAL_GHOSTTY_DARK`: Orca `Ghostty Default Style Dark`(배경 `#282c34`, 전경·커서 `#ffffff`). 내장 카탈로그에 선택지로 남긴다.
-- 라이트 모드 기본: `TERMINAL_LIGHT` (`DEFAULT_TERMINAL_THEME_LIGHT` = Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
-- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 15종(해구 기본값·기존 5종·새 테마 나머지 9종) + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
+- 라이트 모드 기본: `TERMINAL_LIGHT` = **`Krill Paper`** (`DEFAULT_TERMINAL_THEME_LIGHT`, 배경 `#fbf9f4`, 전경 `#24211d`, 커서 `#e5482f`). Orca `Builtin Tango Light`(`TERMINAL_TANGO_LIGHT`, 배경 `#ffffff`, 전경 `#000000`)는 `기본`(`LIGHT`) 앱 테마의 짝으로 내장 카탈로그에 유지한다.
+- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 15종(해구·종이 기본값·기존 4종·새 테마 나머지 9종) + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
 - 설정 화면의 테마 스와치·미리보기처럼 터미널 `Rgb` 색을 UI 요소에 입힐 때는 생 색상 대신 `ui::terminal_rgb_hsla(rgb)`를 쓴다.
 - 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
 
 ### 3.5 앱 테마 (`DarkUiTheme` / `LightUiTheme`)
 
 - 앱 색 조합은 다크·라이트 모드마다 하나씩 고른다(설정 > 일반 > 모양 · 인터페이스의 `다크 테마`·`라이트 테마`, 설정 키 `ui_theme_dark`·`ui_theme_light`). 모드 선택(다크·라이트·시스템)은 그대로 `theme`이 맡는다.
-- 다크 기본은 **해구**(`TRENCH`)다. 다크 목록: 해구 · 흑연 · 해송 · 자수정 · 이탄 · 황혼 · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 기본(`LIGHT`, 기본값 유지) · 종이(`PAPER`) · 월광 · 석회 · 청자 · 빙하.
+- 다크 기본은 **해구**(`TRENCH`), 라이트 기본은 **종이**(`PAPER`)다. 다크 목록: 해구 · 흑연 · 해송 · 자수정 · 이탄 · 황혼 · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 종이(`PAPER`) · 기본(`LIGHT`, 기존 색 유지) · 월광 · 석회 · 청자 · 빙하.
 - 선택지가 4개를 넘는 테마 목록은 `DropdownMenu` / `PopupMenuItem`으로 표시하며 현재 항목에 체크하고 트리거에는 드롭다운 화살표를 둔다. 모드(다크·라이트·시스템)는 기존 세그먼트 컨트롤을 유지한다.
 - 새 팔레트는 [`ui/app_themes.rs`](../crates/krill-app/src/ui/app_themes.rs)에 둔다. 공통 `Palette`의 의미·치수는 그대로다.
 
@@ -137,7 +137,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | 황혼 | `DUSK` | `#211d27` | `#292330` | `Krill Dusk` |
 
 - 테마는 `Palette` 값만 바꾼다. 반경·간격·글자 크기 상수는 모든 테마가 같다. 새 테마도 `Palette` 상수 하나와 짝 터미널 테마 하나로 추가하고, `text_tokens_meet_wcag_aa_on_every_surface` 목록에 넣어 대비를 고정한다.
-- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`TRENCH`·`LIGHT`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
+- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`TRENCH`·`PAPER`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
 - 앱 테마 키가 없으면 새 기본값을 쓰고, 명시적으로 저장된 기존 앱·터미널 선택은 유지한다. 터미널 테마 키가 없으면 선택된 앱 테마의 짝을 쓴다.
 - 앱 테마를 바꿀 때 그 모드의 터미널 테마가 이전 앱 테마의 짝이면 새 짝으로 함께 바꾸고, 사용자가 다른 터미널 테마를 골라 두었으면 그대로 둔다(`Settings::set_ui_theme_dark`·`set_ui_theme_light`).
 

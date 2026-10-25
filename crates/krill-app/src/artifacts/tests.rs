@@ -104,3 +104,91 @@ fn malformed_responses_fail_and_non_web_urls_cannot_be_opened() {
     page.artifacts[0].share_url = "file:///private/key".into();
     assert!(!page.artifacts[0].openable());
 }
+
+#[test]
+fn display_labels_format_type_size_and_timestamps_like_orca() {
+    let md_item: Item = serde_json::from_value(serde_json::json!({
+        "artifact": {
+            "slug": "spec-doc",
+            "title": "Architecture Spec",
+            "originalFileName": "spec.md",
+            "sourceContentType": "text/markdown; charset=utf-8",
+            "updatedAt": "2026-10-25T14:32:10Z",
+            "expiresAt": "2026-11-25T00:00:00Z",
+            "byteSize": 2048
+        },
+        "shareUrl": "https://share.krill.page/a/spec-doc"
+    }))
+    .unwrap();
+    assert_eq!(md_item.type_label(), "Markdown");
+    assert!(md_item.matches("markdown spec"));
+    assert_eq!(format_byte_size(md_item.artifact.byte_size), "2.0 KB");
+    assert_eq!(format_byte_size(Some(512)), "512 B");
+    assert_eq!(format_byte_size(Some(15 * 1024)), "15 KB");
+    assert_eq!(format_byte_size(None), "—");
+    assert_eq!(
+        format_timestamp_short(md_item.artifact.updated_at.as_deref()),
+        "2026-10-25 14:32"
+    );
+    assert_eq!(format_timestamp_short(Some("2026-11-23")), "2026-11-23");
+    assert_eq!(format_timestamp_short(None), "—");
+}
+
+#[gpui::test]
+fn escape_clears_query_then_closes_drawer_then_emits_close_and_delete_removes_item(
+    cx: &mut TestAppContext,
+) {
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let deleted_seen = deleted.clone();
+    let call: Call = Arc::new(|_| Ok(page("one", None)));
+    let delete_call: DeleteCall = Arc::new(move |slug| {
+        deleted_seen.lock().unwrap().push(slug);
+        Ok(())
+    });
+    let closed = Arc::new(Mutex::new(0usize));
+    let closed_seen = closed.clone();
+    let view = cx.new(|cx| {
+        let v = View::with_calls(call, delete_call, None, cx);
+        cx.subscribe(&cx.entity(), move |_, _, _: &Close, _| {
+            *closed_seen.lock().unwrap() += 1;
+        })
+        .detach();
+        v
+    });
+    cx.run_until_parked();
+
+    view.update(cx, |v, cx| {
+        v.query = "계획".into();
+        v.select_slug(Some("one".into()), cx);
+    });
+    // First Escape clears search query while keeping drawer open.
+    view.update(cx, |v, cx| v.handle_escape(None, cx));
+    view.read_with(cx, |v, _| {
+        assert!(v.query.is_empty());
+        assert_eq!(v.selected_slug(), Some("one"));
+    });
+    assert_eq!(*closed.lock().unwrap(), 0);
+
+    // Second Escape closes detail drawer without closing page.
+    view.update(cx, |v, cx| v.handle_escape(None, cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.selected_slug(), None);
+    });
+    assert_eq!(*closed.lock().unwrap(), 0);
+
+    // Selecting and deleting removes the item and clears selected_slug.
+    view.update(cx, |v, cx| {
+        v.select_slug(Some("one".into()), cx);
+        v.delete_artifact("one".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.items.is_empty());
+        assert_eq!(v.selected_slug(), None);
+    });
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one"]);
+
+    // Third Escape when drawer is closed emits Close.
+    view.update(cx, |v, cx| v.handle_escape(None, cx));
+    assert_eq!(*closed.lock().unwrap(), 1);
+}

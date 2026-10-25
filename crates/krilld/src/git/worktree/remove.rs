@@ -190,6 +190,9 @@ pub fn remove_with_state(
     {
         result.warnings.push(format!("worktree prune failed: {e}"));
     }
+    if let Some(dir) = state_dir {
+        prune_removed_worktree_from_projects(dir, &path);
+    }
     Ok(result)
 }
 
@@ -307,6 +310,72 @@ fn remove_orphan(q: &GitQueue, repo: &Path, path: &Path) -> Result<(), String> {
     }
     verify_git_link(q, repo, path)?;
     fs::remove_dir_all(path).map_err(|e| format!("cannot remove orphan worktree directory: {e}"))
+}
+
+fn prune_removed_worktree_from_projects(state_dir: &Path, removed: &Path) {
+    fn alias(path: &str) -> &str {
+        path.strip_prefix("/private")
+            .filter(|_| path.starts_with("/private/"))
+            .unwrap_or(path)
+    }
+    use krill_proto::os::fs::OpenOptionsExt as _;
+    use std::io::{Read as _, Write as _};
+    let file_path = state_dir.join("projects.toml");
+    let Ok(_guard) = krill_proto::config_document::lock_toml(&file_path) else {
+        return;
+    };
+    let Ok(file) = fs::File::open(&file_path) else {
+        return;
+    };
+    let mut raw = String::new();
+    if file.take(512 * 1024 + 1).read_to_string(&mut raw).is_err() || raw.len() > 512 * 1024 {
+        return;
+    }
+    let Ok(mut doc) = toml::from_str::<toml::Value>(&raw) else {
+        return;
+    };
+    let Some(root) = doc.as_table_mut() else {
+        return;
+    };
+    let removed_str = removed.to_string_lossy();
+    let removed_trimmed = removed_str.trim();
+    let removed_norm = alias(removed_trimmed);
+    let matches_removed = |candidate: &str| alias(candidate.trim()) == removed_norm;
+    let mut changed = false;
+    if let Some(toml::Value::Table(worktrees)) = root.get_mut("worktrees") {
+        let before = worktrees.len();
+        worktrees.retain(|k, _| !matches_removed(k));
+        changed |= worktrees.len() != before;
+    }
+    if let Some(toml::Value::Table(lineage)) = root.get_mut("lineage") {
+        let before = lineage.len();
+        lineage.retain(|k, v| {
+            let wp = v
+                .as_table()
+                .and_then(|t| t.get("worktree_path"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or(k);
+            !(matches_removed(k) || matches_removed(wp))
+        });
+        changed |= lineage.len() != before;
+    }
+    if changed && let Ok(body) = toml::to_string_pretty(&doc) {
+        let tmp = state_dir.join(format!(".projects.toml.rm.tmp.{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &file_path)
+        };
+        if write().is_err() {
+            fs::remove_file(&tmp).ok();
+        }
+    }
 }
 
 fn is_valid_worktree_symlink(wt_real: &Path, raw: &str) -> bool {
@@ -629,6 +698,38 @@ mod tests {
     use krill_proto::control::Request;
     use krill_proto::screen::Msg;
     use proptest::prelude::*;
+
+    #[test]
+    fn projects_prune_removes_only_deleted_worktree_and_preserves_future_metadata() {
+        let dir = std::env::temp_dir().join(format!("krill-projects-prune-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("projects.toml");
+        fs::write(
+            &path,
+            r#"
+future = "keep"
+[worktrees."/tmp/deleted"]
+name = "deleted"
+[worktrees."/privateer/tmp/deleted"]
+name = "unrelated"
+[lineage.child]
+worktree_path = "/tmp/deleted"
+[lineage.other]
+worktree_path = "/tmp/other"
+"#,
+        )
+        .unwrap();
+        prune_removed_worktree_from_projects(&dir, Path::new("/private/tmp/deleted"));
+        let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["future"].as_str(), Some("keep"));
+        let worktrees = doc["worktrees"].as_table().unwrap();
+        assert!(!worktrees.contains_key("/tmp/deleted"));
+        assert!(worktrees.contains_key("/privateer/tmp/deleted"));
+        let lineage = doc["lineage"].as_table().unwrap();
+        assert!(!lineage.contains_key("child"));
+        assert!(lineage.contains_key("other"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(unix)]
     fn fixture_worktree(tag: &str) -> (super::super::tests::Fixture, PathBuf, RemoveWorktree) {

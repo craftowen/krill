@@ -23,7 +23,7 @@ pub(super) struct State {
     writes_pending: usize,
     pub store: WorktreeStore,
     pub orchestration: OrchestrationStore,
-    imported: Snapshot,
+    pub imported: Snapshot,
     imported_meta: Meta,
     pub folder_updated_at: BTreeMap<PathBuf, u64>,
     /// 워크트리 폴더 생성 시각(ms). `SortBy::Created` 정렬 키.
@@ -463,14 +463,26 @@ impl Sidebar {
             || (self.path.is_some()
                 && (self.comments != data.comments || self.auto_titles != data.auto_titles))
             || data.prefs.keys().any(|key| !self.prefs.contains_key(key))
+            || data.imported_meta.iter().any(|(key, value)| {
+                value.branch.is_some()
+                    && self
+                        .meta
+                        .get(key)
+                        .and_then(|existing| existing.branch.as_ref())
+                        .is_none()
+            })
     }
 
     pub(super) fn apply_disk_snapshot(&mut self, data: DiskSnapshot) -> bool {
         self.snapshot.trees = data.snapshot.trees;
         for (key, value) in &data.imported_meta {
-            self.meta
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            let entry = self.meta.entry(key.clone()).or_default();
+            if entry.branch.is_none() {
+                entry.branch.clone_from(&value.branch);
+            }
+            if entry.dirty.is_none() {
+                entry.dirty = value.dirty;
+            }
         }
         if self.path.is_some() {
             self.comments = data.comments;
@@ -511,9 +523,13 @@ impl Sidebar {
             }
         }
         for (key, value) in &self.disk.imported_meta {
-            self.meta
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            let entry = self.meta.entry(key.clone()).or_default();
+            if entry.branch.is_none() {
+                entry.branch.clone_from(&value.branch);
+            }
+            if entry.dirty.is_none() {
+                entry.dirty = value.dirty;
+            }
         }
         false
     }

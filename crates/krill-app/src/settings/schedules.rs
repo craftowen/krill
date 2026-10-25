@@ -105,7 +105,10 @@ pub fn format_run_minute(minute: u64) -> String {
     text::SCHEDULE_RUN_TIME.format(&[("date", &date), ("time", &time)])
 }
 
-fn capture_session_output(dir: &Path, session: krill_proto::SessionId) -> Option<String> {
+pub(crate) fn capture_session_output(
+    dir: &Path,
+    session: krill_proto::SessionId,
+) -> Option<String> {
     use krill_proto::control::{CaptureFormat, FEAT_CLI, FEAT_CONTROL, Reply, Request};
     use krill_proto::screen::Msg as _;
     use std::path::PathBuf;

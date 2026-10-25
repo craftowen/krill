@@ -4221,6 +4221,9 @@ fn login_pending_waiting_cancel_and_outcome(cx: &mut TestAppContext) {
                     cancel: Arc::new(AtomicBool::new(false)),
                     cancelling: false,
                     started: Instant::now(),
+                    url: None,
+                    copy_on_ready: false,
+                    copied: false,
                 });
                 cx.notify();
             });
@@ -4228,12 +4231,64 @@ fn login_pending_waiting_cancel_and_outcome(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     };
 
-    // 대기 중: [로그인 취소]는 보이고 [다시 로그인]은 숨는다.
+    // 대기 중: [링크 복사]와 [로그인 취소]는 보이고 [다시 로그인]은 숨는다.
     set_pending(vcx);
+    assert!(
+        vcx.debug_bounds("admin-add-account-copy-link-claude")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-copy-login-link-claude-work")
+            .is_some()
+    );
     assert!(vcx.debug_bounds("admin-cancel-login-claude-work").is_some());
     assert!(
         vcx.debug_bounds("admin-login-account-claude-work")
             .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-copy-login-account-claude-work")
+            .is_none()
+    );
+
+    // [링크 복사]를 먼저 누르고 뒤이어 스레드가 URL을 남기면 폴링 때 클립보드에 자동 복사된다.
+    let copy_bounds = vcx
+        .debug_bounds("admin-copy-login-link-claude-work")
+        .unwrap();
+    vcx.simulate_click(copy_bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.login_pending
+                .as_ref()
+                .is_some_and(|p| p.copy_on_ready && !p.copied)
+        );
+    });
+    let expected_url =
+        "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback";
+    crate::accounts::record_login_url_for_test("claude-work", expected_url);
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| assert!(!v.poll_login_once(cx)));
+        let v = view.read(cx);
+        assert!(
+            v.login_pending
+                .as_ref()
+                .is_some_and(|p| p.copied && !p.copy_on_ready)
+        );
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(expected_url.to_owned())
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("admin-copy-login-link-claude-work")
+            .unwrap()
+            .size
+            .width,
+        copy_bounds.size.width,
+        "reserved label must keep button width identical after copy"
     );
 
     // [로그인 취소] 클릭 → 취소 플래그가 켜지고 버튼이 비활성된다.
@@ -4325,6 +4380,9 @@ fn login_pending_without_outcome_times_out(cx: &mut TestAppContext) {
                 started: std::time::Instant::now()
                     .checked_sub(LOGIN_WAIT_TIMEOUT + std::time::Duration::from_secs(1))
                     .unwrap(),
+                url: None,
+                copy_on_ready: false,
+                copied: false,
             });
             assert!(v.poll_login_once(cx));
             assert!(v.login_pending.is_none());
@@ -8806,36 +8864,48 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
 
     vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
     vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).ui_theme_light, LightUiTheme::Paper);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
+    });
     choose(vcx, "ui-theme-light", 1);
     vcx.update(|_, cx| {
         let s = current(cx);
-        assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+        assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
         assert_eq!(
             s.terminal_theme_light,
-            crate::ui::terminal_themes::KRILL_PAPER
+            crate::ui::terminal_themes::BUILTIN_TANGO_LIGHT
         );
         assert_eq!(cx.theme().mode, ThemeMode::Light);
-        assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::LIGHT);
     });
     fs::remove_dir_all(&d).ok();
 }
 
-/// 앱 테마 키가 없으면 새 기본값 해구·기본을 쓰고, 저장된 선택값은 계속 읽는다.
+/// 앱 테마 키가 없으면 새 기본값 해구·종이를 쓰고, 저장된 선택값은 계속 읽는다.
 #[test]
 fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("theme = \"light\"").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Trench);
-    assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
-    let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
-    assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
     assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+    assert_eq!(
+        s.terminal_theme_dark,
+        crate::ui::DEFAULT_TERMINAL_THEME_DARK
+    );
+    assert_eq!(
+        s.terminal_theme_light,
+        crate::ui::DEFAULT_TERMINAL_THEME_LIGHT
+    );
+    let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"classic\"").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
     assert_eq!(
         s.terminal_theme_dark,
         crate::ui::terminal_themes::KRILL_TIDEPOOL
     );
     assert_eq!(
         s.terminal_theme_light,
-        crate::ui::terminal_themes::KRILL_PAPER
+        crate::ui::terminal_themes::BUILTIN_TANGO_LIGHT
     );
     let s = Settings::parse("ui_theme_dark = 'deep'\nterminal_theme_dark = 'Krill Deep'").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
@@ -8864,7 +8934,7 @@ fn all_ui_theme_choices_roundtrip_and_preserve_custom_terminal_selection() {
         assert_eq!(parsed.ui_theme_light, theme);
         assert_eq!(parsed.terminal_theme_light, theme.terminal_theme_name());
         s.terminal_theme_light = "custom:my-terminal".to_owned();
-        s.set_ui_theme_light(LightUiTheme::Classic);
+        s.set_ui_theme_light(LightUiTheme::Paper);
         assert_eq!(s.terminal_theme_light, "custom:my-terminal");
     }
 }
@@ -10014,4 +10084,39 @@ fn remote_host_accounts_can_be_selected_and_switched_over_host_target(cx: &mut T
     server.join().unwrap();
     fs::remove_file(&sock_path).ok();
     fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn hidden_status_providers_parse_roundtrip_and_toggle() {
+    use krill_proto::usage::ProviderKind;
+
+    let mut s = Settings::default();
+    for p in ProviderKind::ALL {
+        assert!(s.status_provider_visible(p));
+    }
+    assert!(!s.to_toml().contains("hidden_status_providers"));
+
+    s.set_status_provider_visible(ProviderKind::OpenCode, false);
+    s.set_status_provider_visible(ProviderKind::Antigravity, false);
+    assert!(!s.status_provider_visible(ProviderKind::OpenCode));
+    assert!(!s.status_provider_visible(ProviderKind::Antigravity));
+    assert!(s.status_provider_visible(ProviderKind::Claude));
+    assert!(s.status_provider_visible(ProviderKind::Codex));
+
+    let toml_body = s.to_toml();
+    let reparsed = Settings::parse(&toml_body).unwrap();
+    assert_eq!(reparsed.hidden_status_providers, ["opencode", "agy"]);
+    assert!(!reparsed.status_provider_visible(ProviderKind::OpenCode));
+    assert!(!reparsed.status_provider_visible(ProviderKind::Antigravity));
+
+    let aliases = Settings::parse(
+        "hidden_status_providers = [\"Antigravity\", \"agy\", \"OPENCODE\", \"unknown\"]\n",
+    )
+    .unwrap();
+    assert_eq!(aliases.hidden_status_providers, ["agy", "opencode"]);
+
+    s.set_status_provider_visible(ProviderKind::OpenCode, true);
+    s.set_status_provider_visible(ProviderKind::Antigravity, true);
+    assert!(s.hidden_status_providers.is_empty());
+    assert!(!s.to_toml().contains("hidden_status_providers"));
 }

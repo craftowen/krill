@@ -90,6 +90,9 @@ pub struct Settings {
     /// 잠자기 방지 모드(MK-044: `on` / `agent` / `off`).
     #[serde(alias = "awake")]
     pub keep_awake: KeepAwake,
+    /// 하단 상태바 사용량에서 숨길 프로바이더 목록(기본 빈 목록 = 모두 표시).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_status_providers: Vec<String>,
     /// 완료 웹훅 opt-in. 기본은 빈 목록이며 URL에 비밀 토큰이 들어갈 수 있다.
     pub webhooks: Vec<crate::webhook::Endpoint>,
     /// Copy Context의 최근 출력 행 수(1..=1000으로 제한).
@@ -182,7 +185,7 @@ pub struct Settings {
     /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Trench"`, OWE-956).
     #[serde(default = "default_terminal_theme_dark")]
     pub terminal_theme_dark: String,
-    /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Builtin Tango Light"`, OWE-956).
+    /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Paper"`, OWE-956).
     #[serde(default = "default_terminal_theme_light")]
     pub terminal_theme_light: String,
     /// 라이트 모드에서 별도 터미널 테마를 쓸지(기본 true, Orca `terminalUseSeparateLightTheme`, OWE-956).
@@ -279,11 +282,12 @@ impl Default for Settings {
         Self {
             theme: ThemeChoice::System,
             ui_theme_dark: crate::ui::DarkUiTheme::default(),
-            ui_theme_light: crate::ui::LightUiTheme::Classic,
+            ui_theme_light: crate::ui::LightUiTheme::default(),
             language: locale::system_language(),
             zoom: 1.0,
             notifications: true,
             keep_awake: KeepAwake::Off,
+            hidden_status_providers: Vec::new(),
             webhooks: Vec::new(),
             copy_context_lines: 100,
             quick_commands: Vec::new(),
@@ -372,6 +376,16 @@ impl Settings {
         if parsed.terminal_theme_light.trim().is_empty() {
             parsed.terminal_theme_light = default_terminal_theme_light();
         }
+        let mut hidden_providers = Vec::new();
+        for raw in &parsed.hidden_status_providers {
+            if let Some(p) = krill_proto::usage::ProviderKind::parse(raw) {
+                let key = p.as_str();
+                if !key.is_empty() && !hidden_providers.iter().any(|k| k == key) {
+                    hidden_providers.push(key.to_owned());
+                }
+            }
+        }
+        parsed.hidden_status_providers = hidden_providers;
         let table: toml::Table = toml::from_str(s)?;
         if !table.contains_key("terminal_theme_dark") {
             parsed
@@ -495,6 +509,31 @@ impl Settings {
     /// 자른 프롬프트 캐시 TTL(초, `60..=86400`).
     pub fn prompt_cache_ttl_secs(&self) -> u32 {
         self.prompt_cache_ttl_secs.clamp(60, 86_400)
+    }
+
+    /// 해당 프로바이더를 하단 상태바에 표시할지 여부(기본 true).
+    #[must_use]
+    pub fn status_provider_visible(&self, provider: krill_proto::usage::ProviderKind) -> bool {
+        !self
+            .hidden_status_providers
+            .iter()
+            .any(|s| krill_proto::usage::ProviderKind::parse(s) == Some(provider))
+    }
+
+    /// 하단 상태바 프로바이더 표시 여부를 바꾼다.
+    pub fn set_status_provider_visible(
+        &mut self,
+        provider: krill_proto::usage::ProviderKind,
+        visible: bool,
+    ) {
+        self.hidden_status_providers
+            .retain(|s| krill_proto::usage::ProviderKind::parse(s) != Some(provider));
+        if !visible {
+            let key = provider.as_str();
+            if !key.is_empty() {
+                self.hidden_status_providers.push(key.to_owned());
+            }
+        }
     }
 }
 
@@ -1376,6 +1415,26 @@ pub fn set_confirm_running_close(enabled: bool, cx: &mut App) {
     if cx.has_global::<Config>() && current(cx).confirm_running_close != enabled {
         edit(cx, move |s| s.confirm_running_close = enabled);
     }
+}
+
+/// 해당 프로바이더를 하단 상태바에 표시할지 여부(기본 true).
+#[must_use]
+pub fn status_provider_visible(provider: krill_proto::usage::ProviderKind, cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_none_or(|c| c.settings.status_provider_visible(provider))
+}
+
+/// 하단 상태바 프로바이더 표시 여부를 바꾸고 `settings.toml`에 저장한다.
+pub fn set_status_provider_visible(
+    provider: krill_proto::usage::ProviderKind,
+    visible: bool,
+    cx: &mut App,
+) {
+    edit_or_in_memory(cx, move |s| {
+        s.set_status_provider_visible(provider, visible);
+    });
+    cx.refresh_windows();
+    cx.defer(gpui::App::refresh_windows);
 }
 
 /// 알림 사운드 켜짐 여부. `init` 전이면 기본값 true.
@@ -2938,17 +2997,22 @@ pub enum SshHostCardStatus {
 }
 
 /// 브라우저 OAuth 로그인 진행 상태(OWE-881). `account-login-browser` 스레드가
-/// 최대 600초 대기하는 동안 설정 탭은 이 계정 행에 진행 표시·[취소]를 보이고,
+/// 최대 600초 대기하는 동안 설정 탭은 이 계정 행에 진행 표시·[링크 복사]·[취소]를 보이고,
 /// 스레드가 남긴 [`crate::accounts::LoginOutcome`]으로 성공·실패를 닫는다.
 struct PendingLogin {
     account_id: String,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cancelling: bool,
     started: std::time::Instant,
+    url: Option<String>,
+    copy_on_ready: bool,
+    copied: bool,
 }
 
 /// 브라우저 로그인 대기 상한(OWE-881). CLI 스레드의 600초 데드라인에 여유를 둔다.
 const LOGIN_WAIT_TIMEOUT: Duration = Duration::from_secs(605);
+/// 인증 링크가 아직 캡처되지 않았을 때의 빠른 폴링 간격.
+const LOGIN_URL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// 로그인 결과 폴링 간격(OWE-881). 데몬 `ListAccounts`가 아니라 인메모리 결과만 본다.
 const LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -4304,12 +4368,22 @@ impl SettingsView {
 
     /// Claude·Codex는 백그라운드, agy·OpenCode는 안내 후 터미널에서 로그인한다.
     /// 원격 호스트를 선택 중이면 모든 제공자를 원격 터미널 안내 카드로 처리한다.
-    /// 브라우저 로그인이 끝나기 전에는 `login_pending`을 유지해 진행 표시·[취소]를 보이고,
+    /// 브라우저 로그인이 끝나기 전에는 `login_pending`을 유지해 진행 표시·[링크 복사]·[취소]를 보이고,
     /// 스레드가 남긴 [`crate::accounts::LoginOutcome`]으로 성공·실패·취소를 닫는다(OWE-881).
     fn login_account(
         &mut self,
         provider: krill_proto::usage::ProviderKind,
         account: Option<krill_proto::usage::AccountInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.login_account_with_mode(provider, account, true, cx);
+    }
+
+    fn login_account_with_mode(
+        &mut self,
+        provider: krill_proto::usage::ProviderKind,
+        account: Option<krill_proto::usage::AccountInfo>,
+        open_browser: bool,
         cx: &mut Context<Self>,
     ) {
         use krill_proto::usage::UsageRequest;
@@ -4379,7 +4453,12 @@ impl SettingsView {
                         let newly_added = !existing.iter().any(|a| a.id == added.id);
                         (added, newly_added)
                     };
-                    let cancel = crate::accounts::start_login(&paths, &account, newly_added)?;
+                    let cancel = crate::accounts::start_login_with_mode(
+                        &paths,
+                        &account,
+                        newly_added,
+                        open_browser,
+                    )?;
                     Ok::<_, String>((account, cancel))
                 })
                 .await;
@@ -4389,16 +4468,37 @@ impl SettingsView {
                 this.refresh_accounts_async(cx);
                 match result {
                     Ok((account, cancel)) => {
+                        let initial_url = crate::accounts::login_url(&account.id);
+                        let copied = !open_browser && initial_url.is_some();
+                        if let Some(url) = initial_url.as_ref().filter(|_| !open_browser) {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                        }
                         this.login_pending = Some(PendingLogin {
                             account_id: account.id.clone(),
                             cancel,
                             cancelling: false,
                             started: std::time::Instant::now(),
+                            url: initial_url,
+                            copy_on_ready: !open_browser && !copied,
+                            copied,
                         });
                         // 결과 폴링: 스레드가 남긴 LoginOutcome이 있거나 타임아웃이면 닫는다.
                         cx.spawn(async move |this, cx| {
                             loop {
-                                cx.background_executor().timer(LOGIN_POLL_INTERVAL).await;
+                                let wait = this
+                                    .read_with(cx, |this, _| {
+                                        if this
+                                            .login_pending
+                                            .as_ref()
+                                            .is_some_and(|p| p.url.is_none())
+                                        {
+                                            LOGIN_URL_POLL_INTERVAL
+                                        } else {
+                                            LOGIN_POLL_INTERVAL
+                                        }
+                                    })
+                                    .unwrap_or(LOGIN_POLL_INTERVAL);
+                                cx.background_executor().timer(wait).await;
                                 let settled = this
                                     .update(cx, SettingsView::poll_login_once)
                                     .unwrap_or(true);
@@ -4427,6 +4527,18 @@ impl SettingsView {
             ),
             None => return true,
         };
+        if let Some(pending) = self.login_pending.as_mut()
+            && pending.url.is_none()
+            && let Some(url) = crate::accounts::login_url(&account_id)
+        {
+            if pending.copy_on_ready {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                pending.copy_on_ready = false;
+                pending.copied = true;
+            }
+            pending.url = Some(url);
+            cx.notify();
+        }
         match crate::accounts::take_login_outcome(&account_id) {
             None => {
                 if !timed_out {
@@ -4465,6 +4577,25 @@ impl SettingsView {
                 true
             }
         }
+    }
+
+    /// 진행 중 브라우저 로그인의 인증 링크를 클립보드에 복사한다.
+    /// 아직 CLI가 링크를 내보내기 전이면 준비되는 즉시 복사하도록 예약한다.
+    fn copy_pending_login_link(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.login_pending.as_mut() else {
+            return;
+        };
+        if pending.url.is_none() {
+            pending.url = crate::accounts::login_url(&pending.account_id);
+        }
+        if let Some(url) = pending.url.clone() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+            pending.copy_on_ready = false;
+            pending.copied = true;
+        } else {
+            pending.copy_on_ready = true;
+        }
+        cx.notify();
     }
 
     /// 진행 중 브라우저 로그인을 취소한다(OWE-881). 스레드가 자식 CLI를 죽이고
@@ -7892,18 +8023,22 @@ impl SettingsView {
                     | ProviderKind::Antigravity
                     | ProviderKind::OpenCode
             );
+        let can_browser_login = can_login
+            && !self.account_host.is_remote()
+            && matches!(provider, ProviderKind::Claude | ProviderKind::Codex);
         let manageable = !acc.host_default && !orca;
         // Orca 감지 계정은 실행·이름 변경은 못 해도 Krill 목록에서 지울 수는 있다.
         let removable = !acc.host_default;
-        // OWE-881: 이 계정이 브라우저 로그인 대기 중이면 진행 문구와 [취소]만 보인다.
-        let logging_in = self
+        // OWE-881: 이 계정이 브라우저 로그인 대기 중이면 진행 문구와 [링크 복사]·[취소]만 보인다.
+        let pending_for_row = self
             .login_pending
             .as_ref()
-            .is_some_and(|p| p.account_id == acc.id);
-        let cancelling = self
-            .login_pending
-            .as_ref()
-            .is_some_and(|p| p.account_id == acc.id && p.cancelling);
+            .filter(|p| p.account_id == acc.id);
+        let logging_in = pending_for_row.is_some();
+        let cancelling = pending_for_row.is_some_and(|p| p.cancelling);
+        let login_link_copied = pending_for_row.is_some_and(|p| p.copied);
+        let login_link_preparing =
+            pending_for_row.is_some_and(|p| p.copy_on_ready && p.url.is_none());
         let (primary, heading) = account_heading(acc);
         let switching = snap
             .details
@@ -7918,7 +8053,13 @@ impl SettingsView {
         let detail = if switching {
             text::ACCOUNT_SESSION_SWITCHING.get().to_owned()
         } else if logging_in {
-            text::ACCOUNT_LOGIN_WAITING.get().to_owned()
+            if login_link_copied {
+                text::ACCOUNT_LOGIN_LINK_COPIED_WAITING.get().to_owned()
+            } else if login_link_preparing {
+                text::ACCOUNT_LOGIN_LINK_PREPARING.get().to_owned()
+            } else {
+                text::ACCOUNT_LOGIN_WAITING.get().to_owned()
+            }
         } else if needs_login && can_login {
             text::ACCOUNT_SIGN_IN_TO_USE.get().to_owned()
         } else {
@@ -8120,8 +8261,8 @@ impl SettingsView {
                 ));
         }
 
-        // 주 동작 하나: 로그인이 필요하면 "다시 로그인", 아니면 비활성 계정에만 "전환"(.ghost().small()).
-        // 로그인 대기 중이면 진행 표시 대신 [로그인 취소]만 둔다(OWE-881).
+        // 주 동작 하나: 로그인이 필요하면 "다시 로그인"(및 브라우저 제공자는 "링크 복사"), 아니면 비활성 계정에만 "전환"(.ghost().small()).
+        // 로그인 대기 중이면 진행 표시 대신 [링크 복사]·[로그인 취소]만 둔다(OWE-881).
         let mut actions = div()
             .flex_none()
             .flex()
@@ -8129,42 +8270,83 @@ impl SettingsView {
             .gap_1()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if logging_in {
+            let copy_id = format!("admin-copy-login-link-{}", acc.id);
             let cancel_id = format!("admin-cancel-login-{}", acc.id);
-            actions = actions.child(
-                crate::ui::button_with_reserved_label(
-                    gpui::ElementId::Name(cancel_id.clone().into()),
-                    text::ACCOUNT_LOGIN_CANCEL.get(),
-                    text::ACCOUNT_LOGIN_CANCELLING.get(),
-                    cancelling,
+            actions = actions
+                .child(
+                    crate::ui::button_with_reserved_label(
+                        gpui::ElementId::Name(copy_id.clone().into()),
+                        text::ACCOUNT_LOGIN_COPY_LINK_SHORT.get(),
+                        text::ACCOUNT_LOGIN_LINK_COPIED.get(),
+                        login_link_copied,
+                    )
+                    .small()
+                    .outline()
+                    .icon(if login_link_copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    })
+                    .disabled(cancelling)
+                    .debug_selector(move || copy_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_pending_login_link(cx);
+                    })),
                 )
-                .small()
-                .outline()
-                .icon(IconName::Close)
-                .disabled(cancelling)
-                .debug_selector(move || cancel_id.clone())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.cancel_login(cx);
-                })),
-            );
+                .child(
+                    crate::ui::button_with_reserved_label(
+                        gpui::ElementId::Name(cancel_id.clone().into()),
+                        text::ACCOUNT_LOGIN_CANCEL.get(),
+                        text::ACCOUNT_LOGIN_CANCELLING.get(),
+                        cancelling,
+                    )
+                    .small()
+                    .outline()
+                    .icon(IconName::Close)
+                    .disabled(cancelling)
+                    .debug_selector(move || cancel_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cancel_login(cx);
+                    })),
+                );
         } else if can_login && needs_login {
             let login_account = acc.clone();
             let login_id = format!("admin-login-account-{}", acc.id);
+            let login_disabled =
+                self.account_rule_pending || self.login_pending.is_some() || self.accounts_offline;
             actions = actions.child(
                 layout::ghost(
                     gpui::ElementId::Name(login_id.clone().into()),
                     text::ACCOUNT_LOGIN.get(),
                 )
                 .icon(IconName::RefreshCw)
-                .disabled(
-                    self.account_rule_pending
-                        || self.login_pending.is_some()
-                        || self.accounts_offline,
-                )
+                .disabled(login_disabled)
                 .debug_selector(move || login_id.clone())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.login_account(provider, Some(login_account.clone()), cx);
                 })),
             );
+            if can_browser_login {
+                let copy_login_account = acc.clone();
+                let copy_login_id = format!("admin-copy-login-account-{}", acc.id);
+                actions = actions.child(
+                    layout::ghost(
+                        gpui::ElementId::Name(copy_login_id.clone().into()),
+                        text::ACCOUNT_LOGIN_COPY_LINK_SHORT.get(),
+                    )
+                    .icon(IconName::Copy)
+                    .disabled(login_disabled)
+                    .debug_selector(move || copy_login_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.login_account_with_mode(
+                            provider,
+                            Some(copy_login_account.clone()),
+                            false,
+                            cx,
+                        );
+                    })),
+                );
+            }
         } else if !orca && (!acc.active || switch_failed) && !switching {
             let switch_id = format!("admin-switch-account-{}", acc.id);
             let acc_id = acc.id.clone();
@@ -8208,6 +8390,24 @@ impl SettingsView {
                                     .on_click(move |_, _, cx| {
                                         view.update(cx, |this, cx| {
                                             this.login_account(acc.provider, Some(acc.clone()), cx);
+                                        })
+                                        .ok();
+                                    }),
+                            );
+                        }
+                        if can_browser_login {
+                            let (view, acc) = (view.clone(), menu_acc.clone());
+                            menu = menu.item(
+                                PopupMenuItem::new(text::ACCOUNT_LOGIN_COPY_LINK.get())
+                                    .disabled(busy)
+                                    .on_click(move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.login_account_with_mode(
+                                                acc.provider,
+                                                Some(acc.clone()),
+                                                false,
+                                                cx,
+                                            );
                                         })
                                         .ok();
                                     }),
@@ -8585,38 +8785,76 @@ impl SettingsView {
                 )
             };
             let provider_status_id = format!("admin-provider-status-{}", provider.as_str());
+            let show_in_bar = status_provider_visible(provider, cx);
+            let status_bar_toggle_id = format!("admin-provider-status-bar-{}", provider.as_str());
 
             let header = div()
                 .flex()
-                .flex_col()
-                .gap_1()
+                .items_center()
+                .justify_between()
+                .gap_3()
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(crate::ui::icons::provider_icon(
-                            provider,
-                            crate::ui::ICON_LG,
-                            p.foreground,
-                        ))
+                        .flex_col()
+                        .gap_1()
                         .child(
                             div()
-                                .text_size(crate::ui::TEXT_SM)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(title),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(crate::ui::icons::provider_icon(
+                                    provider,
+                                    crate::ui::ICON_LG,
+                                    p.foreground,
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::TEXT_SM)
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
+                                .child(
+                                    crate::ui::badge(p, status_tone, status_label)
+                                        .id(SharedString::from(provider_status_id.clone()))
+                                        .debug_selector(move || provider_status_id.clone()),
+                                ),
                         )
                         .child(
-                            crate::ui::badge(p, status_tone, status_label)
-                                .id(SharedString::from(provider_status_id.clone()))
-                                .debug_selector(move || provider_status_id.clone()),
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(subtitle),
                         ),
                 )
                 .child(
                     div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(subtitle),
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::PROVIDER_SHOW_IN_STATUS_BAR.get()),
+                        )
+                        .child(
+                            layout::switch(
+                                p,
+                                status_bar_toggle_id,
+                                show_in_bar,
+                                false,
+                                move |on, _, cx| {
+                                    set_status_provider_visible(provider, on, cx);
+                                },
+                            )
+                            .aria_label(format!(
+                                "{} · {}",
+                                title,
+                                text::PROVIDER_SHOW_IN_STATUS_BAR.get()
+                            )),
+                        ),
                 );
 
             let add_btn = layout::secondary(
@@ -8647,6 +8885,23 @@ impl SettingsView {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(install_cmd.clone()));
                         queue_terminal_command_on(install_host.clone(), install_cmd.clone(), cx);
                     }),
+                );
+            }
+            if !self.account_host.is_remote()
+                && matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+            {
+                let add_copy_id = format!("admin-add-account-copy-link-{}", provider.as_str());
+                sub_controls = sub_controls.child(
+                    layout::secondary(
+                        gpui::ElementId::Name(add_copy_id.clone().into()),
+                        text::ACCOUNTS_ADD_COPY_LINK.get(),
+                    )
+                    .icon(IconName::Copy)
+                    .disabled(self.login_pending.is_some())
+                    .debug_selector(move || add_copy_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.login_account_with_mode(provider, None, false, cx);
+                    })),
                 );
             }
             sub_controls = sub_controls.child(add_btn);
@@ -11127,8 +11382,8 @@ impl SettingsView {
             .chain(store.archive_scripts.keys())
             .chain(store.comments.keys())
             .chain(store.parents.values())
-            .filter(|r| Path::new(r).is_absolute())
-            .cloned()
+            .map(|r| krill_proto::orchestration::clean_workspace_path_str(r))
+            .filter(|r| Path::new(r).is_absolute() && !r.contains("::workspace:"))
             .collect()
     }
 

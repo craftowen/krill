@@ -1913,11 +1913,15 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         };
         s.focused = Some(SessionId(1));
         s.custom_titles.insert(SessionId(1), "Local title".into());
+        let mut remote_snap = s.snapshot.clone();
+        remote_snap
+            .trees
+            .insert("/remote-only".into(), vec!["/remote-only".into()]);
         s.remote_hosts = vec![RemoteHost {
             id: "studio".into(),
             label: "Studio".into(),
             status: HostStatus::Connected,
-            snapshot: s.snapshot.clone(),
+            snapshot: remote_snap,
             meta: Meta::new(),
             source: None,
             error: None,
@@ -1927,7 +1931,7 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         s.rebuild(cx);
     });
     cx.run_until_parked();
-    let (local_tree, remote_repo, remote_tree) = cx.update(|_, cx| {
+    let (local_tree, remote_repo, remote_only_repo, remote_tree) = cx.update(|_, cx| {
         let s = view.read(cx);
         assert!(!s.rows.iter().any(|r| matches!(r, Row::HostHeader { .. })));
         assert!(matches!(&s.rows[0], Row::Repository(p) if p == Path::new("/repo")));
@@ -1940,13 +1944,17 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
             s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
             Some("Studio".into())
         );
-        // The same project on another PC merges into the one project header.
+        assert_eq!(
+            s.host_badge_for(&remote, Path::new("/remote-only")),
+            Some("Studio".into())
+        );
+        // The same project on another PC merges into the one project header; remote-only stays its own project.
         assert_eq!(
             s.rows
                 .iter()
                 .filter(|r| matches!(r, Row::Repository(_)))
                 .count(),
-            1
+            2
         );
         assert_eq!(
             s.merged_projects.get(&0).map(Vec::as_slice),
@@ -1969,12 +1977,17 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         (
             find(&HostId::Local, false),
             find(&HostId::Local, true),
+            find(&remote, true),
             find(&remote, false),
         )
     });
     let sel = |prefix: &str, index| -> &'static str { format!("{prefix}-{index}").leak() };
-    // A connected PC shows on its cards, not as another badge on the merged header.
+    // A connected PC shows on its cards, not as another badge on either merged or remote-only headers.
     assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
+    assert!(
+        cx.debug_bounds(sel("project-host", remote_only_repo))
+            .is_none()
+    );
     let bounds = cx.debug_bounds(sel("card-session", remote_tree)).unwrap();
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
@@ -2002,6 +2015,14 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
     });
     cx.run_until_parked();
     assert!(view.read_with(cx, |s, _| s.is_row_dimmed(remote_tree)));
+    assert!(
+        cx.debug_bounds(sel("project-host", remote_only_repo))
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds(sel("project-reconnect", remote_only_repo))
+            .is_some()
+    );
     let reconnect = cx
         .debug_bounds(sel("project-reconnect", remote_repo))
         .unwrap();
@@ -5667,6 +5688,27 @@ fn default_worktree_ignores_redundant_project_name_in_prefs(cx: &mut TestAppCont
             assert_eq!(s.name(&repo), "직접 정한 기본 워크트리");
         });
     });
+
+    // `projects.toml`로 등록된 프로젝트(세션 없음)도 `.git/HEAD`에서 브랜치를 읽어 폴더명 대신 브랜치를 표기한다.
+    let dir = std::env::temp_dir().join(format!("krill-imported-branch-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let imported_repo = dir.join("oh-my-vibecode");
+    fs::create_dir_all(imported_repo.join(".git")).unwrap();
+    fs::write(imported_repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let canon_repo = fs::canonicalize(&imported_repo).unwrap();
+    fs::write(
+        dir.join(external::PROJECTS_FILE),
+        format!(
+            "[[projects]]\nid = \"omv\"\npath = \"{}\"\ndisplay_name = \"oh-my-vibecode\"\nkind = \"git\"\n\n\
+             [worktrees.\"{}\"]\nrepo_id = \"omv\"\n",
+            canon_repo.display(),
+            canon_repo.display()
+        ),
+    )
+    .unwrap();
+    let loaded = Sidebar::new_loaded(Some(dir.join("sidebar.bin")));
+    assert_eq!(loaded.name(&canon_repo), "main");
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[gpui::test]
@@ -6244,4 +6286,75 @@ fn remote_host_worktree_creation_and_child_lineage(cx: &mut TestAppContext) {
     assert_eq!(del_sent.len(), 1);
     assert_eq!(del_sent[0].repo, b"/remote/repo".to_vec());
     assert_eq!(del_sent[0].path, b"/remote/repo/child-wt".to_vec());
+}
+
+#[gpui::test]
+fn exited_processes_leave_sidebar_dashboard_counts_and_unread(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(cx, |sidebar, cx| {
+        let mut ended = session(1, AgentState::Exited, Some("/repo/a"));
+        ended.status.agent = "codex".into();
+        ended.status.source = Some(krill_proto::control::Source::Process);
+        let mut hook_ended = session(2, AgentState::Exited, Some("/repo/a"));
+        hook_ended.status.agent = "claude".into();
+        hook_ended.status.source = Some(krill_proto::control::Source::Hook);
+        let mut loose = ended.clone();
+        loose.id = SessionId(3);
+        loose.worktree = None;
+        loose.cwd = None;
+        let mut folder = ended.clone();
+        folder.id = SessionId(4);
+        folder.worktree = None;
+        folder.cwd = Some("/folder".into());
+        let done = session(5, AgentState::Done, Some("/repo/a"));
+        sidebar.unread = BTreeSet::from([SessionId(1), SessionId(2)]);
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![ended, hook_ended, loose, folder, done],
+                    trees: BTreeMap::from([("/repo".into(), vec!["/repo/a".into()])]),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        let mut row_ids: Vec<_> = sidebar
+            .rows
+            .iter()
+            .filter_map(|row| {
+                if let Row::Session(session, _) = row {
+                    Some(session.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        row_ids.sort();
+        assert_eq!(row_ids, vec![SessionId(2), SessionId(5)]);
+        assert_eq!(sidebar.agent_counts(), (0, 0, 1));
+        assert!(sidebar.unread.is_empty());
+        assert_eq!(
+            sidebar
+                .dashboard_sessions()
+                .iter()
+                .map(|(_, session)| session.id)
+                .collect::<Vec<_>>(),
+            vec![SessionId(5)]
+        );
+        // Matching IDs on other hosts must be treated independently.
+        let mut remote_done = session(1, AgentState::Done, None);
+        remote_done.status.agent = "codex".into();
+        sidebar.set_remote_snapshot_for_test(
+            "remote",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![remote_done],
+                ..Snapshot::default()
+            },
+            cx,
+        );
+        assert_eq!(sidebar.dashboard_sessions().len(), 2);
+    });
 }

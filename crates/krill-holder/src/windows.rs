@@ -386,14 +386,15 @@ impl Holder {
             ToHolder::Resize { id, size, .. } => self.live(id)?.console.resize(size)?,
             ToHolder::Terminate { id, .. } => {
                 let s = self.live(id)?;
-                s.console.stop_host()?;
+                s.console.stop_host().ok();
+                s.job.terminate().ok();
                 s.deadline = Some(Instant::now() + Duration::from_secs(5));
             }
             ToHolder::Kill { id, signal, .. } => {
                 let s = self.live(id)?;
-                s.console.stop_host()?;
+                s.console.stop_host().ok();
                 if signal == 9 {
-                    s.job.terminate()?;
+                    s.job.terminate().ok();
                 } else {
                     s.deadline = Some(Instant::now() + Duration::from_secs(5));
                 }

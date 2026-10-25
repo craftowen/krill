@@ -452,6 +452,22 @@ impl Engine {
         self.scheme.cwd.clone_from(&source.scheme.cwd);
     }
 
+    /// 파서가 바닥 상태일 때([`Self::capture_rewind`] == 0, `scan` ground) 전체 엔진 상태를 복제한다.
+    pub(crate) fn clone_ground(&self) -> Option<Self> {
+        if self.capture_rewind() != 0 || !self.scan.mk_is_ground() {
+            return None;
+        }
+        let mut copy = Self::with_history(
+            WinSize {
+                cols: u16::try_from(self.term.columns()).unwrap_or(u16::MAX),
+                rows: u16::try_from(self.term.screen_lines()).unwrap_or(u16::MAX),
+            },
+            self.hot,
+        );
+        copy.rebase_replay(self);
+        Some(copy)
+    }
+
     /// 스크롤백 행 수.
     pub(crate) fn history_len(&self) -> usize {
         self.term.grid().history_size()

@@ -648,6 +648,17 @@ pub fn start_login(
     account: &AccountInfo,
     newly_added: bool,
 ) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
+    start_login_with_mode(paths, account, newly_added, true)
+}
+
+/// 로그인 CLI를 백그라운드에서 실행한다. `open_browser`가 `false`이면 브라우저를 자동으로 열지 않고
+/// 인증 링크만 캡처해([`login_url`]) 클립보드 복사 로그인에 쓴다.
+pub fn start_login_with_mode(
+    paths: &Paths,
+    account: &AccountInfo,
+    newly_added: bool,
+    open_browser: bool,
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
     // agy needs a TTY for its account picker and the SSH OAuth code prompt.
     if account.provider == ProviderKind::Antigravity {
         return Err(crate::i18n::catalog::settings::AGY_LOGIN_GUIDE
@@ -673,7 +684,14 @@ pub fn start_login(
     std::thread::Builder::new()
         .name("account-login-browser".into())
         .spawn(move || {
-            run_browser_login(&paths, &account, newly_added, command, &cancel_for_thread);
+            run_browser_login_with_mode(
+                &paths,
+                &account,
+                newly_added,
+                command,
+                &cancel_for_thread,
+                open_browser,
+            );
         })
         .map_err(|e| e.to_string())?;
     Ok(cancel)
@@ -797,23 +815,79 @@ pub(crate) fn record_login_outcome_for_test(account_id: &str, outcome: LoginOutc
 /// 백그라운드 로그인 스레드가 남긴 종료 사유를 꺼낸다. 없으면 아직 진행 중이다(OWE-881).
 #[must_use]
 pub fn take_login_outcome(account_id: &str) -> Option<LoginOutcome> {
-    match login_outcomes().try_lock() {
+    let outcome = match login_outcomes().try_lock() {
         Ok(mut outcomes) => outcomes.remove(account_id),
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().remove(account_id),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    if outcome.is_some() {
+        clear_login_url(account_id);
+    }
+    outcome
+}
+
+fn login_urls() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static URLS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    URLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lock_login_urls() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    login_urls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn record_login_url(account_id: &str, url: &str) {
+    lock_login_urls().insert(account_id.to_owned(), url.to_owned());
+}
+
+fn clear_login_url(account_id: &str) {
+    lock_login_urls().remove(account_id);
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) fn record_login_url_for_test(account_id: &str, url: &str) {
+    record_login_url(account_id, url);
+}
+
+/// 백그라운드 로그인 스레드가 캡처한 인증 URL을 읽는다(진행 중에 여러 번 복사할 수 있게 유지).
+#[must_use]
+pub fn login_url(account_id: &str) -> Option<String> {
+    match login_urls().try_lock() {
+        Ok(urls) => urls.get(account_id).cloned(),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            error.into_inner().get(account_id).cloned()
+        }
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
+#[cfg(test)]
+#[cfg(unix)]
 fn run_browser_login(
+    paths: &Paths,
+    account: &AccountInfo,
+    newly_added: bool,
+    command: std::process::Command,
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    run_browser_login_with_mode(paths, account, newly_added, command, cancel, true);
+}
+
+fn run_browser_login_with_mode(
     paths: &Paths,
     account: &AccountInfo,
     newly_added: bool,
     mut command: std::process::Command,
     cancel: &std::sync::atomic::AtomicBool,
+    open_browser: bool,
 ) {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::Ordering;
+    clear_login_url(&account.id);
     // 실패 기록+정리를 한 번에 한다. 취소는 별도 경로(호출자가 구분해야 한다).
     let fail = |reason: LoginFailReason| {
         record_login_outcome(&account.id, LoginOutcome::Failed(reason));
@@ -870,13 +944,18 @@ fn run_browser_login(
             && let Some(raw) = browser_link.or(printed_link)
             && let Some(url) = authorize_url(account.provider, &raw)
         {
-            opened = if cfg!(target_os = "macos") {
-                crate::platform::background_command("open")
-                    .arg(url)
-                    .status()
-                    .is_ok_and(|status| status.success())
+            record_login_url(&account.id, url);
+            opened = if open_browser {
+                if cfg!(target_os = "macos") {
+                    crate::platform::background_command("open")
+                        .arg(url)
+                        .status()
+                        .is_ok_and(|status| status.success())
+                } else {
+                    crate::platform::permissions::open_url(url)
+                }
             } else {
-                crate::platform::permissions::open_url(url)
+                true
             };
         }
         match child.try_wait() {

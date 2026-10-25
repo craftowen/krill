@@ -185,9 +185,33 @@ pub fn ensure_session_in(
     want: Option<SessionId>,
     create: &Create,
 ) -> io::Result<Found> {
-    let target = target.into();
-    prepare_status_hook(&target, &create.program);
-    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    ensure_session_inner(&target.into(), want, create, true)
+}
+
+/// [`ensure_session_in`]과 같으나 숨은 칸 복원 등에서 콜드 화면 재생(`Request::Cold`)을 거치지 않고
+/// 곧바로 라이브 재개(`Request::Resume`)로 이어진다.
+///
+/// # Errors
+/// krilld에 붙지 못했거나 세션을 만들지 못했다(`Failure` 문구).
+pub fn ensure_live_session_in(
+    target: impl Into<HostTarget>,
+    want: Option<SessionId>,
+    create: &Create,
+) -> io::Result<(SessionId, bool)> {
+    match ensure_session_inner(&target.into(), want, create, false)? {
+        Found::Live(id, created) => Ok((id, created)),
+        Found::Cold(id, _) => Ok((id, false)),
+    }
+}
+
+fn ensure_session_inner(
+    target: &HostTarget,
+    want: Option<SessionId>,
+    create: &Create,
+    allow_cold: bool,
+) -> io::Result<Found> {
+    prepare_status_hook(target, &create.program);
+    let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT))?;
     let mut call = |req: &Request| -> io::Result<Reply> {
         s.write_all(&req.encode()?)?;
@@ -204,11 +228,12 @@ pub fn ensure_session_in(
             return Ok(Found::Live(id, false));
         }
         if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
-            && let Some(replacement) = account_handoff(&target, id)?
+            && let Some(replacement) = account_handoff(target, id)?
         {
             return Ok(Found::Live(replacement, false));
         }
-        if features & FEAT_COLD != 0
+        if allow_cold
+            && features & FEAT_COLD != 0
             && let Reply::Cold(cold) = call(&Request::Cold { session: id })?
         {
             return Ok(Found::Cold(id, cold));
@@ -240,8 +265,16 @@ pub fn ensure_session_in(
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
             Ok(Found::Live(session, true))
         }
-        Reply::Failed(f) => Err(io::Error::other(f.to_string())),
+        Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
+fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
+    match failure {
+        krill_proto::control::Failure::NoHolder => io::Error::other(failure.to_string()),
+        krill_proto::control::Failure::Os(errno) => io::Error::from_raw_os_error(errno),
+        other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
     }
 }
 
@@ -334,13 +367,7 @@ pub fn resume_session_in(
     let (k, b) = read(&mut s)?;
     match Reply::decode(k, &b)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => Ok(session),
-        Reply::Failed(krill_proto::control::Failure::NoHolder) => Err(io::Error::other(
-            krill_proto::control::Failure::NoHolder.to_string(),
-        )),
-        Reply::Failed(krill_proto::control::Failure::Os(errno)) => {
-            Err(io::Error::from_raw_os_error(errno))
-        }
-        Reply::Failed(f) => Err(io::Error::new(io::ErrorKind::InvalidInput, f.to_string())),
+        Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }
@@ -1218,6 +1245,14 @@ impl<W: Write> Pane<W> {
                 if let Some(cache) = self.history.stable.as_mut() {
                     ev.redraw = cache.accept(reply);
                     ev.history_notice = cache.take_notice().or(ev.history_notice);
+                    if cache.is_stopped() {
+                        self.history.offset = cache.visible();
+                    } else if let Some(total) = cache.complete_total() {
+                        self.history.offset = self.history.offset.min(total);
+                    }
+                    if self.history.offset == 0 && !cache.is_pending() {
+                        self.history.reset();
+                    }
                     if ev.redraw {
                         self.refresh();
                     }
@@ -1781,19 +1816,44 @@ impl History {
 
     fn scroll(&mut self, lines: isize) {
         if let Some(cache) = &self.stable {
-            self.offset = cache.visible().saturating_add_signed(lines);
-            if self.offset == 0 {
+            if (cache.is_stopped() || cache.complete_total() == Some(0)) && cache.visible() == 0 {
                 self.reset();
+                if lines <= 0 {
+                    return;
+                }
+            } else {
+                let base = if cache.is_stopped() {
+                    self.offset.min(cache.visible())
+                } else if let Some(total) = cache.complete_total() {
+                    self.offset.min(total)
+                } else {
+                    self.offset
+                };
+                let next = base.saturating_add_signed(lines);
+                self.offset = if cache.is_stopped() && lines > 0 && !cache.can_compose_at(next) {
+                    cache.visible()
+                } else if let Some(total) = cache.complete_total() {
+                    next.min(total)
+                } else {
+                    next
+                };
+                if self.offset == 0 {
+                    self.reset();
+                }
+                return;
             }
-            return;
         }
-        // 비동기 요청량이 받은 히스토리보다 커도 이동 기준은 실제 보이는 위치다.
-        let next = self.visible().saturating_add_signed(lines);
-        // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 두고, 행이 오면 그만큼 보인다.
+        let base = if self.phase == Phase::Done {
+            self.offset.min(self.total_len())
+        } else {
+            self.offset
+        };
+        let next = base.saturating_add_signed(lines);
+        // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 누적하고, 행이 오면 그만큼 보인다.
         let cap = if self.phase == Phase::Done {
             self.total_len()
         } else {
-            self.visible().saturating_add(lines.unsigned_abs())
+            next
         };
         self.offset = next.min(cap);
         if self.offset == 0 {

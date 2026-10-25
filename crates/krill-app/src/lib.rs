@@ -7,6 +7,7 @@ pub mod agent_history;
 pub mod alert;
 pub mod appearance;
 pub mod artifacts;
+pub mod automations;
 pub mod commands;
 pub mod continue_session;
 pub mod crash;

@@ -129,6 +129,15 @@ pub struct Session {
     pub account: Option<krill_proto::control::SessionAccount>,
 }
 
+impl Session {
+    /// 에이전트 `SessionEnd` hook과 달리 루트 프로세스 종료가 확인된 세션.
+    #[must_use]
+    pub fn is_exited(&self) -> bool {
+        self.status.state == AgentState::Exited
+            && self.status.source == Some(krill_proto::control::Source::Process)
+    }
+}
+
 /// 워크트리 행에 붙는 git 정보. 모르면 `None`(UI가 숨긴다).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tree {
@@ -308,7 +317,10 @@ fn track_unread(
     new: &[Session],
     focused: Option<SessionId>,
 ) {
-    unread.retain(|id| new.iter().any(|s| s.id == *id));
+    unread.retain(|id| {
+        new.iter()
+            .any(|s| s.id == *id && s.status.state != AgentState::Exited)
+    });
     for s in new {
         let before = old.iter().find(|o| o.id == s.id).map(|o| o.status.state);
         let state = s.status.state;
@@ -540,29 +552,35 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
     let (prefs, rest) =
         postcard::take_from_bytes::<Preferences>(body).map_err(|e| invalid(&e.to_string()))?;
     if rest.is_empty() {
-        return Ok((
+        return Ok(sanitize_persisted_sidebar_state((
             prefs,
             WorkspaceOptions::default(),
             lineage::LineageState::default(),
             UiExpansionState::default(),
             Vec::new(),
-        ));
+        )));
     }
     let (opts, rest) =
         postcard::take_from_bytes::<WorkspaceOptions>(rest).map_err(|e| invalid(&e.to_string()))?;
     if rest.is_empty() {
-        return Ok((
+        return Ok(sanitize_persisted_sidebar_state((
             prefs,
             opts,
             lineage::LineageState::default(),
             UiExpansionState::default(),
             Vec::new(),
-        ));
+        )));
     }
     let (lin, rest) = postcard::take_from_bytes::<lineage::LineageState>(rest)
         .map_err(|e| invalid(&e.to_string()))?;
     if rest.is_empty() {
-        return Ok((prefs, opts, lin, UiExpansionState::default(), Vec::new()));
+        return Ok(sanitize_persisted_sidebar_state((
+            prefs,
+            opts,
+            lin,
+            UiExpansionState::default(),
+            Vec::new(),
+        )));
     }
     let (ui, rest) =
         postcard::take_from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?;
@@ -571,7 +589,82 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
     } else {
         postcard::from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
     };
-    Ok((prefs, opts, lin, ui, order))
+    Ok(sanitize_persisted_sidebar_state((
+        prefs, opts, lin, ui, order,
+    )))
+}
+
+fn clean_persisted_path(p: PathBuf) -> PathBuf {
+    if let Some(s) = p.to_str()
+        && let Some(base) = krill_proto::orchestration::strip_workspace_instance(s)
+        && !p.exists()
+    {
+        return PathBuf::from(base);
+    }
+    p
+}
+
+fn sanitize_persisted_sidebar_state(
+    (prefs, mut opts, mut lin, mut ui, order): PersistedSidebarState,
+) -> PersistedSidebarState {
+    let mut clean_prefs = Preferences::default();
+    for (k, mut v) in prefs {
+        let ck = clean_persisted_path(k);
+        if krill_proto::orchestration::strip_workspace_instance(&v.name).is_some() {
+            v.name.clear();
+        }
+        clean_prefs.entry(ck).or_insert(v);
+    }
+    opts.filters.repos = opts
+        .filters
+        .repos
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    let mut clean_parents = BTreeMap::new();
+    for (c, p) in lin.parents {
+        let cc = clean_persisted_path(c);
+        let cp = clean_persisted_path(p);
+        if cc != cp {
+            clean_parents.entry(cc).or_insert(cp);
+        }
+    }
+    lin.parents = clean_parents;
+    lin.collapsed_lineage = lin
+        .collapsed_lineage
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    lin.sleeping_worktrees = lin
+        .sleeping_worktrees
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    ui.collapsed = ui.collapsed.into_iter().map(clean_persisted_path).collect();
+    ui.expanded_cards = ui
+        .expanded_cards
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    ui.selected_worktree = ui.selected_worktree.map(clean_persisted_path);
+    ui.shown_external = ui
+        .shown_external
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    ui.removed_projects = ui
+        .removed_projects
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    let mut clean_order = Vec::with_capacity(order.len());
+    for p in order {
+        let cp = clean_persisted_path(p);
+        if !clean_order.contains(&cp) {
+            clean_order.push(cp);
+        }
+    }
+    (clean_prefs, opts, lin, ui, clean_order)
 }
 
 #[cfg(test)]
@@ -1422,14 +1515,40 @@ impl Sidebar {
         None
     }
 
-    fn host_connected(&self, host: &HostId) -> bool {
+    #[must_use]
+    pub fn host_connected(&self, host: &HostId) -> bool {
         match host {
-            HostId::Local => true,
+            HostId::Local => self.local_status == HostStatus::Connected,
             HostId::Remote(id) => self
                 .remote_hosts
                 .iter()
                 .any(|r| &r.id == id && r.status == HostStatus::Connected),
         }
+    }
+
+    #[must_use]
+    pub fn host_has_trees(&self, host: &HostId) -> bool {
+        !self.snapshot_for(host).trees.is_empty()
+    }
+
+    /// 현재 연결된 모든 호스트의 세션 목록을 `(HostId, SessionId)`로 순회한다.
+    pub fn connected_sessions(&self) -> impl Iterator<Item = (HostId, SessionId)> + '_ {
+        let local = (self.local_status == HostStatus::Connected)
+            .then(|| self.snapshot.sessions.iter().map(|s| (HostId::Local, s.id)))
+            .into_iter()
+            .flatten();
+        let remote = self
+            .remote_hosts
+            .iter()
+            .filter(|r| r.status == HostStatus::Connected)
+            .flat_map(|r| {
+                let host = HostId::Remote(r.id.clone());
+                r.snapshot
+                    .sessions
+                    .iter()
+                    .map(move |s| (host.clone(), s.id))
+            });
+        local.chain(remote)
     }
 
     /// 테스트에서 원격 호스트 스냅샷·상태를 직접 주입한다.
@@ -1763,6 +1882,7 @@ impl Sidebar {
                                 let host_id = HostId::Remote(id.clone());
                                 s.prune_read_done_for_host(&host_id, cx);
                             } else {
+                                s.remote_probed_repos.remove(&id);
                                 let status = s
                                     .remote_info
                                     .get(&id)
@@ -1880,6 +2000,33 @@ impl Sidebar {
         self.snapshot_for(host).sessions.iter().find(|s| s.id == id)
     }
 
+    /// 화면 스트림의 CLOSED를 폴링보다 먼저 반영해 종료 알림·행을 정리한다.
+    pub fn mark_session_exited_on(&mut self, host: &HostId, id: SessionId, cx: &mut Context<Self>) {
+        let snapshot = match host {
+            HostId::Local => Some(&mut self.snapshot),
+            HostId::Remote(host) => self
+                .remote_hosts
+                .iter_mut()
+                .find(|remote| remote.id == *host)
+                .map(|remote| &mut remote.snapshot),
+        };
+        if let Some(session) = snapshot.and_then(|snapshot| {
+            snapshot
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == id)
+        }) {
+            session.status.state = AgentState::Exited;
+            session.status.source = Some(krill_proto::control::Source::Process);
+            session.status.foreground = None;
+        }
+        if host.is_local() {
+            self.unread.remove(&id);
+            crate::alert::dismiss(id, cx);
+        }
+        self.rebuild(cx);
+    }
+
     /// 세션이 속한 호스트(로컬 또는 원격)를 찾는다.
     #[must_use]
     pub fn host_for_session(&self, id: SessionId) -> Option<HostId> {
@@ -1955,8 +2102,8 @@ impl Sidebar {
             match s.status.state {
                 AgentState::Waiting | AgentState::Blocked => waiting += 1,
                 AgentState::Working => working += 1,
-                AgentState::Done | AgentState::Exited => done += 1,
-                AgentState::Unknown => {}
+                AgentState::Done => done += 1,
+                AgentState::Exited | AgentState::Unknown => {}
             }
         }
         (waiting, working, done)
@@ -2509,41 +2656,61 @@ impl Sidebar {
         }
     }
 
-    pub(super) fn project_visual(&self, path: &Path) -> Option<&external::ProjectVisualMeta> {
-        if let Some(v) = self.project_visuals.get(path) {
-            return Some(v);
-        }
-        if let Some(v) = self.remote_visuals.get(path) {
+    fn lookup_visual<'a>(
+        map: &'a BTreeMap<PathBuf, external::ProjectVisualMeta>,
+        path: &Path,
+    ) -> Option<&'a external::ProjectVisualMeta> {
+        if let Some(v) = map.get(path) {
             return Some(v);
         }
         let name = basename(path);
         if name.is_empty() {
             return None;
         }
-        self.project_visuals
-            .iter()
+        map.iter()
             .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
             .map(|(_, v)| v)
-            .or_else(|| {
-                self.remote_visuals
-                    .iter()
-                    .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
-                    .map(|(_, v)| v)
-            })
     }
 
     pub(super) fn project_icon(&self, path: &Path) -> Option<&crate::ui::icons::ProjectIcon> {
-        self.project_visual(path).and_then(|v| v.icon.as_ref())
+        let local = Self::lookup_visual(&self.project_visuals, path).and_then(|v| v.icon.as_ref());
+        let remote = Self::lookup_visual(&self.remote_visuals, path).and_then(|v| v.icon.as_ref());
+        match (local, remote) {
+            (
+                Some(crate::ui::icons::ProjectIcon::Image(lp)),
+                Some(r @ crate::ui::icons::ProjectIcon::Image(rp)),
+            ) if lp
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("url-"))
+                && rp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("remote-")) =>
+            {
+                Some(r)
+            }
+            (Some(l), _) => Some(l),
+            (None, r) => r,
+        }
     }
 
     pub(super) fn project_badge_color(&self, path: &Path) -> Option<&str> {
-        self.project_visual(path)
+        Self::lookup_visual(&self.project_visuals, path)
             .and_then(|v| v.badge_color.as_deref())
+            .or_else(|| {
+                Self::lookup_visual(&self.remote_visuals, path)
+                    .and_then(|v| v.badge_color.as_deref())
+            })
     }
 
     pub(super) fn project_header_name(&self, path: &Path) -> String {
-        self.project_visual(path)
+        Self::lookup_visual(&self.project_visuals, path)
             .and_then(|v| v.display_name.as_deref())
+            .or_else(|| {
+                Self::lookup_visual(&self.remote_visuals, path)
+                    .and_then(|v| v.display_name.as_deref())
+            })
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map_or_else(|| basename(path), str::to_owned)
@@ -2583,7 +2750,12 @@ impl Sidebar {
                         host,
                         label: remote.label.clone(),
                         status: remote.status,
-                        sessions: remote.snapshot.sessions.len(),
+                        sessions: remote
+                            .snapshot
+                            .sessions
+                            .iter()
+                            .filter(|s| !s.is_exited())
+                            .count(),
                     },
                 ));
             }
@@ -2610,6 +2782,7 @@ impl Sidebar {
                 self.snapshot
                     .sessions
                     .iter()
+                    .filter(|s| !s.is_exited())
                     .map(|s| s.status.state)
                     .collect(),
             ),
@@ -2636,7 +2809,12 @@ impl Sidebar {
                         .get()
                         .to_owned(),
                     status: self.local_status,
-                    sessions: self.snapshot.sessions.len(),
+                    sessions: self
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .filter(|s| !s.is_exited())
+                        .count(),
                 });
                 row_hosts.push(HostId::Local);
                 if !self.collapsed_hosts.contains(&HostId::Local) {
@@ -2651,7 +2829,12 @@ impl Sidebar {
                     host: host.clone(),
                     label: remote.label.clone(),
                     status: remote.status,
-                    sessions: remote.snapshot.sessions.len(),
+                    sessions: remote
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .filter(|s| !s.is_exited())
+                        .count(),
                 });
                 row_hosts.push(host.clone());
                 if !self.collapsed_hosts.contains(&host) {
@@ -2905,13 +3088,23 @@ impl Sidebar {
                             .map(Path::to_path_buf);
                         let result = source.fetch().map(|mut snapshot| {
                             external::include_claude_worktrees(&mut snapshot.trees);
-                            let mut meta = source.meta(&snapshot.trees);
+                            let mut imported_meta = Meta::default();
                             if let Some(ref dir) = state_dir {
                                 external::include_imported_projects(
                                     dir,
                                     &mut snapshot.trees,
-                                    &mut meta,
+                                    &mut imported_meta,
                                 );
+                            }
+                            let mut meta = source.meta(&snapshot.trees);
+                            for (key, value) in imported_meta {
+                                let entry = meta.entry(key).or_default();
+                                if entry.branch.is_none() {
+                                    entry.branch = value.branch;
+                                }
+                                if entry.dirty.is_none() {
+                                    entry.dirty = value.dirty;
+                                }
                             }
                             (snapshot, meta)
                         });
@@ -3859,20 +4052,21 @@ impl Sidebar {
     }
 
     pub(super) fn name_on(&self, host: &HostId, path: &Path) -> String {
-        let pref_name = self.custom_worktree_name(path);
+        let pref_name = host
+            .is_local()
+            .then(|| self.custom_worktree_name(path))
+            .flatten();
         if let Some(custom) =
             pref_name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n))
         {
             return custom.to_owned();
         }
-        let branch = self
-            .meta_for(host)
-            .get(path)
-            .and_then(|t| t.branch.as_deref());
         if self.snapshot_for(host).trees.contains_key(path) {
-            return branch.map_or_else(|| basename(path), str::to_owned);
+            return self
+                .branch_on(host, path)
+                .map_or_else(|| basename(path), str::to_owned);
         }
-        if let Some(branch) = branch {
+        if let Some(branch) = self.branch_on(host, path) {
             if !krill_proto::git::is_default_branch_or_worktree_name(branch) {
                 return branch.to_owned();
             }
@@ -3901,10 +4095,13 @@ impl Sidebar {
             .get(path)
             .map(|v| v.name.trim())
             .filter(|s| !s.is_empty())?;
-        if self.snapshot.trees.contains_key(path) {
-            let folder = basename(path);
+        let folder = basename(path);
+        if name.eq_ignore_ascii_case(&folder) {
+            return None;
+        }
+        if self.snapshot.trees.contains_key(path) || self.disk.imported.trees.contains_key(path) {
             let header = self.project_header_name(path);
-            if name.eq_ignore_ascii_case(&folder) || name.eq_ignore_ascii_case(&header) {
+            if name.eq_ignore_ascii_case(&header) {
                 return None;
             }
         }
@@ -3999,6 +4196,7 @@ impl Sidebar {
                 self.snapshot
                     .sessions
                     .iter()
+                    .filter(|s| s.status.state != AgentState::Exited)
                     .cloned()
                     .map(|s| (HostId::Local, s)),
             );
@@ -4013,6 +4211,7 @@ impl Sidebar {
                     .snapshot
                     .sessions
                     .iter()
+                    .filter(|s| s.status.state != AgentState::Exited)
                     .cloned()
                     .map(|s| (host.clone(), s)),
             );
@@ -4072,7 +4271,7 @@ impl Sidebar {
             .snapshot_for(host)
             .sessions
             .iter()
-            .filter(|s| s.worktree.as_deref() == Some(tree))
+            .filter(|s| !s.is_exited() && s.worktree.as_deref() == Some(tree))
             .collect();
         let unread = host.is_local() && sessions.iter().any(|s| self.unread.contains(&s.id));
         let pairs: Vec<_> = sessions

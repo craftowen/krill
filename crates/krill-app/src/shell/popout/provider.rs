@@ -740,6 +740,22 @@ pub(super) fn provider_usage_menu(
                     .ok();
             }),
     );
+    let show_in_bar = krill_app::settings::status_provider_visible(provider, cx);
+    menu = menu.item(
+        PopupMenuItem::element(move |_, _| {
+            div()
+                .id(gpui::SharedString::from(format!(
+                    "status-provider-toggle-bar-{}",
+                    provider.as_str()
+                )))
+                .debug_selector(move || format!("status-provider-toggle-bar-{}", provider.as_str()))
+                .child(provider_text::PROVIDER_SHOW_IN_STATUS_BAR.get())
+        })
+        .checked(show_in_bar)
+        .on_click(move |_, _, cx| {
+            krill_app::settings::set_status_provider_visible(provider, !show_in_bar, cx);
+        }),
+    );
     let options_snap = snap.clone();
     let options_weak = weak.clone();
     let armed = reset_armed.cloned();

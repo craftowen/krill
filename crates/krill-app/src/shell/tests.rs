@@ -239,10 +239,19 @@ fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
         cx.update(|_, cx| view.read(cx).layout.zoomed_pane()),
         Some(id)
     );
+    let header: &'static str = Box::leak(format!("pane-header-{}", id.get()).into_boxed_str());
     let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
     assert!(
+        cx.debug_bounds(badge).is_none(),
+        "running pane header auto-hides until hovered"
+    );
+    let header_at = cx.debug_bounds(header).expect("zoomed header").center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_move(header_at, None, none);
+    cx.run_until_parked();
+    assert!(
         cx.debug_bounds(badge).is_some(),
-        "zoomed pane shows a badge"
+        "zoomed pane shows a badge on hover"
     );
     let unzoom: &'static str = Box::leak(format!("pane-unzoom-{}", id.get()).into_boxed_str());
     assert_eq!(
@@ -251,7 +260,6 @@ fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
         "pane header labels use the same compact control size as split/close icons"
     );
     let at = cx.debug_bounds(unzoom).expect("unzoom button").center();
-    let none = Modifiers::default();
     cx.simulate_mouse_down(at, MouseButton::Left, none);
     cx.simulate_mouse_up(at, MouseButton::Left, none);
     cx.run_until_parked();
@@ -280,9 +288,19 @@ fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
         Some(id)
     );
     let header: &'static str = Box::leak(format!("pane-header-{}", id.get()).into_boxed_str());
-    assert!(cx.debug_bounds(header).is_some(), "zoomed header shows");
+    let header_at = cx.debug_bounds(header).expect("zoomed header").center();
     let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
-    assert!(cx.debug_bounds(badge).is_some(), "zoomed badge shows");
+    assert!(
+        cx.debug_bounds(badge).is_none(),
+        "running pane header auto-hides before hover"
+    );
+    let none = Modifiers::default();
+    cx.simulate_mouse_move(header_at, None, none);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(badge).is_some(),
+        "zoomed badge shows on hover"
+    );
     let (split_count, is_split) = cx.update(|_, cx| {
         let s = view.read(cx);
         (s.layout.visible().len(), s.layout.visible().len() > 1)
@@ -293,7 +311,6 @@ fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
         .debug_bounds(close)
         .expect("header close button")
         .center();
-    let none = Modifiers::default();
     cx.simulate_mouse_down(at, MouseButton::Left, none);
     cx.simulate_mouse_up(at, MouseButton::Left, none);
     cx.run_until_parked();
@@ -2633,25 +2650,32 @@ fn invalid_layout_shows_notice_and_preserves_original(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn closed_pane_offers_restart_and_close(cx: &mut TestAppContext) {
-    let (view, cx) = open(cx, state_path("closed-pane"));
+fn closed_session_closes_last_tab_without_a_banner_or_restart(cx: &mut TestAppContext) {
+    let path = state_path("closed-pane");
+    let (view, cx) = open(cx, path.clone());
     let pane = layout_of(&view, cx).active_tab().focused;
     let (ours, _theirs) = UnixStream::pair().unwrap();
     view.update(cx, |s, cx| {
-        s.layout.set_session(pane, krill_proto::SessionId(83));
-        s.attach_test(pane, krill_proto::SessionId(83), ours, cx);
+        s.layout.set_session(pane, SessionId(83));
+        s.attach_test(pane, SessionId(83), ours, cx);
         assert!(!s.on_frame(pane, krill_proto::screen::kind::CLOSED, &[0], cx));
+        assert!(!s.live.contains_key(&pane));
+        assert!(!s.layout.pane_exists(pane));
+        assert!(s.layout.focused().is_none());
+        assert!(
+            s.closed_tabs.is_empty(),
+            "automatic cleanup must not enter reopen history"
+        );
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("session-ended").is_some());
-    assert!(cx.debug_bounds("close-ended-pane").is_some());
-    let button = cx.debug_bounds("restart-0").unwrap();
-    cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(button.center(), MouseButton::Left, Modifiers::default());
+    assert!(cx.debug_bounds("session-ended").is_none());
+    assert!(cx.debug_bounds("restart-0").is_none());
+    let saved = layout_of(&view, cx);
+    let restored = cx.update(|_, cx| cx.new(|cx| Shell::new(Some(path), cx)));
     cx.run_until_parked();
-    view.update(cx, |s, _| {
-        assert_eq!(s.layout.session(pane), None);
-        assert!(!s.live.contains_key(&pane));
+    restored.read_with(cx, |s, _| {
+        assert_eq!(s.layout.sessions(), saved.sessions());
+        assert!(!s.layout.pane_exists(pane));
     });
 }
 
@@ -2670,26 +2694,26 @@ fn unreadable_layout_disables_saving(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn close_ended_pane_targets_its_own_pane(cx: &mut TestAppContext) {
-    close_ended_pane_in_language(cx, krill_app::i18n::Language::En, px(16.));
+fn close_cold_pane_targets_its_own_pane(cx: &mut TestAppContext) {
+    close_cold_pane_in_language(cx, krill_app::i18n::Language::En, px(16.));
 }
 
 #[gpui::test]
-fn close_ended_pane_targets_its_own_pane_in_korean(cx: &mut TestAppContext) {
-    close_ended_pane_in_language(cx, krill_app::i18n::Language::Ko, px(16.));
+fn close_cold_pane_targets_its_own_pane_in_korean(cx: &mut TestAppContext) {
+    close_cold_pane_in_language(cx, krill_app::i18n::Language::Ko, px(16.));
 }
 
 #[gpui::test]
-fn close_ended_pane_targets_its_own_pane_at_maximum_english_zoom(cx: &mut TestAppContext) {
-    close_ended_pane_in_language(cx, krill_app::i18n::Language::En, px(32.));
+fn close_cold_pane_targets_its_own_pane_at_maximum_english_zoom(cx: &mut TestAppContext) {
+    close_cold_pane_in_language(cx, krill_app::i18n::Language::En, px(32.));
 }
 
 #[gpui::test]
-fn close_ended_pane_targets_its_own_pane_at_maximum_korean_zoom(cx: &mut TestAppContext) {
-    close_ended_pane_in_language(cx, krill_app::i18n::Language::Ko, px(32.));
+fn close_cold_pane_targets_its_own_pane_at_maximum_korean_zoom(cx: &mut TestAppContext) {
+    close_cold_pane_in_language(cx, krill_app::i18n::Language::Ko, px(32.));
 }
 
-fn close_ended_pane_in_language(
+fn close_cold_pane_in_language(
     cx: &mut TestAppContext,
     language: krill_app::i18n::Language,
     rem_size: gpui::Pixels,
@@ -2703,7 +2727,15 @@ fn close_ended_pane_in_language(
     view.update(cx, |s, cx| {
         s.change(true, cx, |l| l.split(Axis::Horizontal));
         s.attach_test(ended, krill_proto::SessionId(83), ours, cx);
-        assert!(!s.on_frame(ended, krill_proto::screen::kind::CLOSED, &[0], cx));
+        s.cold(
+            ended,
+            SessionId(83),
+            krill_proto::control::Cold {
+                screen: Vec::new(),
+                history: Vec::new(),
+            },
+            cx,
+        );
     });
     cx.run_until_parked();
     let other = layout_of(&view, cx).active_tab().focused;
@@ -4749,22 +4781,43 @@ fn single_pane_hides_header_and_commands_live_in_titlebar(cx: &mut TestAppContex
         s.change(true, cx, |l| l.split(Axis::Horizontal));
     });
     cx.run_until_parked();
+    let header_bounds = cx.debug_bounds(header).expect("split panes mount header");
     assert!(
-        cx.debug_bounds(header).is_some(),
-        "split panes show headers"
+        cx.debug_bounds("pane-close-0").is_none(),
+        "floating pane header auto-hides until hovered"
+    );
+    cx.simulate_mouse_move(header_bounds.center(), None, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("pane-close-0").is_some(),
+        "hovering floating pane header reveals controls"
+    );
+    cx.simulate_mouse_move(point(px(120.), px(240.)), None, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("pane-close-0").is_none(),
+        "leaving floating pane header hides controls again"
     );
 }
 
-/// OWE-653: 끝난 세션 배너의 버튼은 문구 오른쪽 끝에 정렬된다.
+/// OWE-653: 콜드 복원 배너의 버튼은 문구 오른쪽 끝에 정렬된다.
 #[gpui::test]
-fn ended_banner_aligns_buttons_to_the_right(cx: &mut TestAppContext) {
+fn cold_banner_aligns_buttons_to_the_right(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("ended-banner"));
     let pane = layout_of(&view, cx).active_tab().focused;
     let (ours, _theirs) = UnixStream::pair().unwrap();
     view.update(cx, |s, cx| {
         s.layout.set_session(pane, krill_proto::SessionId(84));
         s.attach_test(pane, krill_proto::SessionId(84), ours, cx);
-        assert!(!s.on_frame(pane, krill_proto::screen::kind::CLOSED, &[0], cx));
+        s.cold(
+            pane,
+            SessionId(84),
+            krill_proto::control::Cold {
+                screen: Vec::new(),
+                history: Vec::new(),
+            },
+            cx,
+        );
     });
     cx.run_until_parked();
     let banner = cx.debug_bounds("session-ended").expect("banner");
@@ -4781,39 +4834,43 @@ fn ended_banner_aligns_buttons_to_the_right(cx: &mut TestAppContext) {
     );
 }
 
-/// 새로 띄운 에이전트가 곧바로 끝나면 시작 실패로 표시한다. 셸·오래 돈 세션은 그냥 "세션 종료됨".
+/// 셸·에이전트 모두 종료되면 같은 세션의 분할도 닫고 다른 세션의 포커스는 유지한다.
 #[gpui::test]
-fn agent_exiting_right_after_start_is_flagged(cx: &mut TestAppContext) {
-    let (view, cx) = open(cx, state_path("agent-early-exit"));
-    let pane = layout_of(&view, cx).active_tab().focused;
-    let agent = krill_proto::control::AgentLaunch {
-        profile: "codex".into(),
-        permission: krill_proto::agent::Permission::Manual,
-    };
-    let cases = [
-        (Some(agent.clone()), Some(Instant::now()), true),
-        (None, Some(Instant::now()), false),
-        (Some(agent.clone()), None, false),
-        (
-            Some(agent),
-            Instant::now().checked_sub(EARLY_EXIT * 2),
-            false,
-        ),
-    ];
-    for (i, (launch, started, early)) in cases.into_iter().enumerate() {
+fn closed_session_removes_mirrors_and_preserves_other_sessions(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("closed-session-mirrors"));
+    for agent in [false, true] {
         let (ours, _theirs) = UnixStream::pair().unwrap();
         view.update(cx, |s, cx| {
-            let session = krill_proto::SessionId(90 + i as u64);
+            let pane = s.layout.active_tab().focused;
+            let session = SessionId(if agent { 91 } else { 90 });
             s.layout.set_session(pane, session);
             s.attach_test(pane, session, ours, cx);
-            let l = s.live.get_mut(&pane).unwrap();
-            l.launch = launch;
-            l.started = started;
+            if agent {
+                s.live.get_mut(&pane).unwrap().launch = Some(AgentLaunch {
+                    profile: "codex".into(),
+                    permission: krill_proto::agent::Permission::Manual,
+                });
+            }
+            s.change(true, cx, |layout| {
+                layout.split(Axis::Horizontal);
+                let mirror = layout.active_tab().focused;
+                layout.set_session(mirror, session);
+                layout.split(Axis::Vertical);
+            });
+            let other = s.layout.active_tab().focused;
+            let other_session = SessionId(session.0 + 100);
+            let (other_socket, _other_peer) = UnixStream::pair().unwrap();
+            s.layout.set_session(other, other_session);
+            s.attach_test(other, other_session, other_socket, cx);
             assert!(!s.on_frame(pane, krill_proto::screen::kind::CLOSED, &[0], cx));
-            assert_eq!(s.live[&pane].exited_early, early, "case {i}");
+            assert_eq!(s.layout.focused(), Some(other));
+            assert_eq!(s.layout.session(other), Some(other_session));
+            assert!(!s.live[&other].pane.is_closed());
+            assert!(!s.layout.sessions().contains(&session));
+            assert_eq!(s.layout.tabs().len(), 1);
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("session-ended").is_some());
+        assert!(cx.debug_bounds("session-ended").is_none());
     }
 }
 
@@ -4934,8 +4991,20 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         "remote tab must not show host badge in top tab bar"
     );
     assert!(
-        cx.debug_bounds("pane-host-badge-1").is_some(),
-        "remote pane header must show host badge even when unsplit"
+        cx.debug_bounds("pane-host-badge-1").is_none(),
+        "remote pane header auto-hides before hover"
+    );
+    let remote_header = cx
+        .debug_bounds("pane-header-1")
+        .expect("remote pane mounts floating header");
+    cx.simulate_mouse_move(remote_header.center(), None, Modifiers::default());
+    cx.run_until_parked();
+    let badge_bounds = cx
+        .debug_bounds("pane-host-badge-1")
+        .expect("remote pane header shows host badge on hover");
+    assert!(
+        (badge_bounds.left() - remote_header.left()) <= px(8.),
+        "floating pane header must tightly wrap host badge without left gap: header={remote_header:?}, badge={badge_bounds:?}"
     );
 
     // 원격 패인을 분할(⌘D)하면 새로 생긴 패인도 같은 원격 호스트를 이어받는다.
@@ -6091,7 +6160,7 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_some());
     assert!(cx.debug_bounds("sidebar-column").is_some());
-    let close = cx.debug_bounds("automations-page-close").unwrap();
+    let close = cx.debug_bounds("automations-back").unwrap();
     cx.simulate_click(close.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_none());
@@ -6175,6 +6244,34 @@ fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &m
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(cx.debug_bounds("artifacts-page").is_none());
+    assert_eq!(layout_of(&view, cx), before);
+}
+
+#[gpui::test]
+fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("automations-default"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let before = layout_of(&view, cx);
+    let nav = cx.debug_bounds("nav-automations").unwrap();
+    cx.simulate_click(nav.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-page").is_some());
+    assert!(cx.debug_bounds("automations-empty").is_some());
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        assert!(shell.settings.is_none());
+        assert!(shell.artifacts.is_none());
+        assert!(shell.automations.is_some());
+        assert_eq!(shell.layout, before);
+        assert_eq!(
+            shell.nav_history.entries.last(),
+            Some(&NavEntry::Automations)
+        );
+    });
+    let back = cx.debug_bounds("automations-back").unwrap();
+    cx.simulate_click(back.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-page").is_none());
     assert_eq!(layout_of(&view, cx), before);
 }
 

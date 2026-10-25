@@ -1680,3 +1680,82 @@ fn feature_loss_keeps_expired_stable_view_without_invisible_legacy_fetch() {
         "fresh explicit view still supports a legacy daemon"
     );
 }
+
+#[test]
+fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_cache() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+    let mut pane = Pane::default();
+    pane.link(
+        SessionId(1),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    update(&mut pane, 1, snapshot(["live-a", "live-b", "live-c"]));
+    sent(out(&mut pane));
+
+    // Rapid trackpad scroll ticks while the first remote HistoryViewRequest is in flight
+    // must accumulate offset instead of resetting to visible (0) + lines on every event.
+    pane.scroll(3);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let first_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(first_req.view, 0);
+    pane.scroll(5);
+    pane.scroll(-1);
+    assert_eq!(pane.history.offset, 7);
+
+    // If the first response fails (Missing) before any history row was shown (visible == 0),
+    // the pane resets back to live bottom and subsequent upward scroll opens a fresh view
+    // instead of wedging permanently at shown == 0, stopped == true.
+    let missing = HistoryViewRows {
+        req: first_req.req,
+        view: 1,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Missing,
+        identity: None,
+        skip: 0,
+        total: 0,
+        complete: false,
+        rows: Vec::new(),
+    };
+    let ev = feed(&mut pane, &missing.encode().unwrap());
+    assert!(ev.history_notice.is_some());
+    assert_eq!(pane.scroll_offset(), 0);
+    assert!(pane.history.stable.is_none());
+
+    // Scrolling up again must issue a brand new view == 0 request and render returned rows.
+    pane.scroll(2);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let retry_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(retry_req.view, 0);
+    let ready = HistoryViewRows {
+        req: retry_req.req,
+        view: 2,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 0,
+        total: 10,
+        complete: false,
+        rows: vec![row("hist-2"), row("hist-1")],
+    };
+    assert!(feed(&mut pane, &ready.encode().unwrap()).redraw);
+    assert_eq!(pane.scroll_offset(), 2);
+    assert_eq!(
+        pane.shown().rows,
+        vec![row("hist-1"), row("hist-2"), row("live-a")]
+    );
+}

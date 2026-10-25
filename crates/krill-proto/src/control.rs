@@ -529,12 +529,15 @@ pub struct SessionStatus {
 }
 
 /// MK-046 paths use OS bytes, including non-UTF-8 names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidebarData {
     #[serde(deserialize_with = "sidebar_sessions")]
     pub sessions: Vec<SessionDirectory>,
     #[serde(deserialize_with = "sidebar_repositories")]
     pub repositories: Vec<RepositoryTrees>,
+    /// 워크트리 경로별 현재 브랜치(`refs/heads/` 제거). 와이어 호환을 위해 [`Reply::Sidebar`] 꼬리 바이트로만 인코딩한다.
+    #[serde(default, skip)]
+    pub branches: Vec<(Vec<u8>, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +554,22 @@ pub struct RepositoryTrees {
     pub repo: Vec<u8>,
     #[serde(deserialize_with = "sidebar_trees")]
     pub worktrees: Vec<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+struct Branch(
+    #[serde(deserialize_with = "sidebar_path")] Vec<u8>,
+    #[serde(deserialize_with = "branch_text")] String,
+);
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Branches(#[serde(deserialize_with = "bounded::<_, Branch, 512>")] Vec<Branch>);
+fn branch_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let text = <&str>::deserialize(d)?;
+    if text.is_empty() || text.len() > MAX_TITLE_TEXT {
+        return Err(serde::de::Error::custom("branch text exceeds limit"));
+    }
+    Ok(text.to_owned())
 }
 
 pub(crate) fn bounded<'de, D, T, const MAX: usize>(d: D) -> Result<Vec<T>, D::Error>
@@ -1062,6 +1081,13 @@ impl Msg for Reply {
             }
             return crate::ipc::encode_frame(Self::KIND, &body);
         }
+        if let Self::Sidebar(data) = self {
+            let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
+            if !data.branches.is_empty() {
+                body.extend(postcard::to_stdvec(&data.branches).map_err(crate::ipc::Error::Codec)?);
+            }
+            return crate::ipc::encode_frame(Self::KIND, &body);
+        }
         crate::ipc::encode(Self::KIND, self)
     }
 
@@ -1121,6 +1147,34 @@ impl Msg for Reply {
                         tail = next;
                     }
                 }
+            }
+            return Ok(reply);
+        }
+        if kind == Self::KIND && body.first() == Some(&14) {
+            let (mut reply, rest) =
+                postcard::take_from_bytes::<Self>(body).map_err(crate::ipc::Error::Codec)?;
+            if !rest.is_empty()
+                && let Self::Sidebar(data) = &mut reply
+            {
+                let (Branches(branches), _) = postcard::take_from_bytes::<Branches>(rest)
+                    .map_err(crate::ipc::Error::Codec)?;
+                let branches: Vec<_> = branches
+                    .into_iter()
+                    .map(|Branch(path, branch)| (path, branch))
+                    .collect();
+                if branches.len() > 512
+                    || branches.iter().any(|(path, branch)| {
+                        path.is_empty()
+                            || path.len() > 4096
+                            || branch.is_empty()
+                            || branch.len() > MAX_TITLE_TEXT
+                    })
+                {
+                    return Err(crate::ipc::Error::Codec(
+                        postcard::Error::DeserializeBadEncoding,
+                    ));
+                }
+                data.branches = branches;
             }
             return Ok(reply);
         }

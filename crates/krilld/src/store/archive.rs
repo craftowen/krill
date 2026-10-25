@@ -34,6 +34,17 @@ impl Store {
         file.sync_all()
     }
 
+    /// `Resume` 중 holder 기동이 실패했을 때 미리 만들어 둔 `prior` 링크와 빈 디렉터리를 걷는다.
+    pub(crate) fn discard_inherited_history(&self, session: SessionId) {
+        let _gate = super::lock(&self.gate);
+        if !self.recording {
+            return;
+        }
+        let dir = self.session_dir(session);
+        fs::remove_file(dir.join(PRIOR)).ok();
+        fs::remove_dir(&dir).ok();
+    }
+
     pub(super) fn history_chain(&self, session: SessionId) -> Vec<SessionId> {
         let mut seen = Vec::new();
         let mut current = session;

@@ -611,11 +611,14 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
         "dashboard-session-1",
         "dashboard-session-2",
         "dashboard-session-3",
-        "dashboard-session-4",
         "dashboard-session-5",
     ] {
         assert!(visual.debug_bounds(selector).is_some());
     }
+    assert!(
+        visual.debug_bounds("dashboard-session-4").is_none(),
+        "ended sessions are not dashboard cards"
+    );
     assert_eq!(
         [
             lane(AgentState::Waiting),
@@ -1908,16 +1911,16 @@ fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
         expanded_account_usage(&windows, now + 60),
         "5h 0% 1h 30m · 7d 92% 1d 18h"
     );
-    // 좁은 창은 막대 쌍을 유지하고 리셋만 가장 큰 단위로 접는다.
+    // 5시간 사용량은 분까지, 주간 사용량은 남은 시간까지 표기한다.
     assert_eq!(
-        status_window_parts(usage.seven_day.as_ref(), now, true),
-        (Some(92), Some("1d".to_owned()))
+        status_window_parts(usage.seven_day.as_ref(), now),
+        (Some(92), Some("1d 19h".to_owned()))
     );
     assert_eq!(
-        status_window_parts(usage.five_hour.as_ref(), now, false),
+        status_window_parts(usage.five_hour.as_ref(), now),
         (Some(0), Some("1h 31m".to_owned()))
     );
-    assert_eq!(status_window_parts(None, now, true), (None, None));
+    assert_eq!(status_window_parts(None, now), (None, None));
     assert_eq!(status_window_label(None, now), "—");
     for (secs, expected) in [
         (0, "0m"),
@@ -2259,4 +2262,93 @@ fn dashboard_done_lane_orders_unread_top_and_clicked_cards_move_to_bottom(cx: &m
             (SessionId(3), false, Some(2)),
         ]
     );
+}
+
+#[gpui::test]
+fn status_bar_provider_visibility_toggle_hides_and_restores_pill(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountInfo, Snapshot, Window};
+    let (shell, handle) = open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Claude,
+            ProviderKind::OpenCode,
+        ])));
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
+            [ProviderKind::Claude, ProviderKind::OpenCode]
+                .into_iter()
+                .map(|provider| AccountInfo {
+                    id: provider.as_str().into(),
+                    provider,
+                    label: provider.display_name().into(),
+                    email: None,
+                    profile_dir: "/tmp/provider-toggle".into(),
+                    active: true,
+                    host_default: false,
+                    stale: false,
+                    usage: Snapshot {
+                        five_hour: Some(Window {
+                            percent: 12,
+                            resets_at: Some(
+                                (krill_app::accounts::display::now() + 5400).to_string(),
+                            ),
+                        }),
+                        seven_day: Some(Window {
+                            percent: 34,
+                            resets_at: Some(
+                                (krill_app::accounts::display::now() + 172_800).to_string(),
+                            ),
+                        }),
+                    },
+                })
+                .collect();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    assert!(vcx.debug_bounds("status-provider-pill-claude").is_some());
+    assert!(vcx.debug_bounds("status-provider-pill-opencode").is_some());
+
+    // OpenCode pill 메뉴에서 하단바 표시 끄기
+    let oc_pill = vcx.debug_bounds("status-provider-pill-opencode").unwrap();
+    vcx.simulate_click(oc_pill.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let toggle = vcx
+        .debug_bounds("status-provider-toggle-bar-opencode")
+        .unwrap();
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("status-provider-pill-claude").is_some());
+    assert!(vcx.debug_bounds("status-provider-pill-opencode").is_none());
+
+    // 상태바 우클릭 메뉴에서 다시 켜기
+    let bar = vcx.debug_bounds("status-bar").unwrap();
+    vcx.simulate_mouse_down(
+        bar.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    vcx.simulate_mouse_up(
+        bar.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    vcx.run_until_parked();
+    let restore = vcx
+        .debug_bounds("status-bar-menu-provider-opencode")
+        .unwrap();
+    eprintln!(
+        "DEBUG bar={:?} restore={:?} visible_before={}",
+        bar,
+        restore,
+        vcx.read(|cx| krill_app::settings::status_provider_visible(ProviderKind::OpenCode, cx))
+    );
+    vcx.simulate_click(restore.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    eprintln!(
+        "DEBUG visible_after={}",
+        vcx.read(|cx| krill_app::settings::status_provider_visible(ProviderKind::OpenCode, cx))
+    );
+
+    assert!(vcx.debug_bounds("status-provider-pill-opencode").is_some());
 }

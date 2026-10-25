@@ -119,6 +119,10 @@ struct State {
     exited: HashMap<SessionId, i32>,
     /// 닫기를 요청받은 세션. `Exited`가 오면 바로 지운다.
     closing: HashSet<SessionId>,
+    /// 명시적 `Close`로 닫힌 세션. 재부팅 소실 세션과 구분해 `Cold`·`Resume` 부활을 막는다.
+    closed: HashSet<SessionId>,
+    /// 이미 `Resume`으로 새 세션에 인계된 옛 세션. 중복 `Resume`이 빈 로그인 셸을 또 띄우지 않게 한다.
+    resumed: HashSet<SessionId>,
     roots: Roots,
     /// 다음 세션 id 후보.
     next: u64,
@@ -1264,6 +1268,9 @@ impl Registry {
         if !peer.authorize("cold", id, &lock(&self.state).roots, &self.audit) {
             return Err(Failure::Denied);
         }
+        if self.is_closed(id) {
+            return Err(Failure::NoSession);
+        }
         let store = self.store.as_ref().ok_or(Failure::NoSession)?;
         let restored = store
             .history(id)
@@ -1305,7 +1312,8 @@ impl Registry {
         )
     }
 
-    fn create(&self, peer: &Peer, c: Create) -> Result<Reply, Failure> {
+    fn create(&self, peer: &Peer, mut c: Create) -> Result<Reply, Failure> {
+        sanitize_spawn_cwd(&mut c.cwd);
         if c.account.is_some() && !matches!(c.program, Program::Agent { .. }) {
             return Err(Failure::BadRequest);
         }
@@ -1399,6 +1407,7 @@ impl Registry {
                 c.cwd = dir.as_os_str().as_bytes().to_vec();
             }
         }
+        sanitize_spawn_cwd(&mut c.cwd);
         let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
         let status_agent = self.status.get(old).agent;
         let profile_id = stored
@@ -1484,8 +1493,14 @@ impl Registry {
         if !peer.authorize("resume", old, &lock(&self.state).roots, &self.audit) {
             return Err(Failure::Denied);
         }
+        if self.is_closed(old) {
+            return Err(Failure::NoSession);
+        }
         {
             let st = lock(&self.state);
+            if st.resumed.contains(&old) {
+                return Err(Failure::NoSession);
+            }
             if st.sessions.contains_key(&old) && !st.exited.contains_key(&old) {
                 return Err(Failure::BadRequest);
             }
@@ -1493,6 +1508,10 @@ impl Registry {
         // 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다. 두 창이 동시에 눌러도
         // `claude --resume`이 두 번 뜨지 않는다(K-25).
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
+        // A competing resume may have completed between the first check and claim.
+        if self.is_closed(old) || lock(&self.state).resumed.contains(&old) {
+            return Err(Failure::NoSession);
+        }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let stored = self.agents.stored(old).map_err(|e| os(&e))?;
         let state = self.state_dir();
@@ -1505,6 +1524,7 @@ impl Registry {
         {
             c.cwd.clone_from(&s.cwd);
         }
+        sanitize_spawn_cwd(&mut c.cwd);
         let session = self.next_id();
         let Launch { argv, env } = match stored {
             Some(s) => {
@@ -1587,9 +1607,18 @@ impl Registry {
             store.inherit_history(session, old).map_err(|e| os(&e))?;
         }
         let (session, pid) =
-            self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows)?;
+            match self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows) {
+                Ok(spawned) => spawned,
+                Err(e) => {
+                    if let Some(store) = &self.store {
+                        store.discard_inherited_history(session);
+                    }
+                    return Err(e);
+                }
+            };
         let (has_old, exited_old) = {
-            let st = lock(&self.state);
+            let mut st = lock(&self.state);
+            st.resumed.insert(old);
             (st.sessions.contains_key(&old), st.exited.contains_key(&old))
         };
         if has_old && exited_old {
@@ -1631,26 +1660,19 @@ impl Registry {
         peer: &Peer,
         holder: &Holder,
         id: SessionId,
-        argv: Vec<Vec<u8>>,
+        mut argv: Vec<Vec<u8>>,
         mut env: Vec<(Vec<u8>, Vec<u8>)>,
-        cwd: Vec<u8>,
+        mut cwd: Vec<u8>,
         cols: u16,
         rows: u16,
     ) -> Result<(SessionId, u32), Failure> {
         use krill_proto::os::ffi::OsStrExt as _;
+        sanitize_spawn_cwd(&mut cwd);
         env.extend(crate::agent::pane_env_in(id, self.state_dir().as_deref()));
         // daemon `Create`의 거대 cols·rows도 여기서 자른다(K-01, CLI만 막는다).
         let size = crate::term::clamp_size(WinSize { cols, rows });
-        let initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
+        let mut initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
         env.extend(crate::git::worktree::environment(&initial_cwd));
-        let spawn = |req| ToHolder::Spawn {
-            req,
-            id,
-            argv,
-            env,
-            cwd,
-            size,
-        };
         // holder가 spawn한 직후 krilld가 죽어도 생성 계보가 남도록 먼저 저장한다.
         lock(&self.state)
             .roots
@@ -1660,7 +1682,35 @@ impl Registry {
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
         let _commit = lock(&self.hook_commit);
-        match holder.request(spawn).map_err(|_| Failure::NoHolder)? {
+        let mut reply = holder
+            .request(|req| ToHolder::Spawn {
+                req,
+                id,
+                argv: argv.clone(),
+                env: env.clone(),
+                cwd: cwd.clone(),
+                size,
+            })
+            .map_err(|_| Failure::NoHolder)?;
+        if matches!(
+            reply,
+            (FromHolder::Failed { errno, .. }, _)
+                if Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
+        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &env)
+        {
+            initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
+            reply = holder
+                .request(|req| ToHolder::Spawn {
+                    req,
+                    id,
+                    argv,
+                    env,
+                    cwd,
+                    size,
+                })
+                .map_err(|_| Failure::NoHolder)?;
+        }
+        match reply {
             (FromHolder::Spawned { pid, .. }, Some(master)) => {
                 let session = self.start(id, master, size).map_err(|e| {
                     // krilld가 master를 버렸으니 holder 것까지 놓으면 세션은 SIGHUP으로 끝난다.
@@ -2078,7 +2128,7 @@ impl Registry {
             }
             if !st.exited.contains_key(&id) {
                 // 끝나면 on_exited가 지운다. 잠금 안에서 표시해 그사이 온 Exited를 놓치지 않는다.
-                st.closing.insert(id);
+                let first = st.closing.insert(id);
                 drop(st);
                 let end = |req| {
                     if holder.version() >= TERMINATE_SINCE {
@@ -2091,27 +2141,52 @@ impl Registry {
                         }
                     }
                 };
-                return match holder.request(end) {
+                match holder.request(end) {
                     // ESRCH: 그사이 끝났다. Exited가 먼저 와서 on_exited가 지운다.
-                    Ok((FromHolder::Done { .. }, _)) => Ok(Reply::Closed),
+                    Ok((FromHolder::Done { .. }, _)) => {
+                        self.mark_closed(id);
+                        return Ok(Reply::Closed);
+                    }
                     Ok((FromHolder::Failed { errno, .. }, _)) if errno == libc::ESRCH => {
-                        Ok(Reply::Closed)
+                        self.mark_closed(id);
+                        return Ok(Reply::Closed);
                     }
                     r => {
-                        lock(&self.state).closing.remove(&id);
-                        Err(match r {
-                            Ok((FromHolder::Failed { errno, .. }, _)) => Failure::Os(errno),
-                            Ok(_) => Failure::Os(libc::EIO),
-                            Err(_) => Failure::NoHolder,
-                        })
+                        let mut st = lock(&self.state);
+                        if !st.sessions.contains_key(&id) {
+                            return Ok(Reply::Closed);
+                        }
+                        if !st.exited.contains_key(&id) {
+                            if first {
+                                st.closing.remove(&id);
+                            }
+                            return Err(match r {
+                                Ok((FromHolder::Failed { errno, .. }, _)) => Failure::Os(errno),
+                                Ok(_) => Failure::Os(libc::EIO),
+                                Err(_) => Failure::NoHolder,
+                            });
+                        }
                     }
-                };
+                }
             }
         }
         // 이미 끝난 세션: holder가 보관하던 master·상태를 놓게 한다. holder가 없거나 이미 놓았어도 지운다.
         holder.request(|req| ToHolder::Release { req, id }).ok();
+        self.mark_closed(id);
         self.remove(id);
         Ok(Reply::Closed)
+    }
+
+    fn mark_closed(&self, id: SessionId) {
+        lock(&self.state).closed.insert(id);
+        if let Some(store) = &self.store {
+            store.mark_closed(id);
+        }
+    }
+
+    fn is_closed(&self, id: SessionId) -> bool {
+        lock(&self.state).closed.contains(&id)
+            || self.store.as_ref().is_some_and(|s| s.is_closed(id))
     }
 
     /// holder `Exited` 송신 큐의 워커. 응답 리더와 분리해 `Release`가 exec 잠금을 기다려도 응답을 계속 읽는다.
@@ -2133,6 +2208,7 @@ impl Registry {
         if let Some(h) = &self.holder {
             h.notify(|req| ToHolder::Release { req, id }).ok();
         }
+        self.mark_closed(id);
         self.remove(id);
     }
 
@@ -3352,6 +3428,71 @@ impl Registry {
 
 fn os(e: &io::Error) -> Failure {
     Failure::Os(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
+    if let Ok(text) = std::str::from_utf8(cwd) {
+        let cleaned = krill_proto::orchestration::clean_workspace_path_str(text);
+        if cleaned != text {
+            *cwd = cleaned.into_bytes();
+        }
+    }
+}
+
+/// holder Spawn이 ENOENT로 실패했을 때:
+/// - `cwd` 디렉터리가 삭제·유실되어 존재하지 않는 경우 존재하는 상위 폴더·홈·빈 cwd로 폴백한다.
+/// - 로그인 셸(`-l`) 실행 파일이 삭제된 경우(`/opt/homebrew/bin/fish` 등) 시스템 기본 셸로 폴백한다.
+///
+/// 사용자 지정 실행 파일(`Program::Custom`) 자체가 없는 경우는 건드리지 않고 ENOENT를 그대로 돌려준다.
+fn fallback_spawn_on_enoent(
+    #[cfg_attr(
+        not(unix),
+        expect(unused_variables, reason = "로그인 셸(-l) 경로 폴백은 Unix 전용")
+    )]
+    argv: &mut [Vec<u8>],
+    cwd: &mut Vec<u8>,
+    env: &[(Vec<u8>, Vec<u8>)],
+) -> bool {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let mut changed = false;
+    if !cwd.is_empty() {
+        let cwd_path = Path::new(std::ffi::OsStr::from_bytes(cwd));
+        if !cwd_path.is_dir() {
+            let next_cwd = cwd_path
+                .ancestors()
+                .skip(1)
+                .find(|a| !a.as_os_str().is_empty() && a.is_dir())
+                .map(|a| a.as_os_str().as_bytes().to_vec())
+                .or_else(|| {
+                    env.iter()
+                        .find(|(k, _)| k.as_slice() == b"HOME")
+                        .map(|(_, v)| Path::new(std::ffi::OsStr::from_bytes(v)))
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.as_os_str().as_bytes().to_vec())
+                })
+                .unwrap_or_default();
+            *cwd = next_cwd;
+            changed = true;
+        }
+    }
+    #[cfg(unix)]
+    if argv.get(1).is_some_and(|a| a.as_slice() == b"-l")
+        && let Some(prog) = argv.first_mut()
+    {
+        let prog_path = Path::new(std::ffi::OsStr::from_bytes(prog));
+        if prog_path.is_absolute() && !prog_path.is_file() {
+            for candidate in [&b"/bin/zsh"[..], &b"/bin/sh"[..]] {
+                if Path::new(std::ffi::OsStr::from_bytes(candidate)).is_file()
+                    && prog.as_slice() != candidate
+                {
+                    *prog = candidate.to_vec();
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    changed
 }
 
 fn read_only(req: &Request) -> bool {

@@ -18,13 +18,13 @@ use krill_proto::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -94,7 +94,9 @@ pub(super) struct Backend {
     hello: ServerHello,
     host: Value,
     /// 카드 git 요약(branch·added·deleted) cwd별 캐시. 실패도 `Null`로 캐시한다.
-    git_cache: Mutex<HashMap<PathBuf, (Instant, Value)>>,
+    git_cache: Arc<Mutex<HashMap<PathBuf, (Instant, Value)>>>,
+    git_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+    git_revision: Arc<AtomicU64>,
     snapshot_cache: Mutex<Option<DashboardSnapshot>>,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
     settings_lock: Mutex<()>,
@@ -287,7 +289,9 @@ impl Backend {
             dir: dir.map(Path::to_path_buf),
             hello,
             host: host_metadata(),
-            git_cache: Mutex::default(),
+            git_cache: Arc::default(),
+            git_inflight: Arc::default(),
+            git_revision: Arc::default(),
             snapshot_cache: Mutex::default(),
             catalog_cache: Mutex::default(),
             settings_lock: Mutex::default(),
@@ -818,11 +822,19 @@ impl Backend {
         Ok(json!({"quick_commands":normalized}))
     }
 
+    fn effective_revision(&self, registry: &Registry) -> u64 {
+        registry.dashboard_revision()
+            ^ self
+                .git_revision
+                .load(Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
     fn snapshot_since(&self, since: Option<&str>) -> io::Result<Value> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         // This mutex is a snapshot-only singleflight, independent of registry/session IO.
         let mut cached = crate::session::lock(&self.snapshot_cache);
-        let revision = registry.dashboard_revision();
+        let revision = self.effective_revision(&registry);
         if let Some(snapshot) = cached.as_ref()
             && snapshot.revision == revision
             && snapshot.at.elapsed() < GIT_TTL
@@ -851,7 +863,6 @@ impl Backend {
         // Validate the dependency identity actually used by this body. A newer
         // catalog or a fresh post-build stamp cannot authenticate an older body.
         if let Some((paths, stamps)) = self.snapshot_dependencies(&data, catalog_used.as_ref())
-            && registry.dashboard_revision() == revision
             && before == file_stamps(&base_paths)
         {
             *cached = Some(DashboardSnapshot {
@@ -984,6 +995,7 @@ impl Backend {
             _ => control::SidebarData {
                 sessions: Vec::new(),
                 repositories: Vec::new(),
+                branches: Vec::new(),
             },
         };
         let catalog = self.catalog(&sidebar.repositories);
@@ -1002,7 +1014,7 @@ impl Backend {
                 (info, cwd, group)
             })
             .collect();
-        let git = self.git_summaries(
+        let git = self.git_summaries_swr(
             rows.iter()
                 .filter_map(|(_, cwd, group)| git_cwd(cwd, group)),
         );
@@ -1112,8 +1124,130 @@ impl Backend {
             .orchestration_snapshot()?;
         Ok(requests::snapshot(&store))
     }
+    /// 만료된 값도 즉시 반환하고, cwd별로 하나의 백그라운드 조회만 예약한다.
+    /// 최초 미캐시(cold) cwd는 총 80ms 시한 안에서만 즉시 수확하고 넘치면 백그라운드로 넘긴다.
+    fn git_summaries_swr(
+        &self,
+        cwds: impl IntoIterator<Item = PathBuf>,
+    ) -> HashMap<PathBuf, Value> {
+        let mut found = HashMap::new();
+        let mut cold = Vec::new();
+        let mut stale = Vec::new();
+        {
+            let cache = crate::session::lock(&self.git_cache);
+            for cwd in cwds {
+                if found.contains_key(&cwd) {
+                    continue;
+                }
+                let value = if let Some((at, value)) = cache.get(&cwd) {
+                    if at.elapsed() >= GIT_TTL {
+                        stale.push(cwd.clone());
+                    }
+                    value.clone()
+                } else {
+                    cold.push(cwd.clone());
+                    Value::Null
+                };
+                found.insert(cwd, value);
+            }
+        }
+        {
+            let mut inflight = crate::session::lock(&self.git_inflight);
+            cold.retain(|cwd| inflight.insert(cwd.clone()));
+            stale.retain(|cwd| inflight.insert(cwd.clone()));
+        }
+        let mut deferred = Vec::new();
+        if !cold.is_empty() {
+            let queue = crate::git::queue().ok();
+            let pending: Vec<_> = cold
+                .into_iter()
+                .map(|cwd| {
+                    let rx = queue.map(|q| {
+                        crate::git::changes::query_with_branch(
+                            q,
+                            cwd.clone(),
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                    });
+                    (cwd, rx)
+                })
+                .collect();
+            let deadline = Instant::now() + Duration::from_millis(80);
+            for (cwd, rx) in pending {
+                let Some(rx) = rx else {
+                    crate::session::lock(&self.git_cache)
+                        .insert(cwd.clone(), (Instant::now(), Value::Null));
+                    crate::session::lock(&self.git_inflight).remove(&cwd);
+                    continue;
+                };
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(res) => {
+                        let value = res.ok().map_or(Value::Null, |(changes, branch)| {
+                            let (added, deleted) = totals(&changes);
+                            json!({"branch":branch,"added":added,"deleted":deleted})
+                        });
+                        crate::session::lock(&self.git_cache)
+                            .insert(cwd.clone(), (Instant::now(), value.clone()));
+                        crate::session::lock(&self.git_inflight).remove(&cwd);
+                        found.insert(cwd, value);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        deferred.push((cwd, Some(rx)));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        crate::session::lock(&self.git_cache)
+                            .insert(cwd.clone(), (Instant::now(), Value::Null));
+                        crate::session::lock(&self.git_inflight).remove(&cwd);
+                    }
+                }
+            }
+        }
+        if !deferred.is_empty() || !stale.is_empty() {
+            let cache = Arc::clone(&self.git_cache);
+            let inflight = Arc::clone(&self.git_inflight);
+            let revision = Arc::clone(&self.git_revision);
+            let mut scheduled: Vec<PathBuf> = deferred.iter().map(|(cwd, _)| cwd.clone()).collect();
+            scheduled.extend(stale.iter().cloned());
+            let spawned = thread::Builder::new()
+                .name("mobile-git-swr".into())
+                .spawn(move || {
+                    let queue = crate::git::queue().ok();
+                    let mut pending = deferred;
+                    pending.extend(stale.into_iter().map(|cwd| {
+                        let rx = queue.map(|q| {
+                            crate::git::changes::query_with_branch(
+                                q,
+                                cwd.clone(),
+                                Arc::new(AtomicBool::new(false)),
+                            )
+                        });
+                        (cwd, rx)
+                    }));
+                    for (cwd, rx) in pending {
+                        let value = rx
+                            .and_then(|rx| rx.recv().ok())
+                            .and_then(Result::ok)
+                            .map_or(Value::Null, |(changes, branch)| {
+                                let (added, deleted) = totals(&changes);
+                                json!({"branch":branch,"added":added,"deleted":deleted})
+                            });
+                        crate::session::lock(&cache).insert(cwd.clone(), (Instant::now(), value));
+                        crate::session::lock(&inflight).remove(&cwd);
+                        revision.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            if spawned.is_err() {
+                let mut inflight = crate::session::lock(&self.git_inflight);
+                for cwd in scheduled {
+                    inflight.remove(&cwd);
+                }
+            }
+        }
+        found
+    }
     /// 카드용 git 요약을 cwd별로 모은다. 캐시에 없는 cwd는 큐에 전부 먼저 넣고 나서 받는다
     /// (큐 워커 [`crate::git::MAX_CONCURRENT`]개가 서로 다른 cwd를 동시에 돈다. 같은 키만 직렬).
+    #[cfg(all(test, unix))]
     fn git_summaries(&self, cwds: impl IntoIterator<Item = PathBuf>) -> HashMap<PathBuf, Value> {
         let mut found = HashMap::new();
         let mut missing = Vec::new();
@@ -2222,6 +2356,77 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // git CLI shell alias gates the shared queue for this cwd.
+    fn card_git_swr_returns_cold_and_expired_values_before_background_refresh() {
+        let dir = std::env::temp_dir().join(format!("mk-pwa-git-swr-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let output = Command::new("git")
+            .args(["init", "-q", "-b", "swr"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let backend = test_backend();
+        let expected = json!({"branch":"swr","added":0,"deleted":0});
+        let stale = json!({"branch":"old","added":7,"deleted":3});
+        for generation in 1..=2 {
+            if generation == 2 {
+                crate::session::lock(&backend.git_cache).insert(
+                    dir.clone(),
+                    (Instant::now().checked_sub(GIT_TTL).unwrap(), stale.clone()),
+                );
+            }
+            // Keep the real Git query queued until both immediate responses are checked.
+            let gate = crate::git::queue().unwrap().submit(dir.clone(), [
+                "-c", "alias.swr-gate=!touch .git/swr-started; while test ! -e .git/swr-release; do sleep 0.01; done",
+                "swr-gate",
+            ]);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !dir.join(".git/swr-started").exists() {
+                assert!(Instant::now() < deadline, "queue gate did not start");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let started = Instant::now();
+            let found = backend.git_summaries_swr([dir.clone(), dir.clone()]);
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert_eq!(found.len(), 1);
+            let immediate = if generation == 1 {
+                Value::Null
+            } else {
+                stale.clone()
+            };
+            assert_eq!(found[&dir], immediate);
+            assert_eq!(backend.git_summaries_swr([dir.clone()])[&dir], immediate);
+            assert_eq!(crate::session::lock(&backend.git_inflight).len(), 1);
+            assert_eq!(backend.git_revision.load(Ordering::Relaxed), generation - 1);
+            fs::remove_file(dir.join(".git/swr-started")).unwrap();
+            fs::write(dir.join(".git/swr-release"), "").unwrap();
+            assert!(
+                gate.recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            fs::remove_file(dir.join(".git/swr-release")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while backend.git_revision.load(Ordering::Relaxed) < generation {
+                assert!(
+                    Instant::now() < deadline,
+                    "background refresh did not complete"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(backend.git_revision.load(Ordering::Relaxed), generation);
+            assert!(crate::session::lock(&backend.git_inflight).is_empty());
+            assert_eq!(crate::session::lock(&backend.git_cache)[&dir].1, expected);
+            assert_eq!(backend.git_summaries_swr([dir.clone()])[&dir], expected);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn host_metadata_reports_only_actual_hostname_and_platform() {
         let host = host_metadata();
         let expected = Command::new(if cfg!(windows) {
@@ -2348,6 +2553,30 @@ mod tests {
 mod revision_tests {
     use super::*;
     #[test]
+    fn git_refresh_changes_the_effective_dashboard_revision() {
+        let registry = Registry::new(None, None);
+        let backend = Backend::new(
+            Weak::new(),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let before = backend.effective_revision(&registry);
+        assert_eq!(before, registry.dashboard_revision());
+        backend.git_revision.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(backend.effective_revision(&registry), before);
+        assert_eq!(
+            backend.effective_revision(&registry),
+            registry.dashboard_revision() ^ 0x9E37_79B9_7F4A_7C15
+        );
+    }
+
+    #[test]
     fn near_limit_workflow_snapshot_roundtrips_on_rpc_stack() {
         let worker = std::thread::Builder::new().stack_size(super::super::gateway::RPC_STACK).spawn(|| {
             let registry = Arc::new(Registry::new(None, None));
@@ -2357,7 +2586,7 @@ mod revision_tests {
             let sessions: Vec<_> = (1..=64).map(|id| json!({"id":id,"title":"fixture","state":"Working","lines":["one","two","three"]})).collect();
             let data = json!({"sessions":sessions,"padding":"x".repeat(ipc::MAX_FRAME - 20_000),"etag":"stack"});
             *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
-                revision: registry.dashboard_revision(), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
+                revision: backend.effective_revision(&registry), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
             });
             let reply = backend.request("{\"action\":\"snapshot\"}");
             assert!(reply.len() > ipc::MAX_FRAME - 20_000);
@@ -2391,8 +2620,9 @@ mod revision_tests {
                 instance_id: 1,
             },
         );
+        backend.git_revision.store(7, Ordering::Relaxed);
         *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
-            revision: registry.dashboard_revision(),
+            revision: backend.effective_revision(&registry),
             paths: Vec::new(),
             stamps: Vec::new(),
             at: Instant::now(),

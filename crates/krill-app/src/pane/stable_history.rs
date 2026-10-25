@@ -43,8 +43,22 @@ impl Cache {
     pub(super) fn total(&self) -> usize {
         self.complete.unwrap_or(self.known)
     }
+    pub(super) fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub(super) fn complete_total(&self) -> Option<usize> {
+        self.complete
+    }
     pub(super) fn can_compose(&self, lines: usize) -> bool {
         (self.shown.saturating_sub(lines)..self.shown).all(|i| self.rows.contains_key(&i))
+    }
+    pub(super) fn can_compose_at(&self, wanted: usize) -> bool {
+        let wanted = self.complete.map_or(wanted, |total| wanted.min(total));
+        self.lines > 0
+            && (wanted.saturating_sub(self.lines)..wanted).all(|i| self.rows.contains_key(&i))
     }
     pub(super) fn row(&self, index: usize) -> Option<&Vec<Cell>> {
         self.rows.get(&index)

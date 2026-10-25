@@ -109,10 +109,14 @@ pub(super) fn snapshot(
         directories, last, ..
     } = &mut *cache;
     last.retain(|path, _| directories.values().any(|p| p == path));
-    Ok(SidebarData {
+    drop(cache);
+    let mut data = SidebarData {
         sessions,
         repositories: repositories.into_values().collect(),
-    })
+        branches: Vec::new(),
+    };
+    populate_branches(&mut data);
+    Ok(data)
 }
 
 /// 3초 안의 캐시가 있으면 IO 없이 돌려준다. 바깥 `None`은 캐시 없음, 안쪽 `None`은 저장소가 아님이다.
@@ -133,14 +137,14 @@ fn fresh(cache: &Cache, path: &Path) -> Option<Option<RepositoryTrees>> {
 }
 
 /// 요청 스레드용 조회. 파일·git IO는 cwd당 하나의 백그라운드 스레드가 맡고, 여기서는 `deadline`까지만
-/// 기다린다. 시한을 넘기면 마지막 결과를 돌려줘 응답이 막히거나 스레드가 쌓이지 않게 한다.
+/// 기다린다. 이전 결과가 있으면 갱신을 예약하고 즉시 돌려준다.
 fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<RepositoryTrees> {
     let flight = {
         let mut state = lock(cache);
         if let Some(hit) = fresh(&state, path) {
             return hit;
         }
-        if let Some(flight) = state.lookups.get(path) {
+        let flight = if let Some(flight) = state.lookups.get(path) {
             Arc::clone(flight)
         } else {
             let flight = Arc::new(Discovery::default());
@@ -169,7 +173,11 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
             }
             state.lookups.insert(path.to_owned(), Arc::clone(&flight));
             flight
+        };
+        if let Some(cached) = state.last.get(path).cloned() {
+            return Some(cached);
         }
+        flight
     };
     let mut result = lock(&flight.result);
     while matches!(*result, DiscoveryResult::Pending) {
@@ -311,7 +319,8 @@ fn merge_projects(data: &mut SidebarData, state_dir: &Path) {
         return;
     };
     for p in file.projects {
-        let path = p.path.trim().as_bytes();
+        let cleaned = krill_proto::orchestration::clean_workspace_path_str(&p.path);
+        let path = cleaned.as_bytes();
         if p.archived || p.host_id.is_some() || path.is_empty() || path.len() > 4096 {
             continue;
         }
@@ -335,6 +344,53 @@ fn merge_projects(data: &mut SidebarData, state_dir: &Path) {
             });
         }
     }
+    populate_branches(data);
+}
+
+fn small_file(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+fn head_branch(tree: &Path) -> Option<String> {
+    let git = tree.join(".git");
+    let dir = if git.is_dir() {
+        git
+    } else {
+        let link = small_file(&git)?;
+        let dir = PathBuf::from(link.strip_prefix("gitdir:")?.trim());
+        tree.join(dir)
+    };
+    let head = small_file(&dir.join("HEAD"))?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .filter(|b| !b.is_empty() && b.len() <= krill_proto::control::MAX_TITLE_TEXT)
+        .map(str::to_owned)
+}
+
+fn populate_branches(data: &mut SidebarData) {
+    let mut branches = Vec::new();
+    for repo in &data.repositories {
+        for wt in &repo.worktrees {
+            if branches.len() >= 512 {
+                break;
+            }
+            if wt.is_empty() || wt.len() > 4096 {
+                continue;
+            }
+            let path = PathBuf::from(std::ffi::OsString::from_vec(wt.clone()));
+            if let Some(branch) = head_branch(&path) {
+                branches.push((wt.clone(), branch));
+            }
+        }
+    }
+    data.branches = branches;
 }
 
 fn discover(cwd: &Path) -> Option<RepositoryTrees> {
@@ -390,12 +446,19 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("krilld-sidebar-projects-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let git_repo = dir.join("git-repo");
+        std::fs::create_dir_all(git_repo.join(".git")).unwrap();
+        std::fs::write(git_repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(
             dir.join("projects.toml"),
-            "[[projects]]\npath = \"/repo\"\n\n[[projects]]\npath = \"/folder\"\n\n\
-             [[projects]]\npath = \"/repo-wt\"\n\n\
-             [[projects]]\npath = \"/old\"\narchived = true\n\n\
-             [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
+            format!(
+                "[[projects]]\npath = \"/repo\"\n\n[[projects]]\npath = \"/folder\"\n\n\
+                 [[projects]]\npath = \"/repo-wt\"\n\n\
+                 [[projects]]\npath = \"{}\"\n\n\
+                 [[projects]]\npath = \"/old\"\narchived = true\n\n\
+                 [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
+                git_repo.display()
+            ),
         )
         .unwrap();
         let mut data = SidebarData {
@@ -404,16 +467,22 @@ mod tests {
                 repo: b"/repo".to_vec(),
                 worktrees: vec![b"/repo".to_vec(), b"/repo-wt".to_vec()],
             }],
+            branches: Vec::new(),
         };
         merge_projects(&mut data, &dir);
+        let git_repo_bytes = git_repo.as_os_str().as_bytes().to_vec();
         std::fs::remove_dir_all(&dir).ok();
         let repos: Vec<_> = data
             .repositories
             .iter()
             .map(|r| r.repo.as_slice())
             .collect();
-        assert_eq!(repos, [&b"/repo"[..], &b"/folder"[..]]);
+        assert_eq!(
+            repos,
+            [&b"/repo"[..], &b"/folder"[..], git_repo_bytes.as_slice()]
+        );
         assert_eq!(data.repositories[0].worktrees.len(), 2);
+        assert_eq!(data.branches, vec![(git_repo_bytes, "main".to_owned())]);
     }
 
     #[test]
@@ -464,7 +533,7 @@ mod tests {
 mod concurrency_tests {
     use super::*;
     #[test]
-    fn a_stuck_lookup_answers_within_the_deadline_with_the_last_result() {
+    fn a_stuck_lookup_returns_the_last_result_without_waiting() {
         let path = PathBuf::from("/krill-sidebar-stuck-lookup-not-a-repository");
         let cache = Arc::new(Mutex::new(Cache::default()));
         let stuck = Arc::new(Discovery::default());
@@ -478,10 +547,10 @@ mod concurrency_tests {
             state.last.insert(path.clone(), last.clone());
         }
         let started = Instant::now();
-        let got = lookup(&cache, &path, started + Duration::from_millis(50));
+        let got = lookup(&cache, &path, started + LOOKUP_BUDGET);
         assert_eq!(got, Some(last));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        // 같은 cwd의 다음 요청도 새 조회 스레드를 만들지 않고 진행 중인 조회를 기다린다.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // 같은 cwd의 다음 요청도 새 조회 스레드를 만들지 않고 기존 조회를 공유한다.
         assert!(Arc::ptr_eq(
             lock(&cache).lookups.get(&path).unwrap(),
             &stuck

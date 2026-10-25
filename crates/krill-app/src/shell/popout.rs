@@ -755,11 +755,10 @@ fn status_alert_icon(p: &ui::Palette) -> gpui_component::Icon {
         .text_color(p.muted_foreground)
 }
 
-/// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간. `short`면 가장 큰 단위만(`9h 3m` → `9h`).
+/// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간(5시간은 분까지, 주간은 남은 시간까지).
 fn status_window_parts(
     win: Option<&krill_proto::usage::Window>,
     now: u64,
-    short: bool,
 ) -> (Option<u8>, Option<String>) {
     let Some(win) = win else {
         return (None, None);
@@ -770,15 +769,10 @@ fn status_window_parts(
         .map(|ts| krill_app::settings::classify_reset(ts, now));
     match reset {
         Some(krill_app::settings::ResetDue::Stale) => (None, Some("now".into())),
-        Some(krill_app::settings::ResetDue::Future(left)) => {
-            let full = status_reset_duration(left);
-            let reset = if short {
-                full.split(' ').next().unwrap_or_default().to_owned()
-            } else {
-                full
-            };
-            (Some(win.percent.min(100)), Some(reset))
-        }
+        Some(krill_app::settings::ResetDue::Future(left)) => (
+            Some(win.percent.min(100)),
+            Some(status_reset_duration(left)),
+        ),
         _ => (Some(win.percent.min(100)), None),
     }
 }
@@ -790,7 +784,7 @@ fn status_window_segment(
     short: bool,
     p: &ui::Palette,
 ) -> gpui::Div {
-    let (pct, reset) = status_window_parts(win, now, short);
+    let (pct, reset) = status_window_parts(win, now);
     let bar = if short {
         ui::SPACE_4
     } else {
@@ -1341,10 +1335,11 @@ impl Shell {
         let status_providers: Vec<_> = status_providers
             .into_iter()
             .filter(|provider| {
-                has_provider_pill(&snap, *provider, account_host.is_remote(), cx)
-                    || account_hosts
-                        .iter()
-                        .any(|(h, _, s)| h.is_remote() && has_provider_pill(s, *provider, true, cx))
+                krill_app::settings::status_provider_visible(*provider, cx)
+                    && (has_provider_pill(&snap, *provider, account_host.is_remote(), cx)
+                        || account_hosts.iter().any(|(h, _, s)| {
+                            h.is_remote() && has_provider_pill(s, *provider, true, cx)
+                        }))
             })
             .collect();
         let expanded = expanded_usage_fits(
@@ -2042,9 +2037,10 @@ impl Shell {
                     .child(self.resources.clone()),
             )
             // 하-4: 상태바 우클릭 메뉴. 상태바에 이미 있는 동작과 설정 열기만 담는다.
-            .context_menu(move |m, _, _| {
+            .context_menu(move |mut m, _, cx| {
                 let weak = weak.clone();
-                m.action_context(focus.clone())
+                m = m
+                    .action_context(focus.clone())
                     .item(
                         PopupMenuItem::element(|_, _| {
                             div()
@@ -2059,6 +2055,26 @@ impl Shell {
                         }),
                     )
                     .separator()
+                    .label(provider_text::PROVIDER_STATUS_BAR_SECTION.get());
+                for provider in ProviderKind::ALL {
+                    let visible = krill_app::settings::status_provider_visible(provider, cx);
+                    m = m.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .debug_selector(move || {
+                                    format!("status-bar-menu-provider-{}", provider.as_str())
+                                })
+                                .child(provider.display_name())
+                        })
+                        .checked(visible)
+                        .on_click(move |_, _, cx| {
+                            krill_app::settings::set_status_provider_visible(
+                                provider, !visible, cx,
+                            );
+                        }),
+                    );
+                }
+                m.separator()
                     .menu_with_disabled(
                         text::FLOAT_MENU.get(),
                         Box::new(FloatTerminal),

@@ -679,3 +679,127 @@ fn reboot_empty_sidebar_opens_saved_agent_workspace_without_creating_shell(
     assert!(layout.visible().contains(&panes[1]));
     assert_eq!(layout.sessions(), saved.sessions());
 }
+
+#[gpui::test]
+fn closing_remote_session_is_not_readded_after_interleaved_snapshots_and_externally_closed_session_closes_tab(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostStatus;
+    let (view, cx) = open(cx, state_path("workspace-remote-close-loop"));
+    let remote = HostId::Remote("macmini".into());
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "macmini",
+                HostStatus::Connected,
+                live_snapshot(&[41, 42], "/work/krill"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    click_host_card(&view, cx, &remote);
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.layout.sessions_for_host(&remote),
+            vec![SessionId(41), SessionId(42)]
+        );
+        let (tab, _) = s.tab_pane_for_session_on(&remote, SessionId(42)).unwrap();
+        s.do_close_tab(tab, cx);
+        // 종료 직후 스냅샷에서 Exited로 잠깐 바뀌거나 일시 누락된 뒤 지연된 옛 스냅샷이 다시 도착해도
+        // 닫은 원격 세션(42)이 새 Program::Login 탭으로 부활하면 안 된다.
+        let mut exited_snap = live_snapshot(&[41], "/work/krill");
+        let mut s42 = live_session(42, "/work/krill");
+        s42.status.state = krill_proto::control::AgentState::Exited;
+        exited_snap.sessions.push(s42);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test("macmini", HostStatus::Connected, exited_snap, cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "macmini",
+                HostStatus::Connected,
+                live_snapshot(&[41, 42], "/work/krill"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(s.layout.sessions_for_host(&remote), vec![SessionId(41)]);
+        // 원격 클라이언트 등 외부에서 세션 41을 종료해 스냅샷에서 완전히 사라지면
+        // 남아 있던 탭도 함께 정리되고 숨은 세션 복원(restore_hidden_sessions)도 돌지 않는다.
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "macmini",
+                HostStatus::Connected,
+                live_snapshot(&[], "/work/krill"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| {
+        assert!(s.layout.sessions_for_host(&remote).is_empty());
+        assert_eq!(s.closed_sessions, vec![SessionId(42)]);
+    });
+}
+
+/// 종료 스냅샷은 비활성 탭도 정리한다. 호스트별 같은 ID와 셸 안의 `SessionEnd`는 보존한다.
+#[gpui::test]
+fn exited_snapshot_closes_hidden_tab_without_trees_or_prior_observation(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostStatus;
+    use krill_proto::control::{AgentState, Source};
+    let (view, cx) = open(cx, state_path("workspace-exited-snapshot"));
+    let remote = HostId::Remote("studio".into());
+    let (local, ended, hook) = view.update(cx, |s, cx| {
+        let local = s.layout.active_tab().focused;
+        s.change(true, cx, |layout| {
+            layout.set_session(local, SessionId(41));
+            layout.new_tab();
+            layout.set_host(layout.active_tab().focused, remote.clone());
+            layout.set_session(layout.active_tab().focused, SessionId(41));
+        });
+        let ended = s.layout.active_tab().focused;
+        s.change(true, cx, |layout| {
+            layout.new_tab();
+            layout.set_host(layout.active_tab().focused, remote.clone());
+            layout.set_session(layout.active_tab().focused, SessionId(42));
+        });
+        let hook = s.layout.active_tab().focused;
+        s.change(true, cx, |layout| layout.activate(0));
+        assert!(
+            !s.observed_sessions
+                .contains(&(remote.clone(), SessionId(41)))
+        );
+        let mut exited = live_session(41, "/work/krill");
+        exited.status.state = AgentState::Exited;
+        exited.status.source = Some(Source::Process);
+        let mut hook_exited = live_session(42, "/work/krill");
+        hook_exited.status.state = AgentState::Exited;
+        hook_exited.status.source = Some(Source::Hook);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Connected,
+                sidebar::Snapshot {
+                    sessions: vec![exited, hook_exited],
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        (local, ended, hook)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(!s.layout.pane_exists(ended));
+        assert!(s.layout.pane_exists(hook));
+        assert_eq!(s.layout.session(local), Some(SessionId(41)));
+        assert_eq!(s.layout.focused(), Some(local));
+        assert!(s.workspace_closing.contains(&(remote, SessionId(41))));
+    });
+}

@@ -613,8 +613,8 @@ impl DarkUiTheme {
 #[serde(rename_all = "snake_case")]
 pub enum LightUiTheme {
     #[default]
-    Classic,
     Paper,
+    Classic,
     Moonlight,
     Limestone,
     Celadon,
@@ -623,8 +623,8 @@ pub enum LightUiTheme {
 
 impl LightUiTheme {
     pub const ALL: [Self; 6] = [
-        Self::Classic,
         Self::Paper,
+        Self::Classic,
         Self::Moonlight,
         Self::Limestone,
         Self::Celadon,
@@ -634,8 +634,8 @@ impl LightUiTheme {
     #[must_use]
     pub const fn palette(self) -> &'static Palette {
         match self {
-            Self::Classic => &LIGHT,
             Self::Paper => &PAPER,
+            Self::Classic => &LIGHT,
             Self::Moonlight => &MOONLIGHT,
             Self::Limestone => &LIMESTONE,
             Self::Celadon => &CELADON,
@@ -648,8 +648,8 @@ impl LightUiTheme {
     pub fn label(self) -> &'static str {
         use crate::i18n::catalog::settings as text;
         match self {
-            Self::Classic => text::UI_THEME_CLASSIC.get(),
             Self::Paper => text::UI_THEME_PAPER.get(),
+            Self::Classic => text::UI_THEME_CLASSIC.get(),
             Self::Moonlight => text::UI_THEME_MOONLIGHT.get(),
             Self::Limestone => text::UI_THEME_LIMESTONE.get(),
             Self::Celadon => text::UI_THEME_CELADON.get(),
@@ -661,8 +661,8 @@ impl LightUiTheme {
     #[must_use]
     pub const fn terminal_theme_name(self) -> &'static str {
         match self {
-            Self::Classic => super::terminal_themes::DEFAULT_TERMINAL_THEME_LIGHT,
-            Self::Paper => super::terminal_themes::KRILL_PAPER,
+            Self::Paper => super::terminal_themes::DEFAULT_TERMINAL_THEME_LIGHT,
+            Self::Classic => super::terminal_themes::BUILTIN_TANGO_LIGHT,
             Self::Moonlight => super::terminal_themes::KRILL_MOONLIGHT,
             Self::Limestone => super::terminal_themes::KRILL_LIMESTONE,
             Self::Celadon => super::terminal_themes::KRILL_CELADON,
@@ -712,8 +712,33 @@ pub const TERMINAL_DEEP: TerminalTheme = TerminalTheme {
     ..TERMINAL_GHOSTTY_DARK
 };
 
-/// Orca 라이트 터미널 팔레트(`Builtin Tango Light`, `.ref/orca/src/shared/terminal-themes/defaults.ts`).
+/// Krill 라이트 터미널 기본 테마 `Krill Paper`.
 pub const TERMINAL_LIGHT: TerminalTheme = TerminalTheme {
+    foreground: term_rgb(0x24, 0x21, 0x1d),
+    background: term_rgb(0xfb, 0xf9, 0xf4),
+    cursor: term_rgb(0xe5, 0x48, 0x2f),
+    ansi: [
+        term_rgb(0x24, 0x21, 0x1d),
+        term_rgb(0xc6, 0x28, 0x28),
+        term_rgb(0x3f, 0x7d, 0x20),
+        term_rgb(0x9a, 0x6a, 0x00),
+        term_rgb(0x1f, 0x5f, 0xae),
+        term_rgb(0x7b, 0x3f, 0xa8),
+        term_rgb(0x0e, 0x7c, 0x86),
+        term_rgb(0xbf, 0xb8, 0xa8),
+        term_rgb(0x77, 0x71, 0x5f),
+        term_rgb(0xe5, 0x39, 0x35),
+        term_rgb(0x4e, 0x9a, 0x2a),
+        term_rgb(0xb0, 0x7d, 0x00),
+        term_rgb(0x2f, 0x74, 0xc9),
+        term_rgb(0x95, 0x50, 0xc2),
+        term_rgb(0x15, 0x97, 0xa0),
+        term_rgb(0xec, 0xe6, 0xda),
+    ],
+};
+
+/// Orca 라이트 터미널 팔레트(`Builtin Tango Light`, `.ref/orca/src/shared/terminal-themes/defaults.ts`).
+pub const TERMINAL_TANGO_LIGHT: TerminalTheme = TerminalTheme {
     foreground: term_rgb(0x00, 0x00, 0x00),
     background: term_rgb(0xff, 0xff, 0xff),
     cursor: term_rgb(0x00, 0x00, 0x00),
@@ -774,13 +799,13 @@ pub fn terminal_theme(cx: &App) -> TerminalTheme {
     terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
-/// 주어진 [`ThemeMode`]의 기본 팔레트(해구·[`LIGHT`]). 설정 테마는 [`palette`]가 반영한다.
+/// 주어진 [`ThemeMode`]의 기본 팔레트(해구·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
 #[inline]
 pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     if matches!(mode, ThemeMode::Dark) {
         &TRENCH
     } else {
-        &LIGHT
+        &PAPER
     }
 }
 
@@ -1040,9 +1065,9 @@ mod tests {
         let dark = palette_for(ThemeMode::Dark);
         assert!(light.background.l > 0.95);
         assert!(dark.background.l < 0.10);
-        assert!(light.foreground.l < 0.10);
+        assert!(light.foreground.l < 0.15);
         assert!(dark.foreground.l > 0.90);
-        assert_eq!(light, &LIGHT);
+        assert_eq!(light, &PAPER);
         assert_eq!(dark, &TRENCH);
     }
 
@@ -1078,8 +1103,8 @@ mod tests {
 
             apply(ThemeMode::Light, cx);
             assert_eq!(cx.theme().mode, ThemeMode::Light);
-            assert_eq!(cx.theme().background, LIGHT.background);
-            assert_eq!(cx.theme().sidebar, LIGHT.sidebar);
+            assert_eq!(cx.theme().background, PAPER.background);
+            assert_eq!(cx.theme().sidebar, PAPER.sidebar);
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
             assert_ne!(cx.theme().button_primary, cx.theme().button_primary_hover);
@@ -1176,7 +1201,7 @@ mod tests {
     #[test]
     fn ui_themes_map_to_palettes_and_paired_terminal_themes() {
         assert_eq!(DarkUiTheme::default().palette(), &TRENCH);
-        assert_eq!(LightUiTheme::default().palette(), &LIGHT);
+        assert_eq!(LightUiTheme::default().palette(), &PAPER);
         for theme in DarkUiTheme::ALL {
             let p = theme.palette();
             assert!(p.background.l < 0.15, "{theme:?}");
@@ -1194,6 +1219,10 @@ mod tests {
         assert_eq!(
             DarkUiTheme::Trench.terminal_theme_name(),
             super::super::DEFAULT_TERMINAL_THEME_DARK
+        );
+        assert_eq!(
+            LightUiTheme::Paper.terminal_theme_name(),
+            super::super::DEFAULT_TERMINAL_THEME_LIGHT
         );
     }
 

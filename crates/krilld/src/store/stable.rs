@@ -19,11 +19,31 @@ struct FileStamp {
     digest: [u8; 32],
 }
 
+struct Checkpoint {
+    run_id: usize,
+    raw_i: usize,
+    engine: super::Engine,
+}
+
+struct ReplayCache {
+    run_ids: Vec<usize>,
+    static_cps: Vec<Checkpoint>,
+    rolling_cp: Option<Checkpoint>,
+}
+
 pub(crate) struct Manifest {
     history: History,
     files: Vec<FileStamp>,
     cutoff: u64,
     session: SessionId,
+    record_session: SessionId,
+    page_base: usize,
+    cache: std::sync::Mutex<Option<ReplayCache>>,
+}
+
+pub(crate) struct PriorScreen {
+    pub entry: IndexEntry,
+    pub rows: Vec<Box<[u8]>>,
 }
 
 pub(crate) struct Range {
@@ -34,10 +54,51 @@ pub(crate) struct Range {
 }
 
 impl Store {
+    #[cfg(all(test, unix))]
     pub(crate) fn stable_manifest(
         &self,
         id: SessionId,
         cutoff: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Manifest> {
+        self.stable_manifest_for(id, id, cutoff, 0, cancelled)
+    }
+
+    pub(crate) fn stable_manifests(
+        &self,
+        id: SessionId,
+        cutoff: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Vec<Manifest>> {
+        let chain = self.history_chain(id);
+        let mut manifests = Vec::with_capacity(chain.len());
+        let mut page_base = 0usize;
+        let mut total_sources = 0usize;
+        for (gen_idx, record_id) in chain.into_iter().enumerate() {
+            let gen_cutoff = if gen_idx == 0 { cutoff } else { u64::MAX };
+            let manifest =
+                self.stable_manifest_for(id, record_id, gen_cutoff, page_base, cancelled)?;
+            if gen_idx > 0 && manifest.len() == 0 {
+                continue;
+            }
+            // Reserve one page ordinal for a non-empty prior generation's final screen.
+            let extra = manifest.len().saturating_add(usize::from(gen_idx > 0));
+            total_sources = total_sources.saturating_add(extra);
+            if total_sources > MAX_SOURCES {
+                return Err(io::ErrorKind::OutOfMemory.into());
+            }
+            page_base = page_base.saturating_add(extra);
+            manifests.push(manifest);
+        }
+        Ok(manifests)
+    }
+
+    fn stable_manifest_for(
+        &self,
+        owner: SessionId,
+        id: SessionId,
+        cutoff: u64,
+        page_base: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Manifest> {
         let mut paths = Vec::new();
@@ -120,7 +181,10 @@ impl Store {
             history,
             files,
             cutoff,
-            session: id,
+            session: owner,
+            record_session: id,
+            page_base,
+            cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -188,11 +252,22 @@ fn prefix_digest(path: &Path, len: u64, cancelled: &dyn Fn() -> bool) -> io::Res
     Ok(hash.finalize().into())
 }
 impl Manifest {
+    #[cfg(all(test, unix))]
     pub(crate) fn index(
         &self,
         hot: &[Box<[u8]>],
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Vec<IndexEntry>> {
+        self.index_with_screen(hot, false, cancelled)
+            .map(|(entries, _)| entries)
+    }
+
+    pub(crate) fn index_with_screen(
+        &self,
+        hot: &[Box<[u8]>],
+        capture_screen: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<(Vec<IndexEntry>, Option<PriorScreen>)> {
         let _permit = super::replay_gate::acquire(cancelled).ok_or(io::ErrorKind::Interrupted)?;
         self.validate(cancelled)?;
         let mut entries = (0..self.len())
@@ -200,7 +275,8 @@ impl Manifest {
                 identity: HistoryIdentity {
                     session: self.session,
                     source: Source::Cold {
-                        page: u32::try_from(page).unwrap_or(u32::MAX),
+                        page: u32::try_from(self.page_base.saturating_add(page))
+                            .unwrap_or(u32::MAX),
                     },
                     start_seq: Seq(self.history.cleared_seq),
                     end_seq: Seq(self.history.cleared_seq),
@@ -215,8 +291,47 @@ impl Manifest {
         let mut total = 0usize;
         let mut tail = VecDeque::new();
         let mut failed = false;
-        self.history
-            .visit_until(self.cutoff, cancelled, |page, event| match event {
+        let seg_count = self.history.segs.len();
+        let mut run_ids = vec![0usize; seg_count];
+        let mut static_cps: Vec<Checkpoint> = Vec::new();
+        let mut pending_cp = false;
+        let targets = [
+            seg_count / 4,
+            seg_count / 2,
+            seg_count.saturating_mul(3) / 4,
+            seg_count.saturating_sub(24),
+            seg_count.saturating_sub(8),
+            seg_count.saturating_sub(1),
+        ];
+        let mut record_cp = |run_id: usize, raw_i: usize, raw: &super::Engine| {
+            if let Some(slot) = run_ids.get_mut(raw_i) {
+                *slot = run_id;
+            }
+            if raw_i < self.history.first_page {
+                return;
+            }
+            if targets.contains(&raw_i) || pending_cp {
+                if let Some(engine) = raw.clone_ground() {
+                    if static_cps.last().is_none_or(|last| last.raw_i != raw_i)
+                        && static_cps.len() < 6
+                    {
+                        static_cps.push(Checkpoint {
+                            run_id,
+                            raw_i,
+                            engine,
+                        });
+                    }
+                    pending_cp = false;
+                } else {
+                    pending_cp = true;
+                }
+            }
+        };
+        let final_engine = self.history.visit_until_checkpoints(
+            self.cutoff,
+            cancelled,
+            Some(&mut record_cp),
+            |page, event| match event {
                 super::HistoryEvent::Rows(batch) => {
                     for row in batch {
                         match postcard::to_stdvec(&row) {
@@ -257,16 +372,19 @@ impl Manifest {
                     hash = Sha256::new();
                     hash.update(self.history.cleared_seq.to_le_bytes());
                 }
-            });
+            },
+        );
         if cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
         }
         if failed {
             return Err(io::ErrorKind::NotFound.into());
         }
+        // Only the contiguous post-resize suffix of live hot rows matches raw cold harvest;
+        // older rows inside live hot may have been reflowed in-place by a terminal resize.
         for ((page, row), expected) in tail.iter().rev().zip(hot) {
             if row != expected {
-                return Err(io::ErrorKind::InvalidData.into());
+                break;
             }
             if let Some(entry) = entries.get_mut(*page) {
                 entry.covered = entry.covered.saturating_add(1);
@@ -275,8 +393,56 @@ impl Manifest {
         for entry in &mut entries {
             entry.total = entry.total.saturating_sub(entry.covered);
         }
+        let prior_screen = if capture_screen {
+            if let Some(engine) = final_engine {
+                let screen = engine.screen();
+                let end = screen
+                    .rows
+                    .iter()
+                    .rposition(|r| r.iter().any(|c| c.ch != ' ' && c.ch != '\0'))
+                    .map_or(0, |i| i + 1);
+                let mut screen_hash = Sha256::new();
+                screen_hash.update(self.history.cleared_seq.to_le_bytes());
+                let mut rows = Vec::with_capacity(end);
+                for row in screen.rows.into_iter().take(end).rev() {
+                    let bytes = postcard::to_stdvec(&row).map_err(io::Error::other)?;
+                    screen_hash
+                        .update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+                    screen_hash.update(&bytes);
+                    rows.push(bytes.into_boxed_slice());
+                }
+                let end_seq = entries
+                    .last()
+                    .map_or(Seq(self.history.cleared_seq), |e| e.identity.end_seq);
+                let page = u32::try_from(self.page_base.saturating_add(self.len()))
+                    .map_err(io::Error::other)?;
+                Some(PriorScreen {
+                    entry: IndexEntry {
+                        identity: HistoryIdentity {
+                            session: self.session,
+                            source: Source::Cold { page },
+                            start_seq: end_seq,
+                            end_seq,
+                            digest: screen_hash.finalize().into(),
+                        },
+                        total: rows.len(),
+                        covered: 0,
+                    },
+                    rows,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        *super::lock(&self.cache) = Some(ReplayCache {
+            run_ids,
+            static_cps,
+            rolling_cp: None,
+        });
         self.validate(cancelled)?;
-        Ok(entries)
+        Ok((entries, prior_screen))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -300,6 +466,88 @@ impl Manifest {
         Ok(())
     }
 
+    fn warm_engine(
+        &self,
+        raw: usize,
+        seg: &super::segment::Segment,
+        look: &super::Appearance,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<super::Engine> {
+        let cached = {
+            let guard = super::lock(&self.cache);
+            guard.as_ref().and_then(|cache| {
+                let target_run = cache.run_ids.get(raw).copied().unwrap_or(0);
+                if target_run == 0 {
+                    return None;
+                }
+                cache
+                    .static_cps
+                    .iter()
+                    .chain(cache.rolling_cp.iter())
+                    .filter(|cp| cp.run_id == target_run && cp.raw_i <= raw)
+                    .max_by_key(|cp| cp.raw_i)
+                    .and_then(|cp| Some((cp.run_id, cp.raw_i, cp.engine.clone_ground()?)))
+            })
+        };
+        let Some((run_id, cp_raw, mut engine)) = cached else {
+            return self.history.warm_checked(raw, seg, look, cancelled);
+        };
+        if cp_raw == raw {
+            return Ok(engine);
+        }
+        let mid = cp_raw + (raw - cp_raw) / 2;
+        let mut new_rolling = None;
+        for p in cp_raw..raw {
+            if cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let previous = self.history.read_raw(p)?;
+            engine.resize(previous.header.size);
+            if previous.header.start_seq < self.history.cleared_seq {
+                engine.clear_history();
+            }
+            if raw.saturating_sub(cp_raw) >= 2
+                && p == mid
+                && new_rolling.is_none()
+                && let Some(cloned) = engine.clone_ground()
+            {
+                new_rolling = Some(Checkpoint {
+                    run_id,
+                    raw_i: p,
+                    engine: cloned,
+                });
+            }
+            super::replay_harvest_cancelled(
+                &mut engine,
+                &previous,
+                look,
+                None,
+                None,
+                self.history.cleared_seq,
+                cancelled,
+            );
+        }
+        engine.resize(seg.header.size);
+        if seg.header.start_seq <= self.history.cleared_seq {
+            engine.clear_history();
+        }
+        if new_rolling.is_none()
+            && let Some(cloned) = engine.clone_ground()
+        {
+            new_rolling = Some(Checkpoint {
+                run_id,
+                raw_i: raw,
+                engine: cloned,
+            });
+        }
+        if let Some(rolling) = new_rolling
+            && let Some(cache) = super::lock(&self.cache).as_mut()
+        {
+            cache.rolling_cp = Some(rolling);
+        }
+        Ok(engine)
+    }
+
     pub(crate) fn range(
         &self,
         page: usize,
@@ -312,11 +560,11 @@ impl Manifest {
         self.validate(cancelled)?;
         let raw = self.history.raw_index(page)?;
         let seg = self.history.read_raw(raw)?;
-        if seg.header.session != self.session {
+        if seg.header.session != self.record_session {
             return Err(io::ErrorKind::InvalidData.into());
         }
         let look = no_theme();
-        let mut engine = self.history.warm_checked(raw, &seg, &look, cancelled)?;
+        let mut engine = self.warm_engine(raw, &seg, &look, cancelled)?;
         engine.take_history();
         let mut total = 0usize;
         let mut hash = Sha256::new();
@@ -325,6 +573,7 @@ impl Manifest {
         // Verify an exact frozen hot suffix across every newest cold source, never a value-pattern guess.
         let hot = hot.unwrap_or_default();
         let mut tail = VecDeque::new();
+        let mut collected: Option<Vec<Vec<Cell>>> = Some(Vec::new());
         let (gaps, _) = super::replay_harvest_cancelled(
             &mut engine,
             &seg,
@@ -346,6 +595,13 @@ impl Manifest {
                         }
                         Err(_) => encoding_failed = true,
                     }
+                    if let Some(buf) = &mut collected {
+                        if buf.len() < 4096 {
+                            buf.push(row);
+                        } else {
+                            collected = None;
+                        }
+                    }
                     total = total.saturating_add(1);
                 }
             }),
@@ -364,35 +620,41 @@ impl Manifest {
         if !gaps.is_empty() {
             return Err(io::ErrorKind::NotFound.into());
         }
-        let covered = hot.len().min(total);
-        if !tail.iter().rev().eq(hot.iter().take(covered)) {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
+        let covered = tail
+            .iter()
+            .rev()
+            .zip(hot)
+            .take_while(|(row, expected)| row == expected)
+            .count();
         let total = total.saturating_sub(covered);
         let end = total.saturating_sub(skip);
         let start =
             end.saturating_sub(count.min(usize::from(krill_proto::screen::MAX_HISTORY_ROWS)));
         let mut rows = Vec::new();
         if start < end {
-            let mut engine = self.history.warm_checked(raw, &seg, &look, cancelled)?;
-            engine.take_history();
-            let mut at = 0usize;
-            super::replay_harvest_cancelled(
-                &mut engine,
-                &seg,
-                &look,
-                Some(&mut |batch: Vec<Vec<Cell>>| {
-                    for row in batch {
-                        if (start..end).contains(&at) {
-                            rows.push(row);
+            if let Some(all) = collected {
+                rows.extend(all.into_iter().skip(start).take(end - start));
+            } else {
+                let mut engine = self.warm_engine(raw, &seg, &look, cancelled)?;
+                engine.take_history();
+                let mut at = 0usize;
+                super::replay_harvest_cancelled(
+                    &mut engine,
+                    &seg,
+                    &look,
+                    Some(&mut |batch: Vec<Vec<Cell>>| {
+                        for row in batch {
+                            if (start..end).contains(&at) {
+                                rows.push(row);
+                            }
+                            at = at.saturating_add(1);
                         }
-                        at = at.saturating_add(1);
-                    }
-                }),
-                Some(self.cutoff),
-                self.history.cleared_seq,
-                cancelled,
-            );
+                    }),
+                    Some(self.cutoff),
+                    self.history.cleared_seq,
+                    cancelled,
+                );
+            }
         }
         self.validate(cancelled)?;
         rows.reverse();
@@ -400,7 +662,8 @@ impl Manifest {
             identity: HistoryIdentity {
                 session: self.session,
                 source: Source::Cold {
-                    page: u32::try_from(page).map_err(io::Error::other)?,
+                    page: u32::try_from(self.page_base.saturating_add(page))
+                        .map_err(io::Error::other)?,
                 },
                 start_seq: Seq(seg.header.start_seq.max(self.history.cleared_seq)),
                 end_seq: Seq(seg.end_seq().min(self.cutoff)),
@@ -685,6 +948,75 @@ mod tests {
         publishing.join().unwrap();
         finished.recv_timeout(Duration::from_secs(1)).unwrap();
         clearing.join().unwrap();
+        drop(rec);
+        fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn partial_hot_suffix_and_prior_chain_remain_accessible_after_resize_and_resume() {
+        let (path, store, mut rec) = fixture("resize-and-resume");
+        rec.append(&output(0, 60));
+        rec.seal();
+        store
+            .inherit_history(SessionId(702), SessionId(701))
+            .unwrap();
+        let mut child = store
+            .recorder(SessionId(702), WinSize { cols: 80, rows: 24 })
+            .unwrap();
+        child.append(&output(60, 120));
+        child.seal();
+
+        let manifests = store
+            .stable_manifests(SessionId(702), child.seq(), &|| false)
+            .unwrap();
+        assert_eq!(manifests.len(), 2);
+
+        // Build a hot buffer whose newest rows match cold replay, followed by an older
+        // reflowed row that differs from pre-resize cold harvest.
+        let mut raw_rows = Vec::new();
+        {
+            let _permit = super::super::replay_gate::acquire(&|| false).unwrap();
+            manifests[0]
+                .history
+                .visit_until(child.seq(), &|| false, |_, event| {
+                    if let super::super::HistoryEvent::Rows(batch) = event {
+                        raw_rows.extend(batch);
+                    }
+                });
+        }
+        let newest = raw_rows.last().unwrap().clone();
+        let mut reflowed = newest.clone();
+        reflowed[0].ch = 'X';
+        let hot = vec![
+            postcard::to_stdvec(&newest).unwrap().into_boxed_slice(),
+            postcard::to_stdvec(&reflowed).unwrap().into_boxed_slice(),
+        ];
+
+        let (entries0, screen0) = manifests[0]
+            .index_with_screen(&hot, false, &|| false)
+            .unwrap();
+        assert!(screen0.is_none());
+        let last0 = entries0.last().unwrap();
+        assert_eq!(last0.covered, 1);
+        let range0 = manifests[0]
+            .range(
+                manifests[0].len() - 1,
+                0,
+                10,
+                hot.get(0..last0.covered),
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(range0.covered, 1);
+        assert_eq!(range0.total, last0.total);
+
+        let (entries1, screen1) = manifests[1]
+            .index_with_screen(&[], true, &|| false)
+            .unwrap();
+        assert!(!entries1.is_empty());
+        assert!(screen1.is_some_and(|s| !s.rows.is_empty()));
+
+        drop(child);
         drop(rec);
         fs::remove_dir_all(path).ok();
     }

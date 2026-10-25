@@ -773,7 +773,7 @@ pub(super) fn rows_with_options<'a>(
 ) -> Vec<Row> {
     let mut out = Vec::new();
     let mut sessions_by_wt: BTreeMap<&Path, Vec<&'a Session>> = BTreeMap::new();
-    for s in &snapshot.sessions {
+    for s in snapshot.sessions.iter().filter(|s| !s.is_exited()) {
         if let Some(wt) = s.worktree.as_deref() {
             sessions_by_wt.entry(wt).or_default().push(s);
         }
@@ -1106,7 +1106,11 @@ pub(super) fn rows_with_options<'a>(
     }
 
     let mut folders: BTreeMap<&PathBuf, Vec<Row>> = BTreeMap::new();
-    for s in snapshot.sessions.iter().filter(|s| s.worktree.is_none()) {
+    for s in snapshot
+        .sessions
+        .iter()
+        .filter(|s| !s.is_exited() && s.worktree.is_none())
+    {
         if let Some(cwd) = &s.cwd
             && !is_removed(cwd)
         {
@@ -1125,7 +1129,7 @@ pub(super) fn rows_with_options<'a>(
     let loose: Vec<_> = snapshot
         .sessions
         .iter()
-        .filter(|s| s.worktree.is_none() && s.cwd.is_none())
+        .filter(|s| !s.is_exited() && s.worktree.is_none() && s.cwd.is_none())
         .collect();
     if !loose.is_empty() {
         out.push(Row::Loose);

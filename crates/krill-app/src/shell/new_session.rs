@@ -501,6 +501,21 @@ impl Shell {
             .child(
                 Self::nav_row(
                     p,
+                    "nav-automations",
+                    icons::CALENDAR_CLOCK_SVG,
+                    sb_text::NAV_AUTOMATIONS.get(),
+                )
+                .when(self.automations.is_some(), |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.open_automations(Some(window), cx)),
+                ),
+            )
+            .child(
+                Self::nav_row(
+                    p,
                     "nav-agent-dashboard",
                     icons::LAYOUT_DASHBOARD_SVG,
                     sb_text::NAV_AGENT_DASHBOARD.get(),

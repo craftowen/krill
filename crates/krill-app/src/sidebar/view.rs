@@ -471,6 +471,9 @@ fn row_menu(
 
 impl Sidebar {
     /// Connection context lives next to its project, never above the project tree.
+    /// Connected remote hosts already render their `[호스트]` badge on worktree cards and
+    /// session rows (Orca parity), so the project header only shows a status/reconnect
+    /// control when the host is connecting or disconnected.
     fn project_host_control(
         &self,
         index: usize,
@@ -480,6 +483,7 @@ impl Sidebar {
         let Some(remote) = host
             .remote_id()
             .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+            .filter(|r| r.status != HostStatus::Connected)
         else {
             return div().into_any_element();
         };
@@ -541,8 +545,12 @@ impl Sidebar {
     /// 합쳐진 프로젝트 머리줄에, 다시 연결이 필요한 다른 PC의 상태·다시 연결 버튼을 단다.
     /// 연결된 PC는 워크트리·세션 배지로 이미 보이므로 머리줄을 붐비게 하지 않는다.
     fn merged_host_controls(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let primary_host = self.row_host(index);
         let mut hosts: Vec<&HostId> = Vec::new();
         for (host, _) in self.merged_projects.get(&index).into_iter().flatten() {
+            if host == primary_host {
+                continue;
+            }
             let connected = host
                 .remote_id()
                 .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
@@ -1775,7 +1783,7 @@ impl Sidebar {
         let card_expanded = self.session_card_index(index + 1) == Some(index)
             && self.card_list.contains_row(index + 1);
         let pinned = row_host.is_local() && self.prefs.get(path).is_some_and(|p| p.pinned);
-        let name = self.name(path);
+        let name = self.name_on(&row_host, path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
         let branch = self
             .branch_on(&row_host, path)
@@ -1820,7 +1828,7 @@ impl Sidebar {
             .snapshot_for(&row_host)
             .sessions
             .iter()
-            .filter(|s| s.worktree.as_deref() == Some(path))
+            .filter(|s| !s.is_exited() && s.worktree.as_deref() == Some(path))
             .collect();
         let unread =
             row_host.is_local() && tree_sessions.iter().any(|s| self.unread.contains(&s.id));
