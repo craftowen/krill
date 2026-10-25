@@ -145,6 +145,8 @@ class ComparisonTests(unittest.TestCase):
 
     def test_broken_json_and_equal_count_wrong_test_ids_are_rejected(self):
         with self.assertRaises(ValueError):
+            list(cargo_messages('[krill-proto 0.2.4] cargo:rerun-if-changed=build.rs\n'))
+        with self.assertRaises(ValueError):
             list(cargo_messages('{"reason":"compiler-artifact"}\nbroken JSON\n'))
         path = self.root / "consumer/junit.xml"
         path.write_text(path.read_text().replace('name="works"', 'name="different"'))

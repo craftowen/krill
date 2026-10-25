@@ -87,7 +87,7 @@ jobs:
         timeout-minutes: 60
       - name: nextest
         run: |
-          if ! cargo nextest run --cargo-verbose --cargo-verbose --cargo-message-format json \
+          if ! cargo nextest run --cargo-message-format json \
             --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings \
             > "$RUNNER_TEMP/vendor-evidence/nextest-cargo.jsonl" \
             2> "$RUNNER_TEMP/vendor-evidence/nextest.log"; then

@@ -136,6 +136,7 @@ def prepare(directory):
 
 
 def cargo_messages(log):
+    # Cargo -vv also writes textual build-script output to stdout; do not use it.
     for line in log.splitlines():
         if not line.strip():
             continue
