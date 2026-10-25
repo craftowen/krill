@@ -2255,6 +2255,8 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
     let d = dir("owe657-ui");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    // Keep the save control visible when error text wraps with different host fonts.
+    vcx.simulate_resize(size(px(1400.), px(3000.)));
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
         window.draw(cx).clear(cx);
@@ -2277,6 +2279,12 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
     let click_save = |vcx: &mut gpui::VisualTestContext| {
         vcx.run_until_parked();
         let save = vcx.debug_bounds("admin-agent-save-codex").unwrap();
+        assert!(
+            vcx.debug_bounds("admin-content")
+                .unwrap()
+                .contains(&save.center()),
+            "the save button must be inside the settings viewport"
+        );
         vcx.simulate_click(save.center(), gpui::Modifiers::default());
         vcx.run_until_parked();
     };
@@ -2291,6 +2299,12 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
 
     set_env(vcx, "GOOD=1");
     click_save(vcx);
+    vcx.update(|_, cx| {
+        let settings = view.read(cx);
+        assert!(!settings.file_jobs.contains_key("agent-edit"));
+        let (message, is_error) = settings.agent_edits["codex"].status.as_ref().unwrap();
+        assert!(!is_error, "{message}");
+    });
     let text = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
     let a = krill_proto::agent::Agents::load(Some(&text)).unwrap();
     assert_eq!(a.profiles["codex"].env["GOOD"], "1");
