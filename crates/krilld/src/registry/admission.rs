@@ -38,7 +38,11 @@ pub(super) fn protected(request: &krill_proto::control::Request) -> bool {
         request,
         Request::WaitStatus { .. }
             | Request::GitWatch(_)
-            | Request::Orchestration(OrchAction::CheckMessages { wait_ms: 1.., .. })
+            | Request::Orchestration(
+                OrchAction::CheckMessages { wait_ms: 1.., .. }
+                    | OrchAction::CheckMessagesFiltered { wait_ms: 1.., .. }
+                    | OrchAction::WaitAnswer { wait_ms: 1.., .. }
+            )
     )
 }
 

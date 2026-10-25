@@ -73,6 +73,85 @@ fn account_recovery_stays_in_toast_without_resizing_or_releasing_input(cx: &mut 
 }
 
 #[gpui::test]
+fn dismissed_account_recovery_stays_dismissed_across_tab_switches_until_new_failure(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("toast-account-tab-switch"));
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    let session = SessionId(95);
+    let pane = view.read_with(cx, |s, _| s.layout.active_tab().focused);
+    view.update(cx, |s, cx| {
+        s.attach_test(pane, session, ours, cx);
+        s.layout.set_session(pane, session);
+        s.change(true, cx, |l| {
+            l.new_tab();
+            l.activate(0);
+        });
+    });
+    cx.run_until_parked();
+
+    let snapshot_for = |account_id: &str, error: &str| {
+        let mut snap = AccountsSnapshot::default();
+        snap.details.supported = true;
+        snap.details.handoffs.push(SessionHandoff {
+            from: session,
+            to: None,
+            account_id: account_id.into(),
+            error: Some(error.into()),
+        });
+        snap
+    };
+
+    view.update(cx, |s, cx| {
+        s.apply_accounts_snapshot(snapshot_for("selected", "first failure"), cx);
+        s.notice = None;
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("account-input-recovery").is_some());
+
+    // Switching away and back without dismissing keeps the recovery card visible.
+    view.update(cx, |s, cx| s.change(true, cx, |l| l.activate(1)));
+    settle(cx);
+    assert!(cx.debug_bounds("account-input-recovery").is_none());
+    view.update(cx, |s, cx| s.change(true, cx, |l| l.activate(0)));
+    settle(cx);
+    assert!(cx.debug_bounds("account-input-recovery").is_some());
+
+    // Explicitly dismissing the recovery card remembers that dismissal across tab switches.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.notifications.notes[&Kind::AccountInput]
+                .clone()
+                .update(cx, |note, cx| note.dismiss(window, cx));
+        });
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("account-input-recovery").is_none());
+
+    view.update(cx, |s, cx| s.change(true, cx, |l| l.activate(1)));
+    settle(cx);
+    view.update(cx, |s, cx| s.change(true, cx, |l| l.activate(0)));
+    settle(cx);
+    assert!(
+        cx.debug_bounds("account-input-recovery").is_none(),
+        "returning to a tab must not resurrect a dismissed recovery toast for the same failure"
+    );
+
+    // A new switch failure for a different target still notifies the user.
+    view.update(cx, |s, cx| {
+        s.apply_accounts_snapshot(snapshot_for("another", "second failure"), cx);
+        s.notice = None;
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("account-input-recovery").is_some());
+}
+
+#[gpui::test]
 fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut TestAppContext) {
     // GPUI's visual animation uses wall time; timers below use the test clock.
     cx.update(|cx| cx.set_reduce_motion(true));

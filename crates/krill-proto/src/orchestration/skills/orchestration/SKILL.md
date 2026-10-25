@@ -63,11 +63,16 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    Example: `KRILL orchestration worker-start --run <run-id> --task <task-id> --worktree new-child --name <name> --agent <configured-profile> --prompt "<assignment>" --json`.
    The base defaults to the parent branch. See [placement-and-remote](references/placement-and-remote.md)
    for setup approval, explicit base selection, and remote limits.
-   Do not pass Orca's `--model`, `--effort`, or `--retry-of`: Krill does not implement them.
-5. Inspect `task-list --run <run-id> --json`, `worker-list --run <run-id> --json`,
+   Optional `--model <id>` and `--effort <level>` override the profile's launch flags
+   when supported by the provider (`claude`, `codex`, `pi` for effort); do not pass
+   Orca's `--retry-of`.
+5. Inspect `task-list --run <run-id> --json`, `worker-list --run <run-id> --json`
+   (which includes live `session_state`, `terminal_state`, and `next_action` hints),
    and bounded `worker-read <dispatch-id> --lines 60 --json`. Wait with
-   `check --to coordinator --unread --wait --timeout-ms 10000 --json`.
-   See [messaging-and-gates](references/messaging-and-gates.md) before acknowledging mail.
+   `check --to coordinator --run <run-id> --unread --wait --timeout-ms 60000 --json`
+   (plain `--wait` defaults to 60s, max 300s).
+   See [messaging-and-gates](references/messaging-and-gates.md) before acknowledging mail
+   with `--ack` or `--ack-ids <id1,id2,...>`.
    Reply to questions using `reply <message-id> --body "<answer>" --json`.
 6. Read the returned evidence and run the acceptance checks appropriate to the task.
    Use [verification-and-evidence](references/verification-and-evidence.md) for independent

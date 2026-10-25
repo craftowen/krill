@@ -5,7 +5,7 @@ function run(argv) {
   ObjC.import("Foundation");
   const read=p=>{const s=$.NSString.stringWithContentsOfFileEncodingError(p,$.NSUTF8StringEncoding,null);if(!s || s.isNil())throw Error("fixture source unavailable");return ObjC.unwrap(s);};
   const dir=String(argv[0]);
-  const common=read(dir+"/common.js"),observeScript=common+read(dir+"/observe.js"),actionScript=common+read(dir+"/action.js");
+  const common=read(dir+"/common.js"),observeScript=common+read(dir+"/../capture/geometry.js")+read(dir+"/observe.js"),actionScript=common+read(dir+"/action.js");
   const console={log:()=>{}};
   const assert={
     equal:(a,b,message)=>{if(a!==b)throw Error(String(message||"equality")+": "+JSON.stringify(a)+" != "+JSON.stringify(b));},
@@ -32,6 +32,7 @@ function runCase(mode) {
       AXSelectedTextRange:attrObj(()=>mode==='paste-selection-unavailable'?undefined:state.sel,()=>{throw Error('ro');}),
       AXSelectedText:attrObj(()=>mode==='paste-selection-unavailable'?undefined:state.selText,()=>{throw Error('ro');}),
     };
+    if(mode==='metadata-settable-true' || mode==='metadata-settable-false') attrs.AXValue.settable=()=>mode==='metadata-settable-true';
     e.attributes={byName:n=>{if(!attrs[n]) throw Error('no attribute '+n);return attrs[n];}};
     return e;
   }
@@ -103,6 +104,13 @@ function runCase(mode) {
     return {mode,result:out?{rootRole:out.root.role}:{error:err},effects};
   }
   const observed=JSON.parse(observer.run([JSON.stringify(request)]));
+  if(mode.startsWith('metadata-settable-')) {
+    const expected=mode==='metadata-settable-unavailable'?null:mode==='metadata-settable-true';
+    assert.equal(observed.root.children[0].valueSettable,expected);
+    assert.equal(observed.root.valueSettable,null);
+    assert.deepEqual(effects,[]);assert.equal(state.writes,0);
+    return {mode,result:{valueSettable:observed.root.children[0].valueSettable},effects};
+  }
   request.baseRoot=observed.root;
   if(mode==='ancestor-reused'){request.targetRef=3;state.value='different semantic account';}
   if(mode==='disable-after-first-key'){request.kind='pressKey';request.targetRef=1;request.repeat=2;request.keyCode=36;}
@@ -160,7 +168,7 @@ function runCase(mode) {
   }
   return {mode,result,effects,clipboard:state.clipboard,writes:state.writes};
 }
-const modes=['ancestor-reused','disable-after-first-key','paste-throws-after-effect','secure-unavailable','secure-binding-noop','secure-bound-active','secure-bound-inactive','normal','reorder','ambiguous','value-reused','pid-reused','foreground-changed','press-throws-after-effect','long-full-value','write-throws-after-effect','clipboard-conflict','clipboard-too-large','clipboard-write-fails','paste-unconfirmed','paste-confirmed',
+const modes=['metadata-settable-true','metadata-settable-false','metadata-settable-unavailable','ancestor-reused','disable-after-first-key','paste-throws-after-effect','secure-unavailable','secure-binding-noop','secure-bound-active','secure-bound-inactive','normal','reorder','ambiguous','value-reused','pid-reused','foreground-changed','press-throws-after-effect','long-full-value','write-throws-after-effect','clipboard-conflict','clipboard-too-large','clipboard-write-fails','paste-unconfirmed','paste-confirmed',
   'focused-other-number','same-geometry-no-number','geometry-unique-no-number','geometry-same-winid-different','incomplete-census','disabled-target','press-unavailable-no-fallback','setvalue-normalized',
   'drag-normal','drag-target-value-changed','drag-target-disabled',
   'paste-contains-unrelated','paste-extra-suffix','paste-long-selection','paste-selection-unavailable','paste-selection-ambiguous','paste-noop','paste-utf16-split','paste-selection-changed',

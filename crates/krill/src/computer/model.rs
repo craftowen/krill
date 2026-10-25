@@ -167,6 +167,9 @@ pub struct ElementNode {
     pub description: Option<String>,
     #[serde(default)]
     pub value: Option<String>,
+    /// Observed `AXValue` capability; absent means unavailable, never false by default.
+    #[serde(default)]
+    pub value_settable: Option<bool>,
     #[serde(default)]
     pub bounds: Option<Rect>,
     #[serde(default = "default_true")]
@@ -192,10 +195,74 @@ pub struct FlatElement {
     pub role: String,
     pub label: Option<String>,
     pub value: Option<String>,
+    #[serde(default)]
+    pub value_settable: Option<bool>,
     pub bounds: Option<Rect>,
     pub enabled: bool,
     pub focused: bool,
     pub actions: Vec<String>,
+}
+
+/// Wall time is for correlation; monotonic nanoseconds are comparable only within one boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationClock {
+    pub wall_time_ms: u64,
+    pub monotonic_ns: Option<u64>,
+    pub monotonic_clock: Option<String>,
+}
+
+/// Brackets an operation, not an atomic AX/image snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationTiming {
+    pub started: ObservationClock,
+    pub finished: ObservationClock,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayGeometry {
+    pub id: u32,
+    pub logical_bounds: Rect,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub backing_scale_factor: f64,
+    pub rotation_degrees: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometryWitness {
+    /// Diagnostic revision only; guards compare the complete witness as well.
+    pub revision: String,
+    pub coordinate_space: String,
+    pub window_id: String,
+    pub window_bounds: Rect,
+    pub displays: Vec<DisplayGeometry>,
+}
+
+/// Desktop point = (xx*x + xy*y + tx, yx*x + yy*y + ty), using image pixel edges.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AffineTransform {
+    pub xx: f64,
+    pub xy: f64,
+    pub yx: f64,
+    pub yy: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureMapping {
+    pub source_pixels: Rect,
+    pub crop_pixels: Rect,
+    pub resize_scale: Point,
+    pub image_to_desktop: AffineTransform,
+    pub display_id: u32,
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,6 +275,12 @@ pub struct ScreenshotMetadata {
     pub window_id: Option<String>,
     pub logical_bounds: Rect,
     pub measured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<CaptureMapping>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ObservationTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,6 +296,10 @@ pub struct AppStateSnapshot {
     #[serde(default)]
     pub coverage_truncated: bool,
     pub captured_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ax_observation_timing: Option<ObservationTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<GeometryWitness>,
     pub app: AppSummary,
     pub window: Option<WindowSummary>,
     pub focused_element_id: Option<usize>,
@@ -548,6 +625,7 @@ fn visit_ax_node(
                 .value
                 .as_ref()
                 .map(|value| value.chars().take(500).collect()),
+            value_settable: node.value_settable,
             bounds: node.bounds,
             enabled: node.enabled,
             focused: node.focused,

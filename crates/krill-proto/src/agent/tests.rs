@@ -232,3 +232,101 @@ fn install_command_prefers_windows_variant_on_windows() {
         }
     );
 }
+
+#[test]
+fn launch_overrides_encode_decode_and_apply_across_providers() {
+    let agents = Agents::load(None).unwrap();
+
+    // 오버라이드가 없으면 기존 id와 동일해야 한다.
+    let empty = LaunchOverrides::default();
+    let encoded_plain = encode_agent_program_id("codex", &empty).unwrap();
+    assert_eq!(encoded_plain, "codex");
+    assert_eq!(
+        decode_agent_program_id(&encoded_plain).unwrap(),
+        ("codex", empty)
+    );
+
+    // Codex: --model + -c model_reasoning_effort="xhigh"
+    let codex_overrides = LaunchOverrides {
+        model: Some("gpt-5.4".to_owned()),
+        effort: Some("XHIGH".to_owned()),
+    };
+    let encoded = encode_agent_program_id("codex", &codex_overrides).unwrap();
+    assert!(encoded.starts_with("launch\x1f"));
+    let (decoded_id, decoded_overrides) = decode_agent_program_id(&encoded).unwrap();
+    assert_eq!(decoded_id, "codex");
+    assert_eq!(decoded_overrides.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(decoded_overrides.effort.as_deref(), Some("xhigh"));
+
+    let mut codex_profile = agents.profiles["codex"].clone();
+    apply_launch_overrides("codex", &mut codex_profile, &decoded_overrides).unwrap();
+    assert_eq!(
+        codex_profile.argv(Permission::Yolo),
+        [
+            "codex",
+            "--model",
+            "gpt-5.4",
+            "-c",
+            "model_reasoning_effort=\"xhigh\"",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
+
+    // Claude: --model + --effort max
+    let mut claude_profile = agents.profiles["claude"].clone();
+    apply_launch_overrides(
+        "claude",
+        &mut claude_profile,
+        &LaunchOverrides {
+            model: Some("opus".to_owned()),
+            effort: Some("max".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        claude_profile.argv(Permission::Yolo),
+        [
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "max",
+            "--dangerously-skip-permissions",
+        ]
+    );
+
+    // Unsupported effort or conflicting flags are rejected.
+    let agy_profile = &agents.profiles["agy"];
+    assert!(
+        validate_launch_overrides(
+            "agy",
+            agy_profile,
+            &LaunchOverrides {
+                model: None,
+                effort: Some("high".to_owned()),
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        validate_launch_overrides(
+            "claude",
+            &claude_profile,
+            &LaunchOverrides {
+                model: Some("sonnet".to_owned()),
+                effort: None,
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        encode_agent_program_id(
+            "codex",
+            &LaunchOverrides {
+                model: Some("--bad-flag".to_owned()),
+                effort: None,
+            }
+        )
+        .is_err()
+    );
+}

@@ -27,6 +27,10 @@ pub const MAX_COMMENTS_BYTES: u64 = 256 * 1024;
 /// 근거: 본문 300B 하트비트 3,395건 ≈ 2MiB 실측(PH-02). 500건이면 본문만 ~150KiB라 상한에 여유가 있고,
 /// 최근 하트비트 이력은 `check`로 볼 수 있다.
 pub const MAX_RETAINED_EPHEMERAL: usize = 500;
+/// `krill orchestration check --wait`에서 시간 인자(`--timeout-ms`·`<secs>`)를 생략했을 때의 기본 대기 상한(60초).
+pub const DEFAULT_CHECK_WAIT_MS: u64 = 60_000;
+/// `krill orchestration check` 대기 시간의 최대 상한(5분).
+pub const MAX_CHECK_WAIT_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,6 +325,10 @@ pub struct WorkerStartSpec {
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
     pub account: Option<String>,
     #[serde(default)]
     pub session_id: Option<u64>,
@@ -413,6 +421,21 @@ pub enum OrchAction {
     },
     RetainWorker {
         worker_or_dispatch: String,
+    },
+    CheckMessagesFiltered {
+        recipient: Option<String>,
+        run_id: Option<String>,
+        types: Vec<MessageType>,
+        unread_only: bool,
+        ack: bool,
+        wait_ms: u64,
+    },
+    AckMessageIds {
+        recipient: Option<String>,
+        run_id: Option<String>,
+        types: Vec<MessageType>,
+        unread_only: bool,
+        ack_ids: Vec<String>,
     },
 }
 
@@ -1258,11 +1281,27 @@ impl OrchestrationStore {
         unread_only: bool,
         ack: bool,
     ) -> Vec<OrchMessage> {
+        self.check_messages_filtered(recipient, None, types, unread_only, ack)
+    }
+
+    pub fn check_messages_filtered(
+        &mut self,
+        recipient: Option<&str>,
+        run_id: Option<&str>,
+        types: &[MessageType],
+        unread_only: bool,
+        ack: bool,
+    ) -> Vec<OrchMessage> {
         let mut out = Vec::new();
         for msg in &mut self.messages {
             if let Some(rcpt) = recipient
                 && msg.to != rcpt
                 && msg.to != "@all"
+            {
+                continue;
+            }
+            if let Some(rid) = run_id
+                && msg.run_id.as_deref() != Some(rid)
             {
                 continue;
             }
@@ -1278,6 +1317,71 @@ impl OrchestrationStore {
             out.push(msg.clone());
         }
         out
+    }
+
+    pub fn ack_message_ids(
+        &mut self,
+        recipient: Option<&str>,
+        run_id: Option<&str>,
+        types: &[MessageType],
+        unread_only: bool,
+        ack_ids: &[String],
+    ) -> io::Result<Vec<OrchMessage>> {
+        let mut seen = BTreeSet::new();
+        let mut targets = Vec::new();
+        for raw in ack_ids {
+            let id = raw.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if seen.insert(id.to_owned()) {
+                targets.push(id.to_owned());
+            }
+        }
+        if targets.is_empty() {
+            return Err(invalid("ack_ids must contain at least one message id"));
+        }
+
+        let mut matched_indices = Vec::with_capacity(targets.len());
+        for id in &targets {
+            let Some((idx, msg)) = self.messages.iter().enumerate().find(|(_, m)| &m.id == id)
+            else {
+                return Err(not_found(format!("message not found: {id}")));
+            };
+            if let Some(rcpt) = recipient
+                && msg.to != rcpt
+                && msg.to != "@all"
+            {
+                return Err(invalid(format!(
+                    "message '{id}' does not belong to recipient '{rcpt}'"
+                )));
+            }
+            if let Some(rid) = run_id
+                && msg.run_id.as_deref() != Some(rid)
+            {
+                return Err(invalid(format!(
+                    "message '{id}' does not belong to run '{rid}'"
+                )));
+            }
+            if unread_only && msg.acked {
+                return Err(invalid(format!("message '{id}' is already acknowledged")));
+            }
+            if !types.is_empty() && !types.contains(&msg.msg_type) {
+                return Err(invalid(format!(
+                    "message '{id}' does not match requested message types"
+                )));
+            }
+            matched_indices.push(idx);
+        }
+
+        let mut out = Vec::with_capacity(matched_indices.len());
+        for idx in matched_indices {
+            if let Some(msg) = self.messages.get_mut(idx) {
+                msg.acked = true;
+                out.push(msg.clone());
+            }
+        }
+        Ok(out)
     }
 
     pub fn reply_message(
@@ -3781,5 +3885,82 @@ mod extension_wire_tests {
                 .any(|r| r.id == run.id)
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn check_messages_filtered_and_ack_message_ids_enforce_run_and_recipient() {
+        let mut store = OrchestrationStore::default();
+        let run1 = store.create_run("run1", None).unwrap();
+        let run2 = store.create_run("run2", None).unwrap();
+        let msg1 = store
+            .send_message(&SendParams {
+                from: "w1".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Status,
+                summary: "r1".into(),
+                body: String::new(),
+                run_id: Some(run1.id.clone()),
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })
+            .unwrap()[0]
+            .clone();
+        let msg2 = store
+            .send_message(&SendParams {
+                from: "w2".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Status,
+                summary: "r2".into(),
+                body: String::new(),
+                run_id: Some(run2.id.clone()),
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })
+            .unwrap()[0]
+            .clone();
+
+        let filtered =
+            store.check_messages_filtered(Some("coordinator"), Some(&run1.id), &[], true, false);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, msg1.id);
+        assert!(!store.messages.iter().any(|m| m.acked));
+
+        // Wrong run filter on ack_message_ids must fail without mutating anything.
+        assert!(
+            store
+                .ack_message_ids(
+                    Some("coordinator"),
+                    Some(&run1.id),
+                    &[],
+                    true,
+                    std::slice::from_ref(&msg2.id),
+                )
+                .is_err()
+        );
+        assert!(!store.messages.iter().any(|m| m.acked));
+
+        let acked = store
+            .ack_message_ids(
+                Some("coordinator"),
+                Some(&run1.id),
+                &[],
+                true,
+                std::slice::from_ref(&msg1.id),
+            )
+            .unwrap();
+        assert_eq!(acked.len(), 1);
+        assert!(acked[0].acked);
+        assert!(
+            !store
+                .messages
+                .iter()
+                .find(|m| m.id == msg2.id)
+                .unwrap()
+                .acked
+        );
     }
 }
