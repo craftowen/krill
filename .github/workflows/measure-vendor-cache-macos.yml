@@ -59,9 +59,9 @@ jobs:
         id: vendor
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          prefix-key: ${{ inputs.cache-prefix }}
+          # This pinned action ignores `key` when `shared-key` is provided.
+          prefix-key: ${{ inputs.cache-prefix }}-${{ steps.stage.outputs.vendor-hash }}
           shared-key: ci-macos-14
-          key: ${{ steps.stage.outputs.vendor-hash }}
           cache-directories: ${{ steps.stage.outputs.vendor-directory }}
           cache-bin: 'false'
           save-if: ${{ inputs.case == 'producer' }}

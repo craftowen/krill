@@ -62,6 +62,7 @@ def stage(root, cargo_home, vendor_root, directory, case):
     mapping = patches(root)
     vendor_hash = digest_tree(root / "vendor")
     destination = vendor_root / vendor_hash / "vendor"
+    config_hash = None
     if case != "control":
         if destination.exists():
             if digest_tree(destination) != vendor_hash:
@@ -77,9 +78,10 @@ def stage(root, cargo_home, vendor_root, directory, case):
         if (cargo_home / "config").exists() or (config_path.exists() and config_path.read_text() != config):
             raise ValueError("refusing to replace an existing Cargo home configuration")
         config_path.write_text(config)
+        config_hash = hashlib.sha256(config.encode()).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
     record = {"case": case, "vendor_hash": vendor_hash, "patches": mapping,
-              "vendor_directory": str(destination), "cargo_home": str(cargo_home)}
+              "vendor_directory": str(destination), "cargo_home": str(cargo_home), "config_sha256": config_hash}
     (directory / "vendor.json").write_text(json.dumps(record, indent=2) + "\n")
     return record
 
@@ -94,12 +96,21 @@ def normalized_graph(metadata):
     return {"members": sorted(identities[p] for p in metadata["workspace_members"]), "nodes": nodes}
 
 
-def prepare(directory):
+def verify_stage(directory):
     record = json.loads((directory / "vendor.json").read_text())
-    if record["case"] != "control" and digest_tree(Path(record["vendor_directory"])) != record["vendor_hash"]:
-        raise ValueError("restored vendor differs from tracked source content or modes")
+    if record["case"] != "control":
+        if digest_tree(Path(record["vendor_directory"])) != record["vendor_hash"]:
+            raise ValueError("restored vendor differs from tracked source content or modes")
+        config = Path(record["cargo_home"]) / "config.toml"
+        if hashlib.sha256(config.read_bytes()).hexdigest() != record["config_sha256"]:
+            raise ValueError("external Cargo configuration changed")
     if digest_tree(Path("vendor")) != record["vendor_hash"]:
         raise ValueError("tracked vendor changed")
+    return record
+
+
+def prepare(directory):
+    record = verify_stage(directory)
     # Metadata runs through the same global config as rust-cache's own invocation.
     raw = subprocess.check_output(["cargo", "metadata", "--all-features", "--locked", "--format-version=1"],
                                   text=True, timeout=240)
@@ -282,7 +293,7 @@ def compare(directory, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("stage", "prepare", "collect", "compare"))
+    parser.add_argument("action", choices=("stage", "verify", "prepare", "collect", "compare"))
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--case", choices=CASES)
     parser.add_argument("--cargo-home", type=Path)
@@ -295,6 +306,11 @@ def main():
         record = stage(Path.cwd(), args.cargo_home, args.vendor_root, args.directory, args.case)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"vendor-hash={record['vendor_hash']}\nvendor-directory={record['vendor_directory']}\n")
+            if sys.platform == "darwin":
+                sdk = subprocess.check_output(["xcrun", "--show-sdk-version"], text=True, timeout=30).strip()
+                output.write(f"sdk={sdk}\nimage={os.environ.get('ImageOS', 'macos')}-{os.environ.get('ImageVersion', 'local')}\n")
+    elif args.action == "verify":
+        verify_stage(args.directory)
     elif args.action == "prepare":
         prepare(args.directory)
     elif args.action == "collect":

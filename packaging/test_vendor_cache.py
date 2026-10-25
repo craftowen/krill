@@ -3,11 +3,12 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
-from vendor_cache import CASES, HELPERS, STAGES, cargo_messages, compare, digest_tree, normalized_graph, prepare, stage
+from vendor_cache import CASES, HELPERS, STAGES, cargo_messages, compare, digest_tree, normalized_graph, prepare, stage, verify_stage
 
 
 class StagingTests(unittest.TestCase):
@@ -50,7 +51,10 @@ class StagingTests(unittest.TestCase):
     def test_changed_bytes_or_permissions_change_key_even_with_same_mtime(self):
         path = self.project / "vendor/dependency/src/lib.rs"
         first = digest_tree(self.project / "vendor")
+        before = path.stat()
         path.write_text(path.read_text().replace("1", "2"))
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(before.st_mtime_ns, path.stat().st_mtime_ns)
         second = digest_tree(self.project / "vendor")
         self.assertNotEqual(first, second)
         path.chmod(0o700)
@@ -68,6 +72,12 @@ class StagingTests(unittest.TestCase):
         (self.project / "vendor/link").symlink_to(self.project / "Cargo.lock")
         with self.assertRaisesRegex(ValueError, "symlink"):
             self.run_stage()
+
+    def test_changed_global_configuration_is_rejected(self):
+        self.run_stage()
+        (self.root / "home/config.toml").write_text("different config\n")
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            verify_stage(self.root / "evidence")
 
 
 class GraphTests(unittest.TestCase):
