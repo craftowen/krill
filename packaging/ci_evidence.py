@@ -15,7 +15,8 @@ from urllib.parse import urlencode
 CANDIDATE_BRANCH = "release/nightly"
 CHECKS = {
     "ci.yml": {"hygiene"},
-    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest · doctest (macos-14)"},
+    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest · doctest (macos-14)",
+                     "packaging regressions (macos-14)"},
     "release.yml": {"build-windows"},
 }
 REUSE_JOBS = {"ci.yml": "reuse-hygiene-ci", "ci-macos.yml": "reuse-macos-ci"}

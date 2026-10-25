@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -98,6 +100,20 @@ class ProofTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceError, "required validation jobs"):
             fixture.evidence().proof(fixture.filename, SHA, CANDIDATE_BRANCH)
 
+    def test_packaging_must_succeed_even_when_other_required_jobs_are_green(self):
+        for conclusion in (None, "failure", "cancelled", "skipped", "timed_out", "missing"):
+            with self.subTest(conclusion=conclusion):
+                fixture = Fixture()
+                packaging = next(job for job in fixture.jobs
+                                 if job["name"] == "packaging regressions (macos-14)")
+                if conclusion == "missing":
+                    fixture.jobs.remove(packaging)
+                else:
+                    packaging.update(conclusion=conclusion,
+                                     status="in_progress" if conclusion is None else "completed")
+                with self.assertRaisesRegex(EvidenceError, "required validation jobs"):
+                    fixture.evidence().proof(fixture.filename, SHA, CANDIDATE_BRANCH)
+
     def test_skipped_wrong_attempt_and_duplicate_jobs_are_rejected(self):
         for mutation in ("skipped", "attempt", "duplicate", "sha"):
             with self.subTest(mutation=mutation):
@@ -139,9 +155,52 @@ class ProofTests(unittest.TestCase):
         evidence = Evidence(REPO, read=read, now=NOW)
         proof = evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
         self.assertEqual(proof["source"]["run_id"], 100)
-        candidate.jobs.clear()
+        candidate.jobs = [job for job in candidate.jobs
+                          if job["name"] != "packaging regressions (macos-14)"]
         with self.assertRaises(EvidenceError):
             evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
+
+
+class MacosGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Execute the actual Actions gate with its default fail-fast shell semantics.
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci-macos.yml").read_text()
+        gate = workflow.split("\n  ci-macos:\n", 1)[1]
+        cls.script = textwrap.dedent(gate.split("        run: |\n", 1)[1])
+
+    def accepted(self, **overrides):
+        env = dict(os.environ, CHANGES="success", PROOF="success", REUSED="false",
+                   RUST_CHANGED="true", CHECK="success", PACKAGING="success")
+        env.update(overrides)
+        result = subprocess.run(["bash", "-e", "-c", self.script],
+                                env=env, capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+
+    def test_both_jobs_must_succeed_or_both_be_deliberately_skipped(self):
+        states = ("success", "failure", "cancelled", "skipped")
+        for reused, changed in (("false", "true"), ("false", "false"), ("true", "true"), ("true", "false")):
+            expected = "success" if (reused, changed) == ("false", "true") else "skipped"
+            for check in states:
+                for packaging in states:
+                    with self.subTest(reused=reused, changed=changed, check=check, packaging=packaging):
+                        self.assertEqual(self.accepted(REUSED=reused, RUST_CHANGED=changed,
+                                                       CHECK=check, PACKAGING=packaging),
+                                         check == packaging == expected)
+
+    def test_failed_prerequisites_cannot_pass_through_a_docs_or_reuse_skip(self):
+        for prerequisite in ("CHANGES", "PROOF"):
+            for result in ("failure", "cancelled", "skipped", ""):
+                for reused in ("false", "true"):
+                    with self.subTest(prerequisite=prerequisite, result=result, reused=reused):
+                        self.assertFalse(self.accepted(**{prerequisite: result}, REUSED=reused,
+                                                       RUST_CHANGED="false", CHECK="skipped", PACKAGING="skipped"))
+
+    def test_missing_or_unknown_decision_outputs_are_rejected(self):
+        for output in ("REUSED", "RUST_CHANGED"):
+            for value in ("", "unknown"):
+                with self.subTest(output=output, value=value):
+                    self.assertFalse(self.accepted(**{output: value}, CHECK="skipped", PACKAGING="skipped"))
 
 
 class ReuseCommandTests(unittest.TestCase):

@@ -4,7 +4,7 @@
 # 문서만 바뀐 PR에서 워크플로 자체가 안 떠 required check가 영원히 대기하므로,
 # 항상 뜨는 `changes` 잡(ubuntu)이 git diff로 판단하고 고정 이름 `ci-macos` 잡이 결과를 모은다.
 # branch protection의 required check에는 `ci-macos`만 건다(matrix 잡 이름은 skip 시 펼쳐지지 않는다).
-# 저장소/패키징 검사는 ci.yml, 제품 전체 검사는 이 워크플로가 담당한다.
+# 저장소 검사는 ci.yml, 제품 전체·네이티브 패키징 검사는 이 워크플로가 담당한다.
 name: ci-macos
 
 on:
@@ -90,6 +90,21 @@ jobs:
             echo "rust=false" >> "$GITHUB_OUTPUT"
           fi
 
+  packaging:
+    name: packaging regressions (macos-14)
+    needs: [changes, reuse]
+    if: needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Packaging regression tests
+        run: |
+          python3 packaging/macos/test_pipeline.py
+          python3 packaging/homebrew/test_release.py
+
   check:
     name: clippy · nextest · doctest (${{ matrix.os }})
     needs: [changes, reuse]
@@ -130,11 +145,6 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
 
-      - name: Packaging regression tests
-        run: |
-          python3 packaging/macos/test_pipeline.py
-          python3 packaging/homebrew/test_release.py
-
       - name: fmt, supply chain and notices
         run: |
           cargo fmt --all --check
@@ -165,12 +175,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-
-
-  # required check용 고정 이름 잡. check가 건너뛰어졌으면 성공, 실패·취소면 실패.
+  # required check용 고정 이름 잡. 두 macOS 잡의 성공 또는 의도된 생략만 허용한다.
   ci-macos:
     name: ci-macos
-    needs: [changes, check, reuse]
+    needs: [changes, check, packaging, reuse]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -179,13 +187,22 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           CHECK: ${{ needs.check.result }}
+          PACKAGING: ${{ needs.packaging.result }}
           PROOF: ${{ needs.reuse.result }}
           REUSED: ${{ needs.reuse.outputs.reuse }}
+          RUST_CHANGED: ${{ needs.changes.outputs.rust }}
         run: |
-          echo "changes=$CHANGES check=$CHECK reuse=$REUSED"
-          [ "$CHANGES" = success ] && [ "$PROOF" = success ]
-          if [ "$REUSED" = true ]; then
-            [ "$CHECK" = skipped ]
-          else
-            [ "$CHECK" = success ] || { [ "$CHECK" = skipped ] && [ "${{ needs.changes.outputs.rust }}" != true ]; }
-          fi
+          echo "changes=$CHANGES check=$CHECK packaging=$PACKAGING proof=$PROOF reuse=$REUSED rust=$RUST_CHANGED"
+          [ "$CHANGES" = success ]
+          [ "$PROOF" = success ]
+          case "$REUSED:$RUST_CHANGED" in
+            true:true|true:false|false:false)
+              [ "$CHECK" = skipped ]
+              [ "$PACKAGING" = skipped ]
+              ;;
+            false:true)
+              [ "$CHECK" = success ]
+              [ "$PACKAGING" = success ]
+              ;;
+            *) exit 1 ;;
+          esac
