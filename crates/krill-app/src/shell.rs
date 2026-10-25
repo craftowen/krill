@@ -773,6 +773,7 @@ impl Shell {
                 this.launch_host = selected.0;
             }
             this.reconcile_workspace_sessions(cx);
+            this.sync_diff_workspace(cx);
             cx.notify();
         });
         cx.subscribe(
@@ -1289,6 +1290,7 @@ impl Shell {
                 }
                 this.sync(cx);
                 this.reconcile_workspace_sessions(cx);
+                this.sync_diff_workspace(cx);
                 if let Some((host, session)) = this.restore_session.take() {
                     this.open_session_on(host, session, cx);
                 }
@@ -2428,6 +2430,7 @@ impl Shell {
                     }
                     this.sync_settings_account_hosts(cx);
                     this.sync(cx);
+                    this.sync_diff_workspace(cx);
                     cx.notify();
                 }
                 if this.host_refresh_again || !this.host_pending_reconnects.is_empty() {
@@ -2528,6 +2531,75 @@ impl Shell {
         }
         let settings = settings.clone();
         settings.update(cx, |v, cx| v.sync_account_hosts(hosts, snapshots, cx));
+    }
+
+    pub(super) fn remote_target_for_pane(
+        &self,
+        pane: PaneId,
+    ) -> Option<(krill_app::hosts::HostId, krill_app::hosts::HostTarget)> {
+        let host = self.layout.host(pane);
+        if !host.is_remote() {
+            return None;
+        }
+        Some((host.clone(), self.target_for_host(host)?))
+    }
+
+    /// 터미널에서 클릭한 URL을 브라우저로 연다.
+    /// 원격 호스트 패인의 루프백 URL(`localhost`, `127.0.0.1`, `0.0.0.0`, `[::1]`)이면
+    /// 로컬 포워딩 리스너(유휴 10분 뒤 자동 해제)를 먼저 준비하고 포워딩된 로컬 URL로 연다.
+    pub(super) fn open_terminal_url(&mut self, pane: PaneId, uri: &str, cx: &mut Context<Self>) {
+        if let Some((host, target)) = self.remote_target_for_pane(pane)
+            && let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(uri)
+        {
+            let uri = uri.to_owned();
+            cx.spawn(async move |this, cx| {
+                let forwarded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        krill_app::remote_fs::ensure_port_forward(&host, &target, remote_port)
+                    })
+                    .await;
+                this.update(cx, |this, cx| match forwarded {
+                    Ok(local_port) => {
+                        let rewritten =
+                            krill_app::remote_fs::rewrite_loopback_url_port(&uri, local_port);
+                        cx.open_url(&rewritten);
+                    }
+                    Err(err) => {
+                        this.notice = Some(err.to_string());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        cx.open_url(uri);
+    }
+
+    pub(super) fn sync_diff_workspace(&mut self, cx: &mut Context<Self>) {
+        if self.layout.focused().is_none() {
+            return;
+        }
+        let ws = self.active_workspace(cx);
+        let folder = {
+            let focused_folder = self.folder();
+            if focused_folder.as_os_str().is_empty() {
+                ws.folder
+            } else {
+                focused_folder
+            }
+        };
+        let target = self.target_for_host(&ws.host);
+        self.diff.update(cx, |d, cx| {
+            if let Some(target) = target {
+                d.connect(target, cx);
+            }
+            if !folder.as_os_str().is_empty() {
+                d.set_repo(folder, cx);
+            }
+        });
     }
 
     pub(super) fn new_tab_on_launch_host(&mut self, cx: &mut Context<Self>) {
@@ -4926,7 +4998,6 @@ impl Shell {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Layout),
     ) {
-        let folder = self.folder();
         let focused = self.layout.focused();
         let before = self.layout.clone();
         f(&mut self.layout);
@@ -4971,9 +5042,8 @@ impl Shell {
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
         // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
-        if now_focused.is_some() && self.folder() != folder {
-            let folder = self.folder();
-            self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
+        if now_focused.is_some() {
+            self.sync_diff_workspace(cx);
         }
         self.sync(cx);
         if now_focused != focused {
@@ -6024,7 +6094,7 @@ impl Shell {
                             }
                         }
                         if let Some(uri) = url {
-                            cx.open_url(&uri);
+                            this.open_terminal_url(id, &uri, cx);
                         } else {
                             // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
                             match file {

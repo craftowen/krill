@@ -639,6 +639,17 @@ pub fn notebook(
 
 /// 미리보기할 수 없는 파일: 종류·크기와 "기본 앱으로 열기"·"Finder에서 보기".
 pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
+    placeholder_on(path, None, kind, len, cx)
+}
+
+/// 원격 호스트 파일을 포함한 미리보기 불가 자리표시자.
+pub fn placeholder_on(
+    path: &Path,
+    remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
+    kind: Kind,
+    len: u64,
+    cx: &App,
+) -> AnyElement {
     let pal = crate::ui::palette(cx);
     let label = match kind {
         Kind::Media => text::KIND_MEDIA.get(),
@@ -653,9 +664,17 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
         .unwrap_or_default();
     let open_action = {
         let path = path.to_path_buf();
+        let remote = remote.clone();
         crate::ui::primary("file-open-default", text::OPEN_DEFAULT.get())
             .debug_selector(|| "file-open-default".into())
-            .on_click(move |_, _, cx| spawn_open(path.clone(), super::open_default_command, cx))
+            .on_click(move |_, _, cx| {
+                spawn_open_on(
+                    path.clone(),
+                    remote.clone(),
+                    super::open_default_command,
+                    cx,
+                );
+            })
     };
     let reveal_action = {
         let path = path.to_path_buf();
@@ -666,7 +685,9 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
                 .get(),
         )
         .debug_selector(|| "file-reveal".into())
-        .on_click(move |_, _, cx| spawn_open(path.clone(), super::reveal_command, cx))
+        .on_click(move |_, _, cx| {
+            spawn_open_on(path.clone(), remote.clone(), super::reveal_command, cx);
+        })
     };
     div()
         .size_full()
@@ -713,9 +734,34 @@ pub(crate) fn size_label(len: u64) -> String {
 
 /// `open`은 Launch Services 응답을 기다리므로 UI 스레드 밖에서 실행한다. 로그에 경로는 남기지 않는다(A8).
 pub fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
+    spawn_open_on(path, None, command, cx);
+}
+
+/// 원격 파일이면 로컬 캐시로 먼저 내려받은 뒤 `command`를 실행한다.
+pub fn spawn_open_on(
+    path: PathBuf,
+    remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
+    command: fn(&Path) -> Command,
+    cx: &App,
+) {
     cx.background_spawn(async move {
+        let target_path = match remote {
+            Some((host, target)) => match crate::remote_fs::stage_to_local_cache(
+                &target,
+                &host,
+                &path,
+                crate::remote_fs::MAX_STAGE_BYTES,
+            ) {
+                Ok((local, _)) => local,
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), "remote stage for open failed");
+                    return;
+                }
+            },
+            None => path,
+        };
         // Building an Open command can stat the target to avoid executing binaries.
-        match command(&path).status() {
+        match command(&target_path).status() {
             // explorer.exe는 열기에 성공해도 1로 끝난다.
             Ok(status) if status.success() || cfg!(windows) => {}
             Ok(status) => tracing::warn!(?status, "open failed"),

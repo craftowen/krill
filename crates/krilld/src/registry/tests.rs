@@ -1856,9 +1856,9 @@ fn late_hook_cannot_resurrect_a_deleted_session_or_launch_metadata() {
 }
 
 #[test]
-fn reserved_remote_fs_requests_are_rejected_without_filesystem_access() {
+fn unnegotiated_remote_fs_requests_are_rejected_without_filesystem_access() {
     use krill_proto::remote_fs::RemoteFsRequest;
-    assert_eq!(ipc::FEATURES & control::FEAT_REMOTE_FS, 0);
+    assert_ne!(ipc::FEATURES & control::FEAT_REMOTE_FS, 0);
     let (mut client, server) = UnixStream::pair().unwrap();
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
@@ -1874,12 +1874,12 @@ fn reserved_remote_fs_requests_are_rejected_without_filesystem_access() {
         Registry::new(None, None).serve(server, &hello).unwrap();
     });
     let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
-    assert_eq!(
+    assert_ne!(
         ServerHello::decode(kind, &body).unwrap().features & control::FEAT_REMOTE_FS,
         0
     );
     let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
-    hello.features = FEAT_CONTROL | control::FEAT_REMOTE_FS;
+    hello.features = FEAT_CONTROL;
     client.write_all(&hello.encode().unwrap()).unwrap();
     for request in [
         RemoteFsRequest::Stat {
@@ -1906,4 +1906,104 @@ fn reserved_remote_fs_requests_are_rejected_without_filesystem_access() {
     }
     drop(client);
     thread.join().unwrap();
+}
+
+#[test]
+fn negotiated_remote_fs_enforces_scope_and_observer_permissions() {
+    use krill_proto::os::ffi::OsStrExt as _;
+    use krill_proto::remote_fs::{RemoteFsReply, RemoteFsRequest, WireWriteOutcome};
+    let dir = std::env::temp_dir().join(format!("registry-remote-fs-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("document.txt");
+    fs::write(&path, b"original").unwrap();
+    let raw = path.as_os_str().as_bytes().to_vec();
+    let stat = RemoteFsRequest::Stat { path: raw.clone() };
+    let write = RemoteFsRequest::WriteAtomic {
+        path: raw.clone(),
+        bytes: b"updated".to_vec(),
+        expected: None,
+        stage_id: 0,
+        offset: 0,
+        commit: true,
+    };
+    let reg = Registry::new(None, None);
+    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+        for request in [stat.clone(), write.clone()] {
+            assert_eq!(
+                reg.handle(
+                    &Peer { pid: None, scope },
+                    Request::RemoteFs(request),
+                    &mut HashMap::new()
+                ),
+                Reply::Failed(Failure::Denied)
+            );
+        }
+    }
+    for observer in [true, false] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let thread = std::thread::spawn(move || {
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            Registry::new(None, None)
+                .serve_mobile(server, &hello)
+                .unwrap();
+        });
+        let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        ServerHello::decode(kind, &body).unwrap();
+        let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+        hello.features = FEAT_CONTROL | control::FEAT_REMOTE_FS | FEAT_ROLES;
+        client.write_all(&hello.encode().unwrap()).unwrap();
+        if observer {
+            client
+                .write_all(&roles::Request::Set(Role::Observer).encode().unwrap())
+                .unwrap();
+            let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+            assert_eq!(Ack::decode(kind, &body).unwrap(), Ack::Applied);
+        }
+        client
+            .write_all(&Request::RemoteFs(stat.clone()).encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        assert!(
+            matches!(Reply::decode(kind, &body).unwrap(), Reply::RemoteFs(RemoteFsReply::Stat(Ok(s))) if s.is_file)
+        );
+        client
+            .write_all(&Request::RemoteFs(write.clone()).encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        let reply = Reply::decode(kind, &body).unwrap();
+        if observer {
+            assert_eq!(reply, Reply::Failed(Failure::Denied));
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            client
+                .write_all(
+                    &Request::RemoteFs(RemoteFsRequest::PortForward { port: 8080 })
+                        .encode()
+                        .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+            assert_eq!(
+                Reply::decode(kind, &body).unwrap(),
+                Reply::Failed(Failure::Denied)
+            );
+        } else {
+            assert!(matches!(
+                reply,
+                Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(_)))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), b"updated");
+        }
+        drop(client);
+        thread.join().unwrap();
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -227,6 +227,19 @@ impl Shell {
             .any(|pane| self.pane_workspace(pane, cx).as_ref() == Some(workspace))
     }
 
+    pub(super) fn active_workspace(&self, cx: &App) -> Workspace {
+        if let Some(ws) = self.tab_workspace(self.layout.active(), cx) {
+            return ws;
+        }
+        if let Some((host, folder)) = self.sidebar.read(cx).selected_workspace() {
+            return Workspace { host, folder };
+        }
+        Workspace {
+            host: self.launch_host.clone(),
+            folder: self.folder(),
+        }
+    }
+
     fn pane_workspace(&self, pane: PaneId, cx: &App) -> Option<Workspace> {
         if !self.layout.pane_exists(pane) {
             return None;
@@ -236,12 +249,18 @@ impl Shell {
         let folder = self
             .layout
             .launch(pane)
+            .filter(|launch| !launch.cwd.is_empty())
             .map(|launch| PathBuf::from(std::ffi::OsString::from_vec(launch.cwd.clone())))
             .or_else(|| {
                 self.layout
                     .session(pane)
                     .and_then(|sid| self.sidebar.read(cx).folder_on(&host, sid))
                     .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                self.layout
+                    .file(pane)
+                    .and_then(|file| self.sidebar.read(cx).workspace_for_path_on(&host, file))
             })
             .unwrap_or_else(|| {
                 PathBuf::from(std::ffi::OsString::from_vec(self.launch_for(pane).cwd))

@@ -584,8 +584,12 @@ impl Shell {
 
     /// 팝오버의 대상 URL을 브라우저로 열고 닫는다.
     pub(super) fn open_link_menu_in_browser(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = self.security.link_menu() {
-            cx.open_url(&menu.uri);
+        if let Some((pane, uri)) = self
+            .security
+            .link_menu()
+            .map(|menu| (menu.pane, menu.uri.clone()))
+        {
+            self.open_terminal_url(pane, &uri, cx);
         }
         self.close_link_menu(cx);
     }

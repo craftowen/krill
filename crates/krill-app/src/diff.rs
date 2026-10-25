@@ -741,6 +741,18 @@ impl Panel {
 
     pub fn connect(&mut self, target: impl Into<HostTarget>, cx: &mut Context<Self>) {
         let target = target.into();
+        let target_changed = self.explorer.target.as_ref() != Some(&target);
+        if !target_changed && self.source.is_some() {
+            return;
+        }
+        self.explorer.connect(target.clone());
+        if target_changed && self.explorer.loaded_root {
+            let repo = self.explorer.repo.clone();
+            self.explorer.set_repo(repo, false);
+            if self.tab == PanelTab::Files {
+                self.ensure_explorer_loaded_async(cx);
+            }
+        }
         self.editing.connect(target.clone());
         self.refresh_branch_sync(cx);
         self.connect_source(Arc::new(Socket::new(target)), cx);

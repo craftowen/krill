@@ -45,10 +45,15 @@ pub(super) fn read_current_file(
     path: &Path,
     preview: bool,
     expected: Option<ComparedVersion>,
+    remote: Option<&(krill_app::hosts::HostId, krill_app::hosts::HostTarget)>,
 ) -> PreparedFile {
-    let mut loaded = read_file(path, preview);
+    let mut loaded = read_file_on(path, preview, remote);
     if let Ok((_, stamp)) = &loaded.opened {
-        let stable = editor::stamp(path).is_ok_and(|now| now == Some(*stamp));
+        let now = match remote {
+            Some((_, target)) => krill_app::remote_fs::stat(target, path),
+            None => editor::stamp(path),
+        };
+        let stable = now.is_ok_and(|now| now == Some(*stamp));
         let changed = expected.is_some_and(|expected| {
             expected.stamp != *stamp
                 || match &loaded.opened {
@@ -86,6 +91,7 @@ impl Shell {
         let revision = tab.revision;
         let state_id = state.entity_id();
         let draft = state.read(cx).text().clone();
+        let remote = self.remote_target_for_pane(pane);
         self.files.next_request = self.files.next_request.wrapping_add(1);
         let generation = self.files.next_request;
         self.files.loading.insert(pane, (generation, path.clone()));
@@ -101,7 +107,7 @@ impl Shell {
                         gate.await.ok();
                     }
                     (
-                        read_current_file(&read_path, false, None),
+                        read_current_file(&read_path, false, None, remote.as_ref()),
                         draft.to_string(),
                     )
                 })

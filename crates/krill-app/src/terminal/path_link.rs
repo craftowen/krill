@@ -470,12 +470,15 @@ fn trim_cjk_suffix_after_ascii_ext(text: &[char]) -> usize {
 }
 
 /// 찾아 볼 실제 경로들(앞이 우선). URL·빈 경로·제어 문자는 링크가 아니다.
+pub(super) fn valid_raw_candidate(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains("://")
+        && !path.starts_with("mailto:")
+        && !path.chars().any(|c| c.is_control() || is_bidi_control(c))
+}
+
 fn resolve(path: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
-    if path.is_empty()
-        || path.contains("://")
-        || path.starts_with("mailto:")
-        || path.chars().any(|c| c.is_control() || is_bidi_control(c))
-    {
+    if !valid_raw_candidate(path) {
         return Vec::new();
     }
     if path.starts_with('/') {
@@ -620,6 +623,86 @@ impl Cache {
             .clone()
             .filter(|link| (link.column..link.column.saturating_add(link.cols)).contains(&column))
     }
+}
+
+fn bounded_candidates(
+    row: &[Cell],
+    column: u16,
+    cap: usize,
+    crossing: Option<(u16, u16)>,
+) -> Vec<Candidate> {
+    let mut candidates = candidates_at(row, column);
+    if let Some((first_end, last_start)) = crossing {
+        candidates.retain(|candidate| {
+            candidate
+                .starts
+                .first()
+                .is_some_and(|&start| start < first_end)
+                && candidate.end > last_start
+        });
+    }
+    candidates.truncate(cap);
+    candidates
+}
+
+fn collect_remote_queries(
+    candidates: &[Candidate],
+    out: &mut Vec<PathBuf>,
+    seen: &mut std::collections::HashSet<String>,
+    max_queries: usize,
+) {
+    for cand in candidates {
+        if out.len() >= max_queries {
+            break;
+        }
+        let literal: String = cand.chars.iter().collect();
+        if valid_raw_candidate(&literal) && seen.insert(literal.clone()) {
+            out.push(PathBuf::from(&literal));
+            if out.len() >= max_queries {
+                break;
+            }
+        }
+        let (split, _, _, _) = split_location(&cand.chars);
+        if split != literal && valid_raw_candidate(&split) && seen.insert(split.clone()) {
+            out.push(PathBuf::from(split));
+        }
+    }
+}
+
+fn lookup_remote(
+    candidates: &[Candidate],
+    column: u16,
+    resolved: &std::collections::HashMap<String, PathBuf>,
+) -> Option<PathLink> {
+    candidates.iter().find_map(|cand| {
+        let literal: String = cand.chars.iter().collect();
+        let (path, line, col, used) = if let Some(path) = resolved.get(&literal) {
+            (path.clone(), None, None, cand.chars.len())
+        } else {
+            let (raw, line, col, used) = split_location(&cand.chars);
+            let found = resolved.get(&raw)?.clone();
+            (found, line, col, used)
+        };
+        let end = cand.starts.get(used).copied().map_or(cand.end, |next| {
+            let last = cand
+                .starts
+                .get(used.saturating_sub(1))
+                .copied()
+                .unwrap_or(next);
+            next.max(last.saturating_add(1))
+        });
+        let start = *cand.starts.first()?;
+        if !(start..end).contains(&column) {
+            return None;
+        }
+        Some(PathLink {
+            column: start,
+            cols: end - start,
+            path,
+            line,
+            col,
+        })
+    })
 }
 
 #[cfg(test)]

@@ -156,7 +156,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_USAGE_MANAGE | `1 << 59` | `krill_proto::usage` (계정 라벨 변경·데이터 삭제·고아 프로필 정리 요청과 `UsageReply::Orphans`, MK-144·145·OWE-704·705 지휘자 배정; enum 끝에 추가) |
 | FEAT_ACCOUNT_POLICY | `1 << 61` | `krill_proto::usage::policy` (`Create.account` 선택 꼬리·고급 자동전환 정책·전환 이력·모델별 주간 창, MK-152·OWE-712 지휘자 배정; 구 피어에는 꼬리 생략) |
 | FEAT_ACCOUNT_CONNECTION | `1 << 62` | `krill_proto::usage::connections` (연결 상태·직접 사용량 설정 꼬리와 `SetDirectUsage`, OWE-719; 구 피어에는 꼬리 생략) |
-| FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가. 예약된 프로토콜이며 클라이언트 통합·검증 완료 전까지 FEATURES에서 광고하지 않음) |
+| FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가) |
 
 OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisioning`은 미출시 `FEAT_USAGE_MANAGE`(`1 << 59`)에 포함한다(새 비트 없음, 미협상 피어에 요청 금지).
 

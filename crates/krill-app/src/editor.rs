@@ -44,6 +44,29 @@ impl Stamp {
             len: meta.len(),
         }
     }
+
+    #[must_use]
+    pub fn from_wire(w: krill_proto::remote_fs::WireStamp) -> Self {
+        let modified = w
+            .modified_unix_ns
+            .map(|ns| std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns));
+        Self {
+            modified,
+            len: w.len,
+        }
+    }
+
+    #[must_use]
+    pub fn to_wire(self) -> krill_proto::remote_fs::WireStamp {
+        let modified_unix_ns = self
+            .modified
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
+        krill_proto::remote_fs::WireStamp {
+            modified_unix_ns,
+            len: self.len,
+        }
+    }
 }
 
 /// 지금 디스크의 지문. 파일이 없으면 `Ok(None)`.
@@ -282,6 +305,10 @@ impl Doc {
 
     pub fn disk(&self) -> Disk {
         self.disk
+    }
+
+    pub fn stamp(&self) -> Option<Stamp> {
+        self.stamp
     }
 
     /// 에디터가 처음 받은 내용을 기준으로 삼는다(에디터가 내용을 정규화해도 열자마자 dirty가 되지 않게).

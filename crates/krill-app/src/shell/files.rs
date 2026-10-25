@@ -199,6 +199,7 @@ pub(super) struct Files {
 #[derive(Clone, PartialEq)]
 struct LinkKey {
     pane: PaneId,
+    host: krill_app::hosts::HostId,
     input: path_link::Input,
     session: Option<krill_proto::SessionId>,
     line: u16,
@@ -262,10 +263,12 @@ impl Files {
 
     /// 닫히거나 바뀌는 탭의 이미지 캐시를 놓도록 예약한다.
     fn forget(&mut self, tab: &FileTab) {
-        if tab.shows_image()
-            && let Some(doc) = &tab.doc
-        {
-            self.released.push(doc.path().to_owned());
+        if tab.shows_image() {
+            if let Some(staged) = &tab.staged_image {
+                self.released.push(staged.clone());
+            } else if let Some(doc) = &tab.doc {
+                self.released.push(doc.path().to_owned());
+            }
         }
     }
 }
@@ -274,6 +277,7 @@ struct FileTab {
     comparison: Option<FileComparison>,
     recovery: Option<ReloadRecovery>,
     path: PathBuf,
+    staged_image: Option<PathBuf>,
     revision: u64,
     saving: bool,
     preview_generation: u64,
@@ -356,10 +360,26 @@ struct PreparedFile {
     opened: std::io::Result<(Opened, editor::Stamp)>,
     preview: Option<PreparedPreview>,
     baseline: Option<Doc>,
+    staged_image: Option<PathBuf>,
 }
 
+#[cfg(all(test, unix))]
 fn read_file(path: &Path, preview: bool) -> PreparedFile {
-    let opened = editor::open(path);
+    read_file_on(path, preview, None)
+}
+
+fn read_file_on(
+    path: &Path,
+    preview: bool,
+    remote: Option<&(krill_app::hosts::HostId, krill_app::hosts::HostTarget)>,
+) -> PreparedFile {
+    let (opened, staged_image) = match remote {
+        Some((host, target)) => match krill_app::remote_fs::open(target, host, path) {
+            Ok((opened, stamp, staged)) => (Ok((opened, stamp)), staged),
+            Err(e) => (Err(e), None),
+        },
+        None => (editor::open(path), None),
+    };
     let prepared = match &opened {
         Ok((Opened::Text(kind, text), _)) if preview => {
             editor::preview(*kind).map(|p| prepare_preview(p, text))
@@ -374,6 +394,7 @@ fn read_file(path: &Path, preview: bool) -> PreparedFile {
         opened,
         preview: prepared,
         baseline,
+        staged_image,
     }
 }
 
@@ -551,26 +572,72 @@ impl Shell {
 
     /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
     pub(super) fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let host = self.active_workspace(cx).host;
+        self.open_file_on(host, path, cx);
+    }
+
+    pub(super) fn open_file_on(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_proto::os::ffi::OsStrExt as _;
         self.files.recent.retain(|old| old != &path);
         self.files.recent.insert(0, path.clone());
         self.files.recent.truncate(100);
+        let ws = self.active_workspace(cx);
+        let ws_folder = (ws.host == host)
+            .then_some(ws.folder)
+            .filter(|f| !f.as_os_str().is_empty());
         self.close_settings(None, cx);
         self.diff
             .update(cx, krill_app::diff::Panel::clear_selection);
         self.change(true, cx, move |l| {
-            l.open_file(path);
+            let pane = l.open_file_on(host, path);
+            if l.launch(pane).is_none_or(|c| c.cwd.is_empty())
+                && let Some(folder) = ws_folder
+            {
+                l.set_launch(
+                    pane,
+                    Create {
+                        account: None,
+                        program: Program::Login,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: pane::SIZE.0,
+                        rows: pane::SIZE.1,
+                    },
+                );
+            }
         });
         self.files.refocus = true;
     }
 
     /// 파일을 미리보기 탭으로 연다(OWE-849): 같은 칸을 재사용하며 다음 단일 클릭이 교체한다.
     pub(super) fn open_file_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let ws = self.active_workspace(cx);
+        let ws_folder = (!ws.folder.as_os_str().is_empty()).then_some(ws.folder);
         self.close_settings(None, cx);
         self.diff
             .update(cx, krill_app::diff::Panel::clear_selection);
         let tabs = self.workspace_tabs(cx);
         self.change(true, cx, move |l| {
-            l.open_file_preview_in(path, &tabs);
+            let pane = l.open_file_preview_in(path, &tabs);
+            if l.launch(pane).is_none_or(|c| c.cwd.is_empty())
+                && let Some(folder) = ws_folder
+            {
+                l.set_launch(
+                    pane,
+                    Create {
+                        account: None,
+                        program: Program::Login,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: pane::SIZE.0,
+                        rows: pane::SIZE.1,
+                    },
+                );
+            }
         });
         self.files.refocus = true;
     }
@@ -590,10 +657,11 @@ impl Shell {
     /// 세션의 현재 폴더(krilld가 알린 값), 모르면 칸을 연 폴더. 터미널 상대 경로 링크의 기준이다.
     pub(super) fn pane_cwd(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
         use krill_proto::os::ffi::OsStringExt as _;
+        let host = self.layout.host(pane);
         let live = self
             .layout
             .session(pane)
-            .and_then(|id| self.sidebar.read(cx).session(id))
+            .and_then(|id| self.sidebar.read(cx).session_on(host, id))
             .and_then(|s| s.cwd.clone());
         live.or_else(|| {
             let cwd = self.launch_for(pane).cwd;
@@ -609,9 +677,12 @@ impl Shell {
         action: Option<terminal_menu::FileAction>,
         cx: &mut Context<Self>,
     ) -> Option<(u16, PathLink)> {
-        if self.layout.host(pane).is_remote() {
-            return None;
-        }
+        let host = self.layout.host(pane).clone();
+        let remote_target = if host.is_remote() {
+            Some(self.remote_target_for_pane(pane)?.1)
+        } else {
+            None
+        };
         let cwd = self.pane_cwd(pane, cx);
         let l = self.live.get(&pane)?;
         let screen = l.pane.shown();
@@ -622,6 +693,7 @@ impl Shell {
         let input = path_link::Input::at(&screen, line, column)?;
         let key = LinkKey {
             pane,
+            host,
             input,
             session: l.pane.session(),
             line,
@@ -641,6 +713,7 @@ impl Shell {
             self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
             let generation = self.files.link_open_generation;
             let session = l.pane.session();
+            let remote = remote_target.clone();
             let checked = key.clone();
             #[cfg(test)]
             let next_io = self.files.link_next_io.take();
@@ -652,9 +725,14 @@ impl Shell {
                 let found = cx
                     .background_executor()
                     .spawn(async move {
-                        checked
-                            .input
-                            .resolve(&mut path_link::Cache::default(), checked.cwd.as_deref())
+                        match remote {
+                            Some(target) => checked
+                                .input
+                                .resolve_remote(&target, checked.cwd.as_deref()),
+                            None => checked
+                                .input
+                                .resolve(&mut path_link::Cache::default(), checked.cwd.as_deref()),
+                        }
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -697,11 +775,18 @@ impl Shell {
         self.files.link_busy = true;
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok(Some((generation, key, cache))) = this.read_with(cx, |this, _| {
+                let Ok(Some((generation, key, cache, remote))) = this.read_with(cx, |this, _| {
+                    let key = this.files.link_lookup.as_ref()?.key.clone();
+                    let remote = if key.host.is_remote() {
+                        Some(this.target_for_host(&key.host)?)
+                    } else {
+                        None
+                    };
                     Some((
                         this.files.link_generation,
-                        this.files.link_lookup.as_ref()?.key.clone(),
+                        key,
                         this.files.link_cache.clone(),
+                        remote,
                     ))
                 }) else {
                     this.update(cx, |this, _| this.files.link_busy = false).ok();
@@ -711,6 +796,11 @@ impl Shell {
                 let found = cx
                     .background_executor()
                     .spawn(async move {
+                        if let Some(target) = remote {
+                            return checked
+                                .input
+                                .resolve_remote(&target, checked.cwd.as_deref());
+                        }
                         let Ok(mut cache) = cache.lock() else {
                             return None;
                         };
@@ -789,7 +879,7 @@ impl Shell {
     }
 
     fn path_link_key_matches(&self, key: &LinkKey, cx: &App) -> bool {
-        !self.layout.host(key.pane).is_remote()
+        *self.layout.host(key.pane) == key.host
             && self.pane_cwd(key.pane, cx) == key.cwd
             && self.live.get(&key.pane).is_some_and(|live| {
                 live.pane.session() == key.session && key.input.matches(&live.pane.shown())
@@ -803,11 +893,20 @@ impl Shell {
         action: terminal_menu::FileAction,
         cx: &mut Context<Self>,
     ) {
-        let focused = self.layout.focused();
-        if focused.is_some_and(|pane| self.layout.host(pane).is_remote()) {
+        let Some(focused_pane) = self.layout.focused() else {
             return;
-        }
-        let session = focused.and_then(|pane| self.live.get(&pane)?.pane.session());
+        };
+        let host = self.layout.host(focused_pane).clone();
+        let remote = if host.is_remote() {
+            let Some((_, target)) = self.remote_target_for_pane(focused_pane) else {
+                return;
+            };
+            Some(target)
+        } else {
+            None
+        };
+        let focused = Some(focused_pane);
+        let session = self.live.get(&focused_pane).and_then(|l| l.pane.session());
         let target = path.clone();
         self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
         let generation = self.files.link_open_generation;
@@ -815,23 +914,29 @@ impl Shell {
             let check = path.clone();
             let is_file = cx
                 .background_executor()
-                .spawn(async move { check.is_file() })
+                .spawn(async move {
+                    match remote {
+                        Some(target) => krill_app::remote_fs::stat(&target, &check)
+                            .ok()
+                            .flatten()
+                            .is_some(),
+                        None => check.is_file(),
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.files.link_open_generation != generation
                     || this.layout.focused() != focused
-                    || focused.is_some_and(|pane| this.layout.host(pane).is_remote())
-                    || focused.and_then(|pane| this.live.get(&pane)?.pane.session()) != session
-                    || !focused.is_some_and(|pane| {
-                        this.live.get(&pane).is_some_and(|live| {
-                            krill_app::terminal::file_link_target(
-                                &live.pane.shown(),
-                                &live.painted,
-                                position,
-                            )
-                            .as_ref()
-                                == Some(&target)
-                        })
+                    || *this.layout.host(focused_pane) != host
+                    || this.live.get(&focused_pane).and_then(|l| l.pane.session()) != session
+                    || !this.live.get(&focused_pane).is_some_and(|live| {
+                        krill_app::terminal::file_link_target(
+                            &live.pane.shown(),
+                            &live.painted,
+                            position,
+                        )
+                        .as_ref()
+                            == Some(&target)
                     })
                 {
                     return;
@@ -848,7 +953,7 @@ impl Shell {
                         action,
                         cx,
                     );
-                } else {
+                } else if host.is_local() {
                     cx.reveal_path(&path);
                 }
             })
@@ -888,17 +993,14 @@ impl Shell {
             self.files.link_lookup = None;
         }
         let next = if cmd {
-            let remote = self.layout.host(pane).is_remote();
             let osc_or_url = self.live.get(&pane).and_then(|l| {
                 let screen = l.pane.shown();
-                (!remote
-                    || krill_app::terminal::link_target(&screen, &l.painted, position).is_some())
-                .then(|| krill_app::terminal::osc_link_highlight(&screen, &l.painted, position))
-                .flatten()
-                .or_else(|| {
-                    krill_app::terminal::url_link_target(&screen, &l.painted, position)
-                        .map(|(h, _)| h)
-                })
+                krill_app::terminal::osc_link_highlight(&screen, &l.painted, position).or_else(
+                    || {
+                        krill_app::terminal::url_link_target(&screen, &l.painted, position)
+                            .map(|(h, _)| h)
+                    },
+                )
             });
             if osc_or_url.is_some() {
                 self.files.link_generation = self.files.link_generation.wrapping_add(1);
@@ -1125,7 +1227,9 @@ impl Shell {
                     .into_any_element(),
                 Some(Body::Image(view)) => view.clone().into_any_element(),
                 Some(Body::Table(view)) => view.clone().into_any_element(),
-                Some(Body::Placeholder(kind, len)) => fview::placeholder(&path, *kind, *len, cx),
+                Some(Body::Placeholder(kind, len)) => {
+                    fview::placeholder_on(&path, self.remote_target_for_pane(id), *kind, *len, cx)
+                }
                 Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
                 Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
                 None => notice(String::new()),
@@ -1780,6 +1884,7 @@ impl Shell {
         let generation = self.files.next_request;
         self.files.loading.insert(pane, (generation, path.clone()));
         let saved = self.layout.file_state(pane);
+        let remote = self.remote_target_for_pane(pane);
         #[cfg(test)]
         let gate = self.files.next_io.take();
         cx.spawn_in(window, async move |this, cx| {
@@ -1791,7 +1896,7 @@ impl Shell {
                     if let Some(gate) = gate {
                         gate.await.ok();
                     }
-                    read_file(&read_path, saved.is_none_or(|s| s.preview))
+                    read_file_on(&read_path, saved.is_none_or(|s| s.preview), remote.as_ref())
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -1836,6 +1941,7 @@ impl Shell {
             opened,
             preview: prepared,
             baseline,
+            staged_image,
         } = loaded;
         let (body, stamp) = match opened {
             Ok((Opened::Text(kind, text), stamp)) => {
@@ -1886,6 +1992,7 @@ impl Shell {
                     comparison: None,
                     recovery: None,
                     path: path.clone(),
+                    staged_image: None,
                     revision: 0,
                     saving: false,
                     preview_generation: 0,
@@ -1900,10 +2007,13 @@ impl Shell {
                     error: None,
                 };
             }
-            Ok((Opened::Image(Ok(dims)), stamp)) => (
-                Body::Image(cx.new(|_| ImageView::new(path.clone(), Some(dims)))),
-                stamp,
-            ),
+            Ok((Opened::Image(Ok(dims)), stamp)) => {
+                let img_path = staged_image.clone().unwrap_or_else(|| path.clone());
+                (
+                    Body::Image(cx.new(|_| ImageView::new(img_path, Some(dims)))),
+                    stamp,
+                )
+            }
             Ok((Opened::Image(Err(e)), stamp)) => (Body::Failed(fview::image_error(e)), stamp),
             Ok((Opened::Table(table), stamp)) => {
                 (Body::Table(cx.new(|_| CsvView::new(table))), stamp)
@@ -1916,6 +2026,7 @@ impl Shell {
                     comparison: None,
                     recovery: None,
                     path: path.clone(),
+                    staged_image: None,
                     revision: 0,
                     saving: false,
                     preview_generation: 0,
@@ -1931,6 +2042,7 @@ impl Shell {
             comparison: None,
             recovery: None,
             path: path.clone(),
+            staged_image,
             revision: 0,
             saving: false,
             preview_generation: 0,
@@ -2020,6 +2132,7 @@ impl Shell {
 
     /// Save a snapshot off-thread. Edits made while fsync runs stay dirty.
     pub(super) fn save_file(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Task<bool> {
+        let remote = self.remote_target_for_pane(pane);
         let Some(tab) = self.files.tabs.get_mut(&pane) else {
             return Task::ready(false);
         };
@@ -2050,7 +2163,27 @@ impl Shell {
                 if let Some(gate) = gate {
                     gate.await.ok();
                 }
-                let result = snapshot.save(text.to_string());
+                let text_str = text.to_string();
+                let result = if let Some((_, target)) = remote {
+                    if snapshot.disk() == Disk::Changed {
+                        Err(SaveError::Conflict)
+                    } else {
+                        match krill_app::remote_fs::save_atomic(
+                            &target,
+                            snapshot.path(),
+                            &text_str,
+                            snapshot.stamp(),
+                        ) {
+                            Ok(stamp) => {
+                                snapshot.saved_as(text_str, stamp);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                } else {
+                    snapshot.save(text_str)
+                };
                 completed.send((snapshot, result)).ok();
                 finish.send(()).ok();
             })
@@ -2102,6 +2235,7 @@ impl Shell {
     }
 
     fn keep_file(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let remote = self.remote_target_for_pane(pane).map(|(_, target)| target);
         let Some(tab) = self.files.tabs.get(&pane) else {
             return;
         };
@@ -2113,7 +2247,12 @@ impl Shell {
             let read_path = path.clone();
             let now = cx
                 .background_executor()
-                .spawn(async move { editor::stamp(&read_path) })
+                .spawn(async move {
+                    match remote {
+                        Some(target) => krill_app::remote_fs::stat(&target, &read_path),
+                        None => editor::stamp(&read_path),
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 let Some(tab) = this.files.tabs.get_mut(&pane) else {
@@ -2168,6 +2307,7 @@ impl Shell {
         self.files.loading.insert(pane, (generation, path.clone()));
         let saved = self.layout.file_state(pane);
         let previewing = matches!(&tab.body, Body::Text { shown: Some(_), .. });
+        let remote = self.remote_target_for_pane(pane);
         #[cfg(test)]
         let gate = self.files.next_io.take();
         cx.spawn_in(window, async move |this, cx| {
@@ -2179,7 +2319,7 @@ impl Shell {
                     if let Some(gate) = gate {
                         gate.await.ok();
                     }
-                    reload::read_current_file(&read_path, previewing, expected)
+                    reload::read_current_file(&read_path, previewing, expected, remote.as_ref())
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -2204,7 +2344,9 @@ impl Shell {
                 }
                 if !matches!(tab.body, Body::Text { .. }) {
                     if tab.shows_image() {
-                        this.files.released.push(path.clone());
+                        this.files
+                            .released
+                            .push(tab.staged_image.clone().unwrap_or_else(|| path.clone()));
                     }
                     let fresh = Self::load_file_tab(pane, path, saved, window, cx, loaded);
                     this.files.tabs.insert(pane, fresh);
@@ -2221,6 +2363,7 @@ impl Shell {
                     opened,
                     preview: prepared,
                     baseline,
+                    staged_image: _,
                 } = loaded;
                 match opened {
                     Ok((Opened::Text(_, text), stamp)) => {
@@ -2294,7 +2437,13 @@ impl Shell {
                                 || tab.is_dirty()
                                 || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
                         })
-                        .filter_map(|(p, t)| Some((*p, t.revision, t.doc.clone()?)))
+                        .filter_map(|(p, t)| {
+                            let remote = this.remote_target_for_pane(*p).map(|(_, target)| target);
+                            if this.layout.host(*p).is_remote() && remote.is_none() {
+                                return None;
+                            }
+                            Some((*p, t.revision, t.doc.clone()?, remote))
+                        })
                         .collect::<Vec<_>>();
                     Some((paths, req_dir))
                 }) else {
@@ -2311,8 +2460,11 @@ impl Shell {
                             .unwrap_or_default();
                         let stamps = paths
                             .into_iter()
-                            .map(|(p, revision, doc)| {
-                                let now = editor::stamp(doc.path());
+                            .map(|(p, revision, doc, remote)| {
+                                let now = match remote {
+                                    Some(target) => krill_app::remote_fs::stat(&target, doc.path()),
+                                    None => editor::stamp(doc.path()),
+                                };
                                 (p, revision, doc, now)
                             })
                             .collect::<Vec<_>>();
@@ -2375,7 +2527,20 @@ impl Shell {
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
-        let root = self.folder();
+        let ws = self.active_workspace(cx);
+        let ws_host = ws.host.clone();
+        let root = {
+            let focused_folder = self.folder();
+            if focused_folder.as_os_str().is_empty() {
+                ws.folder
+            } else {
+                focused_folder
+            }
+        };
+        let remote_target = ws_host
+            .is_remote()
+            .then(|| self.target_for_host(&ws_host))
+            .flatten();
         let mut recent: Vec<_> = self
             .files
             .recent
@@ -2399,6 +2564,7 @@ impl Shell {
         });
         let selected_files = shared.clone();
         let selected_root = root.clone();
+        let confirm_host = ws_host.clone();
         let events = cx.subscribe_in(
             &palette,
             window,
@@ -2409,7 +2575,7 @@ impl Shell {
                 if let jump::Event::Confirm(id) = *event {
                     let file = editor::quick_open::chosen(&selected_files.borrow(), id).cloned();
                     if let Some(file) = file {
-                        this.open_file(selected_root.join(file), cx);
+                        this.open_file_on(confirm_host.clone(), selected_root.join(file), cx);
                     }
                 }
                 cx.notify();
@@ -2421,11 +2587,19 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let (ordered, items) = loop {
                 if !this
-                    .read_with(cx, |this, _| {
+                    .read_with(cx, |this, cx| {
+                        let current_root = {
+                            let f = this.folder();
+                            if f.as_os_str().is_empty() {
+                                this.active_workspace(cx).folder
+                            } else {
+                                f
+                            }
+                        };
                         this.files.quick_generation == generation
                             && this.files.quick_loading
                             && this.files.quick_open.is_some()
-                            && this.folder() == root
+                            && current_root == root
                     })
                     .unwrap_or(false)
                 {
@@ -2433,10 +2607,17 @@ impl Shell {
                 }
                 let scan = root.clone();
                 let recent = recent.clone();
+                let remote = remote_target.clone();
+                let is_remote = ws_host.is_remote();
                 if let Some(result) = cx
                     .background_executor()
                     .spawn(async move {
-                        let files = editor::quick_open::try_list(&scan)?;
+                        let files = if is_remote {
+                            let target = remote?;
+                            krill_app::remote_fs::quick_open_list(&target, &scan)?
+                        } else {
+                            editor::quick_open::try_list(&scan)?
+                        };
                         let membership: std::collections::HashSet<_> = files.iter().collect();
                         let mut ordered: Vec<_> = recent
                             .into_iter()
@@ -2457,10 +2638,18 @@ impl Shell {
                     .await;
             };
             this.update(cx, |this, cx| {
+                let current_root = {
+                    let f = this.folder();
+                    if f.as_os_str().is_empty() {
+                        this.active_workspace(cx).folder
+                    } else {
+                        f
+                    }
+                };
                 if this.files.quick_generation != generation
                     || !this.files.quick_loading
                     || this.files.quick_open.is_none()
-                    || this.folder() != root
+                    || current_root != root
                 {
                     return;
                 }

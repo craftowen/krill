@@ -872,9 +872,17 @@ impl Layout {
         true
     }
 
-    /// 파일을 연다: 이미 어느 탭의 칸에 열려 있으면 그 탭·칸으로, 아니면 새 탭(폴더는 지금 칸을 물려받는다).
+    /// 파일을 연다: 이미 어느 탭의 칸에 열려 있으면 그 탭·칸으로, 아니면 새 탭(폴더·호스트는 지금 칸을 물려받는다).
     pub fn open_file(&mut self, path: PathBuf) -> PaneId {
-        if let Some((tab, pane)) = self.find_file_pane(&path) {
+        let host = self
+            .focused()
+            .map_or(HostId::Local, |p| self.host(p).clone());
+        self.open_file_on(host, path)
+    }
+
+    /// 지정한 호스트의 파일을 연다: 같은 호스트·경로 칸이 이미 열려 있으면 그 탭·칸으로, 아니면 새 탭에 연다.
+    pub fn open_file_on(&mut self, host: HostId, path: PathBuf) -> PaneId {
+        if let Some((tab, pane)) = self.find_file_pane_on(&host, &path) {
             self.active = tab;
             self.tabs[tab].focused = pane;
             self.record_mru(tab);
@@ -887,6 +895,7 @@ impl Layout {
         self.clear_stale_preview();
         self.new_tab();
         let pane = self.active_tab().focused;
+        self.set_host(pane, host);
         self.files.insert(pane, path);
         pane
     }
@@ -900,7 +909,15 @@ impl Layout {
 
     /// 다른 워크스페이스의 미리보기 칸은 교체하지 않는다.
     pub fn open_file_preview_in(&mut self, path: PathBuf, tabs: &[usize]) -> PaneId {
-        if let Some((tab, pane)) = self.find_file_pane(&path) {
+        let host = self
+            .focused()
+            .map_or(HostId::Local, |p| self.host(p).clone());
+        self.open_file_preview_on(host, path, tabs)
+    }
+
+    /// 지정한 호스트의 파일을 미리보기로 연다.
+    pub fn open_file_preview_on(&mut self, host: HostId, path: PathBuf, tabs: &[usize]) -> PaneId {
+        if let Some((tab, pane)) = self.find_file_pane_on(&host, &path) {
             self.active = tab;
             self.tabs[tab].focused = pane;
             self.record_mru(tab);
@@ -908,6 +925,7 @@ impl Layout {
         }
         if let Some((pane, _)) = self.preview.clone()
             && self.preview_is_live()
+            && self.host(pane) == &host
             && let Some(tab) = self.tab_with(pane)
             && tabs.contains(&tab)
         {
@@ -918,7 +936,7 @@ impl Layout {
             self.record_mru(tab);
             return pane;
         }
-        let pane = self.open_file(path.clone());
+        let pane = self.open_file_on(host, path.clone());
         self.preview = Some((pane, path));
         pane
     }
@@ -937,14 +955,14 @@ impl Layout {
         }
     }
 
-    /// `path`가 열린 (탭 인덱스, 칸)을 찾는다.
-    fn find_file_pane(&self, path: &Path) -> Option<(usize, PaneId)> {
+    /// 지정한 `host`에서 `path`가 열린 (탭 인덱스, 칸)을 찾는다.
+    pub fn find_file_pane_on(&self, host: &HostId, path: &Path) -> Option<(usize, PaneId)> {
         self.tabs.iter().enumerate().find_map(|(i, t)| {
             let mut leaves = Vec::new();
             t.root.leaves(&mut leaves);
             leaves
                 .into_iter()
-                .find(|p| self.files.get(p).is_some_and(|f| f == path))
+                .find(|p| self.files.get(p).is_some_and(|f| f == path) && self.host(*p) == host)
                 .map(|p| (i, p))
         })
     }

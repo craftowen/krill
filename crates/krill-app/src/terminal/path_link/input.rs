@@ -2,7 +2,10 @@
 
 use krill_proto::screen::Screen;
 
-use super::{Cache, Cell, Flags, Path, PathLink, is_bidi_control};
+use super::{
+    Cache, Cell, Flags, Path, PathLink, bounded_candidates, collect_remote_queries,
+    is_bidi_control, lookup_remote,
+};
 
 const MAX_ROWS: usize = 32;
 const MAX_CELLS: usize = 16_384;
@@ -308,6 +311,136 @@ impl Input {
                 };
                 let link = cache
                     .bounded(&flat.cells, flat.hit, cwd, cap, &mut budget, crossing)
+                    .filter(|link| {
+                        crossing.is_none_or(|(first_end, last_start)| {
+                            link.column < first_end
+                                && link.column.saturating_add(link.cols) > last_start
+                        })
+                    })
+                    .and_then(|link| self.project(&flat, link));
+                if let Some(link) = link {
+                    if found.as_ref().is_some_and(|old: &PathLink| {
+                        old.path != link.path || old.line != link.line || old.col != link.col
+                    }) {
+                        return None;
+                    }
+                    found = Some(link);
+                }
+            }
+            if let Some(link) = found {
+                if best.as_ref().is_some_and(|(_, old)| {
+                    old.path != link.path || old.line != link.line || old.col != link.col
+                }) {
+                    return None;
+                }
+                best = Some((span, link));
+            }
+        }
+        best.map(|(_, link)| link)
+    }
+
+    /// 원격 호스트에서 후보 경로들을 단일 배치 RPC로 검사하고 포인터 행의 범위로 투영한다.
+    pub fn resolve_remote(
+        &self,
+        target: &krill_hosts::HostTarget,
+        cwd: Option<&Path>,
+    ) -> Option<PathLink> {
+        let mut groups = Vec::new();
+        for first in 0..=self.soft_first {
+            if first > 0 && self.wrapped(first - 1) {
+                continue;
+            }
+            for last in self.soft_last..self.rows.len() {
+                if self.wrapped(last) {
+                    continue;
+                }
+                groups.push((first, last));
+            }
+        }
+        groups.sort_by_key(|&(a, b)| std::cmp::Reverse(b - a));
+        groups.retain(|g| *g != (self.soft_first, self.soft_last));
+        groups.truncate(MAX_GROUPS - 1);
+        groups.push((self.soft_first, self.soft_last));
+        let variants: usize = groups
+            .iter()
+            .map(|&(a, b)| {
+                if (a..b).any(|i| !self.wrapped(i)) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
+        let cap = (MAX_CANDIDATES / variants.max(1)).max(1);
+
+        let mut query_paths = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // 소프트 줄바꿈 그룹(`soft_first..=soft_last`)의 후보를 먼저 담아 64개 한도 안에서 최우선 검사한다.
+        if let Some(flat) = self.flat(self.soft_first, self.soft_last, false) {
+            let cands = bounded_candidates(&flat.cells, flat.hit, MAX_CANDIDATES, None);
+            collect_remote_queries(
+                &cands,
+                &mut query_paths,
+                &mut seen,
+                krill_proto::remote_fs::MAX_PROBE_PATHS,
+            );
+        }
+        for &(first, last) in &groups {
+            if (first, last) == (self.soft_first, self.soft_last) {
+                continue;
+            }
+            let hard = (first..last).any(|i| !self.wrapped(i));
+            for spaces in [false, true].into_iter().take(if hard { 2 } else { 1 }) {
+                let Some(flat) = self.flat(first, last, spaces) else {
+                    continue;
+                };
+                let crossing = if hard {
+                    self.crossing(&flat, first, last)
+                } else {
+                    None
+                };
+                let cands = bounded_candidates(&flat.cells, flat.hit, cap, crossing);
+                collect_remote_queries(
+                    &cands,
+                    &mut query_paths,
+                    &mut seen,
+                    krill_proto::remote_fs::MAX_PROBE_PATHS,
+                );
+            }
+        }
+        if query_paths.is_empty() {
+            return None;
+        }
+        let probed = crate::remote_fs::probe_paths(target, cwd, &query_paths);
+        let mut resolved = std::collections::HashMap::new();
+        for (raw, found) in query_paths.into_iter().zip(probed) {
+            if let (Some(raw_str), Some(found_path)) = (raw.to_str(), found) {
+                resolved.insert(raw_str.to_owned(), found_path);
+            }
+        }
+        if resolved.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(usize, PathLink)> = None;
+        for (first, last) in groups {
+            let span = last - first;
+            if best.as_ref().is_some_and(|(old_span, _)| *old_span > span) {
+                break;
+            }
+            let hard = (first..last).any(|i| !self.wrapped(i));
+            let mut found = None;
+            for spaces in [false, true].into_iter().take(if hard { 2 } else { 1 }) {
+                let Some(flat) = self.flat(first, last, spaces) else {
+                    continue;
+                };
+                let crossing = if hard {
+                    self.crossing(&flat, first, last)
+                } else {
+                    None
+                };
+                let cands = bounded_candidates(&flat.cells, flat.hit, cap, crossing);
+                let link = lookup_remote(&cands, flat.hit, &resolved)
                     .filter(|link| {
                         crossing.is_none_or(|(first_end, last_start)| {
                             link.column < first_end

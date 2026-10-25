@@ -415,8 +415,8 @@ mod tests {
         assert!(Request::decode(crate::control::kind::REQUEST, &raw).is_err());
     }
     #[test]
-    fn remote_fs_reserved_capability_is_not_advertised_and_forwarding_is_not_read_only() {
-        assert_eq!(crate::ipc::FEATURES & crate::control::FEAT_REMOTE_FS, 0);
+    fn remote_fs_capability_is_advertised_and_forwarding_is_not_read_only() {
+        assert_ne!(crate::ipc::FEATURES & crate::control::FEAT_REMOTE_FS, 0);
         assert!(!RemoteFsRequest::PortForward { port: 8080 }.is_read_only());
         assert!(
             RemoteFsRequest::Stat {

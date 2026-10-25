@@ -1142,3 +1142,25 @@ fn deactivate_hides_tabs_and_survives_close_and_restore() {
     assert_eq!(layout.active(), tabs - 1);
     assert!(layout.focused().is_some());
 }
+
+#[test]
+fn file_tabs_and_previews_keep_identical_paths_on_different_hosts_separate() {
+    let mut layout = Layout::default();
+    let path = PathBuf::from("/repo/shared.rs");
+    let remote = HostId::Remote("remote-a".into());
+    let local_pane = layout.open_file_on(HostId::Local, path.clone());
+    let remote_pane = layout.open_file_on(remote.clone(), path.clone());
+    assert_ne!(local_pane, remote_pane);
+    assert_eq!(layout.open_file_on(HostId::Local, path.clone()), local_pane);
+    assert_eq!(layout.open_file_on(remote.clone(), path), remote_pane);
+    let preview = PathBuf::from("/repo/preview.rs");
+    let tabs: Vec<_> = (0..layout.tabs().len()).collect();
+    let local_preview = layout.open_file_preview_on(HostId::Local, preview.clone(), &tabs);
+    let tabs: Vec<_> = (0..layout.tabs().len()).collect();
+    let remote_preview = layout.open_file_preview_on(remote.clone(), preview.clone(), &tabs);
+    assert_ne!(local_preview, remote_preview);
+    assert_eq!(layout.file(local_preview), Some(preview.as_path()));
+    assert_eq!(layout.host(local_preview), &HostId::Local);
+    assert_eq!(layout.host(remote_preview), &remote);
+    assert!(layout.is_valid());
+}

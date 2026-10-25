@@ -81,6 +81,7 @@ enum Operation {
 struct DiskState {
     repo: PathBuf,
     home: PathBuf,
+    target: Option<crate::hosts::HostTarget>,
     expanded: BTreeSet<PathBuf>,
     dir_cache: BTreeMap<PathBuf, Vec<DirEntry>>,
     ignored: BTreeSet<String>,
@@ -92,6 +93,7 @@ impl DiskState {
         Self {
             repo: explorer.repo.clone(),
             home: explorer.home.clone(),
+            target: explorer.target.clone(),
             expanded: explorer.expanded.clone(),
             dir_cache: explorer.dir_cache.clone(),
             ignored: explorer.ignored.clone(),
@@ -103,6 +105,7 @@ impl DiskState {
         // 디스크 모델은 이 작업 안에서만 생성한다. GPUI 핸들은 스레드 사이로 옮기지 않는다.
         let mut model = Explorer::new(self.repo);
         model.home = self.home;
+        model.target = self.target;
         model.expanded = self.expanded;
         model.dir_cache = self.dir_cache;
         model.ignored = self.ignored;
@@ -136,6 +139,7 @@ pub struct PendingDelete {
 pub struct Explorer {
     pub(crate) repo: PathBuf,
     pub(crate) home: PathBuf,
+    pub(crate) target: Option<crate::hosts::HostTarget>,
     pub(crate) loaded_root: bool,
     pub(crate) loading: bool,
     pub(crate) load_generation: u64,
@@ -188,6 +192,7 @@ impl Explorer {
         Self {
             repo,
             home: crate::accounts::default_home(),
+            target: None,
             loaded_root: false,
             loading: false,
             load_generation: 0,
@@ -223,6 +228,14 @@ impl Explorer {
     /// 휴지통(`~/.Trash`) 기준 홈 디렉터리를 지정한다.
     pub fn set_home(&mut self, home: PathBuf) {
         self.home = home;
+    }
+
+    pub fn connect(&mut self, target: crate::hosts::HostTarget) {
+        self.target = Some(target);
+    }
+
+    pub(crate) fn remote_target(&self) -> Option<&crate::hosts::HostTarget> {
+        self.target.as_ref().filter(|t| !t.allow_local_launch())
     }
 
     /// 워크트리 루트가 바뀔 때 캐시와 펼침 상태를 초기화한다.
@@ -337,9 +350,8 @@ impl Explorer {
 
     /// 지정 폴더의 직속 자식만 읽어 `dir_cache`에 넣는다(지연 로딩).
     pub fn load_dir(&mut self, dir: &Path) {
-        let entries = read_dir_entries(&self.repo, dir);
-        let rels: Vec<String> = entries.iter().map(|e| e.relative_path.clone()).collect();
-        for ignored_rel in query_git_ignored(&self.repo, &rels) {
+        let (entries, ignored) = read_dir_entries_on(self.remote_target(), &self.repo, dir);
+        for ignored_rel in ignored {
             self.ignored.insert(ignored_rel);
         }
         self.dir_cache.insert(dir.to_path_buf(), entries);
@@ -354,8 +366,9 @@ impl Explorer {
         let root = self.repo.clone();
         self.load_dir(&root);
         let dirs: Vec<PathBuf> = self.expanded.iter().cloned().collect();
+        let remote = self.remote_target().is_some();
         for dir in dirs {
-            if dir.is_dir() {
+            if remote || dir.is_dir() {
                 self.load_dir(&dir);
             } else {
                 self.expanded.remove(&dir);
@@ -420,9 +433,9 @@ impl Explorer {
         self.filter_query = next;
         // 이 동기 디스크 모델 API는 백그라운드 작업·헤드리스 테스트 전용이다.
         if !self.filter_query.trim().is_empty() && self.filter_files_cache.is_none() {
-            let scanned = scan_worktree_entries(&self.repo, MAX_FILTER_ENTRIES);
-            let rels: Vec<String> = scanned.iter().map(|e| e.relative_path.clone()).collect();
-            self.ignored.extend(query_git_ignored(&self.repo, &rels));
+            let (scanned, ignored) =
+                scan_worktree_entries_on(self.remote_target(), &self.repo, MAX_FILTER_ENTRIES);
+            self.ignored.extend(ignored);
             self.filter_files_cache = Some(scanned);
         }
         self.rebuild_rows();
@@ -454,27 +467,40 @@ impl Explorer {
     /// 새 빈 파일을 생성하고 부모 폴더를 펼쳐 트리에 반영한다.
     pub fn create_file(&mut self, parent_dir: &Path, name: &str) -> io::Result<PathBuf> {
         self.ensure_loaded();
-        let rel = validate_relative_input(name)?;
-        let (canon_repo, full_path) = ensure_worktree_create_path(&self.repo, parent_dir, &rel)?;
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-            let canon_parent = parent.canonicalize().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target directory is outside worktree",
-                )
-            })?;
-            if !canon_parent.starts_with(&canon_repo) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target directory is outside worktree",
-                ));
+        let full_path = if let Some(target) = self.remote_target().cloned() {
+            crate::remote_fs::explorer_op(
+                &target,
+                &self.repo,
+                krill_proto::remote_fs::WireExplorerOp::CreateFile {
+                    parent: parent_dir.as_os_str().as_bytes().to_vec(),
+                    name: name.to_owned(),
+                },
+            )?
+        } else {
+            let rel = validate_relative_input(name)?;
+            let (canon_repo, full_path) =
+                ensure_worktree_create_path(&self.repo, parent_dir, &rel)?;
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent)?;
+                let canon_parent = parent.canonicalize().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target directory is outside worktree",
+                    )
+                })?;
+                if !canon_parent.starts_with(&canon_repo) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target directory is outside worktree",
+                    ));
+                }
             }
-        }
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&full_path)?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&full_path)?;
+            full_path
+        };
         self.expand_ancestors_to(&full_path);
         self.filter_files_cache = None;
         self.filter_normalized.clear();
@@ -487,30 +513,43 @@ impl Explorer {
     /// 새 폴더를 생성하고 부모 폴더를 펼쳐 트리에 반영한다.
     pub fn create_folder(&mut self, parent_dir: &Path, name: &str) -> io::Result<PathBuf> {
         self.ensure_loaded();
-        let rel = validate_relative_input(name)?;
-        let (canon_repo, full_path) = ensure_worktree_create_path(&self.repo, parent_dir, &rel)?;
-        if full_path.exists() || fs::symlink_metadata(&full_path).is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "folder already exists",
-            ));
-        }
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-            let canon_parent = parent.canonicalize().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target directory is outside worktree",
-                )
-            })?;
-            if !canon_parent.starts_with(&canon_repo) {
+        let full_path = if let Some(target) = self.remote_target().cloned() {
+            crate::remote_fs::explorer_op(
+                &target,
+                &self.repo,
+                krill_proto::remote_fs::WireExplorerOp::CreateFolder {
+                    parent: parent_dir.as_os_str().as_bytes().to_vec(),
+                    name: name.to_owned(),
+                },
+            )?
+        } else {
+            let rel = validate_relative_input(name)?;
+            let (canon_repo, full_path) =
+                ensure_worktree_create_path(&self.repo, parent_dir, &rel)?;
+            if full_path.exists() || fs::symlink_metadata(&full_path).is_ok() {
                 return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target directory is outside worktree",
+                    io::ErrorKind::AlreadyExists,
+                    "folder already exists",
                 ));
             }
-        }
-        fs::create_dir_all(&full_path)?;
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent)?;
+                let canon_parent = parent.canonicalize().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target directory is outside worktree",
+                    )
+                })?;
+                if !canon_parent.starts_with(&canon_repo) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target directory is outside worktree",
+                    ));
+                }
+            }
+            fs::create_dir_all(&full_path)?;
+            full_path
+        };
         self.expand_ancestors_to(&full_path);
         self.expanded.insert(full_path.clone());
         self.load_dir(&full_path);
@@ -539,54 +578,66 @@ impl Explorer {
         {
             return Err(denied());
         }
-        let clean = new_name.trim();
-        if clean.is_empty()
-            || clean == "."
-            || clean == ".."
-            || clean == ".git"
-            || clean.contains('/')
-            || clean.contains('\\')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid file or folder name",
-            ));
-        }
         let parent = target
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
-        let canon_repo = self.repo.canonicalize().map_err(|_| denied())?;
-        let parent_rel = parent.strip_prefix(&self.repo).map_err(|_| denied())?;
-        let mut cur = self.repo.clone();
-        for comp in parent_rel.components() {
-            let Component::Normal(part) = comp else {
-                return Err(denied());
-            };
-            if part == OsStr::new(".git") {
+        let new_path = if let Some(remote_target) = self.remote_target().cloned() {
+            crate::remote_fs::explorer_op(
+                &remote_target,
+                &self.repo,
+                krill_proto::remote_fs::WireExplorerOp::Rename {
+                    path: target.as_os_str().as_bytes().to_vec(),
+                    new_name: new_name.to_owned(),
+                },
+            )?
+        } else {
+            let clean = new_name.trim();
+            if clean.is_empty()
+                || clean == "."
+                || clean == ".."
+                || clean == ".git"
+                || clean.contains('/')
+                || clean.contains('\\')
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid file or folder name",
+                ));
+            }
+            let canon_repo = self.repo.canonicalize().map_err(|_| denied())?;
+            let parent_rel = parent.strip_prefix(&self.repo).map_err(|_| denied())?;
+            let mut cur = self.repo.clone();
+            for comp in parent_rel.components() {
+                let Component::Normal(part) = comp else {
+                    return Err(denied());
+                };
+                if part == OsStr::new(".git") {
+                    return Err(denied());
+                }
+                cur.push(part);
+                let canon_cur = cur.canonicalize().map_err(|_| denied())?;
+                if !canon_cur.starts_with(&canon_repo) {
+                    return Err(denied());
+                }
+            }
+            let canon_parent = parent.canonicalize().map_err(|_| denied())?;
+            if !canon_parent.starts_with(&canon_repo) {
                 return Err(denied());
             }
-            cur.push(part);
-            let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-            if !canon_cur.starts_with(&canon_repo) {
-                return Err(denied());
+            target.symlink_metadata()?;
+            let new_path = parent.join(clean);
+            if new_path == target {
+                return Ok(new_path);
             }
-        }
-        let canon_parent = parent.canonicalize().map_err(|_| denied())?;
-        if !canon_parent.starts_with(&canon_repo) {
-            return Err(denied());
-        }
-        target.symlink_metadata()?;
-        let new_path = parent.join(clean);
-        if new_path == target {
-            return Ok(new_path);
-        }
-        if new_path.exists() || fs::symlink_metadata(&new_path).is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "target name already exists",
-            ));
-        }
-        fs::rename(target, &new_path)?;
+            if new_path.exists() || fs::symlink_metadata(&new_path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "target name already exists",
+                ));
+            }
+            fs::rename(target, &new_path)?;
+            new_path
+        };
 
         let old_expanded: Vec<PathBuf> = self
             .expanded
@@ -607,7 +658,9 @@ impl Explorer {
         }
         self.dir_cache.retain(|k, _| !k.starts_with(target));
         self.load_dir(parent);
-        if self.expanded.contains(&new_path) && new_path.is_dir() {
+        if self.expanded.contains(&new_path)
+            && (self.remote_target().is_some() || new_path.is_dir())
+        {
             self.load_dir(&new_path);
         }
         self.filter_files_cache = None;
@@ -628,9 +681,18 @@ impl Explorer {
                 "cannot delete worktree root or outside path",
             ));
         }
-        let trashed = match krill_proto::usage::profiles::move_path_to_trash(
-            &self.home, &self.repo, target,
-        ) {
+        let res = if let Some(remote_target) = self.remote_target().cloned() {
+            crate::remote_fs::explorer_op(
+                &remote_target,
+                &self.repo,
+                krill_proto::remote_fs::WireExplorerOp::Delete {
+                    path: target.as_os_str().as_bytes().to_vec(),
+                },
+            )
+        } else {
+            krill_proto::usage::profiles::move_path_to_trash(&self.home, &self.repo, target)
+        };
+        let trashed = match res {
             Ok(path) => path,
             Err(err) => {
                 self.error = Some(err.to_string());
@@ -884,7 +946,8 @@ fn validate_relative_input(raw: &str) -> io::Result<PathBuf> {
     Ok(clean)
 }
 
-use std::ffi::OsStr;
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
+use std::ffi::{OsStr, OsString};
 
 fn is_dotfile_rel(relative_path: &str) -> bool {
     relative_path
@@ -998,6 +1061,53 @@ fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
     .collect()
 }
 
+fn wire_listing_to_local(
+    listing: krill_proto::remote_fs::WireDirListing,
+) -> (Vec<DirEntry>, Vec<String>) {
+    let entries = listing
+        .entries
+        .into_iter()
+        .map(|e| DirEntry {
+            name: e.name,
+            path: PathBuf::from(OsString::from_vec(e.path)),
+            relative_path: e.relative_path,
+            is_dir: e.is_dir,
+            is_symlink: e.is_symlink,
+        })
+        .collect();
+    (entries, listing.ignored)
+}
+
+fn read_dir_entries_on(
+    remote: Option<&crate::hosts::HostTarget>,
+    repo: &Path,
+    dir: &Path,
+) -> (Vec<DirEntry>, Vec<String>) {
+    if let Some(target) = remote {
+        return crate::remote_fs::read_dir(target, repo, dir)
+            .map_or_else(|_| (Vec::new(), Vec::new()), wire_listing_to_local);
+    }
+    let entries = read_dir_entries(repo, dir);
+    let rels: Vec<String> = entries.iter().map(|e| e.relative_path.clone()).collect();
+    let ignored = query_git_ignored(repo, &rels);
+    (entries, ignored)
+}
+
+fn scan_worktree_entries_on(
+    remote: Option<&crate::hosts::HostTarget>,
+    repo: &Path,
+    limit: usize,
+) -> (Vec<DirEntry>, Vec<String>) {
+    if let Some(target) = remote {
+        return crate::remote_fs::scan_worktree(target, repo, limit)
+            .map_or_else(|_| (Vec::new(), Vec::new()), wire_listing_to_local);
+    }
+    let entries = scan_worktree_entries(repo, limit);
+    let rels: Vec<String> = entries.iter().map(|e| e.relative_path.clone()).collect();
+    let ignored = query_git_ignored(repo, &rels);
+    (entries, ignored)
+}
+
 impl Panel {
     /// `Files` 탭으로 전환하고 파일 필터 입력창을 준비한다.
     pub fn show_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1021,14 +1131,12 @@ impl Panel {
         self.explorer.load_generation = self.explorer.load_generation.wrapping_add(1);
         let generation = self.explorer.load_generation;
         let repo = self.explorer.repo.clone();
+        let remote = self.explorer.remote_target().cloned();
         self.explorer.load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
-                    let entries = read_dir_entries(&repo, &repo);
-                    let rels: Vec<String> =
-                        entries.iter().map(|e| e.relative_path.clone()).collect();
-                    let ignored = query_git_ignored(&repo, &rels);
+                    let (entries, ignored) = read_dir_entries_on(remote.as_ref(), &repo, &repo);
                     (repo, entries, ignored)
                 })
                 .await;
@@ -1064,6 +1172,7 @@ impl Panel {
         self.explorer.load_generation = self.explorer.load_generation.wrapping_add(1);
         let generation = self.explorer.load_generation;
         let repo = self.explorer.repo.clone();
+        let remote = self.explorer.remote_target().cloned();
         let dirs: Vec<PathBuf> = self.explorer.expanded.iter().cloned().collect();
         let requested: BTreeSet<PathBuf> = dirs.iter().cloned().collect();
         self.explorer.load_task = Some(cx.spawn(async move |this, cx| {
@@ -1073,13 +1182,23 @@ impl Panel {
                     let mut out = Vec::new();
                     let mut all_ignored = Vec::new();
                     let mut targets = vec![repo.clone()];
-                    targets.extend(dirs.into_iter().filter(|dir| dir.is_dir()));
+                    if remote.is_some() {
+                        targets.extend(dirs);
+                    } else {
+                        targets.extend(dirs.into_iter().filter(|dir| dir.is_dir()));
+                    }
                     for dir in targets {
-                        let entries = read_dir_entries(&repo, &dir);
-                        let rels: Vec<String> =
-                            entries.iter().map(|e| e.relative_path.clone()).collect();
-                        all_ignored.extend(query_git_ignored(&repo, &rels));
-                        out.push((dir, entries));
+                        if let Some(target) = remote.as_ref() {
+                            if let Ok(listing) = crate::remote_fs::read_dir(target, &repo, &dir) {
+                                let (entries, ignored) = wire_listing_to_local(listing);
+                                all_ignored.extend(ignored);
+                                out.push((dir, entries));
+                            }
+                        } else {
+                            let (entries, ignored) = read_dir_entries_on(None, &repo, &dir);
+                            all_ignored.extend(ignored);
+                            out.push((dir, entries));
+                        }
                     }
                     (out, all_ignored)
                 })
@@ -1170,6 +1289,7 @@ impl Panel {
             return;
         }
         let repo = self.explorer.repo.clone();
+        let remote = self.explorer.remote_target().cloned();
         self.explorer.filter_task = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor()
@@ -1186,11 +1306,7 @@ impl Panel {
             let scanned = cx
                 .background_executor()
                 .spawn(async move {
-                    let entries = scan_worktree_entries(&repo, MAX_FILTER_ENTRIES);
-                    let rels: Vec<String> =
-                        entries.iter().map(|e| e.relative_path.clone()).collect();
-                    let ignored = query_git_ignored(&repo, &rels);
-                    (entries, ignored)
+                    scan_worktree_entries_on(remote.as_ref(), &repo, MAX_FILTER_ENTRIES)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -2211,6 +2327,8 @@ fn row_context_menu(
         .separator();
 
     let reveal_path = row.path.clone();
+    let reveal_is_dir = row.is_dir;
+    let w_reveal = weak.clone();
     menu = menu.item(
         PopupMenuItem::new(
             text::EXPLORER_REVEAL_FINDER
@@ -2219,7 +2337,22 @@ fn row_context_menu(
         )
         .icon(IconName::FolderOpen)
         .on_click(move |_, _, cx| {
-            cx.reveal_path(&reveal_path);
+            let remote = w_reveal
+                .read_with(cx, |panel, _| panel.explorer.remote_target().cloned())
+                .ok()
+                .flatten();
+            if let Some(target) = remote {
+                if !reveal_is_dir {
+                    crate::file_format::view::spawn_open_on(
+                        reveal_path.clone(),
+                        Some((target.host().clone(), target)),
+                        crate::file_format::reveal_command,
+                        cx,
+                    );
+                }
+            } else {
+                cx.reveal_path(&reveal_path);
+            }
         }),
     );
 

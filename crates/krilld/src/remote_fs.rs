@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash as _, Hasher as _};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
@@ -286,6 +287,18 @@ fn current_stamp(path: &Path) -> Option<WireStamp> {
     fs::metadata(path).ok().map(|m| stamp_from_meta(&m))
 }
 
+fn staging_path(path: &Path, stage_id: u64) -> PathBuf {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hash);
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".krill-stage-{}-{}-{stage_id}.tmp",
+            std::process::id(),
+            hash.finish()
+        ))
+}
+
 fn write_atomic(
     path: &Path,
     bytes: &[u8],
@@ -298,7 +311,7 @@ fn write_atomic(
         return WireWriteOutcome::Failed("missing parent directory".to_owned());
     };
     let pid = std::process::id();
-    let stage_path = parent.join(format!(".krill-stage-{pid}-{stage_id}.tmp"));
+    let stage_path = staging_path(path, stage_id);
     let current = current_stamp(path);
     if expected.is_some() && current != expected {
         if stage_id != 0 {
@@ -336,12 +349,12 @@ fn write_atomic(
             }
         }
     } else {
+        let mut owned_stage = offset != 0;
         let res = (|| -> io::Result<WireWriteOutcome> {
             let mut file = if offset == 0 {
                 OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .open(&stage_path)?
             } else {
                 let f = OpenOptions::new().write(true).open(&stage_path)?;
@@ -353,6 +366,7 @@ fn write_atomic(
                 }
                 f
             };
+            owned_stage = true;
             if offset > 0 {
                 file.seek(SeekFrom::Start(offset))?;
             }
@@ -377,7 +391,9 @@ fn write_atomic(
         match res {
             Ok(outcome) => outcome,
             Err(err) => {
-                fs::remove_file(&stage_path).ok();
+                if owned_stage {
+                    fs::remove_file(&stage_path).ok();
+                }
                 WireWriteOutcome::Failed(truncate_text(err.to_string()))
             }
         }
@@ -936,17 +952,41 @@ fn walk_quick_open(root: &Path, deadline: Instant) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
+
     use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "krilld-remote-fs-{label}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
 
     #[test]
     fn read_write_and_probe_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "krill-remote-fs-{}-{}",
-            std::process::id(),
-            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.as_path().join("hello.txt");
+        let dir = TestDir::new("rw");
+        let file = dir.path().join("hello.txt");
         let write_reply = serve(RemoteFsRequest::WriteAtomic {
             path: file.as_os_str().as_bytes().to_vec(),
             bytes: b"initial\n".to_vec(),
@@ -960,7 +1000,7 @@ mod tests {
         };
 
         let probed = probe_paths(
-            Some(dir.as_path().as_os_str().as_bytes()),
+            Some(dir.path().as_os_str().as_bytes()),
             &[b"hello.txt".to_vec(), b"missing.txt".to_vec()],
         );
         assert_eq!(
@@ -998,7 +1038,115 @@ mod tests {
         ));
         assert_eq!(fs::read(&file).unwrap(), b"staged-commit");
         assert!(scan_worktree_listing(&file, 20).is_err());
-        assert!(scan_worktree_listing(&dir.join("missing"), 20).is_err());
-        fs::remove_dir_all(dir).unwrap();
+        assert!(scan_worktree_listing(&dir.path().join("missing"), 20).is_err());
+    }
+
+    #[test]
+    fn explorer_and_quick_open_operations() {
+        let dir = TestDir::new("explorer");
+        let repo = dir.path().canonicalize().unwrap();
+        let repo_wire = repo.as_os_str().as_bytes().to_vec();
+
+        let created_folder = match serve(RemoteFsRequest::ExplorerOp {
+            repo: repo_wire.clone(),
+            op: WireExplorerOp::CreateFolder {
+                parent: repo_wire.clone(),
+                name: "src".to_owned(),
+            },
+        }) {
+            RemoteFsReply::ExplorerOpResult(Ok(p)) => PathBuf::from(OsString::from_vec(p)),
+            other => panic!("unexpected create folder reply: {other:?}"),
+        };
+        assert!(created_folder.is_dir());
+
+        let created_file = match serve(RemoteFsRequest::ExplorerOp {
+            repo: repo_wire.clone(),
+            op: WireExplorerOp::CreateFile {
+                parent: created_folder.as_os_str().as_bytes().to_vec(),
+                name: "lib.rs".to_owned(),
+            },
+        }) {
+            RemoteFsReply::ExplorerOpResult(Ok(p)) => PathBuf::from(OsString::from_vec(p)),
+            other => panic!("unexpected create file reply: {other:?}"),
+        };
+        assert!(created_file.is_file());
+
+        let renamed = match serve(RemoteFsRequest::ExplorerOp {
+            repo: repo_wire.clone(),
+            op: WireExplorerOp::Rename {
+                path: created_file.as_os_str().as_bytes().to_vec(),
+                new_name: "main.rs".to_owned(),
+            },
+        }) {
+            RemoteFsReply::ExplorerOpResult(Ok(p)) => PathBuf::from(OsString::from_vec(p)),
+            other => panic!("unexpected rename reply: {other:?}"),
+        };
+        assert!(renamed.is_file());
+
+        let RemoteFsReply::QuickOpenFiles(Ok(quick)) = serve(RemoteFsRequest::QuickOpenList {
+            root: repo_wire.clone(),
+        }) else {
+            panic!("expected QuickOpenFiles");
+        };
+        assert_eq!(quick, vec![b"src/main.rs".to_vec()]);
+    }
+
+    #[test]
+    fn loopback_port_bridge_transfers_bidirectional_bytes() {
+        let tcp_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = tcp_listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut conn, _) = tcp_listener.accept().unwrap();
+            let mut buf = [0u8; 4];
+            conn.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+            conn.write_all(b"pong").unwrap();
+        });
+
+        let tcp_client = connect_loopback_port(port).unwrap();
+        let (mut ipc_client, ipc_server) = UnixStream::pair().unwrap();
+        let bridge = thread::spawn(move || {
+            bridge_streams(ipc_server, tcp_client);
+        });
+
+        ipc_client.write_all(b"ping").unwrap();
+        ipc_client.shutdown(Shutdown::Write).unwrap();
+        let mut out = Vec::new();
+        ipc_client.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"pong");
+
+        server.join().unwrap();
+        bridge.join().unwrap();
+    }
+    #[test]
+    fn staged_writes_isolate_destinations_and_preserve_existing_stage_files() {
+        let dir = TestDir::new("stage-isolation");
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        assert_eq!(
+            write_atomic(&a, b"aaa", None, 9, 0, false),
+            WireWriteOutcome::StageAck
+        );
+        assert_eq!(
+            write_atomic(&b, b"bbb", None, 9, 0, false),
+            WireWriteOutcome::StageAck
+        );
+        assert!(matches!(
+            write_atomic(&a, b"A", None, 9, 3, true),
+            WireWriteOutcome::Saved(_)
+        ));
+        assert!(matches!(
+            write_atomic(&b, b"B", None, 9, 3, true),
+            WireWriteOutcome::Saved(_)
+        ));
+        assert_eq!(fs::read(&a).unwrap(), b"aaaA");
+        assert_eq!(fs::read(&b).unwrap(), b"bbbB");
+        let stage = staging_path(&a, 11);
+        fs::write(&stage, b"existing transfer").unwrap();
+        assert!(matches!(
+            write_atomic(&a, b"new", None, 11, 0, false),
+            WireWriteOutcome::Failed(_)
+        ));
+        assert_eq!(fs::read(stage).unwrap(), b"existing transfer");
     }
 }

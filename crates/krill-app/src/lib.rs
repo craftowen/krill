@@ -31,6 +31,7 @@ pub mod platform;
 pub(crate) mod process_io;
 pub mod pull_request;
 pub mod recording;
+pub mod remote_fs;
 pub mod resources;
 #[cfg(target_os = "macos")]
 pub mod responsiveness;
