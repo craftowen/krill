@@ -8,11 +8,11 @@ use krill_proto::os::ffi::OsStrExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use gpui::{AppContext as _, Context, Window};
+use gpui::{AppContext as _, Context, ScrollStrategy, Window};
 use krill_proto::control::{Program, RemoveWorktree, Reply};
 use serde::{Deserialize, Serialize};
 
-use super::{NewSession, Selected, Sidebar};
+use super::{NewSession, PendingWorktree, Row, Selected, Sidebar, Tree, external};
 use crate::worktree;
 
 /// 시각적 들여쓰기 최대 깊이(너무 깊은 중첩에서 카드 폭이 무너지지 않게 제한).
@@ -518,6 +518,17 @@ impl Sidebar {
         let Some(source) = self.source.clone() else {
             return;
         };
+        if let Some((old_dialog, old_sub)) = self.creating.take()
+            && old_dialog.read(cx).is_background()
+        {
+            self.creating_background
+                .push((self.creating_dialog_id, old_dialog, old_sub));
+        }
+        let dialog_id = self.next_creating_id;
+        self.next_creating_id = self.next_creating_id.wrapping_add(1);
+        self.creating_dialog_id = dialog_id;
+
+        let repo_for_event = repo.clone();
         let parent_for_event = parent.clone();
         // OWE-853: 호출한 워크트리(부모 우선, 없으면 레포)의 현재 브랜치를 기본값으로 쓴다.
         let parent_branch = parent
@@ -533,12 +544,15 @@ impl Sidebar {
             &git_refs,
         );
         let dialog = cx.new(|cx| {
-            let mut dialog = worktree::Dialog::new_with_parent(repo, parent, source, window, cx);
-            dialog.set_branch_candidates(initial_candidates, cx);
-            if let Some(ref base) = default_base {
-                dialog.set_base_default(Some(base.clone()), window, cx);
-            }
-            dialog
+            worktree::Dialog::new_with_options(
+                repo,
+                parent,
+                default_base.as_deref(),
+                initial_candidates,
+                source,
+                window,
+                cx,
+            )
         });
         let weak_dialog = dialog.downgrade();
         cx.spawn_in(window, async move |_, cx| {
@@ -559,12 +573,89 @@ impl Sidebar {
                 .ok();
         })
         .detach();
-        let events = cx.subscribe(
+        let events = cx.subscribe_in(
             &dialog,
-            move |s, dialog_entity, event: &worktree::Event, cx| match event {
+            window,
+            move |s, dialog_entity, event: &worktree::Event, window, cx| match event {
+                worktree::Event::Submitting {
+                    repo,
+                    parent,
+                    names,
+                } => {
+                    s.pending_worktrees.retain(|p| p.dialog_id != dialog_id);
+                    s.removed_projects.remove(repo);
+                    s.collapsed.remove(repo);
+                    if !s.options.filters.repos.is_empty() {
+                        s.options.filters.repos.insert(repo.clone());
+                    }
+                    if let Some(parent_path) = parent {
+                        s.collapsed_lineage.remove(parent_path);
+                        s.expand_lineage_ancestors(parent_path);
+                    }
+                    let mut first_pending_id = None;
+                    for name in names {
+                        let id = s.next_creating_id;
+                        s.next_creating_id = s.next_creating_id.wrapping_add(1);
+                        if first_pending_id.is_none() {
+                            first_pending_id = Some(id);
+                        }
+                        s.pending_worktrees.push(PendingWorktree {
+                            id,
+                            dialog_id,
+                            repo: repo.clone(),
+                            parent: parent.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                    s.rebuild(cx);
+                    if let Some(target_id) = first_pending_id
+                        && let Some(idx) = s.rows.iter().enumerate().position(|(i, r)| {
+                            s.row_host(i).is_local()
+                                && matches!(r, Row::PendingWorktree { id, .. } if *id == target_id)
+                        })
+                    {
+                        s.cursor = Some(idx);
+                        s.sync_viewport();
+                        s.scroll_row_into_view(idx, ScrollStrategy::Nearest);
+                    }
+                    if let Some(back) = &s.back {
+                        window.focus(back, cx);
+                    }
+                    cx.notify();
+                }
+                worktree::Event::ModalReopened(err) => {
+                    s.pending_worktrees.retain(|p| p.dialog_id != dialog_id);
+                    s.rebuild(cx);
+                    if s.creating.as_ref().is_some_and(|(d, _)| d == dialog_entity) {
+                        dialog_entity.update(cx, |d, cx| d.focus_on_reopen(window, cx));
+                    } else if dialog_entity.read(cx).is_untrusted() && s.creating.is_none() {
+                        if let Some(pos) = s
+                            .creating_background
+                            .iter()
+                            .position(|(id, _, _)| *id == dialog_id)
+                        {
+                            let (id, d, sub) = s.creating_background.remove(pos);
+                            s.creating_dialog_id = id;
+                            s.creating = Some((d.clone(), sub));
+                            d.update(cx, |dlg, cx| dlg.focus_on_reopen(window, cx));
+                        }
+                    } else {
+                        s.creating_background.retain(|(id, _, _)| *id != dialog_id);
+                        if let Some(msg) = err {
+                            s.notice = Some(msg.clone());
+                        }
+                    }
+                    cx.notify();
+                }
                 worktree::Event::Created(w) => {
                     // OWE-853 / OWE-924: 생성 완료 즉시 새 워크트리로 전환한다.
-                    // 멀티 에이전트 Fan-Out 중이면 모든 워크트리가 만들어질 때까지 모달을 유지한다.
+                    if let Some(pos) = s
+                        .pending_worktrees
+                        .iter()
+                        .position(|p| p.dialog_id == dialog_id)
+                    {
+                        s.pending_worktrees.remove(pos);
+                    }
                     let created_path = PathBuf::from(std::ffi::OsStr::from_bytes(&w.path));
                     let (agent, prompt, has_more) = {
                         let d = dialog_entity.read(cx);
@@ -574,16 +665,51 @@ impl Sidebar {
                             d.has_pending_fan_out(),
                         )
                     };
+                    let trees = s.snapshot.trees.entry(repo_for_event.clone()).or_default();
+                    if !trees.contains(&created_path) {
+                        trees.push(created_path.clone());
+                    }
+                    s.meta.entry(created_path.clone()).or_insert_with(|| Tree {
+                        branch: Some(w.branch.clone()),
+                        dirty: None,
+                    });
+                    s.removed_projects.remove(&repo_for_event);
+                    s.sleeping_worktrees.remove(&created_path);
+                    s.recently_created_worktrees.insert(created_path.clone());
+                    s.pending_reveal_worktree = Some(created_path.clone());
+                    s.collapsed.remove(&repo_for_event);
+                    s.collapsed.remove(&created_path);
+                    if !s.options.filters.repos.is_empty() {
+                        s.options.filters.repos.insert(repo_for_event.clone());
+                    }
+                    if external::is_claude_worktree(&created_path) {
+                        s.shown_external.insert(repo_for_event.clone());
+                    }
                     if let Some(parent_path) = &parent_for_event {
+                        s.collapsed_lineage.remove(parent_path);
                         s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
+                        s.expand_lineage_ancestors(&created_path);
                     }
                     if let Some(prompt_text) = &prompt {
                         s.queue_initial_prompt(created_path.clone(), prompt_text);
                     }
                     if !has_more {
-                        s.creating = None;
+                        if s.creating.as_ref().is_some_and(|(d, _)| d == dialog_entity) {
+                            s.creating = None;
+                        }
+                        s.creating_background.retain(|(id, _, _)| *id != dialog_id);
                     }
-                    s.refresh(cx);
+                    s.selected_worktree = Some(created_path.clone());
+                    s.rebuild(cx);
+                    if let Some(idx) = s.rows.iter().enumerate().position(|(i, r)| {
+                        s.row_host(i).is_local()
+                            && matches!(r, Row::Worktree(p) if p == &created_path)
+                    }) {
+                        s.cursor = Some(idx);
+                        s.sync_viewport();
+                        s.scroll_row_into_view(idx, ScrollStrategy::Nearest);
+                    }
+                    s.write_state(cx);
                     if let Some(agent_id) = agent {
                         cx.emit(NewSession {
                             cwd: created_path,
@@ -597,11 +723,16 @@ impl Sidebar {
                             program: Program::Login,
                         });
                     }
+                    s.refresh(cx);
                     cx.notify();
                 }
                 worktree::Event::Close => {
-                    s.creating = None;
-                    cx.notify();
+                    s.pending_worktrees.retain(|p| p.dialog_id != dialog_id);
+                    if s.creating.as_ref().is_some_and(|(d, _)| d == dialog_entity) {
+                        s.creating = None;
+                    }
+                    s.creating_background.retain(|(id, _, _)| *id != dialog_id);
+                    s.rebuild(cx);
                 }
             },
         );
@@ -631,6 +762,7 @@ impl Sidebar {
         if !self.disk.initialized {
             self.disk.startup.ui.expanded_cards.insert(path.clone());
         }
+        self.recently_created_worktrees.remove(&path);
         self.expanded_cards.remove(&path);
         self.collapsed.insert(path.clone());
         self.sleeping_worktrees.insert(path);
@@ -654,6 +786,7 @@ impl Sidebar {
             if !self.disk.initialized {
                 self.disk.startup.ui.expanded_cards.insert(target.clone());
             }
+            self.recently_created_worktrees.remove(&target);
             self.expanded_cards.remove(&target);
             self.collapsed.insert(target.clone());
             self.sleeping_worktrees.insert(target);
@@ -673,6 +806,7 @@ impl Sidebar {
         splice_lineage_in_map(&mut self.parents, &target.to_path_buf());
         self.collapsed_lineage.remove(target);
         self.sleeping_worktrees.remove(target);
+        self.recently_created_worktrees.remove(target);
         if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let target_str = target.to_string_lossy().into_owned();
             let target_path = target.to_path_buf();

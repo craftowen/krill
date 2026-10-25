@@ -64,15 +64,16 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    The base defaults to the parent branch. See [placement-and-remote](references/placement-and-remote.md)
    for setup approval, explicit base selection, and remote limits.
    Optional `--model <id>` and `--effort <level>` override the profile's launch flags
-   when supported by the provider (`claude`, `codex`, `pi` for effort); do not pass
-   Orca's `--retry-of`.
+   when supported by the provider. `--retry-of <dispatch-id>` or
+   `--retry-request <request-id>` links a bounded retry to its earlier attempt;
+   inspect that attempt before retrying an uncertain start.
 5. Inspect `task-list --run <run-id> --json`, `worker-list --run <run-id> --json`
    (which includes live `session_state`, `terminal_state`, and `next_action` hints),
    and bounded `worker-read <dispatch-id> --lines 60 --json`. Wait with
    `check --to coordinator --run <run-id> --unread --wait --timeout-ms 60000 --json`
    (plain `--wait` defaults to 60s, max 300s).
    See [messaging-and-gates](references/messaging-and-gates.md) before acknowledging mail
-   with `--ack` or `--ack-ids <id1,id2,...>`.
+   with `--ack <delivery-id>` or `--ack-ids <id1,id2,...>`.
    Reply to questions using `reply <message-id> --body "<answer>" --json`.
 6. Read the returned evidence and run the acceptance checks appropriate to the task.
    Use [verification-and-evidence](references/verification-and-evidence.md) for independent
@@ -80,8 +81,9 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    new scoped assignment; do not silently expand the requested result.
 7. Resolve every owned dispatch, recording failed/blocked work honestly. Use
    `worker-retain <dispatch-id>` for a needed settled terminal, otherwise
-   `worker-release <dispatch-id>`. `worker-abandon <dispatch-id>` ends an old
-   attempt and closes its session; it is not a harmless observation command.
+   `worker-release <dispatch-id>`. Release requires settled work and a session
+   created by that dispatch. `worker-abandon <dispatch-id>` fences an old attempt
+   while preserving its session; it still changes task ownership.
    Read [recovery-and-cleanup](references/recovery-and-cleanup.md) before abandoning,
    retrying, or handling an uncertain start. End with each task's outcome, evidence,
    remaining blockers, and retained sessions. Completion means the user's acceptance

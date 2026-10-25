@@ -6,9 +6,9 @@ use gpui::{
     App, Bounds, Context, Entity, Subscription, WeakEntity, Window, WindowBounds, WindowHandle,
     WindowOptions, actions, div, prelude::*, px,
 };
-use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::{Disableable as _, Sizable as _};
 use krill_app::{sidebar, ui};
 use krill_proto::{
     SessionId,
@@ -1600,6 +1600,7 @@ impl Shell {
                     if !workers.is_empty() {
                         menu = menu.separator().label(text::WORKERS.get());
                         for (idx, dispatch) in workers.into_iter().enumerate() {
+                            let can_release = dispatch.validate_release().is_ok();
                             let did = dispatch.id.clone();
                             let label = format!(
                                 "{} ({})",
@@ -1623,6 +1624,7 @@ impl Shell {
                                     .child(
                                         Button::new(gpui::ElementId::Name(button_id.clone().into()))
                                             .label(text::WORKER_RELEASE.get())
+                                            .disabled(!can_release)
                                             .debug_selector(move || button_id.clone())
                                             .ghost()
                                             .xsmall()
@@ -2022,7 +2024,7 @@ pub(super) fn unreleased_workers(
     store
         .dispatches
         .iter()
-        .filter(|disp| disp.status != krill_proto::orchestration::DispatchStatus::Released)
+        .filter(|disp| !disp.is_released())
         .take(3)
         .collect()
 }

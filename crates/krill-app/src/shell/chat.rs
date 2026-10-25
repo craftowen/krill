@@ -59,6 +59,7 @@ struct ChatList {
 #[derive(Default)]
 pub(crate) struct ChatState {
     pub active_sessions: BTreeSet<SessionId>,
+    pub overrides: BTreeMap<SessionId, bool>,
     pub logs: BTreeMap<SessionId, SessionChatLog>,
     pub inputs: BTreeMap<SessionId, (gpui::Entity<InputState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
@@ -74,6 +75,17 @@ pub(crate) struct ChatState {
     prompt_failed: BTreeSet<SessionId>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
+}
+
+impl ChatState {
+    pub(super) fn set_session_chat_view(&mut self, session: SessionId, chat: bool) {
+        self.overrides.insert(session, chat);
+        if chat {
+            self.active_sessions.insert(session);
+        } else {
+            self.active_sessions.remove(&session);
+        }
+    }
 }
 
 fn normalized(text: &str) -> String {
@@ -201,8 +213,25 @@ fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
 }
 
 impl Shell {
-    /// 현재 포커스된 칸의 세션이 Chat 뷰 모드인지 반환한다.
-    pub(super) fn is_active_chat_view(&self) -> bool {
+    pub(super) fn is_session_chat_view(&self, session: SessionId, cx: &gpui::App) -> bool {
+        self.chat
+            .overrides
+            .get(&session)
+            .copied()
+            .unwrap_or_else(|| {
+                self.chat.active_sessions.contains(&session)
+                    || krill_app::settings::default_view_mode(cx)
+                        == krill_app::settings::DefaultViewMode::Chat
+            })
+    }
+
+    pub(super) fn is_active_chat_view_in(&self, cx: &gpui::App) -> bool {
+        self.active_session_id()
+            .is_some_and(|id| self.is_session_chat_view(id, cx))
+    }
+
+    #[cfg(test)]
+    fn is_active_chat_view(&self) -> bool {
         self.active_session_id()
             .is_some_and(|id| self.chat.active_sessions.contains(&id))
     }
@@ -222,8 +251,9 @@ impl Shell {
         let Some(session) = self.active_session_id() else {
             return;
         };
-        if !self.chat.active_sessions.remove(&session) {
-            self.chat.active_sessions.insert(session);
+        let chat = !self.is_session_chat_view(session, cx);
+        self.chat.set_session_chat_view(session, chat);
+        if chat {
             self.chat.last_poll = None;
             self.poll_active_chat(cx);
         }
@@ -238,7 +268,7 @@ impl Shell {
         self.toggle_chat_view(cx);
         if let Some(session) = self
             .active_session_id()
-            .filter(|id| self.chat.active_sessions.contains(id))
+            .filter(|id| self.is_session_chat_view(*id, cx))
         {
             let input = self.ensure_chat_input(session, window, cx);
             input.update(cx, |input, cx| input.focus(window, cx));
@@ -248,7 +278,7 @@ impl Shell {
     }
 
     pub(super) fn maybe_poll_active_chat(&mut self, cx: &mut Context<Self>) {
-        if !self.is_active_chat_view() {
+        if !self.is_active_chat_view_in(cx) {
             return;
         }
         let now = std::time::Instant::now();
@@ -277,7 +307,7 @@ impl Shell {
                     .update(cx, |this, cx| {
                         if this.page_open()
                             || this.dashboard.is_some()
-                            || !this.is_active_chat_view()
+                            || !this.is_active_chat_view_in(cx)
                         {
                             this.chat.poll_timer = None;
                             return false;
@@ -310,7 +340,7 @@ impl Shell {
         session: SessionId,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.task.is_some() || !self.chat.active_sessions.contains(&session) {
+        if self.chat.task.is_some() || !self.is_session_chat_view(session, cx) {
             return;
         }
         self.ensure_chat_poll_timer(cx);
@@ -348,7 +378,7 @@ impl Shell {
                 this.chat.task = None;
                 if this.layout.host(pane) == &host
                     && this.layout.session(pane) == Some(session)
-                    && this.chat.active_sessions.contains(&session)
+                    && this.is_session_chat_view(session, cx)
                     && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
                 {
                     if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
@@ -864,7 +894,7 @@ impl Shell {
             return None;
         }
         let session = self.layout.session(pane)?;
-        if !self.chat.active_sessions.contains(&session) {
+        if !self.is_session_chat_view(session, cx) {
             return None;
         }
         self.ensure_chat_poll_timer(cx);
@@ -1046,7 +1076,7 @@ impl Shell {
                         .xsmall()
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.chat.active_sessions.remove(&session);
+                                this.chat.set_session_chat_view(session, false);
                                 window.focus(&this.focus, cx);
                                 cx.notify();
                             },
@@ -1112,6 +1142,34 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use krill_proto::agent_history::ChatQuestionOption;
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn default_view_mode_applies_to_unselected_sessions_and_preserves_terminal_choice(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::shell::tests::{open, state_path};
+        let (shell, cx) = open(cx, state_path("default-chat-view"));
+        cx.update(|_, cx| {
+            krill_app::settings::edit(cx, |settings| {
+                settings.default_view_mode = krill_app::settings::DefaultViewMode::Chat;
+            });
+        });
+        cx.run_until_parked();
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            shell.layout.set_session(pane, SessionId(701));
+            assert!(shell.is_active_chat_view_in(cx));
+            shell.toggle_chat_view(cx);
+            assert!(!shell.is_active_chat_view_in(cx));
+            shell.layout.set_session(pane, SessionId(702));
+            assert!(shell.is_active_chat_view_in(cx));
+            shell.layout.set_session(pane, SessionId(701));
+            assert!(!shell.is_active_chat_view_in(cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+    }
 
     #[gpui::test]
     fn desktop_hybrid_chat_toggle_and_incremental_poll_render(cx: &mut TestAppContext) {

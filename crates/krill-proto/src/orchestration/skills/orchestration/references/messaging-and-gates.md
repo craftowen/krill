@@ -6,18 +6,19 @@ assigned Run/Task/Dispatch and send to the coordinator, never to a group.
 
 `inbox --to <name> --run <run-id> --json` inspects pending mail with a Run filter.
 `check --to <name> --run <run-id> --unread --wait --timeout-ms 60000 --json` waits
-without acknowledging (plain `--wait` defaults to 60s, max 300s, with a short
-arrival coalescing window so simultaneous completions arrive in one batch). Match
+without acknowledging (plain `--wait` defaults to 60s, max 300s).
+JSON checks return a `delivery` receipt and `messages` array. Match
 each returned message to the owned Run and authoritative dispatch before deciding
 what to do. Group addresses such as `@all`, `@active`, and `@agy` currently span
 matching dispatches in the store; they are not safe Run-scoped broadcasts. Prefer
 explicit recipients.
 
-`check --ack` marks matching mail acknowledged when it is returned, not after
-your reasoning. Prefer inspecting with `check --unread --wait` first and then
-acknowledging specific handled message IDs with
+Inspect with `check --unread --wait` first and acknowledge the returned immutable
+batch with `check --to <name> --run <run-id> --ack <delivery-id> --json` after handling
+it. Mail arriving later stays unread. You can also acknowledge specific handled message IDs with
 `check --to <name> --run <run-id> --ack-ids <id1,id2,...> --json` (`--ack-ids`
-cannot be combined with `--wait`). If acknowledging a batch with `--ack`, preserve
+cannot be combined with `--wait`). A bare `check --ack` acknowledges matching mail
+at read time and returns an array. If using bare `--ack`, preserve
 its full returned receipt and handle every row it returns, including newly arrived
 messages. Avoid bulk `--ack` without `--run` in a shared coordinator inbox when
 another active Run owns matching mail. On restart reconcile the receipt and task

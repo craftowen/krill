@@ -54,12 +54,36 @@ pub(super) fn plan_release(
         .rev()
         .find(|d| d.id == dispatch_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "worker not found"))?;
+    found.validate_release()?;
+    let owner = found.session_id.and_then(|sid| {
+        store
+            .dispatches
+            .iter()
+            .rev()
+            .find(|d| {
+                d.session_id == Some(sid)
+                    && matches!(d.status, DispatchStatus::Active | DispatchStatus::Retained)
+            })
+            .or_else(|| {
+                store
+                    .dispatches
+                    .iter()
+                    .rev()
+                    .find(|d| d.session_id == Some(sid))
+            })
+    });
+    let owns_session = owner.is_some_and(|owner| owner.id == found.id);
     Ok(ReleasePlan {
         dispatch_id: found.id.clone(),
-        session: found.session_id,
-        status: found.status,
+        session: found.session_id.filter(|_| owns_session),
+        status: if found.is_released() {
+            DispatchStatus::Released
+        } else {
+            found.status
+        },
         archived: found.archived_output.clone(),
-        needs_close: found.status != DispatchStatus::Released
+        needs_close: !found.is_released()
+            && owns_session
             && found.session_id.is_some_and(|sid| listed.contains(&sid)),
     })
 }
@@ -91,19 +115,31 @@ pub(super) fn complete_worker_release(
     capture: Option<String>,
     close: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<Dispatch> {
-    if let Some(text) = capture {
-        OrchestrationStore::mutate(state_dir, |s| {
+    // Keep ownership stable through Close. A newly assigned worker cannot borrow
+    // this PTY between authority validation and the verified close operation.
+    OrchestrationStore::mutate(state_dir, |s| {
+        let listed: Vec<_> = plan
+            .session
+            .filter(|_| plan.needs_close)
+            .into_iter()
+            .collect();
+        let current = plan_release(s, &plan.dispatch_id, &listed)?;
+        if current.session != plan.session {
+            return Err(io::Error::other("worker session ownership changed"));
+        }
+        if let Some(text) = capture {
             let stored = s
                 .dispatches
                 .iter_mut()
                 .find(|d| d.id == plan.dispatch_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "dispatch missing"))?;
             stored.archived_output = Some(text);
-            Ok(())
-        })?;
-    }
-    close()?;
-    OrchestrationStore::mutate(state_dir, |s| {
+            // Preserve the captured output even if Close is denied or times out.
+            s.save(state_dir)?;
+        }
+        if current.status != DispatchStatus::Released {
+            close()?;
+        }
         s.stop_or_release_worker(&plan.dispatch_id, true)
     })
 }
@@ -262,6 +298,7 @@ mod tests {
                 "Do the thing",
             )
             .unwrap();
+        store.dispatches[0].status = DispatchStatus::Stopped;
         store.save(dir).unwrap();
         store
     }
@@ -282,6 +319,63 @@ mod tests {
     }
 
     #[test]
+    fn release_rejects_active_borrowed_and_reassigned_sessions_before_close() {
+        use krill_proto::orchestration::DispatchSessionOrigin;
+        let dir = std::env::temp_dir().join(format!("mk-release-authority-{}", std::process::id()));
+        let mut store = test_store(&dir);
+        let id = store.dispatches[0].id.clone();
+        let plan = plan_release(&store, &id, &[10]).unwrap();
+        let closed = std::cell::Cell::new(false);
+        for borrowed in [false, true] {
+            store.dispatches[0].status = if borrowed {
+                DispatchStatus::Stopped
+            } else {
+                DispatchStatus::Active
+            };
+            store.dispatches[0].session_origin = if borrowed {
+                DispatchSessionOrigin::Borrowed
+            } else {
+                DispatchSessionOrigin::Created
+            };
+            store.save(&dir).unwrap();
+            assert!(
+                complete_worker_release(&dir, &plan, Some("keep".into()), || {
+                    closed.set(true);
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert!(!closed.get());
+            assert_eq!(OrchestrationStore::load(&dir).unwrap(), store);
+        }
+        store.dispatches[0].status = DispatchStatus::Stopped;
+        store.dispatches[0].session_origin = DispatchSessionOrigin::Created;
+        let run_id = store.runs[0].id.clone();
+        store
+            .start_worker(
+                &run_id,
+                None,
+                "new-owner",
+                "claude",
+                Some(10),
+                "/tmp",
+                "next",
+            )
+            .unwrap();
+        store.save(&dir).unwrap();
+        assert!(
+            complete_worker_release(&dir, &plan, None, || {
+                closed.set(true);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!closed.get());
+        assert_eq!(OrchestrationStore::load(&dir).unwrap(), store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn complete_worker_release_orders_archive_close_then_released() {
         let dir = std::env::temp_dir().join(format!("mk-release-order-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -292,7 +386,8 @@ mod tests {
         // 성공: 아카이브 저장 → Released.
         let done =
             complete_worker_release(&dir, &plan, Some("output".to_owned()), || Ok(())).unwrap();
-        assert_eq!(done.status, DispatchStatus::Released);
+        assert!(done.is_released());
+        assert_eq!(done.status, DispatchStatus::Stopped);
         assert_eq!(done.archived_output.as_deref(), Some("output"));
 
         // 실패(Denied): 상태는 그대로, 아카이브는 굳어 있다.
@@ -304,7 +399,7 @@ mod tests {
         let denied = || Err::<(), _>(io::Error::other("close request denied"));
         assert!(complete_worker_release(&dir, &plan, Some("output".to_owned()), denied).is_err());
         let kept = OrchestrationStore::load(&dir).unwrap();
-        assert_eq!(kept.dispatches[0].status, DispatchStatus::Active);
+        assert_eq!(kept.dispatches[0].status, DispatchStatus::Stopped);
         assert_eq!(
             kept.dispatches[0].archived_output.as_deref(),
             Some("output")
@@ -314,7 +409,7 @@ mod tests {
         let plan = plan_release(&kept, &id, &[]).unwrap();
         assert!(!plan.needs_close);
         let done = complete_worker_release(&dir, &plan, None, || Ok(())).unwrap();
-        assert_eq!(done.status, DispatchStatus::Released);
+        assert!(done.is_released());
 
         // 없는 디스패치는 저장소를 건드리지 않는다.
         let bogus = ReleasePlan {

@@ -560,14 +560,14 @@ impl Shell {
                     ))
                     .child(ui::button_with_tooltip(
                         Button::new("toggle-chat-view")
-                            .label(if self.is_active_chat_view() {
+                            .label(if self.is_active_chat_view_in(cx) {
                                 "Term"
                             } else {
                                 "Chat"
                             })
                             .ghost()
                             .xsmall()
-                            .toggled(self.is_active_chat_view())
+                            .toggled(self.is_active_chat_view_in(cx))
                             .debug_selector(|| "toggle-chat-view".into())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_chat_view_with_focus(window, cx);

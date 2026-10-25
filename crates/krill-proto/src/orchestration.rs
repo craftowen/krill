@@ -88,7 +88,9 @@ impl TaskStatus {
     }
 }
 
-pub const DEFAULT_MAX_WORKER_DEPTH: u32 = 3;
+pub const MAX_WORKER_DEPTH: u32 = 3;
+pub const DEFAULT_MAX_WORKER_DEPTH: u32 = MAX_WORKER_DEPTH;
+pub const MAX_STORE_BYTES: u64 = MAX_ORCH_BYTES;
 
 /// Retain action/status extension; older peers receive the preserved-session stopped state.
 pub const FEAT_ORCH_RETAIN: u64 = 1 << 19;
@@ -117,6 +119,23 @@ impl DispatchStatus {
             Self::Abandoned => "abandoned",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchReleaseState {
+    #[default]
+    Active,
+    Retained,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchSessionOrigin {
+    #[default]
+    Created,
+    Borrowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +252,18 @@ pub struct Dispatch {
     pub started_at_ms: u64,
     #[serde(default)]
     pub ended_at_ms: Option<u64>,
+    #[serde(default)]
+    pub release_state: DispatchReleaseState,
+    #[serde(default)]
+    pub session_origin: DispatchSessionOrigin,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub retry_of: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +311,17 @@ pub struct DecisionGate {
     pub resolved_at_ms: Option<u64>,
 }
 
+/// Immutable mailbox batch. Acknowledging it never consumes mail arriving later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationDelivery {
+    pub id: String,
+    pub to: String,
+    pub run_id: Option<String>,
+    pub message_ids: Vec<String>,
+    pub created_at_ms: u64,
+    pub acked: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationStore {
     #[serde(default)]
@@ -296,6 +338,13 @@ pub struct OrchestrationStore {
     pub messages: Vec<OrchMessage>,
     #[serde(default)]
     pub gates: Vec<DecisionGate>,
+    #[serde(default)]
+    pub session_runs: BTreeMap<u32, String>,
+    #[serde(default)]
+    pub deliveries: Vec<OrchestrationDelivery>,
+    /// Message IDs already pointed out in a live idle session, keyed by session ID.
+    #[serde(default)]
+    pub idle_mail_notified: BTreeMap<u64, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,10 +374,6 @@ pub struct WorkerStartSpec {
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub effort: Option<String>,
-    #[serde(default)]
     pub account: Option<String>,
     #[serde(default)]
     pub session_id: Option<u64>,
@@ -342,6 +387,14 @@ pub struct WorkerStartSpec {
     pub max_depth: Option<u32>,
     #[serde(default)]
     pub no_spawn: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub retry_of: Option<String>,
+    #[serde(default)]
+    pub retry_request: Option<String>,
 }
 
 /// `krilld` IPC 기반 멀티에이전트 오케스트레이션 요청(MK-227).
@@ -352,7 +405,7 @@ pub enum OrchAction {
         title: String,
         coordinator_session_id: Option<u64>,
     },
-    SetCurrentRun {
+    SetCurrentRunLegacy {
         run_id: Option<String>,
     },
     CreateTask {
@@ -378,7 +431,7 @@ pub enum OrchAction {
         max_depth: u32,
     },
     SendMessage(SendParams),
-    CheckMessages {
+    CheckMessagesLegacy {
         recipient: Option<String>,
         types: Vec<MessageType>,
         unread_only: bool,
@@ -437,22 +490,279 @@ pub enum OrchAction {
         unread_only: bool,
         ack_ids: Vec<String>,
     },
+    StartWorkerConfigured {
+        spec: WorkerStartSpec,
+    },
+    LaunchWorker {
+        dispatch_id: String,
+        account: Option<String>,
+    },
+    WorkerStartFailed {
+        dispatch_id: String,
+        reason: String,
+    },
+    SetCurrentRun {
+        run_id: Option<String>,
+        session_id: Option<u32>,
+    },
+    CheckMessages {
+        recipient: Option<String>,
+        types: Vec<MessageType>,
+        unread_only: bool,
+        ack: bool,
+        wait_ms: u64,
+        run_id: Option<String>,
+        delivery_id: Option<String>,
+    },
+    SnapshotV2,
+    ManageWorker {
+        worker_or_dispatch: String,
+        operation: WorkerOperation,
+        archived_output: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerOperation {
+    Stop,
+    Release,
+    Retain,
+    Abandon,
+}
+
+impl OrchAction {
+    /// New opcodes are a fail-closed capability probe; never replay them on disk
+    /// after an old daemon has rejected them.
+    pub fn requires_v2(&self) -> bool {
+        matches!(
+            self,
+            Self::SetCurrentRun { .. }
+                | Self::CheckMessages { .. }
+                | Self::CheckMessagesFiltered { .. }
+                | Self::AckMessageIds { .. }
+                | Self::SnapshotV2
+                | Self::StartWorkerConfigured { .. }
+                | Self::LaunchWorker { .. }
+                | Self::WorkerStartFailed { .. }
+                | Self::ManageWorker { .. }
+        )
+    }
 }
 
 /// `krilld` IPC 기반 멀티에이전트 오케스트레이션 응답(MK-227).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "WireOrchResponse", from = "WireOrchResponse")]
 pub enum OrchResponse {
     Snapshot(OrchestrationStore),
     Run(Run),
     CurrentRun(Option<String>),
     Task(Task),
-    Dispatch(Dispatch),
+    Dispatch(Box<Dispatch>),
     Messages(Vec<OrchMessage>),
     Message(OrchMessage),
     Answer(Option<OrchMessage>),
     Gate(DecisionGate),
     Reset,
     Error(String),
+    Delivery {
+        delivery: Option<OrchestrationDelivery>,
+        messages: Vec<OrchMessage>,
+    },
+    SnapshotV2(OrchestrationStore),
+    DispatchV2(Box<Dispatch>),
+}
+
+// Frozen N-1 payloads: serde defaults do not extend postcard structs safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyDispatch {
+    pub id: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub worker_name: String,
+    pub agent: String,
+    #[serde(default)]
+    pub session_id: Option<u64>,
+    #[serde(default)]
+    pub depth: u32,
+    pub cwd: String,
+    pub prompt: String,
+    pub status: DispatchStatus,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Terminal output captured before stopping or releasing the worker, separate from its result.
+    #[serde(default)]
+    pub archived_output: Option<String>,
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub ended_at_ms: Option<u64>,
+}
+impl From<Dispatch> for LegacyDispatch {
+    fn from(value: Dispatch) -> Self {
+        let status = match value.release_state {
+            DispatchReleaseState::Released => DispatchStatus::Released,
+            DispatchReleaseState::Retained => DispatchStatus::Retained,
+            DispatchReleaseState::Active => value.status,
+        };
+        Self {
+            id: value.id,
+            run_id: value.run_id,
+            task_id: value.task_id,
+            worker_name: value.worker_name,
+            agent: value.agent,
+            session_id: value.session_id,
+            depth: value.depth,
+            cwd: value.cwd,
+            prompt: value.prompt,
+            status,
+            summary: value.summary,
+            archived_output: value.archived_output,
+            started_at_ms: value.started_at_ms,
+            ended_at_ms: value.ended_at_ms,
+        }
+    }
+}
+
+impl From<LegacyDispatch> for Dispatch {
+    fn from(value: LegacyDispatch) -> Self {
+        Self {
+            id: value.id,
+            run_id: value.run_id,
+            task_id: value.task_id,
+            worker_name: value.worker_name,
+            agent: value.agent,
+            session_id: value.session_id,
+            depth: value.depth,
+            cwd: value.cwd,
+            prompt: value.prompt,
+            status: value.status,
+            summary: value.summary,
+            archived_output: value.archived_output,
+            started_at_ms: value.started_at_ms,
+            ended_at_ms: value.ended_at_ms,
+            release_state: match value.status {
+                DispatchStatus::Released => DispatchReleaseState::Released,
+                DispatchStatus::Retained => DispatchReleaseState::Retained,
+                _ => DispatchReleaseState::Active,
+            },
+            session_origin: DispatchSessionOrigin::Created,
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyOrchestrationStore {
+    #[serde(default)]
+    pub next_seq: u64,
+    #[serde(default)]
+    pub current_run_id: Option<String>,
+    #[serde(default)]
+    pub runs: Vec<Run>,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+    #[serde(default)]
+    pub dispatches: Vec<LegacyDispatch>,
+    #[serde(default)]
+    pub messages: Vec<OrchMessage>,
+    #[serde(default)]
+    pub gates: Vec<DecisionGate>,
+}
+impl From<OrchestrationStore> for LegacyOrchestrationStore {
+    fn from(value: OrchestrationStore) -> Self {
+        Self {
+            next_seq: value.next_seq,
+            current_run_id: value.current_run_id,
+            runs: value.runs,
+            tasks: value.tasks,
+            dispatches: value.dispatches.into_iter().map(Into::into).collect(),
+            messages: value.messages,
+            gates: value.gates,
+        }
+    }
+}
+
+impl From<LegacyOrchestrationStore> for OrchestrationStore {
+    fn from(value: LegacyOrchestrationStore) -> Self {
+        Self {
+            next_seq: value.next_seq,
+            current_run_id: value.current_run_id,
+            runs: value.runs,
+            tasks: value.tasks,
+            dispatches: value.dispatches.into_iter().map(Into::into).collect(),
+            messages: value.messages,
+            gates: value.gates,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum WireOrchResponse {
+    Snapshot(LegacyOrchestrationStore),
+    Run(Run),
+    CurrentRun(Option<String>),
+    Task(Task),
+    Dispatch(Box<LegacyDispatch>),
+    Messages(Vec<OrchMessage>),
+    Message(OrchMessage),
+    Answer(Option<OrchMessage>),
+    Gate(DecisionGate),
+    Reset,
+    Error(String),
+    Delivery {
+        delivery: Option<OrchestrationDelivery>,
+        messages: Vec<OrchMessage>,
+    },
+    SnapshotV2(OrchestrationStore),
+    DispatchV2(Box<Dispatch>),
+}
+
+impl From<OrchResponse> for WireOrchResponse {
+    fn from(value: OrchResponse) -> Self {
+        match value {
+            OrchResponse::Snapshot(s) => Self::Snapshot(s.into()),
+            OrchResponse::Dispatch(d) => Self::Dispatch(Box::new((*d).into())),
+            OrchResponse::Run(v) => Self::Run(v),
+            OrchResponse::CurrentRun(v) => Self::CurrentRun(v),
+            OrchResponse::Task(v) => Self::Task(v),
+            OrchResponse::Messages(v) => Self::Messages(v),
+            OrchResponse::Message(v) => Self::Message(v),
+            OrchResponse::Answer(v) => Self::Answer(v),
+            OrchResponse::Gate(v) => Self::Gate(v),
+            OrchResponse::Reset => Self::Reset,
+            OrchResponse::Error(v) => Self::Error(v),
+            OrchResponse::Delivery { delivery, messages } => Self::Delivery { delivery, messages },
+            OrchResponse::SnapshotV2(v) => Self::SnapshotV2(v),
+            OrchResponse::DispatchV2(v) => Self::DispatchV2(v),
+        }
+    }
+}
+
+impl From<WireOrchResponse> for OrchResponse {
+    fn from(value: WireOrchResponse) -> Self {
+        match value {
+            WireOrchResponse::Snapshot(s) => Self::Snapshot(s.into()),
+            WireOrchResponse::Dispatch(d) => Self::Dispatch(Box::new((*d).into())),
+            WireOrchResponse::Run(v) => Self::Run(v),
+            WireOrchResponse::CurrentRun(v) => Self::CurrentRun(v),
+            WireOrchResponse::Task(v) => Self::Task(v),
+            WireOrchResponse::Messages(v) => Self::Messages(v),
+            WireOrchResponse::Message(v) => Self::Message(v),
+            WireOrchResponse::Answer(v) => Self::Answer(v),
+            WireOrchResponse::Gate(v) => Self::Gate(v),
+            WireOrchResponse::Reset => Self::Reset,
+            WireOrchResponse::Error(v) => Self::Error(v),
+            WireOrchResponse::Delivery { delivery, messages } => {
+                Self::Delivery { delivery, messages }
+            }
+            WireOrchResponse::SnapshotV2(v) => Self::SnapshotV2(v),
+            WireOrchResponse::DispatchV2(v) => Self::DispatchV2(v),
+        }
+    }
 }
 
 impl OrchResponse {
@@ -461,13 +771,18 @@ impl OrchResponse {
     pub fn for_features(mut self, features: u64) -> Self {
         if features & FEAT_ORCH_RETAIN == 0 {
             let downgrade = |dispatch: &mut Dispatch| {
+                if dispatch.release_state == DispatchReleaseState::Retained {
+                    dispatch.release_state = DispatchReleaseState::Active;
+                }
                 if dispatch.status == DispatchStatus::Retained {
                     dispatch.status = DispatchStatus::Stopped;
                 }
             };
             match &mut self {
-                Self::Snapshot(store) => store.dispatches.iter_mut().for_each(downgrade),
-                Self::Dispatch(dispatch) => downgrade(dispatch),
+                Self::Snapshot(store) | Self::SnapshotV2(store) => {
+                    store.dispatches.iter_mut().for_each(downgrade);
+                }
+                Self::Dispatch(dispatch) | Self::DispatchV2(dispatch) => downgrade(dispatch),
                 _ => {}
             }
         }
@@ -547,6 +862,7 @@ impl OrchestrationStore {
         let _guard = LockGuard::acquire(&state_dir.join(ORCH_LOCK))?;
         let mut store = Self::load(state_dir)?;
         let out = f(&mut store)?;
+        store.prune_if_needed()?;
         store.save(state_dir)?;
         Ok(out)
     }
@@ -601,6 +917,10 @@ impl OrchestrationStore {
                 }
             }
             Reply::Orchestration(resp) => Ok(Some(resp)),
+            Reply::Failed(Failure::BadRequest) if action.requires_v2() => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "update krilld for orchestration v2",
+            )),
             Reply::Failed(Failure::BadRequest) => Ok(None),
             Reply::Failed(f) => Err(io::Error::other(f.to_string())),
             _ => Err(invalid("unexpected orchestration response")),
@@ -700,6 +1020,9 @@ impl OrchestrationStore {
             created_at_ms: now,
             updated_at_ms: now,
         };
+        if let Some(sid) = coordinator_session_id.and_then(|sid| u32::try_from(sid).ok()) {
+            self.session_runs.insert(sid, id.clone());
+        }
         self.current_run_id = Some(id);
         self.runs.push(run.clone());
         Ok(run)
@@ -718,6 +1041,31 @@ impl OrchestrationStore {
             }
         }
         Ok(self.current_run_id.clone())
+    }
+
+    pub fn set_session_run(
+        &mut self,
+        session_id: Option<u32>,
+        run_id: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let selected = self.set_current_run(run_id)?;
+        if let Some(sid) = session_id {
+            if let Some(ref id) = selected {
+                self.session_runs.insert(sid, id.clone());
+            } else {
+                self.session_runs.remove(&sid);
+            }
+        }
+        Ok(selected)
+    }
+
+    pub fn resolve_run_for_session(
+        &self,
+        given: Option<&str>,
+        session_id: Option<u32>,
+    ) -> io::Result<String> {
+        let bound = session_id.and_then(|sid| self.session_runs.get(&sid));
+        self.resolve_run_id(given.or_else(|| bound.map(String::as_str)))
     }
 
     pub fn resolve_run_id(&self, given: Option<&str>) -> io::Result<String> {
@@ -910,6 +1258,11 @@ impl OrchestrationStore {
         depth: u32,
         max_depth: u32,
     ) -> io::Result<()> {
+        if max_depth > MAX_WORKER_DEPTH {
+            return Err(invalid(format!(
+                "max_depth {max_depth} exceeds daemon maximum {MAX_WORKER_DEPTH}"
+            )));
+        }
         if depth > max_depth {
             return Err(invalid(format!(
                 "nested worker depth {depth} exceeds max_depth {max_depth}"
@@ -923,6 +1276,11 @@ impl OrchestrationStore {
             return Err(invalid("worker name must not be empty"));
         }
         if let Some(tid) = task_id {
+            if self.consecutive_start_failures(run_id, tid) == 3 {
+                return Err(invalid(
+                    "circuit breaker: task has three consecutive worker session start failures; inspect request-show before retrying",
+                ));
+            }
             let Some(task) = self.tasks.iter().find(|t| t.id == tid) else {
                 return Err(not_found(format!("task not found: {tid}")));
             };
@@ -937,6 +1295,21 @@ impl OrchestrationStore {
             }
         }
         Ok(())
+    }
+
+    fn consecutive_start_failures(&self, run_id: &str, task_id: &str) -> usize {
+        self.dispatches
+            .iter()
+            .rev()
+            .filter(|d| d.run_id == run_id && d.task_id.as_deref() == Some(task_id))
+            .take_while(|d| {
+                d.status == DispatchStatus::Failed
+                    && d.summary
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("worker session start failed:"))
+            })
+            .take(3)
+            .count()
     }
 
     #[must_use]
@@ -1012,6 +1385,12 @@ impl OrchestrationStore {
             archived_output: None,
             started_at_ms: now,
             ended_at_ms: None,
+            release_state: DispatchReleaseState::Active,
+            session_origin: DispatchSessionOrigin::Created,
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
         };
         self.dispatches.push(dispatch.clone());
 
@@ -1044,15 +1423,333 @@ impl OrchestrationStore {
         Ok(dispatch)
     }
 
-    pub fn resolve_recipients(&self, to: &str) -> Vec<String> {
+    /// Prepare a dispatch before launching so failed starts remain inspectable and bounded.
+    pub fn start_worker_configured(&mut self, spec: &WorkerStartSpec) -> io::Result<Dispatch> {
+        let run_id = spec
+            .run_id
+            .as_deref()
+            .ok_or_else(|| invalid("missing run_id"))?;
+        let worker = spec
+            .worker
+            .as_deref()
+            .ok_or_else(|| invalid("missing worker"))?;
+        let agent = spec.agent.as_deref().unwrap_or("claude");
+        if spec
+            .effort
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "minimal" | "low" | "medium" | "high" | "xhigh" | "max"))
+        {
+            return Err(invalid("effort must be minimal|low|medium|high|xhigh|max"));
+        }
+        if spec.session_id.is_some() && (spec.model.is_some() || spec.effort.is_some()) {
+            return Err(invalid("launch overrides require a newly created session"));
+        }
+        if spec.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(invalid("model must not be empty"));
+        }
+        let previous = spec
+            .retry_of
+            .as_deref()
+            .map(|id| {
+                self.dispatches
+                    .iter()
+                    .find(|d| d.id == id)
+                    .ok_or_else(|| not_found(format!("dispatch not found: {id}")))
+            })
+            .transpose()?;
+        if let Some(previous) = previous {
+            if previous.run_id != run_id || previous.task_id != spec.task_id {
+                return Err(invalid("retry dispatch run/task binding mismatch"));
+            }
+            if previous.status == DispatchStatus::Active {
+                return Err(invalid(
+                    "cannot retry an active dispatch; abandon or settle it first",
+                ));
+            }
+        }
+        if let Some(request_id) = spec.retry_request.as_deref() {
+            let previous = self
+                .dispatches
+                .iter()
+                .find(|d| d.request_id.as_deref() == Some(request_id))
+                .ok_or_else(|| not_found(format!("request not found: {request_id}")))?;
+            if spec.retry_of.as_deref() != Some(previous.id.as_str()) {
+                return Err(invalid("retry request does not match retry dispatch"));
+            }
+        }
+        let mut dispatch = self.start_worker_with_depth(
+            run_id,
+            spec.task_id.as_deref(),
+            worker,
+            agent,
+            spec.session_id,
+            spec.cwd.as_deref().unwrap_or_default(),
+            spec.prompt.as_deref().unwrap_or_default(),
+            spec.depth.unwrap_or(0),
+            spec.max_depth.unwrap_or(DEFAULT_MAX_WORKER_DEPTH),
+        )?;
+        dispatch.session_origin = if spec.session_id.is_some() {
+            DispatchSessionOrigin::Borrowed
+        } else {
+            DispatchSessionOrigin::Created
+        };
+        dispatch.model.clone_from(&spec.model);
+        dispatch.effort.clone_from(&spec.effort);
+        dispatch.retry_of.clone_from(&spec.retry_of);
+        dispatch.request_id = Some(self.alloc_id("req"));
+        if let Some(stored) = self.dispatches.iter_mut().find(|d| d.id == dispatch.id) {
+            *stored = dispatch.clone();
+        }
+        Ok(dispatch)
+    }
+
+    pub fn worker_start_failed(&mut self, dispatch_id: &str, reason: &str) -> io::Result<Dispatch> {
+        let dispatch = self
+            .dispatches
+            .iter_mut()
+            .find(|d| d.id == dispatch_id)
+            .ok_or_else(|| not_found(format!("dispatch not found: {dispatch_id}")))?;
+        if dispatch.status != DispatchStatus::Active {
+            return Err(invalid("worker start failure requires an active dispatch"));
+        }
+        dispatch.status = DispatchStatus::Failed;
+        dispatch.summary = Some(format!("worker session start failed: {reason}"));
+        dispatch.ended_at_ms = Some(now_ms());
+        let mut result = dispatch.clone();
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|t| Some(&t.id) == result.task_id.as_ref())
+            && task.active_dispatch_id.as_deref() == Some(dispatch_id)
+        {
+            task.status = TaskStatus::Ready;
+            task.active_dispatch_id = None;
+            task.assigned_worker = None;
+            task.result_summary.clone_from(&result.summary);
+            task.updated_at_ms = now_ms();
+        }
+        self.reconverge_dag();
+        if result
+            .task_id
+            .as_deref()
+            .is_some_and(|id| self.consecutive_start_failures(&result.run_id, id) == 3)
+        {
+            let summary = format!(
+                "{}; circuit breaker opened after three consecutive start failures",
+                result.summary.as_deref().unwrap_or_default()
+            );
+            result.summary = Some(summary.clone());
+            if let Some(stored) = self.dispatches.iter_mut().find(|d| d.id == dispatch_id) {
+                stored.summary = Some(summary);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Replay the oldest compatible immutable batch. Legacy ACK without an ID consumes
+    /// that batch, or creates one if this recipient has never checked its mailbox.
+    pub fn check_delivery(
+        &mut self,
+        recipient: Option<&str>,
+        types: &[MessageType],
+        unread_only: bool,
+        ack: bool,
+        run_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> io::Result<(Option<OrchestrationDelivery>, Vec<OrchMessage>)> {
+        let matches = |m: &OrchMessage| {
+            recipient.is_none_or(|to| m.to == to || m.to == "@all")
+                && run_id.is_none_or(|rid| m.run_id.as_deref() == Some(rid))
+                && (types.is_empty() || types.contains(&m.msg_type))
+        };
+        // Other consumers (reply/answer waits) may have already consumed an entire batch.
+        for delivery in &mut self.deliveries {
+            if delivery
+                .message_ids
+                .iter()
+                .all(|id| self.messages.iter().any(|m| &m.id == id && m.acked))
+            {
+                delivery.acked = true;
+            }
+        }
+        let selected = if let Some(id) = delivery_id {
+            if !ack {
+                return Err(invalid("delivery ID requires --ack"));
+            }
+            let delivery = self
+                .deliveries
+                .iter()
+                .find(|d| d.id == id)
+                .ok_or_else(|| not_found(format!("delivery not found: {id}")))?;
+            if recipient.is_some_and(|to| delivery.to != to)
+                || run_id.is_some_and(|rid| delivery.run_id.as_deref() != Some(rid))
+            {
+                return Err(invalid(
+                    "delivery recipient/run does not match check filters",
+                ));
+            }
+            Some(delivery.clone())
+        } else {
+            self.deliveries
+                .iter()
+                .find(|d| {
+                    !d.acked
+                        && recipient.is_none_or(|to| d.to == to)
+                        && run_id.is_none_or(|id| d.run_id.as_deref() == Some(id))
+                        && d.message_ids
+                            .iter()
+                            .all(|id| self.messages.iter().any(|m| &m.id == id && matches(m)))
+                })
+                .cloned()
+        };
+        let delivery = if let Some(delivery) = selected {
+            Some(delivery)
+        } else {
+            let reserved: BTreeSet<_> = self
+                .deliveries
+                .iter()
+                .filter(|d| !d.acked)
+                .flat_map(|d| d.message_ids.iter())
+                .collect();
+            let first = self
+                .messages
+                .iter()
+                .find(|m| !m.acked && matches(m) && !reserved.contains(&m.id));
+            let batch_to = first.map(|m| m.to.clone()).unwrap_or_default();
+            let batch_run = first.and_then(|m| m.run_id.clone());
+            let ids: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|m| {
+                    !m.acked
+                        && matches(m)
+                        && m.to == batch_to
+                        && m.run_id == batch_run
+                        && !reserved.contains(&m.id)
+                })
+                .take(50)
+                .map(|m| m.id.clone())
+                .collect();
+            if ids.is_empty() {
+                None
+            } else {
+                let delivery = OrchestrationDelivery {
+                    id: self.alloc_id("delivery"),
+                    to: batch_to,
+                    run_id: batch_run,
+                    message_ids: ids,
+                    created_at_ms: now_ms(),
+                    acked: false,
+                };
+                self.deliveries.push(delivery.clone());
+                Some(delivery)
+            }
+        };
+        let Some(mut delivery) = delivery else {
+            let history = if unread_only {
+                Vec::new()
+            } else {
+                self.messages
+                    .iter()
+                    .filter(|m| m.acked && matches(m))
+                    .take(50)
+                    .cloned()
+                    .collect()
+            };
+            return Ok((None, history));
+        };
+        let mut messages = Vec::new();
+        for id in &delivery.message_ids {
+            if let Some(message) = self.messages.iter_mut().find(|m| &m.id == id) {
+                if ack {
+                    message.acked = true;
+                }
+                messages.push(message.clone());
+            }
+        }
+        if ack {
+            delivery.acked = true;
+            if let Some(stored) = self.deliveries.iter_mut().find(|d| d.id == delivery.id) {
+                stored.acked = true;
+            }
+        }
+        Ok((Some(delivery), messages))
+    }
+
+    /// Compact before the atomic size gate, preserving every outstanding delivery and
+    /// the selected Run. Completed older Runs can be discarded under byte pressure.
+    pub fn prune_if_needed(&mut self) -> io::Result<()> {
+        self.prune_messages();
+        let unread: BTreeSet<_> = self
+            .messages
+            .iter()
+            .filter(|m| !m.acked)
+            .map(|m| m.id.clone())
+            .collect();
+        self.idle_mail_notified.retain(|_, ids| {
+            ids.retain(|id| unread.contains(id));
+            !ids.is_empty()
+        });
+        let threshold = MAX_STORE_BYTES.saturating_sub(256 * 1024);
+        let bytes = |store: &Self| -> io::Result<u64> {
+            serde_json::to_vec_pretty(store)
+                .map(|b| u64::try_from(b.len()).unwrap_or(u64::MAX))
+                .map_err(invalid)
+        };
+        if bytes(self)? < threshold {
+            return Ok(());
+        }
+        self.deliveries.retain(|d| !d.acked);
+        let pinned: BTreeSet<_> = self
+            .deliveries
+            .iter()
+            .flat_map(|d| d.message_ids.iter().cloned())
+            .collect();
+        self.messages.retain(|m| !m.acked || pinned.contains(&m.id));
+        let mut completed: Vec<_> = self
+            .runs
+            .iter()
+            .filter(|r| {
+                r.status == RunStatus::Completed
+                    && self.current_run_id.as_deref() != Some(r.id.as_str())
+                    && !self
+                        .dispatches
+                        .iter()
+                        .any(|d| d.run_id == r.id && d.status == DispatchStatus::Active)
+                    && !self.messages.iter().any(|m| {
+                        m.run_id.as_deref() == Some(r.id.as_str()) && pinned.contains(&m.id)
+                    })
+            })
+            .map(|r| (r.updated_at_ms, r.id.clone()))
+            .collect();
+        completed.sort();
+        for (_, id) in completed {
+            if bytes(self)? < threshold {
+                break;
+            }
+            self.reset(Some(&id));
+        }
+        Ok(())
+    }
+
+    pub fn resolve_recipients(&self, to: &str, run_id: Option<&str>) -> Vec<String> {
         let target = to.trim();
         if !target.starts_with('@') {
             return vec![target.to_owned()];
         }
         let mut names = BTreeSet::new();
         for d in &self.dispatches {
+            if run_id.is_some_and(|rid| d.run_id != rid)
+                || d.release_state == DispatchReleaseState::Released
+                || matches!(
+                    d.status,
+                    DispatchStatus::Abandoned | DispatchStatus::Failed | DispatchStatus::Released
+                )
+            {
+                continue;
+            }
             let include = match target {
-                "@all" => matches!(d.status, DispatchStatus::Active | DispatchStatus::Succeeded),
+                "@all" => true,
                 "@idle" => d.status != DispatchStatus::Active,
                 "@active" => d.status == DispatchStatus::Active,
                 "@claude" => d.agent.eq_ignore_ascii_case("claude"),
@@ -1073,11 +1770,7 @@ impl OrchestrationStore {
                 names.insert(d.worker_name.clone());
             }
         }
-        if names.is_empty() {
-            vec![target.to_owned()]
-        } else {
-            names.into_iter().collect()
-        }
+        names.into_iter().collect()
     }
 
     pub fn send_message(&mut self, params: &SendParams) -> io::Result<Vec<OrchMessage>> {
@@ -1228,7 +1921,25 @@ impl OrchestrationStore {
             self.reconverge_dag();
         }
 
-        let recipients = self.resolve_recipients(to);
+        if resolved_run_id.is_none() {
+            resolved_run_id = self
+                .dispatches
+                .iter()
+                .rev()
+                .find(|d| {
+                    d.worker_name == from
+                        && d.release_state != DispatchReleaseState::Released
+                        && !matches!(
+                            d.status,
+                            DispatchStatus::Abandoned
+                                | DispatchStatus::Failed
+                                | DispatchStatus::Released
+                        )
+                })
+                .map(|d| d.run_id.clone())
+                .or_else(|| self.current_run_id.clone());
+        }
+        let recipients = self.resolve_recipients(to, resolved_run_id.as_deref());
         let mut created = Vec::new();
         for rcpt in recipients {
             let msg_id = self.alloc_id("msg");
@@ -1259,13 +1970,23 @@ impl OrchestrationStore {
     /// `question`·`answer`·`escalation`). 버리는 것: 확인済み 하트비트·상태 중 최신
     /// [`MAX_RETAINED_EPHEMERAL`]건을 넘는 오래된 것.
     pub fn prune_messages(&mut self) {
-        let ephemeral = self.messages.iter().filter(|m| is_ephemeral(m)).count();
+        let pinned: BTreeSet<_> = self
+            .deliveries
+            .iter()
+            .filter(|d| !d.acked)
+            .flat_map(|d| d.message_ids.iter().cloned())
+            .collect();
+        let ephemeral = self
+            .messages
+            .iter()
+            .filter(|m| is_ephemeral(m) && !pinned.contains(&m.id))
+            .count();
         let mut drop = ephemeral.saturating_sub(MAX_RETAINED_EPHEMERAL);
         if drop == 0 {
             return;
         }
         self.messages.retain(|m| {
-            if drop > 0 && is_ephemeral(m) {
+            if drop > 0 && is_ephemeral(m) && !pinned.contains(&m.id) {
                 drop = drop.saturating_sub(1);
                 false
             } else {
@@ -1546,7 +2267,8 @@ impl OrchestrationStore {
                 return Err(not_found("dispatch missing"));
             };
             if release {
-                disp.status = DispatchStatus::Released;
+                disp.validate_release()?;
+                disp.release_state = DispatchReleaseState::Released;
             } else if disp.status == DispatchStatus::Active {
                 disp.status = DispatchStatus::Stopped;
             }
@@ -1587,7 +2309,13 @@ impl OrchestrationStore {
             let Some(disp) = self.dispatches.get_mut(idx) else {
                 return Err(not_found("dispatch missing"));
             };
-            disp.status = DispatchStatus::Retained;
+            if disp.is_released() {
+                return Err(invalid("cannot retain a released dispatch"));
+            }
+            disp.release_state = DispatchReleaseState::Retained;
+            if disp.status == DispatchStatus::Active {
+                disp.status = DispatchStatus::Retained;
+            }
             if disp.ended_at_ms.is_none() {
                 disp.ended_at_ms = Some(now);
             }
@@ -1655,6 +2383,8 @@ impl OrchestrationStore {
             if self.current_run_id.as_deref() == Some(rid) {
                 self.current_run_id = None;
             }
+            self.session_runs.retain(|_, id| id != rid);
+            self.deliveries.retain(|d| d.run_id.as_deref() != Some(rid));
             self.runs.retain(|r| r.id != rid);
             self.tasks.retain(|t| t.run_id != rid);
             self.dispatches.retain(|d| d.run_id != rid);
@@ -1668,6 +2398,141 @@ impl OrchestrationStore {
             };
         }
     }
+}
+
+impl Dispatch {
+    pub fn is_released(&self) -> bool {
+        self.release_state == DispatchReleaseState::Released
+            || self.status == DispatchStatus::Released
+    }
+
+    pub fn validate_release(&self) -> io::Result<()> {
+        if self.status == DispatchStatus::Active {
+            return Err(invalid(
+                "cannot release an active dispatch; settle, stop or abandon it first",
+            ));
+        }
+        if self.session_origin == DispatchSessionOrigin::Borrowed {
+            return Err(invalid("cannot release a borrowed session"));
+        }
+        Ok(())
+    }
+}
+
+/// Apply overrides to a session-local profile clone, preserving account and hook setup.
+pub fn worker_launch_profile(
+    profile: &crate::agent::Profile,
+    agent: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> io::Result<crate::agent::Profile> {
+    let runtime = profile
+        .program()
+        .and_then(|p| Path::new(p).file_stem())
+        .and_then(|p| p.to_str())
+        .unwrap_or(agent)
+        .to_owned();
+    let mut profile = profile.clone();
+    crate::agent::encode_agent_program_id(
+        agent,
+        &crate::agent::LaunchOverrides {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        },
+    )
+    .map_err(invalid)?;
+    if let Some(model) = model {
+        if model.trim().is_empty() {
+            return Err(invalid("model must not be empty"));
+        }
+        profile.launch = without_worker_options(&profile.launch, &["--model", "-m"], None);
+        profile.yolo_args = without_worker_options(&profile.yolo_args, &["--model", "-m"], None);
+        profile
+            .launch
+            .extend(["--model".to_owned(), model.to_owned()]);
+    }
+    if let Some(effort) = effort {
+        if !matches!(
+            effort,
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return Err(invalid("invalid effort"));
+        }
+        let mapped = if effort == "max" { "xhigh" } else { effort };
+        let runtime = crate::agent::canonical_id(&runtime);
+        if matches!(effort, "minimal" | "xhigh") && !matches!(runtime, "codex" | "pi") {
+            return Err(invalid("minimal and xhigh effort require Codex or Pi"));
+        }
+        let flags: &[&str] = match runtime {
+            "claude" => &["--effort"],
+            "pi" => &["--thinking"],
+            "opencode" => &["--variant"],
+            _ => &[],
+        };
+        profile.launch = without_worker_options(
+            &profile.launch,
+            flags,
+            (runtime == "codex").then_some("model_reasoning_effort="),
+        );
+        profile.yolo_args = without_worker_options(
+            &profile.yolo_args,
+            flags,
+            (runtime == "codex").then_some("model_reasoning_effort="),
+        );
+        let args = match runtime {
+            "codex" => [
+                "-c".to_owned(),
+                format!("model_reasoning_effort=\"{mapped}\""),
+            ],
+            "claude" => ["--effort".to_owned(), effort.to_owned()],
+            "pi" => ["--thinking".to_owned(), mapped.to_owned()],
+            "opencode" => ["--variant".to_owned(), effort.to_owned()],
+            _ => {
+                return Err(invalid(
+                    "effort override is unsupported for this agent profile",
+                ));
+            }
+        };
+        profile.launch.extend(args);
+    }
+    Ok(profile)
+}
+
+fn without_worker_options(
+    args: &[String],
+    names: &[&str],
+    config_key: Option<&str>,
+) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        if names.contains(&arg.as_str()) {
+            args.next();
+            continue;
+        }
+        if names.iter().any(|name| {
+            arg.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('='))
+        }) {
+            continue;
+        }
+        if let Some(key) = config_key {
+            if matches!(arg.as_str(), "-c" | "--config")
+                && args.peek().is_some_and(|value| value.starts_with(key))
+            {
+                args.next();
+                continue;
+            }
+            if arg
+                .strip_prefix("--config=")
+                .is_some_and(|value| value.starts_with(key))
+            {
+                continue;
+            }
+        }
+        kept.push(arg.clone());
+    }
+    kept
 }
 
 pub fn worker_preamble(dispatch: &Dispatch) -> String {
@@ -2713,11 +3578,12 @@ mod tests {
             assert_eq!(stopped.status, dispatch_status);
             assert_eq!(stopped.summary.as_deref(), Some("Finished"));
             let released = store.stop_or_release_worker("worker", true)?;
-            assert_eq!(released.status, DispatchStatus::Released);
+            assert_eq!(released.status, dispatch_status);
+            assert_eq!(released.release_state, DispatchReleaseState::Released);
             assert_eq!(released.id, dispatch.id);
             assert_eq!(
                 store.stop_or_release_worker(&dispatch.id, false)?.status,
-                DispatchStatus::Released
+                dispatch_status
             );
             let settled_task = store
                 .tasks
@@ -3169,16 +4035,22 @@ mod tests {
         store.start_worker(&run.id, None, "agy-w", "antigravity", None, "/tmp", "p")?;
         store.start_worker(&run.id, None, "cur-w", "cursor", None, "/tmp", "p")?;
         store.start_worker(&run.id, None, "pi-w", "pi", None, "/tmp", "p")?;
-        assert_eq!(store.resolve_recipients("@agy"), vec!["agy-w".to_owned()]);
         assert_eq!(
-            store.resolve_recipients("@antigravity"),
+            store.resolve_recipients("@agy", None),
             vec!["agy-w".to_owned()]
         );
         assert_eq!(
-            store.resolve_recipients("@cursor"),
+            store.resolve_recipients("@antigravity", None),
+            vec!["agy-w".to_owned()]
+        );
+        assert_eq!(
+            store.resolve_recipients("@cursor", None),
             vec!["cur-w".to_owned()]
         );
-        assert_eq!(store.resolve_recipients("@pi"), vec!["pi-w".to_owned()]);
+        assert_eq!(
+            store.resolve_recipients("@pi", None),
+            vec!["pi-w".to_owned()]
+        );
 
         fs::remove_dir_all(&dir).ok();
         Ok(())
@@ -3820,7 +4692,7 @@ mod extension_wire_tests {
             .start_worker(&run.id, None, "w", "codex", Some(42), "/tmp", "p")
             .unwrap();
         let retained = store.retain_worker(&dispatch.id).unwrap();
-        let current = OrchResponse::Dispatch(retained.clone());
+        let current = OrchResponse::Dispatch(Box::new(retained.clone()));
         assert_eq!(current.clone().for_features(FEAT_ORCH_RETAIN), current);
         let OrchResponse::Dispatch(legacy) = current.for_features(0) else {
             panic!("dispatch response")
@@ -3962,5 +4834,534 @@ mod extension_wire_tests {
                 .unwrap()
                 .acked
         );
+    }
+}
+
+#[cfg(test)]
+mod mailbox_and_worker_safety_tests {
+    use super::*;
+
+    fn mail(run: Option<&str>, to: &str, summary: &str) -> SendParams {
+        SendParams {
+            from: "sender".into(),
+            to: to.into(),
+            msg_type: MessageType::Status,
+            summary: summary.into(),
+            body: String::new(),
+            run_id: run.map(str::to_owned),
+            task_id: None,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        }
+    }
+
+    #[test]
+    fn session_run_bindings_survive_global_selection_and_reset() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let first = store.create_run("first", Some(11))?;
+        let second = store.create_run("second", Some(22))?;
+        assert_eq!(store.resolve_run_for_session(None, Some(11))?, first.id);
+        assert_eq!(store.resolve_run_for_session(None, Some(22))?, second.id);
+        store.set_session_run(Some(33), Some(&first.id))?;
+        store.set_current_run(Some(&second.id))?;
+        assert_eq!(store.resolve_run_for_session(None, Some(33))?, first.id);
+        assert_eq!(
+            store.resolve_run_for_session(Some(&second.id), Some(33))?,
+            second.id
+        );
+        store.set_session_run(Some(33), None)?;
+        assert!(!store.session_runs.contains_key(&33));
+        store.reset(Some(&first.id));
+        assert!(!store.session_runs.contains_key(&11));
+        let loaded: OrchestrationStore = serde_json::from_str("{}")?;
+        assert!(loaded.session_runs.is_empty());
+        assert!(loaded.deliveries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn groups_are_run_scoped_and_exclude_failed_abandoned_released_workers() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let a = store.create_run("a", None)?;
+        let b = store.create_run("b", None)?;
+        let active = store.start_worker(&a.id, None, "a-active", "codex", None, "/tmp", "p")?;
+        let idle = store.start_worker(&a.id, None, "a-idle", "codex", None, "/tmp", "p")?;
+        store.stop_or_release_worker(&idle.id, false)?;
+        store.start_worker(&b.id, None, "b-active", "codex", None, "/tmp", "p")?;
+        let failed = store.start_worker(&a.id, None, "failed", "codex", None, "/tmp", "p")?;
+        store.worker_start_failed(&failed.id, "boom")?;
+        let abandoned = store.start_worker(&a.id, None, "abandoned", "codex", None, "/tmp", "p")?;
+        store.abandon_worker(&abandoned.id)?;
+        let released = store.start_worker(&a.id, None, "released", "codex", None, "/tmp", "p")?;
+        store.stop_or_release_worker(&released.id, false)?;
+        store.stop_or_release_worker(&released.id, true)?;
+        assert_eq!(
+            store.resolve_recipients("@all", Some(&a.id)),
+            ["a-active", "a-idle"]
+        );
+        assert_eq!(
+            store.resolve_recipients("@active", Some(&a.id)),
+            ["a-active"]
+        );
+        assert_eq!(store.resolve_recipients("@idle", Some(&a.id)), ["a-idle"]);
+        assert_eq!(
+            store.resolve_recipients("@codex", Some(&a.id)),
+            ["a-active", "a-idle"]
+        );
+        let sent = store.send_message(&SendParams {
+            from: active.worker_name,
+            run_id: None,
+            ..mail(None, "@all", "inferred run")
+        })?;
+        assert_eq!(sent.len(), 2);
+        assert!(
+            sent.iter()
+                .all(|m| m.run_id.as_deref() == Some(a.id.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_deliveries_replay_after_reload_and_ack_only_the_named_batch() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let a = store.create_run("a", None)?;
+        let b = store.create_run("b", None)?;
+        for n in 0..55 {
+            store.send_message(&mail(Some(&a.id), "coordinator", &format!("a-{n}")))?;
+        }
+        store.send_message(&mail(Some(&b.id), "coordinator", "other run"))?;
+        let (batch, messages) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&a.id), None)?;
+        let batch = batch.unwrap();
+        assert_eq!(messages.len(), 50);
+        assert_eq!(
+            batch.message_ids,
+            messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+        store.send_message(&mail(Some(&a.id), "coordinator", "arrived after peek"))?;
+        let raw = serde_json::to_vec(&store)?;
+        let mut store: OrchestrationStore = serde_json::from_slice(&raw)?;
+        let replay =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&a.id), None)?;
+        assert_eq!(replay, (Some(batch.clone()), messages));
+        let before = store.clone();
+        assert!(
+            store
+                .check_delivery(Some("wrong"), &[], true, true, Some(&a.id), Some(&batch.id))
+                .is_err()
+        );
+        assert_eq!(store, before);
+        assert!(
+            store
+                .check_delivery(
+                    Some("coordinator"),
+                    &[],
+                    true,
+                    true,
+                    Some(&b.id),
+                    Some(&batch.id)
+                )
+                .is_err()
+        );
+        let acked = store.check_delivery(
+            Some("coordinator"),
+            &[],
+            true,
+            true,
+            Some(&a.id),
+            Some(&batch.id),
+        )?;
+        assert!(acked.1.iter().all(|m| m.acked));
+        // Repeating an ACK is idempotent, even after a new batch has been fetched.
+        let next =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&a.id), None)?;
+        assert_eq!(next.1.len(), 6);
+        assert_ne!(next.0.as_ref().unwrap().id, batch.id);
+        store.check_delivery(None, &[], true, true, None, Some(&batch.id))?;
+        assert_eq!(store.messages.iter().filter(|m| !m.acked).count(), 7);
+        let other =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&b.id), None)?;
+        assert_eq!(other.1.len(), 1);
+        assert!(
+            other
+                .1
+                .iter()
+                .all(|m| m.run_id.as_deref() == Some(b.id.as_str()))
+        );
+        // Old check --ack syntax consumes only the replayed batch.
+        store.check_delivery(Some("coordinator"), &[], true, true, Some(&a.id), None)?;
+        assert_eq!(store.messages.iter().filter(|m| !m.acked).count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unfiltered_checks_keep_deliveries_consumable_with_run_filters() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("r", None)?;
+        store.send_message(&mail(Some(&run.id), "worker", "hello"))?;
+        let first = store.check_delivery(None, &[], true, false, None, None)?;
+        let scoped = store.check_delivery(Some("worker"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(first, scoped);
+        Ok(())
+    }
+
+    #[test]
+    fn release_rejects_active_and_borrowed_sessions_without_mutation() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("release", None)?;
+        let created =
+            store.start_worker(&run.id, None, "created", "codex", Some(11), "/tmp", "p")?;
+        let before = store.clone();
+        assert!(store.stop_or_release_worker(&created.id, true).is_err());
+        assert_eq!(store, before);
+        let borrowed = store.start_worker_configured(&WorkerStartSpec {
+            run_id: Some(run.id),
+            worker: Some("borrowed".into()),
+            session_id: Some(12),
+            ..WorkerStartSpec::default()
+        })?;
+        assert_eq!(borrowed.session_origin, DispatchSessionOrigin::Borrowed);
+        let fenced = store.abandon_worker(&borrowed.id)?;
+        assert_eq!(fenced.session_id, Some(12));
+        assert_eq!(fenced.release_state, DispatchReleaseState::Active);
+        let before = store.clone();
+        assert!(store.stop_or_release_worker(&borrowed.id, true).is_err());
+        assert_eq!(store, before);
+        store.stop_or_release_worker(&created.id, false)?;
+        let released = store.stop_or_release_worker(&created.id, true)?;
+        assert_eq!(released.release_state, DispatchReleaseState::Released);
+        Ok(())
+    }
+
+    #[test]
+    fn three_start_failures_trip_breaker_and_depth_override_is_daemon_bounded() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("breaker", None)?;
+        let task = store.create_task(&run.id, "task", "", vec![])?;
+        assert!(
+            store
+                .validate_worker_start_with_depth(&run.id, Some(&task.id), "w", 0, 4)
+                .is_err()
+        );
+        for attempt in 0..3 {
+            let d = store.start_worker(&run.id, Some(&task.id), "w", "codex", None, "/tmp", "p")?;
+            let failed = store.worker_start_failed(&d.id, "missing binary")?;
+            assert_eq!(
+                failed
+                    .summary
+                    .as_deref()
+                    .is_some_and(|s| s.contains("circuit breaker")),
+                attempt == 2
+            );
+        }
+        let error = store
+            .validate_worker_start(&run.id, Some(&task.id), "w")
+            .unwrap_err();
+        assert!(error.to_string().contains("circuit breaker"));
+        assert!(store.tasks.iter().all(|t| t.active_dispatch_id.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_overrides_preserve_base_profile_and_use_agent_specific_flags() -> io::Result<()> {
+        let agents = crate::agent::Agents::load(None).unwrap();
+        let (_, base) = agents.resolve("codex").unwrap();
+        let modified = worker_launch_profile(base, "codex", Some("chosen-model"), Some("max"))?;
+        assert_eq!(
+            modified.launch,
+            [
+                "codex",
+                "--model",
+                "chosen-model",
+                "-c",
+                "model_reasoning_effort=\"xhigh\""
+            ]
+        );
+        assert_eq!(base.launch, ["codex"]);
+        assert_eq!(modified.yolo_args, base.yolo_args);
+        assert!(worker_launch_profile(base, "codex", None, Some("invalid")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn byte_pressure_prunes_completed_runs_before_worker_done_save() -> io::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("krill-orch-byte-prune-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        OrchestrationStore::mutate(&dir, |store| {
+            let old = store.create_run("old complete", None)?;
+            let task = store.create_task(&old.id, "old task", "", vec![])?;
+            let dispatch = store.start_worker(
+                &old.id,
+                Some(&task.id),
+                "old",
+                "codex",
+                None,
+                "/tmp",
+                &"x".repeat(700_000),
+            )?;
+            store.send_message(&SendParams {
+                from: "old".into(),
+                msg_type: MessageType::WorkerDone,
+                task_id: Some(task.id),
+                dispatch_id: Some(dispatch.id),
+                outcome: Some("succeeded".into()),
+                ..mail(Some(&old.id), "coordinator", "old result")
+            })?;
+            Ok(())
+        })?;
+        let new = OrchestrationStore::mutate(&dir, |store| {
+            let run = store.create_run("current", None)?;
+            let task = store.create_task(&run.id, "new task", "", vec![])?;
+            store.start_worker(
+                &run.id,
+                Some(&task.id),
+                "new",
+                "codex",
+                None,
+                "/tmp",
+                &"y".repeat(350_000),
+            )
+        })?;
+        OrchestrationStore::mutate(&dir, |store| {
+            store.send_message(&SendParams {
+                from: "new".into(),
+                msg_type: MessageType::WorkerDone,
+                task_id: new.task_id.clone(),
+                dispatch_id: Some(new.id.clone()),
+                outcome: Some("succeeded".into()),
+                ..mail(Some(&new.run_id), "coordinator", "new result")
+            })
+        })?;
+        let loaded = OrchestrationStore::load(&dir)?;
+        assert_eq!(loaded.runs.len(), 1);
+        assert_eq!(loaded.runs.first().unwrap().id, new.run_id);
+        assert_eq!(
+            loaded.dispatches.first().unwrap().status,
+            DispatchStatus::Succeeded
+        );
+        assert!(fs::metadata(dir.join(ORCH_FILE))?.len() < MAX_STORE_BYTES);
+        fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn pruning_preserves_outstanding_delivery_even_for_completed_runs() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let old = store.create_run("old", None)?;
+        store.runs.first_mut().unwrap().status = RunStatus::Completed;
+        store.send_message(&mail(Some(&old.id), "coordinator", &"x".repeat(1_900_000)))?;
+        let batch =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&old.id), None)?;
+        store.create_run("current", None)?;
+        store.prune_if_needed()?;
+        assert!(store.runs.iter().any(|r| r.id == old.id));
+        assert_eq!(
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&old.id), None)?,
+            batch
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod orchestration_wire_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn check_delivery_wire_fixture_roundtrips() {
+        let action = OrchAction::CheckMessages {
+            recipient: Some("w".into()),
+            types: vec![],
+            unread_only: true,
+            ack: true,
+            wait_ms: 0,
+            run_id: Some("r".into()),
+            delivery_id: Some("d".into()),
+        };
+        let fixture = [22, 1, 1, b'w', 0, 1, 1, 0, 1, 1, b'r', 1, 1, b'd'];
+        assert_eq!(postcard::to_stdvec(&action).unwrap(), fixture);
+        assert_eq!(
+            postcard::from_bytes::<OrchAction>(&fixture).unwrap(),
+            action
+        );
+        let response = OrchResponse::Delivery {
+            delivery: Some(OrchestrationDelivery {
+                id: "delivery-1".into(),
+                to: "w".into(),
+                run_id: Some("r".into()),
+                message_ids: vec!["msg-1".into()],
+                created_at_ms: 1,
+                acked: false,
+            }),
+            messages: vec![],
+        };
+        assert_eq!(
+            postcard::from_bytes::<OrchResponse>(&postcard::to_stdvec(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+}
+
+#[cfg(test)]
+mod orchestration_legacy_wire_tests {
+    use super::*;
+
+    #[test]
+    fn filtered_and_id_ack_opcodes_stay_before_new_worker_controls() {
+        let filtered = OrchAction::CheckMessagesFiltered {
+            recipient: None,
+            run_id: None,
+            types: vec![],
+            unread_only: false,
+            ack: false,
+            wait_ms: 0,
+        };
+        let ack = OrchAction::AckMessageIds {
+            recipient: None,
+            run_id: None,
+            types: vec![],
+            unread_only: false,
+            ack_ids: vec![],
+        };
+        for (action, bytes) in [
+            (filtered, vec![16, 0, 0, 0, 0, 0, 0]),
+            (ack, vec![17, 0, 0, 0, 0, 0]),
+        ] {
+            assert!(action.requires_v2());
+            assert_eq!(postcard::to_stdvec(&action).unwrap(), bytes);
+            assert_eq!(postcard::from_bytes::<OrchAction>(&bytes).unwrap(), action);
+        }
+    }
+
+    #[test]
+    fn prior_snapshot_and_check_payloads_keep_frozen_bytes() {
+        let snapshot = OrchResponse::Snapshot(OrchestrationStore::default());
+        let frozen = [0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(postcard::to_stdvec(&snapshot).unwrap(), frozen);
+        assert_eq!(
+            postcard::from_bytes::<OrchResponse>(&frozen).unwrap(),
+            snapshot
+        );
+        let check = OrchAction::CheckMessagesLegacy {
+            recipient: Some("w".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 5,
+        };
+        let frozen = [7, 1, 1, b'w', 0, 1, 0, 5];
+        assert_eq!(postcard::to_stdvec(&check).unwrap(), frozen);
+        assert_eq!(postcard::from_bytes::<OrchAction>(&frozen).unwrap(), check);
+        let select = OrchAction::SetCurrentRunLegacy {
+            run_id: Some("r".into()),
+        };
+        assert_eq!(postcard::to_stdvec(&select).unwrap(), [2, 1, 1, b'r']);
+    }
+
+    #[test]
+    fn legacy_dispatch_layout_and_new_snapshot_fields_roundtrip_separately() {
+        let dispatch: Dispatch = serde_json::from_value(serde_json::json!({
+            "id": "d", "run_id": "r", "worker_name": "w", "agent": "c",
+            "cwd": "/", "prompt": "p", "status": "active", "started_at_ms": 1,
+        }))
+        .unwrap();
+        let response = OrchResponse::Dispatch(Box::new(dispatch.clone()));
+        let frozen = [
+            4, 1, b'd', 1, b'r', 0, 1, b'w', 1, b'c', 0, 0, 1, b'/', 1, b'p', 0, 0, 0, 1, 0,
+        ];
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), frozen);
+        assert_eq!(
+            postcard::from_bytes::<OrchResponse>(&frozen).unwrap(),
+            response
+        );
+        let mut modern = dispatch;
+        modern.model = Some("model".into());
+        modern.effort = Some("high".into());
+        modern.request_id = Some("req-1".into());
+        modern.session_origin = DispatchSessionOrigin::Borrowed;
+        let response = OrchResponse::DispatchV2(Box::new(modern.clone()));
+        assert_eq!(
+            postcard::from_bytes::<OrchResponse>(&postcard::to_stdvec(&response).unwrap()).unwrap(),
+            response
+        );
+        let mut store = OrchestrationStore {
+            dispatches: vec![modern],
+            ..OrchestrationStore::default()
+        };
+        store.session_runs.insert(1, "r".into());
+        let response = OrchResponse::SnapshotV2(store);
+        assert_eq!(
+            postcard::from_bytes::<OrchResponse>(&postcard::to_stdvec(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod orchestration_old_peer_tests {
+    use super::*;
+    use crate::control::{Failure, Reply, Request};
+    use crate::screen::Msg as _;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn v2_rejected_by_prior_daemon_preserves_disk_and_requests_upgrade() -> io::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("krill-orch-v2-old-peer-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("run"))?;
+        let mut store = OrchestrationStore::default();
+        store.create_run("preserve", None)?;
+        store.save(&dir)?;
+        let before = fs::read(dir.join(ORCH_FILE))?;
+        let listener = UnixListener::bind(dir.join("run/krilld.sock"))?;
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .write_all(
+                    &crate::ipc::ServerHello {
+                        proto_min: crate::ipc::PROTO_MIN,
+                        proto_max: crate::ipc::PROTO_MAX,
+                        features: crate::ipc::FEATURES,
+                        build: "prior-daemon-fixture".into(),
+                        instance_id: 1,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            crate::ipc::read_frame(&mut socket).unwrap().unwrap();
+            let (kind, body) = crate::ipc::read_frame(&mut socket).unwrap().unwrap();
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Orchestration(OrchAction::CheckMessages { .. })
+            ));
+            socket
+                .write_all(&Reply::Failed(Failure::BadRequest).encode().unwrap())
+                .unwrap();
+        });
+        let error = OrchestrationStore::try_local_daemon_orch(
+            &dir,
+            &OrchAction::CheckMessages {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: true,
+                ack: true,
+                wait_ms: 0,
+                run_id: None,
+                delivery_id: None,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("update krilld"));
+        server.join().unwrap();
+        assert_eq!(fs::read(dir.join(ORCH_FILE))?, before);
+        fs::remove_dir_all(dir)
     }
 }

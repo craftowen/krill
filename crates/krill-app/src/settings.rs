@@ -142,6 +142,9 @@ pub struct Settings {
     /// 기본 에이전트 ID(기본 `"claude"`).
     #[serde(default = "default_agent_id")]
     pub default_agent: String,
+    /// 세션 칸의 기본 보기 모드(기본 `Terminal`).
+    #[serde(default)]
+    pub default_view_mode: DefaultViewMode,
     /// 새 에이전트 세션 YOLO 권한 우회 모드(기본 true).
     #[serde(default = "default_true")]
     pub yolo_mode: bool,
@@ -258,6 +261,15 @@ impl TerminalCursorShape {
     }
 }
 
+/// 세션 칸의 기본 보기 모드(`terminal` / `chat`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultViewMode {
+    #[default]
+    Terminal,
+    Chat,
+}
+
 fn default_agent_id() -> String {
     "claude".to_owned()
 }
@@ -290,6 +302,7 @@ impl Default for Settings {
             notify_on_done: true,
             notify_on_bell: false,
             default_agent: "claude".to_owned(),
+            default_view_mode: DefaultViewMode::Terminal,
             yolo_mode: true,
             hibernation_enabled: false,
             agent_status_hooks: true,
@@ -1217,6 +1230,12 @@ pub fn terminal_font_pt(cx: &App) -> u8 {
 pub fn editor_font_pt(cx: &App) -> u8 {
     cx.try_global::<Config>()
         .map_or_else(default_editor_font_size, |c| c.settings.editor_font_size())
+}
+
+/// 세션 칸 기본 보기 모드(`Terminal` / `Chat`). 매 프레임 렌더에서 부르므로 전체 복제 없이 읽는다.
+pub fn default_view_mode(cx: &App) -> DefaultViewMode {
+    cx.try_global::<Config>()
+        .map_or(DefaultViewMode::Terminal, |c| c.settings.default_view_mode)
 }
 
 fn edit_or_in_memory(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
@@ -5490,6 +5509,48 @@ impl SettingsView {
                             ),
                     ),
             )
+            .child(
+                row()
+                    .child(label(
+                        text::DEFAULT_VIEW_MODE_TITLE.get(),
+                        text::DEFAULT_VIEW_MODE_DESC.get(),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::segmented_control(
+                                p,
+                                [
+                                    layout::segment(
+                                        p,
+                                        "general-view-mode-terminal",
+                                        text::DEFAULT_VIEW_MODE_TERMINAL.get(),
+                                        s.default_view_mode == DefaultViewMode::Terminal,
+                                    )
+                                    .debug_selector(|| "general-view-mode-terminal".into())
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| {
+                                            s.default_view_mode = DefaultViewMode::Terminal;
+                                        });
+                                    }),
+                                    layout::segment(
+                                        p,
+                                        "general-view-mode-chat",
+                                        text::DEFAULT_VIEW_MODE_CHAT.get(),
+                                        s.default_view_mode == DefaultViewMode::Chat,
+                                    )
+                                    .debug_selector(|| "general-view-mode-chat".into())
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| {
+                                            s.default_view_mode = DefaultViewMode::Chat;
+                                        });
+                                    }),
+                                ],
+                            )
+                            .id("general-default-view-mode")
+                            .debug_selector(|| "general-default-view-mode".into()),
+                        ),
+                    ),
+            )
             .child(layout::section_title(
                 p,
                 "general-section-notifications",
@@ -8886,6 +8947,40 @@ impl SettingsView {
                     .children(default_agent_btns),
             );
 
+        let view_mode_term = layout::segment(
+            p,
+            "admin-view-mode-terminal",
+            text::DEFAULT_VIEW_MODE_TERMINAL.get(),
+            s.default_view_mode == DefaultViewMode::Terminal,
+        )
+        .debug_selector(|| "admin-view-mode-terminal".into())
+        .on_click(|_, _, cx| {
+            edit(cx, move |s| s.default_view_mode = DefaultViewMode::Terminal);
+        });
+        let view_mode_chat = layout::segment(
+            p,
+            "admin-view-mode-chat",
+            text::DEFAULT_VIEW_MODE_CHAT.get(),
+            s.default_view_mode == DefaultViewMode::Chat,
+        )
+        .debug_selector(|| "admin-view-mode-chat".into())
+        .on_click(|_, _, cx| {
+            edit(cx, move |s| s.default_view_mode = DefaultViewMode::Chat);
+        });
+        let default_view_mode_row = layout::row(p)
+            .child(layout::label(
+                p,
+                text::DEFAULT_VIEW_MODE_TITLE.get(),
+                Some(text::DEFAULT_VIEW_MODE_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::segmented_control(p, [view_mode_term, view_mode_chat])
+                        .id("admin-default-view-mode")
+                        .debug_selector(|| "admin-default-view-mode".into()),
+                ),
+            );
+
         // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
         let yolo_seg = layout::segment(
             p,
@@ -9041,6 +9136,7 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .child(default_agent_row)
+            .child(default_view_mode_row)
             .child(yolo_row)
             .child(hib_row)
             .child(hooks_row)

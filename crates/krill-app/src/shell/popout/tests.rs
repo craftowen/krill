@@ -1070,6 +1070,12 @@ fn unreleased_workers_includes_completed_runs_and_hides_released() {
             archived_output: None,
             started_at_ms: 1,
             ended_at_ms: None,
+            release_state: krill_proto::orchestration::DispatchReleaseState::default(),
+            session_origin: krill_proto::orchestration::DispatchSessionOrigin::default(),
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
         }
     }
     let store = OrchestrationStore {

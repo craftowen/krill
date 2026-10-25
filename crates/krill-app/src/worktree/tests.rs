@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Default)]
 struct Fake {
+    snapshot: Mutex<Snapshot>,
+    meta: Mutex<crate::sidebar::Meta>,
     replies: Mutex<VecDeque<Reply>>,
     requests: Mutex<Vec<NewWorktree>>,
     fetches: AtomicUsize,
@@ -21,7 +23,10 @@ struct Fake {
 impl Source for Fake {
     fn fetch(&self) -> io::Result<Snapshot> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        Ok(Snapshot::default())
+        Ok(self.snapshot.lock().unwrap().clone())
+    }
+    fn meta(&self, _: &std::collections::BTreeMap<PathBuf, Vec<PathBuf>>) -> crate::sidebar::Meta {
+        self.meta.lock().unwrap().clone()
     }
     fn prepare_worktree(&self, req: PrepareWorktree) -> io::Result<Reply> {
         if !self.prep_supported.load(Ordering::Acquire) {
@@ -608,4 +613,131 @@ fn worktree_creation_keeps_dialog_until_operation_settles(cx: &mut TestAppContex
     });
     cx.simulate_keystrokes("escape");
     assert_eq!(*events.lock().unwrap(), [Event::Close]);
+}
+
+#[gpui::test]
+fn submit_immediately_hides_modal_and_renders_pending_row_until_created(cx: &mut TestAppContext) {
+    use crate::sidebar::{NewSession, Tree};
+
+    let fake = Arc::new(Fake::default());
+    fake.prep_supported.store(true, Ordering::Release);
+    *fake.snapshot.lock().unwrap() = Snapshot {
+        sessions: Vec::new(),
+        trees: std::collections::BTreeMap::from([(
+            PathBuf::from("/repo"),
+            vec![PathBuf::from("/repo")],
+        )]),
+    };
+    fake.meta.lock().unwrap().insert(
+        PathBuf::from("/repo"),
+        Tree {
+            branch: Some("main".into()),
+            dirty: None,
+        },
+    );
+    fake.replies
+        .lock()
+        .unwrap()
+        .push_back(Reply::WorktreeCreated(Worktree {
+            path: "/repo/즉각-반응".as_bytes().to_vec(),
+            branch: "즉각-반응".into(),
+            base: "main".into(),
+            copied: Vec::new(),
+            warnings: Vec::new(),
+            setup: None,
+        }));
+    cx.update(gpui_component::init);
+    let (sidebar, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    let opened: Rc<Cell<Option<NewSession>>> = Rc::new(Cell::new(None));
+    let got = opened.clone();
+    let source: Arc<dyn Source> = fake.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&sidebar, move |_, e: &NewSession, _| {
+            got.set(Some(e.clone()));
+        })
+        .detach();
+        sidebar.update(cx, |s, cx| {
+            s.connect_source(source, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        sidebar.update(cx, |s, cx| {
+            s.new_worktree("/repo".into(), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("worktree-dialog").is_some(),
+        "modal must be visible before submit"
+    );
+
+    // 모달이 열릴 때 빈 base(None)로 잘못 선행 준비하지 않고 저장소 기본 브랜치("main")로 곧장 준비한다.
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    {
+        let preps = fake.preparations.lock().unwrap();
+        assert!(
+            !preps.is_empty()
+                && preps
+                    .iter()
+                    .filter(|p| !p.cancel)
+                    .all(|p| p.base.as_deref() == Some("main")),
+            "initial speculative preparation must target 'main' directly: {preps:?}"
+        );
+    }
+
+    let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.name.update(cx, |input, cx| {
+                input.set_value("즉각-반응", window, cx);
+            });
+            d.submit(Setup::Ask, cx);
+        });
+        // 백그라운드 생성 태스크가 돌기 전 같은 프레임에서 모달이 사라지고 낙관적 행이 바로 그려져야 한다.
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        fake.requests.lock().unwrap().is_empty(),
+        "background new_worktree has not executed yet"
+    );
+    assert!(
+        cx.debug_bounds("worktree-dialog").is_none(),
+        "modal must disappear on the exact submit frame"
+    );
+    let pending_selectors = [
+        "pending-worktree-0",
+        "pending-worktree-1",
+        "pending-worktree-2",
+        "pending-worktree-3",
+    ];
+    assert!(
+        pending_selectors
+            .iter()
+            .any(|sel| cx.debug_bounds(sel).is_some()),
+        "optimistic pending worktree card must render immediately"
+    );
+
+    // 백그라운드 생성이 끝나면 낙관적 행이 실제 워크트리 행과 새 세션으로 매끄럽게 전환된다.
+    cx.run_until_parked();
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let s = sidebar.read(cx);
+        assert!(s.creating.is_none());
+        assert_eq!(s.selected_worktree(), Some(Path::new("/repo/즉각-반응")));
+    });
+    assert!(
+        !pending_selectors
+            .iter()
+            .any(|sel| cx.debug_bounds(sel).is_some()),
+        "pending worktree card must clear once WorktreeCreated arrives"
+    );
+    assert_eq!(
+        opened.take().map(|s| s.cwd),
+        Some(PathBuf::from("/repo/즉각-반응"))
+    );
 }

@@ -78,8 +78,9 @@ pub(crate) fn launch_in(
 }
 
 const ZSH_ACCOUNT_SYNC_ENV: &str = r#"# Managed by Krill — syncs active AI provider account profiles into login shells.
+_krill_self_zdotdir="${ZDOTDIR-}"
 if [ -n "${KRILL_ORIG_ZDOTDIR+x}" ]; then
-  if [ -n "$KRILL_ORIG_ZDOTDIR" ]; then
+  if [ -n "$KRILL_ORIG_ZDOTDIR" ] && [ "$KRILL_ORIG_ZDOTDIR" != "$_krill_self_zdotdir" ]; then
     export ZDOTDIR="$KRILL_ORIG_ZDOTDIR"
   else
     unset ZDOTDIR
@@ -88,80 +89,164 @@ if [ -n "${KRILL_ORIG_ZDOTDIR+x}" ]; then
 else
   unset ZDOTDIR
 fi
-if [ -f "${ZDOTDIR:-$HOME}/.zshenv" ]; then
+if [[ -o interactive ]] && ! (( $+functions[compdef] )); then
+  typeset -ga __krill_compdef_queue=()
+  compdef() {
+    builtin emulate -L zsh
+    __krill_compdef_queue+=("${(pj:\0:)@}")
+  }
+fi
+if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/.zshenv" ]; then
   . "${ZDOTDIR:-$HOME}/.zshenv"
 fi
-__krill_sync_accounts() {
-  local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
-  if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
-    _krill_env="$HOME/Library/Application Support/dev.krill.app/active-accounts.env"
-  fi
-  if [ -f "$_krill_env" ]; then
-    unset CLAUDE_CONFIG_DIR CODEX_HOME OPENCODE_CONFIG_DIR OPENCODE_DB ANTIGRAVITY_CLI_HOME GEMINI_CLI_HOME
-    . "$_krill_env"
-    if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
-    if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
-    if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ] || [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME/.gemini/antigravity-cli" ]; then
-      unset ANTIGRAVITY_CLI_HOME
+unset _krill_self_zdotdir
+if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
+  __krill_sync_accounts() {
+    if (( $+functions[__krill_flush_compdef] )); then
+      __krill_flush_compdef
     fi
-    if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
-      export XDG_DATA_HOME="$OPENCODE_CONFIG_DIR/data" XDG_STATE_HOME="$OPENCODE_CONFIG_DIR/state" OPENCODE_DB=opencode.db
-      unset OPENCODE_CONFIG_DIR
+    local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
+    if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
+      _krill_env="$HOME/Library/Application Support/dev.krill.app/active-accounts.env"
+    fi
+    if [ -f "$_krill_env" ]; then
+      unset CLAUDE_CONFIG_DIR CODEX_HOME OPENCODE_CONFIG_DIR OPENCODE_DB ANTIGRAVITY_CLI_HOME GEMINI_CLI_HOME
+      . "$_krill_env"
+      if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
+      if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
+      if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ] || [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME/.gemini/antigravity-cli" ]; then
+        unset ANTIGRAVITY_CLI_HOME
+      fi
+      if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
+        export XDG_DATA_HOME="$OPENCODE_CONFIG_DIR/data" XDG_STATE_HOME="$OPENCODE_CONFIG_DIR/state" OPENCODE_DB=opencode.db
+        unset OPENCODE_CONFIG_DIR
+      else
+        unset OPENCODE_CONFIG_DIR OPENCODE_DB
+      fi
+    fi
+  }
+  __krill_sync_accounts
+  typeset -ga precmd_functions preexec_functions
+  if (( ! ${precmd_functions[(I)__krill_sync_accounts]} )); then
+    precmd_functions+=(__krill_sync_accounts)
+  fi
+  if (( ! ${preexec_functions[(I)__krill_sync_accounts]} )); then
+    preexec_functions+=(__krill_sync_accounts)
+  fi
+  agy() {
+    __krill_sync_accounts
+    local _arg
+    for _arg in "$@"; do
+      case "$_arg" in
+        --gemini_dir|--gemini_dir=*|--gemini-dir|--gemini-dir=*)
+          command agy "$@"
+          return
+          ;;
+      esac
+    done
+    if [ -n "${ANTIGRAVITY_CLI_HOME-}" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME/.gemini/antigravity-cli" ]; then
+      SSH_CONNECTION=krill command agy --gemini_dir="$ANTIGRAVITY_CLI_HOME/.gemini" "$@"
     else
-      unset OPENCODE_CONFIG_DIR OPENCODE_DB
+      command agy "$@"
     fi
-  fi
-}
-__krill_sync_accounts
-typeset -ga precmd_functions preexec_functions
-if (( ! ${precmd_functions[(I)__krill_sync_accounts]} )); then
-  precmd_functions+=(__krill_sync_accounts)
-fi
-if (( ! ${preexec_functions[(I)__krill_sync_accounts]} )); then
-  preexec_functions+=(__krill_sync_accounts)
-fi
-agy() {
-  __krill_sync_accounts
-  local _arg
-  for _arg in "$@"; do
-    case "$_arg" in
-      --gemini_dir|--gemini_dir=*|--gemini-dir|--gemini-dir=*)
-        command agy "$@"
-        return
-        ;;
-    esac
-  done
-  if [ -n "${ANTIGRAVITY_CLI_HOME-}" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME/.gemini/antigravity-cli" ]; then
-    SSH_CONNECTION=krill command agy --gemini_dir="$ANTIGRAVITY_CLI_HOME/.gemini" "$@"
-  else
-    command agy "$@"
-  fi
-}
-codex() {
-  __krill_sync_accounts
-  if [ "${KRILL_CODEX_ISOLATE-1}" = "0" ]; then
-    command codex "$@"
-    return
-  fi
-  local _arg
-  for _arg in "$@"; do
-    case "$_arg" in
-      agents|queue|--no-daemon|--remote|--remote=*)
-        command codex "$@"
-        return
-        ;;
-    esac
-  done
-  case "$(command codex --help 2>/dev/null </dev/null)" in
-    *--no-daemon*)
-      command codex --no-daemon "$@"
-      ;;
-    *)
+  }
+  codex() {
+    __krill_sync_accounts
+    if [ "${KRILL_CODEX_ISOLATE-1}" = "0" ]; then
       command codex "$@"
-      ;;
-  esac
-}
+      return
+    fi
+    local _arg
+    for _arg in "$@"; do
+      case "$_arg" in
+        agents|queue|--no-daemon|--remote|--remote=*)
+          command codex "$@"
+          return
+          ;;
+      esac
+    done
+    case "$(command codex --help 2>/dev/null </dev/null)" in
+      *--no-daemon*)
+        command codex --no-daemon "$@"
+        ;;
+      *)
+        command codex "$@"
+        ;;
+    esac
+  }
+fi
+if [[ -o interactive ]] && [[ "${functions[compdef]-}" == *__krill_compdef_queue* ]]; then
+  __krill_flush_compdef() {
+    builtin emulate -L zsh
+    typeset -ga precmd_functions
+    precmd_functions=(${precmd_functions:#__krill_flush_compdef})
+    if (( ${#__krill_compdef_queue} )); then
+      if [[ "${functions[compdef]-}" == *__krill_compdef_queue* ]]; then
+        unfunction compdef 2>/dev/null
+        autoload -Uz compinit && compinit -u
+      fi
+      if (( $+functions[compdef] )) && [[ "${functions[compdef]-}" != *__krill_compdef_queue* ]]; then
+        local _krill_compdef_entry
+        for _krill_compdef_entry in "${__krill_compdef_queue[@]}"; do
+          compdef "${(@0)_krill_compdef_entry}"
+        done
+      fi
+    elif [[ "${functions[compdef]-}" == *__krill_compdef_queue* ]]; then
+      compdef() {
+        builtin emulate -L zsh
+        unfunction compdef 2>/dev/null
+        autoload -Uz compinit && compinit -u
+        (( $+functions[compdef] )) && compdef "$@"
+      }
+    fi
+    unset __krill_compdef_queue
+    unfunction __krill_flush_compdef 2>/dev/null
+  }
+  typeset -ga precmd_functions
+  if (( ! ${precmd_functions[(I)__krill_flush_compdef]} )); then
+    precmd_functions+=(__krill_flush_compdef)
+  fi
+fi
 "#;
+
+/// zsh 세션(`Program::Login` 및 에이전트 `-l -i -c` 런처)에 관리형 `.zshenv`를 주입해
+/// 계정 프로필 동기화와 `compinit` 이전 `compdef` 호출 호환을 보장한다.
+fn inject_zsh_env(login: &mut Launch, state: &Path) {
+    let is_zsh = login
+        .argv
+        .first()
+        .and_then(|a| Path::new(std::ffi::OsStr::from_bytes(a)).file_name())
+        .is_some_and(|n| n == "zsh");
+    if !is_zsh {
+        return;
+    }
+    let zdotdir = state.join("shell").join("zsh");
+    let zshenv = zdotdir.join(".zshenv");
+    let ok = {
+        use krill_proto::os::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&zdotdir)
+            .and_then(|()| accounts::write_atomic_0600(&zshenv, ZSH_ACCOUNT_SYNC_ENV.as_bytes()))
+            .is_ok()
+    };
+    if ok {
+        let zdotdir_bytes = zdotdir.into_os_string().as_encoded_bytes().to_vec();
+        let orig = login
+            .env
+            .iter()
+            .find(|(k, _)| k.as_slice() == b"ZDOTDIR")
+            .map(|(_, v)| v.clone())
+            .filter(|v| v != &zdotdir_bytes)
+            .unwrap_or_default();
+        login
+            .env
+            .retain(|(k, _)| k.as_slice() != b"ZDOTDIR" && k.as_slice() != b"KRILL_ORIG_ZDOTDIR");
+        login.env.push((b"KRILL_ORIG_ZDOTDIR".to_vec(), orig));
+        login.env.push((b"ZDOTDIR".to_vec(), zdotdir_bytes));
+    }
+}
 
 /// 로그인 셸(`Program::Login`) 실행 시 활성 계정 프로필 환경 변수와 셸 동기화 훅(`active-accounts.env`)을 주입한다.
 pub(crate) fn login_in(state: Option<&Path>) -> Launch {
@@ -174,6 +259,7 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         && !state.join("accounts.toml").exists()
         && !state.join("active-accounts.env").exists()
     {
+        inject_zsh_env(&mut login, state);
         return login;
     }
     let home = accounts::default_home();
@@ -228,26 +314,7 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
             login.env.push((key.to_vec(), dir.as_bytes().to_vec()));
         }
     }
-    let is_zsh = login
-        .argv
-        .first()
-        .and_then(|a| Path::new(std::ffi::OsStr::from_bytes(a)).file_name())
-        .is_some_and(|n| n == "zsh");
-    if is_zsh && let Some(zdotdir) = write_zsh_sync_env(state) {
-        let orig = login
-            .env
-            .iter()
-            .find(|(k, _)| k.as_slice() == b"ZDOTDIR")
-            .map_or_else(Vec::new, |(_, v)| v.clone());
-        login
-            .env
-            .retain(|(k, _)| k.as_slice() != b"ZDOTDIR" && k.as_slice() != b"KRILL_ORIG_ZDOTDIR");
-        login.env.push((b"KRILL_ORIG_ZDOTDIR".to_vec(), orig));
-        login.env.push((
-            b"ZDOTDIR".to_vec(),
-            zdotdir.into_os_string().as_encoded_bytes().to_vec(),
-        ));
-    }
+    inject_zsh_env(&mut login, state);
     skills::prepare(None, &login, None);
     login
 }
@@ -1745,6 +1812,9 @@ fn apply_account_env(
         login
             .env
             .push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
+    }
+    if let Some(state) = state {
+        inject_zsh_env(login, state);
     }
     account
 }

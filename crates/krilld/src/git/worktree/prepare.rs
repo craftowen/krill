@@ -31,6 +31,8 @@ struct Owner {
 #[derive(Debug)]
 struct Slot {
     token: u64,
+    req_repo: Vec<u8>,
+    req_base: Option<String>,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
     ready: Option<(PathBuf, String)>,
@@ -141,6 +143,8 @@ impl Pool {
         let cancel = Arc::new(AtomicBool::new(false));
         state.slot = Some(Slot {
             token: req.token,
+            req_repo: req.repo.clone(),
+            req_base: req.base.clone(),
             cancel: cancel.clone(),
             deadline: Instant::now() + self.ttl,
             ready: None,
@@ -158,12 +162,28 @@ impl Pool {
         Status::Preparing
     }
 
+    /// 같은 저장소에서 다른 `base`로 진행 중인 미완료 선행 체크아웃이 실제 생성의 잠금·큐를 막지 않게 중단한다.
+    pub(super) fn cancel_mismatched_in_flight(&self, repo: &[u8], base: Option<&str>) {
+        let mut state = lock(&self.state);
+        if let Some(slot) = state.slot.as_ref()
+            && slot.ready.is_none()
+            && slot.req_repo == repo
+            && slot.req_base.as_deref() != base
+        {
+            let token = slot.token;
+            slot.cancel.store(true, Ordering::Release);
+            state.settle(token, Status::Cancelled);
+            self.changed.notify_all();
+        }
+    }
+
     fn run(&self, req: &PrepareWorktree, cancel: &Arc<AtomicBool>) {
         let result = self.prepare(req, cancel);
         if let Ok(Some((repo, commit))) = &result {
             let mut state = lock(&self.state);
             if let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token) {
-                slot.ready = Some((repo.clone(), commit.clone()));
+                slot.ready
+                    .get_or_insert_with(|| (repo.clone(), commit.clone()));
             }
             self.changed.notify_all();
             loop {
@@ -303,6 +323,17 @@ impl Pool {
             cancel,
         )?;
         disk_usage(&self.tree(), self.limit).map_err(|e| e.to_string())?;
+        // 트랜잭션 파일 잠금을 풀기 전에 ready를 기록해야, 같은 커밋을 기다리던 create_with_pool이
+        // 잠금을 넘겨받자마자 재체크아웃 없이 즉시 promote한다.
+        {
+            let mut state = lock(&self.state);
+            if !cancel.load(Ordering::Acquire)
+                && let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token)
+            {
+                slot.ready = Some((repo.clone(), commit.clone()));
+                self.changed.notify_all();
+            }
+        }
         Ok(Some((repo, commit)))
     }
 
@@ -457,7 +488,9 @@ impl Pool {
                 q,
                 repo,
                 [
-                    OsString::from("-C"),
+                    OsString::from("-c"),
+                    "core.fsmonitor=false".into(),
+                    "-C".into(),
                     path.as_os_str().to_owned(),
                     "checkout".into(),
                     "--no-track".into(),

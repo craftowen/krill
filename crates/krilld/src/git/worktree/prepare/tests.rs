@@ -300,3 +300,59 @@ fn disk_guard_does_not_follow_symlinks_and_checks_allocated_bytes() {
     assert!(disk_usage(&tree, 32 * 1024).is_err());
     assert_eq!(fs::metadata(target).unwrap().len(), 100_000);
 }
+
+#[test]
+fn in_flight_preparation_promotes_matching_base_and_cancels_mismatched_base() {
+    let f = Fixture::new("prep-inflight", "");
+    f.git(&["checkout", "-qb", "dev"]);
+    fs::write(f.repo.join("dev-only"), "1").unwrap();
+    f.git(&["add", "dev-only"]);
+    f.git(&["commit", "-qm", "dev head"]);
+    f.git(&["checkout", "-q", "main"]);
+
+    let pool = pool(&f);
+    // 1. 같은 base("dev")로 선행 체크아웃을 시작하자마자(완료 대기 없이) 생성 요청을 보내도
+    //    트랜잭션 잠금 해제 전 ready 기록 덕분에 재체크아웃 없이 즉시 promote(Skipped)된다.
+    let same_prep = PrepareWorktree {
+        token: 41,
+        repo: f.repo.as_os_str().as_bytes().to_vec(),
+        base: Some("dev".into()),
+        cancel: false,
+    };
+    assert_eq!(pool.request(&same_prep), Status::Preparing);
+    let Outcome::Created { worktree, .. } = create_with_pool(
+        &f.queue,
+        &NewWorktree {
+            repo: same_prep.repo.clone(),
+            name: "fast-same".into(),
+            base: Some("dev".into()),
+            setup: Setup::Skip,
+        },
+        &f.root,
+        &f.trust,
+        Some(&pool),
+    )
+    .unwrap() else {
+        panic!("not created");
+    };
+    assert!(path(&worktree).join("dev-only").exists());
+    assert_eq!(pool.request(&same_prep), Status::Skipped);
+    cleaned(&pool);
+
+    // 2. 미완료 슬롯이 다른 base(None)를 체크아웃 중일 때 base="dev" 생성 요청이 오면 즉시 취소한다.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut st = lock(&pool.state);
+        st.slot = Some(Slot {
+            token: 42,
+            req_repo: f.repo.as_os_str().as_bytes().to_vec(),
+            req_base: None,
+            cancel: cancel_flag.clone(),
+            deadline: Instant::now() + TTL,
+            ready: None,
+        });
+    }
+    pool.cancel_mismatched_in_flight(f.repo.as_os_str().as_bytes(), Some("dev"));
+    assert!(cancel_flag.load(Ordering::Acquire));
+    assert_eq!(pool.request(&request(&f, 42)), Status::Cancelled);
+}

@@ -507,6 +507,8 @@ pub(super) struct WorktreeContext<'a> {
     pub parents: Option<&'a BTreeMap<PathBuf, PathBuf>>,
     pub collapsed_lineage: Option<&'a BTreeSet<PathBuf>>,
     pub sleeping_worktrees: Option<&'a BTreeSet<PathBuf>>,
+    pub recently_created: Option<&'a BTreeSet<PathBuf>>,
+    pub pending_worktrees: &'a [super::PendingWorktree],
     pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
     /// 사용자가 끌어다 놓아 정한 프로젝트 순서. 없는 프로젝트는 그 뒤에 이름순으로 온다.
     pub project_order: Option<&'a [PathBuf]>,
@@ -542,6 +544,7 @@ pub(super) fn is_worktree_awake(
     }
     if prefs.get(path).is_some_and(|p| p.pinned)
         || ctx.unread_worktrees.is_some_and(|u| u.contains(path))
+        || ctx.recently_created.is_some_and(|r| r.contains(path))
     {
         return true;
     }
@@ -740,7 +743,7 @@ pub(super) fn rows_with_options<'a>(
             sessions_by_wt.entry(wt).or_default().push(s);
         }
     }
-    let awake: BTreeSet<_> = snapshot
+    let mut awake: BTreeSet<_> = snapshot
         .sessions
         .iter()
         .filter(|s| {
@@ -757,6 +760,13 @@ pub(super) fn rows_with_options<'a>(
         })
         .filter_map(|s| s.worktree.clone())
         .collect();
+    if let Some(recent) = ctx.recently_created {
+        for path in recent {
+            if !ctx.sleeping_worktrees.is_some_and(|s| s.contains(path)) {
+                awake.insert(path.clone());
+            }
+        }
+    }
     let ctx = &WorktreeContext {
         awake_worktrees: Some(&awake),
         ..*ctx
@@ -827,12 +837,28 @@ pub(super) fn rows_with_options<'a>(
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
+                let pending_for_repo: Vec<_> = ctx
+                    .pending_worktrees
+                    .iter()
+                    .filter(|p| &p.repo == repo)
+                    .collect();
                 let mut vis = visible_in_repo(repo, trees);
-                if filters_active && vis.is_empty() && !trees.is_empty() {
+                if filters_active
+                    && vis.is_empty()
+                    && !trees.is_empty()
+                    && pending_for_repo.is_empty()
+                {
                     continue;
                 }
                 out.push(Row::Repository(repo.clone()));
                 if !collapsed.contains(repo) {
+                    for p in pending_for_repo {
+                        out.push(Row::PendingWorktree {
+                            id: p.id,
+                            repo: p.repo.clone(),
+                            name: p.name.clone(),
+                        });
+                    }
                     sort_worktrees(
                         &mut vis,
                         snapshot,
@@ -875,8 +901,39 @@ pub(super) fn rows_with_options<'a>(
                     }
                 }
             }
+            let mut extra_repos: Vec<PathBuf> = Vec::new();
+            for p in ctx.pending_worktrees {
+                if !snapshot.trees.contains_key(&p.repo)
+                    && !is_removed(&p.repo)
+                    && options.filters.contains_repo(&p.repo)
+                    && !extra_repos.contains(&p.repo)
+                {
+                    extra_repos.push(p.repo.clone());
+                }
+            }
+            for repo in extra_repos {
+                out.push(Row::Repository(repo.clone()));
+                if !collapsed.contains(&repo) {
+                    for p in ctx.pending_worktrees.iter().filter(|p| p.repo == repo) {
+                        out.push(Row::PendingWorktree {
+                            id: p.id,
+                            repo: p.repo.clone(),
+                            name: p.name.clone(),
+                        });
+                    }
+                }
+            }
         }
         GroupBy::WorkspaceStatus => {
+            for p in ctx.pending_worktrees {
+                if !is_removed(&p.repo) && options.filters.contains_repo(&p.repo) {
+                    out.push(Row::PendingWorktree {
+                        id: p.id,
+                        repo: p.repo.clone(),
+                        name: p.name.clone(),
+                    });
+                }
+            }
             let mut buckets: BTreeMap<usize, Vec<&PathBuf>> = BTreeMap::new();
             for (repo, trees) in &snapshot.trees {
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
@@ -925,6 +982,15 @@ pub(super) fn rows_with_options<'a>(
             }
         }
         GroupBy::PrStatus => {
+            for p in ctx.pending_worktrees {
+                if !is_removed(&p.repo) && options.filters.contains_repo(&p.repo) {
+                    out.push(Row::PendingWorktree {
+                        id: p.id,
+                        repo: p.repo.clone(),
+                        name: p.name.clone(),
+                    });
+                }
+            }
             let mut buckets: BTreeMap<PrGroup, Vec<&PathBuf>> = BTreeMap::new();
             for (repo, trees) in &snapshot.trees {
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
@@ -969,6 +1035,15 @@ pub(super) fn rows_with_options<'a>(
             }
         }
         GroupBy::None => {
+            for p in ctx.pending_worktrees {
+                if !is_removed(&p.repo) && options.filters.contains_repo(&p.repo) {
+                    out.push(Row::PendingWorktree {
+                        id: p.id,
+                        repo: p.repo.clone(),
+                        name: p.name.clone(),
+                    });
+                }
+            }
             let mut all_trees: Vec<&PathBuf> = Vec::new();
             for (repo, trees) in &snapshot.trees {
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
@@ -1109,6 +1184,8 @@ impl Sidebar {
             parents: Some(&parents),
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
+            recently_created: Some(&self.recently_created_worktrees),
+            pending_worktrees: &self.pending_worktrees,
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
         };

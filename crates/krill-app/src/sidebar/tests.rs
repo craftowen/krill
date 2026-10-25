@@ -1212,7 +1212,6 @@ fn jump_provider_uses_foreground_when_session_has_a_custom_title() {
 #[gpui::test]
 fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAppContext) {
     use crate::pull_request::Status;
-    use gpui::{Modifiers, MouseButton};
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let path = PathBuf::from("/repo/feature");
@@ -1229,20 +1228,27 @@ fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAp
     cx.executor().advance_clock(Duration::from_secs(10));
     cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| view.read(cx).renders), renders);
+    let header_before = cx.debug_bounds("sidebar-header").unwrap();
+    let list_before = cx.debug_bounds("sidebar-viewport").unwrap();
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.prs.insert(path.clone(), Status::Missing);
+            s.poll_error = Some("daemon slow".into());
+            s.notice = Some("sidebar notice".into());
+            s.error = Some("save failed".into());
             cx.notify();
         });
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("pr-badge-1").is_none());
-    assert!(cx.debug_bounds("sidebar-pr-guidance").is_some());
-    let dismiss = cx.debug_bounds("sidebar-pr-guidance-dismiss").unwrap();
-    cx.simulate_mouse_down(dismiss.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(dismiss.center(), MouseButton::Left, Modifiers::default());
-    cx.run_until_parked();
+    // 인라인 알림 배너는 제거하고 우하단 토스트로 위임하므로 사이드바 레이아웃 시프트가 발생하지 않는다.
     assert!(cx.debug_bounds("sidebar-pr-guidance").is_none());
+    assert!(cx.debug_bounds("sidebar-preference-error").is_none());
+    assert_eq!(cx.debug_bounds("sidebar-header").unwrap(), header_before);
+    assert_eq!(cx.debug_bounds("sidebar-viewport").unwrap(), list_before);
+    assert!(cx.update(|_, cx| view.read(cx).pr_guidance().is_some()));
+    cx.update(|_, cx| view.update(cx, Sidebar::dismiss_pr_guidance));
+    assert!(cx.update(|_, cx| view.read(cx).pr_guidance().is_none()));
 }
 
 /// OWE-610(4): 사이드바는 제어 연결을 재사용해 500ms마다 새 UDS 2개를 열지 않으며,
@@ -5786,4 +5792,212 @@ fn worktree_delete_enters_cancel_focus_and_restores_background_on_escape(cx: &mu
     });
     assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(selected.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[gpui::test]
+fn worktree_creation_and_deferred_session_focus_keep_sidebar_selection_synced(
+    cx: &mut TestAppContext,
+) {
+    struct CreateProbe;
+    impl Source for CreateProbe {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(Snapshot {
+                sessions: vec![session(1, AgentState::Working, Some("/repo/ui-개선"))],
+                trees: BTreeMap::from([(
+                    PathBuf::from("/repo"),
+                    vec![
+                        PathBuf::from("/repo"),
+                        PathBuf::from("/repo/ui-개선"),
+                        PathBuf::from("/repo/orca-비교"),
+                    ],
+                )]),
+            })
+        }
+        fn new_worktree(
+            &self,
+            _: krill_proto::control::NewWorktree,
+        ) -> io::Result<krill_proto::control::Reply> {
+            Ok(krill_proto::control::Reply::WorktreeCreated(
+                krill_proto::control::Worktree {
+                    path: "/repo/orca-비교".as_bytes().to_vec(),
+                    branch: "orca-비교".into(),
+                    base: "main".into(),
+                    copied: Vec::new(),
+                    warnings: Vec::new(),
+                    setup: None,
+                },
+            ))
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let source: Arc<dyn Source> = Arc::new(CreateProbe);
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.connect_source(source, cx);
+            s.options.filters.hide_sleeping = true;
+            s.options.filters.always_show_default_branch = true;
+            s.apply(
+                Ok((
+                    Snapshot {
+                        sessions: vec![session(1, AgentState::Working, Some("/repo/ui-개선"))],
+                        trees: BTreeMap::from([(
+                            PathBuf::from("/repo"),
+                            vec![PathBuf::from("/repo"), PathBuf::from("/repo/ui-개선")],
+                        )]),
+                    },
+                    BTreeMap::from([
+                        (
+                            PathBuf::from("/repo"),
+                            Tree {
+                                branch: Some("main".into()),
+                                dirty: None,
+                            },
+                        ),
+                        (
+                            PathBuf::from("/repo/ui-개선"),
+                            Tree {
+                                branch: Some("ui-개선".into()),
+                                dirty: None,
+                            },
+                        ),
+                    ]),
+                )),
+                BTreeMap::new(),
+                cx,
+            );
+            s.set_focused(Some(SessionId(1)), cx);
+            s.new_worktree("/repo".into(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 새 워크트리 생성 제출 및 완료(아직 새 PTY 세션 SessionId(2)가 스냅샷에 들어오기 전)
+    cx.simulate_input("orca-비교");
+    cx.simulate_keystrokes("cmd-enter");
+    cx.run_until_parked();
+    cx.run_until_parked();
+
+    // 1) 스냅샷이 새 세션을 알기 전에 셸이 먼저 set_focused(Some(SessionId(2)))를 호출해도
+    //    이전 워크트리(ui-개선)가 아니라 새로 만든 워크트리(orca-비교)가 숨김 필터를 뚫고 유일한 활성 카드가 된다.
+    view.update(cx, |s, cx| {
+        s.set_focused(Some(SessionId(2)), cx);
+        let active: Vec<PathBuf> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Row::Worktree(p) if s.worktree_card_active(i, p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(active, vec![PathBuf::from("/repo/orca-비교")]);
+        assert_eq!(s.focused_synced, None);
+    });
+
+    // 2) 뒤늦게 폴링 스냅샷에 로그인 셸 세션(SessionId(2), AgentState::Unknown)이 도착하면
+    //    지연된 포커스가 즉시 동기화되어 커서와 세션 하이라이트가 orca-비교로 맞춰진다.
+    let meta = BTreeMap::from([
+        (
+            PathBuf::from("/repo"),
+            Tree {
+                branch: Some("main".into()),
+                dirty: None,
+            },
+        ),
+        (
+            PathBuf::from("/repo/ui-개선"),
+            Tree {
+                branch: Some("ui-개선".into()),
+                dirty: None,
+            },
+        ),
+        (
+            PathBuf::from("/repo/orca-비교"),
+            Tree {
+                branch: Some("orca-비교".into()),
+                dirty: None,
+            },
+        ),
+    ]);
+    view.update(cx, |s, cx| {
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![
+                        session(1, AgentState::Working, Some("/repo/ui-개선")),
+                        session(2, AgentState::Unknown, Some("/repo/orca-비교")),
+                    ],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/repo"),
+                        vec![
+                            PathBuf::from("/repo"),
+                            PathBuf::from("/repo/ui-개선"),
+                            PathBuf::from("/repo/orca-비교"),
+                        ],
+                    )]),
+                },
+                meta.clone(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(s.focused_synced, Some(SessionId(2)));
+        let wt_idx = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Worktree(p) if p == Path::new("/repo/orca-비교")))
+            .expect("new worktree row must stay visible under hide_sleeping");
+        assert_eq!(s.cursor, Some(wt_idx));
+        assert!(s.is_session_focused(wt_idx, SessionId(2)));
+    });
+
+    // 3) 같은 워크트리에 두 번째 세션(SessionId(3))이 추가되고 포커스가 넘어가면
+    //    2+ 세션 카드가 자동으로 펼쳐지며 활성 세션 행(Row::Session)으로 커서와 강조가 이동한다.
+    view.update(cx, |s, cx| {
+        s.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![
+                        session(1, AgentState::Working, Some("/repo/ui-개선")),
+                        session(2, AgentState::Unknown, Some("/repo/orca-비교")),
+                        session(3, AgentState::Unknown, Some("/repo/orca-비교")),
+                    ],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/repo"),
+                        vec![
+                            PathBuf::from("/repo"),
+                            PathBuf::from("/repo/ui-개선"),
+                            PathBuf::from("/repo/orca-비교"),
+                        ],
+                    )]),
+                },
+                meta,
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        s.set_focused(Some(SessionId(3)), cx);
+        assert!(s.expanded_cards.contains(Path::new("/repo/orca-비교")));
+        let s3_idx = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Session(sess, true) if sess.id == SessionId(3)))
+            .expect("expanded card must expose SessionId(3) row");
+        let s2_idx = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Session(sess, true) if sess.id == SessionId(2)))
+            .expect("expanded card must expose SessionId(2) row");
+        assert_eq!(s.cursor, Some(s3_idx));
+        assert!(s.is_session_focused(s3_idx, SessionId(3)));
+        assert!(!s.is_session_focused(s2_idx, SessionId(2)));
+
+        // 같은 워크트리 내 다른 칸(SessionId(2))으로 포커스를 바꾸면 세션 행 선택도 즉시 따라간다.
+        s.set_focused(Some(SessionId(2)), cx);
+        assert_eq!(s.cursor, Some(s2_idx));
+        assert!(s.is_session_focused(s2_idx, SessionId(2)));
+        assert!(!s.is_session_focused(s3_idx, SessionId(3)));
+    });
 }

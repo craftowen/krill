@@ -24,8 +24,8 @@ such as researcher, implementer, or verifier maps to a configured profile; it is
 not a model ID. Respect user model/account choices. Krill has no provider-ranking,
 model-price, or cross-provider fallback oracle. `worker-start --agent <profile>`
 uses that profile's argv/env, with optional `--model <id>` and `--effort <level>`
-overrides when supported by the provider (`claude`, `codex`, `pi` for effort).
-Unsupported `--retry-of` must not be used as if it controlled execution. Propose
+overrides when supported by the provider. `--retry-of <dispatch-id>` and
+`--retry-request <request-id>` preserve retry lineage and the configured retry bound. Propose
 profile changes if needed, without altering unrelated credentials or silently
 switching paid providers.
 

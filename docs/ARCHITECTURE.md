@@ -210,6 +210,8 @@ Resource Manager(MK-071)는 control에 `Request::Resources(Action)`·`Reply::Res
 
 **예약 번호 범위**: 기능 비트 `1 << 27`~`1 << 29`, kind 클라→데몬 `0x1A`~`0x1F`·데몬→클라 `0x2E`~`0x2F`. (`control` Request/Reply enum은 postcard 순차 인덱스라 끝에만 추가하며 현재 Request 0..=26, Reply 0..=30까지 배정됨).
 
+오케스트레이션의 `Request::Orchestration` 내부 opcode는 기존 0..15를 유지한다. 16은 Run 필터 메시지 조회, 17은 메시지 ID별 ACK이며, v0.1.46의 구성된 워커 시작·실행·실패 기록·세션별 Run 선택·배치 조회·확장 스냅샷·워커 관리 요청은 18..24에 덧붙인다. 새 요청이 구버전 데몬에서 거부되면 같은 변경을 디스크로 재실행하지 않는다. 기존 `Snapshot`·`Dispatch` 응답은 N-1 postcard 구조를 고정한 별도 wire 타입으로 직렬화하며, 배달 영수증과 확장 스냅샷·디스패치는 새 응답 variant로만 보낸다. 배치 ACK는 조회 시 고정한 메시지 ID만 확인 처리해 나중에 도착한 메시지를 소비하지 않는다. 워커 해제는 실행 상태·세션 소유권을 먼저 확인하며, 빌린 세션이나 다른 디스패치로 재배정된 PTY를 닫지 않는다.
+
 **kind 확장 범위(2026-10-15)**: `0x10`~`0x1F`·`0x20`~`0x2F`가 차서 새 전용 kind는 클라→데몬 `0x40`~, 데몬→클라 `0x60`~를 배정한다. control enum에 빈 번호를 채우는 예약 변형(`#[serde(skip)]`)은 금지 — 직렬화·역직렬화 변형 번호가 어긋날 수 있다.
 
 holder 채널(`krill_proto::holder`)은 별도 번호 공간이다(`0x01`~`0x08`, `0x81`~`0x88`). `krill-proto`에는 기능 비트 겹침 const assert와 kind 중복 테스트를 둔다.

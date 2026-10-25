@@ -107,8 +107,8 @@ impl Shell {
         }
     }
 
-    fn chat_request_binding_matches(&self, request: &RequestIdentity) -> bool {
-        if !self.chat.active_sessions.contains(&request.session)
+    fn chat_request_binding_matches(&self, request: &RequestIdentity, cx: &gpui::App) -> bool {
+        if !self.is_session_chat_view(request.session, cx)
             || self.layout.session(request.pane) != Some(request.session)
             || self.layout.host(request.pane) != &request.host
             || self.layout.file(request.pane).is_some()
@@ -168,7 +168,7 @@ impl Shell {
                             | krill_proto::control::AgentState::Blocked
                     )
                 })
-            && self.chat_request_binding_matches(request)
+            && self.chat_request_binding_matches(request, cx)
             && self.live.get(&request.pane).is_some_and(|live| {
                 live.target
                     .as_ref()

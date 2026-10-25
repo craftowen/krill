@@ -196,6 +196,9 @@ pub fn create_with_pool(
     trust: &Path,
     pool: Option<&prepare::Pool>,
 ) -> Result<Outcome, String> {
+    if let Some(pool) = pool {
+        pool.cancel_mismatched_in_flight(&req.repo, req.base.as_deref());
+    }
     let given = Path::new(OsStr::from_bytes(&req.repo));
     // 넘겨받은 워크트리가 설정·include의 출처다. 경로는 비 UTF-8 바이트도 보존한다.
     let top = output_path(
@@ -255,9 +258,17 @@ pub fn create_with_pool(
         }
     };
     if !promoted {
-        let mut add: Vec<OsString> = ["worktree", "add", "--no-track", "-b", branch.as_str()]
-            .map(OsString::from)
-            .into();
+        let mut add: Vec<OsString> = [
+            "-c",
+            "core.fsmonitor=false",
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch.as_str(),
+        ]
+        .map(OsString::from)
+        .into();
         add.push(path.clone().into_os_string());
         add.push(base.clone().into());
         if let Err(e) = git(q, &top, add).and_then(|out| text(out, "git worktree add failed")) {

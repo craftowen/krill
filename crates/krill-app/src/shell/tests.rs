@@ -4221,7 +4221,7 @@ fn status_account_rule_helpers_persist_all_fields_and_remove_rule(cx: &mut TestA
 /// 오케스트레이션 메뉴의 [Release]는 디스패치를 놓아 주는 데서 끝나지 않고 krilld에 `Close`를 보낸다.
 #[gpui::test]
 fn orchestration_release_button_closes_worker_session(cx: &mut TestAppContext) {
-    use krill_proto::orchestration::{DispatchStatus, OrchestrationStore};
+    use krill_proto::orchestration::OrchestrationStore;
     use krill_proto::screen::Msg as _;
     use std::io::Write as _;
     use std::os::unix::net::UnixListener;
@@ -4231,7 +4231,8 @@ fn orchestration_release_button_closes_worker_session(cx: &mut TestAppContext) {
     std::fs::create_dir_all(dir.join("run")).unwrap();
     OrchestrationStore::mutate(&dir, |s| {
         let run = s.create_run("Release", None)?;
-        s.start_worker(&run.id, None, "w1", "claude", Some(77), "/tmp", "p")
+        let dispatch = s.start_worker(&run.id, None, "w1", "claude", Some(77), "/tmp", "p")?;
+        s.stop_or_release_worker(&dispatch.id, false)
     })
     .unwrap();
     let socket = dir.join("run/krilld.sock");
@@ -4329,7 +4330,7 @@ fn orchestration_release_button_closes_worker_session(cx: &mut TestAppContext) {
     let store = loop {
         cx.run_until_parked();
         let store = OrchestrationStore::load(&dir).unwrap();
-        if store.dispatches[0].status == DispatchStatus::Released {
+        if store.dispatches[0].is_released() {
             break store;
         }
         assert!(
@@ -9301,4 +9302,104 @@ fn tab_close_modals_enter_scope_and_restore_terminal_focus(cx: &mut TestAppConte
         assert!(view.read(cx).pending_running_close.is_none());
         assert!(view.read(cx).focus.is_focused(window));
     });
+}
+
+#[gpui::test]
+fn settled_fresh_local_session_immediately_refreshes_and_focuses_sidebar(cx: &mut TestAppContext) {
+    struct DynamicSource(std::sync::Mutex<sidebar::Snapshot>);
+    impl sidebar::Source for DynamicSource {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    let initial = sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(1),
+            status: krill_proto::control::AgentStatus {
+                agent: "claude".into(),
+                state: krill_proto::control::AgentState::Working,
+                ..krill_proto::control::AgentStatus::UNKNOWN
+            },
+            worktree: Some("/repo/old".into()),
+            cwd: Some("/repo/old".into()),
+            account: None,
+        }],
+        trees: [(
+            PathBuf::from("/repo"),
+            vec![PathBuf::from("/repo/old"), PathBuf::from("/repo/new")],
+        )]
+        .into(),
+    };
+    let source = std::sync::Arc::new(DynamicSource(std::sync::Mutex::new(initial)));
+    let (view, cx) = open(cx, state_path("settled-focuses-sidebar"));
+    let src_for_sidebar: std::sync::Arc<dyn sidebar::Source> = source.clone();
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(src_for_sidebar, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 처음에는 기존 세션(SessionId(1), /repo/old)이 활성 상태라고 가정한다.
+    view.update(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_session(pane, SessionId(1));
+        s.sync_focused_session(cx);
+    });
+    assert_eq!(
+        view.read_with(cx, |s, cx| {
+            s.sidebar
+                .read(cx)
+                .selected_worktree()
+                .map(std::path::Path::to_path_buf)
+        }),
+        Some(PathBuf::from("/repo/old"))
+    );
+
+    // 데몬에 새 워크트리 세션(SessionId(2), /repo/new)이 생기고 칸에 settled로 연결된다.
+    source.0.lock().unwrap().sessions.push(sidebar::Session {
+        id: SessionId(2),
+        status: krill_proto::control::AgentStatus::UNKNOWN,
+        worktree: Some("/repo/new".into()),
+        cwd: Some("/repo/new".into()),
+        account: None,
+    });
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let reader = ours.try_clone().unwrap();
+    let writer = pane::Writer::spawn(ours).unwrap();
+    view.update(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        s.live
+            .entry(pane)
+            .or_insert_with(|| Live::new(Task::ready(())));
+        let next = s.settled(
+            pane,
+            Ok(Got::Live {
+                session: SessionId(2),
+                linked: Ok(pane::Linked {
+                    reader,
+                    writer,
+                    instance: 1,
+                    launch: None,
+                    features: krill_proto::input::FEAT_INPUT,
+                    search: false,
+                }),
+                prior_cold: None,
+            }),
+            cx,
+        );
+        assert!(matches!(next, Next::Read(_)));
+    });
+    // 1.5초 폴링 타이머를 기다리지 않아도 즉시 사이드바를 다시 읽어 새 워크트리로 선택이 옮겨간다.
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, cx| {
+            s.sidebar
+                .read(cx)
+                .selected_worktree()
+                .map(std::path::Path::to_path_buf)
+        }),
+        Some(PathBuf::from("/repo/new"))
+    );
 }

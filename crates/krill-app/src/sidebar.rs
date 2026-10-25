@@ -213,6 +213,15 @@ pub(super) struct DeleteConfirm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingWorktree {
+    pub id: u64,
+    pub dialog_id: u64,
+    pub repo: PathBuf,
+    pub parent: Option<PathBuf>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
     HostHeader {
         host: HostId,
@@ -225,6 +234,11 @@ enum Row {
     GroupHeader {
         key: GroupKey,
         count: usize,
+    },
+    PendingWorktree {
+        id: u64,
+        repo: PathBuf,
+        name: String,
     },
     Worktree(PathBuf),
     HiddenWorktrees(PathBuf, usize, bool),
@@ -728,6 +742,8 @@ pub struct Sidebar {
     collapsed: BTreeSet<PathBuf>,
     /// 카드 하단 요약 알약을 눌러 개별 세션 행을 펼친 워크트리 집합(Orca 기본값: 접힘).
     expanded_cards: BTreeSet<PathBuf>,
+    /// 사용자가 요약 알약을 눌러 명시적으로 접은 다중 세션 카드(자동 펼침 예외).
+    manually_folded_cards: BTreeSet<PathBuf>,
     /// 마지막으로 선택·활성화된 워크트리/폴더 경로(`sidebar.bin`에 영속화, OWE-842).
     selected_worktree: Option<PathBuf>,
     /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
@@ -759,6 +775,12 @@ pub struct Sidebar {
     edit_subscription: Option<Subscription>,
     orca_import_subscription: Option<Subscription>,
     pub(crate) creating: Option<(Entity<worktree::Dialog>, Subscription)>,
+    pub(super) creating_background: Vec<(u64, Entity<worktree::Dialog>, Subscription)>,
+    pub(super) creating_dialog_id: u64,
+    pub(super) next_creating_id: u64,
+    pub(super) pending_worktrees: Vec<PendingWorktree>,
+    pub(super) recently_created_worktrees: BTreeSet<PathBuf>,
+    pub(super) pending_reveal_worktree: Option<PathBuf>,
     /// OWE-924: 워크트리 생성 시 예약된 초기 프롬프트(워크트리 경로 → 프롬프트).
     pending_prompts: BTreeMap<PathBuf, String>,
     /// OWE-854: 셸 탭에서 사용자가 직접 지정한 세션별 제목. 세션 행 라벨의 최우선 후보.
@@ -774,6 +796,8 @@ pub struct Sidebar {
     now_override_ns: Option<u64>,
     /// 셸의 포커스 칸 세션(OWE-662 미확인 판정).
     focused: Option<SessionId>,
+    /// 로컬 스냅샷 행 선택과 이미 동기화된 포커스 세션.
+    focused_synced: Option<SessionId>,
     /// 보지 않은 사이 완료·대기로 바뀐 세션(OWE-662).
     unread: BTreeSet<SessionId>,
     /// 에이전트 대시보드에서 사용자가 클릭해 확인한 완료(`Done | Exited`) 세션과 읽은 순서.
@@ -1040,6 +1064,7 @@ impl Sidebar {
             shown_external: ui.shown_external,
             collapsed: ui.collapsed,
             expanded_cards: ui.expanded_cards,
+            manually_folded_cards: BTreeSet::new(),
             selected_worktree: ui.selected_worktree,
             removed_projects: ui.removed_projects,
             project_visuals: BTreeMap::new(),
@@ -1062,6 +1087,12 @@ impl Sidebar {
             edit_subscription: None,
             orca_import_subscription: None,
             creating: None,
+            creating_background: Vec::new(),
+            creating_dialog_id: 0,
+            next_creating_id: 1,
+            pending_worktrees: Vec::new(),
+            recently_created_worktrees: BTreeSet::new(),
+            pending_reveal_worktree: None,
             pending_prompts: BTreeMap::new(),
             custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
@@ -1070,6 +1101,7 @@ impl Sidebar {
             last_activity_minute: None,
             now_override_ns: None,
             focused: None,
+            focused_synced: None,
             unread: BTreeSet::new(),
             read_done: BTreeMap::new(),
             next_read_done_seq: 0,
@@ -1183,6 +1215,10 @@ impl Sidebar {
         self.automation_worktrees
             .retain(|path| live.contains(path.as_path()));
         self.cli_worktrees
+            .retain(|path| live.contains(path.as_path()));
+        self.recently_created_worktrees
+            .retain(|path| live.contains(path.as_path()));
+        self.manually_folded_cards
             .retain(|path| live.contains(path.as_path()));
     }
 
@@ -1982,27 +2018,127 @@ impl Sidebar {
         let changed = self.focused != session;
         self.focused = session;
         let cleared = session.is_some_and(|id| self.unread.remove(&id));
-        if let Some(wt) = session
-            .and_then(|id| self.folder(id))
-            .map(Path::to_path_buf)
-            && self.selected_worktree.as_ref() != Some(&wt)
-        {
-            self.selected_worktree = Some(wt);
-            self.write_state(cx);
-        }
-        if changed
-            && let Some(path) = session
-                .and_then(|id| self.folder_on(&HostId::Local, id))
-                .map(Path::to_path_buf)
-        {
-            self.cursor = self.rows.iter().enumerate().position(|(i, row)| {
-                self.row_host(i).is_local()
-                    && matches!(row, Row::Worktree(p) | Row::Folder(p) if p == &path)
-            });
-            self.sync_viewport();
+        if let Some(id) = session {
+            if changed || self.focused_synced != Some(id) {
+                if let Some(wt) = self.folder(id).map(Path::to_path_buf)
+                    && self.selected_worktree.as_ref() != Some(&wt)
+                {
+                    self.selected_worktree = Some(wt);
+                    self.write_state(cx);
+                }
+                self.sync_focused_row(id, changed, cx);
+            }
+        } else {
+            self.focused_synced = None;
+            if changed && self.options.filters.hide_sleeping {
+                self.rebuild(cx);
+            }
         }
         if changed || cleared {
             cx.notify();
+        }
+    }
+
+    /// 포커스 세션(`self.focused`)이 로컬 스냅샷에 존재할 때 워크트리 선택·펼침·커서·스크롤을 맞춘다.
+    fn sync_focused_row(&mut self, id: SessionId, focus_changed: bool, cx: &mut Context<Self>) {
+        let Some(path) = self.folder_on(&HostId::Local, id).map(Path::to_path_buf) else {
+            self.focused_synced = None;
+            if focus_changed && self.options.filters.hide_sleeping {
+                self.rebuild(cx);
+            }
+            return;
+        };
+        self.focused_synced = Some(id);
+        let mut need_rebuild = focus_changed && self.options.filters.hide_sleeping;
+        let mut need_persist = false;
+        let reveal_created = self.pending_reveal_worktree.as_deref() == Some(path.as_path());
+        if reveal_created {
+            self.pending_reveal_worktree = None;
+            if self.collapsed.remove(&path) {
+                need_persist = true;
+            }
+            if self.expand_lineage_ancestors(&path) {
+                need_persist = true;
+            }
+            let is_claude_wt = external::is_claude_worktree(&path);
+            let parent_repos: Vec<PathBuf> = self
+                .snapshot
+                .trees
+                .iter()
+                .filter(|&(repo, trees)| repo == &path || trees.iter().any(|t| t == &path))
+                .map(|(repo, _)| repo.clone())
+                .collect();
+            for repo in parent_repos {
+                if self.collapsed.remove(&repo) {
+                    need_persist = true;
+                }
+                if is_claude_wt && self.shown_external.insert(repo) {
+                    need_persist = true;
+                }
+            }
+        }
+        let is_worktree = self
+            .snapshot
+            .sessions
+            .iter()
+            .any(|s| s.id == id && s.worktree.as_deref() == Some(path.as_path()));
+        if is_worktree {
+            let session_count = self
+                .snapshot
+                .sessions
+                .iter()
+                .filter(|s| s.worktree.as_deref() == Some(path.as_path()))
+                .count();
+            if session_count >= 2
+                && !self.expanded_cards.contains(&path)
+                && !self.manually_folded_cards.contains(&path)
+            {
+                self.expanded_cards.insert(path.clone());
+                self.collapsed.remove(&path);
+                need_persist = true;
+            }
+        }
+        let selected_changed = self.selected_worktree.as_ref() != Some(&path);
+        if selected_changed {
+            self.selected_worktree = Some(path.clone());
+        }
+        if self.options.filters.hide_sleeping
+            && !self.rows.iter().enumerate().any(|(i, row)| {
+                self.row_host(i).is_local()
+                    && matches!(row, Row::Worktree(p) | Row::Folder(p) if p == &path)
+            })
+        {
+            need_rebuild = true;
+        }
+        if need_persist {
+            self.persist(cx);
+        } else {
+            if selected_changed {
+                self.write_state(cx);
+            }
+            if need_rebuild {
+                self.rebuild(cx);
+            }
+        }
+        let prefer_session_row = !is_worktree || self.expanded_cards.contains(&path);
+        let session_idx = prefer_session_row
+            .then(|| {
+                self.rows.iter().enumerate().position(|(i, row)| {
+                    self.row_host(i).is_local() && matches!(row, Row::Session(s, _) if s.id == id)
+                })
+            })
+            .flatten();
+        self.cursor = session_idx.or_else(|| {
+            self.rows.iter().enumerate().position(|(i, row)| {
+                self.row_host(i).is_local()
+                    && matches!(row, Row::Worktree(p) | Row::Folder(p) if p == &path)
+            })
+        });
+        self.sync_viewport();
+        if let Some(cursor) = self.cursor
+            && reveal_created
+        {
+            self.scroll_row_into_view(cursor, ScrollStrategy::Nearest);
         }
     }
 
@@ -2046,6 +2182,7 @@ impl Sidebar {
         };
         let target_wt = self.folder(focused_id).map(Path::to_path_buf);
         let mut uncollapsed = false;
+        let mut prefer_session = false;
         if let Some(wt) = &target_wt {
             if self.collapsed.remove(wt) {
                 uncollapsed = true;
@@ -2053,6 +2190,19 @@ impl Sidebar {
             if self.expand_lineage_ancestors(wt) {
                 uncollapsed = true;
             }
+            let session_count = self
+                .snapshot
+                .sessions
+                .iter()
+                .filter(|s| s.worktree.as_deref() == Some(wt.as_path()))
+                .count();
+            if session_count >= 2 {
+                self.manually_folded_cards.remove(wt);
+                if self.expanded_cards.insert(wt.clone()) {
+                    uncollapsed = true;
+                }
+            }
+            prefer_session = session_count == 0 || self.expanded_cards.contains(wt);
             let is_claude_wt = external::is_claude_worktree(wt);
             let parent_repos: Vec<PathBuf> = self
                 .snapshot
@@ -2078,10 +2228,20 @@ impl Sidebar {
         } else if target_wt.is_some() {
             self.write_state(cx);
         }
-        let idx = self.rows.iter().position(|r| match r {
-            Row::Worktree(p) | Row::Folder(p) => target_wt.as_ref() == Some(p),
-            Row::Session(s, _) => s.id == focused_id,
-            _ => false,
+        let session_idx = prefer_session
+            .then(|| {
+                self.rows.iter().enumerate().position(|(i, r)| {
+                    self.row_host(i).is_local()
+                        && matches!(r, Row::Session(s, _) if s.id == focused_id)
+                })
+            })
+            .flatten();
+        let idx = session_idx.or_else(|| {
+            self.rows.iter().position(|r| match r {
+                Row::Worktree(p) | Row::Folder(p) => target_wt.as_ref() == Some(p),
+                Row::Session(s, _) => s.id == focused_id,
+                _ => false,
+            })
         });
         if let Some(i) = idx {
             self.cursor = Some(i);
@@ -2092,10 +2252,10 @@ impl Sidebar {
     }
 
     /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
-    /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
     /// 펼침 집합은 `UiExpansionState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub fn toggle_card_sessions(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.expanded_cards.remove(path) {
+            self.manually_folded_cards.insert(path.to_path_buf());
             if let Some(c) = self.cursor
                 && matches!(
                     self.rows.get(c),
@@ -2110,8 +2270,18 @@ impl Sidebar {
             self.write_state(cx);
             cx.notify();
         } else {
+            self.manually_folded_cards.remove(path);
             self.expanded_cards.insert(path.to_path_buf());
             self.collapsed.remove(path);
+            if let Some(focused_id) = self.focused
+                && self.folder_on(&HostId::Local, focused_id) == Some(path)
+                && let Some(idx) = self.rows.iter().enumerate().position(|(i, r)| {
+                    self.row_host(i).is_local()
+                        && matches!(r, Row::Session(s, true) if s.id == focused_id)
+                })
+            {
+                self.cursor = Some(idx);
+            }
         }
         self.persist(cx);
     }
@@ -2531,6 +2701,28 @@ impl Sidebar {
                         self.persist(cx);
                     } else {
                         self.rebuild(cx);
+                    }
+                    if let Some(focused_id) = self.focused
+                        && let Some(wt) = self
+                            .folder_on(&HostId::Local, focused_id)
+                            .map(Path::to_path_buf)
+                    {
+                        let multi_needs_expand = self
+                            .snapshot
+                            .sessions
+                            .iter()
+                            .filter(|s| s.worktree.as_deref() == Some(wt.as_path()))
+                            .count()
+                            >= 2
+                            && !self.expanded_cards.contains(&wt)
+                            && !self.manually_folded_cards.contains(&wt);
+                        if self.focused_synced != Some(focused_id)
+                            || self.pending_reveal_worktree.as_deref() == Some(wt.as_path())
+                            || multi_needs_expand
+                        {
+                            self.sync_focused_row(focused_id, false, cx);
+                            cx.notify();
+                        }
                     }
                 } else {
                     let now_ns = self.now_unix_ns();
@@ -3611,6 +3803,66 @@ impl Sidebar {
             .iter()
             .filter(|s| s.worktree.as_deref() == Some(path) || s.cwd.as_deref() == Some(path))
             .find_map(|s| self.auto_titles.get(&s.id).map(String::as_str))
+    }
+
+    /// 사이드바 설정 저장/손상 오류 문구(셸 우하단 토스트 동기화용).
+    #[must_use]
+    pub fn preference_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn clear_preference_error(&mut self, cx: &mut Context<Self>) {
+        if self.error.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 데몬 스냅샷 폴링 실패 문구(셸 우하단 토스트 동기화용).
+    #[must_use]
+    pub fn poll_error(&self) -> Option<&str> {
+        self.poll_error.as_deref()
+    }
+
+    pub fn set_poll_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        if self.poll_error != error {
+            self.poll_error = error;
+            cx.notify();
+        }
+    }
+
+    pub fn clear_poll_error(&mut self, cx: &mut Context<Self>) {
+        self.set_poll_error(None, cx);
+    }
+
+    /// 사이드바 단발성 알림 문구(셸 우하단 토스트 동기화용).
+    #[must_use]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn clear_notice(&mut self, cx: &mut Context<Self>) {
+        if self.notice.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// PR CLI(gh) 미설치/인증 안내 문구(셸 우하단 토스트 동기화용).
+    #[must_use]
+    pub fn pr_guidance(&self) -> Option<&'static str> {
+        (!self.pr_guidance_dismissed)
+            .then(|| {
+                self.prs
+                    .values()
+                    .find_map(crate::pull_request::Status::guidance)
+            })
+            .flatten()
+    }
+
+    pub fn dismiss_pr_guidance(&mut self, cx: &mut Context<Self>) {
+        if !self.pr_guidance_dismissed {
+            self.pr_guidance_dismissed = true;
+            cx.notify();
+        }
     }
 
     fn branch(&self, path: &Path) -> Option<&str> {

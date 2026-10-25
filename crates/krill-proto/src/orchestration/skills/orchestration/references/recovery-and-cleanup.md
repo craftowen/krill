@@ -16,20 +16,21 @@ Use these actual Krill lifecycle semantics:
 - `worker-retain <dispatch-id>` keeps the terminal. **For an active dispatch it
   ends ownership and returns its task to ready**; it is not a pause/continue verb.
   Use it on settled work when preserving output or handing ownership back is intended.
-- `worker-release <dispatch-id>` archives bounded output and closes its session.
-  **Krill also permits this on active work**; the coordinator must not use it as
-  routine cleanup before settlement or an explicitly authorized cancellation.
-- `worker-stop <dispatch-id>` also closes the session. Closing destroys the running
+- `worker-release <dispatch-id>` archives bounded output and closes its owned session.
+  Active dispatches must first settle, stop, or be abandoned. Borrowed and reassigned
+  sessions are preserved.
+- `worker-stop <dispatch-id>` closes an owned session. Closing destroys the running
   worker; preserve needed output and changes first.
 - `worker-abandon <dispatch-id>` fences the old attempt, returns its task to ready,
-  **and closes its session when present**. This differs from Orca's non-destructive
-  abandon. Use only after identifying the exact owned attempt and deciding to end it.
+  while preserving its terminal session. Use only after identifying the exact owned
+  attempt and deciding to end its ownership.
   A late `worker_done` from that attempt is rejected.
 
 For a known failed/stopped attempt, preserve its report, end any still-active
 ownership deliberately, verify the task is startable, then `worker-start --run
 <run-id> --task <same-task-id> --worker <new-unique-name> ...` with failure context.
-Krill has no `--retry-of` linkage; record the prior dispatch in the assignment/report.
+Use `--retry-of <dispatch-id>` or `--retry-request <request-id>` to retain the prior
+attempt's lineage and retry bound. Preserve failure context in the assignment/report.
 Changed code may invalidate a completed dependent verification: make it pending
 again with `task-update <task-id> --status pending --summary "<why recheck>"`
 and inspect the resulting readiness before dispatching. Do not mark it completed.

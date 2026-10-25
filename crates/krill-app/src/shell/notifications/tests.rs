@@ -358,3 +358,50 @@ fn hook_setup_hint_expires_without_reappearing_on_render(cx: &mut TestAppContext
     assert!(cx.debug_bounds("fix-banner").is_none());
     assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
 }
+
+#[gpui::test]
+fn sidebar_poll_and_notice_alerts_render_as_toasts_without_sidebar_layout_shift(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("toast-sidebar-alerts"));
+    let sidebar_header_before = cx.debug_bounds("sidebar-header").unwrap();
+    let sidebar_viewport_before = cx.debug_bounds("sidebar-viewport").unwrap();
+    let terminal_before = cx.debug_bounds("terminal-surface").unwrap();
+
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_poll_error(Some("daemon slow".into()), cx);
+        });
+    });
+    cx.run_until_parked();
+    settle(cx);
+
+    assert_eq!(
+        cx.debug_bounds("sidebar-header").unwrap(),
+        sidebar_header_before
+    );
+    assert_eq!(
+        cx.debug_bounds("sidebar-viewport").unwrap(),
+        sidebar_viewport_before
+    );
+    assert_eq!(
+        cx.debug_bounds("terminal-surface").unwrap(),
+        terminal_before
+    );
+    let poll_toast = cx.debug_bounds("sidebar-poll-error").unwrap();
+    cx.update(|window, _| {
+        assert!(poll_toast.origin.x > window.viewport_size().width / 2.);
+        assert!(poll_toast.origin.y > window.viewport_size().height / 2.);
+    });
+
+    // 폴링이 복구되면 토스트가 자동으로 사라진다.
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sb, cx| {
+            sb.clear_poll_error(cx);
+        });
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("sidebar-poll-error").is_none());
+}

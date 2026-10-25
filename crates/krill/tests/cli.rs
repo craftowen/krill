@@ -1070,24 +1070,54 @@ launch = ["/bin/sh", "-c", "exit 3"]
 #[test]
 fn orchestration_worker_stop_settles_after_session_killed() {
     let d = Daemon::new("orch-stop-gone");
+    fs::write(
+        d.dir.join("agents.toml"),
+        r#"
+[agent.owned_fixture]
+name = "Owned worker fixture"
+launch = ["/bin/sh", "-c", "printf 'fixture-ready\\n> '; IFS= read -r line; exec sleep 30"]
+"#,
+    )
+    .unwrap();
     let run = d.ok(&["orchestration", "run-create", "--title", "R", "--json"]);
     let run: serde_json::Value = serde_json::from_str(&run).unwrap();
     let run = run["id"].as_str().unwrap();
     for (worker, release) in [("w-gone-stop", false), ("w-gone-release", true)] {
-        let sid = d.ok(&["new", "--", "/bin/sleep", "30"]);
-        let sid = sid.trim().to_owned();
-        d.ok(&[
+        let started = d.ok(&[
             "orchestration",
             "worker-start",
             "--run",
             run,
             "--worker",
             worker,
-            "--session",
-            &sid,
+            "--agent",
+            "owned_fixture",
+            "--cwd",
+            d.dir.to_str().unwrap(),
             "--prompt",
             "do it",
+            "--json",
         ]);
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let sid = started["session_id"].as_u64().unwrap().to_string();
+        if release {
+            d.ok(&[
+                "orchestration",
+                "send",
+                "--from",
+                worker,
+                "--type",
+                "worker_done",
+                "--run",
+                run,
+                "--dispatch",
+                started["id"].as_str().unwrap(),
+                "--outcome",
+                "succeeded",
+                "--summary",
+                "finished",
+            ]);
+        }
         d.ok(&["kill", &sid]);
         let sub = if release {
             "worker-release"
@@ -1101,6 +1131,41 @@ fn orchestration_worker_stop_settles_after_session_killed() {
             "{show}"
         );
     }
+}
+
+#[test]
+fn orchestration_borrowed_session_survives_stop_rejection_and_abandon() {
+    let d = Daemon::new("orch-borrowed");
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "borrowed",
+        "--json",
+    ]))
+    .unwrap();
+    let sid = d.ok(&["new", "--", "/bin/sleep", "30"]);
+    let sid = sid.trim();
+    d.ok(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run["id"].as_str().unwrap(),
+        "--worker",
+        "borrowed",
+        "--session",
+        sid,
+        "--no-preamble",
+        "--prompt",
+        "inspect",
+    ]);
+    let rejected = d.run(&["orchestration", "worker-stop", "borrowed"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("borrowed"));
+    assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    d.ok(&["orchestration", "worker-abandon", "borrowed"]);
+    assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    d.ok(&["kill", sid]);
 }
 
 /// agy-shaped PTY work uses Krill's guide, absolute CLI, Unicode questions, and settlement.

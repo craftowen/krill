@@ -28,7 +28,15 @@ use crate::i18n::catalog::worktree as text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// 사이드바를 바로 새로 고친다. 대화상자는 결과(경고 포함)를 보여 주며 열려 있다.
+    /// 생성 제출 즉시 내보낸다. 모달을 닫고 사이드바에 낙관적 대기 카드를 표시한다.
+    Submitting {
+        repo: PathBuf,
+        parent: Option<PathBuf>,
+        names: Vec<String>,
+    },
+    /// 미승인 setup 스크립트 확인 또는 생성 실패로 모달을 다시 띄워야 할 때 내보낸다.
+    ModalReopened(Option<String>),
+    /// 사이드바를 바로 새로 고친다.
     Created(Worktree),
     Close,
 }
@@ -235,7 +243,7 @@ impl Dialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_parent(repo, None, source, window, cx)
+        Self::new_with_options(repo, None, None, Vec::new(), source, window, cx)
     }
 
     pub fn new_with_parent(
@@ -245,8 +253,26 @@ impl Dialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_options(repo, parent, None, Vec::new(), source, window, cx)
+    }
+
+    pub fn new_with_options(
+        repo: PathBuf,
+        parent: Option<PathBuf>,
+        initial_base: Option<&str>,
+        candidates: Vec<String>,
+        source: Arc<dyn Source>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder(text::NAME.get()));
-        let base = cx.new(|cx| InputState::new(window, cx).placeholder(text::BASE.get()));
+        let base = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder(text::BASE.get());
+            if let Some(default) = initial_base.map(str::trim).filter(|s| !s.is_empty()) {
+                state.set_value(default, window, cx);
+            }
+            state
+        });
         let initial_prompt = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get())
         });
@@ -280,6 +306,9 @@ impl Dialog {
             hooks: krill_proto::orchestration::RepoHookSummary::default(),
             hooks_task: None,
         };
+        if !candidates.is_empty() {
+            dialog.set_branch_candidates(candidates, cx);
+        }
         let repo = dialog.repo.clone();
         let state_dir = crate::settings::state_dir(cx);
         dialog.hooks_task = Some(cx.spawn(async move |this, cx| {
@@ -298,6 +327,29 @@ impl Dialog {
         }));
         dialog.prepare(cx);
         dialog
+    }
+
+    /// 백그라운드 생성 중이거나 생성 완료된 상태인지(`true`이면 모달을 가리고 사이드바 대기 행으로 표시한다).
+    #[must_use]
+    pub fn is_background(&self) -> bool {
+        matches!(self.phase, Phase::Creating | Phase::Done(_))
+    }
+
+    #[must_use]
+    pub fn is_untrusted(&self) -> bool {
+        matches!(self.phase, Phase::Untrusted { .. })
+    }
+
+    pub fn focus_on_reopen(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.phase {
+            Phase::Edit(_) => {
+                self.name.update(cx, |input, cx| input.focus(window, cx));
+            }
+            Phase::Untrusted { .. } => {
+                self.focus.focus(window, cx);
+            }
+            Phase::Creating | Phase::Done(_) => {}
+        }
     }
 
     #[must_use]
@@ -395,6 +447,7 @@ impl Dialog {
                 input.set_value(&default, window, cx);
             });
             self.highlight = None;
+            self.prepare(cx);
             cx.notify();
         }
     }
@@ -643,8 +696,17 @@ impl Dialog {
                 return;
             }
         };
+        let names = requests
+            .iter()
+            .map(|(req, _, _)| req.name.clone())
+            .collect();
         self.pending_fan_out = requests.len();
         self.phase = Phase::Creating;
+        cx.emit(Event::Submitting {
+            repo: self.repo.clone(),
+            parent: self.parent.clone(),
+            names,
+        });
         cx.notify();
         let source = self.source.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -675,44 +737,54 @@ impl Dialog {
                 self.cancel_preparation(cx);
                 self.last_created_agent = agent;
                 self.last_created_prompt = prompt;
-                cx.emit(Event::Created(w.clone()));
-                self.phase = Phase::Done(w);
+                self.phase = Phase::Done(w.clone());
+                cx.emit(Event::Created(w));
                 cx.notify();
                 self.pending_fan_out > 0
             }
             Ok(Reply::SetupUntrusted { script, hash }) => {
                 self.pending_fan_out = 0;
                 self.phase = Phase::Untrusted { script, hash };
+                cx.emit(Event::ModalReopened(None));
                 cx.notify();
                 false
             }
             Ok(Reply::WorktreeFailed(e)) => {
                 self.pending_fan_out = 0;
-                self.phase = Phase::Edit(Some(e));
+                self.phase = Phase::Edit(Some(e.clone()));
+                cx.emit(Event::ModalReopened(Some(e)));
                 cx.notify();
                 false
             }
             Ok(Reply::Failed(f)) => {
+                let msg = f.to_string();
                 self.pending_fan_out = 0;
-                self.phase = Phase::Edit(Some(f.to_string()));
+                self.phase = Phase::Edit(Some(msg.clone()));
+                cx.emit(Event::ModalReopened(Some(msg)));
                 cx.notify();
                 false
             }
             Ok(_) => {
+                let msg = text::UNEXPECTED.get().to_owned();
                 self.pending_fan_out = 0;
-                self.phase = Phase::Edit(Some(text::UNEXPECTED.get().to_owned()));
+                self.phase = Phase::Edit(Some(msg.clone()));
+                cx.emit(Event::ModalReopened(Some(msg)));
                 cx.notify();
                 false
             }
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                let msg = text::UNSUPPORTED.get().to_owned();
                 self.pending_fan_out = 0;
-                self.phase = Phase::Edit(Some(text::UNSUPPORTED.get().to_owned()));
+                self.phase = Phase::Edit(Some(msg.clone()));
+                cx.emit(Event::ModalReopened(Some(msg)));
                 cx.notify();
                 false
             }
             Err(e) => {
+                let msg = e.to_string();
                 self.pending_fan_out = 0;
-                self.phase = Phase::Edit(Some(e.to_string()));
+                self.phase = Phase::Edit(Some(msg.clone()));
+                cx.emit(Event::ModalReopened(Some(msg)));
                 cx.notify();
                 false
             }

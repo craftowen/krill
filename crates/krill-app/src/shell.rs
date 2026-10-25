@@ -3064,8 +3064,13 @@ impl Shell {
                         handoff.from,
                         to,
                     );
-                    if !panes.is_empty() && self.chat.active_sessions.remove(&handoff.from) {
-                        self.chat.active_sessions.insert(to);
+                    if !panes.is_empty() {
+                        let was_active = self.chat.active_sessions.remove(&handoff.from);
+                        if let Some(chat) = self.chat.overrides.remove(&handoff.from) {
+                            self.chat.set_session_chat_view(to, chat);
+                        } else if was_active {
+                            self.chat.set_session_chat_view(to, true);
+                        }
                         self.chat.logs.remove(&handoff.from);
                     }
                     changed |= !panes.is_empty();
@@ -3744,6 +3749,16 @@ impl Shell {
                 }
                 self.layout.set_session(pane, session);
                 self.sync_sidebar_custom_titles(cx);
+                self.sync_focused_session(cx);
+                if self.layout.host(pane).is_local()
+                    && self
+                        .sidebar
+                        .read(cx)
+                        .session_on(&krill_app::hosts::HostId::Local, session)
+                        .is_none()
+                {
+                    self.sidebar.update(cx, sidebar::Sidebar::refresh);
+                }
                 self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
@@ -3811,6 +3826,7 @@ impl Shell {
             self.layout.clear_session(pane);
             self.layout.set_session(pane, session);
             self.sync_sidebar_custom_titles(cx);
+            self.sync_focused_session(cx);
             self.record_workspace_nav(cx);
             self.save();
             self.refresh_detached(cx);
@@ -4460,7 +4476,7 @@ impl Shell {
         let blink = active
             && !self.page_open()
             && self.dashboard.is_none()
-            && !self.is_active_chat_view()
+            && !self.is_active_chat_view_in(cx)
             && self
                 .layout
                 .focused()

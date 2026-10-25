@@ -18,6 +18,10 @@ enum Kind {
     Reconnected,
     Away,
     Notice,
+    SidebarNotice,
+    SidebarPreferenceError,
+    SidebarPollError,
+    SidebarPrGuidance,
     Stalled,
     AccountInput,
     Fix(String),
@@ -31,6 +35,10 @@ impl Kind {
             Self::Reconnected => "reconnected-banner".into(),
             Self::Away => "away-summary".into(),
             Self::Notice => "notice".into(),
+            Self::SidebarNotice => "sidebar-notice".into(),
+            Self::SidebarPreferenceError => "sidebar-preference-error".into(),
+            Self::SidebarPollError => "sidebar-poll-error".into(),
+            Self::SidebarPrGuidance => "sidebar-pr-guidance".into(),
             Self::Stalled => "stalled".into(),
             Self::AccountInput => "account-input-recovery".into(),
             Self::Fix(id) => format!("fix-{id}").into(),
@@ -75,11 +83,24 @@ impl Shell {
                 })
             });
         let mut current = Vec::new();
+        let (sb_notice, sb_pref_err, sb_poll_err, sb_pr_guidance) = {
+            let sb = self.sidebar.read(cx);
+            (
+                sb.notice().map(str::to_owned),
+                sb.preference_error().map(str::to_owned),
+                sb.poll_error().map(str::to_owned),
+                sb.pr_guidance().map(str::to_owned),
+            )
+        };
         for (kind, message) in [
             (Kind::Link, self.link.banner()),
             (Kind::Reconnected, self.reconnected.clone()),
             (Kind::Away, self.away.clone()),
             (Kind::Notice, self.notice.clone()),
+            (Kind::SidebarNotice, sb_notice),
+            (Kind::SidebarPreferenceError, sb_pref_err),
+            (Kind::SidebarPollError, sb_poll_err),
+            (Kind::SidebarPrGuidance, sb_pr_guidance),
             (Kind::Stalled, self.stalled_banner()),
         ] {
             if let Some(message) = message {
@@ -155,8 +176,14 @@ impl Shell {
                 Value::Text(message) => {
                     let message = krill_app::i18n::cached_notice(message);
                     let note = match kind {
-                        Kind::Notice | Kind::Stalled => {
+                        Kind::Notice
+                        | Kind::SidebarNotice
+                        | Kind::SidebarPollError
+                        | Kind::Stalled => {
                             Notification::new().with_type(NotificationType::Warning)
+                        }
+                        Kind::SidebarPreferenceError => {
+                            Notification::new().with_type(NotificationType::Error)
                         }
                         Kind::Link if matches!(self.link, Link::Failed(_)) => {
                             Notification::new().with_type(NotificationType::Error)
@@ -171,7 +198,11 @@ impl Shell {
                     // stack's 5s timer; the reconnected source clears after RECONNECTED_FOR.
                     let note = note.autohide(matches!(
                         kind,
-                        Kind::Notice | Kind::Away | Kind::Reconnected
+                        Kind::Notice
+                            | Kind::SidebarNotice
+                            | Kind::SidebarPrGuidance
+                            | Kind::Away
+                            | Kind::Reconnected
                     ));
                     let marker = kind.key();
                     let note = note.content(move |_, _, _| {
@@ -186,7 +217,15 @@ impl Shell {
                             .child(message.clone())
                             .into_any_element()
                     });
-                    if matches!(kind, Kind::Away | Kind::Notice) {
+                    if matches!(
+                        kind,
+                        Kind::Away
+                            | Kind::Notice
+                            | Kind::SidebarNotice
+                            | Kind::SidebarPreferenceError
+                            | Kind::SidebarPollError
+                            | Kind::SidebarPrGuidance
+                    ) {
                         let click_shell = close_shell.clone();
                         let click_kind = kind.clone();
                         let click_value = value.clone();
@@ -203,6 +242,34 @@ impl Shell {
                                             if this.notice.as_ref() == Some(message) =>
                                         {
                                             this.notice = None;
+                                        }
+                                        (Kind::SidebarNotice, Value::Text(message)) => {
+                                            this.sidebar.update(cx, |sb, cx| {
+                                                if sb.notice() == Some(message.as_str()) {
+                                                    sb.clear_notice(cx);
+                                                }
+                                            });
+                                        }
+                                        (Kind::SidebarPreferenceError, Value::Text(message)) => {
+                                            this.sidebar.update(cx, |sb, cx| {
+                                                if sb.preference_error() == Some(message.as_str()) {
+                                                    sb.clear_preference_error(cx);
+                                                }
+                                            });
+                                        }
+                                        (Kind::SidebarPollError, Value::Text(message)) => {
+                                            this.sidebar.update(cx, |sb, cx| {
+                                                if sb.poll_error() == Some(message.as_str()) {
+                                                    sb.clear_poll_error(cx);
+                                                }
+                                            });
+                                        }
+                                        (Kind::SidebarPrGuidance, Value::Text(message)) => {
+                                            this.sidebar.update(cx, |sb, cx| {
+                                                if sb.pr_guidance() == Some(message.as_str()) {
+                                                    sb.dismiss_pr_guidance(cx);
+                                                }
+                                            });
                                         }
                                         _ => {}
                                     }
@@ -284,6 +351,34 @@ impl Shell {
                                 if this.notice.as_ref() == Some(message) =>
                             {
                                 this.notice = None;
+                            }
+                            (Kind::SidebarNotice, Value::Text(message)) => {
+                                this.sidebar.update(cx, |sb, cx| {
+                                    if sb.notice() == Some(message.as_str()) {
+                                        sb.clear_notice(cx);
+                                    }
+                                });
+                            }
+                            (Kind::SidebarPreferenceError, Value::Text(message)) => {
+                                this.sidebar.update(cx, |sb, cx| {
+                                    if sb.preference_error() == Some(message.as_str()) {
+                                        sb.clear_preference_error(cx);
+                                    }
+                                });
+                            }
+                            (Kind::SidebarPollError, Value::Text(message)) => {
+                                this.sidebar.update(cx, |sb, cx| {
+                                    if sb.poll_error() == Some(message.as_str()) {
+                                        sb.clear_poll_error(cx);
+                                    }
+                                });
+                            }
+                            (Kind::SidebarPrGuidance, Value::Text(message)) => {
+                                this.sidebar.update(cx, |sb, cx| {
+                                    if sb.pr_guidance() == Some(message.as_str()) {
+                                        sb.dismiss_pr_guidance(cx);
+                                    }
+                                });
                             }
                             (Kind::Away, Value::Text(message))
                                 if this.away.as_ref() == Some(message) =>

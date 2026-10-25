@@ -165,6 +165,7 @@ pub(super) fn row_id(host: &HostId, row: &Row) -> SharedString {
         Row::HostHeader { host, .. } => format!("host/{host:?}"),
         Row::GroupHeader { key, .. } => format!("group/{key:?}"),
         Row::Repository(path) => format!("repo/{path:?}"),
+        Row::PendingWorktree { id, .. } => format!("pending/{id}"),
         Row::Worktree(path) => format!("tree/{path:?}"),
         Row::Folder(path) => format!("folder/{path:?}"),
         Row::HiddenWorktrees(path, ..) => format!("hidden/{path:?}"),
@@ -179,6 +180,7 @@ pub(super) fn same_item(a: &Row, b: &Row) -> bool {
     match (a, b) {
         (Row::HostHeader { host: a, .. }, Row::HostHeader { host: b, .. }) => a == b,
         (Row::GroupHeader { key: a, .. }, Row::GroupHeader { key: b, .. }) => a == b,
+        (Row::PendingWorktree { id: a, .. }, Row::PendingWorktree { id: b, .. }) => a == b,
         (Row::HiddenWorktrees(a, ..), Row::HiddenWorktrees(b, ..))
         | (Row::Repository(a), Row::Repository(b))
         | (Row::Worktree(a), Row::Worktree(b))

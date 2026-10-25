@@ -688,7 +688,18 @@ impl Registry {
         loop {
             let decoded = Request::decode(control::kind::REQUEST, &body);
             if !mobile {
-                if decoded.as_ref().is_ok_and(admission::protected) {
+                if decoded.as_ref().is_ok_and(|request| {
+                    admission::protected(request)
+                        || matches!(
+                            request,
+                            Request::Orchestration(
+                                krill_proto::orchestration::OrchAction::CheckMessagesLegacy {
+                                    wait_ms: 1..,
+                                    ..
+                                }
+                            )
+                        )
+                }) {
                     control_slot = None;
                 } else if control_slot.is_none() {
                     control_slot = Some(admission::control().ok_or_else(|| {
@@ -2678,6 +2689,178 @@ impl Registry {
         }
     }
 
+    /// Launch from a dispatch recorded before spawn. Overrides affect only this profile
+    /// clone, so configured accounts, trust, hooks and launch metadata remain intact.
+    fn launch_orchestration_worker(
+        &self,
+        peer: &Peer,
+        dispatch_id: &str,
+        account: Option<&str>,
+    ) -> io::Result<krill_proto::orchestration::Dispatch> {
+        use krill_proto::orchestration::{
+            DispatchSessionOrigin, DispatchStatus, OrchestrationStore, worker_launch_profile,
+        };
+        let dir = self
+            .state_dir()
+            .ok_or_else(|| io::Error::other("missing state directory"))?;
+        // The orchestration lock serializes duplicate launch requests for one dispatch.
+        OrchestrationStore::mutate(&dir, |store| {
+            let dispatch = store
+                .dispatches
+                .iter()
+                .find(|d| d.id == dispatch_id)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "dispatch not found"))?;
+            if dispatch.status != DispatchStatus::Active
+                || dispatch.session_origin == DispatchSessionOrigin::Borrowed
+            {
+                return Err(io::Error::other(
+                    "dispatch is not eligible for a new session",
+                ));
+            }
+            if dispatch.session_id.is_some() {
+                return Ok(dispatch);
+            }
+            let agents = self.agents.agents()?;
+            let (canonical, profile) = agents
+                .resolve(&dispatch.agent)
+                .ok_or_else(|| io::Error::other("unknown agent profile"))?;
+            let profile = worker_launch_profile(
+                profile,
+                canonical,
+                dispatch.model.as_deref(),
+                dispatch.effort.as_deref(),
+            )?;
+            let holder = self
+                .holder
+                .as_ref()
+                .ok_or_else(|| io::Error::other("no holder"))?;
+            let session = self.next_id();
+            let cwd = dispatch.cwd.as_bytes().to_vec();
+            let (launch, agent_session_id, account) = crate::agent::launch_selected_in(
+                &profile,
+                agents.permission,
+                session,
+                Some(&dir),
+                account,
+            )?;
+            crate::agent::pre_trust_workspace(&profile, &cwd, account.as_ref());
+            let metadata = control::AgentLaunch {
+                profile: canonical.to_owned(),
+                permission: agents.permission,
+            };
+            self.agents
+                .remember_session(session, &metadata, agent_session_id, cwd.clone(), account)
+                .inspect_err(|_| self.discard_settings(session))?;
+            let mut launch = launch;
+            for (key, value) in [
+                ("KRILL_ORCH_DEPTH", dispatch.depth.saturating_add(1)),
+                (
+                    "KRILL_ORCH_MAX_DEPTH",
+                    krill_proto::orchestration::MAX_WORKER_DEPTH,
+                ),
+            ] {
+                launch
+                    .env
+                    .push((key.as_bytes().to_vec(), value.to_string().into_bytes()));
+            }
+            let (session, _) = self
+                .spawn_holder(peer, holder, session, launch.argv, launch.env, cwd, 120, 36)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let stored = store
+                .dispatches
+                .iter_mut()
+                .find(|d| d.id == dispatch_id)
+                .ok_or_else(|| io::Error::other("dispatch missing after launch"))?;
+            stored.session_id = Some(session.0);
+            let result = stored.clone();
+            if let Ok(sid) = u32::try_from(session.0) {
+                store.session_runs.insert(sid, dispatch.run_id);
+            }
+            Ok(result)
+        })
+    }
+
+    /// Submit only a mailbox pointer to an idle live PTY, once per unacknowledged mail.
+    /// Message content stays in the durable mailbox, not in terminal input.
+    fn notify_idle_orchestration_mail(&self, dir: &Path) -> io::Result<()> {
+        use krill_proto::orchestration::{
+            DispatchReleaseState, DispatchStatus, OrchestrationStore,
+        };
+        OrchestrationStore::mutate(dir, |store| {
+            let mut targets: BTreeMap<(u64, String, Option<String>), Vec<String>> = BTreeMap::new();
+            for message in store.messages.iter().filter(|m| !m.acked) {
+                let session = if message.to == "coordinator" {
+                    store
+                        .runs
+                        .iter()
+                        .find(|r| Some(&r.id) == message.run_id.as_ref())
+                        .and_then(|r| r.coordinator_session_id)
+                } else {
+                    store
+                        .dispatches
+                        .iter()
+                        .rev()
+                        .find(|d| {
+                            d.worker_name == message.to
+                                && message.run_id.as_ref().is_none_or(|id| &d.run_id == id)
+                                && d.release_state != DispatchReleaseState::Released
+                                && !matches!(
+                                    d.status,
+                                    DispatchStatus::Abandoned
+                                        | DispatchStatus::Failed
+                                        | DispatchStatus::Released
+                                )
+                        })
+                        .and_then(|d| d.session_id)
+                };
+                let Some(sid) = session else {
+                    continue;
+                };
+                if store
+                    .idle_mail_notified
+                    .get(&sid)
+                    .is_some_and(|ids| ids.contains(&message.id))
+                {
+                    continue;
+                }
+                targets
+                    .entry((sid, message.to.clone(), message.run_id.clone()))
+                    .or_default()
+                    .push(message.id.clone());
+            }
+            for ((sid, recipient, run_id), ids) in targets {
+                let session = SessionId(sid);
+                // Waiting includes approval/questions; never type mail into those prompts.
+                if self.status.get(session).state != control::AgentState::Done {
+                    continue;
+                }
+                let tap = lock(&self.state)
+                    .sessions
+                    .get(&session)
+                    .map(|entry| entry.session.tap());
+                let Some(tap) = tap.filter(|tap| !tap.pulse().closed) else {
+                    continue;
+                };
+                // Avoid interpreting names as shell fragments, even for a login shell.
+                let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+                let run_flag = run_id
+                    .as_deref()
+                    .map(|id| format!(" --run {}", quote(id)))
+                    .unwrap_or_default();
+                let pointer = format!(
+                    "[Krill orchestration] Unread mail. Read with: krill orchestration check --to {}{} --unread --json",
+                    quote(&recipient),
+                    run_flag
+                );
+                if Self::deliver_input_to_tap(&tap, pointer.as_bytes(), true).is_ok() {
+                    store.idle_mail_notified.entry(sid).or_default().extend(ids);
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn orchestration(
         &self,
         peer: &Peer,
@@ -2691,8 +2874,35 @@ impl Registry {
         let Some(dir) = self.state_dir() else {
             return Err(Failure::Os(libc::EIO));
         };
+        let v2 = action.requires_v2();
+        let action = match action {
+            OrchAction::SetCurrentRunLegacy { run_id } => OrchAction::SetCurrentRun {
+                run_id,
+                session_id: None,
+            },
+            OrchAction::CheckMessagesLegacy {
+                recipient,
+                types,
+                unread_only,
+                ack,
+                wait_ms,
+            } => OrchAction::CheckMessages {
+                recipient,
+                types,
+                unread_only,
+                ack,
+                wait_ms,
+                run_id: None,
+                delivery_id: None,
+            },
+            action => action,
+        };
         let res: io::Result<OrchResponse> = match action {
             OrchAction::Snapshot => self.orchestration_snapshot().map(OrchResponse::Snapshot),
+            OrchAction::SnapshotV2 => self.orchestration_snapshot().map(OrchResponse::SnapshotV2),
+            OrchAction::SetCurrentRunLegacy { .. } | OrchAction::CheckMessagesLegacy { .. } => {
+                Err(io::Error::other("legacy action normalization failed"))
+            }
             OrchAction::CreateRun {
                 title,
                 coordinator_session_id,
@@ -2701,10 +2911,12 @@ impl Registry {
                     self.notify_orch();
                     OrchResponse::Run(r)
                 }),
-            OrchAction::SetCurrentRun { run_id } => OrchestrationStore::mutate(&dir, |s| {
-                s.set_current_run(run_id.as_deref())?;
-                Ok(OrchResponse::CurrentRun(s.current_run_id.clone()))
-            }),
+            OrchAction::SetCurrentRun { run_id, session_id } => {
+                OrchestrationStore::mutate(&dir, |s| {
+                    s.set_session_run(session_id, run_id.as_deref())?;
+                    Ok(OrchResponse::CurrentRun(s.current_run_id.clone()))
+                })
+            }
             OrchAction::CreateTask {
                 run_id,
                 title,
@@ -2751,11 +2963,72 @@ impl Registry {
             })
             .map(|d| {
                 self.notify_orch();
-                OrchResponse::Dispatch(d)
+                OrchResponse::Dispatch(Box::new(d))
             }),
+            OrchAction::StartWorkerConfigured { spec } => {
+                OrchestrationStore::mutate(&dir, |s| s.start_worker_configured(&spec)).map(
+                    |dispatch| {
+                        self.notify_orch();
+                        OrchResponse::DispatchV2(Box::new(dispatch))
+                    },
+                )
+            }
+            OrchAction::LaunchWorker {
+                dispatch_id,
+                account,
+            } => self
+                .launch_orchestration_worker(peer, &dispatch_id, account.as_deref())
+                .map(|dispatch| {
+                    self.notify_orch();
+                    OrchResponse::DispatchV2(Box::new(dispatch))
+                }),
+            OrchAction::WorkerStartFailed {
+                dispatch_id,
+                reason,
+            } => OrchestrationStore::mutate(&dir, |s| s.worker_start_failed(&dispatch_id, &reason))
+                .map(|dispatch| {
+                    self.notify_orch();
+                    OrchResponse::DispatchV2(Box::new(dispatch))
+                }),
+            OrchAction::ManageWorker {
+                worker_or_dispatch,
+                operation,
+                archived_output,
+            } => {
+                use krill_proto::orchestration::WorkerOperation;
+                OrchestrationStore::mutate(&dir, |store| {
+                    let result = match operation {
+                        WorkerOperation::Stop => {
+                            store.stop_or_release_worker(&worker_or_dispatch, false)
+                        }
+                        WorkerOperation::Release => {
+                            store.stop_or_release_worker(&worker_or_dispatch, true)
+                        }
+                        WorkerOperation::Retain => store.retain_worker(&worker_or_dispatch),
+                        WorkerOperation::Abandon => store.abandon_worker(&worker_or_dispatch),
+                    }?;
+                    let stored = store
+                        .dispatches
+                        .iter_mut()
+                        .find(|d| d.id == result.id)
+                        .ok_or_else(|| io::Error::other("dispatch missing"))?;
+                    if archived_output.is_some() {
+                        stored.archived_output = archived_output;
+                    }
+                    Ok(stored.clone())
+                })
+                .map(|dispatch| {
+                    self.notify_orch();
+                    OrchResponse::DispatchV2(Box::new(dispatch))
+                })
+            }
             OrchAction::SendMessage(params) => {
                 OrchestrationStore::mutate(&dir, |s| s.send_message(&params)).map(|msgs| {
                     self.notify_orch();
+                    // Mail is committed even when a best-effort PTY pointer cannot be sent.
+                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                        tracing::warn!(kind = ?error.kind(), "orchestration idle mail notification failed");
+                    }
                     OrchResponse::Messages(msgs)
                 })
             }
@@ -2765,14 +3038,50 @@ impl Registry {
                 unread_only,
                 ack,
                 wait_ms,
-            } => self.check_messages_wait(
-                &dir,
-                (recipient.as_deref(), None),
-                &types,
-                unread_only,
-                ack,
-                wait_ms,
-            ),
+                run_id,
+                delivery_id,
+            } => {
+                let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
+                loop {
+                    let seen_gen = *lock(&self.orch_signal.0);
+                    let checked = OrchestrationStore::mutate(&dir, |s| {
+                        s.check_delivery(
+                            recipient.as_deref(),
+                            &types,
+                            unread_only,
+                            ack,
+                            run_id.as_deref(),
+                            delivery_id.as_deref(),
+                        )
+                    });
+                    match checked {
+                        Ok((delivery, messages))
+                            if !messages.is_empty() || Instant::now() >= deadline =>
+                        {
+                            break Ok(if !v2 || (ack && delivery_id.is_none()) {
+                                OrchResponse::Messages(messages)
+                            } else {
+                                OrchResponse::Delivery { delivery, messages }
+                            });
+                        }
+                        Ok(_) => {
+                            let rem = deadline.saturating_duration_since(Instant::now());
+                            if rem.is_zero() {
+                                break Ok(OrchResponse::Delivery {
+                                    delivery: None,
+                                    messages: Vec::new(),
+                                });
+                            }
+                            let (lock_gen, cvar) = &self.orch_signal;
+                            let g = lock(lock_gen);
+                            if *g == seen_gen {
+                                drop(cvar.wait_timeout(g, rem.min(Duration::from_millis(250))));
+                            }
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
+            }
             OrchAction::CheckMessagesFiltered {
                 recipient,
                 run_id,
@@ -2894,13 +3203,13 @@ impl Registry {
             })
             .map(|d| {
                 self.notify_orch();
-                OrchResponse::Dispatch(d)
+                OrchResponse::Dispatch(Box::new(d))
             }),
             OrchAction::AbandonWorker { worker_or_dispatch } => {
                 OrchestrationStore::mutate(&dir, |s| s.abandon_worker(&worker_or_dispatch)).map(
                     |d| {
                         self.notify_orch();
-                        OrchResponse::Dispatch(d)
+                        OrchResponse::Dispatch(Box::new(d))
                     },
                 )
             }
@@ -2908,7 +3217,7 @@ impl Registry {
                 OrchestrationStore::mutate(&dir, |s| s.retain_worker(&worker_or_dispatch)).map(
                     |d| {
                         self.notify_orch();
-                        OrchResponse::Dispatch(d)
+                        OrchResponse::Dispatch(Box::new(d))
                     },
                 )
             }
@@ -2956,6 +3265,11 @@ fn read_only(req: &Request) -> bool {
             )
             | Request::Orchestration(
                 krill_proto::orchestration::OrchAction::Snapshot
+                    | krill_proto::orchestration::OrchAction::SnapshotV2
+                    | krill_proto::orchestration::OrchAction::CheckMessagesLegacy {
+                        ack: false,
+                        ..
+                    }
                     | krill_proto::orchestration::OrchAction::CheckMessages { ack: false, .. }
                     | krill_proto::orchestration::OrchAction::CheckMessagesFiltered {
                         ack: false,
@@ -2968,3 +3282,107 @@ fn read_only(req: &Request) -> bool {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod orchestration_delivery_tests {
+    use super::*;
+    use krill_proto::orchestration::{MessageType, OrchAction, OrchestrationStore, SendParams};
+    use std::io::Read as _;
+
+    #[test]
+    fn idle_headless_mail_pointer_is_delivered_once_and_busy_mail_is_deferred() -> io::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("krill-idle-mail-pointer-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let reg = Registry::new(None, Some(&dir));
+        let id = SessionId(411);
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        lock(&reg.state).sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: 0,
+                cwd: PathBuf::from("/tmp"),
+            },
+        );
+        let run = OrchestrationStore::mutate(&dir, |s| {
+            let run = s.create_run("mail pointers", Some(id.0))?;
+            s.start_worker(&run.id, None, "worker", "codex", Some(id.0), "/tmp", "work")?;
+            Ok(run)
+        })?;
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let status = |name: &str, ns| -> io::Result<()> {
+            reg.status.hook(&[(
+                id,
+                &HookEvent {
+                    id: hook::EventId {
+                        pid: 99,
+                        unix_ns: ns,
+                    },
+                    agent: "claude".into(),
+                    ppid: 0,
+                    input: hook::Input::Complete,
+                    payload: serde_json::to_vec(&serde_json::json!({"hook_event_name": name}))?,
+                },
+            )])?;
+            Ok(())
+        };
+        let send = |to: &str, summary: &str| -> io::Result<()> {
+            reg.orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "sender".into(),
+                    to: to.into(),
+                    msg_type: MessageType::Status,
+                    summary: summary.into(),
+                    body: "private body stays in mailbox".into(),
+                    run_id: Some(run.id.clone()),
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(())
+        };
+        status("UserPromptSubmit", 1)?;
+        send("worker", "busy mail")?;
+        let mut bytes = [0_u8; 4096];
+        assert!(terminal.read(&mut bytes).is_err());
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .idle_mail_notified
+                .is_empty()
+        );
+        status("Stop", 2)?;
+        // A subsequent send retries previously unnotified mail for newly idle recipients.
+        send("coordinator", "wake idle coordinator")?;
+        let count = terminal.read(&mut bytes)?;
+        let pointer = String::from_utf8_lossy(bytes.get(..count).unwrap());
+        assert!(pointer.contains("orchestration check --to"));
+        assert!(pointer.contains(&run.id));
+        assert!(!pointer.contains("private body"));
+        let recorded = OrchestrationStore::load(&dir)?.idle_mail_notified;
+        assert!(recorded.get(&id.0).is_some_and(|ids| ids.len() == 3));
+        // Drain the second mailbox pointer if the socket split the writes.
+        while terminal.read(&mut bytes).is_ok() {}
+        reg.notify_idle_orchestration_mail(&dir)?;
+        assert!(terminal.read(&mut bytes).is_err());
+        assert_eq!(OrchestrationStore::load(&dir)?.idle_mail_notified, recorded);
+        drop(reg);
+        drop(terminal);
+        std::fs::remove_dir_all(dir)
+    }
+}

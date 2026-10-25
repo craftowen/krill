@@ -1719,3 +1719,97 @@ fn codex_no_daemon_probe_and_zsh_wrapper_isolate_sessions() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn zsh_wrapper_handles_compdef_before_compinit_without_error() {
+    if !Path::new("/bin/zsh").exists() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("krill-zsh-compdef-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // 1. .zshrc에서 compinit 없이 compdef만 호출하는 경우(예: openclaw.zsh)
+    std::fs::write(
+        home.join(".zshrc"),
+        "compdef _openclaw_root_completion openclaw\n",
+    )
+    .unwrap();
+
+    let mut login = Launch {
+        argv: vec![b"/bin/zsh".to_vec(), b"-l".to_vec()],
+        env: vec![
+            kv("HOME", home.to_str().unwrap()),
+            kv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+        ],
+    };
+    super::inject_zsh_env(&mut login, &state);
+    let out = Command::new("/bin/zsh")
+        .args([
+            "-l",
+            "-i",
+            "-c",
+            "__krill_sync_accounts; printf 'comp=%s\\n' \"${_comps[openclaw]-missing}\"",
+        ])
+        .env_clear()
+        .envs(
+            login
+                .env
+                .iter()
+                .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr={stderr} stdout={stdout}");
+    assert!(
+        !stderr.contains("command not found: compdef"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("comp=_openclaw_root_completion"),
+        "stdout={stdout} stderr={stderr}"
+    );
+
+    // 2. .zshrc에서 compdef 호출 뒤 나중에 compinit이 실행되는 경우(예: openclaw.zsh + ~/.bun/_bun)
+    std::fs::write(
+        home.join(".zshrc"),
+        "compdef _openclaw_root_completion openclaw\nautoload -U compinit && compinit -u\ncompdef _bun bun\n",
+    )
+    .unwrap();
+    let out = Command::new("/bin/zsh")
+        .args([
+            "-l",
+            "-i",
+            "-c",
+            "__krill_sync_accounts; printf 'openclaw=%s bun=%s\\n' \"${_comps[openclaw]-missing}\" \"${_comps[bun]-missing}\"",
+        ])
+        .env_clear()
+        .envs(
+            login
+                .env
+                .iter()
+                .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr={stderr} stdout={stdout}");
+    assert!(
+        !stderr.contains("command not found: compdef"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("openclaw=_openclaw_root_completion bun=_bun"),
+        "stdout={stdout} stderr={stderr}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

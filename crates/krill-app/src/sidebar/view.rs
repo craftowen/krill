@@ -541,6 +541,9 @@ impl Sidebar {
     }
 
     pub(super) fn worktree_card_active(&self, index: usize, path: &std::path::Path) -> bool {
+        if matches!(self.cursor_row(), Some(Row::PendingWorktree { .. })) {
+            return false;
+        }
         // A selected workspace owns the entire selection surface. Old terminal focus
         // must not leave another project (or a same-ID remote session) highlighted.
         if let Some(cursor) = self.cursor
@@ -556,6 +559,13 @@ impl Sidebar {
         }
         self.selected_workspace()
             .is_some_and(|(host, folder)| self.row_host(index) == &host && folder == path)
+    }
+
+    pub(super) fn is_session_focused(&self, index: usize, id: krill_proto::SessionId) -> bool {
+        self.row_host(index).is_local()
+            && self.focused == Some(id)
+            && self.cursor.is_none_or(|c| self.row_host(c).is_local())
+            && !matches!(self.cursor_row(), Some(Row::PendingWorktree { .. }))
     }
 
     /// 카드 머리줄과 세션을 따로 가상화하되 표면·테두리는 끊김 없이 잇는다.
@@ -638,11 +648,19 @@ impl Sidebar {
             .border_r_1()
             .border_color(ui::TRANSPARENT)
             .when(last, |d| d.mb_0p5().border_b_1().rounded_b(ui::RADIUS_MD))
-            .when(self.worktree_card_active(parent, path), |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.sidebar_ring.opacity(0.65))
+            .when(active, |d| {
+                let row_highlighted = matches!(
+                    row,
+                    Row::Session(s, _) if self.cursor == Some(index) || self.is_session_focused(index, s.id)
+                );
+                d.bg(if row_highlighted {
+                    p.worktree_sidebar_accent
+                } else {
+                    p.worktree_sidebar
+                })
+                .border_color(p.sidebar_ring.opacity(0.65))
             })
-            .when(depth > 0 && !self.worktree_card_active(parent, path), |d| {
+            .when(depth > 0 && !active, |d| {
                 d.border_l_2().border_color(p.worktree_sidebar_border)
             })
     }
@@ -1189,6 +1207,9 @@ impl Sidebar {
                 super::external::render_hidden_row(base, repo, *count, *expanded, cx)
                     .ml(px(6. + CHILD_INDENT + host_indent))
             }
+            Row::PendingWorktree { name, .. } => {
+                self.render_pending_worktree(base, index, name, cx)
+            }
             Row::Worktree(path) => self.render_worktree(base, index, path, cx),
             Row::Session(session, nested) => {
                 let id = session.id;
@@ -1225,6 +1246,7 @@ impl Sidebar {
                     })
                     .flatten();
                 let inside_card = self.session_card_index(index).is_some();
+                let session_highlighted = selected || self.is_session_focused(index, id);
                 // 프로젝트 기준 보기에서 카드 밖 원격 세션(폴더·작업 폴더 모르는 세션)은 PC 배지로 구분한다.
                 let host_label = (self.options.group_by == super::GroupBy::Repo && !inside_card)
                     .then(|| {
@@ -1277,7 +1299,15 @@ impl Sidebar {
                         d.pl(px(pl)).pr_2()
                     })
                     .cursor_pointer()
-                    .text_color(p.sidebar_foreground)
+                    .when(!session_highlighted, |d| d.text_color(p.sidebar_foreground))
+                    .when(session_highlighted, |d| {
+                        d.bg(if inside_card {
+                            p.worktree_sidebar_accent
+                        } else {
+                            p.sidebar_accent
+                        })
+                        .text_color(p.sidebar_accent_foreground)
+                    })
                     .hover(|d| {
                         d.bg(if inside_card {
                             p.worktree_sidebar_accent
@@ -1563,6 +1593,123 @@ impl Sidebar {
     fn worktree_margin(&self, lineage_depth: usize) -> f32 {
         let depth = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
         6. + CHILD_INDENT + self.host_indent() + depth * 14.
+    }
+
+    fn render_pending_worktree(
+        &self,
+        base: gpui::Stateful<gpui::Div>,
+        index: usize,
+        name: &str,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use krill_proto::control::AgentState;
+
+        let p = ui::palette(cx);
+        let active = self.cursor == Some(index);
+        let status_label = crate::i18n::catalog::worktree::CREATING_ROW.get();
+        let left_margin = px(self.worktree_margin(0));
+        let spinner = status::status_glyph_slot(
+            AgentState::Working,
+            false,
+            Size::Sm,
+            self.spinner_slots(index),
+            cx,
+        );
+        let card = base
+            .debug_selector(move || format!("pending-worktree-{index}"))
+            .aria_label(format!("{name}, {status_label}"))
+            .mr_1p5()
+            .ml(left_margin)
+            .my_0p5()
+            .px_2p5()
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .when(active, |d| {
+                d.bg(p.worktree_sidebar)
+                    .border_color(p.sidebar_ring.opacity(0.65))
+            })
+            .when(!active, |d| {
+                d.bg(p.worktree_sidebar.opacity(0.6))
+                    .border_color(p.worktree_sidebar_border)
+            })
+            .text_color(p.worktree_sidebar_foreground)
+            .flex()
+            .flex_col();
+
+        if self.options.card_layout == super::CardLayout::Compact {
+            return card.min_h(px(28.)).child(
+                div()
+                    .w_full()
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(spinner),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(name.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(status_label),
+                    ),
+            );
+        }
+
+        card.py_2()
+            .gap_0p5()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(spinner),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(name.to_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(20.))
+                    .truncate()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(status_label),
+            )
     }
 
     fn render_worktree(
@@ -2326,6 +2473,7 @@ impl Sidebar {
                                 let (sess_name, _) = self.session_label_on(&row_host, sess);
                                 let sess_unread = row_host.is_local() && self.is_unread(sess.id);
                                 let sess_id = sess.id;
+                                let sess_focused = self.is_session_focused(index, sess_id);
                                 let sess_host = row_host.clone();
                                 d.child(
                                     div()
@@ -2344,6 +2492,7 @@ impl Sidebar {
                                         .items_center()
                                         .gap_1p5()
                                         .cursor_pointer()
+                                        .when(sess_focused, |d| d.bg(p.worktree_sidebar_accent))
                                         .hover(|d| d.bg(p.worktree_sidebar_accent))
                                         .child(status::status_glyph_slot(
                                             sess.status.state,
@@ -2366,7 +2515,14 @@ impl Sidebar {
                                                 .min_w_0()
                                                 .truncate()
                                                 .text_size(ui::TEXT_XS)
-                                                .text_color(p.muted_foreground)
+                                                .text_color(if sess_focused {
+                                                    p.sidebar_accent_foreground
+                                                } else {
+                                                    p.muted_foreground
+                                                })
+                                                .when(sess_focused, |d| {
+                                                    d.font_weight(gpui::FontWeight::MEDIUM)
+                                                })
                                                 .child(sess_name),
                                         )
                                         .when(sess.status.since_unix_ns > 0, |d| {
@@ -3059,6 +3215,11 @@ impl Render for Sidebar {
         let setup_prompt = self.render_setup_prompt_card(cx);
         let rename = self.render_rename(cx);
         let delete_confirm = self.render_delete_confirm(window, cx);
+        let modal_creating = self
+            .creating
+            .as_ref()
+            .filter(|(dialog, _)| !dialog.read(cx).is_background())
+            .map(|(dialog, _)| dialog.clone());
         let projects: Vec<_> = self
             .snapshot
             .trees
@@ -3075,7 +3236,7 @@ impl Render for Sidebar {
         div()
             .id("sidebar")
             .when(
-                self.editing.is_none() && self.creating.is_none() && self.delete_confirm.is_none(),
+                self.editing.is_none() && modal_creating.is_none() && self.delete_confirm.is_none(),
                 |d| d.key_context(KEY_CONTEXT),
             )
             .when_some(self.focus.as_ref(), InteractiveElement::track_focus)
@@ -3204,105 +3365,9 @@ impl Render for Sidebar {
                             }),
                     ),
             )
-            .children(self.error.clone().map(|e| {
-                ui::error_banner(p, crate::i18n::cached_notice(&e))
-                    .id("sidebar-preference-error")
-                    .debug_selector(|| "sidebar-preference-error".into())
-                    .mx_2()
-                    .my_0p5()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.destructive.opacity(0.15)))
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        s.error = None;
-                        cx.notify();
-                    }))
-            }))
-            .children(self.poll_error.clone().map(|e| {
-                div()
-                    .mx_2()
-                    .my_0p5()
-                    .px_3()
-                    .py_2()
-                    .rounded(ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(p.warning.opacity(0.3))
-                    .bg(p.warning.opacity(0.1))
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.warning)
-                    .child(crate::i18n::cached_notice(&e))
-            }))
-            .children(
-                (!self.pr_guidance_dismissed)
-                    .then(|| {
-                        self.prs
-                            .values()
-                            .find_map(crate::pull_request::Status::guidance)
-                    })
-                    .flatten()
-                    .map(|hint| {
-                        div()
-                            .id("sidebar-pr-guidance")
-                            .debug_selector(|| "sidebar-pr-guidance".into())
-                            .px_3()
-                            .py_1()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_1p5()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
-                            .active(|d| d.bg(p.accent))
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.pr_guidance_dismissed = true;
-                                cx.notify();
-                            }))
-                            .child(div().flex_1().min_w_0().child(hint))
-                            .child(
-                                ui::button_with_tooltip(
-                                    Button::new("sidebar-pr-guidance-dismiss")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Close),
-                                    "sidebar-pr-guidance-dismiss",
-                                    text::CANCEL.get(),
-                                )
-                                .debug_selector(|| "sidebar-pr-guidance-dismiss".into())
-                                .on_click(cx.listener(
-                                    |s, _, _, cx| {
-                                        cx.stop_propagation();
-                                        s.pr_guidance_dismissed = true;
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                    }),
-            )
-            .children(self.notice.clone().map(|e| {
-                div()
-                    .id("sidebar-notice")
-                    .mx_2()
-                    .my_0p5()
-                    .px_3()
-                    .py_2()
-                    .rounded(ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(p.warning.opacity(0.3))
-                    .bg(p.warning.opacity(0.1))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.warning.opacity(0.15)))
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.warning)
-                    .child(crate::i18n::cached_notice(&e))
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        s.notice = None;
-                        cx.notify();
-                    }))
-            }))
             .children(setup_prompt)
             .children(rename)
-            .children(self.creating.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(modal_creating)
             .children(delete_confirm)
             .when(self.rows.is_empty(), |d| {
                 d.child(
