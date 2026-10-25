@@ -1854,3 +1854,56 @@ fn late_hook_cannot_resurrect_a_deleted_session_or_launch_metadata() {
     drop(user);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn reserved_remote_fs_requests_are_rejected_without_filesystem_access() {
+    use krill_proto::remote_fs::RemoteFsRequest;
+    assert_eq!(ipc::FEATURES & control::FEAT_REMOTE_FS, 0);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let thread = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        Registry::new(None, None).serve(server, &hello).unwrap();
+    });
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(
+        ServerHello::decode(kind, &body).unwrap().features & control::FEAT_REMOTE_FS,
+        0
+    );
+    let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+    hello.features = FEAT_CONTROL | control::FEAT_REMOTE_FS;
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    for request in [
+        RemoteFsRequest::Stat {
+            path: b"/reserved".to_vec(),
+        },
+        RemoteFsRequest::WriteAtomic {
+            path: b"/reserved".to_vec(),
+            bytes: b"blocked".to_vec(),
+            expected: None,
+            stage_id: 0,
+            offset: 0,
+            commit: true,
+        },
+        RemoteFsRequest::PortForward { port: 8080 },
+    ] {
+        client
+            .write_all(&Request::RemoteFs(request).encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        assert_eq!(
+            Reply::decode(kind, &body).unwrap(),
+            Reply::Failed(Failure::BadRequest)
+        );
+    }
+    drop(client);
+    thread.join().unwrap();
+}

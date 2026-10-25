@@ -43,6 +43,7 @@ pub(super) fn protected(request: &krill_proto::control::Request) -> bool {
                     | OrchAction::CheckMessagesFiltered { wait_ms: 1.., .. }
                     | OrchAction::WaitAnswer { wait_ms: 1.., .. }
             )
+            | Request::RemoteFs(krill_proto::remote_fs::RemoteFsRequest::PortForward { .. })
     )
 }
 

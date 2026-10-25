@@ -16,6 +16,7 @@ pub mod monitor;
 mod os;
 pub mod registry;
 pub mod rejoin;
+pub mod remote_fs;
 mod resources;
 pub mod scope;
 pub mod search;

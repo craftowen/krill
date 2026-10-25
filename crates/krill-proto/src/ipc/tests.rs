@@ -348,6 +348,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
             crate::control::FEAT_WORKTREE_PREPARE,
             52,
         ),
+        ("FEAT_REMOTE_FS", crate::control::FEAT_REMOTE_FS, 27),
     ];
     // 새 상수를 표·fixture 양쪽에서 빠뜨리는 것도 잡는다.
     let declared: std::collections::BTreeSet<_> =

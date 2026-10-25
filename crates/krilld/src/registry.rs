@@ -816,6 +816,37 @@ impl Registry {
                 )) if n.features & krill_proto::orchestration::FEAT_ORCH_RETAIN == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::RemoteFs(_)) if n.features & control::FEAT_REMOTE_FS == 0 => {
+                    Reply::Failed(Failure::BadRequest)
+                }
+                Ok(Request::RemoteFs(krill_proto::remote_fs::RemoteFsRequest::PortForward {
+                    port,
+                })) => {
+                    if role == Role::Observer || peer.scope != Scope::Full {
+                        peer.deny("port-forward", &self.audit);
+                        s.write_all(&Reply::Failed(Failure::Denied).encode()?)?;
+                        return Ok(());
+                    }
+                    match crate::remote_fs::connect_loopback_port(port) {
+                        Ok(tcp) => {
+                            let ok = Reply::RemoteFs(
+                                krill_proto::remote_fs::RemoteFsReply::PortForwarded(Ok(())),
+                            );
+                            s.write_all(&ok.encode()?)?;
+                            s.flush().ok();
+                            drop(control_slot);
+                            crate::remote_fs::bridge_streams(s, tcp);
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            let failed = Reply::RemoteFs(
+                                krill_proto::remote_fs::RemoteFsReply::PortForwarded(Err(err)),
+                            );
+                            s.write_all(&failed.encode()?)?;
+                            return Ok(());
+                        }
+                    }
+                }
                 Ok(req) if role == Role::Observer && !read_only(&req) => {
                     Reply::Failed(Failure::Denied)
                 }
@@ -1075,6 +1106,14 @@ impl Registry {
                 wait_submit,
             } => self.send_input(peer, session, &bytes, submit, wait_submit),
             Request::Orchestration(action) => self.orchestration(peer, action),
+            Request::RemoteFs(req) => {
+                if peer.scope == Scope::Full {
+                    Ok(Reply::RemoteFs(crate::remote_fs::serve(req)))
+                } else {
+                    peer.deny("remote-fs", &self.audit);
+                    Err(Failure::Denied)
+                }
+            }
         };
         r.unwrap_or_else(Reply::Failed)
     }
@@ -3343,7 +3382,8 @@ fn read_only(req: &Request) -> bool {
                         ..
                     }
             )
-    )
+            | Request::RemoteFs(_)
+    ) && !matches!(req, Request::RemoteFs(r) if !r.is_read_only())
 }
 
 #[cfg(test)]

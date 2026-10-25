@@ -101,6 +101,8 @@ pub use crate::ipc::FEAT_GIT_SYNC;
 pub const FEAT_SESSION_ACCOUNT: u64 = 1 << 58;
 /// 세션 스크롤백 지우기 요청(OWE-873b, 지휘자 배정). [`Request::ClearScrollback`]·[`Reply::ScrollbackCleared`] 한 쌍.
 pub const FEAT_CLEAR_SCROLLBACK: u64 = 1 << 47;
+/// 원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩. [`Request::RemoteFs`]·[`Reply::RemoteFs`] 한 쌍.
+pub const FEAT_REMOTE_FS: u64 = 1 << 27;
 /// 캡처 한 번의 최대 바이트. 넘으면 잘라내지 않고 `BadRequest`로 거부한다.
 pub const MAX_CAPTURE: usize = 512 * 1024;
 
@@ -240,6 +242,8 @@ pub enum Request {
         session: SessionId,
         since: Option<CaptureStamp>,
     },
+    /// `FEAT_REMOTE_FS` 필요. 원격 파일 탐색·읽기·원자적 저장·Quick Open·루프백 포트 포워딩.
+    RemoteFs(crate::remote_fs::RemoteFsRequest),
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -891,6 +895,8 @@ pub enum Reply {
         #[serde(deserialize_with = "optional_capture_bytes")]
         bytes: Option<Vec<u8>>,
     },
+    /// `FEAT_REMOTE_FS` 필요. [`Request::RemoteFs`]의 응답.
+    RemoteFs(crate::remote_fs::RemoteFsReply),
 }
 
 /// Only meaningful in one negotiated daemon incarnation; includes session to prevent cross-scope reuse.
