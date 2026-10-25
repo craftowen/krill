@@ -84,6 +84,7 @@ impl<W: Write> Pane<W> {
                     line: last,
                     column: screen.cols.saturating_sub(1),
                 },
+                block: false,
             }
             .text(&screen);
             return Ok(Some(text));

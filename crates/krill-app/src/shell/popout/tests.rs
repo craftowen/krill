@@ -485,7 +485,7 @@ fn dashboard_provider_uses_status_foreground_and_original_title_after_rename() {
 #[gpui::test]
 fn dashboard_expands_and_keeps_readable_lanes_in_small_windows(cx: &mut TestAppContext) {
     let (main, window) = open(cx);
-    cx.simulate_keystrokes(window, "alt-cmd-shift-a");
+    cx.simulate_keystrokes(window, "cmd-shift-l");
     cx.run_until_parked();
     let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
     dashboard.update(cx, |d, cx| {
@@ -568,7 +568,7 @@ fn dashboard_many_cards_scroll_to_last_at_large_zoom(cx: &mut TestAppContext) {
         }
     }
     let (_, window) = open(cx);
-    cx.simulate_keystrokes(window, "alt-cmd-shift-a");
+    cx.simulate_keystrokes(window, "cmd-shift-l");
     let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
     dashboard.update(cx, |d, cx| {
         d.sidebar
@@ -595,7 +595,7 @@ fn dashboard_many_cards_scroll_to_last_at_large_zoom(cx: &mut TestAppContext) {
 #[gpui::test]
 fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     let (main, main_window) = open(cx);
-    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.simulate_keystrokes(main_window, "cmd-shift-l");
     cx.run_until_parked();
     let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
     cx.update(|cx| {
@@ -694,7 +694,7 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
         .unwrap();
 
     // 플로팅 창에서 에이전트 대시보드를 호출하면 메인 창에 인앱 모달을 띄운다.
-    cx.simulate_keystrokes(floating.into(), "alt-cmd-shift-a");
+    cx.simulate_keystrokes(floating.into(), "cmd-shift-l");
     cx.run_until_parked();
     assert!(
         cx.read(|cx| existing_dashboard(cx).is_some()),
@@ -716,7 +716,8 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
 fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
     let (main, main_window) = open(cx);
     // 세션 2번 칸에 테스트 PTY를 붙여 미리보기가 생기게 한다.
-    let (ours, _peer) = UnixStream::pair().unwrap();
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_nonblocking(true).unwrap();
     cx.update(|cx| {
         main.update(cx, |s, cx| {
             let pane = s.layout.active_tab().focused;
@@ -724,7 +725,7 @@ fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
             s.attach_test(pane, SessionId(2), ours, cx);
         });
     });
-    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.simulate_keystrokes(main_window, "cmd-shift-l");
     cx.run_until_parked();
     let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
     cx.update(|cx| {
@@ -744,12 +745,23 @@ fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
     // 미리보기가 없는 세션 0번 카드: NO_PREVIEW만 있고 PREVIEW는 없다.
     assert!(visual.debug_bounds("dashboard-no-preview-0").is_some());
     assert!(visual.debug_bounds("dashboard-preview-0").is_none());
-    // Esc로 닫힌다.
+    // 뒷배경 Shell이나 사이드바로 포커스가 넘어가더라도 대시보드가 열려 있는 동안
+    // Esc는 대시보드를 닫아야 하며 뒷배경 PTY로 `\x1b`를 보내지 않는다.
+    visual.update(|window, cx| {
+        let focus = main.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    });
     visual.simulate_keystrokes("escape");
     visual.run_until_parked();
     assert!(
         cx.read(|cx| existing_dashboard(cx).is_none()),
         "escape closes dashboard"
+    );
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        std::io::Read::read(&mut peer, &mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "escape while dashboard is open must not send \\x1b to background session PTY"
     );
 }
 
@@ -796,7 +808,7 @@ fn floating_find_shortcut_opens_search(cx: &mut TestAppContext) {
 #[gpui::test]
 fn dashboard_escape_closes_window(cx: &mut TestAppContext) {
     let (_main, main_window) = open(cx);
-    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.simulate_keystrokes(main_window, "cmd-shift-l");
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.read(|cx| existing_dashboard(cx).is_some()));
@@ -814,7 +826,7 @@ fn dashboard_stable_poll_does_not_notify_and_changed_snapshot_refreshes(cx: &mut
         }
     }
     let (main, main_window) = open(cx);
-    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.simulate_keystrokes(main_window, "cmd-shift-l");
     cx.run_until_parked();
     let entity = cx.read(|cx| existing_dashboard(cx).unwrap());
     cx.update(|cx| {
@@ -933,8 +945,8 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
         });
     });
     cx.run_until_parked();
-    // Pressing Shift+Option+Cmd+A while SettingsView is open opens the Dashboard modal.
-    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    // Pressing Shift+Cmd+L while SettingsView is open opens the Dashboard modal.
+    cx.simulate_keystrokes(main_window, "cmd-shift-l");
     cx.run_until_parked();
     main.read_with(cx, |shell, cx| {
         assert!(shell.dashboard.is_some());

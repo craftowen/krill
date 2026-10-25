@@ -83,4 +83,16 @@ fn agy_presence_beats_old_brain_handles_but_ambiguity_fails_closed() {
         )
         .is_err()
     );
+    let wal_found = from_paths(
+        ProviderKind::Antigravity,
+        [
+            root.join("conversations/wal-only.db-wal"),
+            root.join("conversations/wal-only.db-shm"),
+        ],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(wal_found.id, "wal-only");
+    assert_eq!(wal_found.home, root);
+    assert_eq!(wal_found.path, root.join("conversations/wal-only.db"));
 }

@@ -660,8 +660,11 @@ pub struct Shell {
     /// 상태바 사용량 팝업의 "사용량 초기화" 1단계(무장). 메뉴가 닫혔다 다시 열리면 확인 행을 보인다.
     pub(super) reset_armed: Option<(krill_proto::usage::ProviderKind, String)>,
     account_handoff_poll: Option<Task<()>>,
+    remote_account_handoff_polls: BTreeMap<krill_app::hosts::HostId, Task<()>>,
     account_cancel: Option<krill_proto::SessionId>,
     pub(super) accounts_snapshot: Arc<krill_proto::usage::AccountsSnapshot>,
+    pub(super) remote_accounts:
+        BTreeMap<krill_app::hosts::HostId, Arc<krill_proto::usage::AccountsSnapshot>>,
     pub(super) ssh_hosts: Vec<krill_app::ssh_hosts::SshHost>,
     pub(super) host_manager: krill_app::hosts::HostManager,
     /// 같은 기기를 가리키는 중복 등록 id → 대표 id(`ssh -G` 기준, 백그라운드에서 구한다).
@@ -1162,9 +1165,11 @@ impl Shell {
             closed_sessions: Vec::new(),
             closed_tabs: Vec::new(),
             accounts_snapshot,
+            remote_accounts: BTreeMap::new(),
             usage_refresh: None,
             reset_armed: None,
             account_handoff_poll: None,
+            remote_account_handoff_polls: BTreeMap::new(),
             account_cancel: None,
             accounts_poll: None,
             update_poll: None,
@@ -1702,6 +1707,13 @@ impl Shell {
             self.settings = Some(created.clone());
             created
         };
+        self.sync_settings_account_hosts(cx);
+        if tab == krill_app::settings::AdminTab::Accounts {
+            let active_host = self.active_account_host();
+            if active_host.is_remote() {
+                view.update(cx, |v, cx| v.select_account_host(active_host, cx));
+            }
+        }
         let visible = window.as_deref().is_some_and(Window::is_window_active);
         view.update(cx, |view, cx| view.set_visible(visible, cx));
         self.nav_history.push(NavEntry::Settings(tab));
@@ -2386,11 +2398,33 @@ impl Shell {
                     this.host_aliases = aliases;
                     this.host_statuses = statuses;
                     this.host_targets = targets;
+                    this.remote_accounts
+                        .retain(|host, _| this.host_targets.contains_key(host));
+                    this.remote_account_handoff_polls
+                        .retain(|host, _| this.host_targets.contains_key(host));
+                    let connected_remotes: Vec<krill_app::hosts::HostId> = this
+                        .host_statuses
+                        .iter()
+                        .filter(|(_, status)| *status == krill_app::hosts::HostStatus::Connected)
+                        .map(|(spec, _)| krill_app::hosts::HostId::Remote(spec.id.clone()))
+                        .collect();
+                    for host in connected_remotes {
+                        if !this.remote_accounts.contains_key(&host)
+                            && this.host_targets.contains_key(&host)
+                        {
+                            this.refresh_accounts_for_host(
+                                host,
+                                krill_proto::usage::UsageRequest::ListAccounts,
+                                cx,
+                            );
+                        }
+                    }
                     if this.paths.is_some() {
                         let manager = this.host_manager.clone();
                         this.sidebar
                             .update(cx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
                     }
+                    this.sync_settings_account_hosts(cx);
                     this.sync(cx);
                     cx.notify();
                 }
@@ -2420,6 +2454,78 @@ impl Shell {
     pub(super) fn target_for_pane(&self, pane: PaneId) -> Option<krill_app::hosts::HostTarget> {
         let host = self.layout.host(pane);
         self.target_for_host(host)
+    }
+
+    /// 상태바·새 세션·설정 진입 시 우선할 계정 대상 호스트.
+    /// 메뉴에서 원격 실행 위치(`launch_host`)를 골랐거나 원격 칸이 포커스된 상태면 그 원격 호스트를,
+    /// 그 외에는 로컬 호스트를 돌려준다.
+    pub(super) fn active_account_host(&self) -> krill_app::hosts::HostId {
+        if self.launch_host.is_remote() {
+            return self.launch_host.clone();
+        }
+        if !self.page_open()
+            && self.dashboard.is_none()
+            && let Some(pane) = self.layout.focused()
+            && self.layout.host(pane).is_remote()
+        {
+            return self.layout.host(pane).clone();
+        }
+        krill_app::hosts::HostId::Local
+    }
+
+    pub(super) fn accounts_for_host(
+        &self,
+        host: &krill_app::hosts::HostId,
+    ) -> Arc<krill_proto::usage::AccountsSnapshot> {
+        match host {
+            krill_app::hosts::HostId::Local => self.accounts_snapshot.clone(),
+            krill_app::hosts::HostId::Remote(_) => {
+                self.remote_accounts.get(host).cloned().unwrap_or_else(|| {
+                    if self.host_targets.contains_key(host) {
+                        Arc::default()
+                    } else {
+                        self.accounts_snapshot.clone()
+                    }
+                })
+            }
+        }
+    }
+
+    pub(super) fn sync_settings_account_hosts(&self, cx: &mut Context<Self>) {
+        let Some(settings) = &self.settings else {
+            return;
+        };
+        let mut hosts: Vec<(
+            krill_app::hosts::HostId,
+            String,
+            Option<krill_app::hosts::HostTarget>,
+        )> = self
+            .execution_locations(cx)
+            .into_iter()
+            .map(|(host, label)| {
+                let target = self.target_for_host(&host);
+                (host, label, target)
+            })
+            .collect();
+        for (host, target) in &self.host_targets {
+            if !hosts.iter().any(|(h, _, _)| h == host) {
+                hosts.push((
+                    host.clone(),
+                    host.remote_id().unwrap_or_else(|| host.as_key()).to_owned(),
+                    Some(target.clone()),
+                ));
+            }
+        }
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(
+            krill_app::hosts::HostId::Local,
+            (*self.accounts_snapshot).clone(),
+        );
+        for (host, snap) in &self.remote_accounts {
+            snapshots.insert(host.clone(), (**snap).clone());
+        }
+        let settings = settings.clone();
+        settings.update(cx, |v, cx| v.sync_account_hosts(hosts, snapshots, cx));
     }
 
     pub(super) fn new_tab_on_launch_host(&mut self, cx: &mut Context<Self>) {
@@ -2476,7 +2582,25 @@ impl Shell {
         if self.terminal_theme != krill_app::ui::terminal_theme(cx) {
             self.push_appearance(cx);
         }
+        if let Some(settings) = &self.settings {
+            let (selected_host, selected_snap) = {
+                let view = settings.read(cx);
+                (view.account_host().clone(), view.accounts().clone())
+            };
+            if selected_host.is_remote() {
+                self.remote_accounts
+                    .insert(selected_host, Arc::new(selected_snap));
+            }
+        }
         self.refresh_local_state(cx);
+        let active_host = self.active_account_host();
+        if active_host.is_remote() && self.host_targets.contains_key(&active_host) {
+            self.refresh_accounts_for_host(
+                active_host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+        }
         self.sidebar
             .update(cx, krill_app::sidebar::Sidebar::reload_external);
         if let Some(host) = krill_app::settings::take_pending_ssh_connect(cx) {
@@ -2493,13 +2617,15 @@ impl Shell {
                 });
             }
         }
+        let cmd_host = krill_app::settings::take_pending_terminal_host(cx)
+            .unwrap_or(krill_app::hosts::HostId::Local);
         let mut ran_terminal_cmd = false;
         while let Some(cmd) = krill_app::settings::take_pending_terminal_command(cx) {
             if !ran_terminal_cmd {
                 self.close_settings(None, cx);
                 ran_terminal_cmd = true;
             }
-            self.run_terminal_command(&cmd, None, cx);
+            self.run_terminal_command_on(&cmd_host, &cmd, None, cx);
         }
         if ran_terminal_cmd && let Some(win) = self.window {
             let focus = self.focus.clone();
@@ -2530,7 +2656,11 @@ impl Shell {
         self.local_generation = self.local_generation.wrapping_add(1);
         let generation = self.local_generation;
         if self.link == Link::Up {
-            self.refresh_accounts(krill_proto::usage::UsageRequest::ListAccounts, cx);
+            self.refresh_accounts_for_host(
+                krill_app::hosts::HostId::Local,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
             self.refresh_ssh_hosts(cx);
             return;
         }
@@ -2603,7 +2733,11 @@ impl Shell {
                 self.load_away_summary(since, cx);
             }
             self.load_agents(None, cx);
-            self.refresh_accounts(krill_proto::usage::UsageRequest::ListAccounts, cx);
+            self.refresh_accounts_for_host(
+                krill_app::hosts::HostId::Local,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
             self.refresh_ssh_hosts(cx);
             if self.role == WindowRole::Main
                 && self.update_poll.is_none()
@@ -2623,8 +2757,21 @@ impl Shell {
         if self.usage_refresh.is_some() {
             return;
         }
-        let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
-            self.refresh_accounts(krill_proto::usage::UsageRequest::ListAccounts, cx);
+        let host = self.active_account_host();
+        let target = match &host {
+            krill_app::hosts::HostId::Local => self
+                .paths
+                .clone()
+                .filter(|_| self.link == Link::Up)
+                .map(krill_app::hosts::HostTarget::local),
+            krill_app::hosts::HostId::Remote(_) => self.target_for_host(&host),
+        };
+        let Some(target) = target else {
+            self.refresh_accounts_for_host(
+                host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
             return;
         };
         cx.notify();
@@ -2632,16 +2779,16 @@ impl Shell {
             let first = cx
                 .background_executor()
                 .spawn({
-                    let paths = paths.clone();
+                    let target = target.clone();
                     async move {
                         // 사용자가 누른 새로고침만 조회 주기를 무시한다. 구 데몬은 `ListAccounts`로.
-                        krill_app::accounts::request_ipc(
-                            &paths,
+                        krill_app::accounts::request_target(
+                            &target,
                             &krill_proto::usage::UsageRequest::RefreshUsage,
                         )
                         .or_else(|_| {
-                            krill_app::accounts::request_ipc(
-                                &paths,
+                            krill_app::accounts::request_target(
+                                &target,
                                 &krill_proto::usage::UsageRequest::ListAccounts,
                             )
                         })
@@ -2651,7 +2798,7 @@ impl Shell {
             let ok = this
                 .update(cx, |this, cx| match first {
                     Ok(snap) => {
-                        this.apply_accounts_snapshot(snap, cx);
+                        this.apply_accounts_snapshot_for_host(host.clone(), snap, cx);
                         true
                     }
                     Err(e) => {
@@ -2672,18 +2819,19 @@ impl Shell {
                 let follow = cx
                     .background_executor()
                     .spawn({
-                        let paths = paths.clone();
+                        let target = target.clone();
                         async move {
-                            krill_app::accounts::request_ipc(
-                                &paths,
+                            krill_app::accounts::request_target(
+                                &target,
                                 &krill_proto::usage::UsageRequest::ListAccounts,
                             )
                         }
                     })
                     .await;
                 if let Ok(snap) = follow {
+                    let host = host.clone();
                     this.update(cx, |this, cx| {
-                        this.apply_accounts_snapshot(snap, cx);
+                        this.apply_accounts_snapshot_for_host(host, snap, cx);
                     })
                     .ok();
                 }
@@ -2830,7 +2978,53 @@ impl Shell {
         req: krill_proto::usage::UsageRequest,
         cx: &mut Context<Self>,
     ) {
+        let host = self.active_account_host();
+        self.refresh_accounts_for_host(host, req, cx);
+    }
+
+    pub(super) fn refresh_accounts_for_host(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        req: krill_proto::usage::UsageRequest,
+        cx: &mut Context<Self>,
+    ) {
         let mutating = !matches!(req, krill_proto::usage::UsageRequest::ListAccounts);
+        if host.is_remote() {
+            let Some(target) = self.target_for_host(&host) else {
+                if mutating {
+                    self.notice = Some(
+                        krill_app::i18n::catalog::sidebar::HOST_DISCONNECTED
+                            .get()
+                            .into(),
+                    );
+                    cx.notify();
+                }
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move { krill_app::accounts::request_target(&target, &req) })
+                    .await;
+                this.update(cx, |this, cx| match res {
+                    Ok(snap) => {
+                        this.apply_accounts_snapshot_for_host(host, snap, cx);
+                        if mutating {
+                            cx.defer(krill_app::settings::notify_external_change);
+                        }
+                    }
+                    Err(e) => {
+                        if mutating {
+                            this.notice = Some(e);
+                            cx.notify();
+                        }
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
             let state_dir = self.state_dir(cx);
             // OWE-697: 실제 상태 디렉터리에서 데몬 없이 계정을 바꾸지 않는다(읽기 전용).
@@ -2910,7 +3104,16 @@ impl Shell {
             provider,
             account_id,
         };
-        let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
+        let host = self.active_account_host();
+        let target = match &host {
+            krill_app::hosts::HostId::Local => self
+                .paths
+                .clone()
+                .filter(|_| self.link == Link::Up)
+                .map(krill_app::hosts::HostTarget::local),
+            krill_app::hosts::HostId::Remote(_) => self.target_for_host(&host),
+        };
+        let Some(target) = target else {
             self.notice = Some(
                 krill_app::i18n::catalog::settings::ACCOUNTS_DAEMON_REQUIRED
                     .get()
@@ -2922,11 +3125,13 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { krill_app::accounts::consume_reset_credit_ipc(&paths, &req) })
+                .spawn(
+                    async move { krill_app::accounts::consume_reset_credit_target(&target, &req) },
+                )
                 .await;
             this.update(cx, |this, cx| match res {
                 Ok(consumed) => {
-                    this.apply_accounts_snapshot(consumed.snapshot, cx);
+                    this.apply_accounts_snapshot_for_host(host, consumed.snapshot, cx);
                     this.notice = Some(match consumed.outcome {
                         ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed => {
                             krill_app::i18n::catalog::status::PROVIDER_RESET_USAGE_DONE
@@ -2958,9 +3163,7 @@ impl Shell {
 
     fn failed_account_input(&self) -> Option<krill_proto::SessionId> {
         let pane = self.layout.focused()?;
-        if !self.layout.host(pane).is_local() {
-            return None;
-        }
+        let host = self.layout.host(pane);
         let session = self.layout.session(pane)?;
         if self
             .live
@@ -2969,7 +3172,7 @@ impl Shell {
         {
             return None;
         }
-        self.accounts_snapshot
+        self.accounts_for_host(host)
             .details
             .handoffs
             .iter()
@@ -2985,7 +3188,21 @@ impl Shell {
         if self.account_cancel.is_some() || self.failed_account_input() != Some(session) {
             return;
         }
-        let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
+        let host = self
+            .layout
+            .focused()
+            .map_or(krill_app::hosts::HostId::Local, |p| {
+                self.layout.host(p).clone()
+            });
+        let target = match &host {
+            krill_app::hosts::HostId::Local => self
+                .paths
+                .clone()
+                .filter(|_| self.link == Link::Up)
+                .map(krill_app::hosts::HostTarget::local),
+            krill_app::hosts::HostId::Remote(_) => self.target_for_host(&host),
+        };
+        let Some(target) = target else {
             return;
         };
         self.account_cancel = Some(session);
@@ -2994,8 +3211,8 @@ impl Shell {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    krill_app::accounts::request_ipc(
-                        &paths,
+                    krill_app::accounts::request_target(
+                        &target,
                         &krill_proto::usage::UsageRequest::CancelAccountSwitch { session },
                     )
                 })
@@ -3005,7 +3222,7 @@ impl Shell {
                 match result {
                     Ok(snapshot) => {
                         this.notice = None;
-                        this.apply_accounts_snapshot(snapshot, cx);
+                        this.apply_accounts_snapshot_for_host(host, snapshot, cx);
                     }
                     Err(error) => {
                         this.notice = Some(error);
@@ -3023,6 +3240,15 @@ impl Shell {
         snap: krill_proto::usage::AccountsSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.apply_accounts_snapshot_for_host(krill_app::hosts::HostId::Local, snap, cx);
+    }
+
+    pub(super) fn apply_accounts_snapshot_for_host(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        snap: krill_proto::usage::AccountsSnapshot,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ev) = snap.switched.first() {
             self.notice = Some(
                 krill_app::i18n::catalog::popout::AUTO_SWITCH_NOTICE.format(&[
@@ -3033,10 +3259,12 @@ impl Shell {
                 ]),
             );
         }
-        krill_app::alert::sync_account_switches(&snap.advanced, cx);
+        if host.is_local() {
+            krill_app::alert::sync_account_switches(&snap.advanced, cx);
+        }
         let mut input_notices = Vec::new();
         for (pane, live) in &mut self.live {
-            if !self.layout.host(*pane).is_local() || !snap.details.supported {
+            if self.layout.host(*pane) != &host || !snap.details.supported {
                 continue;
             }
             let handoff = self
@@ -3059,11 +3287,7 @@ impl Shell {
             let mut changed = false;
             for handoff in &snap.details.handoffs {
                 if let Some(to) = handoff.to.filter(|to| *to != handoff.from) {
-                    let panes = self.layout.rebind_session(
-                        &krill_app::hosts::HostId::Local,
-                        handoff.from,
-                        to,
-                    );
+                    let panes = self.layout.rebind_session(&host, handoff.from, to);
                     if !panes.is_empty() {
                         let was_active = self.chat.active_sessions.remove(&handoff.from);
                         if let Some(chat) = self.chat.overrides.remove(&handoff.from) {
@@ -3087,7 +3311,7 @@ impl Shell {
                         }
                     }
                 } else if let Some(error) = &handoff.error
-                    && self.layout.sessions().contains(&handoff.from)
+                    && self.layout.sessions_for_host(&host).contains(&handoff.from)
                     && self.handoff_errors.insert(error.clone())
                 {
                     // Failed switches already released the pane above; input is not held.
@@ -3099,23 +3323,31 @@ impl Shell {
                 break;
             }
         }
-        self.handoff_errors.retain(|error| {
-            snap.details
-                .handoffs
-                .iter()
-                .any(|h| h.error.as_ref() == Some(error))
-        });
+        if host.is_local() {
+            self.handoff_errors.retain(|error| {
+                snap.details
+                    .handoffs
+                    .iter()
+                    .any(|h| h.error.as_ref() == Some(error))
+            });
+        }
         let pending = snap
             .details
             .handoffs
             .iter()
             .any(|h| h.to.is_none() && h.error.is_none());
         if let Some(settings) = &self.settings {
+            let host_clone = host.clone();
+            let snap_clone = snap.clone();
             settings.update(cx, |settings, cx| {
-                settings.update_accounts_snapshot(snap.clone(), cx);
+                settings.update_accounts_snapshot_for_host(&host_clone, snap_clone, cx);
             });
         }
-        self.accounts_snapshot = Arc::new(snap);
+        if host.is_local() {
+            self.accounts_snapshot = Arc::new(snap);
+        } else {
+            self.remote_accounts.insert(host.clone(), Arc::new(snap));
+        }
         if rebound {
             for pane in reconnect {
                 if let Some(target) = self.target_for_pane(pane) {
@@ -3134,48 +3366,99 @@ impl Shell {
         for notice in &input_notices {
             self.show(Some(notice), cx);
         }
-        if pending
-            && self.account_handoff_poll.is_none()
-            && let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up)
-        {
-            self.account_handoff_poll = Some(cx.spawn(async move |this, cx| {
-                for _ in 0..120 {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(500))
-                        .await;
-                    let result = cx
-                        .background_executor()
-                        .spawn({
-                            let paths = paths.clone();
-                            async move {
-                                krill_app::accounts::request_ipc(
-                                    &paths,
-                                    &krill_proto::usage::UsageRequest::ListAccounts,
-                                )
+        if pending {
+            if host.is_local() {
+                if self.account_handoff_poll.is_none()
+                    && let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up)
+                {
+                    self.account_handoff_poll = Some(cx.spawn(async move |this, cx| {
+                        for _ in 0..120 {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(500))
+                                .await;
+                            let result = cx
+                                .background_executor()
+                                .spawn({
+                                    let paths = paths.clone();
+                                    async move {
+                                        krill_app::accounts::request_ipc(
+                                            &paths,
+                                            &krill_proto::usage::UsageRequest::ListAccounts,
+                                        )
+                                    }
+                                })
+                                .await;
+                            let pending = this
+                                .update(cx, |this, cx| {
+                                    if let Ok(snapshot) = result {
+                                        this.apply_accounts_snapshot(snapshot, cx);
+                                    }
+                                    this.accounts_snapshot
+                                        .details
+                                        .handoffs
+                                        .iter()
+                                        .any(|h| h.to.is_none() && h.error.is_none())
+                                })
+                                .unwrap_or(false);
+                            if !pending {
+                                break;
                             }
+                        }
+                        this.update(cx, |this, _| {
+                            this.account_handoff_poll = None;
                         })
-                        .await;
-                    let pending = this
-                        .update(cx, |this, cx| {
-                            if let Ok(snapshot) = result {
-                                this.apply_accounts_snapshot(snapshot, cx);
-                            }
-                            this.accounts_snapshot
-                                .details
-                                .handoffs
-                                .iter()
-                                .any(|h| h.to.is_none() && h.error.is_none())
-                        })
-                        .unwrap_or(false);
-                    if !pending {
-                        break;
-                    }
+                        .ok();
+                    }));
                 }
-                this.update(cx, |this, _| {
-                    this.account_handoff_poll = None;
-                })
-                .ok();
-            }));
+            } else if !self.remote_account_handoff_polls.contains_key(&host)
+                && let Some(target) = self.target_for_host(&host)
+            {
+                let poll_host = host.clone();
+                let task = cx.spawn(async move |this, cx| {
+                    for _ in 0..120 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(500))
+                            .await;
+                        let result = cx
+                            .background_executor()
+                            .spawn({
+                                let target = target.clone();
+                                async move {
+                                    krill_app::accounts::request_target(
+                                        &target,
+                                        &krill_proto::usage::UsageRequest::ListAccounts,
+                                    )
+                                }
+                            })
+                            .await;
+                        let host_for_update = poll_host.clone();
+                        let pending = this
+                            .update(cx, |this, cx| {
+                                if let Ok(snapshot) = result {
+                                    this.apply_accounts_snapshot_for_host(
+                                        host_for_update.clone(),
+                                        snapshot,
+                                        cx,
+                                    );
+                                }
+                                this.accounts_for_host(&host_for_update)
+                                    .details
+                                    .handoffs
+                                    .iter()
+                                    .any(|h| h.to.is_none() && h.error.is_none())
+                            })
+                            .unwrap_or(false);
+                        if !pending {
+                            break;
+                        }
+                    }
+                    this.update(cx, |this, _| {
+                        this.remote_account_handoff_polls.remove(&poll_host);
+                    })
+                    .ok();
+                });
+                self.remote_account_handoff_polls.insert(host, task);
+            }
         }
         cx.notify();
     }
@@ -3198,17 +3481,28 @@ impl Shell {
         window: Option<&Window>,
         cx: &mut Context<Self>,
     ) {
+        self.run_terminal_command_on(&krill_app::hosts::HostId::Local, command, window, cx);
+    }
+
+    pub(super) fn run_terminal_command_on(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        command: &str,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) {
         let trimmed = command.trim();
         if trimmed.is_empty() {
             return;
         }
         let cmd = format!("{trimmed}\n");
         let focused = self.layout.focused();
+        let same_host = focused.is_some_and(|p| self.layout.host(p) == host);
         let was_remote = focused.is_some_and(|p| !self.layout.host(p).is_local());
         let open_new_tab = self.focused_live().is_none()
+            || !same_host
             || focused.is_none_or(|focused| {
-                was_remote
-                    || (self.link == Link::Up && self.layout.session(focused).is_some())
+                (host.is_local() && self.link == Link::Up && self.layout.session(focused).is_some())
                     || matches!(
                         self.layout.launch(focused).map(|c| &c.program),
                         Some(Program::Agent { .. } | Program::Custom { .. })
@@ -3222,18 +3516,26 @@ impl Shell {
                     })
             });
         if open_new_tab {
-            let cwd = (!was_remote)
-                .then(|| {
-                    focused
-                        .and_then(|p| self.layout.launch(p))
-                        .map(|c| c.cwd.clone())
-                        .filter(|cwd| !cwd.is_empty())
-                })
-                .flatten()
-                .unwrap_or_else(|| folder::default_folder().as_os_str().as_bytes().to_vec());
+            let cwd = if host.is_remote() {
+                Vec::new()
+            } else {
+                (!was_remote)
+                    .then(|| {
+                        focused
+                            .and_then(|p| self.layout.launch(p))
+                            .map(|c| c.cwd.clone())
+                            .filter(|cwd| !cwd.is_empty())
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| folder::default_folder().as_os_str().as_bytes().to_vec())
+            };
+            let target_host = host.clone();
             self.change(true, cx, |l| {
                 l.new_tab();
                 if let Some(pane) = l.focused() {
+                    if target_host.is_remote() {
+                        l.set_host(pane, target_host);
+                    }
                     l.set_launch(
                         pane,
                         Create {
@@ -4114,6 +4416,14 @@ impl Shell {
     }
 
     fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 에이전트 대시보드가 열려 있을 때는 Esc가 대시보드만 닫고 뒷배경 세션 PTY로 `\x1b`를 보내지 않는다.
+        if self.dashboard.is_some() {
+            if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                self.close_dashboard(Some(window), cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
         if self.page_open() || !self.focus.is_focused(window) {
             return;
         }
@@ -4247,7 +4557,7 @@ impl Shell {
     fn on_key_up(&mut self, e: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         // AS-12: `on_key_down`과 같이 포커스를 검사한다. 검색 바·Jump·사이드바 입력 중에
         // 올라온 Release가 버블링돼 터미널 PTY로 새는 것을 막는다(kitty 플래그 2 보고 모드).
-        if self.page_open() || !self.focus.is_focused(window) {
+        if self.page_open() || self.dashboard.is_some() || !self.focus.is_focused(window) {
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -4372,7 +4682,7 @@ impl Shell {
         pane: PaneId,
         position: Point<Pixels>,
         click_count: usize,
-        shift: bool,
+        modifiers: gpui::Modifiers,
         cx: &mut Context<Self>,
     ) {
         let Some(l) = self.live.get_mut(&pane) else {
@@ -4383,16 +4693,22 @@ impl Shell {
             return;
         };
         let at = select::Point { line, column };
-        if shift && l.selection.is_some() {
+        if modifiers.shift && l.selection.is_some() {
             let anchor = l.selection.map_or(at, |sel| sel.anchor);
-            l.selection = Some(Selection { anchor, head: at });
+            l.selection = Some(Selection {
+                anchor,
+                head: at,
+                block: modifiers.alt || l.selection.is_some_and(|sel| sel.block),
+            });
             l.selection_text = None;
             l.selecting = true;
             l.selecting_kind = SelectKind::Char;
             cx.notify();
             return;
         }
-        let (selection, kind) = if click_count >= 3 {
+        let (selection, kind) = if modifiers.alt {
+            (Selection::new_block(at), SelectKind::Char)
+        } else if click_count >= 3 {
             (Selection::line_at(&screen, at), SelectKind::Line)
         } else if click_count == 2 {
             (Selection::word_at(&screen, at), SelectKind::Word)
@@ -5264,7 +5580,7 @@ impl Shell {
         Some(id.clone())
     }
 
-    /// MK-131: 원격 호스트 세션 패인의 탭·패인 헤더에 표시하는 호스트 이름 배지.
+    /// MK-131: 원격 호스트 세션 패인 헤더에 표시하는 호스트 이름 배지(상단 탭 바에는 공간 절약을 위해 표시하지 않는다).
     pub(super) fn host_badge(
         &self,
         pane: PaneId,
@@ -5714,7 +6030,7 @@ impl Shell {
                         window.focus(&this.focus, cx);
                     }
                     if this.selects(id, e.modifiers) {
-                        this.select_begin(id, e.position, e.click_count, e.modifiers.shift, cx);
+                        this.select_begin(id, e.position, e.click_count, e.modifiers, cx);
                     } else {
                         this.mouse_input(
                             id,
@@ -5823,12 +6139,8 @@ impl Shell {
                 this.on_scroll(id, e, window, cx);
             }))
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
-                use krill_proto::os::ffi::OsStrExt as _;
                 this.change(true, cx, |l| l.focus(id));
-                let text = krill_term::paste::dropped(
-                    paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
-                );
-                this.paste_bytes(&text, window, cx);
+                this.paste_dropped_paths(paths, window, cx);
             }));
         // 우클릭 메뉴는 프로그램이 마우스 보고를 켜지 않았을 때만(켰으면 우클릭은 프로그램 것이다).
         let menu = self
@@ -6326,6 +6638,7 @@ impl Render for Shell {
                                 line: rows.saturating_sub(1),
                                 column: cols.saturating_sub(1),
                             },
+                            block: false,
                         });
                         l.snapshot_selection();
                         l.selecting = false;
@@ -6535,11 +6848,22 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_toggle_secure_input))
             .on_action(cx.listener(Self::on_float_terminal))
             .on_action(cx.listener(Self::on_dashboard))
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if this.dashboard.is_some()
+                    && e.keystroke.key == "escape"
+                    && !e.keystroke.modifiers.modified()
+                {
+                    this.close_dashboard(Some(window), cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_link_modifiers))
             .when(
-                !self.page_open() && !self.diff.read(cx).has_center_diff(),
+                !self.page_open()
+                    && self.dashboard.is_none()
+                    && !self.diff.read(cx).has_center_diff(),
                 |d| d.child(input),
             )
             .on_drag_move(

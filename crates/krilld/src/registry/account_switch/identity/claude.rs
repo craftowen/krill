@@ -9,7 +9,7 @@ use std::process::Command;
 
 use krill_proto::usage::ProviderKind;
 
-use super::{Identity, process_pids, transcript};
+use super::{Identity, descendant_pids, process_pids, transcript};
 
 pub(super) fn discover(
     homes: &[PathBuf],
@@ -17,7 +17,13 @@ pub(super) fn discover(
     foreground: Option<u32>,
 ) -> io::Result<Option<Identity>> {
     let mut found: Option<Identity> = None;
-    for pid in process_pids(root, foreground) {
+    let mut candidates = process_pids(root, foreground);
+    for pid in descendant_pids(root, foreground) {
+        if !candidates.contains(&pid) {
+            candidates.push(pid);
+        }
+    }
+    for pid in candidates {
         if crate::sys::process_name(pid).ok().as_deref() != Some("claude") {
             continue;
         }
@@ -32,7 +38,14 @@ pub(super) fn discover(
         if !output.status.success() {
             continue;
         }
-        let birth = String::from_utf8_lossy(&output.stdout);
+        let birth_utc = String::from_utf8_lossy(&output.stdout).into_owned();
+        let birth_local = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
         for home in homes {
             let record = home.join("sessions").join(format!("{pid}.json"));
             let Ok(file) = File::open(record) else {
@@ -40,7 +53,14 @@ pub(super) fn discover(
             };
             let mut bytes = Vec::new();
             file.take(64 * 1024).read_to_end(&mut bytes)?;
-            let Some(identity) = from_record(&bytes, pid, birth.trim(), home)? else {
+            let mut identity = from_record(&bytes, pid, birth_utc.trim(), home)?;
+            if identity.is_none()
+                && let Some(local) = birth_local.as_deref().map(str::trim)
+                && local != birth_utc.trim()
+            {
+                identity = from_record(&bytes, pid, local, home)?;
+            }
+            let Some(identity) = identity else {
                 continue;
             };
             if let Some(previous) = &found {

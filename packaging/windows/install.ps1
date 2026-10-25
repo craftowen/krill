@@ -28,11 +28,129 @@ if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
 if ($arch -ne 'AMD64') { throw 'Windows release packages require an x64 PC.' }
 if (Test-Path $Dest) { throw "$Dest already exists; update from the app or run: krill-app.exe --update-cli" }
 
+# -----------------------------------------------------------------------------
+# Trench Clack Pipeline UI (docs/STYLEGUIDE.md tokens, PS 5.1 & PS 7 compatible)
+# Uses 7-bit safe \uXXXX unescaping so Windows PowerShell 5.1 without UTF-8 BOM
+# never corrupts box-drawing, arc spinner, or Korean status strings.
+# -----------------------------------------------------------------------------
+function Convert-KrillUnicode([string]$Text) {
+    return [regex]::Unescape($Text)
+}
+
+$krillUi = $false
+if ($env:KRILL_FORCE_UI -eq '1') {
+    $krillUi = $true
+} elseif ($env:KRILL_INSTALL_UI -ne '0' -and $env:TERM -ne 'dumb') {
+    try {
+        if ([Environment]::UserInteractive -and -not [Console]::IsErrorRedirected) {
+            $krillUi = $true
+        }
+    } catch {
+        $krillUi = $false
+    }
+}
+
+$krillColor = $krillUi -and [string]::IsNullOrEmpty($env:NO_COLOR)
+$krillAnim = $krillUi -and ($env:KRILL_INSTALL_ANIMATE -ne '0')
+
+$esc = [string][char]27
+$cTrenchBg = if ($krillColor) { "$esc[48;2;6;22;32m" } else { '' }
+$cCoral    = if ($krillColor) { "$esc[1;38;2;255;82;56m" } else { '' }
+$cFg       = if ($krillColor) { "$esc[38;2;223;237;242m" } else { '' }
+$cSuccess  = if ($krillColor) { "$esc[38;2;134;239;172m" } else { '' }
+$cWarn     = if ($krillColor) { "$esc[38;2;234;179;8m" } else { '' }
+$cFail     = if ($krillColor) { "$esc[38;2;255;101;104m" } else { '' }
+$cMuted    = if ($krillColor) { "$esc[38;2;154;163;181m" } else { '' }
+$cReset    = if ($krillColor) { "$esc[0m" } else { '' }
+
+$gTop   = Convert-KrillUnicode '\u250C' # ┌
+$gPipe  = Convert-KrillUnicode '\u2502' # │
+$gStep  = Convert-KrillUnicode '\u25C7' # ◇
+$gBot   = Convert-KrillUnicode '\u2514' # └
+$gCross = Convert-KrillUnicode '\u00D7' # ×
+$gDot   = Convert-KrillUnicode '\u00B7' # ·
+$gArrow = Convert-KrillUnicode '\u2192' # →
+$gArcs  = @(
+    (Convert-KrillUnicode '\u25DC'), # ◜
+    (Convert-KrillUnicode '\u25E0'), # ◠
+    (Convert-KrillUnicode '\u25DD'), # ◝
+    (Convert-KrillUnicode '\u25DF'), # ◞
+    (Convert-KrillUnicode '\u25E1'), # ◡
+    (Convert-KrillUnicode '\u25DE')  # ◟
+)
+
+$kWork  = Convert-KrillUnicode '\uC791\uC5C5' # 작업
+$kFail  = Convert-KrillUnicode '\uC2E4\uD328' # 실패
+$kAbort = Convert-KrillUnicode '\uC124\uCE58\uB97C \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4' # 설치를 중단했습니다
+$kDone  = Convert-KrillUnicode '\uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4' # 설치했습니다
+$kStart = Convert-KrillUnicode '\uC2DC\uC791' # 시작
+
+$installTimer = [Diagnostics.Stopwatch]::StartNew()
+$stepTimer = [Diagnostics.Stopwatch]::New()
+$currentStepId = '01'
+$currentStepLabel = ''
+
+function Write-KrillErr([string]$Text) {
+    if (-not $krillUi) { return }
+    try { [Console]::Error.Write($Text) } catch {}
+}
+
+function Write-KrillErrLine([string]$Text) {
+    if (-not $krillUi) { return }
+    try { [Console]::Error.WriteLine($Text) } catch {}
+}
+
+function Format-KrillSec([Diagnostics.Stopwatch]$Sw) {
+    return ('{0:0.0}s' -f ($Sw.ElapsedMilliseconds / 1000.0))
+}
+
+function Show-KrillIntro([string]$ModeDesc) {
+    if (-not $krillUi) { return }
+    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+    Write-KrillErrLine ("{0}{1} {2}  Krill{3}  /  install                         {4}" -f $cTrenchBg, $cCoral, $gTop, $cFg, $cReset)
+    Write-KrillErrLine ("{0} {1}  {2}{3}" -f $cMuted, $gPipe, $ModeDesc, $cReset)
+    Write-KrillErrLine ("{0} {1}{2}" -f $cMuted, $gPipe, $cReset)
+}
+
+function Start-KrillStep([string]$StepId, [string]$Label, [int]$ArcIdx = 0) {
+    $script:currentStepId = $StepId
+    $script:currentStepLabel = $Label
+    $stepTimer.Restart()
+    if (-not $krillUi) { return }
+    $arc = $gArcs[$ArcIdx % $gArcs.Count]
+    if ($krillAnim) {
+        Write-KrillErr ("`r$esc[2K {0}{1}  [{2}/06 {3}]{4} {5}{6}{4}" -f $cWarn, $arc, $StepId, $kWork, $cReset, $cFg, $Label)
+    } else {
+        Write-KrillErrLine (" {0}{1}  [{2}/06 {3}]{4} {5}{6}{4}" -f $cWarn, $arc, $StepId, $kWork, $cReset, $cFg, $Label)
+    }
+}
+
+function Complete-KrillStep([string]$StepId, [string]$Badge, [string]$DoneLabel) {
+    $stepTimer.Stop()
+    if (-not $krillUi) { return }
+    $elapsed = Format-KrillSec $stepTimer
+    $prefix = if ($krillAnim) { "`r$esc[2K" } else { '' }
+    Write-KrillErrLine ("{0} {1}{2}  [{3}/06 {4}]{5} {6}{7}{5}  {8}{9}{5}" -f $prefix, $cSuccess, $gStep, $StepId, $Badge, $cReset, $cFg, $DoneLabel, $cMuted, $elapsed)
+}
+
+function Fail-KrillStep([string]$Reason) {
+    $stepTimer.Stop()
+    if (-not $krillUi) { return }
+    $prefix = if ($krillAnim) { "`r$esc[2K" } else { '' }
+    Write-KrillErrLine ("{0} {1}{2}  [{3}/06 {4}] {5}{6}" -f $prefix, $cFail, $gCross, $script:currentStepId, $kFail, $Reason, $cReset)
+    Write-KrillErrLine (" {0}{1}  {2}{3}" -f $cFail, $gBot, $kAbort, $cReset)
+}
+
 $download = -not $Zip
+$modeText = if ($download) { "Windows $gDot x64 $gDot release: $Release" } else { "Windows $gDot x64 $gDot local package" }
+Show-KrillIntro $modeText
+
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("krill-install-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $tmp | Out-Null
 try {
     if ($download) {
+        # [01/06] 릴리스 확인
+        Start-KrillStep '01' (Convert-KrillUnicode '\uB9B4\uB9AC\uC2A4 \uD655\uC778 \uC911') 0
         # Windows PowerShell 5.1 may otherwise negotiate an obsolete TLS version.
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $api = 'https://api.github.com/repos/craftowen/krill/releases/'
@@ -44,50 +162,118 @@ try {
         $asset = $packages[0]
         $checksums = @($releaseInfo.assets | Where-Object { $_.name -ceq ($asset.name + '.sha256') })
         if ($checksums.Count -ne 1) { throw 'The Windows package SHA-256 file is missing.' }
+        Complete-KrillStep '01' (Convert-KrillUnicode '\uD655\uC778') ((Convert-KrillUnicode '\uB9B4\uB9AC\uC2A4 \uB2E4\uC6B4\uB85C\uB4DC \uACBD\uB85C \uD655\uC778 (') + $asset.name + ')')
+
+        # [02/06] 번들 다운로드
+        Start-KrillStep '02' ((Convert-KrillUnicode '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC911 (') + $asset.name + ')') 1
         $Zip = Join-Path $tmp $asset.name
         $checksumFile = Join-Path $tmp 'package.sha256'
-        foreach ($item in @(@{ Asset = $asset; File = $Zip }, @{ Asset = $checksums[0]; File = $checksumFile })) {
-            $url = [uri]$item.Asset.browser_download_url
-            if ($url.Scheme -ne 'https' -or $url.Host -ne 'github.com' -or
-                -not $url.AbsolutePath.StartsWith('/craftowen/krill/releases/download/')) {
-                throw 'Unexpected release asset URL.'
+        $savedProgress = $ProgressPreference
+        try {
+            if ($krillUi) { $ProgressPreference = 'SilentlyContinue' }
+            foreach ($item in @(@{ Asset = $asset; File = $Zip }, @{ Asset = $checksums[0]; File = $checksumFile })) {
+                $url = [uri]$item.Asset.browser_download_url
+                if ($url.Scheme -ne 'https' -or $url.Host -ne 'github.com' -or
+                    -not $url.AbsolutePath.StartsWith('/craftowen/krill/releases/download/')) {
+                    throw 'Unexpected release asset URL.'
+                }
+                Invoke-WebRequest -UseBasicParsing -Uri $url.AbsoluteUri -OutFile $item.File
             }
-            Invoke-WebRequest -UseBasicParsing -Uri $url.AbsoluteUri -OutFile $item.File
+        } finally {
+            $ProgressPreference = $savedProgress
         }
+        $zipBytes = if (Test-Path -LiteralPath $Zip) { (Get-Item -LiteralPath $Zip).Length } else { 0 }
+        $zipMib = ('{0:0.0} MiB' -f ($zipBytes / 1048576.0))
+        Complete-KrillStep '02' (Convert-KrillUnicode '\uC218\uC2E0') ((Convert-KrillUnicode '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC644\uB8CC (') + $zipMib + ')')
+
+        # [03/06] SHA-256 비교
+        Start-KrillStep '03' (Convert-KrillUnicode 'SHA-256 \uBE44\uAD50 \uC911') 2
         $checksum = (Get-Content -LiteralPath $checksumFile -Raw).Trim()
         if ($checksum -notmatch '^([0-9a-fA-F]{64})(?:\s+\*?([^\r\n]+))?$') { throw 'Invalid SHA-256 file.' }
         $expected = $Matches[1]
         if ($Matches[2] -and $Matches[2] -cne $asset.name) { throw 'SHA-256 filename does not match the package.' }
         if ((Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash -ne $expected) { throw 'Windows package SHA-256 mismatch; nothing was installed.' }
         if (-not $PSBoundParameters.ContainsKey('AddToPath')) { $AddToPath = $true }
+        Complete-KrillStep '03' (Convert-KrillUnicode '\uC77C\uCE58') (Convert-KrillUnicode 'SHA-256 \uCCB4\uD06C\uC12C \uC77C\uCE58')
+    } else {
+        $leafName = Split-Path -Leaf $Zip
+        Start-KrillStep '01' (Convert-KrillUnicode '\uB85C\uCEEC \uD328\uD0A4\uC9C0 \uD655\uC778 \uC911') 0
+        Complete-KrillStep '01' (Convert-KrillUnicode '\uD655\uC778') ((Convert-KrillUnicode '\uB85C\uCEEC \uD328\uD0A4\uC9C0 \uC9C0\uC815 (') + $leafName + ')')
+        Start-KrillStep '02' (Convert-KrillUnicode '\uB85C\uCEEC \uBC88\uB4E4 \uC900\uBE44 \uC911') 1
+        Complete-KrillStep '02' (Convert-KrillUnicode '\uC218\uC2E0') (Convert-KrillUnicode '\uB85C\uCEEC \uBC88\uB4E4 \uC0AC\uC6A9 (\uB2E4\uC6B4\uB85C\uB4DC \uC0DD\uB7B5)')
+        Start-KrillStep '03' (Convert-KrillUnicode '\uC624\uD504\uB77C\uC778 \uBAA8\uB4DC \uD655\uC778 \uC911') 2
+        Complete-KrillStep '03' (Convert-KrillUnicode '\uC0DD\uB7B5') (Convert-KrillUnicode '\uC624\uD504\uB77C\uC778 \uD328\uD0A4\uC9C0 (\uC678\uBD80 \uCCB4\uD06C\uC12C \uC0DD\uB7B5)')
     }
+
+    # [04/06] 번들 해제·실행 파일 검사
+    Start-KrillStep '04' (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C\u00B7\uAD6C\uC131 \uD30C\uC77C \uAC80\uC0AC \uC911') 3
     $unpacked = Join-Path $tmp 'unpacked'
-    Expand-Archive -LiteralPath $Zip -DestinationPath $unpacked
+    $savedProgress2 = $ProgressPreference
+    try {
+        if ($krillUi) { $ProgressPreference = 'SilentlyContinue' }
+        Expand-Archive -LiteralPath $Zip -DestinationPath $unpacked
+    } finally {
+        $ProgressPreference = $savedProgress2
+    }
     foreach ($file in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe')) {
         if (-not (Test-Path -LiteralPath (Join-Path $unpacked "Krill\$file") -PathType Leaf)) {
             throw "Not a Krill package (missing $file)."
         }
     }
+    Complete-KrillStep '04' (Convert-KrillUnicode '\uAC80\uC99D') (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C 5\uC885 \uD655\uC778')
+
+    # [05/06] 앱 파일 설치
+    Start-KrillStep '05' ((Convert-KrillUnicode '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 (') + $Dest + ')') 4
     New-Item -ItemType Directory -Force (Split-Path -Parent $Dest) | Out-Null
     Move-Item -LiteralPath (Join-Path $unpacked 'Krill') -Destination $Dest
+    Complete-KrillStep '05' (Convert-KrillUnicode '\uC124\uCE58') ($Dest + (Convert-KrillUnicode ' \uC124\uCE58 \uC644\uB8CC'))
+} catch {
+    Fail-KrillStep $_.Exception.Message
+    throw
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
-if (-not $NoShortcut) {
-    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Krill.lnk'
-    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-    $s.TargetPath = Join-Path $Dest 'krill-app.exe'
-    # 작업 디렉터리를 설치 폴더로 두지 않는다(실행 중 프로세스의 cwd가 설치 폴더면 교체가 어려워진다).
-    $s.WorkingDirectory = $env:USERPROFILE
-    $s.Save()
-}
-if ($AddToPath) {
-    $path = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($path -split ';') -notcontains $Dest) {
-        [Environment]::SetEnvironmentVariable('Path', ((@($path, $Dest) | Where-Object { $_ }) -join ';'), 'User')
+# [06/06] 바로가기·PATH 연결·앱 열기 요청
+Start-KrillStep '06' (Convert-KrillUnicode 'CLI PATH \u00B7 \uBC14\uB85C\uAC00\uAE30 \u00B7 \uC571 \uC5F4\uAE30 \uAD6C\uC131 \uC911') 5
+try {
+    if (-not $NoShortcut) {
+        $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Krill.lnk'
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $s.TargetPath = Join-Path $Dest 'krill-app.exe'
+        # 작업 디렉터리를 설치 폴더로 두지 않는다(실행 중 프로세스의 cwd가 설치 폴더면 교체가 어려워진다).
+        $s.WorkingDirectory = $env:USERPROFILE
+        $s.Save()
     }
-    if (($env:Path -split ';') -notcontains $Dest) { $env:Path += ";$Dest" }
+    if ($AddToPath) {
+        $path = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (($path -split ';') -notcontains $Dest) {
+            [Environment]::SetEnvironmentVariable('Path', ((@($path, $Dest) | Where-Object { $_ }) -join ';'), 'User')
+        }
+        if (($env:Path -split ';') -notcontains $Dest) { $env:Path += ";$Dest" }
+    }
+    $openNote = if ($download -and -not $NoOpen) {
+        Convert-KrillUnicode '\uC571 \uC5F4\uAE30 \uC694\uCCAD \uC804\uB2EC'
+    } else {
+        Convert-KrillUnicode '\uC571 \uC5F4\uAE30 \uC0DD\uB7B5'
+    }
+    Complete-KrillStep '06' (Convert-KrillUnicode '\uC644\uB8CC') ((Convert-KrillUnicode 'CLI \uAD6C\uC131 \u00B7 ') + $openNote)
+} catch {
+    Fail-KrillStep $_.Exception.Message
+    throw
 }
+
+$installTimer.Stop()
+if ($krillUi) {
+    $totalElapsed = Format-KrillSec $installTimer
+    $cliPath = Join-Path $Dest 'krill.exe'
+    $appPath = Join-Path $Dest 'krill-app.exe'
+    Write-KrillErrLine ("{0} {1}{2}" -f $cMuted, $gPipe, $cReset)
+    Write-KrillErrLine (" {0}{1}  {2}{3}  {4}/  {5}{3}" -f $cSuccess, $gBot, $kDone, $cReset, $cMuted, $totalElapsed)
+    Write-KrillErrLine ("    {0}Krill          {1} {2}{3}" -f $cFg, $gArrow, $Dest, $cReset)
+    Write-KrillErrLine ("    {0}CLI            {1} {2}{3}" -f $cMuted, $gArrow, $cliPath, $cReset)
+    Write-KrillErrLine ("    {0}{1}           {2} {3}{4}" -f $cMuted, $kStart, $gArrow, $appPath, $cReset)
+}
+
 "installed: $Dest"
 if ($download -and -not $NoOpen) { Start-Process -FilePath (Join-Path $Dest 'krill-app.exe') }

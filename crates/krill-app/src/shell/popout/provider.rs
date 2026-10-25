@@ -362,16 +362,38 @@ fn render_details(
     detail
 }
 
+pub(super) struct ProviderHostScope<'a> {
+    pub(super) snap: &'a AccountsSnapshot,
+    pub(super) active_host: &'a krill_app::hosts::HostId,
+    pub(super) account_hosts: &'a [(
+        krill_app::hosts::HostId,
+        String,
+        std::sync::Arc<AccountsSnapshot>,
+    )],
+}
+
 pub(super) fn provider_usage_menu(
     mut menu: PopupMenu,
-    snap: &AccountsSnapshot,
+    scope: &ProviderHostScope<'_>,
     provider: ProviderKind,
     weak: WeakEntity<Shell>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
     reset_armed: Option<&(ProviderKind, String)>,
 ) -> PopupMenu {
+    let snap = scope.snap;
+    let active_host = scope.active_host;
+    let account_hosts = scope.account_hosts;
     let groups = account_groups(snap, provider);
+    let active_host_badge = (account_hosts.len() > 1).then(|| {
+        account_hosts
+            .iter()
+            .find(|(h, _, _)| h == active_host)
+            .map_or_else(
+                || active_host.as_key().to_owned(),
+                |(_, label, _)| label.clone(),
+            )
+    });
     let available = window.bounds().size.width - ui::SPACE_4 * 2.;
     // 비교표가 창 폭을 다 차지하지 않게 상세 패널 자리를 먼저 남긴다.
     let detail_width = (ui::DIALOG_WIDTH * 0.625).min(available / 3.);
@@ -420,7 +442,13 @@ pub(super) fn provider_usage_menu(
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(p.foreground)
                                 .child(provider.display_name()),
-                        ),
+                        )
+                        .children(active_host_badge.as_ref().map(|host_label| {
+                            div()
+                                .id("status-provider-active-host")
+                                .debug_selector(|| "status-provider-active-host".into())
+                                .child(ui::badge(p, ui::BadgeTone::Muted, host_label.clone()))
+                        })),
                 )
                 .child(
                     div()
@@ -614,6 +642,88 @@ pub(super) fn provider_usage_menu(
                     })
             },
         ));
+    }
+    if account_hosts.len() > 1 {
+        let other_hosts: Vec<_> = account_hosts
+            .iter()
+            .filter(|(h, _, _)| h != active_host)
+            .cloned()
+            .collect();
+        if !other_hosts.is_empty() {
+            menu = menu.separator();
+            for (other_host, other_label, other_snap) in other_hosts {
+                let profiles: Vec<AccountInfo> = other_snap
+                    .accounts
+                    .iter()
+                    .filter(|a| a.provider == provider && !krill_app::accounts::orca_managed(a))
+                    .cloned()
+                    .collect();
+                let active_label = profiles
+                    .iter()
+                    .find(|a| a.active)
+                    .or_else(|| profiles.first())
+                    .map(account_name);
+                let title = match active_label {
+                    Some(active) => format!("{other_label} · {active}"),
+                    None => other_label.clone(),
+                };
+                let host_weak = weak.clone();
+                menu = menu.submenu(title, window, cx, move |mut sub, _, _| {
+                    let select_weak = host_weak.clone();
+                    let select_host = other_host.clone();
+                    sub = sub.item(
+                        PopupMenuItem::new(format!(
+                            "{}: {other_label}",
+                            account_text::ACCOUNTS_HOST_TITLE.get()
+                        ))
+                        .on_click(move |_, _, cx| {
+                            select_weak
+                                .update(cx, |shell, cx| {
+                                    shell.set_launch_host(select_host.clone(), cx);
+                                })
+                                .ok();
+                        }),
+                    );
+                    if !profiles.is_empty() {
+                        sub = sub.separator();
+                        for profile in &profiles {
+                            let switch_weak = host_weak.clone();
+                            let switch_host = other_host.clone();
+                            let account_id = profile.id.clone();
+                            let item_label = if profile.label.trim().is_empty() {
+                                account_name(profile)
+                            } else if let Some(email) =
+                                profile.email.as_deref().filter(|s| !s.trim().is_empty())
+                                && !profile.label.trim().eq_ignore_ascii_case(email.trim())
+                            {
+                                format!("{} ({})", profile.label.trim(), email.trim())
+                            } else {
+                                profile.label.trim().to_owned()
+                            };
+                            sub = sub.item(
+                                PopupMenuItem::new(item_label)
+                                    .checked(profile.active)
+                                    .on_click(move |_, _, cx| {
+                                        switch_weak
+                                            .update(cx, |shell, cx| {
+                                                shell.refresh_accounts_for_host(
+                                                    switch_host.clone(),
+                                                    UsageRequest::SwitchAccount {
+                                                        provider,
+                                                        account_id: account_id.clone(),
+                                                    },
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }),
+                            );
+                        }
+                    }
+                    sub
+                });
+            }
+        }
     }
     let policy = snap.auto_switch.clone();
     let toggle_weak = weak.clone();

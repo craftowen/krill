@@ -41,6 +41,42 @@ fn switch_identity_merge_keeps_late_hook_and_source_account_across_restart() {
         Control::new(Some(&dir)).stored(session).unwrap().unwrap(),
         merged
     );
+    let agy_session = SessionId(2);
+    let db_path = Path::new("/tmp/profile/.gemini/antigravity-cli/conversations/conv-1.db");
+    let jsonl_path = Path::new(
+        "/tmp/profile/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript.jsonl",
+    );
+    assert!(valid_transcript_path(db_path.to_str().unwrap()));
+    assert!(!valid_transcript_path("/tmp/other/conv-1.db"));
+    c.remember_session(
+        agy_session,
+        &AgentLaunch {
+            profile: "agy".into(),
+            permission: Permission::Yolo,
+        },
+        None,
+        b"/project".to_vec(),
+        None,
+    )
+    .unwrap();
+    c.bind_discovered_session(agy_session, "conv-1", Some(db_path));
+    assert_eq!(
+        c.stored(agy_session)
+            .unwrap()
+            .unwrap()
+            .transcript_path
+            .as_deref(),
+        db_path.to_str()
+    );
+    c.bind_discovered_session(agy_session, "conv-1", Some(jsonl_path));
+    assert_eq!(
+        c.stored(agy_session)
+            .unwrap()
+            .unwrap()
+            .transcript_path
+            .as_deref(),
+        jsonl_path.to_str()
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

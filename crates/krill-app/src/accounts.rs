@@ -270,7 +270,15 @@ pub fn request(paths: Option<&Paths>, req: &UsageRequest) -> Result<AccountsSnap
 
 /// 데몬에만 묻는다(로컬 폴백 없음). 설정 화면이 데몬 연결 여부를 가릴 때 쓴다(OWE-697).
 pub fn request_ipc(paths: &Paths, req: &UsageRequest) -> Result<AccountsSnapshot, String> {
-    match exchange(paths, req)? {
+    request_target(&krill_hosts::HostTarget::local(paths.clone()), req)
+}
+
+/// 지정한 호스트 타깃(로컬·원격) 데몬에 `FEAT_USAGE` 요청을 보낸다(로컬 폴백 없음).
+pub fn request_target(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<AccountsSnapshot, String> {
+    match exchange_target(target, req)? {
         UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => Ok(snap),
         UsageReply::Current(_) | UsageReply::Orphans(_) | UsageReply::Provisioning(_) => {
             Ok(AccountsSnapshot::default())
@@ -284,7 +292,15 @@ pub fn consume_reset_credit_ipc(
     paths: &Paths,
     req: &UsageRequest,
 ) -> Result<ResetConsumed, String> {
-    match exchange(paths, req)? {
+    consume_reset_credit_target(&krill_hosts::HostTarget::local(paths.clone()), req)
+}
+
+/// 지정한 호스트 타깃(로컬·원격) 데몬에 리셋 크레딧 소진을 요청한다.
+pub fn consume_reset_credit_target(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<ResetConsumed, String> {
+    match exchange_target(target, req)? {
         UsageReply::ResetConsumed {
             snapshot,
             outcome,
@@ -301,7 +317,15 @@ pub fn consume_reset_credit_ipc(
 
 /// 고아 프로필 목록·정리 요청(OWE-704). 데몬에만 묻는다.
 pub fn orphans_ipc(paths: &Paths, req: &UsageRequest) -> Result<Vec<OrphanProfile>, String> {
-    match exchange(paths, req)? {
+    orphans_target(&krill_hosts::HostTarget::local(paths.clone()), req)
+}
+
+/// 지정한 호스트 타깃(로컬·원격) 데몬에 고아 프로필 목록·정리를 요청한다.
+pub fn orphans_target(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<Vec<OrphanProfile>, String> {
+    match exchange_target(target, req)? {
         UsageReply::Orphans(list) => Ok(list),
         UsageReply::Failed(e) => Err(failure_text(e)),
         UsageReply::Accounts(_)
@@ -326,7 +350,10 @@ fn failure_text(e: krill_proto::control::Failure) -> String {
     }
 }
 
-fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
+fn exchange_target(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<UsageReply, String> {
     let mut hello = daemon::client_hello(ClientRole::App, "krill-app accounts");
     hello.features = FEAT_USAGE
         | krill_proto::usage::FEAT_PROVIDER_DETAILS
@@ -341,7 +368,7 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
         | krill_proto::usage::FEAT_USAGE_RESET
         | krill_proto::usage::FEAT_USAGE_REFRESH;
-    let mut conn = daemon::connect(paths, &hello).map_err(|e| e.to_string())?;
+    let mut conn = target.connect(&hello).map_err(|e| e.to_string())?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("FEAT_USAGE not negotiated".to_owned());
     }
@@ -358,13 +385,22 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
     let timeout = Some(Duration::from_secs(5));
     conn.stream.set_read_timeout(timeout).ok();
     conn.stream.set_write_timeout(timeout).ok();
-    conn.stream
-        .write_all(&req.encode().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let (kind, body) = ipc::read_frame(&mut conn.stream)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "daemon closed usage stream".to_owned())?;
-    UsageReply::decode(kind, &body).map_err(|e| e.to_string())
+    let encoded = req.encode().map_err(|e| e.to_string())?;
+    if let Err(err) = conn.stream.write_all(&encoded) {
+        target.record_outcome(false, Some(&err));
+        return Err(err.to_string());
+    }
+    let (kind, body) = match ipc::read_frame(&mut conn.stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err("daemon closed usage stream".to_owned()),
+        Err(err) => {
+            target.record_outcome(false, Some(&err));
+            return Err(err.to_string());
+        }
+    };
+    let reply = UsageReply::decode(kind, &body).map_err(|e| e.to_string())?;
+    target.record_outcome(true, None);
+    Ok(reply)
 }
 
 pub fn request_local(
@@ -662,35 +698,56 @@ pub fn terminal_login_command(account: &AccountInfo) -> String {
 #[cfg(not(windows))]
 fn terminal_login_command_unix(account: &AccountInfo) -> String {
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    if account.provider == ProviderKind::Antigravity {
-        return if account.host_default {
-            "agy".into()
-        } else {
-            format!(
-                "env SSH_CONNECTION=krill agy --gemini_dir={}",
-                quote(
-                    &Path::new(&account.profile_dir)
-                        .join(".gemini")
-                        .to_string_lossy()
+    match account.provider {
+        ProviderKind::Claude => {
+            if account.host_default {
+                "claude auth login".into()
+            } else {
+                format!(
+                    "env CLAUDE_CONFIG_DIR={} claude auth login",
+                    quote(&account.profile_dir)
                 )
+            }
+        }
+        ProviderKind::Codex => {
+            if account.host_default {
+                "codex login".into()
+            } else {
+                format!("env CODEX_HOME={} codex login", quote(&account.profile_dir))
+            }
+        }
+        ProviderKind::Antigravity | ProviderKind::Gemini => {
+            if account.host_default {
+                "agy".into()
+            } else {
+                format!(
+                    "env SSH_CONNECTION=krill agy --gemini_dir={}",
+                    quote(
+                        &Path::new(&account.profile_dir)
+                            .join(".gemini")
+                            .to_string_lossy()
+                    )
+                )
+            }
+        }
+        ProviderKind::OpenCode => {
+            let unsets = ProviderKind::OpenCode
+                .credential_overrides()
+                .iter()
+                .map(|key| format!("-u {key}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if account.host_default {
+                return format!("env {unsets} opencode auth login");
+            }
+            let dir = Path::new(&account.profile_dir);
+            format!(
+                "env {unsets} XDG_DATA_HOME={} XDG_STATE_HOME={} OPENCODE_DB=opencode.db opencode auth login",
+                quote(&dir.join("data").to_string_lossy()),
+                quote(&dir.join("state").to_string_lossy())
             )
-        };
+        }
     }
-    let unsets = ProviderKind::OpenCode
-        .credential_overrides()
-        .iter()
-        .map(|key| format!("-u {key}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if account.host_default {
-        return format!("env {unsets} opencode auth login");
-    }
-    let dir = Path::new(&account.profile_dir);
-    format!(
-        "env {unsets} XDG_DATA_HOME={} XDG_STATE_HOME={} OPENCODE_DB=opencode.db opencode auth login",
-        quote(&dir.join("data").to_string_lossy()),
-        quote(&dir.join("state").to_string_lossy())
-    )
 }
 
 /// 백그라운드 브라우저 로그인의 종료 사유(OWE-881). 설정 탭의 모니터가

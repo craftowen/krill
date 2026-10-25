@@ -360,3 +360,86 @@ fn link_only_remote_never_receives_a_local_media_path() {
     let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3]);
     assert!(super::remote_text_without_upload(&gpui::ClipboardItem::new_image(&image)).is_none());
 }
+
+#[test]
+fn remote_host_target_uploads_clipboard_bytes_without_ssh_cli() {
+    use krill_proto::control::{Program, Reply, Request};
+    use krill_proto::ipc::{self, ServerHello};
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let root = state_path("upload-via-target")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let sock_path = root.join("remote.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let server_root = root.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 99,
+        };
+        stream.write_all(&hello.encode().unwrap()).unwrap();
+        drop(ipc::read_frame(&mut stream).unwrap().unwrap());
+        let mut captured_stdout = Vec::new();
+        while let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) {
+            match Request::decode(kind, &body).unwrap() {
+                Request::Create(create) => {
+                    if let Program::Custom { program, args } = create.program {
+                        let mut cmd =
+                            std::process::Command::new(std::ffi::OsStr::from_bytes(&program));
+                        cmd.env("TMPDIR", &server_root);
+                        for a in &args {
+                            // `sleep 2` at the end is only for keeping a real PTY alive until Capture
+                            let s = String::from_utf8_lossy(a).replace("sleep 2", "true");
+                            cmd.arg(s);
+                        }
+                        let out = cmd.output().unwrap();
+                        captured_stdout = out.stdout;
+                    }
+                    let reply = Reply::Created {
+                        session: krill_proto::SessionId(1),
+                        pid: 123,
+                    };
+                    stream.write_all(&reply.encode().unwrap()).unwrap();
+                }
+                Request::Capture { .. } => {
+                    let reply = Reply::Captured {
+                        bytes: captured_stdout.clone(),
+                        seq: krill_proto::screen::Seq(1),
+                    };
+                    stream.write_all(&reply.encode().unwrap()).unwrap();
+                }
+                Request::Close { .. } => {
+                    let reply = Reply::Closed {};
+                    stream.write_all(&reply.encode().unwrap()).unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let target = krill_app::hosts::HostTarget::remote("iroh:test-mac", sock_path);
+    let payload = b"\x89PNG\r\n\x1a\nremote-paste-image-bytes";
+    let uploaded_path = super::upload_bytes_via_target(
+        &target,
+        "clipboard-image.png",
+        payload,
+        Duration::from_secs(5),
+    )
+    .expect("upload via HostTarget must succeed");
+    server.join().unwrap();
+
+    assert_eq!(std::fs::read(&uploaded_path).unwrap(), payload);
+    std::fs::remove_dir_all(root).unwrap();
+}

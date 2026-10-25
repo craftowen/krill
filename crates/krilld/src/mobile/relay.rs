@@ -771,59 +771,77 @@ fn serve_mux_client(
     registry: &Weak<Registry>,
     hello: &ServerHello,
 ) -> io::Result<()> {
-    lock(&shared.state).devices.attempt(now_ms())?;
-    let greeting = serde_json::json!({"version": 2, "challenge": hex(&challenge)});
-    outbox.send_mux(MUX_TEXT, conn_id, greeting.to_string().as_bytes())?;
-    let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
-    if opcode != ws::TEXT || body.len() > 4096 {
-        return Err(invalid());
-    }
-    let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
-    let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
-    let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
-    let secret = {
-        let s = lock(&shared.state);
-        match (&token, &auth.device_id) {
-            (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
-            (None, Some(d)) => s.devices.device_secret(d)?,
-            _ => return Err(invalid()),
-        }
-    };
-    let mut salt = [0_u8; 64];
-    for (a, b) in salt
-        .iter_mut()
-        .zip(challenge.into_iter().chain(client_nonce))
-    {
-        *a = b;
-    }
-    let mut channel = Channel::new(&secret, &salt, Endpoint::Daemon)?;
-    let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
-    if opcode != ws::BINARY || body.len() > 512 {
-        return Err(invalid());
-    }
-    let proof: AuthProof = serde_json::from_slice(&channel.open(&body)?).map_err(|_| invalid())?;
-    let authenticated = {
-        let mut s = lock(&shared.state);
-        if s.stopped || !s.connections.contains_key(&id) {
+    lock(&shared.state).devices.check_cooldown(now_ms())?;
+    let result = (|| {
+        let greeting = serde_json::json!({"version": 2, "challenge": hex(&challenge)});
+        outbox.send_mux(MUX_TEXT, conn_id, greeting.to_string().as_bytes())?;
+        let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
+        if opcode == 8 {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        let (device_id, credential) = if let Some(token) = token {
-            let (device, credential) = s.devices.pair(&token, &proof.label, now_ms())?;
-            (device.device_id, Some(hex(&credential)))
-        } else {
-            let device_id = auth.device_id.ok_or_else(invalid)?;
-            s.devices.seen(&device_id, now_ms())?;
-            (device_id, None)
-        };
-        let conn = s.connections.get_mut(&id).ok_or_else(invalid)?;
-        conn.device = Some(device_id.clone());
-        Authenticated {
-            device_id,
-            credential,
+        if opcode != ws::TEXT || body.len() > 4096 {
+            return Err(invalid());
         }
-    };
-    let payload = channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;
-    outbox.send_mux(MUX_BINARY, conn_id, &payload)?;
+        let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
+        let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
+        let secret = {
+            let s = lock(&shared.state);
+            match (&token, &auth.device_id) {
+                (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
+                (None, Some(d)) => s.devices.device_secret(d)?,
+                _ => return Err(invalid()),
+            }
+        };
+        let mut salt = [0_u8; 64];
+        for (a, b) in salt
+            .iter_mut()
+            .zip(challenge.into_iter().chain(client_nonce))
+        {
+            *a = b;
+        }
+        let mut channel = Channel::new(&secret, &salt, Endpoint::Daemon)?;
+        let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
+        if opcode == 8 {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        if opcode != ws::BINARY || body.len() > 512 {
+            return Err(invalid());
+        }
+        let proof: AuthProof =
+            serde_json::from_slice(&channel.open(&body)?).map_err(|_| invalid())?;
+        let authenticated = {
+            let mut s = lock(&shared.state);
+            if s.stopped || !s.connections.contains_key(&id) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let (device_id, credential) = if let Some(token) = token {
+                let (device, credential) = s.devices.pair(&token, &proof.label, now_ms())?;
+                (device.device_id, Some(hex(&credential)))
+            } else {
+                let device_id = auth.device_id.ok_or_else(invalid)?;
+                s.devices.seen(&device_id, now_ms())?;
+                (device_id, None)
+            };
+            let conn = s.connections.get_mut(&id).ok_or_else(invalid)?;
+            conn.device = Some(device_id.clone());
+            Authenticated {
+                device_id,
+                credential,
+            }
+        };
+        let payload =
+            channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;
+        outbox.send_mux(MUX_BINARY, conn_id, &payload)?;
+        Ok(channel)
+    })();
+    if result
+        .as_ref()
+        .is_err_and(|error: &io::Error| error.kind() == io::ErrorKind::InvalidData)
+    {
+        lock(&shared.state).devices.attempt(now_ms()).ok();
+    }
+    let channel = result?;
     shared.wake();
 
     let registry = registry.upgrade().ok_or_else(invalid)?;

@@ -292,7 +292,15 @@ impl Shell {
         host: krill_app::hosts::HostId,
         cx: &mut Context<Self>,
     ) {
-        self.launch_host = host;
+        self.launch_host = host.clone();
+        if host.is_remote() && self.host_targets.contains_key(&host) {
+            self.refresh_accounts_for_host(
+                host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+        }
+        self.sync_settings_account_hosts(cx);
         cx.notify();
     }
 
@@ -304,7 +312,7 @@ impl Shell {
         let p = krill_app::ui::palette(cx);
         let show_automations = krill_app::settings::current(cx).show_automations_button;
         let settings = self.agents.clone();
-        let accounts = self.accounts_snapshot.clone();
+        let accounts = self.accounts_for_host(&self.launch_host);
         let permission = settings.as_ref().map(|a| a.permission).unwrap_or_default();
         let disabled = settings.is_none() || self.agents_busy || self.link != Link::Up;
         let locations = self.execution_locations(cx);

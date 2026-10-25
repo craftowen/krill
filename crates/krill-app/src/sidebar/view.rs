@@ -1030,14 +1030,8 @@ impl Sidebar {
                         div()
                             .debug_selector(move || format!("repo-icon-{index}"))
                             .child(ui::icons::project_header_icon(
-                                row_host
-                                    .is_local()
-                                    .then(|| self.project_icon(path))
-                                    .flatten(),
-                                row_host
-                                    .is_local()
-                                    .then(|| self.project_badge_color(path))
-                                    .flatten(),
+                                self.project_icon(path),
+                                self.project_badge_color(path),
                                 ui::ICON_MD,
                                 p.muted_foreground,
                             )),
@@ -1047,11 +1041,7 @@ impl Sidebar {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(if row_host.is_local() {
-                                self.project_header_name(path)
-                            } else {
-                                basename(path)
-                            }),
+                            .child(self.project_header_name(path)),
                     )
                     .when(wt_count > 0, |d| {
                         d.child(
@@ -1150,14 +1140,8 @@ impl Sidebar {
                             })),
                     )
                     .child(ui::icons::project_header_icon(
-                        row_host
-                            .is_local()
-                            .then(|| self.project_icon(path))
-                            .flatten(),
-                        row_host
-                            .is_local()
-                            .then(|| self.project_badge_color(path))
-                            .flatten(),
+                        self.project_icon(path),
+                        self.project_badge_color(path),
                         ui::ICON_MD,
                         p.muted_foreground,
                     ))
@@ -1167,11 +1151,7 @@ impl Sidebar {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(if row_host.is_local() {
-                                self.project_header_name(path)
-                            } else {
-                                basename(path)
-                            }),
+                            .child(self.project_header_name(path)),
                     )
                     .child(self.project_host_control(index, &row_host, cx))
                     .children(merged_hosts)

@@ -750,6 +750,10 @@ pub struct Sidebar {
     removed_projects: BTreeSet<PathBuf>,
     /// 프로젝트(저장소·폴더) 헤더 아이콘·배지 색상·표시 이름 메타.
     project_visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
+    /// 원격 호스트 저장소에서 탐지한 아이콘·메타 캐시.
+    remote_visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
+    /// 원격 호스트별로 이미 아이콘 탐지를 요청한 저장소 경로 집합.
+    remote_probed_repos: BTreeMap<String, BTreeSet<PathBuf>>,
     disk: async_state::State,
     /// 저장소 훅 IO는 렌더링과 분리해 마지막 완료 결과만 표시한다.
     setup_prompt: hooks::SetupPrompt,
@@ -1068,6 +1072,8 @@ impl Sidebar {
             selected_worktree: ui.selected_worktree,
             removed_projects: ui.removed_projects,
             project_visuals: BTreeMap::new(),
+            remote_visuals: BTreeMap::new(),
+            remote_probed_repos: BTreeMap::new(),
             setup_prompt: hooks::SetupPrompt::default(),
             delete_confirm: None,
             delete_scope_focus: None,
@@ -1723,6 +1729,7 @@ impl Sidebar {
                                 return;
                             }
                             let mut changed = false;
+                            let mut probe_repos = Vec::new();
                             if let Ok((snap, meta)) = res {
                                 if entry.status != HostStatus::Connected
                                     || entry.snapshot != snap
@@ -1732,6 +1739,14 @@ impl Sidebar {
                                     entry.snapshot = snap;
                                     entry.meta = meta;
                                     changed = true;
+                                }
+                                let repo_keys: Vec<PathBuf> =
+                                    entry.snapshot.trees.keys().cloned().collect();
+                                let probed = s.remote_probed_repos.entry(id.clone()).or_default();
+                                for repo in repo_keys {
+                                    if probed.insert(repo.clone()) {
+                                        probe_repos.push(repo);
+                                    }
                                 }
                                 let host_id = HostId::Remote(id.clone());
                                 s.prune_read_done_for_host(&host_id, cx);
@@ -1744,6 +1759,31 @@ impl Sidebar {
                                     entry.status = status;
                                     changed = true;
                                 }
+                            }
+                            if !probe_repos.is_empty()
+                                && let Some(target) = source.target().cloned()
+                            {
+                                let state_dir = s.state_dir().map(Path::to_path_buf);
+                                let bg_probe = cx.background_executor().clone();
+                                cx.spawn(async move |this, cx| {
+                                    let resolved = bg_probe
+                                        .spawn(async move {
+                                            external::probe_remote_project_visuals(
+                                                &target,
+                                                state_dir.as_deref(),
+                                                &probe_repos,
+                                            )
+                                        })
+                                        .await;
+                                    if !resolved.is_empty() {
+                                        this.update(cx, |s, cx| {
+                                            s.remote_visuals.extend(resolved);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    }
+                                })
+                                .detach();
                             }
                             if changed {
                                 s.rebuild(cx);
@@ -2435,19 +2475,40 @@ impl Sidebar {
         }
     }
 
+    pub(super) fn project_visual(&self, path: &Path) -> Option<&external::ProjectVisualMeta> {
+        if let Some(v) = self.project_visuals.get(path) {
+            return Some(v);
+        }
+        if let Some(v) = self.remote_visuals.get(path) {
+            return Some(v);
+        }
+        let name = basename(path);
+        if name.is_empty() {
+            return None;
+        }
+        self.project_visuals
+            .iter()
+            .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
+            .map(|(_, v)| v)
+            .or_else(|| {
+                self.remote_visuals
+                    .iter()
+                    .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
+                    .map(|(_, v)| v)
+            })
+    }
+
     pub(super) fn project_icon(&self, path: &Path) -> Option<&crate::ui::icons::ProjectIcon> {
-        self.project_visuals.get(path).and_then(|v| v.icon.as_ref())
+        self.project_visual(path).and_then(|v| v.icon.as_ref())
     }
 
     pub(super) fn project_badge_color(&self, path: &Path) -> Option<&str> {
-        self.project_visuals
-            .get(path)
+        self.project_visual(path)
             .and_then(|v| v.badge_color.as_deref())
     }
 
     pub(super) fn project_header_name(&self, path: &Path) -> String {
-        self.project_visuals
-            .get(path)
+        self.project_visual(path)
             .and_then(|v| v.display_name.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty())

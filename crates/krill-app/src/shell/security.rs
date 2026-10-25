@@ -25,6 +25,16 @@ const LINK_MENU_WIDTH: Pixels = px(420.);
 /// Bound clipboard-owner stalls, image conversion and filesystem preparation together.
 const PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Remote clipboard uploads (TIFF->PNG conversion + SSH / tunnel transfer) need a longer budget.
+const REMOTE_PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Clone)]
+pub(crate) struct RemoteUploadTarget {
+    pub ssh_host: Option<krill_app::ssh_hosts::SshHost>,
+    pub host_target: Option<krill_app::hosts::HostTarget>,
+    pub prefer_target_ipc: bool,
+}
+
 #[derive(Default)]
 pub(super) struct PasteQueue {
     next: u64,
@@ -96,6 +106,11 @@ impl Shell {
     fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {
         let pane = self.layout.focused()?;
         let session = self.live.get(&pane)?.pane.session()?;
+        let timeout = if self.layout.host(pane).is_remote() {
+            REMOTE_PASTE_PREPARATION_TIMEOUT
+        } else {
+            PASTE_PREPARATION_TIMEOUT
+        };
         // Existing composition precedes the paste; later keystrokes enter slots
         // behind it, so a slow image or clipboard owner cannot reorder input.
         self.commit_ime(pane, Some(window), cx);
@@ -108,9 +123,7 @@ impl Shell {
         });
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(PASTE_PREPARATION_TIMEOUT)
-                .await;
+            cx.background_executor().timer(timeout).await;
             handle
                 .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
@@ -124,39 +137,176 @@ impl Shell {
         Some(id)
     }
 
+    pub(super) fn ssh_host_for_remote_id(
+        &self,
+        id: &str,
+        cx: &App,
+    ) -> Option<krill_app::ssh_hosts::SshHost> {
+        if let Some(h) = self.ssh_hosts.iter().find(|h| h.id == id) {
+            return Some(h.clone());
+        }
+        if let Some(canon) = self.host_aliases.get(id)
+            && let Some(h) = self.ssh_hosts.iter().find(|h| h.id == *canon)
+        {
+            return Some(h.clone());
+        }
+        if let Some(h) = self
+            .ssh_hosts
+            .iter()
+            .find(|h| self.host_aliases.get(&h.id).is_some_and(|c| c == id))
+        {
+            return Some(h.clone());
+        }
+        if let Some(h) = self.ssh_hosts.iter().find(|h| h.destination == id) {
+            return Some(h.clone());
+        }
+        let remote_label = self
+            .sidebar
+            .read(cx)
+            .remote_hosts()
+            .iter()
+            .find(|h| h.id == id)
+            .map(|h| h.label.clone())
+            .or_else(|| {
+                self.host_statuses
+                    .iter()
+                    .find(|(s, _)| s.id == id)
+                    .map(|(s, _)| s.display_name().to_owned())
+            });
+        if let Some(label) = remote_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && let Some(h) = self.ssh_hosts.iter().find(|h| {
+                h.label.trim().eq_ignore_ascii_case(label)
+                    || h.destination.trim().eq_ignore_ascii_case(label)
+            })
+        {
+            return Some(h.clone());
+        }
+        if !id.starts_with("iroh:")
+            && let Some((spec, _)) = self
+                .host_statuses
+                .iter()
+                .find(|(s, _)| s.id == id && !s.address.trim().is_empty())
+        {
+            return Some(krill_app::ssh_hosts::SshHost {
+                id: spec.id.clone(),
+                label: spec.label.clone(),
+                destination: spec.address.clone(),
+                port: spec.port,
+                identity_file: spec.identity_file.clone(),
+                remote_socket: spec.remote_socket.clone(),
+                imported: false,
+                copy_id_first: false,
+            });
+        }
+        None
+    }
+
+    pub(super) fn remote_upload_target_for_pane(
+        &self,
+        pane: PaneId,
+        cx: &App,
+    ) -> Option<RemoteUploadTarget> {
+        match self.layout.host(pane) {
+            krill_app::hosts::HostId::Remote(id) => {
+                let ssh_host = self.ssh_host_for_remote_id(id, cx);
+                let host_target = self.target_for_pane(pane);
+                if ssh_host.is_none() && host_target.is_none() {
+                    return None;
+                }
+                Some(RemoteUploadTarget {
+                    ssh_host,
+                    host_target,
+                    prefer_target_ipc: id.starts_with("iroh:"),
+                })
+            }
+            krill_app::hosts::HostId::Local => None,
+        }
+    }
+
     pub(super) fn paste_clipboard(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(id) = self.begin_clipboard_paste(window, cx) else {
             return;
         };
-        // 원격 칸이면 로컬 경로를 그대로 보내지 않고 SSH로 파일을 올려 원격 경로를 붙여넣는다.
-        // 앱(맥북)이 가진 클립보드를 원격 데몬(맥미니) PTY가 읽을 수 있게 한다.
+        // 원격 칸이면 로컬 경로를 그대로 보내지 않고 SSH 또는 원격 제어 소켓으로 파일을 올려
+        // 원격 경로를 붙여넣는다. 앱(맥북)이 가진 클립보드를 원격 데몬(맥미니) PTY가 읽을 수 있게 한다.
         let remote_pane = self
             .layout
             .focused()
             .is_some_and(|pane| self.layout.host(pane).is_remote());
-        let remote_host: Option<krill_app::ssh_hosts::SshHost> =
-            self.layout
-                .focused()
-                .and_then(|pane| match self.layout.host(pane) {
-                    krill_app::hosts::HostId::Remote(id) => {
-                        self.ssh_hosts.iter().find(|h| h.id == *id).cloned()
-                    }
-                    krill_app::hosts::HostId::Local => None,
-                });
+        let remote_target = self
+            .layout
+            .focused()
+            .and_then(|pane| self.remote_upload_target_for_pane(pane, cx));
         let read = cx.read_from_clipboard_async();
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let item = read.await.ok().flatten();
+            #[cfg(not(test))]
+            let item = augment_clipboard_item_from_pasteboard(item);
             let payload = cx
                 .background_executor()
                 .spawn(async move {
                     item.as_ref().and_then(|item| {
-                        if remote_pane && remote_host.is_none() {
+                        if remote_pane && remote_target.is_none() {
                             remote_text_without_upload(item)
                         } else {
-                            clipboard_paste_payload_for_host(item, remote_host.as_ref())
+                            clipboard_paste_payload_for_target(item, remote_target.as_ref())
                         }
                     })
+                })
+                .await;
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.complete_clipboard_paste(id, payload, window, cx);
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn paste_dropped_paths(
+        &mut self,
+        paths: &gpui::ExternalPaths,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let remote_pane = self
+            .layout
+            .focused()
+            .is_some_and(|pane| self.layout.host(pane).is_remote());
+        if !remote_pane {
+            let text =
+                krill_term::paste::dropped(paths.paths().iter().map(|p| p.as_os_str().as_bytes()));
+            self.paste_bytes(&text, window, cx);
+            return;
+        }
+        let Some(id) = self.begin_clipboard_paste(window, cx) else {
+            return;
+        };
+        let remote_target = self
+            .layout
+            .focused()
+            .and_then(|pane| self.remote_upload_target_for_pane(pane, cx));
+        let item = gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::ExternalPaths(paths.clone())],
+        };
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let payload = cx
+                .background_executor()
+                .spawn(async move {
+                    if remote_target.is_none() {
+                        remote_text_without_upload(&item)
+                    } else {
+                        clipboard_paste_payload_for_target(&item, remote_target.as_ref())
+                    }
                 })
                 .await;
             handle
@@ -181,12 +331,26 @@ impl Shell {
         let Some(id) = self.begin_clipboard_paste(window, cx) else {
             return;
         };
+        let remote_pane = self
+            .layout
+            .focused()
+            .is_some_and(|pane| self.layout.host(pane).is_remote());
+        let remote_target = self
+            .layout
+            .focused()
+            .and_then(|pane| self.remote_upload_target_for_pane(pane, cx));
         let item = item.clone();
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let payload = cx
                 .background_executor()
-                .spawn(async move { clipboard_paste_payload(&item) })
+                .spawn(async move {
+                    if remote_pane && remote_target.is_none() {
+                        remote_text_without_upload(&item)
+                    } else {
+                        clipboard_paste_payload_for_target(&item, remote_target.as_ref())
+                    }
+                })
                 .await;
             handle
                 .update(cx, |_, window, cx| {
@@ -801,7 +965,44 @@ pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<
     None
 }
 
-// A link-only remote cannot read files saved on this computer.
+#[cfg(not(test))]
+fn augment_clipboard_item_from_pasteboard(
+    item: Option<gpui::ClipboardItem>,
+) -> Option<gpui::ClipboardItem> {
+    if let Some(ref existing) = item {
+        let has_image = existing
+            .entries()
+            .iter()
+            .any(|e| matches!(e, gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty()));
+        if has_image {
+            return item;
+        }
+        let has_dead_paths = existing.entries().iter().any(|e| {
+            matches!(
+                e,
+                gpui::ClipboardEntry::ExternalPaths(p)
+                    if !p.paths().is_empty() && p.paths().iter().all(|path| !path.exists())
+            )
+        });
+        let has_only_blank_text = existing.text().is_some_and(|t| t.trim().is_empty());
+        let prefer_over_text = has_dead_paths || has_only_blank_text;
+        if let Some((fmt, bytes)) = krill_app::platform::read_pasteboard_image(prefer_over_text) {
+            let img = gpui::Image::from_bytes(fmt, bytes);
+            if has_dead_paths {
+                let mut entries = existing.entries().to_vec();
+                entries.push(gpui::ClipboardEntry::Image(img));
+                return Some(gpui::ClipboardItem { entries });
+            }
+            return Some(gpui::ClipboardItem::new_image(&img));
+        }
+        return item;
+    }
+    let (fmt, bytes) = krill_app::platform::read_pasteboard_image(true)?;
+    let img = gpui::Image::from_bytes(fmt, bytes);
+    Some(gpui::ClipboardItem::new_image(&img))
+}
+
+// A disconnected remote without an upload target cannot read files saved on this computer.
 fn remote_text_without_upload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
     if item.entries().iter().any(|entry| {
         matches!(
@@ -816,23 +1017,36 @@ fn remote_text_without_upload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
         .map(String::into_bytes)
 }
 
+#[cfg(all(test, unix))]
 pub(crate) fn clipboard_paste_payload_for_host(
     item: &gpui::ClipboardItem,
     remote: Option<&krill_app::ssh_hosts::SshHost>,
 ) -> Option<Vec<u8>> {
-    let Some(host) = remote else {
+    let target = remote.cloned().map(|h| RemoteUploadTarget {
+        ssh_host: Some(h),
+        host_target: None,
+        prefer_target_ipc: false,
+    });
+    clipboard_paste_payload_for_target(item, target.as_ref())
+}
+
+pub(crate) fn clipboard_paste_payload_for_target(
+    item: &gpui::ClipboardItem,
+    remote: Option<&RemoteUploadTarget>,
+) -> Option<Vec<u8>> {
+    let Some(target) = remote else {
         return clipboard_paste_payload(item);
     };
     let has_valid_image = item.entries().iter().any(|entry| {
         matches!(entry, gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
     });
     let _permit = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS)?;
-    remote_payload_inner(item, host, has_valid_image)
+    remote_payload_inner(item, target, has_valid_image)
 }
 
 fn remote_payload_inner(
     item: &gpui::ClipboardItem,
-    host: &krill_app::ssh_hosts::SshHost,
+    target: &RemoteUploadTarget,
     has_valid_image: bool,
 ) -> Option<Vec<u8>> {
     let mut skipped_dead = false;
@@ -850,7 +1064,7 @@ fn remote_payload_inner(
                 }
                 return None;
             }
-            return upload_local_paths(host, &existing);
+            return upload_local_paths(target, &existing);
         }
     }
     if !skipped_dead {
@@ -876,7 +1090,7 @@ fn remote_payload_inner(
             if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
                 continue;
             }
-            if let Some(payload) = upload_clipboard_image(host, img) {
+            if let Some(payload) = upload_clipboard_image(target, img) {
                 return Some(payload);
             }
         }
@@ -906,6 +1120,35 @@ fn sanitize_remote_filename(name: &str) -> String {
     }
 }
 
+fn upload_bytes_to_remote_target(
+    target: &RemoteUploadTarget,
+    filename: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    if target.prefer_target_ipc {
+        if let Some(ht) = &target.host_target
+            && let Some(path) =
+                upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15))
+        {
+            return Some(path);
+        }
+        if let Some(host) = &target.ssh_host {
+            return upload_bytes_to_remote(host, filename, bytes);
+        }
+        None
+    } else {
+        if let Some(host) = &target.ssh_host
+            && let Some(path) = upload_bytes_to_remote(host, filename, bytes)
+        {
+            return Some(path);
+        }
+        if let Some(ht) = &target.host_target {
+            return upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15));
+        }
+        None
+    }
+}
+
 fn upload_bytes_to_remote(
     host: &krill_app::ssh_hosts::SshHost,
     filename: &str,
@@ -918,6 +1161,214 @@ fn upload_bytes_to_remote(
         "ssh".as_ref(),
         Duration::from_secs(15),
     )
+}
+
+fn base64_encode(input: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(input.len().div_ceil(3).saturating_mul(4));
+    for chunk in input.chunks(3) {
+        let b0 = chunk.first().copied().unwrap_or(0);
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        let i0 = ((n >> 18) & 0x3f) as usize;
+        let i1 = ((n >> 12) & 0x3f) as usize;
+        let i2 = ((n >> 6) & 0x3f) as usize;
+        let i3 = (n & 0x3f) as usize;
+        out.push(TABLE.get(i0).copied().unwrap_or(b'A'));
+        out.push(TABLE.get(i1).copied().unwrap_or(b'A'));
+        out.push(if chunk.len() > 1 {
+            TABLE.get(i2).copied().unwrap_or(b'A')
+        } else {
+            b'='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE.get(i3).copied().unwrap_or(b'A')
+        } else {
+            b'='
+        });
+    }
+    out
+}
+
+fn run_custom_and_wait_marker(
+    stream: &mut krill_proto::os::net::UnixStream,
+    args: Vec<Vec<u8>>,
+    marker_prefix: &str,
+    marker_suffix: &str,
+    error_marker: &str,
+    deadline: std::time::Instant,
+) -> Option<String> {
+    use krill_proto::control::{CaptureFormat, Create, Program, Reply, Request};
+    use krill_proto::ipc;
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+
+    let create = Request::Create(Create {
+        account: None,
+        program: Program::Custom {
+            program: b"/bin/sh".to_vec(),
+            args,
+        },
+        cwd: b"/tmp".to_vec(),
+        cols: 1024,
+        rows: 24,
+    });
+    stream.write_all(&create.encode().ok()?).ok()?;
+    let (kind, body) = ipc::read_frame(stream).ok()??;
+    let Reply::Created { session, .. } = Reply::decode(kind, &body).ok()? else {
+        return None;
+    };
+
+    let mut result = None;
+    while std::time::Instant::now() < deadline {
+        let cap_req = Request::Capture {
+            session,
+            format: CaptureFormat::Plain,
+        };
+        if stream
+            .write_all(&cap_req.encode().unwrap_or_default())
+            .is_err()
+        {
+            break;
+        }
+        let Ok(Some((k, b))) = ipc::read_frame(stream) else {
+            break;
+        };
+        match Reply::decode(k, &b) {
+            Ok(Reply::Captured { bytes: cap, .. }) => {
+                let text = String::from_utf8_lossy(&cap);
+                let flat: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
+                if flat.contains(error_marker) {
+                    break;
+                }
+                if let Some((_, after)) = flat.split_once(marker_prefix)
+                    && let Some((inner, _)) = after.split_once(marker_suffix)
+                {
+                    result = Some(inner.trim().to_owned());
+                    break;
+                }
+            }
+            Ok(Reply::Failed(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    if let Ok(close_bytes) = (Request::Close { session }).encode()
+        && stream.write_all(&close_bytes).is_ok()
+    {
+        ipc::read_frame(stream).ok();
+    }
+    result
+}
+
+pub(crate) fn upload_bytes_via_target(
+    target: &krill_app::hosts::HostTarget,
+    filename: &str,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Option<String> {
+    use krill_proto::control::{FEAT_CLI, FEAT_CONTROL};
+    use krill_proto::ipc::{self, ClientRole};
+    use std::io::Write as _;
+
+    // 96 KiB is a multiple of 3 (so each Base64 chunk is 128 KiB with no mid-stream '=' padding)
+    // and stays well below ARG_MAX (1 MiB) and ipc::MAX_FRAME (1 MiB).
+    const RAW_CHUNK_BYTES: usize = 96 * 1024;
+
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let filename = sanitize_remote_filename(filename);
+    let required = FEAT_CONTROL | FEAT_CLI;
+    let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-clipboard");
+    let mut stream = if target.allow_local_launch() {
+        let mut s = krill_proto::os::net::UnixStream::connect(target.socket()).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+        let (kind, body) = ipc::read_frame(&mut s).ok()??;
+        let server = ipc::ServerHello::decode(kind, &body).ok()?;
+        let negotiated = ipc::negotiate(&server, &hello)?;
+        if negotiated.features & required != required {
+            return None;
+        }
+        s.write_all(&hello.encode().ok()?).ok()?;
+        s
+    } else {
+        let c = target.connect(&hello).ok()?;
+        if c.negotiated.features & required != required {
+            return None;
+        }
+        c.stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
+        c.stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
+        c.stream
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut chunks = bytes.chunks(RAW_CHUNK_BYTES);
+    let first_chunk = chunks.next()?;
+    let first_b64 = base64_encode(first_chunk);
+    let create_script = format!(
+        "umask 077; \
+         d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\" 2>/dev/null || mktemp -d /tmp/krill-paste.XXXXXXXX) || exit 1; \
+         f=\"$d/{filename}\"; \
+         if printf '%s' \"$1\" | (base64 -d 2>/dev/null || base64 -D 2>/dev/null || openssl base64 -d -A 2>/dev/null) > \"$f\" && [ -s \"$f\" ]; then \
+           printf 'KRILL_PASTE_OK:%s:END\\n' \"$f\"; \
+         else \
+           rm -rf \"$d\"; printf 'KRILL_PASTE_ERR\\n'; \
+         fi; \
+         sleep 3"
+    );
+    let remote_path = run_custom_and_wait_marker(
+        &mut stream,
+        vec![
+            b"-c".to_vec(),
+            create_script.into_bytes(),
+            b"sh".to_vec(),
+            first_b64,
+        ],
+        "KRILL_PASTE_OK:",
+        ":END",
+        "KRILL_PASTE_ERR",
+        deadline,
+    )?;
+    if !remote_path.starts_with('/') || remote_path.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+
+    let append_script = b"umask 077; \
+        if printf '%s' \"$2\" | (base64 -d 2>/dev/null || base64 -D 2>/dev/null || openssl base64 -d -A 2>/dev/null) >> \"$1\"; then \
+          printf 'KRILL_APPEND_OK:ok:END\\n'; \
+        else \
+          rm -f \"$1\"; printf 'KRILL_APPEND_ERR\\n'; \
+        fi; \
+        sleep 3"
+        .to_vec();
+
+    for chunk in chunks {
+        let chunk_b64 = base64_encode(chunk);
+        run_custom_and_wait_marker(
+            &mut stream,
+            vec![
+                b"-c".to_vec(),
+                append_script.clone(),
+                b"sh".to_vec(),
+                remote_path.as_bytes().to_vec(),
+                chunk_b64,
+            ],
+            "KRILL_APPEND_OK:",
+            ":END",
+            "KRILL_APPEND_ERR",
+            deadline,
+        )?;
+    }
+
+    Some(remote_path)
 }
 
 fn upload_bytes_with_program(
@@ -941,10 +1392,12 @@ fn upload_bytes_with_program(
     args.extend([
         "-o".to_owned(),
         "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "StrictHostKeyChecking=accept-new".to_owned(),
         destination.to_owned(),
         // A private, unique directory prevents collisions and follows the remote TMPDIR.
         format!(
-            "umask 077; d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\") || exit 1; \
+            "umask 077; d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\" 2>/dev/null || mktemp -d /tmp/krill-paste.XXXXXXXX) || exit 1; \
              if cat > \"$d/{filename}\"; then printf '%s\\n' \"$d/{filename}\"; \
              else rm -rf \"$d\"; exit 1; fi"
         ),
@@ -1001,7 +1454,7 @@ fn upload_bytes_with_program(
 }
 
 fn upload_local_paths(
-    host: &krill_app::ssh_hosts::SshHost,
+    target: &RemoteUploadTarget,
     paths: &[&std::path::PathBuf],
 ) -> Option<Vec<u8>> {
     let mut remote_paths: Vec<String> = Vec::new();
@@ -1023,7 +1476,7 @@ fn upload_local_paths(
             .file_name()
             .and_then(|name| name.to_str())
             .map_or_else(|| "pasted-file".to_owned(), sanitize_remote_filename);
-        remote_paths.push(upload_bytes_to_remote(host, &filename, &bytes)?);
+        remote_paths.push(upload_bytes_to_remote_target(target, &filename, &bytes)?);
     }
     if remote_paths.is_empty() {
         return None;
@@ -1033,10 +1486,7 @@ fn upload_local_paths(
     ))
 }
 
-fn upload_clipboard_image(
-    host: &krill_app::ssh_hosts::SshHost,
-    img: &gpui::Image,
-) -> Option<Vec<u8>> {
+fn upload_clipboard_image(target: &RemoteUploadTarget, img: &gpui::Image) -> Option<Vec<u8>> {
     if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         return None;
     }
@@ -1052,7 +1502,7 @@ fn upload_clipboard_image(
             (sniffed_ext, img.bytes.clone())
         };
     let filename = format!("clipboard-{:016x}.{}", img.id, ext);
-    let remote_path = upload_bytes_to_remote(host, &filename, &payload)?;
+    let remote_path = upload_bytes_to_remote_target(target, &filename, &payload)?;
     Some(krill_term::paste::dropped([remote_path.as_bytes()]))
 }
 

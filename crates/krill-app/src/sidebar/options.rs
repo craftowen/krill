@@ -23,8 +23,6 @@ use super::{
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 
-type ProjectVisuals = BTreeMap<PathBuf, super::external::ProjectVisualMeta>;
-
 /// 사이드바 워크트리 목록 그룹화 기준.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GroupBy {
@@ -335,14 +333,43 @@ impl WorkspaceFilters {
     }
 
     #[must_use]
+    pub fn is_repo_selected(&self, repo: &Path) -> bool {
+        if self.repos.contains(repo) {
+            return true;
+        }
+        let key = basename(repo);
+        !key.is_empty()
+            && self
+                .repos
+                .iter()
+                .any(|r| basename(r).eq_ignore_ascii_case(&key))
+    }
+
+    #[must_use]
     pub fn contains_repo(&self, repo: &Path) -> bool {
-        self.repos.is_empty() || self.repos.contains(repo)
+        self.repos.is_empty() || self.is_repo_selected(repo)
     }
 
     pub fn toggle_repo(&mut self, repo: PathBuf) {
-        if !self.repos.remove(&repo) {
-            self.repos.insert(repo);
+        if self.repos.remove(&repo) {
+            return;
         }
+        let key = basename(&repo);
+        if !key.is_empty() {
+            let matching: Vec<PathBuf> = self
+                .repos
+                .iter()
+                .filter(|r| basename(r).eq_ignore_ascii_case(&key))
+                .cloned()
+                .collect();
+            if !matching.is_empty() {
+                for m in matching {
+                    self.repos.remove(&m);
+                }
+                return;
+            }
+        }
+        self.repos.insert(repo);
     }
 
     pub fn reset(&mut self) {
@@ -722,7 +749,15 @@ fn ordered_projects<'a>(
 ) -> Vec<(&'a PathBuf, &'a Vec<PathBuf>)> {
     let mut repos: Vec<_> = snapshot.trees.iter().collect();
     if let Some(order) = order.filter(|o| !o.is_empty()) {
-        repos.sort_by_key(|(repo, _)| order.iter().position(|o| o == *repo).unwrap_or(usize::MAX));
+        repos.sort_by_key(|(repo, _)| {
+            let name = basename(repo);
+            order
+                .iter()
+                .position(|o| {
+                    o == *repo || (!name.is_empty() && basename(o).eq_ignore_ascii_case(&name))
+                })
+                .unwrap_or(usize::MAX)
+        });
     }
     repos
 }
@@ -1200,16 +1235,45 @@ impl Sidebar {
         )
     }
 
+    pub(super) fn filterable_project_repos(&self) -> Vec<PathBuf> {
+        let mut repos: Vec<PathBuf> = Vec::new();
+        let mut seen_keys: BTreeSet<String> = BTreeSet::new();
+        let mut push_repo = |repo: &PathBuf| {
+            if self.removed_projects.contains(repo) {
+                return;
+            }
+            let key = basename(repo).to_lowercase();
+            let dedup_key = if key.is_empty() {
+                repo.to_string_lossy().into_owned()
+            } else {
+                key
+            };
+            if seen_keys.insert(dedup_key) {
+                repos.push(repo.clone());
+            }
+        };
+        for (repo, _) in ordered_projects(&self.snapshot, Some(&self.project_order)) {
+            push_repo(repo);
+        }
+        for remote in &self.remote_hosts {
+            if remote.status == HostStatus::Connected
+                || !remote.snapshot.sessions.is_empty()
+                || !remote.snapshot.trees.is_empty()
+                || self.remote_info.contains_key(&remote.id)
+            {
+                for (repo, _) in ordered_projects(&remote.snapshot, Some(&self.project_order)) {
+                    push_repo(repo);
+                }
+            }
+        }
+        repos
+    }
+
     pub(super) fn remote_rows(
         &self,
         remote: &super::RemoteHost,
         collapsed: &BTreeSet<PathBuf>,
     ) -> Vec<Row> {
-        // The project selector is populated from self.snapshot (local projects).
-        // Applying its paths to another PC hides valid daemon-owned projects,
-        // including when both machines happen to use the same absolute paths.
-        let mut options = self.options.clone();
-        options.filters.repos.clear();
         let ctx = WorktreeContext {
             meta: Some(&remote.meta),
             prs: Some(&self.prs),
@@ -1232,7 +1296,7 @@ impl Sidebar {
             collapsed,
             &self.collapsed_groups,
             &self.shown_external,
-            &options,
+            &self.options,
             &ctx,
         )
     }
@@ -1614,7 +1678,7 @@ pub(super) fn project_visibility_summary(filters: &WorkspaceFilters, repos: &[Pa
     }
     let selected: Vec<&PathBuf> = repos
         .iter()
-        .filter(|r| filters.repos.contains(*r))
+        .filter(|r| filters.is_repo_selected(r))
         .collect();
     if selected.is_empty() || selected.len() == repos.len() {
         text::ALL_PROJECTS.get().to_owned()
@@ -1655,7 +1719,7 @@ fn build_options_menu(
         .is_some_and(|s| !s.read(cx).remote_hosts.is_empty());
     let has_projects = this
         .upgrade()
-        .is_some_and(|s| s.read(cx).snapshot.trees.len() > 1);
+        .is_some_and(|s| !s.read(cx).filterable_project_repos().is_empty());
     let mut menu = menu
         .min_w(px(284.))
         .max_w(px(296.))
@@ -1775,7 +1839,7 @@ fn add_options_submenu(
                     }
                     OptionsSubmenu::Projects => project_visibility_summary(
                         &sidebar.options.filters,
-                        &sidebar.snapshot.trees.keys().cloned().collect::<Vec<_>>(),
+                        &sidebar.filterable_project_repos(),
                     ),
                     OptionsSubmenu::SortBy => sidebar.options.sort_by.short_label().to_owned(),
                     OptionsSubmenu::CardLayout => {
@@ -1843,14 +1907,10 @@ fn render_options_submenu(
             .collect::<Vec<_>>();
             render_hosts_panel(sidebar, menu, &s.options.filters, &hosts, p)
         }
-        OptionsSubmenu::Projects => render_projects_panel(
-            sidebar,
-            menu,
-            &s.options.filters,
-            &s.snapshot.trees.keys().cloned().collect::<Vec<_>>(),
-            &s.project_visuals,
-            p,
-        ),
+        OptionsSubmenu::Projects => {
+            let repos = s.filterable_project_repos();
+            render_projects_panel(sidebar, menu, s, &repos, p)
+        }
         OptionsSubmenu::SortBy => render_sort_panel(sidebar, menu, s.options.sort_by, p),
         OptionsSubmenu::CardLayout => {
             render_card_layout_panel(sidebar, menu, s.options.card_layout, p)
@@ -1969,11 +2029,11 @@ fn render_hosts_panel(
 fn render_projects_panel(
     sidebar_weak: &gpui::WeakEntity<Sidebar>,
     menu_weak: &gpui::WeakEntity<PopupMenu>,
-    filters: &WorkspaceFilters,
+    sidebar: &Sidebar,
     repos: &[PathBuf],
-    visuals: &ProjectVisuals,
     p: &'static ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
+    let filters = &sidebar.options.filters;
     let has_selection = !filters.repos.is_empty();
     let clear_sb = sidebar_weak.clone();
     let clear_mn = menu_weak.clone();
@@ -2018,8 +2078,9 @@ fn render_projects_panel(
         .child(menu_separator(p));
 
     for (idx, repo) in repos.iter().enumerate() {
-        let checked = filters.repos.contains(repo);
+        let checked = filters.is_repo_selected(repo);
         let name = basename(repo);
+        let display_name = sidebar.project_header_name(repo);
         let row_id = format!("sidebar-project-item-{idx}");
         let debug_id = format!("sidebar-project-item-{name}");
         let target = repo.clone();
@@ -2044,8 +2105,8 @@ fn render_projects_panel(
                 })
                 .child(check_slot(checked, p))
                 .child(ui::icons::project_header_icon(
-                    visuals.get(repo).and_then(|v| v.icon.as_ref()),
-                    visuals.get(repo).and_then(|v| v.badge_color.as_deref()),
+                    sidebar.project_icon(repo),
+                    sidebar.project_badge_color(repo),
                     ui::ICON_XS,
                     p.muted_foreground,
                 ))
@@ -2056,7 +2117,7 @@ fn render_projects_panel(
                         .truncate()
                         .text_size(ui::TEXT_XS)
                         .text_color(p.popover_foreground)
-                        .child(name),
+                        .child(display_name),
                 ),
         );
     }

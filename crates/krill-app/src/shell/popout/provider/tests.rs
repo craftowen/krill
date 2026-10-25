@@ -371,3 +371,171 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         assert!(s.notice.is_some(), "사용 버튼은 전환 IPC를 요청한다");
     });
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    use krill_proto::ipc::{self, ClientHello, ServerHello};
+    use krill_proto::screen::Msg as _;
+    use krill_proto::usage::{
+        FEAT_PROVIDER_DETAILS, FEAT_USAGE, FEAT_USAGE_STATUS, SessionHandoff, UsageReply,
+    };
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    let sock_path = std::path::PathBuf::from(format!("/tmp/kr-rpop-{}.s", std::process::id()));
+    std::fs::remove_file(&sock_path).ok();
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let mut primary = profile("remote-main", Some("main@remote.example"));
+    primary.active = true;
+    primary.host_default = true;
+    let secondary = profile("remote-alt", Some("alt@remote.example"));
+    let remote_snap = Arc::new(Mutex::new(AccountsSnapshot {
+        accounts: vec![primary, secondary],
+        ..Default::default()
+    }));
+    let server_snap = Arc::clone(&remote_snap);
+    let server = std::thread::spawn(move || {
+        let server_hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: FEAT_USAGE | FEAT_USAGE_STATUS | FEAT_PROVIDER_DETAILS,
+            build: "test".to_owned(),
+            instance_id: 7777,
+        };
+        while let Ok((mut stream, _)) = listener.accept() {
+            if stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .is_err()
+            {
+                break; // The explicit shutdown connection may already be closed on accept.
+            }
+            if stream.write_all(&server_hello.encode().unwrap()).is_err() {
+                break;
+            }
+            let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                break;
+            };
+            let Ok(client) = ClientHello::decode(kind, &body) else {
+                break;
+            };
+            let features = ipc::negotiate(&server_hello, &client).unwrap().features;
+            let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                continue;
+            };
+            let Ok(req) = UsageRequest::decode(kind, &body) else {
+                continue;
+            };
+            let mut snap = server_snap.lock().unwrap();
+            if let UsageRequest::SwitchAccount {
+                provider,
+                account_id,
+            } = req
+            {
+                for acc in &mut snap.accounts {
+                    if acc.provider == provider {
+                        acc.active = acc.id == account_id;
+                    }
+                }
+                snap.details.supported = true;
+                snap.details.handoffs = vec![SessionHandoff {
+                    from: krill_proto::SessionId(11),
+                    to: Some(krill_proto::SessionId(22)),
+                    account_id,
+                    error: None,
+                }];
+            }
+            let reply = UsageReply::Accounts(snap.clone()).for_features(features);
+            stream.write_all(&reply.encode().unwrap()).ok();
+        }
+    });
+
+    let (shell, handle) = super::super::tests::open(cx);
+    let remote_host = krill_app::hosts::HostId::Remote("iroh:remote-pc".into());
+    let remote_target = krill_app::hosts::HostTarget::remote("iroh:remote-pc", sock_path.clone());
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![])));
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_host(pane, remote_host.clone());
+        s.layout.set_session(pane, krill_proto::SessionId(11));
+        s.host_targets.insert(remote_host.clone(), remote_target);
+        s.host_statuses.push((
+            krill_app::hosts::RemoteHostSpec {
+                id: "iroh:remote-pc".into(),
+                label: "Remote PC".into(),
+                address: "iroh:remote-pc".into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            },
+            krill_app::hosts::HostStatus::Connected,
+        ));
+        s.remote_accounts.insert(
+            remote_host.clone(),
+            Arc::new(remote_snap.lock().unwrap().clone()),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(gpui::px(890.), gpui::px(700.)));
+    visual.run_until_parked();
+
+    let pill = visual
+        .debug_bounds("status-provider-pill-codex")
+        .expect("remote codex pill must be shown even when codex is not installed locally");
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+
+    assert!(
+        visual.debug_bounds("status-provider-active-host").is_some(),
+        "remote host badge must appear in provider popup header"
+    );
+    let use_alt = visual
+        .debug_bounds("status-provider-use-remote-alt")
+        .expect("use button for inactive remote profile");
+    visual.simulate_click(use_alt.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+
+    for _ in 0..20 {
+        let switched = shell.read_with(visual, |s, _| {
+            s.accounts_for_host(&remote_host)
+                .accounts
+                .iter()
+                .find(|a| a.id == "remote-alt")
+                .is_some_and(|a| a.active)
+        });
+        if switched {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        visual.run_until_parked();
+    }
+
+    shell.read_with(visual, |s, _| {
+        assert!(
+            s.accounts_for_host(&remote_host)
+                .accounts
+                .iter()
+                .find(|a| a.id == "remote-alt")
+                .is_some_and(|a| a.active),
+            "remote profile must be switched via status bar popup"
+        );
+        let pane = s.layout.focused().unwrap();
+        assert_eq!(
+            s.layout.session(pane),
+            Some(krill_proto::SessionId(22)),
+            "remote session handoff must rebind the remote pane session"
+        );
+    });
+
+    drop(std::os::unix::net::UnixStream::connect(&sock_path).unwrap());
+    server.join().unwrap();
+    std::fs::remove_file(&sock_path).ok();
+}

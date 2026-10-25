@@ -201,7 +201,7 @@ impl SettingsView {
         .detach();
         cx.notify();
     }
-    /// 탭 진입 시 기기 목록·활성 오퍼를 자동 조회한다(Orca 마운트 조회 대응, OWE-880).
+    /// 탭 진입 시 활성 오퍼를 복원하고, 첫 기기 연결·단독 페이지에서는 QR을 자동 발급한다.
     /// 진행 중인 요청이 있으면 그 결과가 오면 폴링이 시작되므로 중복 호출하지 않는다.
     pub(super) fn mobile_enter(&mut self, cx: &mut Context<Self>) {
         if self.mobile.pending || self.mobile.pairing_pending() {
@@ -211,18 +211,33 @@ impl SettingsView {
         let generation = self.mobile.generation;
         self.mobile.pending = true;
         self.mobile.error = None;
+        let auto_mint = self.mobile_page;
+        let custom_address = self.mobile.address.clone();
         let call = Arc::clone(&self.mobile.call);
         cx.spawn(async move |this, cx| {
             let got = cx
                 .background_executor()
                 .spawn(async move {
                     let status = call(MobileRequest::Status);
-                    // 활성 오퍼가 있을 때만 복원한다. 티켓이 없으면 데몬이
-                    // Err를 돌려주므로 무조건 조회하면 오류가 뜬다.
                     let offer = match &status {
                         Ok(MobileReply::GatewayStatus {
-                            active_offer: true, ..
-                        }) => Some(call(MobileRequest::CurrentPairingOffer)),
+                            active_offer,
+                            mode,
+                            devices,
+                            ..
+                        }) => {
+                            if *active_offer {
+                                Some(call(MobileRequest::CurrentPairingOffer))
+                            } else if auto_mint || devices.is_empty() {
+                                Some(call(MobileRequest::MintPairingTicket {
+                                    mode: *mode,
+                                    custom_address,
+                                    rotate: false,
+                                }))
+                            } else {
+                                None
+                            }
+                        }
                         _ => None,
                     };
                     (status, offer)
@@ -256,14 +271,20 @@ impl SettingsView {
         let call = Arc::clone(&self.mobile.call);
         self.mobile.timer = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok((generation, poll)) = this.read_with(cx, |this, _| {
-                    (
-                        this.mobile.generation,
-                        this.visible && this.tab == super::AdminTab::Mobile
-                            || this.mobile.pairing_pending()
-                            || this.mobile.offer.is_some(),
-                    )
-                }) else {
+                let Ok((generation, poll, had_offer, auto_mint, mode, custom_address)) = this
+                    .read_with(cx, |this, _| {
+                        (
+                            this.mobile.generation,
+                            this.visible && this.tab == super::AdminTab::Mobile
+                                || this.mobile.pairing_pending()
+                                || this.mobile.offer.is_some(),
+                            this.mobile.offer.is_some(),
+                            this.mobile_page,
+                            this.mobile.mode,
+                            this.mobile.address.clone(),
+                        )
+                    })
+                else {
                     return;
                 };
                 if !poll {
@@ -274,11 +295,27 @@ impl SettingsView {
                 let data = cx
                     .background_executor()
                     .spawn(async move {
-                        (
-                            call(MobileRequest::Status),
-                            call(MobileRequest::ConnectedDevices),
-                            call(MobileRequest::CurrentPairingOffer),
-                        )
+                        let status = call(MobileRequest::Status);
+                        let connected = call(MobileRequest::ConnectedDevices);
+                        let offer = (had_offer || auto_mint).then(|| {
+                            let offer = call(MobileRequest::CurrentPairingOffer);
+                            if auto_mint
+                                && !matches!(
+                                    &offer,
+                                    Ok(MobileReply::PairingOffer { expires_at_ms, .. })
+                                        if *expires_at_ms > krill_proto::mobile::client::now_ms()
+                                )
+                            {
+                                call(MobileRequest::MintPairingTicket {
+                                    mode,
+                                    custom_address,
+                                    rotate: false,
+                                })
+                            } else {
+                                offer
+                            }
+                        });
+                        (status, connected, offer)
                     })
                     .await;
                 if this
@@ -295,8 +332,8 @@ impl SettingsView {
                         if let Ok(reply) = data.1 {
                             this.mobile.accept(reply);
                         }
-                        if this.mobile.offer.is_some() {
-                            if let Ok(reply) = data.2 {
+                        if let Some(offer) = data.2 {
+                            if let Ok(reply) = offer {
                                 this.mobile.accept(reply);
                             } else {
                                 this.mobile.offer = None;

@@ -2320,11 +2320,13 @@ fn agy_root_and_id_from_vnodes(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
 }
 
 fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf, String)> {
+    let mut seeds = Vec::new();
     let mut cur = fg_pid.unwrap_or(root_pid);
-    for _ in 0..8 {
-        if cur <= 1 {
+    for _ in 0..16 {
+        if cur <= 1 || seeds.contains(&cur) {
             break;
         }
+        seeds.push(cur);
         let paths = crate::sys::open_vnode_paths(cur);
         if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
             return Some(found);
@@ -2340,16 +2342,37 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
         }
         cur = parent;
     }
-    if root_pid > 1
+    if root_pid > 1 && !seeds.contains(&root_pid) {
+        seeds.push(root_pid);
+        let paths = crate::sys::open_vnode_paths(root_pid);
+        if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
+            return Some(found);
+        }
+    }
+    if !seeds.is_empty()
         && let Ok(pids) = crate::sys::all_pids()
     {
-        for pid in pids {
-            if pid != root_pid && crate::sys::parent_pid(pid).ok() == Some(root_pid) {
-                let paths = crate::sys::open_vnode_paths(pid);
-                if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
-                    return Some(found);
+        let mut seen = seeds;
+        let mut frontier = seen.clone();
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for &pid in &pids {
+                if pid <= 1 || seen.contains(&pid) {
+                    continue;
+                }
+                if crate::sys::parent_pid(pid).is_ok_and(|ppid| frontier.contains(&ppid)) {
+                    seen.push(pid);
+                    next.push(pid);
+                    let paths = crate::sys::open_vnode_paths(pid);
+                    if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
+                        return Some(found);
+                    }
                 }
             }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
         }
     }
     None
@@ -2362,9 +2385,38 @@ fn agy_transcript_for_conv(agy_root: &Path, conv_id: &str) -> Option<PathBuf> {
         logs.join("transcript.jsonl"),
         logs.join("transcript_full.jsonl"),
         conv_dir.join("transcript.jsonl"),
+        agy_root.join("sessions").join(format!("{conv_id}.jsonl")),
+        agy_root.join("conversations").join(format!("{conv_id}.db")),
     ]
     .into_iter()
     .find(|p| p.is_file())
+}
+
+pub(crate) fn cached_live_agy_identity(
+    session: krill_proto::SessionId,
+) -> Option<(PathBuf, String, PathBuf)> {
+    let cache_mutex = AGY_LIVE_TITLE_CACHE.get()?;
+    let (agy_root, conv_id) = {
+        let cache = lock(cache_mutex);
+        let entry = cache.get(&session.0)?;
+        (entry.agy_root.clone()?, entry.conv_id.clone()?)
+    };
+    if !crate::agent::control::valid_session_id(&conv_id) {
+        return None;
+    }
+    let path = agy_transcript_for_conv(&agy_root, &conv_id)
+        .unwrap_or_else(|| agy_root.join("conversations").join(format!("{conv_id}.db")));
+    Some((agy_root, conv_id, path))
+}
+
+pub(crate) fn discover_live_agy_identity(
+    root_pid: u32,
+    fg_pid: Option<u32>,
+) -> Option<(PathBuf, String, PathBuf)> {
+    let (agy_root, conv_id) = discover_agy_from_pids(root_pid, fg_pid)?;
+    let path = agy_transcript_for_conv(&agy_root, &conv_id)
+        .unwrap_or_else(|| agy_root.join("conversations").join(format!("{conv_id}.db")));
+    Some((agy_root, conv_id, path))
 }
 
 fn read_agy_first_user_prompt(agy_root: &Path, conv_id: &str) -> Option<String> {
@@ -2445,13 +2497,18 @@ pub(crate) fn resolve_live_agy_title(
     stored: Option<&crate::agent::control::StoredLaunch>,
 ) -> (Option<String>, Option<(String, Option<PathBuf>)>) {
     let cache_mutex = AGY_LIVE_TITLE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let needs_store_binding =
+        stored.is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none());
     let cached_snapshot = {
         let cache = lock(cache_mutex);
         if let Some(entry) = cache.get(&session.0) {
-            if entry.checked_at.elapsed() < Duration::from_secs(2) && entry.title.is_some() {
+            if !needs_store_binding
+                && entry.checked_at.elapsed() < Duration::from_secs(2)
+                && entry.title.is_some()
+            {
                 return (entry.title.clone(), None);
             }
-            if entry.checked_at.elapsed() < Duration::from_secs(1) {
+            if !needs_store_binding && entry.checked_at.elapsed() < Duration::from_secs(1) {
                 return (None, None);
             }
             Some((
@@ -2493,6 +2550,11 @@ pub(crate) fn resolve_live_agy_title(
                         .is_file()
                         || cand.join("brain").join(sid).is_dir()
                         || cand.join("presence").join(format!("{sid}.lock")).is_file()
+                        || cand
+                            .join("conversations")
+                            .join(format!("{sid}.db"))
+                            .is_file()
+                        || cand.join("sessions").join(format!("{sid}.jsonl")).is_file()
                     {
                         resolved_pair = Some((cand, sid.to_owned()));
                         break 'search;
@@ -2509,19 +2571,25 @@ pub(crate) fn resolve_live_agy_title(
         resolved_pair = Some((agy_root, conv_id));
     }
 
+    if resolved_pair.is_none()
+        && let Some((Some(prev_root), Some(prev_id), _, _)) = &cached_snapshot
+    {
+        resolved_pair = Some((prev_root.clone(), prev_id.clone()));
+    }
+
     if let Some((ref agy_root, ref conv_id)) = resolved_pair
-        && stored.is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
+        && stored.is_some_and(|s| {
+            s.session_id.is_none()
+                || s.transcript_path.is_none()
+                || s.transcript_path
+                    .as_deref()
+                    .is_some_and(crate::agent::control::is_agy_conversation_db_path)
+        })
     {
         let tp = agy_transcript_for_conv(agy_root, conv_id);
         if stored.is_some_and(|s| s.session_id.is_none()) || tp.is_some() {
             discovered_for_store = Some((conv_id.clone(), tp));
         }
-    }
-
-    if resolved_pair.is_none()
-        && let Some((Some(prev_root), Some(prev_id), _, _)) = &cached_snapshot
-    {
-        resolved_pair = Some((prev_root.clone(), prev_id.clone()));
     }
 
     let Some((agy_root, conv_id)) = resolved_pair else {

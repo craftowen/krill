@@ -602,6 +602,8 @@ pub struct Config {
     pending_ssh_connect: Option<crate::ssh_hosts::SshHost>,
     /// 설정·점검 창에서 요청한 터미널 명령 자동 입력 큐(메인 셸 창이 순서대로 꺼내 실행).
     pending_terminal_commands: std::collections::VecDeque<String>,
+    /// 설정·점검 창에서 요청한 터미널 명령의 실행 대상 호스트(`None`이면 로컬).
+    pending_terminal_host: Option<crate::hosts::HostId>,
     /// 관리자 YOLO 토글이 요청한 새 세션 권한(메인 셸 창이 꺼내 데몬에 적용).
     pending_permission: Option<krill_proto::agent::Permission>,
     /// `ssh-copy-id` 실행 안내처럼 설정 창이 닫힌 뒤에도 보여야 할 문구(메인 셸 창이 꺼내 배너로 표시).
@@ -698,6 +700,11 @@ pub fn take_pending_ssh_connect(cx: &mut App) -> Option<crate::ssh_hosts::SshHos
 
 /// 설정·점검 화면에서 메인 셸 터미널 탭에 자동 입력·실행할 명령을 예약한다.
 pub fn queue_terminal_command(cmd: impl Into<String>, cx: &mut App) {
+    queue_terminal_command_on(crate::hosts::HostId::Local, cmd, cx);
+}
+
+/// 지정한 호스트의 터미널 탭에 자동 입력·실행할 명령을 예약한다.
+pub fn queue_terminal_command_on(host: crate::hosts::HostId, cmd: impl Into<String>, cx: &mut App) {
     let cmd = cmd.into().trim().to_owned();
     if cmd.is_empty() {
         return;
@@ -705,9 +712,16 @@ pub fn queue_terminal_command(cmd: impl Into<String>, cx: &mut App) {
     if !cx.has_global::<Config>() {
         cx.set_global(Config::default());
     }
-    cx.global_mut::<Config>()
-        .pending_terminal_commands
-        .push_back(cmd);
+    let config = cx.global_mut::<Config>();
+    config.pending_terminal_host = host.is_remote().then_some(host);
+    config.pending_terminal_commands.push_back(cmd);
+}
+
+/// 예약된 터미널 자동 입력 명령의 대상 호스트를 꺼낸다(`None`이면 로컬).
+pub fn take_pending_terminal_host(cx: &mut App) -> Option<crate::hosts::HostId> {
+    cx.try_global::<Config>()
+        .and_then(|c| c.pending_terminal_host.clone())
+        .and_then(|_| cx.global_mut::<Config>().pending_terminal_host.take())
 }
 
 /// 예약된 터미널 자동 입력 명령을 순서대로 꺼낸다.
@@ -1018,6 +1032,7 @@ fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App)
         stamp: [None; 7],
         pending_ssh_connect: None,
         pending_terminal_commands: std::collections::VecDeque::new(),
+        pending_terminal_host: None,
         pending_permission: None,
         pending_notice: None,
     });
@@ -2632,6 +2647,17 @@ pub struct SettingsView {
     automations_page: bool,
     automations: schedules::SchedulesState,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
+    account_host: crate::hosts::HostId,
+    account_hosts: Vec<(
+        crate::hosts::HostId,
+        String,
+        Option<crate::hosts::HostTarget>,
+    )>,
+    local_accounts_snapshot: krill_proto::usage::AccountsSnapshot,
+    remote_accounts_snapshots:
+        std::collections::BTreeMap<crate::hosts::HostId, krill_proto::usage::AccountsSnapshot>,
+    remote_orphan_profiles:
+        std::collections::BTreeMap<crate::hosts::HostId, Vec<krill_proto::usage::OrphanProfile>>,
     accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     account_error: Option<SharedString>,
     /// 마지막 계정 갱신 때 데몬에 닿지 못했다. 로컬 파일을 읽기 전용으로 보이고 변경은 막는다(OWE-697).
@@ -3065,6 +3091,11 @@ impl SettingsView {
             automations_page: false,
             automations: schedules::SchedulesState::default(),
             remote_krill: None,
+            account_host: crate::hosts::HostId::Local,
+            account_hosts: Vec::new(),
+            local_accounts_snapshot: krill_proto::usage::AccountsSnapshot::default(),
+            remote_accounts_snapshots: std::collections::BTreeMap::new(),
+            remote_orphan_profiles: std::collections::BTreeMap::new(),
             accounts_snapshot: krill_proto::usage::AccountsSnapshot::default(),
             account_error: None,
             accounts_offline: false,
@@ -3415,10 +3446,12 @@ impl SettingsView {
 
     /// 단독 모바일 페이지 모드를 켜거나 끈다. 켤 때는 모바일 탭으로 전환한다.
     pub fn set_mobile_page(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.mobile_page = on;
         if on && self.tab != AdminTab::Mobile {
             self.set_tab(AdminTab::Mobile, cx);
+        } else if on && self.mobile.offer.is_none() {
+            self.mobile_enter(cx);
         }
-        self.mobile_page = on;
         cx.notify();
     }
 
@@ -3560,12 +3593,127 @@ impl SettingsView {
         &self.accounts_snapshot
     }
 
+    #[must_use]
+    pub fn account_host(&self) -> &crate::hosts::HostId {
+        &self.account_host
+    }
+
+    #[must_use]
+    pub fn account_hosts(
+        &self,
+    ) -> &[(
+        crate::hosts::HostId,
+        String,
+        Option<crate::hosts::HostTarget>,
+    )] {
+        &self.account_hosts
+    }
+
+    fn selected_account_target(&self) -> Option<crate::hosts::HostTarget> {
+        self.account_hosts
+            .iter()
+            .find(|(h, _, _)| h == &self.account_host)
+            .and_then(|(_, _, target)| target.clone())
+    }
+
+    /// 메인 셸(`Shell`)에서 연결된 원격 호스트 목록·타깃·계정 스냅샷을 설정 뷰와 동기화한다.
+    pub fn sync_account_hosts(
+        &mut self,
+        hosts: Vec<(
+            crate::hosts::HostId,
+            String,
+            Option<crate::hosts::HostTarget>,
+        )>,
+        snapshots: std::collections::BTreeMap<
+            crate::hosts::HostId,
+            krill_proto::usage::AccountsSnapshot,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_hosts = hosts;
+        for (host, snap) in snapshots {
+            if host.is_local() {
+                self.local_accounts_snapshot = snap.clone();
+            } else {
+                self.remote_accounts_snapshots
+                    .insert(host.clone(), snap.clone());
+            }
+            if !self.account_rule_pending && self.account_host == host {
+                self.accounts_snapshot = snap;
+            }
+        }
+        if self.account_host.is_remote()
+            && !self
+                .account_hosts
+                .iter()
+                .any(|(h, _, _)| h == &self.account_host)
+        {
+            self.select_account_host(crate::hosts::HostId::Local, cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    /// `AI 제공자 계정` 탭에서 관리할 대상 호스트를 전환한다.
+    pub fn select_account_host(&mut self, host: crate::hosts::HostId, cx: &mut Context<Self>) {
+        if self.account_host != host {
+            if self.account_host.is_local() {
+                self.local_accounts_snapshot = self.accounts_snapshot.clone();
+            } else {
+                self.remote_accounts_snapshots
+                    .insert(self.account_host.clone(), self.accounts_snapshot.clone());
+            }
+            self.account_error = None;
+            self.accounts_offline = false;
+            self.terminal_login_provider = None;
+            self.terminal_login_account = None;
+            self.removing = None;
+            self.rename = None;
+            self.disarm(cx);
+            self.accounts_snapshot = if host.is_local() {
+                self.local_accounts_snapshot.clone()
+            } else {
+                self.remote_accounts_snapshots
+                    .get(&host)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            self.orphan_profiles = if host.is_local() {
+                Vec::new()
+            } else {
+                self.remote_orphan_profiles
+                    .get(&host)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            self.account_host = host;
+        }
+        self.accounts_refresh_pending = false;
+        self.refresh_accounts_async(cx);
+        cx.notify();
+    }
+
     pub fn update_accounts_snapshot(
         &mut self,
         snapshot: krill_proto::usage::AccountsSnapshot,
         cx: &mut Context<Self>,
     ) {
-        if self.account_rule_pending {
+        self.update_accounts_snapshot_for_host(&crate::hosts::HostId::Local, snapshot, cx);
+    }
+
+    pub fn update_accounts_snapshot_for_host(
+        &mut self,
+        host: &crate::hosts::HostId,
+        snapshot: krill_proto::usage::AccountsSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if host.is_local() {
+            self.local_accounts_snapshot = snapshot.clone();
+        } else {
+            self.remote_accounts_snapshots
+                .insert(host.clone(), snapshot.clone());
+        }
+        if &self.account_host != host || self.account_rule_pending {
             return;
         }
         if let Some(error) = snapshot
@@ -3592,6 +3740,13 @@ impl SettingsView {
         if self.account_rule_pending || self.daemon_required(cx) {
             return;
         }
+        if self.account_host.is_remote() {
+            self.apply_account_request(
+                krill_proto::usage::UsageRequest::UpsertAutoSwitchRule(rule),
+                cx,
+            );
+            return;
+        }
         let dir = state_dir(cx);
         if is_daemon_state_dir(dir.as_deref()) {
             self.spawn_account_rule_request(
@@ -3613,6 +3768,16 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         if self.account_rule_pending || self.daemon_required(cx) {
+            return;
+        }
+        if self.account_host.is_remote() {
+            self.apply_account_request(
+                krill_proto::usage::UsageRequest::RemoveAutoSwitchRule {
+                    provider,
+                    from_account_id: from_account_id.to_owned(),
+                },
+                cx,
+            );
             return;
         }
         let dir = state_dir(cx);
@@ -3663,6 +3828,12 @@ impl SettingsView {
         self.account_rule_pending = false;
         match result {
             Ok(snap) => {
+                if self.account_host.is_local() {
+                    self.local_accounts_snapshot = snap.clone();
+                } else {
+                    self.remote_accounts_snapshots
+                        .insert(self.account_host.clone(), snap.clone());
+                }
                 self.accounts_snapshot = snap;
                 self.account_error = None;
                 cx.defer(notify_external_change);
@@ -3770,6 +3941,59 @@ impl SettingsView {
             return;
         }
         self.accounts_refresh_pending = true;
+        if self.account_host.is_remote() {
+            let host = self.account_host.clone();
+            let target = self.selected_account_target();
+            let before = (self.accounts_snapshot.clone(), self.account_error.clone());
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let loaded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let target = target.ok_or_else(|| "remote host disconnected".to_owned())?;
+                        let snapshot = crate::accounts::request_target(
+                            &target,
+                            &krill_proto::usage::UsageRequest::ListAccounts,
+                        )?;
+                        let orphans = crate::accounts::orphans_target(
+                            &target,
+                            &krill_proto::usage::UsageRequest::ListOrphanProfiles,
+                        )
+                        .unwrap_or_default();
+                        Ok::<_, String>((snapshot, orphans))
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.accounts_refresh_pending = false;
+                    if this.account_host != host {
+                        return;
+                    }
+                    this.accounts_offline = false;
+                    match loaded {
+                        Ok((snapshot, orphans)) => {
+                            this.orphan_profiles.clone_from(&orphans);
+                            this.remote_orphan_profiles.insert(host.clone(), orphans);
+                            this.remote_accounts_snapshots
+                                .insert(host, snapshot.clone());
+                            if !this.account_rule_pending
+                                && this.accounts_snapshot == before.0
+                                && this.account_error == before.1
+                            {
+                                this.accounts_snapshot = snapshot;
+                                this.account_error = None;
+                            }
+                        }
+                        Err(error) => {
+                            this.account_error = Some(error.into());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let file_revision = self.file_revision;
         cx.notify();
         let before = (self.accounts_snapshot.clone(), self.account_error.clone());
@@ -3824,6 +4048,14 @@ impl SettingsView {
                 .await;
             this.update(cx, |this, cx| {
                 this.accounts_refresh_pending = false;
+                if this.account_host.is_remote() {
+                    if this.file_revision == file_revision {
+                        this.ssh_hosts = loaded.1;
+                    }
+                    this.local_accounts_snapshot = loaded.0;
+                    cx.notify();
+                    return;
+                }
                 this.accounts_offline = loaded.3;
                 this.orphan_profiles = loaded.4;
                 this.account_file_stamp = loaded.5;
@@ -3839,6 +4071,7 @@ impl SettingsView {
                     if !daemon {
                         Self::merge_local_snapshot_tails(&this.accounts_snapshot, &mut next);
                     }
+                    this.local_accounts_snapshot = next.clone();
                     this.accounts_snapshot = next;
                     this.account_error = loaded.2.map(SharedString::from);
                 }
@@ -3853,7 +4086,7 @@ impl SettingsView {
     }
 
     fn refresh_accounts_manually(&mut self, cx: &mut Context<Self>) {
-        let daemon = is_daemon_state_dir(state_dir(cx).as_deref());
+        let daemon = self.account_host.is_remote() || is_daemon_state_dir(state_dir(cx).as_deref());
         self.apply_account_request(krill_proto::usage::UsageRequest::ListAccounts, cx);
         if daemon {
             cx.spawn(async move |this, cx| {
@@ -3985,6 +4218,38 @@ impl SettingsView {
         if self.daemon_required(cx) {
             return;
         }
+        if self.account_host.is_remote() {
+            let host = self.account_host.clone();
+            let target = self.selected_account_target();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let target = target.ok_or_else(|| "remote host disconnected".to_owned())?;
+                        crate::accounts::orphans_target(
+                            &target,
+                            &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
+                        )
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    match result {
+                        Ok(left) => {
+                            this.remote_orphan_profiles
+                                .insert(host.clone(), left.clone());
+                            if this.account_host == host {
+                                this.orphan_profiles = left;
+                            }
+                        }
+                        Err(e) => this.account_error = Some(e.into()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let dir = state_dir(cx);
         if !is_daemon_state_dir(dir.as_deref()) {
             let home = crate::accounts::default_home();
@@ -4037,6 +4302,7 @@ impl SettingsView {
     }
 
     /// Claude·Codex는 백그라운드, agy·OpenCode는 안내 후 터미널에서 로그인한다.
+    /// 원격 호스트를 선택 중이면 모든 제공자를 원격 터미널 안내 카드로 처리한다.
     /// 브라우저 로그인이 끝나기 전에는 `login_pending`을 유지해 진행 표시·[취소]를 보이고,
     /// 스레드가 남긴 [`crate::accounts::LoginOutcome`]으로 성공·실패·취소를 닫는다(OWE-881).
     fn login_account(
@@ -4049,24 +4315,17 @@ impl SettingsView {
         if self.account_rule_pending || self.login_pending.is_some() {
             return;
         }
-        if !matches!(
-            provider,
-            krill_proto::usage::ProviderKind::Claude | krill_proto::usage::ProviderKind::Codex
-        ) {
+        if self.account_host.is_remote()
+            || !matches!(
+                provider,
+                krill_proto::usage::ProviderKind::Claude | krill_proto::usage::ProviderKind::Codex
+            )
+        {
             // 대화형 로그인은 안내 카드에서 [터미널에서 실행]을 눌러야 명령이 간다.
             // 예전처럼 호출 즉시 큐에 넣고 설정 화면을 닫지 않는다.
-            if matches!(
-                provider,
-                krill_proto::usage::ProviderKind::OpenCode
-                    | krill_proto::usage::ProviderKind::Antigravity
-            ) {
-                self.terminal_login_provider = Some(provider);
-                self.terminal_login_account = account;
-                self.account_error = None;
-                cx.notify();
-                return;
-            }
-            self.account_error = Some(text::ACCOUNT_LOGIN_UNSUPPORTED.get().into());
+            self.terminal_login_provider = Some(provider);
+            self.terminal_login_account = account;
+            self.account_error = None;
             cx.notify();
             return;
         }
@@ -4234,6 +4493,8 @@ impl SettingsView {
             return;
         };
         let account = self.terminal_login_account.take();
+        let host = self.account_host.clone();
+        let remote_target = host.is_remote().then(|| self.selected_account_target());
         let dir = state_dir(cx);
         let daemon = is_daemon_state_dir(dir.as_deref());
         let n = self.added_counter;
@@ -4247,15 +4508,19 @@ impl SettingsView {
             .unwrap_or_else(crate::accounts::default_home);
         self.added_counter = n.saturating_add(1);
         let request = move || {
-            let paths = if daemon {
+            let paths = if remote_target.is_none() && daemon {
                 Some(krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?)
             } else {
                 None
             };
-            let send = |req: &UsageRequest| match &paths {
-                Some(paths) => crate::accounts::request_ipc(paths, req),
-                None => crate::accounts::request_local(&home, dir.as_deref(), req)
-                    .map_err(|e| e.to_string()),
+            let send = |req: &UsageRequest| match &remote_target {
+                Some(Some(target)) => crate::accounts::request_target(target, req),
+                Some(None) => Err("remote host disconnected".to_owned()),
+                None => match &paths {
+                    Some(paths) => crate::accounts::request_ipc(paths, req),
+                    None => crate::accounts::request_local(&home, dir.as_deref(), req)
+                        .map_err(|e| e.to_string()),
+                },
             };
             let snap = send(&UsageRequest::ListAccounts)?;
             let account = if let Some(account) = account {
@@ -4300,9 +4565,17 @@ impl SettingsView {
                     this.account_rule_pending = false;
                     match result {
                         Ok((snap, command)) => {
-                            this.accounts_snapshot = snap;
+                            if host.is_local() {
+                                this.local_accounts_snapshot = snap.clone();
+                            } else {
+                                this.remote_accounts_snapshots
+                                    .insert(host.clone(), snap.clone());
+                            }
+                            if this.account_host == host {
+                                this.accounts_snapshot = snap;
+                            }
                             this.account_error = None;
-                            queue_terminal_command(&command, cx);
+                            queue_terminal_command_on(host, &command, cx);
                         }
                         Err(error) => this.account_error = Some(error.into()),
                     }
@@ -4419,6 +4692,25 @@ impl SettingsView {
     ) {
         let listing = matches!(req, krill_proto::usage::UsageRequest::ListAccounts);
         if !listing && self.daemon_required(cx) {
+            return;
+        }
+        if self.account_host.is_remote() {
+            if listing {
+                self.refresh_accounts_async(cx);
+                return;
+            }
+            if self.account_rule_pending {
+                return;
+            }
+            let Some(target) = self.selected_account_target() else {
+                self.account_error = Some("remote host disconnected".into());
+                cx.notify();
+                return;
+            };
+            self.spawn_account_rule_request(
+                async move { crate::accounts::request_target(&target, &req) },
+                cx,
+            );
             return;
         }
         let dir = state_dir(cx);
@@ -8185,6 +8477,44 @@ impl SettingsView {
                     .debug_selector(|| "admin-account-error".into())
             }));
 
+        if self.account_hosts.len() > 1 {
+            let current_host = self.account_host.clone();
+            let host_btns = self
+                .account_hosts
+                .iter()
+                .map(|(host, label, _)| {
+                    let key = match host {
+                        crate::hosts::HostId::Local => "local".to_owned(),
+                        crate::hosts::HostId::Remote(id) => id.clone(),
+                    };
+                    let id_str = format!("admin-accounts-host-{key}");
+                    let selected = *host == current_host;
+                    let target_host = host.clone();
+                    layout::segment(
+                        p,
+                        gpui::ElementId::Name(id_str.clone().into()),
+                        label.clone(),
+                        selected,
+                    )
+                    .debug_selector(move || id_str.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_account_host(target_host.clone(), cx);
+                    }))
+                })
+                .collect::<Vec<_>>();
+            root = root.child(
+                layout::row(p)
+                    .id("admin-accounts-host-bar")
+                    .debug_selector(|| "admin-accounts-host-bar".into())
+                    .child(layout::label(
+                        p,
+                        text::ACCOUNTS_HOST_TITLE.get(),
+                        Some(text::ACCOUNTS_HOST_DESC.get()),
+                    ))
+                    .child(layout::controls().child(layout::segmented_control(p, host_btns))),
+            );
+        }
+
         let providers = [
             (
                 ProviderKind::Claude,
@@ -8229,7 +8559,11 @@ impl SettingsView {
             // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
             accounts.sort_by_key(|a| !a.host_default);
             let add_id = format!("admin-add-account-{}", provider.as_str());
-            let provider_installed = crate::accounts::installed::is_installed(cx, provider);
+            let provider_installed = if self.account_host.is_remote() {
+                !accounts.is_empty()
+            } else {
+                crate::accounts::installed::is_installed(cx, provider)
+            };
             let active_conn = accounts.iter().find(|a| a.active).and_then(|acc| {
                 let usage = crate::accounts::display::account(
                     acc,
@@ -8300,6 +8634,7 @@ impl SettingsView {
                 && let Some(install_cmd) = agent_install_command(provider.as_str())
             {
                 let install_id = format!("admin-install-provider-{}", provider.as_str());
+                let install_host = self.account_host.clone();
                 sub_controls = sub_controls.child(
                     layout::secondary(
                         gpui::ElementId::Name(install_id.clone().into()),
@@ -8309,7 +8644,7 @@ impl SettingsView {
                     .debug_selector(move || install_id.clone())
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(install_cmd.clone()));
-                        queue_terminal_command(install_cmd.clone(), cx);
+                        queue_terminal_command_on(install_host.clone(), install_cmd.clone(), cx);
                     }),
                 );
             }
@@ -8384,8 +8719,10 @@ impl SettingsView {
                             text::ACCOUNT_LOGIN_UNSUPPORTED.get(),
                             if provider == ProviderKind::Antigravity {
                                 text::AGY_LOGIN_GUIDE.get().to_owned()
-                            } else {
+                            } else if provider == ProviderKind::OpenCode {
                                 text::OPENCODE_LOGIN_GUIDE.get().to_owned()
+                            } else {
+                                text::REMOTE_CLI_LOGIN_GUIDE.get().to_owned()
                             },
                         ))
                         .child(
@@ -8460,7 +8797,7 @@ impl SettingsView {
                 .child(header)
                 .child(subheader)
                 .child(active_line);
-            if provider == ProviderKind::OpenCode {
+            if provider == ProviderKind::OpenCode && self.account_host.is_local() {
                 section = section.child(self.render_opencode_api_key_card(window, cx));
             }
             section = section.child(list);
@@ -8833,17 +9170,19 @@ impl SettingsView {
                                 this.refresh_accounts_manually(cx);
                             })),
                         )
-                        .child(
-                            layout::secondary(
-                                "admin-open-accounts-toml",
-                                text::ACCOUNTS_OPEN_TOML.get(),
+                        .when(self.account_host.is_local(), |c| {
+                            c.child(
+                                layout::secondary(
+                                    "admin-open-accounts-toml",
+                                    text::ACCOUNTS_OPEN_TOML.get(),
+                                )
+                                .icon(IconName::ExternalLink)
+                                .debug_selector(|| "admin-open-accounts-toml".into())
+                                .on_click(|_, _, cx| {
+                                    open_file("accounts.toml", "", cx);
+                                }),
                             )
-                            .icon(IconName::ExternalLink)
-                            .debug_selector(|| "admin-open-accounts-toml".into())
-                            .on_click(|_, _, cx| {
-                                open_file("accounts.toml", "", cx);
-                            }),
-                        ),
+                        }),
                 ),
         );
 

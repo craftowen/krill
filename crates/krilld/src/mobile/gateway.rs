@@ -1238,66 +1238,83 @@ pub(super) fn auth_close_code(error: &io::Error) -> Option<u16> {
 
 fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Result<Channel> {
     // 주소와 무관한 실패 예산. 미인증 연결은 최대 4개·5초로 제한한다.
-    lock(&shared.state).devices.attempt(now_ms())?;
-    let challenge = random()?;
-    ws::write(
-        socket,
-        ws::TEXT,
-        serde_json::to_vec(&serde_json::json!({"version":2,"challenge":hex(&challenge)}))
-            .map_err(io::Error::other)?
-            .as_slice(),
-    )?;
-    let (opcode, body) = ws::read_limited(socket, 4096)?;
-    if opcode != ws::TEXT {
-        return Err(invalid());
-    }
-    let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
-    let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
-    let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
-    let secret = {
-        let s = lock(&shared.state);
-        match (&token, &auth.device_id) {
-            (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
-            (None, Some(d)) => s.devices.device_secret(d)?,
-            _ => return Err(invalid()),
-        }
-    };
-    let mut salt = [0; 64];
-    for (a, b) in salt
-        .iter_mut()
-        .zip(challenge.into_iter().chain(client_nonce))
-    {
-        *a = b;
-    }
-    let mut channel = Channel::new(&secret, &salt, Endpoint::Daemon)?;
-    let (opcode, body) = ws::read_limited(socket, 512)?;
-    if opcode != ws::BINARY {
-        return Err(invalid());
-    }
-    let proof: AuthProof = serde_json::from_slice(&channel.open(&body)?).map_err(|_| invalid())?;
-    let authenticated = {
-        let mut s = lock(&shared.state);
-        if s.stopped || !s.connections.contains_key(&id) {
+    lock(&shared.state).devices.check_cooldown(now_ms())?;
+    let result = (|| {
+        let challenge = random()?;
+        ws::write(
+            socket,
+            ws::TEXT,
+            serde_json::to_vec(&serde_json::json!({"version":2,"challenge":hex(&challenge)}))
+                .map_err(io::Error::other)?
+                .as_slice(),
+        )?;
+        let (opcode, body) = ws::read_limited(socket, 4096)?;
+        if opcode == 8 {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        let (device_id, credential) = if let Some(token) = token {
-            let (device, credential) = s.devices.pair(&token, &proof.label, now_ms())?;
-            (device.device_id, Some(hex(&credential)))
-        } else {
-            let device_id = auth.device_id.ok_or_else(invalid)?;
-            s.devices.seen(&device_id, now_ms())?;
-            (device_id, None)
-        };
-        let conn = s.connections.get_mut(&id).ok_or_else(invalid)?;
-        conn.device = Some(device_id.clone());
-        Authenticated {
-            device_id,
-            credential,
+        if opcode != ws::TEXT {
+            return Err(invalid());
         }
-    };
-    let payload = channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;
-    ws::write(socket, ws::BINARY, &payload)?;
-    Ok(channel)
+        let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
+        let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
+        let secret = {
+            let s = lock(&shared.state);
+            match (&token, &auth.device_id) {
+                (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
+                (None, Some(d)) => s.devices.device_secret(d)?,
+                _ => return Err(invalid()),
+            }
+        };
+        let mut salt = [0; 64];
+        for (a, b) in salt
+            .iter_mut()
+            .zip(challenge.into_iter().chain(client_nonce))
+        {
+            *a = b;
+        }
+        let mut channel = Channel::new(&secret, &salt, Endpoint::Daemon)?;
+        let (opcode, body) = ws::read_limited(socket, 512)?;
+        if opcode == 8 {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        if opcode != ws::BINARY {
+            return Err(invalid());
+        }
+        let proof: AuthProof =
+            serde_json::from_slice(&channel.open(&body)?).map_err(|_| invalid())?;
+        let authenticated = {
+            let mut s = lock(&shared.state);
+            if s.stopped || !s.connections.contains_key(&id) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let (device_id, credential) = if let Some(token) = token {
+                let (device, credential) = s.devices.pair(&token, &proof.label, now_ms())?;
+                (device.device_id, Some(hex(&credential)))
+            } else {
+                let device_id = auth.device_id.ok_or_else(invalid)?;
+                s.devices.seen(&device_id, now_ms())?;
+                (device_id, None)
+            };
+            let conn = s.connections.get_mut(&id).ok_or_else(invalid)?;
+            conn.device = Some(device_id.clone());
+            Authenticated {
+                device_id,
+                credential,
+            }
+        };
+        let payload =
+            channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;
+        ws::write(socket, ws::BINARY, &payload)?;
+        Ok(channel)
+    })();
+    if result
+        .as_ref()
+        .is_err_and(|error: &io::Error| error.kind() == io::ErrorKind::InvalidData)
+    {
+        lock(&shared.state).devices.attempt(now_ms()).ok();
+    }
+    result
 }
 
 /// 암호화 페이로드 하나는 IPC 프레임 하나다. 연결이 끊기면 이 pair만 닫는다.

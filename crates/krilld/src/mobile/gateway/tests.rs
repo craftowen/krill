@@ -381,6 +381,49 @@ fn individual_revocation_preserves_other_device_and_listener() {
 }
 
 #[test]
+fn legitimate_reconnects_and_pre_auth_eof_do_not_consume_failure_budget() {
+    let (_r, g) = start();
+    let (port, ticket) = offer(&g);
+    let client = Client::pair(port, &ticket);
+    let (device, credential) = (client.device.clone(), client.credential);
+    drop(client);
+    until(|| lock(&g.shared.state).connections.is_empty());
+    for _ in 0..7 {
+        // A network switch can drop the socket either before AuthHello or before its proof.
+        let (socket, _) = websocket(port);
+        drop(socket);
+        until(|| lock(&g.shared.state).connections.is_empty());
+        let (mut socket, _) = websocket(port);
+        send(
+            &mut socket,
+            ws::TEXT,
+            &serde_json::to_vec(&AuthHello {
+                token: None,
+                device_id: Some(device.clone()),
+                client_nonce: hex(&random().unwrap()),
+            })
+            .unwrap(),
+        );
+        drop(socket);
+        until(|| lock(&g.shared.state).connections.is_empty());
+        let (mut socket, _) = websocket(port);
+        send(&mut socket, 8, &1000_u16.to_be_bytes());
+        assert!(receive(&mut socket).is_err());
+        until(|| lock(&g.shared.state).connections.is_empty());
+        let client = Client::reconnect(port, &device, &credential);
+        assert_eq!(client.device, device);
+        drop(client);
+        until(|| lock(&g.shared.state).connections.is_empty());
+    }
+    // Five failures must still fit: none of the successful or dropped sockets counted.
+    let mut state = lock(&g.shared.state);
+    for _ in 0..5 {
+        state.devices.attempt(now_ms()).unwrap();
+    }
+    assert!(state.devices.check_cooldown(now_ms()).is_err());
+}
+
+#[test]
 fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
     let (_r, g) = start();
     let (port, t) = offer(&g);

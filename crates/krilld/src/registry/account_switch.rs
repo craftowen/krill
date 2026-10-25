@@ -871,6 +871,23 @@ impl Registry {
                 observed = identity::discover_claude(&claude_homes, old_pid, foreground)
                     .map_err(|e| prepare_failure("process_identity", &e))?;
             }
+            if observed.is_none()
+                && provider == ProviderKind::Antigravity
+                && let Some((home, id, path)) =
+                    crate::agent_history::vault::discover_live_agy_identity(old_pid, foreground)
+                        .or_else(|| crate::agent_history::vault::cached_live_agy_identity(old))
+            {
+                observed = Some(identity::Identity { id, path, home });
+            }
+            if observed.is_none()
+                && stored.session_id.is_none()
+                && provider == ProviderKind::Claude
+                && let Some(sid) = state_dir
+                    .as_deref()
+                    .and_then(|d| crate::agent::claude::session_id(d, old))
+            {
+                stored.session_id = Some(sid);
+            }
             if let Some(found) = observed {
                 // Old versions could persist a display-only cwd guess. A live process
                 // observation must agree even when a record already contains an ID.

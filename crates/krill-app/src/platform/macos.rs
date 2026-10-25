@@ -350,6 +350,92 @@ pub fn tiff_to_png(tiff: &[u8]) -> Option<Vec<u8>> {
     Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
 }
 
+/// macOS 시스템 클립보드(`NSPasteboard::generalPasteboard`)에서 이미지 바이트를 직접 읽는다.
+///
+/// `gpui`의 기본 클립보드 리더는 `NSFilenamesPboardType`이나 `public.utf8-plain-text`가 함께 들어 있으면
+/// 이미지 항목(`public.png`·`public.tiff`)을 건너뛴다. `prefer_over_text`가 `false`면 클립보드 `types`
+/// 선언 순서에서 이미지 UTI가 파일·일반 텍스트보다 먼저 선언된 경우(Safari·Preview·CleanShot 등의 이미지 복사)에만
+/// 이미지를 추출하며, `true`면(죽은 임시 파일 경로·빈 문자열 등) 텍스트 순서와 무관하게 이미지를 추출한다.
+#[must_use]
+pub fn read_pasteboard_image(prefer_over_text: bool) -> Option<(gpui::ImageFormat, Vec<u8>)> {
+    let pb_cls = AnyClass::get(c"NSPasteboard")?;
+    // SAFETY: `[NSPasteboard generalPasteboard]`는 AppKit 시스템 클립보드 싱글턴을 돌려준다.
+    let pb: *mut AnyObject = unsafe { msg_send![pb_cls, generalPasteboard] };
+    if pb.is_null() {
+        return None;
+    }
+    // SAFETY: `pb`는 널이 아닌 `NSPasteboard`이며 `types`는 선언된 UTI 배열(`nullable NSArray *`)을 돌려준다.
+    let types: *mut AnyObject = unsafe { msg_send![pb, types] };
+    if types.is_null() {
+        return None;
+    }
+
+    let index_of = |uti: &str| -> Option<usize> {
+        let s = NSString::from_str(uti);
+        // SAFETY: `types`는 유효한 `NSArray`이고 `s`는 유효한 `NSString`이다.
+        let contains: bool = unsafe { msg_send![types, containsObject: &*s] };
+        if !contains {
+            return None;
+        }
+        // SAFETY: `containsObject:`가 참이므로 해당 인덱스를 돌려준다.
+        let idx: usize = unsafe { msg_send![types, indexOfObject: &*s] };
+        Some(idx)
+    };
+
+    let candidates = [
+        ("public.png", gpui::ImageFormat::Png),
+        ("public.jpeg", gpui::ImageFormat::Jpeg),
+        ("org.webmproject.webp", gpui::ImageFormat::Webp),
+        ("com.compuserve.gif", gpui::ImageFormat::Gif),
+        ("com.microsoft.bmp", gpui::ImageFormat::Bmp),
+        ("public.tiff", gpui::ImageFormat::Tiff),
+    ];
+
+    let min_img_idx = candidates
+        .iter()
+        .filter_map(|(uti, _)| index_of(uti))
+        .min()?;
+
+    if !prefer_over_text {
+        let file_idx = index_of("NSFilenamesPboardType").or_else(|| index_of("public.file-url"));
+        if file_idx.is_some_and(|idx| idx < min_img_idx) {
+            return None;
+        }
+        if index_of("public.utf8-plain-text").is_some_and(|idx| idx < min_img_idx) {
+            return None;
+        }
+    }
+
+    for (uti, fmt) in candidates {
+        if index_of(uti).is_none() {
+            continue;
+        }
+        let s = NSString::from_str(uti);
+        // SAFETY: `pb`는 유효한 `NSPasteboard`이고 `dataForType:`는 `nullable NSData *`를 돌려준다.
+        let data: *mut AnyObject = unsafe { msg_send![pb, dataForType: &*s] };
+        if data.is_null() {
+            continue;
+        }
+        // SAFETY: `data`는 널이 아닌 `NSData`다.
+        let len: usize = unsafe { msg_send![data, length] };
+        // SAFETY: `data`는 널이 아닌 `NSData`이며 `bytes`는 내부 버퍼 포인터를 돌려준다.
+        let ptr: *const u8 = unsafe { msg_send![data, bytes] };
+        if len == 0 || ptr.is_null() {
+            continue;
+        }
+        // SAFETY: `ptr`은 `data` 내부의 `len` 바이트 버퍼를 가리키며 아래 `to_vec()` 동안 살아 있다.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        if fmt == gpui::ImageFormat::Tiff {
+            if let Some(png) = tiff_to_png(&bytes) {
+                return Some((gpui::ImageFormat::Png, png));
+            }
+            return Some((gpui::ImageFormat::Tiff, bytes));
+        }
+        return Some((fmt, bytes));
+    }
+    None
+}
+
 // `AppKit` 공개 심볼.
 unsafe extern "C" {
     static NSApp: *mut AnyObject;

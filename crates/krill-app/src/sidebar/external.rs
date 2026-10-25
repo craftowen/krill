@@ -1783,8 +1783,18 @@ fn resolve_explicit_repo_icon(
                 } else {
                     repo_path.join(p)
                 };
-                has_valid_icon_magic(&candidate)
-                    .then_some(crate::ui::icons::ProjectIcon::Image(candidate))
+                if has_valid_icon_magic(&candidate) {
+                    return Some(crate::ui::icons::ProjectIcon::Image(candidate));
+                }
+                if let Some(dir) = cache_dir
+                    && let Some(name) = candidate.file_name()
+                {
+                    let cached_candidate = dir.join(name);
+                    if has_valid_icon_magic(&cached_candidate) {
+                        return Some(crate::ui::icons::ProjectIcon::Image(cached_candidate));
+                    }
+                }
+                None
             }
         }
         _ => None,
@@ -1856,11 +1866,12 @@ pub(super) fn resolve_project_visuals(
         .map(|d| d.join(REPO_ICON_DIR))
         .or_else(default_icon_cache_dir);
     let mut imported_map: BTreeMap<PathBuf, ImportedVisualEntry> = BTreeMap::new();
+    let mut imported_by_key: BTreeMap<String, ImportedVisualEntry> = BTreeMap::new();
     if let Some(dir) = state_dir
         && let Some(file) = load_imported_projects(dir)
     {
         for proj in file.projects {
-            if proj.archived || proj.host_id.is_some() || proj.path.trim().is_empty() {
+            if proj.archived || proj.path.trim().is_empty() {
                 continue;
             }
             let norm = normalize_imported_path(Path::new(proj.path.trim()));
@@ -1882,6 +1893,12 @@ pub(super) fn resolve_project_visuals(
                 repo_icon: proj.repo_icon,
                 is_git,
             };
+            let proj_key = super::basename(&key).to_lowercase();
+            if !proj_key.is_empty() {
+                imported_by_key
+                    .entry(proj_key)
+                    .or_insert_with(|| entry.clone());
+            }
             if norm != key {
                 imported_map.insert(norm, entry.clone());
             }
@@ -1896,9 +1913,15 @@ pub(super) fn resolve_project_visuals(
         .chain(folder_paths.iter().map(|p| (p, false)))
     {
         let norm_path = normalize_imported_path(path);
+        let proj_key = super::basename(path).to_lowercase();
         let imported = imported_map
             .get(path)
-            .or_else(|| imported_map.get(&norm_path));
+            .or_else(|| imported_map.get(&norm_path))
+            .or_else(|| {
+                (!proj_key.is_empty())
+                    .then(|| imported_by_key.get(&proj_key))
+                    .flatten()
+            });
         let display_name = imported.and_then(|e| e.display_name.clone());
         let badge_color = imported.and_then(|e| e.badge_color.clone());
         let explicit_icon = imported.and_then(|e| e.repo_icon.as_ref());
@@ -1915,7 +1938,172 @@ pub(super) fn resolve_project_visuals(
             );
         }
     }
+    for (path, entry) in &imported_map {
+        if out.contains_key(path) {
+            continue;
+        }
+        let icon = resolve_project_icon(
+            path,
+            entry.is_git,
+            cache_dir.as_deref(),
+            entry.repo_icon.as_ref(),
+        );
+        if entry.display_name.is_some() || entry.badge_color.is_some() || icon.is_some() {
+            out.insert(
+                path.clone(),
+                ProjectVisualMeta {
+                    display_name: entry.display_name.clone(),
+                    badge_color: entry.badge_color.clone(),
+                    icon,
+                },
+            );
+        }
+    }
     out
+}
+
+/// 원격 호스트의 저장소 목록에 대해 원격 `.git/config`의 GitHub 소유자 아바타를 조회해 로컬 캐시 아이콘으로 변환한다.
+pub(super) fn probe_remote_project_visuals(
+    target: &crate::hosts::HostTarget,
+    state_dir: Option<&Path>,
+    repos: &[PathBuf],
+) -> BTreeMap<PathBuf, ProjectVisualMeta> {
+    #[cfg(test)]
+    {
+        let _ = (target, state_dir, repos);
+        BTreeMap::new()
+    }
+    #[cfg(not(test))]
+    {
+        use krill_proto::control::{
+            CaptureFormat, Create, FEAT_CLI, FEAT_CONTROL, Program, Reply, Request,
+        };
+        use krill_proto::ipc::{self, ClientRole};
+        use krill_proto::os::ffi::OsStrExt as _;
+        use krill_proto::screen::Msg as _;
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        if repos.is_empty() {
+            return BTreeMap::new();
+        }
+        let Some(cache_dir) = state_dir
+            .map(|d| d.join(REPO_ICON_DIR))
+            .or_else(default_icon_cache_dir)
+        else {
+            return BTreeMap::new();
+        };
+        let required = FEAT_CONTROL | FEAT_CLI;
+        let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-remote-icons");
+        let Ok(conn) = target.connect(&hello) else {
+            return BTreeMap::new();
+        };
+        if conn.negotiated.features & required != required {
+            return BTreeMap::new();
+        }
+        let mut stream = conn.stream;
+        stream.set_read_timeout(Some(Duration::from_secs(4))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
+
+        let script = b"for r in \"$@\"; do \
+            u=$(git -C \"$r\" config --get remote.upstream.url 2>/dev/null || git -C \"$r\" config --get remote.origin.url 2>/dev/null); \
+            if [ -n \"$u\" ]; then printf 'KRILL_RVIS|%s|%s|END\\n' \"$r\" \"$u\"; fi; \
+          done; \
+          printf 'KRILL_RVIS_DONE\\n'; \
+          sleep 2"
+            .to_vec();
+        let mut args = vec![b"-c".to_vec(), script, b"sh".to_vec()];
+        for repo in repos.iter().take(64) {
+            args.push(repo.as_os_str().as_bytes().to_vec());
+        }
+        let create = Request::Create(Create {
+            account: None,
+            program: Program::Custom {
+                program: b"/bin/sh".to_vec(),
+                args,
+            },
+            cwd: b"/tmp".to_vec(),
+            cols: 1024,
+            rows: 100,
+        });
+        let Ok(encoded) = create.encode() else {
+            return BTreeMap::new();
+        };
+        if stream.write_all(&encoded).is_err() {
+            return BTreeMap::new();
+        }
+        let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+            return BTreeMap::new();
+        };
+        let Ok(Reply::Created { session, .. }) = Reply::decode(kind, &body) else {
+            return BTreeMap::new();
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut captured_text = String::new();
+        while std::time::Instant::now() < deadline {
+            let cap_req = Request::Capture {
+                session,
+                format: CaptureFormat::Plain,
+            };
+            if stream
+                .write_all(&cap_req.encode().unwrap_or_default())
+                .is_err()
+            {
+                break;
+            }
+            let Ok(Some((k, b))) = ipc::read_frame(&mut stream) else {
+                break;
+            };
+            match Reply::decode(k, &b) {
+                Ok(Reply::Captured { bytes: cap, .. }) => {
+                    let text = String::from_utf8_lossy(&cap).into_owned();
+                    if text.contains("KRILL_RVIS_DONE") {
+                        captured_text = text;
+                        break;
+                    }
+                    captured_text = text;
+                }
+                Ok(Reply::Failed(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Ok(close_bytes) = (Request::Close { session }).encode()
+            && stream.write_all(&close_bytes).is_ok()
+        {
+            ipc::read_frame(&mut stream).ok();
+        }
+
+        let mut out = BTreeMap::new();
+        for line in captured_text.lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("KRILL_RVIS|") else {
+                continue;
+            };
+            let Some(inner) = rest.strip_suffix("|END") else {
+                continue;
+            };
+            let Some((repo_str, url_str)) = inner.split_once('|') else {
+                continue;
+            };
+            let Some(owner) = github_avatar_slug(url_str.trim()) else {
+                continue;
+            };
+            let avatar_url = format!("https://github.com/{owner}.png?size=64");
+            if let Some(icon) = resolve_or_fetch_remote_icon(&avatar_url, &cache_dir) {
+                out.insert(
+                    PathBuf::from(repo_str),
+                    ProjectVisualMeta {
+                        display_name: None,
+                        badge_color: None,
+                        icon: Some(icon),
+                    },
+                );
+            }
+        }
+        out
+    }
 }
 
 /// 디렉터리 mtime별 발견 목록 캐시(스냅샷 폴링마다 디렉터리 IO를 반복하지 않기 위해).

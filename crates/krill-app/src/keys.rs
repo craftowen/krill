@@ -210,6 +210,7 @@ mod tests {
             ("cmd-shift-d", "ctrl-alt-shift-d"),
             ("cmd-alt-t", "ctrl-alt-t"),
             ("alt-cmd-shift-a", "ctrl-alt-shift-a"),
+            ("cmd-shift-l", "ctrl-alt-shift-l"),
             ("cmd-[", "ctrl-shift-["),
             ("cmd-shift-]", "ctrl-alt-shift-]"),
             ("cmd-1", "ctrl-1"),

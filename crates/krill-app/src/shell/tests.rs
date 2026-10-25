@@ -3351,6 +3351,7 @@ fn stale_selection_clears_on_new_output(cx: &mut TestAppContext) {
         l.selection = Some(Selection {
             anchor: select::Point { line: 0, column: 0 },
             head: select::Point { line: 0, column: 4 },
+            block: false,
         });
         l.selecting = true;
         assert!(s.select_end(pane, cx));
@@ -4921,7 +4922,7 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
     assert!(cx.debug_bounds("host-header-local").is_none());
     assert!(cx.debug_bounds("host-header-studio-mac").is_none());
 
-    // 로컬 탭에는 호스트 배지가 없고, 원격 탭과 원격 패인 헤더에는 호스트 배지가 표시된다.
+    // 상단 탭에는 로컬·원격 모두 호스트 배지를 표시하지 않고, 원격 패인 헤더에만 표시한다.
     assert_eq!(local_pane.get(), 0);
     assert_eq!(remote_pane.get(), 1);
     assert!(
@@ -4929,8 +4930,8 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         "local tab must not show host badge"
     );
     assert!(
-        cx.debug_bounds("tab-host-badge-1").is_some(),
-        "remote tab must show host badge"
+        cx.debug_bounds("tab-host-badge-1").is_none(),
+        "remote tab must not show host badge in top tab bar"
     );
     assert!(
         cx.debug_bounds("pane-host-badge-1").is_some(),
@@ -7007,7 +7008,7 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
                     bounds.origin.y + cell.height * (line + 0.5),
                 )
             };
-            s.select_begin(pane, pos(7., 0.), 2, false, cx);
+            s.select_begin(pane, pos(7., 0.), 2, gpui::Modifiers::default(), cx);
             assert!(s.select_end(pane, cx));
         });
     });
@@ -7023,7 +7024,7 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
                     bounds.origin.y + cell.height * (line + 0.5),
                 )
             };
-            s.select_begin(pane, pos(7., 0.), 2, false, cx);
+            s.select_begin(pane, pos(7., 0.), 2, gpui::Modifiers::default(), cx);
             s.select_move(pane, pos(13., 0.), cx);
             assert!(s.select_end(pane, cx));
         });
@@ -7040,7 +7041,7 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
                     bounds.origin.y + cell.height * (line + 0.5),
                 )
             };
-            s.select_begin(pane, pos(3., 0.), 3, false, cx);
+            s.select_begin(pane, pos(3., 0.), 3, gpui::Modifiers::default(), cx);
             assert!(s.select_end(pane, cx));
         });
     });
@@ -7056,8 +7057,17 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
                     bounds.origin.y + cell.height * (line + 0.5),
                 )
             };
-            s.select_begin(pane, pos(0., 1.), 1, false, cx);
-            s.select_begin(pane, pos(5., 1.), 1, true, cx);
+            s.select_begin(pane, pos(0., 1.), 1, gpui::Modifiers::default(), cx);
+            s.select_begin(
+                pane,
+                pos(5., 1.),
+                1,
+                gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                cx,
+            );
             assert!(s.select_end(pane, cx));
             let sel = s.live[&pane].selection.expect("shift selection");
             assert_eq!(sel.anchor, select::Point { line: 1, column: 0 });
@@ -7065,6 +7075,33 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
         });
     });
     assert_eq!(text_of(&view, cx).as_deref(), Some("second"));
+
+    // Alt+drag selects the same column range on every row.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(
+                pane,
+                pos(0., 0.),
+                1,
+                gpui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                cx,
+            );
+            s.select_move(pane, pos(4., 1.), cx);
+            assert!(s.select_end(pane, cx));
+            assert!(s.live[&pane].selection.unwrap().block);
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("hello\nsecon"));
 
     // 구분자 더블클릭(한 칸)도 해제에 지워지지 않는다.
     cx.update(|_, cx| {
@@ -7076,7 +7113,7 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
                     bounds.origin.y + cell.height * (line + 0.5),
                 )
             };
-            s.select_begin(pane, pos(11., 0.), 2, false, cx);
+            s.select_begin(pane, pos(11., 0.), 2, gpui::Modifiers::default(), cx);
             assert!(s.select_end(pane, cx));
             assert!(s.live[&pane].selection.is_some());
         });
@@ -7092,7 +7129,7 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
                     bounds.origin.y + cell.height * (line + 0.5),
                 )
             };
-            s.select_begin(pane, pos(1., 1.), 1, false, cx);
+            s.select_begin(pane, pos(1., 1.), 1, gpui::Modifiers::default(), cx);
             assert!(s.select_end(pane, cx));
             assert!(s.live[&pane].selection.is_none());
         });

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement as _,
-    ParentElement as _, SharedString, Styled as _, Subscription, Task, Window, div,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, Window, div,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::Disableable as _;
@@ -47,6 +48,7 @@ pub(crate) struct SessionChatLog {
     epoch: u64,
     submissions: BTreeMap<String, Submission>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
+    pub expanded_items: BTreeSet<usize>,
 }
 
 struct ChatList {
@@ -78,13 +80,41 @@ pub(crate) struct ChatState {
 }
 
 impl ChatState {
-    pub(super) fn set_session_chat_view(&mut self, session: SessionId, chat: bool) {
+    pub(crate) fn set_session_chat_view(&mut self, session: SessionId, chat: bool) {
         self.overrides.insert(session, chat);
         if chat {
             self.active_sessions.insert(session);
         } else {
             self.active_sessions.remove(&session);
         }
+    }
+}
+
+fn agent_display_name(agent_id: &str) -> &'static str {
+    match krill_proto::agent::canonical_id(agent_id) {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "agy" => "Antigravity",
+        "opencode" => "OpenCode",
+        "cursor" | "cursor-agent" => "Cursor",
+        "pi" => "Pi",
+        _ => "Agent",
+    }
+}
+
+fn compact_preview(text: &str, max_chars: usize) -> String {
+    let first_line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let total = first_line.chars().count();
+    if total <= max_chars {
+        first_line.to_owned()
+    } else {
+        let mut s: String = first_line.chars().take(max_chars).collect();
+        s.push('…');
+        s
     }
 }
 
@@ -230,10 +260,13 @@ impl Shell {
             .is_some_and(|id| self.is_session_chat_view(id, cx))
     }
 
+    /// 현재 포커스된 칸의 세션이 명시적 Chat 뷰 모드인지 반환한다(테스트/내부 호환용).
     #[cfg(test)]
-    fn is_active_chat_view(&self) -> bool {
-        self.active_session_id()
-            .is_some_and(|id| self.chat.active_sessions.contains(&id))
+    pub(super) fn is_active_chat_view(&self) -> bool {
+        self.active_session_id().is_some_and(|id| {
+            self.chat.active_sessions.contains(&id)
+                || self.chat.overrides.get(&id).copied().unwrap_or(false)
+        })
     }
 
     pub(super) fn active_session_id(&self) -> Option<SessionId> {
@@ -438,6 +471,7 @@ impl Shell {
             log.answered.clear();
             log.multi_selected.clear();
             log.submissions.clear();
+            log.expanded_items.clear();
             self.chat.request_tasks.remove(&session);
         }
         log.binding = binding;
@@ -448,6 +482,7 @@ impl Shell {
                 let excess = log.items.len() - 250;
                 log.items.drain(0..excess);
                 log.base_index = log.base_index.saturating_add(excess);
+                let min_abs = log.base_index;
                 let retained: BTreeSet<_> = log
                     .items
                     .iter()
@@ -457,6 +492,7 @@ impl Shell {
                 log.answered.retain(|key| retained.contains(key));
                 log.multi_selected.retain(|key, _| retained.contains(key));
                 log.submissions.retain(|key, _| retained.contains(key));
+                log.expanded_items.retain(|&idx| idx >= min_abs);
             }
         }
         log.offset = snap.next_offset;
@@ -645,6 +681,61 @@ impl Shell {
         None
     }
 
+    pub(super) fn toggle_chat_item_expanded(
+        &mut self,
+        session: SessionId,
+        abs_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(log) = self.chat.logs.get_mut(&session) else {
+            return;
+        };
+        if !log.expanded_items.remove(&abs_idx) {
+            log.expanded_items.insert(abs_idx);
+        }
+        log.revision = log.revision.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn render_chat_file_button(
+        &self,
+        pane: super::PaneId,
+        abs_idx: usize,
+        file_path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        if file_path.is_empty() {
+            return None;
+        }
+        let raw_path = std::path::PathBuf::from(file_path);
+        let path = if raw_path.is_relative() {
+            self.pane_cwd(pane, cx)
+                .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
+        } else {
+            raw_path
+        };
+        let label = std::path::Path::new(file_path).file_name().map_or_else(
+            || file_path.to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        Some(
+            Button::new(SharedString::from(format!(
+                "chat-open-file-{}-{abs_idx}",
+                pane.get()
+            )))
+            .label(label)
+            .max_w(gpui::relative(0.45))
+            .overflow_hidden()
+            .tooltip(file_path.to_owned())
+            .accessibility_label(file_path.to_owned())
+            .ghost()
+            .xsmall()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_file_at(path.clone(), 1, 1, cx);
+            })),
+        )
+    }
+
     fn render_chat_item(
         &mut self,
         pane: super::PaneId,
@@ -653,235 +744,430 @@ impl Shell {
         item: &ChatItem,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let panel_bg = theme.muted;
-        let border = theme.border;
-        let fg = theme.foreground;
-        let muted_fg = theme.muted_foreground;
-        let warning = theme.warning;
-        let role_label = match item.kind {
-            ChatItemKind::User => "YOU",
-            ChatItemKind::Assistant => "AGENT",
-            ChatItemKind::Reasoning => "REASONING",
-            ChatItemKind::ToolCall => "TOOL CALL",
-            ChatItemKind::ToolResult => "TOOL RESULT",
-            ChatItemKind::Question => "QUESTION",
-            ChatItemKind::Permission => "PERMISSION",
-        };
-        let card_border = if matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission)
-        {
-            warning
-        } else {
-            border
-        };
+        let p = ui::palette(cx);
         let item_selector = format!("chat-item-{}-{abs_idx}", pane.get());
         let debug_selector = item_selector.clone();
-        let mut card = div()
+        let wrapper = div()
             .id(SharedString::from(item_selector))
             .debug_selector(move || debug_selector.clone())
-            .p_3()
-            .rounded(ui::RADIUS_MD)
-            .border_1()
-            .border_color(card_border)
-            .bg(panel_bg)
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(
-                div()
+            .pb_3();
+
+        match item.kind {
+            ChatItemKind::User => {
+                let bubble = div()
+                    .max_w(gpui::relative(0.82))
+                    .px_3p5()
+                    .py_2p5()
+                    .rounded(ui::RADIUS_LG)
+                    .bg(p.accent)
+                    .border_1()
+                    .border_color(p.ring.opacity(0.45))
+                    .text_size(ui::TEXT_MD)
+                    .text_color(p.accent_foreground)
+                    .child(item.text.clone());
+
+                wrapper
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .items_end()
+                    .pl_12()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_1()
+                            .text_size(ui::TEXT_2XS)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.muted_foreground)
+                            .child(ctext::YOU.get()),
+                    )
+                    .child(bubble)
+                    .into_any_element()
+            }
+            ChatItemKind::Assistant => {
+                let agent_id = self
+                    .chat
+                    .logs
+                    .get(&session)
+                    .map_or("", |l| l.agent.as_str())
+                    .to_owned();
+                let agent_name = agent_display_name(&agent_id);
+                let file_btn = self.render_chat_file_button(pane, abs_idx, &item.file_path, cx);
+
+                wrapper
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .pr_8()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .min_w_0()
+                                    .child(ui::icons::agent_brand_icon(
+                                        &agent_id,
+                                        ui::ICON_MD,
+                                        p.foreground,
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(p.foreground)
+                                            .child(agent_name),
+                                    )
+                                    .children((!item.title.is_empty()).then(|| {
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .truncate()
+                                            .child(format!("• {}", item.title))
+                                    })),
+                            )
+                            .children(file_btn),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .pl_5()
+                            .text_size(ui::TEXT_MD)
+                            .text_color(p.foreground)
+                            .child(item.text.clone()),
+                    )
+                    .into_any_element()
+            }
+            ChatItemKind::Reasoning | ChatItemKind::ToolCall | ChatItemKind::ToolResult => {
+                let expanded = self
+                    .chat
+                    .logs
+                    .get(&session)
+                    .is_some_and(|l| l.expanded_items.contains(&abs_idx));
+                let is_mono =
+                    matches!(item.kind, ChatItemKind::ToolCall | ChatItemKind::ToolResult);
+                let badge_label = match item.kind {
+                    ChatItemKind::Reasoning => ctext::REASONING.get(),
+                    ChatItemKind::ToolCall => ctext::TOOL_CALL.get(),
+                    ChatItemKind::ToolResult if item.is_error => ctext::TOOL_ERROR.get(),
+                    _ => ctext::TOOL_RESULT.get(),
+                };
+                let badge_color = if item.is_error {
+                    p.destructive
+                } else {
+                    p.muted_foreground
+                };
+                let border_color = if item.is_error {
+                    p.destructive.opacity(0.45)
+                } else {
+                    p.border
+                };
+                let preview = compact_preview(&item.text, 90);
+                let file_btn = self.render_chat_file_button(pane, abs_idx, &item.file_path, cx);
+                let chevron = if expanded {
+                    gpui_component::IconName::ChevronDown
+                } else {
+                    gpui_component::IconName::ChevronRight
+                };
+
+                let mut card = div()
+                    .ml_5()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(border_color)
+                    .bg(p.card.opacity(0.6))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "chat-activity-toggle-{}-{abs_idx}",
+                                pane.get()
+                            )))
+                            .debug_selector(|| "chat-activity-toggle".into())
+                            .px_2p5()
+                            .py_1p5()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(p.muted.opacity(0.65)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_chat_item_expanded(session, abs_idx, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        gpui_component::Icon::new(chevron)
+                                            .with_size(ui::ICON_SM)
+                                            .text_color(p.muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(ui::TEXT_2XS)
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(badge_color)
+                                            .child(badge_label),
+                                    )
+                                    .children((!item.title.is_empty()).then(|| {
+                                        div()
+                                            .flex_none()
+                                            .text_size(ui::TEXT_XS)
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(p.foreground)
+                                            .child(item.title.clone())
+                                    }))
+                                    .children((!expanded && !preview.is_empty()).then(|| {
+                                        let mut prev = div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground);
+                                        if is_mono {
+                                            prev = prev.font_family(ui::FONT_MONO);
+                                        }
+                                        prev.child(preview)
+                                    })),
+                            )
+                            .children(file_btn),
+                    );
+
+                if expanded && !item.text.is_empty() {
+                    let mut body = div()
+                        .px_2p5()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(p.border.opacity(0.6))
+                        .bg(p.background.opacity(0.5))
+                        .text_size(ui::TEXT_XS)
+                        .text_color(if item.is_error {
+                            p.destructive
+                        } else {
+                            p.muted_foreground
+                        });
+                    if is_mono {
+                        body = body.font_family(ui::FONT_MONO);
+                    }
+                    card = card.child(body.child(item.text.clone()));
+                }
+
+                wrapper.child(card).into_any_element()
+            }
+            ChatItemKind::Question | ChatItemKind::Permission => {
+                let role_label = if item.kind == ChatItemKind::Question {
+                    ctext::QUESTION.get()
+                } else {
+                    ctext::PERMISSION.get()
+                };
+                let accent_border = if item.kind == ChatItemKind::Question {
+                    p.agent_question
+                } else {
+                    p.warning
+                };
+                let file_btn = self.render_chat_file_button(pane, abs_idx, &item.file_path, cx);
+                let mut card = div()
+                    .ml_5()
+                    .p_3()
+                    .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(accent_border)
+                    .bg(p.card)
+                    .flex()
+                    .flex_col()
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(muted_fg)
-                            .child(if item.title.is_empty() {
-                                SharedString::from(role_label)
-                            } else {
-                                SharedString::from(format!("{role_label} • {}", item.title))
-                            }),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_XS)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(accent_border)
+                                    .child(if item.title.is_empty() {
+                                        SharedString::from(role_label)
+                                    } else {
+                                        SharedString::from(format!("{role_label} • {}", item.title))
+                                    }),
+                            )
+                            .children(file_btn),
                     )
-                    .children((!item.file_path.is_empty()).then(|| {
-                        let raw_path = std::path::PathBuf::from(&item.file_path);
-                        let path = if raw_path.is_relative() {
-                            self.pane_cwd(pane, cx)
-                                .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.foreground)
+                            .child(item.text.clone()),
+                    );
+
+                let request = self.chat_request_identity(pane, session, abs_idx, item);
+                let answer_key = request.key.clone();
+                let submission = self
+                    .chat
+                    .logs
+                    .get(&session)
+                    .and_then(|log| log.submissions.get(&answer_key));
+                let current = self.chat_request_is_current(&request, cx);
+                let disabled = !current || submission.is_some_and(Submission::blocks_input);
+                let status = if !current
+                    && !matches!(
+                        submission,
+                        Some(Submission::Confirmed | Submission::ReviewRequired)
+                    ) {
+                    ctext::REQUEST_UNVERIFIED.get()
+                } else {
+                    submission.map_or(ctext::REQUEST_READY.get(), Submission::label)
+                };
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-request-status-{}-{abs_idx}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-request-status".into())
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(status),
+                );
+
+                if item.kind == ChatItemKind::Question && !item.options.is_empty() {
+                    let multi_select = item.multi_select;
+                    let selected_set = self
+                        .chat
+                        .logs
+                        .get(&session)
+                        .and_then(|l| l.multi_selected.get(&answer_key))
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut opts_row = div().flex().flex_wrap().gap_1p5();
+                    for (opt_idx, opt) in item.options.iter().enumerate() {
+                        let request_clone = request.clone();
+                        let is_checked = selected_set.contains(&opt_idx);
+                        let prefix = if multi_select {
+                            if is_checked { "[✓] " } else { "[ ] " }
+                        } else if is_checked {
+                            "✓ "
                         } else {
-                            raw_path
+                            ""
                         };
-                        Button::new(SharedString::from(format!(
-                            "chat-open-file-{}-{abs_idx}",
-                            pane.get()
-                        )))
-                        .label(
-                            std::path::Path::new(&item.file_path)
-                                .file_name()
-                                .map_or_else(
-                                    || item.file_path.clone(),
-                                    |name| name.to_string_lossy().into_owned(),
-                                ),
-                        )
-                        .max_w(gpui::relative(0.45))
-                        .overflow_hidden()
-                        .tooltip(item.file_path.clone())
-                        .accessibility_label(item.file_path.clone())
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_file_at(path.clone(), 1, 1, cx);
-                        }))
-                    })),
-            )
-            .child(
-                div()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(fg)
-                    .child(item.text.clone()),
-            );
-
-        let request = self.chat_request_identity(pane, session, abs_idx, item);
-        let answer_key = request.key.clone();
-        let submission = self
-            .chat
-            .logs
-            .get(&session)
-            .and_then(|log| log.submissions.get(&answer_key));
-        let current = self.chat_request_is_current(&request, cx);
-        let disabled = !current || submission.is_some_and(Submission::blocks_input);
-        if matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission) {
-            let status = if !current
-                && !matches!(
-                    submission,
-                    Some(Submission::Confirmed | Submission::ReviewRequired)
-                ) {
-                ctext::REQUEST_UNVERIFIED.get()
-            } else {
-                submission.map_or(ctext::REQUEST_READY.get(), Submission::label)
-            };
-            card = card.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "chat-request-status-{}-{abs_idx}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-request-status".into())
-                    .text_size(ui::TEXT_XS)
-                    .text_color(muted_fg)
-                    .child(status),
-            );
-        }
-        if item.kind == ChatItemKind::Question && !item.options.is_empty() {
-            let multi_select = item.multi_select;
-            let selected_set = self
-                .chat
-                .logs
-                .get(&session)
-                .and_then(|l| l.multi_selected.get(&answer_key))
-                .cloned()
-                .unwrap_or_default();
-            let mut opts_row = div().flex().flex_wrap().gap_1p5();
-            for (opt_idx, opt) in item.options.iter().enumerate() {
-                let request_clone = request.clone();
-                let is_checked = selected_set.contains(&opt_idx);
-                let prefix = if multi_select {
-                    if is_checked { "[✓] " } else { "[ ] " }
-                } else if is_checked {
-                    "✓ "
-                } else {
-                    ""
-                };
-                let label = if opt.description.is_empty() {
-                    format!("{prefix}{}", opt.label)
-                } else {
-                    format!("{prefix}{} — {}", opt.label, opt.description)
-                };
-                opts_row = opts_row.child(
-                    Button::new(SharedString::from(format!(
-                        "chat-q-{}-{abs_idx}-{opt_idx}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-question-option".into())
-                    .label(label)
-                    .small()
-                    .ghost()
-                    .disabled(disabled)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if multi_select {
-                            this.toggle_chat_multi_option(&request_clone, opt_idx, cx);
+                        let label = if opt.description.is_empty() {
+                            format!("{prefix}{}", opt.label)
                         } else {
-                            this.answer_chat_question(
-                                request_clone.clone(),
-                                vec![opt_idx],
-                                false,
-                                cx,
-                            );
-                        }
-                    })),
-                );
-            }
-            if multi_select {
-                let request_submit = request.clone();
-                let picks: Vec<usize> = selected_set.into_iter().collect();
-                opts_row = opts_row.child(
-                    Button::new(SharedString::from(format!(
-                        "chat-q-submit-{}-{abs_idx}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-question-submit".into())
-                    .label(ctext::SUBMIT.format(&[("n", &picks.len().to_string())]))
-                    .small()
-                    .primary()
-                    .disabled(disabled || picks.is_empty())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.answer_chat_question(request_submit.clone(), picks.clone(), true, cx);
-                    })),
-                );
-            }
-            card = card.child(opts_row);
-        } else if item.kind == ChatItemKind::Permission {
-            let yes_request = request.clone();
-            card = card.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "chat-perm-yes-{}-{abs_idx}",
-                            pane.get()
-                        )))
-                        .debug_selector(|| "chat-permission-approve".into())
-                        .disabled(disabled)
-                        .label(ctext::APPROVE.get())
-                        .small()
-                        .primary()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.approve_chat_permission(yes_request.clone(), true, cx);
-                        })),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "chat-perm-no-{}-{abs_idx}",
-                            pane.get()
-                        )))
-                        .debug_selector(|| "chat-permission-deny".into())
-                        .disabled(disabled)
-                        .label(ctext::DENY.get())
-                        .small()
-                        .ghost()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.approve_chat_permission(request.clone(), false, cx);
-                        })),
-                    ),
-            );
-        }
+                            format!("{prefix}{} — {}", opt.label, opt.description)
+                        };
+                        opts_row = opts_row.child(
+                            Button::new(SharedString::from(format!(
+                                "chat-q-{}-{abs_idx}-{opt_idx}",
+                                pane.get()
+                            )))
+                            .debug_selector(|| "chat-question-option".into())
+                            .label(label)
+                            .small()
+                            .ghost()
+                            .disabled(disabled)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if multi_select {
+                                        this.toggle_chat_multi_option(&request_clone, opt_idx, cx);
+                                    } else {
+                                        this.answer_chat_question(
+                                            request_clone.clone(),
+                                            vec![opt_idx],
+                                            false,
+                                            cx,
+                                        );
+                                    }
+                                },
+                            )),
+                        );
+                    }
+                    if multi_select {
+                        let request_submit = request.clone();
+                        let picks: Vec<usize> = selected_set.into_iter().collect();
+                        opts_row = opts_row.child(
+                            Button::new(SharedString::from(format!(
+                                "chat-q-submit-{}-{abs_idx}",
+                                pane.get()
+                            )))
+                            .debug_selector(|| "chat-question-submit".into())
+                            .label(ctext::SUBMIT.format(&[("n", &picks.len().to_string())]))
+                            .small()
+                            .primary()
+                            .disabled(disabled || picks.is_empty())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.answer_chat_question(
+                                        request_submit.clone(),
+                                        picks.clone(),
+                                        true,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        );
+                    }
+                    card = card.child(opts_row);
+                } else if item.kind == ChatItemKind::Permission {
+                    let yes_request = request.clone();
+                    card =
+                        card.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-perm-yes-{}-{abs_idx}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-permission-approve".into())
+                                    .disabled(disabled)
+                                    .label(ctext::APPROVE.get())
+                                    .small()
+                                    .primary()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.approve_chat_permission(yes_request.clone(), true, cx);
+                                    })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-perm-no-{}-{abs_idx}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-permission-deny".into())
+                                    .disabled(disabled)
+                                    .label(ctext::DENY.get())
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.approve_chat_permission(request.clone(), false, cx);
+                                    })),
+                                ),
+                        );
+                }
 
-        div().pb_2().child(card).into_any_element()
+                wrapper.child(card).into_any_element()
+            }
+        }
     }
 
     pub(super) fn render_pane_chat_overlay(
@@ -898,6 +1184,12 @@ impl Shell {
             return None;
         }
         self.ensure_chat_poll_timer(cx);
+        if !self.chat.logs.contains_key(&session)
+            && !self.chat.poll_failed.contains(&session)
+            && self.target_for_host(self.layout.host(pane)).is_some()
+        {
+            self.poll_session_chat(pane, session, cx);
+        }
         let input_state = self.ensure_chat_input(session, window, cx);
         let theme = cx.theme();
         let bg = theme.background;
@@ -923,7 +1215,9 @@ impl Shell {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .p_3()
+            .px_4()
+            .pb_3()
+            .pt(ui::PANE_HEADER_HEIGHT + ui::SPACE_2)
             .flex()
             .flex_col()
             .gap_2();
@@ -1368,5 +1662,79 @@ mod tests {
             assert!(shell.chat.task.is_none());
             assert!(!shell.chat.logs.contains_key(&SessionId(321)));
         });
+    }
+
+    #[gpui::test]
+    fn default_view_mode_chat_and_collapsible_tool_activity(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-default-view-mode-test-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.toml"), "default_view_mode = \"chat\"\n").unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            krill_app::settings::init_at(Some(dir.clone()), cx);
+        });
+        let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+        cx.run_until_parked();
+
+        shell.update(cx, |this, cx| {
+            let pane = this.layout.focused().unwrap();
+            this.layout.set_session(pane, SessionId(77));
+            assert!(this.is_active_chat_view_in(cx));
+            this.apply_chat_poll(
+                SessionId(77),
+                ChatPollSnapshot {
+                    agent: "codex".into(),
+                    session_id: "sid-77".into(),
+                    transcript_path: "/tmp/sid-77.jsonl".into(),
+                    next_offset: 256,
+                    reset: false,
+                    bound: true,
+                    items: vec![
+                        ChatItem {
+                            kind: ChatItemKind::User,
+                            text: "고쳐줘".into(),
+                            ..ChatItem::default()
+                        },
+                        ChatItem {
+                            kind: ChatItemKind::ToolCall,
+                            title: "Bash".into(),
+                            text: "cargo check -p krill-app --locked\necho done".into(),
+                            ..ChatItem::default()
+                        },
+                        ChatItem {
+                            kind: ChatItemKind::Assistant,
+                            text: "수정 완료했습니다.".into(),
+                            ..ChatItem::default()
+                        },
+                    ],
+                },
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("desktop-chat-overlay").is_some());
+        let toggle_bounds = cx
+            .debug_bounds("chat-activity-toggle")
+            .expect("tool activity row should render");
+        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        shell.read_with(cx, |this, _| {
+            assert!(this.chat.logs[&SessionId(77)].expanded_items.contains(&1));
+        });
+
+        let term_bounds = cx
+            .debug_bounds("chat-switch-terminal")
+            .expect("Term switch button should render");
+        cx.simulate_click(term_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+        shell.read_with(cx, |this, cx| {
+            assert!(!this.is_active_chat_view_in(cx));
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

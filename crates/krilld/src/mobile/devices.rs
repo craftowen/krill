@@ -100,6 +100,15 @@ impl Devices {
     }
     /// 실패 예산은 ticket 회전으로 초기화하지 않는다. 전체 게이트웨이에 적용해 주소 우회를 막는다.
     pub fn attempt(&mut self, now: u64) -> io::Result<()> {
+        self.check_cooldown(now)?;
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= 5 {
+            self.retry_at = now.saturating_add(60_000);
+        }
+        Ok(())
+    }
+    /// 연결 성공·전송 중단은 실패 예산을 소모하지 않는다.
+    pub fn check_cooldown(&mut self, now: u64) -> io::Result<()> {
         if now < self.retry_at {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -109,10 +118,6 @@ impl Devices {
         if self.retry_at != 0 {
             self.failures = 0;
             self.retry_at = 0;
-        }
-        self.failures = self.failures.saturating_add(1);
-        if self.failures >= 5 {
-            self.retry_at = now.saturating_add(60_000);
         }
         Ok(())
     }

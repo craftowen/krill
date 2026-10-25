@@ -657,25 +657,36 @@ fn resolve_transcript_uncached(
     filter: &CwdFallbackFilter<'_>,
     budget: &mut ScanBudget,
 ) -> Option<(PathBuf, String)> {
-    let sid = stored.session_id.as_deref().unwrap_or("").trim();
+    let mut sid = stored.session_id.as_deref().unwrap_or("").trim().to_owned();
+    let mut agy_bound_root: Option<PathBuf> = None;
     if let Some(tp) = stored.transcript_path.as_deref()
         && crate::agent::control::valid_transcript_path(tp)
     {
         let p = Path::new(tp);
-        if p.is_file() {
+        if crate::agent::control::is_agy_conversation_db_path(tp) {
+            if let Some((root, db_sid)) = super::vault::agy_root_and_id_from_path(p) {
+                if sid.is_empty() {
+                    sid = db_sid;
+                }
+                agy_bound_root = Some(root);
+            }
+        } else if p.is_file() {
             let inferred_sid = if sid.is_empty() {
                 p.file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_owned()
             } else {
-                sid.to_owned()
+                sid
             };
             return Some((p.to_path_buf(), inferred_sid));
         }
     }
 
     let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(root) = agy_bound_root {
+        search_dirs.push(root);
+    }
     if let Some(acc) = &stored.account
         && !acc.dir.is_empty()
     {
@@ -710,15 +721,15 @@ fn resolve_transcript_uncached(
         for dir in &claude_dirs {
             let cand = dir.join(format!("{sid}.jsonl"));
             if cand.is_file() {
-                return Some((cand, sid.to_owned()));
+                return Some((cand, sid));
             }
         }
     }
 
     if !sid.is_empty() {
         for root in &search_dirs {
-            if let Some(found) = find_transcript_by_id(root, agent, sid, budget) {
-                return Some((found, sid.to_owned()));
+            if let Some(found) = find_transcript_by_id(root, agent, &sid, budget) {
+                return Some((found, sid));
             }
         }
     }

@@ -3281,6 +3281,16 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("font-inc").is_none());
+    assert!(vcx.debug_bounds("general-view-mode-terminal").is_some());
+    assert!(vcx.debug_bounds("general-view-mode-chat").is_some());
+    click(vcx, "general-view-mode-chat");
+    vcx.update(|_, cx| {
+        assert_eq!(default_view_mode(cx), DefaultViewMode::Chat);
+    });
+    click(vcx, "general-view-mode-terminal");
+    vcx.update(|_, cx| {
+        assert_eq!(default_view_mode(cx), DefaultViewMode::Terminal);
+    });
     assert!(vcx.debug_bounds("admin-tab-terminal").is_some());
     click(vcx, "admin-tab-terminal");
     vcx.update(|window, cx| window.draw(cx).clear(cx));
@@ -9816,5 +9826,192 @@ fn automations_page_templates_editor_roundtrip_and_navigation(cx: &mut TestAppCo
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("automations-search-input").is_some());
+    fs::remove_dir_all(d).ok();
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn remote_host_accounts_can_be_selected_and_switched_over_host_target(cx: &mut TestAppContext) {
+    use krill_proto::ipc::{self, ClientHello, ServerHello};
+    use krill_proto::screen::Msg as _;
+    use krill_proto::usage::{
+        AccountInfo, AccountsSnapshot, FEAT_PROVIDER_DETAILS, FEAT_USAGE, FEAT_USAGE_STATUS,
+        ProviderKind, Snapshot, UsageReply, UsageRequest,
+    };
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    let d = dir("racc");
+    let sock_path = PathBuf::from(format!("/tmp/kr-racc-{}.s", std::process::id()));
+    fs::remove_file(&sock_path).ok();
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let remote_snap = Arc::new(Mutex::new(AccountsSnapshot {
+        accounts: vec![
+            AccountInfo {
+                id: "remote-1".into(),
+                provider: ProviderKind::Codex,
+                label: "Remote Main".into(),
+                email: Some("main@remote.example".into()),
+                profile_dir: "/remote/profiles/main".into(),
+                active: true,
+                host_default: true,
+                stale: false,
+                usage: Snapshot::default(),
+            },
+            AccountInfo {
+                id: "remote-2".into(),
+                provider: ProviderKind::Codex,
+                label: "Remote Backup".into(),
+                email: Some("backup@remote.example".into()),
+                profile_dir: "/remote/profiles/backup".into(),
+                active: false,
+                host_default: false,
+                stale: false,
+                usage: Snapshot::default(),
+            },
+        ],
+        ..Default::default()
+    }));
+    let seen_requests: Arc<Mutex<Vec<UsageRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let server_snap = Arc::clone(&remote_snap);
+    let server_reqs = Arc::clone(&seen_requests);
+    let server = std::thread::spawn(move || {
+        let server_hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: FEAT_USAGE | FEAT_USAGE_STATUS | FEAT_PROVIDER_DETAILS,
+            build: "test".to_owned(),
+            instance_id: 4242,
+        };
+        while let Ok((mut stream, _)) = listener.accept() {
+            if stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .is_err()
+            {
+                break; // The explicit shutdown connection may already be closed on accept.
+            }
+            if stream.write_all(&server_hello.encode().unwrap()).is_err() {
+                break;
+            }
+            let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                break;
+            };
+            let Ok(client) = ClientHello::decode(kind, &body) else {
+                break;
+            };
+            let features = ipc::negotiate(&server_hello, &client).unwrap().features;
+            let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                continue;
+            };
+            let Ok(req) = UsageRequest::decode(kind, &body) else {
+                continue;
+            };
+            server_reqs.lock().unwrap().push(req.clone());
+            let mut snap = server_snap.lock().unwrap();
+            if let UsageRequest::SwitchAccount {
+                provider,
+                account_id,
+            } = req
+            {
+                for acc in &mut snap.accounts {
+                    if acc.provider == provider {
+                        acc.active = acc.id == account_id;
+                    }
+                }
+            }
+            let reply = UsageReply::Accounts(snap.clone()).for_features(features);
+            stream.write_all(&reply.encode().unwrap()).ok();
+        }
+    });
+
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.run_until_parked();
+
+    let remote_id = crate::hosts::HostId::Remote("iroh:remote-mac".into());
+    let remote_target = crate::hosts::HostTarget::remote("iroh:remote-mac", sock_path.clone());
+    view.update(vcx, |v, cx| {
+        v.set_tab(AdminTab::Accounts, cx);
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert(crate::hosts::HostId::Local, AccountsSnapshot::default());
+        snapshots.insert(remote_id.clone(), remote_snap.lock().unwrap().clone());
+        v.sync_account_hosts(
+            vec![
+                (crate::hosts::HostId::Local, "내 Mac".into(), None),
+                (
+                    remote_id.clone(),
+                    "Remote Studio".into(),
+                    Some(remote_target.clone()),
+                ),
+            ],
+            snapshots,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("admin-accounts-host-bar").is_some());
+    assert!(vcx.debug_bounds("admin-accounts-host-local").is_some());
+    let remote_btn = vcx
+        .debug_bounds("admin-accounts-host-iroh:remote-mac")
+        .expect("remote host selector button");
+    vcx.simulate_click(remote_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    for _ in 0..20 {
+        if vcx.debug_bounds("admin-account-row-remote-2").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        vcx.run_until_parked();
+    }
+    let backup_row = vcx
+        .debug_bounds("admin-account-row-remote-2")
+        .expect("remote backup account row");
+    vcx.simulate_click(backup_row.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    for _ in 0..20 {
+        let switched = view.read_with(vcx, |v, _| {
+            v.accounts()
+                .accounts
+                .iter()
+                .find(|a| a.id == "remote-2")
+                .is_some_and(|a| a.active)
+        });
+        if switched {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        vcx.run_until_parked();
+    }
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.account_host(), &remote_id);
+        assert!(
+            v.accounts()
+                .accounts
+                .iter()
+                .find(|a| a.id == "remote-2")
+                .is_some_and(|a| a.active),
+            "remote account profile must become active after clicking row"
+        );
+    });
+    assert!(
+        seen_requests.lock().unwrap().iter().any(|r| matches!(
+            r,
+            UsageRequest::SwitchAccount {
+                provider: ProviderKind::Codex,
+                account_id
+            } if account_id == "remote-2"
+        )),
+        "SwitchAccount must be sent over the remote HostTarget"
+    );
+
+    drop(std::os::unix::net::UnixStream::connect(&sock_path).unwrap());
+    server.join().unwrap();
+    fs::remove_file(&sock_path).ok();
     fs::remove_dir_all(d).ok();
 }

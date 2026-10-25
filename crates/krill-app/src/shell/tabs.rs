@@ -292,7 +292,6 @@ impl Shell {
                                         // OWE-886: 빈 에이전트도 `status::agent_icon` 하나로 통일(§6.5).
                                         ui::status::agent_icon(agent, ui::ICON_SM, p.foreground),
                                     )
-                                    .children(self.host_badge(tab.focused, "tab-host-badge", cx))
                                     .into_any_element()
                             }),
                     )

@@ -23,7 +23,7 @@ use krill_proto::{
 use super::{Link, Shell, WindowRole};
 
 mod provider;
-use provider::provider_usage_menu;
+use provider::{ProviderHostScope, provider_usage_menu};
 
 use krill_app::i18n::catalog::{popout as text, status as provider_text};
 
@@ -224,7 +224,7 @@ pub(super) fn bind_keys(cx: &mut App) {
         // OWE-851: 대시보드도 Esc로 닫힌다(터미널 입력이 없어 PTY 전달 걱정이 없다).
         krill_app::keys::bind("escape", CloseDashboard, Some("Dashboard")),
         krill_app::keys::bind("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
-        krill_app::keys::bind("alt-cmd-shift-a", DashboardPopout, None),
+        krill_app::keys::bind("cmd-shift-l", DashboardPopout, None),
     ]);
 }
 
@@ -844,7 +844,12 @@ fn status_hot_meter(
         .max_by_key(|(_, pct)| *pct)
 }
 
-fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) -> bool {
+fn has_provider_pill(
+    snap: &AccountsSnapshot,
+    provider: ProviderKind,
+    remote: bool,
+    cx: &App,
+) -> bool {
     snap.accounts.iter().any(|a| {
         a.provider == provider
             && !krill_app::accounts::orca_managed(a)
@@ -852,7 +857,7 @@ fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) 
                 || !a.host_default
                 || !a.usage.is_empty()
                 || snap.meters_for(&a.id).is_some_and(|m| !m.meters.is_empty()))
-    }) && krill_app::accounts::installed::is_installed(cx, provider)
+    }) && (remote || krill_app::accounts::installed::is_installed(cx, provider))
 }
 
 /// Codex banked reset 크레딧 수. 미터가 없으면 `None`(행 자체를 그리지 않는다).
@@ -1025,22 +1030,48 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(ACCOUNTS_POLL).await;
-                let Ok(Some(paths)) =
-                    this.read_with(cx, |s, _| s.paths.clone().filter(|_| s.link == Link::Up))
-                else {
+                let Ok((local_paths, remote_targets)) = this.read_with(cx, |s, _| {
+                    let local_paths = s.paths.clone().filter(|_| s.link == Link::Up);
+                    let remote_targets: Vec<_> = s
+                        .host_targets
+                        .iter()
+                        .map(|(h, t)| (h.clone(), t.clone()))
+                        .collect();
+                    (local_paths, remote_targets)
+                }) else {
                     return;
                 };
-                let res = cx
+                let Some(paths) = local_paths else {
+                    return;
+                };
+                let (local_res, remote_res) = cx
                     .background_executor()
                     .spawn(async move {
-                        krill_app::accounts::request_ipc(&paths, &UsageRequest::ListAccounts)
+                        let local =
+                            krill_app::accounts::request_ipc(&paths, &UsageRequest::ListAccounts);
+                        let mut remotes = Vec::with_capacity(remote_targets.len());
+                        for (host, target) in remote_targets {
+                            if let Ok(snap) = krill_app::accounts::request_target(
+                                &target,
+                                &UsageRequest::ListAccounts,
+                            ) {
+                                remotes.push((host, snap));
+                            }
+                        }
+                        (local, remotes)
                     })
                     .await;
-                if let Ok(snap) = res
-                    && this
-                        .update(cx, |s, cx| s.apply_accounts_snapshot(snap, cx))
-                        .is_err()
-                {
+                let keep_going = this
+                    .update(cx, |s, cx| {
+                        if let Ok(snap) = local_res {
+                            s.apply_accounts_snapshot(snap, cx);
+                        }
+                        for (host, snap) in remote_res {
+                            s.apply_accounts_snapshot_for_host(host, snap, cx);
+                        }
+                    })
+                    .is_ok();
+                if !keep_going {
                     return;
                 }
             }
@@ -1278,7 +1309,29 @@ impl Shell {
         // OWE-851: 메뉴가 열려 있는 동안은 상태바 호버 툴팁을 숨긴다.
         let tooltips_on = self.status_menus_open == 0;
         let session = self.layout.focused().and_then(|p| self.layout.session(p));
-        let snap = self.accounts_snapshot.clone();
+        let account_host = self.active_account_host();
+        let snap = self.accounts_for_host(&account_host);
+        let account_hosts: Vec<(
+            krill_app::hosts::HostId,
+            String,
+            std::sync::Arc<AccountsSnapshot>,
+        )> = {
+            let mut list: Vec<_> = self
+                .execution_locations(cx)
+                .into_iter()
+                .map(|(h, label)| {
+                    let s = self.accounts_for_host(&h);
+                    (h, label, s)
+                })
+                .collect();
+            for (h, s) in &self.remote_accounts {
+                if !list.iter().any(|(existing, _, _)| existing == h) {
+                    let label = h.remote_id().unwrap_or_else(|| h.as_key()).to_owned();
+                    list.push((h.clone(), label, s.clone()));
+                }
+            }
+            list
+        };
         let status_providers = [
             ProviderKind::Claude,
             ProviderKind::Codex,
@@ -1287,7 +1340,12 @@ impl Shell {
         ];
         let status_providers: Vec<_> = status_providers
             .into_iter()
-            .filter(|provider| has_provider_pill(&snap, *provider, cx))
+            .filter(|provider| {
+                has_provider_pill(&snap, *provider, account_host.is_remote(), cx)
+                    || account_hosts
+                        .iter()
+                        .any(|(h, _, s)| h.is_remote() && has_provider_pill(s, *provider, true, cx))
+            })
             .collect();
         let expanded = expanded_usage_fits(
             window.viewport_size().width,
@@ -1406,12 +1464,18 @@ impl Shell {
                 .child(ui::icons::provider_icon(provider, ui::ICON_SM, color))
                 .child(detail);
             let reset_armed = self.reset_armed.clone();
+            let menu_account_host = account_host.clone();
+            let menu_account_hosts = account_hosts.clone();
             provider_pills = provider_pills.child(
                 ui::button_with_tooltip_when(tooltips_on, pill_btn, selector, description)
                     .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, cx| {
                         provider_usage_menu(
                             fit_above_status_bar(menu, window),
-                            &provider_snap,
+                            &ProviderHostScope {
+                                snap: &provider_snap,
+                                active_host: &menu_account_host,
+                                account_hosts: &menu_account_hosts,
+                            },
                             provider,
                             weak.clone(),
                             window,
@@ -2249,7 +2313,7 @@ impl Dashboard {
 
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if std::mem::take(&mut self.focus_on_render) {
+        if std::mem::take(&mut self.focus_on_render) || !self.focus.contains_focused(window, cx) {
             window.focus(&self.focus, cx);
         }
         if self.language != krill_app::i18n::language() {

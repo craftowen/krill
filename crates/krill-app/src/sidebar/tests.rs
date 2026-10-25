@@ -5288,7 +5288,7 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestAppContext) {
+fn project_filter_and_icons_include_remote_daemon_projects(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let selected = PathBuf::from("/Users/local/projects/selected");
@@ -5304,7 +5304,14 @@ fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestApp
                     (hidden_local.clone(), vec![hidden_local.clone()]),
                 ]),
             };
-            s.options.filters.repos.insert(selected.clone());
+            s.project_visuals.insert(
+                PathBuf::from("/Users/local/projects/gwiinsaju"),
+                external::ProjectVisualMeta {
+                    display_name: Some("귀인사주".into()),
+                    badge_color: Some("#6366f1".into()),
+                    icon: Some(crate::ui::icons::ProjectIcon::Emoji("🔮".into())),
+                },
+            );
             let mut loose = session(5, AgentState::Unknown, None);
             loose.cwd = Some(remote_home.clone());
             s.remote_hosts = vec![RemoteHost {
@@ -5315,7 +5322,6 @@ fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestApp
                     sessions: vec![loose],
                     trees: BTreeMap::from([
                         (remote_repo.clone(), vec![remote_repo.clone()]),
-                        // Equal path strings on two PCs still identify separate projects.
                         (hidden_local.clone(), vec![hidden_local.clone()]),
                     ]),
                 },
@@ -5323,17 +5329,34 @@ fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestApp
                 source: None,
                 error: None,
             }];
+            // 원격 호스트 저장소도 필터 가능한 프로젝트 목록에 포함되며, 동명 프로젝트는 하나로 합쳐진다.
+            let filterable = s.filterable_project_repos();
+            assert_eq!(
+                filterable,
+                vec![hidden_local.clone(), selected.clone(), remote_repo.clone(),]
+            );
+            // 원격 저장소 경로라도 프로젝트 키(basename) 매칭으로 아이콘·배지 색상·표시 이름을 찾는다.
+            assert_eq!(
+                s.project_icon(&remote_repo),
+                Some(&crate::ui::icons::ProjectIcon::Emoji("🔮".into()))
+            );
+            assert_eq!(s.project_badge_color(&remote_repo), Some("#6366f1"));
+            assert_eq!(s.project_header_name(&remote_repo), "귀인사주");
+
+            // 프로젝트 필터 선택 시 로컬과 원격 모두 선택된 프로젝트만 표시한다.
+            s.options.filters.repos.insert(remote_repo.clone());
             s.rebuild(cx);
             let local = s.local_rows();
-            assert!(local.contains(&Row::Repository(selected.clone())));
+            assert!(!local.contains(&Row::Repository(selected.clone())));
             assert!(!local.contains(&Row::Repository(hidden_local.clone())));
             let remote = s.remote_rows(&s.remote_hosts[0], &s.collapsed);
             assert!(remote.contains(&Row::Repository(remote_repo.clone())));
             assert!(remote.contains(&Row::Worktree(remote_repo.clone())));
-            assert!(remote.contains(&Row::Repository(hidden_local.clone())));
+            assert!(!remote.contains(&Row::Repository(hidden_local.clone())));
             assert!(remote.contains(&Row::Folder(remote_home.clone())));
             assert_eq!(s.remote_hosts[0].snapshot.sessions.len(), 1);
             // Host-level visibility remains an explicit independent control.
+            s.options.filters.repos.clear();
             s.options
                 .filters
                 .hosts

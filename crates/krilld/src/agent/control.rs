@@ -291,7 +291,15 @@ impl Control {
             return Err(io::ErrorKind::InvalidData.into());
         }
         stored.session_id.clone_from(&discovered.session_id);
-        if stored.transcript_path.is_none() {
+        let should_upgrade_db_path = stored
+            .transcript_path
+            .as_deref()
+            .is_some_and(is_agy_conversation_db_path)
+            && discovered
+                .transcript_path
+                .as_deref()
+                .is_some_and(|p| valid_transcript_path(p) && !is_agy_conversation_db_path(p));
+        if stored.transcript_path.is_none() || should_upgrade_db_path {
             stored.transcript_path = discovered
                 .transcript_path
                 .clone()
@@ -540,14 +548,20 @@ impl Control {
             stored.session_id = Some(session_id.to_owned());
             changed = true;
         }
-        if stored.transcript_path.is_none()
-            && let Some(tp) = transcript_path
-                .and_then(Path::to_str)
-                .map(str::trim)
-                .filter(|p| valid_transcript_path(p))
+        if let Some(tp) = transcript_path
+            .and_then(Path::to_str)
+            .map(str::trim)
+            .filter(|p| valid_transcript_path(p))
         {
-            stored.transcript_path = Some(tp.to_owned());
-            changed = true;
+            let should_upgrade_db_path = stored
+                .transcript_path
+                .as_deref()
+                .is_some_and(is_agy_conversation_db_path)
+                && !is_agy_conversation_db_path(tp);
+            if stored.transcript_path.is_none() || should_upgrade_db_path {
+                stored.transcript_path = Some(tp.to_owned());
+                changed = true;
+            }
         }
         if !changed {
             return;
@@ -639,6 +653,20 @@ fn extract_hook_session_id(p: &serde_json::Value) -> Option<&str> {
         .filter(|id| valid_session_id(id))
 }
 
+pub(crate) fn is_agy_conversation_db_path(path: &str) -> bool {
+    let p = Path::new(path);
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        && p.parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            == Some("conversations")
+        && p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(valid_session_id)
+}
+
 pub(crate) fn valid_transcript_path(path: &str) -> bool {
     if path.is_empty() || path.len() > 4096 || path.contains('\0') {
         return false;
@@ -648,9 +676,9 @@ pub(crate) fn valid_transcript_path(path: &str) -> bool {
         && !p
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
-        && p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+        && (p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
             ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
-        })
+        }) || is_agy_conversation_db_path(path))
 }
 
 fn extract_hook_transcript_path(p: &serde_json::Value) -> Option<&str> {

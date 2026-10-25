@@ -18,6 +18,8 @@ pub struct Point {
 pub struct Selection {
     pub anchor: Point,
     pub head: Point,
+    /// `⌥ Option`(Alt)+드래그 사각형(열 구간) 선택 여부.
+    pub block: bool,
 }
 
 impl Selection {
@@ -25,6 +27,16 @@ impl Selection {
         Self {
             anchor: at,
             head: at,
+            block: false,
+        }
+    }
+
+    /// `⌥ Option`(Alt)+드래그로 시작하는 사각형(열 구간) 선택.
+    pub fn new_block(at: Point) -> Self {
+        Self {
+            anchor: at,
+            head: at,
+            block: true,
         }
     }
 
@@ -119,6 +131,7 @@ impl Selection {
                 line: at.line,
                 column: last,
             },
+            block: false,
         }
     }
 
@@ -136,6 +149,7 @@ impl Selection {
                 line: at.line,
                 column: screen.cols - 1,
             },
+            block: false,
         }
     }
 
@@ -152,6 +166,11 @@ impl Selection {
         let (start, end) = self.ordered();
         if line < start.line || line > end.line || cols == 0 {
             return None;
+        }
+        if self.block {
+            let first = self.anchor.column.min(self.head.column);
+            let last = self.anchor.column.max(self.head.column).min(cols - 1);
+            return (first <= last).then(|| (first, last - first + 1));
         }
         let first = if line == start.line { start.column } else { 0 };
         let last = if line == end.line {
@@ -213,7 +232,8 @@ impl Selection {
                 seg.extend(&c.zerowidth);
             }
             let to_end = first + n == usize::from(screen.cols);
-            let wraps = to_end
+            let wraps = !self.block
+                && to_end
                 && row.len() == usize::from(screen.cols)
                 && row
                     .last()
@@ -229,6 +249,327 @@ impl Selection {
         }
         out
     }
+
+    /// TUI 장식(`| `, `│ `, 박스 테두리)과 강제 줄바꿈·들여쓰기를 정리한 텍스트.
+    pub fn clean_text(self, screen: &Screen) -> String {
+        clean_text(&self.text(screen))
+    }
+}
+
+fn str_display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+fn is_box_border_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let count = trimmed.chars().count();
+    count >= 3
+        && trimmed.chars().any(|c| {
+            matches!(
+                c,
+                '─' | '━'
+                    | '═'
+                    | '╭'
+                    | '╮'
+                    | '╯'
+                    | '╰'
+                    | '┌'
+                    | '┐'
+                    | '┘'
+                    | '└'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+            )
+        })
+        && trimmed.chars().all(|c| {
+            matches!(
+                c,
+                '─' | '━'
+                    | '═'
+                    | '╭'
+                    | '╮'
+                    | '╯'
+                    | '╰'
+                    | '┌'
+                    | '┐'
+                    | '┘'
+                    | '└'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '-'
+                    | '+'
+                    | ' '
+            )
+        })
+}
+
+fn parse_gutter_prefix(line: &str) -> Option<(char, &str)> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if !matches!(first, '|' | '│' | '┃' | '丨' | '❯' | '>') {
+        return None;
+    }
+    let rest = chars.as_str();
+    match rest.chars().next() {
+        None => Some((first, "")),
+        Some(' ') => Some((first, rest.strip_prefix(' ').unwrap_or(rest))),
+        Some(_) if matches!(first, '│' | '┃' | '丨') => Some((first, rest)),
+        Some(_) => None,
+    }
+}
+
+fn strip_right_gutter(line: &str, gutter: char) -> &str {
+    let trimmed = line.trim_end_matches(' ');
+    if !matches!(gutter, '|' | '│' | '┃' | '丨') {
+        return trimmed;
+    }
+    if let Some(before) = trimmed.strip_suffix(gutter)
+        && (before.is_empty() || before.ends_with(' ') || matches!(gutter, '│' | '┃' | '丨'))
+    {
+        return before.trim_end_matches(' ');
+    }
+    trimmed
+}
+
+fn strip_gutters(mut lines: Vec<&str>) -> (Vec<&str>, bool) {
+    let mut stripped_box = false;
+    while lines.first().is_some_and(|l| is_box_border_line(l)) {
+        lines.remove(0);
+        stripped_box = true;
+    }
+    while lines.last().is_some_and(|l| is_box_border_line(l)) {
+        lines.pop();
+        stripped_box = true;
+    }
+    if lines.is_empty() {
+        return (lines, stripped_box);
+    }
+    if lines.len() == 1 {
+        if let Some((g, rest)) = parse_gutter_prefix(lines[0])
+            && matches!(g, '|' | '│' | '┃' | '丨')
+        {
+            return (vec![strip_right_gutter(rest, g)], true);
+        }
+        return (lines, stripped_box);
+    }
+    let non_empty: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if let Some((first_g, _)) = non_empty.first().and_then(|l| parse_gutter_prefix(l))
+        && non_empty
+            .iter()
+            .all(|l| parse_gutter_prefix(l).is_some_and(|(g, _)| g == first_g))
+    {
+        let out = lines
+            .into_iter()
+            .map(|l| parse_gutter_prefix(l).map_or(l, |(g, rest)| strip_right_gutter(rest, g)))
+            .collect();
+        return (out, true);
+    }
+    // 첫 줄에서 기호 오른쪽부터 드래그를 시작해 2번째 줄부터만 기호가 붙은 경우.
+    let tail_non_empty: Vec<&str> = lines[1..]
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if let Some((tail_g, _)) = tail_non_empty.first().and_then(|l| parse_gutter_prefix(l))
+        && tail_non_empty
+            .iter()
+            .all(|l| parse_gutter_prefix(l).is_some_and(|(g, _)| g == tail_g))
+    {
+        let mut out = Vec::with_capacity(lines.len());
+        out.push(strip_right_gutter(lines[0], tail_g));
+        for l in &lines[1..] {
+            out.push(parse_gutter_prefix(l).map_or(*l, |(g, rest)| strip_right_gutter(rest, g)));
+        }
+        return (out, true);
+    }
+    (lines, stripped_box)
+}
+
+#[derive(Default, Clone, Copy)]
+struct ScanState {
+    in_single: bool,
+    in_double: bool,
+    escaped: bool,
+    paren: usize,
+    bracket: usize,
+}
+
+impl ScanState {
+    fn feed(&mut self, line: &str) {
+        for ch in line.chars() {
+            if self.escaped {
+                self.escaped = false;
+                continue;
+            }
+            if self.in_single {
+                if ch == '\'' {
+                    self.in_single = false;
+                }
+                continue;
+            }
+            if ch == '\\' {
+                self.escaped = true;
+                continue;
+            }
+            if self.in_double {
+                if ch == '"' {
+                    self.in_double = false;
+                }
+                continue;
+            }
+            match ch {
+                '\'' => self.in_single = true,
+                '"' => self.in_double = true,
+                '(' => self.paren = self.paren.saturating_add(1),
+                ')' => self.paren = self.paren.saturating_sub(1),
+                '[' => self.bracket = self.bracket.saturating_add(1),
+                ']' => self.bracket = self.bracket.saturating_sub(1),
+                _ => {}
+            }
+        }
+        self.escaped = false;
+    }
+
+    fn is_open(self) -> bool {
+        self.in_single || self.in_double || self.paren > 0 || self.bracket > 0
+    }
+}
+
+fn leading_spaces(s: &str) -> usize {
+    s.bytes().take_while(|&b| b == b' ').count()
+}
+
+fn should_join_without_space(cur: &str, next: &str, max_w: usize) -> bool {
+    if cur.is_empty() || next.is_empty() {
+        return true;
+    }
+    if max_w >= 45 && str_display_width(cur) + 1 >= max_w {
+        return true;
+    }
+    if cur.ends_with(['=', '/', '(', '[', '{', '@'])
+        || next.starts_with([',', ';', ')', ']', '}', '.'])
+    {
+        return true;
+    }
+    // 따옴표·인자 안 경로가 줄바꿈으로 잘린 경우(예: `"/Users/macm` + `ini/Library`).
+    let last_token = cur.split_whitespace().last().unwrap_or("");
+    let first_token = next.split_whitespace().next().unwrap_or("");
+    if last_token.contains('/')
+        && first_token.contains('/')
+        && first_token
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '/')
+    {
+        return true;
+    }
+    false
+}
+
+/// TUI 출력에서 복사한 문자열의 박스/인용 기호(`| `, `│ `)와 강제 줄바꿈·들여쓰기를 정리한다.
+#[must_use]
+pub fn clean_text(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let raw_lines: Vec<&str> = raw.split('\n').collect();
+    let (mut lines, had_gutter) = strip_gutters(raw_lines);
+    if lines.is_empty() {
+        return String::new();
+    }
+    if lines.len() == 1 {
+        return lines[0].to_owned();
+    }
+
+    // 공통 앞 공백 또는 행잉 인덴트(첫 줄 0칸, 2번째 줄부터 균일한 2~12칸 공백)를 계산한다.
+    let non_empty_indents: Vec<usize> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| leading_spaces(l))
+        .collect();
+    let min_all = non_empty_indents.iter().copied().min().unwrap_or(0);
+    if min_all > 0 {
+        for l in &mut lines {
+            if leading_spaces(l) >= min_all {
+                *l = l.get(min_all..).unwrap_or(l);
+            }
+        }
+    }
+
+    let has_empty = lines.iter().any(|l| l.trim().is_empty());
+    let tail_indents: Vec<usize> = lines[1..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| leading_spaces(l))
+        .collect();
+    let uniform_hanging =
+        !has_empty && leading_spaces(lines[0]) == 0 && !tail_indents.is_empty() && {
+            let first = tail_indents[0];
+            (2..=12).contains(&first) && tail_indents.iter().all(|&n| n == first)
+        };
+    let uniform_flat =
+        !has_empty && (min_all > 0 || had_gutter) && tail_indents.iter().all(|&n| n == 0);
+
+    if uniform_hanging || uniform_flat {
+        let stripped: Vec<&str> = if uniform_hanging {
+            let hang = tail_indents[0];
+            std::iter::once(lines[0])
+                .chain(lines[1..].iter().map(|l| l.get(hang..).unwrap_or(l)))
+                .collect()
+        } else {
+            lines.clone()
+        };
+        let max_w = stripped
+            .iter()
+            .map(|l| str_display_width(l))
+            .max()
+            .unwrap_or(0);
+        let mut scan = ScanState::default();
+        let mut open_breaks = 0usize;
+        for l in &stripped[..stripped.len() - 1] {
+            scan.feed(l);
+            if scan.is_open() {
+                open_breaks += 1;
+            }
+        }
+        let first_ends_block = stripped[0].trim_end().ends_with([':', '{', '}', ';']);
+        let looks_wrapped = open_breaks > 0 || (!first_ends_block && max_w >= 50);
+        if looks_wrapped {
+            let mut out = String::new();
+            for (idx, &line) in stripped.iter().enumerate() {
+                if idx == 0 {
+                    out.push_str(line);
+                    continue;
+                }
+                let prev = stripped[idx - 1];
+                if let Some(before_bs) = out.strip_suffix('\\') {
+                    let trimmed_len = before_bs.trim_end_matches(' ').len();
+                    out.truncate(trimmed_len);
+                    out.push(' ');
+                    out.push_str(line);
+                } else if should_join_without_space(prev, line, max_w) {
+                    out.push_str(line);
+                } else {
+                    out.push(' ');
+                    out.push_str(line);
+                }
+            }
+            return out;
+        }
+    }
+
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -265,7 +606,37 @@ mod tests {
                 line: b.0,
                 column: b.1,
             },
+            block: false,
         }
+    }
+
+    #[test]
+    fn rectangular_selection_keeps_columns_and_row_breaks_in_both_directions() {
+        let mut screen = screen(&["abcd", "efgh"], 4);
+        screen.rows[0][3].flags = Flags::WRAPLINE;
+        let mut selection = Selection::new_block(Point { line: 1, column: 2 });
+        selection.head = Point { line: 0, column: 1 };
+        assert_eq!(selection.span(0, 4), Some((1, 2)));
+        assert_eq!(selection.span(1, 4), Some((1, 2)));
+        assert_eq!(selection.text(&screen), "bc\nfg");
+        selection.anchor = Point { line: 0, column: 0 };
+        selection.head = Point { line: 1, column: 3 };
+        assert_eq!(selection.text(&screen), "abcd\nefgh");
+        assert_eq!(sel((0, 0), (1, 3)).text(&screen), "abcdefgh");
+    }
+
+    #[test]
+    fn clean_copy_preserves_unicode_blank_lines_and_plain_multiline_text() {
+        assert_eq!(clean_text("  한글\n\u{3000}\n  끝"), "한글\n\u{3000}\n끝");
+        assert_eq!(clean_text("hello\nworld"), "hello\nworld");
+        assert_eq!(
+            clean_text("╭───╮\n│ alpha │\n│ beta │\n╰───╯"),
+            "alpha\nbeta"
+        );
+        assert_eq!(
+            clean_text("tool --path \"/Users/macm\n  ini/Library/file\""),
+            "tool --path \"/Users/macmini/Library/file\""
+        );
     }
 
     #[test]
@@ -350,6 +721,7 @@ mod tests {
             Selection {
                 anchor: at(0),
                 head: at(4),
+                block: false,
             }
         );
         assert_eq!(Selection::word_at(&s, at(1)).text(&s), "hello");
@@ -360,6 +732,7 @@ mod tests {
             Selection {
                 anchor: at(11),
                 head: at(11),
+                block: false,
             }
         );
         assert_eq!(Selection::word_at(&s, at(13)).text(&s), "foo-bar");
@@ -370,6 +743,7 @@ mod tests {
             Selection {
                 anchor: at(5),
                 head: at(5),
+                block: false,
             }
         );
     }

@@ -56,6 +56,34 @@ fn process_pids(root: u32, foreground: Option<u32>) -> Vec<u32> {
     pids
 }
 
+pub(super) fn descendant_pids(root: u32, foreground: Option<u32>) -> Vec<u32> {
+    let seeds = process_pids(root, foreground);
+    let Ok(all) = crate::sys::all_pids() else {
+        return Vec::new();
+    };
+    let mut seen = seeds;
+    let mut frontier = seen.clone();
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for &pid in &all {
+            if pid <= 1 || seen.contains(&pid) {
+                continue;
+            }
+            if crate::sys::parent_pid(pid).is_ok_and(|ppid| frontier.contains(&ppid)) {
+                seen.push(pid);
+                out.push(pid);
+                next.push(pid);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
 pub(in crate::registry) struct Identity {
     pub id: String,
     pub path: PathBuf,
@@ -93,29 +121,18 @@ pub(in crate::registry) fn discover(
         return Ok(None);
     }
     let found = from_paths(provider, paths)?;
-    if found.is_some() || foreground.is_some_and(|pid| pid != root) {
+    if found.is_some() {
         return Ok(found);
     }
-    // Some configured launchers retain a shell as group leader instead of exec'ing.
-    // Only actual provider children may supply evidence; helpers are not searched.
+    // Configured launchers and Node/shell wrappers often keep a shell or wrapper as group
+    // leader while a descendant process in this PTY tree holds the conversation files.
     let mut paths = Vec::new();
-    for pid in crate::sys::all_pids().unwrap_or_default() {
-        if crate::sys::parent_pid(pid).ok() != Some(root)
-            || crate::sys::process_name(pid)
-                .ok()
-                .as_deref()
-                .and_then(ProviderKind::parse)
-                != Some(provider)
-        {
-            continue;
-        }
+    for pid in descendant_pids(root, foreground) {
         let Ok(start) = crate::sys::start_us(pid) else {
             continue;
         };
         let observed = crate::sys::open_vnode_paths(pid);
-        if crate::sys::start_us(pid).ok() == Some(start)
-            && crate::sys::parent_pid(pid).ok() == Some(root)
-        {
+        if crate::sys::start_us(pid).ok() == Some(start) {
             paths.extend(observed);
         }
     }
@@ -174,7 +191,13 @@ fn agy_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Option
                 && p.extension().is_some_and(|e| e == "lock")
         } else {
             p.parent().is_some_and(|d| d.ends_with("conversations"))
-                && p.extension().is_some_and(|e| e == "db")
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("db")
+                            || ext.eq_ignore_ascii_case("db-wal")
+                            || ext.eq_ignore_ascii_case("db-shm")
+                    }) && !n.is_empty()
+                })
         }
     }) {
         let Some((home, id)) = crate::agent_history::vault::agy_root_and_id_from_path(path) else {
@@ -185,16 +208,19 @@ fn agy_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Option
                 return Err(io::ErrorKind::InvalidData.into());
             }
         } else {
-            let transcript = home
-                .join("brain")
-                .join(&id)
-                .join(".system_generated/logs/transcript.jsonl");
+            let conv_dir = home.join("brain").join(&id);
+            let logs = conv_dir.join(".system_generated/logs");
+            let transcript = [
+                logs.join("transcript.jsonl"),
+                logs.join("transcript_full.jsonl"),
+                conv_dir.join("transcript.jsonl"),
+                home.join("sessions").join(format!("{id}.jsonl")),
+            ]
+            .into_iter()
+            .find(|p| p.is_file());
             found = Some(Identity {
-                path: if transcript.is_file() {
-                    transcript
-                } else {
-                    home.join("conversations").join(format!("{id}.db"))
-                },
+                path: transcript
+                    .unwrap_or_else(|| home.join("conversations").join(format!("{id}.db"))),
                 home,
                 id,
             });

@@ -1825,6 +1825,8 @@ impl Registry {
                                     &found.id,
                                     Some(&found.path),
                                 );
+                            } else {
+                                self.agents.bind_discovered_session(session, conv_id, None);
                             }
                         }
                         if !exited
@@ -1919,6 +1921,42 @@ impl Registry {
         let is_subagent_or_foreign =
             self.agents
                 .record_hook_session_with_context(id, &e.payload, Some(&e.agent), cwd_hint);
+        if !is_subagent_or_foreign
+            && let Ok(Some(stored)) = self.agents.stored(id)
+            && (stored.session_id.is_none() || stored.transcript_path.is_none())
+        {
+            let root_pid = lock(&self.state)
+                .sessions
+                .get(&id)
+                .map_or(0, |entry| entry.pid);
+            let fg_pid = (e.ppid > 1)
+                .then_some(e.ppid)
+                .or_else(|| tap.and_then(Tap::foreground));
+            let provider = krill_proto::usage::ProviderKind::parse(&stored.profile)
+                .or_else(|| krill_proto::usage::ProviderKind::parse(&e.agent));
+            if let Some(provider) = provider
+                && root_pid > 1
+            {
+                let discovered = account_switch::identity::discover(provider, root_pid, fg_pid)
+                    .ok()
+                    .flatten()
+                    .map(|found| (found.id, found.path))
+                    .or_else(|| {
+                        (provider == krill_proto::usage::ProviderKind::Antigravity).then(|| {
+                            crate::agent_history::vault::discover_live_agy_identity(
+                                root_pid, fg_pid,
+                            )
+                            .or_else(|| crate::agent_history::vault::cached_live_agy_identity(id))
+                            .map(|(_, conv_id, path)| (conv_id, path))
+                        })?
+                    });
+                if let Some((conv_id, path)) = discovered {
+                    self.agents
+                        .bind_discovered_session(id, &conv_id, Some(&path));
+                    self.agents.observe_account_resume(id, &conv_id);
+                }
+            }
+        }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         self.observe_webhook(id);
         if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
@@ -2424,7 +2462,14 @@ impl Registry {
                     if s.session_id.is_none() {
                         s.session_id = Some(found.id);
                     }
-                    if s.transcript_path.is_none()
+                    let should_upgrade_db = s
+                        .transcript_path
+                        .as_deref()
+                        .is_some_and(crate::agent::control::is_agy_conversation_db_path)
+                        && found.path.to_str().is_some_and(|p| {
+                            !crate::agent::control::is_agy_conversation_db_path(p)
+                        });
+                    if (s.transcript_path.is_none() || should_upgrade_db)
                         && let Some(p) = found
                             .path
                             .to_str()
@@ -2463,7 +2508,11 @@ impl Registry {
         );
         if let Some((path, sid)) = resolved
             && stored.as_ref().is_some_and(|s| {
-                s.session_id.as_deref() == Some(&sid) && s.transcript_path.is_none()
+                s.session_id.as_deref() == Some(&sid)
+                    && (s.transcript_path.is_none()
+                        || s.transcript_path
+                            .as_deref()
+                            .is_some_and(crate::agent::control::is_agy_conversation_db_path))
             })
         {
             // Cwd/recency fallback is for displaying history only. It must never become

@@ -122,5 +122,176 @@ fn hidden_mobile_poll_skips_inventory_but_active_pairing_continues(cx: &mut gpui
     vcx.update(|_, cx| view.update(cx, |view, _| view.mobile.pairing = PairingState::Connecting));
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
-    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+fn pairing_offer(url: &str, expires_at_ms: u64) -> MobileReply {
+    MobileReply::PairingOffer {
+        url: url.into(),
+        host: "example.test".into(),
+        port: 443,
+        expires_at_ms,
+        mode: ConnectMode::Tailscale,
+        interfaces: Vec::new(),
+    }
+}
+
+#[gpui::test]
+fn mobile_enter_mints_first_device_or_standalone_page_without_rotation(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::sync::Mutex;
+    cx.update(gpui_component::init);
+    for (mobile_page, has_device, already_mobile) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let record = requests.clone();
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let mut view = SettingsView::new(cx);
+            view.mobile = Panel::new(Arc::new(move |request| {
+                record.lock().unwrap().push(request.clone());
+                Ok(match request {
+                    MobileRequest::Status => MobileReply::GatewayStatus {
+                        listening: true,
+                        bind_addrs: Vec::new(),
+                        mode: ConnectMode::Tailscale,
+                        tunnel_url: None,
+                        active_offer: false,
+                        devices: if has_device {
+                            vec![device(1, 1)]
+                        } else {
+                            Vec::new()
+                        },
+                    },
+                    MobileRequest::MintPairingTicket { .. }
+                    | MobileRequest::CurrentPairingOffer => {
+                        pairing_offer("https://example.test/#pair=fixture", u64::MAX)
+                    }
+                    MobileRequest::ConnectedDevices => MobileReply::ConnectedDevices(Vec::new()),
+                    other => panic!("unexpected request: {other:?}"),
+                })
+            }));
+            view.mobile.address = Some("100.64.1.2:443".into());
+            if already_mobile {
+                view.tab = super::super::AdminTab::Mobile;
+            }
+            if mobile_page {
+                view.set_mobile_page(true, cx);
+            } else {
+                view.set_tab(super::super::AdminTab::Mobile, cx);
+            }
+            view
+        });
+        vcx.run_until_parked();
+        let should_mint = mobile_page || !has_device;
+        vcx.update(|_, cx| {
+            let mobile = &view.read(cx).mobile;
+            assert_eq!(mobile.offer.is_some(), should_mint);
+            assert!(!mobile.pending);
+            assert!(mobile.error.is_none());
+        });
+        let requests = requests.lock().unwrap();
+        let minted: Vec<_> = requests
+            .iter()
+            .filter(|r| matches!(r, MobileRequest::MintPairingTicket { .. }))
+            .collect();
+        assert_eq!(minted.len(), usize::from(should_mint));
+        if should_mint {
+            assert!(matches!(
+                minted[0],
+                MobileRequest::MintPairingTicket {
+                    mode: ConnectMode::Tailscale,
+                    custom_address: Some(address),
+                    rotate: false,
+                } if address == "100.64.1.2:443"
+            ));
+        }
+    }
+}
+
+#[gpui::test]
+fn mobile_poll_renews_missing_failed_or_expired_standalone_offer(cx: &mut gpui::TestAppContext) {
+    use std::sync::Mutex;
+    cx.update(gpui_component::init);
+    for (auto_mint, had_offer, current) in [
+        (true, true, Err("consumed ticket".into())),
+        (true, false, Err("missing ticket".into())),
+        (true, true, Ok(MobileReply::Failed("expired ticket".into()))),
+        (
+            true,
+            true,
+            Ok(pairing_offer("https://example.test/#old", 0)),
+        ),
+        (false, true, Err("expired ticket".into())),
+        (
+            true,
+            true,
+            Ok(pairing_offer("https://example.test/#valid", u64::MAX)),
+        ),
+    ] {
+        let should_mint = auto_mint
+            && !matches!(&current, Ok(MobileReply::PairingOffer { expires_at_ms, .. }) if *expires_at_ms > 0);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let record = requests.clone();
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let mut view = SettingsView::new(cx);
+            view.tab = super::super::AdminTab::Mobile;
+            view.mobile_page = auto_mint;
+            view.mobile = Panel::new(Arc::new(move |request| {
+                record.lock().unwrap().push(request.clone());
+                match request {
+                    MobileRequest::CurrentPairingOffer => current.clone(),
+                    MobileRequest::MintPairingTicket { .. } => {
+                        Ok(pairing_offer("https://example.test/#renewed", u64::MAX))
+                    }
+                    MobileRequest::ConnectedDevices => {
+                        Ok(MobileReply::ConnectedDevices(Vec::new()))
+                    }
+                    MobileRequest::Status => Ok(MobileReply::GatewayStatus {
+                        listening: true,
+                        bind_addrs: Vec::new(),
+                        mode: ConnectMode::Tailscale,
+                        tunnel_url: None,
+                        active_offer: false,
+                        devices: vec![device(1, 1)],
+                    }),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }));
+            view.mobile.mode = ConnectMode::Tailscale;
+            view.mobile.address = Some("100.64.1.2:443".into());
+            if had_offer {
+                view.mobile
+                    .accept(pairing_offer("https://example.test/#old", u64::MAX));
+            }
+            view.mobile_poll(cx);
+            view
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let mobile = &view.read(cx).mobile;
+            assert_eq!(mobile.offer.is_some(), auto_mint);
+            if should_mint {
+                assert_eq!(
+                    mobile.offer.as_ref().unwrap().0,
+                    "https://example.test/#renewed"
+                );
+            }
+        });
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, MobileRequest::MintPairingTicket { .. }))
+                .count(),
+            usize::from(should_mint)
+        );
+        assert!(requests.iter().all(|r| !matches!(r, MobileRequest::MintPairingTicket { mode, custom_address, rotate }
+            if *mode != ConnectMode::Tailscale || custom_address.as_deref() != Some("100.64.1.2:443") || *rotate)));
+    }
 }
