@@ -3232,7 +3232,9 @@ impl Registry {
                 let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
                 loop {
                     let seen_gen = *lock(&self.orch_signal.0);
-                    let checked = OrchestrationStore::mutate(&dir, |s| {
+                    // 빈 폴링은 캐시 사본만 확인한다. ack=false도 명시적 ACK에 쓸
+                    // 영속 delivery가 필요하므로, 전달할 때는 잠금 안에서 다시 선택한다.
+                    let check = |s: &mut OrchestrationStore| {
                         s.check_delivery(
                             recipient.as_deref(),
                             &types,
@@ -3241,6 +3243,14 @@ impl Registry {
                             run_id.as_deref(),
                             delivery_id.as_deref(),
                         )
+                    };
+                    let checked = self.orchestration_snapshot().and_then(|mut snapshot| {
+                        let preview = check(&mut snapshot)?;
+                        if !preview.1.is_empty() || delivery_id.is_some() {
+                            OrchestrationStore::mutate(&dir, check)
+                        } else {
+                            Ok(preview)
+                        }
                     });
                     match checked {
                         Ok((delivery, messages))
@@ -3311,7 +3321,7 @@ impl Registry {
                 let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
                 loop {
                     let seen_gen = *lock(&self.orch_signal.0);
-                    let found = OrchestrationStore::load(&dir).ok().and_then(|s| {
+                    let found = self.orchestration_snapshot().ok().and_then(|s| {
                         s.messages
                             .iter()
                             .find(|m| m.reply_to.as_deref() == Some(question_id.as_str()))
@@ -3542,6 +3552,244 @@ mod orchestration_delivery_tests {
     use super::*;
     use krill_proto::orchestration::{MessageType, OrchAction, OrchestrationStore, SendParams};
     use std::io::Read as _;
+
+    #[test]
+    fn empty_orchestration_waiters_preserve_file_and_response_shapes() -> io::Result<()> {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        let dir = std::env::temp_dir().join(format!("krill-empty-waits-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        OrchestrationStore::mutate(&dir, |s| s.create_run("empty wait", None))?;
+        let before = stamp(&dir.join(ORCH_FILE)).unwrap();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let start = Arc::new(std::sync::Barrier::new(5));
+        let waiters: Vec<_> = (0..4)
+            .map(|i| {
+                let reg = Arc::clone(&reg);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    reg.orchestration(
+                        &Peer {
+                            pid: None,
+                            scope: Scope::Full,
+                        },
+                        if i < 2 {
+                            OrchAction::CheckMessagesLegacy {
+                                recipient: Some("empty".into()),
+                                types: vec![],
+                                unread_only: true,
+                                ack: i == 1,
+                                wait_ms: 800,
+                            }
+                        } else {
+                            OrchAction::CheckMessages {
+                                recipient: Some("empty".into()),
+                                types: vec![],
+                                unread_only: true,
+                                ack: i == 3,
+                                wait_ms: 800,
+                                run_id: None,
+                                delivery_id: None,
+                            }
+                        },
+                    )
+                })
+            })
+            .collect();
+        start.wait();
+        // 250ms 재확인을 여러 번 거쳐도 inode/mtime이 바뀌지 않아야 한다.
+        for _ in 0..35 {
+            std::thread::sleep(Duration::from_millis(25));
+            assert_eq!(stamp(&dir.join(ORCH_FILE)).as_ref(), Some(&before));
+        }
+        for (i, waiter) in waiters.into_iter().enumerate() {
+            let response = waiter.join().unwrap().unwrap();
+            if i == 2 {
+                assert!(
+                    matches!(response, Reply::Orchestration(OrchResponse::Delivery { delivery: None, messages }) if messages.is_empty())
+                );
+            } else {
+                assert!(
+                    matches!(response, Reply::Orchestration(OrchResponse::Messages(messages)) if messages.is_empty())
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn cached_answer_wait_observes_external_reply_without_idle_writes() -> io::Result<()> {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        let dir = std::env::temp_dir().join(format!("krill-answer-wait-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let question = OrchestrationStore::mutate(&dir, |s| {
+            s.send_message(&SendParams {
+                from: "worker".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Question,
+                summary: "question".into(),
+                body: String::new(),
+                run_id: None,
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })
+            .map(|messages| messages[0].clone())
+        })?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let question_id = question.id.clone();
+            std::thread::spawn(move || {
+                reg.orchestration(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    OrchAction::WaitAnswer {
+                        question_id,
+                        wait_ms: 5000,
+                    },
+                )
+            })
+        };
+        let before = stamp(&dir.join(ORCH_FILE));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(stamp(&dir.join(ORCH_FILE)), before);
+        // 외부 프로세스의 저장처럼 notify 없이 파일 교체만으로 캐시를 무효화한다.
+        let reply = OrchestrationStore::mutate(&dir, |s| {
+            s.reply_message(&question.id, "coordinator", "answer")
+        })?;
+        assert_eq!(
+            waiter.join().unwrap().unwrap(),
+            Reply::Orchestration(OrchResponse::Answer(Some(reply.clone())))
+        );
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .messages
+                .iter()
+                .any(|m| m.id == reply.id && m.acked)
+        );
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn cached_wait_wakes_and_replays_durable_delivery_before_explicit_ack() -> io::Result<()> {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        let dir = std::env::temp_dir().join(format!("krill-delivery-wait-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("delivery wait", None))?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let action = OrchAction::CheckMessages {
+            recipient: Some("receiver".into()),
+            types: vec![MessageType::Status],
+            unread_only: true,
+            ack: false,
+            wait_ms: 5000,
+            run_id: Some(run.id.clone()),
+            delivery_id: None,
+        };
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let action = action.clone();
+            std::thread::spawn(move || {
+                reg.orchestration(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    action,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let send = |summary: &str| {
+            reg.orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "sender".into(),
+                    to: "receiver".into(),
+                    msg_type: MessageType::Status,
+                    summary: summary.into(),
+                    body: String::new(),
+                    run_id: Some(run.id.clone()),
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .unwrap()
+        };
+        let sent_at = Instant::now();
+        send("first");
+        let Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(batch),
+            messages,
+        }) = waiter.join().unwrap().unwrap()
+        else {
+            panic!("expected durable delivery")
+        };
+        assert!(sent_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].acked);
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.deliveries.as_slice(),
+            std::slice::from_ref(&batch)
+        );
+        let before = stamp(&dir.join(ORCH_FILE));
+        assert_eq!(
+            reg.orchestration(&peer, action.clone()).unwrap(),
+            Reply::Orchestration(OrchResponse::Delivery {
+                delivery: Some(batch.clone()),
+                messages: messages.clone()
+            })
+        );
+        assert_eq!(stamp(&dir.join(ORCH_FILE)), before);
+        send("later");
+        let OrchAction::CheckMessages {
+            recipient,
+            types,
+            unread_only,
+            wait_ms,
+            run_id,
+            ..
+        } = action
+        else {
+            unreachable!()
+        };
+        let ack = OrchAction::CheckMessages {
+            recipient,
+            types,
+            unread_only,
+            wait_ms,
+            run_id,
+            ack: true,
+            delivery_id: Some(batch.id.clone()),
+        };
+        let Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(acked),
+            messages,
+        }) = reg.orchestration(&peer, ack).unwrap()
+        else {
+            panic!("expected explicit ack delivery")
+        };
+        assert_eq!(acked.id, batch.id);
+        assert!(acked.acked);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].acked);
+        let store = OrchestrationStore::load(&dir)?;
+        assert_eq!(store.messages.iter().filter(|m| !m.acked).count(), 1);
+        std::fs::remove_dir_all(dir)
+    }
 
     #[test]
     fn idle_headless_mail_pointer_is_delivered_once_and_busy_mail_is_deferred() -> io::Result<()> {
