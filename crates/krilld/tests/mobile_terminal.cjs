@@ -189,7 +189,71 @@ async function main(){
  await testPasteButton();
  await testTextLayer();
  await testLivePreviewAndHeldIme();
+ // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
+ context.performance={now:()=>clock};try{await testTuiScrollRouting();await testScrollPhysics();await testHistoryRefreshMerge();}finally{delete context.performance;}
  console.log('All terminal adapter regression checks passed.');
+}
+// 대체 화면(TUI)은 셸 기록을 접고 위·아래 쓸기를 모두 TUI에 보고한다. 보고는 입력 ACK·커서·라이브 복귀와 분리하고, 늦은 기록 응답은 TUI 화면을 건드리지 않는다.
+async function testTuiScrollRouting(){
+ const {root,handle,socket}=await mount(2001),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history'),grid=find(root,'terminal-grid'),controls=find(root,'terminal-history-controls'),latest=find(root,'terminal-latest'),preview=find(root,'live-preview');let top=0;port.clientHeight=432;
+ Object.defineProperty(grid,'offsetTop',{get:()=>hist.hidden?0:(controls.hidden?0:32)+hist.children.length*18});Object.defineProperty(port,'scrollHeight',{get:()=>grid.offsetTop+(grid.hidden?0:432)});Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
+ const requests=()=>socket.sent.filter(a=>a[4]===0x12),row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),reply=(total,pages,n)=>{const r=T.reader(requests().at(-1).slice(5));socket.frame(0x26,T.v(r.n()),T.v(total),T.v(pages),T.v(0),T.v(n),...Array(n).fill(row));};
+ const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]}),drag=(from,to)=>{touch('touchstart',150,from);touch('touchmove',150,from+(to>from?10:-10));const e=touch('touchmove',150,to);touch('touchend');return e;},modes=f=>socket.frame(0x2b,Uint8Array.of(0),T.v(f)),since=n=>inputs(socket).slice(n).join('');
+ handle.loadHistory();reply(5000,0,100);assert.equal(hist.children.length,100);assert.equal(top,1832);socket.screen('before alt');await flush();handle.loadHistory(false,true);
+ modes(4|16|64|128);assert.equal(root.dataset.alt,'true');assert.equal(hist.hidden,true);assert.equal(controls.hidden,true);assert.equal(grid.hidden,false);assert.equal(top,0);assert.equal(latest.hidden,true);
+ reply(120,0,120);assert.equal(hist.children.length,100,'a reply requested before ALT does not touch the TUI view');const n=requests().length;handle.loadHistory();assert.equal(requests().length,n,'automatic history loads stop in ALT');
+ let base=inputs(socket).length,e=drag(100,160);assert(e.defaultPrevented);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}$/,'finger down scrolls the TUI up (first 10px counted)');
+ base=inputs(socket).length;drag(300,240);assert.match(since(base),/^(\x1b\[<65;\d+;\d+M){4}$/);assert.equal(requests().length,n);assert.equal(latest.hidden,true);assert.equal(hist.children.length,100);
+ await advance(10000);assert.equal(root.dataset.phase,'ready','scroll reports never wait for input confirmation');assert.equal(socket.readyState,1);assert.equal(preview.hidden,true);assert.equal(top,0);socket.autoAck=true;await handle.sendKey('enter');socket.autoAck=false;
+ base=inputs(socket).length;e=event(port,'wheel',{deltaX:0,deltaY:-30,deltaMode:0});assert(e.defaultPrevented);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){2}$/);base=inputs(socket).length;event(port,'wheel',{deltaX:0,deltaY:1,deltaMode:1});assert.match(since(base),/^\x1b\[<65;\d+;\d+M$/,'reversing the wheel answers at once');base=inputs(socket).length;event(port,'wheel',{deltaX:0,deltaY:-1,deltaMode:2});assert.equal((since(base).match(/\x1b\[<64;/g)||[]).length,30);
+ modes(64|128);base=inputs(socket).length;drag(100,160);drag(300,240);assert.equal(since(base),'\x1b[A'.repeat(4)+'\x1b[B'.repeat(4),'DEC 1007 sends arrows');
+ modes(1|64|128);base=inputs(socket).length;drag(100,130);assert.equal(since(base),'\x1bOA\x1bOA','application cursor arrows');
+ modes(4|64|128);base=inputs(socket).length;drag(100,160);assert.equal(since(base),'','mouse without SGR invents no input');assert.equal(requests().length,n);
+ modes(4|16|64|128);handle.toggleShift(true);base=inputs(socket).length;e=drag(100,160);assert.equal(since(base),'','sticky Shift bypasses the TUI');assert.equal(find(root,'shift-toggle').getAttribute('aria-pressed'),'false');drag(100,130);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){2}$/);
+ modes(4|16);assert.equal(root.dataset.alt,'false');assert.equal(hist.hidden,false);assert.equal(controls.hidden,false);assert.equal(top,1832,'leaving ALT follows live output again');
+ base=inputs(socket).length;drag(100,160);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}$/,'inline mouse TUI owns a gesture that starts on live output');assert.equal(requests().length,n);
+ port.scrollTop=500;event(port,'scroll');base=inputs(socket).length;e=drag(100,160);assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','a gesture started in shell history stays native');
+ modes(4|16|64|128);const m=requests().length;handle.loadHistory(true);assert.equal(requests().length,m+1,'explicit reveal is still allowed in ALT');reply(100,0,100);assert.equal(hist.hidden,false);handle.unmount();assert.equal(root.dataset.alt,undefined);
+ console.log('PASS ALT folds shell history, both directions reach the TUI (SGR, 1007 arrows, SS3), report path skips ACK/cursor, wheel deltaMode, Shift bypass, late replies ignored, inline live gestures');
+}
+// 손가락 스크롤 물리: 첫 이동 반영, 방향 반전 즉시 반응, 지수 감속 관성과 중단 조건, 넘침 있을 때만 가로 잠금, 터치 중 글자 층 보류.
+async function testScrollPhysics(){
+ const {root,handle,socket}=await mount(2002),port=find(root,'terminal-scroll'),layer=find(root,'terminal-text');port.clientHeight=432;port.scrollLeft=0;await advance(16);
+ const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]}),up=()=>(inputs(socket).join('').match(/\x1b\[<64;/g)||[]).length,down=()=>(inputs(socket).join('').match(/\x1b\[<65;/g)||[]).length;
+ socket.frame(0x2b,Uint8Array.of(0),T.v(4|16|64|128));
+ touch('touchstart',100,100);touch('touchmove',100,130);assert.equal(up(),2,'the move that picks the axis keeps its distance');touch('touchmove',100,150);assert.equal(up(),3);touch('touchmove',100,135);assert.equal(down(),1,'15px back reverses at once (no carried remainder)');touch('touchend');await advance(100);assert.equal(up(),3);assert.equal(down(),1);
+ const fling=async()=>{touch('touchstart',100,100);await advance(16);touch('touchmove',100,130);await advance(16);touch('touchmove',100,160);touch('touchend');};
+ await fling();let count=up(),frames=[];for(let i=0;i<20;i++){await advance(16);frames.push(up()-count);count=up();}
+ assert(frames[0]>0&&frames.every(f=>f<=8),'momentum continues after release, at most 8 detents a frame');assert(frames.slice(0,5).reduce((a,b)=>a+b)>frames.slice(15).reduce((a,b)=>a+b),'momentum decays');
+ await advance(2000);count=up();await advance(500);assert.equal(up(),count,'momentum stops');
+ await fling();await advance(32);touch('touchstart',100,100);count=up();await advance(500);assert.equal(up(),count,'a new touch stops momentum');touch('touchend');
+ touch('touchstart',100,100);await advance(16);touch('touchmove',100,160);await advance(16);touch('touchmove',100,145);const revUp=up(),revDown=down();touch('touchend');await advance(32);assert.equal(up(),revUp,'reversal before release never flings in the old direction');assert(down()>=revDown);await advance(2000);
+ await fling();await advance(32);socket.frame(0x2b,Uint8Array.of(0),T.v(4|16));count=up();await advance(500);assert.equal(up(),count,'a mode change stops momentum');
+ await fling();const hide=handle.setVisible(false);socket.frame(0x2c,T.v(0));await hide;count=up();await advance(500);assert.equal(up(),count,'hiding stops momentum');await handle.setVisible(true);
+ socket.frame(0x2b,Uint8Array.of(0),T.v(0));port.scrollWidth=port.clientWidth;let e;touch('touchstart',200,300);e=touch('touchmove',188,292);touch('touchmove',180,200);assert.equal(e.defaultPrevented,false);assert.equal(port.scrollLeft,0,'no horizontal overflow keeps a diagonal swipe vertical');touch('touchend');
+ port.scrollWidth=1000;touch('touchstart',200,300);touch('touchmove',190,292);touch('touchmove',150,280);assert.equal(port.scrollLeft,0,'10px against 8px is still vertical');touch('touchend');
+ touch('touchstart',300,200);await advance(16);e=touch('touchmove',270,201);assert(e.defaultPrevented);await advance(16);touch('touchmove',240,202);assert.equal(port.scrollLeft,60);touch('touchend');await advance(16);assert(port.scrollLeft>60,'horizontal pan glides after release');await advance(2000);const left=port.scrollLeft;await advance(500);assert.equal(port.scrollLeft,left);
+ touch('touchstart',100,100);socket.screen('during touch');await advance(16);assert.doesNotMatch(layer.children[0].textContent,/during touch/,'text rows wait while a finger is down');touch('touchend');assert.match(layer.children[0].textContent,/^during touch/);handle.unmount();
+ console.log('PASS touch keeps its first distance, reverses without a deadzone, exponential momentum stops on touch/mode/hide, axis lock needs overflow, text layer waits for the finger');
+}
+// 새로고침이 같은 기록을 돌려주면 DOM을 건드리지 않고, 새 행만 덧붙이며, 1000행을 넘으면 맨 앞을 잘라 낸다. 창 모드에서 바닥까지 내리면 라이브로 돌아간다.
+async function testHistoryRefreshMerge(){
+ const setup=async id=>{const {root,handle,socket}=await mount(id),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history');port.clientHeight=400;
+  const requests=()=>socket.sent.filter(a=>a[4]===0x12),last=()=>{const r=T.reader(requests().at(-1).slice(5));return {id:r.n(),source:r.n(),skip:r.n(),count:r.n()};};
+  const row=t=>C.concat(T.v([...t].length),...[...t].map(ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0))));
+  return {root,handle,socket,port,hist,requests,last,reply:(total,pages,skip,texts)=>socket.frame(0x26,T.v(last().id),T.v(total),T.v(pages),T.v(skip),T.v(texts.length),...texts.map(row))};};
+ const names=(from,n,p='r')=>Array.from({length:n},(_,i)=>p+(from+i)),same=(nodes,hist,offset=0)=>nodes.every((c,i)=>hist.children[i+offset]===c);
+ let t=await setup(2003);t.handle.loadHistory();t.reply(100,0,0,names(0,100));let nodes=[...t.hist.children];
+ t.handle.loadHistory(false,true);assert.equal(t.last().count,300);t.reply(100,0,0,names(0,100));assert.equal(t.hist.children.length,100);assert(same(nodes,t.hist),'an identical refresh keeps every row node');
+ t.handle.loadHistory(false,true);t.reply(105,0,0,[...names(0,100),...names(0,5,'n')]);assert.equal(t.hist.children.length,105);assert(same(nodes,t.hist),'new output only appends');assert.equal(t.hist.children[104].textContent,'n4\n');t.handle.unmount();
+ t=await setup(2007);t.handle.loadHistory();t.reply(100,0,0,Array(100).fill('same'));nodes=[...t.hist.children];t.handle.loadHistory(false,true);t.reply(105,0,0,Array(105).fill('same'));assert.equal(t.hist.children.length,105);assert(same(nodes,t.hist),'repeated-row refresh still appends at the tail');t.handle.unmount();
+ t=await setup(2004);t.handle.loadHistory();t.reply(1000,0,0,names(0,1000));nodes=[...t.hist.children];t.handle.loadHistory(false,true);assert.equal(t.last().count,1000);t.reply(1005,0,0,[...names(5,995),...names(0,5,'n')]);
+ assert.equal(t.hist.children.length,1000);assert(same(nodes.slice(5),t.hist),'the bound drops only the oldest rows');assert.equal(t.hist.children[999].textContent,'n4\n');assert.equal(find(t.root,'terminal-grid').hidden,false);t.handle.unmount();
+ t=await setup(2005);t.handle.loadHistory();t.reply(5000,0,0,names(0,600));nodes=[...t.hist.children];t.handle.loadHistory(false,true);assert.equal(t.last().count,600);t.reply(5005,0,0,[...names(5,595),...names(0,5,'n')]);
+ assert.equal(t.hist.children.length,605);assert(same(nodes,t.hist));t.handle.loadHistory();assert.deepEqual([t.last().source,t.last().skip],[0,605],'older paging continues after the kept rows');t.handle.unmount();
+ t=await setup(2006);const grid=find(t.root,'terminal-grid');t.port.scrollHeight=20000;t.handle.loadHistory();t.reply(5000,1,0,names(0,600));t.handle.loadHistory();t.reply(5000,1,600,names(600,600));assert.equal(grid.hidden,true);
+ t.port.scrollTop=19000;event(t.port,'scroll');assert.equal(grid.hidden,true);t.port.scrollTop=19590;event(t.port,'scroll');assert.equal(grid.hidden,false,'scrolling to the bottom of a history window returns to live');assert.deepEqual([t.last().source,t.last().skip],[0,0]);assert.equal(find(t.root,'terminal-latest').hidden,true);t.handle.unmount();
+ console.log('PASS history refresh keeps identical rows, appends new output, trims the oldest past 1000, keeps paging position, window bottom returns to live');
 }
 async function testLivePreviewAndHeldIme(){
  // P0-1: Direct live-preview in dock above accessory, shown while pending or held, hidden on 0x21 or 0x27 ACK, cleared on invalidateInput.

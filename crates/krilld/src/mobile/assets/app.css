@@ -383,6 +383,7 @@ button.account-row:disabled{opacity:1}
 
 /* History stays readable while the live terminal updates below it. */
 .terminal-frame{position:relative}.terminal-scroll{-webkit-overflow-scrolling:touch}
+.terminal-mount[data-alt=true] .terminal-scroll:has(>.terminal-history[hidden]){overscroll-behavior-y:none}.terminal-mount[data-alt=true][data-fit=true] .terminal-scroll:has(>.terminal-history[hidden]){touch-action:none}
 .terminal-latest{position:absolute;right:var(--space-md);bottom:var(--space-md);z-index:2;min-height:var(--touch-target);padding:var(--space-sm) var(--space-md);border:1px solid var(--border);border-radius:var(--radius-card);background:var(--surface-raised);color:var(--foreground);font-size:var(--font-meta)}
 .terminal-latest::before{content:'↓';margin-right:var(--space-sm)}
 .terminal-history-controls{flex-wrap:wrap}.history-status{overflow-wrap:anywhere}
