@@ -305,27 +305,18 @@ impl Sidebar {
             .map(|(repo, _)| repo.clone())
     }
 
-    /// 지정한 호스트 스냅샷에서 워크트리(또는 하위 디렉터리)가 속한 저장소 루트 경로를 찾는다.
+    /// 지정한 호스트 스냅샷에서 워크트리가 속한 저장소 루트 경로를 찾는다.
     #[must_use]
     pub fn repo_for_worktree_on(
         &self,
         host: &crate::hosts::HostId,
         path: &Path,
     ) -> Option<PathBuf> {
-        let snapshot = self.snapshot_for(host);
-        if let Some((repo, _)) = snapshot
+        self.snapshot_for(host)
             .trees
             .iter()
             .find(|&(repo, list)| repo == path || list.iter().any(|t| t == path))
-        {
-            return Some(repo.clone());
-        }
-        snapshot
-            .trees
-            .keys()
-            .filter(|repo| !repo.as_os_str().is_empty() && super::path_within(path, repo))
-            .max_by_key(|repo| repo.as_os_str().len())
-            .cloned()
+            .map(|(repo, _)| repo.clone())
     }
 
     /// 같은 저장소 안에서 `path`의 부모가 될 수 있는 후보 워크트리 목록.
@@ -525,30 +516,36 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_child_worktree_on(crate::hosts::HostId::Local, parent, window, cx);
+        self.new_child_worktree_on(&crate::hosts::HostId::Local, parent, window, cx);
     }
 
     pub fn new_child_worktree_on(
         &mut self,
-        host: crate::hosts::HostId,
+        host: &crate::hosts::HostId,
         parent: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let repo = self
-            .repo_for_worktree_on(&host, &parent)
+            .repo_for_worktree_on(host, &parent)
             .unwrap_or_else(|| parent.clone());
         self.open_worktree_dialog_on(host, repo, Some(parent), window, cx);
     }
 
     pub fn new_worktree_on(
         &mut self,
-        host: crate::hosts::HostId,
+        host: &crate::hosts::HostId,
         repo: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let repo = self.repo_for_worktree_on(&host, &repo).unwrap_or(repo);
+        let repo = self
+            .repo_for_worktree_on(host, &repo)
+            .or_else(|| {
+                let ws = self.workspace_for_path_on(host, &repo)?;
+                self.repo_for_worktree_on(host, &ws).or(Some(ws))
+            })
+            .unwrap_or(repo);
         self.open_worktree_dialog_on(host, repo, None, window, cx);
     }
 
@@ -643,21 +640,21 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_worktree_dialog_on(crate::hosts::HostId::Local, repo, parent, window, cx);
+        self.open_worktree_dialog_on(&crate::hosts::HostId::Local, repo, parent, window, cx);
     }
 
     pub(super) fn open_worktree_dialog_on(
         &mut self,
-        host: crate::hosts::HostId,
+        host: &crate::hosts::HostId,
         repo: PathBuf,
         parent: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let host_options = self.worktree_host_options(&host, &repo);
+        let host_options = self.worktree_host_options(host, &repo);
         let selected_opt = host_options
             .iter()
-            .find(|o| o.host == host)
+            .find(|o| &o.host == host)
             .or_else(|| host_options.first())
             .cloned();
         let (target_host, source, target_repo) = if let Some(opt) = selected_opt {
@@ -675,7 +672,7 @@ impl Sidebar {
             let Some(source) = self.source.clone() else {
                 return;
             };
-            (host, source, repo)
+            (host.clone(), source, repo)
         };
         if let Some((old_dialog, old_sub)) = self.creating.take()
             && old_dialog.read(cx).is_background()

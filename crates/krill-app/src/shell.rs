@@ -3642,7 +3642,7 @@ impl Shell {
             self.toggle_sidebar(cx);
         }
         self.sidebar
-            .update(cx, |s, cx| s.new_worktree_on(host, repo, window, cx));
+            .update(cx, |s, cx| s.new_worktree_on(&host, repo, window, cx));
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {

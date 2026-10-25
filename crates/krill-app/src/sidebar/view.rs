@@ -275,12 +275,7 @@ fn row_menu(
                 .on_click(move |_, window, cx| {
                     child_this
                         .update(cx, |s, cx| {
-                            s.new_child_worktree_on(
-                                child_host.clone(),
-                                child_parent.clone(),
-                                window,
-                                cx,
-                            );
+                            s.new_child_worktree_on(&child_host, child_parent.clone(), window, cx);
                         })
                         .ok();
                 }),
@@ -416,7 +411,7 @@ fn row_menu(
                     .on_click(move |_, window, cx| {
                         wt_this
                             .update(cx, |s, cx| {
-                                s.new_worktree_on(wt_host.clone(), wt_repo.clone(), window, cx);
+                                s.new_worktree_on(&wt_host, wt_repo.clone(), window, cx);
                             })
                             .ok();
                     }),
@@ -1085,7 +1080,7 @@ impl Sidebar {
                                         .on_click(cx.listener(move |s, _, window, cx| {
                                             cx.stop_propagation();
                                             s.new_worktree_on(
-                                                new_wt_host.clone(),
+                                                &new_wt_host,
                                                 repo.clone(),
                                                 window,
                                                 cx,
@@ -3361,7 +3356,7 @@ impl Render for Sidebar {
                                                             sidebar
                                                                 .update(cx, |s, cx| {
                                                                     s.new_worktree_on(
-                                                                        host.clone(),
+                                                                        &host,
                                                                         repo.clone(),
                                                                         window,
                                                                         cx,

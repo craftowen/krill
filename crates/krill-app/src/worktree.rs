@@ -27,7 +27,7 @@ use crate::sidebar::Source;
 
 use crate::i18n::catalog::worktree as text;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRepoOption {
     pub path: PathBuf,
     pub label: String,
@@ -414,7 +414,6 @@ impl Dialog {
         if self.repo == repo {
             return;
         }
-        self.parent = None;
         let repo_branch = self
             .host_options
             .iter()
@@ -422,6 +421,7 @@ impl Dialog {
             .and_then(|o| o.repos.iter().find(|r| r.path == repo))
             .and_then(|r| r.branch.clone());
         self.repo = repo;
+        self.parent = None;
         self.apply_repo_branch_options(repo_branch.as_deref(), window, cx);
         self.refresh_repo_hooks(cx);
         self.prepare(cx);

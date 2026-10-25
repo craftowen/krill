@@ -787,10 +787,8 @@ fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut Tes
     let sidebar_for_sub = sidebar.clone();
     cx.update(|_, cx| {
         cx.subscribe(&sidebar_for_sub, move |s, e: &NewSession, cx| {
-            spawned_sink
-                .lock()
-                .unwrap()
-                .push((s.update(cx, |s, _| s.take_action_host()), e.clone()));
+            let host = s.update(cx, |s, _| s.take_action_host());
+            spawned_sink.lock().unwrap().push((host, e.clone()));
         })
         .detach();
     });
