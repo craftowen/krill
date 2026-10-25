@@ -18,6 +18,42 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
+/// Serialize a TOML read/modify/replace transaction across processes.
+/// The separate lock inode survives atomic replacement; dropping the file unlocks it.
+pub fn lock_toml(path: &Path) -> io::Result<std::fs::File> {
+    use crate::os::fs::OpenOptionsExt as _;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock)
+                if started.elapsed() < std::time::Duration::from_secs(3) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "configuration file is busy",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
 /// Render a TOML edit against the original schema projection, preserving unknown data.
 pub fn edit_toml<T: Serialize + DeserializeOwned>(
     original: &str,

@@ -226,6 +226,15 @@ globalThis.MkTerminalCodec=(()=>{
   sendCapture(bytes){if(!bytes)return;if(!this.ready){this.invalidateInput();this.error(Error('Wait for the live terminal to connect'));return;}const generation=this.inputGeneration;this.previewPending=true;const p=this.input(bytes);this.updatePreview();this.guard(async()=>{try{await p;}catch(error){if(generation===this.inputGeneration){this.contextBlocked=true;this.invalidateInput();this.recoverButton.hidden=false;}throw error;}});}
   syncComposing(){const cur=this.capture.value;if(cur===(this.sent||'')){clearTimeout(this.heldTimer);this.heldTimer=null;this.held='';this.updatePreview();return;}if(/[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]$/.test(cur)){const committed=cur.slice(0,-1),held=cur.slice(-1);if(committed!==(this.sent||'')){const before=[...this.sent||''],after=[...committed];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;const added=after.slice(same).join(''),removed='\x7f'.repeat(before.length-same);this.sent=committed;const bytes=removed+(added?this.consumeShift(added,false):'');if(bytes)this.sendCapture(bytes);}this.held=held;clearTimeout(this.heldTimer);this.heldTimer=setTimeout(()=>this.flushHeld(),300);this.updatePreview();}}
   syncCapture(pasted=false){const before=[...this.sent||''],now=this.capture.value,after=[...now];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;const added=after.slice(same).join(''),removed='\x7f'.repeat(before.length-same);if(pasted||/[\r\n]/.test(added)){this.resetCapture();this.paste(added,removed);return;}if(added&&(this.modifiers?.ctrl||this.modifiers?.alt)){this.resetCapture();const bytes=removed+this.consumeShift(added,false);this.guard(()=>this.input(bytes));return;}this.sent=now;const bytes=removed+(added?this.consumeShift(added,false):'');if(bytes)this.sendCapture(bytes);else this.updatePreview();}
+  insertText(text){
+   const clean=String(text??'').replace(/\r\n?/g,'\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'').replace(/^\n+|\n+$/g,'');if(!clean)return false;
+   if(this.inputMode==='buffered'){
+    const value=this.command.value,start=typeof this.command.selectionStart==='number'?this.command.selectionStart:value.length,end=typeof this.command.selectionEnd==='number'?this.command.selectionEnd:start;
+    this.command.value=value.slice(0,start)+clean+value.slice(end);this.command.selectionStart=this.command.selectionEnd=start+clean.length;
+    this.bufferedVersion=(this.bufferedVersion||0)+1;drafts.set(this.stateKey,this.command.value);this.sizeCommand();this.command.focus?.();
+   }else{this.paste(clean);this.capture?.focus?.();}
+   return true;
+  }
   paste(text,prefix=''){
    // Remove control sequences, including embedded bracketed-paste terminators.
    const clean=text.replace(/\r\n?/g,'\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'');if(!clean&&!prefix)return;
@@ -426,5 +435,5 @@ globalThis.MkTerminalCodec=(()=>{
   updateBusy(scope=''){return [...uncertainInputs].some(key=>String(key).startsWith(scope))||[...instances].some(i=>String(i.stateKey).startsWith(scope)&&(i.composing||i.bufferedComposing||i.bufferedPending||i.pendingInputs.size||i.pendingRoles.length||i.deferredKeys.length||i.heldPointer!=null||i.pasteReview||i.contextBlocked||i.sent||i.held||i.historyRows.length&&!i.atBottom()));},
   snapshotDrafts(){const saved=new Map(drafts);for(const i of instances){if(i.command.value)saved.set(i.stateKey,i.command.value);else saved.delete(i.stateKey);}return [...saved];},
   restoreDrafts(entries){for(const [key,value] of entries)if(typeof key==='string'&&typeof value==='string'&&value)drafts.set(key,value);},
-  mount(root,options){const instance=new Terminal(root,options);instances.add(instance);return Object.freeze(Object.fromEntries(['unmount','focus','setInputActive','setVisible','setFontScale','setInputMode','getInputMode','sendKey','toggleShift','fitToPhone','loadHistory','text'].map(name=>[name,instance[name].bind(instance)])));}});
+  mount(root,options){const instance=new Terminal(root,options);instances.add(instance);return Object.freeze(Object.fromEntries(['unmount','focus','setInputActive','setVisible','setFontScale','setInputMode','getInputMode','insertText','sendKey','toggleShift','fitToPhone','loadHistory','text'].map(name=>[name,instance[name].bind(instance)])));}});
 })();

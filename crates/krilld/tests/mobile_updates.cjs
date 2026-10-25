@@ -112,3 +112,8 @@ test('update preparation has at most two active decoded bodies and worker hashin
  f.context.Worker=class{constructor(url){assert.equal(url,'updates.js');}postMessage(buffer,transfer){assert.equal(transfer[0],buffer);hashes++;queueMicrotask(()=>this.onmessage({data:{hash:crypto.createHash('sha256').update(new Uint8Array(buffer)).digest('hex').slice(0,16)}}));}terminate(){terminated++;}};
  await f.context.KrillMobile.updates.prepare(f.hash,new AbortController().signal);assert.equal(peak,2);assert.equal(active,0);assert.equal(hashes,1);assert.equal(terminated,1);assert.equal(f.cache.size,inventory.length+1);
 });
+
+test('view handoff includes Git patch, settings and connection logs',()=>{
+ const f=fixture(),selectors=['.git-patch','.settings-list','.connection-log'],nodes=selectors.map((_,i)=>({scrollTop:70+i,scrollLeft:10+i,scrollHeight:1000,clientHeight:100,scrollWidth:500,clientWidth:100})),root=Object.assign(new EventTarget(),{querySelectorAll:s=>selectors.includes(s)?[nodes[selectors.indexOf(s)]]:[]});
+ f.context.MutationObserver=class{observe(){}disconnect(){}};const saved=f.context.KrillMobile.updates.captureView(root);assert.equal(saved.length,3);for(const node of nodes)node.scrollTop=node.scrollLeft=0;f.context.KrillMobile.updates.restoreView(root,saved);for(let i=0;i<nodes.length;i++){assert.equal(nodes[i].scrollTop,70+i);assert.equal(nodes[i].scrollLeft,10+i);}
+});

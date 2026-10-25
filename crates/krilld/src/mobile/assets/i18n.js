@@ -2,6 +2,16 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Close": "닫기",
+ "Delete": "삭제",
+ "Edit": "편집",
+ "Add": "추가",
+ "Saved on this phone. Could not sync quick actions to desktop. Reconnect and save again.": "이 휴대폰에 저장했습니다. 데스크톱과 퀵액션을 동기화하지 못했습니다. 다시 연결한 뒤 저장하세요.",
+ "Add quick action": "퀵액션 추가",
+ "Skill, command, or prompt": "스킬, 명령어 또는 프롬프트",
+ "Inserted into the active terminal or chat input without pressing Enter.": "활성 터미널 또는 채팅 입력란에 엔터 없이 입력됩니다.",
+ "No quick actions yet. Save skills like /krill-orchestration, shell commands, or prompts to insert without pressing Enter.": "저장된 퀵액션이 없습니다. /krill-orchestration 같은 스킬, 셸 명령어, 프롬프트를 저장하고 엔터 없이 입력하세요.",
+ "Insert a saved skill, command, or prompt. Press Enter separately to run.": "저장한 스킬, 명령어 또는 프롬프트를 입력합니다. 실행하려면 엔터를 따로 누르세요.",
  "Clear": "비우기",
  "Filter projects": "프로젝트 필터",
  "Filter projects...": "프로젝트 검색...",

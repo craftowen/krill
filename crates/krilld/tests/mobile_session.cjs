@@ -59,16 +59,23 @@ function testImeDefersSnapshotUpdates(){
  fire('compositionstart');context.update();fire('focusout');assert.equal(updates.length,4,'blur without compositionend still releases the gate');fire('compositionstart');fire('compositionend');assert.equal(updates.length,4,'no update when nothing was missed');
  console.log('PASS IME composition defers snapshot screen updates and catches up once');
 }
-function testQuickActions(){
- const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'}],undefined,true),seen=[];
- const wire=h=>{let mode='direct';h.getInputMode=()=>mode;h.setInputMode=value=>{mode=value;seen.push([h.options.sessionId,value]);};h.loadHistory=value=>seen.push([h.options.sessionId,'history',value]);h.fitToPhone=value=>seen.push([h.options.sessionId,'fit',value]);};
- const first=f.mounts[0];wire(first);first.options.onQuickActions();assert.equal(f.sheets.at(-1).title,'Quick actions');assert.equal(f.sheets.at(-1)[0].label,'Send prompt');assert(!f.sheets.at(-1).some(item=>item.danger));
+async function testQuickActions(){
+ const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'}],{quick_commands:[{name:'Orchestrate',text:'/krill-orchestration '},{name:'Git status',text:'git status'}]},true),seen=[];
+ f.ctx.rpc=async request=>{f.calls.push(request);return {quick_commands:request.commands};};
+ const wire=h=>h.insertText=text=>{assert(!text.includes('\r'));seen.push([h.options.sessionId,text]);return true;};
+ const first=f.mounts[0];wire(first);
+ const open=h=>{h.options.onQuickActions();const body=new Element('div');f.sheets.at(-1).render(body);return body;},all=body=>body.descendants(),by=(body,label)=>all(body).find(n=>n.textContent===label&&n.tag==='button');
+ let body=open(first);assert.equal(f.sheets.at(-1).title,'Quick actions');let cards=all(body).filter(n=>n.className==='quick-action-insert');assert.equal(cards[0].children[0].textContent,'Orchestrate');cards[0].action();assert.deepEqual(seen,[[7,'/krill-orchestration ']]);
  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();const second=f.mounts.at(-1);wire(second);
- second.options.onQuickActions();f.sheets.at(-1).find(item=>item.label==='Load earlier output').action();
- f.sheets.at(-1).find(item=>item.label==='Fit to Phone').action();f.sheets.at(-1).find(item=>item.label==='Switch to buffered input').action();
- assert.deepEqual(seen,[[8,'history',true],[8,'fit',true],[8,'buffered']]);assert.equal(f.calls.length,0,'quick actions never send unchecked approvals or close a PTY');
- second.options.onQuickActions();assert(f.sheets.at(-1).some(item=>item.label==='Switch to direct input'));f.sheets.at(-1).find(item=>item.label==='Edit terminal keys').action();assert.equal(f.routes.at(-1),'/settings/terminal');
- f.view.cleanup();console.log('PASS fixed quick actions target only the active split terminal, retain mode labels and expose key settings');
+ // A quick-action activation also selects its pane when no pointer event ran first.
+ body=open(first);all(body).find(n=>n.className==='quick-action-insert').action();body=open(second);all(body).find(n=>n.className==='quick-action-insert').action();assert.deepEqual(seen.slice(-2),[[7,'/krill-orchestration '],[8,'/krill-orchestration ']]);
+ body=open(second);by(body,'+ Add').action();let fields=all(body),name=fields.find(n=>n.tag==='input'),text=fields.find(n=>n.tag==='textarea');name.value='Ship';text.value='/ship-dev ';await by(body,'Save').action();assert.equal(f.calls.at(-1).action,'save_quick_commands');assert.equal(f.state.preferences.quickCommands.at(-1).text,'/ship-dev ');assert.equal(f.state.snapshot.quick_commands.length,3);
+ by(body,'Edit').action();fields=all(body);fields.find(n=>n.tag==='input').value='Prompt';fields.find(n=>n.tag==='textarea').value='Review this\nthen explain';await by(body,'Save').action();assert.equal(f.state.preferences.quickCommands[0].name,'Prompt');assert.equal(f.calls.at(-1).commands[0].text,'Review this\nthen explain');
+ await by(body,'Delete').action({stopPropagation(){}});assert.equal(f.state.preferences.quickCommands.length,2);assert.equal(f.calls.at(-1).commands.length,2);
+ let errors=[];f.ctx.error=e=>errors.push(e);f.ctx.rpc=async()=>{throw Error('offline');};by(body,'+ Add').action();fields=all(body);fields.find(n=>n.tag==='input').value='Offline';fields.find(n=>n.tag==='textarea').value='kept locally';await by(body,'Save').action();assert.equal(errors.length,1);assert.equal(f.state.preferences.quickCommands.at(-1).name,'Offline');assert(!f.calls.some(q=>q.action==='prompt'));
+ f.view.cleanup();
+ const fallback=fixture(undefined,{},false,{quickCommands:[{name:'Fallback',text:'saved prompt'}]});const fallbackBody=openFallback();function openFallback(){fallback.mounts[0].options.onQuickActions();const b=new Element('div');fallback.sheets.at(-1).render(b);return b;}assert(all(fallbackBody).some(n=>n.textContent==='Fallback'));fallback.view.cleanup();
+ console.log('PASS saved quick actions snapshot/fallback, active split insertion without Enter, add/edit/delete RPC and preferences, offline local retention');
 }
 function testSplitContinuity(){
  for(const direction of ['auto','columns','rows'])for(const active of [0,1]){
@@ -116,7 +123,7 @@ function testSplitTabReplacement(){
  console.log('PASS third tab replaces either active pane in place, cancels stale retries and preserves the inactive terminal and scroll');
 }
 async function main(){
- testQuickActions();testSplitContinuity();testSplitTabReplacement();
+ await testQuickActions();testSplitContinuity();testSplitTabReplacement();
  testHostViewBudgets();testImeDefersSnapshotUpdates();testSessionBackSkipsSessionHistory();
  {const sessions=Array.from({length:64},(_,n)=>({id:n+7,agent:'codex',state:'Working'})),f=fixture(sessions);const initial=f.buttons.filter(b=>b.className==='session-tab'),marks=initial.map(b=>b.children[1]);for(let i=0;i<100;i++)f.view.update();assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,64);assert(initial.every((tab,i)=>tab.children[1]===marks[i]));const removed=sessions[63],down=new Event('pointerdown');down.button=0;initial[63].dispatchEvent(down);assert.equal(f.timers.size,1);f.state.groups.get('g').sessions=sessions.slice(0,63);f.state.sessions.delete(removed.id);f.view.update();assert.equal(f.timers.size,0,'removed tab cancels pending long press');f.view.cleanup();console.log('PASS 64 keyed tabs x100 updates: new buttons/icons 0, removed-tab handlers cleaned');}
 
@@ -220,6 +227,11 @@ async function main(){
 }
 // 새 세션은 누르는 즉시 /s/new로 옮기고, 응답이 오면 그 자리를 새 세션으로 바꾼다. 스냅샷을 기다리지 않고, 아직 스냅샷에 없는 새 세션 때문에 다른 세션으로 튀지 않는다.
 async function testInstantCreate(){
+ const anchored=fixture([{id:7,title:'First',state:'Working'},{id:8,title:'Second',state:'Working'}]),tabStrip=anchored.root.descendants().find(n=>n.className==='tab-scroll');tabStrip.clientWidth=100;tabStrip.scrollLeft=120;tabStrip.getBoundingClientRect=()=>({left:0,right:100});for(const [i,tab] of tabStrip.children.entries())tab.getBoundingClientRect=()=>{const grow=tabStrip.children[0].children.at(-1).textContent==='A much longer first title'?40:0;const left=(i?120+grow:0)-tabStrip.scrollLeft;return {left,right:left+120};};const visible=tabStrip.children[1],oldX=visible.getBoundingClientRect().left;anchored.state.sessions.get(7).title='A much longer first title';anchored.view.update();assert.equal(visible.getBoundingClientRect().left,oldX);assert.equal(tabStrip.scrollLeft,160);anchored.view.cleanup();
+ Element.prototype.clientWidth=1200;
+ const wide=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true,{tabletSplits:{tabletSplit:{session:8,active:0,direction:'auto'}}});
+ assert.equal(wide.root.descendants().find(n=>n.className==='session-panels').dataset.layout,'columns','restored wide split starts in columns before ResizeObserver fires');wide.view.cleanup();delete Element.prototype.clientWidth;
+
  const lines=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),pick=marker=>{const i=lines.findIndex(l=>l.trim().startsWith(marker));assert(i>=0,marker);return lines[i];};
  const create=lines.findIndex(l=>l.trim().startsWith('function createSession('));
  const source=[pick('function parseRoute('),pick('const groupRoute='),pick('function group(data)'),pick('let creating=null;'),lines[create],lines[create+1]].join('\n')+'\nglobalThis.A={createSession,group,current:()=>creating};';
@@ -242,7 +254,7 @@ async function testInstantCreate(){
  console.log('PASS new session: instant pending route, in-place replace without waiting for the snapshot, no jump to another session, failure returns');
  // /s/new 화면: 선택된 새 탭과 빈 터미널 면을 바로 그리고, 생성이 끝나면(작업 없음) 작업 공간으로 돌린다.
  const f=fixture();f.view.cleanup();const job={group:f.state.groups.get('g'),agent:'codex'};let current=job;f.ctx.creating=()=>current;f.ctx.route={groupKey:'g',sessionId:'new'};f.ctx.groupRoute=(g,id)=>`/g/${g?.key}/${id??''}`;const root=new Element('main'),view=f.sandbox.KrillMobile.screens.session(root,f.ctx);
- const tabs=root.descendants().filter(n=>n.className==='session-tab');assert.deepEqual(tabs.map(n=>[n.attrs['aria-label'],n.attrs['aria-selected']]),[['Shell','false'],['Codex','true']]);const again=new Element('main');f.sandbox.KrillMobile.screens.session(again,{...f.ctx,creating:()=>({...job,agent:''})}).cleanup();assert.deepEqual(again.descendants().filter(n=>n.className==='session-tab').map(n=>n.attrs['aria-label']),['Shell','Shell 2'],'pending tab uses the real tab numbering');assert(root.descendants().some(n=>n.className==='terminal-mount'));assert.equal(f.mounts.length,1,'no terminal attaches before the session exists');
+ const tabs=root.descendants().filter(n=>n.className==='session-tab');assert.deepEqual(tabs.map(n=>[n.attrs['aria-label'],n.attrs['aria-selected']]),[['Shell','false'],['Codex','true']]);const again=new Element('main');f.sandbox.KrillMobile.screens.session(again,{...f.ctx,creating:()=>({...job,agent:''})}).cleanup();assert.deepEqual(again.descendants().filter(n=>n.className==='session-tab').map(n=>n.attrs['aria-label']),['Shell','Shell 2'],'pending tab uses the real tab numbering');assert(root.descendants().some(n=>n.className==='terminal-mount'));const dock=root.descendants().find(n=>n.className==='command-dock');assert(dock,'pending session reserves the dock before mounting a Terminal');assert.equal(dock.attrs['aria-hidden'],'true');assert(!root.descendants().some(n=>n.className==='terminal-canvas'));assert.equal(f.mounts.length,1,'no terminal attaches before the session exists');
  const summary=root.descendants().find(n=>n.className==='session-summary').children[1];assert.equal(root.descendants().find(n=>n.className==='live-dot').dataset.live,'false');assert.equal(summary.textContent,'\u00a0','the summary line keeps its height without wording');f.advance(1000);assert.equal(summary.textContent,'Connecting…');
  current=null;view.update();assert.equal(f.routes.at(-1),'/g/g/');view.cleanup();
  console.log('PASS pending session screen: selected new tab and blank terminal surface at once, wording only after 1s');
@@ -271,7 +283,7 @@ async function testHybridChatToggleAndQuestionCards(){
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
  const session={id:7,state:'Working',agent:'claude',branch:'main',lines:['● Editing src/lib.rs']},shellSession={id:8,state:'Idle',agent:'',branch:'main',lines:['$']},group={key:'g',label:'Workspace',sessions:[session,shellSession]},state={groups:new Map([['g',group]]),sessions:new Map([[7,session],[8,shellSession]]),connection:{phase:'ready'},preferences:{},drafts:new Map()};
  const el=(...args)=>new Element(...args);
- const ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(){},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>sheets.push({title,entries,render}),act:fn=>fn(),rpc:async req=>{calls.push(req);if(req.action==='chat_poll')return {agent:'claude',bound:true,next_offset:128,reset:false,items:[{kind:'user',text:'Fix bug'},{kind:'tool_call',tool_name:'Edit',title:'Update lib',file_path:'src/lib.rs',text:'src/lib.rs'},{kind:'question',title:'Mode',text:'Pick one',multi_select:false,options:[{label:'Fast',description:'Quick'},{label:'Safe',description:'Thorough'}]}]};if(req.action==='git')return {patch:'+added line'};return {sent:true};},refresh:async()=>{}};
+ const ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(){},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},error(){},photo(){},transport:{},closeSheet(){},sheet:(title,entries,_,render)=>sheets.push({title,entries,render}),act:fn=>fn(),rpc:async req=>{calls.push(req);if(req.action==='chat_poll')return {agent:'claude',bound:true,next_offset:128,reset:false,items:[{kind:'user',text:'Fix bug'},{kind:'tool_call',tool_name:'Edit',title:'Update lib',file_path:'src/lib.rs',text:'src/lib.rs'},{kind:'question',title:'Mode',text:'Pick one',multi_select:false,options:[{label:'Fast',description:'Quick'},{label:'Safe',description:'Thorough'}]}]};if(req.action==='git')return {patch:'+added line'};return {sent:true};},refresh:async()=>{}};
  const root=el('main');
  const view=sandbox.KrillMobile.screens.session(root,ctx);
  assert.equal(mounts.length,1);
@@ -283,6 +295,8 @@ async function testHybridChatToggleAndQuestionCards(){
  const preparedFeed=root.descendants().find(n=>n.className==='chat-feed');
  const preparedQuestion=root.descendants().find(n=>n.className==='chat-card chat-question');
  buttons.find(b=>b.textContent==='Terminal actions').action();assert.equal(sheets.at(-1).entries[0].label,'Switch to Chat');sheets.at(-1).entries[0].action();assert.equal(toggleBtn.textContent,'Term');assert.equal(toggleBtn.getAttribute('aria-label'),'Term');assert.equal(state.preferences.sessionViewModes[7],'chat');assert.equal(mounts[0].visible,false);
+ state.snapshot||={};state.snapshot.quick_commands=[{name:'Chat skill',text:'/ship-dev '}];buttons.find(b=>b.className==='btn chat-quick-actions-btn').action();const quickBody=el('div');sheets.at(-1).render(quickBody);const quick=quickBody.descendants().find(n=>n.className==='quick-action-insert'),beforeQuick=calls.filter(c=>c.action==='prompt').length;quick.action();assert.equal(root.descendants().find(n=>n.className==='chat-input').value,'/ship-dev ');assert.equal(state.drafts.get(7),'/ship-dev ');assert.equal(calls.filter(c=>c.action==='prompt').length,beforeQuick);
+
  await flush();
  assert(calls.some(c=>c.action==='chat_poll'&&c.session===7));
  const fastOpt=buttons.find(b=>b.textContent?.startsWith('Fast'));

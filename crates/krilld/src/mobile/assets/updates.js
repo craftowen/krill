@@ -42,7 +42,7 @@
    throw error;
   }finally{signal?.removeEventListener('abort',abort);}
  }
- const scrollSelectors=['.home-list','.workspace-list','.detail-list','.account-list','.terminal-scroll','.chat-feed','.tab-scroll','.diff-patch'];
+ const scrollSelectors=['.home-list','.workspace-list','.detail-list','.account-list','.terminal-scroll','.chat-feed','.tab-scroll','.diff-patch','.git-patch','.settings-list','.connection-log'];
  function captureView(root){return scrollSelectors.flatMap(selector=>[...root.querySelectorAll(selector)].map((node,index)=>({selector,index,top:node.scrollTop,left:node.scrollLeft})));}
  function restoreView(root,view){
   if(!Array.isArray(view))return;

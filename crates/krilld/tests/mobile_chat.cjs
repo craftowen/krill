@@ -18,7 +18,7 @@ const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 function fixture(options={}){
  const buttons=[],calls=[],sheets=[],errors=[],tasks=[],timers=new Map();let id=0,term=0;
  const copied=[];
- const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible',body:new Element('body'),execCommand:()=>true});
+ const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible',createElementNS:(_,tag)=>new Element(tag),body:new Element('body'),execCommand:()=>true});
  const sandbox={Event,document:doc,isSecureContext:true,navigator:{clipboard:{writeText:async text=>{copied.push(text);}}},Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
  const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:options.phase||'ready'},drafts:new Map()};
@@ -26,9 +26,9 @@ function fixture(options={}){
  let handler=options.handler|| (async request=>request.action==='chat_poll'?{generation:'g1',agent:'claude',bound:true,items:[],next_offset:request.offset}:{sent:true});
  let prepare=async()=>({mime:'image/jpeg',data:'encoded'});
  const ctx={el,state,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},rpc:async request=>{calls.push(request);return handler(request);},photo:(...args)=>prepare(...args),act(fn){const p=Promise.resolve().then(fn).catch(e=>errors.push(e));tasks.push(p);return p;},refresh:async()=>{},sheet(title,_,__,render){const body=el('body');render(body);sheets.push({title,body});}};
- let view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,visible:options.visible,onSwitchTerm:()=>term++});
+ let view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,visible:options.visible,onQuickActions:options.onQuickActions,onSwitchTerm:()=>term++});
  const find=cls=>root.descendants().find(n=>n.className===cls),button=label=>root.descendants().find(n=>n.tag==='button'&&n.textContent===label);
- return {root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,copied,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
+ return {insertText:text=>view.insertText(text),root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,copied,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
 }
 function unitServer(f){let total=0;const page=q=>{const start=q.offset,end=Math.min(total,start+128,q.end_offset??Infinity);return {generation:'g1',items:Array.from({length:end-start},(_,i)=>({id:start+':'+i,kind:'assistant',text:'Message '+(start+i)})),next_offset:end,bound:true};};f.handler=async q=>page(q);return {page,set total(n){total=n;}};}
 async function historyRace(){
@@ -123,11 +123,34 @@ async function markdownFormatting(){
  f.input('short');assert.equal(chatInput.style.height,'28px','sizeInput clamps to 28px min');
  f.dispose();console.log('PASS mobile Markdown: Korean bold, inline code, ol/blockquote/table, headings, emphasis, safe links, literal code/HTML and sizeInput');
 }
+async function quickActions(){
+ let opened=0;const f=fixture({onQuickActions:()=>opened++});await flush();const quick=f.find('btn chat-quick-actions-btn');assert(quick);assert.equal(quick.attrs['aria-label'],'Quick actions');assert.equal(quick.title,'Quick actions');quick.action();assert.equal(opened,1);
+ assert.equal(f.insertText('\r\n'),false);const input=f.find('chat-input');assert.equal(f.insertText('/krill-orchestration '),true);assert.equal(input.value,'/krill-orchestration ');assert.equal(input.selectionEnd,input.value.length);
+ input.value='use OLD please';input.selectionStart=4;input.selectionEnd=7;f.insertText('/ship-dev');assert.equal(input.value,'use /ship-dev please');assert.equal(f.state.drafts.get(7),input.value);assert.equal(input.selectionStart,13);assert(!f.calls.some(q=>q.action==='prompt'),'insert never submits');
+ input.selectionStart=input.selectionEnd=undefined;f.insertText('\r\nnext\r\nline\r\n');assert(input.value.endsWith('next\nline'));f.remount();assert.equal(f.find('chat-input').value,'use /ship-dev pleasenext\nline');
+ f.dispose();
+}
+// Same-generation tail refresh is a merge, including open disclosures and reader anchors.
+async function stableLatestRefresh(){
+ let now=10000;const Clock=class extends Date{static now(){return now;}},items=Array.from({length:30},(_,i)=>({id:'stable'+i,kind:i===0?'reasoning':'assistant',text:'Message '+i})),page=items=>({generation:'g1',agent:'claude',bound:true,items,page_start:0,next_offset:items.length});
+ const f=fixture({Date:Clock,handler:async()=>page(items)});await flush();const feed=f.find('chat-feed'),card=feed.children[0],details=f.find('chat-reasoning');details.open=true;details.dispatchEvent(new Event('toggle'));feed.scrollTop=400;feed.dispatchEvent(new Event('scroll'));const reader=feed.children[4];
+ f.setVisible(false);now+=5000;f.handler=async()=>page([...items,{id:'next',kind:'assistant',text:'New reply'}]);f.setVisible(true);await flush();assert.equal(f.calls.at(-1).latest,true);assert.equal(feed.children[0],card);assert.equal(f.find('chat-reasoning'),details);assert(details.open);assert.equal(f.entry.disclosures.size,1);assert.equal(feed.scrollTop,400);assert.equal(feed.children[4],reader);
+ // A shifted window retains overlapping cards, and a changed item updates its content in place.
+ f.setVisible(false);now+=5000;f.handler=async()=>page([...items.slice(10).map(item=>item.id==='stable12'?{...item,text:'Updated reply'}:item),{id:'last',kind:'assistant',text:'Latest'}]);const updated=feed.children[12];f.setVisible(true);await flush();assert.equal(feed.children[0],card);assert.equal(feed.children[12],updated);assert(updated.descendants().some(n=>n.textContent==='Updated reply'));assert.equal(feed.scrollTop,400);
+ // Trim from above the reader while keeping the surviving card's offset.
+ const many=Array.from({length:1000},(_,i)=>({id:'many'+i,kind:'assistant',text:'Many '+i}));await f.poll({generation:'g2',bound:true,reset:true,items:many,next_offset:1000});feed.scrollTop=400;feed.dispatchEvent(new Event('scroll'));const kept=feed.children[4];await f.poll({generation:'g2',bound:true,items:[{id:'many1000',kind:'assistant',text:'New'}],next_offset:1001});assert.equal(feed.children[3],kept);assert.equal(feed.scrollTop,300);
+ // Model chrome above the feed to prove error show/hide compensates the reader's viewport top.
+ const status=feed.parentElement.children[1];feed.getBoundingClientRect=()=>({top:status.hidden?0:50});for(const child of feed.children)child.getBoundingClientRect=()=>({top:(status.hidden?0:50)+child.offsetTop-feed.scrollTop,bottom:(status.hidden?0:50)+child.offsetTop+100-feed.scrollTop});
+ const readerTop=kept.getBoundingClientRect().top;f.handler=async()=>{throw Error('offline');};f.update();await flush();assert.equal(kept.getBoundingClientRect().top,readerTop);await f.poll({generation:'g2',bound:true,items:[],next_offset:1001});assert.equal(kept.getBoundingClientRect().top,readerTop);f.dispose();
+ console.log('PASS CLS chat: latest merge retains cards/disclosure/following, updates content, trims and error chrome preserve reader anchor');
+}
 async function main(){
+ await quickActions();
  await markdownFormatting();
  await orcaComposerAndMeta();
  await hiddenPrefetchAndOldDaemon();
  await tailFollow();
+ await stableLatestRefresh();
  await renderBudgets();
  const cold=deferred(),recent=Array.from({length:128},(_,i)=>({id:`872:${i}`,kind:'assistant',text:`Message ${872+i}`}));
  let now=Date.now();const chatClock=class extends Date{static now(){return now;}};

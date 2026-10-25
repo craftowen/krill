@@ -1666,6 +1666,7 @@ fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::i
     use std::io::{self, Write as _};
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    let _document_lock = krill_proto::config_document::lock_toml(path)?;
 
     let body = match std::fs::read_to_string(path) {
         Ok(body) => {

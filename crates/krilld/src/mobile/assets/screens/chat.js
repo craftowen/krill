@@ -102,7 +102,14 @@ function mountChat(root,opts){
  const retryBtn=button(t('Retry'),()=>pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
  const input=el('textarea',undefined,'chat-input');input.rows=1;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
  function sizeInput(){if(!input.style)return;input.style.height='auto';if(input.scrollHeight)input.style.height=Math.min(140,Math.max(28,input.scrollHeight))+'px';}
- input.value=drafts.get(sessionId)||'';sizeInput();
+ input.value=drafts.get(sessionId)||'';
+ function insertText(text){
+  const clean=String(text??'').replace(/\r\n?/g,'\n').replace(/^\n+|\n+$/g,'');if(!clean)return false;
+  const value=input.value,start=typeof input.selectionStart==='number'?input.selectionStart:value.length,end=typeof input.selectionEnd==='number'?input.selectionEnd:start;
+  input.value=value.slice(0,start)+clean+value.slice(end);input.selectionStart=input.selectionEnd=start+clean.length;
+  entry.draftVersion=(entry.draftVersion||0)+1;drafts.set(sessionId,input.value);sizeInput();input.focus?.();return true;
+ }
+
  let composing=false,disposed=false,pollTimer=null,inFlight=false,retryWithoutTail=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
@@ -125,7 +132,9 @@ function mountChat(root,opts){
  // Orca 컴포저: 둥근 카드 안에 입력, 아래 줄에 사진(+)·모델·전송(↑)을 둔다.
  const sendBtn=el('button',undefined,'primary composer-send');sendBtn.type='submit';sendBtn.setAttribute('aria-label',t('Send'));if(ctx.icon)sendBtn.append(ctx.icon('arrowUp'));else sendBtn.textContent=t('Send');
  const modelBtn=button(t('Model'),()=>chooseModel(),'composer-pill');
- const bar=el('div',undefined,'chat-composer-bar'),box=el('div',undefined,'chat-composer-box');bar.append(attachBtn,modelBtn,el('span',undefined,'composer-spacer'),sendBtn);
+ const bar=el('div',undefined,'chat-composer-bar'),box=el('div',undefined,'chat-composer-box');bar.append(attachBtn);
+ if(typeof opts.onQuickActions==='function'){const quick=button(t('Quick actions'),()=>opts.onQuickActions(),'btn chat-quick-actions-btn');quick.type='button';quick.setAttribute('aria-label',t('Quick actions'));quick.title=t('Quick actions');const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d','m5 6 6 6-6 6m8 0h6');path.setAttribute('fill','none');path.setAttribute('stroke','currentColor');path.setAttribute('stroke-width','2');svg.append(path);quick.replaceChildren(svg);bar.append(quick);}
+ bar.append(modelBtn,el('span',undefined,'composer-spacer'),sendBtn);
  box.append(input,bar);composer.append(attachment,box);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
  // 모델 전환은 에이전트 자체의 /model 명령으로 보낸다. Claude는 별칭으로 바로 바꾸고, Codex·Gemini는 터미널의 선택 화면에서 고른다.
  const modelChoices={claude:[['default','Default (recommended)'],['opus','Opus'],['sonnet','Sonnet'],['haiku','Haiku']]},modelPicker=new Set(['codex','gemini']);
@@ -212,14 +221,17 @@ function mountChat(root,opts){
  });
  shell.append(history,pollStatus,feed,strip,composer);root.replaceChildren(shell);
  function itemKey(item,idx){return `${entry.generation||''}:${item.id||`${item._pageStart||0}:${idx}:${item.tool_id||''}:${item.text}`}`;}
+ function readerAnchor(){if(following||!(feed.clientHeight>0))return null;const top=feed.getBoundingClientRect?.().top,node=Array.from(feed.children||[]).find(card=>card.getBoundingClientRect?card.getBoundingClientRect().bottom>top:(card.offsetTop||0)+(card.clientHeight||0)>feed.scrollTop);return node?{node,top:node.getBoundingClientRect?node.getBoundingClientRect().top:(node.offsetTop||0)-feed.scrollTop}:null;}
+ function restoreReader(anchor){if(!following&&anchor&&anchor.node.parentElement){const top=anchor.node.getBoundingClientRect?anchor.node.getBoundingClientRect().top:(anchor.node.offsetTop||0)-feed.scrollTop;feed.scrollTop+=top-anchor.top;lastTop=feed.scrollTop;}}
  function renderItems(appendFrom){
+  const anchor=readerAnchor();
   const incremental=appendFrom>0&&renderedItems===entry.items&&renderedCount===appendFrom;
   const wanted=new Set(),wantedRuns=new Set(),nodes=[];let run=incremental?tailRun:null;
   // Retain the actual question/details nodes so selection, write-in, focus and expansion survive deltas.
   for(let idx=incremental?appendFrom:0;idx<entry.items.length;idx++){const item=entry.items[idx];
    const key=itemKey(item,idx);wanted.add(key);
    let card=cards.get(key);
-   if(!card){card=renderCard(item,key);card.dataset.chatId=key;cards.set(key,card);}
+   if(!card){card=renderCard(item,key);card.dataset.chatId=key;cards.set(key,card);}else if(!sameItem(card._item,item)){const next=renderCard(item,key);card.replaceChildren(...Array.from(next.children));}card._item=item;
    if(item.kind==='tool_call'||item.kind==='tool_result'){
     if(!run){let group=toolRuns.get(key);if(!group){const details=el('details',undefined,'chat-tool-run'),summary=el('summary',undefined,'chat-tool-summary'),body=el('div',undefined,'chat-tool-items');rememberDetails(details,'run:'+key);details.append(summary,body);group={details,summary,body};toolRuns.set(key,group);}run={...group,key,nodes:[],steps:new Map(),count:0,errors:0};wantedRuns.add(key);nodes.push(run.details);}
     run.nodes.push(card);if(item.is_error)run.errors++;if(item.kind==='tool_call'){run.count++;const step=toolStep(item.tool_name);run.steps.set(step,(run.steps.get(step)||0)+1);}run.summary.textContent=[run.errors||!run.count?t(run.errors?'Tool error':'Tool activity'):'',...[...run.steps].map(([step,n])=>t(step,n))].filter(Boolean).join(' · ');
@@ -243,7 +255,7 @@ function mountChat(root,opts){
   latestBtn.hidden=!entry.live;
   historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
   historyText.hidden=!entry.live;history.hidden=earlierBtn.hidden&&latestBtn.hidden;
-  pinLatest();
+  pinLatest();restoreReader(anchor);
  }
  function rememberDetails(node,key){node.open=entry.disclosures?.get(key)||false;node.addEventListener('toggle',()=>{entry.disclosures||=new Map();if(node.open)entry.disclosures.set(key,true);else entry.disclosures.delete(key);});}
  function lazyDetails(details,build){if(details.open)build();else details.addEventListener('toggle',()=>{if(details.open&&!details.dataset.loaded){details.dataset.loaded='true';build();}});if(details.open)details.dataset.loaded='true';}
@@ -294,10 +306,10 @@ function mountChat(root,opts){
   });
  }
  function updateStrip(){
-  const sess=state.sessions?.get(sessionId);stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';syncAgent();
+  const sess=state.sessions?.get(sessionId),hidden=!['Waiting','Blocked'].includes(sess?.state),anchor=strip.hidden!==hidden?readerAnchor():null;stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';syncAgent();
   // 헤더가 연결·모드를 보이므로 하단 줄은 사용자가 답해야 할 때만 띄운다.
-  strip.hidden=!['Waiting','Blocked'].includes(sess?.state);
-  stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));
+  strip.hidden=hidden;
+  stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));restoreReader(anchor);
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start,_retainedBytes:JSON.stringify(item).length*2}));}
  function clearTranscript(){entry.items=[];entry.retainedBytes=0;entry.disclosures?.clear();entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();resize?.disconnect();resize?.observe(feed);}
@@ -316,9 +328,9 @@ function mountChat(root,opts){
   return true;
  }
  function showPollError(error){
-  failures++;pollStatus.hidden=false;
+  const anchor=readerAnchor();failures++;pollStatus.hidden=false;
   const when=lastSuccess?new Date(lastSuccess).toTimeString().slice(0,8):t('never');
-  pollText.textContent=`${t('Chat history update failed')} (${failures}). ${t('Last updated')}: ${when}. ${t('Retry or check Term.')} ${String(error?.message||error||'')}`;
+  pollText.textContent=`${t('Chat history update failed')} (${failures}). ${t('Last updated')}: ${when}. ${t('Retry or check Term.')} ${String(error?.message||error||'')}`;restoreReader(anchor);
  }
  function sameItem(a,b){
   if(!a||!b)return false;
@@ -345,18 +357,19 @@ function mountChat(root,opts){
     latest=true;changed=true;
    }
    const rItems=res.items||[],sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
-   const reset=latest&&!sameTail||res.reset||changed,metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
-   const hadItems=entry.items.length,wasLoaded=entry.loaded;
+   const reset=Boolean(res.reset||changed),metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
+   const hadItems=entry.items.length,wasLoaded=entry.loaded,anchor=!sameTail&&(rItems.length||metaChanged)||!pollStatus.hidden?readerAnchor():null;
    if(reset){clearTranscript();following=true;}
    entry.generation=res.generation||entry.generation;entry.agent=res.agent||'';entry.bound=!!res.bound;
    entry.initialized=entry.bound;entry.loaded=true;refreshLatest=false;
    const effectiveStart=res.page_start??(res.reset?0:start);
    const incoming=normalizeItems(res,effectiveStart),before=entry.items.length;
-   if(incoming.length){const seen=new Set(entry.items.map(item=>item.id));entry.items.push(...incoming.filter(item=>!seen.has(item.id)));rememberPage(effectiveStart,res.next_offset);}
+   let reconciled=false;
+   if(incoming.length){if(latest&&!reset&&!sameTail){const incomingIds=new Set(incoming.map(item=>item.id)),overlap=entry.items.findIndex(old=>incomingIds.has(old.id)),next=overlap>=0?[...entry.items.slice(0,overlap),...incoming]:incoming;reconciled=next.length!==entry.items.length||next.some((item,i)=>!sameItem(entry.items[i],item));if(reconciled)entry.items=next;}else if(!sameTail){const seen=new Set(entry.items.map(item=>item.id));entry.items.push(...incoming.filter(item=>!seen.has(item.id)));}rememberPage(effectiveStart,res.next_offset);}
    const trimmed=incoming.length&&trimItems(true);
    if(typeof res.next_offset==='number')entry.offset=res.next_offset;
    lastSuccess=entry.lastSuccess=Date.now();failures=0;pollStatus.hidden=true;
-   if(entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed?before:undefined);updateStrip();pruneCache(state);
+   if(reconciled||entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed&&!reconciled?before:undefined);updateStrip();restoreReader(anchor);pruneCache(state);
   }catch(error){if(disposed)return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
  }
  async function loadEarlier(){
@@ -389,7 +402,7 @@ function mountChat(root,opts){
  globalThis.document?.addEventListener?.('visibilitychange',visibilityChanged);
  entry.notifyComposer=updateComposer;
  renderItems();updateStrip();updateComposer();pollNow(true);schedule();
- return {setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
+ return {insertText,pollNow,setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
 }
 M.chat={mount:mountChat,pruneCache,forgetSession};
 M.screens.chat=(root,ctx)=>{

@@ -51,7 +51,18 @@ async function testHiddenPaint(){
  await hidden.handle.setVisible(true);await advance(16);assert.equal(paint.calls.draws,1);await advance(500);assert.match(paint.getAttribute('aria-label'),/hidden 9/);context.document.visibilityState='hidden';context.document.dispatchEvent(new Event('visibilitychange'));await flush();const draws=paint.calls.draws,label=paint.getAttribute('aria-label');hidden.socket.screen('background current');await advance(600);assert.equal(paint.calls.draws,draws);assert.equal(paint.getAttribute('aria-label'),label);context.document.visibilityState='visible';context.document.dispatchEvent(new Event('visibilitychange'));await advance(16);assert.equal(paint.calls.draws,draws+1);assert.match(hidden.handle.text(),/background current/);hidden.handle.unmount();
  console.log('PASS hidden canvas draws/aria 0, model decode retained, restore full paint once (view and document visibility)');
 }
+async function testInsertText(){
+ const {root,handle,socket}=await mount(910,{stateKey:'quick-host:910',preferences:{fitToPhone:false,inputMode:'direct'}});socket.autoAck=true;
+ assert.equal(handle.insertText(null),false);assert.equal(handle.insertText('\r\n\x1b\r\n'),false);
+ assert.equal(handle.insertText('\r\n/krill-orchestration \r\n'),true);await flush();assert.equal(inputs(socket).at(-1),'/krill-orchestration ');assert(!inputs(socket).at(-1).includes('\r'));
+ handle.setInputMode('buffered');const command=find(root,'command-input'),before=inputs(socket).length;
+ assert.equal(handle.insertText('/ship-dev'),true);assert.equal(command.value,'/ship-dev');assert.equal(command.selectionStart,9);assert.equal(new Map(api.snapshotDrafts()).get('quick-host:910'),'/ship-dev');
+ command.value='git OLD --short';command.selectionStart=4;command.selectionEnd=7;handle.insertText('status');assert.equal(command.value,'git status --short');assert.equal(command.selectionEnd,10);
+ command.selectionStart=command.selectionEnd=undefined;handle.insertText(' ');assert.equal(command.value,'git status --short ');await flush();assert.equal(inputs(socket).length,before,'buffered insertion never submits');handle.unmount();
+ console.log('PASS saved text insertion: direct PTY bytes omit Enter, trailing space kept, buffered selection/cursor and host draft updated without send');
+}
 async function main(){
+ await testInsertText();
  await testHiddenPaint();
  for(const n of [0,1,127,128,300,65535,Number.MAX_SAFE_INTEGER]){const r=T.reader(T.v(n));assert.equal(r.n(),n);r.end();}assert.throws(()=>T.reader(T.v(128)).n(127),/Screen limit/);assert.throws(()=>T.reader(T.v(128)).n(128-1),/Screen limit/);assert.throws(()=>T.reader(T.v(1n<<53n)).n(),/Screen limit/);assert.throws(()=>T.reader(Uint8Array.of(128)).n(),/Truncated/);
  for(const text of ['', 'a', '\0', '한글', 'é', '😀']){const r=T.reader(T.text(text));assert.equal(r.text(),text);r.end();}assert.throws(()=>T.reader(Uint8Array.of(1,255)).text());assert.throws(()=>T.reader(Uint8Array.of(2,97)).text(),/Truncated/);
@@ -452,8 +463,13 @@ async function testFailurePaths(){
  const restoredA=await mount(901,{stateKey:'host-A\n901'});assert.equal(find(restoredA.root,'command-input').value,'HOST_A_PRIVATE_DRAFT');assert.equal(restoredA.handle.getInputMode(),'buffered');assert(context.KrillMobile.terminal.snapshotDrafts().some(([key,text])=>key==='host-A\n901'&&text==='HOST_A_PRIVATE_DRAFT'));assert.equal(inputs(restoredA.socket).length,0);restoredA.handle.unmount();
  console.log('PASS host-scoped terminal drafts/modes restore without input replay for identical session IDs');}
 }
+// These layout rules complement the real-browser port geometry probe.
+function stableStatusLayout(){const css=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.css'),'utf8');
+ for(const selector of ['.live-preview','.terminal-status','.terminal-frame>.ghost.small','#connection-banner'])assert(css.split(selector+'{').slice(1).some(rule=>rule.split('}')[0].includes('position:absolute')),selector+' overlays without taking port space');
+ assert(!/\[data-keyboard-open=true\] \.command-dock\{padding-bottom:0/.test(css),'keyboard safe area changes continuously');assert(css.includes('calc(env(safe-area-inset-bottom) - var(--keyboard-inset,0px))'));assert(css.includes('.is-split>.terminal-pane[data-active=false] .command-dock{visibility:hidden;pointer-events:none}'));
+ console.log('PASS CLS terminal overlays, continuous safe-area inset and reserved inactive split docks');}
 if(process.argv.includes('--harness')){
  const directory='/tmp/mk-mobile/term';fs.mkdirSync(directory,{recursive:true});fs.writeFileSync(path.join(directory,'fixture.js'),`(${fixture})();\n${source}\n globalThis.handle=mountFixture(document.querySelector('main'));setTimeout(()=>{sockets[0].handshake();sockets[0].screen('~/krill  git: mobile-orca-ui');sockets[0].autoAck=true;},0);`);
  fs.writeFileSync(path.join(directory,'term-harness.html'),'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><link rel="stylesheet" href="/app.css"><main class="terminal-mount"></main><script src="/fixture.js"></script>');
  console.log('Harness written to '+directory);
-}else{const watchdog=setTimeout(()=>{console.error('Terminal checks did not settle');process.exitCode=1;},5000);main().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>clearTimeout(watchdog));}
+}else{stableStatusLayout();const watchdog=setTimeout(()=>{console.error('Terminal checks did not settle');process.exitCode=1;},5000);main().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>clearTimeout(watchdog));}

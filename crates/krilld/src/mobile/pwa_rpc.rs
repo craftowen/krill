@@ -31,6 +31,48 @@ use std::time::{Duration, Instant};
 
 mod requests;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct QuickCommandEntry {
+    name: String,
+    text: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct QuickCommandsFile {
+    #[serde(default)]
+    quick_commands: Vec<QuickCommandEntry>,
+}
+
+fn normalize_quick_command(mut entry: QuickCommandEntry) -> QuickCommandEntry {
+    entry.name = entry.name.trim().to_owned();
+    entry
+        .text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_matches('\n')
+        .clone_into(&mut entry.text);
+    entry
+}
+
+fn load_quick_commands(dir: Option<&Path>) -> Vec<QuickCommandEntry> {
+    dir.and_then(|dir| fs::read_to_string(dir.join("settings.toml")).ok())
+        .and_then(|content| toml::from_str::<QuickCommandsFile>(&content).ok())
+        .unwrap_or_default()
+        .quick_commands
+        .into_iter()
+        .filter(|entry| !entry.name.trim().is_empty() && !entry.text.trim().is_empty())
+        .map(normalize_quick_command)
+        .take(128)
+        .collect()
+}
+
+fn quick_commands_json(dir: Option<&Path>) -> Value {
+    load_quick_commands(dir)
+        .into_iter()
+        .map(|entry| json!({"name":entry.name,"text":entry.text}))
+        .collect()
+}
+
 /// `create_terminal`이 받는 에이전트 프로필(`registry` create와 같은 출처) id·이름, 표준 순서. 설정을 못 읽으면 빈 목록.
 /// 미설치 CLI도 싣는다 — 띄우면 로그인 셸 preflight가 설치 안내를 보여 준다.
 fn agents_json(dir: Option<&Path>) -> Value {
@@ -55,6 +97,7 @@ pub(super) struct Backend {
     git_cache: Mutex<HashMap<PathBuf, (Instant, Value)>>,
     snapshot_cache: Mutex<Option<DashboardSnapshot>>,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
+    settings_lock: Mutex<()>,
 }
 type FileStamp = Option<crate::agent::control::cache::Stamp>;
 type SnapshotDependencies = (Vec<PathBuf>, Vec<FileStamp>);
@@ -97,6 +140,9 @@ enum Action {
     Snapshot {
         #[serde(default)]
         since: Option<String>,
+    },
+    SaveQuickCommands {
+        commands: Vec<QuickCommandEntry>,
     },
     CreateTerminal {
         #[serde(default)]
@@ -244,6 +290,7 @@ impl Backend {
             git_cache: Mutex::default(),
             snapshot_cache: Mutex::default(),
             catalog_cache: Mutex::default(),
+            settings_lock: Mutex::default(),
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -266,6 +313,7 @@ impl Backend {
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
             Action::Snapshot { since } => self.snapshot_since(since.as_deref()),
+            Action::SaveQuickCommands { commands } => self.save_quick_commands(commands),
             Action::CreateTerminal {
                 cwd_session,
                 workspace,
@@ -717,6 +765,59 @@ impl Backend {
         }
         Ok(PathBuf::from(std::ffi::OsString::from_vec(directory.cwd)))
     }
+    fn save_quick_commands(&self, commands: Vec<QuickCommandEntry>) -> io::Result<Value> {
+        if commands.len() > 128 {
+            return Err(invalid());
+        }
+        let normalized: Vec<_> = commands.into_iter().map(normalize_quick_command).collect();
+        for entry in &normalized {
+            if entry.name.is_empty()
+                || entry.name.len() > 120
+                || entry.name.chars().any(char::is_control)
+                || entry.text.trim().is_empty()
+                || entry.text.len() > 16 * 1024
+                || entry
+                    .text
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                return Err(invalid());
+            }
+        }
+        let _guard = crate::session::lock(&self.settings_lock);
+        let dir = self.dir.as_deref().ok_or_else(invalid)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let path = dir.join("settings.toml");
+        let _document_lock = krill_proto::config_document::lock_toml(&path)?;
+        let content = krill_proto::config_document::save_toml(
+            &path,
+            &QuickCommandsFile {
+                quick_commands: normalized.clone(),
+            },
+        )
+        .map_err(io::Error::other)?;
+        let tmp = dir.join(format!(".settings.{}.tmp", hex(&random()?)));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &path)
+        })();
+        if let Err(error) = result {
+            fs::remove_file(&tmp).ok();
+            return Err(error);
+        }
+        *crate::session::lock(&self.snapshot_cache) = None;
+        Ok(json!({"quick_commands":normalized}))
+    }
+
     fn snapshot_since(&self, since: Option<&str>) -> io::Result<Value> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         // This mutex is a snapshot-only singleflight, independent of registry/session IO.
@@ -790,6 +891,7 @@ impl Backend {
         if let Some(dir) = &self.dir {
             for name in [
                 "projects.toml",
+                "settings.toml",
                 "sidebar.bin",
                 "worktree-comments.toml",
                 "session-titles.json",
@@ -997,7 +1099,8 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true},
+            "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
     }
@@ -1532,6 +1635,258 @@ fn plan_question_keystrokes_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quick_commands_test_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("pwa-quick-commands-{}", hex(&random().unwrap())))
+    }
+
+    fn rpc(backend: &Backend, request: &Value) -> Value {
+        serde_json::from_str(&backend.request(&request.to_string())).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_quick_commands_preserves_settings_and_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = quick_commands_test_dir();
+        let mut backend = test_backend();
+        backend.dir = Some(dir.clone());
+        let commands = json!([{"name":"  orchestration  ","text":"\r\n/krill-orchestration \r\n"}]);
+        let expected = json!([{"name":"orchestration","text":"/krill-orchestration "}]);
+        let saved = rpc(
+            &backend,
+            &json!({"action":"save_quick_commands","commands":commands}),
+        );
+        assert_eq!(saved["ok"], true);
+        assert_eq!(saved["data"]["quick_commands"], expected);
+        let path = dir.join("settings.toml");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(quick_commands_json(Some(&dir)), expected);
+
+        let preserved = "# user preferences\nterminal_font_size = 15 # keep font\nfuture = { enabled = true }\n\n[[webhooks]]\n# keep webhook\nurl = 'https://example.test/hook'\nevents = ['done']\n";
+        fs::write(&path, format!("{preserved}\n[[quick_commands]]\nname = 'old'\ntext = 'old text'\nfuture_command = 42\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let saved = rpc(
+            &backend,
+            &json!({"action":"save_quick_commands","commands":[{"name":"new","text":"\n  prompt\r\n\tline\rtail \n"}]}),
+        );
+        assert_eq!(saved["ok"], true);
+        assert_eq!(
+            saved["data"]["quick_commands"],
+            json!([{"name":"new","text":"  prompt\n\tline\ntail "}])
+        );
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with(preserved));
+        assert!(content.contains("future_command = 42"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            quick_commands_json(Some(&dir)),
+            saved["data"]["quick_commands"]
+        );
+        let cleared = rpc(
+            &backend,
+            &json!({"action":"save_quick_commands","commands":[]}),
+        );
+        assert_eq!(cleared["ok"], true);
+        assert_eq!(quick_commands_json(Some(&dir)), json!([]));
+        assert!(fs::read_to_string(&path).unwrap().starts_with(preserved));
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["settings.toml", "settings.toml.lock"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_quick_commands_refresh_after_mobile_save_and_desktop_edit() {
+        let dir = quick_commands_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.toml"),
+            "[[quick_commands]]\nname = 'desktop'\ntext = '/desktop '\n",
+        )
+        .unwrap();
+        let registry = Arc::new(Registry::new(None, None));
+        let mut backend = test_backend();
+        backend.dir = Some(dir.clone());
+        backend.registry = Arc::downgrade(&registry);
+        let first = rpc(&backend, &json!({"action":"snapshot"}));
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["data"]["capabilities"]["quick_commands"], true);
+        assert_eq!(
+            first["data"]["quick_commands"],
+            json!([{"name":"desktop","text":"/desktop "}])
+        );
+        assert!(crate::session::lock(&backend.snapshot_cache).is_some());
+        let etag = first["data"]["etag"].as_str().unwrap();
+        assert_eq!(
+            backend.snapshot_since(Some(etag)).unwrap()["unchanged"],
+            true
+        );
+
+        let saved = rpc(
+            &backend,
+            &json!({"action":"save_quick_commands","commands":[{"name":"mobile","text":"/mobile "}]}),
+        );
+        assert_eq!(saved["ok"], true);
+        assert!(crate::session::lock(&backend.snapshot_cache).is_none());
+        let refreshed = backend.snapshot_since(Some(etag)).unwrap();
+        assert_ne!(refreshed["etag"], first["data"]["etag"]);
+        assert_eq!(refreshed["quick_commands"], saved["data"]["quick_commands"]);
+
+        let replacement = dir.join("settings.new");
+        fs::write(
+            &replacement,
+            "[[quick_commands]]\nname = 'desktop edit'\ntext = '/desktop-updated '\n",
+        )
+        .unwrap();
+        fs::rename(replacement, dir.join("settings.toml")).unwrap();
+        let desktop = backend.snapshot_since(refreshed["etag"].as_str()).unwrap();
+        assert_ne!(desktop["etag"], refreshed["etag"]);
+        assert_eq!(
+            desktop["quick_commands"],
+            json!([{"name":"desktop edit","text":"/desktop-updated "}])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quick_commands_wait_for_an_external_settings_writer_and_preserve_its_changes() {
+        let dir = quick_commands_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        fs::write(&path, "terminal_font_size = 15\n").unwrap();
+        let guard = krill_proto::config_document::lock_toml(&path).unwrap();
+        let mut backend = test_backend();
+        backend.dir = Some(dir.clone());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = backend.save_quick_commands(vec![QuickCommandEntry {
+                name: "mobile".into(),
+                text: "/skill ".into(),
+            }]);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        fs::write(&path, "terminal_font_size = 19\nfuture_flag = true\n").unwrap();
+        drop(guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["terminal_font_size"].as_integer(), Some(19));
+        assert_eq!(saved["future_flag"].as_bool(), Some(true));
+        assert_eq!(saved["quick_commands"][0]["text"].as_str(), Some("/skill "));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_quick_commands_rejects_invalid_requests_without_changing_settings() {
+        let dir = quick_commands_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let original = "terminal_font_size = 15\n";
+        let path = dir.join("settings.toml");
+        fs::write(&path, original).unwrap();
+        let mut backend = test_backend();
+        backend.dir = Some(dir.clone());
+        for commands in [
+            json!([{"name":" \t ","text":"valid"}]),
+            json!([{"name":"valid","text":" \r\n\t"}]),
+            json!([{"name":"invalid\nname","text":"valid"}]),
+            json!([{"name":"invalid\u{7f}name","text":"valid"}]),
+            json!([{"name":"valid","text":"invalid\u{1b}text"}]),
+            json!([{"name":"valid","text":"invalid\u{0}text"}]),
+            json!([{"name":"x".repeat(121),"text":"valid"}]),
+            json!([{"name":"valid","text":"x".repeat(16 * 1024 + 1)}]),
+            json!(vec![json!({"name":"valid","text":"valid"}); 129]),
+            json!([{"name":"missing text"}]),
+        ] {
+            let response = rpc(
+                &backend,
+                &json!({"action":"save_quick_commands","commands":commands}),
+            );
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        let maximum = json!([{"name":"x".repeat(120),"text":"x".repeat(16 * 1024)}]);
+        assert_eq!(
+            rpc(
+                &backend,
+                &json!({"action":"save_quick_commands","commands":maximum})
+            )["ok"],
+            true
+        );
+        let maximum_count = json!(vec![json!({"name":"valid","text":"valid"}); 128]);
+        assert_eq!(
+            rpc(
+                &backend,
+                &json!({"action":"save_quick_commands","commands":maximum_count})
+            )["ok"],
+            true
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_quick_commands_normalizes_filters_caps_and_tolerates_missing_or_invalid_files() {
+        assert!(load_quick_commands(None).is_empty());
+        let dir = quick_commands_test_dir();
+        assert!(load_quick_commands(Some(&dir)).is_empty());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        fs::write(&path, "invalid [").unwrap();
+        assert!(load_quick_commands(Some(&dir)).is_empty());
+        fs::write(&path, "terminal_font_size = 15\n").unwrap();
+        assert!(load_quick_commands(Some(&dir)).is_empty());
+        let mut commands = vec![
+            QuickCommandEntry {
+                name: "  ".into(),
+                text: "valid".into(),
+            },
+            QuickCommandEntry {
+                name: "valid".into(),
+                text: " \r\n\t".into(),
+            },
+        ];
+        commands.extend((0..130).map(|i| QuickCommandEntry {
+            name: format!(" command {i} "),
+            text: "\r\n  /skill \r\nnext\rtail \r\n".into(),
+        }));
+        fs::write(
+            &path,
+            toml::to_string(&QuickCommandsFile {
+                quick_commands: commands,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = load_quick_commands(Some(&dir));
+        assert_eq!(loaded.len(), 128);
+        assert_eq!(loaded.first().unwrap().name, "command 0");
+        assert_eq!(loaded.first().unwrap().text, "  /skill \nnext\ntail ");
+        assert_eq!(loaded.last().unwrap().name, "command 127");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn historical_approval_and_question_requests_fail_closed_before_input() {
