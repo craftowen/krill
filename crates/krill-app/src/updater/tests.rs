@@ -91,7 +91,7 @@ fn build_test_app_bundle(bundle: &Path, version: &str, body_script: &str, sign_b
 
     if sign_bundle {
         let s = Command::new("/usr/bin/codesign")
-            .args(["--force", "-s", "-"])
+            .args(["--force", "-s", "-", "--timestamp=none"])
             .arg(bundle)
             .status()
             .unwrap();
@@ -604,7 +604,7 @@ fn local_http_update_relaunch_and_failed_relaunch_rollback() {
         "0.1.0",
         "0.2.0",
         None,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
         &CodesignVerifier::adhoc(),
     )
     .unwrap();

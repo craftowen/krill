@@ -251,18 +251,33 @@ fn pack_row(row: &[Cell]) -> Option<Box<[u8]>> {
         .iter()
         .rposition(|c| *c != Cell::default())
         .map_or(0, |i| i + 1);
+    let slice = row.get(..end)?;
     let mut runs: Vec<PackedRun> = Vec::new();
     let mut offset_in_run: u16 = 0;
-    for c in row.get(..end)? {
+    let mut i = 0;
+    while let Some(c) = slice.get(i) {
+        let base_flags = Flags(c.flags.0 & !(Flags::WIDE.0 | Flags::SPACER.0));
+        let paired_wide = c.ch != '\0'
+            && c.flags.contains(Flags::WIDE)
+            && !c.flags.contains(Flags::SPACER)
+            && slice.get(i + 1).is_some_and(|next| {
+                next.ch == ' '
+                    && next.zerowidth.is_empty()
+                    && next.fg == c.fg
+                    && next.bg == c.bg
+                    && next.underline == c.underline
+                    && next.flags == Flags(base_flags.0 | Flags::SPACER.0)
+            });
+        let run_flags = if paired_wide { base_flags } else { c.flags };
         let same = runs.last().is_some_and(|r| {
-            r.fg == c.fg && r.bg == c.bg && r.underline == c.underline && r.flags == c.flags
+            r.fg == c.fg && r.bg == c.bg && r.underline == c.underline && r.flags == run_flags
         });
         if !same {
             runs.push(PackedRun {
                 fg: c.fg,
                 bg: c.bg,
                 underline: c.underline,
-                flags: c.flags,
+                flags: run_flags,
                 text: String::new(),
                 zw: Vec::new(),
             });
@@ -274,7 +289,14 @@ fn pack_row(row: &[Cell]) -> Option<Box<[u8]>> {
                 run.zw.push((offset_in_run, c.zerowidth.clone()));
             }
             offset_in_run = offset_in_run.saturating_add(1);
+            if paired_wide {
+                run.text.push('\0');
+                offset_in_run = offset_in_run.saturating_add(1);
+                i += 2;
+                continue;
+            }
         }
+        i += 1;
     }
     postcard::to_stdvec(&PackedRow { len, runs })
         .ok()
@@ -286,21 +308,45 @@ fn unpack_row(bytes: &[u8]) -> Option<Vec<Cell>> {
     let mut out = Vec::with_capacity(usize::from(packed.len));
     for run in packed.runs {
         let mut zw_iter = run.zw.into_iter().peekable();
-        for (idx, ch) in run.text.chars().enumerate() {
+        let mut chars = run.text.chars().enumerate().peekable();
+        while let Some((idx, ch)) = chars.next() {
             let idx_u16 = u16::try_from(idx).unwrap_or(u16::MAX);
             let zerowidth = if zw_iter.peek().is_some_and(|(at, _)| *at == idx_u16) {
                 zw_iter.next().map_or_else(Vec::new, |(_, zw)| zw)
             } else {
                 Vec::new()
             };
-            out.push(Cell {
-                ch,
-                zerowidth,
-                fg: run.fg,
-                bg: run.bg,
-                underline: run.underline,
-                flags: run.flags,
-            });
+            if !run.flags.contains(Flags::WIDE)
+                && !run.flags.contains(Flags::SPACER)
+                && chars.peek().is_some_and(|(_, next_ch)| *next_ch == '\0')
+            {
+                chars.next();
+                out.push(Cell {
+                    ch,
+                    zerowidth,
+                    fg: run.fg,
+                    bg: run.bg,
+                    underline: run.underline,
+                    flags: Flags(run.flags.0 | Flags::WIDE.0),
+                });
+                out.push(Cell {
+                    ch: ' ',
+                    zerowidth: Vec::new(),
+                    fg: run.fg,
+                    bg: run.bg,
+                    underline: run.underline,
+                    flags: Flags(run.flags.0 | Flags::SPACER.0),
+                });
+            } else {
+                out.push(Cell {
+                    ch,
+                    zerowidth,
+                    fg: run.fg,
+                    bg: run.bg,
+                    underline: run.underline,
+                    flags: run.flags,
+                });
+            }
         }
     }
     out.resize_with(usize::from(packed.len), Cell::default);
