@@ -9747,7 +9747,17 @@ fn run_pane_against(
         });
     });
     for _ in 0..rounds {
-        cx.run_until_parked();
+        // The daemon uses real socket threads. Give them this retry interval before
+        // advancing the simulated clock; otherwise eight ticks can finish before
+        // the first handshake runs on a busy CI host.
+        let tick = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            cx.run_until_parked();
+            if std::time::Instant::now() >= tick {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         cx.executor().advance_clock(Duration::from_millis(500));
     }
     cx.run_until_parked();
