@@ -2145,6 +2145,11 @@ fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
     use std::os::fd::AsFd as _;
     use std::os::unix::ffi::OsStrExt as _;
 
+    // The fake holder has no OS process. Low fake PIDs can name real CI processes,
+    // whose live cwd would override the initial fallback being tested here.
+    const FIRST_FAKE_PID: u32 = u32::MAX - 1;
+    const SECOND_FAKE_PID: u32 = u32::MAX;
+
     let dir = std::env::temp_dir().join(format!("mk-spawn-fallback-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     let parent_dir = dir.join("workspace-parent");
@@ -2200,7 +2205,7 @@ fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
                 &FromHolder::Spawned {
                     req: req1,
                     id: id1,
-                    pid: 901,
+                    pid: FIRST_FAKE_PID,
                 }
                 .encode()
                 .unwrap(),
@@ -2248,7 +2253,7 @@ fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
                 &FromHolder::Spawned {
                     req: req3,
                     id: id3,
-                    pid: 902,
+                    pid: SECOND_FAKE_PID,
                 }
                 .encode()
                 .unwrap(),
@@ -2272,7 +2277,16 @@ fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
         }),
         &mut HashMap::new(),
     );
-    assert!(matches!(r1, Reply::Created { pid: 901, .. }), "{r1:?}");
+    assert!(
+        matches!(
+            r1,
+            Reply::Created {
+                pid: FIRST_FAKE_PID,
+                ..
+            }
+        ),
+        "{r1:?}"
+    );
 
     let r2 = reg.handle(
         &full,
@@ -2287,7 +2301,7 @@ fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
     );
     let Reply::Created {
         session: s2,
-        pid: 902,
+        pid: SECOND_FAKE_PID,
     } = r2
     else {
         panic!("expected Created on fallback retry, got {r2:?}");
