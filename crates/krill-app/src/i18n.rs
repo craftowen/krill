@@ -294,7 +294,7 @@ catalog! {
         TITLE => ("모바일 원격 제어 · QR 페어링", "Mobile remote control · QR pairing"),
         PAIR_SECTION => ("휴대폰 페어링 및 연결 경로", "Pair a phone & connection path"),
         PAIR_TITLE => ("1회용 페어링 QR 및 티켓", "One-time pairing QR & ticket"),
-        PAIR_DESC => ("경로를 누르면 즉시 적용하고 QR을 발급합니다. 휴대폰에서 스캔하거나 링크를 복사하세요.", "Selecting a path applies it and generates a QR immediately. Scan it on your phone or copy the link."),
+        PAIR_DESC => ("경로를 누르면 즉시 적용하고 QR을 발급합니다. 앱 설치(APK) 없이 휴대폰 브라우저에서 열립니다. 카메라가 반응하지 않으면 링크를 복사해 휴대폰에서 여세요(1회용·곧 만료).", "Selecting a path applies it and generates a QR immediately. It opens in your phone's browser with no app (APK) to install. If the camera doesn't react, copy the link and open it on your phone (single-use, expires soon)."),
         TAILSCALE => ("Tailscale (외부 사설망 · VPN)", "Tailscale (private network · VPN)"),
         TAILSCALE_DESC => ("같은 Tailscale 사설망 기기에서 접속합니다. Android에서는 VPN 활성화 시 삼성페이 등과 충돌할 수 있습니다.", "Connect over your Tailscale private network. On Android, an active VPN may conflict with Samsung Pay."),
         TUNNEL => ("릴레이 서버 (외부 접속 권장 · 무계정)", "Relay server (Recommended · no account)"),
@@ -317,7 +317,7 @@ catalog! {
         CONNECTED => ("연결됨", "Connected"),
         OFFLINE => ("오프라인", "Offline"),
         PAGE_TITLE => ("휴대폰에서 Krill을 여세요.", "Open Krill on your phone."),
-        PAGE_DESC => ("휴대폰 카메라로 QR을 스캔하면 브라우저에서 Krill 모바일이 열리고 이 Mac과 연결됩니다.", "Scan the QR with your phone camera to open Krill Mobile in the browser, paired to this Mac."),
+        PAGE_DESC => ("휴대폰 카메라로 QR을 스캔하면 앱 설치(APK) 없이 브라우저에서 Krill 모바일이 열리고 이 컴퓨터와 연결됩니다. 카메라가 반응하지 않으면 링크를 복사해 휴대폰에서 여세요(1회용·곧 만료).", "Scan the QR with your phone camera to open Krill Mobile in the browser, paired to this computer, with no app (APK) to install. If the camera doesn't react, copy the link and open it on your phone (single-use, expires soon)."),
         PAGE_HOME_TITLE => ("홈 화면에 추가하면 앱처럼 쓸 수 있어요", "Add it to your home screen to use it like an app"),
         PAGE_HOME_DESC => ("Krill이 열리면 아래처럼 홈 화면에 추가하세요. 다음부터는 아이콘만 누르면 주소창 없이 전체 화면으로 바로 열립니다.", "Once Krill opens, add it to your home screen. Next time, just tap the icon to open it full screen without the address bar."),
         PAGE_HOME_IOS => ("iPhone · Safari: QR을 한 번 스캔한 뒤 공유(□↑) → ‘홈 화면에 추가’를 누르고 5분 안에 홈 화면 앱을 여세요. 페어링이 자동으로 이어져 QR을 다시 스캔할 필요가 없습니다.", "iPhone · Safari: Scan the QR once, tap Share (□↑) → ‘Add to Home Screen’, and open the Home Screen app within 5 minutes. Pairing transfers automatically without scanning again."),
@@ -584,6 +584,7 @@ catalog! {
         AGENT_EXITED_EARLY => ("{agent}이(가) 시작하자마자 종료됐습니다. 아래 출력에서 이유(설치·로그인)를 확인한 뒤 다시 시작하세요.", "{agent} exited right after starting. Check the output below for why (install, sign-in), then restart."),
         START_NO_HOLDER => ("세션을 만들 수 없습니다. 세션 보관 프로세스(krill-holder)가 연결되지 않았습니다. 터미널에서 krill doctor로 점검하세요.", "Can't create a session: the session keeper (krill-holder) isn't connected. Run krill doctor in a terminal to check."),
         START_UNKNOWN_AGENT => ("이 에이전트 설정을 찾지 못했습니다. 설정 › 에이전트에서 확인한 뒤 다시 시작하세요.", "Couldn't find this agent's profile. Check Settings › Agents, then restart."),
+        START_UNCONFIRMED => ("새 세션이 만들어졌는지 확인하지 못했습니다. 다른 세션을 열기 전에 사이드바에서 기존 세션을 확인하세요.", "Could not confirm whether the new session was created. Check the sidebar for existing sessions before opening another."),
         CLOSE_PANE => ("칸 닫기", "Close pane"),
         LAYOUT_RECOVERED => ("레이아웃을 복원하지 못했습니다. 원본은 .corrupt 파일로 보존했습니다", "Could not restore layout. The original was preserved as a .corrupt file."),
         LAYOUT_UNREADABLE => ("레이아웃을 읽거나 보존하지 못했습니다. 원본 보호를 위해 레이아웃 저장을 중단했습니다", "Could not read or preserve layout. Saving is paused to protect the original."),
@@ -1313,7 +1314,7 @@ catalog! {
         YOLO_MODE_YOLO => ("자동 승인", "Auto-approve"),
         YOLO_MODE_MANUAL => ("매번 확인", "Ask every time"),
         SSH_TITLE => ("SSH 호스트 관리", "Manage SSH Hosts"),
-        SSH_DESC => ("자주 쓰는 원격 Apple Silicon Mac을 등록해 두면 사이드바에서 한 번에 연결합니다. 주소·포트·SSH 키를 저장하고, 연결 전에 테스트할 수 있습니다.", "Register remote Apple Silicon Macs to connect from the sidebar in one click. Saves address, port, and SSH key, and lets you test before connecting."),
+        SSH_DESC => ("자주 쓰는 원격 호스트를 등록해 두면 사이드바에서 한 번에 연결합니다. 주소·포트·SSH 키를 저장하고, 연결 전에 테스트할 수 있습니다.", "Register remote hosts to connect from the sidebar in one click. Saves address, port, and SSH key, and lets you test before connecting."),
         SSH_IMPORT => ("~/.ssh/config 가져오기", "Import ~/.ssh/config"),
         SSH_DUPES_TITLE => ("같은 기기 중복 등록 {count}개", "{count} duplicate entries for the same machine"),
         SSH_DUPES_DESC => ("별칭·IP로 따로 등록됐지만 같은 기기입니다. 사이드바에는 이미 한 번만 보입니다. 먼저 등록한 항목만 남기고 지웁니다.", "Registered separately by alias or IP but they are the same machine. The sidebar already shows each once. Keeps the first entry and removes the rest."),
@@ -1355,12 +1356,12 @@ catalog! {
         SSH_DISCOVERED_FILL => ("+ 입력", "+ Fill in"),
         SSH_DISCOVERED_ADDED => ("추가됨", "Added"),
         SSH_REGISTER_BUTTON => ("이 기기 등록하기", "Register this device"),
-        SSH_KEYGEN_CONFIRM_PROMPT => ("기본 SSH 키(~/.ssh/id_ed25519)가 없습니다. 새 키를 만들고 상대 맥에 등록할까요?", "No default SSH key (~/.ssh/id_ed25519) found. Generate a new key and register with the remote Mac?"),
+        SSH_KEYGEN_CONFIRM_PROMPT => ("기본 SSH 키(~/.ssh/id_ed25519)가 없습니다. 새 키를 만들고 원격 호스트에 등록할까요?", "No default SSH key (~/.ssh/id_ed25519) found. Generate a new key and register with the remote host?"),
         SSH_KEYGEN_CONFIRM_YES => ("키 생성 후 등록", "Generate key & register"),
         SSH_KEYGEN_CANCEL => ("취소", "Cancel"),
-        SSH_REGISTER_STARTED => ("{label}: 새 터미널 탭에서 ssh-copy-id를 실행했습니다. 상대 맥 비밀번호를 1회 입력해 주세요.", "{label}: Launched ssh-copy-id in a new terminal tab. Enter the remote Mac password once."),
+        SSH_REGISTER_STARTED => ("{label}: 새 터미널 탭에서 ssh-copy-id를 실행했습니다. 원격 호스트 비밀번호를 1회 입력해 주세요.", "{label}: Launched ssh-copy-id in a new terminal tab. Enter the remote host password once."),
         SSH_AUTH_FAILED_GUIDE => ("{label}: SSH 키가 아직 등록되지 않았습니다 ({error}). '이 기기 등록하기'를 눌러 비밀번호 1회 입력으로 등록하세요.", "{label}: SSH key is not registered yet ({error}). Click 'Register this device' to set it up with a one-time password."),
-        SSH_AUTH_USER_HINT => (" 주소에 사용자를 안 적어 이 PC 계정 '{user}'로 접속했습니다. 상대 Mac 계정이 다르면 '편집'에서 주소를 '계정@{address}'로 바꾸세요(상대 Mac 터미널에서 whoami로 확인).", " No user in the address, so this PC's account '{user}' was used. If the remote Mac account differs, use 'Edit' to change the address to 'account@{address}' (check with whoami on the remote Mac)."),
+        SSH_AUTH_USER_HINT => (" 주소에 사용자를 안 적어 이 컴퓨터 계정 '{user}'로 접속했습니다. 원격 호스트 계정이 다르면 '편집'에서 주소를 '계정@{address}'로 바꾸세요(원격 터미널에서 whoami로 확인).", " No user in the address, so this computer's account '{user}' was used. If the remote host account differs, use 'Edit' to change the address to 'account@{address}' (check with whoami on the remote host)."),
         SSH_CONN_REFUSED_GUIDE => ("{label}: 원격 로그인이 꺼져 있습니다. 상대 맥에서 시스템 설정 > 일반 > 공유 > 원격 로그인 켜기를 확인해 주세요.", "{label}: Remote Login is off. On the remote Mac, enable System Settings > General > Sharing > Remote Login."),
         SSH_REMOTE_PROBE => ("원격 정보 확인", "Check remote"),
         SSH_REMOTE_REFRESH => ("새로고침", "Refresh"),
@@ -2024,6 +2025,8 @@ catalog! {
         CREATE => ("PR 만들기 (브라우저)", "Create PR (browser)"),
         MISSING => ("PR 연동: GitHub CLI(gh)를 설치하세요", "PR integration: install GitHub CLI (gh)"),
         FAILED => ("PR 조회 실패 — gh auth login 및 GitHub 원격 저장소를 확인하세요", "PR lookup failed — check gh auth login and the GitHub remote"),
+        TIMED_OUT => ("PR 조회 시간 초과 — 네트워크를 확인한 뒤 다시 시도하세요", "PR lookup timed out — check your network and try again"),
+        GH_FAILED => ("PR 조회 실패 — GitHub CLI(gh)가 오류를 냈습니다. 잠시 후 다시 시도하세요", "PR lookup failed — GitHub CLI (gh) returned an error. Try again shortly"),
         PACED => ("PR 요청 제한 — 잠시 후 다시 시도하세요", "PR request limit reached — try again shortly"),
         OPEN => ("PR 열림", "PR Open"),
         DRAFT => ("PR 초안", "PR Draft"),
@@ -2273,7 +2276,7 @@ catalog! {
 
     orca_import {
         TITLE => ("Orca 설정·계정·프로젝트 가져오기", "Import settings, accounts & projects from Orca"),
-        SUBTITLE => ("이 Mac에서 Orca 데이터를 감지했습니다. 원하는 항목만 골라 재시작 없이 바로 가져옵니다.", "Detected existing Orca data on this Mac. Choose categories to import immediately without restarting."),
+        SUBTITLE => ("이 컴퓨터에서 Orca 데이터를 감지했습니다. 원하는 항목만 골라 재시작 없이 바로 가져옵니다.", "Detected existing Orca data on this computer. Choose categories to import immediately without restarting."),
         MODAL_TITLE => ("Orca에서 가져오기", "Import from Orca"),
         MODAL_SUBTITLE => ("가져올 카테고리를 선택하세요. 원본 Orca 파일은 변경하거나 삭제하지 않습니다.", "Choose categories to import. Your original Orca files are never modified or deleted."),
         SUMMARY => ("Claude 계정 {claude}개 · Codex 계정 {codex}개 · 원격 호스트 {ssh}개 · 프로젝트/폴더 {projects}개 · 워크트리 메타 {worktrees}개 · 빠른 명령/스케줄 {commands}개 · 에이전트 세션 {sessions}개", "Claude accounts {claude} · Codex accounts {codex} · Remote hosts {ssh} · Projects/folders {projects} · Worktree metadata {worktrees} · Quick commands/schedules {commands} · Agent sessions {sessions}"),
@@ -2672,10 +2675,13 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         &[
             "초대",
             "페어링",
+            "다른 컴퓨터",
+            "원격 컴퓨터",
             "다른 Mac",
             "접속 허용",
             "invite",
             "pair",
+            "computer",
             "device",
             "p2p",
             "qr",
@@ -2984,10 +2990,15 @@ mod platform_shortcut_tests {
 
     #[test]
     fn remote_pairing_copy_is_platform_neutral_in_both_languages() {
-        for message in link_ui::ALL
-            .iter()
-            .chain(std::iter::once(&catalog::settings::TAB_REMOTE_KRILL_DESC))
-        {
+        for message in link_ui::ALL.iter().chain([
+            &catalog::settings::TAB_REMOTE_KRILL_DESC,
+            &catalog::mobile::PAGE_DESC,
+            &catalog::orca_import::SUBTITLE,
+            &catalog::settings::SSH_DESC,
+            &catalog::settings::SSH_KEYGEN_CONFIRM_PROMPT,
+            &catalog::settings::SSH_REGISTER_STARTED,
+            &catalog::settings::SSH_AUTH_USER_HINT,
+        ]) {
             for language in [Language::Ko, Language::En] {
                 let copy = message.in_language(language).to_ascii_lowercase();
                 assert!(!copy.contains("mac"), "{}: {copy}", message.id);

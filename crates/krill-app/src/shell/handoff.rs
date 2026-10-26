@@ -166,6 +166,8 @@ enum SendOutcome {
     Sent,
     /// 탭을 닫았으면 조용히 그만둔다.
     Gone,
+    /// Transmission was attempted; do not retry or show a delivery warning.
+    Uncertain,
     NoLive,
     Refused,
     InputFailed(String),
@@ -191,6 +193,10 @@ fn send_brief(
         None => {
             shell.show(None, cx);
             SendOutcome::Sent
+        }
+        Some(notice) if notice.fate == krill_proto::input::Fate::Uncertain => {
+            shell.show(Some(&notice), cx);
+            SendOutcome::Uncertain
         }
         Some(notice) => SendOutcome::InputFailed(notice_text(&notice)),
     }
@@ -309,9 +315,6 @@ impl Shell {
                 forked_pane = Some(p);
             }
         });
-        let agent_name = self.agent_display_name(&agent);
-        self.notice =
-            Some(krill_app::i18n::catalog::shell::FORKED_SESSION.format(&[("agent", &agent_name)]));
         cx.notify();
         forked_pane
     }
@@ -484,10 +487,14 @@ impl Shell {
             weak.update(cx, |this, cx| {
                 let agent = this.agent_display_name(&agent);
                 match outcome {
-                    Outcome::Delivered => {
-                        this.notice = Some(text::HANDOFF_SPAWNED.format(&[("agent", &agent)]));
+                    Outcome::Delivered | Outcome::Dropped => {
+                        // The destination tab shows the result. Only clear our own
+                        // progress message; preserve any newer actionable error.
+                        let waiting = text::HANDOFF_WAITING.format(&[("agent", &agent)]);
+                        if this.notice.as_ref() == Some(&waiting) {
+                            this.notice = None;
+                        }
                     }
-                    Outcome::Dropped => {}
                     Outcome::Failed(kind) => {
                         this.notice = Some(fail_text(&kind, &agent));
                     }
@@ -537,7 +544,7 @@ async fn deliver_handoff(
     }
     // 3. bracketed paste + Enter 전송.
     match weak.update(cx, |s, cx| send_brief(s, pane, brief, cx)) {
-        Err(_) | Ok(SendOutcome::Gone) => Outcome::Dropped,
+        Err(_) | Ok(SendOutcome::Gone | SendOutcome::Uncertain) => Outcome::Dropped,
         Ok(SendOutcome::Sent) => Outcome::Delivered,
         Ok(SendOutcome::NoLive) => {
             Outcome::Failed(FailKind::Transport("pane is not attached".to_owned()))
@@ -660,7 +667,9 @@ mod tests {
             assert!(shell.can_fork_pane(p0, cx));
             assert!(shell.can_continue_pane(p0));
 
+            shell.notice = Some("Existing actionable error".into());
             let forked = shell.fork_pane_session(p0, cx).expect("fork pane");
+            assert_eq!(shell.notice.as_deref(), Some("Existing actionable error"));
             assert_eq!(shell.layout.tabs().len(), 3);
             assert_eq!(shell.layout.active(), 1);
             assert_eq!(shell.layout.tabs()[0].focused, p0);

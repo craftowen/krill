@@ -15,7 +15,7 @@ Krill workers and cannot replace these operations.
 
 ## Select the role and executable
 
-- `[MK ORCHESTRATION PREAMBLE]` or `[Krill Worker] run=... task=... dispatch=...`
+- `[KRILL ORCHESTRATION PREAMBLE]` or `[Krill Worker] run=... task=... dispatch=...`
   means **worker**. Follow that assignment and its exact IDs; do not become a coordinator.
 - An explicit request to supervise or divide work means **coordinator**.
 - Otherwise continue ordinary work. Merely installing this skill grants no authority

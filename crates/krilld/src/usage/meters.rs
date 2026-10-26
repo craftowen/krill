@@ -15,28 +15,52 @@ mod claude;
 
 type Key = (PathBuf, ProviderKind, PathBuf);
 static CACHE: Mutex<BTreeMap<Key, (Instant, AccountMeters)>> = Mutex::new(BTreeMap::new());
+const CACHE_TTL: Duration = Duration::from_mins(30);
 
 pub(super) fn remember(home: &Path, provider: ProviderKind, dir: &Path, reading: AccountMeters) {
     let mut cache = lock(&CACHE);
-    cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
+    cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
     cache.insert(
         (home.into(), provider, dir.into()),
         (Instant::now(), reading),
     );
 }
 
+pub(super) fn has_cached(home: &Path, provider: ProviderKind, dir: &Path) -> bool {
+    lock(&CACHE)
+        .get(&(home.into(), provider, dir.into()))
+        .is_some_and(|(at, _)| at.elapsed() < CACHE_TTL)
+}
+
 pub(super) fn evict(home: &Path) {
     lock(&CACHE).retain(|(h, _, _), _| h != home);
+}
+
+pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
+    lock(&CACHE).remove(&(home.into(), provider, dir.into()));
 }
 
 pub(super) fn read(home: &Path, account: &AccountInfo) -> AccountMeters {
     let dir = Path::new(&account.profile_dir);
     let cached = lock(&CACHE)
         .get(&(home.into(), account.provider, dir.into()))
-        .filter(|(at, _)| at.elapsed() < Duration::from_secs(600))
+        .filter(|(at, _)| at.elapsed() < CACHE_TTL)
         .map(|(_, reading)| reading.clone());
+    let from_cache = cached.is_some();
     let mut reading = cached.unwrap_or_else(|| read_local(home, account));
     reading.account_id.clone_from(&account.id);
+    if from_cache && account.provider == ProviderKind::Claude {
+        for (key, window) in [
+            ("five_hour", &account.usage.five_hour),
+            ("seven_day", &account.usage.seven_day),
+        ] {
+            if let Some(window) = window
+                && let Some(meter) = reading.meters.iter_mut().find(|m| m.key == key)
+            {
+                meter.window = Some(window.clone());
+            }
+        }
+    }
     if reading.meters.is_empty() {
         for (key, label, window) in [
             ("five_hour", "5h", &account.usage.five_hour),

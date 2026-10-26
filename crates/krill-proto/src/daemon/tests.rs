@@ -144,6 +144,59 @@ fn holder_plist_lints() {
     std::fs::remove_dir_all(&d).ok();
 }
 
+/// 전환 중인 krilld(업그레이드로 끝나는 구 krilld 등)가 Hello 전에 연달아 닫아도 `connect`는 holder를 띄우지
+/// 않고 다음 krilld에 붙는다. 기동 락 아래 두 번째 EOF를 곧바로 "cannot talk to krilld: unexpected end of file"로
+/// 돌려주던 회귀 방지(Windows 업데이트 뒤 빈 터미널).
+#[test]
+fn transient_close_before_hello_waits_for_successor_without_launch() {
+    let d = dir("transition");
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    let socket = d.join("run/krilld.sock");
+    // 실행할 수 없는 일반 파일: 띄우려 하면 `Spawn` 오류로 실패한다.
+    let holder = d.join("krill-holder");
+    std::fs::write(&holder, b"not an executable").unwrap();
+    let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        // 쓰기 쪽만 닫아 Hello 전 EOF를 만든다. 읽기 쪽은 유지해 macOS의 닫힌 피어 setsockopt(EINVAL)
+        // 경합을 피하고, 이 테스트가 확인하는 핸드셰이크 EOF에 도달하게 한다.
+        let mut retired = Vec::new();
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            retired.push(stream);
+        }
+        // 감시 handshake 한 번 + 실제 handshake 한 번.
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let server = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "successor".into(),
+                instance_id: 2,
+            };
+            stream.write_all(&server.encode().unwrap()).unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            let client = ClientHello::decode(kind, &body).unwrap();
+            if is_watch(client.features) {
+                stream
+                    .write_all(&HolderStatus::Linked.encode().unwrap())
+                    .unwrap();
+            }
+        }
+    });
+    let paths = Paths {
+        socket,
+        holder: holder.clone(),
+        krilld: holder,
+    };
+    let connected = connect(&paths, &hello()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!connected.launched);
+    assert_eq!(connected.server.instance_id, 2);
+    worker.join().unwrap();
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[test]
 fn missing_holder_is_reported() {
     let d = dir("missing");

@@ -2546,7 +2546,7 @@ pub fn worker_preamble(dispatch: &Dispatch) -> String {
         .map(|t| format!(" --task {t}"))
         .unwrap_or_default();
     format!(
-        "[MK ORCHESTRATION PREAMBLE]\n\
+        "[KRILL ORCHESTRATION PREAMBLE]\n\
          Run: {run} | Dispatch: {disp} | Worker: {worker}{task_line}\n\
          Task Prompt: {prompt}\n\
          First read the Krill worker contract: krill skills get orchestration --reference references/worker-contract.md. If KRILL_CLI is set, use that absolute executable instead of bare krill; quote it for your shell. This is the krill-orchestration skill, not Orca orchestration.\n\
@@ -4717,6 +4717,10 @@ mod tests {
             "Check preamble",
         )?;
         let preamble = worker_preamble(&disp);
+        assert!(
+            preamble.starts_with("[KRILL ORCHESTRATION PREAMBLE]\n"),
+            "{preamble}"
+        );
         assert!(preamble.contains("--wait"), "{preamble}");
         assert!(preamble.contains("--outcome succeeded"), "{preamble}");
 

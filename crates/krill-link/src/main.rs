@@ -235,7 +235,7 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "초대 링크 (10분간 1회 유효 — 다른 맥에서 붙여넣으세요 / Invite link, valid once for 10m):\n{}",
+            "초대 링크 (10분간 1회 유효 — 다른 컴퓨터에서 붙여넣으세요 / Invite link, valid once for 10m):\n{}",
             out.link
         )
         .ok();

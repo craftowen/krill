@@ -68,11 +68,34 @@ fn main() -> std::process::ExitCode {
     {
         return shell::files::bench::run(&dir);
     }
+    // Windows는 X로 닫아도 트레이에 남고 재실행해도 OS가 기존 앱을 깨우지 않는다(on_reopen 미호출).
+    // 같은 상태 폴더의 앱이 있으면 그 앱에 창 열기를 넘기고 끝낸다. 업데이트 health 확인 실행은
+    // 넘기지 않는다(넘기면 새 버전이 바로 끝나 롤백된다).
+    #[cfg(windows)]
+    let mut instance = {
+        let key = krill_app::platform::instance_key(krill_proto::daemon::state_dir().as_deref());
+        let forward = std::env::var_os(krill_app::updater::READY_ENV).is_none();
+        match krill_app::platform::instance::claim(&key, forward) {
+            Some(instance) => instance,
+            None => return std::process::ExitCode::SUCCESS,
+        }
+    };
+    #[cfg(windows)]
+    let opens = instance.take_opens();
     // OWE-576: gpui-component 아이콘 자산은 재열기·새 창에서도 같은 소스를 쓴다.
     let application = gpui_platform::application().with_assets(krill_app::ui::icons::AppAssets);
     application.on_reopen(|cx| request_open_from_menu(None, cx));
-    application.run(|cx: &mut App| {
+    application.run(move |cx: &mut App| {
         init(cx);
+        #[cfg(windows)]
+        if let Some(mut opens) = opens {
+            cx.spawn(async move |cx| {
+                while opens.recv().await.is_some() {
+                    cx.update(|cx| request_open_from_menu(None, cx));
+                }
+            })
+            .detach();
+        }
         cx.set_global(OpeningWindow {
             pending: true,
             session: None,
@@ -161,6 +184,8 @@ fn main() -> std::process::ExitCode {
         })
         .detach();
     });
+    #[cfg(windows)]
+    drop(instance);
     std::process::ExitCode::SUCCESS
 }
 

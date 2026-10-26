@@ -291,7 +291,7 @@ pub fn sanitize_branch_slug(raw: &str) -> Option<String> {
     Some(final_slug)
 }
 
-/// 프롬프트 원문에서 `<USER_REQUEST>` 래퍼, `[Image #N]`·`[Pasted ...]` 마커, 선행 붙여넣기 파일 경로를 걷어낸다.
+/// 프롬프트 원문에서 `<USER_REQUEST>` 래퍼, 오케스트레이션·핸드오프 프리앰블, `[Image #N]`·`[Pasted ...]` 마커, 선행 붙여넣기 파일 경로를 걷어낸다.
 #[must_use]
 pub fn clean_user_prompt(raw: &str) -> String {
     let mut s = raw.trim();
@@ -304,6 +304,9 @@ pub fn clean_user_prompt(raw: &str) -> String {
                 tail.trim()
             };
         }
+    }
+    if let Some(stripped) = strip_orchestration_or_handoff_wrapper(s) {
+        s = stripped;
     }
     loop {
         s = s.trim_start();
@@ -318,6 +321,60 @@ pub fn clean_user_prompt(raw: &str) -> String {
         break;
     }
     s.trim().to_owned()
+}
+
+fn strip_orchestration_or_handoff_wrapper(s: &str) -> Option<&str> {
+    if let Some(rest) = s
+        .strip_prefix("[KRILL ORCHESTRATION PREAMBLE]")
+        .or_else(|| s.strip_prefix("[MK ORCHESTRATION PREAMBLE]"))
+    {
+        if let Some((_, after_label)) = rest.split_once("Task Prompt:") {
+            let body = after_label
+                .split_once("\nFirst read the Krill worker contract:")
+                .map_or(after_label, |(prompt, _)| prompt);
+            return Some(body.trim());
+        }
+        let rest = rest.trim_start();
+        if let Some(after_run) = rest.strip_prefix("Run:") {
+            return Some(
+                after_run
+                    .split_once('\n')
+                    .map_or("", |(_, tail)| tail.trim()),
+            );
+        }
+        return Some(rest);
+    }
+    if let Some(rest) = s.strip_prefix("[Krill Worker]") {
+        let body = rest
+            .split_once("\nRead `krill skills get orchestration")
+            .map_or(rest, |(head, _)| head);
+        let first_line_end = body.find('\n').unwrap_or(body.len());
+        let first_line = body.get(..first_line_end).unwrap_or(body);
+        if let Some((_, after_colon)) = first_line.split_once(": ") {
+            let offset = first_line.len().checked_sub(after_colon.len())?;
+            return body.get(offset..).map(str::trim);
+        }
+        return Some(body.trim());
+    }
+    if let Some(rest) = s
+        .strip_prefix("[KRILL SESSION HANDOFF]")
+        .or_else(|| s.strip_prefix("[MK SESSION HANDOFF]"))
+        && let Some((_, after_inst)) = rest.split_once("Instructions:")
+    {
+        let body = after_inst
+            .split_once("\n--- Recent terminal context ---")
+            .map_or(after_inst, |(inst, _)| inst);
+        return Some(body.trim());
+    }
+    if (s.starts_with("[KRILL HANDOFF from session") || s.starts_with("[MK HANDOFF from session"))
+        && let Some((_, after_prompt)) = s.split_once("\nPrompt:\n")
+    {
+        let body = after_prompt
+            .split_once("\nRecent terminal context:\n")
+            .map_or(after_prompt, |(prompt, _)| prompt);
+        return Some(body.trim());
+    }
+    None
 }
 
 fn strip_leading_bracket_marker(s: &str) -> Option<&str> {
@@ -634,6 +691,19 @@ mod slug_tests {
             prompt_branch_slug("'/var/folders/nm/foo/T/krill-paste/img.png'"),
             None
         );
+        let orch_prompt = "[KRILL ORCHESTRATION PREAMBLE]\nRun: run-1 | Dispatch: disp-1 | Worker: w1 | Task: task-1\nTask Prompt: 상단 탭 클릭 시 사이드바 포커싱 동기화\nFirst read the Krill worker contract: krill skills get orchestration";
+        assert_eq!(
+            clean_user_prompt(orch_prompt),
+            "상단 탭 클릭 시 사이드바 포커싱 동기화"
+        );
+        assert_eq!(
+            prompt_branch_slug(orch_prompt).as_deref(),
+            Some("상단-탭-클릭-시-사이드바")
+        );
+        let min_prompt = "[Krill Worker] run=run-1 task=task-1 dispatch=disp-1 worker=w1: 모바일 채팅 레이아웃 수정\nRead `krill skills get orchestration --reference references/worker-contract.md`";
+        assert_eq!(clean_user_prompt(min_prompt), "모바일 채팅 레이아웃 수정");
+        let handoff_prompt = "[KRILL SESSION HANDOFF]\nSource session: s42\nTarget agent: codex\nInstructions: 남은 단위 테스트 마무리\n--- Recent terminal context ---\nfoo\n--- End context ---\n";
+        assert_eq!(clean_user_prompt(handoff_prompt), "남은 단위 테스트 마무리");
 
         let dir = std::env::temp_dir().join(format!("owe737-titles-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();

@@ -123,6 +123,11 @@ fn watch_permission_with(
 }
 
 fn authorize(requested: bool) -> FixOutcome {
+    // Windows 토스트에는 앱별 사전 동의·조회 API가 없다. 꺼 두면 OS가 조용히 버리므로
+    // 알림마다 "권한 확인 불가" 안내를 띄우지 않고 그대로 보낸다.
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
     authorize_status(
         perm::query_notification_status(Duration::from_secs(2)),
         requested,
@@ -273,6 +278,14 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("system error"));
         assert!(authorize_status(Some(Status::NotDetermined), false, || Outcome::Timeout).is_err());
+    }
+
+    /// Windows는 조회할 권한이 없으므로 알림마다 "권한 확인 불가" 안내를 만들지 않는다.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn platforms_without_consent_api_deliver_without_notice() {
+        assert!(authorize(false).is_ok());
+        assert!(authorize(true).is_ok());
     }
 
     #[gpui::test]

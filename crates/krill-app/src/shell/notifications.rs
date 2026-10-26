@@ -15,8 +15,6 @@ mod tests;
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum Kind {
     Link,
-    Reconnected,
-    Away,
     Notice,
     SidebarNotice,
     SidebarPreferenceError,
@@ -32,8 +30,6 @@ impl Kind {
     fn key(&self) -> SharedString {
         match self {
             Self::Link => "link-banner".into(),
-            Self::Reconnected => "reconnected-banner".into(),
-            Self::Away => "away-summary".into(),
             Self::Notice => "notice".into(),
             Self::SidebarNotice => "sidebar-notice".into(),
             Self::SidebarPreferenceError => "sidebar-preference-error".into(),
@@ -88,14 +84,17 @@ impl Shell {
             (
                 sb.notice().map(str::to_owned),
                 sb.preference_error().map(str::to_owned),
-                sb.poll_error().map(str::to_owned),
+                sb.poll_error_notice().map(str::to_owned),
                 sb.pr_guidance().map(str::to_owned),
             )
         };
         for (kind, message) in [
-            (Kind::Link, self.link.banner()),
-            (Kind::Reconnected, self.reconnected.clone()),
-            (Kind::Away, self.away.clone()),
+            (
+                Kind::Link,
+                matches!(self.link, Link::Failed(_))
+                    .then(|| self.link.banner())
+                    .flatten(),
+            ),
             (Kind::Notice, self.notice.clone()),
             (Kind::SidebarNotice, sb_notice),
             (Kind::SidebarPreferenceError, sb_pref_err),
@@ -194,15 +193,12 @@ impl Shell {
                         ),
                     };
                     // State-dependent warnings and errors remain readable until
-                    // resolved or dismissed. One-shot notices and summaries use the
-                    // stack's 5s timer; the reconnected source clears after RECONNECTED_FOR.
+                    // resolved or dismissed. One-shot notices use the stack's 5s timer.
                     let note = note.autohide(matches!(
                         kind,
                         Kind::Notice
                             | Kind::SidebarNotice
                             | Kind::SidebarPrGuidance
-                            | Kind::Away
-                            | Kind::Reconnected
                     ));
                     let marker = kind.key();
                     let note = note.content(move |_, _, _| {
@@ -219,25 +215,19 @@ impl Shell {
                     });
                     if matches!(
                         kind,
-                        Kind::Away
-                            | Kind::Notice
+                        Kind::Notice
                             | Kind::SidebarNotice
                             | Kind::SidebarPreferenceError
                             | Kind::SidebarPollError
                             | Kind::SidebarPrGuidance
                     ) {
                         let click_shell = close_shell.clone();
-                        let click_kind = kind.clone();
                         let click_value = value.clone();
+                        let click_kind = kind.clone();
                         note.on_click(move |_, _, cx| {
                             click_shell
                                 .update(cx, |this, cx| {
                                     match (&click_kind, &click_value) {
-                                        (Kind::Away, Value::Text(message))
-                                            if this.away.as_ref() == Some(message) =>
-                                        {
-                                            this.away = None;
-                                        }
                                         (Kind::Notice, Value::Text(message))
                                             if this.notice.as_ref() == Some(message) =>
                                         {
@@ -379,11 +369,6 @@ impl Shell {
                                         sb.dismiss_pr_guidance(cx);
                                     }
                                 });
-                            }
-                            (Kind::Away, Value::Text(message))
-                                if this.away.as_ref() == Some(message) =>
-                            {
-                                this.away = None;
                             }
                             (Kind::Paste, Value::Paste(pending))
                                 if this.security.pending_paste() == Some(pending) =>

@@ -234,11 +234,146 @@ fn use_button(
         })
 }
 
+fn render_detail_reset_controls(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+    reset_armed: Option<&(ProviderKind, String)>,
+    weak: &WeakEntity<Shell>,
+    menu: &WeakEntity<PopupMenu>,
+    detail_menu: &WeakEntity<PopupMenu>,
+    p: &ui::Palette,
+) -> Option<gpui::Div> {
+    if !matches!(account.provider, ProviderKind::Codex | ProviderKind::Claude)
+        || krill_app::accounts::orca_managed(account)
+    {
+        return None;
+    }
+    let credits = super::reset_credit_count(snap, account);
+    let armed =
+        reset_armed.is_some_and(|(prov, id)| *prov == account.provider && *id == account.id);
+    if armed {
+        let (title, _) = krill_app::settings::account_heading(account);
+        let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
+        let confirm_id = format!("status-provider-detail-reset-confirm-{}", account.id);
+        let confirm_selector = confirm_id.clone();
+        let confirm_weak = weak.clone();
+        let confirm_menu = menu.clone();
+        let confirm_provider = account.provider;
+        let confirm_acc_id = account.id.clone();
+
+        let cancel_id = format!("status-provider-detail-reset-cancel-{}", account.id);
+        let cancel_selector = cancel_id.clone();
+        let cancel_weak = weak.clone();
+        let cancel_detail_menu = detail_menu.clone();
+        return Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .pt_1()
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(info),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Button::new(gpui::SharedString::from(confirm_id))
+                                .small()
+                                .danger()
+                                .label(provider_text::PROVIDER_RESET_USAGE_CONFIRM.get())
+                                .debug_selector(move || confirm_selector.clone())
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    confirm_weak
+                                        .update(cx, |shell, cx| {
+                                            shell.consume_reset_credit(
+                                                confirm_provider,
+                                                confirm_acc_id.clone(),
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                    confirm_menu
+                                        .update(cx, |_, cx| cx.emit(gpui::DismissEvent))
+                                        .ok();
+                                }),
+                        )
+                        .child(
+                            Button::new(gpui::SharedString::from(cancel_id))
+                                .small()
+                                .outline()
+                                .label(provider_text::PROVIDER_RESET_USAGE_CANCEL.get())
+                                .debug_selector(move || cancel_selector.clone())
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    cancel_weak
+                                        .update(cx, |shell, cx| {
+                                            shell.reset_armed = None;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    cancel_detail_menu.update(cx, |_, cx| cx.notify()).ok();
+                                }),
+                        ),
+                ),
+        );
+    }
+    let btn_id = format!("status-provider-detail-reset-{}", account.id);
+    let selector = btn_id.clone();
+    if credits == Some(0) {
+        return Some(
+            div().pt_1().child(
+                Button::new(gpui::SharedString::from(btn_id))
+                    .small()
+                    .outline()
+                    .disabled(true)
+                    .label(provider_text::PROVIDER_RESET_USAGE_NONE.get())
+                    .debug_selector(move || selector.clone()),
+            ),
+        );
+    }
+    let arm_weak = weak.clone();
+    let arm_detail_menu = detail_menu.clone();
+    let provider = account.provider;
+    let account_id = account.id.clone();
+    let label = match credits {
+        Some(c) if c > 0 => format!("{} ({c})", provider_text::PROVIDER_RESET_USAGE.get()),
+        _ => provider_text::PROVIDER_RESET_USAGE.get().to_owned(),
+    };
+    Some(
+        div().pt_1().child(
+            Button::new(gpui::SharedString::from(btn_id))
+                .small()
+                .outline()
+                .label(label)
+                .debug_selector(move || selector.clone())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    arm_weak
+                        .update(cx, |shell, cx| {
+                            shell.reset_armed = Some((provider, account_id.clone()));
+                            cx.notify();
+                        })
+                        .ok();
+                    arm_detail_menu.update(cx, |_, cx| cx.notify()).ok();
+                }),
+        ),
+    )
+}
+
 fn render_details(
     snap: &AccountsSnapshot,
     group: &AccountGroup,
+    reset_armed: Option<&(ProviderKind, String)>,
     weak: &WeakEntity<Shell>,
     menu: &WeakEntity<PopupMenu>,
+    detail_menu: &WeakEntity<PopupMenu>,
     p: &ui::Palette,
 ) -> gpui::Div {
     let mut detail = div()
@@ -357,6 +492,11 @@ fn render_details(
                 .into_iter()
                 .map(|note| div().child(note)),
         );
+        if let Some(reset_box) =
+            render_detail_reset_controls(snap, account, reset_armed, weak, menu, detail_menu, p)
+        {
+            profile = profile.child(reset_box);
+        }
         detail = detail.child(profile);
     }
     detail
@@ -490,13 +630,19 @@ pub(super) fn provider_usage_menu(
         let panel_weak = weak.clone();
         let parent_menu = menu_weak.clone();
         let panel_account = account.clone();
-        let panel = PopupMenu::build(window, cx, move |menu, _, _| {
+        let panel = PopupMenu::build(window, cx, move |menu, _, cx| {
+            let detail_menu = cx.entity().downgrade();
             menu.min_w(detail_width)
                 .max_w(detail_width)
+                .max_h(px(560.))
                 .scrollable(true)
                 .item(
                     PopupMenuItem::element(move |_, cx| {
                         let p = ui::palette(cx);
+                        let armed = panel_weak
+                            .read_with(cx, |shell, _| shell.reset_armed.clone())
+                            .ok()
+                            .flatten();
                         let selector = format!("status-provider-details-{}", panel_account.id);
                         let debug_id = selector.clone();
                         div()
@@ -517,8 +663,10 @@ pub(super) fn provider_usage_menu(
                             .child(render_details(
                                 &panel_snap,
                                 &panel_group,
+                                armed.as_ref(),
                                 &panel_weak,
                                 &parent_menu,
+                                &detail_menu,
                                 p,
                             ))
                     })

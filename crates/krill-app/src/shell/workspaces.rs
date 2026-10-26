@@ -97,8 +97,10 @@ impl Shell {
         };
         // Create can appear in the daemon list before its reply reaches the
         // launching pane. Wait for that pane's ID before importing missing IDs.
+        // A pane whose Create reply was lost never receives it, so import instead.
         if self.live.keys().any(|pane| {
             self.layout.session(*pane).is_none()
+                && !self.outcome_unknown.contains_key(pane)
                 && self.layout.file(*pane).is_none()
                 && self.pane_workspace(*pane, cx).as_ref() == Some(&workspace)
         }) {
@@ -249,6 +251,13 @@ impl Shell {
                     .await;
                 this.update(cx, |this, cx| {
                     this.restoring_sessions.remove(&old);
+                    // 재개 요청이 닿았는지 모르면, 보이게 된 칸도 다시 재개하지 않고 아는 세션만 찾는다.
+                    if let Err(e) = &got
+                        && pane::is_unknown_outcome(e)
+                    {
+                        this.outcome_unknown
+                            .insert(pane_id, super::start_error_text(e));
+                    }
                     let session = match got {
                         Ok(Some(new)) => {
                             this.observed_sessions.insert((HostId::Local, new));

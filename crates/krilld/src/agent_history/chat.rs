@@ -611,6 +611,25 @@ impl CwdFallbackFilter<'_> {
         }
         true
     }
+
+    /// Codex files each rollout under its local creation date. A `YYYY[-MM[-DD]]` period that
+    /// ended two days before the session started (one for any time zone, one of margin)
+    /// cannot hold its transcript. Only folder names decide; file names and times never prune.
+    fn predates_codex_period(&self, period: &str) -> bool {
+        let Some(min_birth) = self.min_birth_secs else {
+            return false;
+        };
+        let mut parts = period.split('-').map(str::parse::<i64>);
+        let end = match (parts.next(), parts.next(), parts.next()) {
+            (Some(Ok(y)), None | Some(Ok(12)), None) => format!("{:04}-01-01T00:00:00Z", y + 1),
+            (Some(Ok(y)), Some(Ok(m)), None) => format!("{y:04}-{:02}-01T00:00:00Z", m + 1),
+            (Some(Ok(y)), Some(Ok(m)), Some(Ok(d))) => format!("{y:04}-{m:02}-{d:02}T23:59:59Z"),
+            _ => return false,
+        };
+        krill_proto::time::parse_rfc3339_epoch(&end)
+            .and_then(|end| u64::try_from(end).ok())
+            .is_some_and(|end| end.saturating_add(2 * 86_400) < min_birth)
+    }
 }
 
 fn resolve_transcript(
@@ -962,6 +981,7 @@ fn find_newest_transcript_by_cwd(
             walk_codex_for_cwd(
                 &root.join("sessions"),
                 4,
+                Some(""),
                 norm_cwd,
                 filter,
                 &mut best,
@@ -1015,9 +1035,13 @@ fn find_newest_transcript_by_cwd(
     best
 }
 
+/// Codex keeps rollouts under `sessions/YYYY/MM/DD`. Walk newest-first: NTFS lists names
+/// ascending, so the shared budget used to run out in old days before reaching today.
+/// `period` is the canonical date so far (`""`, `YYYY`, `YYYY-MM`); `None` below other names.
 fn walk_codex_for_cwd(
     dir: &Path,
     depth: usize,
+    period: Option<&str>,
     norm_cwd: &str,
     filter: &CwdFallbackFilter<'_>,
     best: &mut Option<(u64, PathBuf, String)>,
@@ -1029,7 +1053,9 @@ fn walk_codex_for_cwd(
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.take(256).flatten() {
+    let mut entries: Vec<_> = entries.take(65_536).flatten().collect();
+    entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    for entry in entries {
         if !budget.take() {
             break;
         }
@@ -1041,7 +1067,34 @@ fn walk_codex_for_cwd(
         }
         let p = entry.path();
         if ft.is_dir() {
-            walk_codex_for_cwd(&p, depth - 1, norm_cwd, filter, best, budget);
+            let digits = if depth == 4 { 4 } else { 2 };
+            let child = entry
+                .file_name()
+                .to_str()
+                .filter(|name| name.len() == digits && name.bytes().all(|b| b.is_ascii_digit()))
+                .zip(period)
+                .map(|(name, period)| {
+                    if period.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{period}-{name}")
+                    }
+                });
+            if child
+                .as_deref()
+                .is_some_and(|child| filter.predates_codex_period(child))
+            {
+                continue;
+            }
+            walk_codex_for_cwd(
+                &p,
+                depth - 1,
+                child.as_deref(),
+                norm_cwd,
+                filter,
+                best,
+                budget,
+            );
         } else if ft.is_file()
             && p.extension().is_some_and(|e| e == "jsonl")
             && let Some(mtime) = file_mtime(&p)
@@ -2848,6 +2901,83 @@ mod performance_tests {
             ),
             None
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_cwd_fallback_skips_old_date_folders_and_ignores_name_order_within_a_day() {
+        use std::os::macos::fs::FileTimesExt as _;
+        let dir = std::env::temp_dir().join(format!("chat-codex-newest-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let roots = VaultRoots {
+            codex: vec![dir.clone()],
+            ..VaultRoots::default()
+        };
+        // A Windows workspace with Hangul, written as Codex records it in `session_meta`.
+        let cwd = r"C:\Users\user\orca\workspaces\onetab.bundle\간단작업";
+        let rollout = |day: &Path, time: &str, id: &str| {
+            fs::create_dir_all(day).unwrap();
+            let path = day.join(format!("rollout-{time}-{id}.jsonl"));
+            let meta = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}});
+            fs::write(&path, format!("{meta}\n")).unwrap();
+            path
+        };
+        // More same-cwd history than the whole scan budget. Walked first (NTFS lists names
+        // ascending), it used to exhaust the budget, and an exhausted scan answers nothing.
+        for day in 1..=30 {
+            for n in 0..70 {
+                rollout(
+                    &dir.join(format!("sessions/2025/01/{day:02}")),
+                    &format!("2025-01-{day:02}T00-00-{n:02}"),
+                    &format!("old-{day}-{n}"),
+                );
+            }
+        }
+        // A future folder never ages into pruning. Within it, a copied file sorts after the
+        // live rollout but was born before the session: name order must not hide the live one.
+        let day = dir.join("sessions/2999/01/01");
+        let copied = rollout(&day, "2999-01-01T09-00-00", "copied-before-launch");
+        File::options()
+            .write(true)
+            .open(&copied)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_created(std::time::SystemTime::now() - Duration::from_secs(3600)),
+            )
+            .unwrap();
+        let live = rollout(&day, "2999-01-01T08-30-00", "live");
+        let stored = StoredLaunch {
+            profile: "codex".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: cwd.as_bytes().to_vec(),
+            hibernation_blocked: true,
+            account: None,
+        };
+        let empty_ids = BTreeSet::new();
+        let empty_paths = BTreeSet::new();
+        let filter = CwdFallbackFilter {
+            min_birth_secs: Some(UNIX_EPOCH.elapsed().unwrap().as_secs() - 60),
+            claimed_ids: &empty_ids,
+            claimed_paths: &empty_paths,
+        };
+        let mut budget = ScanBudget::new();
+        assert_eq!(
+            resolve_transcript_uncached(
+                &roots,
+                VaultAgent::Codex,
+                &stored,
+                cwd,
+                &filter,
+                &mut budget
+            ),
+            Some((live, "live".into()))
+        );
+        // 2025 ended long before the session, so its folders were never opened.
+        assert!(budget.remaining > 2000);
         fs::remove_dir_all(dir).unwrap();
     }
 

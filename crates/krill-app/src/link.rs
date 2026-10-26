@@ -22,6 +22,30 @@ pub enum Link {
 }
 
 impl Link {
+    /// 일시적인 연결 전환은 백그라운드에서 다시 붙고, 설치·권한·프로토콜 오류만 사용자 조치를 요청한다.
+    pub fn connect_failure(error: &krill_proto::daemon::Error) -> Self {
+        use std::io::ErrorKind;
+        match error {
+            krill_proto::daemon::Error::LockTimeout => Self::Down,
+            krill_proto::daemon::Error::Io(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::Interrupted
+                        | ErrorKind::TimedOut
+                        | ErrorKind::WouldBlock
+                ) =>
+            {
+                Self::Down
+            }
+            _ => Self::Failed(error.to_string()),
+        }
+    }
+
     /// 가운데 열 위 배너. 붙어 있거나 처음 붙는 중이면 없음.
     pub fn banner(&self) -> Option<String> {
         match self {
@@ -90,6 +114,28 @@ pub fn notice_text(n: &Notice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_connect_failures_retry_without_actionable_error() {
+        use krill_proto::daemon::Error;
+        use std::io::{self, ErrorKind};
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+        ] {
+            assert_eq!(Link::connect_failure(&Error::Io(kind.into())), Link::Down);
+        }
+        assert_eq!(Link::connect_failure(&Error::LockTimeout), Link::Down);
+        for error in [
+            Error::Missing("krill-holder".into()),
+            Error::Io(io::Error::from(ErrorKind::PermissionDenied)),
+            Error::Io(io::Error::from(ErrorKind::InvalidData)),
+            Error::Timeout,
+        ] {
+            assert!(matches!(Link::connect_failure(&error), Link::Failed(_)));
+        }
+    }
 
     #[test]
     fn banner_only_when_not_up() {

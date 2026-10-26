@@ -164,7 +164,7 @@ fn linked_account_refresh_keeps_daemon_snapshot_on_ipc_failure(cx: &mut TestAppC
         shell.link = Link::Up;
         shell.accounts_snapshot = (snapshot.clone()).into();
         shell.notice = None;
-        shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+        shell.refresh_accounts(UsageRequest::RefreshUsage, cx);
     });
     cx.run_until_parked();
     cx.executor().advance_clock(Duration::from_secs(2));

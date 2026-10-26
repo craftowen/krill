@@ -591,13 +591,13 @@ fn daemon_link_shows_banner(cx: &mut TestAppContext) {
     assert_eq!(banner(cx), None);
 }
 
-/// 데몬 재연결: 끊긴 동안 보존 톤 배너, 다시 붙어도 실제 세션 목록이 오기 전에는 확인 문구가 없고,
-/// 목록이 오면 "세션 n개에 다시 연결했습니다"를 잠깐 보인 뒤 지운다. 처음 붙을 때는 보이지 않는다.
+/// 재연결 완료는 정상 화면 복귀로 충분하다. 세션 목록을 받아도 별도 토스트를 띄우지 않는다.
 #[gpui::test]
-fn reconnect_confirmation_waits_for_session_list(cx: &mut TestAppContext) {
-    struct Memory(sidebar::Snapshot);
+fn reconnect_restores_session_list_without_success_toast(cx: &mut TestAppContext) {
+    struct Memory(sidebar::Snapshot, Arc<std::sync::atomic::AtomicUsize>);
     impl sidebar::Source for Memory {
         fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.0.clone())
         }
     }
@@ -613,7 +613,7 @@ fn reconnect_confirmation_waits_for_session_list(cx: &mut TestAppContext) {
         sessions: vec![session(1), session(2)],
         trees: std::collections::BTreeMap::new(),
     };
-    let shown = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).reconnected.clone());
+    let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let set = |cx: &mut VisualTestContext, link: Link| {
         cx.update(|_, cx| view.update(cx, |s, cx| s.set_link(link, cx)));
         cx.run_until_parked();
@@ -621,62 +621,42 @@ fn reconnect_confirmation_waits_for_session_list(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.set_link(Link::Up, cx);
-            s.sidebar
-                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+            s.sidebar.update(cx, |b, cx| {
+                b.connect_source(Arc::new(Memory(snapshot, fetched.clone())), cx);
+            });
         });
     });
     cx.run_until_parked();
-    assert_eq!(shown(cx), None, "처음 붙을 때는 재연결 확인이 없다");
+    assert!(cx.debug_bounds("reconnected-banner").is_none());
 
     set(cx, Link::Down);
-    assert!(cx.debug_bounds("link-banner").is_some());
-    set(cx, Link::Up);
-    assert_eq!(
-        shown(cx),
-        None,
-        "목록 도착 전에는 다시 연결했다고 말하지 않는다"
+    assert!(
+        cx.debug_bounds("link-banner").is_none(),
+        "automatic reconnect stays in the background"
     );
+    set(cx, Link::Up);
     assert!(cx.debug_bounds("reconnected-banner").is_none());
 
     cx.executor().advance_clock(Duration::from_secs(2));
     cx.run_until_parked();
-    assert_eq!(
-        shown(cx).as_deref(),
-        Some(
-            krill_app::i18n::catalog::link::RECONNECTED
-                .format(&[("n", "2")])
-                .as_str()
-        )
-    );
-    assert!(cx.debug_bounds("reconnected-banner").is_some());
-
-    cx.executor().advance_clock(RECONNECTED_FOR);
-    cx.run_until_parked();
-    assert_eq!(shown(cx), None);
+    assert!(cx.debug_bounds("link-banner").is_none());
+    assert!(cx.debug_bounds("reconnected-banner").is_none());
+    assert!(fetched.load(std::sync::atomic::Ordering::SeqCst) >= 2);
 }
 
-/// 자리 비운 사이 요약은 보존 톤 한 줄로 보이고 누르면 닫힌다.
+/// 오래 비운 뒤 돌아와도 요약 팝업을 띄우지 않고 마지막 생존 시각만 갱신한다.
 #[gpui::test]
-fn away_summary_banner_dismisses_on_click(cx: &mut TestAppContext) {
-    cx.update(|cx| cx.set_reduce_motion(true));
-    let (view, cx) = open(cx, state_path("away-summary"));
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.away = Some("Krill을 닫아 둔 2시간 동안 3개 완료".into());
-            cx.notify();
-        });
+fn absence_tracking_stays_quiet(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("quiet-away"));
+    view.update(cx, |s, cx| {
+        s.layout.set_last_seen_unix_ns(1);
+        s.start_away_tracking(cx);
     });
+    cx.executor().advance_clock(away::HEARTBEAT);
     cx.run_until_parked();
-    assert!(cx.debug_bounds("away-summary").is_some());
-    for _ in 0..8 {
-        cx.executor().advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-    click(cx, "away-summary");
-    cx.executor().advance_clock(Duration::from_millis(250));
-    cx.run_until_parked();
-    assert_eq!(cx.update(|_, cx| view.read(cx).away.clone()), None);
+    assert!(view.read_with(cx, |s, _| s.layout.last_seen_unix_ns().unwrap() > 1));
     assert!(cx.debug_bounds("away-summary").is_none());
+    assert!(cx.debug_bounds("notice").is_none());
 }
 
 /// 빈 작업 공간: 브랜드 타일·세션 생존 문구가 단축키 행 위에 보인다.
@@ -3907,7 +3887,7 @@ fn clipboard_image_and_external_paths_paste_into_focused_pane(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn account_switch_and_auto_switch_banner_notification(cx: &mut TestAppContext) {
+fn account_switch_updates_state_without_auto_switch_notification(cx: &mut TestAppContext) {
     use krill_proto::input::Input;
     use krill_proto::screen::Msg as _;
     use krill_proto::usage::{AccountsSnapshot, AutoSwitchEvent, AutoSwitchPolicy, ProviderKind};
@@ -3918,6 +3898,7 @@ fn account_switch_and_auto_switch_banner_notification(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         krill_app::settings::init_at(Some(state_dir.clone()), cx);
         view.update(cx, |s, cx| {
+            s.notice = Some("Existing actionable error".into());
             s.apply_accounts_snapshot(
                 AccountsSnapshot {
                     accounts: Vec::new(),
@@ -3940,9 +3921,11 @@ fn account_switch_and_auto_switch_banner_notification(cx: &mut TestAppContext) {
         });
     });
     let notice = cx.update(|_, cx| view.read(cx).notice.clone()).unwrap();
-    assert!(notice.contains("Host (.claude)"));
-    assert!(notice.contains("Backup Max"));
-    assert!(notice.contains("95%"));
+    assert_eq!(notice, "Existing actionable error");
+    assert_eq!(
+        view.read_with(cx, |s, _| s.accounts_snapshot.switched.len()),
+        1
+    );
 
     // Verify state_dir resolution when paths.socket is under `<state_dir>/run/krilld.sock`
     // and live sync of SSH hosts + connect_ssh_host from Config.
@@ -4433,7 +4416,7 @@ fn tab_close_visible_only_on_selected_and_titlebar_height(cx: &mut TestAppContex
 #[gpui::test]
 fn handoff_spawns_agent_tab_and_waits_for_ready(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("handoff"));
-    let brief = "[MK SESSION HANDOFF]\nSource session: s9\nTarget agent: codex\n".to_owned();
+    let brief = "[KRILL SESSION HANDOFF]\nSource session: s9\nTarget agent: codex\n".to_owned();
     let tabs_before = layout_of(&view, cx).tabs().len();
     view.update(cx, |this, cx| {
         this.spawn_handoff_agent("codex", brief.clone(), cx);
@@ -5997,6 +5980,30 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
     assert!(
         cx.debug_bounds("status-provider-reset-usage-confirm")
             .is_none()
+    );
+    // 미터가 아직 없더라도(초기 로드/로컬 파일 폴백) 실시간 프로브·차감을 위해 초기화 행이 활성화된다.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            let mut snap = with_credits("1");
+            snap.details.accounts.clear();
+            shell.accounts_snapshot = snap.into();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    open_menu(cx);
+    let arm_unprobed = cx
+        .debug_bounds("status-provider-reset-usage")
+        .expect("reset row must remain available before meters are fetched");
+    cx.simulate_click(arm_unprobed.center(), Modifiers::default());
+    cx.run_until_parked();
+    open_menu(cx);
+    assert!(
+        cx.debug_bounds("status-provider-reset-usage-confirm")
+            .is_some(),
+        "clicking unprobed reset row must arm confirmation"
     );
 }
 
@@ -9617,4 +9624,427 @@ fn alt_drag_block_selection_and_copy_clean_strip_tui_decorations(cx: &mut TestAp
         cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
         Some("hello\nworld")
     );
+}
+
+/// 가짜 krilld. 처음 `drop_first`개 연결은 핸드셰이크 전에 닫는다(데몬 교체·수용 한도 초과처럼). 그 뒤로는
+/// List·Create·Attach에 답하고, `lose_first_create`면 첫 Create는 세션을 만든 뒤 답 없이 끊는다.
+/// 화면 연결은 `Attached` 조금 뒤 닫아 칸이 아는 세션으로 다시 붙게 한다. 받은 제어 요청을 돌려준다.
+fn transient_daemon(
+    socket: &std::path::Path,
+    drop_first: usize,
+    lose_first_create: bool,
+) -> Arc<std::sync::Mutex<Vec<krill_proto::control::Request>>> {
+    use krill_proto::control::{Info, Reply, Request};
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        let created = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        for (n, conn) in listener.incoming().enumerate() {
+            let Ok(mut s) = conn else { return };
+            if n < drop_first {
+                continue;
+            }
+            let (seen, created) = (Arc::clone(&seen), Arc::clone(&created));
+            std::thread::spawn(move || {
+                let hello = krill_proto::ipc::ServerHello {
+                    proto_min: krill_proto::ipc::PROTO_MIN,
+                    proto_max: krill_proto::ipc::PROTO_MAX,
+                    features: krill_proto::control::FEAT_CONTROL | krill_proto::screen::FEAT_SCREEN,
+                    build: "test".into(),
+                    instance_id: 1,
+                };
+                if s.write_all(&hello.encode().unwrap()).is_err() {
+                    return;
+                }
+                let Ok(Some(_)) = krill_proto::ipc::read_frame(&mut s) else {
+                    return;
+                };
+                while let Ok(Some((k, b))) = krill_proto::ipc::read_frame(&mut s) {
+                    if k == krill_proto::screen::kind::ATTACH {
+                        let attached = krill_proto::screen::Attached {
+                            seq: krill_proto::screen::Seq(0),
+                            revision: krill_proto::screen::Revision(0),
+                        };
+                        s.write_all(&attached.encode().unwrap()).ok();
+                        // 칸이 붙기를 마칠 때까지 열어 둔다(macOS는 닫힌 피어의 setsockopt를 EINVAL로 거부한다).
+                        std::thread::sleep(Duration::from_millis(100));
+                        return;
+                    }
+                    let Ok(request) = Request::decode(k, &b) else {
+                        return;
+                    };
+                    seen.lock().unwrap().push(request.clone());
+                    let reply = match request {
+                        Request::List => Reply::Sessions(
+                            created
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .map(|&id| Info {
+                                    session: SessionId(id),
+                                    pid: 1,
+                                    status: None,
+                                })
+                                .collect(),
+                        ),
+                        Request::Create(_) => {
+                            let mut created = created.lock().unwrap();
+                            let id = 41 + u64::try_from(created.len()).unwrap();
+                            created.push(id);
+                            if lose_first_create && id == 41 {
+                                return;
+                            }
+                            Reply::Created {
+                                session: SessionId(id),
+                                pid: 1,
+                            }
+                        }
+                        _ => Reply::Failed(krill_proto::control::Failure::BadRequest),
+                    };
+                    if s.write_all(&reply.encode().unwrap()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    requests
+}
+
+fn creates(requests: &std::sync::Mutex<Vec<krill_proto::control::Request>>) -> usize {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                krill_proto::control::Request::Create(_)
+                    | krill_proto::control::Request::Resume { .. }
+            )
+        })
+        .count()
+}
+
+/// 보이는 칸을 가짜 데몬에 붙이고, 칸 재시도 타이머(최대 500ms)를 `rounds`번 흘린다.
+fn run_pane_against(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    dir: &std::path::Path,
+    rounds: usize,
+) {
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.paths = Some(Paths {
+                socket: dir.join("k.sock"),
+                holder: dir.join("missing-holder"),
+                krilld: dir.join("missing-krilld"),
+            });
+            s.sync(cx);
+        });
+    });
+    for _ in 0..rounds {
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(500));
+    }
+    cx.run_until_parked();
+}
+
+/// Actorjin(Windows): 업데이트 직후 데몬이 연결을 핸드셰이크 전에 닫아("unexpected end of file") 빈 터미널이 됐다.
+/// 요청을 보내기 전의 끊김은 저절로 다시 붙어 세션을 하나만 만든다.
+#[gpui::test]
+fn pane_recovers_after_transient_daemon_eof_with_one_session(cx: &mut TestAppContext) {
+    let layout = state_path("transient-eof");
+    let dir = layout.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let requests = transient_daemon(&dir.join("k.sock"), 3, false);
+    let (view, cx) = open(cx, layout);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    run_pane_against(&view, cx, &dir, 8);
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(creates(&requests), 1);
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert!(s.outcome_unknown.is_empty());
+        assert_eq!(s.live.get(&pane).and_then(|l| l.error.clone()), None);
+    });
+}
+
+/// Actorjin(Windows): Create를 보낸 뒤 답을 잃으면 데몬이 세션을 만들었을 수 있다. 같은 Create를 저절로 다시
+/// 보내지 않고(PTY 중복), 다시 보내는 버튼도 없이 사이드바에서 기존 세션을 확인하라는 문구를 보인다.
+#[gpui::test]
+fn lost_create_reply_is_not_replayed(cx: &mut TestAppContext) {
+    let layout = state_path("lost-create");
+    let dir = layout.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let requests = transient_daemon(&dir.join("k.sock"), 0, true);
+    let (view, cx) = open(cx, layout);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    run_pane_against(&view, cx, &dir, 8);
+    let unconfirmed = Some(text::START_UNCONFIRMED.get());
+    let error = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).live.get(&pane).and_then(|l| l.error.clone()))
+    };
+    assert_eq!(creates(&requests), 1, "lost Create must not be replayed");
+    assert_eq!(layout_of(&view, cx).session(pane), None);
+    assert_eq!(error(cx).as_deref(), unconfirmed);
+    cx.update(|_, cx| assert!(view.read(cx).outcome_unknown.contains_key(&pane)));
+    let restart: &'static str = format!("restart-{}", pane.get()).leak();
+    assert!(cx.debug_bounds(restart).is_none(), "no one-click replay");
+
+    // 칸이 숨었다 다시 보여 IO 태스크를 새로 띄워도 만들지 않고 같은 안내를 보인다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.live.remove(&pane);
+            s.sync(cx);
+        });
+    });
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    assert_eq!(creates(&requests), 1);
+    assert_eq!(error(cx).as_deref(), unconfirmed);
+}
+
+/// 재개 응답을 잃은 옛 화면은 재렌더·조회 후에도 안내를 유지하고, 중복 재개 버튼을 노출하지 않는다.
+#[gpui::test]
+fn uncertain_cold_session_keeps_guidance_on_read_only_refresh(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("uncertain-cold-refresh"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, SessionId(42), ours, cx);
+            s.outcome_unknown
+                .insert(pane, text::START_UNCONFIRMED.get().into());
+            s.cold(
+                pane,
+                SessionId(42),
+                krill_proto::control::Cold {
+                    screen: Vec::new(),
+                    history: Vec::new(),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).live[&pane].error.as_deref(),
+            Some(text::START_UNCONFIRMED.get())
+        );
+    });
+    let restart: &'static str = format!("restart-{}", pane.get()).leak();
+    assert!(cx.debug_bounds(restart).is_none());
+}
+
+#[gpui::test]
+fn jump_remote_search_routes_colliding_ids_and_refreshes_connected_snapshots(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_proto::control::AgentStatus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Memory {
+        snapshot: sidebar::Snapshot,
+        reads: Arc<AtomicUsize>,
+    }
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.snapshot.clone())
+        }
+    }
+    let snapshot = |title: &str| sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(7),
+            status: AgentStatus {
+                title: Some(title.into()),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: Some("/srv/repo/wt".into()),
+            cwd: Some("/srv/repo/wt/subdir".into()),
+            account: None,
+        }],
+        trees: [(
+            "/srv/repo".into(),
+            vec!["/srv/repo/wt".into(), "/srv/repo/empty".into()],
+        )]
+        .into(),
+    };
+    let (view, cx) = open(cx, state_path("jump-host-collision"));
+    let reads = Arc::new(AtomicUsize::new(0));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar.update(cx, |sb, cx| {
+                sb.connect_source(
+                    Arc::new(Memory {
+                        snapshot: snapshot("Local task"),
+                        reads: reads.clone(),
+                    }),
+                    cx,
+                );
+                for id in ["studio", "laptop"] {
+                    sb.set_remote_snapshot_for_test(
+                        id,
+                        HostStatus::Connected,
+                        snapshot("Remote task"),
+                        cx,
+                    );
+                }
+            });
+            let pane = s.layout.focused().unwrap();
+            s.layout.set_session(pane, SessionId(7));
+        });
+    });
+    cx.run_until_parked();
+    let reads_before = reads.load(Ordering::Relaxed);
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    cx.simulate_input("studio");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let p = s.jump.as_ref().unwrap().0.read(cx);
+        let items = p.matches().collect::<Vec<_>>();
+        assert!(!items.is_empty());
+        assert_eq!(items[0].host, HostId::Remote("studio".into()));
+        assert!(
+            !items[0].is_current_tab,
+            "local id collision does not mark remote current"
+        );
+    });
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        reads_before,
+        "typing uses cached snapshots"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let studio_pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(
+        layout_of(&view, cx).host(studio_pane),
+        &HostId::Remote("studio".into())
+    );
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+
+    // 다른 호스트의 같은 ID는 새 탭으로, 같은 호스트를 다시 고르면 기존 탭으로 간다.
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let p = s.jump.as_ref().unwrap().0.read(cx);
+        let current = p.matches().filter(|i| i.is_current_tab).collect::<Vec<_>>();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].host, HostId::Remote("studio".into()));
+    });
+    cx.simulate_input("laptop");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let laptop_pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(
+        layout_of(&view, cx).host(laptop_pane),
+        &HostId::Remote("laptop".into())
+    );
+    assert_eq!(layout_of(&view, cx).tabs().len(), 3);
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    cx.simulate_input("studio");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(layout_of(&view, cx).active_tab().focused, studio_pane);
+    assert_eq!(layout_of(&view, cx).tabs().len(), 3);
+
+    // 열린 상태에서 받은 스냅샷을 검색하고, 연결이 해제되면 결과에서 뺀다.
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |sb, cx| {
+            sb.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Connected,
+                snapshot("zzfreshzz needle"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_input("zzfreshzz");
+    cx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx)
+                .jump
+                .as_ref()
+                .unwrap()
+                .0
+                .read(cx)
+                .matches()
+                .count(),
+            1
+        );
+    });
+    cx.update(|_, cx| {
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |sb, cx| {
+            sb.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Disconnected,
+                snapshot("zzfreshzz needle"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx)
+                .jump
+                .as_ref()
+                .unwrap()
+                .0
+                .read(cx)
+                .matches()
+                .count(),
+            0
+        );
+    });
+}
+
+#[gpui::test]
+fn jump_sessionless_remote_worktree_uses_its_host(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus};
+    let (view, cx) = open(cx, state_path("jump-remote-worktree"));
+    let remote = HostId::Remote("studio".into());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "studio",
+                    HostStatus::Connected,
+                    sidebar::Snapshot {
+                        sessions: Vec::new(),
+                        trees: [("/srv/repo".into(), vec!["/srv/repo/empty".into()])].into(),
+                    },
+                    cx,
+                );
+            });
+            let entry = s
+                .sidebar
+                .read(cx)
+                .jump_worktrees()
+                .into_iter()
+                .find(|t| t.host == remote)
+                .unwrap();
+            s.open_palette_worktree(&entry, cx);
+            let pane = s.layout.focused().unwrap();
+            assert_eq!(s.layout.host(pane), &remote);
+            assert_eq!(s.launch_for(pane).cwd, b"/srv/repo/empty");
+        });
+    });
 }

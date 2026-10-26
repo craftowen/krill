@@ -1759,3 +1759,130 @@ fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_ca
         vec![row("hist-1"), row("hist-2"), row("live-a")]
     );
 }
+
+/// 가짜 krilld. 붙기마다 감시 연결(핸드셰이크 뒤 클라이언트가 닫음)과 제어 연결 한 쌍을 받고, 제어 연결은
+/// `handlers`를 차례로 쓴다. 처리기는 받은 요청을 `seen`에 적는다.
+type Handler = Box<dyn FnOnce(&mut UnixStream, &mut Vec<Request>) + Send>;
+
+fn control_fixture(
+    name: &str,
+    features: u64,
+    handlers: Vec<Handler>,
+) -> (Paths, thread::JoinHandle<Vec<Request>>) {
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("mk-pane-{name}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = Paths {
+        socket: dir.join("k.sock"),
+        holder: dir.join("holder"),
+        krilld: dir.join("daemon"),
+    };
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let server = thread::spawn(move || {
+        let hello = ipc::ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        let mut seen = Vec::new();
+        for handle in handlers {
+            let (mut watch, _) = listener.accept().unwrap();
+            watch.write_all(&hello.encode().unwrap()).unwrap();
+            ipc::read_frame(&mut watch).unwrap().unwrap();
+            drop(watch);
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(&hello.encode().unwrap()).unwrap();
+            ipc::read_frame(&mut s).unwrap().unwrap();
+            handle(&mut s, &mut seen);
+        }
+        seen
+    });
+    (paths, server)
+}
+
+fn next_request(s: &mut UnixStream, seen: &mut Vec<Request>) -> Option<Request> {
+    let (k, b) = ipc::read_frame(s).unwrap()?;
+    let request = Request::decode(k, &b).unwrap();
+    seen.push(request.clone());
+    Some(request)
+}
+
+fn login(cwd: &[u8]) -> Create {
+    Create {
+        account: None,
+        program: Program::Login,
+        cwd: cwd.to_vec(),
+        cols: 80,
+        rows: 24,
+    }
+}
+
+/// Actorjin(Windows): Create·Resume 프레임을 보낸 뒤 연결이 끊기면(데몬 교체 등) krilld가 세션을 만들었는지 알 수
+/// 없다. 그 실패만 [`is_unknown_outcome`]이고, 요청을 보내기 전 조회 실패는 다시 시도해도 되는 일반 오류다.
+#[test]
+fn only_failures_after_a_session_request_have_unknown_outcome() {
+    let (paths, server) = control_fixture(
+        "unknown-outcome",
+        FEAT_CONTROL | FEAT_RESUME,
+        vec![
+            // 1. 새 세션: Create를 받고 답 없이 끊는다.
+            Box::new(|s, seen| {
+                assert!(matches!(next_request(s, seen), Some(Request::Create(_))));
+            }),
+            // 2. 아는 세션 조회: List를 받고 답 없이 끊는다(아직 아무것도 바꾸지 않았다).
+            Box::new(|s, seen| {
+                assert_eq!(next_request(s, seen), Some(Request::List));
+            }),
+            // 3. 다시 시작(Resume): 받고 답 없이 끊는다.
+            Box::new(|s, seen| {
+                assert!(matches!(
+                    next_request(s, seen),
+                    Some(Request::Resume { .. })
+                ));
+            }),
+            // 4. 결과를 모르는 칸의 조회는 목록만 묻고 만들지 않는다.
+            Box::new(|s, seen| {
+                assert_eq!(next_request(s, seen), Some(Request::List));
+                s.write_all(&Reply::Sessions(Vec::new()).encode().unwrap())
+                    .unwrap();
+                assert_eq!(next_request(s, seen), None, "lookup must not mutate");
+            }),
+        ],
+    );
+    let create = login(b"/w");
+    let lost = ensure_session_in(&paths, None, &create).unwrap_err();
+    assert!(is_unknown_outcome(&lost), "{lost:?}");
+    assert_eq!(lost.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(lost.to_string(), "unexpected end of file");
+
+    let before = ensure_session_in(&paths, Some(SessionId(7)), &create).unwrap_err();
+    assert!(!is_unknown_outcome(&before), "{before:?}");
+    assert_eq!(before.kind(), io::ErrorKind::UnexpectedEof);
+
+    let resume = resume_session_in(&paths, Some(SessionId(7)), &create).unwrap_err();
+    assert!(is_unknown_outcome(&resume), "{resume:?}");
+
+    assert!(find_session_in(&paths, SessionId(7)).unwrap().is_none());
+    let seen = server.join().unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|r| matches!(r, Request::Create(_) | Request::Resume { .. }))
+            .count(),
+        2
+    );
+}
+
+/// 쓰다 끊긴 생성 요청도 krilld가 프레임을 다 받았는지 알 수 없다. 조회 요청의 같은 실패는 다시 시도해도 된다.
+#[test]
+fn write_failure_of_a_session_request_has_unknown_outcome() {
+    let (mut ours, theirs) = UnixStream::pair().unwrap();
+    drop(theirs);
+    let create = call(&mut ours, &Request::Create(login(b"/w"))).unwrap_err();
+    assert!(is_unknown_outcome(&create), "{create:?}");
+    let list = call(&mut ours, &Request::List).unwrap_err();
+    assert!(!is_unknown_outcome(&list), "{list:?}");
+    assert_eq!(create.kind(), list.kind());
+}

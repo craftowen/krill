@@ -4917,6 +4917,104 @@ impl SettingsView {
         .detach();
     }
 
+    fn reset_credit_count(&self, account_id: &str) -> Option<u64> {
+        self.accounts_snapshot
+            .meters_for(account_id)?
+            .meters
+            .iter()
+            .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
+            .value
+            .as_deref()?
+            .parse::<u64>()
+            .ok()
+    }
+
+    fn consume_reset_credit(
+        &mut self,
+        provider: krill_proto::usage::ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::i18n::catalog::status as status_text;
+        use krill_proto::usage::{ResetConsumeOutcome, UsageRequest};
+        if self.account_rule_pending || self.daemon_required(cx) {
+            return;
+        }
+        let host = self.account_host.clone();
+        let target = if host.is_remote() {
+            let Some(target) = self.selected_account_target() else {
+                self.account_error = Some("remote host disconnected".into());
+                cx.notify();
+                return;
+            };
+            target
+        } else {
+            let Ok(paths) = krill_proto::daemon::Paths::dev() else {
+                self.account_error = Some(text::ACCOUNTS_DAEMON_REQUIRED.get().into());
+                cx.notify();
+                return;
+            };
+            crate::hosts::HostTarget::local(paths)
+        };
+        let req = UsageRequest::ConsumeResetCredit {
+            provider,
+            account_id,
+        };
+        self.account_rule_pending = true;
+        self.account_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let consumed = crate::accounts::consume_reset_credit_target(&target, &req)?;
+                    drop(crate::accounts::request_target(
+                        &target,
+                        &UsageRequest::RefreshUsage,
+                    ));
+                    Ok::<_, String>(consumed)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.account_rule_pending = false;
+                match result {
+                    Ok(consumed) => {
+                        if host.is_local() {
+                            this.local_accounts_snapshot = consumed.snapshot.clone();
+                        } else {
+                            this.remote_accounts_snapshots
+                                .insert(host.clone(), consumed.snapshot.clone());
+                        }
+                        if this.account_host == host {
+                            this.accounts_snapshot = consumed.snapshot;
+                        }
+                        match consumed.outcome {
+                            ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed => {
+                                this.account_error = None;
+                                cx.defer(notify_external_change);
+                            }
+                            ResetConsumeOutcome::NoCredit => {
+                                this.account_error =
+                                    Some(status_text::PROVIDER_RESET_USAGE_NO_CREDIT.get().into());
+                            }
+                            ResetConsumeOutcome::NothingToReset => {
+                                this.account_error =
+                                    Some(status_text::PROVIDER_RESET_USAGE_NOTHING.get().into());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        this.account_error = Some(err.into());
+                    }
+                }
+                this.refresh_accounts_async(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn import_ssh_hosts(&mut self, cx: &mut Context<Self>) {
         let dir = state_dir(cx);
         self.file_job(
@@ -8026,6 +8124,10 @@ impl SettingsView {
         let can_browser_login = can_login
             && !self.account_host.is_remote()
             && matches!(provider, ProviderKind::Claude | ProviderKind::Codex);
+        let can_reset_usage = !orca
+            && !needs_login
+            && matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+            && self.reset_credit_count(&acc.id) != Some(0);
         let manageable = !acc.host_default && !orca;
         // Orca 감지 계정은 실행·이름 변경은 못 해도 Krill 목록에서 지울 수는 있다.
         let removable = !acc.host_default;
@@ -8367,7 +8469,24 @@ impl SettingsView {
                 })),
             );
         }
-        if can_login || removable {
+        if !logging_in && can_reset_usage {
+            let reset_id: SharedString = format!("admin-reset-usage-{}", acc.id).into();
+            let reset_acc_id = acc.id.clone();
+            let reset_disabled =
+                self.account_rule_pending || self.login_pending.is_some() || self.accounts_offline;
+            actions = actions.child(
+                self.confirm_button(
+                    reset_id,
+                    crate::i18n::catalog::status::PROVIDER_RESET_USAGE.get(),
+                    cx,
+                    move |this, cx| {
+                        this.consume_reset_credit(provider, reset_acc_id.clone(), cx);
+                    },
+                )
+                .disabled(reset_disabled),
+            );
+        }
+        if can_login || can_reset_usage || removable {
             let menu_id = format!("admin-account-menu-{}", acc.id);
             let view = cx.entity().downgrade();
             let menu_acc = acc.clone();
@@ -8382,6 +8501,33 @@ impl SettingsView {
                     .accessibility_label(text::ACCOUNT_MORE.get())
                     .debug_selector(move || menu_id.clone())
                     .dropdown_menu(move |mut menu, _, _| {
+                        if can_reset_usage {
+                            let (view, acc) = (view.clone(), menu_acc.clone());
+                            menu = menu.item(
+                                PopupMenuItem::new(
+                                    crate::i18n::catalog::status::PROVIDER_RESET_USAGE.get(),
+                                )
+                                .disabled(busy)
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        let reset_id: SharedString =
+                                            format!("admin-reset-usage-{}", acc.id).into();
+                                        if this.armed.as_ref() == Some(&reset_id) {
+                                            this.disarm(cx);
+                                            this.consume_reset_credit(
+                                                acc.provider,
+                                                acc.id.clone(),
+                                                cx,
+                                            );
+                                        } else {
+                                            this.armed = Some(reset_id);
+                                            cx.notify();
+                                        }
+                                    })
+                                    .ok();
+                                }),
+                            );
+                        }
                         if can_login {
                             let (view, acc) = (view.clone(), menu_acc.clone());
                             menu = menu.item(
@@ -12776,7 +12922,7 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_component::{Icon, IconName, Sizable as _};
         if self.mobile_page {
-            return self.render_mobile_page(cx).into_any_element();
+            return self.render_mobile_page(window, cx).into_any_element();
         }
         let has_modal =
             self.removing.is_some() || self.schedule_modal.is_some() || self.space.cleanup_open;

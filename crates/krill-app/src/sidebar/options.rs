@@ -424,7 +424,7 @@ impl PrGroup {
                 crate::pull_request::Status::Draft
                 | crate::pull_request::Status::NoPr
                 | crate::pull_request::Status::Missing
-                | crate::pull_request::Status::Failed,
+                | crate::pull_request::Status::Failed(_),
             ) => Self::DraftOrNoPr,
             None => {
                 if has_checkpoint_pr {
@@ -1134,6 +1134,9 @@ pub(super) fn rows_with_options<'a>(
             out.extend(sessions);
         }
     }
+    if options.group_by == GroupBy::Repo {
+        super::order_project_rows(&mut out, ctx.project_order.unwrap_or_default());
+    }
     let loose: Vec<_> = snapshot
         .sessions
         .iter()
@@ -1211,6 +1214,38 @@ impl LocalRowsCache {
 }
 
 impl Sidebar {
+    /// Use the same status and checkpoint fallbacks as the rendered host rows.
+    pub(super) fn group_for_path(&self, host: &HostId, path: &Path) -> Option<GroupKey> {
+        match self.options.group_by {
+            GroupBy::WorkspaceStatus => {
+                let status = if host.is_local() {
+                    let mut derived = self.local_rows_cache.borrow_mut();
+                    derived.refresh(self);
+                    derived.statuses.get(path).copied()
+                } else {
+                    self.worktree_statuses.get(path).copied()
+                };
+                Some(GroupKey::WorkspaceStatus(
+                    status.unwrap_or(WorkspaceStatus::Todo),
+                ))
+            }
+            GroupBy::PrStatus => {
+                let checkpoint = if host.is_local() {
+                    let mut derived = self.local_rows_cache.borrow_mut();
+                    derived.refresh(self);
+                    derived.checkpoint_prs.contains(path)
+                } else {
+                    false
+                };
+                Some(GroupKey::PrStatus(PrGroup::from_status(
+                    self.prs.get(path),
+                    checkpoint,
+                )))
+            }
+            GroupBy::Repo | GroupBy::None => None,
+        }
+    }
+
     pub(super) fn local_rows(&self) -> Vec<Row> {
         let mut derived = self.local_rows_cache.borrow_mut();
         derived.refresh(self);

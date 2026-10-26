@@ -115,7 +115,10 @@ impl Dialog {
         if hosts.is_empty() {
             hosts.push((
                 HostId::Local,
-                crate::i18n::catalog::shell::HOST_LOCAL.get().to_owned(),
+                crate::i18n::catalog::shell::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned(),
             ));
         }
         let host = if hosts.iter().any(|(id, _)| id == &initial) {

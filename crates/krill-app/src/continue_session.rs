@@ -68,7 +68,7 @@ pub fn format_handoff_brief(
         context.trim_end()
     };
     format!(
-        "[MK SESSION HANDOFF]\nSource session: s{}\nTarget agent: {target_agent}\nInstructions: {instruction}\n--- Recent terminal context ---\n{body}\n--- End context ---\n",
+        "[KRILL SESSION HANDOFF]\nSource session: s{}\nTarget agent: {target_agent}\nInstructions: {instruction}\n--- Recent terminal context ---\n{body}\n--- End context ---\n",
         source.0
     )
 }

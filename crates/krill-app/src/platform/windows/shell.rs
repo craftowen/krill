@@ -355,3 +355,199 @@ pub mod menu_bar {
         }
     }
 }
+
+/// 상태 폴더별 단일 실행. X로 닫아도 트레이에 남는 앱이 있으면, 같은 상태 폴더의 두 번째 실행은
+/// 그 앱에 창 열기를 넘기고 끝난다. 다른 `KRILL_STATE_DIR`(테스트·격리 실행)은 서로 막지 않는다.
+/// 트레이 아이콘 생성과 무관한 숨은 창을 쓰므로 트레이를 못 만든 경우에도 같은 경로로 열린다.
+pub mod instance {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW,
+        GetWindowThreadProcessId, PostMessageW, RegisterClassW, WM_APP, WNDCLASSW,
+    };
+
+    use super::{ptr, wide};
+
+    const CLASS: &str = "KrillInstance";
+    const OPEN: u32 = WM_APP + 18;
+    /// 기존 앱이 아직 창을 만들기 전일 수 있어 잠시 다시 찾는다.
+    const FIND_TRIES: u32 = 50;
+    const FIND_GAP: Duration = Duration::from_millis(100);
+
+    thread_local! {
+        static OPENS: RefCell<Option<UnboundedSender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// 이 프로세스가 가진 실행 표지. 프로세스가 끝날 때까지 살려 둔다.
+    #[derive(Debug)]
+    pub struct Instance {
+        mutex: HANDLE,
+        hwnd: HWND,
+        opens: Option<UnboundedReceiver<()>>,
+    }
+
+    impl Instance {
+        /// 다른 실행이 보낸 열기 요청. 한 번만 꺼낸다.
+        pub fn take_opens(&mut self) -> Option<UnboundedReceiver<()>> {
+            self.opens.take()
+        }
+    }
+
+    impl Drop for Instance {
+        fn drop(&mut self) {
+            if !self.hwnd.is_null() {
+                // SAFETY: this hidden HWND was created by `claim` on this same UI thread.
+                unsafe { DestroyWindow(self.hwnd) };
+            }
+            if !self.mutex.is_null() {
+                // SAFETY: closes exactly the handle CreateMutexW returned to `claim`.
+                unsafe { CloseHandle(self.mutex) };
+            }
+        }
+    }
+
+    /// UI 스레드(main)에서 gpui 시작 전에 부른다. `key`가 같은 앱이 이미 있고 `forward`면 그 앱에
+    /// 열기를 넘기고 `None`(호출자는 종료)이다. 넘기지 못하면(응답 없는 앱) 그냥 실행한다.
+    pub fn claim(key: &str, forward: bool) -> Option<Instance> {
+        let name = wide(&format!("Local\\{key}"));
+        // SAFETY: null security attributes; `name` is a live NUL-terminated buffer.
+        let mutex = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        // SAFETY: reads this thread's last error immediately after CreateMutexW.
+        let existed = !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if existed && forward {
+            if forward_open(key) {
+                // SAFETY: closes the handle CreateMutexW just returned.
+                unsafe { CloseHandle(mutex) };
+                return None;
+            }
+            tracing::warn!("running Krill did not accept open; starting another instance");
+        }
+        let (tx, rx) = unbounded_channel();
+        // 표지만 열린 두 번째 실행은 듣지 않는다: 열기는 기존 앱 하나만 받는다.
+        let hwnd = if existed {
+            ptr::null_mut()
+        } else {
+            OPENS.with_borrow_mut(|opens| *opens = Some(tx));
+            let hwnd = listen(key);
+            if hwnd.is_null() {
+                // 표지는 가졌지만 받을 창이 없다: 다음 실행은 5초 찾다가 따로 뜬다(중복 가능).
+                tracing::warn!("instance window unavailable; relaunch cannot reopen this app");
+            }
+            hwnd
+        };
+        Some(Instance {
+            mutex,
+            hwnd,
+            opens: Some(rx),
+        })
+    }
+
+    fn listen(key: &str) -> HWND {
+        let class = wide(CLASS);
+        let title = wide(key);
+        // SAFETY: obtains a borrowed process-lifetime module handle.
+        let module = unsafe { GetModuleHandleW(ptr::null()) };
+        let info = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: module,
+            lpszClassName: class.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: `info` and its class name live through registration; the callback is
+        // static and panic-contained.
+        unsafe { RegisterClassW(&raw const info) };
+        // SAFETY: registered class and live buffers; the hidden top-level HWND is owned by
+        // `Instance` and destroyed on this thread. Top-level (not message-only) so FindWindowW sees it.
+        unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                module,
+                ptr::null(),
+            )
+        }
+    }
+
+    fn forward_open(key: &str) -> bool {
+        let class = wide(CLASS);
+        let title = wide(key);
+        for _ in 0..FIND_TRIES {
+            // SAFETY: both arguments are live NUL-terminated buffers.
+            let hwnd = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+            if !hwnd.is_null() {
+                let mut pid = 0;
+                // SAFETY: `pid` is a writable u32; a stale hwnd only returns 0.
+                unsafe { GetWindowThreadProcessId(hwnd, &raw mut pid) };
+                // 사용자가 방금 실행한 이 프로세스가 앞으로 가져오기 권한을 기존 앱에 넘긴다.
+                // SAFETY: takes a plain process id, no pointers.
+                unsafe { AllowSetForegroundWindow(pid) };
+                // SAFETY: no pointers in the message; a stale hwnd makes the post fail.
+                if unsafe { PostMessageW(hwnd, OPEN, 0, 0) } != 0 {
+                    return true;
+                }
+            }
+            std::thread::sleep(FIND_GAP);
+        }
+        false
+    }
+
+    unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        // Never unwind through a Win32 callback, including RefCell borrow failures.
+        std::panic::catch_unwind(|| {
+            if msg == OPEN {
+                OPENS.with_borrow(|opens| {
+                    if let Some(opens) = opens {
+                        opens.send(()).ok();
+                    }
+                });
+                return 0;
+            }
+            // SAFETY: forwards untouched callback arguments to Windows' default procedure.
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        })
+        .unwrap_or(0)
+    }
+
+    /// 실제 창 열기 수신(gpui 메시지 루프)은 Windows 실기·CI에서만 확인한다. 여기서는 표지 획득·해제와
+    /// 같은 키 두 번째 실행의 전달, 다른 상태 폴더 키의 독립만 본다.
+    #[cfg(test)]
+    mod tests {
+        use super::claim;
+
+        #[test]
+        fn second_launch_forwards_only_for_the_same_state_dir_and_owner_release_frees_it() {
+            let key = format!("Krill-App-test-{}", std::process::id());
+            let owner = claim(&key, true).expect("first launch owns the key");
+            assert!(!owner.hwnd.is_null(), "owner listens for reopen");
+            // 같은 상태 폴더: 기존 앱에 열기를 넘기고 끝난다.
+            assert!(claim(&key, true).is_none());
+            // 업데이트 health 확인 실행은 넘기지 않고 듣지도 않는다.
+            let update = claim(&key, false).expect("update launch is never forwarded");
+            assert!(update.hwnd.is_null());
+            drop(update);
+            // 다른 상태 폴더는 막지 않는다.
+            let other = claim(&format!("{key}-other"), true).expect("other state dir");
+            drop(other);
+            drop(owner);
+            // 기존 앱이 끝나면(업데이트 교체 포함) 다음 실행이 다시 주인이 된다.
+            let next = claim(&key, true).expect("released key is claimable");
+            assert!(!next.hwnd.is_null());
+        }
+    }
+}

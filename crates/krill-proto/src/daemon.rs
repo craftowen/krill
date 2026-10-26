@@ -11,6 +11,7 @@
 //! 단일 인스턴스는 krilld의 소켓 락(MK-022)과 holder가 쥔 listen 소켓(OWE-491)이 보장한다. holder가 살아 있으면
 //! krilld가 재기동 중이어도 소켓이 연결을 받아 두므로(`ConnectionRefused`가 아님) holder를 새로 띄우지 않는다.
 //! 여기서는 앱과 `krill`가 동시에 기동하다 holder를 둘 띄우지 않도록 `<소켓>.launch` flock 아래에서 다시 확인하고 띄운다.
+//! 다시 확인할 때도 Hello 전에 닫히면(업그레이드·재기동 전환) 띄우지 않고 핸드셰이크만 다시 해 다음 krilld를 기다린다.
 //!
 //! # 업그레이드 (MK-062)
 //!
@@ -702,6 +703,11 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         Ok(Some(c)) => return Ok(c),
         Ok(None) => {}
         Err(e) if is_absent(&e) => {}
+        Err(e) if is_transition(&e) => {
+            if let Some(c) = await_successor(&paths.socket, hello, e)? {
+                return Ok(c);
+            }
+        }
         Err(e) => return Err(Error::Io(e)),
     }
     let mut command = Command::new(&paths.holder);
@@ -759,12 +765,38 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
     }
 }
 
-/// 다른 기동자가 재결합 중 구 krilld를 닫은 경우. 이것만으로 띄우지 않고 기동 락 아래 다시 확인한다.
+/// 소켓은 살아 있는데 Hello 전에 닫혔다(업그레이드로 끝나는 구 krilld, 재결합 중 닫힌 구 krilld, 막 뜬 뒤 죽은
+/// krilld). 이것만으로 띄우지 않고 기동 락 아래 다시 확인한다.
 fn is_transition(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
     )
+}
+
+/// 기동 락 아래에서도 전환 중이면 holder를 띄우지 않고 다음 krilld를 [`LAUNCH_TIMEOUT`]까지 기다린다.
+/// 다시 보내는 것은 핸드셰이크뿐이라 요청이 두 번 가지 않는다. 붙으면 연결, 소켓이 사라졌거나 고아면 `None`
+/// (호출자가 holder를 띄운다). 기한까지 계속 닫히면 마지막 오류.
+fn await_successor(
+    socket: &Path,
+    hello: &ClientHello,
+    mut last: io::Error,
+) -> Result<Option<Connection>, Error> {
+    let deadline = Instant::now()
+        .checked_add(LAUNCH_TIMEOUT)
+        .ok_or(Error::Timeout)?;
+    let mut attempt = 0u32;
+    while Instant::now() < deadline {
+        thread::sleep(retry_delay(attempt));
+        attempt = attempt.saturating_add(1);
+        match ready_handshake(socket, hello) {
+            Ok(c) => return Ok(c),
+            Err(e) if is_absent(&e) => return Ok(None),
+            Err(e) if is_transition(&e) => last = e,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Err(Error::Io(last))
 }
 
 /// 초기 상태는 전용 감시 연결에서 읽는다. 일반 제어·화면 연결에는 새 프레임을 섞지 않는다.

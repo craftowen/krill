@@ -854,8 +854,11 @@ fn has_provider_pill(
     }) && (remote || krill_app::accounts::installed::is_installed(cx, provider))
 }
 
-/// Codex banked reset 크레딧 수. 미터가 없으면 `None`(행 자체를 그리지 않는다).
-fn reset_credit_count(snap: &AccountsSnapshot, account: &AccountInfo) -> Option<u64> {
+/// Codex banked reset 및 Claude 주간 세션·프로모션 리셋 크레딧 수. 미터가 아직 없으면 `None`.
+pub(in crate::shell) fn reset_credit_count(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+) -> Option<u64> {
     snap.meters_for(&account.id)?
         .meters
         .iter()
@@ -866,8 +869,9 @@ fn reset_credit_count(snap: &AccountsSnapshot, account: &AccountInfo) -> Option<
         .ok()
 }
 
-/// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex 전용 2단계 확인).
+/// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex·Claude 2단계 확인).
 /// 1단계 행을 누르면 무장하고 메뉴가 닫히고, 다시 열면 안내·실행·취소 행이 보인다.
+/// 미터가 아직 조회되지 않았더라도(`None`) 소진 시점에 실시간 프로브·차감할 수 있게 활성화한다.
 fn append_reset_credit_rows(
     mut menu: PopupMenu,
     snap: &AccountsSnapshot,
@@ -880,12 +884,10 @@ fn append_reset_credit_rows(
     if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return menu;
     }
-    let Some(account) = active else {
+    let Some(account) = active.filter(|a| !krill_app::accounts::orca_managed(a)) else {
         return menu;
     };
-    let Some(credits) = reset_credit_count(snap, account) else {
-        return menu;
-    };
+    let credits = reset_credit_count(snap, account);
     let account_id = account.id.clone();
     let armed = reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
     if armed {
@@ -949,29 +951,7 @@ fn append_reset_credit_rows(
                     .ok();
             }),
         );
-    } else if credits > 0 {
-        let arm_weak = weak.clone();
-        menu = menu.item(
-            PopupMenuItem::element(move |_, cx| {
-                let p = ui::palette(cx);
-                div()
-                    .id("status-provider-reset-usage")
-                    .debug_selector(|| "status-provider-reset-usage".into())
-                    .w(px(264.))
-                    .py_0p5()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.foreground)
-                    .child(provider_text::PROVIDER_RESET_USAGE.get())
-            })
-            .on_click(move |_, _, cx| {
-                arm_weak
-                    .update(cx, |shell, _| {
-                        shell.reset_armed = Some((provider, account_id.clone()));
-                    })
-                    .ok();
-            }),
-        );
-    } else {
+    } else if credits == Some(0) {
         menu = menu.item(
             PopupMenuItem::element(|_, cx| {
                 let p = ui::palette(cx);
@@ -985,6 +965,39 @@ fn append_reset_credit_rows(
                     .child(provider_text::PROVIDER_RESET_USAGE_NONE.get())
             })
             .disabled(true),
+        );
+    } else {
+        let arm_weak = weak.clone();
+        menu = menu.item(
+            PopupMenuItem::element(move |_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage")
+                    .debug_selector(|| "status-provider-reset-usage".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.foreground)
+                    .child(provider_text::PROVIDER_RESET_USAGE.get())
+                    .children(credits.filter(|c| *c > 0).map(|c| {
+                        div()
+                            .font_family(ui::FONT_MONO)
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(c.to_string())
+                    }))
+            })
+            .on_click(move |_, _, cx| {
+                arm_weak
+                    .update(cx, |shell, _| {
+                        shell.reset_armed = Some((provider, account_id.clone()));
+                    })
+                    .ok();
+            }),
         );
     }
     menu
@@ -1752,10 +1765,10 @@ impl Shell {
                     }
                     if let Some((sid, ref text_body)) = active_handoff_text {
                         let body_codex = format!(
-                            "[MK SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: codex\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
+                            "[KRILL SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: codex\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
                         );
                         let body_claude = format!(
-                            "[MK SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: claude\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
+                            "[KRILL SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: claude\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
                         );
                         let weak_codex = weak.clone();
                         let weak_claude = weak.clone();

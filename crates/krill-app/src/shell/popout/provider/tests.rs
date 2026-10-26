@@ -283,6 +283,32 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .debug_bounds("status-provider-detail-host-model-pool")
             .is_some()
     );
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-host")
+            .is_some()
+    );
+    let saved_reset = visual
+        .debug_bounds("status-provider-detail-reset-saved")
+        .expect("inactive profile in details panel must also expose reset usage button");
+    visual.simulate_click(saved_reset.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-confirm-saved")
+            .is_some(),
+        "clicking detail reset button arms confirmation in-place without closing panel"
+    );
+    let cancel_reset = visual
+        .debug_bounds("status-provider-detail-reset-cancel-saved")
+        .unwrap();
+    visual.simulate_click(cancel_reset.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-confirm-saved")
+            .is_none()
+    );
     let saved = visual.debug_bounds("status-provider-use-saved").unwrap();
     visual.simulate_mouse_move(saved.center(), None, gpui::Modifiers::default());
     visual.run_until_parked();

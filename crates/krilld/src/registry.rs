@@ -2529,6 +2529,14 @@ impl Registry {
                 (0, None, true)
             }
         };
+        // Windows has no PTY foreground group. Without this, an agent typed into a shell
+        // never gets a transcript unless its hook arrives (Codex has none outside Krill launches).
+        #[cfg(windows)]
+        let fg_pid = fg_pid.or_else(|| {
+            (!exited)
+                .then(|| crate::sys::session_agent_process(root_pid))
+                .flatten()
+        });
         let cwd = self
             .session_cwd(id)
             .map(|p| p.as_os_str().as_bytes().to_vec())
@@ -2626,6 +2634,13 @@ impl Registry {
         }
 
         let launched_at = self.agents.launched_at(id);
+        // A shell-launched agent has no launch record; its transcript cannot predate its process.
+        // Windows `start_us` counts from 1601, 11,644,473,600 s before the Unix epoch.
+        #[cfg(windows)]
+        let launched_at = launched_at.or_else(|| {
+            let start = crate::sys::start_us(fg_pid?).ok()?;
+            (start / 1_000_000).checked_sub(11_644_473_600)
+        });
         let claimed = self.agents.claimed_transcripts(id);
         let (snapshot, resolved) = crate::agent_history::chat::poll_session_bounded(
             self.state_dir().as_deref(),

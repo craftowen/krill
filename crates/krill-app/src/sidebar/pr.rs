@@ -76,7 +76,7 @@ impl Sidebar {
         if self
             .prs
             .get(&path)
-            .is_some_and(|s| matches!(s, Status::Missing | Status::Failed))
+            .is_some_and(|s| matches!(s, Status::Missing | Status::Failed(_)))
         {
             self.notice = self
                 .prs

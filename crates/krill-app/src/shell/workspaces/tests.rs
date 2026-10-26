@@ -861,3 +861,51 @@ fn windows_workspace_aliases_share_tabs_and_new_tab_keeps_active_cwd(cx: &mut Te
         );
     });
 }
+
+/// Actorjin(Windows): 새 세션(에이전트)도 지금 워크트리의 탭들 바로 옆에 열린다. 다른 워크스페이스 탭이 전체 목록
+/// 사이에 있어도, 사이드바 선택이 아직 없고 경로 표기가 달라도 새 워크스페이스·목록을 시작하지 않는다.
+#[gpui::test]
+fn new_agent_session_opens_beside_tabs_of_the_same_windows_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("windows-agent-same-workspace"));
+    view.update(cx, |s, cx| {
+        s.sidebar
+            .update(cx, |sidebar, cx| sidebar.select_worktree(None, cx));
+        let login = |cwd: &str| Create {
+            account: None,
+            program: Program::Login,
+            cwd: cwd.as_bytes().to_vec(),
+            cols: 80,
+            rows: 24,
+        };
+        s.change(true, cx, |layout| {
+            let first = layout.active_tab().focused;
+            layout.set_launch(first, login(r"\\?\C:\Users\Owen\간단작업"));
+            layout.new_tab();
+            let other = layout.active_tab().focused;
+            layout.set_launch(other, login(r"C:\Users\Owen\다른작업"));
+            layout.activate(0);
+        });
+        assert_eq!(s.workspace_tabs(cx), [0]);
+
+        s.new_agent("codex".into(), cx);
+        let added = s.layout.active_tab().focused;
+        let launch = s.layout.launch(added).unwrap().clone();
+        assert_eq!(launch.program, Program::Agent { id: "codex".into() });
+        assert_eq!(launch.cwd, r"\\?\C:\Users\Owen\간단작업".as_bytes());
+        assert_eq!(s.layout.host(added), &HostId::Local);
+        // 새 세션은 같은 워크스페이스의 마지막 탭 바로 옆(화면상 두 번째)이고 활성이다.
+        assert_eq!(s.workspace_tabs(cx), [0, s.layout.active()]);
+
+        // 같은 폴더의 다른 표기로 시작한 칸에서 열어도 같은 탭 목록에 붙는다.
+        s.change(true, cx, |layout| {
+            let mut alias = layout.launch(added).unwrap().clone();
+            alias.cwd = "c:/users/owen/간단작업/".as_bytes().to_vec();
+            layout.set_launch(added, alias);
+        });
+        s.new_agent("claude".into(), cx);
+        assert_eq!(s.layout.tabs().len(), 4);
+        let tabs = s.workspace_tabs(cx);
+        assert_eq!(tabs.len(), 3, "{tabs:?}");
+        assert_eq!(tabs.last(), Some(&s.layout.active()));
+    });
+}

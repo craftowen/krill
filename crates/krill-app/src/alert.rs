@@ -633,8 +633,8 @@ fn basename(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests;
 
-/// OWE-712: 데몬 이력으로 주기 틱·CLI 전환도 알리고 같은 이력은 한 번만 보낸다.
-/// 최초 스냅샷은 기준점으로 삼아 앱 재시작 때 과거 알림을 재생하지 않는다.
+/// 자동 계정 전환은 진단 로그에만 남긴다. 사용자 조치가 필요하지 않아 알림을 보내지 않는다.
+/// 최초 스냅샷은 기준점으로 삼아 앱 재시작 때 과거 이력을 다시 기록하지 않는다.
 /// 정책 꼬리가 없는 스냅샷(로컬 폴백·구 데몬)은 이력을 모르는 것이라 기준점을 건드리지 않는다.
 pub fn sync_account_switches(advanced: &krill_proto::usage::AccountPolicyState, cx: &mut App) {
     if !advanced.supported {
@@ -648,30 +648,11 @@ pub fn sync_account_switches(advanced: &krill_proto::usage::AccountPolicyState, 
         .account_switch_sequence
         .replace(latest);
     let Some(previous) = previous else { return };
-    let cfg = effective_settings(cx);
-    if !cfg.notifications {
-        return;
-    }
-    let active = !cx.windows().is_empty() && cx.global::<AlertState>().window_active;
-    if cfg.notify_only_inactive && active {
-        return;
-    }
     for record in history.iter().filter(|r| r.sequence > previous) {
-        let event = &record.event;
-        let body = crate::i18n::catalog::popout::AUTO_SWITCH_NOTICE.format(&[
-            ("provider", event.provider.display_name()),
-            ("from", &event.from_label),
-            ("pct", &event.reason_percent.to_string()),
-            ("to", &event.to_label),
-        ]);
-        crate::onboarding::actions::show_notification(
-            SystemNotification {
-                tag: format!("account-switch:{}", record.sequence).into(),
-                title: crate::i18n::catalog::shell::ACCOUNT_POLICY.get().into(),
-                body: body.into(),
-                actions: Vec::new(),
-            },
-            cx,
+        tracing::debug!(
+            sequence = record.sequence,
+            provider = record.event.provider.display_name(),
+            "account switched automatically"
         );
     }
 }

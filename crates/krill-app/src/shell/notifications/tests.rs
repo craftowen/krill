@@ -152,6 +152,90 @@ fn dismissed_account_recovery_stays_dismissed_across_tab_switches_until_new_fail
 }
 
 #[gpui::test]
+fn uncertain_input_is_silent_but_rejected_input_remains_visible(cx: &mut TestAppContext) {
+    use krill_proto::input::Fate;
+
+    let (view, cx) = open(cx, state_path("quiet-uncertain-input"));
+    view.update(cx, |s, cx| {
+        s.show(
+            Some(&Notice {
+                fate: Fate::Uncertain,
+                bytes: b"private input".to_vec(),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("notice").is_none());
+    view.update(cx, |s, cx| {
+        for fate in [
+            Fate::Expired,
+            Fate::NewSession,
+            Fate::SessionClosed,
+            Fate::Full,
+            Fate::Unsupported,
+            Fate::AccountSwitchFailed,
+        ] {
+            let notice = Notice {
+                fate,
+                bytes: b"rejected input".to_vec(),
+            };
+            s.show(Some(&notice), cx);
+            let important = s.notice.clone();
+            assert_eq!(important.as_deref(), Some(notice_text(&notice).as_str()));
+            s.show(
+                Some(&Notice {
+                    fate: Fate::Uncertain,
+                    bytes: b"other input".to_vec(),
+                }),
+                cx,
+            );
+            assert_eq!(
+                s.notice, important,
+                "uncertainty must not replace actionable errors"
+            );
+        }
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("notice").is_some());
+}
+
+#[gpui::test]
+fn background_account_failure_preserves_existing_notice_but_user_action_reports_error(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::usage::UsageRequest;
+
+    let path = state_path("quiet-account-refresh");
+    let missing_socket = path.with_extension("missing.sock");
+    let (view, cx) = open(cx, path);
+    view.update(cx, |s, cx| {
+        // Bypass connection setup: both requests fail immediately on the same missing socket.
+        s.link = Link::Up;
+        s.paths = Some(krill_proto::daemon::Paths {
+            socket: missing_socket,
+            holder: PathBuf::from("/bin/echo"),
+            krilld: PathBuf::from("/bin/echo"),
+        });
+        s.notice = Some("Existing actionable error".into());
+        s.refresh_accounts(UsageRequest::ListAccounts, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.notice.clone()).as_deref(),
+        Some("Existing actionable error")
+    );
+
+    view.update(cx, |s, cx| {
+        s.refresh_accounts(UsageRequest::RefreshUsage, cx);
+    });
+    cx.run_until_parked();
+    let notice = view.read_with(cx, |s, _| s.notice.clone());
+    assert!(notice.is_some());
+    assert_ne!(notice.as_deref(), Some("Existing actionable error"));
+}
+
+#[gpui::test]
 fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut TestAppContext) {
     // GPUI's visual animation uses wall time; timers below use the test clock.
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -223,22 +307,17 @@ fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut Test
 }
 
 #[gpui::test]
-fn summaries_expire_and_resolved_link_dismisses_without_hiding_new_errors(cx: &mut TestAppContext) {
+fn resolved_link_dismisses_without_hiding_new_errors(cx: &mut TestAppContext) {
     // GPUI's visual animation uses wall time; timers below use the test clock.
     cx.update(|cx| cx.set_reduce_motion(true));
     let (view, cx) = open(cx, state_path("toast-lifecycle"));
     view.update(cx, |s, cx| {
-        s.link = Link::Down;
-        s.away = Some("3 sessions completed while away".into());
+        s.link = Link::Failed("Connection needs attention".into());
         cx.notify();
     });
     cx.run_until_parked();
     settle(cx);
-    assert!(cx.debug_bounds("away-summary").is_some());
-    cx.executor().advance_clock(Duration::from_secs(6));
-    cx.run_until_parked();
-    settle(cx);
-    assert!(view.read_with(cx, |s, _| s.away.is_none()));
+    assert!(cx.debug_bounds("link-banner").is_some());
     view.update(cx, |s, cx| {
         s.link = Link::Up;
         s.notice = Some("Action failed: retry from the settings page".into());
@@ -404,4 +483,21 @@ fn sidebar_poll_and_notice_alerts_render_as_toasts_without_sidebar_layout_shift(
     cx.run_until_parked();
     settle(cx);
     assert!(cx.debug_bounds("sidebar-poll-error").is_none());
+}
+
+#[gpui::test]
+fn automatic_reconnect_is_quiet_but_actionable_failure_is_visible(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("quiet-reconnect"));
+    view.update(cx, |s, cx| s.set_link(Link::Down, cx));
+    settle(cx);
+    assert!(cx.debug_bounds("link-banner").is_none());
+    view.update(cx, |s, cx| {
+        s.set_link(Link::Failed("permission denied".into()), cx);
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("link-banner").is_some());
+    view.update(cx, |s, cx| s.set_link(Link::Up, cx));
+    settle(cx);
+    assert!(cx.debug_bounds("link-banner").is_none());
 }

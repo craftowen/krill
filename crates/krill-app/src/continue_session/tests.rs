@@ -12,6 +12,7 @@ fn format_handoff_brief_includes_instructions_and_context() {
         "  verify edge cases  ",
         "line 1\nline 2\n",
     );
+    assert!(brief.starts_with("[KRILL SESSION HANDOFF]\n"), "{brief}");
     assert!(brief.contains("Source session: s42"), "{brief}");
     assert!(brief.contains("Target agent: codex"), "{brief}");
     assert!(brief.contains("Instructions: verify edge cases"), "{brief}");

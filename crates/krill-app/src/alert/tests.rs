@@ -852,7 +852,7 @@ fn notification_sound_gates_beep_count(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn account_switch_history_notifies_once_after_initial_snapshot(cx: &mut TestAppContext) {
+fn account_switch_history_stays_silent_and_tracks_latest_sequence(cx: &mut TestAppContext) {
     let _guard = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -885,14 +885,16 @@ fn account_switch_history_notifies_once_after_initial_snapshot(cx: &mut TestAppC
         sync_account_switches(&state(vec![record(1), record(2)]), cx);
         sync_account_switches(&state(vec![record(1), record(2)]), cx);
     });
-    assert_eq!(cx.delivered_system_notifications().len(), 1);
+    assert!(cx.delivered_system_notifications().is_empty());
+    cx.read(|cx| assert_eq!(cx.global::<AlertState>().account_switch_sequence, Some(2)));
     fs::write(dir.join("settings.toml"), "notifications = false\n").unwrap();
     cx.update(settings::reload);
     cx.run_until_parked();
     cx.update(|cx| {
         sync_account_switches(&state(vec![record(2), record(3)]), cx);
     });
-    assert_eq!(cx.delivered_system_notifications().len(), 1);
+    assert!(cx.delivered_system_notifications().is_empty());
+    cx.read(|cx| assert_eq!(cx.global::<AlertState>().account_switch_sequence, Some(3)));
     fs::remove_dir_all(dir).ok();
 }
 

@@ -30,7 +30,7 @@ const MAX_OUTPUT: u64 = 256 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Missing,
-    Failed,
+    Failed(Failure),
     NoPr,
     Open,
     Draft,
@@ -52,7 +52,7 @@ impl Status {
     pub fn guidance(&self) -> Option<&'static str> {
         match self {
             Self::Missing => Some(MISSING.get()),
-            Self::Failed => Some(FAILED.get()),
+            Self::Failed(failure) => Some(failure.guidance()),
             _ => None,
         }
     }
@@ -219,7 +219,7 @@ impl Service {
     }
 
     fn reserve_slot(&self, _now: Instant) -> Result<SlotGuard<'_>, &'static str> {
-        let mut state = self.state.lock().map_err(|_| FAILED.get())?;
+        let mut state = self.state.lock().map_err(|_| text::GH_FAILED.get())?;
         if !state.reserve_interactive() {
             return Err(PACED.get());
         }
@@ -298,13 +298,7 @@ impl Service {
         self.runner
             .run(folder, branch, Action::Create)
             .map(|_| ())
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    MISSING.get()
-                } else {
-                    FAILED.get()
-                }
-            })
+            .map_err(|e| failure_text(&e))
     }
 
     pub fn create_with_draft(
@@ -319,13 +313,7 @@ impl Service {
         self.runner
             .create_pr(folder, branch, title, body)
             .map(|_| ())
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    MISSING.get()
-                } else {
-                    FAILED.get()
-                }
-            })
+            .map_err(|e| failure_text(&e))
     }
 
     pub fn generate_draft(&self, folder: &Path, branch: &str) -> Result<Draft, String> {
@@ -345,13 +333,9 @@ impl Service {
         now: Instant,
     ) -> Result<PrInspection, &'static str> {
         let _slot = self.reserve_slot(now)?;
-        self.runner.inspect_pr(folder, branch).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                MISSING.get()
-            } else {
-                FAILED.get()
-            }
-        })
+        self.runner
+            .inspect_pr(folder, branch)
+            .map_err(|e| failure_text(&e))
     }
 
     pub fn merge(
@@ -361,13 +345,9 @@ impl Service {
         method: PrMergeMethod,
     ) -> Result<(), &'static str> {
         let _slot = self.reserve_slot(Instant::now())?;
-        self.runner.merge_pr(folder, branch, method).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                MISSING.get()
-            } else {
-                FAILED.get()
-            }
-        })
+        self.runner
+            .merge_pr(folder, branch, method)
+            .map_err(|e| failure_text(&e))
     }
 
     /// 확인한 PR과 현재 스냅샷이 같을 때만 명시 PR 대상을 병합한다.
@@ -417,21 +397,64 @@ impl Service {
         let _slot = self.reserve_slot(Instant::now())?;
         self.runner
             .set_pr_draft(folder, branch, to_draft)
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    MISSING.get()
-                } else {
-                    FAILED.get()
-                }
-            })
+            .map_err(|e| failure_text(&e))
     }
 }
+
+/// 조회·생성 실패 원인. stderr는 읽지 않는다(비밀 노출·로케일 의존 없음).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// gh 종료 코드 4(gh 문서: 인증 필요).
+    Auth,
+    TimedOut,
+    Other,
+}
+
+impl Failure {
+    fn of(error: &io::Error) -> Self {
+        if error
+            .get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync + 'static>::is::<GhAuthRequired>)
+        {
+            Self::Auth
+        } else if error.kind() == io::ErrorKind::TimedOut {
+            Self::TimedOut
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn guidance(self) -> &'static str {
+        match self {
+            Self::Auth => FAILED.get(),
+            Self::TimedOut => text::TIMED_OUT.get(),
+            Self::Other => text::GH_FAILED.get(),
+        }
+    }
+}
+
+/// `execute`가 gh 종료 코드 4에 붙이는 표지.
+#[derive(Debug)]
+struct GhAuthRequired;
+impl std::fmt::Display for GhAuthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("gh authentication required")
+    }
+}
+impl std::error::Error for GhAuthRequired {}
 
 fn status_error(error: &io::Error) -> Status {
     if error.kind() == io::ErrorKind::NotFound {
         Status::Missing
     } else {
-        Status::Failed
+        Status::Failed(Failure::of(error))
+    }
+}
+
+fn failure_text(error: &io::Error) -> &'static str {
+    match status_error(error) {
+        Status::Failed(failure) => failure.guidance(),
+        _ => MISSING.get(),
     }
 }
 
@@ -715,6 +738,12 @@ pub(super) fn execute(cmd: &mut Command, timeout: Duration) -> io::Result<Vec<u8
         }
         captured.bytes
     };
+    if status.code() == Some(4) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            GhAuthRequired,
+        ));
+    }
     if !status.success() {
         return Err(io::Error::other("gh failed"));
     }

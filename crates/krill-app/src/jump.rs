@@ -21,6 +21,7 @@ use krill_proto::SessionId;
 use krill_proto::agent_history::{VaultAgent, VaultHit, VaultScope};
 use krill_proto::control::AgentState;
 
+use crate::hosts::HostId;
 use crate::i18n::catalog::agent_history as vault_text;
 use crate::i18n::catalog::jump as text;
 use crate::layout::TabColor;
@@ -38,6 +39,9 @@ const ROW_HEIGHT: f32 = 28.;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub id: SessionId,
+    pub host: HostId,
+    pub cwd: String,
+    pub worktree_path: String,
     pub label: String,
     pub needs_you: bool,
     pub title: String,
@@ -84,6 +88,9 @@ impl Item {
         let chars = label.chars().flat_map(char::to_lowercase).collect();
         Self {
             id,
+            host: HostId::Local,
+            cwd: String::new(),
+            worktree_path: String::new(),
             title: label.clone(),
             label,
             needs_you,
@@ -116,8 +123,17 @@ impl Item {
                 .unwrap_or(&self.label),
         );
         let combined = format!(
-            "{} {} {} {} {} {}",
-            self.label, self.title, self.agent, self.repo_name, self.worktree_name, self.id.0
+            "{} {} {} {} {} {} {} {} {} {}",
+            self.label,
+            self.title,
+            self.agent,
+            self.repo_name,
+            self.worktree_name,
+            self.id.0,
+            self.host_label,
+            self.host.as_key(),
+            self.cwd,
+            self.worktree_path
         );
         self.chars = combined.chars().flat_map(char::to_lowercase).collect();
     }
@@ -127,6 +143,7 @@ impl Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeItem {
     pub path: PathBuf,
+    pub host: HostId,
     pub session_id: Option<SessionId>,
     pub name: String,
     pub branch: String,
@@ -159,10 +176,14 @@ impl WorktreeItem {
         is_main: bool,
         is_current: bool,
     ) -> Self {
-        let combined = format!("{name} {branch} {repo_name} {}", path.display());
+        let combined = format!(
+            "{name} {branch} {repo_name} {host_label} {}",
+            path.display()
+        );
         let chars = combined.chars().flat_map(char::to_lowercase).collect();
         Self {
             path,
+            host: HostId::Local,
             session_id,
             name,
             branch,
@@ -364,27 +385,33 @@ fn score(query: &[char], text: &[char]) -> Option<u32> {
 }
 
 /// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 `boost`가 참인 항목 먼저, 그다음 원래 순서. 공백은 무시한다.
-fn rank(all: &[&[char]], boost: &[bool], query: &str) -> Vec<usize> {
-    let query: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
+fn rank<'a>(
+    all: impl Iterator<Item = (usize, &'a [char], bool)> + Clone,
+    query: &[char],
+) -> Vec<usize> {
+    // 빈 검색은 점수 정렬 없이 원래 순서·우선순위만 보존한다.
     if query.is_empty() {
-        return (0..all.len())
-            .filter(|&i| boost.get(i).copied().unwrap_or(false))
-            .chain((0..all.len()).filter(|&i| !boost.get(i).copied().unwrap_or(false)))
+        return all
+            .clone()
+            .filter(|(_, _, boost)| *boost)
+            .chain(all.filter(|(_, _, boost)| !*boost))
+            .map(|(i, _, _)| i)
             .collect();
     }
     let mut hits: Vec<_> = all
-        .iter()
-        .enumerate()
-        .filter_map(|(i, text)| {
-            score(&query, text).map(|s| (Reverse(s), !boost.get(i).copied().unwrap_or(false), i))
-        })
+        .filter_map(|(i, text, boost)| score(query, text).map(|s| (Reverse(s), !boost, i)))
         .collect();
     hits.sort_unstable();
     hits.into_iter().map(|(_, _, i)| i).collect()
+}
+
+fn query_chars(query: &str, files: bool) -> Vec<char> {
+    query
+        .trim()
+        .chars()
+        .filter(|c| files || !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 입력 대기 세션 먼저, 그다음 원래 순서. 공백은 무시한다.
@@ -404,30 +431,40 @@ fn search_controlled(
     query: &str,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return (0..items.len())
-            .filter(|&i| items[i].needs_you)
-            .chain((0..items.len()).filter(|&i| !items[i].needs_you))
-            .collect();
-    }
     let files = items.iter().any(|item| item.is_file);
-    let query = if files {
-        lower_chars(query.trim())
-    } else {
-        query
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect()
-    };
+    search_items(items, &query_chars(query, files), files, None, cancel)
+}
+
+fn search_items(
+    items: &[Item],
+    query: &[char],
+    files: bool,
+    project: Option<&str>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<usize> {
+    let eligible =
+        |item: &Item| project.is_none_or(|p| item.repo_name == p || item.worktree_name == p);
+    if query.is_empty() {
+        return rank(
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| eligible(item))
+                .map(|(i, item)| (i, item.chars.as_slice(), !files && item.needs_you)),
+            query,
+        );
+    }
     let mut hits = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Vec::new();
         }
-        if let Some(path_score) = score(&query, &item.chars) {
+        if !eligible(item) {
+            continue;
+        }
+        if let Some(path_score) = score(query, &item.chars) {
             let bonus = if files {
-                score(&query, &item.filename_chars).map_or(0, |s| s + 100)
+                score(query, &item.filename_chars).map_or(0, |s| s + 100)
             } else {
                 0
             };
@@ -447,28 +484,28 @@ fn lower_chars(text: &str) -> Vec<char> {
 
 /// 워크트리 목록에서 `query`와 일치하는 인덱스(점수 높은 순, 원래 순서는 유지).
 pub fn worktree_search(entries: &[WorktreeEntry], query: &str) -> Vec<usize> {
-    let all: Vec<&[char]> = entries.iter().map(|entry| entry.chars.as_slice()).collect();
-    rank(&all, &vec![false; entries.len()], query)
+    rank(
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| (i, entry.chars.as_slice(), false)),
+        &query_chars(query, false),
+    )
 }
 
 fn search_worktrees(
     items: &[WorktreeItem],
-    query: &str,
+    query: &[char],
     project_filter: Option<&str>,
 ) -> Vec<usize> {
-    let query: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    let mut hits: Vec<_> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, wt)| project_filter.is_none_or(|p| wt.repo_name == p))
-        .filter_map(|(i, wt)| score(&query, &wt.chars).map(|s| (Reverse(s), !wt.is_current, i)))
-        .collect();
-    hits.sort_unstable();
-    hits.into_iter().map(|(_, _, i)| i).collect()
+    rank(
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| project_filter.is_none_or(|p| wt.repo_name == p))
+            .map(|(i, wt)| (i, wt.chars.as_slice(), wt.is_current)),
+        query,
+    )
 }
 
 /// 팔레트에서 바로 실행하는 빠른 액션(OWE-865). `QuickCommand`는 설정의
@@ -502,11 +539,13 @@ impl ActionEntry {
 
 /// 빠른 액션 목록에서 `query`와 일치하는 인덱스(점수 높은 순, 원래 순서는 유지).
 pub fn action_search(actions: &[ActionEntry], query: &str) -> Vec<usize> {
-    let all: Vec<&[char]> = actions
-        .iter()
-        .map(|action| action.chars.as_slice())
-        .collect();
-    rank(&all, &vec![false; actions.len()], query)
+    rank(
+        actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| (i, action.chars.as_slice(), false)),
+        &query_chars(query, false),
+    )
 }
 
 /// 팔레트 진입점별 섹션 순서(OWE-865): ⌘J는 세션부터, ⇧⌘P는 액션부터 보여준다.
@@ -652,9 +691,10 @@ fn filter_vault(
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Confirm(SessionId),
+    ConfirmOn(HostId, SessionId),
     /// 세션 없는 `worktrees` 목록 인덱스: 새 세션을 만든다.
     /// (세션이 있는 항목은 [`Event::Confirm`]으로 나간다.)
     OpenWorktree(usize),
@@ -666,7 +706,7 @@ pub enum Event {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ItemSelection {
-    Session(SessionId),
+    Session(HostId, SessionId),
     File {
         path: String,
         root: Option<String>,
@@ -691,6 +731,7 @@ pub struct Palette {
     actions: Vec<ActionEntry>,
     action_matches: Vec<usize>,
     quick_commands: Vec<crate::commands::QuickCommand>,
+    quick_chars: Vec<Vec<char>>,
     quick_matches: Vec<usize>,
     vault_hits: Vec<VaultHit>,
     vault_matches: Vec<usize>,
@@ -760,6 +801,7 @@ impl Palette {
             actions: Vec::new(),
             action_matches: Vec::new(),
             quick_commands: Vec::new(),
+            quick_chars: Vec::new(),
             quick_matches: Vec::new(),
             items: std::sync::Arc::new(items),
             item_task: None,
@@ -903,7 +945,11 @@ impl Palette {
         I: IntoIterator<Item = T>,
         T: Into<WorktreeItem>,
     {
-        self.worktrees = worktrees.into_iter().map(Into::into).collect();
+        let worktrees = worktrees.into_iter().map(Into::into).collect::<Vec<_>>();
+        if self.worktrees == worktrees {
+            return;
+        }
+        self.worktrees = worktrees;
         self.rebuild_projects();
         self.recompute_all_matches(cx);
         cx.notify();
@@ -920,6 +966,10 @@ impl Palette {
         quick_commands: Vec<crate::commands::QuickCommand>,
         cx: &mut Context<Self>,
     ) {
+        self.quick_chars = quick_commands
+            .iter()
+            .map(|c| lower_chars(&format!("{} {}", c.name, c.text)))
+            .collect();
         self.quick_commands = quick_commands;
         self.recompute_all_matches(cx);
         cx.notify();
@@ -1015,27 +1065,24 @@ impl Palette {
             None
         };
         let proj = self.project_filter.as_deref();
-        let hits = if background {
+        let files = self.mode == Mode::Files;
+        let query = query_chars(&self.query, files);
+        self.matches = if background {
             Vec::new()
         } else {
-            search(&self.items, &self.query)
-        };
-        self.matches = if let Some(p) = proj {
-            hits.into_iter()
-                .filter(|&i| {
-                    self.items
-                        .get(i)
-                        .is_some_and(|item| item.repo_name == p || item.worktree_name == p)
-                })
-                .collect()
-        } else {
-            hits
+            search_items(
+                &self.items,
+                &query,
+                files,
+                proj,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
         };
         if background {
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.item_cancel = Some(ItemSearchCancel(std::sync::Arc::clone(&cancel)));
             let items = std::sync::Arc::clone(&self.items);
-            let query = self.query.clone();
+            let query = query.clone();
             let project = self.project_filter.clone();
             let restore = restore.clone();
             self.item_task = Some(cx.spawn(async move |this, cx| {
@@ -1044,16 +1091,7 @@ impl Palette {
                     .spawn(async move {
                         let _span =
                             tracing::debug_span!("jump.search", items = items.len()).entered();
-                        search_controlled(&items, &query, &cancel)
-                            .into_iter()
-                            .filter(|&i| {
-                                project.as_ref().is_none_or(|p| {
-                                    items.get(i).is_some_and(|item| {
-                                        item.repo_name == *p || item.worktree_name == *p
-                                    })
-                                })
-                            })
-                            .collect()
+                        search_items(&items, &query, files, project.as_deref(), &cancel)
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -1086,16 +1124,22 @@ impl Palette {
         if self.worktrees.is_empty() {
             self.worktree_matches.clear();
         } else {
-            self.worktree_matches = search_worktrees(&self.worktrees, &self.query, proj);
+            self.worktree_matches = search_worktrees(&self.worktrees, &query, proj);
         }
-        self.action_matches = action_search(&self.actions, &self.query);
-        let all: Vec<Vec<char>> = self
-            .quick_commands
-            .iter()
-            .map(|c| lower_chars(&format!("{} {}", c.name, c.text)))
-            .collect();
-        let refs: Vec<&[char]> = all.iter().map(Vec::as_slice).collect();
-        self.quick_matches = rank(&refs, &vec![false; all.len()], &self.query);
+        self.action_matches = rank(
+            self.actions
+                .iter()
+                .enumerate()
+                .map(|(i, action)| (i, action.chars.as_slice(), false)),
+            &query,
+        );
+        self.quick_matches = rank(
+            self.quick_chars
+                .iter()
+                .enumerate()
+                .map(|(i, chars)| (i, chars.as_slice(), false)),
+            &query,
+        );
         if !background {
             self.restore_item_selection(restore);
         }
@@ -1110,7 +1154,7 @@ impl Palette {
                 host: item.host_label.clone(),
             }
         } else {
-            ItemSelection::Session(item.id)
+            ItemSelection::Session(item.host.clone(), item.id)
         }
     }
 
@@ -1122,7 +1166,9 @@ impl Palette {
                     .iter()
                     .position(|&index| {
                         self.items.get(index).is_some_and(|item| match &selected {
-                            ItemSelection::Session(id) => !item.is_file && item.id == *id,
+                            ItemSelection::Session(host, id) => {
+                                !item.is_file && item.id == *id && item.host == *host
+                            }
                             ItemSelection::File { path, root, host } => {
                                 item.is_file
                                     && item.label == *path
@@ -1145,6 +1191,27 @@ impl Palette {
     }
 
     pub fn set_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
+        if *self.items == items {
+            return;
+        }
+        self.replace_items(items, cx);
+    }
+
+    /// 수신 스냅샷의 두 섹션을 한 번에 바꾸어 비동기 검색 중에도 선택을 보존한다.
+    pub fn set_snapshot(
+        &mut self,
+        items: Vec<Item>,
+        worktrees: Vec<WorktreeItem>,
+        cx: &mut Context<Self>,
+    ) {
+        if *self.items == items && self.worktrees == worktrees {
+            return;
+        }
+        self.worktrees = worktrees;
+        self.replace_items(items, cx);
+    }
+
+    fn replace_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
         // 절대 행 번호에서 세션 위치만 살린다(Commands 모드에서는 세션이 뒤에 있다).
         let selected = self
             .row_at(self.selected)
@@ -1379,7 +1446,11 @@ impl Palette {
         match self.row_at(self.selected) {
             Some((Section::Sessions, pos)) => {
                 if let Some(item) = self.matches.get(pos).and_then(|&i| self.items.get(i)) {
-                    cx.emit(Event::Confirm(item.id));
+                    cx.emit(if item.host.is_local() {
+                        Event::Confirm(item.id)
+                    } else {
+                        Event::ConfirmOn(item.host.clone(), item.id)
+                    });
                 }
             }
             Some((Section::Vault, pos)) => {
@@ -1392,7 +1463,11 @@ impl Palette {
                     && let Some(entry) = self.worktrees.get(index)
                 {
                     if let Some(id) = entry.session_id {
-                        cx.emit(Event::Confirm(id));
+                        cx.emit(if entry.host.is_local() {
+                            Event::Confirm(id)
+                        } else {
+                            Event::ConfirmOn(entry.host.clone(), id)
+                        });
                     } else {
                         cx.emit(Event::OpenWorktree(index));
                     }

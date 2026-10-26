@@ -85,6 +85,52 @@ fn read(s: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
     ipc::read_frame(s)?.ok_or_else(|| io::ErrorKind::UnexpectedEof.into())
 }
 
+/// 세션을 만드는 요청(Create·Resume·Hibernation)을 쓰기 시작한 뒤 답을 받지 못했다(쓰기 중 끊김·끊김·응답 시간
+/// 초과·깨진 답). krilld가 이미 세션을 만들었을 수 있으니 자동으로 다시 보내지 않는다. 문구와 종류는 원래 오류 그대로다.
+#[derive(Debug)]
+struct UnknownOutcome(io::Error);
+
+impl std::fmt::Display for UnknownOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for UnknownOutcome {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn unknown_outcome(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), UnknownOutcome(e))
+}
+
+/// 세션을 만드는 요청이 krilld에 닿았는지 알 수 없는 실패다. 같은 요청을 자동으로 다시 보내면 PTY가 둘이 될 수 있다.
+#[must_use]
+pub fn is_unknown_outcome(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(inner) if inner.is::<UnknownOutcome>())
+}
+
+/// 제어 요청 하나를 보내고 답을 읽는다. 세션을 만드는 요청이면 쓰기 시작한 뒤의 모든 실패를 [`UnknownOutcome`]으로
+/// 표시한다(쓰다 끊겨도 krilld가 프레임을 다 받았는지 앱은 알 수 없다).
+fn call(s: &mut UnixStream, req: &Request) -> io::Result<Reply> {
+    let frame = req.encode()?;
+    let reply = s
+        .write_all(&frame)
+        .and_then(|()| read(s))
+        .and_then(|(k, b)| Ok(Reply::decode(k, &b)?));
+    let mutates = matches!(
+        req,
+        Request::Create(_) | Request::Resume { .. } | Request::Hibernation { .. }
+    );
+    if mutates {
+        reply.map_err(unknown_outcome)
+    } else {
+        reply
+    }
+}
+
 /// [`ensure_session`]의 결과.
 #[derive(Debug)]
 pub enum Found {
@@ -188,6 +234,48 @@ pub fn ensure_session_in(
     ensure_session_inner(&target.into(), want, create, true)
 }
 
+/// 이미 아는 세션만 찾는다: 라이브면 [`Found::Live`], 디스크 기록만 있으면 [`Found::Cold`], 없으면 `None`.
+/// 세션을 만들거나 깨우지 않는다 — 앞서 만든 요청의 결과를 모르는 칸([`is_unknown_outcome`])이 쓴다.
+///
+/// # Errors
+/// krilld에 붙지 못했거나 답을 읽지 못했다.
+pub fn find_session_in(
+    target: impl Into<HostTarget>,
+    session: SessionId,
+) -> io::Result<Option<Found>> {
+    let target = target.into();
+    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    known_session(&target, &mut s, features, session, true)
+}
+
+/// 목록·계정 이어받기·콜드 기록에서 `id`를 찾는다(읽기만).
+fn known_session(
+    target: &HostTarget,
+    s: &mut UnixStream,
+    features: u64,
+    id: SessionId,
+    allow_cold: bool,
+) -> io::Result<Option<Found>> {
+    if let Reply::Sessions(list) = call(s, &Request::List)?
+        && list.iter().any(|i| i.session == id)
+    {
+        return Ok(Some(Found::Live(id, false)));
+    }
+    if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
+        && let Some(replacement) = account_handoff(target, id)?
+    {
+        return Ok(Some(Found::Live(replacement, false)));
+    }
+    if allow_cold
+        && features & FEAT_COLD != 0
+        && let Reply::Cold(cold) = call(s, &Request::Cold { session: id })?
+    {
+        return Ok(Some(Found::Cold(id, cold)));
+    }
+    Ok(None)
+}
+
 /// [`ensure_session_in`]과 같으나 숨은 칸 복원 등에서 콜드 화면 재생(`Request::Cold`)을 거치지 않고
 /// 곧바로 라이브 재개(`Request::Resume`)로 이어진다.
 ///
@@ -213,30 +301,14 @@ fn ensure_session_inner(
     prepare_status_hook(target, &create.program);
     let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    let mut call = |req: &Request| -> io::Result<Reply> {
-        s.write_all(&req.encode()?)?;
-        let (k, b) = read(&mut s)?;
-        Ok(Reply::decode(k, &b)?)
-    };
     if let Some(id) = want {
-        if let Some(session) = hibernation::wake(&mut call, features, id, create)? {
+        if let Some(session) =
+            hibernation::wake(&mut |req| call(&mut s, req), features, id, create)?
+        {
             return Ok(Found::Live(session, true));
         }
-        if let Reply::Sessions(list) = call(&Request::List)?
-            && list.iter().any(|i| i.session == id)
-        {
-            return Ok(Found::Live(id, false));
-        }
-        if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
-            && let Some(replacement) = account_handoff(target, id)?
-        {
-            return Ok(Found::Live(replacement, false));
-        }
-        if allow_cold
-            && features & FEAT_COLD != 0
-            && let Reply::Cold(cold) = call(&Request::Cold { session: id })?
-        {
-            return Ok(Found::Cold(id, cold));
+        if let Some(found) = known_session(target, &mut s, features, id, allow_cold)? {
+            return Ok(found);
         }
     }
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
@@ -261,7 +333,7 @@ fn ensure_session_inner(
         },
         None => Request::Create(create.clone()),
     };
-    match call(&create)? {
+    match call(&mut s, &create)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
             Ok(Found::Live(session, true))
         }
@@ -363,9 +435,7 @@ pub fn resume_session_in(
         },
         None => Request::Create(create.clone()),
     };
-    s.write_all(&req.encode()?)?;
-    let (k, b) = read(&mut s)?;
-    match Reply::decode(k, &b)? {
+    match call(&mut s, &req)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => Ok(session),
         Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(io::ErrorKind::InvalidData.into()),

@@ -1,6 +1,6 @@
 # Worker obligations
 
-Both `[MK ORCHESTRATION PREAMBLE]` and `[Krill Worker]` identify a dispatched
+Both `[KRILL ORCHESTRATION PREAMBLE]` and `[Krill Worker]` identify a dispatched
 worker. Preserve its Run, Task, Dispatch, worker name, and execution host. Load the
 Krill guide with the executable in `KRILL_CLI` when available; never replace this
 assignment with Orca or native subagent messages.

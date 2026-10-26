@@ -28,6 +28,10 @@ use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, SIO_AF_UNIX_GETPEERPID, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl,
 };
+#[cfg(not(test))]
+use windows_sys::Win32::Security::Credentials::{
+    CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+};
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
@@ -480,6 +484,33 @@ pub(crate) fn hostname() -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
     Ok(interface_name(&name))
+}
+
+/// 자격 증명 관리자의 일반 자격 증명 blob. go-keyring(agy 등)은 `service:account` 이름으로 저장한다.
+/// 읽기만 하고, 없거나 읽을 수 없으면 `None`이다. 복사 뒤 원본 버퍼를 0으로 지우고 푼다.
+#[cfg(not(test))]
+pub(crate) fn generic_credential(target: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let name: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+    let mut credential: *mut CREDENTIALW = ptr::null_mut();
+    // SAFETY: name은 NUL로 끝나는 살아 있는 버퍼이고 credential은 쓰기 위치다. 성공하면 아래에서 CredFree로 푼다.
+    let ok = unsafe { CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut credential) };
+    if ok == 0 || credential.is_null() {
+        return None;
+    }
+    // SAFETY: CredReadW가 성공했으므로 credential은 CredFree 전까지 유효한 CREDENTIALW다.
+    let cred = unsafe { &*credential };
+    let (data, size) = (cred.CredentialBlob, cred.CredentialBlobSize);
+    let len = usize::try_from(size).unwrap_or(0);
+    let bytes = (!data.is_null() && len > 0).then(|| {
+        // SAFETY: blob은 credential 수명 동안 len 바이트로 유효하고, 복사한 뒤 이 함수만 지운다.
+        let copy = Zeroizing::new(unsafe { std::slice::from_raw_parts(data, len) }.to_vec());
+        // SAFETY: 같은 blob을 len 바이트만큼 0으로 덮는다(CredReadW가 이 호출자에게 준 버퍼).
+        unsafe { ptr::write_bytes(data, 0, len) };
+        copy
+    });
+    // SAFETY: CredReadW가 할당한 버퍼를 정확히 한 번 푼다.
+    unsafe { CredFree(credential.cast()) };
+    bytes
 }
 
 /// DPAPI로 봉인한다(현재 사용자 범위, UI 없음). 같은 사용자 로그온에서만 풀 수 있다.

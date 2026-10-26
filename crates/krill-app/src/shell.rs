@@ -37,7 +37,7 @@ mod tabs;
 mod terminal_menu;
 mod workspaces;
 
-// 앱이 꺼져 있던 동안의 변화 요약.
+// 앱의 마지막 생존 시각 저장.
 mod artifacts;
 mod away;
 
@@ -93,8 +93,6 @@ const KEY_CONTEXT: &str = "Shell";
 const CURSOR_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 /// 분할선의 잡는 폭(pt). 보이는 선은 1pt.
 const DIVIDER_GRAB: Pixels = krill_app::ui::DIVIDER_HIT_PX;
-/// 재연결 확인 배너가 보이는 시간.
-const RECONNECTED_FOR: Duration = Duration::from_millis(2500);
 
 /// 사용자에게 보이는 ko/en 문자열 키(MK-094).
 use krill_app::i18n::catalog::shell as text;
@@ -124,6 +122,14 @@ enum Got {
         prior_cold: Option<(krill_proto::SessionId, krill_proto::control::Cold)>,
     },
     Cold(krill_proto::SessionId, krill_proto::control::Cold),
+    /// 콜드 화면을 띄우되, 그 세션을 다시 시작한 요청의 결과는 모른다(같은 요청을 자동으로 보내지 않는다).
+    ColdUnknown(
+        krill_proto::SessionId,
+        krill_proto::control::Cold,
+        std::io::Error,
+    ),
+    /// 세션 생성 결과를 모르는 칸이 찾을 세션이 없다. 새로 만들지 않고 멈춘다.
+    Stopped,
 }
 
 pub(crate) fn saved_window_bounds_from_gpui(wb: gpui::WindowBounds) -> layout::SavedWindowBounds {
@@ -535,7 +541,6 @@ pub struct Shell {
     _sidebar_close_session: Subscription,
     _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
-    _sidebar_relisted: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
     sidebar_collapsed: bool,
@@ -569,6 +574,9 @@ pub struct Shell {
     restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
     restore_attempted: std::collections::HashSet<krill_proto::SessionId>,
     restarting_panes: std::collections::HashSet<PaneId>,
+    /// 세션을 만드는 요청(Create·Resume)을 보냈지만 답을 잃은 칸과 그 안내 문구. 이미 아는 세션에만 다시 붙고
+    /// 새로 만들지 않는다(PTY 중복 방지). 만들어졌다면 사이드바에 보인다.
+    outcome_unknown: HashMap<PaneId, String>,
     observed_sessions:
         std::collections::HashSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
@@ -582,14 +590,6 @@ pub struct Shell {
     /// 이미 알린 계정 전환 실패. 데몬이 매 스냅샷마다 같은 실패를 다시 보내도 한 번만 띄운다.
     handoff_errors: HashSet<String>,
     notifications: notifications::Notifications,
-    /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
-    reconnected: Option<String>,
-    reconnected_task: Option<Task<()>>,
-    /// 자리 비운 사이 요약의 기준 시각. 이 프로세스의 첫 메인 창이 데몬에 처음 붙을 때 한 번 쓴다.
-    away_since: Option<u64>,
-    /// 자리 비운 사이 요약 한 줄(누르면 닫힘).
-    away: Option<String>,
-    away_task: Option<Task<()>>,
     /// 마지막 생존 시각 주기 저장([`away::HEARTBEAT`]).
     heartbeat: Option<Task<()>>,
     app_quit: Option<Subscription>,
@@ -771,6 +771,7 @@ impl Shell {
             }
             this.reconcile_workspace_sessions(cx);
             this.sync_diff_workspace(cx);
+            this.refresh_jump(cx);
             cx.notify();
         });
         cx.subscribe(
@@ -844,9 +845,6 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
-        let sidebar_relisted = cx.subscribe(&sidebar, |this, _, e: &sidebar::Relisted, cx| {
-            this.show_reconnected(e.0, cx);
-        });
         let close_session =
             cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::CloseSession, cx| {
                 let host = sidebar
@@ -1089,7 +1087,6 @@ impl Shell {
             _sidebar_close_session: close_session,
             _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
-            _sidebar_relisted: sidebar_relisted,
             _sidebar_tabs: sidebar_tabs,
             layout,
             sidebar_collapsed,
@@ -1120,6 +1117,7 @@ impl Shell {
             restoring_sessions: std::collections::HashSet::new(),
             restore_attempted: std::collections::HashSet::new(),
             restarting_panes: std::collections::HashSet::new(),
+            outcome_unknown: HashMap::new(),
             observed_sessions: std::collections::HashSet::new(),
             titles: HashMap::new(),
             agents: None,
@@ -1128,12 +1126,7 @@ impl Shell {
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
             handoff_errors: HashSet::new(),
-            reconnected: None,
             notifications: notifications::Notifications::default(),
-            reconnected_task: None,
-            away_since: None,
-            away: None,
-            away_task: None,
             heartbeat: None,
             app_quit: None,
             window: None,
@@ -1742,10 +1735,7 @@ impl Shell {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        self.open_settings(krill_app::settings::AdminTab::Workflows, window, cx);
-        if let Some(settings) = &self.settings {
-            settings.update(cx, |v, cx| v.set_automations_page(true, cx));
-        }
+        self.open_automations(window, cx);
     }
 
     pub(super) fn automations_page_open(&self, cx: &App) -> bool {
@@ -1846,30 +1836,7 @@ impl Shell {
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
-        let (mut items, worktrees) = {
-            let sb = self.sidebar.read(cx);
-            (sb.jump_items(), sb.jump_worktrees())
-        };
-        let recent: Vec<_> = self
-            .layout
-            .mru_order()
-            .into_iter()
-            .filter_map(|i| {
-                self.layout
-                    .tabs()
-                    .get(i)
-                    .and_then(|t| self.layout.session(t.focused))
-            })
-            .collect();
-        items.sort_by_key(|item| {
-            (
-                item.is_current_tab,
-                recent
-                    .iter()
-                    .position(|id| *id == item.id)
-                    .unwrap_or(usize::MAX),
-            )
-        });
+        let (items, worktrees) = self.jump_entries(cx);
         let ws = Some(self.folder().display().to_string());
         self.history
             .update(cx, |h, cx| h.update_scope_paths(ws.clone(), Vec::new(), cx));
@@ -1893,6 +1860,64 @@ impl Shell {
         );
         self.jump = Some((palette, events));
         cx.notify();
+    }
+
+    /// 수신한 스냅샷만 읽고 호스트별 현재 위치·MRU를 맞춘다.
+    fn jump_entries(&self, cx: &gpui::App) -> (Vec<jump::Item>, Vec<jump::WorktreeItem>) {
+        let sidebar = self.sidebar.read(cx);
+        let mut items = sidebar.jump_items();
+        let mut worktrees = sidebar.jump_worktrees();
+        let focused = self.layout.focused().and_then(|pane| {
+            self.layout
+                .session(pane)
+                .map(|id| (self.layout.host(pane), id))
+        });
+        let folder = focused.and_then(|(host, id)| sidebar.folder_on(host, id));
+        let mut recent = std::collections::BTreeMap::new();
+        for (rank, index) in self.layout.mru_order().into_iter().enumerate() {
+            if let Some(tab) = self.layout.tabs().get(index)
+                && let Some(id) = self.layout.session(tab.focused)
+            {
+                recent
+                    .entry((self.layout.host(tab.focused), id))
+                    .or_insert(rank);
+            }
+        }
+        for item in &mut items {
+            item.is_current_tab = focused == Some((&item.host, item.id));
+            item.is_current_worktree = !item.is_current_tab
+                && focused.is_some_and(|(host, _)| host == &item.host)
+                && folder.is_some()
+                && folder
+                    == Some(std::path::Path::new(if item.worktree_path.is_empty() {
+                        &item.cwd
+                    } else {
+                        &item.worktree_path
+                    }));
+        }
+        items.sort_by_key(|item| {
+            (
+                item.is_current_tab,
+                recent
+                    .get(&(&item.host, item.id))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        for entry in &mut worktrees {
+            entry.is_current = focused.is_some_and(|(host, _)| host == &entry.host)
+                && folder == Some(entry.path.as_path());
+        }
+        (items, worktrees)
+    }
+
+    fn refresh_jump(&self, cx: &mut Context<Self>) {
+        if let Some((palette, _)) = &self.jump {
+            let (items, worktrees) = self.jump_entries(cx);
+            palette.update(cx, |palette, cx| {
+                palette.set_snapshot(items, worktrees, cx);
+            });
+        }
     }
 
     /// Cmd+G/⇧Cmd+G: 열린 터미널 검색 바의 검색어로 다음/이전 일치를 찾는다(OWE-868). 바가 닫혀 있으면 무시한다.
@@ -1950,10 +1975,7 @@ impl Shell {
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
-        let (items, worktrees) = {
-            let sb = self.sidebar.read(cx);
-            (sb.jump_items(), sb.jump_worktrees())
-        };
+        let (items, worktrees) = self.jump_entries(cx);
         let ws = Some(self.folder().display().to_string());
         self.history
             .update(cx, |h, cx| h.update_scope_paths(ws.clone(), Vec::new(), cx));
@@ -2009,6 +2031,7 @@ impl Shell {
         self.jump = None;
         match *event {
             jump::Event::Confirm(id) => self.open_session(id, cx),
+            jump::Event::ConfirmOn(ref host, id) => self.open_session_on(host.clone(), id, cx),
             jump::Event::OpenWorktree(_) => {
                 if let Some(entry) = worktree {
                     self.open_palette_worktree(&entry, cx);
@@ -2030,9 +2053,9 @@ impl Shell {
     /// 없으면 새 탭에 새 세션을 만든다(사이드바 카드 클릭과 같다).
     fn open_palette_worktree(&mut self, entry: &jump::WorktreeItem, cx: &mut Context<Self>) {
         if let Some(id) = entry.session_id {
-            self.open_session(id, cx);
+            self.open_session_on(entry.host.clone(), id, cx);
         } else {
-            self.open_saved_workspace(krill_app::hosts::HostId::Local, &entry.path, cx);
+            self.open_saved_workspace(entry.host.clone(), &entry.path, cx);
         }
     }
 
@@ -2199,7 +2222,8 @@ impl Shell {
             let mut conn = match bg.spawn(async move { t.connect(&h) }).await {
                 Ok(c) => c,
                 Err(e) => {
-                    let link = Link::Failed(e.to_string());
+                    tracing::warn!(error = %e, "initial daemon connection failed; retrying");
+                    let link = Link::connect_failure(&e);
                     if this.update(cx, |this, cx| this.set_link(link, cx)).is_err() {
                         return;
                     }
@@ -2808,10 +2832,7 @@ impl Shell {
         if link != Link::Up {
             krill_app::alert::disconnected(cx);
             self.appearance = None;
-            self.reconnected = None;
-            self.reconnected_task = None;
         }
-        // 재연결 확인은 다시 붙은 뒤 실제 세션 목록이 도착해야 보인다(결과 동사 규칙, STYLEGUIDE §7.1.1).
         let reconnecting = link == Link::Down;
         self.sidebar
             .update(cx, |s, cx| s.set_local_reconnecting(reconnecting, cx));
@@ -2819,9 +2840,6 @@ impl Shell {
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
-            if let Some(since) = self.away_since.take() {
-                self.load_away_summary(since, cx);
-            }
             self.load_agents(None, cx);
             self.refresh_accounts_for_host(
                 krill_app::hosts::HostId::Local,
@@ -2841,8 +2859,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// 메인 창이면 지난번 마지막 생존 시각을 요약 기준으로 잡고, 이후 주기·종료 때 생존 시각을 레이아웃에 쓴다.
-    /// 창을 닫았다 다시 연 같은 프로세스에서는 요약하지 않는다(앱은 계속 돌고 있었다).
     pub(super) fn refresh_usage_manually(&mut self, cx: &mut Context<Self>) {
         if self.usage_refresh.is_some() {
             return;
@@ -2934,13 +2950,10 @@ impl Shell {
         }));
     }
 
+    /// 주기·정상 종료 때 마지막 생존 시각을 레이아웃에 쓴다.
     fn start_away_tracking(&mut self, cx: &mut Context<Self>) {
-        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
         if self.path.is_none() || self.role != WindowRole::Main || self.heartbeat.is_some() {
             return;
-        }
-        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            self.away_since = self.layout.last_seen_unix_ns();
         }
         self.heartbeat = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -2965,50 +2978,6 @@ impl Shell {
     fn touch_last_seen(&mut self) {
         self.layout.set_last_seen_unix_ns(away::now_ns());
         self.save();
-    }
-
-    /// 실제 상태 목록을 받은 뒤에만 요약을 세운다. 읽지 못하면 아무것도 보이지 않는다.
-    fn load_away_summary(&mut self, since: u64, cx: &mut Context<Self>) {
-        let Some(paths) = self.paths.clone() else {
-            return;
-        };
-        let target = krill_app::hosts::HostTarget::local(paths);
-        self.away_task = Some(cx.spawn(async move |this, cx| {
-            let statuses = cx
-                .background_executor()
-                .spawn(async move { away::fetch_statuses(&target) })
-                .await;
-            let Ok(statuses) = statuses else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                if let Some((away_for, counts)) =
-                    away::count(&statuses, Some(since), away::now_ns())
-                {
-                    this.away = Some(away::summary(away_for, counts));
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-    }
-
-    fn show_reconnected(&mut self, sessions: usize, cx: &mut Context<Self>) {
-        if self.link != Link::Up {
-            return;
-        }
-        self.reconnected = Some(
-            krill_app::i18n::catalog::link::RECONNECTED.format(&[("n", &sessions.to_string())]),
-        );
-        self.reconnected_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(RECONNECTED_FOR).await;
-            this.update(cx, |this, cx| {
-                this.reconnected = None;
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
     }
 
     fn poll_updates(state_dir: PathBuf, cx: &mut Context<Self>) -> Task<()> {
@@ -3170,8 +3139,12 @@ impl Shell {
                     }
                 }
                 Err(e) => {
-                    this.notice = Some(e);
-                    cx.notify();
+                    if mutating {
+                        this.notice = Some(e);
+                        cx.notify();
+                    } else {
+                        tracing::debug!(error = %e, "background account refresh failed");
+                    }
                 }
             })
             .ok();
@@ -3339,16 +3312,6 @@ impl Shell {
         snap: krill_proto::usage::AccountsSnapshot,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ev) = snap.switched.first() {
-            self.notice = Some(
-                krill_app::i18n::catalog::popout::AUTO_SWITCH_NOTICE.format(&[
-                    ("provider", ev.provider.display_name()),
-                    ("from", &ev.from_label),
-                    ("pct", &ev.reason_percent.to_string()),
-                    ("to", &ev.to_label),
-                ]),
-            );
-        }
         if host.is_local() {
             krill_app::alert::sync_account_switches(&snap.advanced, cx);
         }
@@ -3882,6 +3845,7 @@ impl Shell {
         self.restore_hidden_sessions(&visible, cx);
         let layout = &self.layout;
         self.creations.retain(|p, _| layout.pane_exists(*p));
+        self.outcome_unknown.retain(|p, _| layout.pane_exists(*p));
         self.live.retain(|p, live| {
             visible.contains(p) || layout.pane_exists(*p) && live.pane.keep_account_input()
         });
@@ -3995,8 +3959,8 @@ impl Shell {
                 if !target.is_current() {
                     return;
                 }
-                let Ok(Some((want, known, launch, creation, allow_cold_resume))) =
-                    this.read_with(cx, |t, _| {
+                let Ok(Some((want, known, launch, creation, allow_cold_resume, uncertain))) = this
+                    .read_with(cx, |t, _| {
                         let want = t.layout.session(pane);
                         let l = t.live.get(&pane)?;
                         let host = t.layout.host(pane);
@@ -4022,6 +3986,7 @@ impl Shell {
                             launch,
                             l.creation.clone(),
                             allow_cold_resume,
+                            t.outcome_unknown.contains_key(&pane),
                         ))
                     })
                 else {
@@ -4032,6 +3997,17 @@ impl Shell {
                 let got = bg
                     .spawn(async move {
                         let (session, prior_cold) = match old {
+                            // 앞서 보낸 생성 요청의 결과를 모른다: 아는 세션만 찾고 만들지 않는다.
+                            _ if uncertain => match want {
+                                Some(want) => match pane::find_session_in(&p, want)? {
+                                    Some(pane::Found::Live(session, _)) => (session, None),
+                                    Some(pane::Found::Cold(session, cold)) => {
+                                        return Ok(Got::Cold(session, cold));
+                                    }
+                                    None => return Ok(Got::Stopped),
+                                },
+                                None => return Ok(Got::Stopped),
+                            },
                             Some(old) => (
                                 pane::resume_session_in(&p, Some(old), &launch)?,
                                 pane::load_cold(&p, old).map(|c| (old, c)),
@@ -4049,6 +4025,9 @@ impl Shell {
                                     match pane::resume_session_in(&p, Some(cold_session), &launch) {
                                         Ok(new_session) => {
                                             (new_session, Some((cold_session, cold)))
+                                        }
+                                        Err(e) if pane::is_unknown_outcome(&e) => {
+                                            return Ok(Got::ColdUnknown(cold_session, cold, e));
                                         }
                                         Err(_) => return Ok(Got::Cold(cold_session, cold)),
                                     }
@@ -4142,6 +4121,24 @@ impl Shell {
         self.restarting_panes.remove(&pane);
         let got = match got {
             Ok(Got::Cold(session, cold)) => return self.cold(pane, session, cold, cx),
+            Ok(Got::ColdUnknown(session, cold, e)) => {
+                let error = start_error_text(&e);
+                self.outcome_unknown.insert(pane, error.clone());
+                let next = self.cold(pane, session, cold, cx);
+                if let Some(l) = self.live.get_mut(&pane) {
+                    l.error = Some(error);
+                }
+                return next;
+            }
+            Ok(Got::Stopped) => {
+                if let Some(l) = self.live.get_mut(&pane)
+                    && l.error.is_none()
+                {
+                    l.error = self.outcome_unknown.get(&pane).cloned();
+                }
+                cx.notify();
+                return Next::Gone;
+            }
             Ok(Got::Live {
                 session,
                 linked,
@@ -4204,7 +4201,15 @@ impl Shell {
                         }
                         l.error = Some(start_error_text(&e));
                         cx.notify();
-                        if permanent { Next::Gone } else { Next::Retry }
+                        // 생성 요청이 닿았는지 모르면 다시 보내지 않는다. 연결·조회 실패는 계속 다시 붙는다.
+                        if pane::is_unknown_outcome(&e) {
+                            self.outcome_unknown.insert(pane, start_error_text(&e));
+                            Next::Gone
+                        } else if permanent {
+                            Next::Gone
+                        } else {
+                            Next::Retry
+                        }
                     }
                     None => Next::Gone,
                 }
@@ -4248,7 +4253,7 @@ impl Shell {
         // 읽기 전용 옛 화면이라 낙관적 확정 글자를 지운다(OWE-615 원인 1).
         if let Some(l) = self.live.get_mut(&pane) {
             l.ime.clear_pending();
-            l.error = None;
+            l.error = self.outcome_unknown.get(&pane).cloned();
         }
         if let Some(state) = self.update_ready.take() {
             cx.background_spawn(async move {
@@ -4271,6 +4276,8 @@ impl Shell {
             .filter(|_| self.layout.visible().contains(&pane))
         {
             self.restarting_panes.insert(pane);
+            // 사용자가 직접 다시 시작했다: 결과를 모르던 생성 요청과 별개로 새로 만들어도 된다.
+            self.outcome_unknown.remove(&pane);
             let old = self
                 .live
                 .get(&pane)
@@ -4309,6 +4316,7 @@ impl Shell {
         let Some(l) = self.live.get_mut(&pane) else {
             return Next::Gone;
         };
+        self.outcome_unknown.remove(&pane);
         l.error = None;
         if let Some(launch) = &linked.launch
             && self.layout.host(pane).is_local()
@@ -4439,6 +4447,14 @@ impl Shell {
 
     fn show(&mut self, notice: Option<&Notice>, cx: &mut Context<Self>) {
         if let Some(n) = notice {
+            // Delivery uncertainty is diagnostic only. Never log the input text.
+            if n.fate == krill_proto::input::Fate::Uncertain {
+                tracing::debug!(
+                    bytes = n.bytes.len(),
+                    "input delivery uncertain; not resent"
+                );
+                return;
+            }
             self.notice = Some(notice_text(n));
             cx.notify();
         }
@@ -4750,11 +4766,6 @@ impl Shell {
             reason = "휠 한 번은 수백 행 안이고 abs 뒤에만 usize로 바꾼다"
         )]
         if lines != 0. {
-            if e.modifiers.platform || (cfg!(target_os = "windows") && e.modifiers.control) {
-                krill_app::settings::step_terminal_font_size(if lines > 0. { 1 } else { -1 }, cx);
-                cx.stop_propagation();
-                return;
-            }
             if let Some((column, line)) = cell_at(&l.painted, l.pane.screen(), e.position)
                 && let Some(bytes) = keys::tui::mouse(
                     l.pane.modes(),
@@ -5074,7 +5085,9 @@ impl Shell {
             // 비활성 탭 닫기 버튼(close-tab-{i}) 등 레이아웃 변경 시 버튼으로 빠져나간 포커스를 활성 칸으로 되돌린다.
             self.files.refocus = true;
         }
-        self.sync_focused_session(cx);
+        if save || now_focused != focused {
+            self.sync_focused_session(cx);
+        }
         self.sync_sidebar_custom_titles(cx);
         // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
         if now_focused.is_some() {
@@ -5094,21 +5107,35 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn focused_local_session(&self) -> Option<krill_proto::SessionId> {
+    pub(super) fn focused_session(
+        &self,
+    ) -> Option<(krill_app::hosts::HostId, krill_proto::SessionId)> {
         if self.page_open() || self.dashboard.is_some() {
             return None;
         }
         let pane = self.layout.focused()?;
-        if self.layout.file(pane).is_some() || !self.layout.host(pane).is_local() {
+        if self.layout.file(pane).is_some() {
             return None;
         }
-        self.layout.session(pane)
+        Some((self.layout.host(pane).clone(), self.layout.session(pane)?))
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn focused_local_session(&self) -> Option<krill_proto::SessionId> {
+        self.focused_session()
+            .and_then(|(host, session)| host.is_local().then_some(session))
     }
 
     pub(super) fn sync_focused_session(&self, cx: &mut Context<Self>) {
-        let session = self.focused_local_session();
-        krill_app::alert::focus(session, cx);
-        self.sidebar.update(cx, |s, cx| s.set_focused(session, cx));
+        let focused = self.focused_session();
+        let local = focused
+            .as_ref()
+            .and_then(|(host, session)| host.is_local().then_some(*session));
+        krill_app::alert::focus(local, cx);
+        self.sidebar.update(cx, |s, cx| match focused {
+            Some((host, session)) => s.set_focused_on(host, Some(session), cx),
+            None => s.set_focused(None, cx),
+        });
     }
 
     /// 세션을 보인다: 어떤 탭의 칸에 있으면 그 탭·칸으로, 없으면(분리된 세션) 새 탭에 붙인다.
@@ -6010,19 +6037,24 @@ impl Shell {
                                         .flex_wrap()
                                         .items_center()
                                         .gap_1()
-                                        .child(
-                                            Button::new(ElementId::Name(
-                                                format!("restart-{}", id.get()).into(),
-                                            ))
-                                            .debug_selector(move || format!("restart-{}", id.get()))
-                                            .label(text::RESTART.get())
-                                            .primary()
-                                            .xsmall()
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.restart(id, cx);
-                                            })),
-                                        )
+                                        // 다시 시작 요청의 결과를 모르면 버튼으로 또 보내지 않는다(사이드바에서 확인).
+                                        .when(!self.outcome_unknown.contains_key(&id), |d| {
+                                            d.child(
+                                                Button::new(ElementId::Name(
+                                                    format!("restart-{}", id.get()).into(),
+                                                ))
+                                                .debug_selector(move || {
+                                                    format!("restart-{}", id.get())
+                                                })
+                                                .label(text::RESTART.get())
+                                                .primary()
+                                                .xsmall()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.restart(id, cx);
+                                                })),
+                                            )
+                                        })
                                         .child(
                                             Button::new(("close-ended-pane", id.get()))
                                                 .label(text::CLOSE_PANE.get())
@@ -6431,16 +6463,7 @@ impl Render for Shell {
         }
         if self.language != krill_app::i18n::language() {
             self.language = krill_app::i18n::language();
-            if let Some((palette, _)) = &self.jump {
-                let (items, worktrees) = {
-                    let sb = self.sidebar.read(cx);
-                    (sb.jump_items(), sb.jump_worktrees())
-                };
-                palette.update(cx, |palette, cx| {
-                    palette.set_items(items, cx);
-                    palette.set_worktrees(worktrees, cx);
-                });
-            }
+            self.refresh_jump(cx);
         }
         if self.system_appearance.is_none() {
             self.system_appearance = Some(cx.observe_window_appearance(window, |_, window, cx| {
@@ -7647,10 +7670,13 @@ fn is_permanent_error(err: &std::io::Error) -> bool {
     )
 }
 
-/// 세션을 만들거나 붙지 못한 이유를 칸에 보일 문구로 바꾼다. 아는 krilld 거절은 다음 할 일을 담은 문구로,
-/// 나머지는 원문 그대로 둔다.
+/// 세션을 만들거나 붙지 못한 이유를 칸에 보일 문구로 바꾼다. 생성 결과를 모르는 실패와 아는 krilld 거절은 다음 할
+/// 일을 담은 문구로, 나머지는 원문 그대로 둔다.
 fn start_error_text(err: &std::io::Error) -> String {
     use krill_proto::control::Failure;
+    if pane::is_unknown_outcome(err) {
+        return text::START_UNCONFIRMED.get().to_owned();
+    }
     let raw = err.to_string();
     if raw == Failure::NoHolder.to_string() {
         text::START_NO_HOLDER.get().to_owned()

@@ -590,9 +590,9 @@ impl Sidebar {
         }
         if let Some(focused) = self
             .focused
-            .and_then(|id| self.folder_on(&HostId::Local, id))
+            .and_then(|id| self.folder_on(&self.focused_host, id))
         {
-            return self.row_host(index).is_local() && focused == path;
+            return self.row_host(index) == &self.focused_host && focused == path;
         }
         self.selected_workspace()
             .is_some_and(|(host, folder)| self.row_host(index) == &host && folder == path)
@@ -1128,27 +1128,6 @@ impl Sidebar {
                         s.cursor = Some(index);
                         s.fold(&fold_row, None, cx);
                     }))
-                    // Orca처럼 프로젝트 머리줄을 끌어다 다른 프로젝트 위에 놓아 순서를 바꾼다(내 Mac 프로젝트만).
-                    .when(row_host.is_local(), |d| {
-                        let drop_to = path.clone();
-                        let ring = p.ring;
-                        d.on_drag(
-                            ProjectDrag {
-                                path: path.clone(),
-                                name: basename(path).into(),
-                            },
-                            |drag, _, _, cx| cx.new(|_| drag.clone()),
-                        )
-                        .drag_over::<ProjectDrag>(move |d, _, _, _| {
-                            d.border_t_2().border_color(ring)
-                        })
-                        .on_drop(cx.listener(
-                            move |s, drag: &ProjectDrag, _, cx| {
-                                cx.stop_propagation();
-                                s.move_project(&drag.path, &drop_to, cx);
-                            },
-                        ))
-                    })
             }
             Row::Folder(path) => {
                 let (fold_btn, fold_row, fresh, fresh_host) =
@@ -1433,6 +1412,34 @@ impl Sidebar {
                     }))
             }
         };
+        let project =
+            super::project_key(row).filter(|_| self.options.group_by == super::GroupBy::Repo);
+        let element = element.when_some(project, |d, (_, path)| {
+            let drop_to = path.clone();
+            let ring = p.ring;
+            d.on_drag(
+                ProjectDrag {
+                    path: path.clone(),
+                    name: if row_host.is_local() {
+                        self.project_header_name(path)
+                    } else {
+                        basename(path)
+                    }
+                    .into(),
+                    index,
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
+            .drag_over::<ProjectDrag>(move |d, drag, _, _| match drag.index.cmp(&index) {
+                std::cmp::Ordering::Equal => d,
+                std::cmp::Ordering::Less => d.border_b_2().border_color(ring),
+                std::cmp::Ordering::Greater => d.border_t_2().border_color(ring),
+            })
+            .on_drop(cx.listener(move |s, drag: &ProjectDrag, _, cx| {
+                cx.stop_propagation();
+                s.move_project(&drag.path, &drop_to, cx);
+            }))
+        });
         self.card_segment(index, row, element, cx)
     }
 
@@ -1757,6 +1764,7 @@ impl Sidebar {
                     WorktreeDrag(ProjectDrag {
                         path: path.to_path_buf(),
                         name: self.name(path).into(),
+                        index,
                     }),
                     |drag, _, _, cx| cx.new(|_| drag.clone()),
                 )
@@ -3537,6 +3545,7 @@ pub(super) fn disconnect_reason(error: &str) -> &'static str {
 #[derive(Clone)]
 struct ProjectDrag {
     path: PathBuf,
+    index: usize,
     name: gpui::SharedString,
 }
 

@@ -46,6 +46,7 @@ const MAX_BYTES: u64 = 512 * 1024;
 /// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다(직접 조회가 켜져 있을 때).
 pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     lock(&CACHE).remove(&(home.to_path_buf(), provider, dir.to_path_buf()));
+    super::meters::evict_profile(home, provider, dir);
 }
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
@@ -123,7 +124,8 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
             && (lock(&RETRY)
                 .get(&key)
                 .is_some_and(|(until, _)| Instant::now() < *until)
-                || live_fresh(provider, &key.2))
+                || (live_fresh(provider, &key.2)
+                    && super::meters::has_cached(&key.0, provider, &key.2)))
             || lock(&CACHE)
                 .get(&key)
                 .is_some_and(|(at, u)| u.error.is_none() && !u.stale && at.elapsed() < interval)
@@ -164,7 +166,7 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                     let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
                     retry.insert(job.clone(), (Instant::now() + wait, streak));
                     drop(retry);
-                    mark_rate_limited(&mut lock(&CACHE), &job);
+                    mark_rate_limited(&mut lock(&CACHE), &job, now);
                     None
                 }
                 Fetched::Failed => {
@@ -228,12 +230,28 @@ fn failure_wait(streak: u32) -> Duration {
 }
 
 /// 429 때: 마지막 정상 값은 받은 시각을 그대로 둔 채 오래됨으로 바꾼다. 정상 값이 없으면
-/// 오류 행을 지워 프로필 사용량 파일(statusline 캐시)로 넘어가게 한다.
-fn mark_rate_limited(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key) {
+/// '모름(--)' 대신 요청 제한 오류로 둔다(값은 지어내지 않는다). 사용량이 빈 오류 행이라
+/// 프로필 사용량 파일(statusline 캐시)이 있으면 그 값이 이긴다.
+fn mark_rate_limited(
+    cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>,
+    key: &Key,
+    now: Option<u64>,
+) {
     match cache.get_mut(key) {
         Some((_, u)) if u.error.is_none() && !u.usage.is_empty() => u.stale = true,
         _ => {
-            cache.remove(key);
+            cache.insert(
+                key.clone(),
+                (
+                    Instant::now(),
+                    ProfileUsage {
+                        error: Some("요청 제한".into()),
+                        detail: Some("사용량 API 요청 제한(429)".into()),
+                        updated_at: now,
+                        ..ProfileUsage::default()
+                    },
+                ),
+            );
         }
     }
 }
@@ -454,21 +472,25 @@ impl ClaudeResetProgram {
     }
 }
 
-/// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 하나라도 실패하면
+/// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 두 프로브가 모두 실패하면
 /// `None`(기존 미터를 유지하고 다음 주기에 다시 시도한다).
-#[cfg_attr(
-    test,
-    expect(dead_code, reason = "테스트 빌드는 네트워크 조회 경로를 쓰지 않는다")
-)]
 pub(super) fn claude_reset_count(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
 ) -> Option<u64> {
-    let status = send(&claude_probe_config(token, ClaudeResetProbe::Juniper)?)?;
-    let juniper = u64::from(parse_juniper_status(std::str::from_utf8(&status).ok()?)?);
-    let cedar_body = send(&claude_probe_config(token, ClaudeResetProbe::Cedar)?)?;
-    let cedar = parse_cedar_status(std::str::from_utf8(&cedar_body).ok()?, now_secs())?;
-    Some(juniper.saturating_add(cedar))
+    let juniper = claude_probe_config(token, ClaudeResetProbe::Juniper)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_juniper_status(std::str::from_utf8(&body).ok()?))
+        .map(u64::from);
+    let cedar = claude_probe_config(token, ClaudeResetProbe::Cedar)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_cedar_status(std::str::from_utf8(&body).ok()?, now_secs()));
+    match (juniper, cedar) {
+        (Some(j), Some(c)) => Some(j.saturating_add(c)),
+        (Some(j), None) => Some(j),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
 }
 
 /// 소진 시점에 제공 중인 프로그램. 바깥은 `None`(프로브 실패)과 제공 없음(`Some(None)`)을
@@ -478,17 +500,20 @@ pub(super) fn claude_offered_program(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
 ) -> Option<Option<ClaudeResetProgram>> {
-    let status = send(&claude_probe_config(token, ClaudeResetProbe::Juniper)?)?;
-    if parse_juniper_status(std::str::from_utf8(&status).ok()?)? {
+    let juniper = claude_probe_config(token, ClaudeResetProbe::Juniper)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_juniper_status(std::str::from_utf8(&body).ok()?));
+    if juniper == Some(true) {
         return Some(Some(ClaudeResetProgram::Juniper));
     }
-    let cedar_body = send(&claude_probe_config(token, ClaudeResetProbe::Cedar)?)?;
-    let usable = parse_cedar_status(std::str::from_utf8(&cedar_body).ok()?, now_secs())?;
-    Some(if usable > 0 {
-        Some(ClaudeResetProgram::Cedar)
-    } else {
-        None
-    })
+    let cedar = claude_probe_config(token, ClaudeResetProbe::Cedar)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_cedar_status(std::str::from_utf8(&body).ok()?, now_secs()));
+    match (juniper, cedar) {
+        (_, Some(usable)) if usable > 0 => Some(Some(ClaudeResetProgram::Cedar)),
+        (Some(_), _) | (_, Some(_)) => Some(None),
+        (None, None) => None,
+    }
 }
 
 /// Claude 리셋 상태 조회 설정. 프로브마다 고정 쿼리를 쓴다.
@@ -899,7 +924,7 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
 
 // Claude Code·agy(go-keyring)는 `/usr/bin/security`로 항목을 만들어 ACL이 그 도구만 믿는다.
 // krilld가 SecItem으로 직접 읽으면 macOS가 매번 로그인 키체인 암호를 묻는다 — Orca처럼 같은 도구로 읽는다.
-#[cfg(not(test))]
+#[cfg(all(not(test), not(windows)))]
 fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
     let output = Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
@@ -909,6 +934,11 @@ fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
         .ok()?;
     let stdout = Zeroizing::new(output.stdout);
     (output.status.success() && u64::try_from(stdout.len()).ok()? <= MAX_BYTES).then_some(stdout)
+}
+// Windows go-keyring은 자격 증명 관리자에 `service:account` 이름의 일반 자격 증명으로 둔다(agy 로그인).
+#[cfg(all(not(test), windows))]
+fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
+    crate::sys::generic_credential(&format!("{service}:{account}"))
 }
 #[cfg(test)]
 fn keychain(_: &str, _: &str) -> Option<Zeroizing<Vec<u8>>> {
@@ -1515,6 +1545,12 @@ pub(crate) mod agy {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // krilld는 콘솔 없이(DETACHED_PROCESS) 돈다. 막지 않으면 agy가 조회마다 콘솔 창을 띄운다.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         if ssh_connection {
             cmd.env("SSH_CONNECTION", "krill");
         } else {
@@ -2144,6 +2180,24 @@ mod tests {
             offered(r#"{"juniper_tide":null}"#, r#"{"cedar_ember":null}"#),
             Some(None)
         );
+        assert_eq!(
+            offered(
+                "{}",
+                r#"{"cedar_ember":{"eligible":true,"grants":[{"id":"g","resets_left":1,"usable_now":true}]}}"#
+            ),
+            Some(Some(ClaudeResetProgram::Cedar))
+        );
+        assert_eq!(
+            claude_reset_count("fixture-only", |config| {
+                let body = if config.contains("at_wall") {
+                    "{}"
+                } else {
+                    r#"{"cedar_ember":{"eligible":true,"grants":[{"id":"g","resets_left":2,"usable_now":true}]}}"#
+                };
+                Some(Zeroizing::new(body.as_bytes().to_vec()))
+            }),
+            Some(2)
+        );
         assert!(
             claude_offered_program("fixture-only", |_| None).is_none(),
             "probe failure must not look like no offer"
@@ -2260,7 +2314,7 @@ mod tests {
         };
         let at = Instant::now();
         let mut cache = BTreeMap::from([(key.clone(), (at, good.clone()))]);
-        mark_rate_limited(&mut cache, &key);
+        mark_rate_limited(&mut cache, &key, Some(200));
         let (kept_at, kept) = &cache[&key];
         assert_eq!(*kept_at, at);
         assert!(kept.stale && kept.updated_at == Some(100) && kept.usage == good.usage);
@@ -2274,8 +2328,14 @@ mod tests {
                 },
             ),
         );
-        mark_rate_limited(&mut cache, &key);
-        assert!(cache.is_empty());
+        mark_rate_limited(&mut cache, &key, Some(200));
+        // 정상 값이 없으면 지어낸 값 없이 요청 제한 오류(조회 오류 표시)로 남는다.
+        let (_, limited) = &cache[&key];
+        assert!(limited.usage.is_empty() && limited.updated_at == Some(200));
+        assert_eq!(limited.error.as_deref(), Some("요청 제한"));
+        cache.clear();
+        mark_rate_limited(&mut cache, &key, None);
+        assert_eq!(cache[&key].1.error.as_deref(), Some("요청 제한"));
     }
 
     /// Orca 패리티: 방금 쓴 statusline 값이 있으면 자동 조회를 건너뛰고, 직접 조회 값보다 새롭거나

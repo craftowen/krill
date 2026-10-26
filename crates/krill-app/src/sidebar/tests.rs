@@ -1234,7 +1234,7 @@ fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAp
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.prs.insert(path.clone(), Status::Missing);
-            s.poll_error = Some("daemon slow".into());
+            s.poll_error = Some(("daemon slow".into(), false));
             s.notice = Some("sidebar notice".into());
             s.error = Some("save failed".into());
             cx.notify();
@@ -6604,4 +6604,225 @@ fn dragging_worktree_cards_changes_manual_order_and_persists_without_reordering_
     }
     assert!(decode_state(&legacy).unwrap().5.is_empty());
     fs::remove_dir_all(&dir).ok();
+}
+
+/// 백그라운드 폴링 재시도는 조용히 복구하고 권한·프로토콜 오류는 조치를 요청한다.
+#[gpui::test]
+fn transient_poll_errors_keep_diagnostics_without_popup(cx: &mut TestAppContext) {
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+    sidebar.update(cx, |s, cx| {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            s.apply(Err(kind.into()), BTreeMap::new(), cx);
+            assert!(s.poll_error().is_some());
+            assert_eq!(s.poll_error_notice(), None);
+            assert_eq!(s.local_status, HostStatus::Disconnected);
+        }
+        s.apply(
+            Err(io::ErrorKind::PermissionDenied.into()),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(s.poll_error_notice().is_some());
+        s.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
+        assert_eq!(s.poll_error(), None);
+        assert_eq!(s.poll_error_notice(), None);
+        assert_eq!(s.local_status, HostStatus::Connected);
+    });
+}
+
+#[test]
+fn jump_connected_snapshots_keep_host_identity_labels_paths_and_local_preferences_separate() {
+    let mut sidebar = Sidebar::new_loaded(None);
+    let mut local = session(7, AgentState::Working, Some("/srv/repo/feature"));
+    local.cwd = Some("/srv/repo/feature/local-subdir".into());
+    sidebar.snapshot = Snapshot {
+        sessions: vec![local],
+        trees: [("/srv/repo".into(), vec!["/srv/repo/feature".into()])].into(),
+    };
+    sidebar
+        .custom_titles
+        .insert(SessionId(7), "Local alias".into());
+    sidebar.focused = Some(SessionId(7));
+    sidebar.unread.insert(SessionId(7));
+    let mut remote_session = session(7, AgentState::Waiting, Some("/srv/repo/feature"));
+    remote_session.cwd = Some("/srv/repo/feature/zzremotezz".into());
+    remote_session.status.title = Some("Remote task".into());
+    for (id, status) in [
+        ("studio", HostStatus::Connected),
+        ("offline", HostStatus::Disconnected),
+    ] {
+        sidebar.remote_hosts.push(RemoteHost {
+            id: id.into(),
+            label: format!("{id} PC"),
+            status,
+            snapshot: Snapshot {
+                sessions: vec![remote_session.clone()],
+                trees: [("/srv/repo".into(), vec!["/srv/repo/feature".into()])].into(),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        });
+    }
+    // 접힘·사이드바 필터로 보이지 않는 세션도 Jump의 수신 스냅샷에는 남아 있다.
+    sidebar
+        .collapsed_hosts
+        .insert(HostId::Remote("studio".into()));
+    let items = sidebar.jump_items();
+    assert_eq!(items.len(), 2);
+    let local = items.iter().find(|i| i.host.is_local()).unwrap();
+    let remote = items.iter().find(|i| i.host.is_remote()).unwrap();
+    assert_eq!(local.title, "Local alias");
+    assert!(local.is_current_tab && local.unread);
+    assert_eq!(remote.host, HostId::Remote("studio".into()));
+    assert_eq!(remote.host_label, "studio PC");
+    assert_eq!(remote.title, "Remote task");
+    assert!(!remote.is_current_tab && !remote.is_current_worktree && !remote.unread);
+    assert_eq!(remote.repo_name, "repo");
+    assert_eq!(remote.cwd, "/srv/repo/feature/zzremotezz");
+    assert_eq!(crate::jump::search(&items, "zzremotezz").len(), 1);
+    let trees = sidebar.jump_worktrees();
+    assert_eq!(trees.len(), 2, "same path on two hosts remains two rows");
+    let remote_tree = trees.iter().find(|t| t.host.is_remote()).unwrap();
+    assert_eq!(remote_tree.host, remote.host);
+    assert_eq!(remote_tree.session_id, Some(SessionId(7)));
+    assert!(!remote_tree.is_current && !remote_tree.unread);
+}
+
+/// A local snapshot refresh must not steal focus from a colliding remote ID.
+#[gpui::test]
+fn local_poll_keeps_remote_focus_and_local_unread(cx: &mut TestAppContext) {
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+    sidebar.update(cx, |s, cx| {
+        let local = session(7, AgentState::Done, Some("/srv/local"));
+        let remote = session(7, AgentState::Waiting, Some("/srv/remote"));
+        s.snapshot.sessions = vec![local];
+        s.snapshot
+            .trees
+            .insert("/srv/local".into(), vec!["/srv/local".into()]);
+        s.remote_hosts.push(RemoteHost {
+            id: "studio".into(),
+            label: "Studio".into(),
+            status: HostStatus::Connected,
+            snapshot: Snapshot {
+                sessions: vec![remote],
+                trees: [("/srv/remote".into(), vec!["/srv/remote".into()])].into(),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        });
+        s.unread.insert(SessionId(7));
+        s.set_focused_on(HostId::Remote("studio".into()), Some(SessionId(7)), cx);
+        let mut next = s.snapshot.clone();
+        next.sessions[0].status.title = Some("Local update".into());
+        s.apply(Ok((next, Meta::new())), BTreeMap::new(), cx);
+        assert_eq!(s.focused_host, HostId::Remote("studio".into()));
+        assert!(s.unread.contains(&SessionId(7)));
+        assert_eq!(s.focused_synced, None);
+        assert!(
+            s.cursor
+                .is_some_and(|i| s.row_host(i) == &HostId::Remote("studio".into()))
+        );
+    });
+}
+
+#[gpui::test]
+fn focusing_session_expands_collapsed_project_and_selects_session_row_across_hosts(
+    cx: &mut TestAppContext,
+) {
+    let view = cx.new(|cx| {
+        let mut s = Sidebar::new(None);
+        let mut local_a = session(7, AgentState::Working, Some("/repo-a/feat-a"));
+        local_a.cwd = Some("/repo-a/feat-a".into());
+        let mut local_b = session(8, AgentState::Waiting, Some("/repo-b/feat-b"));
+        local_b.cwd = Some("/repo-b/feat-b".into());
+        s.snapshot = Snapshot {
+            sessions: vec![local_a, local_b],
+            trees: [
+                (
+                    "/repo-a".into(),
+                    vec!["/repo-a".into(), "/repo-a/feat-a".into()],
+                ),
+                (
+                    "/repo-b".into(),
+                    vec!["/repo-b".into(), "/repo-b/feat-b".into()],
+                ),
+            ]
+            .into(),
+        };
+        let mut remote_s = session(7, AgentState::Working, Some("/srv/repo-r/feat-r"));
+        remote_s.cwd = Some("/srv/repo-r/feat-r".into());
+        s.remote_hosts.push(RemoteHost {
+            id: "studio".into(),
+            label: "studio PC".into(),
+            status: HostStatus::Connected,
+            snapshot: Snapshot {
+                sessions: vec![remote_s],
+                trees: [(
+                    "/srv/repo-r".into(),
+                    vec!["/srv/repo-r".into(), "/srv/repo-r/feat-r".into()],
+                )]
+                .into(),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        });
+        s.collapsed.insert("/repo-b".into());
+        s.collapsed.insert("/repo-b/feat-b".into());
+        s.collapsed.insert("/srv/repo-r".into());
+        s.collapsed.insert("/srv/repo-r/feat-r".into());
+        s.collapsed_hosts.insert(HostId::Remote("studio".into()));
+        s.rebuild(cx);
+        s
+    });
+
+    // 1. 접혀 있는 로컬 저장소·워크트리의 세션을 포커싱하면 펼치고 세션 행을 선택·노출한다.
+    view.update(cx, |s, cx| {
+        s.set_focused_on(HostId::Local, Some(SessionId(8)), cx);
+        assert!(!s.is_collapsed(Path::new("/repo-b")));
+        assert!(!s.is_collapsed(Path::new("/repo-b/feat-b")));
+        assert_eq!(s.selected_worktree(), Some(Path::new("/repo-b/feat-b")));
+        let idx = s.cursor.expect("local session row must be selected");
+        assert_eq!(s.row_host(idx), &HostId::Local);
+        assert!(matches!(
+            s.rows.get(idx),
+            Some(Row::Session(sess, true)) if sess.id == SessionId(8)
+        ));
+        assert!(
+            s.card_list.contains_row(idx),
+            "focused local session row must be visible in card_list viewport"
+        );
+        assert_eq!(s.card_list.pending_reveal.get(), Some(idx));
+    });
+
+    // 2. 동일한 SessionId(7)를 가진 원격 호스트 세션을 포커싱하면 원격 호스트·저장소·워크트리를 펼치고
+    //    로컬이 아닌 원격 호스트의 세션 행을 정확히 선택·노출한다.
+    let remote_host = HostId::Remote("studio".into());
+    view.update(cx, |s, cx| {
+        s.set_focused_on(remote_host.clone(), Some(SessionId(7)), cx);
+        assert!(!s.is_host_collapsed(&remote_host));
+        assert!(!s.is_collapsed(Path::new("/srv/repo-r")));
+        assert!(!s.is_collapsed(Path::new("/srv/repo-r/feat-r")));
+        assert_eq!(
+            s.selected_workspace(),
+            Some((remote_host.clone(), PathBuf::from("/srv/repo-r/feat-r")))
+        );
+        let idx = s.cursor.expect("remote session row must be selected");
+        assert_eq!(s.row_host(idx), &remote_host);
+        assert!(matches!(
+            s.rows.get(idx),
+            Some(Row::Session(sess, true)) if sess.id == SessionId(7)
+        ));
+        assert!(
+            s.card_list.contains_row(idx),
+            "focused remote session row must be visible in card_list viewport"
+        );
+        assert_eq!(s.card_list.pending_reveal.get(), Some(idx));
+    });
 }

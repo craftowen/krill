@@ -65,7 +65,8 @@ impl Settings {
         let dir = state.join(DIR);
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let state = state.canonicalize()?;
-        let krill = krill.canonicalize()?;
+        // Windows statusLine은 Git Bash가 실행한다: `\\?\` 접두 없는 경로를 넘긴다(전역 설치와 같은 모양).
+        let krill = krill_proto::os::canonicalize(krill)?;
         #[cfg(not(windows))]
         let command = format!(
             "env KRILL_STATE_DIR={} {} hook claude",
@@ -413,8 +414,11 @@ mod windows_tests {
         let handler = &value["hooks"]["PreToolUse"][0]["hooks"][0];
         assert_eq!(
             std::path::Path::new(handler["command"].as_str().unwrap()),
-            exe.canonicalize().unwrap()
+            krill_proto::os::canonicalize(&exe).unwrap()
         );
+        // statusLine은 Git Bash가 실행하므로 `\\?\` 접두 없는 경로를 쓴다.
+        let status_line = value["statusLine"]["command"].as_str().unwrap_or_default();
+        assert!(!status_line.contains(r"\\?\"), "{status_line}");
         assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
         std::fs::remove_dir_all(state).ok();
     }

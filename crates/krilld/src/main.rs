@@ -257,18 +257,45 @@ fn main() -> ExitCode {
     let accept = thread::Builder::new()
         .name("accept".to_owned())
         .spawn(move || {
+            // 여기서 닫는 연결은 Hello 없이 끝나 클라이언트에는 EOF로만 보인다. 상태가 바뀔 때만 남긴다.
+            let mut rejected = None;
+            let mut spawn_error = None;
+            let mut full = 0u64;
             loop {
-                if let Ok(s) = lis.accept() {
-                    // Bound unclassified connection threads without counting existing
-                    // attach/watch/wait clients or the dedicated holder connection.
-                    let Some(permit) = krilld::registry::admission::handshake() else {
+                let s = match lis.accept() {
+                    Ok(s) => s,
+                    Err(error) => {
+                        if rejected.replace(error.kind()) != Some(error.kind()) {
+                            tracing::warn!(kind = ?error.kind(), "connection closed before hello");
+                        }
                         continue;
-                    };
-                    let (hello, r) = (hello.clone(), Arc::clone(&registry));
-                    thread::Builder::new()
-                        .name("conn".to_owned())
-                        .spawn(move || r.serve_admitted(s, &hello, permit).ok())
-                        .ok();
+                    }
+                };
+                rejected = None;
+                // Bound unclassified connection threads without counting existing
+                // attach/watch/wait clients or the dedicated holder connection.
+                let Some(permit) = krilld::registry::admission::handshake() else {
+                    if full == 0 {
+                        tracing::warn!("handshake admission full; closing new connections");
+                    }
+                    full = full.saturating_add(1);
+                    continue;
+                };
+                if full > 0 {
+                    tracing::info!(closed = full, "handshake admission recovered");
+                    full = 0;
+                }
+                let (hello, r) = (hello.clone(), Arc::clone(&registry));
+                match thread::Builder::new()
+                    .name("conn".to_owned())
+                    .spawn(move || r.serve_admitted(s, &hello, permit).ok())
+                {
+                    Ok(_) => spawn_error = None,
+                    Err(error) => {
+                        if spawn_error.replace(error.kind()) != Some(error.kind()) {
+                            tracing::warn!(kind = ?error.kind(), "could not start connection handler");
+                        }
+                    }
                 }
             }
         });
