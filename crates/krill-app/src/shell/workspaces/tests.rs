@@ -748,7 +748,7 @@ fn closing_remote_session_is_not_readded_after_interleaved_snapshots_and_externa
     });
 }
 
-/// 종료 스냅샷은 비활성 탭도 정리한다. 호스트별 같은 ID와 셸 안의 `SessionEnd`는 보존한다.
+/// 종료 스냅샷은 비활성 탭도 정리한다. 호스트별 같은 ID와 셸 안의 `SessionEnd` 이벤트는 보존한다.
 #[gpui::test]
 fn exited_snapshot_closes_hidden_tab_without_trees_or_prior_observation(cx: &mut TestAppContext) {
     use krill_app::hosts::HostStatus;
@@ -801,5 +801,63 @@ fn exited_snapshot_closes_hidden_tab_without_trees_or_prior_observation(cx: &mut
         assert_eq!(s.layout.session(local), Some(SessionId(41)));
         assert_eq!(s.layout.focused(), Some(local));
         assert!(s.workspace_closing.contains(&(remote, SessionId(41))));
+    });
+}
+
+#[gpui::test]
+fn windows_workspace_aliases_share_tabs_and_new_tab_keeps_active_cwd(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("windows-workspace-identity"));
+    view.update(cx, |s, cx| {
+        s.sidebar
+            .update(cx, |sidebar, cx| sidebar.select_worktree(None, cx));
+        s.change(true, cx, |layout| {
+            let pane = layout.active_tab().focused;
+            layout.set_launch(
+                pane,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: r"\\?\C:\Users\Owen\간단작업".as_bytes().to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+        });
+        let original = s.layout.active();
+        // No selected sidebar workspace yet: the active launch still owns the cwd.
+        s.new_tab_on_launch_host(cx);
+        assert_eq!(s.layout.tabs().len(), 2);
+        let added = s.layout.active_tab().focused;
+        assert_eq!(
+            s.layout.launch(added).unwrap().cwd,
+            r"\\?\C:\Users\Owen\간단작업".as_bytes()
+        );
+        s.change(true, cx, |layout| {
+            let mut launch = layout.launch(added).unwrap().clone();
+            launch.cwd = "c:/users/owen/간단작업/".as_bytes().to_vec();
+            layout.set_launch(added, launch);
+        });
+        assert_eq!(s.workspace_tabs(cx), [original, s.layout.active()]);
+        s.open_workspace_on(HostId::Local, PathBuf::from(r"C:\USERS\OWEN\간단작업"), cx);
+        assert_eq!(s.layout.tabs().len(), 2);
+        let local = Workspace {
+            host: HostId::Local,
+            folder: PathBuf::from(r"C:\Users\Owen\간단작업"),
+        };
+        let remote = Workspace {
+            host: HostId::Remote("windows".into()),
+            folder: local.folder.clone(),
+        };
+        assert_ne!(local, remote);
+        assert_ne!(
+            Workspace {
+                host: HostId::Local,
+                folder: "/Repo".into()
+            },
+            Workspace {
+                host: HostId::Local,
+                folder: "/repo".into()
+            }
+        );
     });
 }

@@ -294,18 +294,14 @@ impl Sidebar {
             .trees
             .keys()
             .chain(self.snapshot.trees.values().flatten())
-            .filter(|wt| !wt.as_os_str().is_empty() && path.starts_with(wt.as_path()))
+            .filter(|wt| !wt.as_os_str().is_empty() && super::path_within(path, wt))
             .max_by_key(|wt| wt.as_os_str().len())
             .cloned()
     }
 
     /// 워크트리가 속한 저장소 루트 경로를 찾는다.
     pub(super) fn repo_for_worktree(&self, path: &Path) -> Option<PathBuf> {
-        self.snapshot
-            .trees
-            .iter()
-            .find(|&(repo, list)| repo == path || list.iter().any(|t| t == path))
-            .map(|(repo, _)| repo.clone())
+        self.repo_for_worktree_on(&crate::hosts::HostId::Local, path)
     }
 
     /// 지정한 호스트 스냅샷에서 워크트리가 속한 저장소 루트 경로를 찾는다.
@@ -318,7 +314,10 @@ impl Sidebar {
         self.snapshot_for(host)
             .trees
             .iter()
-            .find(|&(repo, list)| repo == path || list.iter().any(|t| t == path))
+            .find(|&(repo, list)| {
+                super::path_identity::same(repo, path)
+                    || list.iter().any(|t| super::path_identity::same(t, path))
+            })
             .map(|(repo, _)| repo.clone())
     }
 

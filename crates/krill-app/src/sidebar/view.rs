@@ -1748,6 +1748,25 @@ impl Sidebar {
         use krill_proto::control::AgentState;
 
         let p = ui::palette(cx);
+        let base = base.when(
+            self.row_host(index).is_local() && self.editing.is_none(),
+            |d| {
+                let drop_to = path.to_path_buf();
+                let ring = p.ring;
+                d.on_drag(
+                    WorktreeDrag(ProjectDrag {
+                        path: path.to_path_buf(),
+                        name: self.name(path).into(),
+                    }),
+                    |drag, _, _, cx| cx.new(|_| drag.clone()),
+                )
+                .drag_over::<WorktreeDrag>(move |d, _, _, _| d.border_t_2().border_color(ring))
+                .on_drop(cx.listener(move |s, drag: &WorktreeDrag, _, cx| {
+                    cx.stop_propagation();
+                    s.move_worktree(&drag.0.path, &drop_to, cx);
+                }))
+            },
+        );
         let row_host = self.row_host(index).clone();
         let virtualized = self.rows.len() >= 100;
         let row_key = (row_host.clone(), path.to_path_buf());
@@ -3519,6 +3538,27 @@ pub(super) fn disconnect_reason(error: &str) -> &'static str {
 struct ProjectDrag {
     path: PathBuf,
     name: gpui::SharedString,
+}
+
+#[derive(Clone)]
+struct WorktreeDrag(ProjectDrag);
+
+impl Render for WorktreeDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
+        div()
+            .px(ui::SPACE_3)
+            .py(ui::SPACE_2)
+            .rounded(ui::RADIUS_SM)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .child(self.0.name.clone())
+    }
 }
 
 impl Render for ProjectDrag {

@@ -2619,6 +2619,15 @@ impl Shell {
             self.new_folder_tab_on(host, &folder, Program::Login, cx);
             return;
         }
+        // A live or restored active tab may predate the sidebar selection/poll.
+        // Keep its launch workspace instead of falling back to the default folder.
+        if let Some(pane) = self.layout.focused()
+            && self.layout.host(pane) == &host
+        {
+            let folder = self.folder();
+            self.new_folder_tab_on(host, &folder, Program::Login, cx);
+            return;
+        }
         self.change(true, cx, |l| {
             l.new_tab();
             if host.is_remote()

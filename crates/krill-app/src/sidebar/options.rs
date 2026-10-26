@@ -88,7 +88,7 @@ pub enum SortBy {
     #[default]
     Recent,
     Name,
-    /// Orca Manual처럼 생성 시각 내림차순(새 워크트리가 위, 활동해도 순서 고정).
+    /// 수동으로 옮긴 순서, 나머지는 생성 시각 내림차순(활동해도 순서 고정).
     /// sidebar.bin·모바일(`krilld::mobile::workspaces`)이 변형 인덱스를 읽으므로 끝에만 추가한다.
     Created,
 }
@@ -538,6 +538,7 @@ pub(super) struct WorktreeContext<'a> {
     pub pending_worktrees: &'a [super::PendingWorktree],
     pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
     /// 사용자가 끌어다 놓아 정한 프로젝트 순서. 없는 프로젝트는 그 뒤에 이름순으로 온다.
+    pub worktree_order: Option<&'a [PathBuf]>,
     pub project_order: Option<&'a [PathBuf]>,
 }
 
@@ -722,7 +723,14 @@ pub(super) fn sort_worktrees(
             }
             SortBy::Name => Reverse(0),
         };
-        (rank, recent_key, name, *a)
+        let manual = if sort_by == SortBy::Created {
+            ctx.worktree_order
+                .and_then(|order| order.iter().position(|p| p == *a))
+                .unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        (manual, rank, recent_key, name, *a)
     });
 }
 
@@ -1233,6 +1241,7 @@ impl Sidebar {
             pending_worktrees: &pending,
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
+            worktree_order: Some(&self.worktree_order),
         };
         rows_with_options(
             &self.snapshot,
@@ -1305,6 +1314,7 @@ impl Sidebar {
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
+            worktree_order: Some(&self.worktree_order),
             ..WorktreeContext::default()
         };
         rows_with_options(
@@ -1571,7 +1581,7 @@ impl Sidebar {
                     .map_or_else(|| id.clone(), |r| r.label.clone()),
             ),
             HostId::Local => (self.options.group_by != GroupBy::Repo
-                && !self.remote_hosts.is_empty())
+                && self.has_connected_remote_hosts())
             .then(|| {
                 text::HOST_LOCAL
                     .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
@@ -1733,7 +1743,7 @@ fn build_options_menu(
     }
     let has_hosts = this
         .upgrade()
-        .is_some_and(|s| !s.read(cx).remote_hosts.is_empty());
+        .is_some_and(|s| s.read(cx).has_connected_remote_hosts());
     let has_projects = this
         .upgrade()
         .is_some_and(|s| !s.read(cx).filterable_project_repos().is_empty());
@@ -1849,6 +1859,7 @@ fn add_options_submenu(
                             sidebar
                                 .remote_hosts
                                 .iter()
+                                .filter(|h| h.status == HostStatus::Connected)
                                 .map(|h| (HostId::Remote(h.id.clone()), h.label.clone())),
                         )
                         .collect::<Vec<_>>();
@@ -1916,11 +1927,16 @@ fn render_options_submenu(
                     .to_owned(),
                 status_label: host_status_label(s.local_status),
             })
-            .chain(s.remote_hosts.iter().map(|h| HostMenuEntry {
-                id: HostId::Remote(h.id.clone()),
-                label: h.label.clone(),
-                status_label: host_status_label(h.status),
-            }))
+            .chain(
+                s.remote_hosts
+                    .iter()
+                    .filter(|h| h.status == HostStatus::Connected)
+                    .map(|h| HostMenuEntry {
+                        id: HostId::Remote(h.id.clone()),
+                        label: h.label.clone(),
+                        status_label: host_status_label(h.status),
+                    }),
+            )
             .collect::<Vec<_>>();
             render_hosts_panel(sidebar, menu, &s.options.filters, &hosts, p)
         }

@@ -37,6 +37,7 @@ mod hooks;
 mod ipc;
 pub mod lineage;
 pub mod options;
+mod path_identity;
 mod pr;
 mod startup;
 mod view;
@@ -355,6 +356,7 @@ fn windows_style(path: &Path) -> bool {
     let bytes = path.as_os_str().as_encoded_bytes();
     matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
         || bytes.starts_with(br"\\")
+        || bytes.starts_with(b"//")
 }
 
 fn windows_parts(path: &str) -> impl Iterator<Item = &str> {
@@ -363,12 +365,7 @@ fn windows_parts(path: &str) -> impl Iterator<Item = &str> {
 
 /// `path`가 `root` 아래(같은 경로 포함)인지. Windows 경로는 구분자(`\`·`/`)와 대소문자를 가리지 않는다.
 pub(crate) fn path_within(path: &Path, root: &Path) -> bool {
-    if !windows_style(root) {
-        return path.starts_with(root);
-    }
-    let (path, root) = (path.to_string_lossy(), root.to_string_lossy());
-    let mut parts = windows_parts(&path);
-    windows_parts(&root).all(|r| parts.next().is_some_and(|p| p.eq_ignore_ascii_case(r)))
+    krill_proto::path::within(path, root)
 }
 
 /// 세션 행의 이름과 보조 문구. 이름은 터미널 제목 → 에이전트 → 폴더 이름 → "세션 n" 순서로 고른다.
@@ -506,13 +503,14 @@ impl UiExpansionState {
     }
 }
 
-/// 마지막 `Vec<PathBuf>`는 사용자가 끌어다 놓아 정한 프로젝트 순서(5번째 구간). postcard는 구조체 끝 필드 추가를
+/// 두 `Vec<PathBuf>`는 수동 프로젝트 순서(5번째)와 워크트리 순서(6번째 구간)다. postcard는 구조체 끝 필드 추가를
 /// 옛 파일에서 못 읽으므로 구간을 따로 덧붙인다. 옛 앱은 남는 바이트를 무시한다.
 type PersistedSidebarState = (
     Preferences,
     WorkspaceOptions,
     lineage::LineageState,
     UiExpansionState,
+    Vec<PathBuf>,
     Vec<PathBuf>,
 );
 
@@ -558,6 +556,7 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
             lineage::LineageState::default(),
             UiExpansionState::default(),
             Vec::new(),
+            Vec::new(),
         )));
     }
     let (opts, rest) =
@@ -568,6 +567,7 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
             opts,
             lineage::LineageState::default(),
             UiExpansionState::default(),
+            Vec::new(),
             Vec::new(),
         )));
     }
@@ -580,17 +580,28 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
             lin,
             UiExpansionState::default(),
             Vec::new(),
+            Vec::new(),
         )));
     }
     let (ui, rest) =
         postcard::take_from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?;
-    let order = if rest.is_empty() {
+    let (order, rest) = if rest.is_empty() {
+        (Vec::new(), rest)
+    } else {
+        postcard::take_from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
+    };
+    let worktree_order = if rest.is_empty() {
         Vec::new()
     } else {
         postcard::from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
     };
     Ok(sanitize_persisted_sidebar_state((
-        prefs, opts, lin, ui, order,
+        prefs,
+        opts,
+        lin,
+        ui,
+        order,
+        worktree_order,
     )))
 }
 
@@ -605,7 +616,7 @@ fn clean_persisted_path(p: PathBuf) -> PathBuf {
 }
 
 fn sanitize_persisted_sidebar_state(
-    (prefs, mut opts, mut lin, mut ui, order): PersistedSidebarState,
+    (prefs, mut opts, mut lin, mut ui, order, worktree_order): PersistedSidebarState,
 ) -> PersistedSidebarState {
     let mut clean_prefs = Preferences::default();
     for (k, mut v) in prefs {
@@ -664,7 +675,17 @@ fn sanitize_persisted_sidebar_state(
             clean_order.push(cp);
         }
     }
-    (clean_prefs, opts, lin, ui, clean_order)
+    (
+        clean_prefs,
+        opts,
+        lin,
+        ui,
+        clean_order,
+        worktree_order
+            .into_iter()
+            .map(clean_persisted_path)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -677,6 +698,7 @@ fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
         &lineage::LineageState::default(),
         &UiExpansionState::default(),
         &[],
+        &[],
     )
 }
 
@@ -687,9 +709,10 @@ fn save_state(
     lin: &lineage::LineageState,
     ui: &UiExpansionState,
     order: &[PathBuf],
+    worktree_order: &[PathBuf],
 ) -> io::Result<()> {
     let mut bytes = postcard::to_stdvec(prefs).map_err(io::Error::other)?;
-    let need_ui = !ui.is_empty() || !order.is_empty();
+    let need_ui = !ui.is_empty() || !order.is_empty() || !worktree_order.is_empty();
     let need_lin = !lin.is_empty() || need_ui;
     if opts.is_customized() || need_lin {
         bytes.extend(postcard::to_stdvec(opts).map_err(io::Error::other)?);
@@ -697,8 +720,12 @@ fn save_state(
             bytes.extend(postcard::to_stdvec(lin).map_err(io::Error::other)?);
             if need_ui {
                 bytes.extend(postcard::to_stdvec(ui).map_err(io::Error::other)?);
-                if !order.is_empty() {
+                if !order.is_empty() || !worktree_order.is_empty() {
                     bytes.extend(postcard::to_stdvec(order).map_err(io::Error::other)?);
+                    if !worktree_order.is_empty() {
+                        bytes
+                            .extend(postcard::to_stdvec(worktree_order).map_err(io::Error::other)?);
+                    }
                 }
             }
         }
@@ -805,6 +832,7 @@ pub struct Sidebar {
     collapsed_hosts: BTreeSet<HostId>,
     /// 사용자가 끌어다 놓아 정한 프로젝트(저장소) 순서(`sidebar.bin` 5번째 구간).
     project_order: Vec<PathBuf>,
+    worktree_order: Vec<PathBuf>,
     row_hosts: Vec<HostId>,
     action_host: Option<HostId>,
     prs: BTreeMap<PathBuf, crate::pull_request::Status>,
@@ -911,6 +939,8 @@ pub struct Sidebar {
     active: bool,
     /// 키보드 탐색 위치(행 인덱스).
     cursor: Option<usize>,
+    /// 연결이 잠시 사라져도 동명 경로가 있는 다른 호스트로 커서를 옮기지 않는다.
+    cursor_anchor: Option<(HostId, Row)>,
     focus: Option<FocusHandle>,
     /// Enter·Esc 뒤 돌려줄 포커스(셸).
     back: Option<FocusHandle>,
@@ -1046,14 +1076,13 @@ impl ProjectMerge {
         projects
     }
 
-    /// 프로젝트 → 프로젝트 없는 호스트 상태 줄 → 작업 폴더 모르는 세션 순으로 편다.
+    /// 프로젝트 → 작업 폴더 모르는 세션 순으로 편다.
     #[expect(
         clippy::type_complexity,
         reason = "rows, row hosts and merged headers are built together"
     )]
     fn finish(
         self,
-        idle: Vec<(HostId, Row)>,
     ) -> (
         Vec<Row>,
         Vec<HostId>,
@@ -1074,7 +1103,6 @@ impl ProjectMerge {
             start += chunk.rows.len();
             chunk.rows.into_iter().for_each(&mut push);
         }
-        idle.into_iter().for_each(&mut push);
         if !self.loose.is_empty() {
             push((HostId::Local, Row::Loose));
             self.loose.into_iter().for_each(&mut push);
@@ -1135,6 +1163,7 @@ impl Sidebar {
             remote_info: BTreeMap::new(),
             collapsed_hosts: ui.collapsed_hosts,
             project_order: Vec::new(),
+            worktree_order: Vec::new(),
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -1211,6 +1240,7 @@ impl Sidebar {
             visible: true,
             active: true,
             cursor: None,
+            cursor_anchor: None,
             hovered_worktree: None,
             focus: None,
             back: None,
@@ -1294,33 +1324,35 @@ impl Sidebar {
     /// 재삽입으로 누적되지 않게 한다. 사용자 접힘·핀·부모·이름 설정은 건드리지 않는다.
     fn prune_stale_worktree_state(&mut self) {
         use std::collections::BTreeSet;
-        let mut live: BTreeSet<&Path> = BTreeSet::new();
+        let mut live: BTreeSet<PathBuf> = BTreeSet::new();
         for wts in self.snapshot.trees.values() {
             for wt in wts {
-                live.insert(wt.as_path());
+                live.insert(krill_proto::path::identity(wt));
             }
         }
         for s in &self.snapshot.sessions {
             if let Some(wt) = s.worktree.as_deref() {
-                live.insert(wt);
+                live.insert(krill_proto::path::identity(wt));
             }
         }
         self.worktree_statuses
-            .retain(|path, _| live.contains(path.as_path()));
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
         self.worktree_updated_at
-            .retain(|path, _| live.contains(path.as_path()));
-        self.issues.retain(|path, _| live.contains(path.as_path()));
-        self.ports.retain(|path, _| live.contains(path.as_path()));
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
+        self.issues
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
+        self.ports
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
         self.worktree_hosts
-            .retain(|path, _| live.contains(path.as_path()));
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
         self.automation_worktrees
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
         self.cli_worktrees
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
         self.recently_created_worktrees
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
         self.manually_folded_cards
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
     }
 
     /// 외부 파일(`projects.toml`, `worktree-comments.toml`) 변경을 즉시 반영해 사이드바 트리를 다시 그린다.
@@ -1462,10 +1494,16 @@ impl Sidebar {
     pub fn has_projects(&self) -> bool {
         !self.snapshot.trees.is_empty()
             || !self.snapshot.sessions.is_empty()
-            || self
-                .remote_hosts
-                .iter()
-                .any(|r| !r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
+            || self.remote_hosts.iter().any(|r| {
+                r.status == HostStatus::Connected
+                    && (!r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
+            })
+    }
+
+    pub(super) fn has_connected_remote_hosts(&self) -> bool {
+        self.remote_hosts
+            .iter()
+            .any(|r| r.status == HostStatus::Connected)
     }
 
     /// 마지막으로 선택·활성화된 워크트리/폴더 경로.
@@ -1488,6 +1526,11 @@ impl Sidebar {
             if self.host_connected(&host) {
                 return Some((host, path));
             }
+            return None;
+        }
+        if let Some((host, _)) = &self.cursor_anchor
+            && !self.host_connected(host)
+        {
             return None;
         }
         // 커서 밖 선택(복원된 상태 등)은 스냅샷에서 소유 호스트를 찾는다.
@@ -1596,6 +1639,7 @@ impl Sidebar {
             self.disk.startup.touch("selected");
         }
         if self.selected_worktree != path || !self.disk.initialized {
+            self.cursor_anchor = None;
             self.selected_worktree = path;
             self.persist(cx);
         }
@@ -2549,10 +2593,12 @@ impl Sidebar {
                 let Some(path) = s.worktree.as_deref().or(s.cwd.as_deref()) else {
                     return false;
                 };
-                self.workspace_for_path_on(host, path)
-                    .as_deref()
-                    .unwrap_or(path)
-                    == folder
+                path_identity::same(
+                    self.workspace_for_path_on(host, path)
+                        .as_deref()
+                        .unwrap_or(path),
+                    folder,
+                )
             })
             .map(|s| s.id)
             .collect()
@@ -2649,7 +2695,7 @@ impl Sidebar {
     }
 
     fn host_indent(&self) -> f32 {
-        if self.remote_hosts.is_empty() || self.options.group_by == GroupBy::Repo {
+        if !self.has_connected_remote_hosts() || self.options.group_by == GroupBy::Repo {
             0.
         } else {
             HOST_CHILD_INDENT
@@ -2716,62 +2762,45 @@ impl Sidebar {
             .map_or_else(|| basename(path), str::to_owned)
     }
 
-    /// 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
-    /// 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
+    /// 연결된 원격 호스트만 목록에 띄운다(연결 안 된 호스트와 그 프로젝트는 숨기고, 호스트 관리는 설정에서 한다).
     fn live_remote_hosts(&self) -> impl Iterator<Item = &RemoteHost> {
         self.remote_hosts.iter().filter(|r| {
-            self.options
-                .filters
-                .contains_host(&HostId::Remote(r.id.clone()))
-                && (r.status == HostStatus::Connected
-                    || !r.snapshot.sessions.is_empty()
-                    || !r.snapshot.trees.is_empty()
-                    || self.remote_info.contains_key(&r.id))
+            r.status == HostStatus::Connected
+                && self
+                    .options
+                    .filters
+                    .contains_host(&HostId::Remote(r.id.clone()))
         })
     }
 
     /// Orca처럼 프로젝트가 맨 위 단계다. 여러 PC에 같은 프로젝트가 있으면 한 머리줄 아래로 합치고
-    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. PC별 상태 줄은 다시 연결이 필요한
-    /// 프로젝트 없는 호스트에만 남기고, 작업 폴더를 모르는 세션은 모든 PC 것을 끝에 한 묶음으로 둔다.
+    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. 작업 폴더를 모르는 세션은 끝에 한 묶음으로 둔다.
     fn rebuild_by_project(&mut self) {
         let mut merge = ProjectMerge::default();
         if self.options.filters.contains_host(&HostId::Local) {
             merge.absorb(&HostId::Local, self.local_rows());
         }
-        let mut idle = Vec::new();
         for remote in self.live_remote_hosts() {
             let host = HostId::Remote(remote.id.clone());
             let collapsed = merge.aligned_collapsed(&self.collapsed, &remote.snapshot);
-            let projects = merge.absorb(&host, self.remote_rows(remote, &collapsed));
-            if !projects && remote.status != HostStatus::Connected {
-                idle.push((
-                    host.clone(),
-                    Row::HostHeader {
-                        host,
-                        label: remote.label.clone(),
-                        status: remote.status,
-                        sessions: remote
-                            .snapshot
-                            .sessions
-                            .iter()
-                            .filter(|s| !s.is_exited())
-                            .count(),
-                    },
-                ));
-            }
+            merge.absorb(&host, self.remote_rows(remote, &collapsed));
         }
-        let (rows, row_hosts, merged) = merge.finish(idle);
+        let (rows, row_hosts, merged) = merge.finish();
         self.rows = rows;
         self.row_hosts = row_hosts;
         self.merged_projects = merged;
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let cursor_item = self.cursor.and_then(|i| {
-            self.rows
-                .get(i)
-                .map(|row| (self.row_host(i).clone(), row.clone()))
-        });
+        self.reconcile_path_identity();
+        let cursor_item = self
+            .cursor
+            .and_then(|i| {
+                self.rows
+                    .get(i)
+                    .map(|row| (self.row_host(i).clone(), row.clone()))
+            })
+            .or_else(|| self.cursor_anchor.take());
         self.status_summary = (
             self.snapshot
                 .sessions
@@ -2789,7 +2818,7 @@ impl Sidebar {
         );
         self.ensure_external_polling(cx);
         self.merged_projects.clear();
-        if self.remote_hosts.is_empty() {
+        if !self.has_connected_remote_hosts() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
                 self.local_rows()
             } else {
@@ -2864,6 +2893,7 @@ impl Sidebar {
             .cursor
             .map(|i| i.min(self.rows.len().saturating_sub(1)))
             .filter(|_| !self.rows.is_empty());
+        self.cursor_anchor = cursor_item.filter(|_| self.cursor.is_none());
         self.index_lineage();
         self.sync_viewport();
         self.card_list.invalidate_heights();
@@ -3184,8 +3214,9 @@ impl Sidebar {
             removed_projects: self.removed_projects.clone(),
         };
         let order = self.project_order.clone();
+        let worktree_order = self.worktree_order.clone();
         self.enqueue_disk_write(
-            move || save_state(&path, &prefs, &opts, &lin, &ui, &order),
+            move || save_state(&path, &prefs, &opts, &lin, &ui, &order, &worktree_order),
             cx,
         );
     }
@@ -3400,7 +3431,12 @@ impl Sidebar {
         self.snapshot_for(host)
             .sessions
             .iter()
-            .find(|s| s.worktree.as_deref().or(s.cwd.as_deref()) == Some(folder))
+            .find(|s| {
+                s.worktree
+                    .as_deref()
+                    .or(s.cwd.as_deref())
+                    .is_some_and(|p| path_identity::same(p, folder))
+            })
             .map(|s| s.id)
     }
 
@@ -3497,6 +3533,67 @@ impl Sidebar {
             Some(Row::HiddenWorktrees(repo, _, _)) => self.toggle_external(&repo, cx),
             _ => {}
         }
+    }
+
+    /// 같은 표시 그룹·계보의 형제 카드 순서를 고정한다. 자동 정렬을 다시 선택하면 그 정렬을 따른다.
+    pub fn move_worktree(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        let positions = |path: &Path| {
+            self.rows.iter().enumerate().find_map(|(i, row)| {
+                (matches!(row, Row::Worktree(p) if p == path) && self.row_host(i).is_local())
+                    .then_some(i)
+            })
+        };
+        let (Some(from_index), Some(to_index)) = (positions(from), positions(to)) else {
+            return;
+        };
+        let group = |index: usize| {
+            self.rows.iter().take(index).rposition(|row| {
+                matches!(
+                    row,
+                    Row::Repository(_) | Row::GroupHeader { .. } | Row::HiddenWorktrees(..)
+                )
+            })
+        };
+        let parents = self.merged_parents();
+        if from_index == to_index
+            || group(from_index) != group(to_index)
+            || parents.get(from) != parents.get(to)
+        {
+            return;
+        }
+        let bucket = group(from_index);
+        let mut order: Vec<_> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                Row::Worktree(path)
+                    if self.row_host(i).is_local()
+                        && group(i) == bucket
+                        && parents.get(path) == parents.get(from) =>
+                {
+                    Some(path.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let (Some(i), Some(j)) = (
+            order.iter().position(|p| p == from),
+            order.iter().position(|p| p == to),
+        ) else {
+            return;
+        };
+        let moved = order.remove(i);
+        order.insert(j, moved);
+        // Retain hidden/filtered cards and the manual order in other groups.
+        for path in &self.worktree_order {
+            if !order.contains(path) {
+                order.push(path.clone());
+            }
+        }
+        self.worktree_order = order;
+        self.options.sort_by = SortBy::Created;
+        self.persist(cx);
     }
 
     /// 프로젝트(저장소) `from`을 `to` 자리로 옮긴다(Orca처럼 끌어다 놓기). 지금 보이는 순서를 통째로 저장한다.

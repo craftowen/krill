@@ -8,10 +8,16 @@ use std::path::Path;
 #[cfg(all(test, unix))]
 mod tests;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub(super) struct Workspace {
     pub(super) host: HostId,
     pub(super) folder: PathBuf,
+}
+
+impl PartialEq for Workspace {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host && krill_proto::path::equivalent(&self.folder, &other.folder)
+    }
 }
 
 impl Shell {
@@ -353,8 +359,9 @@ impl Shell {
             .unwrap_or(folder);
         self.launch_host = host.clone();
         let target = self.layout.mru_order().into_iter().find(|&index| {
-            self.tab_workspace(index, cx)
-                .is_some_and(|w| w.host == host && w.folder == folder)
+            self.tab_workspace(index, cx).is_some_and(|w| {
+                w.host == host && krill_proto::path::equivalent(&w.folder, &folder)
+            })
         });
         if let Some(index) = target {
             self.dashboard = None;

@@ -776,11 +776,11 @@ catalog! {
         SORT_BY_SMART => ("스마트 정렬", "Smart sort"),
         SORT_BY_RECENT => ("최근 활동순", "Recent activity"),
         SORT_BY_NAME => ("이름순", "Name"),
-        SORT_BY_CREATED => ("생성순", "Created"),
+        SORT_BY_CREATED => ("수동", "Manual"),
         SORT_BY_SHORT_SMART => ("스마트", "Smart"),
         SORT_BY_SHORT_RECENT => ("최근", "Recent"),
         SORT_BY_SHORT_NAME => ("이름", "Name"),
-        SORT_BY_SHORT_CREATED => ("생성", "Created"),
+        SORT_BY_SHORT_CREATED => ("수동", "Manual"),
         FILTERS => ("필터", "Filters"),
         FILTER_HIDE_SLEEPING => ("유휴/수면 워크트리 숨기기", "Hide sleeping worktrees"),
         FILTER_ALWAYS_SHOW_DEFAULT => ("기본 브랜치는 항상 표시", "Always show default branch"),
@@ -1231,7 +1231,7 @@ catalog! {
         TAB_ACCOUNTS_DESC => ("제공자별 로그인 프로필을 관리하고 한도 도달 시 자동 계정 전환을 설정합니다.", "Manage provider sign-in profiles and configure automatic account switching on rate limits."),
         TAB_INSTALL_DESC => ("프론티어 AI CLI, 필수 개발 도구(Git·Node.js·gh), 런타임을 원클릭으로 설치하고 셸 에일리어스를 설정합니다.", "Install frontier AI CLIs, core developer tools (Git, Node.js, gh), and runtimes in one click, and configure shell aliases."),
         TAB_SSH_DESC => ("SSH 주소·포트·키를 등록하고 연결을 테스트하거나 원격 호스트에 연결합니다.", "Manage SSH addresses, ports, and keys, test connections, and connect to remote hosts."),
-        TAB_REMOTE_KRILL_DESC => ("초대 링크로 다른 Mac의 Krill에 연결하고 이 Mac의 접속 허용과 페어링된 기기를 관리합니다.", "Connect to Krill on another Mac with an invite link, manage incoming access, and review paired devices."),
+        TAB_REMOTE_KRILL_DESC => ("초대 링크로 다른 컴퓨터의 Krill에 연결하고 이 컴퓨터의 접속 허용과 페어링된 기기를 관리합니다.", "Connect to Krill on another computer with an invite link, manage incoming access, and review paired devices."),
         TAB_WORKFLOWS_DESC => ("멀티 에이전트 오케스트레이션, 스케줄 자동화, 워크트리 훅, 빠른 명령과 웹훅을 관리합니다.", "Manage multi-agent orchestration, scheduled automations, worktree hooks, quick commands, and webhooks."),
         TAB_RESOURCES_DESC => ("메모리 예산, 세션 기록, 보안 키보드 입력, 자가 진단과 워크트리 디스크 용량을 관리합니다.", "Manage memory budget, session history recording, secure keyboard input, diagnostics, and worktree disk space."),
         TAB_MOBILE_DESC => ("QR 코드로 스마트폰을 페어링해 밖에서도 터미널과 에이전트 세션을 제어합니다.", "Pair your phone via QR code to monitor and control terminal and agent sessions remotely."),
@@ -2894,9 +2894,9 @@ pub mod link_ui {
     }
 
     link_ui_catalog! {
-        SERVER_TITLE => ("이 Mac에 다른 기기 접속 허용", "Allow other devices to connect to this Mac"),
-        SERVER_DESC_ON => ("켜져 있습니다. 초대한 내 다른 Mac에서만 이 Mac의 작업 화면에 연결할 수 있습니다.", "Enabled. Only other Macs you invite can connect to this Mac."),
-        SERVER_DESC_OFF => ("이 Mac으로 들어오는 연결을 허용하지 않습니다. 다른 Mac에 연결하는 기능은 계속 사용할 수 있습니다.", "When off, incoming access is disabled. You can still connect to other Macs."),
+        SERVER_TITLE => ("이 컴퓨터에 다른 기기 접속 허용", "Allow other devices to connect to this computer"),
+        SERVER_DESC_ON => ("켜져 있습니다. 초대한 내 다른 컴퓨터에서만 이 컴퓨터의 작업 화면에 연결할 수 있습니다.", "Enabled. Only other computers you invite can connect to this computer."),
+        SERVER_DESC_OFF => ("이 컴퓨터로 들어오는 연결을 허용하지 않습니다. 다른 컴퓨터에 연결하는 기능은 계속 사용할 수 있습니다.", "When off, incoming access is disabled. You can still connect to other computers."),
         SERVER_OFF_NOTICE => ("현재 접속 허용이 꺼져 있습니다. 초대하려면 스위치를 켜 주세요.", "Incoming access is off. Turn it on to create an invite."),
         TOGGLE_ON => ("켜짐", "On"),
         TOGGLE_OFF => ("꺼짐", "Off"),
@@ -2905,17 +2905,17 @@ pub mod link_ui {
         CREATE_INVITE => ("초대 링크 만들기", "Create invite link"),
         RECREATE_INVITE => ("새로 만들기", "Create new link"),
         INVITE_HEADING => ("1회용 초대 링크", "One-time invite link"),
-        INVITE_GUIDE => ("아래 링크를 복사하거나 QR 코드를 다른 Mac에서 스캔해 연결하세요.", "Copy the link below or scan the QR code from your other Mac to connect."),
+        INVITE_GUIDE => ("아래 링크를 복사하거나 QR 코드를 다른 컴퓨터에서 스캔해 연결하세요.", "Copy the link below or scan the QR code from your other computer to connect."),
         COPY_LINK => ("링크 복사", "Copy link"),
         COPIED_LINK => ("복사됨", "Copied"),
         EXPIRES_IN_MS => ("남은 유효 시간: {m}분 {s}초", "Expires in {m}m {s}s"),
         EXPIRES_IN_S => ("남은 유효 시간: {s}초", "Expires in {s}s"),
         INVITE_EXPIRED => ("초대 링크의 유효 시간이 지났습니다. 새로 만들어 주세요.", "This invite link has expired. Please create a new one."),
-        DEVICES_TITLE => ("이 Mac에 접근 가능한 기기", "Devices allowed to access this Mac"),
-        REMOTE_HOSTS_TITLE => ("연결한 원격 Mac", "Remote Macs"),
-        REMOTE_HOSTS_EMPTY => ("아직 등록한 원격 Mac이 없습니다. 아래에서 다른 Mac의 초대 링크로 연결하세요.", "No remote Macs added yet. Connect using another Mac’s invite link below."),
-        REMOTE_DISCONNECT_DETAIL => ("이 Mac의 연결 목록에서 제거합니다. 원격 세션은 계속 실행되며, 다시 연결하려면 초대 링크가 필요합니다.", "Remove this connection from this Mac. Remote sessions keep running. An invite link is needed to reconnect."),
-        DEVICES_EMPTY => ("이 Mac에 접근을 허용한 기기가 없습니다. 위의 초대 링크로 다른 Mac을 연결하면 여기에 표시됩니다.", "No devices are allowed to access this Mac yet. Share an invite link above to allow one."),
+        DEVICES_TITLE => ("이 컴퓨터에 접근 가능한 기기", "Devices allowed to access this computer"),
+        REMOTE_HOSTS_TITLE => ("연결한 원격 컴퓨터", "Remote computers"),
+        REMOTE_HOSTS_EMPTY => ("아직 등록한 원격 컴퓨터가 없습니다. 아래에서 다른 컴퓨터의 초대 링크로 연결하세요.", "No remote computers added yet. Connect using another computer’s invite link below."),
+        REMOTE_DISCONNECT_DETAIL => ("이 컴퓨터의 연결 목록에서 제거합니다. 원격 세션은 계속 실행되며, 다시 연결하려면 초대 링크가 필요합니다.", "Remove this connection from this computer. Remote sessions keep running. An invite link is needed to reconnect."),
+        DEVICES_EMPTY => ("이 컴퓨터에 접근을 허용한 기기가 없습니다. 위의 초대 링크로 다른 컴퓨터를 연결하면 여기에 표시됩니다.", "No devices are allowed to access this computer yet. Share an invite link above to allow one."),
         DEVICE_META => ("추가: {added} · 마지막 접속: {last_seen}", "Added: {added} · Last seen: {last_seen}"),
         TIME_JUST_NOW => ("방금 전", "Just now"),
         TIME_MINUTES_AGO => ("{m}분 전", "{m}m ago"),
@@ -2927,60 +2927,82 @@ pub mod link_ui {
         RENAME_HOST_SAVE => ("저장", "Save"),
         RENAME_HOST_CANCEL => ("취소", "Cancel"),
         REVOKE_CONFIRM_TITLE => ("'{name}' 기기의 연결을 끊을까요?", "Disconnect '{name}'?"),
-        REVOKE_CONFIRM_DETAIL => ("연결을 끊으면 이 기기에서는 더 이상 이 Mac의 작업 화면을 볼 수 없습니다. 다시 연결하려면 새 초대 링크가 필요합니다.", "Once disconnected, this device can no longer view sessions on this Mac. A new invite link will be required to reconnect."),
+        REVOKE_CONFIRM_DETAIL => ("연결을 끊으면 이 기기에서는 더 이상 이 컴퓨터의 작업 화면을 볼 수 없습니다. 다시 연결하려면 새 초대 링크가 필요합니다.", "Once disconnected, this device can no longer view sessions on this computer. A new invite link will be required to reconnect."),
         REVOKE_CONFIRM_YES => ("연결 끊기", "Disconnect"),
         REVOKE_CONFIRM_AGAIN => ("다시 눌러 연결 끊기", "Click again to disconnect"),
         REVOKE_CONFIRM_CANCEL => ("취소", "Cancel"),
-        CLIENT_TITLE => ("다른 Mac 추가", "Add another Mac"),
-        CLIENT_DESC => ("다른 Mac에서 만든 초대 링크를 붙여넣어 연결하세요.", "Paste an invite link created on another Mac to connect."),
-        PAIRING_TITLE => ("다른 Mac 연결", "Connect another Mac"),
+        CLIENT_TITLE => ("다른 컴퓨터 추가", "Add another computer"),
+        CLIENT_DESC => ("다른 컴퓨터에서 만든 초대 링크를 붙여넣어 연결하세요.", "Paste an invite link created on another computer to connect."),
+        PAIRING_TITLE => ("다른 컴퓨터 연결", "Connect another computer"),
         CLIENT_CLEAR => ("지우기", "Clear"),
         LINK_LABEL => ("초대 링크", "Invite link"),
         LINK_PLACEHOLDER => ("krill://pair?... 링크를 붙여넣으세요", "Paste krill://pair?... link here"),
         PASTE_BUTTON => ("붙여넣기", "Paste"),
         CLIPBOARD_FOUND => ("클립보드에 초대 링크가 있습니다", "Invite link found in clipboard"),
         CLIPBOARD_AUTO_FILL => ("클립보드 링크 자동 채움", "Fill from clipboard"),
-        HOST_NAME_LABEL => ("연결할 Mac 이름 (이 Mac에서 보일 이름)", "Name for the other Mac (shown on this Mac)"),
-        HOST_NAME_PLACEHOLDER => ("비워 두면 상대 Mac이 알려준 이름을 씁니다", "Leave empty to use the other Mac’s own name"),
-        DEVICE_NAME_LABEL => ("이 Mac 이름 (상대 Mac에서 보일 이름)", "This Mac’s name (shown on the other Mac)"),
-        DEVICE_NAME_PLACEHOLDER => ("예: 오웬의 MacBook Air", "e.g. Owen’s MacBook Air"),
-        DEFAULT_DEVICE_NAME => ("내 Mac", "My Mac"),
-        USER_MAC_NAME => ("{user}의 Mac", "{user}’s Mac"),
+        HOST_NAME_LABEL => ("연결할 컴퓨터 이름 (이 컴퓨터에서 보일 이름)", "Name for the other computer (shown on this computer)"),
+        HOST_NAME_PLACEHOLDER => ("비워 두면 상대 컴퓨터가 알려준 이름을 씁니다", "Leave empty to use the other computer’s own name"),
+        DEVICE_NAME_LABEL => ("이 컴퓨터 이름 (상대 컴퓨터에서 보일 이름)", "This computer’s name (shown on the other computer)"),
+        DEVICE_NAME_PLACEHOLDER => ("예: 오웬의 노트북", "e.g. Owen’s laptop"),
+        DEFAULT_DEVICE_NAME => ("내 컴퓨터", "My computer"),
+        USER_MAC_NAME => ("{user}의 컴퓨터", "{user}’s computer"),
         CONNECT_BUTTON => ("연결", "Connect"),
         CLOSE_BUTTON => ("닫기", "Close"),
-        STATUS_CONNECTING => ("연결 중… 상대 Mac과 페어링를 진행하고 있습니다.", "Connecting… Pairing with the other Mac."),
+        STATUS_CONNECTING => ("연결 중… 상대 컴퓨터와 페어링을 진행하고 있습니다.", "Connecting… Pairing with the other computer."),
         STATUS_PAIRED => ("페어링 완료! '{name}' 기기와 연결되었습니다.", "Pairing complete! Connected to '{name}'."),
         STATUS_FAILED_PREFIX => ("연결 실패: {reason}", "Connection failed: {reason}"),
-        ERR_EXPIRED_LINK => ("만료된 링크입니다. 상대 Mac에서 초대 링크를 새로 만들어 다시 시도해 주세요.", "This invite link has expired. Create a new link on the other Mac and try again."),
+        ERR_EXPIRED_LINK => ("만료된 링크입니다. 상대 컴퓨터에서 초대 링크를 새로 만들어 다시 시도해 주세요.", "This invite link has expired. Create a new link on the other computer and try again."),
         ERR_ALREADY_USED_LINK => ("이미 쓴 링크입니다. 초대 링크는 한 번만 사용할 수 있으니 새로 만들어 주세요.", "This invite link was already used. Each link works once; please create a new one."),
-        ERR_REMOTE_MAC_OFFLINE => ("상대 Mac이 꺼져 있거나 접속 허용이 꺼져 있습니다. 상대 Mac을 확인한 뒤 다시 시도해 주세요.", "The other Mac is turned off or has remote access disabled. Check the other Mac and try again."),
+        ERR_REMOTE_MAC_OFFLINE => ("상대 컴퓨터가 꺼져 있거나 접속 허용이 꺼져 있습니다. 상대 컴퓨터를 확인한 뒤 다시 시도해 주세요.", "The other computer is turned off or has remote access disabled. Check the other computer and try again."),
         ERR_NO_INTERNET => ("인터넷 연결이 없습니다. Wi-Fi나 네트워크 상태를 확인한 뒤 다시 시도해 주세요.", "No internet connection. Check your Wi-Fi or network connection and try again."),
         ERR_SERVER_CHANGE => ("접속 허용 설정을 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요.", "Could not change access settings. Please try again."),
-        ERR_SERVER_NOT_READY => ("이 Mac의 접속 허용을 켜고 준비가 끝난 뒤 초대 링크를 만들어 주세요.", "Turn on access to this Mac and wait until it is ready before creating an invite."),
-        ERR_UNAVAILABLE => ("연결을 완료하지 못했습니다. 상대 Mac과 네트워크를 확인한 뒤 다시 시도해 주세요.", "Could not connect. Check the other Mac and your network, then try again."),
+        ERR_SERVER_NOT_READY => ("이 컴퓨터의 접속 허용을 켜고 준비가 끝난 뒤 초대 링크를 만들어 주세요.", "Turn on access to this computer and wait until it is ready before creating an invite."),
+        ERR_UNAVAILABLE => ("연결을 완료하지 못했습니다. 상대 컴퓨터와 네트워크를 확인한 뒤 다시 시도해 주세요.", "Could not connect. Check the other computer and your network, then try again."),
         ERR_DISCONNECT => ("연결을 해제하지 못했습니다. 잠시 후 다시 시도해 주세요.", "Could not disconnect. Please try again."),
         ERR_RATE_LIMITED => ("시도가 너무 많습니다. 잠시 기다린 뒤 다시 연결해 주세요.", "Too many attempts. Wait a moment and try again."),
         ERR_QR => ("QR 코드를 만들지 못했습니다. 초대 링크를 새로 만들어 주세요.", "Could not create the QR code. Please create a new invite."),
-        ERR_REVOKED => ("이 Mac의 접속 권한이 해제됐습니다. 다시 초대받아 주세요.", "This Mac’s access has been revoked. Please ask for a new invite."),
+        ERR_REVOKED => ("이 컴퓨터의 접속 권한이 해제됐습니다. 다시 초대받아 주세요.", "This computer’s access has been revoked. Please ask for a new invite."),
         ROUTE_DIRECT => ("직접 연결", "Direct"),
         ROUTE_RELAY => ("중계 연결", "Relay"),
         RTT => ("응답 {ms}ms", "RTT {ms}ms"),
-        ERR_INVALID_LINK => ("올바른 초대 링크 형식이 아닙니다. 상대 Mac에서 복사한 초대 링크(krill://pair?...)를 붙여넣어 주세요.", "Not a valid invite link. Paste the krill://pair?... link copied from the other Mac."),
-        NEARBY_TITLE => ("근처 Mac (같은 Wi-Fi)", "Nearby Macs (Same Wi-Fi)"),
+        ERR_INVALID_LINK => ("올바른 초대 링크 형식이 아닙니다. 상대 컴퓨터에서 복사한 초대 링크(krill://pair?...)를 붙여넣어 주세요.", "Not a valid invite link. Paste the krill://pair?... link copied from the other computer."),
+        NEARBY_TITLE => ("근처 컴퓨터 (같은 Wi-Fi)", "Nearby computers (Same Wi-Fi)"),
         NEARBY_REFRESH => ("다시 찾기", "Refresh"),
-        NEARBY_EMPTY => ("근처 Mac 자동 찾기는 아직 지원하지 않습니다. 초대 링크로 연결해 주세요.", "Nearby discovery is not available yet. Please use an invite link."),
+        NEARBY_EMPTY => ("근처 컴퓨터 자동 찾기는 아직 지원하지 않습니다. 초대 링크로 연결해 주세요.", "Nearby discovery is not available yet. Please use an invite link."),
         NEARBY_SELECT => ("선택", "Select"),
         NEARBY_CONNECT => ("연결", "Connect"),
-        DEMO_DEVICE_AIR => ("오웬의 MacBook Air", "Owen’s MacBook Air"),
-        DEMO_DEVICE_STUDIO => ("작업실 Mac Studio", "Studio Mac Studio"),
-        DEMO_NEARBY_HOME => ("집 맥미니", "Home Mac mini"),
-        DEMO_NEARBY_IMAC => ("거실 iMac", "Living Room iMac"),
+        DEMO_DEVICE_AIR => ("오웬의 노트북", "Owen’s laptop"),
+        DEMO_DEVICE_STUDIO => ("작업실 데스크톱", "Studio desktop"),
+        DEMO_NEARBY_HOME => ("집 컴퓨터", "Home computer"),
+        DEMO_NEARBY_IMAC => ("거실 컴퓨터", "Living Room computer"),
     }
 }
 
 #[cfg(test)]
 mod platform_shortcut_tests {
     use super::*;
+
+    #[test]
+    fn remote_pairing_copy_is_platform_neutral_in_both_languages() {
+        for message in link_ui::ALL
+            .iter()
+            .chain(std::iter::once(&catalog::settings::TAB_REMOTE_KRILL_DESC))
+        {
+            for language in [Language::Ko, Language::En] {
+                let copy = message.in_language(language).to_ascii_lowercase();
+                assert!(!copy.contains("mac"), "{}: {copy}", message.id);
+                assert!(!copy.contains("맥"), "{}: {copy}", message.id);
+            }
+        }
+        assert_eq!(
+            link_ui::DEFAULT_DEVICE_NAME.in_language(Language::En),
+            "My computer"
+        );
+        assert_eq!(
+            link_ui::USER_MAC_NAME.in_language(Language::Ko),
+            "{user}의 컴퓨터"
+        );
+    }
 
     #[test]
     fn catalog_shortcut_hints_match_platform_bindings() {

@@ -26,6 +26,7 @@ pub mod ipc;
 pub mod mobile;
 pub mod orchestration;
 pub mod os;
+pub mod path;
 pub mod remote_fs;
 pub mod resources;
 pub mod roles;

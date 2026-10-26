@@ -62,7 +62,8 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
         );
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("host-error-iroh:studio").is_some());
+    assert!(vcx.debug_bounds("host-header-iroh:studio").is_none());
+    assert!(vcx.debug_bounds("host-error-iroh:studio").is_none());
 }
 
 #[gpui::test]
@@ -1752,9 +1753,9 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
                 .collect::<Vec<_>>()
         })
     };
-    // 세션이 남은 끊긴 호스트(kak)는 다시 연결하도록 보이고, 세션 없는 끊긴 호스트 둘과
-    // 프로젝트 없이 연결만 된 호스트(oci, 관리는 설정)는 프로젝트 목록에 띄우지 않는다.
-    assert_eq!(headers(cx), ["kak"]);
+    // 연결 안 된 호스트와 프로젝트 없이 연결만 된 호스트(oci, 관리는 설정)는 프로젝트 목록에 띄우지 않는다.
+    assert!(headers(cx).is_empty());
+    assert!(cx.update(|_, cx| view.read(cx).rows.is_empty()));
 
     assert_eq!(
         super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
@@ -1848,7 +1849,7 @@ fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) 
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rows, ["/local", "/tax", "/seol", "host:off", "loose"]);
+        assert_eq!(rows, ["/local", "/tax", "/seol", "loose"]);
         // The other PC's worktree sits inside the local project, before the next project.
         let merged = s
             .rows
@@ -1874,7 +1875,7 @@ fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) 
         let loose_hosts = (loose + 1..s.rows.len())
             .map(|i| s.row_host(i).as_key().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(loose_hosts, ["win", "off"]);
+        assert_eq!(loose_hosts, ["win"]);
     });
     // Folding the merged header folds the other PC's part too.
     view.update(cx, |s, cx| s.fold(Path::new("/local"), Some(false), cx));
@@ -2002,36 +2003,31 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         let remote_session = &s.remote_hosts[0].snapshot.sessions[0];
         assert_ne!(s.session_label_on(&remote, remote_session).0, "Local title");
     });
-    let reconnected = Rc::new(RefCell::new(Vec::new()));
-    let out = reconnected.clone();
-    let _sub = cx.update(|_, cx| {
-        cx.subscribe(&view, move |_, event: &ReconnectHost, _| {
-            out.borrow_mut().push(event.0.clone());
-        })
-    });
     view.update(cx, |s, cx| {
         s.remote_hosts[0].status = HostStatus::Disconnected;
         s.rebuild(cx);
     });
     cx.run_until_parked();
-    assert!(view.read_with(cx, |s, _| s.is_row_dimmed(remote_tree)));
+    view.read_with(cx, |s, _| {
+        assert!(s.row_hosts.iter().all(HostId::is_local));
+        assert!(s.merged_projects.is_empty());
+    });
+    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
+    assert!(
+        cx.debug_bounds(sel("project-reconnect", remote_repo))
+            .is_none()
+    );
     assert!(
         cx.debug_bounds(sel("project-host", remote_only_repo))
-            .is_some()
+            .is_none()
     );
     assert!(
         cx.debug_bounds(sel("project-reconnect", remote_only_repo))
-            .is_some()
+            .is_none()
     );
-    let reconnect = cx
-        .debug_bounds(sel("project-reconnect", remote_repo))
-        .unwrap();
-    cx.simulate_click(reconnect.center(), Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(reconnected.borrow().as_slice(), &[remote]);
     assert!(
         selected.borrow().len() == 1,
-        "reconnect must not activate or fold the project"
+        "disconnect must not activate or fold the project"
     );
 }
 
@@ -5119,7 +5115,7 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    let (_, _, _, _, order) = load_state(&file).unwrap();
+    let (_, _, _, _, order, _) = load_state(&file).unwrap();
     assert_eq!(
         order,
         [
@@ -6357,4 +6353,255 @@ fn exited_processes_leave_sidebar_dashboard_counts_and_unread(cx: &mut TestAppCo
         );
         assert_eq!(sidebar.dashboard_sessions().len(), 2);
     });
+}
+
+#[gpui::test]
+fn windows_identity_merges_imported_repositories_sessions_and_preferences(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |s, cx| {
+        let repo = PathBuf::from(r"C:\Users\Owen\프로젝트");
+        let tree = PathBuf::from(r"C:\Workspaces\간단작업");
+        s.snapshot = Snapshot {
+            trees: BTreeMap::from([
+                (repo.clone(), vec![repo.clone(), tree.clone()]),
+                (
+                    PathBuf::from(r"\\?\c:\users\owen\프로젝트"),
+                    vec![PathBuf::from("c:/workspaces/간단작업/")],
+                ),
+            ]),
+            sessions: vec![
+                Session {
+                    cwd: Some(PathBuf::from(r"\\?\C:\WORKSPACES\간단작업")),
+                    worktree: None,
+                    ..session(1, AgentState::Working, None)
+                },
+                Session {
+                    cwd: Some(PathBuf::from("c:/workspaces/간단작업/sub")),
+                    worktree: None,
+                    ..session(2, AgentState::Unknown, None)
+                },
+            ],
+        };
+        s.prefs.insert(
+            tree.clone(),
+            Preference {
+                pinned: true,
+                name: String::new(),
+            },
+        );
+        let alias = PathBuf::from(r"\\?\C:\WORKSPACES\간단작업");
+        s.comments.insert(tree.clone(), String::new());
+        s.comments.insert(alias.clone(), "Review me".into());
+        s.meta.insert(
+            tree.clone(),
+            Tree {
+                branch: None,
+                dirty: Some(0),
+            },
+        );
+        s.meta.insert(
+            alias.clone(),
+            Tree {
+                branch: Some("topic".into()),
+                dirty: Some(3),
+            },
+        );
+        s.worktree_updated_at.insert(tree.clone(), 10);
+        s.worktree_updated_at.insert(alias.clone(), 20);
+        s.prefs.insert(
+            PathBuf::from(r"\\?\C:\WORKSPACES\간단작업"),
+            Preference {
+                name: "간단작업".into(),
+                pinned: false,
+            },
+        );
+        s.selected_worktree = Some(PathBuf::from("c:/workspaces/간단작업"));
+        s.rebuild(cx);
+        assert_eq!(s.snapshot.trees.len(), 1);
+        assert_eq!(s.snapshot.trees[&repo], [repo.clone(), tree.clone()]);
+        assert!(
+            s.snapshot
+                .sessions
+                .iter()
+                .all(|session| session.worktree.as_ref() == Some(&tree))
+        );
+        assert!(!s.rows.iter().any(|row| matches!(row, Row::Folder(_))));
+        assert_eq!(s.selected_worktree, Some(tree.clone()));
+        assert_eq!(s.prefs[&tree].name, "간단작업");
+        assert!(s.prefs[&tree].pinned);
+        assert_eq!(s.comments[&tree], "Review me");
+        assert_eq!(s.meta[&tree].branch.as_deref(), Some("topic"));
+        assert_eq!(s.meta[&tree].dirty, Some(3));
+        assert_eq!(s.worktree_updated_at[&tree], 20);
+        assert_eq!(
+            s.worktree_for_path(Path::new(r"\\?\c:\workspaces\간단작업\sub")),
+            Some(tree.clone())
+        );
+        assert_eq!(
+            s.repo_for_worktree(Path::new("C:/WORKSPACES/간단작업")),
+            Some(repo)
+        );
+        assert_eq!(
+            s.session_for_workspace(&HostId::Local, Path::new("C:/WORKSPACES/간단작업")),
+            Some(SessionId(1))
+        );
+        let before = s.snapshot.clone();
+        s.rebuild(cx);
+        assert_eq!(before, s.snapshot);
+        s.prefs = BTreeMap::from([
+            (
+                tree.clone(),
+                Preference {
+                    pinned: false,
+                    name: "간단작업".into(),
+                },
+            ),
+            (
+                alias,
+                Preference {
+                    pinned: true,
+                    name: String::new(),
+                },
+            ),
+        ]);
+        s.rebuild(cx);
+        assert!(s.prefs[&tree].pinned);
+        assert_eq!(s.prefs[&tree].name, "간단작업");
+    });
+}
+
+#[gpui::test]
+fn windows_slash_unc_snapshot_merges_aliases_without_drive_paths(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            trees: BTreeMap::from([
+                (
+                    "//SERVER/Share".into(),
+                    vec!["//SERVER/Share/간단작업".into()],
+                ),
+                (
+                    "//server/share".into(),
+                    vec!["//server/share/간단작업".into()],
+                ),
+            ]),
+            sessions: vec![Session {
+                cwd: Some("//server/share/간단작업/sub".into()),
+                worktree: None,
+                ..session(1, AgentState::Working, None)
+            }],
+        };
+        s.rebuild(cx);
+        assert_eq!(s.snapshot.trees.len(), 1);
+        assert_eq!(s.snapshot.trees.values().next().unwrap().len(), 1);
+        assert!(krill_proto::path::equivalent(
+            s.snapshot.sessions[0].worktree.as_deref().unwrap(),
+            Path::new("//server/share/간단작업"),
+        ));
+    });
+}
+
+#[gpui::test]
+fn dragging_worktree_cards_changes_manual_order_and_persists_without_reordering_projects(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-card-drag-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view({
+        let file = file.clone();
+        move |_, _| Sidebar::new_loaded(Some(file))
+    });
+    view.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![],
+            trees: BTreeMap::from([
+                (
+                    "/repo".into(),
+                    vec!["/repo".into(), "/a".into(), "/b".into()],
+                ),
+                ("/other".into(), vec!["/other".into()]),
+            ]),
+        };
+        s.options.sort_by = SortBy::Smart;
+        s.project_order = vec!["/repo".into(), "/other".into()];
+        s.rebuild(cx);
+    });
+    cx.run_until_parked();
+    let bounds = |path: &str, cx: &mut gpui::VisualTestContext| {
+        let index = view.read_with(cx, |s, _| {
+            s.rows
+                .iter()
+                .position(|r| matches!(r, Row::Worktree(p) if p == Path::new(path)))
+                .unwrap()
+        });
+        let selector: &'static str = Box::leak(format!("worktree-card-{index}").into_boxed_str());
+        cx.debug_bounds(selector).unwrap()
+    };
+    // Exercise actual detailed and compact card drag handlers.
+    for layout in [CardLayout::Detailed, CardLayout::Compact] {
+        view.update(cx, |s, cx| {
+            s.options.card_layout = layout;
+            s.worktree_order.clear();
+            s.set_sort_by(SortBy::Smart, cx);
+        });
+        cx.run_until_parked();
+        let from = bounds("/b", cx).center();
+        let to = bounds("/a", cx).center();
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            to,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |s, cx| {
+            let cards = |s: &Sidebar| {
+                s.rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        Row::Worktree(p) => Some(p.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(s.options.sort_by, SortBy::Created);
+            assert_eq!(cards(s), ["/b", "/a", "/repo", "/other"].map(PathBuf::from));
+            assert_eq!(s.project_order, ["/repo", "/other"].map(PathBuf::from));
+            s.move_worktree(Path::new("/b"), Path::new("/repo"), cx);
+            assert_eq!(cards(s), ["/a", "/repo", "/b", "/other"].map(PathBuf::from));
+            // A drop into a different repository must not move or regroup cards.
+            let order = s.worktree_order.clone();
+            s.move_worktree(Path::new("/b"), Path::new("/other"), cx);
+            assert_eq!(s.worktree_order, order);
+            s.set_sort_by(SortBy::Name, cx);
+            assert_eq!(cards(s), ["/a", "/b", "/repo", "/other"].map(PathBuf::from));
+        });
+    }
+    cx.run_until_parked();
+    let restored = Sidebar::new_loaded(Some(file.clone()));
+    assert_eq!(
+        restored.worktree_order,
+        ["/a", "/repo", "/b"].map(PathBuf::from)
+    );
+    assert_eq!(restored.options.sort_by, SortBy::Name);
+    // Existing five-segment files still load with an empty manual card order.
+    let mut legacy = vec![FORMAT_VERSION];
+    for segment in [
+        postcard::to_stdvec(&restored.prefs).unwrap(),
+        postcard::to_stdvec(&restored.options).unwrap(),
+        postcard::to_stdvec(&lineage::LineageState::default()).unwrap(),
+        postcard::to_stdvec(&UiExpansionState::default()).unwrap(),
+        postcard::to_stdvec(&restored.project_order).unwrap(),
+    ] {
+        legacy.extend(segment);
+    }
+    assert!(decode_state(&legacy).unwrap().5.is_empty());
+    fs::remove_dir_all(&dir).ok();
 }

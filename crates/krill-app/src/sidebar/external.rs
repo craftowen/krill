@@ -1193,11 +1193,24 @@ pub fn remove_imported_project(state_dir: &Path, project_path: &Path) {
     fs::rename(&tmp, &path).ok();
 }
 
-/// `<state_dir>/projects.toml`의 표시 이름·고정 여부·코멘트·이슈·상태를
-/// 사이드바 인메모리 상태에 반영한다. 계보(부모 워크트리)는 이관기가 `WorktreeStore`(단일 원천)에 기록한다.
-///
-/// `pinned`와 `display_name`은 `prefs`에 해당 경로 엔트리가 아직 없을 때(`Entry::Vacant`)만
-/// 초기값으로 주입해, 이미 사용자가 수정한 `sidebar.bin` 설정(핀 해제·이름 초기화)을 덮어쓰지 않는다(`OWE-767`).
+/// Resolve occupied aliases before inserting imported defaults.
+pub(super) fn imported_entry<'a, T>(
+    map: &'a mut BTreeMap<PathBuf, T>,
+    path: &Path,
+) -> std::collections::btree_map::Entry<'a, PathBuf, T> {
+    let key = if map.contains_key(path) {
+        path.to_path_buf()
+    } else {
+        map.keys()
+            .find(|key| krill_proto::path::equivalent(key, path))
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    map.entry(key)
+}
+
+/// `<state_dir>/projects.toml` 표시 설정을 읽는다. 동등한 경로의 설정이 있으면
+/// 사용자가 해제한 핀·비운 이름도 그대로 보존한다(`OWE-767`).
 pub(super) fn apply_imported_project_prefs(
     state_dir: &Path,
     prefs: &mut super::Preferences,
@@ -1215,7 +1228,7 @@ pub(super) fn apply_imported_project_prefs(
         let repo = normalize_imported_path(Path::new(proj.path.trim()));
         let dn = proj.display_name.trim();
         if (!dn.is_empty() || proj.pinned)
-            && let std::collections::btree_map::Entry::Vacant(vacant) = prefs.entry(repo)
+            && let std::collections::btree_map::Entry::Vacant(vacant) = imported_entry(prefs, &repo)
         {
             vacant.insert(super::Preference {
                 pinned: proj.pinned,
@@ -1234,7 +1247,8 @@ pub(super) fn apply_imported_project_prefs(
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if (dn.is_some() || wt.pinned)
-            && let std::collections::btree_map::Entry::Vacant(vacant) = prefs.entry(wt_path.clone())
+            && let std::collections::btree_map::Entry::Vacant(vacant) =
+                imported_entry(prefs, &wt_path)
         {
             vacant.insert(super::Preference {
                 pinned: wt.pinned,
@@ -1244,20 +1258,18 @@ pub(super) fn apply_imported_project_prefs(
         if let Some(ref c) = wt.comment {
             let clean = sanitize(c);
             if !clean.is_empty() {
-                comments.entry(wt_path.clone()).or_insert(clean);
+                imported_entry(comments, &wt_path).or_insert(clean);
             }
         }
         if let Some(ref iss) = wt.issue
             && !iss.trim().is_empty()
         {
-            issues
-                .entry(wt_path.clone())
-                .or_insert_with(|| iss.trim().to_owned());
+            imported_entry(issues, &wt_path).or_insert_with(|| iss.trim().to_owned());
         }
         if let Some(ref st_str) = wt.workspace_status
             && let Ok(st) = krill_proto::orchestration::WorkspaceStatus::parse(st_str)
         {
-            statuses.entry(wt_path).or_insert(st);
+            imported_entry(statuses, &wt_path).or_insert(st);
         }
     }
 }
@@ -3313,6 +3325,66 @@ parent_worktree_path = "/Users/test/repo"
         })
     );
 
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn windows_imported_alias_does_not_revive_cleared_user_preferences() {
+    let dir = std::env::temp_dir().join(format!("krill-imported-alias-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(PROJECTS_FILE),
+        r#"
+[[projects]]
+id = "repo"
+path = '\\?\C:\Work'
+display_name = "Imported Repo"
+pinned = true
+
+[worktrees.'\\?\C:\Work\간단작업']
+repo_id = "repo"
+display_name = "Imported Worktree"
+pinned = true
+comment = "Imported comment"
+issue = "OLD-1"
+workspace_status = "completed"
+"#,
+    )
+    .unwrap();
+    let repo = PathBuf::from("c:/work");
+    let tree = PathBuf::from("c:/work/간단작업");
+    // After reconciliation the user clears the imported name and pin. A later
+    // disk refresh must recognize these occupied entries despite their spelling.
+    let mut prefs = BTreeMap::from([
+        (repo, super::Preference::default()),
+        (tree.clone(), super::Preference::default()),
+    ]);
+    let mut comments = BTreeMap::from([(tree.clone(), "My comment".into())]);
+    let mut issues = BTreeMap::from([(tree.clone(), "NEW-2".into())]);
+    let mut statuses = BTreeMap::from([(
+        tree,
+        krill_proto::orchestration::WorkspaceStatus::InProgress,
+    )]);
+    for _ in 0..2 {
+        apply_imported_project_prefs(&dir, &mut prefs, &mut comments, &mut issues, &mut statuses);
+        assert_eq!(prefs.len(), 2);
+        assert!(
+            prefs
+                .values()
+                .all(|pref| !pref.pinned && pref.name.is_empty())
+        );
+        assert_eq!(
+            comments.values().collect::<Vec<_>>(),
+            [&"My comment".to_owned()]
+        );
+        assert_eq!(issues.values().collect::<Vec<_>>(), [&"NEW-2".to_owned()]);
+        assert_eq!(
+            statuses.values().copied().collect::<Vec<_>>(),
+            [krill_proto::orchestration::WorkspaceStatus::InProgress]
+        );
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
