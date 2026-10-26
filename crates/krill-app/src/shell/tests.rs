@@ -6178,6 +6178,25 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_none());
 
+    // show_automations_button = false 설정 시 사이드바에서 '자동화' 행이 완전히 사라져야 한다(중복 렌더링 회귀 방지).
+    cx.update(|_, cx| {
+        krill_app::settings::edit(cx, |s| {
+            s.show_automations_button = false;
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("nav-automations").is_none(),
+        "nav-automations must be hidden when show_automations_button is false"
+    );
+    cx.update(|_, cx| {
+        krill_app::settings::edit(cx, |s| {
+            s.show_automations_button = true;
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("nav-automations").is_some());
+
     // 'Krill 모바일'은 사이드바를 둔 채 본문에 모바일 페이지를 연다.
     let mobile = cx.debug_bounds("nav-mobile").unwrap();
     cx.simulate_click(mobile.center(), Modifiers::default());
@@ -6194,6 +6213,21 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
         );
         assert!(settings.read(cx).mobile_page());
     });
+
+    // 모바일 단독 페이지에서 일반 설정으로 이동한 뒤 navigate_back 시 mobile_page()가 true로 복원된다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            assert!(!s.mobile_page_open(cx));
+            assert!(s.navigate_back(None, cx));
+            assert!(s.mobile_page_open(cx));
+            let settings = s.settings.as_ref().unwrap().read(cx);
+            assert_eq!(settings.tab(), krill_app::settings::AdminTab::Mobile);
+            assert!(settings.mobile_page());
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_some());
 
     // '기기 관리'는 전체 설정의 모바일 탭으로 넘어간다.
     let manage = cx.debug_bounds("mobile-page-manage").unwrap();
@@ -6286,6 +6320,17 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_none());
     assert_eq!(layout_of(&view, cx), before);
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.open_automations_page(Some(window), cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-page").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.close_settings(None, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-page").is_none());
 }
 
 /// 여러 `Shell` 창이 열려 있을 때 한 창에서 인앱 설정을 닫으면 해당 창의 설정만 닫히고,

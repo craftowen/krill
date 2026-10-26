@@ -950,3 +950,86 @@ fn osc52_write_reaches_negotiated_clients_only_after_attach() {
     child.wait().unwrap();
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn negotiated_history_after_csi_3j_redraw_serves_hot_and_deduplicates_cold() {
+    use krill_proto::screen::{HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+    let dir = tmp("csi3j-hot-cold");
+    let st = store(
+        &dir,
+        Limits {
+            seal_bytes: 16 << 10,
+            ..Limits::default()
+        },
+    );
+    let script = "/usr/bin/perl -e '$|=1; for $i (1..1500) { printf \"line-%04d\\n\", $i } select(undef,undef,undef,0.05); print \"\\e[2J\\e[3J\\e[H\"; for $i (1..24) { printf \"screen-%02d\\n\", $i }'";
+    let (mut child, session) = spawn(Some(&st), 72, SMALL, script);
+    assert!(child.wait().unwrap().success());
+    let tap = session.tap();
+    tap.wait(|progress| progress.closed);
+    let sock = server(&dir, vec![tap]);
+    let (mut connection, _) = connect(&sock, screen(72, None));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    read_snapshot(&mut connection, &mut View::default());
+    let ask = |connection: &mut UnixStream, request: HistoryViewRequest| {
+        connection.write_all(&request.encode().unwrap()).unwrap();
+        loop {
+            match frame(connection) {
+                (kind::HISTORY_VIEW_ROWS, body) => {
+                    return HistoryViewRows::decode(kind::HISTORY_VIEW_ROWS, &body).unwrap();
+                }
+                (kind::UPDATE | kind::CLOSED, _) => {}
+                (kind, _) => unreachable!("unexpected frame {kind:#04x}"),
+            }
+        }
+    };
+    let row_text = |row: &[krill_proto::screen::Cell]| -> String {
+        row.iter()
+            .filter(|c| !c.flags.contains(krill_proto::screen::Flags::SPACER))
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+
+    // First scroll request after attaching to a CSI 3 J TUI session hits Source::Hot directly.
+    let hot = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 1,
+            view: 0,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(hot.status, HistoryViewStatus::Ready);
+    assert_eq!(hot.identity.as_ref().map(|id| id.source), Some(Source::Hot));
+    assert_eq!(hot.total, 1_000);
+    assert_eq!(
+        hot.rows.iter().map(|r| row_text(r)).collect::<Vec<_>>(),
+        vec!["screen-01", "line-1477", "line-1476", "line-1475"]
+    );
+
+    // Scrolling past the 1,000 hot rows seamlessly deduplicates hot coverage in Source::Cold.
+    let cold = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 2,
+            view: hot.view,
+            skip: 1_000,
+            count: 4,
+        },
+    );
+    assert_eq!(cold.status, HistoryViewStatus::Ready);
+    assert!(matches!(
+        cold.identity.as_ref().map(|id| id.source),
+        Some(Source::Cold { .. })
+    ));
+    assert_eq!(
+        cold.rows.iter().map(|r| row_text(r)).collect::<Vec<_>>(),
+        vec!["line-0478", "line-0477", "line-0476", "line-0475"]
+    );
+    fs::remove_dir_all(&dir).ok();
+}

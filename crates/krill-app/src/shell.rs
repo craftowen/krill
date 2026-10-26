@@ -351,6 +351,7 @@ pub(super) enum NavEntry {
         worktree: Option<PathBuf>,
     },
     Settings(krill_app::settings::AdminTab),
+    Mobile,
     Artifacts,
     Automations,
 }
@@ -1497,7 +1498,10 @@ impl Shell {
 
     fn is_entry_reachable(&self, entry: &NavEntry, cx: &App) -> bool {
         match entry {
-            NavEntry::Settings(_) | NavEntry::Artifacts | NavEntry::Automations => true,
+            NavEntry::Settings(_)
+            | NavEntry::Mobile
+            | NavEntry::Artifacts
+            | NavEntry::Automations => true,
             NavEntry::Workspace {
                 pane,
                 session,
@@ -1610,6 +1614,7 @@ impl Shell {
         match entry {
             NavEntry::Artifacts => self.open_artifacts(window, cx),
             NavEntry::Automations => self.open_automations(window, cx),
+            NavEntry::Mobile => self.open_mobile_page(window, cx),
             NavEntry::Settings(tab) => {
                 self.open_settings(tab, window, cx);
             }
@@ -1666,6 +1671,17 @@ impl Shell {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        self.open_settings_surface(tab, false, NavEntry::Settings(tab), window, cx);
+    }
+
+    fn open_settings_surface(
+        &mut self,
+        tab: krill_app::settings::AdminTab,
+        mobile_page: bool,
+        nav_entry: NavEntry,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         if !cx.has_global::<krill_app::settings::Config>() {
             let dir = self.state_dir(cx);
             krill_app::settings::init_at(dir, cx);
@@ -1678,6 +1694,7 @@ impl Shell {
             cx.defer(move |cx| krill_app::settings::open_window_at_tab(tab, cx));
             return;
         }
+        self.record_workspace_nav(cx);
         self.jump = None;
         self.continue_session = None;
         self.dashboard = None;
@@ -1692,15 +1709,18 @@ impl Shell {
         }
         let view = if let Some(existing) = &self.settings {
             existing.update(cx, |v, cx| {
-                v.set_mobile_page(false, cx);
                 v.set_automations_page(false, cx);
                 v.set_tab(tab, cx);
+                v.set_mobile_page(mobile_page, cx);
             });
             existing.clone()
         } else {
             let created = cx.new(|cx| {
                 let mut v = krill_app::settings::SettingsView::new(cx);
                 v.set_tab(tab, cx);
+                if mobile_page {
+                    v.set_mobile_page(true, cx);
+                }
                 krill_app::settings::SettingsView::sync_recording_paused(cx);
                 v
             });
@@ -1716,7 +1736,7 @@ impl Shell {
         }
         let visible = window.as_deref().is_some_and(Window::is_window_active);
         view.update(cx, |view, cx| view.set_visible(visible, cx));
-        self.nav_history.push(NavEntry::Settings(tab));
+        self.nav_history.push(nav_entry);
         self.sync_focused_session(cx);
         if let Some(window) = window {
             self.window = Some(window.window_handle());
@@ -1745,10 +1765,13 @@ impl Shell {
     }
 
     pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        self.open_settings(krill_app::settings::AdminTab::Mobile, window, cx);
-        if let Some(settings) = &self.settings {
-            settings.update(cx, |v, cx| v.set_mobile_page(true, cx));
-        }
+        self.open_settings_surface(
+            krill_app::settings::AdminTab::Mobile,
+            true,
+            NavEntry::Mobile,
+            window,
+            cx,
+        );
     }
 
     /// 사이드바 'Krill 모바일' 페이지가 열려 있다.
@@ -6244,9 +6267,40 @@ impl Shell {
                                 && l.selection.is_some_and(|s| s.anchor == s.head)
                         });
                     if this.select_end(id, cx) {
-                        if clicked && let Some((_, uri)) = this.click_link_at(id, e.position) {
-                            this.open_link_menu(id, uri, e.position, cx);
-                            return;
+                        if clicked {
+                            if let Some((_, uri)) = this.click_link_at(id, e.position) {
+                                this.open_link_menu(id, uri, e.position, cx);
+                                return;
+                            }
+                            if let Some(path) = this
+                                .live
+                                .get(&id)
+                                .filter(|l| !l.pane.modes().mouse())
+                                .and_then(|l| {
+                                    file_link_target(&l.pane.shown(), &l.painted, e.position)
+                                })
+                            {
+                                this.open_terminal_file(
+                                    path,
+                                    e.position,
+                                    terminal_menu::FileAction::Open,
+                                    cx,
+                                );
+                                return;
+                            }
+                            if let Some((_, link)) = this.path_link_at(
+                                id,
+                                e.position,
+                                Some(terminal_menu::FileAction::Open),
+                                cx,
+                            ) {
+                                this.activate_terminal_file(
+                                    link,
+                                    terminal_menu::FileAction::Open,
+                                    cx,
+                                );
+                                return;
+                            }
                         }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
                         if krill_app::settings::copy_on_select(cx) {

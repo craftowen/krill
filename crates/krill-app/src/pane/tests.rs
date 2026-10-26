@@ -1758,6 +1758,35 @@ fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_ca
         pane.shown().rows,
         vec![row("hist-1"), row("hist-2"), row("live-a")]
     );
+
+    // Prefetch rows 3..6 along with 0..2, then jump wanted to 10 (wanted - lines = 7 > shown = 2):
+    // Cache::show must still advance shown across the contiguous cached prefix (up to 6).
+    pane.scroll(1);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let req2 = HistoryViewRequest::decode(*kind, body).unwrap();
+    let prefetch = HistoryViewRows {
+        req: req2.req,
+        view: 2,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 2,
+        total: 20,
+        complete: false,
+        rows: vec![row("hist-3"), row("hist-4"), row("hist-5"), row("hist-6")],
+    };
+    assert!(feed(&mut pane, &prefetch.encode().unwrap()).redraw);
+    assert_eq!(pane.scroll_offset(), 3);
+    pane.scroll(7);
+    assert_eq!(pane.scroll_offset(), 6);
 }
 
 /// 가짜 krilld. 붙기마다 감시 연결(핸드셰이크 뒤 클라이언트가 닫음)과 제어 연결 한 쌍을 받고, 제어 연결은

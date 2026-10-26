@@ -27,8 +27,7 @@ impl Tap {
         let (stamp, seq, rows) = {
             let _access = self.access_history(cancelled)?;
             let live = lock(&self.0.live);
-            let mut rows = live.engine.history_rows(0, crate::HOT_LINES).1;
-            rows.reverse();
+            let rows = live.engine.snapshot_hot_rows();
             let (epoch, seq) = (live.history_epoch, live.seq);
             drop(live);
             let stamp = match self.0.store.as_ref() {

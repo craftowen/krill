@@ -84,6 +84,8 @@ impl EventListener for Events {
 #[derive(Default)]
 struct RawScan {
     on: bool,
+    alt: bool,
+    history_cleared: bool,
     /// alacritty가 아직 답하지 않은 `CSI ?2031$p`마다 질의 시점의 상태. DEC 2026 sync 안의 질의는 alacritty가
     /// 구간이 끝날 때 답하므로 큐로 둔다.
     asked: VecDeque<bool>,
@@ -98,10 +100,21 @@ impl Perform for RawScan {
         }
         let mut modes = params.iter().map(|p| p.first().copied());
         match (action, intermediates) {
-            ('h' | 'l', [b'?']) if modes.any(|m| m == Some(SCHEME_MODE)) => self.on = action == 'h',
+            ('h' | 'l', [b'?']) => {
+                for mode in modes.flatten() {
+                    if mode == SCHEME_MODE {
+                        self.on = action == 'h';
+                    } else if matches!(mode, 47 | 1047 | 1049) {
+                        self.alt = action == 'h';
+                    }
+                }
+            }
             // alacritty처럼 첫 번째 인자만 본다.
             ('p', [b'?', b'$']) if modes.next() == Some(Some(SCHEME_MODE)) => {
                 self.asked.push_back(self.on);
+            }
+            ('J', []) if !self.alt && modes.any(|m| m == Some(3)) => {
+                self.history_cleared = true;
             }
             _ => {}
         }
@@ -110,6 +123,8 @@ impl Perform for RawScan {
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         if byte == b'c' && intermediates.is_empty() {
             self.on = false; // RIS
+            self.alt = false;
+            self.history_cleared = true;
         }
     }
 
@@ -201,6 +216,10 @@ pub(crate) struct Engine {
     cli_boundary: crate::cli::Boundary,
     /// 강등이 풀렸을 때의 핫 스크롤백 행 수(≤ [`HOT_LINES`]).
     hot: usize,
+    /// 강등 중인지 여부.
+    demoted: bool,
+    /// 강등(`demote`)이나 자식이 보낸 `CSI 3 J`·`RIS` 직전의 핫 스크롤백(최신 행부터, postcard + zstd 압축).
+    parked_hot: Option<Box<[u8]>>,
     /// 창 제목(OSC 0·2). [`MAX_TITLE`]에서 자른다.
     title: String,
     /// 살아 있는 바이트([`Feed::Live`])로 울린 벨 수.
@@ -227,6 +246,8 @@ impl Engine {
             scheme: RawScan::default(),
             cli_boundary: crate::cli::Boundary::default(),
             hot,
+            demoted: false,
+            parked_hot: None,
             title: String::new(),
             bells: 0,
             clips: 0,
@@ -237,13 +258,47 @@ impl Engine {
     /// 바이트를 처리하고, 그 안의 질의에 대한 응답(PTY에 쓸 바이트)을 질의 순서대로 돌려준다.
     pub(crate) fn feed(&mut self, bytes: &[u8], feed: Feed, look: &Appearance) -> String {
         self.cli_boundary.advance(bytes);
+        let temp_hot = feed == Feed::Live && self.demoted && self.hot > 0 && !bytes.is_empty();
+        if temp_hot {
+            self.term.set_options(config(self.hot));
+        }
         // RawScan only observes escape sequences; printable ASCII and C0 controls
         // have no side effects while its parser has no pending sequence/codepoint.
         if !self.scan.mk_is_ground() || !bytes.is_ascii() || bytes.contains(&0x1b) {
             self.scan.advance(&mut self.scheme, bytes);
         }
+        let pre_clear = if self.hot > 0
+            && self.scheme.history_cleared
+            && !self.term.mode().contains(TermMode::ALT_SCREEN)
+            && self.history_len() > 0
+        {
+            let mut rows = self.history_rows(0, self.hot).1;
+            rows.reverse();
+            Some(rows)
+        } else {
+            None
+        };
         self.parser.advance(&mut self.term, bytes);
-        self.replies(feed, look)
+        if self.parser.sync_bytes_count() == 0 {
+            if let Some(rows) = pre_clear {
+                self.save_hot_rows(rows);
+            }
+            self.scheme.history_cleared = false;
+        }
+        let out = self.replies(feed, look);
+        if temp_hot {
+            if self.parser.sync_bytes_count() == 0
+                && !self.term.mode().contains(TermMode::ALT_SCREEN)
+                && self.history_len() > 0
+            {
+                self.save_hot();
+            }
+            self.set_history(0, look);
+            self.term.grid_mut().truncate();
+        } else if self.parked_hot.is_some() && self.history_len() >= self.hot {
+            self.parked_hot = None;
+        }
+        out
     }
 
     /// 열린 sync(DEC 2026) 구간이 강제로 반영돼야 하는 시각. 없으면 `None`.
@@ -253,14 +308,49 @@ impl Engine {
 
     /// 종료 신호(ESU) 없이 마감이 지난 sync 버퍼를 화면에 반영한다. 버퍼 안 질의의 응답을 돌려준다.
     pub(crate) fn end_sync(&mut self, feed: Feed, look: &Appearance) -> String {
+        let temp_hot = feed == Feed::Live && self.demoted && self.hot > 0;
+        if temp_hot {
+            self.term.set_options(config(self.hot));
+        }
+        let pre_clear = if self.hot > 0
+            && self.scheme.history_cleared
+            && !self.term.mode().contains(TermMode::ALT_SCREEN)
+            && self.history_len() > 0
+        {
+            let mut rows = self.history_rows(0, self.hot).1;
+            rows.reverse();
+            Some(rows)
+        } else {
+            None
+        };
         self.parser.stop_sync(&mut self.term);
-        self.replies(feed, look)
+        if let Some(rows) = pre_clear {
+            self.save_hot_rows(rows);
+        }
+        self.scheme.history_cleared = false;
+        let out = self.replies(feed, look);
+        if temp_hot {
+            if !self.term.mode().contains(TermMode::ALT_SCREEN) && self.history_len() > 0 {
+                self.save_hot();
+            }
+            self.set_history(0, look);
+            self.term.grid_mut().truncate();
+        } else if self.parked_hot.is_some() && self.history_len() >= self.hot {
+            self.parked_hot = None;
+        }
+        out
     }
 
     /// 숨긴 세션 강등(MK-035): 핫 스크롤백을 비워 메모리를 돌려주고 새 행을 쌓지 않는다. 화면·모드·제목·파서 꼬리는
     /// 그대로다. 파서가 바닥 상태(sync 버퍼·미완성 제어열·UTF-8 꼬리 없음)일 때만 vte 파서를 새로 만들어 큰 sync 뒤
     /// 남은 버퍼 용량도 돌려준다. 버린 행은 세그먼트(MK-024) 콜드 페이지에 있다.
     pub(crate) fn demote(&mut self, look: &Appearance) {
+        if !self.demoted {
+            if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                self.save_hot();
+            }
+            self.demoted = true;
+        }
         self.set_history(0, look);
         // `set_options`만으로는 alacritty가 캐시 1,000행을 남긴다(비공개 MK-009 스파이크 기록 원인 3).
         // ponytail: 대체 화면 중에는 기본 화면 grid가 비활성이라 공개 API로 truncate할 수 없어 캐시가 최대 1,000행
@@ -273,6 +363,7 @@ impl Engine {
 
     /// 강등을 푼다: 핫 스크롤백을 다시 만들 때의 상한(≤ [`HOT_LINES`])까지 쌓는다(이전 행은 콜드 페이지로).
     pub(crate) fn promote(&mut self, look: &Appearance) {
+        self.demoted = false;
         self.set_history(self.hot, look);
     }
 
@@ -443,11 +534,15 @@ impl Engine {
         self.term
             .inactive_keyboard_mode_stack
             .clone_from(&source.term.inactive_keyboard_mode_stack);
+        self.demoted = source.demoted;
+        self.parked_hot = None;
         self.title.clone_from(&source.title);
         self.bells = source.bells;
         self.clips = source.clips;
         self.clip.clone_from(&source.clip);
         self.scheme.on = source.scheme.on;
+        self.scheme.alt = source.scheme.alt;
+        self.scheme.history_cleared = source.scheme.history_cleared;
         self.scheme.asked.clone_from(&source.scheme.asked);
         self.scheme.cwd.clone_from(&source.scheme.cwd);
     }
@@ -475,6 +570,8 @@ impl Engine {
 
     /// 핫 스크롤백을 비운다. 보이는 화면·커서·모드는 그대로 둔다(OWE-873b).
     pub(crate) fn clear_history(&mut self) {
+        self.parked_hot = None;
+        self.scheme.history_cleared = false;
         self.term.grid_mut().clear_history();
     }
 
@@ -506,6 +603,57 @@ impl Engine {
             .map(|k| capture_row(&grid[Line(-k)], self.term.colors()).0)
             .collect();
         (total, rows)
+    }
+
+    fn decode_parked_hot(&self) -> Vec<Vec<Cell>> {
+        let Some(compressed) = self.parked_hot.as_deref() else {
+            return Vec::new();
+        };
+        zstd::stream::decode_all(compressed)
+            .ok()
+            .and_then(|bytes| postcard::from_bytes::<Vec<Vec<Cell>>>(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_hot_rows(&mut self, mut rows: Vec<Vec<Cell>>) {
+        if self.hot == 0 || rows.is_empty() {
+            return;
+        }
+        if rows.len() < self.hot {
+            let old = self.decode_parked_hot();
+            rows.extend(old.into_iter().take(self.hot.saturating_sub(rows.len())));
+        } else {
+            rows.truncate(self.hot);
+        }
+        if let Ok(bytes) = postcard::to_stdvec(&rows)
+            && let Ok(compressed) = zstd::bulk::compress(&bytes, 1)
+        {
+            self.parked_hot = Some(compressed.into_boxed_slice());
+        }
+    }
+
+    fn save_hot(&mut self) {
+        if self.hot == 0 {
+            self.parked_hot = None;
+            return;
+        }
+        let mut rows = self.history_rows(0, self.hot).1;
+        rows.reverse();
+        self.save_hot_rows(rows);
+    }
+
+    /// 최신 행부터 정렬된 핫 스크롤백 스냅샷(강등·`CSI 3 J` 이전 보존 행 포함, 최대 `self.hot`행).
+    pub(crate) fn snapshot_hot_rows(&self) -> Vec<Vec<Cell>> {
+        if self.hot == 0 || self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return Vec::new();
+        }
+        let mut rows = self.history_rows(0, self.hot).1;
+        rows.reverse();
+        if rows.len() < self.hot {
+            let old = self.decode_parked_hot();
+            rows.extend(old.into_iter().take(self.hot.saturating_sub(rows.len())));
+        }
+        rows
     }
 
     /// 보이는 화면(화면 전송 키프레임, MK-023). [`MAX_COLS`]×[`MAX_LINES`]까지만 담는다.

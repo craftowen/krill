@@ -233,7 +233,10 @@ impl View {
                 .ok_or(io::ErrorKind::InvalidData)?;
             let total = u64::try_from(info.total).map_err(io::Error::other)?;
             let end = base.saturating_add(total);
-            let oldest = index + 1 == self.info.len();
+            let oldest = self.info.get(index + 1..).is_none_or(|rest| {
+                rest.iter()
+                    .all(|slot| slot.as_ref().is_some_and(|next| next.total == 0))
+            });
             if oldest && target >= end {
                 target = end
                     .saturating_sub(u64::try_from(count).unwrap_or(u64::MAX))

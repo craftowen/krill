@@ -301,6 +301,8 @@ impl Manifest {
             seg_count.saturating_mul(3) / 4,
             seg_count.saturating_sub(24),
             seg_count.saturating_sub(8),
+            seg_count.saturating_sub(4),
+            seg_count.saturating_sub(2),
             seg_count.saturating_sub(1),
         ];
         let mut record_cp = |run_id: usize, raw_i: usize, raw: &super::Engine| {
@@ -313,7 +315,7 @@ impl Manifest {
             if targets.contains(&raw_i) || pending_cp {
                 if let Some(engine) = raw.clone_ground() {
                     if static_cps.last().is_none_or(|last| last.raw_i != raw_i)
-                        && static_cps.len() < 6
+                        && static_cps.len() < 8
                     {
                         static_cps.push(Checkpoint {
                             run_id,

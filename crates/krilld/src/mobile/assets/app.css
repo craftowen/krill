@@ -207,8 +207,6 @@ button.account-row:disabled{opacity:1}
 .project-filter-empty{padding:12px 0;font-size:var(--font-meta)}
 .project-picker>svg{flex:none;margin-left:auto;transition:transform .15s}.project-picker[aria-expanded=true]>svg{transform:rotate(90deg)}
 .workspaces .workspace-list{padding-inline:var(--space-sm)}
-
-.workspaces .workspace-list{padding-inline:var(--space-sm)}
 .repo-group{border-bottom:1px solid var(--border)}
 .repo-toggle{display:flex;align-items:center;gap:var(--space-md);width:100%;min-height:72px;padding:var(--space-md) var(--space-sm);text-align:left;font-size:var(--font-body);font-weight:600;color:var(--foreground)}
 .project-icon{width:32px;height:32px;display:grid;place-items:center;flex:none;border:1px solid var(--border);border-radius:var(--radius-row);background:var(--surface-panel);color:var(--muted-foreground)}
@@ -317,9 +315,6 @@ button.account-row:disabled{opacity:1}
  .form-sheet{border-radius:var(--radius-card)}
  .workspace-filters>select{flex:0 1 280px;width:auto}
  .workspace-toolbar>.spacer{flex:1}
- .workspace-search{display:flex;align-items:center;gap:var(--space-sm)}
- .workspace-search input{flex:1;min-width:0;min-height:44px}
- .workspace-search>.text-button{margin:0;flex:none}
  .settings-nav{justify-content:center}
  .settings-nav button{flex:0 1 160px}
  .chat-view{width:100%;max-width:var(--conversation-width);align-self:center}
@@ -523,6 +518,8 @@ button.account-row:disabled{opacity:1}
 @media(orientation:landscape) and (max-height:500px){
  .command-dock>.buffered-command textarea.command-input{min-height:var(--touch-target);max-height:20dvh}
  .sheet{max-height:max(44px,calc(100dvh - var(--keyboard-inset,0px) - env(safe-area-inset-top) - 8px))}
+ #mobile-app .session.screen>.page-header{min-height:44px}
+ .session.screen .session-summary{display:none}
 }
 
 .status-dot.working{width:12px;height:12px;border:0;border-radius:0;background:var(--status-working);mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%227%22%3E%3Cpath%20d%3D%22M14.91%204.01A8.5%208.5%200%200%201%2020.37%2013.48M17.46%2018.51A8.5%208.5%200%200%201%206.54%2018.51M3.63%2013.48A8.5%208.5%200%200%201%209.09%204.01%22%2F%3E%3C%2Fsvg%3E") center/contain no-repeat;animation:spin 1s steps(12) infinite;}
@@ -634,12 +631,6 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 .chat-md th{background:var(--surface-raised);color:var(--foreground);font-weight:600}
 .chat-md a{color:var(--foreground);text-decoration:underline;text-underline-offset:.2em;overflow-wrap:anywhere}
 .chat-md a:focus-visible{outline:2px solid var(--muted-foreground);outline-offset:2px;border-radius:var(--radius-row)}
-
-
-@media(orientation:landscape) and (max-height:500px){
- #mobile-app .session.screen>.page-header{min-height:44px}
- .session.screen .session-summary{display:none}
-}
 
 #mobile-app .session-tabs :is(.session-tab,.tab-add,.tab-quick):focus-visible{outline-offset:-2px}
 

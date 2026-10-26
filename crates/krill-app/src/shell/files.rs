@@ -206,11 +206,34 @@ struct LinkKey {
     column: u16,
     cwd: Option<PathBuf>,
 }
+
+impl LinkKey {
+    fn same_context(&self, other: &Self) -> bool {
+        self.pane == other.pane
+            && self.host == other.host
+            && self.session == other.session
+            && self.line == other.line
+            && self.cwd == other.cwd
+            && self.input.same_context(&other.input)
+    }
+}
+
 struct LinkLookup {
     key: LinkKey,
     ready: bool,
     checked_at: Option<std::time::Instant>,
     found: Option<PathLink>,
+}
+
+impl LinkLookup {
+    fn covers(&self, key: &LinkKey) -> bool {
+        self.key == *key
+            || (self.ready
+                && self.key.same_context(key)
+                && self.found.as_ref().is_some_and(|link| {
+                    (link.column..link.column.saturating_add(link.cols)).contains(&key.column)
+                }))
+    }
 }
 
 impl Default for Files {
@@ -572,7 +595,14 @@ impl Shell {
 
     /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
     pub(super) fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let host = self.active_workspace(cx).host;
+        let host = self
+            .layout
+            .focused()
+            .filter(|_| !self.page_open() && self.dashboard.is_none())
+            .map_or_else(
+                || self.active_workspace(cx).host,
+                |p| self.layout.host(p).clone(),
+            );
         self.open_file_on(host, path, cx);
     }
 
@@ -661,6 +691,7 @@ impl Shell {
         let live = self
             .layout
             .session(pane)
+            .or_else(|| self.live.get(&pane).and_then(|l| l.pane.session()))
             .and_then(|id| self.sidebar.read(cx).session_on(host, id))
             .and_then(|s| s.cwd.clone());
         live.or_else(|| {
@@ -702,7 +733,7 @@ impl Shell {
         };
         if let Some(action) = action {
             if let Some(lookup) = &self.files.link_lookup
-                && lookup.key == key
+                && lookup.covers(&key)
                 && lookup.ready
                 && lookup
                     .checked_at
@@ -714,6 +745,7 @@ impl Shell {
             let generation = self.files.link_open_generation;
             let session = l.pane.session();
             let remote = remote_target.clone();
+            let cache = self.files.link_cache.clone();
             let checked = key.clone();
             #[cfg(test)]
             let next_io = self.files.link_next_io.take();
@@ -725,13 +757,19 @@ impl Shell {
                 let found = cx
                     .background_executor()
                     .spawn(async move {
+                        let Ok(mut cache) = cache.lock() else {
+                            return None;
+                        };
+                        if cache.0.elapsed() >= Duration::from_millis(500) {
+                            *cache = (std::time::Instant::now(), path_link::Cache::default());
+                        }
                         match remote {
-                            Some(target) => checked
-                                .input
-                                .resolve_remote(&target, checked.cwd.as_deref()),
-                            None => checked
-                                .input
-                                .resolve(&mut path_link::Cache::default(), checked.cwd.as_deref()),
+                            Some(target) => checked.input.resolve_remote_cached(
+                                &mut cache.1,
+                                &target,
+                                checked.cwd.as_deref(),
+                            ),
+                            None => checked.input.resolve(&mut cache.1, checked.cwd.as_deref()),
                         }
                     })
                     .await;
@@ -754,7 +792,7 @@ impl Shell {
             return None;
         }
         if let Some(lookup) = &mut self.files.link_lookup
-            && lookup.key == key
+            && lookup.covers(&key)
             && (!lookup.ready
                 || lookup
                     .checked_at
@@ -796,16 +834,18 @@ impl Shell {
                 let found = cx
                     .background_executor()
                     .spawn(async move {
-                        if let Some(target) = remote {
-                            return checked
-                                .input
-                                .resolve_remote(&target, checked.cwd.as_deref());
-                        }
                         let Ok(mut cache) = cache.lock() else {
                             return None;
                         };
                         if cache.0.elapsed() >= Duration::from_millis(500) {
                             *cache = (std::time::Instant::now(), path_link::Cache::default());
+                        }
+                        if let Some(target) = remote {
+                            return checked.input.resolve_remote_cached(
+                                &mut cache.1,
+                                &target,
+                                checked.cwd.as_deref(),
+                            );
                         }
                         checked.input.resolve(&mut cache.1, checked.cwd.as_deref())
                     })
@@ -840,7 +880,12 @@ impl Shell {
                         let Some(lookup) = &mut this.files.link_lookup else {
                             return false;
                         };
-                        if lookup.key != key {
+                        let same_found_span = lookup.key.same_context(&key)
+                            && found.as_ref().is_some_and(|link| {
+                                (link.column..link.column.saturating_add(link.cols))
+                                    .contains(&lookup.key.column)
+                            });
+                        if lookup.key != key && !same_found_span {
                             return false;
                         }
                         lookup.ready = true;
@@ -851,7 +896,15 @@ impl Shell {
                                 command
                                     && this.live.get(&key.pane).is_some_and(|live| {
                                         cell_at(&live.painted, &live.pane.shown(), position)
-                                            == Some((key.column, key.line))
+                                            .is_some_and(|(col, line)| {
+                                                line == key.line
+                                                    && (col == key.column
+                                                        || (link.column
+                                                            ..link
+                                                                .column
+                                                                .saturating_add(link.cols))
+                                                            .contains(&col))
+                                            })
                                     })
                             });
                             if under_pointer {

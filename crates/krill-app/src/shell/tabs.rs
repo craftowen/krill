@@ -560,9 +560,9 @@ impl Shell {
                     .child(ui::button_with_tooltip(
                         Button::new("toggle-chat-view")
                             .label(if self.is_active_chat_view_in(cx) {
-                                "Term"
+                                text::VIEW_TERM.get()
                             } else {
-                                "Chat"
+                                text::VIEW_CHAT.get()
                             })
                             .ghost()
                             .xsmall()
@@ -572,7 +572,7 @@ impl Shell {
                                 this.toggle_chat_view_with_focus(window, cx);
                             })),
                         "toggle-chat-view",
-                        "Toggle Chat / Terminal view",
+                        text::TOGGLE_CHAT_VIEW.get(),
                     ))
                     .child(ui::button_with_tooltip(
                         Button::new("toggle-panel")

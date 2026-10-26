@@ -64,7 +64,7 @@ function mountChat(root,opts){
  entry.pages||=[];entry.photoVersion||=0;
  entry.mounts=(entry.mounts||0)+1;cacheMap.delete(sessionId);cacheMap.set(sessionId,entry);pruneCache(state);
  const shell=el('div',undefined,'chat-view'),feed=el('div',undefined,'chat-feed'),strip=el('div',undefined,'chat-live-strip'),composer=el('form',undefined,'chat-composer');
- const stripBadge=el('span','IDLE','badge'),stripText=el('span',t('Waiting for transcript…'),'chat-live-text'),rawBtn=button(t('Term →'),()=>onSwitchTerm?.(),'ghost small chat-raw-btn');
+ const stripBadge=el('span','IDLE','badge'),stripText=el('span','','chat-live-text'),rawBtn=button(t('Term →'),()=>onSwitchTerm?.(),'ghost small chat-raw-btn');
  strip.append(stripBadge,stripText,rawBtn);
  const history=el('div',undefined,'chat-actions chat-history'),historyText=el('span',undefined,'muted');
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
@@ -231,7 +231,7 @@ function mountChat(root,opts){
   tailRun=run;renderedCount=entry.items.length;renderedItems=entry.items;
   if(!entry.items.length&&entry.loaded){
    const empty=el('div',undefined,'chat-empty');
-   empty.append(el('p',t(entry.bound?'No chat turns recorded yet.':'Waiting for agent hook or transcript binding…'),'muted'));
+   empty.append(el('p',t('Enter a new message'),'muted'));
    feed.append(empty);
   }
   const first=entry.items[0];

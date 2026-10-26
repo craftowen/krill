@@ -1904,6 +1904,8 @@ impl History {
                     cache.visible()
                 } else if let Some(total) = cache.complete_total() {
                     next.min(total)
+                } else if cache.is_pending() && lines > 0 && lines < isize::MAX {
+                    next.min(cache.visible().saturating_add(128).max(self.offset))
                 } else {
                     next
                 };

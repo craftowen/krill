@@ -56,30 +56,49 @@ fn hard_join(screen: &Screen, line: usize) -> bool {
     let Some(b) = screen.rows.get(line + 1) else {
         return false;
     };
-    let (Some((ai, end)), Some((bi, _))) = (bounds(a), bounds(b)) else {
+    let (Some((ai, end)), Some((bi, b_end))) = (bounds(a), bounds(b)) else {
         return false;
     };
     if ai != bi
-        || end + 3 < usize::from(screen.cols)
         || screen.links.get(line).is_some_and(|l| !l.is_empty())
         || screen.links.get(line + 1).is_some_and(|l| !l.is_empty())
     {
         return false;
     }
-    let Some(style) = a.get(ai) else {
+    let a_tok_start = a[ai..end]
+        .iter()
+        .rposition(|c| c.ch == ' ')
+        .map_or(ai, |i| ai + i + 1);
+    let b_tok_end = b[bi..b_end]
+        .iter()
+        .position(|c| c.ch == ' ')
+        .map_or(b_end, |i| bi + i);
+    let cols = usize::from(screen.cols);
+    let near_right_edge = end + 3 >= cols;
+    let path_wrapped = end + (b_tok_end - bi) + 3 >= cols
+        && (b.get(bi).is_some_and(|c| c.ch == '/')
+            || a[a_tok_start..end].iter().any(|c| c.ch == '/'));
+    if !near_right_edge && !path_wrapped {
+        return false;
+    }
+    let Some(style) = a.get(end - 1) else {
         return false;
     };
-    a.iter().chain(b).filter(|c| c.ch != ' ').all(|c| {
+    let clean = |c: &Cell| {
         !c.flags.contains(Flags::HIDDEN)
             && !c.flags.contains(Flags::LINK)
             && !c.ch.is_control()
             && !is_bidi_control(c.ch)
             && c.zerowidth
                 .iter()
-                .all(|c| !c.is_control() && !is_bidi_control(*c))
-            && c.fg == style.fg
-            && c.bg == style.bg
-    })
+                .all(|z| !z.is_control() && !is_bidi_control(*z))
+    };
+    a.iter().chain(b).filter(|c| c.ch != ' ').all(clean)
+        && a[a_tok_start..end]
+            .iter()
+            .chain(&b[bi..b_tok_end])
+            .filter(|c| c.ch != ' ')
+            .all(|c| c.fg == style.fg && c.bg == style.bg)
 }
 
 struct Flat {
@@ -158,6 +177,15 @@ impl Input {
     /// 현재 입력과 비교해 이웃 행·줄바꿈·링크 메타데이터 변경도 확인한다.
     pub fn matches(&self, screen: &Screen) -> bool {
         Self::at(screen, self.line, self.column).as_ref() == Some(self)
+    }
+
+    /// 같은 행·줄바꿈·링크 스냅샷인지 확인한다(같은 링크 안에서 포인터 열만 이동할 때 재사용).
+    pub fn same_context(&self, other: &Self) -> bool {
+        self.cols == other.cols
+            && self.line == other.line
+            && self.rows == other.rows
+            && self.soft_first == other.soft_first
+            && self.soft_last == other.soft_last
     }
 
     fn wrapped(&self, index: usize) -> bool {
@@ -345,6 +373,16 @@ impl Input {
         target: &krill_hosts::HostTarget,
         cwd: Option<&Path>,
     ) -> Option<PathLink> {
+        self.resolve_remote_cached(&mut Cache::default(), target, cwd)
+    }
+
+    /// 원격 호스트 후보 검사 결과를 `cache`에 재사용하며 포인터 행의 범위로 투영한다.
+    pub fn resolve_remote_cached(
+        &self,
+        cache: &mut Cache,
+        target: &krill_hosts::HostTarget,
+        cwd: Option<&Path>,
+    ) -> Option<PathLink> {
         let mut groups = Vec::new();
         for first in 0..=self.soft_first {
             if first > 0 && self.wrapped(first - 1) {
@@ -411,13 +449,7 @@ impl Input {
         if query_paths.is_empty() {
             return None;
         }
-        let probed = crate::remote_fs::probe_paths(target, cwd, &query_paths);
-        let mut resolved = std::collections::HashMap::new();
-        for (raw, found) in query_paths.into_iter().zip(probed) {
-            if let (Some(raw_str), Some(found_path)) = (raw.to_str(), found) {
-                resolved.insert(raw_str.to_owned(), found_path);
-            }
-        }
+        let resolved = cache.probe_remote(target, cwd, &query_paths);
         if resolved.is_empty() {
             return None;
         }

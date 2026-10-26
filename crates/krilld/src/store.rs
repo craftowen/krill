@@ -725,7 +725,9 @@ impl Restored {
 
     /// 화면 위 스크롤백, 오래된 행부터(최대 [`HOT_LINES`](crate::HOT_LINES)행).
     pub fn history(&self) -> Vec<Vec<Cell>> {
-        self.engine.history_rows(0, self.engine.history_len()).1
+        let mut rows = self.engine.snapshot_hot_rows();
+        rows.reverse();
+        rows
     }
 }
 
@@ -900,6 +902,8 @@ impl History {
         let mut harvested: Option<Engine> = None;
         let mut previous_end = None;
         let mut parser_reset = false;
+        let mut view_diverged = false;
+        let mut raw_size: Option<WinSize> = None;
         let mut run_id = 0usize;
         // Cleared pages still contain parser state needed by the first visible page.
         // Warm that prefix once in forward order too, instead of rereading it twice.
@@ -914,6 +918,8 @@ impl History {
                     canonical = None;
                     harvested = None;
                     previous_end = None;
+                    view_diverged = false;
+                    raw_size = None;
                     if let Some(page) = page {
                         visitor(page, HistoryEvent::End(Err(error)));
                     }
@@ -939,14 +945,22 @@ impl History {
                 };
                 canonical = start();
                 harvested = start();
+                view_diverged = false;
+                raw_size = Some(crate::term::clamp_size(seg.header.size));
             } else if parser_reset {
                 // A parser panic can reset only one view. Rebuild that exceptional
                 // prefix once; ordinary resize/alt/sync histories never use this path.
                 harvested = self.warm_checked(raw_i, &seg, &look, cancelled).ok();
+                view_diverged = true;
             }
             let (Some(raw), Some(view)) = (canonical.as_mut(), harvested.as_mut()) else {
                 return None;
             };
+            let next_size = crate::term::clamp_size(seg.header.size);
+            if raw_size != Some(next_size) {
+                view_diverged = true;
+                raw_size = Some(next_size);
+            }
             raw.resize(seg.header.size);
             if seg.header.start_seq <= self.cleared_seq {
                 raw.clear_history();
@@ -955,7 +969,12 @@ impl History {
                 record_cp(run_id, raw_i, raw);
             }
             if page.is_some() {
-                view.rebase_replay(raw);
+                if view_diverged
+                    || (raw.input_modes().flags & krill_proto::term_modes::Modes::ALT_SCREEN != 0)
+                {
+                    view.rebase_replay(raw);
+                    view_diverged = false;
+                }
                 view.clear_history();
             } else {
                 view.resize(seg.header.size);
@@ -1001,6 +1020,18 @@ impl History {
                 return None;
             }
             parser_reset = raw_reset || view_reset;
+            for rec in &seg.records {
+                if let Record::Resize(s) = rec {
+                    let clamped = crate::term::clamp_size(*s);
+                    if raw_size != Some(clamped) {
+                        view_diverged = true;
+                        raw_size = Some(clamped);
+                    }
+                }
+            }
+            if parser_reset {
+                view_diverged = true;
+            }
             previous_end = Some(end_seq);
             if let Some(page) = page
                 && end_seq > self.cleared_seq

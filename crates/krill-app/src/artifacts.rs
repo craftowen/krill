@@ -1051,180 +1051,6 @@ impl Render for View {
             .and_then(|slug| self.items.iter().find(|i| i.artifact.slug == slug))
             .cloned();
 
-        let mut rows = div()
-            .id("artifact-list")
-            .debug_selector(|| "artifact-list".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col();
-
-        let mut visible = 0usize;
-        for (index, item) in self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.matches(&self.query))
-        {
-            visible += 1;
-            let open = item.share_url.clone();
-            let copy = open.clone();
-            let slug = item.artifact.slug.clone();
-            let slug_select = slug.clone();
-            let slug_copy = slug.clone();
-            let slug_delete = slug.clone();
-            let is_selected = self.selected_slug.as_deref() == Some(slug.as_str());
-            let is_deleting = self.deleting_slug.as_deref() == Some(slug.as_str());
-            let id = format!("artifact-row-{index}");
-            let selector = id.clone();
-            let type_label = item.type_label();
-            let size_label = format_byte_size(item.artifact.byte_size);
-            let updated_label = format_timestamp_short(item.artifact.updated_at.as_deref());
-            let expires_label = format_timestamp_short(item.artifact.expires_at.as_deref());
-
-            rows = rows.child(
-                div()
-                    .id(id)
-                    .debug_selector(move || selector.clone())
-                    .w_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .cursor_pointer()
-                    .when(is_selected, |d| d.bg(p.accent.opacity(0.6)))
-                    .hover(|s| {
-                        s.bg(if is_selected {
-                            p.accent.opacity(0.6)
-                        } else {
-                            p.muted.opacity(0.25)
-                        })
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_slug(Some(slug_select.clone()), cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.))
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_SM)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(p.foreground)
-                                    .truncate()
-                                    .child(item.title().to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .truncate()
-                                    .child(item.share_url.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(84.))
-                            .flex_none()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .truncate()
-                            .child(type_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(72.))
-                            .flex_none()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .truncate()
-                            .child(size_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(116.))
-                            .flex_none()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .truncate()
-                            .child(updated_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(116.))
-                            .flex_none()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .truncate()
-                            .child(expires_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(184.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_1()
-                            .child(
-                                ui::ghost(format!("artifact-copy-{index}"), text::COPY.get())
-                                    .debug_selector(move || format!("artifact-copy-{index}"))
-                                    .disabled(!item.openable())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy.clone(),
-                                        ));
-                                        this.copied_slug = Some(slug_copy.clone());
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                ui::secondary(format!("artifact-open-{index}"), text::OPEN.get())
-                                    .debug_selector(move || format!("artifact-open-{index}"))
-                                    .disabled(!item.openable())
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.open_url(&open);
-                                    }),
-                            )
-                            .child(
-                                ui::ghost(format!("artifact-delete-{index}"), "")
-                                    .debug_selector(move || format!("artifact-delete-{index}"))
-                                    .icon(IconName::Delete)
-                                    .disabled(is_deleting)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.delete_artifact(slug_delete.clone(), cx);
-                                    })),
-                            ),
-                    ),
-            );
-        }
-
-        if visible == 0 && !self.items.is_empty() && !self.loading && self.error.is_none() {
-            rows = rows.child(
-                div()
-                    .id("artifacts-empty")
-                    .debug_selector(|| "artifacts-empty".into())
-                    .px_3()
-                    .py_6()
-                    .text_center()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::NO_MATCHES.get()),
-            );
-        }
-
         // Toolbar (ArtifactListToolbar)
         let toolbar = div()
             .flex_none()
@@ -1298,6 +1124,185 @@ impl Render for View {
                 .child(self.render_empty_state(p, cx))
                 .into_any_element()
         } else {
+            let mut rows = div()
+                .id("artifact-list")
+                .debug_selector(|| "artifact-list".into())
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col();
+
+            let mut visible = 0usize;
+            for (index, item) in self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.matches(&self.query))
+            {
+                visible += 1;
+                let open = item.share_url.clone();
+                let copy = open.clone();
+                let slug = item.artifact.slug.clone();
+                let slug_select = slug.clone();
+                let slug_copy = slug.clone();
+                let slug_delete = slug.clone();
+                let is_selected = self.selected_slug.as_deref() == Some(slug.as_str());
+                let is_deleting = self.deleting_slug.as_deref() == Some(slug.as_str());
+                let id = format!("artifact-row-{index}");
+                let selector = id.clone();
+                let type_label = item.type_label();
+                let size_label = format_byte_size(item.artifact.byte_size);
+                let updated_label = format_timestamp_short(item.artifact.updated_at.as_deref());
+                let expires_label = format_timestamp_short(item.artifact.expires_at.as_deref());
+
+                rows = rows.child(
+                    div()
+                        .id(id)
+                        .debug_selector(move || selector.clone())
+                        .w_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(p.border)
+                        .cursor_pointer()
+                        .when(is_selected, |d| d.bg(p.accent.opacity(0.6)))
+                        .hover(|s| {
+                            s.bg(if is_selected {
+                                p.accent.opacity(0.6)
+                            } else {
+                                p.muted.opacity(0.25)
+                            })
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_slug(Some(slug_select.clone()), cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.))
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_SM)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.foreground)
+                                        .truncate()
+                                        .child(item.title().to_owned()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .truncate()
+                                        .child(item.share_url.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(84.))
+                                .flex_none()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .truncate()
+                                .child(type_label),
+                        )
+                        .child(
+                            div()
+                                .w(px(72.))
+                                .flex_none()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .truncate()
+                                .child(size_label),
+                        )
+                        .child(
+                            div()
+                                .w(px(116.))
+                                .flex_none()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .truncate()
+                                .child(updated_label),
+                        )
+                        .child(
+                            div()
+                                .w(px(116.))
+                                .flex_none()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .truncate()
+                                .child(expires_label),
+                        )
+                        .child(
+                            div()
+                                .w(px(184.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_1()
+                                .child(
+                                    ui::ghost(format!("artifact-copy-{index}"), text::COPY.get())
+                                        .debug_selector(move || format!("artifact-copy-{index}"))
+                                        .disabled(!item.openable())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy.clone(),
+                                            ));
+                                            this.copied_slug = Some(slug_copy.clone());
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    ui::secondary(
+                                        format!("artifact-open-{index}"),
+                                        text::OPEN.get(),
+                                    )
+                                    .debug_selector(move || format!("artifact-open-{index}"))
+                                    .disabled(!item.openable())
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.open_url(&open);
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    ui::ghost(format!("artifact-delete-{index}"), "")
+                                        .debug_selector(move || format!("artifact-delete-{index}"))
+                                        .icon(IconName::Delete)
+                                        .disabled(is_deleting)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_artifact(slug_delete.clone(), cx);
+                                        })),
+                                ),
+                        ),
+                );
+            }
+
+            if visible == 0 && !self.items.is_empty() && !self.loading && self.error.is_none() {
+                rows = rows.child(
+                    div()
+                        .id("artifacts-empty")
+                        .debug_selector(|| "artifacts-empty".into())
+                        .px_3()
+                        .py_6()
+                        .text_center()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::NO_MATCHES.get()),
+                );
+            }
+
             div()
                 .flex_1()
                 .min_h_0()

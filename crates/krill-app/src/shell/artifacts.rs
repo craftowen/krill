@@ -15,7 +15,9 @@ impl Shell {
             self.commit_ime(pane, window.as_deref(), cx);
         }
         self.record_workspace_nav(cx);
-        self.settings = None;
+        if let Some(settings) = self.settings.take() {
+            cx.defer(move |cx| settings.update(cx, |v, cx| v.set_visible(false, cx)));
+        }
         self.automations = None;
         self.jump = None;
         self.continue_session = None;
@@ -67,7 +69,9 @@ impl Shell {
             self.commit_ime(pane, window.as_deref(), cx);
         }
         self.record_workspace_nav(cx);
-        self.settings = None;
+        if let Some(settings) = self.settings.take() {
+            cx.defer(move |cx| settings.update(cx, |v, cx| v.set_visible(false, cx)));
+        }
         self.artifacts = None;
         self.jump = None;
         self.continue_session = None;
