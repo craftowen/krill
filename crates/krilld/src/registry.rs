@@ -1865,10 +1865,15 @@ impl Registry {
                 .into_iter()
                 .map(|(session, root, exited, tap)| {
                     let mut status = self.status.get(session);
-                    status.foreground =
-                        status::foreground_process(root, tap.foreground(), exited, |pid| {
-                            crate::sys::process_name(pid).ok()
-                        });
+                    // Pi has no hook identity. Its executable may be reported as `node`,
+                    // and its terminal title can be renamed. Keep the explicit launch identity.
+                    if status.agent.is_empty()
+                        && let Ok(Some(launch)) = self.agents.launch(session)
+                        && launch.profile == "pi"
+                    {
+                        status.agent = launch.profile;
+                    }
+                    status.foreground = status::session_foreground(root, tap.foreground(), exited);
                     status.title = tap.title();
                     let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
                         || status.agent.eq_ignore_ascii_case("antigravity")

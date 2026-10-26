@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <strong>Parallel AI coding agents. Terminal sessions that outlive the app.</strong><br/>
-  Run Claude Code, Codex, Antigravity, Cursor, and OpenCode side-by-side in isolated Git worktrees — powered by a 3-tier native Rust architecture (<code>krill-app</code> + <code>krilld</code> + <code>krill-holder</code>).
+  <strong>Parallel AI coding agents in pure Rust — 1/15th the memory of Orca (Electron).</strong><br/>
+  Run Claude Code, Codex, Antigravity, Cursor, and OpenCode side-by-side in isolated Git worktrees with persistent sessions — using <strong>85.9 MiB RAM</strong> instead of <strong>1,274.9 MiB</strong> at 10 terminals.
 </p>
 
 <p align="center">
@@ -26,14 +26,59 @@
 
 ---
 
-## Why Krill?
+## Why Krill over Orca (Electron) &amp; `tmux`?
 
-Standard terminals lose context when you juggle multiple coding agents; `tmux` lacks Git worktree isolation, diff review, and native agent notifications; Electron wrappers tie your running agent processes to a heavy GUI renderer.
+Agent workspaces like [Orca](https://github.com/stablyai/orca) already keep terminal sessions alive across app restarts and manage Git worktrees. **Session survival across app restarts is table stakes — not the differentiator.**
 
-Krill is built in **pure Rust (GPUI)** around a **3-tier process boundary**:
-- **`krill-app` (Native UI)** — Renders only visible rows from snapshots and deltas (target budget ≤ 120 MB). Close, crash, or update the app without killing your agents.
-- **`krilld` (Session Daemon)** — The single terminal query responder. Maintains a 1,000-row hot grid plus `zstd` cold scrollback segments (target budget ≤ 60 MB at 10 terminals; design targets, not a universal release benchmark).
-- **`krill-holder` (PTY Parent)** — A tiny, panic-free supervisor (≤ 1,300 lines on macOS) that owns the PTY file descriptors and hands them to `krilld` over `SCM_RIGHTS`.
+The difference is **resource efficiency and process architecture**. Orca is built on Electron (Chromium + Node.js), spawning separate main, GPU, renderer, and daemon processes while keeping a terminal instance in the renderer for every open tab. Krill delivers the same parallel-agent workflow in **pure Rust (`gpui`)**, attaching UI render state only to visible panes while keeping terminal state in a single lightweight daemon (`krilld`) backed by a panic-free PTY parent (`krill-holder`).
+
+### Measured Benchmark: Krill 0.2.2 vs. Orca 1.4.237 (2026-10-25)
+
+Measured on the same **Mac mini (Apple M6, 32 GB, macOS 27.0.1)** using unmodified `/Applications` release builds, fresh isolated profiles, identical `1200×760pt` windows (`1176×746` actual), and 3-run medians across 18/18 valid runs (each terminal printing 20,000 lines / ~2.8 MB of Korean, ANSI color, and >120-column text; screen locked):
+
+| Metric (10 terminals, 3-run median) | Krill 0.2.2 (Rust · GPUI) | Orca 1.4.237 (Electron) | Krill vs. Orca |
+|---|---:|---:|---|
+| **Memory (`phys_footprint`, all app + daemon processes)** | **85.9 MiB** | 1,274.9 MiB | **1/15th** (`1 / 14.8`) |
+| **Idle CPU (30s avg after output, screen locked)** | **1.13%** | 31.0% | **1/27th** (`1 / 27.4`) |
+| **Output Processing CPU Time (10 × 2.8 MB burst)** | **1.22 s** | 6.44 s | **1/5th** (`1 / 5.3`) |
+| **Install Size (`.app` bundle on disk)** | **92.1 MiB** | 689.1 MiB | **1/7th** (`1 / 7.5`) |
+
+#### Where the Memory Goes (10 Terminals, Median `phys_footprint`)
+
+| Process Group | Krill 0.2.2 | Orca 1.4.237 | Why It Differs |
+|---|---:|---:|---|
+| **App &amp; UI Rendering** | **30.2 MiB** (`krill-app`) | **994.3 MiB** (`GPU 522.9` + `Main 259.3` + `Renderer 212.1`) | Single native Rust GPUI process vs. Chromium main + GPU + renderer processes |
+| **Terminal Daemon** | **46.5 MiB** (`krilld 44.9` + `holder 1.6`) | **256.3 MiB** (`orca-terminal-host`) | 1,000 hot rows + `zstd` cold scrollback vs. Node/JS terminal host |
+| **Other Helpers** | **9.2 MiB** (`krill-link serve`) | **24.1 MiB** (`parcel-watcher 14.0` + `Network 7.6` + `crashpad 2.5`) | Built-in mobile/tunnel gateway vs. Electron utility helpers |
+| **Total (excluding shells)** | **85.9 MiB** | **1,274.9 MiB** | **Krill uses 1/15th the memory (`1 / 14.8`)** |
+
+#### Scaling by Terminal Count (1 · 10 · 20 Terminals, 3-Run Median)
+
+| Metric | Terminals | Krill 0.2.2 | Orca 1.4.237 | Krill / Orca |
+|---|---:|---:|---:|---|
+| **Memory (`phys_footprint`)** | 1 | **56.6 MiB** | 844.9 MiB | `1 / 14.9` (1/15th) |
+| | 10 | **85.9 MiB** | 1,274.9 MiB | `1 / 14.8` (**1/15th**) |
+| | 20 | **115.0 MiB** | 1,382.7 MiB | `1 / 12.0` (**1/12th**) |
+| **Idle CPU (30s avg, screen locked)** | 1 | **0.97%** | 32.6% | `1 / 33.6` (1/34th) |
+| | 10 | **1.13%** | 31.0% | `1 / 27.4` (**1/27th**) |
+| | 20 | **1.17%** | 29.0% | `1 / 24.8` (**1/25th**) |
+| **Output Processing CPU Time (2.8 MB × N)** | 1 | **0.05 s** | 1.07 s | `1 / 21.4` |
+| | 10 | **1.22 s** | 6.44 s | `1 / 5.3` (**1/5th**) |
+| | 20 | **2.91 s** | 7.69 s | `1 / 2.6` |
+| **Output Wall-Clock Time (2.8 MB × N)** | 1 | **0.21 s** | 0.22 s | `1 / 1.0` |
+| | 10 | **2.25 s** | 2.92 s | `1 / 1.3` |
+| | 20 | **7.54 s** | **3.95 s** | **1.9× slower on Krill** (runs: `1.85 / 7.54 / 7.86 s`) |
+
+<details>
+<summary><strong>Measurement conditions &amp; known limitations (read alongside the numbers)</strong></summary>
+
+- **Identical setup**: Unmodified `/Applications` bundles (`Krill 0.2.2`, `Orca 1.4.237`) on Mac mini (Apple M6, 32 GB, macOS 27.0.1, 2026-10-25). Fresh isolated profile per run, `1200×760pt` window (`1176×746` actual), `N` login shell (`/bin/zsh -l`) tabs in the same 1-commit Git repository with 1 tab visible (`orca_orphaned_terminals = 0` across all 18 runs).
+- **Identical load &amp; accounting**: Each tab outputs 20,000 lines (~2.8 MB of Korean, ANSI colors, and >120-col lines). After a 30s settle, `phys_footprint` is sampled 3 times at 5s intervals and the per-process medians are summed across all app, helper, GPU, renderer, and daemon processes (including `krill-link serve`). Login shells and `perl` generators are excluded on both sides.
+- **Screen-locked state**: All 18 runs were recorded with the display locked (windows not composited on screen). Even with the display locked, Orca's GPU process used ~21–24% CPU and its renderer ~7.5%. Unlocked/visible-window CPU is a separate measurement and is not claimed here.
+- **Shared-machine load &amp; 20-tab wall-clock**: Runs executed on a shared workstation with concurrent background tasks (1-minute load average `15.0–184.8`, alternating app order per repetition). Memory (`phys_footprint`) is largely unaffected by background load, whereas CPU and wall-clock burst duration can fluctuate — at 20 terminals, Krill's median wall-clock output completion was **7.54 s vs. Orca's 3.95 s** (Krill runs: `1.85 / 7.54 / 7.86 s`).
+- **Architectural difference**: Krill connects only the visible pane to the daemon and keeps terminal state in one daemon (`krilld`), whereas Orca keeps a terminal instance in the renderer for each tab plus state in `orca-terminal-host`. This measures real resource usage when a user opens `N` tabs. Agent processes (`claude`, `codex`, etc.) are excluded because they are identical regardless of host app.
+
+</details>
 
 ---
 

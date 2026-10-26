@@ -1,4 +1,4 @@
-//! 자식 파이프·프로세스 그룹 제어. Windows Job Object 대응은 이 모듈에서 교체한다.
+//! 자식 파이프·프로세스 그룹 제어. 명령 자식은 PTY 세션과 독립적으로 정리한다.
 
 use std::io;
 #[cfg(unix)]
@@ -17,6 +17,104 @@ pub(crate) fn own_group(cmd: &mut Command) -> &mut Command {
     #[cfg(unix)]
     cmd.process_group(0);
     cmd
+}
+
+/// 유일한 리더가 소유하는 파이프. Windows는 읽을 수 있는 바이트만 읽어 취소·시간 제한을 지킨다.
+pub(crate) struct PipeReader<T>(T);
+
+impl<T: AsFd> PipeReader<T> {
+    pub(crate) fn new(pipe: T) -> io::Result<Self> {
+        #[cfg(unix)]
+        nonblocking(&pipe)?;
+        #[cfg(windows)]
+        crate::sys::pipe_available(pipe.as_handle())?;
+        Ok(Self(pipe))
+    }
+}
+
+impl<T: io::Read + AsFd> io::Read for PipeReader<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(windows)]
+        {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let Some(available) = crate::sys::pipe_available(self.0.as_handle())? else {
+                return Ok(0);
+            };
+            if available == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let count = buf
+                .len()
+                .min(usize::try_from(available).unwrap_or(usize::MAX));
+            let slice = buf.get_mut(..count).ok_or(io::ErrorKind::InvalidInput)?;
+            self.0.read(slice)
+        }
+        #[cfg(unix)]
+        self.0.read(buf)
+    }
+}
+
+#[cfg(unix)]
+impl<T: AsFd> AsFd for PipeReader<T> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsFd> AsFd for PipeReader<T> {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        self.0.as_handle()
+    }
+}
+
+/// RAII cleanup includes descendants, even if only the leader has exited.
+pub(crate) struct Process {
+    child: Child,
+    #[cfg(windows)]
+    job: crate::sys::CommandJob,
+}
+
+impl std::ops::Deref for Process {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for Process {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        self.job.terminate();
+        kill_and_reap(&mut self.child);
+    }
+}
+
+pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Process> {
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+        crate::sys::CommandJob::new()?
+    };
+    let child = cmd.spawn()?;
+    let process = Process {
+        child,
+        #[cfg(windows)]
+        job,
+    };
+    #[cfg(windows)]
+    process.job.start(&process.child)?;
+    Ok(process)
 }
 
 #[cfg(unix)]
@@ -99,3 +197,7 @@ pub(crate) fn terminate_gracefully(child: &mut Child, grace: Duration) {
     }
     kill_and_reap(child);
 }
+
+#[cfg(all(test, windows))]
+#[path = "child/windows_tests.rs"]
+mod windows_tests;

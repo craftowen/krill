@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use krill_proto::control::{RemoveWorktree, RemovedWorktree, Reply};
 
-use crate::child::{kill_and_reap, nonblocking};
+use crate::child::PipeReader;
 
 use super::{GitQueue, git, output_path, queue, text, transaction};
 
@@ -340,7 +340,9 @@ fn prune_removed_worktree_from_projects(state_dir: &Path, removed: &Path) {
     let removed_str = removed.to_string_lossy();
     let removed_trimmed = removed_str.trim();
     let removed_norm = alias(removed_trimmed);
-    let matches_removed = |candidate: &str| alias(candidate.trim()) == removed_norm;
+    let matches_removed = |candidate: &str| {
+        krill_proto::path::equivalent(Path::new(alias(candidate.trim())), Path::new(removed_norm))
+    };
     let mut changed = false;
     if let Some(toml::Value::Table(worktrees)) = root.get_mut("worktrees") {
         let before = worktrees.len();
@@ -500,7 +502,14 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
 
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
     let envs = super::compat::environment_in(q, wt)?;
-    let mut cmd = std::process::Command::new("/bin/sh");
+    #[cfg(windows)]
+    let shell = output_path(
+        git(q, wt, ["var", "GIT_SHELL_PATH"])?,
+        "cannot find Git shell",
+    )?;
+    #[cfg(unix)]
+    let shell = Path::new("/bin/sh");
+    let mut cmd = std::process::Command::new(shell);
     crate::child::own_group(&mut cmd)
         .arg("-c")
         .arg(script)
@@ -529,35 +538,22 @@ fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String>
     Err(format!("archive hook failed: {detail}"))
 }
 
-struct Reap(Child);
-
-impl Drop for Reap {
-    fn drop(&mut self) {
-        kill_and_reap(&mut self.0);
-    }
-}
-
 fn run_bounded_command(
     cmd: &mut std::process::Command,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("archive hook failed to start: {e}"))?;
-    let mut child = Reap(child);
-    let mut stdout = child
-        .0
+    let mut child =
+        crate::child::spawn(cmd).map_err(|e| format!("archive hook failed to start: {e}"))?;
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "archive hook failed: missing stdout".to_owned())?;
-    let mut stderr = child
-        .0
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| "archive hook failed: missing stderr".to_owned())?;
-    nonblocking(&stdout)
-        .and_then(|()| nonblocking(&stderr))
-        .map_err(|e| format!("archive hook failed: {e}"))?;
+    let mut stdout = PipeReader::new(stdout).map_err(|e| format!("archive hook failed: {e}"))?;
+    let mut stderr = PipeReader::new(stderr).map_err(|e| format!("archive hook failed: {e}"))?;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut buf = [0u8; 8192];
@@ -568,7 +564,7 @@ fn run_bounded_command(
         if let Err(e) = a.and(b) {
             return Err(format!("archive hook failed: {e}"));
         }
-        match child.0.try_wait() {
+        match child.try_wait() {
             Ok(Some(status)) => {
                 drain_capped(&mut stdout, &mut out, &mut buf).ok();
                 drain_capped(&mut stderr, &mut err, &mut buf).ok();
@@ -582,7 +578,7 @@ fn run_bounded_command(
             Err(e) => return Err(format!("archive hook failed: {e}")),
         }
         if Instant::now() >= deadline {
-            terminate_gracefully(&mut child.0);
+            terminate_gracefully(&mut child);
             return Err("archive hook failed: timed out".to_owned());
         }
         thread::sleep(Duration::from_millis(5));
@@ -590,10 +586,12 @@ fn run_bounded_command(
 }
 
 fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<()> {
-    loop {
+    let mut read = 0;
+    while read < super::super::DRAIN_BYTES {
         match pipe.read(buf) {
             Ok(0) => return Ok(()),
             Ok(n) => {
+                read += n;
                 let remaining = MAX_ARCHIVE_OUTPUT_BYTES.saturating_sub(dst.len());
                 if remaining > 0 {
                     dst.extend(buf.iter().take(n.min(remaining)).copied());
@@ -610,6 +608,7 @@ fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> 
             Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 
 fn terminate_gracefully(child: &mut Child) {
@@ -674,7 +673,10 @@ fn parse_entries(bytes: &[u8]) -> Result<Vec<Entry>, String> {
     for field in bytes.split(|b| *b == 0) {
         if let Some(path) = field.strip_prefix(b"worktree ") {
             entries.push(Entry {
-                path: PathBuf::from(OsString::from_vec(path.to_vec())),
+                path: {
+                    let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+                    fs::canonicalize(&path).unwrap_or(path)
+                },
                 branch: None,
                 locked: false,
             });

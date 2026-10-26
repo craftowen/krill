@@ -19,7 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::child::{AsFd, kill_and_reap, nonblocking};
+use crate::child::{AsFd, PipeReader, kill_and_reap};
 use crate::session::lock;
 
 pub mod changes;
@@ -325,22 +325,21 @@ fn run_guarded(
     mut guard: impl FnMut() -> io::Result<()>,
 ) -> io::Result<Output> {
     guard()?;
-    let mut child = command(program, repo, args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let Some(mut stdout) = child.stdout.take() else {
+    let mut child = crate::child::spawn(
+        command(program, repo, args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
+    let Some(stdout) = child.stdout.take() else {
         kill_and_reap(&mut child);
         return Err(io::Error::other("missing git stdout"));
     };
-    let Some(mut stderr) = child.stderr.take() else {
+    let Some(stderr) = child.stderr.take() else {
         kill_and_reap(&mut child);
         return Err(io::Error::other("missing git stderr"));
     };
-    if let Err(e) = nonblocking(&stdout).and_then(|()| nonblocking(&stderr)) {
-        kill_and_reap(&mut child);
-        return Err(e);
-    }
+    let mut stdout = PipeReader::new(stdout)?;
+    let mut stderr = PipeReader::new(stderr)?;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut buf = [0u8; 8192];
@@ -465,3 +464,6 @@ pub(crate) fn queue() -> Result<&'static Arc<GitQueue>, String> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod platform_tests;

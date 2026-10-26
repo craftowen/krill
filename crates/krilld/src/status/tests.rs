@@ -659,6 +659,7 @@ fn rate_limit_trigger_respects_existing_policy() {
 /// 다른 pgrp에서 실행 중인 명령이면 `process_name`으로 이름을 채운다.
 #[test]
 fn foreground_process_distinguishes_root_shell_and_child_command() {
+    assert_eq!(session_foreground(std::process::id(), None, true), None);
     assert_eq!(
         foreground_process(100, Some(100), false, |_| panic!("root shell skips lookup")),
         None

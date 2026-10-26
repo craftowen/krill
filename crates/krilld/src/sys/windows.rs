@@ -47,6 +47,11 @@ use zeroize::Zeroizing;
 
 use super::{AUDIT_TOKEN_LEN, CodeSign, User};
 
+mod child;
+mod foreground;
+pub(crate) use child::{CommandJob, pipe_available};
+pub(crate) use foreground::session_agent_process;
+
 /// Windows에는 UID가 없어 "이 프로세스와 같은 사용자 SID"를 이 값 하나로 나타낸다([`crate::os::euid`]).
 pub(crate) const SAME_USER: u32 = 0;
 /// Toolhelp 스냅숏을 다시 쓰는 시간. [`crate::resources`]가 pid마다 [`parent_pid`]를 불러 스냅숏을 pid 수만큼

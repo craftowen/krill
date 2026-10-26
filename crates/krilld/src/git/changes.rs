@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use krill_proto::control::Reply;
 use krill_proto::git::{ChangedFile, Changes, MAX_FILES, MAX_PATH_BYTES, Numstat};
 
-use crate::child::{AsFd, nonblocking};
+use crate::child::{AsFd, PipeReader};
 
 use super::GitQueue;
 
@@ -281,15 +281,6 @@ fn number(bytes: &[u8]) -> Result<Option<u64>, String> {
         .ok_or_else(|| "invalid numstat count".to_owned())
 }
 
-/// Reaped children return an error from kill and a cached wait result. Early returns reap too.
-struct Reap(Child);
-impl Drop for Reap {
-    fn drop(&mut self) {
-        self.0.kill().ok();
-        self.0.wait().ok();
-    }
-}
-
 fn interrupted(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
     if cancel.load(Ordering::Acquire) {
         return Err("git query cancelled".to_owned());
@@ -310,16 +301,15 @@ fn stream(
 ) -> Result<(), String> {
     interrupted(cancel, deadline)?;
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let child = super::command(program, repo, &args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut child = crate::child::spawn(
+        super::command(program, repo, &args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut stdout = PipeReader::new(child.stdout.take().ok_or("missing git stdout")?)
         .map_err(|e| e.to_string())?;
-    let mut child = Reap(child);
-    let mut stdout = child.0.stdout.take().ok_or("missing git stdout")?;
-    let mut stderr = child.0.stderr.take().ok_or("missing git stderr")?;
-    nonblocking(&stdout)
-        .and_then(|()| nonblocking(&stderr))
+    let mut stderr = PipeReader::new(child.stderr.take().ok_or("missing git stderr")?)
         .map_err(|e| e.to_string())?;
     let mut pending = Vec::new();
     let mut errors = Vec::new();
@@ -369,18 +359,9 @@ fn stream(
                 Err(e) => return Err(e.to_string()),
             }
         }
-        if eof && let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+        if eof && let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             // Drain final stderr while respecting the retained byte limit.
-            while let Ok(n) = stderr.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                errors.extend(
-                    buf.iter()
-                        .take(n)
-                        .take(MAX_STDERR.saturating_sub(errors.len())),
-                );
-            }
+            drain_final_stderr(&mut stderr, &mut errors, &mut buf, cancel, deadline)?;
             if !status.success() {
                 return Err(format!(
                     "git failed: {}",
@@ -401,6 +382,27 @@ fn stream(
             Duration::from_millis(10),
         );
     }
+}
+
+fn drain_final_stderr(
+    stderr: &mut impl Read,
+    errors: &mut Vec<u8>,
+    buf: &mut [u8],
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), String> {
+    while let Ok(n) = stderr.read(buf) {
+        interrupted(cancel, deadline)?;
+        if n == 0 {
+            break;
+        }
+        errors.extend(
+            buf.iter()
+                .take(n)
+                .take(MAX_STDERR.saturating_sub(errors.len())),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

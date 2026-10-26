@@ -35,6 +35,8 @@ use crate::usage::accounts;
 
 pub mod detect;
 mod monitor;
+#[cfg(any(windows, test))]
+pub(crate) mod process_tree;
 mod subagents;
 pub(crate) use monitor::monitor;
 
@@ -456,6 +458,17 @@ pub(crate) fn foreground_process(
     resolve(pid)
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty() && name.len() <= krill_proto::control::MAX_AGENT_TEXT)
+}
+
+/// Unix reports the terminal foreground group. Windows instead identifies an unambiguous
+/// native agent in this session's process tree, without treating generic runtimes as agents.
+pub(crate) fn session_foreground(root: u32, fg: Option<u32>, exited: bool) -> Option<String> {
+    if exited {
+        return None;
+    }
+    #[cfg(windows)]
+    let fg = fg.or_else(|| crate::sys::session_agent_process(root));
+    foreground_process(root, fg, false, |pid| crate::sys::process_name(pid).ok())
 }
 
 #[cfg(test)]
