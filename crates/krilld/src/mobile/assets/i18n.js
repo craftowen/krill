@@ -219,6 +219,7 @@
  "Load earlier output": "이전 출력 불러오기",
  "Load earlier messages": "이전 대화 불러오기",
  "Terminal actions": "세션 메뉴",
+ "Terminal keys": "터미널 키",
  "Terminals": "터미널",
  "Create Tab": "탭 만들기",
  "Quick Commands": "빠른 명령",

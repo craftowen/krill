@@ -861,7 +861,8 @@ impl Backend {
         let normalized: Vec<_> = commands.into_iter().map(normalize_quick_command).collect();
         for entry in &normalized {
             if entry.name.is_empty()
-                || entry.name.len() > 120
+                || entry.name.chars().count() > 120
+                || entry.name.len() > 480
                 || entry.name.chars().any(char::is_control)
                 || entry.text.trim().is_empty()
                 || entry.text.len() > 16 * 1024
@@ -2199,6 +2200,7 @@ mod tests {
             json!([{"name":"valid","text":"invalid\u{1b}text"}]),
             json!([{"name":"valid","text":"invalid\u{0}text"}]),
             json!([{"name":"x".repeat(121),"text":"valid"}]),
+            json!([{"name":"한".repeat(121),"text":"valid"}]),
             json!([{"name":"valid","text":"x".repeat(16 * 1024 + 1)}]),
             json!(vec![json!({"name":"valid","text":"valid"}); 129]),
             json!([{"name":"missing text"}]),
@@ -2215,6 +2217,13 @@ mod tests {
             rpc(
                 &backend,
                 &json!({"action":"save_quick_commands","commands":maximum})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            rpc(
+                &backend,
+                &json!({"action":"set_quick_commands","commands":[{"name":"한".repeat(120),"text":"cargo check"}]})
             )["ok"],
             true
         );

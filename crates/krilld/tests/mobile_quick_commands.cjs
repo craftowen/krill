@@ -22,7 +22,11 @@ async function main(makeFixture=require('./mobile_session.cjs').fixture){
  search.value='review';search.dispatchEvent(new Event('input'));pendingSave=deferred();const adding=all('quick-command-result')[0].action();const before=sheets.length;body.isConnected=false;pendingSave.resolve();await adding;assert.equal(sheets.length,before);pendingSave=null;
  buttons.find(b=>b.className==='tab-quick').action();render();pendingPrompt=deferred();const run=all('quick-command-run')[0],sending=run.action();await run.action();assert.equal(prompts.length,1);assert.equal(prompts[0].session,7);assert.equal(prompts[0].text,'$inspect');pendingPrompt.resolve();await sending;
  // Editing and deletion preserve unrelated commands and never use a stale row index.
+ assert.equal(find('icon-button quick-command-edit').getAttribute('aria-label'),'Edit: inspect');
+ assert.equal(find('icon-button quick-command-delete').getAttribute('aria-label'),'Delete: inspect');
  find('icon-button quick-command-edit').action();render();const name=find('quick-command-name-input'),text=find('quick-command-text-input'),form=find('quick-command-form');name.value='Edited';text.value='$inspect --detail';form.dispatchEvent(new Event('submit',{cancelable:true}));await flush();render();assert.equal(state.snapshot.quick_commands[0].name,'Edited');
+ assert.equal(find('icon-button quick-command-edit').getAttribute('aria-label'),'Edit: Edited');
+ assert.equal(find('icon-button quick-command-delete').getAttribute('aria-label'),'Delete: Edited');
  const deleted=all('icon-button quick-command-delete')[0];state.snapshot.quick_commands.unshift({name:'Inserted elsewhere',text:'elsewhere'});await deleted.action();render();assert.equal(state.snapshot.quick_commands.length,2);assert.equal(state.snapshot.quick_commands[0].text,'elsewhere');assert(!state.snapshot.quick_commands.some(c=>c.name==='Edited'));
  f.view.cleanup();
  // A catalog response after navigation/disposal cannot create actionable results.

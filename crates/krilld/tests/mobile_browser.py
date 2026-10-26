@@ -29,9 +29,10 @@ def main():
     shots = Path(args.screenshots).resolve()
     shots.mkdir(parents=True, exist_ok=True)
     session = f'mobile-shell-{os.getpid()}'
+    address = args.address if ':' in args.address else f'{args.address}:0'
     with tempfile.TemporaryDirectory(prefix='mobile-shell-') as scratch:
         metadata = Path(scratch) / 'fixture.json'
-        env = dict(os.environ, M9_UI_QA='1', M9_BROWSER_ADDRESS=args.address, M9_BROWSER_METADATA=str(metadata))
+        env = dict(os.environ, M9_UI_QA='1', M9_BROWSER_ADDRESS=address, M9_BROWSER_METADATA=str(metadata))
         with (Path(scratch) / 'fixture.log').open('w+') as log:
             fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')), str(target / 'debug/krilld'), '--keep'], env=env, stdout=log, stderr=log)
             try:
@@ -69,7 +70,7 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 wait('!!document.querySelector(".host-card")')
                 assert evaluate('sessionStorage.getItem("interrupted")') == 'yes'
                 assert len(json.loads((Path(cfg['dir'])/'mobile-devices.json').read_text())) == 1
-                security = evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("minikrill-mobile-v2"),hash:location.hash})')
+                security = evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!(localStorage.getItem("krill-mobile-v2")||localStorage.getItem("krill-mobile-hosts-v1")),hash:location.hash})')
                 assert security['paired'] and security['hash'] == '#/', security
                 # Chromium treats loopback as secure, while LAN IPs are insecure.
                 # mobile_pwa.cjs separately exercises encryption without subtle.

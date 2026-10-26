@@ -143,8 +143,8 @@ button.account-row:disabled{opacity:1}
 @media(max-width:360px){.session>.page-header .icon-button{width:var(--touch-target);min-width:var(--touch-target)}}
 /* Palette mapping: STYLEGUIDE §3.1 background/card/secondary/border, both modes. */
 :root{--surface-base:#0b0d13;--surface-panel:#161a24;--surface-raised:#1f2430;--foreground:#fafafa;--muted-foreground:#9aa3b5;--text-muted:#9aa3b5;--border:rgba(255,255,255,.08);--editor-surface:#1e1e1e;--status-connected:#86efac;--status-done:#86efac}
-:root[data-theme=light]{--surface-base:#ffffff;--surface-panel:#ffffff;--surface-raised:#f3f4f7;--foreground:#0a0a0a;--muted-foreground:#646b78;--text-muted:#646b78;--border:#e4e7ec;--editor-surface:#ffffff;--status-connected:#15803d;--status-done:#15803d}
-@media(prefers-color-scheme:light){:root:not([data-theme=dark]):not([data-theme=light]){--surface-base:#ffffff;--surface-panel:#ffffff;--surface-raised:#f3f4f7;--foreground:#0a0a0a;--muted-foreground:#646b78;--text-muted:#646b78;--border:#e4e7ec;--editor-surface:#ffffff;--status-connected:#15803d;--status-done:#15803d}}
+:root[data-theme=light]{--surface-base:#ffffff;--surface-panel:#ffffff;--surface-raised:#f3f4f7;--foreground:#0a0a0a;--muted-foreground:#646b78;--text-muted:#646b78;--border:#e4e7ec;--editor-surface:#ffffff;--status-connected:#15803d;--status-done:#15803d;--status-green:#15803d;--status-amber:#b45309;--status-red:#b91c1c}
+@media(prefers-color-scheme:light){:root:not([data-theme=dark]):not([data-theme=light]){--surface-base:#ffffff;--surface-panel:#ffffff;--surface-raised:#f3f4f7;--foreground:#0a0a0a;--muted-foreground:#646b78;--text-muted:#646b78;--border:#e4e7ec;--editor-surface:#ffffff;--status-connected:#15803d;--status-done:#15803d;--status-green:#15803d;--status-amber:#b45309;--status-red:#b91c1c}}
 .command-dock>.buffered-command{padding:12px;flex-wrap:wrap;border-top:1px solid var(--border)}.command-dock>.buffered-command>label{width:100%;display:flex;flex-direction:column;gap:8px}.command-dock>.buffered-command textarea.command-input{width:100%;height:auto;min-height:112px;max-height:30vh;padding:10px;resize:vertical}
 
 
@@ -428,11 +428,11 @@ button.account-row:disabled{opacity:1}
 #mobile-app .session .command-dock .dismiss-keyboard{margin:4px 0 4px 8px}
 #mobile-app .session .command-dock .accessory-key[aria-pressed=true],#mobile-app .session .terminal-mount[data-input-mode=direct] .command-dock .direct-toggle{border-color:rgb(59 130 246 / 45%);background:rgb(59 130 246 / 18%);color:var(--foreground)}
 #mobile-app .session .command-dock .input-row{min-height:46px;padding:6px 12px;gap:8px;border-top:1px solid var(--border);background:var(--surface-panel);align-items:center}
-#mobile-app .session .command-dock .live-focus-target{flex:1;min-width:0;min-height:36px;height:36px;margin:0;padding:0 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface-base);color:var(--foreground);display:flex;align-items:center;justify-content:flex-start;gap:8px;text-align:left}
+#mobile-app .session .command-dock .live-focus-target{flex:1;min-width:0;min-height:max(36px,calc(36px * var(--ui-scale,1)));height:max(36px,calc(36px * var(--ui-scale,1)));margin:0;padding:0 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface-base);color:var(--foreground);display:flex;align-items:center;justify-content:flex-start;gap:8px;overflow:hidden;text-align:left}
 #mobile-app .session .command-dock .live-focus-target>svg{width:14px;height:14px;color:var(--muted-foreground);flex:none}
-#mobile-app .session .command-dock .live-input-copy{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;min-width:0;flex:1}
-#mobile-app .session .command-dock .live-input-copy strong{font-size:calc(12px * var(--ui-scale,1));font-weight:600;line-height:1.15;color:var(--foreground);white-space:nowrap;flex:none}
-#mobile-app .session .command-dock .live-input-copy small{font:calc(12px * var(--ui-scale,1))/1.15 var(--font-mono);color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;min-width:0}
+#mobile-app .session .command-dock .live-input-copy{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;min-width:0;flex:1;overflow:hidden}
+#mobile-app .session .command-dock .live-input-copy strong{font-size:calc(12px * var(--ui-scale,1));font-weight:600;line-height:1.15;height:calc(14px * var(--ui-scale,1));color:var(--foreground);white-space:nowrap;flex:none}
+#mobile-app .session .command-dock .live-input-copy small{font:calc(12px * var(--ui-scale,1))/1.15 var(--font-mono);height:calc(14px * var(--ui-scale,1));color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;min-width:0}
 /* Live ACK feedback belongs in the reserved input box; never resize the terminal for each ACK. */
 .terminal-mount[data-input-mode=direct][data-phase=input-pending] .terminal-status{display:none}
 #mobile-app .session .command-dock .live-input-copy strong{max-width:100%;overflow:hidden;text-overflow:ellipsis}
@@ -447,9 +447,9 @@ button.account-row:disabled{opacity:1}
 #mobile-app .quick-command-search{flex:none;width:100%;min-width:0;min-height:44px;font-size:calc(16px * var(--ui-scale,1))}
 #mobile-app .sheet .quick-command-hint{margin:0;padding:0 4px;font-size:var(--font-meta)}
 .quick-command-results{display:flex;flex-direction:column;gap:6px;max-height:38dvh;overflow:auto;overscroll-behavior:contain;min-width:0}
-#mobile-app .quick-command-result{display:flex;align-items:center;gap:8px;text-align:left;min-width:0;min-height:52px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised)}
+#mobile-app .quick-command-result{display:flex;flex:none;align-items:center;gap:8px;text-align:left;min-width:0;min-height:52px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);overflow:hidden}
 .quick-command-source{font-size:var(--font-meta);color:var(--muted-foreground)}
-.quick-command-description{font-size:var(--font-meta);color:var(--muted-foreground);overflow-wrap:anywhere;white-space:normal}
+.quick-command-description{font-size:var(--font-meta);color:var(--muted-foreground);overflow-wrap:anywhere;white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
 .quick-command-added{flex:none;font-size:var(--font-meta);color:var(--muted-foreground)}
 #mobile-app .quick-command-custom{min-height:44px}
 .quick-commands-list{display:flex;flex-direction:column;gap:6px;max-height:45dvh;overflow-y:auto}
@@ -461,7 +461,7 @@ button.account-row:disabled{opacity:1}
 #mobile-app .quick-command-row>.icon-button{width:36px;height:36px;min-width:36px;min-height:36px;border-radius:6px}
 #mobile-app .quick-command-row>.icon-button svg{width:15px;height:15px}
 #mobile-app .quick-command-delete{color:var(--status-blocked)}
-#mobile-app .quick-command-add{display:flex;align-items:center;justify-content:center;gap:6px;min-height:40px;padding:8px 14px}
+#mobile-app .quick-command-add{display:flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:8px 14px}
 #mobile-app .quick-command-add svg{width:16px;height:16px}
 #mobile-app .chat-composer{border-top:0;background:var(--surface-base);padding:6px 10px calc(8px + max(0px, env(safe-area-inset-bottom) - var(--keyboard-inset,0px)));gap:6px}
 .chat-composer-box{display:flex;flex-direction:column;gap:6px;padding:12px 10px 10px;border:1px solid var(--border);border-radius:24px;background:var(--surface-panel)}
@@ -640,3 +640,7 @@ button.quick-action-insert:active{background:var(--surface-raised)}
  #mobile-app .session.screen>.page-header{min-height:44px}
  .session.screen .session-summary{display:none}
 }
+
+#mobile-app .session-tabs :is(.session-tab,.tab-add,.tab-quick):focus-visible{outline-offset:-2px}
+
+.sheet-notice{padding:8px 10px;border:1px solid color-mix(in srgb,var(--status-blocked) 45%,var(--border));border-radius:var(--radius-row);background:color-mix(in srgb,var(--status-blocked) 14%,var(--surface-raised));color:var(--foreground);font-size:var(--font-meta);line-height:1.4;overflow-wrap:anywhere}
