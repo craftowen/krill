@@ -328,7 +328,7 @@ fn client_dialog_clipboard_prefill_nearby_and_all_pair_outcomes(cx: &mut TestApp
     assert!(vcx.debug_bounds("link-client-failure-expired").is_some());
     assert!(PairFailure::ExpiredLink.text().contains("만료된 링크"));
 
-    // 6. 상대 Mac이 꺼져 있음 → "상대 Mac이 꺼져 있거나" 실패 사유.
+    // 6. 상대 컴퓨터가 꺼져 있음 → 플랫폼에 중립적인 오프라인 실패 사유.
     vcx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
             d.set_link_value("krill://pair?invite=offline-host", window, cx);
@@ -344,10 +344,9 @@ fn client_dialog_clipboard_prefill_nearby_and_all_pair_outcomes(cx: &mut TestApp
         );
     });
     assert!(vcx.debug_bounds("link-client-failure-offline").is_some());
-    assert!(
-        PairFailure::RemoteMacOffline
-            .text()
-            .contains("상대 Mac이 꺼져")
+    assert_eq!(
+        PairFailure::RemoteMacOffline.text(),
+        "상대 컴퓨터가 꺼져 있거나 접속 허용이 꺼져 있습니다. 상대 컴퓨터를 확인한 뒤 다시 시도해 주세요."
     );
 
     // 7. 인터넷 연결 없음 → "인터넷 연결이 없습니다" 실패 사유.
