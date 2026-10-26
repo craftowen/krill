@@ -1,4 +1,4 @@
-"""Chromium responsive matrix against the isolated mobile_pwa.cjs LAN fixture.
+"""Chromium responsive matrix against the isolated mobile_pwa.cjs loopback fixture.
 
 Run with CARGO_TARGET_DIR pointing at the actual Cargo target directory.
 --phase before records problems without failing; after enforces the contract.
@@ -33,7 +33,7 @@ MEASURE = """(()=>{
  const dock=document.querySelector('.terminal-mount:not([hidden]) .command-dock');
  const conversation=document.querySelector('.chat-view');
  const headerControls=[...document.querySelectorAll('.page-header button,.home-topbar button')].filter(visible).map(rect);
- return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,conversation:conversation?rect(conversation):null,sheet:dialog?rect(dialog):null,dock:dock?rect(dock):null};
+ return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,conversation:conversation?rect(conversation):null,sheet:dialog?.classList.contains('sheet')?rect(dialog):null,scanner:dialog?.classList.contains('scanner')?rect(dialog):null,dock:dock?rect(dock):null};
 })()"""
 
 
@@ -55,6 +55,11 @@ def problems(m):
         # Very short landscape screens keep the full available height scrollable.
         if abs(m['sheet']['y'] - (m['height'] - m['sheet']['h']) / 2) > 2:
             issues.append('sheet not centered')
+    scanner = m.get('scanner')
+    if scanner and (abs(scanner['x']) > 1 or abs(scanner['y']) > 1
+                    or abs(scanner['w'] - m['width']) > 1
+                    or abs(scanner['h'] - m['height']) > 1):
+        issues.append('scanner must fill the viewport')
     if m['dock'] and m['dock']['bottom'] > m['height'] + 1:
         issues.append('terminal dock below viewport')
     if m.get('conversation') and m['conversation']['w'] > 1041:
@@ -144,12 +149,12 @@ def main():
                     capture('scanner-photo-fallback', width, height)
                     named('Close scanner')
                 browser('open', cfg['url'])
-                wait('!!document.querySelector(".pair-screen")')
-                for width, height in VIEWPORTS:
-                    browser('set', 'viewport', str(width), str(height))
-                    capture('pair-confirm', width, height)
-                named('Pair')
+                # Opening a pairing link now connects immediately; no manual Pair
+                # confirmation is shown. Keep the device and secret-removal checks.
                 wait('KrillMobile.store.connection.phase==="ready"')
+                assert evaluate('location.hash.startsWith("#/") && !["pair","key","t","r"].some(k=>new URLSearchParams(location.hash.slice(1)).has(k))')
+                assert not evaluate('!!document.querySelector(".pair-screen")')
+                assert len(json.loads((Path(cfg['dir']) / 'mobile-devices.json').read_text())) == 1
                 sid = cfg['session']
                 wait(f'KrillMobile.store.sessions.has({sid})')
                 route = evaluate(f'"/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({sid}).groupKey)+"/s/{sid}"')
@@ -169,7 +174,8 @@ def main():
                     capture('workspace-terminals', width, height)
                     click('.workspace-toolbar .filter-chip')
                     capture('workspace-options', width, height)
-                    close()
+                    click('.workspace-toolbar .filter-chip')
+                    assert evaluate('document.querySelector(".workspace-options").hidden')
                     named('Search')
                     browser('fill', 'input[type=search]', 'no-matching-workspace')
                     capture('workspace-search-empty', width, height)
@@ -199,12 +205,12 @@ def main():
                     evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
                     settle()
                     capture('session-buffered', width, height)
-                    evaluate(f'KrillMobile.store.chatCache?.delete({sid});true')
                     named('Chat')
                     wait('!!document.querySelector(".chat-feed")')
                     capture('chat-empty', width, height)
                     # Real renderer, deterministic content: the shell fixture has no
-                    # agent transcript. Seed only its cache; no production QA hooks.
+                    # agent transcript. The hidden view already preloads its cache;
+                    # keep that mounted entry and seed it without replacing its Map.
                     evaluate(f'''(()=>{{const e=KrillMobile.store.chatCache.get({sid});e.items=[{{kind:'user',text:'폴드를 펼친 뒤에도 입력을 이어갑니다. '.repeat(8)}},{{kind:'assistant',text:'Long readable conversation on a wide screen. '.repeat(28)}}];e.bound=true;return true;}})()''')
                     named('Term')
                     named('Chat')
@@ -355,7 +361,7 @@ def main():
                         capture('dialog-ko-large-light', width, height)
                         close()
                         click('.session .mode-toggle')
-                # Keep the original 608 captures before any split reload or new input.
+                # Keep the viewport captures before any split reload or new input.
                 navigate('/settings')
                 click('[data-focus-key="preference-language-en"]')
                 click('[data-focus-key="preference-appearance-dark"]')
@@ -400,7 +406,7 @@ def main():
                 pane_ready()
                 assert evaluate('getComputedStyle(document.querySelector(".terminal-pane[data-active=true]"),"::after").borderTopWidth') == '2px'
                 assert evaluate('document.getElementById("notice").hidden || !document.getElementById("notice").textContent.includes("Wait for the live terminal")')
-                assert evaluate('!document.querySelector(".primary-pane .command-dock").getClientRects().length && !!document.querySelector(".secondary-pane .command-dock").getClientRects().length')
+                assert evaluate('getComputedStyle(document.querySelector(".primary-pane .command-dock")).visibility==="hidden" && getComputedStyle(document.querySelector(".primary-pane .command-dock")).pointerEvents==="none" && getComputedStyle(document.querySelector(".secondary-pane .command-dock")).visibility==="visible"')
                 capture('tablet-split-columns-active-second', 1180, 820)
                 assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'row'
                 assert evaluate('document.querySelectorAll(".is-split > .terminal-pane > .pane-header").length') == 2
@@ -546,7 +552,7 @@ def main():
     print(f'{args.phase}: {len(results)} screenshots; {len(failed)} states with issues; {len(resizing)} live resizes')
     if args.phase == 'after':
         assert not failed, '\n'.join(f'{r["viewport"]}/{r["screen"]}: {r["issues"]}' for r in failed)
-        print('PASS responsive Chromium LAN matrix')
+        print('PASS responsive Chromium loopback matrix')
 
 
 if __name__ == '__main__':
