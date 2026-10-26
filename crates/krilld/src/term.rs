@@ -218,8 +218,8 @@ pub(crate) struct Engine {
     hot: usize,
     /// 강등 중인지 여부.
     demoted: bool,
-    /// 강등(`demote`)이나 자식이 보낸 `CSI 3 J`·`RIS` 직전의 핫 스크롤백(최신 행부터, postcard + zstd 압축).
-    parked_hot: Option<Box<[u8]>>,
+    /// 강등(`demote`)이나 자식이 보낸 `CSI 3 J`·`RIS` 직전의 핫 스크롤백(최신 행부터, 행별 RLE postcard).
+    parked_hot: VecDeque<Box<[u8]>>,
     /// 창 제목(OSC 0·2). [`MAX_TITLE`]에서 자른다.
     title: String,
     /// 살아 있는 바이트([`Feed::Live`])로 울린 벨 수.
@@ -227,6 +227,84 @@ pub(crate) struct Engine {
     /// 살아 있는 바이트로 받은 OSC 52 쓰기 수와 마지막 값(MK-033).
     clips: u64,
     clip: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PackedRun {
+    fg: Color,
+    bg: Color,
+    underline: Color,
+    flags: Flags,
+    text: String,
+    zw: Vec<(u16, Vec<char>)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PackedRow {
+    len: u16,
+    runs: Vec<PackedRun>,
+}
+
+fn pack_row(row: &[Cell]) -> Option<Box<[u8]>> {
+    let len = u16::try_from(row.len()).ok()?;
+    let end = row
+        .iter()
+        .rposition(|c| *c != Cell::default())
+        .map_or(0, |i| i + 1);
+    let mut runs: Vec<PackedRun> = Vec::new();
+    let mut offset_in_run: u16 = 0;
+    for c in row.get(..end)? {
+        let same = runs.last().is_some_and(|r| {
+            r.fg == c.fg && r.bg == c.bg && r.underline == c.underline && r.flags == c.flags
+        });
+        if !same {
+            runs.push(PackedRun {
+                fg: c.fg,
+                bg: c.bg,
+                underline: c.underline,
+                flags: c.flags,
+                text: String::new(),
+                zw: Vec::new(),
+            });
+            offset_in_run = 0;
+        }
+        if let Some(run) = runs.last_mut() {
+            run.text.push(c.ch);
+            if !c.zerowidth.is_empty() {
+                run.zw.push((offset_in_run, c.zerowidth.clone()));
+            }
+            offset_in_run = offset_in_run.saturating_add(1);
+        }
+    }
+    postcard::to_stdvec(&PackedRow { len, runs })
+        .ok()
+        .map(Vec::into_boxed_slice)
+}
+
+fn unpack_row(bytes: &[u8]) -> Option<Vec<Cell>> {
+    let packed = postcard::from_bytes::<PackedRow>(bytes).ok()?;
+    let mut out = Vec::with_capacity(usize::from(packed.len));
+    for run in packed.runs {
+        let mut zw_iter = run.zw.into_iter().peekable();
+        for (idx, ch) in run.text.chars().enumerate() {
+            let idx_u16 = u16::try_from(idx).unwrap_or(u16::MAX);
+            let zerowidth = if zw_iter.peek().is_some_and(|(at, _)| *at == idx_u16) {
+                zw_iter.next().map_or_else(Vec::new, |(_, zw)| zw)
+            } else {
+                Vec::new()
+            };
+            out.push(Cell {
+                ch,
+                zerowidth,
+                fg: run.fg,
+                bg: run.bg,
+                underline: run.underline,
+                flags: run.flags,
+            });
+        }
+    }
+    out.resize_with(usize::from(packed.len), Cell::default);
+    Some(out)
 }
 
 impl Engine {
@@ -247,7 +325,7 @@ impl Engine {
             cli_boundary: crate::cli::Boundary::default(),
             hot,
             demoted: false,
-            parked_hot: None,
+            parked_hot: VecDeque::new(),
             title: String::new(),
             bells: 0,
             clips: 0,
@@ -295,8 +373,9 @@ impl Engine {
             }
             self.set_history(0, look);
             self.term.grid_mut().truncate();
-        } else if self.parked_hot.is_some() && self.history_len() >= self.hot {
-            self.parked_hot = None;
+        } else if !self.parked_hot.is_empty() && self.history_len() >= self.hot {
+            self.parked_hot.clear();
+            self.parked_hot.shrink_to_fit();
         }
         out
     }
@@ -335,8 +414,9 @@ impl Engine {
             }
             self.set_history(0, look);
             self.term.grid_mut().truncate();
-        } else if self.parked_hot.is_some() && self.history_len() >= self.hot {
-            self.parked_hot = None;
+        } else if !self.parked_hot.is_empty() && self.history_len() >= self.hot {
+            self.parked_hot.clear();
+            self.parked_hot.shrink_to_fit();
         }
         out
     }
@@ -535,7 +615,8 @@ impl Engine {
             .inactive_keyboard_mode_stack
             .clone_from(&source.term.inactive_keyboard_mode_stack);
         self.demoted = source.demoted;
-        self.parked_hot = None;
+        self.parked_hot.clear();
+        self.parked_hot.shrink_to_fit();
         self.title.clone_from(&source.title);
         self.bells = source.bells;
         self.clips = source.clips;
@@ -570,7 +651,8 @@ impl Engine {
 
     /// 핫 스크롤백을 비운다. 보이는 화면·커서·모드는 그대로 둔다(OWE-873b).
     pub(crate) fn clear_history(&mut self) {
-        self.parked_hot = None;
+        self.parked_hot.clear();
+        self.parked_hot.shrink_to_fit();
         self.scheme.history_cleared = false;
         self.term.grid_mut().clear_history();
     }
@@ -605,36 +687,24 @@ impl Engine {
         (total, rows)
     }
 
-    fn decode_parked_hot(&self) -> Vec<Vec<Cell>> {
-        let Some(compressed) = self.parked_hot.as_deref() else {
-            return Vec::new();
-        };
-        zstd::stream::decode_all(compressed)
-            .ok()
-            .and_then(|bytes| postcard::from_bytes::<Vec<Vec<Cell>>>(&bytes).ok())
-            .unwrap_or_default()
-    }
-
-    fn save_hot_rows(&mut self, mut rows: Vec<Vec<Cell>>) {
+    fn save_hot_rows(&mut self, rows: Vec<Vec<Cell>>) {
         if self.hot == 0 || rows.is_empty() {
             return;
         }
-        if rows.len() < self.hot {
-            let old = self.decode_parked_hot();
-            rows.extend(old.into_iter().take(self.hot.saturating_sub(rows.len())));
-        } else {
-            rows.truncate(self.hot);
+        for row in rows.into_iter().take(self.hot).rev() {
+            if let Some(packed) = pack_row(&row) {
+                self.parked_hot.push_front(packed);
+            }
         }
-        if let Ok(bytes) = postcard::to_stdvec(&rows)
-            && let Ok(compressed) = zstd::bulk::compress(&bytes, 1)
-        {
-            self.parked_hot = Some(compressed.into_boxed_slice());
+        while self.parked_hot.len() > self.hot {
+            self.parked_hot.pop_back();
         }
     }
 
     fn save_hot(&mut self) {
         if self.hot == 0 {
-            self.parked_hot = None;
+            self.parked_hot.clear();
+            self.parked_hot.shrink_to_fit();
             return;
         }
         let mut rows = self.history_rows(0, self.hot).1;
@@ -650,8 +720,13 @@ impl Engine {
         let mut rows = self.history_rows(0, self.hot).1;
         rows.reverse();
         if rows.len() < self.hot {
-            let old = self.decode_parked_hot();
-            rows.extend(old.into_iter().take(self.hot.saturating_sub(rows.len())));
+            let need = self.hot.saturating_sub(rows.len());
+            rows.extend(
+                self.parked_hot
+                    .iter()
+                    .take(need)
+                    .filter_map(|b| unpack_row(b)),
+            );
         }
         rows
     }

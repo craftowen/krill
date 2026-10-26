@@ -364,6 +364,7 @@ impl Session {
             .spawn({
                 let shared = Arc::clone(&shared);
                 move || {
+                    crate::alloc::mobile_thread().ok();
                     if let Some(r) = &rec {
                         rebuild(&shared, r, size);
                     }
