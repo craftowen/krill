@@ -143,6 +143,7 @@ enum Action {
         #[serde(default)]
         since: Option<String>,
     },
+    #[serde(alias = "set_quick_commands")]
     SaveQuickCommands {
         commands: Vec<QuickCommandEntry>,
     },
@@ -2043,7 +2044,7 @@ mod tests {
 
         let saved = rpc(
             &backend,
-            &json!({"action":"save_quick_commands","commands":[{"name":"mobile","text":"/mobile "}]}),
+            &json!({"action":"set_quick_commands","commands":[{"name":"mobile","text":"/mobile "}]}),
         );
         assert_eq!(saved["ok"], true);
         assert!(crate::session::lock(&backend.snapshot_cache).is_none());

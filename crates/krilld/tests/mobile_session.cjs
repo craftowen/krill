@@ -330,9 +330,21 @@ async function testHybridChatToggleAndQuestionCards(){
  buttons.length=0;const savedView=sandbox.KrillMobile.screens.session(el('main'),ctx);assert.equal(buttons.find(b=>b.className?.includes('mode-toggle')).textContent,'Term');savedView.cleanup();
  // 일반 셸 세션(agent === '')은 기본값이 Term 뷰다.
  buttons.length=0;
- const shellView=sandbox.KrillMobile.screens.session(el('main'),{...ctx,route:{groupKey:'g',sessionId:8}});
+ const shellRoot=el('main'),shellView=sandbox.KrillMobile.screens.session(shellRoot,{...ctx,route:{groupKey:'g',sessionId:8}});
  const shellToggle=buttons.find(b=>b.className?.includes('mode-toggle'));
  assert.equal(shellToggle.textContent,'Chat');
+ const tabs=shellRoot.descendants().find(n=>n.className==='session-tabs');
+ assert(tabs.descendants().some(n=>n.className==='tab-action-divider'),'tab bar includes vertical divider before Quick Commands');
+ const quickBtn=buttons.find(b=>b.className==='tab-quick'&&b.textContent==='Quick Commands');
+ assert(quickBtn,'Quick Commands button is placed in the top tab bar');
+ state.snapshot={quick_commands:[{name:'Run tests',text:'cargo nextest run'}]};ctx.closeSheet=()=>{};
+ quickBtn.action();
+ assert.equal(sheets.at(-1).title,'Quick Commands');
+ sheets.at(-1).render(el('div'));
+ const runCmd=buttons.find(b=>b.className==='quick-command-run');
+ assert(runCmd);
+ await runCmd.action();
+ assert(calls.some(c=>c.action==='prompt'&&c.session===8&&c.text==='cargo nextest run'));
  shellView.cleanup();
 }
 async function testTransportAuthRetries(){
