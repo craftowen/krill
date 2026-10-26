@@ -36,7 +36,7 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
 {const sessions=new Map([[1,{id:1,state:'Blocked'}],[2,{id:2,state:'Waiting'}],[3,{id:3,state:'Waiting',exited:1}],[4,{id:4,state:'Working'}]]),need=sandbox.KrillMobile.needsYou({sessions,snapshot:{orchestration:{gates:[{status:'pending'}],questions:[{to:'user'},{to:'mobile'},{to:'coordinator'}]}}});assert.equal(need.total,5);assert.deepEqual([...need.sessions.map(s=>s.id)],[2,1]);}
 {const L=sandbox.KrillMobile.connectionLog;assert.equal(L.elapsed(1234),'+1.23s');assert.equal(L.elapsed(12345),'+12.3s');assert.equal(L.elapsed(123456),'+123s');assert.match(L.clock(0),/^\d\d:\d\d:\d\d$/);}
 {const lines=fs.readFileSync(path.join(assets,'app.js'),'utf8').split('\n'),timers=[],notice=new EventTarget();notice.hidden=true;notice.textContent='';
- const context=vm.createContext({notice,t:s=>s,URLSearchParams,setTimeout:fn=>timers.push({fn}),clearTimeout:id=>{if(timers[id-1])timers[id-1].fn=()=>{};}});
+ const context=vm.createContext({notice,dialog:{open:false},t:s=>s,URLSearchParams,setTimeout:fn=>timers.push({fn}),clearTimeout:id=>{if(timers[id-1])timers[id-1].fn=()=>{};}});
  vm.runInContext(lines.find(l=>l.includes('let noticeTimer'))+lines.find(l=>l.includes('const pairingLink='))+'globalThis.T={toast,error,pairingLink};',context);const T=context.T;
  T.error(Error('RPC failed'));assert.equal(notice.hidden,false);assert.equal(notice.textContent,'RPC failed');T.error(Error('RPC failed'));timers[0].fn();assert.equal(notice.hidden,false);timers.at(-1).fn();assert.equal(notice.hidden,true);
  T.toast('Photo attached',3000);notice.dispatchEvent(new Event('click'));assert.equal(notice.hidden,true);
