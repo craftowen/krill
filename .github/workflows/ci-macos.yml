@@ -136,14 +136,45 @@ jobs:
         with:
           tool: cargo-nextest,cargo-deny
 
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        run: |
+          python3 packaging/vendor_cache.py stage --case producer \
+            --cargo-home "$CARGO_HOME" --vendor-root /tmp/krill-ci-vendor \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Find current vendor dependency cache
+        id: vendor-cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
+          shared-key: ci-${{ matrix.os }}
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
+          cache-bin: 'false'
+          lookup-only: 'true'
+          save-if: 'false'
+
+      - name: Seed dependencies from the legacy cache when migrating
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: ci-${{ matrix.os }}
+          cache-bin: 'false'
+          save-if: 'false'
+
       - name: Restore Rust dependencies
         id: cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
           shared-key: ci-${{ matrix.os }}
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
           cache-bin: 'false'
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+
+      - name: Verify restored vendor and external configuration
+        run: python3 packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
       - name: fmt, supply chain and notices
         run: |
