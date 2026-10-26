@@ -44,8 +44,11 @@ impl Agent {
             Self::Codex => &[
                 "SessionStart",
                 "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
                 "PermissionRequest",
                 "Stop",
+                "Interrupt",
                 "SessionEnd",
             ],
             // Observational events only: never return an allow/deny decision to Cursor.
@@ -135,7 +138,9 @@ export const KrillHook = async () => {{
     if (!process.env.MK_PANE_ID) return;
     const names = {{ "session.created": "SessionStart", "session.idle": "Stop",
       "session.deleted": "SessionEnd", "permission.asked": "PermissionRequest",
-      "permission.replied": "PostToolUse" }};
+      "permission.updated": "PermissionRequest", "permission.replied": "PostToolUse",
+      "question.asked": "PermissionRequest", "question.replied": "PostToolUse",
+      "question.rejected": "PostToolUse" }};
     const name = event.type === "session.status" && event.properties?.status?.type === "busy"
       ? "UserPromptSubmit" : names[event.type];
     if (!name) return;

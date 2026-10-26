@@ -194,7 +194,16 @@ fn agy_sequence_snapshot() {
             5,
             r#"{"hook_event_name":"PostToolUse","tool_name":"ask_permission"}"#,
         ),
-        ev(6, r#"{"hook_event_name":"PostInvocation"}"#),
+        ev(
+            6,
+            r#"{"hook_event_name":"PreToolUse","toolCall":{"name":"ask_question"}}"#,
+        ),
+        ev(7, r#"{"hook_event_name":"Stop","fullyIdle":false}"#),
+        ev(
+            8,
+            r#"{"hook_event_name":"PostToolUse","toolCall":{"name":"ask_question"}}"#,
+        ),
+        ev(9, r#"{"hook_event_name":"PostInvocation"}"#),
     ];
     let st = Statuses::open(None);
     assert_eq!(
@@ -204,7 +213,10 @@ fn agy_sequence_snapshot() {
 {"hook_event_name":"PostToolUse","tool_name":"ask_question"} => Working/Some(Hook)/High since=30 applied
 {"hook_event_name":"PreToolUse","tool_name":"ask_permission"} => Waiting/Some(Hook)/High since=40 applied
 {"hook_event_name":"PostToolUse","tool_name":"ask_permission"} => Working/Some(Hook)/High since=50 applied
-{"hook_event_name":"PostInvocation"} => Done/Some(Hook)/High since=60 applied
+{"hook_event_name":"PreToolUse","toolCall":{"name":"ask_question"}} => Waiting/Some(Hook)/High since=60 applied
+{"hook_event_name":"Stop","fullyIdle":false} => Waiting/Some(Hook)/High since=60 ignored
+{"hook_event_name":"PostToolUse","toolCall":{"name":"ask_question"}} => Working/Some(Hook)/High since=80 applied
+{"hook_event_name":"PostInvocation"} => Done/Some(Hook)/High since=90 applied
 "#
     );
     assert_eq!(st.get(S1).agent, "agy");

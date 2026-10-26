@@ -111,10 +111,22 @@ impl Detector {
             self.dialog_waiting_since = None;
         }
         let title_state = self.title_state(title);
-        let (state, source, confidence) = if let Some(state) = title_state {
+        if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
+            && status.source == Some(Source::Screen)
+            && !quiet
+            && title_state != Some(AgentState::Working)
+        {
+            return None;
+        }
+        let (state, source, confidence) = if quiet && let Some(state) = menu {
+            (state, Source::Screen, Confidence::Low)
+        } else if let Some(state) = title_state {
             (state, Source::Title, Confidence::Medium)
-        } else if quiet {
-            (menu?, Source::Screen, Confidence::Low)
+        } else if quiet
+            && status.source == Some(Source::Screen)
+            && matches!(status.state, AgentState::Waiting | AgentState::Blocked)
+        {
+            (AgentState::Working, Source::Screen, Confidence::Low)
         } else {
             return None;
         };

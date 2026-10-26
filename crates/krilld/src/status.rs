@@ -175,8 +175,11 @@ impl Statuses {
             if let Some(r) = map.get(&session) {
                 if r.status.source == Some(Source::Process)
                     || (r.status.source == Some(Source::Hook)
-                        && !(r.status.state == AgentState::Waiting
-                            && evidence.dismissed_since == Some(r.status.since_unix_ns)))
+                        && !(matches!(r.status.state, AgentState::Waiting | AgentState::Blocked)
+                            && evidence.dismissed_since == Some(r.status.since_unix_ns))
+                        && !(!matches!(r.status.state, AgentState::Waiting | AgentState::Blocked)
+                            && evidence.source == Source::Screen
+                            && matches!(evidence.state, AgentState::Waiting | AgentState::Blocked)))
                 {
                     return;
                 }
@@ -283,13 +286,22 @@ pub(crate) fn now_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
+/// Antigravity 등 중첩 `toolCall` 객체에서 도구 이름을 읽는 보조 필드.
+#[derive(Deserialize)]
+struct ToolCallFields {
+    #[serde(alias = "toolName", alias = "tool_name")]
+    name: Option<String>,
+}
+
 /// hook payload(JSON)에서 읽는 필드. 나머지는 무시한다.
 #[derive(Deserialize)]
 struct Fields {
     #[serde(alias = "hookEventName", alias = "event")]
     hook_event_name: Option<String>,
-    #[serde(alias = "toolName")]
+    #[serde(alias = "toolName", alias = "name")]
     tool_name: Option<String>,
+    #[serde(alias = "toolCall")]
+    tool_call: Option<ToolCallFields>,
     #[serde(alias = "notificationType")]
     notification_type: Option<String>,
     #[serde(alias = "agentId", alias = "subagent_id", alias = "subagentId")]
@@ -300,6 +312,8 @@ struct Fields {
     teammate_id: Option<String>,
     #[serde(default, alias = "isSubagent")]
     is_subagent: bool,
+    #[serde(alias = "fullyIdle")]
+    fully_idle: Option<bool>,
 }
 
 /// Claude·Codex·Cursor·OpenCode·Antigravity hook payload 하나를 상태로. 상태를 바꾸지 않는 이벤트(서브에이전트·압축 등)와
@@ -310,7 +324,7 @@ struct Fields {
 /// | `SessionStart`, Cursor `sessionStart` | done(프롬프트에서 대기, 턴 완료 여부는 wait 기준점으로 구분) |
 /// | `Stop`, `StopFailure`, `Interrupt`, Antigravity `PostInvocation`, Cursor `stop` | done(프롬프트에서 대기) |
 /// | `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, Antigravity `PreInvocation`, Cursor `beforeSubmitPrompt`·`afterShellExecution`·`afterMCPExecution` | working |
-/// | `PermissionRequest`, 질문 도구(`AskUserQuestion`·`request_user_input`·`ask_question`·`ask_permission`)의 `PreToolUse`/`BeforeTool` | waiting |
+/// | `PermissionRequest`, 질문 도구(`AskUserQuestion`·`ExitPlanMode`·`request_user_input`·`ask_question`·`ask_permission`·`question`)의 `PreToolUse`/`BeforeTool` | waiting |
 /// | `Notification`의 `permission_prompt`·`elicitation_dialog` | waiting(`idle_prompt`는 Stop 약 60초 뒤라 무시) |
 /// | `SessionEnd`, Cursor `sessionEnd` | exited |
 pub fn normalize(payload: &[u8]) -> Option<AgentState> {
@@ -324,8 +338,13 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
     {
         return None;
     }
-    let asks = f.tool_name.as_deref().is_some_and(asks_user);
+    let tool = f
+        .tool_name
+        .as_deref()
+        .or_else(|| f.tool_call.as_ref()?.name.as_deref());
+    let asks = tool.is_some_and(asks_user);
     Some(match f.hook_event_name.as_deref()? {
+        "Stop" if f.fully_idle == Some(false) => return None,
         "SessionStart" | "sessionStart" | "Stop" | "StopFailure" | "Interrupt" | "AfterAgent"
         | "PostInvocation" | "stop" => AgentState::Done,
         "PreToolUse" | "BeforeTool" if asks => AgentState::Waiting,
@@ -353,7 +372,7 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
     })
 }
 
-/// 사람에게 묻는 도구(Claude `AskUserQuestion`, Codex `request_user_input`, Antigravity `ask_question`·`ask_permission`). 대소문자·구분자 무시.
+/// 사람에게 묻는 도구(Claude `AskUserQuestion`·`ExitPlanMode`, Codex `request_user_input`, Antigravity `ask_question`·`ask_permission`, `OpenCode` `question`). 대소문자·구분자 무시.
 fn asks_user(tool: &str) -> bool {
     let n: String = tool
         .chars()
@@ -362,7 +381,12 @@ fn asks_user(tool: &str) -> bool {
         .collect();
     matches!(
         n.as_str(),
-        "askuserquestion" | "requestuserinput" | "askquestion" | "askpermission"
+        "askuserquestion"
+            | "exitplanmode"
+            | "requestuserinput"
+            | "askquestion"
+            | "askpermission"
+            | "question"
     )
 }
 

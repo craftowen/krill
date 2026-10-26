@@ -277,10 +277,16 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         if dir.is_empty() {
             continue;
         }
-        if provider == ProviderKind::Antigravity
-            && let Some(host_home) = trust_home_for_runtime()
-        {
-            sync_agy_profile_hooks_in(&host_home, Path::new(dir)).ok();
+        if let Some(host_home) = trust_home_for_runtime() {
+            match provider {
+                ProviderKind::Antigravity => {
+                    sync_agy_profile_hooks_in(&host_home, Path::new(dir)).ok();
+                }
+                ProviderKind::Claude => {
+                    sync_claude_profile_hooks_in(&host_home, Path::new(dir)).ok();
+                }
+                _ => {}
+            }
         }
         login.env.retain(|(key, _)| {
             !provider
@@ -1703,6 +1709,81 @@ pub(crate) fn sync_agy_profile_hooks_in(host_home: &Path, account_home: &Path) -
     write_trust_file_cas(&target, orig_bytes.as_deref(), next.as_bytes(), None)
 }
 
+/// 호스트 `~/.claude/settings.json`에 `"name": "krill"` 훅이 설치돼 있으면
+/// 격리된 Claude 계정 프로필(`<claude_config_dir>/settings.json`)에도 Krill 훅을 동기화한다.
+pub(crate) fn sync_claude_profile_hooks_in(
+    host_home: &Path,
+    claude_config_dir: &Path,
+) -> io::Result<bool> {
+    if host_home.as_os_str().is_empty() || claude_config_dir.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    let default_claude_dir = host_home.join(".claude");
+    if claude_config_dir == host_home || claude_config_dir == default_claude_dir {
+        return Ok(false);
+    }
+    let host_canon = std::fs::canonicalize(&default_claude_dir).unwrap_or(default_claude_dir);
+    let acc_canon = std::fs::canonicalize(claude_config_dir)
+        .unwrap_or_else(|_| claude_config_dir.to_path_buf());
+    if host_canon == acc_canon {
+        return Ok(false);
+    }
+    let host_settings_path = host_home.join(".claude/settings.json");
+    let Ok(Some(host_bytes)) = read_trust_file_snapshot(&host_settings_path) else {
+        return Ok(false);
+    };
+    let Ok(host_val) = serde_json::from_slice::<serde_json::Value>(&host_bytes) else {
+        return Ok(false);
+    };
+    let Some(command) = host_val
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|hooks_map| {
+            hooks_map.values().find_map(|entries| {
+                entries.as_array()?.iter().find_map(|entry| {
+                    entry
+                        .get("hooks")?
+                        .as_array()?
+                        .iter()
+                        .find(|h| {
+                            h.get("name").and_then(serde_json::Value::as_str) == Some("krill")
+                        })
+                        .and_then(|h| h.get("command").and_then(serde_json::Value::as_str))
+                })
+            })
+        })
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(false);
+    };
+    let _guard = crate::session::lock(&TRUST_LOCK);
+    let target = claude_config_dir.join("settings.json");
+    let Ok(orig_bytes) = read_trust_file_snapshot(&target) else {
+        return Ok(false);
+    };
+    let existing = match orig_bytes.as_deref() {
+        Some(b) if !b.iter().all(u8::is_ascii_whitespace) => {
+            let Ok(s) = std::str::from_utf8(b) else {
+                return Ok(false);
+            };
+            Some(s)
+        }
+        _ => None,
+    };
+    let Ok(next) = krill_proto::agent::hooks::install_claude_json(existing, command) else {
+        return Ok(false);
+    };
+    if let (Some(prev), Ok(prev_val), Ok(next_val)) = (
+        existing,
+        serde_json::from_str::<serde_json::Value>(existing.unwrap_or("{}")),
+        serde_json::from_str::<serde_json::Value>(&next),
+    ) && (prev == next || prev_val == next_val)
+    {
+        return Ok(false);
+    }
+    write_trust_file_cas(&target, orig_bytes.as_deref(), next.as_bytes(), None)
+}
+
 /// 계정 프로필 env를 넣고 넣은 계정을 돌려준다(실행 기록에 남긴다, OWE-698).
 /// `pinned`가 있으면 그 계정, 없으면 지금 활성 계정이다.
 fn apply_account_env(
@@ -1728,11 +1809,14 @@ fn apply_account_env(
         });
     }
     if let Some(account) = &account {
-        if (is(profile, "agy") || is(profile, "antigravity"))
-            && !account.dir.is_empty()
+        if !account.dir.is_empty()
             && let Some(host_home) = trust_home_for_runtime()
         {
-            sync_agy_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
+            if is(profile, "agy") || is(profile, "antigravity") {
+                sync_agy_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
+            } else if is(profile, "claude") {
+                sync_claude_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
+            }
         }
         if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
             login
@@ -2022,8 +2106,38 @@ fn codex_hooks(
         command,
         env,
     )?;
+    let added = receipt
+        .pointer("/codex/added")
+        .and_then(serde_json::Value::as_object)
+        .filter(|m| !m.is_empty());
+    let args = if let Some(added) = added {
+        let quoted = serde_json::Value::String(command.to_owned()).to_string();
+        Agent::Codex
+            .events()
+            .iter()
+            .filter(|event| {
+                let mut snake = String::new();
+                for (i, ch) in event.chars().enumerate() {
+                    if ch.is_ascii_uppercase() && i > 0 {
+                        snake.push('_');
+                    }
+                    snake.push(ch.to_ascii_lowercase());
+                }
+                let key = format!("/<session-flags>/config.toml:{snake}:0:0");
+                added.contains_key(&key)
+            })
+            .flat_map(|event| {
+                [
+                    "-c".to_owned(),
+                    format!("hooks.{event}=[{{hooks=[{{type=\"command\",command={quoted}}}]}}]"),
+                ]
+            })
+            .collect()
+    } else {
+        hooks::codex_args(command)
+    };
     let mut profile = profile.clone();
-    profile.launch.splice(1..1, hooks::codex_args(command));
+    profile.launch.splice(1..1, args);
     Ok(Some(profile))
 }
 

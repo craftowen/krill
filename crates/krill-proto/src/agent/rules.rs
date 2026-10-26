@@ -135,6 +135,9 @@ fn default_blocked_phrases() -> Vec<String> {
 fn default_waiting_phrases() -> Vec<String> {
     [
         "do you want to proceed",
+        "do you want to make this edit",
+        "do you want to create",
+        "would you like to proceed",
         "would you like to run",
         "allow this",
     ]
@@ -152,8 +155,8 @@ fn default_waiting_combo() -> Vec<String> {
 
 fn default_select_prefixes() -> Vec<String> {
     [
-        "❯ 1.", "› 1.", "> 1.", "1. Yes", "1. Allow", "❯ Yes", "› Yes", "> Yes", "❯ No", "› No",
-        "> No",
+        "❯ 1.", "› 1.", "> 1.", "❯ 2.", "› 2.", "> 2.", "❯ 3.", "› 3.", "> 3.", "1. Yes",
+        "1. Allow", "❯ Yes", "› Yes", "> Yes", "❯ No", "› No", "> No",
     ]
     .into_iter()
     .map(str::to_owned)

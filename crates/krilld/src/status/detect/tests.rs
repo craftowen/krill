@@ -301,3 +301,54 @@ fn custom_rules_replace_screen_knowledge() {
         .unwrap();
     assert_eq!(e.state, AgentState::Done);
 }
+
+#[test]
+fn screen_menu_overrides_terminal_title_and_hook_working() {
+    let st = Statuses::open(None);
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let dialog = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+
+    // 제목이 ✳ Claude Code(Done)이거나 ◐(Working)이어도 QUIET 뒤 화면 메뉴가 우선한다.
+    assert_eq!(
+        detector
+            .observe("✳ Claude Code", dialog, 1, &st.get(ID), now)
+            .unwrap()
+            .state,
+        AgentState::Done
+    );
+    let e = detector
+        .observe("✳ Claude Code", dialog, 1, &st.get(ID), now + QUIET)
+        .unwrap();
+    assert_eq!(
+        (e.state, e.source, e.confidence),
+        (AgentState::Waiting, Source::Screen, Confidence::Low)
+    );
+    st.inferred(ID, e, 10);
+    assert_eq!(st.get(ID).state, AgentState::Waiting);
+
+    // Hook Working 상태에서도 전용 훅 없이 뜬 화면 승인 메뉴는 Waiting(Screen)으로 반영된다.
+    let work = crate::status::tests::event(1, 20, "agy", r#"{"hook_event_name":"PreInvocation"}"#);
+    st.hook(&[(ID, &work)]).unwrap();
+    assert_eq!(
+        (st.get(ID).state, st.get(ID).source),
+        (AgentState::Working, Some(Source::Hook))
+    );
+    detector.observe("", dialog, 2, &st.get(ID), now + QUIET);
+    let e = detector
+        .observe("", dialog, 2, &st.get(ID), now + QUIET * 2)
+        .unwrap();
+    st.inferred(ID, e, 30);
+    assert_eq!(
+        (st.get(ID).state, st.get(ID).source),
+        (AgentState::Waiting, Some(Source::Screen))
+    );
+
+    // 메뉴가 사라지고 명령 실행 화면(프롬프트 아님)으로 바뀌면 Working으로 복귀한다.
+    detector.observe("", "Running cargo test...", 3, &st.get(ID), now + QUIET * 2);
+    let e = detector
+        .observe("", "Running cargo test...", 3, &st.get(ID), now + QUIET * 3)
+        .unwrap();
+    st.inferred(ID, e, 40);
+    assert_eq!(st.get(ID).state, AgentState::Working);
+}
