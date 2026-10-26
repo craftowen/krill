@@ -62,6 +62,8 @@ async function tailFollow(){
  Object.defineProperty(feed,'scrollHeight',{value:5000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,5000,'late code/image/disclosure growth keeps a following reader at the bottom');delete feed.scrollHeight;
  reopen.resolve(page(0,30));await flush();
  feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));assert.equal(feed.scrollTop,2900,'scroll near the tail keeps following');
+ // Scrolling up by 15px within the bottom 60px band must disengage following immediately so ResizeObserver / new messages do not snap back to bottom.
+ feed.scrollTop=feed.scrollHeight-feed.clientHeight-15;feed.dispatchEvent(new Event('scroll'));Object.defineProperty(feed,'scrollHeight',{value:5500,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,2885,'upward scroll within bottom 60px disengages following');delete feed.scrollHeight;
  feed.scrollTop=400;feed.dispatchEvent(new Event('scroll'));Object.defineProperty(feed,'scrollHeight',{value:6000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,400,'late growth never drags a reader who scrolled up');delete feed.scrollHeight;
  await f.poll(page(30,32));assert.equal(feed.children.length,32);assert.equal(feed.scrollTop,400,'new messages do not pull a reader who scrolled up');
  feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));await f.poll(page(32,33));assert.equal(feed.scrollTop,feed.scrollHeight,'returning to the bottom resumes following');

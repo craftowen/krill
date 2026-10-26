@@ -91,7 +91,7 @@ function mountChat(root,opts){
  entry.loaded??=entry.initialized;
  let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
  // Only the reader moving up stops following; pins and late layout growth never do.
- let lastTop=0;feed.addEventListener('scroll',()=>{if(!visible)return;const top=feed.scrollTop;if(feed.scrollHeight-top-feed.clientHeight<60)following=true;else if(top<lastTop-1)following=false;lastTop=top;});
+ let lastTop=0;feed.addEventListener('scroll',()=>{if(!visible)return;const top=feed.scrollTop,gap=feed.scrollHeight-top-feed.clientHeight;if(gap<=1)following=true;else if(top<lastTop-1)following=false;else if(gap<60)following=true;lastTop=top;});
  function pinLatest(){if(visible&&following&&!entry.live){feed.scrollTop=feed.scrollHeight||0;lastTop=feed.scrollTop;}}
  // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
  const resize=globalThis.ResizeObserver?new ResizeObserver(()=>pinLatest()):null;resize?.observe(feed);

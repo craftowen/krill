@@ -201,8 +201,39 @@ async function main(){
  await testTextLayer();
  await testLivePreviewAndHeldIme();
  // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
- context.performance={now:()=>clock};try{await testTuiScrollRouting();await testScrollPhysics();await testHistoryRefreshMerge();}finally{delete context.performance;}
+ context.performance={now:()=>clock};try{await testTuiScrollRouting();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
  console.log('All terminal adapter regression checks passed.');
+}
+async function testInitialAndQueuedHistoryScroll(){
+ // 1. Hidden mount (e.g. opened in Chat view) preloads 300 rows as soon as setVisible(true) is called.
+ const hidden=await mount(2010,{visible:false,preferences:{fitToPhone:false}}),hp=find(hidden.root,'terminal-scroll');hp.clientHeight=400;
+ assert.equal(hidden.socket.sent.filter(a=>a[4]===0x12).length,0,'hidden mount waits before preloading history');
+ await hidden.handle.setVisible(true);
+ assert.equal(hidden.socket.sent.filter(a=>a[4]===0x12).length,1,'becoming visible preloads 300 history rows');
+ hidden.handle.unmount();
+ // 2. Queued refresh while initial loadHistory is in flight + unscrollable touch drag continuing once history arrives.
+ const {root,handle,socket}=await mount(2011,{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history'),grid=find(root,'terminal-grid'),controls=find(root,'terminal-history-controls');
+ let top=0;port.clientHeight=400;
+ Object.defineProperty(grid,'offsetTop',{get:()=>(controls.hidden?0:32)+hist.children.length*18});
+ Object.defineProperty(port,'scrollHeight',{get:()=>grid.offsetTop+400});
+ Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
+ const requests=()=>socket.sent.filter(a=>a[4]===0x12),row=ch=>C.concat(T.v(1),T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));
+ handle.loadHistory();assert.equal(requests().length,1);
+ // User starts pulling down while scrollHeight === clientHeight (400) and initial request is still pending; new output arrives meanwhile.
+ socket.screen('newer output');await flush();
+ event(port,'touchstart',{touches:[{clientX:150,clientY:100}]});
+ event(port,'touchmove',{touches:[{clientX:150,clientY:120}]});
+ // Initial history reply arrives with 10 rows -> queued refresh fires immediately, and continuing the same touch drag scrolls up.
+ const req1=T.reader(requests().at(-1).slice(5)).n();
+ socket.frame(0x26,T.v(req1),T.v(10),T.v(0),T.v(0),T.v(10),...Array(10).fill(row('a')));
+ assert.equal(requests().length,2,'refresh requested during pending loadHistory is queued and sent after reply');
+ const beforeDragTop=port.scrollTop;
+ const moveEvt=event(port,'touchmove',{touches:[{clientX:150,clientY:160}]});
+ assert(moveEvt.defaultPrevented,'unscrollable-at-touchstart drag manually scrolls once history arrives');
+ assert.equal(port.scrollTop,beforeDragTop-40);
+ event(port,'touchend',{touches:[]});
+ handle.unmount();
+ console.log('PASS hidden session preloads history on setVisible(true), queued refresh fires after in-flight load, unscrollable touchstart scrolls after history arrives');
 }
 // 대체 화면(TUI)은 셸 기록을 접고 위·아래 쓸기를 모두 TUI에 보고한다. 보고는 입력 ACK·커서·라이브 복귀와 분리하고, 늦은 기록 응답은 TUI 화면을 건드리지 않는다.
 async function testTuiScrollRouting(){
@@ -217,15 +248,22 @@ async function testTuiScrollRouting(){
  base=inputs(socket).length;drag(300,240);assert.match(since(base),/^(\x1b\[<65;\d+;\d+M){4}$/);assert.equal(requests().length,n);assert.equal(latest.hidden,true);assert.equal(hist.children.length,100);
  await advance(10000);assert.equal(root.dataset.phase,'ready','scroll reports never wait for input confirmation');assert.equal(socket.readyState,1);assert.equal(preview.hidden,true);assert.equal(top,0);socket.autoAck=true;await handle.sendKey('enter');socket.autoAck=false;
  base=inputs(socket).length;e=event(port,'wheel',{deltaX:0,deltaY:-30,deltaMode:0});assert(e.defaultPrevented);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){2}$/);base=inputs(socket).length;event(port,'wheel',{deltaX:0,deltaY:1,deltaMode:1});assert.match(since(base),/^\x1b\[<65;\d+;\d+M$/,'reversing the wheel answers at once');base=inputs(socket).length;event(port,'wheel',{deltaX:0,deltaY:-1,deltaMode:2});assert.equal((since(base).match(/\x1b\[<64;/g)||[]).length,30);
+ // Codex TUI mode: SGR mouse enabled, alternate screen enabled, DEC 1007 disabled (4|16|64 or 30|64).
+ modes(30|64);base=inputs(socket).length;drag(100,160);drag(300,240);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}(\x1b\[<65;\d+;\d+M){4}$/,'Codex ALT_SCREEN + SGR mouse without DEC 1007 scrolls in both directions');
  modes(64|128);base=inputs(socket).length;drag(100,160);drag(300,240);assert.equal(since(base),'\x1b[A'.repeat(4)+'\x1b[B'.repeat(4),'DEC 1007 sends arrows');
  modes(1|64|128);base=inputs(socket).length;drag(100,130);assert.equal(since(base),'\x1bOA\x1bOA','application cursor arrows');
  modes(4|64|128);base=inputs(socket).length;drag(100,160);assert.equal(since(base),'','mouse without SGR invents no input');assert.equal(requests().length,n);
  modes(4|16|64|128);handle.toggleShift(true);base=inputs(socket).length;e=drag(100,160);assert.equal(since(base),'','sticky Shift bypasses the TUI');assert.equal(find(root,'shift-toggle').getAttribute('aria-pressed'),'false');drag(100,130);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){2}$/);
+ // When ALT+Fit has a shrunk viewport (e.g. keyboard open) so canvas overflows (hi > lo), local canvas scroll works before reporting to TUI.
+ const fitP=handle.fitToPhone(true);socket.frame(0x2c,T.v(0));await fitP;
+ port.clientHeight=200;top=100;base=inputs(socket).length;drag(100,140);assert.equal(top,60,'ALT+Fit overflowing canvas scrolls locally first');assert.equal(since(base),'');
+ const offP=handle.fitToPhone(false);socket.frame(0x2c,T.v(0));await offP;
+ port.clientHeight=432;top=0;
  modes(4|16);assert.equal(root.dataset.alt,'false');assert.equal(hist.hidden,false);assert.equal(controls.hidden,false);assert.equal(top,1832,'leaving ALT follows live output again');
  base=inputs(socket).length;drag(100,160);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}$/,'inline mouse TUI owns a gesture that starts on live output');assert.equal(requests().length,n);
  port.scrollTop=500;event(port,'scroll');base=inputs(socket).length;e=drag(100,160);assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','a gesture started in shell history stays native');
  modes(4|16|64|128);const m=requests().length;handle.loadHistory(true);assert.equal(requests().length,m+1,'explicit reveal is still allowed in ALT');reply(100,0,100);assert.equal(hist.hidden,false);handle.unmount();assert.equal(root.dataset.alt,undefined);
- console.log('PASS ALT folds shell history, both directions reach the TUI (SGR, 1007 arrows, SS3), report path skips ACK/cursor, wheel deltaMode, Shift bypass, late replies ignored, inline live gestures');
+ console.log('PASS ALT folds shell history, both directions reach the TUI (SGR, Codex 30|64, 1007 arrows, SS3), report path skips ACK/cursor, wheel deltaMode, Shift bypass, late replies ignored, inline live gestures');
 }
 // 손가락 스크롤 물리: 첫 이동 반영, 방향 반전 즉시 반응, 지수 감속 관성과 중단 조건, 넘침 있을 때만 가로 잠금, 터치 중 글자 층 보류.
 async function testScrollPhysics(){
