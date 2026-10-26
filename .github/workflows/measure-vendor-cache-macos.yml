@@ -1,0 +1,120 @@
+# Reusable isolated measurement; not release validation evidence.
+name: Measure macOS vendor cache
+
+on:
+  workflow_call:
+    inputs:
+      case:
+        type: string
+        required: true
+      cache-prefix:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: vendor-cache-${{ inputs.case }} (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_PROFILE_TEST_OPT_LEVEL: 2
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CACHE_CASE: ${{ inputs.case }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Rust 1.98 + clippy
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: '1.98'
+          components: rustfmt, clippy
+      - name: nextest tools
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: cargo-nextest,cargo-deny
+      - name: Restore identical production dependency seed, read-only
+        if: inputs.case != 'consumer'
+        id: baseline
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: ci-macos-14
+          cache-bin: 'false'
+          save-if: 'false'
+      - name: Stage unchanged vendor and external Cargo configuration
+        id: stage
+        run: |
+          python3 packaging/vendor_cache.py stage --case "$CACHE_CASE" \
+            --cargo-home "$CARGO_HOME" --vendor-root /tmp/krill-ci-vendor \
+            --directory "$RUNNER_TEMP/vendor-evidence"
+      - name: Restore isolated vendor cache; only the producer may save
+        if: inputs.case != 'control'
+        id: vendor
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          # This pinned action ignores `key` when `shared-key` is provided.
+          prefix-key: ${{ inputs.cache-prefix }}-${{ steps.stage.outputs.vendor-hash }}
+          shared-key: ci-macos-14
+          cache-directories: ${{ steps.stage.outputs.vendor-directory }}
+          cache-bin: 'false'
+          save-if: ${{ inputs.case == 'producer' }}
+      - name: Record matching source, graph, hardware and cache
+        env:
+          RESTORED_CACHE_HIT: ${{ inputs.case == 'consumer' && steps.vendor.outputs.cache-hit || steps.baseline.outputs.cache-hit }}
+          BASELINE_CACHE_HIT: ${{ steps.baseline.outputs.cache-hit }}
+          VENDOR_CACHE_HIT: ${{ steps.vendor.outputs.cache-hit }}
+        run: python3 packaging/vendor_cache.py prepare --directory "$RUNNER_TEMP/vendor-evidence"
+      - name: fmt, supply chain and notices
+        run: |
+          cargo fmt --all --check
+          cargo deny --locked check --hide-inclusion-graph
+          python3 docs/licensing/generate_notices.py --check
+      - name: clippy
+        run: |
+          if ! cargo clippy --workspace --all-targets --locked --message-format json-render-diagnostics \
+            -- -D warnings > "$RUNNER_TEMP/vendor-evidence/clippy-cargo.jsonl" \
+            2> "$RUNNER_TEMP/vendor-evidence/clippy.log"; then
+            cat "$RUNNER_TEMP/vendor-evidence/clippy.log"
+            exit 1
+          fi
+        timeout-minutes: 60
+      - name: nextest
+        run: |
+          if ! cargo nextest run --cargo-message-format json \
+            --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings \
+            > "$RUNNER_TEMP/vendor-evidence/nextest-cargo.jsonl" \
+            2> "$RUNNER_TEMP/vendor-evidence/nextest.log"; then
+            cat "$RUNNER_TEMP/vendor-evidence/nextest.log"
+            exit 1
+          fi
+        timeout-minutes: 120
+      - name: Test inventory
+        run: |
+          cargo nextest list --profile ci --workspace --locked --cargo-profile test \
+            --message-format json > "$RUNNER_TEMP/vendor-evidence/test-list.json" \
+            2> "$RUNNER_TEMP/vendor-evidence/list.log"
+      - name: doctest
+        run: cargo test --workspace --doc --locked -q
+        timeout-minutes: 30
+      - name: Native packaging regressions
+        run: |
+          python3 packaging/macos/test_pipeline.py
+          python3 packaging/homebrew/test_release.py
+      - name: Collect evidence
+        if: always()
+        run: python3 packaging/vendor_cache.py collect --directory "$RUNNER_TEMP/vendor-evidence"
+      - name: Upload evidence before cache post-cleanup
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: vendor-cache-${{ inputs.case }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/vendor-evidence/
+          if-no-files-found: error
+          retention-days: 14
