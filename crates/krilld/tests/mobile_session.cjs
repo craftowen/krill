@@ -223,6 +223,7 @@ async function main(){
  await testPromptDraftAndInactiveMenu();
  await testHybridChatToggleAndQuestionCards();
  await testInstantCreate();
+ await require('./mobile_quick_commands.cjs').main(fixture);
  console.log('PASS Hybrid Chat visibility, chat_poll cards, historical answers remain notes until Terminal review, and current diff modal');
 }
 // 새 세션은 누르는 즉시 /s/new로 옮기고, 응답이 오면 그 자리를 새 세션으로 바꾼다. 스냅샷을 기다리지 않고, 아직 스냅샷에 없는 새 세션 때문에 다른 세션으로 튀지 않는다.

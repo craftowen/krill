@@ -387,7 +387,7 @@ button.account-row:disabled{opacity:1}
 .terminal-latest::before{content:'↓';margin-right:var(--space-sm)}
 .terminal-history-controls{flex-wrap:wrap}.history-status{overflow-wrap:anywhere}
 /* Keep Safari's invisible input at the keyboard dock, inside the viewport. */
-.live-capture{top:auto;bottom:0;left:0;min-height:1px;max-height:1px;padding:0;border:0;outline:none;color:transparent;caret-color:transparent;background:transparent;clip-path:inset(50%);overflow:hidden;white-space:nowrap;pointer-events:none;resize:none}
+.live-capture{top:50%;bottom:auto;left:12px;min-height:1px;max-height:1px;padding:0;border:0;outline:none;color:transparent;caret-color:transparent;background:transparent;clip-path:inset(50%);overflow:hidden;white-space:nowrap;pointer-events:none;resize:none}
 @media(max-width:599px){
  .terminal-mount[data-input-mode=buffered] .direct-toggle{font-family:inherit}
  .session .terminal-frame{padding:var(--space-xs) var(--space-xs) 0}
@@ -433,11 +433,25 @@ button.account-row:disabled{opacity:1}
 #mobile-app .session .command-dock .live-input-copy{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;min-width:0;flex:1}
 #mobile-app .session .command-dock .live-input-copy strong{font-size:calc(12px * var(--ui-scale,1));font-weight:600;line-height:1.15;color:var(--foreground);white-space:nowrap;flex:none}
 #mobile-app .session .command-dock .live-input-copy small{font:calc(12px * var(--ui-scale,1))/1.15 var(--font-mono);color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;min-width:0}
+/* Live ACK feedback belongs in the reserved input box; never resize the terminal for each ACK. */
+.terminal-mount[data-input-mode=direct][data-phase=input-pending] .terminal-status{display:none}
+#mobile-app .session .command-dock .live-input-copy strong{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+#mobile-app .session .command-dock .live-input-copy small[data-preview=true]{display:block;align-self:stretch;text-overflow:clip;white-space:pre}
 #mobile-app .session .command-dock :is(.photo-attach,.command-send){width:36px;height:36px;min-width:36px;min-height:36px;border-radius:17px;padding:0;display:grid;place-items:center;flex:none}
 #mobile-app .session .command-dock .photo-attach{background:var(--surface-raised);color:var(--muted-foreground)}
 #mobile-app .session .command-dock .command-send{background:var(--foreground);color:var(--surface-base)}
 #mobile-app .session .command-dock :is(.photo-attach,.command-send) svg{width:16px;height:16px}
 #mobile-app .session .buffered-command>.command-input{min-height:36px;height:36px;max-height:108px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-raised)}
+.quick-command-content{display:flex;flex-direction:column;gap:8px;min-width:0}
+.quick-command-form{display:flex;flex-direction:column;gap:8px;min-width:0}
+#mobile-app .quick-command-search{flex:none;width:100%;min-width:0;min-height:44px;font-size:calc(16px * var(--ui-scale,1))}
+#mobile-app .sheet .quick-command-hint{margin:0;padding:0 4px;font-size:var(--font-meta)}
+.quick-command-results{display:flex;flex-direction:column;gap:6px;max-height:38dvh;overflow:auto;overscroll-behavior:contain;min-width:0}
+#mobile-app .quick-command-result{display:flex;align-items:center;gap:8px;text-align:left;min-width:0;min-height:52px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised)}
+.quick-command-source{font-size:var(--font-meta);color:var(--muted-foreground)}
+.quick-command-description{font-size:var(--font-meta);color:var(--muted-foreground);overflow-wrap:anywhere;white-space:normal}
+.quick-command-added{flex:none;font-size:var(--font-meta);color:var(--muted-foreground)}
+#mobile-app .quick-command-custom{min-height:44px}
 .quick-commands-list{display:flex;flex-direction:column;gap:6px;max-height:45dvh;overflow-y:auto}
 .quick-command-row{display:flex;align-items:center;gap:4px;padding:4px 4px 4px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised)}
 #mobile-app .quick-command-run{flex:1;min-width:0;min-height:36px;padding:6px 4px;text-align:left;display:flex;align-items:center}
@@ -554,7 +568,6 @@ button.account-row:disabled{opacity:1}
 .worktree-advanced-toggle.open svg{transform:rotate(180deg)}
 .worktree-actions{display:flex;justify-content:flex-end;padding-top:4px}
 .worktree-submit{min-height:44px;padding:10px 18px;border-radius:12px;font-weight:600}
-.live-preview{position:absolute;left:var(--space-md);right:var(--space-md);bottom:calc(100% + 4px);z-index:4;margin:0;max-height:4.5em;overflow:hidden;pointer-events:none;box-shadow:0 4px 12px rgba(0,0,0,.28);padding:4px 10px;background:var(--surface-raised);border-top:1px solid var(--border);color:var(--foreground);font:var(--font-meta) var(--font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
 .chat-ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:4px}.chat-quote{margin:0;padding:4px 10px;border-left:2px solid var(--border);color:var(--muted-foreground)}.chat-table{width:100%;border-collapse:collapse;font-size:var(--font-meta)}.chat-table th,.chat-table td{padding:6px 8px;border:1px solid var(--border);text-align:left}.chat-photo-thumb{width:40px;height:40px;object-fit:cover;border-radius:6px;border:1px solid var(--border);flex:none}
 .session-summary[data-reconnectable=true]{cursor:pointer;text-decoration:underline}
 body:not([data-screen=session]) #notice{bottom:calc(16px + env(safe-area-inset-bottom) + var(--keyboard-inset,0px))}

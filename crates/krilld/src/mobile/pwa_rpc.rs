@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod command_catalog;
 mod requests;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -238,6 +239,10 @@ enum Action {
     Git {
         session: u64,
         path: Option<String>,
+    },
+    /// Selected session CLI skills and custom command metadata.
+    CommandCatalog {
+        session: u64,
     },
 }
 #[derive(Debug, Deserialize)]
@@ -647,7 +652,78 @@ impl Backend {
                 serde_json::from_slice(&output).map_err(io::Error::other)
             }
             Action::Git { session, path } => self.git(session, path.as_deref()),
+            Action::CommandCatalog { session } => self.command_catalog(session),
         }
+    }
+    fn command_catalog(&self, session: u64) -> io::Result<Value> {
+        let cwd = self.cwd(session)?;
+        let stored =
+            crate::agent::control::Control::new(self.dir.as_deref()).stored(SessionId(session))?;
+        let status = match self.control(&Request::States)? {
+            Reply::States(states) => states.into_iter().find(|s| s.session.0 == session),
+            _ => None,
+        };
+        let observed = status.as_ref().map(|s| &s.status);
+        let agent = observed
+            .map(|s| s.agent.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| stored.as_ref().map(|s| s.profile.as_str()))
+            .or_else(|| observed.and_then(|s| s.foreground.as_deref()))
+            .unwrap_or_default();
+        let raw = self
+            .dir
+            .as_ref()
+            .and_then(|dir| fs::read_to_string(dir.join(krill_proto::agent::FILE_NAME)).ok());
+        let agents = krill_proto::agent::Agents::load(raw.as_deref()).map_err(io::Error::other)?;
+        let profile = agents.resolve(agent).map(|(_, profile)| profile);
+        let program = profile
+            .and_then(krill_proto::agent::Profile::program)
+            .unwrap_or(agent);
+        let program = Path::new(program)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(agent);
+        let canonical = krill_proto::agent::canonical_id(agent);
+        let provider = if matches!(
+            canonical,
+            "claude" | "codex" | "agy" | "cursor" | "opencode" | "pi"
+        ) {
+            canonical
+        } else {
+            krill_proto::agent::canonical_id(program)
+        };
+        let key = match provider {
+            "claude" => "CLAUDE_CONFIG_DIR",
+            "codex" => "CODEX_HOME",
+            "opencode" => "OPENCODE_CONFIG_DIR",
+            "pi" => "PI_CODING_AGENT_DIR",
+            _ => "",
+        };
+        let config = stored
+            .as_ref()
+            .and_then(|s| s.account.as_ref())
+            .filter(|a| a.env_key == key && !a.dir.is_empty())
+            .map(|a| PathBuf::from(&a.dir))
+            .or_else(|| {
+                profile
+                    .and_then(|p| p.env.get(key))
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| {
+                std::env::var_os(key)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            });
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(invalid)?;
+        Ok(command_catalog::load(
+            &home,
+            &cwd,
+            provider,
+            config.as_deref(),
+        ))
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
         self.registry

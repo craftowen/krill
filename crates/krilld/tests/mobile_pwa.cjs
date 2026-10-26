@@ -126,7 +126,7 @@ for(let n=0;n<128;n++){const bytes=crypto.randomBytes(n);try{T.update(bytes,{col
 assert.equal(sandbox.KrillMobile.terminal.keys.length,24);
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
-const env={...process.env,KRILL_STATE_DIR:dir,HOME:home,TMPDIR:path.join(dir,'paste')};
+const env={...process.env,KRILL_STATE_DIR:dir,HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'.claude'),CODEX_HOME:path.join(home,'.codex'),TMPDIR:path.join(dir,'paste')};
 const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,webhookServer,files=[];
 const deadline=setTimeout(()=>{console.error('PWA E2E deadline exceeded');cleanup();process.exit(1);},150_000);
 function cli(args){return execFileSync(mk,args,{env,encoding:'utf8',timeout:20000,stdio:['ignore','pipe','pipe']}).trim();}
@@ -171,6 +171,9 @@ async function connect(url,credential){
   daemon=await new Promise((resolve,reject)=>{const socket=net.createConnection(path.join(dir,'run/krilld.sock'));let bytes=Buffer.alloc(0);socket.setTimeout(5000,()=>socket.destroy(Error('hello timeout')));socket.on('error',reject);socket.on('data',part=>{bytes=Buffer.concat([bytes,part]);if(bytes.length>=4&&bytes.length>=4+bytes.readUInt32LE()){const r=reader(bytes.subarray(5));r.u();r.u();r.u();r.text();resolve(Number(r.u()));socket.destroy();}});});
   const shell=`stty -echo; sleep 0.15; '${mk}' hook claude <'${dir}/waiting.json' >/dev/null; printf 'READY\\n'; while IFS= read -r line; do printf 'got:%s\\n' "$line"; done`;
   const session=Number(cli(['new','--cwd',repo,'--','/bin/sh','-c',shell]));await until(()=>cli(['read',String(session)]).includes('READY'));
+  for(const [file,content] of [['.claude/skills/mobile-check/SKILL.md','---\nname: mobile-check\ndescription: Project verification 한국어\n---\nPrivate instructions'],['.agents/skills/codex-only/SKILL.md','---\nname: codex-only\ndescription: Shared agent skill\n---'],['.claude/commands/mobile-review.md','---\ndescription: Review mobile changes\n---']]){const filePath=path.join(repo,file);fs.mkdirSync(path.dirname(filePath),{recursive:true});fs.writeFileSync(filePath,content);}
+  fs.appendFileSync(path.join(repo,'.git/info/exclude'),'\n.agents/\n.claude/\n');
+  const globalCommand=path.join(home,'.claude/commands/mobile-global.md');fs.mkdirSync(path.dirname(globalCommand),{recursive:true});fs.writeFileSync(globalCommand,'---\ndescription: Global mobile command\n---');
   const run=jsonCli(['orchestration','run-create','--title','Mobile run']);const runId=run.id||run.run_id||run.run?.id;assert(runId,JSON.stringify(run));
   const task=jsonCli(['orchestration','task-create','--run',runId,'--title','Mobile task']);
   const question=jsonCli(['orchestration','ask','--from','mobile-worker','--to','user','--run',runId,'--question','Proceed with fixture?']);
@@ -191,6 +194,10 @@ async function connect(url,credential){
     await until(()=>cli(['read',String(terminalSession)]).includes('LIVE RED'));
   }clearTimeout(deadline);fs.writeFileSync(metadata,JSON.stringify({dir,repo,url,session,terminalSession,extraSessions,base,daemon,gateId,profile}));console.log('Browser fixture ready');await new Promise(r=>process.once('SIGTERM',r));return;}
   phone=await connect(url);let data=await phone.rpc({action:'snapshot'});const same=await phone.rpc({action:'snapshot',since:data.etag});assert.deepEqual(same,{unchanged:true,etag:data.etag});const card=data.sessions.find(s=>s.id===session);assert(card);assert.equal(card.state,'Waiting');assert.equal(card.branch,'mobile-test');assert.equal(card.added,1);assert(card.lines.some(l=>l.includes('READY')));assert(data.orchestration.gates.some(g=>g.id===gateId));assert(data.orchestration.tasks.length>=1);assert(data.orchestration.questions.some(q=>q.id===question.id));assert(!data.orchestration.questions.some(q=>q.id===internalQuestion.id));
+  const commandCatalog=await phone.rpc({action:'command_catalog',session});assert.equal(commandCatalog.agent,'claude');assert(commandCatalog.items.some(c=>c.text==='/mobile-check'&&c.scope==='Project'));assert(commandCatalog.items.some(c=>c.text==='/mobile-review'&&c.kind==='Command'));assert(commandCatalog.items.some(c=>c.text==='/mobile-global'&&c.scope==='Global'));assert(!commandCatalog.items.some(c=>c.text==='/codex-only'));assert(!JSON.stringify(commandCatalog).includes('Private instructions'));
+  await assert.rejects(phone.rpc({action:'command_catalog',session:999999999}));await assert.rejects(phone.rpc({action:'command_catalog',session,cwd:'/tmp/forged'}));
+  const quickSaved=await phone.rpc({action:'set_quick_commands',commands:[{name:'mobile-check',text:'/mobile-check'}]});assert.equal(quickSaved.quick_commands[0].text,'/mobile-check');assert.equal((await phone.rpc({action:'snapshot'})).quick_commands[0].text,'/mobile-check');await phone.rpc({action:'set_quick_commands',commands:[]});
+  console.log('PASS real daemon CLI command catalog: scoped project/global metadata, safe invocation, forbidden session/path rejection and quick-command persistence');
   const latestChat=await phone.rpc({action:'chat_poll',session,latest:true});
   assert.equal(latestChat.items.at(-1).text,'MOBILE CHAT 1049');assert(latestChat.page_start>0);assert.equal(latestChat.has_earlier,true);
   const earlierChat=await phone.rpc({action:'chat_poll',session,latest:true,end_offset:latestChat.page_start});
