@@ -132,7 +132,7 @@ catalog! {
         USER => ("채팅 화면을 더 읽기 쉽게 정리해 주세요.\nKeep my terminal session running while we review the conversation.", "Make the chat easier to read.\nKeep my terminal session running while we review the conversation."),
         REASONING => ("먼저 메시지의 위계를 살펴보고, 대화와 도구 실행 내역을 구분하겠습니다.\nLong diagnostic details remain available when expanded.", "I will review the message hierarchy and separate conversation from tool activity.\nLong diagnostic details remain available when expanded."),
         TOOL_RESULT => ("Read complete. Message history and terminal remain attached.\n한글과 English가 섞인 긴 도구 출력도 펼쳐서 확인할 수 있습니다.", "Read complete. Message history and terminal remain attached.\nLong tool output can be expanded for review."),
-        ASSISTANT => ("대화 내용은 넓게 읽고, 도구 실행 과정은 필요한 때 펼칠 수 있도록 정리했습니다.\n\n```rust\nfn main() {\n    println!(\"안녕하세요, Krill!\");\n}\n```\n\nYou can copy this message or the code separately.", "Conversation stays readable while tool activity expands on demand.\n\n```rust\nfn main() {\n    println!(\"Hello, Krill!\");\n}\n```\n\nYou can copy this message or the code separately."),
+        ASSISTANT => ("대화 내용은 넓게 읽고, 도구 실행 과정은 필요한 때 펼칠 수 있도록 정리했습니다.\n\n```rust\nfn main() {\n    println!(\"Hello, Krill!\");\n}\n```\n\nYou can copy this message or the code separately.", "Conversation stays readable while tool activity expands on demand.\n\n```rust\nfn main() {\n    println!(\"Hello, Krill!\");\n}\n```\n\nYou can copy this message or the code separately."),
         QUESTION_TITLE => ("다음 확인 항목", "Next review"),
         REVIEW => ("화면 검토", "Review layout"),
         REVIEW_DESC => ("메시지와 입력창을 확인합니다.", "Inspect messages and the composer."),
