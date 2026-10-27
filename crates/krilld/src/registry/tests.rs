@@ -2515,3 +2515,106 @@ fn maybe_rename_from_hook_records_every_prompt_turn_while_preserving_first_title
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// foundation-02: 1MiB 프레임을 넘는 스냅샷(활성 task 12개 × 100KB)은 EOF가 아니라 명시 오류로 답하고
+/// 연결은 살아 있으며, 페이지 스냅샷은 같은 연결에서 디스크와 같은 저장소를 무손실로 돌려준다. 기능을
+/// 협상하지 않은(N-1) 피어의 페이지 요청은 `BadRequest`다.
+#[test]
+fn oversized_orchestration_snapshot_answers_explicitly_and_pages_losslessly() {
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, OrchAction, OrchResponse, OrchestrationStore,
+    };
+    let dir = std::env::temp_dir().join(format!("krill-orch-paged-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let mut store = OrchestrationStore::default();
+    let run = store
+        .create_run("verify_core independent synthetic snapshot", None)
+        .unwrap();
+    for i in 0..12_u8 {
+        let description = String::from_utf8(vec![b'A' + i; 100_000]).unwrap();
+        store
+            .create_task(&run.id, &format!("fixture-{i}"), &description, vec![])
+            .unwrap();
+    }
+    store.save(&dir).unwrap();
+    assert!(fs::metadata(dir.join("orchestration.json")).unwrap().len() > 1 << 20);
+    let serve = |features: u64| {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let dir = dir.clone();
+        let thread = std::thread::spawn(move || {
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            Registry::new(None, Some(&dir))
+                .serve(server, &hello)
+                .unwrap();
+        });
+        let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        ServerHello::decode(kind, &body).unwrap();
+        let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
+        hello.features = features;
+        client.write_all(&hello.encode().unwrap()).unwrap();
+        (client, thread)
+    };
+    let request = |client: &mut UnixStream, action: OrchAction| -> Reply {
+        client
+            .write_all(&Request::Orchestration(action).encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(client)
+            .unwrap()
+            .expect("daemon closed the stream instead of replying");
+        Reply::decode(kind, &body).unwrap()
+    };
+
+    let (mut client, thread) = serve(ipc::FEATURES);
+    // 구 CLI 경로: 단일 프레임 SnapshotV2는 EOF 대신 명시 오류이고 연결은 살아 있다.
+    match request(&mut client, OrchAction::SnapshotV2) {
+        Reply::Orchestration(OrchResponse::Error(msg)) => {
+            assert!(msg.contains(FRAME_LIMIT_ERROR), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // 새 CLI 경로: 같은 연결에서 페이지로 읽어 디스크와 같다.
+    let fetched = OrchestrationStore::fetch_paged(|generation, offset| {
+        match request(&mut client, OrchAction::SnapshotPage { generation, offset }) {
+            Reply::Orchestration(response) => Ok(response),
+            other => Err(io::Error::other(format!("{other:?}"))),
+        }
+    })
+    .unwrap();
+    assert_eq!(fetched, OrchestrationStore::load(&dir).unwrap());
+    assert_eq!(fetched.tasks.len(), 12);
+    assert!(fetched.tasks.iter().all(|t| t.description.len() == 100_000));
+    let check = OrchAction::CheckMessages {
+        recipient: Some("nobody".into()),
+        types: vec![],
+        unread_only: true,
+        ack: false,
+        wait_ms: 0,
+        run_id: None,
+        delivery_id: None,
+    };
+    assert!(matches!(
+        request(&mut client, check),
+        Reply::Orchestration(OrchResponse::Delivery { delivery: None, messages }) if messages.is_empty()
+    ));
+    drop(client);
+    thread.join().unwrap();
+
+    let (mut old, thread) = serve(ipc::FEATURES & !FEAT_ORCH_SNAPSHOT_PAGE);
+    let page = OrchAction::SnapshotPage {
+        generation: None,
+        offset: 0,
+    };
+    assert_eq!(request(&mut old, page), Reply::Failed(Failure::BadRequest));
+    drop(old);
+    thread.join().unwrap();
+    fs::remove_dir_all(dir).ok();
+}

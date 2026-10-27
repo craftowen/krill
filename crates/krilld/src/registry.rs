@@ -824,6 +824,11 @@ impl Registry {
                 )) if n.features & krill_proto::orchestration::FEAT_ORCH_RETAIN == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::Orchestration(
+                    krill_proto::orchestration::OrchAction::SnapshotPage { .. },
+                )) if n.features & krill_proto::orchestration::FEAT_ORCH_SNAPSHOT_PAGE == 0 => {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(Request::RemoteFs(_)) if n.features & control::FEAT_REMOTE_FS == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
@@ -858,6 +863,10 @@ impl Registry {
                 Ok(req) if role == Role::Observer && !read_only(&req) => {
                     Reply::Failed(Failure::Denied)
                 }
+                // 페이지 내용은 이 연결의 협상 기능으로 내려 보내야 하므로 여기서 다룬다.
+                Ok(Request::Orchestration(
+                    krill_proto::orchestration::OrchAction::SnapshotPage { generation, offset },
+                )) => self.orchestration_page(&peer, generation, offset, n.features),
                 Ok(req) => self.handle_as(&peer, &client.name, req, &mut clients),
                 Err(_) => Reply::Failed(Failure::BadRequest),
             };
@@ -867,7 +876,16 @@ impl Registry {
                 }
                 reply => reply,
             };
-            let sent = s.write_all(&reply.encode()?);
+            let frame = match reply.encode() {
+                Ok(frame) => frame,
+                // 1MiB 프레임을 넘는 응답은 스트림을 닫지 않고 N-1 와이어의 작은 명시 오류로 바꾼다
+                // (foundation-02). 클라이언트는 EOF 대신 이유를 받고 페이지 스냅샷·디스크 읽기로 넘어간다.
+                Err(krill_proto::ipc::Error::BadLength(bytes)) => {
+                    oversized_reply(&reply, bytes).encode()?
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let sent = s.write_all(&frame);
             if reply == Reply::Upgrade(control::Upgraded::Started)
                 || (restart && matches!(reply, Reply::Resources(_)))
             {
@@ -2834,6 +2852,43 @@ impl Registry {
         }
     }
 
+    /// `FEAT_ORCH_SNAPSHOT_PAGE` 요청 하나. 범위 검사는 [`Self::orchestration`]과 같다.
+    fn orchestration_page(
+        &self,
+        peer: &Peer,
+        generation: Option<u64>,
+        offset: u32,
+        features: u64,
+    ) -> Reply {
+        if matches!(peer.scope, Scope::Restricted) {
+            peer.deny("orchestration", &self.audit);
+            return Reply::Failed(Failure::Denied);
+        }
+        Reply::Orchestration(self.snapshot_page_response(generation, offset, features))
+    }
+
+    /// 단일 프레임 `SnapshotV2`와 같은 바이트(`features`로 내린 뒤 postcard)의 한 조각. 페이지마다 다시
+    /// 직렬화해 세대(바이트 해시)를 비교하므로 핀 캐시 없이도(데몬 메모리 상한 안) 바뀐 저장소의 조각이
+    /// 섞이지 않는다.
+    // ponytail: 페이지마다 재직렬화(≤2MiB, 수 ms). 느리면 orch_cache에 (stamp, features)별 바이트를 캐시한다.
+    fn snapshot_page_response(
+        &self,
+        generation: Option<u64>,
+        offset: u32,
+        features: u64,
+    ) -> krill_proto::orchestration::OrchResponse {
+        use krill_proto::orchestration::{OrchResponse, snapshot_page};
+        self.orchestration_snapshot()
+            .and_then(|store| {
+                postcard::to_stdvec(&OrchResponse::SnapshotV2(store).for_features(features))
+                    .map_err(io::Error::other)
+            })
+            .map_or_else(
+                |e| OrchResponse::Error(e.to_string()),
+                |bytes| snapshot_page(&bytes, generation, offset),
+            )
+    }
+
     pub(crate) fn dashboard_tail(&self, id: SessionId) -> Option<Vec<String>> {
         let tap = lock(&self.state)
             .sessions
@@ -3177,6 +3232,10 @@ impl Registry {
         let res: io::Result<OrchResponse> = match action {
             OrchAction::Snapshot => self.orchestration_snapshot().map(OrchResponse::Snapshot),
             OrchAction::SnapshotV2 => self.orchestration_snapshot().map(OrchResponse::SnapshotV2),
+            // 제어 루프가 협상 기능과 함께 먼저 처리한다. 직접 호출은 이 빌드의 전체 기능으로 답한다.
+            OrchAction::SnapshotPage { generation, offset } => {
+                Ok(self.snapshot_page_response(generation, offset, krill_proto::ipc::FEATURES))
+            }
             OrchAction::SetCurrentRunLegacy { .. } | OrchAction::CheckMessagesLegacy { .. } => {
                 Err(io::Error::other("legacy action normalization failed"))
             }
@@ -3417,6 +3476,18 @@ impl Registry {
                             .cloned()
                     });
                     if let Some(ans) = found {
+                        // 예산 도입 전의 초과 답장은 확인 처리 전에 명시 오류로 끝낸다(인코딩 실패 뒤 ACK 금지).
+                        if !krill_proto::orchestration::response_fits_frame(&OrchResponse::Answer(
+                            Some(ans.clone()),
+                        )) {
+                            break Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "answer {} exceeds the IPC frame limit; read it with `inbox --all --json`",
+                                    ans.id
+                                ),
+                            ));
+                        }
                         let ans_id = ans.id.clone();
                         drop(OrchestrationStore::mutate(&dir, |s| {
                             for m in &mut s.messages {
@@ -3529,6 +3600,18 @@ fn os(e: &io::Error) -> Failure {
     Failure::Os(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
+/// [`krill_proto::ipc::MAX_FRAME`]을 넘는 `reply`(본문 `bytes`) 대신 보내는 작은 응답. 어떤 Reply 종류든
+/// 스트림을 닫지 않고, 기존 와이어 variant만 써서 N-1 클라이언트도 읽는다.
+fn oversized_reply(reply: &Reply, bytes: u64) -> Reply {
+    if matches!(reply, Reply::Orchestration(_)) {
+        Reply::Orchestration(krill_proto::orchestration::OrchResponse::Error(
+            krill_proto::orchestration::frame_limit_error(bytes),
+        ))
+    } else {
+        Reply::Failed(Failure::Os(libc::EMSGSIZE))
+    }
+}
+
 fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
     if let Ok(text) = std::str::from_utf8(cwd) {
         let cleaned = krill_proto::orchestration::clean_workspace_path_str(text);
@@ -3618,6 +3701,7 @@ fn read_only(req: &Request) -> bool {
             | Request::Orchestration(
                 krill_proto::orchestration::OrchAction::Snapshot
                     | krill_proto::orchestration::OrchAction::SnapshotV2
+                    | krill_proto::orchestration::OrchAction::SnapshotPage { .. }
                     | krill_proto::orchestration::OrchAction::CheckMessagesLegacy {
                         ack: false,
                         ..
@@ -3704,6 +3788,72 @@ mod orchestration_delivery_tests {
                 );
             }
         }
+        std::fs::remove_dir_all(dir)
+    }
+
+    /// foundation-02: 예산 도입 전의 초과 답장(>1MiB)은 확인 처리 전에 명시 오류로 끝난다(ACK 없음).
+    #[test]
+    fn oversized_legacy_answer_is_reported_before_acknowledging() -> io::Result<()> {
+        use krill_proto::orchestration::{OrchMessage, OrchResponse};
+        let dir =
+            std::env::temp_dir().join(format!("krill-answer-oversize-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let question = OrchestrationStore::mutate(&dir, |s| {
+            s.send_message(&SendParams {
+                from: "worker".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Question,
+                summary: "question".into(),
+                body: String::new(),
+                run_id: None,
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })
+            .map(|messages| messages[0].clone())
+        })?;
+        OrchestrationStore::mutate(&dir, |s| {
+            s.messages.push(OrchMessage {
+                id: "msg-legacy-answer".into(),
+                run_id: None,
+                task_id: None,
+                dispatch_id: None,
+                from: "coordinator".into(),
+                to: "worker".into(),
+                msg_type: MessageType::Answer,
+                summary: "answer".into(),
+                body: "y".repeat(1_100_000),
+                reply_to: Some(question.id.clone()),
+                acked: false,
+                created_at_ms: 2,
+            });
+            Ok(())
+        })?;
+        let reg = Registry::new(None, Some(&dir));
+        let reply = reg
+            .orchestration(
+                &Peer {
+                    pid: None,
+                    scope: Scope::Full,
+                },
+                OrchAction::WaitAnswer {
+                    question_id: question.id,
+                    wait_ms: 0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            reply,
+            Reply::Orchestration(OrchResponse::Error(msg)) if msg.contains("exceeds")
+        ));
+        let stored = OrchestrationStore::load(&dir)?;
+        assert!(
+            stored
+                .messages
+                .iter()
+                .any(|m| m.id == "msg-legacy-answer" && !m.acked)
+        );
         std::fs::remove_dir_all(dir)
     }
 

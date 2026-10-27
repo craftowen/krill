@@ -16,9 +16,10 @@ use krill_proto::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
-    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchSessionOrigin, DispatchStatus, GateStatus,
-    MessageType, OrchAction, OrchResponse, OrchestrationStore, Run, SendParams, TaskStatus,
-    WorkerOperation, WorkerStartSpec, worker_preamble,
+    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchSessionOrigin, DispatchStatus,
+    FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType, OrchAction, OrchResponse,
+    OrchestrationStore, Run, SendParams, TaskStatus, WorkerOperation, WorkerStartSpec,
+    worker_preamble,
 };
 use krill_proto::screen::Msg;
 
@@ -103,6 +104,15 @@ impl<'a> OrchCtx<'a> {
     /// `krilld` socket is active for `daemon::state_dir()`. Returns `Ok(None)` when local
     /// and no daemon is listening so unit tests and offline invocations can use disk fallback.
     fn try_ipc(&self, action: &OrchAction, timeout: Duration) -> io::Result<Option<OrchResponse>> {
+        let Some(mut conn) = self.connect_ipc()? else {
+            return Ok(None);
+        };
+        self.request_ipc(&mut conn, action, timeout)
+    }
+
+    /// Opens one orchestration connection (see [`Self::try_ipc`]); `Ok(None)` means local without a
+    /// listening daemon. The control connection serves several requests, so paged reads reuse it.
+    fn connect_ipc(&self) -> io::Result<Option<krill_proto::daemon::Connection>> {
         let is_remote = self.is_remote();
         if !is_remote && daemon::state_dir().as_deref() != Some(self.state_dir) {
             return Ok(None);
@@ -115,7 +125,7 @@ impl<'a> OrchCtx<'a> {
             },
         };
         let hello = daemon::client_hello(ClientRole::Cli, "krill");
-        let mut conn = if is_remote {
+        let conn = if is_remote {
             target
                 .connect(&hello)
                 .map_err(|e| io::Error::other(e.to_string()))?
@@ -134,6 +144,18 @@ impl<'a> OrchCtx<'a> {
             }
             return Ok(None);
         }
+        Ok(Some(conn))
+    }
+
+    /// One request on an open connection. `Ok(None)`: an older local daemon rejected a legacy
+    /// opcode, so the caller may apply the same change on disk (never for `requires_v2` opcodes).
+    fn request_ipc(
+        &self,
+        conn: &mut krill_proto::daemon::Connection,
+        action: &OrchAction,
+        timeout: Duration,
+    ) -> io::Result<Option<OrchResponse>> {
+        let is_remote = self.is_remote();
         if matches!(action, OrchAction::RetainWorker { .. })
             && conn.negotiated.features & krill_proto::orchestration::FEAT_ORCH_RETAIN == 0
         {
@@ -168,14 +190,59 @@ impl<'a> OrchCtx<'a> {
         }
     }
 
+    /// Read-only snapshot. A daemon with `FEAT_ORCH_SNAPSHOT_PAGE` streams it in bounded pages so
+    /// a valid store larger than one IPC frame is still read losslessly. An older daemon serves one
+    /// `SnapshotV2` frame; if that frame cannot fit (EOF from a prior build, or the explicit frame-limit
+    /// error), a local caller reads the same `orchestration.json` the daemon serves — read-only, never
+    /// for mutations — while a remote caller gets an explicit error instead of any local state.
     fn load_store(&self) -> io::Result<OrchestrationStore> {
-        if let Some(OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store)) =
-            self.try_ipc(&OrchAction::SnapshotV2, Duration::from_secs(2))?
-        {
-            return Ok(store);
+        let Some(mut conn) = self.connect_ipc()? else {
+            return OrchestrationStore::load(self.state_dir);
+        };
+        let timeout = Duration::from_secs(2);
+        let fetched = if conn.negotiated.features & FEAT_ORCH_SNAPSHOT_PAGE != 0 {
+            OrchestrationStore::fetch_paged(|generation, offset| {
+                self.request_ipc(
+                    &mut conn,
+                    &OrchAction::SnapshotPage { generation, offset },
+                    timeout,
+                )?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "update krilld for orchestration v2",
+                    )
+                })
+            })
+        } else {
+            match self.request_ipc(&mut conn, &OrchAction::SnapshotV2, timeout) {
+                Ok(Some(OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store))) => {
+                    Ok(store)
+                }
+                Ok(Some(_)) => Err(io::Error::other("unexpected orchestration reply")),
+                Ok(None) => return OrchestrationStore::load(self.state_dir),
+                Err(e) => Err(e),
+            }
+        };
+        match fetched {
+            Err(e) if snapshot_unavailable(&e) => {
+                if self.is_remote() {
+                    Err(io::Error::other(format!(
+                        "remote orchestration state exceeds the IPC frame limit; update the remote krilld ({e})"
+                    )))
+                } else {
+                    OrchestrationStore::load(self.state_dir)
+                }
+            }
+            other => other,
         }
-        OrchestrationStore::load(self.state_dir)
     }
+}
+
+/// A single-frame snapshot that an older daemon could not deliver: a prior build closes the stream
+/// (EOF) and the current build answers with the frame-limit error. Nothing else qualifies.
+fn snapshot_unavailable(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::UnexpectedEof || e.to_string().contains(FRAME_LIMIT_ERROR)
 }
 
 fn classify_orch_error(msg: String) -> io::Error {
@@ -4248,5 +4315,33 @@ mod delivery_and_launch_cli_tests {
         assert_eq!(fenced.session_id, Some(1234));
         assert_eq!(fenced.status, DispatchStatus::Abandoned);
         std::fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_fallback_tests {
+    use super::*;
+
+    /// foundation-02: 읽기 전용 디스크 fallback(로컬)·명시 오류(원격)는 구 데몬의 단일 프레임 초과 신호
+    /// 두 가지(이전 빌드의 EOF, 현재 빌드의 프레임 상한 오류)에만 반응한다.
+    #[test]
+    fn snapshot_unavailable_matches_only_prior_daemon_overflow_signals() {
+        assert!(snapshot_unavailable(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(snapshot_unavailable(&io::Error::new(
+            io::ErrorKind::InvalidInput,
+            krill_proto::orchestration::frame_limit_error(1_204_357),
+        )));
+        assert!(!snapshot_unavailable(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "run not found"
+        )));
+        assert!(!snapshot_unavailable(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+        assert!(!snapshot_unavailable(&io::Error::other(
+            "orchestration snapshot kept changing while paging; retry"
+        )));
     }
 }

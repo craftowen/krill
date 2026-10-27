@@ -158,6 +158,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_ACCOUNT_POLICY | `1 << 61` | `krill_proto::usage::policy` (`Create.account` 선택 꼬리·고급 자동전환 정책·전환 이력·모델별 주간 창, MK-152·OWE-712 지휘자 배정; 구 피어에는 꼬리 생략) |
 | FEAT_ACCOUNT_CONNECTION | `1 << 62` | `krill_proto::usage::connections` (연결 상태·직접 사용량 설정 꼬리와 `SetDirectUsage`, OWE-719; 구 피어에는 꼬리 생략) |
 | FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가) |
+| FEAT_ORCH_SNAPSHOT_PAGE | `1 << 35` | `krill_proto::orchestration` (1MiB 프레임을 넘는 유효 저장소의 무손실 페이지 스냅샷 `OrchAction::SnapshotPage`(opcode 25)/`OrchResponse::SnapshotPage`(wire 14), foundation-02 지휘자 배정 2026-10-27; enum 끝에 추가, 미협상 피어에는 요청 금지) |
 
 OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisioning`은 미출시 `FEAT_USAGE_MANAGE`(`1 << 59`)에 포함한다(새 비트 없음, 미협상 피어에 요청 금지).
 
@@ -212,7 +213,7 @@ Resource Manager(MK-071)는 control에 `Request::Resources(Action)`·`Reply::Res
 
 **예약 번호 범위**: 기능 비트 `1 << 27`~`1 << 29`, kind 클라→데몬 `0x1A`~`0x1F`·데몬→클라 `0x2E`~`0x2F`. (`control` Request/Reply enum은 postcard 순차 인덱스라 끝에만 추가하며 현재 Request 0..=26, Reply 0..=30까지 배정됨).
 
-오케스트레이션의 `Request::Orchestration` 내부 opcode는 기존 0..15를 유지한다. 16은 Run 필터 메시지 조회, 17은 메시지 ID별 ACK이며, v0.1.46의 구성된 워커 시작·실행·실패 기록·세션별 Run 선택·배치 조회·확장 스냅샷·워커 관리 요청은 18..24에 덧붙인다. 새 요청이 구버전 데몬에서 거부되면 같은 변경을 디스크로 재실행하지 않는다. 기존 `Snapshot`·`Dispatch` 응답은 N-1 postcard 구조를 고정한 별도 wire 타입으로 직렬화하며, 배달 영수증과 확장 스냅샷·디스패치는 새 응답 variant로만 보낸다. 배치 ACK는 조회 시 고정한 메시지 ID만 확인 처리해 나중에 도착한 메시지를 소비하지 않는다. 워커 해제는 실행 상태·세션 소유권을 먼저 확인하며, 빌린 세션이나 다른 디스패치로 재배정된 PTY를 닫지 않는다.
+오케스트레이션의 `Request::Orchestration` 내부 opcode는 기존 0..15를 유지한다. 16은 Run 필터 메시지 조회, 17은 메시지 ID별 ACK이며, v0.1.46의 구성된 워커 시작·실행·실패 기록·세션별 Run 선택·배치 조회·확장 스냅샷·워커 관리 요청은 18..24에 덧붙인다. 25는 페이지 스냅샷(`FEAT_ORCH_SNAPSHOT_PAGE`)이며 응답 variant 14로만 답한다: 데몬은 단일 프레임 `SnapshotV2`와 같은 바이트를 512KiB 조각으로 주고, 조각마다 세대(바이트 해시)를 비교해 저장소가 바뀐 조각을 섞지 않는다. 1MiB 프레임을 넘는 응답은 어떤 Reply든 연결을 끊지 않고 `OrchResponse::Error`(오케스트레이션)·`Failure::Os(EMSGSIZE)`(그 밖)로 답한다. `check` 배달은 건수 50과 바이트 예산 512KiB 안에서만 확인 처리하고(메시지 하나는 summary+body 256KiB 이하), 예산 밖 메시지는 다음 배치로 넘긴다. 새 요청이 구버전 데몬에서 거부되면 같은 변경을 디스크로 재실행하지 않는다. 기존 `Snapshot`·`Dispatch` 응답은 N-1 postcard 구조를 고정한 별도 wire 타입으로 직렬화하며, 배달 영수증과 확장 스냅샷·디스패치는 새 응답 variant로만 보낸다. 배치 ACK는 조회 시 고정한 메시지 ID만 확인 처리해 나중에 도착한 메시지를 소비하지 않는다. 워커 해제는 실행 상태·세션 소유권을 먼저 확인하며, 빌린 세션이나 다른 디스패치로 재배정된 PTY를 닫지 않는다.
 
 **kind 확장 범위(2026-10-15)**: `0x10`~`0x1F`·`0x20`~`0x2F`가 차서 새 전용 kind는 클라→데몬 `0x40`~, 데몬→클라 `0x60`~를 배정한다. control enum에 빈 번호를 채우는 예약 변형(`#[serde(skip)]`)은 금지 — 직렬화·역직렬화 변형 번호가 어긋날 수 있다.
 
