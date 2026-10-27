@@ -2216,3 +2216,115 @@ fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppC
     drop(UnixStream::connect(&sock_path));
     daemon.join().ok();
 }
+
+/// APP-RUNTIME-004: `layout_loading` 중에 파일을 열어 에디터를 띄우고 저장하지 않은 내용을 입력한 뒤
+/// `restore_layout`이 끝나도, 미저장 버퍼·더티 상태·`EditorState` 이벤트 구독 콜백과 이후 `Cmd+S` 저장까지
+/// 모두 같은 파일 탭을 가리키며 복원된 저장본 탭과 `PaneId`가 충돌하지 않는다.
+#[gpui::test]
+fn early_file_editor_unsaved_buffer_and_subscription_survive_startup_restore(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("startup-early-editor");
+    let saved_file = dir.0.join("saved.rs");
+    let early_file = dir.0.join("early.rs");
+    fs::write(&saved_file, "const SAVED: usize = 1;\n").unwrap();
+    fs::write(&early_file, "fn main() {}\n").unwrap();
+
+    let path = state_path("startup-early-editor-layout");
+    let mut saved = krill_app::layout::Layout::default();
+    let saved_term = saved.focused().unwrap();
+    saved.set_session(saved_term, krill_proto::SessionId(7));
+    let saved_editor_pane = saved.open_file(saved_file.clone());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::shell::bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut shell = crate::shell::Shell::new_with_restore_gate(Some(path.clone()), gate, cx);
+        assert!(shell.layout_loading);
+        shell.open_file(early_file.clone(), cx);
+        shell
+    });
+    cx.run_until_parked();
+
+    let (early_pane, editor_entity_before) = view.read_with(cx, |shell, _| {
+        assert!(shell.layout_loading);
+        let pane = shell.layout.active_tab().focused;
+        let entity_id = shell.files.tabs[&pane].editor().unwrap().entity_id();
+        (pane, entity_id)
+    });
+    assert_eq!(
+        early_pane, saved_editor_pane,
+        "early file tab originally collides with saved editor PaneId before saved-layout rekey"
+    );
+    assert_eq!(editor_text(&view, early_pane, cx), "fn main() {}\n");
+
+    cx.simulate_input("// unsaved\n");
+    assert_eq!(
+        editor_text(&view, early_pane, cx),
+        "// unsaved\nfn main() {}\n"
+    );
+    assert!(dirty(&view, early_pane, cx));
+
+    // 이제 백그라운드 레이아웃 복원이 끝난다.
+    release.send(()).unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.layout_loading);
+        assert_eq!(shell.layout.tabs().len(), 3);
+        assert_eq!(shell.layout.active(), 2);
+        assert_eq!(shell.layout.tab_panes(2), vec![early_pane]);
+        assert_ne!(shell.layout.tab_panes(1)[0], early_pane);
+        assert_eq!(
+            shell.layout.file(shell.layout.tab_panes(1)[0]),
+            Some(saved_file.as_path())
+        );
+        assert_eq!(
+            shell.files.tabs[&early_pane].editor().unwrap().entity_id(),
+            editor_entity_before,
+            "same EditorState entity must survive startup restore without reload"
+        );
+    });
+    assert_eq!(
+        editor_text(&view, early_pane, cx),
+        "// unsaved\nfn main() {}\n"
+    );
+    assert!(dirty(&view, early_pane, cx));
+
+    // 복원 뒤에 저장한 뒤 다시 입력해 EditorState 구독 콜백(file_edited)이 여전히 early_pane을 더티로 바꾸는지 검증한다.
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert!(!dirty(&view, early_pane, cx));
+    assert_eq!(
+        fs::read_to_string(&early_file).unwrap(),
+        "// unsaved\nfn main() {}\n"
+    );
+
+    cx.simulate_input("// post-restore\n");
+    assert!(
+        dirty(&view, early_pane, cx),
+        "EditorState subscription captured during layout_loading must still mark early_pane dirty"
+    );
+    assert_eq!(
+        editor_text(&view, early_pane, cx),
+        "// unsaved\n// post-restore\nfn main() {}\n"
+    );
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert!(!dirty(&view, early_pane, cx));
+    assert_eq!(
+        fs::read_to_string(&early_file).unwrap(),
+        "// unsaved\n// post-restore\nfn main() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved_file).unwrap(),
+        "const SAVED: usize = 1;\n"
+    );
+}

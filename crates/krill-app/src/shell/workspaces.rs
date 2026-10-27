@@ -8,6 +8,8 @@ use std::path::Path;
 #[cfg(all(test, unix))]
 mod tests;
 
+const MAX_STARTUP_WORKSPACES: usize = 64;
+
 #[derive(Clone, Debug, Eq)]
 pub(super) struct Workspace {
     pub(super) host: HostId,
@@ -89,47 +91,126 @@ impl Shell {
                 }
             });
         }
-        let sidebar = self.sidebar.read(cx);
-        // Preserve explicit close intent across disconnected or stale relists.
-        let Some((host, folder)) = sidebar.selected_workspace().or_else(|| {
-            // A restored layout can be ready before sidebar selection is
-            // restored (or selection can be empty). Reconcile the workspace
-            // already on screen without requiring a sidebar click first.
-            self.tab_workspace(self.layout.active(), cx)
-                .map(|workspace| (workspace.host, workspace.folder))
-        }) else {
-            return;
-        };
-        let workspace = Workspace {
-            host: host.clone(),
-            folder: folder.clone(),
-        };
-        // Create can appear in the daemon list before its reply reaches the
-        // launching pane. Wait for that pane's ID before importing missing IDs.
-        // A pane whose Create reply was lost never receives it, so import instead.
-        if self.live.keys().any(|pane| {
-            self.layout.session(*pane).is_none()
-                && !self.outcome_unknown.contains_key(pane)
-                && self.layout.file(*pane).is_none()
-                && self.pane_workspace(*pane, cx).as_ref() == Some(&workspace)
-        }) {
-            return;
+        self.startup_reconcile_panes
+            .retain(|pane| self.layout.pane_exists(*pane));
+        let primary = self
+            .sidebar
+            .read(cx)
+            .selected_workspace()
+            .map(|(host, folder)| Workspace { host, folder })
+            .or_else(|| {
+                // A restored layout can be ready before sidebar selection is
+                // restored (or selection can be empty). Reconcile the workspace
+                // already on screen without requiring a sidebar click first.
+                self.tab_workspace(self.layout.active(), cx)
+            });
+        let mut targets = Vec::new();
+        if let Some(ws) = &primary {
+            targets.push(ws.clone());
         }
-        let existing = self.layout.sessions_for_host(&host);
-        let missing: Vec<_> = sidebar
-            .live_sessions_in_workspace(&host, &folder)
-            .into_iter()
-            .filter(|session| {
-                !existing.contains(session)
-                    && !self.workspace_closing.contains(&(host.clone(), *session))
-            })
-            .collect();
-        if missing.is_empty() {
+        for &pane in &self.startup_reconcile_panes {
+            if let Some(ws) = self.pane_workspace(pane, cx)
+                && !targets.contains(&ws)
+            {
+                targets.push(ws);
+            }
+        }
+        if targets.is_empty() {
             return;
         }
         let active = self.layout.active();
         let focused = self.layout.focused();
+        let mut imported = false;
+        let mut imported_primary = false;
+        for workspace in &targets {
+            let added = self.import_missing_workspace_sessions(workspace, cx);
+            if added && primary.as_ref() == Some(workspace) {
+                imported_primary = true;
+            }
+            imported |= added;
+        }
+        if !self.startup_reconcile_panes.is_empty() {
+            let pending = std::mem::take(&mut self.startup_reconcile_panes);
+            for pane in pending {
+                if !self.startup_pane_settled(pane, cx) {
+                    self.startup_reconcile_panes.push(pane);
+                }
+            }
+        }
+        if !imported {
+            return;
+        }
+        if let Some(focused) = focused {
+            self.layout.activate(active);
+            self.layout.focus(focused);
+        } else if imported_primary {
+            self.sync(cx);
+        } else {
+            self.layout.deactivate();
+        }
+        self.save();
+        self.refresh_detached(cx);
+        cx.notify();
+    }
+
+    pub(super) fn enqueue_startup_workspaces(
+        &mut self,
+        saved_tab_count: usize,
+        saved_active: usize,
+    ) {
+        self.startup_reconcile_panes.clear();
+        let order = (saved_active < saved_tab_count)
+            .then_some(saved_active)
+            .into_iter()
+            .chain((0..saved_tab_count).filter(|&i| i != saved_active));
+        for index in order {
+            for pane in self.layout.tab_panes(index) {
+                if self.layout.file(pane).is_some() || self.startup_reconcile_panes.contains(&pane)
+                {
+                    continue;
+                }
+                if self.startup_reconcile_panes.len() >= MAX_STARTUP_WORKSPACES {
+                    return;
+                }
+                self.startup_reconcile_panes.push(pane);
+            }
+        }
+    }
+
+    fn workspace_awaiting_create(&self, workspace: &Workspace, cx: &App) -> bool {
+        // Create can appear in the daemon list before its reply reaches the
+        // launching pane. Wait for that pane's ID before importing missing IDs.
+        // A pane whose Create reply was lost never receives it, so import instead.
+        self.live.keys().any(|pane| {
+            self.layout.session(*pane).is_none()
+                && !self.outcome_unknown.contains_key(pane)
+                && self.layout.file(*pane).is_none()
+                && self.pane_workspace(*pane, cx).as_ref() == Some(workspace)
+        })
+    }
+
+    fn import_missing_workspace_sessions(&mut self, workspace: &Workspace, cx: &App) -> bool {
+        if self.workspace_awaiting_create(workspace, cx) {
+            return false;
+        }
+        let existing = self.layout.sessions_for_host(&workspace.host);
+        let missing: Vec<_> = self
+            .sidebar
+            .read(cx)
+            .live_sessions_in_workspace(&workspace.host, &workspace.folder)
+            .into_iter()
+            .filter(|session| {
+                !existing.contains(session)
+                    && !self
+                        .workspace_closing
+                        .contains(&(workspace.host.clone(), *session))
+            })
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
         let mut represented = existing;
+        let mut imported = false;
         for session in missing {
             if represented.contains(&session) {
                 continue;
@@ -137,30 +218,46 @@ impl Shell {
             self.layout
                 .new_tab_after(self.layout.tabs().len().saturating_sub(1));
             if let Some(pane) = self.layout.focused() {
-                self.layout.set_host(pane, host.clone());
+                self.layout.set_host(pane, workspace.host.clone());
                 self.layout.set_session(pane, session);
                 self.layout.set_launch(
                     pane,
                     Create {
                         account: None,
                         program: Program::Login,
-                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cwd: workspace.folder.as_os_str().as_bytes().to_vec(),
                         cols: pane::SIZE.0,
                         rows: pane::SIZE.1,
                     },
                 );
             }
             represented.push(session);
+            imported = true;
         }
-        if let Some(focused) = focused {
-            self.layout.activate(active);
-            self.layout.focus(focused);
-        } else {
-            self.sync(cx);
+        imported
+    }
+
+    fn startup_pane_settled(&self, pane: PaneId, cx: &App) -> bool {
+        let Some(workspace) = self.pane_workspace(pane, cx) else {
+            return true;
+        };
+        if self.workspace_awaiting_create(&workspace, cx) {
+            return false;
         }
-        self.save();
-        self.refresh_detached(cx);
-        cx.notify();
+        let sidebar = self.sidebar.read(cx);
+        if !sidebar.host_connected(&workspace.host) || !sidebar.host_has_trees(&workspace.host) {
+            return false;
+        }
+        if workspace.host.is_remote()
+            || !sidebar
+                .live_sessions_in_workspace(&workspace.host, &workspace.folder)
+                .is_empty()
+        {
+            return true;
+        }
+        self.layout
+            .session(pane)
+            .is_none_or(|sid| sidebar.session_on(&workspace.host, sid).is_some())
     }
 
     pub(super) fn open_saved_workspace(
@@ -271,7 +368,10 @@ impl Shell {
                         Ok(Some(new)) => {
                             this.observed_sessions.insert((HostId::Local, new));
                             if new != old {
-                                this.layout.rebind_session(&HostId::Local, old, new);
+                                for rebound in this.layout.rebind_session(&HostId::Local, old, new)
+                                {
+                                    this.drop_stale_pastes_for_pane(rebound, Some(new), cx);
+                                }
                                 this.save();
                             }
                             new

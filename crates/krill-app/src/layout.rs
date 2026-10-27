@@ -3,7 +3,7 @@
 //! gpui에 의존하지 않는다. UI 프레임워크가 바뀌어도(MK-002 잠정 결정) 이 모듈과 저장 파일은 그대로 쓴다.
 
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -1040,50 +1040,146 @@ impl Layout {
         id
     }
 
+    fn is_untouched_startup_tab(
+        &self,
+        index: usize,
+        tab: &Tab,
+        baseline: &Self,
+        retained_panes: &BTreeSet<PaneId>,
+        retained_tabs: &BTreeSet<usize>,
+    ) -> bool {
+        if !baseline.tabs.contains(tab) || retained_tabs.contains(&index) {
+            return false;
+        }
+        let mut leaves = Vec::new();
+        tab.root.leaves(&mut leaves);
+        leaves.into_iter().all(|pane| {
+            !retained_panes.contains(&pane)
+                && self.sessions.get(&pane) == baseline.sessions.get(&pane)
+                && self.launches.get(&pane) == baseline.launches.get(&pane)
+                && self.hosts.get(&pane) == baseline.hosts.get(&pane)
+                && self.files.get(&pane) == baseline.files.get(&pane)
+                && self.file_states.get(&pane) == baseline.file_states.get(&pane)
+                && self.respawn_cwds.get(&pane) == baseline.respawn_cwds.get(&pane)
+                && !self.zoomed.contains(&pane)
+                && self.preview.as_ref().is_none_or(|(p, _)| *p != pane)
+        })
+    }
+
     /// 시작 복원이 끝나기 전 임시 기본 레이아웃(`baseline`) 위에서 사용자가 만든 변경을 복원한 레이아웃(`self`)에
-    /// 합친다. 저장된 탭·분할·세션·파일·호스트 매핑은 그대로 두고, 로딩 중 새로 만든 탭은 뒤에 덧붙이며 칸 번호는
-    /// 충돌하지 않게 다시 매긴다. 시작 placeholder와 같은 탭은 버린다(붙을 세션이 없는 빈 칸이다). 로딩 중 바꾼
-    /// 사이드바·패널 상태는 사용자 선택을 따른다. 로딩 중 만든 탭이 활성이었으면 그 탭이 활성으로 남는다.
-    pub fn absorb_startup_edits(&mut self, baseline: &Self, edited: &Self) {
-        let mut active = None;
-        for (index, tab) in edited.tabs.iter().enumerate() {
-            if baseline.tabs.contains(tab) {
-                continue;
+    /// 합친다. 로딩 중 열린 에디터 구독·탭 이름 편집·입력 큐가 원래 `PaneId`를 붙잡고 있으므로 초기 칸 번호는
+    /// 그대로 두고, 새로 붙일 저장본(`self`)의 칸 번호를 `edited.next_pane` 위로 옮겨 충돌을 막는다.
+    /// 아무 입력·런타임 의도도 없는 시작 placeholder 탭은 빼고, 유지된 임시 탭의 `옛 탭 번호 -> 새 탭 번호` 매핑을 돌려준다.
+    pub fn absorb_startup_edits(
+        &mut self,
+        baseline: &Self,
+        edited: &Self,
+        retained_panes: &BTreeSet<PaneId>,
+        retained_tabs: &BTreeSet<usize>,
+    ) -> BTreeMap<usize, usize> {
+        let saved_no_active = self.active >= self.tabs.len();
+        let kept: Vec<(usize, &Tab)> = edited
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(idx, tab)| {
+                !edited.is_untouched_startup_tab(*idx, tab, baseline, retained_panes, retained_tabs)
+            })
+            .collect();
+        if !kept.is_empty() {
+            let mut next_pane = edited.next_pane;
+            let mut saved_map = BTreeMap::new();
+            for old in self.panes() {
+                let new = PaneId(next_pane);
+                next_pane = next_pane.saturating_add(1);
+                saved_map.insert(old, new);
             }
+            for tab in &mut self.tabs {
+                tab.root.remap(&saved_map);
+                if let Some(&focused) = saved_map.get(&tab.focused) {
+                    tab.focused = focused;
+                }
+            }
+            self.sessions = remap_pane_map(std::mem::take(&mut self.sessions), &saved_map);
+            self.launches = remap_pane_map(std::mem::take(&mut self.launches), &saved_map);
+            self.hosts = remap_pane_map(std::mem::take(&mut self.hosts), &saved_map);
+            self.files = remap_pane_map(std::mem::take(&mut self.files), &saved_map);
+            self.file_states = remap_pane_map(std::mem::take(&mut self.file_states), &saved_map);
+            self.respawn_cwds = remap_pane_map(std::mem::take(&mut self.respawn_cwds), &saved_map);
+            self.preview = self
+                .preview
+                .take()
+                .and_then(|(p, path)| saved_map.get(&p).map(|&np| (np, path)));
+            self.zoomed = std::mem::take(&mut self.zoomed)
+                .into_iter()
+                .filter_map(|p| saved_map.get(&p).copied())
+                .collect();
+            self.mru.panes = std::mem::take(&mut self.mru.panes)
+                .into_iter()
+                .filter_map(|p| saved_map.get(&p).copied())
+                .collect();
+            self.next_pane = next_pane;
+        }
+
+        let mut tab_map = BTreeMap::new();
+        let mut kept_panes = BTreeSet::new();
+        for (old_index, tab) in kept {
+            let new_index = self.tabs.len();
+            tab_map.insert(old_index, new_index);
             let mut leaves = Vec::new();
             tab.root.leaves(&mut leaves);
-            let mut map = BTreeMap::new();
-            for old in leaves {
-                let new = self.alloc_pane();
-                map.insert(old, new);
-                if let Some(v) = edited.sessions.get(&old) {
-                    self.sessions.insert(new, *v);
+            for pane in leaves {
+                kept_panes.insert(pane);
+                if let Some(&v) = edited.sessions.get(&pane) {
+                    self.sessions.insert(pane, v);
                 }
-                if let Some(v) = edited.launches.get(&old) {
-                    self.launches.insert(new, v.clone());
+                if let Some(v) = edited.launches.get(&pane) {
+                    self.launches.insert(pane, v.clone());
                 }
-                if let Some(v) = edited.hosts.get(&old) {
-                    self.hosts.insert(new, v.clone());
+                if let Some(v) = edited.hosts.get(&pane) {
+                    self.hosts.insert(pane, v.clone());
                 }
-                if let Some(v) = edited.files.get(&old) {
-                    self.files.insert(new, v.clone());
+                if let Some(v) = edited.files.get(&pane) {
+                    self.files.insert(pane, v.clone());
                 }
-                if let Some(v) = edited.file_states.get(&old) {
-                    self.file_states.insert(new, *v);
+                if let Some(&v) = edited.file_states.get(&pane) {
+                    self.file_states.insert(pane, v);
                 }
-                if let Some(v) = edited.respawn_cwds.get(&old) {
-                    self.respawn_cwds.insert(new, v.clone());
+                if let Some(v) = edited.respawn_cwds.get(&pane) {
+                    self.respawn_cwds.insert(pane, v.clone());
                 }
             }
-            let mut tab = tab.clone();
-            tab.root.remap(&map);
-            if let Some(focused) = map.get(&tab.focused) {
-                tab.focused = *focused;
+            self.tabs.push(tab.clone());
+        }
+        for &pane in &edited.zoomed {
+            if kept_panes.contains(&pane) && !self.zoomed.contains(&pane) {
+                self.zoomed.push(pane);
             }
-            self.tabs.push(tab);
-            if index == edited.active {
-                active = Some(self.tabs.len().saturating_sub(1));
+        }
+        if let Some((pane, path)) = &edited.preview
+            && kept_panes.contains(pane)
+        {
+            self.preview = Some((*pane, path.clone()));
+        }
+        if !kept_panes.is_empty() {
+            let mut panes = Vec::new();
+            for &pane in &edited.mru.panes {
+                if kept_panes.contains(&pane) && !panes.contains(&pane) {
+                    panes.push(pane);
+                }
             }
+            for &pane in &self.mru.panes {
+                if !panes.contains(&pane) {
+                    panes.push(pane);
+                }
+            }
+            self.mru.panes = panes;
+        }
+        if (edited.sidebar_width - baseline.sidebar_width).abs() > f32::EPSILON {
+            self.sidebar_width = edited.sidebar_width;
+        }
+        if (edited.panel_width - baseline.panel_width).abs() > f32::EPSILON {
+            self.panel_width = edited.panel_width;
         }
         if edited.sidebar_collapsed != baseline.sidebar_collapsed {
             self.sidebar_collapsed = edited.sidebar_collapsed;
@@ -1094,12 +1190,44 @@ impl Layout {
         if edited.panel_tab != baseline.panel_tab {
             self.panel_tab = edited.panel_tab;
         }
-        if let Some(index) = active {
+        if edited.mru.scope != baseline.mru.scope {
+            self.mru.scope = edited.mru.scope;
+        }
+        if edited.window_bounds != baseline.window_bounds && edited.window_bounds.is_some() {
+            self.window_bounds = edited.window_bounds;
+        }
+        if !tab_map.is_empty() {
+            let mut order = Vec::with_capacity(self.tabs.len());
+            for &old_idx in &edited.mru.order {
+                if let Some(&new_idx) = tab_map.get(&old_idx)
+                    && !order.contains(&new_idx)
+                {
+                    order.push(new_idx);
+                }
+            }
+            for &saved_idx in &self.mru.order {
+                if !order.contains(&saved_idx) {
+                    order.push(saved_idx);
+                }
+            }
+            self.mru.order = order;
+        }
+        self.prune();
+        if let Some(&index) = tab_map.get(&edited.active) {
             self.active = index;
             self.record_mru(index);
+        } else if saved_no_active {
+            if let Some(&first_kept) = tab_map.values().next() {
+                self.active = first_kept;
+                self.record_mru(first_kept);
+            } else {
+                self.active = self.tabs.len();
+                self.sync_mru();
+            }
         } else {
             self.sync_mru();
         }
+        tab_map
     }
 
     fn sync_mru(&mut self) {
@@ -1892,6 +2020,15 @@ pub fn clamp_column(width: f32, total: f32, other: f32) -> f32 {
     width.clamp(MIN_PANE_PX, max)
 }
 
+fn remap_pane_map<V>(
+    map: BTreeMap<PaneId, V>,
+    ids: &BTreeMap<PaneId, PaneId>,
+) -> BTreeMap<PaneId, V> {
+    map.into_iter()
+        .filter_map(|(old, value)| ids.get(&old).map(|&new| (new, value)))
+        .collect()
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
@@ -1944,5 +2081,33 @@ mod leaf_mru_tests {
         assert_eq!(layout.pane_mru_order(), before);
         layout.toggle_mru_scope();
         assert_eq!(layout.mru_scope(), MruScope::Workspace);
+    }
+
+    #[test]
+    fn startup_merge_preserves_early_pane_identity_across_platforms() {
+        let mut saved = Layout::default();
+        saved.set_session(PaneId(0), SessionId(11));
+        let saved_file_pane = saved.open_file(PathBuf::from("saved.md"));
+        let baseline = Layout::default();
+        let mut edited = baseline.clone();
+        let file_pane = edited.open_file(PathBuf::from("README.md"));
+        assert_eq!(file_pane, saved_file_pane);
+
+        let mut merged = saved;
+        let map = merged.absorb_startup_edits(
+            &baseline,
+            &edited,
+            &BTreeSet::from([file_pane]),
+            &BTreeSet::new(),
+        );
+        assert!(merged.is_valid());
+        assert_eq!(map.get(&1).copied(), Some(2));
+        assert_eq!(merged.file(file_pane), Some(Path::new("README.md")));
+        let restored = merged.tab_panes(0)[0];
+        let restored_file = merged.tab_panes(1)[0];
+        assert_ne!(restored, file_pane);
+        assert_ne!(restored_file, file_pane);
+        assert_eq!(merged.session(restored), Some(SessionId(11)));
+        assert_eq!(merged.file(restored_file), Some(Path::new("saved.md")));
     }
 }
