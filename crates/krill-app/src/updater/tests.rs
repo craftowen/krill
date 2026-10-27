@@ -1350,6 +1350,195 @@ fn inplace_recovery_before_backup_completes_drops_partial_prev() {
     assert_eq!(bundle_version(&staging), "0.2.0");
 }
 
+/// APP-F02: 저널이 없으면 `.prev`가 완결된 백업인지 알 수 없다. `rollback_with`는 `NoJournal`로 거부하고
+/// 아직 백업되지 않은 원본이 든 번들과 불완전한 `.prev`를 모두 그대로 둔다. 없음을 완결로 보던 코드는
+/// 불완전한 `.prev`를 번들에 동기화하며 원본 파일을 prune으로 지웠다.
+#[test]
+fn inplace_rollback_refuses_missing_journal() {
+    let d = TempGuard(temp_dir("inplace-no-journal"));
+    let state = d.0.join("state");
+    let app = d.0.join("Krill.app");
+    let prev = prev_path(&app);
+    build_test_app_bundle(&app, "0.1.0", "exit 0", false);
+    fs::write(app.join("Contents/Resources/uncopied.txt"), "original").unwrap();
+    // 중단된 백업: Info.plist만 복사됐고 실행 파일·uncopied.txt는 아직 없다.
+    fs::create_dir_all(prev.join("Contents")).unwrap();
+    fs::copy(
+        app.join("Contents/Info.plist"),
+        prev.join("Contents/Info.plist"),
+    )
+    .unwrap();
+    assert!(Journal::load(&state).unwrap().is_none());
+
+    let err = relaunch::rollback_with(relaunch::Mode::InPlace, &app, &state, "manual").unwrap_err();
+    assert!(matches!(err, Error::NoJournal), "{err:?}");
+    assert_eq!(bundle_version(&app), "0.1.0");
+    assert!(app.join("Contents/MacOS/krill-app").is_file());
+    assert_eq!(
+        fs::read_to_string(app.join("Contents/Resources/uncopied.txt")).unwrap(),
+        "original"
+    );
+    assert!(prev.join("Contents/Info.plist").is_file());
+    assert!(!prev.join("Contents/MacOS").exists());
+    assert!(Journal::load(&state).unwrap().is_none());
+}
+
+/// APP-F03: 교체 단계(`MovingStagingToTarget`)에서 파일 복사가 중간에 실패하면 완결된 `.prev`로 번들을
+/// 되돌린 뒤에만 `RolledBack`을 기록하고, relauncher는 복원된 구 앱을 다시 띄운다.
+#[test]
+fn inplace_swap_mid_copy_failure_restores_backup_before_rolled_back() {
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    // UDS 경로 상한(104바이트) 때문에 짧은 `/tmp` 경로를 쓴다.
+    let root = PathBuf::from("/tmp").join(format!("mk-updater-mc-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let d = TempGuard(root);
+    let state = d.0.join("state");
+    let app = d.0.join("Krill.app");
+    let staging = staging_path(&app);
+    let prev = prev_path(&app);
+    build_test_app_bundle(&app, "0.1.0", "exit 0", false);
+    fs::write(app.join("Contents/Resources/old-only.txt"), "old").unwrap();
+    build_test_app_bundle(&staging, "0.2.0", "exit 0", false);
+    fs::write(staging.join("Contents/Resources/new-only.txt"), "new").unwrap();
+    // 스테이징 안의 소켓 파일: `fs::copy`가 정규 파일이 아니라며 교체 복사 도중 결정적으로 실패한다.
+    let socket = staging.join("Contents/Resources/l.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let err = relaunch::swap_with(
+        relaunch::Mode::InPlace,
+        &app,
+        &state,
+        "0.1.0",
+        "0.2.0",
+        Duration::from_secs(1),
+        &Accept,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(bundle_version(&app), "0.1.0");
+    assert_eq!(
+        fs::read_to_string(app.join("Contents/Resources/old-only.txt")).unwrap(),
+        "old"
+    );
+    assert!(!app.join("Contents/Resources/new-only.txt").exists());
+    assert!(app.join("Contents/MacOS/krill-app").is_file());
+    assert!(!prev.exists());
+    assert!(staging.exists(), "failed staging stays for the next retry");
+    let journal = Journal::load(&state).unwrap().unwrap();
+    assert!(
+        matches!(journal.stage, Stage::RolledBack { .. }),
+        "{journal:?}"
+    );
+
+    // relauncher 전체 흐름: 같은 실패 뒤 복원된 구 앱을 다시 띄우고 RolledBack을 돌려준다.
+    fs::remove_dir_all(&state).unwrap();
+    let result = relaunch_and_verify(
+        &app,
+        &state,
+        "0.1.0",
+        "0.2.0",
+        None,
+        Duration::from_millis(100),
+        &Accept,
+    );
+    let RelaunchOutcome::RolledBack { mut restored, .. } = result.unwrap() else {
+        panic!("restored bundle must restart");
+    };
+    assert!(restored.wait().unwrap().success());
+    assert_eq!(bundle_version(&app), "0.1.0");
+    assert!(!app.join("Contents/Resources/new-only.txt").exists());
+    assert!(!prev.exists());
+}
+
+/// APP-F03: 백업이 끝난 뒤 교체 도중 실패했는데 `.prev`가 (외부에서) 사라졌으면 복원할 수 없다.
+/// 복원했다고 기록하지 않는다: 저널은 `MovingStagingToTarget`, 스테이징은 그대로, 오류는 그대로 전파된다.
+/// relauncher는 `RolledBack`을 돌려주지 않고(혼합 번들을 띄우지 않고) 실패하며, 다음 시작의 복구는
+/// `NoBackup`으로 알린다.
+#[test]
+fn inplace_swap_failure_without_backup_keeps_journal_and_staging_for_recovery() {
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let root = PathBuf::from("/tmp").join(format!("mk-updater-nb-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let d = TempGuard(root);
+    let state = d.0.join("state");
+    let app = d.0.join("Krill.app");
+    let staging = staging_path(&app);
+    let prev = prev_path(&app);
+    build_test_app_bundle(&app, "0.1.0", "exit 0", false);
+    fs::write(app.join("Contents/Resources/old-only.txt"), "old").unwrap();
+    build_test_app_bundle(&staging, "0.2.0", "exit 0", false);
+    let socket = staging.join("Contents/Resources/l.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let remove_prev = |prev: PathBuf| {
+        relaunch::AFTER_BACKUP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(prev.is_dir(), "backup must exist before it is removed");
+                fs::remove_dir_all(&prev).unwrap();
+            }));
+        });
+    };
+
+    remove_prev(prev.clone());
+    let err = relaunch::swap_with(
+        relaunch::Mode::InPlace,
+        &app,
+        &state,
+        "0.1.0",
+        "0.2.0",
+        Duration::from_secs(1),
+        &Accept,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert!(!prev.exists());
+    assert!(staging.exists());
+    assert!(app.join("Contents/Resources/old-only.txt").is_file());
+    let journal = Journal::load(&state).unwrap().unwrap();
+    assert_eq!(
+        journal.stage,
+        Stage::MovingStagingToTarget,
+        "must not claim a rollback without a backup"
+    );
+    let recover = relaunch::recover_with(relaunch::Mode::InPlace, &state).unwrap_err();
+    assert!(matches!(recover, Error::NoBackup(_)), "{recover:?}");
+    assert_eq!(Journal::load(&state).unwrap().unwrap(), journal);
+    assert!(staging.exists());
+
+    // relauncher 전체 흐름도 RolledBack 대신 오류를 돌려주고 저널·스테이징을 남긴다.
+    fs::remove_dir_all(&state).unwrap();
+    remove_prev(prev.clone());
+    let result = relaunch_and_verify(
+        &app,
+        &state,
+        "0.1.0",
+        "0.2.0",
+        None,
+        Duration::from_millis(100),
+        &Accept,
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(
+        Journal::load(&state).unwrap().unwrap().stage,
+        Stage::MovingStagingToTarget
+    );
+    assert!(!prev.exists());
+    assert!(staging.exists());
+}
+
 #[test]
 fn as12_manifest_rejects_unsigned_future_policy_fields() {
     let mut value = serde_json::json!({
@@ -1918,6 +2107,32 @@ mod rename_mode {
         ] {
             assert_eq!(read(&install, rel).as_deref(), Some("new"), "{rel}");
         }
+    }
+
+    /// APP-F02(Rename): 저널 없이는 `.prev`를 완결로 보지 않는다. 옛 코드는 설치 폴더를 통째로 비운 뒤
+    /// 파일 하나뿐인 `.prev`를 옮겨 구 파일을 잃었다.
+    #[test]
+    fn updater_rename_rollback_refuses_missing_journal() {
+        let d = TempGuard(temp_dir("rename-no-journal"));
+        let state = d.0.join("state");
+        let (install, _staging) = layout(&d.0);
+        let prev = prev_path(&install);
+        // 중단된 백업: krill-link.exe만 옮겨졌다.
+        fs::create_dir_all(&prev).unwrap();
+        fs::rename(install.join("krill-link.exe"), prev.join("krill-link.exe")).unwrap();
+
+        let err = rollback_with(Mode::Rename, &install, &state, "manual").unwrap_err();
+        assert!(matches!(err, Error::NoJournal), "{err:?}");
+        for rel in [
+            "Krill.json",
+            "krill-app.exe",
+            "krilld.exe",
+            "x64/OpenConsole.exe",
+        ] {
+            assert_eq!(read(&install, rel).as_deref(), Some("old"), "{rel}");
+        }
+        assert_eq!(read(&prev, "krill-link.exe").as_deref(), Some("old"));
+        assert!(Journal::load(&state).unwrap().is_none());
     }
 }
 

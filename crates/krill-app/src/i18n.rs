@@ -2003,6 +2003,7 @@ catalog! {
         UPDATE_ERR_NETWORK => ("업데이트 다운로드에 실패했습니다: {detail}", "Update download failed: {detail}"),
         UPDATE_ERR_UNPACK => ("업데이트 압축 해제에 실패했습니다: {detail}", "Update unpack failed: {detail}"),
         UPDATE_ERR_BACKUP => ("롤백용 백업이 없습니다", "No backup bundle found for rollback"),
+        UPDATE_ERR_JOURNAL => ("업데이트 기록이 없어 백업을 확인할 수 없습니다. 롤백하지 않았습니다", "No update journal to verify the backup; rollback was not performed"),
         UPDATE_ERR_IO => ("업데이트 중 파일 오류: {detail}", "Updater file error: {detail}"),
         REASON_INTERRUPTED => ("교체 중 중단됨", "Interrupted during bundle replacement"),
         REASON_EXITED_EARLY => ("새 앱이 준비 신호 전에 종료됨({status})", "New app exited before ready ({status})"),
