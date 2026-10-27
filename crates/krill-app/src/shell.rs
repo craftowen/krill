@@ -1447,7 +1447,7 @@ impl Shell {
     }
 
     /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
-    /// `layout.launches`의 폴더(워크트리 루트·`folder()`·Open in·새 에이전트 기준)는 건드리지 않는다.
+    /// 일반 cd는 `layout.launches`의 폴더를 바꾸지 않는다. 프로젝트 생성 작업은 실제 성공 cwd를 확인한 뒤 전환한다.
     /// 재부팅 뒤에도 살아남도록 꼬리(`LayoutTail.respawn_cwds`)로 영속한다.
     pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) {
         let mut changed = false;
@@ -1469,6 +1469,14 @@ impl Shell {
             let cwd_bytes = live_cwd.as_os_str().as_bytes();
             if self.layout.respawn_cwd(pane) != Some(cwd_bytes) {
                 changed |= self.layout.set_respawn_cwd(pane, cwd_bytes.to_vec());
+            }
+            if let Some(completed) = self
+                .layout
+                .launch(pane)
+                .and_then(|launch| folder::completed_project(launch, live_cwd))
+            {
+                self.layout.set_launch(pane, completed);
+                changed = true;
             }
         }
         if changed {

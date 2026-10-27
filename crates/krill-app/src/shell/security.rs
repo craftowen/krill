@@ -1252,7 +1252,7 @@ fn upload_bytes_to_remote(
     )
 }
 
-fn base64_encode(input: &[u8]) -> Vec<u8> {
+pub(super) fn base64_encode(input: &[u8]) -> Vec<u8> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(input.len().div_ceil(3).saturating_mul(4));
     for chunk in input.chunks(3) {
