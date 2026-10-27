@@ -137,7 +137,12 @@ fn account_config_is_respected_and_hidden_or_invalid_skills_are_excluded() {
         "codex",
         Some(&f.0.join("account")),
     );
-    let items = value["items"].as_array().unwrap();
+    let items: Vec<_> = value["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["scope"] != "Built-in")
+        .collect();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["text"], "$account");
 }
@@ -151,7 +156,13 @@ fn symlink_skills_work_and_cycles_and_files_are_bounded() {
     fs::create_dir_all(&root).unwrap();
     std::os::unix::fs::symlink(f.0.join("real"), root.join("linked")).unwrap();
     std::os::unix::fs::symlink(&root, root.join("cycle")).unwrap();
-    let items = f.load("codex")["items"].as_array().unwrap().clone();
+    let items: Vec<_> = f.load("codex")["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["scope"] != "Built-in")
+        .cloned()
+        .collect();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["text"], "$linked");
     for n in 0..MAX_ENTRIES + 8 {

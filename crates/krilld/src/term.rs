@@ -24,6 +24,25 @@
 //! 셸이 알리는 현재 디렉터리(OSC 7 `file://host/path`, Windows Terminal식 OSC 9;9 `"C:\path"`)도 alacritty가
 //! 버리므로 같은 곁 파서가 본다([`Engine::cwd`]). 프로세스 cwd를 읽지 못하는 Windows의 세션 cwd가 이것이다.
 
+/// Printed text from a bounded native CLI output slice; ANSI control/OSC payloads are omitted.
+/// This is command confirmation evidence, never a substitute for the current screen/cursor guards.
+pub(crate) fn printed_text(bytes: &[u8]) -> String {
+    struct Text(String);
+    impl Perform for Text {
+        fn print(&mut self, c: char) {
+            self.0.push(c);
+        }
+        fn execute(&mut self, byte: u8) {
+            if byte == b'\n' || byte == b'\r' {
+                self.0.push(' ');
+            }
+        }
+    }
+    let mut text = Text(String::new());
+    Parser::new().advance(&mut text, bytes);
+    text.0
+}
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};

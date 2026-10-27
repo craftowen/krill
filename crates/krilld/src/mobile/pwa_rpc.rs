@@ -30,6 +30,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 mod command_catalog;
+mod composer;
+mod mention_files;
 mod requests;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -243,6 +245,17 @@ enum Action {
     /// Selected session CLI skills and custom command metadata.
     CommandCatalog {
         session: u64,
+    },
+    MentionFiles {
+        session: u64,
+        query: String,
+    },
+    ComposerModels {
+        session: u64,
+    },
+    SetModel {
+        session: u64,
+        model: String,
     },
 }
 #[derive(Debug, Deserialize)]
@@ -652,78 +665,21 @@ impl Backend {
                 serde_json::from_slice(&output).map_err(io::Error::other)
             }
             Action::Git { session, path } => self.git(session, path.as_deref()),
-            Action::CommandCatalog { session } => self.command_catalog(session),
+            Action::CommandCatalog { session } => {
+                let context = self.composer_context(session)?;
+                Ok(command_catalog::load(
+                    &context.home,
+                    &context.cwd,
+                    &context.agent,
+                    context.config.as_deref(),
+                ))
+            }
+            Action::MentionFiles { session, query } => {
+                mention_files::load(&self.cwd(session)?, &query)
+            }
+            Action::ComposerModels { session } => self.composer_models(session),
+            Action::SetModel { session, model } => self.set_composer_model(session, &model),
         }
-    }
-    fn command_catalog(&self, session: u64) -> io::Result<Value> {
-        let cwd = self.cwd(session)?;
-        let stored =
-            crate::agent::control::Control::new(self.dir.as_deref()).stored(SessionId(session))?;
-        let status = match self.control(&Request::States)? {
-            Reply::States(states) => states.into_iter().find(|s| s.session.0 == session),
-            _ => None,
-        };
-        let observed = status.as_ref().map(|s| &s.status);
-        let agent = observed
-            .map(|s| s.agent.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| stored.as_ref().map(|s| s.profile.as_str()))
-            .or_else(|| observed.and_then(|s| s.foreground.as_deref()))
-            .unwrap_or_default();
-        let raw = self
-            .dir
-            .as_ref()
-            .and_then(|dir| fs::read_to_string(dir.join(krill_proto::agent::FILE_NAME)).ok());
-        let agents = krill_proto::agent::Agents::load(raw.as_deref()).map_err(io::Error::other)?;
-        let profile = agents.resolve(agent).map(|(_, profile)| profile);
-        let program = profile
-            .and_then(krill_proto::agent::Profile::program)
-            .unwrap_or(agent);
-        let program = Path::new(program)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(agent);
-        let canonical = krill_proto::agent::canonical_id(agent);
-        let provider = if matches!(
-            canonical,
-            "claude" | "codex" | "agy" | "cursor" | "opencode" | "pi"
-        ) {
-            canonical
-        } else {
-            krill_proto::agent::canonical_id(program)
-        };
-        let key = match provider {
-            "claude" => "CLAUDE_CONFIG_DIR",
-            "codex" => "CODEX_HOME",
-            "opencode" => "OPENCODE_CONFIG_DIR",
-            "pi" => "PI_CODING_AGENT_DIR",
-            _ => "",
-        };
-        let config = stored
-            .as_ref()
-            .and_then(|s| s.account.as_ref())
-            .filter(|a| a.env_key == key && !a.dir.is_empty())
-            .map(|a| PathBuf::from(&a.dir))
-            .or_else(|| {
-                profile
-                    .and_then(|p| p.env.get(key))
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| {
-                std::env::var_os(key)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-            });
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(invalid)?;
-        Ok(command_catalog::load(
-            &home,
-            &cwd,
-            provider,
-            config.as_deref(),
-        ))
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
         self.registry
@@ -1106,6 +1062,8 @@ impl Backend {
         );
         let mut cards = Vec::new();
         let mut workspace_titles = std::collections::BTreeMap::new();
+        let launch_metadata = crate::agent::control::Control::new(self.dir.as_deref());
+        let agent_profiles = launch_metadata.agents().unwrap_or_default();
         // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
         let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
         // 데스크톱 "잠든 작업 공간 숨기기"의 깨어 있음 판정: 작업 중·대기·완료이거나 에이전트가 살아 있는 세션.
@@ -1149,6 +1107,7 @@ impl Backend {
             .map(krill_proto::git::load_session_auto_titles)
             .unwrap_or_default();
         for (info, cwd_bytes, group) in rows {
+            let stored_launch = launch_metadata.stored(info.session).ok().flatten();
             if let Some(title) = auto_titles.get(&info.session)
                 && let Some(path) = &group.path
             {
@@ -1189,6 +1148,9 @@ impl Backend {
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
             cards.push(json!({"id":info.session.0,"state":state.state,"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+                "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
+                "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
+                "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),
                 "repo_key":group.repo_key,"worktree_key":group.worktree_key,
                 "group_label":group.label,"group_path":group.path,
                 "state_source":state.source,"state_confidence":state.confidence,
@@ -1197,7 +1159,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"model_set":cfg!(unix)},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
