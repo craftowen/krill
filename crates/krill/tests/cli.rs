@@ -1388,17 +1388,21 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    // 릴레이가 없으면 오류를 반환하고, 설치된 퀵터널로 폴백하지 않는다.
+    // 로그인 전에는 릴레이 접속을 거부하고, 설치된 퀵터널로 폴백하지 않는다.
     let out = d.run(&["mobile", "pair", "--tunnel", "--json"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("모바일 릴레이에 연결하지 못했습니다"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Sign in with Google to use the relay"),
+        "unexpected relay rejection: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(out.stdout.is_empty());
     let status: krill_proto::mobile::MobileReply =
         serde_json::from_str(&d.ok(&["mobile", "serve"])).unwrap();
     assert!(matches!(
         status,
         krill_proto::mobile::MobileReply::GatewayStatus {
-            mode: krill_proto::mobile::ConnectMode::Tunnel,
+            mode: krill_proto::mobile::ConnectMode::Lan,
             tunnel_url: None,
             ..
         }
