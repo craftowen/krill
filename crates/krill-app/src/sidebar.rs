@@ -39,6 +39,7 @@ pub mod lineage;
 pub mod options;
 mod path_identity;
 mod pr;
+mod profiles;
 mod startup;
 mod view;
 mod viewport;
@@ -389,6 +390,43 @@ pub fn session_label(session: &Session, title: Option<&str>) -> (String, String)
         .filter(|d| *d != name)
         .collect();
     (name, detail.join(" · "))
+}
+
+/// Windows console titles can retain the launcher's executable after an agent
+/// starts. Recognize only exact shell labels or drive-absolute shell paths.
+fn is_windows_shell_title(title: &str) -> bool {
+    let title = title.trim();
+    let title = title
+        .split_once(':')
+        .filter(|(prefix, _)| {
+            prefix.trim().eq_ignore_ascii_case("administrator")
+                || prefix.trim() == crate::i18n::WINDOWS_ADMIN_TITLE_KO
+        })
+        .map_or(title, |(_, rest)| rest.trim());
+    let title = title
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(title);
+    if [
+        "Windows PowerShell",
+        "PowerShell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "cmd",
+        "cmd.exe",
+    ]
+    .iter()
+    .any(|shell| title.eq_ignore_ascii_case(shell))
+    {
+        return true;
+    }
+    matches!(title.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        && title.rsplit(['\\', '/']).next().is_some_and(|leaf| {
+            ["powershell.exe", "pwsh.exe", "cmd.exe"]
+                .iter()
+                .any(|shell| leaf.eq_ignore_ascii_case(shell))
+        })
 }
 
 #[cfg(test)]
@@ -792,6 +830,15 @@ pub struct CloseSession(pub SessionId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContinueSession(pub SessionId);
 
+/// The menu owns its clicked target, independently of pane focus and row indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchSessionAccount {
+    pub host: HostId,
+    pub session: SessionId,
+    pub provider: krill_proto::usage::ProviderKind,
+    pub account_id: String,
+}
+
 /// OWE-854: 사이드바 세션 행 메뉴의 '이름 변경'. 셸이 그 세션의 탭을 열고 탭 이름 변경(OWE-870)을 띄운다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenameSession(pub SessionId);
@@ -938,6 +985,7 @@ pub struct Sidebar {
     next_read_done_seq: u64,
     /// 워크트리 행 메뉴·단축키에서 띄울 에이전트 프로필 목록.
     agents: Vec<AgentProfile>,
+    profiles: profiles::State,
     /// 사이드바 열이 펼쳐져 있는지.
     visible: bool,
     /// 창이 활성 상태인지.
@@ -965,6 +1013,7 @@ impl EventEmitter<NewSession> for Sidebar {}
 impl EventEmitter<OpenWorkspace> for Sidebar {}
 impl EventEmitter<CloseSession> for Sidebar {}
 impl EventEmitter<ContinueSession> for Sidebar {}
+impl EventEmitter<SwitchSessionAccount> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
@@ -1295,6 +1344,7 @@ impl Sidebar {
             read_done: BTreeMap::new(),
             next_read_done_seq: 0,
             agents: Vec::new(),
+            profiles: profiles::State::default(),
             disk: async_state::State::default(),
             visible: true,
             active: true,
@@ -2100,11 +2150,16 @@ impl Sidebar {
 
     /// 지정한 호스트의 스냅샷에서 세션을 찾는다.
     pub fn session_on(&self, host: &HostId, id: SessionId) -> Option<&Session> {
-        self.snapshot_for(host).sessions.iter().find(|s| s.id == id)
+        self.snapshot_for(host)
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .or_else(|| self.profiles.fallback(host, id))
     }
 
     /// 화면 스트림의 CLOSED를 폴링보다 먼저 반영해 종료 알림·행을 정리한다.
     pub fn mark_session_exited_on(&mut self, host: &HostId, id: SessionId, cx: &mut Context<Self>) {
+        self.profiles.remove_fallback(host, id);
         let snapshot = match host {
             HostId::Local => Some(&mut self.snapshot),
             HostId::Remote(host) => self
@@ -2632,6 +2687,74 @@ impl Sidebar {
                     uncollapsed = true;
                 }
             }
+            if !focused_host.is_local() && self.options.group_by == GroupBy::Repo {
+                let candidate_projects: Vec<&Path> = if parent_repos.is_empty() {
+                    vec![wt.as_path()]
+                } else {
+                    parent_repos.iter().map(PathBuf::as_path).collect()
+                };
+                for project_path in candidate_projects {
+                    let key = basename(project_path).to_ascii_lowercase();
+                    let matching_collapsed: Vec<PathBuf> = self
+                        .collapsed
+                        .iter()
+                        .filter(|p| basename(p).to_ascii_lowercase() == key)
+                        .cloned()
+                        .collect();
+                    for path in matching_collapsed {
+                        if self.collapsed.remove(&path) {
+                            uncollapsed = true;
+                        }
+                    }
+                }
+            }
+            if !self.collapsed_groups.is_empty() {
+                match self.options.group_by {
+                    GroupBy::WorkspaceStatus => {
+                        let status = if focused_host.is_local() {
+                            self.worktree_statuses
+                                .get(wt)
+                                .copied()
+                                .or_else(|| {
+                                    self.disk
+                                        .store
+                                        .statuses
+                                        .get(wt.to_string_lossy().as_ref())
+                                        .and_then(|v| {
+                                            krill_proto::orchestration::WorkspaceStatus::parse(v)
+                                                .ok()
+                                        })
+                                })
+                                .unwrap_or(krill_proto::orchestration::WorkspaceStatus::Todo)
+                        } else {
+                            krill_proto::orchestration::WorkspaceStatus::Todo
+                        };
+                        if self
+                            .collapsed_groups
+                            .remove(&GroupKey::WorkspaceStatus(status))
+                        {
+                            uncollapsed = true;
+                        }
+                    }
+                    GroupBy::PrStatus => {
+                        let pr_group = if focused_host.is_local() {
+                            let has_cp = self
+                                .disk
+                                .store
+                                .prs
+                                .get(wt.to_string_lossy().as_ref())
+                                .is_some_and(|&pr| pr > 0);
+                            options::PrGroup::from_status(self.prs.get(wt), has_cp)
+                        } else {
+                            options::PrGroup::from_status(None, false)
+                        };
+                        if self.collapsed_groups.remove(&GroupKey::PrStatus(pr_group)) {
+                            uncollapsed = true;
+                        }
+                    }
+                    GroupBy::Repo | GroupBy::None => {}
+                }
+            }
         }
         let selected_changed = if target_wt.is_some() && self.selected_worktree != target_wt {
             self.selected_worktree.clone_from(&target_wt);
@@ -2732,7 +2855,7 @@ impl Sidebar {
             .sessions
             .iter()
             .filter(|s| {
-                if s.status.state == AgentState::Exited {
+                if s.is_exited() {
                     return false;
                 }
                 let Some(path) = s.worktree.as_deref().or(s.cwd.as_deref()) else {
@@ -3109,6 +3232,7 @@ impl Sidebar {
     ) {
         match result {
             Ok((snapshot, meta)) => {
+                let profiles_changed = self.profiles.observe(&HostId::Local, &snapshot);
                 if self.relink == Relink::AwaitingList {
                     self.relink = Relink::Steady;
                     cx.emit(Relisted(snapshot.sessions.len()));
@@ -3117,7 +3241,8 @@ impl Sidebar {
                 let status_changed = self.local_status != HostStatus::Connected;
                 self.local_status = HostStatus::Connected;
 
-                if snapshot != self.snapshot
+                if profiles_changed
+                    || snapshot != self.snapshot
                     || meta != self.meta
                     || comments != self.comments
                     || auto_titles != self.auto_titles
@@ -3132,6 +3257,14 @@ impl Sidebar {
                         &snapshot.sessions,
                         self.focused.filter(|_| self.focused_host.is_local()),
                     );
+                    // Screen streams are dropped for hidden tabs. Once the
+                    // daemon publishes a changed title, an older screen cache
+                    // must not keep masking it indefinitely.
+                    self.titles.retain(|id, _| {
+                        let previous = self.snapshot.sessions.iter().find(|s| s.id == *id);
+                        let current = snapshot.sessions.iter().find(|s| s.id == *id);
+                        previous.map(|s| &s.status.title) == current.map(|s| &s.status.title)
+                    });
                     self.snapshot = snapshot;
                     self.prune_read_done_for_host(&HostId::Local, cx);
                     self.meta = meta;
@@ -4526,36 +4659,58 @@ impl Sidebar {
     }
 
     pub fn session_label(&self, session: &Session) -> (String, String) {
-        let custom_title = self
-            .custom_titles
-            .get(&session.id)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
-        // 칸이 열려 있으면 그 제목(즉시 반영), 아니면 krilld가 알려 준 제목. 에이전트 기본 제목은 자동 제목에 양보한다.
-        let explicit_title = self
-            .titles
-            .get(&session.id)
-            .and_then(|t| krill_proto::control::display_title(t))
-            .or_else(|| session.status.title.clone())
-            .filter(|t| {
-                !krill_proto::git::is_default_branch_or_worktree_name(t)
-                    && !t.eq_ignore_ascii_case("claude code")
-            });
-        let title = custom_title
-            .or(explicit_title.as_deref())
-            .or_else(|| self.auto_titles.get(&session.id).map(String::as_str))
-            .or_else(|| self.titles.get(&session.id).map(String::as_str));
-        session_label(session, title)
+        self.session_label_on_with_title(&HostId::Local, session, None)
     }
 
     #[must_use]
     pub fn session_label_on(&self, host: &HostId, session: &Session) -> (String, String) {
-        if host.is_local() {
-            self.session_label(session)
-        } else {
-            session_label(session, session.status.title.as_deref())
-        }
+        self.session_label_on_with_title(host, session, None)
+    }
+
+    /// Tabs and sidebar rows share title precedence, including a pane's newest
+    /// OSC title. Local custom/auto titles never cross into another host's IDs.
+    #[must_use]
+    pub fn session_label_on_with_title(
+        &self,
+        host: &HostId,
+        session: &Session,
+        pane_title: Option<&str>,
+    ) -> (String, String) {
+        let local = host.is_local();
+        let custom_title = local
+            .then(|| self.custom_titles.get(&session.id))
+            .flatten()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        let cached_title = local
+            .then(|| self.titles.get(&session.id))
+            .flatten()
+            .map(String::as_str);
+        let live_title = pane_title
+            .or(cached_title)
+            .and_then(krill_proto::control::display_title);
+        let auto_title = local
+            .then(|| self.auto_titles.get(&session.id))
+            .flatten()
+            .map(String::as_str)
+            .filter(|title| !title.trim().is_empty());
+        let has_agent_prompt = !session.status.agent.trim().is_empty() && auto_title.is_some();
+        let specific = |title: &&str| {
+            !(krill_proto::git::is_default_branch_or_worktree_name(title)
+                || title.eq_ignore_ascii_case("claude code")
+                || has_agent_prompt && is_windows_shell_title(title))
+        };
+        let explicit_title = live_title
+            .as_deref()
+            .filter(specific)
+            .or_else(|| session.status.title.as_deref().filter(specific));
+        let title = custom_title
+            .or(explicit_title)
+            .or(auto_title)
+            .or(live_title.as_deref())
+            .or(session.status.title.as_deref());
+        session_label(session, title)
     }
 
     /// 로컬 세션의 최근 프롬프트 턴 히스토리를 돌려준다.

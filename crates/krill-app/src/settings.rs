@@ -5768,7 +5768,7 @@ impl SettingsView {
     }
 
     fn refresh_error_reporting(&mut self, cx: &mut Context<Self>) {
-        if self.error_reporting.pending {
+        if self.error_reporting.pending || self.file_jobs.contains_key("error-reporting-read") {
             return;
         }
         let dir = state_dir(cx);

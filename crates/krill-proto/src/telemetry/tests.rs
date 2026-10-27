@@ -1,10 +1,11 @@
 use super::*;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn state_dir() -> PathBuf {
+pub(super) fn state_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "mk-telemetry-{}-{}",
         std::process::id(),
@@ -40,19 +41,25 @@ fn all_events() -> Vec<Event> {
     ]
 }
 
-/// 완료 조건: 기본 꺼짐에서는 무엇을 보내려 해도 전송 0회.
 #[test]
-fn default_off_sends_nothing() {
+fn default_enabled_without_legacy_consent() {
     let dir = state_dir();
-    let consent = consent(Some(&dir), &Env::stub(&[]));
-    assert_eq!(consent, Consent::Disabled(Reason::NoConsentFile));
-    let mut recorder = Recorder::default();
-    for event in all_events() {
-        assert!(!emit(&consent, event, 1_700_000_000, &mut recorder));
-    }
-    assert!(recorder.sent.is_empty());
+    assert_eq!(consent(Some(&dir), &Env::default()), Consent::Enabled);
     assert!(!dir.join(CONSENT_FILE).exists());
-    fs::remove_dir_all(&dir).ok();
+    disable(&dir).unwrap();
+    assert_eq!(
+        consent(Some(&dir), &Env::default()),
+        Consent::Disabled(Reason::UserDisabled)
+    );
+    let mut recorder = Recorder::default();
+    assert!(!emit(
+        &consent(Some(&dir), &Env::default()),
+        all_events().remove(0),
+        1,
+        &mut recorder
+    ));
+    assert!(recorder.sent.is_empty());
+    fs::remove_dir_all(dir).ok();
 }
 
 /// 거부 변수가 동의 파일보다 이긴다. 거짓값은 거부하지 않는다.
@@ -191,22 +198,24 @@ fn enable_disable_roundtrip() {
     let dir = state_dir();
     let target = dir.join("nested");
     enable(&target).unwrap();
+    disable(&target).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = fs::metadata(target.join(CONSENT_FILE))
+        let mode = fs::metadata(target.join(DISABLED_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
     }
+    enable(&target).unwrap();
     assert_eq!(consent(Some(&target), &Env::stub(&[])), Consent::Enabled);
     disable(&target).unwrap();
     disable(&target).unwrap();
     assert_eq!(
         consent(Some(&target), &Env::stub(&[])),
-        Consent::Disabled(Reason::NoConsentFile)
+        Consent::Disabled(Reason::UserDisabled)
     );
     fs::remove_dir_all(&dir).ok();
 }

@@ -797,13 +797,17 @@ fn serve_enforces_peer_signing_policy() {
 }
 
 #[test]
-fn telemetry_publisher_requires_consent_and_respects_environment_vetoes() {
+fn telemetry_publisher_defaults_on_and_respects_opt_out_and_environment_vetoes() {
     use krill_proto::telemetry::{self, Env, Event};
     let dir = std::env::temp_dir().join(format!("mk089-publish-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
     let registry = Registry::new(None, Some(&dir));
     let event = Event::AppOpened(telemetry::AppOpened {});
     let mut transport = telemetry::Recorder::default();
+    assert!(registry.emit_telemetry_to(&Env::default(), event.clone(), &mut transport));
+    assert_eq!(transport.sent.len(), 1);
+    transport.sent.clear();
+    telemetry::disable(&dir).unwrap();
     assert!(!registry.emit_telemetry_to(&Env::default(), event.clone(), &mut transport));
     assert!(transport.sent.is_empty());
     telemetry::enable(&dir).unwrap();

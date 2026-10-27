@@ -50,6 +50,7 @@ mod account_switch;
 pub mod admission;
 mod agent_history;
 mod hibernation;
+mod hook_identity;
 mod orch_cache;
 mod schedule;
 mod sidebar;
@@ -154,6 +155,7 @@ pub struct Registry {
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
     account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
     account_recovered: std::sync::atomic::AtomicBool,
+    account_processing: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
     account_switch_opt_out: Mutex<std::collections::BTreeSet<SessionId>>,
     /// main에 프로세스 종료를 알린다(업그레이드 답을 보낸 뒤).
@@ -222,6 +224,7 @@ impl Registry {
             ),
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
+            account_processing: std::sync::atomic::AtomicBool::new(false),
             account_replacements: Mutex::default(),
             account_switch_opt_out: Mutex::default(),
             exit: OnceLock::new(),
@@ -345,9 +348,10 @@ impl Registry {
                     .collect()
             };
             for (id, cwd, tap, e) in found {
-                self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))?;
-                self.auto_switch_from_hook(id, e);
-                hooked.push((id, e.payload.clone()));
+                if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
+                    self.auto_switch_from_hook(id, e);
+                    hooked.push((id, e.payload.clone()));
+                }
             }
             Ok(())
         })
@@ -1978,9 +1982,12 @@ impl Registry {
             })
         };
         if let Some((id, cwd, tap)) = target {
-            self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))?;
-            self.auto_switch_from_hook(id, e);
-            Ok(Some(id))
+            if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
+                self.auto_switch_from_hook(id, e);
+                Ok(Some(id))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
@@ -2033,12 +2040,28 @@ impl Registry {
         e: &HookEvent,
         cwd: Option<&Path>,
         tap: Option<&Tap>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         use krill_proto::os::ffi::OsStrExt as _;
         let cwd_hint = cwd.map(|cwd| cwd.as_os_str().as_bytes());
-        let is_subagent_or_foreign =
-            self.agents
-                .record_hook_session_with_context(id, &e.payload, Some(&e.agent), cwd_hint);
+        let root = lock(&self.state).sessions.get(&id).map(|entry| entry.pid);
+        let origin = root.map_or(hook_identity::Origin::Unverified, |root| {
+            hook_identity::origin(root, tap.and_then(Tap::foreground), e)
+        });
+        let is_subagent_or_foreign = match origin {
+            hook_identity::Origin::Foreground => self
+                .agents
+                .record_foreground_hook_session(id, &e.payload, &e.agent, cwd_hint),
+            hook_identity::Origin::Auxiliary => {
+                self.agents.block_hibernation(id);
+                true
+            }
+            hook_identity::Origin::Unverified => self.agents.record_hook_session_with_context(
+                id,
+                &e.payload,
+                Some(&e.agent),
+                cwd_hint,
+            ),
+        };
         if !is_subagent_or_foreign
             && let Ok(Some(stored)) = self.agents.stored(id)
             && (stored.session_id.is_none() || stored.transcript_path.is_none())
@@ -2112,7 +2135,7 @@ impl Registry {
                 crate::usage::accounts::record_rate_limited(provider, &account_id);
             }
         }
-        Ok(())
+        Ok(!is_subagent_or_foreign)
     }
 
     // Account evaluation wakes the session worker. Release `state` first: the worker's
@@ -2368,6 +2391,28 @@ impl Registry {
             UsageRequest::RefreshUsage => {
                 crate::usage::direct::refresh_manual(&home, state_ref);
                 UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+            }
+            UsageRequest::SwitchSessionAccount {
+                session,
+                provider,
+                account_id,
+            } => {
+                let required = krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
+                    | krill_proto::usage::FEAT_PROVIDER_DETAILS;
+                if features & required == required {
+                    let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                    match self.queue_session_account_switch(
+                        session,
+                        provider,
+                        &account_id,
+                        &snapshot,
+                    ) {
+                        Ok(()) => UsageReply::Accounts(snapshot),
+                        Err(error) => UsageReply::Failed(error),
+                    }
+                } else {
+                    UsageReply::Failed(Failure::BadRequest)
+                }
             }
             UsageRequest::SwitchAccount {
                 provider,

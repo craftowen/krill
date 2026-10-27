@@ -115,7 +115,7 @@
  const wide=globalThis.matchMedia?.('(min-width:1000px)')||{matches:false},splitKey=ctx.sessionKey?.('tabletSplit')??'tabletSplit',savedSplit=state.preferences?.tabletSplits?.[splitKey];
  let direction=['auto','columns','rows'].includes(savedSplit?.direction)?savedSplit.direction:'auto',panelWidth=panels.clientWidth||root.clientWidth||(typeof window!=='undefined'&&window.innerWidth)||0;
  let splitSession=state.sessions.get(savedSplit?.session),activePane=savedSplit?.active===1?1:0,secondary,secondaryHandle,secondaryMount,secondaryTitle,secondaryRetry,secondaryPhase,secondaryGeneration=0;const splitAbort=new AbortController();
- if(!splitSession||splitSession.id===selectedId||splitSession.exited){splitSession=null;activePane=0;}
+ if(!live(splitSession)||splitSession.id===selectedId){splitSession=null;activePane=0;}
  const splitButton=button(t('Split terminal'),chooseSplit,'ghost small split-toggle');header.insertBefore(splitButton,more);
 
  const directionNames={auto:'Automatic',columns:'Side by side',rows:'Stacked'},splitControls=el('div',undefined,'split-controls'),directionButton=button('',chooseDirection,'ghost split-direction');splitControls.hidden=true;splitControls.append(directionButton);screen.insertBefore(splitControls,panels);

@@ -17,7 +17,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::Disableable as _;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use krill_app::i18n::catalog::chat as ctext;
 use krill_app::ui;
 use krill_proto::SessionId;
@@ -63,7 +63,7 @@ pub(crate) struct ChatState {
     pub active_sessions: BTreeSet<SessionId>,
     pub overrides: BTreeMap<SessionId, bool>,
     pub logs: BTreeMap<SessionId, SessionChatLog>,
-    pub inputs: BTreeMap<SessionId, (gpui::Entity<InputState>, Subscription)>,
+    pub inputs: BTreeMap<SessionId, (gpui::Entity<TextareaState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
     poll_timer: Option<Task<()>>,
@@ -512,7 +512,7 @@ impl Shell {
         self.apply_chat_poll_for_host(session, host, snap);
     }
 
-    fn apply_chat_poll_for_host(
+    pub(super) fn apply_chat_poll_for_host(
         &mut self,
         session: SessionId,
         host: krill_app::hosts::HostId,
@@ -645,12 +645,16 @@ impl Shell {
         session: SessionId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::Entity<InputState> {
+    ) -> gpui::Entity<TextareaState> {
         if let Some((input, _)) = self.chat.inputs.get(&session) {
             return input.clone();
         }
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(ctext::PROMPT_PLACEHOLDER.get()));
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .submit_on_enter(true)
+                .placeholder(ctext::PROMPT_PLACEHOLDER.get())
+        });
         let sub = cx.subscribe_in(
             &input,
             window,
@@ -659,10 +663,13 @@ impl Shell {
                     ev,
                     InputEvent::PressEnter {
                         secondary: false,
-                        ..
+                        shift: false,
                     }
                 ) {
                     this.submit_chat_prompt(session, window, cx);
+                }
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
                 }
             },
         );
@@ -699,7 +706,7 @@ impl Shell {
     }
 
     fn clear_sent_chat_draft(
-        input: &gpui::Entity<InputState>,
+        input: &gpui::Entity<TextareaState>,
         sent: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1468,7 +1475,7 @@ impl Shell {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&input_state).small().cleanable(true)),
+                    .child(Textarea::new(&input_state).small()),
             )
             .child(
                 Button::new(SharedString::from(format!(

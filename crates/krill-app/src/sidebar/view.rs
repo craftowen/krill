@@ -1237,6 +1237,13 @@ impl Sidebar {
                     .as_ref()
                     .map(|a| a.label.trim())
                     .filter(|l| !l.is_empty());
+                let account_choices = self.session_account_choices(&row_host, session);
+                let account_host = row_host.clone();
+                let account_pending = self.session_account_pending(&account_host, id);
+                let account_error = self
+                    .session_account_error(&account_host, id)
+                    .map(str::to_owned);
+                let current_account = session.account.as_ref().map(|a| a.account_id.clone());
                 let app_settings = crate::settings::current(cx);
                 let session_cache_secs = app_settings
                     .prompt_cache_timer_enabled
@@ -1437,6 +1444,81 @@ impl Sidebar {
                                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                             })
                     }))
+                    .children(
+                        (account_label.is_some()
+                            || !account_choices.is_empty()
+                            || account_pending
+                            || account_error.is_some())
+                        .then(|| {
+                            let full = account_label
+                                .unwrap_or_else(|| text::SESSION_ACCOUNT_SWITCH.get())
+                                .to_owned();
+                            let pending = account_pending;
+                            let tip = self.session_account_tooltip(&account_host, id, &full);
+                            let button = ui::button_with_tooltip(
+                                Button::new(("account-badge", index))
+                                    .debug_selector(move || format!("account-badge-{index}"))
+                                    .when_some(account_label, |button, label| {
+                                        button
+                                            .label(status::abbreviate_account_label(label))
+                                            .icon(IconName::ChevronDown)
+                                    })
+                                    .when(account_label.is_none(), |button| {
+                                        button.icon(IconName::User)
+                                    })
+                                    .ghost()
+                                    .xsmall()
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(if account_error.is_some() && !pending {
+                                        p.destructive
+                                    } else {
+                                        p.muted_foreground
+                                    })
+                                    .loading(self.session_account_loading(&account_host, id)),
+                                format!("session-account-tooltip-{index}"),
+                                tip,
+                            );
+                            if account_choices.is_empty() {
+                                return button.disabled(true).into_any_element();
+                            }
+                            let sidebar = cx.weak_entity();
+                            button
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    menu = menu.label(text::SESSION_ACCOUNT_SWITCH.get());
+                                    for account in &account_choices {
+                                        let target = super::SwitchSessionAccount {
+                                            host: account_host.clone(),
+                                            session: id,
+                                            provider: account.provider,
+                                            account_id: account.id.clone(),
+                                        };
+                                        let sidebar = sidebar.clone();
+                                        let current = current_account.as_ref() == Some(&account.id);
+                                        menu = menu.item(
+                                            PopupMenuItem::new(super::profiles::account_label(
+                                                account,
+                                                &account_choices,
+                                            ))
+                                            .icon(ui::icons::provider_menu_icon(account.provider))
+                                            .checked(current)
+                                            .disabled(current)
+                                            .on_click(move |_, _, cx| {
+                                                sidebar
+                                                    .update(cx, |s, cx| {
+                                                        s.switch_session_account(
+                                                            target.clone(),
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                            }),
+                                        );
+                                    }
+                                    menu
+                                })
+                                .into_any_element()
+                        }),
+                    )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         cx.stop_propagation();
                         s.select_session(index, id, cx);

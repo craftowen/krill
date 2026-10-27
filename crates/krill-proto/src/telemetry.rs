@@ -1,25 +1,27 @@
 #![forbid(unsafe_code)]
-//! 텔레메트리 opt-in(MK-089, T4 §3.4.4·T4-34).
-//!
-//! - **기본 꺼짐**: 상태 디렉터리에 [`CONSENT_FILE`]이 있을 때만 켜진다. 파일이 없으면
-//!   어떤 네트워크 전송도 하지 않는다(완료 조건).
-//! - **환경 거부**: `DO_NOT_TRACK`·`KRILL_TELEMETRY_DISABLED`·CI 환경 변수가 참값이면
-//!   동의 파일이 있어도 꺼진 것으로 본다(Orca `consent.ts`와 같은 범주, T4 §3.4.4).
-//! - **이벤트 상한**: [`MAX_EVENTS`]개 이하. 이름은 [`Event::ALL`]에 고정된다.
-//! - **엄격 스키마**: 봉투·페이로드 모두 `deny_unknown_fields`. 프롬프트·경로·명령 문자열·
-//!   레포 이름 같은 자유 텍스트는 스키마에 없다(개수·성공 여부·지연·RSS 구간만).
-//! - **네트워크 없음(구조적)**: 이 모듈은 소켓·HTTP 코드를 전혀 포함하지 않는다. 전송은
-//!   호출자가 넣는 [`Transport`]로만 나가고, 꺼져 있으면 [`emit`]이 트랜스포트를 건드리지
-//!   않는다. 실제 HTTPS 엔드포인트 연결(계정·키·수집 서버 결정)은 별도 작업이다.
+//! 기본 활성화된 설치·활성 사용자 분석. 환경 거부와 영속 opt-out을 우선한다.
+//! `consent(None)`의 환경 거부 API와 기존 로그용 이벤트는 오류 보고·데몬 호환용이다.
+//! 실제 앱 사용 전송은 닫힌 [`UsageEvent`] 스키마와 bounded 디스크 큐만 사용한다.
 
-use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write as _};
+mod storage;
+mod usage;
+pub use storage::{
+    ActivityGeneration, FlushReport, Outcome, Status, activity_generation, flush_with,
+    record_activity, record_activity_for_generation, record_open, status_with,
+};
+pub use usage::{
+    Ack, Batch, ENDPOINT, ENDPOINT_VAR, MAX_BATCH, MAX_PENDING, MAX_REQUEST_BYTES, UsageEvent,
+    UsageName, random_uuid,
+};
+
+use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// opt-in 표시 파일(상태 디렉터리 바로 아래, 0600). 있으면 동의, 없으면 거부(기본값).
+/// 이전 버전의 opt-in 표시 파일. 호환을 위해 남기지만 활성화에 필요하지 않다.
 pub const CONSENT_FILE: &str = "telemetry.enabled";
+/// 영속 opt-out 표시 파일.
+pub const DISABLED_FILE: &str = "telemetry.disabled";
 /// 허용하는 이벤트 이름 상한(T4 §3.4.4: 10개 이하로 시작).
 pub const MAX_EVENTS: usize = 10;
 /// [`Envelope`] 스키마 버전.
@@ -101,6 +103,7 @@ pub enum Consent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     NoConsentFile,
+    UserDisabled,
     EnvVeto(&'static str),
 }
 
@@ -116,12 +119,12 @@ impl Consent {
     pub fn veto_var(self) -> Option<&'static str> {
         match self {
             Self::Disabled(Reason::EnvVeto(name)) => Some(name),
-            Self::Enabled | Self::Disabled(Reason::NoConsentFile) => None,
+            Self::Enabled | Self::Disabled(Reason::NoConsentFile | Reason::UserDisabled) => None,
         }
     }
 }
 
-/// 현재 동의 상태. 동의 파일이 있어고 거부 변수가 하나라도 참값이면 꺼짐이 이긴다.
+/// 기본 활성화 상태. 환경 거부와 영속 opt-out이 우선하며, 상태 디렉터리를 모르면 꺼진다.
 #[must_use]
 pub fn consent(state: Option<&Path>, env: &Env) -> Consent {
     for name in VETO_VARS.iter().chain(CI_VARS.iter()) {
@@ -129,43 +132,21 @@ pub fn consent(state: Option<&Path>, env: &Env) -> Consent {
             return Consent::Disabled(Reason::EnvVeto(name));
         }
     }
-    if state.is_some_and(|dir| dir.join(CONSENT_FILE).is_file()) {
-        Consent::Enabled
-    } else {
-        Consent::Disabled(Reason::NoConsentFile)
+    match state {
+        Some(dir) if dir.join(DISABLED_FILE).exists() => Consent::Disabled(Reason::UserDisabled),
+        Some(_) => Consent::Enabled,
+        None => Consent::Disabled(Reason::NoConsentFile),
     }
 }
 
-/// `state`에 동의 파일을 만든다(멱등). 거부 변수가 켜져 있어도 파일은 남긴다(변수를
-/// 끄면 다시 묻지 않고 켜진다).
-///
-/// # Errors
-/// 상태 디렉터리를 만들거나 파일을 쓰지 못하면 OS 오류.
+/// 영속 opt-out을 해제한다. 환경 거부는 계속 우선한다.
 pub fn enable(state: &Path) -> io::Result<()> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state)?;
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(state.join(CONSENT_FILE))?
-        .write_all(b"")?;
-    Ok(())
+    storage::set_enabled(state, true)
 }
 
-/// 동의 파일을 지운다(없어도 성공).
-///
-/// # Errors
-/// 없음 외의 삭제 실패는 OS 오류.
+/// 영속 opt-out을 기록하고 대기열을 지운다. 전송 응답의 옛 세대 재기록을 차단한다.
 pub fn disable(state: &Path) -> io::Result<()> {
-    match fs::remove_file(state.join(CONSENT_FILE)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    storage::set_enabled(state, false)
 }
 
 /// 허용된 이벤트 이름(T4 §3.4.4 목록 그대로, 7개).
@@ -320,8 +301,7 @@ pub fn now_unix() -> u64 {
 }
 
 /// 전송 통로. 구현이 실패를 삼킨다(텔레메트리가 앱·데몬 동작에 영향을 주지 않는다).
-/// 이 모듈에는 실제 네트워크 구현이 없다 — HTTPS 엔드포인트가 정해지면 별도 이슈에서
-/// `Transport` 구현으로 붙인다.
+/// 기존 데몬 호출은 로그용이다. 설치·활성 사용자 전송은 별도 `UsageEvent` 큐만 쓴다.
 pub trait Transport {
     fn send(&mut self, body: &str);
 }
@@ -354,3 +334,5 @@ pub fn emit(consent: &Consent, event: Event, ts_unix: u64, transport: &mut impl 
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_tests;

@@ -46,7 +46,8 @@ fn account_recovery_stays_in_toast_without_resizing_or_releasing_input(cx: &mut 
     let recovery = cx.debug_bounds("account-input-recovery").unwrap();
     cx.update(|window, cx| {
         assert!(recovery.origin.x > window.viewport_size().width / 2.);
-        assert!(recovery.origin.y > window.viewport_size().height / 2.);
+        assert!(recovery.origin.y >= ui::TITLEBAR_HEIGHT);
+        assert!(recovery.bottom() < window.viewport_size().height / 2.);
         assert!(view.read(cx).focus.is_focused(window));
     });
     assert!(cx.debug_bounds("account-continue-original").is_some());
@@ -236,7 +237,7 @@ fn background_account_failure_preserves_existing_notice_but_user_action_reports_
 }
 
 #[gpui::test]
-fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut TestAppContext) {
+fn notices_overlay_top_right_without_resize_focus_or_duplicates(cx: &mut TestAppContext) {
     // GPUI's visual animation uses wall time; timers below use the test clock.
     cx.update(|cx| cx.set_reduce_motion(true));
     let (view, cx) = open(cx, state_path("toast-geometry"));
@@ -252,7 +253,8 @@ fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut Test
     let notice = cx.debug_bounds("notice").unwrap();
     cx.update(|window, cx| {
         assert!(notice.origin.x > window.viewport_size().width / 2.);
-        assert!(notice.origin.y > window.viewport_size().height / 2.);
+        assert!(notice.origin.y >= ui::TITLEBAR_HEIGHT);
+        assert!(notice.bottom() < window.viewport_size().height / 2.);
         assert!(notice.right() <= window.viewport_size().width);
         assert!(
             notice.size.height >= ui::TEXT_SM.to_pixels(window.rem_size()) * 2.,
@@ -403,7 +405,8 @@ fn safety_and_hook_actions_remain_available_in_toasts(cx: &mut TestAppContext) {
     settle(cx);
     assert!(cx.debug_bounds("fix-banner-fix").is_some());
     let fix = cx.debug_bounds("fix-banner").unwrap();
-    assert!(fix.origin.y > cx.debug_bounds("terminal-surface").unwrap().size.height / 2.);
+    assert!(fix.origin.y >= ui::TITLEBAR_HEIGHT);
+    assert!(fix.bottom() < cx.debug_bounds("terminal-surface").unwrap().size.height / 2.);
     let close = cx.debug_bounds("fix-banner-close").unwrap().center();
     cx.simulate_click(close, Modifiers::default());
     settle(cx);
@@ -471,7 +474,8 @@ fn sidebar_poll_and_notice_alerts_render_as_toasts_without_sidebar_layout_shift(
     let poll_toast = cx.debug_bounds("sidebar-poll-error").unwrap();
     cx.update(|window, _| {
         assert!(poll_toast.origin.x > window.viewport_size().width / 2.);
-        assert!(poll_toast.origin.y > window.viewport_size().height / 2.);
+        assert!(poll_toast.origin.y >= ui::TITLEBAR_HEIGHT);
+        assert!(poll_toast.bottom() < window.viewport_size().height / 2.);
     });
 
     // 폴링이 복구되면 토스트가 자동으로 사라진다.

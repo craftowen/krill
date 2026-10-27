@@ -137,6 +137,16 @@ impl RunGuard {
         process: Process,
         consent: &Consent,
     ) -> io::Result<Option<Self>> {
+        Self::start_attempt(state, process, consent, true)
+    }
+
+    #[cfg(unix)]
+    fn start_attempt(
+        state: &Path,
+        process: Process,
+        consent: &Consent,
+        retry: bool,
+    ) -> io::Result<Option<Self>> {
         if !matches!(process, Process::App | Process::Daemon) {
             return Ok(None);
         }
@@ -166,17 +176,27 @@ impl RunGuard {
         let Some(bytes) = record.encode() else {
             return Ok(None);
         };
+        let path = runs.join(format!("{}{MARKER_EXT}", record.run_id));
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(runs.join(format!("{}{MARKER_EXT}", record.run_id)))?;
+            .open(&path)?;
         if file.try_lock().is_err() {
             return Ok(None);
         }
         // 쓰다 실패하면 손상 레코드로 남고, 잠금이 풀린 뒤 스캐너가 기록 없이 지운다.
         file.write_all(&bytes)?;
+        // A scanner can acquire and delete an empty file before our first lock.
+        // Never retain an orphaned inode; retry once with a new instance ID.
+        if !marker_is_current(&file, &path) {
+            return if retry {
+                Self::start_attempt(state, process, consent, false)
+            } else {
+                Ok(None)
+            };
+        }
         if super::consent::read(state)?.as_ref() != Some(consent) {
             file.write_all_at(&[CLEAN], STATE_AT).ok();
             return Ok(None);
@@ -500,6 +520,14 @@ fn claim_open(file: File, path: PathBuf, generation: &str) -> Option<Stale> {
 #[cfg(unix)]
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.file_type().is_file() && b.file_type().is_file() && a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(unix)]
+fn marker_is_current(file: &File, path: &Path) -> bool {
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(held), Ok(current)) => same_file(&held, &current),
+        _ => false,
+    }
 }
 
 #[cfg(unix)]

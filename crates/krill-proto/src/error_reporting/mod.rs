@@ -12,6 +12,7 @@ mod consent;
 mod file;
 pub mod native;
 mod outbox;
+mod rate;
 pub mod runs;
 mod types;
 

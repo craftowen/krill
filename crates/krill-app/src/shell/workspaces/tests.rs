@@ -413,6 +413,7 @@ fn selecting_workspace_reconciles_detached_and_late_sessions_preserving_layout(
         let mut snapshot = live_snapshot(&[101, 102, 103, 103], "/work/a");
         let mut exited = live_session(104, "/work/a");
         exited.status.state = krill_proto::control::AgentState::Exited;
+        exited.status.source = Some(krill_proto::control::Source::Process);
         snapshot.sessions.push(exited);
         s.sidebar.update(cx, |sidebar, cx| {
             sidebar.connect_source(Arc::new(LiveSnapshot(snapshot)), cx);

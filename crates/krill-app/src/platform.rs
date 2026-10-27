@@ -44,13 +44,10 @@ pub use windows::*;
 /// Windows 단일 실행 표지 이름. 같은 상태 폴더(대소문자·구분자·끝 구분자 무시)끼리만 같다.
 pub fn instance_key(state_dir: Option<&std::path::Path>) -> String {
     use sha2::Digest as _;
-    let path = state_dir.map_or_else(String::new, |dir| {
-        dir.to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase()
-    });
-    let digest = sha2::Sha256::digest(path.as_bytes());
+    let path = state_dir
+        .map(krill_proto::path::identity)
+        .unwrap_or_default();
+    let digest = sha2::Sha256::digest(path.as_os_str().as_encoded_bytes());
     let head = u64::from_be_bytes([
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     ]);

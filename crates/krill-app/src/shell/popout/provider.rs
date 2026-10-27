@@ -526,6 +526,429 @@ fn window_bar_color(win: Option<&UsageWindow>, p: &ui::Palette) -> gpui::Hsla {
         .map_or(p.muted_foreground, |pct| provider_usage_color(pct, p))
 }
 
+fn render_popover_usage_ghost_row(
+    window_label: &str,
+    win: Option<&UsageWindow>,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let display = krill_app::accounts::display::window(
+        win,
+        i64::try_from(krill_app::accounts::display::now()).unwrap_or(i64::MAX),
+    );
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_x_2()
+                .gap_y_0p5()
+                .text_size(ui::TEXT_XS)
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_family(ui::FONT_MONO)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(p.muted_foreground)
+                                .child(window_label.to_owned()),
+                        )
+                        .child(
+                            div()
+                                .font_family(ui::FONT_MONO)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.foreground)
+                                .child(display.text),
+                        ),
+                )
+                .children(krill_app::settings::window_reset_suffix(win).map(|reset| {
+                    div()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .text_color(p.muted_foreground)
+                        .child(reset)
+                })),
+        )
+        .child(div().w_full().h(px(5.)).rounded_full())
+}
+
+fn render_detail_reset_controls_ghost(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+    armed: bool,
+    p: &ui::Palette,
+) -> Option<gpui::Div> {
+    if !matches!(account.provider, ProviderKind::Codex | ProviderKind::Claude)
+        || krill_app::accounts::orca_managed(account)
+    {
+        return None;
+    }
+    let credits = super::reset_credit_count(snap, account);
+    if armed {
+        let (title, _) = krill_app::settings::account_heading(account);
+        let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
+        return Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .pt_1()
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(info),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Button::new("ghost-reset-confirm")
+                                .small()
+                                .danger()
+                                .label(provider_text::PROVIDER_RESET_USAGE_CONFIRM.get()),
+                        )
+                        .child(
+                            Button::new("ghost-reset-cancel")
+                                .small()
+                                .outline()
+                                .label(provider_text::PROVIDER_RESET_USAGE_CANCEL.get()),
+                        ),
+                ),
+        );
+    }
+    let label = match credits {
+        Some(0) => provider_text::PROVIDER_RESET_USAGE_NONE.get().to_owned(),
+        Some(c) => format!("{} ({c})", provider_text::PROVIDER_RESET_USAGE.get()),
+        None => provider_text::PROVIDER_RESET_USAGE.get().to_owned(),
+    };
+    Some(
+        div().pt_1().child(
+            Button::new("ghost-reset-btn")
+                .small()
+                .outline()
+                .label(label),
+        ),
+    )
+}
+
+fn render_detail_panel_ghost(
+    snap: &AccountsSnapshot,
+    group: &AccountGroup,
+    detail_panel_width: gpui::Pixels,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let Some(panel_account) = group.selected() else {
+        return div().w(detail_panel_width).flex_none();
+    };
+    let peak = account_peak_percent(snap, panel_account);
+    let (tone, tone_label) = usage_tone_badge(peak);
+    let mut detail = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_size(ui::TEXT_XS)
+        .text_color(p.muted_foreground);
+    if group.profiles.len() > 1 {
+        detail = detail.child(provider_text::PROVIDER_GROUP_PROFILES.get());
+    }
+    for account in &group.profiles {
+        let mut profile = div()
+            .w_full()
+            .min_w_0()
+            .pt_2()
+            .border_t_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .gap_2();
+        if group.profiles.len() > 1 {
+            let label = if account.host_default {
+                account_text::SYSTEM_DEFAULT.get().to_owned()
+            } else if account.label.trim().is_empty() {
+                account.id.clone()
+            } else {
+                account.label.clone()
+            };
+            profile = profile.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(if account.active {
+                        ui::badge(
+                            p,
+                            ui::BadgeTone::Success,
+                            account_text::ACCOUNT_IN_USE.get(),
+                        )
+                        .into_any_element()
+                    } else {
+                        Button::new("ghost-profile-use")
+                            .small()
+                            .primary()
+                            .label(provider_text::PROVIDER_USE.get())
+                            .into_any_element()
+                    }),
+            );
+        }
+        let status = krill_app::accounts::display::account(
+            account,
+            snap.status_for(&account.id),
+            krill_app::accounts::display::now(),
+        );
+        profile = profile.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(ui::TEXT_2XS)
+                .child(ui::badge(p, ui::BadgeTone::Muted, status.label))
+                .child(div().child(status.updated)),
+        );
+        if let Some(meters) = snap.meters_for(&account.id) {
+            profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
+            for meter in &meters.meters {
+                let label = krill_app::accounts::display::meter_label(meter);
+                profile = profile.child(if let Some(value) = &meter.value {
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap_2()
+                        .child(label)
+                        .child(div().font_family(ui::FONT_MONO).child(value.clone()))
+                        .into_any_element()
+                } else {
+                    render_popover_usage_ghost_row(&label, meter.window.as_ref(), p)
+                        .into_any_element()
+                });
+            }
+        } else {
+            for (label, window) in [
+                (
+                    provider_text::PROVIDER_USED_5H.get(),
+                    account.usage.five_hour.as_ref(),
+                ),
+                (
+                    provider_text::PROVIDER_USED_7D.get(),
+                    account.usage.seven_day.as_ref(),
+                ),
+            ] {
+                profile = profile.child(render_popover_usage_ghost_row(label, window, p));
+            }
+        }
+        if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
+            profile = profile.child(format!(
+                "{} · {}",
+                provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
+                krill_app::settings::rule_summary(rule, &snap.accounts)
+            ));
+        }
+        profile = profile.children(
+            advanced_notes(snap, account)
+                .into_iter()
+                .map(|note| div().child(note)),
+        );
+        if let Some(reset_box) = render_detail_reset_controls_ghost(snap, account, false, p) {
+            profile = profile.child(reset_box);
+        }
+        if group.profiles.len() == 1 {
+            profile = profile.child(
+                div()
+                    .pt_1p5()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .grid()
+                            .child(div().row_start(1).col_start(1).flex().items_center().child(
+                                ui::badge(
+                                    p,
+                                    ui::BadgeTone::Success,
+                                    provider_text::PROVIDER_ACTIVE_NOW.get(),
+                                ),
+                            ))
+                            .child(
+                                div().row_start(1).col_start(1).child(
+                                    Button::new("ghost-detail-use")
+                                        .small()
+                                        .primary()
+                                        .label(provider_text::PROVIDER_SWITCH_NOW.get()),
+                                ),
+                            ),
+                    ),
+            );
+        }
+        detail = detail.child(profile);
+    }
+    div()
+        .w(detail_panel_width)
+        .flex_none()
+        .p_2p5()
+        .rounded(ui::RADIUS_SM)
+        .border_1()
+        .border_color(p.border)
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(ui::TEXT_SM)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(account_name(panel_account)),
+                )
+                .child(ui::badge(p, tone, tone_label)),
+        )
+        .child(detail)
+}
+
+fn render_remote_hosts_tab_ghost(
+    provider: ProviderKind,
+    other_hosts: &[(
+        krill_app::hosts::HostId,
+        String,
+        std::sync::Arc<AccountsSnapshot>,
+    )],
+    content_width: gpui::Pixels,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let mut container = div()
+        .w(content_width)
+        .py_1()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_size(ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(provider_text::PROVIDER_REMOTE_HINT.get()),
+        );
+    for (_, other_label, other_snap) in other_hosts {
+        let profiles: Vec<AccountInfo> = other_snap
+            .accounts
+            .iter()
+            .filter(|a| a.provider == provider && !krill_app::accounts::orca_managed(a))
+            .cloned()
+            .collect();
+        let active_profile = profiles
+            .iter()
+            .find(|a| a.active)
+            .or_else(|| profiles.first())
+            .cloned();
+        let peak_pct = active_profile
+            .as_ref()
+            .and_then(|acc| account_peak_percent(other_snap, acc));
+        let (tone, tone_label) = usage_tone_badge(peak_pct);
+        let mut host_card = div()
+            .p_2p5()
+            .rounded(ui::RADIUS_SM)
+            .border_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(ui::STATE_DOT).rounded_full().flex_none())
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(ui::TEXT_SM)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(other_label.clone()),
+                            )
+                            .children(
+                                peak_pct
+                                    .map(|pct| ui::badge(p, tone, format!("{tone_label} {pct}%"))),
+                            ),
+                    )
+                    .child(
+                        Button::new("ghost-select-host")
+                            .xsmall()
+                            .outline()
+                            .label(format!(
+                                "{}: {other_label}",
+                                account_text::ACCOUNTS_HOST_TITLE.get()
+                            )),
+                    ),
+            );
+        if !profiles.is_empty() {
+            let mut profile_list = div().flex().flex_col().gap_1();
+            for profile in &profiles {
+                profile_list = profile_list.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded(ui::RADIUS_XS)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(ui::TEXT_XS)
+                                .child(account_name(profile)),
+                        )
+                        .child(
+                            Button::new("ghost-remote-use")
+                                .xsmall()
+                                .primary()
+                                .label(provider_text::PROVIDER_USE.get()),
+                        ),
+                );
+            }
+            host_card = host_card.child(profile_list);
+        }
+        container = container.child(host_card);
+    }
+    container
+}
+
 fn render_details(
     snap: &AccountsSnapshot,
     group: &AccountGroup,
@@ -692,12 +1115,24 @@ fn render_details(
                     .justify_between()
                     .gap_2()
                     .child(if account.active {
-                        ui::badge(
-                            p,
-                            ui::BadgeTone::Success,
-                            provider_text::PROVIDER_ACTIVE_NOW.get(),
-                        )
-                        .into_any_element()
+                        div()
+                            .grid()
+                            .child(
+                                div().row_start(1).col_start(1).invisible().child(
+                                    Button::new("ghost-active-detail-use")
+                                        .small()
+                                        .primary()
+                                        .label(provider_text::PROVIDER_SWITCH_NOW.get()),
+                                ),
+                            )
+                            .child(div().row_start(1).col_start(1).flex().items_center().child(
+                                ui::badge(
+                                    p,
+                                    ui::BadgeTone::Success,
+                                    provider_text::PROVIDER_ACTIVE_NOW.get(),
+                                ),
+                            ))
+                            .into_any_element()
                     } else {
                         detail_use_button(account, weak.clone(), menu.clone()).into_any_element()
                     }),
@@ -1093,31 +1528,24 @@ pub(super) fn provider_usage_menu(
                             .into_any_element()
                         }),
                 )
-                .when(!remote_tab, |d| {
-                    d.child(
-                        div()
-                            .w(master_width)
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(provider_text::PROVIDER_ACCOUNT.get()),
-                            )
-                            .children(headers.iter().map(|label| {
-                                div()
-                                    .w(column_width)
-                                    .flex_none()
-                                    .truncate()
-                                    .child(label.clone())
-                            })),
-                    )
-                })
+                .child(
+                    div()
+                        .w(master_width)
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(ui::TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .when(remote_tab, Styled::invisible)
+                        .children(headers.iter().map(|label| {
+                            div()
+                                .w(column_width)
+                                .flex_none()
+                                .truncate()
+                                .child(label.clone())
+                        })),
+                )
         })
         .disabled(true),
     );
@@ -1131,18 +1559,7 @@ pub(super) fn provider_usage_menu(
     menu = menu.separator().item(
         PopupMenuItem::element(move |_, cx| {
             let p = ui::palette(cx);
-            if is_remote_tab_for(cx, provider, has_remote_hosts) {
-                return render_remote_hosts_tab(
-                    provider,
-                    &body_other_hosts,
-                    content_width,
-                    &body_weak,
-                    &body_menu,
-                    p,
-                )
-                .into_any_element();
-            }
-
+            let remote_tab = is_remote_tab_for(cx, provider, has_remote_hosts);
             let selected_group = selected_account_for(cx, provider, &body_groups);
             let selected_id = selected_group
                 .as_ref()
@@ -1352,7 +1769,7 @@ pub(super) fn provider_usage_menu(
                 let debug_id = selector.clone();
                 let peak = account_peak_percent(&body_snap, &panel_account);
                 let (tone, tone_label) = usage_tone_badge(peak);
-                div()
+                let active_detail = div()
                     .id(gpui::SharedString::from(selector))
                     .debug_selector(move || debug_id.clone())
                     .w(detail_panel_width)
@@ -1396,21 +1813,74 @@ pub(super) fn provider_usage_menu(
                         &body_menu,
                         &body_menu,
                         p,
-                    ))
+                    ));
+
+                let mut stack = div().w(detail_panel_width).flex_none().grid();
+                for group in &body_groups {
+                    if group.selected().is_some_and(|a| a.id == panel_account.id) {
+                        continue;
+                    }
+                    stack = stack.child(div().row_start(1).col_start(1).invisible().child(
+                        render_detail_panel_ghost(&body_snap, group, detail_panel_width, p),
+                    ));
+                }
+                stack
+                    .child(div().row_start(1).col_start(1).child(active_detail))
                     .into_any_element()
             } else {
                 div().w(detail_panel_width).flex_none().into_any_element()
             };
 
-            div()
+            let local_view = div()
                 .w(content_width)
                 .py_1()
                 .flex()
                 .items_start()
                 .gap_3()
                 .child(master_col)
-                .child(detail_col)
-                .into_any_element()
+                .child(detail_col);
+
+            if !has_remote_hosts {
+                return local_view.into_any_element();
+            }
+
+            if remote_tab {
+                let remote_view = render_remote_hosts_tab(
+                    provider,
+                    &body_other_hosts,
+                    content_width,
+                    &body_weak,
+                    &body_menu,
+                    p,
+                );
+                div()
+                    .w(content_width)
+                    .grid()
+                    .child(
+                        div()
+                            .row_start(1)
+                            .col_start(1)
+                            .invisible()
+                            .child(local_view),
+                    )
+                    .child(div().row_start(1).col_start(1).child(remote_view))
+                    .into_any_element()
+            } else {
+                let remote_ghost =
+                    render_remote_hosts_tab_ghost(provider, &body_other_hosts, content_width, p);
+                div()
+                    .w(content_width)
+                    .grid()
+                    .child(
+                        div()
+                            .row_start(1)
+                            .col_start(1)
+                            .invisible()
+                            .child(remote_ghost),
+                    )
+                    .child(div().row_start(1).col_start(1).child(local_view))
+                    .into_any_element()
+            }
         })
         .disabled(true),
     );

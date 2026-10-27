@@ -99,6 +99,19 @@ fn refresh_run_at(state: &Path, slot: &Mutex<RunSlot>) {
     }
 }
 
+fn finish_run(slot: &Mutex<RunSlot>) {
+    // Join an in-flight refresh off GPUI, then fence late refresh jobs.
+    // Skipping a busy slot or allowing a new marker after this point
+    // would turn a normal app quit into an uncertain-exit report.
+    let mut run = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run.closed = true;
+    if let Some(guard) = run.guard.take() {
+        guard.finish();
+    }
+}
+
 /// Refresh the current process marker after a consent change, off the UI thread.
 pub(crate) fn refresh_run(cx: &mut App) {
     let Some(state) = crate::settings::state_dir(cx) else {
@@ -126,16 +139,7 @@ pub fn start(cx: &mut App) {
     cx.on_app_quit(move |cx| {
         let run = Arc::clone(&quitting_run);
         cx.background_spawn(async move {
-            // Join an in-flight refresh off GPUI, then fence late refresh jobs.
-            // Skipping a busy slot or allowing a new marker after this point
-            // would turn a normal app quit into an uncertain-exit report.
-            let mut run = run
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            run.closed = true;
-            if let Some(guard) = run.guard.take() {
-                guard.finish();
-            }
+            finish_run(&run);
         })
     })
     .detach();
@@ -191,5 +195,41 @@ fn send_pending(state: &Path) -> io::Result<()> {
             return Err(io::ErrorKind::TimedOut.into());
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn error_reporting_quit_waits_for_refresh_and_fences_late_refresh() {
+        let state =
+            std::env::temp_dir().join(format!("krill-error-reporting-quit-{}", std::process::id()));
+        std::fs::remove_dir_all(&state).ok();
+        error_reporting::enable(&state).unwrap();
+        let slot = Arc::new(Mutex::new(RunSlot::default()));
+        let refreshing = slot.lock().unwrap();
+        let finishing = Arc::clone(&slot);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let quit = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finish_run(&finishing);
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(refreshing);
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        quit.join().unwrap();
+        assert!(slot.lock().unwrap().closed);
+
+        refresh_run_at(&state, &slot);
+        let slot = slot.lock().unwrap();
+        assert!(slot.guard.is_none());
+        assert!(slot.generation.is_none());
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

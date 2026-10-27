@@ -209,6 +209,9 @@ pub fn record_with_consent(state: &Path, event: Event, expected: &Consent) -> io
         return Ok(false);
     }
     let now = now_ms();
+    if !super::rate::admit(&dir, expected, &event, now)? {
+        return Ok(false);
+    }
     let outbox = dir.join(OUTBOX);
     DirBuilder::new()
         .recursive(true)
@@ -257,6 +260,7 @@ pub(crate) fn next_attempt(dir: &Path, generation: &str, now: u64) -> Option<u64
 pub(crate) fn wipe(dir: &Path) {
     fs::remove_dir_all(dir.join(OUTBOX)).ok();
     fs::remove_file(dir.join(RETRY_FILE)).ok();
+    fs::remove_file(dir.join(super::rate::FILE)).ok();
 }
 
 /// 대기열을 비운다: 큐 잠금 안에서 정리·선택하고, 잠금을 놓은 채 `transport`로 보내고, 다시 잠금 안에서
@@ -265,7 +269,7 @@ pub(crate) fn wipe(dir: &Path) {
 /// - 200 ACK: 요청한 ID만 겹치지 않게 담겨야 유효하다. 유효하면 ACK된 항목만 지우고, 일부만 ACK되면
 ///   나머지에 큐 전체 재시도를 건다. 파싱 실패·모르는 ID·겹친 ID는 묶음 전체를 남긴다.
 /// - 400/413/415: 여러 건 묶음이면 아무것도 지우지 않고 단건 전송으로 바꾼다. 단건이 거부될 때만 버린다.
-/// - 429·5xx 등 그 밖의 실패: `Retry-After`가 있으면 그 값, 없으면 지수 증가(60초~24시간 + 지터)로 큐 전체
+/// - 429·5xx 등 그 밖의 실패: `Retry-After`와 지수 증가 중 큰 값(60초~24시간 + 지터)으로 큐 전체
 ///   재시도를 건다. 응답이 없으면(연결 실패 등) 지수 증가.
 ///
 /// # Errors
@@ -526,7 +530,7 @@ fn settle(
     Ok(out)
 }
 
-/// 큐 전체 재시도 시각을 정한다: `Retry-After` 또는 60초×2^(실패-1)을 60초~24시간으로 자르고 최대 20% 지터.
+/// 큐 전체 재시도 시각을 정한다: `Retry-After`와 60초×2^(실패-1) 중 큰 값을 60초~24시간으로 자르고 최대 20% 지터.
 fn backoff(
     retry: &mut Retry,
     retry_after_secs: Option<u64>,
@@ -535,10 +539,8 @@ fn backoff(
 ) {
     retry.failures = retry.failures.saturating_add(1);
     let exponent = retry.failures.saturating_sub(1).min(20);
-    let base = retry_after_secs.map_or_else(
-        || RETRY_MIN_MS.saturating_mul(2u64.saturating_pow(exponent)),
-        |secs| secs.saturating_mul(1000),
-    );
+    let exponential = RETRY_MIN_MS.saturating_mul(2u64.saturating_pow(exponent));
+    let base = exponential.max(retry_after_secs.unwrap_or(0).saturating_mul(1000));
     let delay = base.clamp(RETRY_MIN_MS, RETRY_MAX_MS);
     let spread = delay.checked_div(5).unwrap_or(0);
     let delay = delay

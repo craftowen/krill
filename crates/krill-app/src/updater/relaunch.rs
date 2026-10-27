@@ -482,14 +482,34 @@ fn spawn_bundle_app(
     ready_file: Option<&Path>,
 ) -> io::Result<Child> {
     let mut cmd = crate::platform::background_command(app_bundle.join(APP_EXE));
-    cmd.env("KRILL_STATE_DIR", state_dir)
-        .stdin(Stdio::null())
+    set_relaunch_state(
+        &mut cmd,
+        state_dir,
+        krill_proto::daemon::default_state_dir().as_deref(),
+        krill_proto::daemon::state_dir_override().is_some(),
+    );
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(ready) = ready_file {
         cmd.env(READY_ENV, ready);
     }
     cmd.spawn()
+}
+
+/// Keep explicit isolation, but do not turn a normal install into an isolated
+/// one merely because it was restarted by the updater.
+fn set_relaunch_state(
+    command: &mut std::process::Command,
+    state: &Path,
+    default: Option<&Path>,
+    explicitly_overridden: bool,
+) {
+    if explicitly_overridden
+        || default.is_none_or(|default| !krill_proto::path::equivalent(state, default))
+    {
+        command.env("KRILL_STATE_DIR", state);
+    }
 }
 
 #[cfg(unix)]
@@ -745,6 +765,28 @@ fn load_rollback(state_dir: PathBuf, recover: bool, window: &Window, cx: &mut Ap
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn update_relaunch_preserves_explicit_state_without_isolating_default_install() {
+        let state = Path::new(r"C:\Users\Owen\AppData\Local\Krill");
+        let default = Path::new("c:/users/owen/appdata/local/krill");
+        for (path, default, explicit, sets_override) in [
+            (state, Some(default), false, false),
+            (state, Some(default), true, true),
+            (Path::new("/isolated-state"), Some(default), false, true),
+            (state, None, false, true),
+        ] {
+            let mut command = Command::new("fixture-not-executed");
+            set_relaunch_state(&mut command, path, default, explicit);
+            let override_value = command
+                .get_envs()
+                .find(|(key, _)| *key == "KRILL_STATE_DIR");
+            assert_eq!(override_value.is_some(), sets_override);
+            if let Some((_, value)) = override_value {
+                assert_eq!(value, Some(path.as_os_str()));
+            }
+        }
+    }
 
     #[test]
     fn regression_config_parse_error_aborts_relauncher() {

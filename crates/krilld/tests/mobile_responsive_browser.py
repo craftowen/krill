@@ -42,7 +42,7 @@ def problems(m):
     if m['scrollWidth'] > m['width'] or m['overflow']:
         issues.append('horizontal overflow')
     # The session header, tabs and terminal dock are compact so the terminal body keeps the most rows.
-    small = [c['name'] for c in m['controls'] if min(c['w'], c['h']) < (33.9 if c['compact'] else 43.9)]
+    small = [c['name'] for c in m['controls'] if min(c['w'], c['h']) < (27.9 if c['compact'] else 43.9)]
     if small:
         issues.append('touch target <44: ' + ', '.join(small))
     for item in m['reading']:

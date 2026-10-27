@@ -420,6 +420,21 @@ mod windows_tests {
         let status_line = value["statusLine"]["command"].as_str().unwrap_or_default();
         assert!(!status_line.contains(r"\\?\"), "{status_line}");
         assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
+        let statusline = value["statusLine"]["command"].as_str().unwrap();
+        assert!(
+            !statusline.contains(r"\\?\"),
+            "Git Bash cannot run a verbatim path"
+        );
+        assert_eq!(
+            krill_proto::statusline::classify_command(
+                statusline,
+                krill_proto::os::canonicalize(&exe)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            ),
+            krill_proto::statusline::OwnCommand::Bare
+        );
         std::fs::remove_dir_all(state).ok();
     }
 }

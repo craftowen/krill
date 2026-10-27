@@ -70,7 +70,11 @@ impl Drop for State {
 
 /// 종류별 필수 필드를 채운 이벤트.
 fn event(code: Code) -> Event {
-    let mut event = Event::new(Process::Cli, code, None).unwrap();
+    let location = format!(
+        "crates/krill/src/main.rs:{}",
+        NEXT.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    );
+    let mut event = Event::new(Process::Cli, code, Some(location)).unwrap();
     match code.kind() {
         Kind::UiHang => event.hang_bucket_ms = Some(1500),
         Kind::NativeCrash => event.native = Some(NativeData::unknown()),
@@ -145,6 +149,92 @@ fn flush_at(
 
 const WIRE_REQUEST: &str = r#"{"schema_version":1,"events":[{"event_id":"0123456789abcdef0123456789abcdef","process":"krill-app","kind":"operation_error","error_code":"update_failed","release":"0.1.42","build_id":"0.1.42+dev.e7f7f0edcae739d1","os":"macos","arch":"aarch64","source_loc":null,"hang_bucket_ms":null,"native":null}]}"#;
 const WIRE_NATIVE: &str = r#"{"exception":"EXC_BAD_ACCESS","signal":"SIGSEGV","frames":[{"image_uuid":"0123456789abcdef0123456789abcdef","offset":1234}]}"#;
+
+#[test]
+fn repeated_fingerprint_is_suppressed_after_ack_and_reset_by_new_consent() {
+    let state = State::new();
+    let consent = state.consent();
+    let mut repeated = event(Code::SchedulerFailed);
+    assert!(record_with_consent(state.path(), repeated.clone(), &consent).unwrap());
+    let report = flush_at(&state, &consent, now_ms(), |body| ack(&sent_ids(body), &[]));
+    assert_eq!(report.accepted, 1);
+    repeated.event_id = event(Code::SchedulerFailed).event_id;
+    for _ in 0..100 {
+        assert!(!record_with_consent(state.path(), repeated.clone(), &consent).unwrap());
+    }
+    assert!(state.entries().is_empty());
+    disable(state.path()).unwrap();
+    assert!(!dir(state.path()).join(super::rate::FILE).exists());
+    let consent = state.consent();
+    assert!(record_with_consent(state.path(), repeated, &consent).unwrap());
+}
+
+#[test]
+fn fingerprint_window_expires_without_requiring_queue_replay() {
+    let state = State::new();
+    let consent = state.consent();
+    let event = event(Code::Panic);
+    let now = now_ms();
+    let folder = dir(state.path());
+    assert!(super::rate::admit(&folder, &consent, &event, now).unwrap());
+    assert!(!super::rate::admit(&folder, &consent, &event, now + 3_599_999).unwrap());
+    assert!(super::rate::admit(&folder, &consent, &event, now + 3_600_000).unwrap());
+    for _ in 0..3 {
+        assert!(
+            super::rate::admit(&folder, &consent, &self::event(Code::NativeCrash), now).unwrap()
+        );
+    }
+}
+
+#[test]
+fn withdrawal_removes_consent_published_while_waiting_for_queue_lock() {
+    use std::time::Duration;
+    let state = State::new();
+    let consent = state.consent();
+    let held = Lock::try_acquire(&dir(state.path()), QUEUE_LOCK)
+        .unwrap()
+        .unwrap();
+    let path = state.0.clone();
+    let worker = std::thread::spawn(move || disable(&path));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while dir(state.path()).join(CONSENT_FILE).exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    consent::write_atomic(
+        &dir(state.path()),
+        CONSENT_FILE,
+        &serde_json::to_vec(&consent).unwrap(),
+    )
+    .unwrap();
+    drop(held);
+    worker.join().unwrap().unwrap();
+    assert!(
+        consent_with(state.path(), &Env::stub(&[]))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn short_retry_after_never_resets_exponential_backoff() {
+    let state = State::new();
+    let consent = state.consent();
+    queue(&state, &consent, 1);
+    let mut now = now_ms();
+    let mut delays = Vec::new();
+    for _ in 0..4 {
+        let report = flush_at(&state, &consent, now, |_| Reply::Http {
+            status: 429,
+            retry_after_secs: Some(60),
+            body: Vec::new(),
+        });
+        let next = report.next_attempt_at_ms.unwrap();
+        delays.push(next - now);
+        now = next;
+    }
+    assert_eq!(delays, [72_000, 144_000, 288_000, 576_000]);
+}
 
 #[test]
 fn wire_example_round_trips_and_validates() {

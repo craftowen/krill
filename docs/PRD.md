@@ -63,7 +63,7 @@ AI 코딩 에이전트를 동시에 여러 개(5~20개) 돌리는 macOS(Apple Si
 | Apple Developer Program 가입(연 $99) | 미가입 동안 ad-hoc 서명·소스 빌드 우선, Developer ID 서명·공증은 별도 게이트 | 보류 (MK-104) |
 | krilld panic 전략 | `unwind` 유지 + 세션 단위 `catch_unwind` 격리 | 확정 (CONVENTIONS P4) |
 | GitHub 원격·CI | `craftowen/krill` + GitHub Actions(저장소 검사 + macOS ARM 전체 게이트 + Windows 네이티브 빌드·스모크) | 확정 (MK-017) |
-| 텔레메트리 | 기본 꺼짐(opt-in, `DO_NOT_TRACK` 존중) | 확정 (MK-089) |
+| 텔레메트리 | 별도 동의창 없이 기본 활성. 무작위 설치 ID·최초 실행·앱 실행·일별 입력 활동·버전·OS·아키텍처 집계. 명시적 비활성화·`DO_NOT_TRACK` 존중 | 2026-10-27 사용자 지시로 변경 (MK-089), [수집·운영 안내](../services/telemetry/CLIENT.md) |
 | Windows 지원 범위 | 공통 컴파일 계층 + 네이티브 ConPTY 실기 스파이크 먼저, WSL2·앱만 원격은 보류 | 확정 (2026-10-18, M11) |
 | Windows 코드 서명(Authenticode, 유료 인증서) | 사람이 결정 | 보류 (MK-219) |
 

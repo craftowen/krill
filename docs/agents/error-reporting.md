@@ -11,6 +11,8 @@ krill errors disable
 
 Enabling reporting applies to new events. Disabling it clears pending reports. Re-enabling creates a new consent generation; earlier reports are not revived. `KRILL_ERROR_REPORTING_DISABLED`, `DO_NOT_TRACK`, `KRILL_TELEMETRY_DISABLED`, and the existing CI environment vetoes take precedence over consent. A saved consent can remain on while an environment veto stops transmission.
 
+Environment vetoes apply to the process that inherits them. Setting `DO_NOT_TRACK` only in a shell does not change an app already launched from the Dock; use the settings switch or `krill errors disable` for a persistent change. If concurrent consent management keeps cleanup busy, disabling removes the consent immediately but reports a failure so that cleanup can be retried.
+
 ## Data sent
 
 Reports contain a random event ID, a closed error code and event kind, Krill component, version/build, operating system, architecture, and an optional relative location in Krill's public source. Responsiveness reports use duration buckets. There is no persistent installation or account identifier and no precise client occurrence timestamp in the network payload.
@@ -26,6 +28,8 @@ On Unix, long-lived app and daemon instances can leave a locked local execution 
 The app periodically invokes a background CLI uploader while reporting is enabled. The daemon records local events and never performs the network upload in its PTY or session work. For headless use, run `krill errors flush`; opening the app also resumes delivery.
 
 The local queue is limited to 64 events, 4 KiB per event, and seven days of retention. Retry attempts are limited. Network failures, throttling, and server failures retain pending events with backoff. The uploader removes only IDs acknowledged by the server; corrupt local events and individually rejected events can be discarded. Event IDs let the receiver recognize retries. These limits are policies, not measured performance guarantees.
+
+Repeated ordinary errors, panics, and responsiveness reports with the same component, code, public source location, version/build and duration bucket are admitted once per hour. A bounded local cache keeps this suppression after uploads and is deleted when consent is withdrawn. Distinct native crashes and uncertain exits keep their incident IDs. Server counts describe admitted reports rather than every occurrence. Retry delays use the greater of exponential backoff and the server's `Retry-After`, subject to the daily maximum delay.
 
 The default receiver is `https://errors.krill.page/v1/events`. A receiver must be provisioned and deployed before reports can be received; enabling consent alone does not establish a working server. Server deployment is separate from building the desktop app. Queued events remain subject to the local retention and retry limits while the receiver is unavailable.
 

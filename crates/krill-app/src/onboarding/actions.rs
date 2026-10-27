@@ -296,6 +296,15 @@ pub(super) fn install_managed_cli(env: &Env) -> FixOutcome {
 }
 
 fn install_managed_cli_at(env: &Env, path: &std::ffi::OsStr) -> FixOutcome {
+    // The Windows installer already exposes the native CLI. Do not try to
+    // replace it with a Unix-only managed symlink during automatic preparation.
+    #[cfg(windows)]
+    if matches!(
+        super::cli(&env.krill, path, &env.home),
+        super::Cli::Installed
+    ) {
+        return Ok(());
+    }
     let managed = [
         env.home.join(".local/bin"),
         env.home.join("bin"),
@@ -586,7 +595,7 @@ pub fn note_agent_session(agent: &str, cx: &mut App) {
     let Some(env) = Env::current() else {
         return;
     };
-    if env.state != super::default_state_dir(&env.home) {
+    if env.is_isolated_state() {
         return;
     }
     hook_notice::note_agent_session_at(agent, env, cx);
@@ -723,7 +732,7 @@ const HOOK_AGENTS: [(TargetAgent, &str); 5] = [
 /// 설정의 상태 감지 훅 스위치를 바꾼 직후 백그라운드에서 반영한다. 켜면 설치된 에이전트에 훅을
 /// 설치하고, 끄면 Krill 설치 영수증이 있는 훅만 되돌린다(사용자가 고친 항목은 남는다).
 pub fn apply_hook_preference(env: Env, enabled: bool, cx: &mut App) -> Task<()> {
-    if env.state != super::default_state_dir(&env.home) {
+    if env.is_isolated_state() {
         return Task::ready(());
     }
     cx.background_executor().spawn(async move {

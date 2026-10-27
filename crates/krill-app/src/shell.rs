@@ -33,6 +33,7 @@ mod persist;
 pub(crate) mod popout;
 mod release;
 pub(crate) mod security;
+mod session_accounts;
 mod tabs;
 mod terminal_menu;
 mod workspaces;
@@ -864,6 +865,13 @@ impl Shell {
                 this.continue_sidebar_session(&host, e.0, cx);
             },
         );
+        cx.subscribe(
+            &sidebar,
+            |this, _, target: &sidebar::SwitchSessionAccount, cx| {
+                this.switch_sidebar_session_account(target.clone(), cx);
+            },
+        )
+        .detach();
         // OWE-854: 사이드바 세션 '이름 변경'은 그 세션 탭을 열고(없으면 새로) 탭 이름 변경(OWE-870)을 띄운다.
         cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::RenameSession, cx| {
             let host = sidebar
@@ -3099,10 +3107,15 @@ impl Shell {
             cx.spawn(async move |this, cx| {
                 let res = cx
                     .background_executor()
-                    .spawn(async move { krill_app::accounts::request_target(&target, &req) })
+                    .spawn(async move {
+                        krill_app::accounts::request_target_with_features(&target, &req)
+                    })
                     .await;
                 this.update(cx, |this, cx| match res {
-                    Ok(snap) => {
+                    Ok((snap, features)) => {
+                        this.sidebar.update(cx, |s, cx| {
+                            s.set_session_account_features(host.clone(), features, cx);
+                        });
                         this.apply_accounts_snapshot_for_host(host, snap, cx);
                         if mutating {
                             cx.defer(krill_app::settings::notify_external_change);
@@ -3165,10 +3178,22 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { krill_app::accounts::request_ipc(&paths, &req) })
+                .spawn(async move {
+                    krill_app::accounts::request_target_with_features(
+                        &krill_app::hosts::HostTarget::local(paths),
+                        &req,
+                    )
+                })
                 .await;
             this.update(cx, |this, cx| match res {
-                Ok(snap) => {
+                Ok((snap, features)) => {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.set_session_account_features(
+                            krill_app::hosts::HostId::Local,
+                            features,
+                            cx,
+                        );
+                    });
                     this.apply_accounts_snapshot(snap, cx);
                     if mutating {
                         cx.defer(krill_app::settings::notify_external_change);
@@ -3348,6 +3373,9 @@ impl Shell {
         snap: krill_proto::usage::AccountsSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.sync_session_accounts(&host, Arc::new(snap.clone()), cx);
+        });
         if host.is_local() {
             krill_app::alert::sync_account_switches(&snap.advanced, cx);
         }
@@ -4032,6 +4060,34 @@ impl Shell {
                 let old = resume.filter(|r| want.is_none() || want == Some(*r));
                 let got = bg
                     .spawn(async move {
+                        // A session already seen alive can attach directly. Avoid
+                        // hook setup and Hibernation/List on every tab switch.
+                        // Launch metadata is still queried because hooks can rebind
+                        // another agent to the same PTY. Refusal falls back to
+                        // the normal handoff/cold path; transient errors never
+                        // create or resume a process.
+                        if old.is_none()
+                            && !allow_cold_resume
+                            && let Some(session) = want
+                        {
+                            match pane::attach(&p, session, known) {
+                                Ok(linked) => {
+                                    return Ok(Got::Live {
+                                        session,
+                                        linked: Ok(linked),
+                                        prior_cold: None,
+                                    });
+                                }
+                                Err(error) if !is_permanent_error(&error) => {
+                                    return Ok(Got::Live {
+                                        session,
+                                        linked: Err(error),
+                                        prior_cold: None,
+                                    });
+                                }
+                                Err(_) => {}
+                            }
+                        }
                         let (session, prior_cold) = match old {
                             // 앞서 보낸 생성 요청의 결과를 모른다: 아는 세션만 찾고 만들지 않는다.
                             _ if uncertain => match want {
@@ -6947,6 +7003,7 @@ impl Render for Shell {
 
         div()
             .relative()
+            .child(krill_app::telemetry::activity_observer())
             // OWE-860: 설정 화면에서도 Shell 키 문맥을 유지해 전역 탐색 단축키(⌘J·⌘B·⌘P 등)와
             // 커스텀 ClosePane(⌘W) 바인딩이 동작하게 한다. 터미널 편집 액션은 각 핸들러의 settings 가드가 막는다.
             .key_context(KEY_CONTEXT)
@@ -7680,8 +7737,8 @@ impl Shell {
                 .debug_selector(|| "update-card".into())
                 .occlude()
                 .absolute()
-                .bottom(px(34.))
-                .right(px(12.))
+                .top(krill_app::ui::TITLEBAR_HEIGHT + krill_app::ui::SPACE_4)
+                .right(krill_app::ui::SPACE_3)
                 .w(px(300.))
                 .max_w((window.viewport_size().width - krill_app::ui::SPACE_4 * 2.).max(px(0.)))
                 .max_h((window.viewport_size().height - px(50.)).max(px(0.)))

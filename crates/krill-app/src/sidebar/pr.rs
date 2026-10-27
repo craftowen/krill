@@ -52,9 +52,9 @@ impl Sidebar {
                                     && current.get(path) == branches.get(path)
                             })
                             .collect();
-                        if !statuses.values().any(|st| st.guidance().is_some()) {
-                            s.pr_guidance_dismissed = false;
-                        }
+                        // 자동 조회 결과는 배지/메뉴의 상태로만 보관한다. 시작 시 네트워크·
+                        // gh 실패가 모든 워크스페이스에 안내를 반복해서 띄우지 않게 한다.
+                        s.pr_guidance_dismissed = true;
                         if s.prs != statuses {
                             s.prs = statuses;
                             cx.notify();
@@ -103,5 +103,55 @@ impl Sidebar {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AppContext as _;
+    use std::io;
+    use std::path::Path;
+
+    struct Unavailable(io::ErrorKind);
+
+    impl crate::pull_request::Runner for Unavailable {
+        fn run(&self, _: &Path, _: &str, _: crate::pull_request::Action) -> io::Result<Status> {
+            Err(self.0.into())
+        }
+    }
+
+    #[gpui::test]
+    fn automatic_pr_failures_stay_quiet_until_user_action(cx: &mut gpui::TestAppContext) {
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::NotFound,
+        ] {
+            let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+            let path = PathBuf::from("/no-real-io");
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.meta.insert(
+                    path.clone(),
+                    super::super::Tree {
+                        branch: Some("topic".into()),
+                        dirty: None,
+                    },
+                );
+                sidebar.connect_pr(Arc::new(Service::new(Arc::new(Unavailable(kind)))), cx);
+            });
+            cx.run_until_parked();
+            sidebar.update(cx, |sidebar, cx| {
+                assert!(sidebar.prs[&path].guidance().is_some());
+                assert!(sidebar.pr_guidance_dismissed);
+                assert!(sidebar.notice.is_none());
+                sidebar.create_pr(path.clone(), cx);
+                assert_eq!(
+                    sidebar.notice.as_deref(),
+                    sidebar.prs[&path].guidance(),
+                    "manual actions must retain actionable guidance"
+                );
+            });
+        }
     }
 }

@@ -1279,7 +1279,7 @@ impl Sidebar {
             worktree_order: Some(&self.worktree_order),
         };
         rows_with_options(
-            &self.snapshot,
+            &self.profiles.snapshot(&HostId::Local, &self.snapshot),
             &self.prefs,
             &self.collapsed,
             &self.collapsed_groups,
@@ -1353,7 +1353,9 @@ impl Sidebar {
             ..WorktreeContext::default()
         };
         rows_with_options(
-            &remote.snapshot,
+            &self
+                .profiles
+                .snapshot(&HostId::Remote(remote.id.clone()), &remote.snapshot),
             &self.prefs,
             collapsed,
             &self.collapsed_groups,

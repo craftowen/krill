@@ -13,6 +13,8 @@ pub const FEAT_USAGE: u64 = 1 << 17;
 pub const FEAT_PROVIDER_DETAILS: u64 = 1 << 15;
 /// Explicitly resume input on the original session after a failed account handoff.
 pub const FEAT_ACCOUNT_CANCEL: u64 = 1 << 22;
+/// Resume exactly one session under another account without changing the provider default.
+pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
 mod details;
 pub use details::{
     AccountMeters, ProviderDetails, RESET_CREDITS_METER_KEY, RESET_CREDITS_METER_LABEL,
@@ -843,6 +845,13 @@ pub enum UsageRequest {
     /// 사용자가 누른 사용량 새로고침 → [`UsageReply::Accounts`]. `ListAccounts`와 달리 조회 주기·
     /// Retry-After를 무시하고 바로 다시 조회한다. [`FEAT_USAGE_REFRESH`]를 협상한 피어에만 보낸다.
     RefreshUsage,
+    /// Resume this session only; provider defaults and other sessions are unchanged.
+    /// Requires [`FEAT_SESSION_ACCOUNT_SWITCH`] and [`FEAT_PROVIDER_DETAILS`].
+    SwitchSessionAccount {
+        session: crate::SessionId,
+        provider: ProviderKind,
+        account_id: String,
+    },
 }
 
 impl UsageRequest {
@@ -852,6 +861,7 @@ impl UsageRequest {
         let retired = |provider: ProviderKind| provider == ProviderKind::Gemini;
         match self {
             Self::SwitchAccount { provider, .. }
+            | Self::SwitchSessionAccount { provider, .. }
             | Self::AddAccount { provider, .. }
             | Self::RemoveAccount { provider, .. }
             | Self::RemoveAutoSwitchRule { provider, .. }
@@ -893,6 +903,10 @@ impl UsageRequest {
             features |= FEAT_USAGE_PROVIDER_METRICS;
         }
         let provider = match self {
+            Self::SwitchSessionAccount { provider, .. } => {
+                features |= FEAT_SESSION_ACCOUNT_SWITCH | FEAT_PROVIDER_DETAILS;
+                Some(*provider)
+            }
             Self::CancelAccountSwitch { .. } => {
                 features |= FEAT_ACCOUNT_CANCEL;
                 None

@@ -37,6 +37,7 @@ fn fixture(name: &str) -> (PathBuf, Env) {
         shell: "/bin/false".into(),
         krill: root.join("source/krill"),
         state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
         home: root.join("home"),
         state_overridden: true,
     };

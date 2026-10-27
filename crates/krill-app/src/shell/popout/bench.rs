@@ -1,6 +1,9 @@
 //! 실제 Metal 창의 MK-098 재현 측정. 데몬/실제 에이전트 없이 고정된 10세션 화면을 쓴다.
 //! `KRILL_STATE_DIR` 격리 + onboarding.done 생성 후 krill-app --popout-bench=terminal|dashboard|both.
 //! `--popout-bench=accounts`는 같은 합성 계정으로 실제 상태바 팝업을 수동 확인한다.
+//! `--popout-bench=chat`은 데몬 없이 실제 채팅 화면의 레이아웃과 상호작용을 확인한다.
+
+mod chat;
 
 use std::{
     io,
@@ -52,12 +55,16 @@ impl sidebar::Source for AccountsPreview {
                 id: SessionId(51),
                 status: AgentStatus {
                     state: AgentState::Done,
-                    agent: "pi".into(),
+                    agent: "claude".into(),
                     ..AgentStatus::UNKNOWN
                 },
                 worktree: Some(tree.clone()),
                 cwd: Some(tree.clone()),
-                account: None,
+                account: Some(krill_proto::control::SessionAccount {
+                    session: SessionId(51),
+                    account_id: "layout-main".into(),
+                    label: "Synthetic main".into(),
+                }),
             }],
             trees: [(repo, vec![tree])].into(),
         })
@@ -133,7 +140,12 @@ pub(super) fn account_popup_snapshot() -> AccountsSnapshot {
     let account = |id: &str, email: &str, active: bool, usage| AccountInfo {
         id: id.into(),
         provider: ProviderKind::Claude,
-        label: "Synthetic layout fixture".into(),
+        label: if active {
+            "Synthetic main"
+        } else {
+            "Synthetic other"
+        }
+        .into(),
         email: Some(email.into()),
         profile_dir: "/tmp/krill-popup-layout-fixture".into(),
         active,
@@ -181,11 +193,11 @@ pub(super) fn account_popup_snapshot() -> AccountsSnapshot {
 pub(crate) fn run(mode: String) -> ExitCode {
     if !matches!(
         mode.as_str(),
-        "terminal" | "dashboard" | "both" | "accounts"
+        "terminal" | "dashboard" | "both" | "accounts" | "chat"
     ) || std::env::var_os("KRILL_STATE_DIR").is_none()
     {
         eprintln!(
-            "BENCH_ERROR use KRILL_STATE_DIR and --popout-bench=terminal|dashboard|both|accounts"
+            "BENCH_ERROR use KRILL_STATE_DIR and --popout-bench=terminal|dashboard|both|accounts|chat"
         );
         return ExitCode::FAILURE;
     }
@@ -193,7 +205,7 @@ pub(crate) fn run(mode: String) -> ExitCode {
     let result = Arc::clone(&failed);
     gpui_platform::application().with_assets(krill_app::ui::icons::AppAssets).run(move |cx| {
         crate::init(cx);
-        if mode == "accounts" {
+        if matches!(mode.as_str(), "accounts" | "chat") {
             let state = std::env::var_os("KRILL_STATE_DIR").map(std::path::PathBuf::from);
             // Shell::new schedules a local snapshot read. Inject an empty home
             // before construction so even that background read stays synthetic.
@@ -206,6 +218,15 @@ pub(crate) fn run(mode: String) -> ExitCode {
             );
         }
         let Some(main) = crate::open_shell(cx, None) else { cx.quit(); return };
+        if mode == "chat" {
+            if main.update(cx, chat::install).is_err() {
+                cx.quit();
+                return;
+            }
+            result.store(false, Ordering::Relaxed);
+            println!("CHAT_FIXTURE pid={} · synthetic transcript, no agent or daemon", std::process::id());
+            return;
+        }
         if mode == "accounts" {
             cx.set_global(krill_app::accounts::installed::Installed(Some(vec![ProviderKind::Claude])));
             main.update(cx, |shell, window, cx| {
@@ -221,7 +242,13 @@ pub(crate) fn run(mode: String) -> ExitCode {
                 }
                 shell.accounts_snapshot = account_popup_snapshot().into();
                 shell.notice = Some("Synthetic account popup preview".into());
-                shell.sidebar.update(cx, |s, cx| s.connect_source(Arc::new(AccountsPreview), cx));
+                let accounts = shell.accounts_snapshot.clone();
+                shell.sidebar.update(cx, |s, cx| {
+                    s.set_session_account_features(krill_app::hosts::HostId::Local, krill_proto::usage::FEAT_USAGE | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH | krill_proto::usage::FEAT_PROVIDER_DETAILS, cx);
+                    s.sync_session_accounts(&krill_app::hosts::HostId::Local, accounts, cx);
+                    s.connect_source(Arc::new(AccountsPreview), cx);
+                    s.toggle_card_sessions(std::path::Path::new("/tmp/krill-ui-preview/account-popup"), cx);
+                });
                 if let Ok(width) = std::env::var("KRILL_BENCH_WIDTH")
                     && let Ok(width) = width.parse::<f32>()
                 {

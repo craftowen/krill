@@ -47,7 +47,11 @@ fn consent(state: &Path) -> Consent {
 
 fn record(state: &Path, consent: &Consent, n: usize) {
     for _ in 0..n {
-        let event = Event::new(Process::Cli, Code::DaemonConnectFailed, None).unwrap();
+        let location = format!(
+            "crates/krill/src/main.rs:{}",
+            NEXT.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        );
+        let event = Event::new(Process::Cli, Code::DaemonConnectFailed, Some(location)).unwrap();
         assert!(reporting::record_with_consent(state, event, consent).unwrap());
     }
 }

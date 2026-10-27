@@ -823,10 +823,18 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
         assert!(!lock(&reg.state).closing.contains(&SessionId(11)));
         // It is scheduled, not a spin loop or a visible permanent failure.
         reg.process_account_work_in(&home);
-        assert!(lock(&reg.account_work.pending).contains_key(&ProviderKind::Antigravity));
+        assert!(
+            lock(&reg.account_work.pending).contains_key(&SwitchScope::Session(
+                SessionId(11),
+                ProviderKind::Antigravity
+            ))
+        );
         fs::remove_file(wal).unwrap();
         lock(&reg.account_work.pending)
-            .get_mut(&ProviderKind::Antigravity)
+            .get_mut(&SwitchScope::Session(
+                SessionId(11),
+                ProviderKind::Antigravity,
+            ))
             .unwrap()
             .not_before = None;
         reg.process_account_work_in(&home);
@@ -1378,7 +1386,7 @@ fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prune
 
     // Automatic background switch (`prepared: false`) prunes 99 & 52 and skips unbound 51.
     lock(&reg.account_work.pending).insert(
-        ProviderKind::Codex,
+        SwitchScope::Provider(ProviderKind::Codex),
         crate::usage::accounts::switch_work::SwitchTarget {
             account_id: target.clone(),
             prepared: false,
@@ -1491,4 +1499,629 @@ impl Drop for FileHolder {
         self.0.kill().ok();
         self.0.wait().ok();
     }
+}
+
+#[test]
+fn later_selection_preserves_the_durable_alias_while_original_binding_retires() {
+    let root = std::env::temp_dir().join(format!("kas-retiring-select-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let profile = root.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    let snapshot = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Later",
+        None,
+        profile.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.label == "Later")
+        .unwrap()
+        .id
+        .clone();
+    let session = SessionId(7);
+    let (reg, _original) = kept_fixture(&state, session);
+    reg.agents
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+            Some("original-conversation".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    let alias = SessionHandoff {
+        from: session,
+        to: Some(SessionId(8)),
+        account_id: "committed-selection".into(),
+        error: None,
+    };
+    lock(&reg.account_handoffs).insert(session, alias.clone());
+    reg.save_account_handoffs().unwrap();
+    let before = fs::read(state.join(FILE)).unwrap();
+    let retiring = reg.agents.retire_account_binding(session);
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    reg.queue_session_account_switch(session, ProviderKind::Codex, &target, &snapshot)
+        .unwrap();
+    let saved = load(Some(&state));
+    assert_eq!(saved.get(&session), Some(&alias));
+    assert_eq!(fs::read(state.join(FILE)).unwrap(), before);
+    assert_eq!(
+        lock(&reg.account_work.pending)
+            .get(&SwitchScope::Session(session, ProviderKind::Codex))
+            .unwrap()
+            .account_id,
+        target
+    );
+    assert!(!lock(&reg.state).closing.contains(&session));
+    drop(retiring);
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stale_provider_handoff_is_cancelled_and_rejected_before_reading_transcripts() {
+    let root = std::env::temp_dir().join(format!("kas-provider-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("claude");
+    let to = root.join("codex");
+    fs::create_dir_all(from.join("sessions")).unwrap();
+    fs::create_dir_all(from.join("projects/demo")).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+    let snapshot = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+    let session = SessionId(39374);
+    let (reg, mut original) = kept_fixture(&state, session);
+    reg.agents
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("claude-conversation".into()),
+            Vec::new(),
+            Some(LaunchAccount {
+                id: "claude-old".into(),
+                env_key: "CLAUDE_CONFIG_DIR".into(),
+                dir: from.display().to_string(),
+            }),
+        )
+        .unwrap();
+    let path = from.join("projects/demo/claude-conversation.jsonl");
+    fs::write(&path, "{\"sessionId\":\"claude-conversation\"}\n").unwrap();
+    let hook = serde_json::to_vec(&serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": "claude-conversation", "transcript_path": path
+    })).unwrap();
+    reg.agents
+        .record_hook_session_with_context(session, &hook, Some("claude"), None);
+    lock(&reg.account_handoffs).insert(
+        session,
+        SessionHandoff {
+            from: session,
+            to: None,
+            account_id: target.clone(),
+            error: None,
+        },
+    );
+    let before = reg.agents.stored(session).unwrap().unwrap();
+    assert_eq!(
+        reg.handoff_account(
+            &Peer {
+                pid: None,
+                scope: Scope::Full
+            },
+            session,
+            ProviderKind::Codex,
+            &target,
+            &home
+        ),
+        Err(Failure::BadRequest)
+    );
+    assert_eq!(reg.agents.stored(session).unwrap().unwrap(), before);
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    assert!(!lock(&reg.account_handoffs).contains_key(&session));
+    assert!(!load(Some(&state)).contains_key(&session));
+    assert!(!lock(&reg.state).closing.contains(&session));
+    original.write_all(b"original still running\r\n").unwrap();
+    assert!(
+        fs::read_dir(&to)
+            .unwrap()
+            .all(|entry| entry.unwrap().file_name() == "auth.json")
+    );
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[expect(clippy::unwrap_used, reason = "deterministic account fixture setup")]
+fn kept_sessions_fixture(root: &Path, ids: &[SessionId]) -> (Registry, Vec<UnixStream>) {
+    fs::create_dir_all(root).unwrap();
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let mut processes = Vec::new();
+    let sessions = ids
+        .iter()
+        .map(|id| {
+            let (master, process) = UnixStream::pair().unwrap();
+            processes.push(process);
+            Kept {
+                id: *id,
+                pid: 800,
+                status: None,
+                master: OwnedFd::from(master),
+            }
+        })
+        .collect();
+    let (holder, _reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(Some((holder, sessions)), Some(root));
+    (reg, processes)
+}
+
+#[test]
+fn bounded_handoff_workers_overlap_without_exceeding_limit() {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let entered = Arc::new(Barrier::new(MAX_HANDOFF_WORKERS + 1));
+    let release = Arc::new(Barrier::new(MAX_HANDOFF_WORKERS + 1));
+    let started = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let worker = {
+        let (entered, release, started, completed, active, peak) = (
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&started),
+            Arc::clone(&completed),
+            Arc::clone(&active),
+            Arc::clone(&peak),
+        );
+        std::thread::spawn(move || {
+            run_bounded(&(0..12).collect::<Vec<_>>(), |_| {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                if started.fetch_add(1, Ordering::SeqCst) < MAX_HANDOFF_WORKERS {
+                    entered.wait();
+                    release.wait();
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        })
+    };
+    entered.wait();
+    assert_eq!(started.load(Ordering::SeqCst), MAX_HANDOFF_WORKERS);
+    assert_eq!(active.load(Ordering::SeqCst), MAX_HANDOFF_WORKERS);
+    release.wait();
+    worker.join().unwrap();
+    assert_eq!(completed.load(Ordering::SeqCst), 12);
+    assert_eq!(peak.load(Ordering::SeqCst), MAX_HANDOFF_WORKERS);
+}
+
+#[test]
+fn session_switch_validates_exact_target_preserves_default_and_recovers_exact_scope() {
+    use krill_proto::roles::Role;
+    use krill_proto::usage::{FEAT_SESSION_ACCOUNT_SWITCH, UsageReply, UsageRequest};
+    let root = Path::new("/tmp").join(format!("kas-session-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let profile = root.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    let snapshot = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Chosen",
+        None,
+        profile.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.label == "Chosen")
+        .unwrap()
+        .id
+        .clone();
+    let (reg, _processes) = kept_sessions_fixture(&state, &[SessionId(7), SessionId(8)]);
+    for session in [SessionId(7), SessionId(8)] {
+        reg.agents
+            .remember_session(
+                session,
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                Some("bound-id".into()),
+                Vec::new(),
+                Some(LaunchAccount {
+                    id: "codex-old".into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: home.display().to_string(),
+                }),
+            )
+            .unwrap();
+    }
+    let config = fs::read(state.join("accounts.toml")).unwrap();
+    assert_eq!(
+        reg.queue_session_account_switch(SessionId(99), ProviderKind::Codex, &target, &snapshot),
+        Err(Failure::NoSession)
+    );
+    assert_eq!(
+        reg.queue_session_account_switch(SessionId(7), ProviderKind::Claude, &target, &snapshot),
+        Err(Failure::BadRequest)
+    );
+    assert_eq!(
+        reg.queue_session_account_switch(SessionId(7), ProviderKind::Codex, "missing", &snapshot),
+        Err(Failure::BadRequest)
+    );
+    assert!(lock(&reg.account_handoffs).is_empty());
+    reg.queue_session_account_switch(SessionId(7), ProviderKind::Codex, &target, &snapshot)
+        .unwrap();
+    assert_eq!(fs::read(state.join("accounts.toml")).unwrap(), config);
+    assert_eq!(
+        load(Some(&state)).keys().copied().collect::<Vec<_>>(),
+        [SessionId(7)]
+    );
+    let mut cancel_snapshot = snapshot.clone();
+    let mut original = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.id == target)
+        .unwrap()
+        .clone();
+    original.id = "codex-old".into();
+    cancel_snapshot.accounts.push(original);
+    reg.queue_session_account_switch(
+        SessionId(7),
+        ProviderKind::Codex,
+        "codex-old",
+        &cancel_snapshot,
+    )
+    .unwrap();
+    assert!(lock(&reg.account_handoffs).is_empty());
+    assert!(!reg.account_selection_current(
+        SessionId(7),
+        ProviderKind::Codex,
+        &target,
+        &lock(&reg.account_work.pending)
+    ));
+    reg.queue_session_account_switch(SessionId(7), ProviderKind::Codex, &target, &snapshot)
+        .unwrap();
+    let other_profile = root.join("other-profile");
+    fs::create_dir_all(&other_profile).unwrap();
+    let snapshot = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Other",
+        None,
+        other_profile.to_str().unwrap(),
+    )
+    .unwrap();
+    let other_target = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.label == "Other")
+        .unwrap()
+        .id
+        .clone();
+    reg.queue_session_account_switch(SessionId(8), ProviderKind::Codex, &other_target, &snapshot)
+        .unwrap();
+    let pending = lock(&reg.account_work.pending);
+    assert!(reg.account_selection_current(SessionId(7), ProviderKind::Codex, &target, &pending));
+    assert!(reg.account_selection_current(
+        SessionId(8),
+        ProviderKind::Codex,
+        &other_target,
+        &pending
+    ));
+    assert!(!reg.account_selection_current(SessionId(8), ProviderKind::Codex, &target, &pending));
+    drop(pending);
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let request = UsageRequest::SwitchSessionAccount {
+        session: SessionId(7),
+        provider: ProviderKind::Codex,
+        account_id: target.clone(),
+    };
+    assert_eq!(
+        reg.on_usage_negotiated(
+            &peer,
+            Role::Observer,
+            request.clone(),
+            krill_proto::ipc::FEATURES
+        ),
+        UsageReply::Failed(Failure::Denied)
+    );
+    assert_eq!(
+        reg.on_usage_negotiated(
+            &peer,
+            Role::Interactive,
+            request,
+            krill_proto::ipc::FEATURES & !FEAT_SESSION_ACCOUNT_SWITCH
+        ),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    lock(&reg.account_work.pending).clear();
+    reg.recover_account_work(&home);
+    let pending = lock(&reg.account_work.pending);
+    assert_eq!(pending.len(), 2);
+    assert!(pending.contains_key(&SwitchScope::Session(SessionId(7), ProviderKind::Codex)));
+    assert!(!pending.contains_key(&SwitchScope::Provider(ProviderKind::Codex)));
+    drop(pending);
+    assert!(reg.claim_resume(SessionId(7)).is_some());
+    let claim = reg.claim_resume(SessionId(7)).unwrap();
+    assert!(reg.claim_resume(SessionId(7)).is_none());
+    drop(claim);
+    // A late click still naming the original must keep its durable alias and queue
+    // against the confirmed replacement, even before retirement is fully observed.
+    lock(&reg.account_handoffs).insert(
+        SessionId(7),
+        SessionHandoff {
+            from: SessionId(7),
+            to: Some(SessionId(8)),
+            account_id: target.clone(),
+            error: None,
+        },
+    );
+    let retiring = reg.agents.retire_account_binding(SessionId(7));
+    reg.queue_session_account_switch(SessionId(7), ProviderKind::Codex, &target, &snapshot)
+        .unwrap();
+    assert_eq!(load(Some(&state))[&SessionId(7)].to, Some(SessionId(8)));
+    assert_eq!(load(Some(&state))[&SessionId(8)].account_id, target);
+    drop(retiring);
+    lock(&reg.state).closing.insert(SessionId(7));
+    lock(&reg.account_replacements).insert(SessionId(8));
+    reg.queue_session_account_switch(SessionId(7), ProviderKind::Codex, &target, &snapshot)
+        .unwrap();
+    let saved = load(Some(&state));
+    assert_eq!(saved[&SessionId(7)].to, Some(SessionId(8)));
+    assert_eq!(saved[&SessionId(8)].account_id, target);
+    assert!(
+        lock(&reg.account_work.pending)
+            .contains_key(&SwitchScope::Session(SessionId(8), ProviderKind::Codex))
+    );
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_journals_are_independent_and_legacy_record_is_preserved() {
+    let root = Path::new("/tmp").join(format!("kas-journals-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let reg = Registry::new(None, Some(&root));
+    for id in [SessionId(8), SessionId(9)] {
+        accounts::write_atomic_0600(&replacement_journal(&root, id), b"fixture").unwrap();
+    }
+    fs::write(root.join(PREPARED_FILE), b"legacy").unwrap();
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(7),
+        session: SessionId(8),
+        committed: true,
+    });
+    assert!(!replacement_journal(&root, SessionId(8)).exists());
+    assert!(replacement_journal(&root, SessionId(9)).exists());
+    assert!(root.join(PREPARED_FILE).exists());
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retirement_transfer_preserves_newer_replacement_target_and_cancel() {
+    check_retirement_transfer(TransferSelection::NewTarget, false);
+    check_retirement_transfer(TransferSelection::Cancel, false);
+}
+
+#[test]
+fn retirement_transfer_rechecks_target_and_cancel_arriving_during_refresh() {
+    check_retirement_transfer(TransferSelection::NewTarget, true);
+    check_retirement_transfer(TransferSelection::Cancel, true);
+}
+
+#[test]
+fn retirement_transfer_applies_follow_up_when_no_newer_replacement_request_exists() {
+    check_retirement_transfer(TransferSelection::FollowUp, false);
+}
+
+#[expect(clippy::unwrap_used, reason = "deterministic account fixture setup")]
+fn check_retirement_transfer(selection: TransferSelection, during_refresh: bool) {
+    for provider_scope in [false, true] {
+        for retired in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "kas-transfer-{}-{selection:?}-{during_refresh}-{provider_scope}-{retired}",
+                std::process::id()
+            ));
+            fs::remove_dir_all(&root).ok();
+            let state = root.join("state");
+            let home = root.join("home");
+            let mut snapshot = AccountsSnapshot::default();
+            let mut ids = Vec::new();
+            for label in ["Running", "Stale", "Newest"] {
+                let profile = root.join(label);
+                fs::create_dir_all(&profile).unwrap();
+                snapshot = accounts::add_account(
+                    &home,
+                    Some(&state),
+                    ProviderKind::Codex,
+                    label,
+                    None,
+                    profile.to_str().unwrap(),
+                )
+                .unwrap();
+                ids.push(
+                    snapshot
+                        .accounts
+                        .iter()
+                        .find(|a| a.label == label)
+                        .unwrap()
+                        .id
+                        .clone(),
+                );
+            }
+            let mut ids = ids.into_iter();
+            let running = ids.next().unwrap();
+            let stale = ids.next().unwrap();
+            let newest = ids.next().unwrap();
+            let (reg, _processes) = kept_sessions_fixture(&state, &[SessionId(7), SessionId(8)]);
+            reg.agents
+                .remember_session(
+                    SessionId(8),
+                    &AgentLaunch {
+                        profile: "codex".into(),
+                        permission: Permission::Manual,
+                    },
+                    Some("confirmed-conversation".into()),
+                    Vec::new(),
+                    Some(LaunchAccount {
+                        id: running.clone(),
+                        env_key: "CODEX_HOME".into(),
+                        dir: root.join("Running").display().to_string(),
+                    }),
+                )
+                .unwrap();
+            let alias = SessionHandoff {
+                from: SessionId(7),
+                to: Some(SessionId(8)),
+                account_id: running.clone(),
+                error: None,
+            };
+            lock(&reg.account_handoffs).insert(SessionId(7), alias.clone());
+            reg.save_account_handoffs().unwrap();
+            let retirement = reg.agents.retire_account_binding(SessionId(7));
+            if retired {
+                lock(&reg.state).exited.insert(SessionId(7), 0);
+            }
+            let scope = if provider_scope {
+                SwitchScope::Provider(ProviderKind::Codex)
+            } else {
+                SwitchScope::Session(SessionId(7), ProviderKind::Codex)
+            };
+            lock(&reg.account_work.pending).insert(
+                scope,
+                accounts::switch_work::SwitchTarget {
+                    account_id: stale.clone(),
+
+                    prepared: true,
+                    not_before: None,
+                },
+            );
+            let chosen = match selection {
+                TransferSelection::FollowUp => &stale,
+                TransferSelection::NewTarget => &newest,
+                TransferSelection::Cancel => &running,
+            };
+            let explicit = !matches!(selection, TransferSelection::FollowUp);
+            let select_new = || {
+                reg.queue_session_account_switch(
+                    SessionId(8),
+                    ProviderKind::Codex,
+                    chosen,
+                    &snapshot,
+                )
+                .unwrap();
+            };
+            if explicit && !during_refresh {
+                select_new();
+            }
+            let saved_before = fs::read(state.join(FILE)).unwrap();
+            let refreshed = std::cell::Cell::new(false);
+            reg.transfer_account_selection(
+                SessionId(7),
+                SessionId(8),
+                ProviderKind::Codex,
+                &running,
+                || {
+                    refreshed.set(true);
+                    // Injection point: the old/provider request exists, but discovery is
+                    // still outside the mutex. The newly accepted choice must win.
+                    if explicit && during_refresh {
+                        select_new();
+                    }
+                    snapshot.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(refreshed.get(), !explicit || during_refresh);
+            let pending = lock(&reg.account_work.pending);
+            assert_eq!(
+                pending
+                    .get(&SwitchScope::Session(SessionId(8), ProviderKind::Codex))
+                    .unwrap()
+                    .account_id,
+                *chosen
+            );
+            assert!(
+                !pending.contains_key(&SwitchScope::Session(SessionId(7), ProviderKind::Codex))
+            );
+            assert_eq!(
+                pending.contains_key(&SwitchScope::Provider(ProviderKind::Codex)),
+                provider_scope
+            );
+            drop(pending);
+            let saved = load(Some(&state));
+            assert_eq!(saved.get(&SessionId(7)), Some(&alias));
+            if matches!(selection, TransferSelection::Cancel) {
+                assert!(!saved.contains_key(&SessionId(8)));
+            } else {
+                assert_eq!(saved.get(&SessionId(8)).unwrap().account_id, *chosen);
+            }
+            if explicit && !during_refresh {
+                assert_eq!(fs::read(state.join(FILE)).unwrap(), saved_before);
+            }
+            drop(retirement);
+            drop(reg);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransferSelection {
+    FollowUp,
+    NewTarget,
+    Cancel,
 }

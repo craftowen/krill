@@ -264,6 +264,23 @@ fn record_layout_matches_in_place_offsets() {
 }
 
 #[test]
+fn owner_detects_a_marker_removed_or_replaced_before_its_first_lock() {
+    let (state, consent) = consented("owner-publication");
+    fs::create_dir_all(runs_dir(&state.0)).unwrap();
+    let path = write_record(&state.0, &sample(&consent, Process::App, 42, now_ms()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(marker_is_current(&file, &path));
+    fs::remove_file(&path).unwrap();
+    assert!(!marker_is_current(&file, &path));
+    fs::write(&path, b"replacement").unwrap();
+    assert!(!marker_is_current(&file, &path));
+}
+
+#[test]
 fn encode_refuses_fields_outside_the_record_format() {
     let consent = Consent {
         generation: "0".repeat(32),

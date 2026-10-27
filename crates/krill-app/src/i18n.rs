@@ -41,6 +41,9 @@ pub(crate) fn set_language(language: Language, cx: &mut gpui::App) {
     });
 }
 
+/// Nonlocalized Windows system title prefix, used for parsing rather than UI copy.
+pub(crate) const WINDOWS_ADMIN_TITLE_KO: &str = "관리자";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {
     pub id: &'static str,
@@ -125,6 +128,18 @@ macro_rules! catalog {
 }
 
 catalog! {
+    chat_preview {
+        USER => ("채팅 화면을 더 읽기 쉽게 정리해 주세요.\nKeep my terminal session running while we review the conversation.", "Make the chat easier to read.\nKeep my terminal session running while we review the conversation."),
+        REASONING => ("먼저 메시지의 위계를 살펴보고, 대화와 도구 실행 내역을 구분하겠습니다.\nLong diagnostic details remain available when expanded.", "I will review the message hierarchy and separate conversation from tool activity.\nLong diagnostic details remain available when expanded."),
+        TOOL_RESULT => ("Read complete. Message history and terminal remain attached.\n한글과 English가 섞인 긴 도구 출력도 펼쳐서 확인할 수 있습니다.", "Read complete. Message history and terminal remain attached.\nLong tool output can be expanded for review."),
+        ASSISTANT => ("대화 내용은 넓게 읽고, 도구 실행 과정은 필요한 때 펼칠 수 있도록 정리했습니다.\n\n```rust\nfn main() {\n    println!(\"안녕하세요, Krill!\");\n}\n```\n\nYou can copy this message or the code separately.", "Conversation stays readable while tool activity expands on demand.\n\n```rust\nfn main() {\n    println!(\"Hello, Krill!\");\n}\n```\n\nYou can copy this message or the code separately."),
+        QUESTION_TITLE => ("다음 확인 항목", "Next review"),
+        REVIEW => ("화면 검토", "Review layout"),
+        REVIEW_DESC => ("메시지와 입력창을 확인합니다.", "Inspect messages and the composer."),
+        KEYS => ("키보드 동작 확인", "Review keyboard behavior"),
+        KEYS_DESC => ("줄바꿈과 초안 유지 동작을 확인합니다.", "Inspect line breaks and draft preservation."),
+        QUESTION => ("어떤 동작을 먼저 확인할까요?", "Which behavior should we review first?"),
+    }
     artifacts {
         TITLE => ("아티팩트", "Artifacts"),
         DESCRIPTION => ("문서와 시각 자료는 기본으로 Krill 아티팩트로 만들어집니다. 발행한 링크를 여기서 확인하세요.", "Documents and visual deliverables use Krill artifacts by default. Find published links here."),
@@ -750,6 +765,7 @@ catalog! {
             "Krill 데몬 응답이 늦어 다시 시도하는 중입니다",
             "The Krill daemon is slow to respond. Retrying…"
         ),
+        SESSION_ACCOUNT_SWITCH => ("세션 계정 변경", "Change session account"),
         SESSION_ACCOUNT => ("계정 {label}", "Account {label}"),
         INFERRED_STATUS_TOOLTIP => ("터미널 제목이나 화면에서 추정한 상태입니다. 실제 상태와 다를 수 있습니다.", "Status inferred from the terminal title or screen. It may differ from the actual state."),
         COORD_BADGE => ("지휘자", "coord"),
@@ -1084,7 +1100,10 @@ catalog! {
         SAVE_CONFLICT => ("저장하지 않았습니다: 파일이 디스크에서 바뀌었습니다. 다시 읽거나 '내 편집 유지'를 고른 뒤 저장하세요.", "Not saved: the file changed on disk. Reload, or choose Keep my edits, then save again."),
         PREVIEW => ("미리보기", "Preview"),
         EDIT => ("편집", "Edit"),
+        EDIT_CODE => ("코드 편집", "Edit Code"),
         EDIT_TEXT => ("텍스트로 편집", "Edit as Text"),
+        OPEN_BROWSER => ("브라우저로 열기", "Open in Browser"),
+        OPEN_BROWSER_TOOLTIP => ("기본 웹 브라우저에서 이 HTML 파일을 엽니다", "Open this HTML file in your default web browser"),
         TABLE => ("표", "Table"),
         CELLS => ("셀", "Cells"),
         IMAGE => ("이미지", "Image"),
@@ -1959,6 +1978,7 @@ catalog! {
         UPDATE_ERR_URL => ("업데이트 주소가 올바르지 않습니다: {detail}", "Invalid update URL: {detail}"),
         UPDATE_ERR_VERSION => ("업데이트 버전이 올바르지 않습니다: {detail}", "Invalid update version: {detail}"),
         UPDATE_ERR_DOWNGRADE => ("낮은 버전으로는 업데이트할 수 없습니다(현재 {current}, 제공 {offered})", "Downgrade refused (current {current}, offered {offered})"),
+        UPDATE_ERR_PROTOCOL => ("v{version} 업데이트에는 데몬 프로토콜 {required} 이상이 필요합니다(현재 {supported})", "Update v{version} requires daemon protocol {required} or newer (current {supported})"),
         UPDATE_ERR_ROLLOUT => ("순차 배포 대상이 아닙니다(rollout {pct}%)", "Not in the rollout cohort (rollout {pct}%)"),
         UPDATE_ERR_SIGNATURE => ("업데이트 서명 검증에 실패했습니다", "Update signature verification failed"),
         UPDATE_ERR_SHA256 => ("업데이트 파일 검증에 실패했습니다(무결성 불일치)", "Update file integrity check failed (sha256 mismatch)"),
@@ -2048,11 +2068,11 @@ catalog! {
         WARNING => ("기록 중단 · 키체인/기록 설정 확인", "Recording paused · Check Keychain and recording settings"),
     }
     pull_request {
+        TIMED_OUT => ("PR 조회 시간이 초과되었습니다. 잠시 후 다시 시도하세요", "PR lookup timed out. Try again shortly."),
+        GH_FAILED => ("PR 조회에 실패했습니다. GitHub CLI와 원격 저장소 연결을 확인하세요", "PR lookup failed. Check GitHub CLI and the remote connection."),
         CREATE => ("PR 만들기 (브라우저)", "Create PR (browser)"),
         MISSING => ("PR 연동: GitHub CLI(gh)를 설치하세요", "PR integration: install GitHub CLI (gh)"),
         FAILED => ("PR 조회 실패 — gh auth login 및 GitHub 원격 저장소를 확인하세요", "PR lookup failed — check gh auth login and the GitHub remote"),
-        TIMED_OUT => ("PR 조회 시간 초과 — 네트워크를 확인한 뒤 다시 시도하세요", "PR lookup timed out — check your network and try again"),
-        GH_FAILED => ("PR 조회 실패 — GitHub CLI(gh)가 오류를 냈습니다. 잠시 후 다시 시도하세요", "PR lookup failed — GitHub CLI (gh) returned an error. Try again shortly"),
         PACED => ("PR 요청 제한 — 잠시 후 다시 시도하세요", "PR request limit reached — try again shortly"),
         OPEN => ("PR 열림", "PR Open"),
         DRAFT => ("PR 초안", "PR Draft"),
@@ -2242,9 +2262,11 @@ catalog! {
         KIND_MEDIA => ("오디오·비디오 파일", "Audio or video file"),
         KIND_FONT => ("글꼴 파일", "Font file"),
         KIND_PDF => ("PDF 문서", "PDF document"),
+        KIND_HTML => ("HTML 웹 문서", "HTML web document"),
         KIND_BINARY => ("바이너리 파일", "Binary file"),
         KIND_TOO_LARGE => ("미리보기 한도를 넘는 큰 파일", "File exceeds the preview limit"),
         NO_PREVIEW => ("앱 안에서 미리볼 수 없습니다", "This file can't be previewed in the app"),
+        HTML_PREVIEW_DESC => ("브라우저에서 렌더링된 화면을 확인하거나 코드 편집기로 소스를 수정할 수 있습니다.", "Open in your browser to view the rendered page, or switch to the code editor to edit the source."),
         OPEN_DEFAULT => ("기본 앱으로 열기", "Open with Default App"),
         REVEAL => ("Finder에서 보기", "Reveal in Finder"),
         FIT => ("맞춤", "Fit"),

@@ -10,8 +10,14 @@ use crate::session::lock;
 
 #[derive(Default)]
 pub(crate) struct SwitchWork {
-    pub pending: Mutex<BTreeMap<ProviderKind, SwitchTarget>>,
+    pub pending: Mutex<BTreeMap<SwitchScope, SwitchTarget>>,
     pub wake: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SwitchScope {
+    Provider(ProviderKind),
+    Session(krill_proto::SessionId, ProviderKind),
 }
 
 pub(crate) struct SwitchTarget {
@@ -41,8 +47,9 @@ pub(super) fn notify(home: &Path, state: Option<&Path>, events: &[AutoSwitchEven
     if let Some(worker) = worker {
         let mut pending = lock(&worker.pending);
         for event in events {
+            pending.retain(|scope, _| !matches!(scope, SwitchScope::Session(_, provider) if *provider == event.provider));
             pending.insert(
-                event.provider,
+                SwitchScope::Provider(event.provider),
                 SwitchTarget {
                     account_id: event.to_id.clone(),
                     prepared: false,

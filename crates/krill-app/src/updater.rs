@@ -46,8 +46,11 @@ pub use self::relaunch::{
 /// 상태 디렉터리의 업데이터 설정 파일 이름.
 pub const CONFIG_FILE: &str = "updater.toml";
 /// 기본 업데이트 매니페스트 URL.
-pub const DEFAULT_URL: &str =
-    "https://github.com/craftowen/krill/releases/latest/download/latest.json";
+pub const DEFAULT_URL: &str = if cfg!(windows) {
+    "https://github.com/craftowen/krill/releases/latest/download/latest-windows.json"
+} else {
+    "https://github.com/craftowen/krill/releases/latest/download/latest.json"
+};
 // RFC 8032 §7.1의 공개된 비밀키에 대응하는 테스트 키는 배포에 사용할 수 없다.
 const TEST_PUBLIC_KEYS: [&str; 3] = [
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
@@ -199,6 +202,41 @@ pub enum Decision {
     IncompatibleProtocol { required: u16, supported: u16 },
     /// 점진 롤아웃(`rollout_pct`) 대상 밖.
     DeferredByRollout,
+}
+
+impl Decision {
+    fn cli_status(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::UpToDate => "up_to_date",
+            Self::ChannelMismatch => "channel_mismatch",
+            Self::IncompatibleProtocol { .. } => "incompatible_protocol",
+            Self::DeferredByRollout => "deferred_by_rollout",
+        }
+    }
+
+    fn skip_message(&self, current: &str, manifest: &Manifest, channel: Channel) -> String {
+        match self {
+            Self::UpToDate => format!("Krill v{current} is up to date."),
+            Self::ChannelMismatch => format!(
+                "Update skipped: settings channel ({}) differs from the offered build channel ({}).",
+                channel.as_str(),
+                manifest.channel.as_str()
+            ),
+            Self::IncompatibleProtocol {
+                required,
+                supported,
+            } => format!(
+                "Update v{} requires daemon protocol {required} or newer (current {supported}).",
+                manifest.version
+            ),
+            Self::DeferredByRollout => format!(
+                "Update v{} is available but this installation is outside the rollout cohort ({}%).",
+                manifest.version, manifest.rollout_pct
+            ),
+            Self::Available => format!("Update v{} is available.", manifest.version),
+        }
+    }
 }
 
 /// 업데이터 설정(`updater.toml`). 서명 검증을 끄는 필드는 두지 않는다(CONVENTIONS C1-I3).
@@ -1352,13 +1390,37 @@ fn decide_and_stage(
     let pk = cfg.public_key_bytes()?;
     let from_version = effective_version(Some(app_bundle));
     let bucket = rollout_bucket(state_dir);
-    if manifest.evaluate(&pk, &from_version, cfg.channel, PROTO_MAX, bucket)?
-        == Decision::ChannelMismatch
-    {
-        return Ok(CheckStatus::ChannelMismatch {
-            configured: cfg.channel,
-            offered: manifest.channel,
-        });
+    match manifest.evaluate(&pk, &from_version, cfg.channel, PROTO_MAX, bucket)? {
+        Decision::UpToDate => {
+            return Ok(CheckStatus::UpToDate {
+                version: from_version,
+            });
+        }
+        Decision::ChannelMismatch => {
+            return Ok(CheckStatus::ChannelMismatch {
+                configured: cfg.channel,
+                offered: manifest.channel,
+            });
+        }
+        Decision::DeferredByRollout => {
+            return Ok(CheckStatus::Error(
+                crate::i18n::catalog::updater_relaunch::UPDATE_ERR_ROLLOUT
+                    .format(&[("pct", &manifest.rollout_pct.to_string())]),
+            ));
+        }
+        Decision::IncompatibleProtocol {
+            required,
+            supported,
+        } => {
+            return Ok(CheckStatus::Error(
+                crate::i18n::catalog::updater_relaunch::UPDATE_ERR_PROTOCOL.format(&[
+                    ("version", &manifest.version),
+                    ("required", &required.to_string()),
+                    ("supported", &supported.to_string()),
+                ]),
+            ));
+        }
+        Decision::Available => {}
     }
     let verifier = CodesignVerifier::from_config(cfg);
     let staged = download_and_stage(
@@ -1728,7 +1790,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
             println!(
                 "{}",
                 serde_json::json!({
-                    "status": if available { "available" } else { "up_to_date" },
+                    "status": decision.cli_status(),
                     "current_version": from_version,
                     "latest_version": manifest.version,
                     "available": available,
@@ -1741,14 +1803,11 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
                 manifest.version,
                 app_bundle.display()
             );
-        } else if decision == Decision::ChannelMismatch {
-            println!(
-                "Update skipped: settings channel ({}) differs from the offered build channel ({}).",
-                cfg.channel.as_str(),
-                manifest.channel.as_str()
-            );
         } else {
-            println!("Krill v{from_version} is up to date.");
+            println!(
+                "{}",
+                decision.skip_message(&from_version, &manifest, cfg.channel)
+            );
         }
         return Ok(0);
     }
@@ -1758,20 +1817,17 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
             println!(
                 "{}",
                 serde_json::json!({
-                    "status": "up_to_date",
+                    "status": decision.cli_status(),
                     "current_version": from_version,
                     "latest_version": manifest.version,
                     "updated": false,
                 })
             );
-        } else if decision == Decision::ChannelMismatch {
-            println!(
-                "Update skipped: settings channel ({}) differs from the offered build channel ({}).",
-                cfg.channel.as_str(),
-                manifest.channel.as_str()
-            );
         } else {
-            println!("Krill v{from_version} is already up to date.");
+            println!(
+                "{}",
+                decision.skip_message(&from_version, &manifest, cfg.channel)
+            );
         }
         return Ok(0);
     }
@@ -2015,3 +2071,26 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_bundle_without_update_url_uses_windows_manifest() {
+    let root =
+        std::env::temp_dir().join(format!("krill-windows-update-url-{}", std::process::id()));
+    let bundle = root.join("Krill");
+    let state = root.join("state");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        bundle.join("Krill.json"),
+        r#"{"CFBundleShortVersionString":"0.2.6"}"#,
+    )
+    .unwrap();
+    let config = Config::load_for_bundle(&state, Some(&bundle)).unwrap();
+    assert_eq!(
+        config.url,
+        "https://github.com/craftowen/krill/releases/latest/download/latest-windows.json"
+    );
+    assert_eq!(effective_version(Some(&bundle)), "0.2.6");
+    fs::remove_dir_all(root).unwrap();
+}

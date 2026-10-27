@@ -245,3 +245,5 @@ ZIP SHA-256 검사 뒤 `%LOCALAPPDATA%\Programs\Krill`에 설치하고 시작 �
 [아키텍처](docs/ARCHITECTURE.md) · [로드맵](docs/ROADMAP.md) · [코드 규칙](docs/CONVENTIONS.md) · [디자인 시스템](docs/STYLEGUIDE.md).
 
 Apache-2.0 ([LICENSE](LICENSE), Copyright 2026 Krill contributors). [서드파티 고지](THIRD_PARTY_NOTICES.md)·[라이선스 기록](docs/licensing/README.md)을 참고합니다. 기여 시 Zed `terminal`·`terminal_view`(GPL-3.0) 코드는 읽거나 복사하지 않으며, 허용된 Orca 소스 차용에는 출처·저작권을 표기합니다.
+
+사용 통계는 별도 동의창 없이 기본 활성화됩니다. 무작위 설치 ID·최초 실행·앱 실행·일별 입력 활동·버전·OS·아키텍처를 집계하며, 프롬프트·터미널 출력·명령·프로젝트 경로·계정 정보는 제외합니다. `krill telemetry disable` 또는 `DO_NOT_TRACK=1`로 수집을 끌 수 있습니다. 전송 상태와 운영자 설정은 [사용 통계 안내](services/telemetry/CLIENT.md)를 참고합니다. 오류 보고는 별도 설정이며 기본 꺼짐입니다.

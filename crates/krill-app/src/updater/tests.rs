@@ -322,6 +322,58 @@ fn channel_mismatch_surfaces_configured_and_offered_without_staging() {
 }
 
 #[test]
+fn newer_release_skipped_by_rollout_or_protocol_never_reports_up_to_date() {
+    let sk = [42; 32];
+    let cfg = Config {
+        public_key: encode_hex(&test_public_key(&sk)),
+        ..Config::default()
+    };
+    let d = TempGuard(temp_dir("not-up-to-date"));
+    let app = d.0.join("Krill.app");
+    build_test_app_bundle(&app, "0.2.6", "exit 0", false);
+    let mut manifest = Manifest {
+        version: "0.2.7".into(),
+        url: "https://example.com/never-download.zip".into(),
+        sha256: sha256_hex(b"never-download"),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 0,
+    };
+    sign_manifest(&mut manifest, &sk);
+    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0).unwrap() else {
+        panic!("a newer release outside rollout must not appear up to date");
+    };
+    assert_eq!(
+        message,
+        crate::i18n::catalog::updater_relaunch::UPDATE_ERR_ROLLOUT.format(&[("pct", "0")])
+    );
+    manifest.rollout_pct = 100;
+    manifest.min_daemon_protocol = PROTO_MAX.checked_add(1).unwrap();
+    sign_manifest(&mut manifest, &sk);
+    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0).unwrap() else {
+        panic!("a newer incompatible release must not appear up to date");
+    };
+    assert!(message.contains("0.2.7"));
+    assert!(!staging_path(&app).exists());
+    for decision in [
+        Decision::ChannelMismatch,
+        Decision::DeferredByRollout,
+        Decision::IncompatibleProtocol {
+            required: PROTO_MAX + 1,
+            supported: PROTO_MAX,
+        },
+    ] {
+        assert_ne!(decision.cli_status(), "up_to_date");
+        assert!(
+            !decision
+                .skip_message("0.2.6", &manifest, cfg.channel)
+                .contains("up to date")
+        );
+    }
+}
+
+#[test]
 fn forged_archive_and_codesign_verification_interface() {
     let d = TempGuard(temp_dir("codesign"));
     let sk = decode_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")

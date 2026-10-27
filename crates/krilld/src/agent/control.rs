@@ -14,6 +14,7 @@ use krill_proto::agent::{Agents, FILE_NAME, Permission};
 use krill_proto::control::{
     AgentLaunch, AgentProfile, AgentSettings, MAX_AGENT_PROFILES, MAX_AGENT_TEXT,
 };
+use krill_proto::usage::ProviderKind;
 
 use crate::session::lock;
 pub(crate) mod cache;
@@ -61,6 +62,7 @@ pub(crate) struct Control {
     account_resumes: Mutex<std::collections::HashMap<SessionId, Option<String>>>,
     /// 한도 초과(`StopFailure` / `agy_rate_limited`)로 중단돼 계정 전환 뒤 작업을 이어갈 세션.
     rate_limited: Mutex<std::collections::HashSet<SessionId>>,
+    account_retirements: Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl Control {
@@ -72,6 +74,7 @@ impl Control {
             veto: Mutex::default(),
             account_resumes: Mutex::default(),
             rate_limited: Mutex::default(),
+            account_retirements: Mutex::default(),
         }
     }
 
@@ -383,6 +386,43 @@ impl Control {
         agent_hint: Option<&str>,
         cwd_hint: Option<&[u8]>,
     ) -> bool {
+        self.record_hook_identity(
+            session,
+            payload,
+            agent_hint,
+            cwd_hint,
+            HookBinding::Existing,
+        )
+    }
+
+    /// Only the registry's live foreground/caller ancestry check grants this authority.
+    pub(crate) fn record_foreground_hook_session(
+        &self,
+        session: SessionId,
+        payload: &[u8],
+        agent_hint: &str,
+        cwd_hint: Option<&[u8]>,
+    ) -> bool {
+        self.record_hook_identity(
+            session,
+            payload,
+            Some(agent_hint),
+            cwd_hint,
+            HookBinding::Foreground,
+        )
+    }
+
+    fn record_hook_identity(
+        &self,
+        session: SessionId,
+        payload: &[u8],
+        agent_hint: Option<&str>,
+        cwd_hint: Option<&[u8]>,
+        binding: HookBinding,
+    ) -> bool {
+        if lock(&self.account_retirements).contains(&session) {
+            return true;
+        }
         let payload = serde_json::from_slice::<serde_json::Value>(payload);
         let id = payload.as_ref().ok().and_then(extract_hook_session_id);
         let transcript_path = payload.as_ref().ok().and_then(extract_hook_transcript_path);
@@ -459,6 +499,70 @@ impl Control {
             }
             Err(_) => return explicit_subagent,
         };
+        let incoming_provider = agent_hint.and_then(ProviderKind::parse);
+        let provider_changed = incoming_provider.is_some_and(|incoming| {
+            self.user()
+                .and_then(|user| self.agents_locked(user.as_deref()))
+                .ok()
+                .and_then(|agents| {
+                    let (_, profile) = agents.resolve(&stored.profile)?;
+                    ProviderKind::parse(Path::new(profile.program()?).file_name()?.to_str()?)
+                })
+                .or_else(|| ProviderKind::parse(&stored.profile))
+                .is_some_and(|existing| existing != incoming)
+        });
+        let identity_changed =
+            id.is_some_and(|incoming| stored.session_id.as_deref() != Some(incoming));
+        let legitimate_rotation = payload.as_ref().is_ok_and(|p| {
+            hook_event(p).is_some_and(|event| is_legitimate_session_id_rotation(event, p))
+        });
+        // A shell can start a different CLI after the previous one exits. Replace the
+        // entire binding only with live caller evidence, never a nested tool's hint.
+        let rebind = binding == HookBinding::Foreground
+            && !explicit_subagent
+            && id.is_some()
+            && (provider_changed
+                || (stored.session_id.is_some() && identity_changed && !legitimate_rotation))
+            && payload
+                .as_ref()
+                .ok()
+                .and_then(hook_event)
+                .is_some_and(|event| {
+                    matches!(event, "SessionStart" | "sessionStart" | "PreInvocation")
+                });
+        let watching_resume = lock(&self.account_resumes).contains_key(&session);
+        if rebind && !watching_resume {
+            if let Some(provider) = incoming_provider {
+                provider.as_str().clone_into(&mut stored.profile);
+            }
+            stored.permission = Permission::Manual;
+            stored.session_id = id.map(str::to_owned);
+            stored.transcript_path = transcript_path.map(str::to_owned);
+            stored.cwd = payload
+                .as_ref()
+                .ok()
+                .and_then(|p| p.get("cwd").and_then(serde_json::Value::as_str))
+                .filter(|cwd| !cwd.is_empty() && cwd.len() <= 4096)
+                .map_or_else(
+                    || cwd_hint.unwrap_or_default().to_vec(),
+                    |cwd| cwd.as_bytes().to_vec(),
+                );
+            stored.account = None;
+            stored.hibernation_blocked = true;
+            self.block_hibernation(session);
+            if let Ok(path) = self.launch_path(session)
+                && let Ok(bytes) = serde_json::to_vec(&stored)
+            {
+                save(&path, &bytes).ok();
+            }
+            return false;
+        }
+        // A matching ID alone cannot authenticate a different provider's hook, nor
+        // can an unexpected foreground conversation confirm an in-flight resume.
+        if provider_changed || (watching_resume && identity_changed) {
+            self.block_hibernation(session);
+            return true;
+        }
         let foreign_session_id = match (stored.session_id.as_deref(), id, payload.as_ref().ok()) {
             (Some(existing), Some(incoming), Some(p)) if existing != incoming => {
                 match hook_event(p) {
@@ -633,6 +737,20 @@ impl Control {
         lock(&self.veto).insert(session);
     }
 
+    /// Freeze only hook identity updates, allowing the holder's exit observer to run.
+    /// The caller serializes this transition with hooks through `Registry::hook_commit`.
+    pub(crate) fn retire_account_binding(&self, session: SessionId) -> RetiringBinding<'_> {
+        lock(&self.account_retirements).insert(session);
+        RetiringBinding {
+            control: self,
+            session,
+        }
+    }
+
+    pub(crate) fn account_binding_retiring(&self, session: SessionId) -> bool {
+        lock(&self.account_retirements).contains(&session)
+    }
+
     pub fn hibernation_blocked(&self, session: SessionId) -> bool {
         lock(&self.veto).contains(&session)
     }
@@ -645,6 +763,23 @@ impl Control {
             fs::remove_file(path).ok();
         }
     }
+}
+
+pub(crate) struct RetiringBinding<'a> {
+    control: &'a Control,
+    session: SessionId,
+}
+
+impl Drop for RetiringBinding<'_> {
+    fn drop(&mut self) {
+        lock(&self.control.account_retirements).remove(&self.session);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookBinding {
+    Existing,
+    Foreground,
 }
 
 fn unknown_roster() -> bool {

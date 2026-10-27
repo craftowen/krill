@@ -1110,7 +1110,7 @@ fn unreleased_workers_includes_completed_runs_and_hides_released() {
 }
 
 /// OWE-702: 데몬 연결 중에만 `ACCOUNTS_POLL`마다 계정을 다시 묻고, 링크가 끊기면 멈춘다.
-/// 가짜 데몬 소켓은 연결 수만 센다(응답 없음 → 조용히 다음 바퀴).
+/// 가짜 데몬은 준비·감시 연결을 제외하고 계정 요청만 센다(응답 없음 → 조용히 다음 바퀴).
 #[gpui::test]
 fn accounts_poll_runs_only_while_linked(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1123,9 +1123,32 @@ fn accounts_poll_runs_only_while_linked(cx: &mut TestAppContext) {
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
     std::thread::spawn(move || {
+        use std::io::Write as _;
         for stream in listener.incoming() {
-            counter.fetch_add(1, Ordering::SeqCst);
-            drop(stream);
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            let server = ipc::ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: krill_proto::usage::FEAT_USAGE,
+                build: "fixture".into(),
+                instance_id: 1,
+            };
+            if stream.write_all(&server.encode().unwrap()).is_err() {
+                continue;
+            }
+            let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                continue;
+            };
+            let Ok(hello) = ipc::ClientHello::decode(kind, &body) else {
+                continue;
+            };
+            if hello.features & krill_proto::usage::FEAT_USAGE != 0
+                && matches!(ipc::read_frame(&mut stream), Ok(Some(_)))
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }
     });
     let paths = krill_proto::daemon::Paths {

@@ -356,16 +356,15 @@ pub mod menu_bar {
     }
 }
 
-/// 상태 폴더별 단일 실행. X로 닫아도 트레이에 남는 앱이 있으면, 같은 상태 폴더의 두 번째 실행은
-/// 그 앱에 창 열기를 넘기고 끝난다. 다른 `KRILL_STATE_DIR`(테스트·격리 실행)은 서로 막지 않는다.
-/// 트레이 아이콘 생성과 무관한 숨은 창을 쓰므로 트레이를 못 만든 경우에도 같은 경로로 열린다.
+/// State-scoped Windows app reopening; native handles remain owned.
 pub mod instance {
     use std::cell::RefCell;
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
     use std::time::Duration;
 
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+        ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -374,7 +373,11 @@ pub mod instance {
         GetWindowThreadProcessId, PostMessageW, RegisterClassW, WM_APP, WNDCLASSW,
     };
 
-    use super::{ptr, wide};
+    use std::ptr;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
 
     const CLASS: &str = "KrillInstance";
     const OPEN: u32 = WM_APP + 18;
@@ -389,7 +392,7 @@ pub mod instance {
     /// 이 프로세스가 가진 실행 표지. 프로세스가 끝날 때까지 살려 둔다.
     #[derive(Debug)]
     pub struct Instance {
-        mutex: HANDLE,
+        _mutex: Option<OwnedHandle>,
         hwnd: HWND,
         opens: Option<UnboundedReceiver<()>>,
     }
@@ -406,10 +409,7 @@ pub mod instance {
             if !self.hwnd.is_null() {
                 // SAFETY: this hidden HWND was created by `claim` on this same UI thread.
                 unsafe { DestroyWindow(self.hwnd) };
-            }
-            if !self.mutex.is_null() {
-                // SAFETY: closes exactly the handle CreateMutexW returned to `claim`.
-                unsafe { CloseHandle(self.mutex) };
+                OPENS.with_borrow_mut(|opens| *opens = None);
             }
         }
     }
@@ -422,10 +422,15 @@ pub mod instance {
         let mutex = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         // SAFETY: reads this thread's last error immediately after CreateMutexW.
         let existed = !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let mutex = if mutex.is_null() {
+            tracing::warn!("instance mutex unavailable");
+            None
+        } else {
+            // SAFETY: CreateMutexW returned a unique owned non-null handle.
+            Some(unsafe { OwnedHandle::from_raw_handle(mutex) })
+        };
         if existed && forward {
             if forward_open(key) {
-                // SAFETY: closes the handle CreateMutexW just returned.
-                unsafe { CloseHandle(mutex) };
                 return None;
             }
             tracing::warn!("running Krill did not accept open; starting another instance");
@@ -444,7 +449,7 @@ pub mod instance {
             hwnd
         };
         Some(Instance {
-            mutex,
+            _mutex: mutex,
             hwnd,
             opens: Some(rx),
         })

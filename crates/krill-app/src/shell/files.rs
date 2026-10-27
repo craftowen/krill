@@ -334,6 +334,10 @@ enum Shown {
     Table(gpui::Entity<CsvView>),
     Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
     Image(gpui::Entity<ImageView>),
+    Html {
+        title: Option<String>,
+        len: u64,
+    },
 }
 
 /// Parse bounded preview data on the executor; entity creation remains on the UI.
@@ -342,6 +346,7 @@ enum PreparedPreview {
     Table(csv::Table),
     Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
     Svg(Arc<gpui::Image>),
+    Html { title: Option<String>, len: u64 },
 }
 
 fn prepare_preview(preview: Preview, text: &str) -> PreparedPreview {
@@ -363,6 +368,10 @@ fn prepare_preview(preview: Preview, text: &str) -> PreparedPreview {
             gpui::ImageFormat::Svg,
             text.as_bytes().to_vec(),
         ))),
+        Preview::Html => PreparedPreview::Html {
+            title: editor::syntax::html_title(text),
+            len: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        },
     }
 }
 
@@ -376,6 +385,7 @@ fn build_preview(prepared: PreparedPreview, cx: &mut App) -> Shown {
         PreparedPreview::Table(table) => Shown::Table(cx.new(|_| CsvView::new(table))),
         PreparedPreview::Notebook(result) => Shown::Notebook(result),
         PreparedPreview::Svg(image) => Shown::Image(cx.new(|_| ImageView::new_svg_image(image))),
+        PreparedPreview::Html { title, len } => Shown::Html { title, len },
     }
 }
 
@@ -428,6 +438,7 @@ fn toggle_labels(preview: Preview) -> (&'static str, &'static str) {
         Preview::Table(_) => (etext::TABLE.get(), etext::EDIT_TEXT.get()),
         Preview::Notebook => (etext::CELLS.get(), etext::EDIT_TEXT.get()),
         Preview::Svg => (etext::IMAGE.get(), etext::EDIT_TEXT.get()),
+        Preview::Html => (etext::PREVIEW.get(), etext::EDIT_CODE.get()),
     }
 }
 
@@ -1171,6 +1182,7 @@ impl Shell {
                 )
             })
             .children(self.preview_toggle(id, cx))
+            .children(Self::open_browser_button(id, &path))
             .children(self.share_button(id, &path, cx))
             .when(is_split, |d| {
                 d.child(
@@ -1277,6 +1289,19 @@ impl Shell {
                     }
                     Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
                     Shown::Image(view) => view.clone().into_any_element(),
+                    Shown::Html { title, len } => {
+                        let weak = cx.weak_entity();
+                        fview::html_preview(
+                            &path,
+                            title.as_deref(),
+                            *len,
+                            move |window, cx| {
+                                weak.update(cx, |this, cx| this.set_preview(id, false, window, cx))
+                                    .ok();
+                            },
+                            cx,
+                        )
+                    }
                 },
                 Some(Body::Text { state, .. }) => div()
                     .size_full()
@@ -1327,6 +1352,34 @@ impl Shell {
             return None;
         };
         Some(preview.is_some() && shown.is_some())
+    }
+
+    /// 열린 HTML 파일을 기본 웹 브라우저에서 여는 머리 버튼.
+    fn open_browser_button(id: PaneId, path: &Path) -> Option<Button> {
+        if !krill_app::file_format::is_html_path(path) {
+            return None;
+        }
+        let path = path.to_path_buf();
+        Some(
+            Button::new(("file-open-browser", id.get()))
+                .debug_selector(|| "file-open-browser".into())
+                .icon(IconName::ExternalLink)
+                .label(etext::OPEN_BROWSER.get())
+                .ghost()
+                .xsmall()
+                .max_w(gpui::relative(1.))
+                .overflow_hidden()
+                .accessibility_label(etext::OPEN_BROWSER_TOOLTIP.get())
+                .tooltip(etext::OPEN_BROWSER_TOOLTIP.get())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    fview::spawn_open(
+                        path.clone(),
+                        krill_app::file_format::open_default_command,
+                        cx,
+                    );
+                }),
+        )
     }
 
     /// 열린 HTML·Markdown 파일을 아티팩트(공개 링크)로 공유하는 머리 버튼.
@@ -2009,12 +2062,14 @@ impl Shell {
                 let preview = editor::preview(kind);
                 let shown = prepared.map(|prepared| build_preview(prepared, cx));
                 let state = cx.new(|cx| {
-                    EditorState::new(window, cx)
+                    let mut ed = EditorState::new(window, cx)
                         .language(language)
                         .line_number(true)
                         // OWE-874: 긴 줄은 자동 줄 바꿈(기본값 true를 고정 — 잘려서 못 보는 일이 없게).
                         .soft_wrap(true)
-                        .default_value(text)
+                        .default_value(text);
+                    editor::syntax::install(&mut ed, language, cx);
+                    ed
                 });
                 // EditorMode preserves source bytes, including CRLF. The IO worker
                 // already prepared the baseline, avoiding a full UI rope conversion.

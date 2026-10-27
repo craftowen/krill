@@ -138,7 +138,7 @@ pub fn enable(state: &Path) -> io::Result<()> {
 /// 기다린 뒤 대기열·재시도·native 캐시·실행 표식을 지운다. 잠금을 못 얻어도 지우기는 계속한다.
 ///
 /// # Errors
-/// 없음 외의 동의 파일 삭제 실패.
+/// 없음 외의 동의 파일 삭제 실패, 또는 동시 관리 작업 때문에 정리를 직렬화하지 못한 경우.
 pub fn disable(state: &Path) -> io::Result<()> {
     let dir = dir(state);
     match fs::remove_file(dir.join(CONSENT_FILE)) {
@@ -149,8 +149,24 @@ pub fn disable(state: &Path) -> io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
-    let lock = Lock::wait(&dir, QUEUE_LOCK, MANAGE_WAIT).ok();
+    let lock = Lock::wait(&dir, QUEUE_LOCK, MANAGE_WAIT);
+    // An overlapping enable may have published a fresh consent while we waited.
+    match fs::remove_file(dir.join(CONSENT_FILE)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     wipe(&dir);
+    // Revocation takes effect immediately, but do not claim completed cleanup
+    // if an enable could still publish after our final removal.
+    if let Err(error) = &lock
+        && error.kind() == io::ErrorKind::WouldBlock
+    {
+        return Err(io::Error::new(
+            error.kind(),
+            "error reporting cleanup is busy; retry disable",
+        ));
+    }
     drop(lock);
     Ok(())
 }

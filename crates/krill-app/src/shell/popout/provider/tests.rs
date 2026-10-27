@@ -324,6 +324,13 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .is_some(),
         "행에서 상세 패널로 이동해도 패널이 유지된다"
     );
+    let header_before = visual.debug_bounds("status-provider-table-header").unwrap();
+    let toggle_before = visual
+        .debug_bounds("status-provider-toggle-bar-codex")
+        .unwrap();
+    let open_accounts_before = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
     visual.simulate_click(other.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(
@@ -336,10 +343,20 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .debug_bounds("status-provider-details-other")
             .is_some()
     );
-    assert!(
-        visual
-            .debug_bounds("status-provider-table-header")
-            .is_some()
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header_before),
+        "계정 선택이 바뀌어도 상단 헤더 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-toggle-bar-codex"),
+        Some(toggle_before),
+        "상세 패널 길이가 다른 계정으로 바꿔도 하단 메뉴 항목 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(open_accounts_before),
+        "상세 패널 전환 시 팝오버 전체 높이가 변하지 않는다 (CONVENTIONS G7)"
     );
     shell.read_with(visual, |s, _| {
         assert!(
@@ -404,7 +421,6 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     });
 }
 
-#[cfg(unix)]
 #[gpui::test]
 fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff(
     cx: &mut gpui::TestAppContext,
@@ -441,12 +457,6 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
             instance_id: 7777,
         };
         while let Ok((mut stream, _)) = listener.accept() {
-            if stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                .is_err()
-            {
-                break; // The explicit shutdown connection may already be closed on accept.
-            }
             if stream.write_all(&server_hello.encode().unwrap()).is_err() {
                 break;
             }
@@ -541,6 +551,13 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
             .debug_bounds("status-provider-remote-hosts-view")
             .is_none()
     );
+    let header_before_tab = visual.debug_bounds("status-provider-table-header").unwrap();
+    let toggle_before_tab = visual
+        .debug_bounds("status-provider-toggle-bar-codex")
+        .unwrap();
+    let open_accounts_before_tab = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
     visual.simulate_click(tab_remote.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(
@@ -548,6 +565,21 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
             .debug_bounds("status-provider-remote-hosts-view")
             .is_some(),
         "clicking remote tab switches popover body to remote hosts view"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header_before_tab),
+        "로컬↔원격 탭 전환 시 상단 헤더 높이와 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-toggle-bar-codex"),
+        Some(toggle_before_tab),
+        "로컬↔원격 탭 전환 시 하단 메뉴 항목 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(open_accounts_before_tab),
+        "로컬↔원격 탭 전환 시 팝오버 전체 높이가 유지된다 (CONVENTIONS G7)"
     );
     let tab_local = visual
         .debug_bounds("status-provider-tab-local")
@@ -559,6 +591,14 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
             .debug_bounds("status-provider-remote-hosts-view")
             .is_none(),
         "clicking local tab returns to master-detail account view"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header_before_tab)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(open_accounts_before_tab)
     );
     let use_alt = visual
         .debug_bounds("status-provider-use-remote-alt")
@@ -598,7 +638,7 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
         );
     });
 
-    drop(std::os::unix::net::UnixStream::connect(&sock_path).unwrap());
-    server.join().unwrap();
+    std::os::unix::net::UnixStream::connect(&sock_path).ok();
+    server.join().ok();
     std::fs::remove_file(&sock_path).ok();
 }

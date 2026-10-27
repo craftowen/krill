@@ -278,13 +278,22 @@ pub fn request_target(
     target: &krill_hosts::HostTarget,
     req: &UsageRequest,
 ) -> Result<AccountsSnapshot, String> {
-    match exchange_target(target, req)? {
-        UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => Ok(snap),
+    request_target_with_features(target, req).map(|(snapshot, _)| snapshot)
+}
+
+pub fn request_target_with_features(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<(AccountsSnapshot, u64), String> {
+    let (reply, features) = exchange_target_with_features(target, req)?;
+    let snapshot = match reply {
+        UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => snap,
         UsageReply::Current(_) | UsageReply::Orphans(_) | UsageReply::Provisioning(_) => {
-            Ok(AccountsSnapshot::default())
+            AccountsSnapshot::default()
         }
-        UsageReply::Failed(e) => Err(failure_text(e)),
-    }
+        UsageReply::Failed(e) => return Err(failure_text(e)),
+    };
+    Ok((snapshot, features))
 }
 
 /// Codex banked reset 크레딧 소진. 데몬에만 묻는다(로컬 폴백 없음).
@@ -354,6 +363,13 @@ fn exchange_target(
     target: &krill_hosts::HostTarget,
     req: &UsageRequest,
 ) -> Result<UsageReply, String> {
+    exchange_target_with_features(target, req).map(|(reply, _)| reply)
+}
+
+fn exchange_target_with_features(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<(UsageReply, u64), String> {
     let mut hello = daemon::client_hello(ClientRole::App, "krill-app accounts");
     hello.features = FEAT_USAGE
         | krill_proto::usage::FEAT_PROVIDER_DETAILS
@@ -367,7 +383,8 @@ fn exchange_target(
         | krill_proto::usage::FEAT_ACCOUNT_POLICY
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
         | krill_proto::usage::FEAT_USAGE_RESET
-        | krill_proto::usage::FEAT_USAGE_REFRESH;
+        | krill_proto::usage::FEAT_USAGE_REFRESH
+        | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH;
     let mut conn = target.connect(&hello).map_err(|e| e.to_string())?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("FEAT_USAGE not negotiated".to_owned());
@@ -400,7 +417,7 @@ fn exchange_target(
     };
     let reply = UsageReply::decode(kind, &body).map_err(|e| e.to_string())?;
     target.record_outcome(true, None);
-    Ok(reply)
+    Ok((reply, conn.negotiated.features))
 }
 
 pub fn request_local(
@@ -412,6 +429,10 @@ pub fn request_local(
         UsageRequest::CancelAccountSwitch { .. } => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "account handoff cancellation requires the daemon",
+        )),
+        UsageRequest::SwitchSessionAccount { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "session account switching requires the daemon",
         )),
         UsageRequest::Get
         | UsageRequest::ListAccounts

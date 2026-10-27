@@ -183,6 +183,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn other_platforms_do_not_require_macos_notification_permission() {
+        assert!(authorize(false).is_ok());
+        assert!(authorize(true).is_ok());
+    }
+
     #[gpui::test]
     fn settings_permission_change_clears_only_notification_need(cx: &mut gpui::TestAppContext) {
         let status = Arc::new(AtomicUsize::new(1));

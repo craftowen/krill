@@ -134,6 +134,7 @@ fn main() -> std::process::ExitCode {
                 cx.set_global(StartupBounds(bounds));
                 krill_app::settings::init(cx);
                 krill_app::errors::start(cx);
+                krill_app::telemetry::start(cx);
                 let Some(window) = new_window(cx) else {
                     cx.quit();
                     return;

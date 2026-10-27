@@ -90,6 +90,12 @@ fn extension(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// 브라우저로 바로 열 수 있는 HTML 웹 문서(`.html`·`.htm`)인가.
+#[must_use]
+pub fn is_html_path(path: &Path) -> bool {
+    matches!(extension(path).as_deref(), Some("html" | "htm"))
+}
+
 /// 앞 [`BINARY_PROBE_BYTES`] 안에 NUL이 있으면 바이너리.
 pub fn looks_binary(head: &[u8]) -> bool {
     head.iter().take(BINARY_PROBE_BYTES).any(|&b| b == 0)

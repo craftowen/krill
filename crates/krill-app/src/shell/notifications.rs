@@ -327,7 +327,7 @@ impl Shell {
                 }
             }
             .id1::<Kind>(kind.key())
-            .placement(Anchor::BottomRight)
+            .placement(Anchor::TopRight)
             .delivery(NotificationDelivery::InApp)
             .font_family(ui::FONT_UI)
             .text_size(ui::TEXT_SM)

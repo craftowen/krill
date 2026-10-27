@@ -83,6 +83,8 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 - **G3 SHOULD** 단축키는 `actions!` + `KeyBinding` + `key_context` + `on_action`.
 - **G5 MUST** `krill-term`은 gpui 없이 일반 `#[test]`로 검증.
 - **G6 MUST** 모든 UI/UX 작업(색·타이포그래피·간격·반경·컴포넌트·화면 전환·문구)은 [docs/STYLEGUIDE.md](STYLEGUIDE.md)와 `krill_app::ui` 디자인 시스템 토큰·프리미티브를 따른다. `ui/`·`terminal.rs` 밖에서 생 `gpui::rgb`/`hsla`/`black`/`white`·임의 픽셀 글자 크기(`.text_size(px(..))`) 하드코딩 금지, 미구현 기능 UI 노출 금지.
+- **G7 MUST (레이아웃 시프트 금지 — 공간 사전 예약)**: 마우스 호버(`on_mouse_move`), 행/탭 선택 변경, 2단계 무장(`armed`), 진행 상태 전환, 폴링 갱신으로 내부 자식이 바뀌는 팝오버·모달·마스터-디테일·버튼은 1×1 `grid()` 중첩(`Styled::invisible`로 비활성 분기를 숨겨 레이아웃 치수만 유지, `ui::button_with_reserved_label`·`ui::danger_confirm` 패턴) 또는 고정 치수 예약으로 가장 넓은/높은 상태의 공간을 미리 확보한다. 상호작용 전후 외곽 컨테이너와 인접 컨트롤의 `bounds`가 흔들리면 안 되며 `#[gpui::test]`에서 `debug_bounds` 불변식으로 검증한다([docs/STYLEGUIDE.md §7.3](STYLEGUIDE.md)).
+- **G8 MUST (Flex 행 텍스트 열 0px 세로 줄바꿈 금지)**: 가로 `flex` 행 안에서 고정 폭(`w(..)` + `flex_none()`) 형제들과 `flex_1().min_w_0()` 텍스트 열을 함께 배치할 때, 고정 폭 형제들의 합이 부모 폭을 모두 잠식해 텍스트 열이 `0px`로 붕괴하고 한 글자씩 세로로 접히는 결함(`계\n정` 등)을 금지한다. 텍스트 열에는 반드시 `.truncate()`와 충분한 잔여 폭(또는 `min_w(..)`)을 보장하거나 고정 폭 열들과 별도 행으로 분리한다([docs/STYLEGUIDE.md §6.3·§7.3](STYLEGUIDE.md)).
 - **MUST** Zed의 `terminal`·`terminal_view`(GPL-3.0) 코드는 열어 보고 베끼지 않는다. 필요한 동작은 ARCHITECTURE·이슈 설명·Apache-2.0 gpui API로만 구현한다.
 
 ## 8. 공급망·라이선스

@@ -247,3 +247,5 @@ Design documents currently remain in Korean: [Architecture](docs/ARCHITECTURE.md
 ## License
 
 Apache-2.0 — [LICENSE](LICENSE), Copyright 2026 Krill contributors. See [third-party notices](THIRD_PARTY_NOTICES.md) and [license records](docs/licensing/README.md). Do not read or copy Zed's GPL-3.0 `terminal` or `terminal_view` code when contributing; credit any permitted Orca source reuse as described in [Contributing](CONTRIBUTING.md).
+
+Usage metrics are enabled by default without a consent dialog: a random installation ID, first launch, app launches, daily interaction, version, OS, and architecture. Prompts, terminal output, commands, project paths, and account details are excluded. Run `krill telemetry disable` to stop collection; `DO_NOT_TRACK=1` also disables it. See [usage metrics](services/telemetry/CLIENT.md) for delivery status and operator setup. Error reporting has a separate, default-off setting.

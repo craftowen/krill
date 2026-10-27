@@ -53,7 +53,7 @@
 | 데몬 업그레이드 | T4 세대 공존 + 세션 0 구 데몬 은퇴 / T2 holder 유지, krilld만 교체 | **T2 방식.** krilld는 holder가 새 바이너리로 재기동, holder는 exec 핸드오프. 세대 공존 없음. 앱·CLI는 Hello에서 N-1 호환 | 세대가 하나뿐이면 "고아 데몬 0"이 구조적으로 보장된다 |
 | 메모리 목표 | T1 ≤150MB / T3 ≤180MB(상한 200) / T4 게이트 ≤200 | **목표 180MB(앱 120 + 데몬 60), 출시 차단선 200MB**, 터미널 10개, phys_footprint, 에이전트 프로세스 제외, 창 1600×1000pt @2x(MK-009). 창 drawable은 창 픽셀 수에 비례하므로 더 큰 창은 이 예산으로 판정하지 않는다(2026-10-22 실측: 2560×1319pt @2x에서 drawable 1장 52.6MB, 3장 약 158MB) | T3가 창 drawable(IOSurface)을 실측해 150MB가 비현실적임을 보였다 |
 | diff 뷰 범위 | T1 v1.x / T3 M2 | **읽기 전용 diff + 변경 파일 목록은 M3(P1)**, 커밋 UI·줄 주석은 M5 | 에이전트 결과를 검토하는 핵심 동선이지만 편집 기능은 범위 밖 |
-| 텔레메트리 | T1 v1 없음 / T4 opt-in | **v1 없음**, M5에서 opt-in(기본 꺼짐) | 두 의견이 양립 |
+| 텔레메트리 | 초기 opt-in / 기본 활성 사용 통계 | **별도 동의창 없이 기본 활성**(2026-10-27 사용자 지시). 설치별 무작위 ID·최초 실행·앱 실행·일별 입력 활동만 백그라운드 전송. 오류 보고 opt-in은 독립 유지 | 환경 거부·명시적 비활성화 지원. [수집·집계 규약](../services/telemetry/CLIENT.md) |
 
 ## 4. 세션 데몬 (T2)
 
@@ -121,6 +121,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_SIDEBAR | `1 << 14` | `krill_proto::control` (세션 cwd·워크트리 조회, Request 10 / Reply 14, OWE-411 지휘자 배정) |
 | FEAT_PROVIDER_DETAILS | `1 << 15` | `krill_proto::usage` (제공자별 상세 사용량·계정 전환 상태, 기존 사용량 응답 뒤 확장) |
 | FEAT_ACCOUNT_CANCEL | `1 << 22` | `krill_proto::usage` (실패한 계정 전환 취소·원본 세션 입력 재개, 명시적 동의 후에만 보류 입력 전달) |
+| FEAT_SESSION_ACCOUNT_SWITCH | `1 << 28` | `krill_proto::usage` (클릭한 호스트의 단일 세션 계정 전환 `UsageRequest::SwitchSessionAccount`; 기본 계정·다른 세션 유지, 지휘자 배정 2026-10-27) |
 | FEAT_HISTORY | `1 << 16` | `krill_proto::history` (기록 삭제, 전용 요청·응답, OWE-440) |
 | FEAT_USAGE | `1 << 17` | `krill_proto::usage` (사용량·프로바이더 다계정 조회·전환·자동전환, 전용 요청·응답, MK-084·MK-107·MK-108) |
 | FEAT_ORCH_RETAIN | `1 << 19` | `krill_proto::orchestration` (retain 요청·상태, v0.1.23 지휘자 배정; 구 피어 응답은 Stopped로 변환) |

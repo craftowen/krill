@@ -88,6 +88,7 @@ pub const FEATURES: u64 = crate::screen::FEAT_HISTORY_VIEW
     | crate::usage::FEAT_USAGE_RESET
     | crate::usage::FEAT_USAGE_REFRESH
     | crate::usage::FEAT_PROVIDER_DETAILS
+    | crate::usage::FEAT_SESSION_ACCOUNT_SWITCH
     | crate::usage::FEAT_ACCOUNT_CANCEL
     | crate::usage::FEAT_ACCOUNT_POLICY
     | crate::history::FEAT_HISTORY_PAUSE
@@ -98,7 +99,7 @@ pub const FEATURES: u64 = crate::screen::FEAT_HISTORY_VIEW
     | crate::mobile::FEAT_MOBILE
     | crate::orchestration::FEAT_ORCH_RETAIN;
 // 기능 비트는 서로 겹치면 안 된다(2026-10-15 번호 충돌 사고 방지). 비트가 모두 다르면 합의 1 비트 수가 항목 수와 같다.
-const _: () = assert!(FEATURES.count_ones() == 57);
+const _: () = assert!(FEATURES.count_ones() == 58);
 /// 프레임 최대 길이(`len` 값 기준).
 pub const MAX_FRAME: usize = 1 << 20;
 /// [`ClientHello::name`] 최대 바이트.

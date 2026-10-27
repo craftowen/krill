@@ -117,6 +117,45 @@ fn states_missing_cli_and_auth_failure_hide_badges_and_provide_guidance() {
 }
 
 #[test]
+fn failures_distinguish_auth_timeout_and_general_errors_without_leaking_details() {
+    type Case = (io::Error, Failure, &'static str);
+    let cases: [Case; 3] = [
+        (
+            io::Error::new(io::ErrorKind::PermissionDenied, GhAuthRequired),
+            Failure::Auth,
+            FAILED.get(),
+        ),
+        (
+            io::Error::new(io::ErrorKind::TimedOut, "secret timeout"),
+            Failure::TimedOut,
+            text::TIMED_OUT.get(),
+        ),
+        (
+            io::Error::other("secret response"),
+            Failure::Other,
+            text::GH_FAILED.get(),
+        ),
+    ];
+    for (error, expected, message) in cases {
+        let status = status_error(&error);
+        assert_eq!(status, Status::Failed(expected));
+        assert_eq!(status.guidance(), Some(message));
+        assert_eq!(failure_text(&error), message);
+        assert!(!message.contains("secret"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn gh_exit_four_is_authentication_required_without_stderr_in_guidance() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "printf secret >&2; exit 4"]);
+    let error = execute(&mut cmd, Duration::from_secs(1)).unwrap_err();
+    assert_eq!(status_error(&error), Status::Failed(Failure::Auth));
+    assert!(!error.to_string().contains("secret"));
+}
+
+#[test]
 fn literal_head_and_web_creation_never_request_push_or_fork() {
     let folder = Path::new("/tmp/한글 ' $(touch never)");
     let branch = "feature/a;$(touch never)";
