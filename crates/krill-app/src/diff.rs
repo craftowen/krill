@@ -745,7 +745,23 @@ impl Panel {
         if !target_changed && self.source.is_some() {
             return;
         }
+        let host_changed =
+            self.explorer.target.as_ref().map(HostTarget::host) != Some(target.host());
         self.explorer.connect(target.clone());
+        if host_changed {
+            // 같은 경로라도 호스트가 다르면 다른 저장소다. 이전 호스트의 패치·검색 결과를 남기지 않는다.
+            if self.selected.take().is_some() {
+                self.invalidate_patch();
+                self.message = text::EMPTY.get().into();
+                self.displayed_patch = None;
+                self.state.update(cx, |s, cx| s.set_files([], cx));
+            }
+            let remote = self.remote_host();
+            self.search.set_remote(remote, self.tab == PanelTab::Search);
+            if self.tab == PanelTab::Search && !self.search.options.query.trim().is_empty() {
+                self.spawn_async_search(cx);
+            }
+        }
         if target_changed && self.explorer.loaded_root {
             let repo = self.explorer.repo.clone();
             self.explorer.set_repo(repo, false);
@@ -756,6 +772,12 @@ impl Panel {
         self.editing.connect(target.clone());
         self.refresh_branch_sync(cx);
         self.connect_source(Arc::new(Socket::new(target)), cx);
+    }
+
+    /// 원격 호스트 작업공간이면 `true`. 로컬 git·파일시스템을 읽거나 바꾸는 동작은 이때 실행하지
+    /// 않는다(IPC로 같은 동작을 보낼 수 없으면 명시적으로 지원하지 않는다고 표시한다, APP-F01·F05).
+    pub(crate) fn remote_host(&self) -> bool {
+        self.explorer.remote_target().is_some()
     }
 
     pub fn connect_source(&mut self, source: Arc<dyn Source>, cx: &mut Context<Self>) {

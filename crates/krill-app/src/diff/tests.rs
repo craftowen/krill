@@ -1314,6 +1314,124 @@ fn workspace_search_engine_options_and_globs_work() {
     }
 }
 
+/// APP-F06: 폴백 정규식 엔진은 `rg`(Rust regex 문법)와 같은 의미여야 한다. 인라인 플래그·교대·
+/// 반복 횟수·그룹 반복이 `rg` 유무와 무관하게 같은 줄을 찾고, 잘못된 패턴은 명시적 오류다.
+#[test]
+fn workspace_search_regex_semantics_match_ripgrep_on_both_engines() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.0.join("words.txt"),
+        "needle\nNEEDLE\nfoo\nbar\nbaz\nabab\nabbb\na\naa\naaa\nfoo bar\n",
+    )
+    .unwrap();
+
+    for run_fn in [search_worktree, search_worktree_fallback] {
+        let lines = |query: &str, whole_word: bool| -> Vec<u32> {
+            let res = run_fn(
+                &repo.0,
+                &SearchOptions {
+                    query: query.to_owned(),
+                    use_regex: true,
+                    case_sensitive: true,
+                    whole_word,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+            res.files
+                .iter()
+                .flat_map(|f| f.matches.iter().map(|m| m.line))
+                .collect()
+        };
+        assert_eq!(lines("(?i)needle", false), [1, 2]);
+        assert_eq!(lines("foo|bar", false), [3, 4, 11, 11]);
+        assert_eq!(lines("^(ab)+$", false), [6]);
+        assert_eq!(lines("^a{2,3}$", false), [9, 10]);
+        assert_eq!(lines("ba.", true), [4, 5, 11]);
+        assert!(
+            run_fn(
+                &repo.0,
+                &SearchOptions {
+                    query: "(".to_owned(),
+                    use_regex: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .is_err()
+        );
+    }
+}
+
+/// APP-F05: 원격 호스트 작업공간 검색은 같은 절대 경로의 로컬 디렉터리를 뒤지지 않고 명시적 미지원
+/// 상태를 보여 준다. 호스트 전환은 이전 호스트의 검색 결과를 지운다.
+#[gpui::test]
+fn remote_workspace_search_fails_closed_and_host_switch_clears_results(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = Repo::new();
+    std::fs::write(repo.0.join("local.txt"), "SECRET_LOCAL_TOKEN\n").unwrap();
+
+    cx.update(gpui_component::init);
+    let repo_path = repo.0.clone();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(repo_path, cx);
+        p.visible = false;
+        p
+    });
+    cx.run_until_parked();
+
+    // 로컬 작업공간: 검색이 로컬 파일을 찾는다.
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| {
+            p.show_search(window, cx);
+            p.set_search_query("SECRET_LOCAL_TOKEN", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search_result().total_matches),
+        1
+    );
+    assert!(cx.debug_bounds("search-remote-unsupported").is_none());
+
+    // 같은 경로의 원격 호스트로 전환: 이전 결과가 지워지고 로컬을 검색하지 않는다.
+    let sock = repo.0.join("missing.sock");
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.connect(HostTarget::remote("fixture", sock), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.search.remote);
+        assert_eq!(p.search_result().total_matches, 0);
+        assert!(p.search_rows().is_empty());
+        assert!(!p.search.searching);
+        assert!(p.search.error.is_none());
+        assert_eq!(p.search_options().query, "SECRET_LOCAL_TOKEN");
+    });
+    assert!(cx.debug_bounds("search-remote-unsupported").is_some());
+    assert!(cx.debug_bounds("search-empty-no-results").is_none());
+    assert!(cx.debug_bounds("search-loading").is_none());
+
+    // 원격 상태에서 다시 검색을 요청해도 로컬 결과는 나오지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_search_query("SECRET_LOCAL_TOKEN", cx));
+    });
+    cx.executor()
+        .advance_clock(search::SEARCH_DEBOUNCE + Duration::from_millis(50));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert_eq!(p.search_result().total_matches, 0);
+        assert!(p.search_rows().is_empty());
+        assert!(!p.search.searching);
+    });
+    assert!(cx.debug_bounds("search-remote-unsupported").is_some());
+}
+
 #[gpui::test]
 fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx: &mut gpui::TestAppContext,
@@ -1593,7 +1711,8 @@ fn workspace_search_long_line_highlight_regex_step_cap_and_rg_truncation_work() 
         assert_eq!(after, suffix);
     }
 
-    // 2. Catastrophic backtracking regex in fallback engine completes bounded by step cap.
+    // 2. Patterns that explode in a backtracking engine stay bounded (the fallback compiles the
+    //    same linear-time `regex` engine `rg` uses, APP-F06).
     std::fs::write(
         repo.0.join("src/backtrack.txt"),
         format!("{}!\naaaaaab\n", "a".repeat(60)),
