@@ -3,10 +3,152 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use gpui::TestAppContext;
-use krill_proto::input::Input;
+use krill_proto::input::{Input, Now};
 use krill_proto::screen::Msg as _;
 
 use crate::shell::tests::{open, state_path};
+
+fn typed(bytes: &[u8]) -> krill_term::ime::Output {
+    krill_term::ime::Output {
+        pty: bytes.to_vec(),
+        discard_ime: false,
+    }
+}
+
+// `cfg(all(test, unix))` 모듈의 헬퍼는 clippy의 테스트 예외(`allow-unwrap-in-tests`)를 받지 못한다.
+#[expect(clippy::unwrap_used, reason = "테스트 헬퍼")]
+fn read_input(peer: &mut UnixStream) -> Vec<u8> {
+    let (kind, body) = krill_proto::ipc::read_frame(peer).unwrap().unwrap();
+    Input::decode(kind, &body).unwrap().bytes
+}
+
+#[expect(clippy::unwrap_used, reason = "테스트 헬퍼")]
+fn assert_nothing_sent(peer: &mut UnixStream) {
+    peer.set_nonblocking(true).unwrap();
+    assert_eq!(
+        peer.read(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "bytes reached the PTY too early"
+    );
+    peer.set_nonblocking(false).unwrap();
+}
+
+/// APP-RUNTIME-002: bracketed paste가 꺼진 세션에서 여러 줄 붙여넣기가 경고에 걸리면, 그 뒤에 친 키와 다음 붙여넣기는
+/// 확인이 끝날 때까지 큐에 남아 제출 순서를 지키고, 연속 붙여넣기는 덮어쓰이지 않고 차례로 확인한다.
+#[gpui::test]
+fn multiline_paste_warning_holds_later_input_and_queues_the_next_paste(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("async-paste-warn-order"));
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(42), ours, cx);
+    });
+    let (first, second) = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let first = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.send(&typed(b"x"), Some(window), cx);
+            let second = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.send(&typed(b"y"), Some(window), cx);
+            (first, second)
+        })
+    });
+    // 둘째가 먼저 준비돼도 첫째 뒤에서 기다린다.
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(second, Some(b"echo B\necho BB".to_vec()), window, cx);
+            shell.complete_clipboard_paste(first, Some(b"echo A\necho AA".to_vec()), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        view.read_with(cx, |shell, _| {
+            shell.security.pending_paste().map(|p| p.payload.clone())
+        })
+    };
+    assert_eq!(
+        shown(cx),
+        Some(b"echo A\recho AA".to_vec()),
+        "the first paste awaits confirmation"
+    );
+    assert_nothing_sent(&mut theirs);
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| shell.confirm_pending_paste(window, cx));
+    });
+    assert_eq!(read_input(&mut theirs), b"echo A\recho AA");
+    assert_eq!(
+        read_input(&mut theirs),
+        b"x",
+        "typed keys follow the confirmed paste"
+    );
+    assert_eq!(
+        shown(cx),
+        Some(b"echo B\recho BB".to_vec()),
+        "the second paste is confirmed next instead of overwriting the first"
+    );
+    assert_nothing_sent(&mut theirs);
+
+    cx.update(|_, cx| view.update(cx, super::Shell::cancel_pending_paste));
+    assert_eq!(
+        read_input(&mut theirs),
+        b"y",
+        "cancel drops only the payload"
+    );
+    assert_eq!(shown(cx), None);
+    assert!(view.read_with(cx, |shell, _| !shell.paste_queue.has_pending_for(pane)));
+}
+
+/// APP-RUNTIME-003: 첫 세션에 붙기 전 클립보드 붙여넣기는 버리지 않고 칸 저널에 보관돼, 그 뒤에 친 키와 함께 제출
+/// 순서대로 첫 세션에 전달된다(STYLEGUIDE §7.0 "기다리는 동안에도 입력을 받는다").
+#[gpui::test]
+fn clipboard_paste_before_the_first_session_reaches_it_in_order(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("async-paste-pre-attach"));
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    view.update(cx, |shell, _| {
+        let live = crate::shell::Live::new(gpui::Task::ready(()));
+        assert!(live.pane.session().is_none());
+        shell.live.insert(pane, live);
+    });
+    let request = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let request = shell
+                .begin_clipboard_paste(window, cx)
+                .expect("paste is accepted before the first session");
+            shell.send(&typed(b"ls\r"), Some(window), cx);
+            request
+        })
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(request, Some(b"hello".to_vec()), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |shell, _| !shell.paste_queue.has_pending_for(pane)));
+
+    // 이제 첫 세션에 붙는다: 보관된 입력이 제출 순서대로 나간다.
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    view.update(cx, |shell, cx| {
+        let live = shell.live.get_mut(&pane).unwrap();
+        let notices = live.pane.link(
+            krill_proto::SessionId(42),
+            1,
+            krill_app::pane::Writer::spawn(ours).unwrap(),
+            krill_proto::input::FEAT_INPUT,
+            Now::get(),
+        );
+        assert!(notices.is_empty());
+        cx.notify();
+    });
+    assert_eq!(read_input(&mut theirs), b"hello");
+    assert_eq!(read_input(&mut theirs), b"ls\r");
+}
 
 #[gpui::test]
 fn slow_pastes_keep_keystrokes_in_submission_order(cx: &mut TestAppContext) {

@@ -3943,6 +3943,7 @@ impl Shell {
             self.show(Some(notice), cx);
         }
         self.security.retain_panes(&visible);
+        self.refresh_pending_paste_banner(cx);
         if self.paths.is_none() && self.host_targets.is_empty() {
             return;
         }
