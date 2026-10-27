@@ -10292,3 +10292,120 @@ fn sticky_last_prompt_bar_and_tab_hover_card_render_and_toggle_timeline(cx: &mut
         "clicking close button must dismiss timeline popover"
     );
 }
+
+/// APP-F01·F05: 포커스된 탭이 원격 호스트인데 그 호스트의 전송이 없으면(시작 중·호스트 제거) Changes 패널은
+/// 같은 절대 경로의 로컬 저장소에 붙지 않는다. 전송이 생겨도 원격 모드를 지키고, 로컬 탭으로 돌아오면
+/// 이 Mac의 저장소에 붙는다.
+#[gpui::test]
+fn remote_tab_without_host_target_keeps_diff_panel_off_local_repo(cx: &mut TestAppContext) {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::sync::Arc;
+
+    let repo = std::env::temp_dir().join(format!("mk-shell-remote-diff-{}", std::process::id()));
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("remote-diff-guard"));
+    let host = krill_app::hosts::HostId::Remote("studio".into());
+    let repo_cwd = repo.as_os_str().as_bytes().to_vec();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_host(pane, host.clone());
+            let mut launch = s.launch_for(pane);
+            launch.cwd = repo_cwd.clone();
+            s.layout.set_launch(pane, launch);
+            assert!(s.target_for_host(&host).is_none());
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    let remote =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).diff.read(cx).remote_host());
+    assert!(
+        remote(cx),
+        "remote tab without transport must not fall back to the local repo"
+    );
+    assert!(cx.debug_bounds("diff-tab-changes").is_some());
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+    assert!(cx.debug_bounds("changed-file-0").is_none());
+
+    // 데몬이 늦게 붙어도(시작 레이스) 원격 작업공간을 로컬 저장소로 바꾸지 않는다.
+    // holder·krilld 경로가 파일이 아니면 `daemon::connect`가 기동 없이 바로 실패한다.
+    let paths = krill_proto::daemon::Paths {
+        socket: repo.join("krilld.sock"),
+        holder: PathBuf::new(),
+        krilld: PathBuf::new(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            // `connect_daemon_with_paths`는 활성 작업공간이 로컬일 때만 Changes 패널을 로컬에 붙인다.
+            assert_eq!(s.active_workspace(cx).host, host);
+            s.paths = Some(paths);
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(remote(cx));
+
+    // 전송이 생기면(실패하는 커넥터라도) 원격 타깃으로 잇되 원격 모드는 유지한다.
+    let target = krill_hosts::HostTarget::remote_with_connector(
+        "studio",
+        PathBuf::from("/unused"),
+        krill_hosts::RemoteConnector::new(
+            || Err(std::io::ErrorKind::NotConnected.into()),
+            |_, _| {},
+        )
+        .with_lifetime(Arc::new(()), || true),
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_targets.insert(host.clone(), target);
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(remote(cx));
+    assert!(cx.debug_bounds("changed-file-0").is_none());
+
+    // 호스트가 제거되면 다시 전송 없는 원격: 여전히 로컬에 붙지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_targets.clear();
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(remote(cx));
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+
+    // 로컬 탭으로 돌아오면 이 Mac의 저장소에 붙는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_host(pane, krill_app::hosts::HostId::Local);
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(!remote(cx));
+    std::fs::remove_dir_all(&repo).ok();
+}

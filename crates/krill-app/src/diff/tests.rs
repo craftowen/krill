@@ -1494,6 +1494,169 @@ fn workspace_search_whole_word_matches_ripgrep_half_boundaries() {
     }
 }
 
+/// APP-F01·F05: 원격 호스트 작업공간인데 전송이 없으면(시작 중·호스트 제거) 같은 절대 경로의 로컬
+/// 저장소에 붙은 채로 두지 않는다. 변경 목록·검색·PR 체크·기록 범위가 모두 닫히고 연결 안내만 보이며,
+/// 전송이 생겨 실제 원격 타깃이 오면 원격 모드를 유지하고, 로컬로 돌아오면 로컬 목록이 다시 로드된다.
+#[gpui::test]
+fn remote_workspace_without_transport_never_touches_colliding_local_repo(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::agent_history::VaultScope;
+
+    let repo = Repo::new();
+    repo.git(&["config", "user.email", "test@example.com"]);
+    repo.git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.0.join("tracked.txt"), "one\n").unwrap();
+    repo.git(&["add", "tracked.txt"]);
+    repo.git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.0.join("tracked.txt"), "two\n").unwrap();
+
+    cx.update(gpui_component::init);
+    let history = cx.update(|cx| {
+        cx.new(|_| {
+            crate::agent_history::Panel::new(Arc::new(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no daemon in tests",
+                ))
+            }))
+        })
+    });
+    let repo_path = repo.0.clone();
+    let hist = history.clone();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        // `Panel::new`는 테스트에서 실제 git을 읽는 인메모리 감시 허브를 단다(로컬 호스트).
+        let mut p = Panel::new(repo_path, cx);
+        p.set_history(hist, cx);
+        p
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        history.update(cx, |h, cx| h.set_scope(VaultScope::Workspace, cx));
+    });
+    let local_files = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .changes
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    // 허브의 첫 스냅샷은 FSEvents 등록·백그라운드 git을 기다린다(기존 감시 테스트와 같은 대기).
+    let wait_local_files = |cx: &mut gpui::VisualTestContext| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while local_files(cx) != [b"tracked.txt".to_vec()] {
+            assert!(Instant::now() < deadline, "local snapshot should load");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_local_files(cx);
+    assert!(!cx.update(|_, cx| view.read(cx).remote_host()));
+    let scope_path = repo.0.display().to_string();
+    assert_eq!(
+        cx.update(|_, cx| history.read(cx).build_search_query().paths),
+        [scope_path.as_str()]
+    );
+
+    // 전송 없는 원격 호스트로 전환: 로컬 목록·기록 범위가 사라지고 감시도 돌지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.disconnect_remote(&HostId::Remote("studio".into()), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.source.is_none());
+        assert!(p.watch_task.is_none());
+        assert!(p.changes.files.is_empty());
+        assert!(p.loaded);
+        assert_eq!(
+            p.repo_error.as_deref(),
+            Some(text::REMOTE_DISCONNECTED.get())
+        );
+        assert!(p.search.remote);
+        assert!(p.checks.inspection.is_none());
+        assert!(history.read(cx).build_search_query().paths.is_empty());
+    });
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+
+    // 다른 폴더로 바꾸거나(셸의 `set_repo` 순서) 같은 경로를 다시 지정하거나 새로고침해도 로컬 저장소를
+    // 읽지 않고 연결 안내를 유지한다.
+    let repo_path = repo.0.clone();
+    let other = repo.0.join("other");
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.set_repo(other, cx);
+            p.set_repo(repo_path, cx);
+            p.refresh(cx);
+            p.disconnect_remote(&HostId::Remote("studio".into()), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.source.is_none());
+        assert!(p.changes.files.is_empty());
+        assert!(p.remote_host());
+        assert_eq!(
+            p.repo_error.as_deref(),
+            Some(text::REMOTE_DISCONNECTED.get())
+        );
+    });
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+
+    // 로컬 호스트는 `disconnect_remote`의 대상이 아니다(전송 없는 로컬은 그대로 둔다).
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.disconnect_remote(&HostId::Local, cx));
+    });
+    assert!(cx.update(|_, cx| view.read(cx).remote_host()));
+
+    // 전송이 생기면 같은 호스트의 실제 타깃으로 바꾸되 원격 모드는 유지한다(로컬 목록이 돌아오지 않는다).
+    let sock = repo.0.join("missing.sock");
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.connect(HostTarget::remote("studio", sock), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.source.is_some());
+        assert!(p.changes.files.is_empty());
+        assert!(p.search.remote);
+    });
+
+    // 로컬 호스트로 돌아오면 이 Mac의 저장소 목록이 다시 로드된다.
+    let paths = Paths {
+        socket: repo.0.join("local.sock"),
+        holder: PathBuf::new(),
+        krilld: PathBuf::new(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            let hub: Arc<dyn Source> = Arc::new(TestHubSource(Mutex::new(
+                krilld::git::watch::Hub::default(),
+            )));
+            p.connect_with(HostTarget::local(paths), Some(hub), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).remote_host()));
+    wait_local_files(cx);
+    assert!(cx.update(|_, cx| view.read(cx).repo_error.is_none()));
+    assert_eq!(
+        cx.update(|_, cx| history.read(cx).build_search_query().paths),
+        [scope_path.as_str()]
+    );
+}
+
 #[gpui::test]
 fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx: &mut gpui::TestAppContext,
