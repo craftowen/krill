@@ -599,6 +599,7 @@ impl Shell {
     /// 배너의 붙여넣기를 보낸다. 페이로드 → 그 뒤 큐에 쌓인 키 → 지금 조합 중인 IME 글자 순서(제출 순서)로 간다.
     pub(super) fn confirm_pending_paste(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(pending) = self.take_confirming(cx) else {
+            self.drain_paste_queue(cx);
             return;
         };
         self.deliver_queued(pending.pane, &pending.payload, cx);
@@ -610,22 +611,26 @@ impl Shell {
 
     /// 배너의 붙여넣기를 버린다. 그 뒤에 친 키는 순서대로 보낸다.
     pub(super) fn cancel_pending_paste(&mut self, cx: &mut Context<Self>) {
-        if self.take_confirming(cx).is_some() {
-            self.drain_paste_queue(cx);
-        }
+        let _ = self.take_confirming(cx);
+        self.drain_paste_queue(cx);
     }
 
     /// 배너에 보이는 확인 대기 항목을 큐에서 뺀다.
     fn take_confirming(&mut self, cx: &mut Context<Self>) -> Option<PendingPaste> {
         let shown = self.security.take_pending_paste()?;
+        cx.notify();
         let index = self.paste_queue.entries.iter().position(|entry| {
             matches!(&entry.kind, QueuedKind::Paste(_, PreparedPaste::Confirming(p)) if *p == shown)
-        });
-        if let Some(index) = index {
-            let _removed = self.paste_queue.entries.remove(index);
-        }
-        cx.notify();
-        Some(shown)
+        })?;
+        let entry = self.paste_queue.entries.remove(index)?;
+        // 배너를 띄운 뒤 같은 칸이 새 세션에 붙을 수 있다. 큐의 원래 세션과 일치할 때만 확인을 보낸다.
+        (self.layout.pane_exists(entry.pane)
+            && self.live.get(&entry.pane).is_some_and(|live| {
+                entry
+                    .session
+                    .is_none_or(|session| live.pane.session() == Some(session))
+            }))
+        .then_some(shown)
     }
 
     /// 맨 클릭한 링크의 팝오버를 클릭한 자리에 연다.

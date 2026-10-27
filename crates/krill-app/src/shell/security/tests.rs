@@ -151,6 +151,69 @@ fn clipboard_paste_before_the_first_session_reaches_it_in_order(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn confirming_paste_does_not_reach_a_replacement_session(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("paste-confirm-session-change"));
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    let (old, mut old_peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(42), old, cx);
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.paste_bytes(b"echo old\necho old2", window, cx);
+            shell.send(&typed(b"old keys"), Some(window), cx);
+            assert!(shell.security.pending_paste().is_some());
+        });
+    });
+    assert_nothing_sent(&mut old_peer);
+
+    let (new, mut new_peer) = UnixStream::pair().unwrap();
+    new_peer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(43), new, cx);
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.send(&typed(b"new keys"), Some(window), cx);
+            shell.confirm_pending_paste(window, cx);
+        });
+    });
+    assert_eq!(read_input(&mut new_peer), b"new keys");
+    assert_nothing_sent(&mut new_peer);
+    assert!(
+        view.read_with(cx, |shell, _| shell.security.pending_paste().is_none()
+            && !shell.paste_queue.has_pending_for(pane))
+    );
+}
+
+#[gpui::test]
+fn stale_confirmation_banner_without_a_queued_paste_sends_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("paste-confirm-stale-banner"));
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(42), ours, cx);
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.paste_bytes(b"echo stale\necho stale2", window, cx);
+            assert!(shell.security.pending_paste().is_some());
+            shell.paste_queue.entries.clear();
+            shell.confirm_pending_paste(window, cx);
+            assert!(shell.security.pending_paste().is_none());
+        });
+    });
+    peer.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    assert!(matches!(
+        peer.read(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+}
+
+#[gpui::test]
 fn slow_pastes_keep_keystrokes_in_submission_order(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("async-paste-order"));
     let (ours, mut theirs) = UnixStream::pair().unwrap();
