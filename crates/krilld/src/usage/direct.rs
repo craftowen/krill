@@ -18,6 +18,8 @@ use zeroize::Zeroizing;
 use super::{ProfileUsage, Usage, Window, accounts};
 use crate::session::lock;
 
+mod codex_reset;
+
 type Key = (PathBuf, ProviderKind, PathBuf);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
@@ -330,6 +332,9 @@ fn fetch(
         Fetched::Usage(usage, meters) => (usage, meters),
         failure => return failure,
     };
+    if provider == ProviderKind::Codex {
+        codex_reset::supplement(&mut meters, &token, account.as_deref(), get_text);
+    }
     // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
     // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
     if provider == ProviderKind::Claude
