@@ -689,6 +689,9 @@ impl Shell {
         if self.send_to_session(session, &bytes, cx) {
             Self::clear_sent_chat_draft(&input, &text, window, cx);
             self.chat.prompt_failed.remove(&session);
+            self.sidebar.update(cx, |s, cx| {
+                s.record_local_prompt(session, &text, cx);
+            });
         } else {
             self.chat.prompt_failed.insert(session);
         }

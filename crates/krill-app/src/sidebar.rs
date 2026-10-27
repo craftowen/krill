@@ -917,6 +917,8 @@ pub struct Sidebar {
     titles: BTreeMap<SessionId, String>,
     /// 첫 프롬프트 훅에서 자동 생성된 세션 제목(`session-titles.json`, OWE-737).
     auto_titles: BTreeMap<SessionId, String>,
+    /// 세션별 최근 프롬프트 턴 히스토리(`session-prompts.json`).
+    prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
     /// 활성 Claude 프롬프트 캐시 카운트다운의 마지막 1초 틱(`now_ns / 1e9`, OWE-737).
     last_cache_tick_sec: Option<u64>,
     last_activity_minute: Option<u64>,
@@ -1189,6 +1191,15 @@ fn load_auto_titles_from_sidebar_path(sidebar_path: Option<&Path>) -> BTreeMap<S
     krill_proto::git::load_session_auto_titles(dir)
 }
 
+fn load_prompt_histories_from_sidebar_path(
+    sidebar_path: Option<&Path>,
+) -> BTreeMap<SessionId, krill_proto::git::SessionPromptHistory> {
+    let Some(dir) = sidebar_path.and_then(Path::parent) else {
+        return BTreeMap::new();
+    };
+    krill_proto::git::load_session_prompt_histories(dir)
+}
+
 impl Sidebar {
     pub fn new(path: Option<PathBuf>) -> Self {
         // Construction runs inside cx.new: all persisted state is loaded later on the executor.
@@ -1273,6 +1284,7 @@ impl Sidebar {
             custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
             auto_titles: BTreeMap::new(),
+            prompt_histories: BTreeMap::new(),
             last_cache_tick_sec: None,
             last_activity_minute: None,
             now_override_ns: None,
@@ -2779,7 +2791,8 @@ impl Sidebar {
         }
     }
 
-    pub(super) fn now_unix_ns(&self) -> u64 {
+    #[must_use]
+    pub fn now_unix_ns(&self) -> u64 {
         self.now_override_ns.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3082,7 +3095,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let auto_titles = self.auto_titles.clone();
-        self.apply_with_auto_titles(result, comments, auto_titles, cx);
+        let prompt_histories = self.prompt_histories.clone();
+        self.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
     }
 
     fn apply_with_auto_titles(
@@ -3090,6 +3104,7 @@ impl Sidebar {
         result: io::Result<(Snapshot, Meta)>,
         comments: BTreeMap<PathBuf, String>,
         auto_titles: BTreeMap<SessionId, String>,
+        prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
         cx: &mut Context<Self>,
     ) {
         match result {
@@ -3106,6 +3121,7 @@ impl Sidebar {
                     || meta != self.meta
                     || comments != self.comments
                     || auto_titles != self.auto_titles
+                    || prompt_histories != self.prompt_histories
                     || self.poll_error.is_some()
                     || status_changed
                     || crate::alert::needs_snapshot(cx)
@@ -3121,11 +3137,14 @@ impl Sidebar {
                     self.meta = meta;
                     self.comments = comments;
                     self.auto_titles = auto_titles;
+                    self.prompt_histories = prompt_histories;
                     let auto_changed = self.include_imported_snapshot();
                     self.poll_error = None;
                     let live = &self.snapshot.sessions;
                     self.titles.retain(|id, _| live.iter().any(|s| s.id == *id));
                     self.auto_titles
+                        .retain(|id, _| live.iter().any(|s| s.id == *id));
+                    self.prompt_histories
                         .retain(|id, _| live.iter().any(|s| s.id == *id));
                     // OWE-898: 사라진 워크트리의 파생 상태가 폴링마다 누적되지 않게
                     // 라이브 집합에 없는 키를 정리한다(사용자 접힘·핀·부모 설정은 유지).
@@ -3249,13 +3268,15 @@ impl Sidebar {
                     return;
                 };
                 let sp = sidebar_path.clone();
-                let (result, comments, auto_titles, fallback) = bg
+                let (result, comments, auto_titles, prompt_histories, fallback) = bg
                     .spawn(async move {
                         let mut comments = source.comments();
                         if comments.is_empty() {
                             comments = external::load_comments_from_sidebar_path(sp.as_deref());
                         }
                         let auto_titles = load_auto_titles_from_sidebar_path(sp.as_deref());
+                        let prompt_histories =
+                            load_prompt_histories_from_sidebar_path(sp.as_deref());
                         let state_dir = sp
                             .as_deref()
                             .and_then(Path::parent)
@@ -3298,7 +3319,7 @@ impl Sidebar {
                         } else {
                             None
                         };
-                        (result, comments, auto_titles, fallback)
+                        (result, comments, auto_titles, prompt_histories, fallback)
                     })
                     .await;
                 let next_delay = this.update(cx, |s, cx| {
@@ -3313,7 +3334,7 @@ impl Sidebar {
                         s.meta.extend(meta);
                         s.rebuild(cx);
                     }
-                    s.apply_with_auto_titles(result, comments, auto_titles, cx);
+                    s.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
                     s.is_visible().then(|| s.poll_interval())
                 });
                 forced = false;
@@ -4535,6 +4556,72 @@ impl Sidebar {
         } else {
             session_label(session, session.status.title.as_deref())
         }
+    }
+
+    /// 로컬 세션의 최근 프롬프트 턴 히스토리를 돌려준다.
+    #[must_use]
+    pub fn session_prompt_history(
+        &self,
+        id: SessionId,
+    ) -> Option<&krill_proto::git::SessionPromptHistory> {
+        self.prompt_histories.get(&id)
+    }
+
+    /// 호스트 구분을 포함해 세션의 최근 프롬프트 턴 히스토리를 돌려준다(현재는 로컬 호스트 지원).
+    #[must_use]
+    pub fn session_prompt_history_on(
+        &self,
+        host: &HostId,
+        id: SessionId,
+    ) -> Option<&krill_proto::git::SessionPromptHistory> {
+        host.is_local()
+            .then(|| self.prompt_histories.get(&id))
+            .flatten()
+    }
+
+    /// 하이브리드 채팅 등 앱 내부에서 프롬프트를 전송했을 때 즉시 메모리·디스크 히스토리에 반영한다.
+    pub fn record_local_prompt(
+        &mut self,
+        session: SessionId,
+        prompt: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let now_ns = self.now_unix_ns();
+        let changed = self
+            .prompt_histories
+            .entry(session)
+            .or_default()
+            .record_turn(prompt, now_ns);
+        if !changed {
+            return;
+        }
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
+            let owned = prompt.to_owned();
+            cx.background_executor()
+                .spawn(async move {
+                    krill_proto::git::record_session_prompt(&dir, session, &owned, now_ns).ok();
+                })
+                .detach();
+        }
+        cx.notify();
+    }
+
+    /// 백그라운드 폴링(사이드바 접힘 상태 포함)에서 읽어 온 프롬프트 히스토리를 동기화한다.
+    pub fn sync_prompt_histories(
+        &mut self,
+        mut histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.snapshot.sessions.is_empty() {
+            let live = &self.snapshot.sessions;
+            histories.retain(|id, _| live.iter().any(|s| s.id == *id));
+        }
+        if self.prompt_histories == histories {
+            return false;
+        }
+        self.prompt_histories = histories;
+        cx.notify();
+        true
     }
 
     /// OWE-662: 로컬 호스트 워크트리 세션의 상태 묶음과 미확인 세션이 있는지.

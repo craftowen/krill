@@ -219,9 +219,51 @@ impl Shell {
                     .as_ref()
                     .filter(|r| tab.root.contains(r.pane))
                     .map(|r| r.input.clone());
+                let tab_hover_spec = if self.layout.file(pane).is_none() {
+                    let sidebar_ref = self.sidebar.read(cx);
+                    let now_ns = sidebar_ref.now_unix_ns();
+                    let prompt_history = self
+                        .layout
+                        .session(pane)
+                        .and_then(|sid| sidebar_ref.session_prompt_history_on(host, sid));
+                    let since_ns = session.map_or(0, |s| s.status.since_unix_ns);
+                    let state_with_age = if since_ns > 0 {
+                        format!(
+                            "{} ({})",
+                            state_text.trim_end(),
+                            krill_app::jump::format_age_ns(since_ns, now_ns)
+                        )
+                    } else {
+                        state_text.trim_end().to_owned()
+                    };
+                    Some(ui::SessionHoverCardSpec {
+                        id: format!("tab-hover-{i}").into(),
+                        title: label.clone().into(),
+                        agent: agent.to_owned().into(),
+                        state_line: state_with_age.into(),
+                        total_turns: prompt_history.map_or(0, |h| h.total_turns),
+                        last_prompt: prompt_history
+                            .and_then(krill_proto::git::SessionPromptHistory::display_last_prompt)
+                            .map(Into::into),
+                        last_prompt_age: prompt_history
+                            .and_then(krill_proto::git::SessionPromptHistory::latest_unix_ns)
+                            .filter(|&ts| ts > 0)
+                            .map(|ts| krill_app::jump::format_age_ns(ts, now_ns).into()),
+                        prev_turn: prompt_history
+                            .and_then(krill_proto::git::SessionPromptHistory::previous_turn)
+                            .map(|t| (t.turn, t.text.clone().into())),
+                    })
+                } else {
+                    None
+                };
                 Tab::new()
                     .when(rename_input.is_none(), |t| {
                         t.label(SharedString::from(label.clone()))
+                    })
+                    .when_some(tab_hover_spec, |t, spec| {
+                        t.tooltip(move |window, cx| {
+                            ui::session_hover_card_view(spec.clone(), window, cx)
+                        })
                     })
                     .when_some(rename_input, |t, input| {
                         t.child(

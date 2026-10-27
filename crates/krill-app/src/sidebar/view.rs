@@ -1261,8 +1261,39 @@ impl Sidebar {
                             .map(|r| r.label.clone())
                     })
                     .flatten();
+                let now_ns = self.now_unix_ns();
+                let prompt_history = self.session_prompt_history_on(&row_host, id);
+                let state_with_age = if session.status.since_unix_ns > 0 {
+                    format!(
+                        "{state} ({})",
+                        crate::jump::format_age_ns(session.status.since_unix_ns, now_ns)
+                    )
+                } else {
+                    state.to_owned()
+                };
+                let inferred_agent = status::infer_agent_from_status(&session.status, &name);
+                let hover_spec = ui::SessionHoverCardSpec {
+                    id: format!("sidebar-session-hover-{}", id.0).into(),
+                    title: name.clone().into(),
+                    agent: inferred_agent.to_owned().into(),
+                    state_line: state_with_age.into(),
+                    total_turns: prompt_history.map_or(0, |h| h.total_turns),
+                    last_prompt: prompt_history
+                        .and_then(krill_proto::git::SessionPromptHistory::display_last_prompt)
+                        .map(Into::into),
+                    last_prompt_age: prompt_history
+                        .and_then(krill_proto::git::SessionPromptHistory::latest_unix_ns)
+                        .filter(|&ts| ts > 0)
+                        .map(|ts| crate::jump::format_age_ns(ts, now_ns).into()),
+                    prev_turn: prompt_history
+                        .and_then(krill_proto::git::SessionPromptHistory::previous_turn)
+                        .map(|t| (t.turn, t.text.clone().into())),
+                };
                 single_line(base)
                     .debug_selector(move || format!("sidebar-session-{index}"))
+                    .tooltip(move |window, cx| {
+                        ui::session_hover_card_view(hover_spec.clone(), window, cx)
+                    })
                     .h(px(if *nested { 26. } else { ROW_HEIGHT }))
                     // Orca 에이전트 행(`text-[11px]`)처럼 카드 제목보다 한 단계 작게.
                     .text_size(ui::TEXT_XS)

@@ -718,6 +718,8 @@ pub struct Shell {
     pub(super) nav_history: NavHistory,
     /// OWE-946 / MK-243: 데스크톱 Hybrid Chat `[Chat | Term]` 오버레이 상태.
     pub(super) chat: chat::ChatState,
+    /// 터미널 상단 고정 프롬프트 바(제안 C)에서 최근 턴 히스토리 타임라인 팝오버를 펼친 패인 집합.
+    pub(super) expanded_prompt_panes: HashSet<PaneId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1206,6 +1208,7 @@ impl Shell {
             tab_rename: None,
             nav_history: NavHistory::default(),
             chat: chat::ChatState::default(),
+            expanded_prompt_panes: HashSet::new(),
         };
         // Unexpected entity release still hands the latest state to the
         // app-owned writer before Saver::drop disconnects it.
@@ -1336,9 +1339,12 @@ impl Shell {
                     .iter()
                     .map(|(id, screen)| (*id, (**screen).clone()))
                     .collect::<Vec<_>>();
-                let (snapshot, ports) = cx
+                let (snapshot, prompts, ports) = cx
                     .background_executor()
                     .spawn(async move {
+                        let prompts = dir
+                            .as_deref()
+                            .map(krill_proto::git::load_session_prompt_histories);
                         let snapshot = dir.map(|dir| {
                             Arc::new(krill_proto::orchestration::OrchestrationStore::load_cached(
                                 &dir,
@@ -1350,12 +1356,17 @@ impl Shell {
                                 (id, popout::detect_ports(id, &screen, previous.remove(&id)))
                             })
                             .collect::<HashMap<_, _>>();
-                        (snapshot, ports)
+                        (snapshot, prompts, ports)
                     })
                     .await;
                 if this
                     .update(cx, |this, cx| {
                         let mut changed = false;
+                        if let Some(prompts) = prompts {
+                            changed |= this
+                                .sidebar
+                                .update(cx, |s, cx| s.sync_prompt_histories(prompts, cx));
+                        }
                         if let Some(snapshot) = snapshot
                             && this.orch_snapshot != snapshot
                         {
@@ -6134,6 +6145,10 @@ impl Shell {
             self.terminal_theme,
             krill_app::settings::terminal_opacity_pct(cx),
         );
+        let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, cx) {
+            Some((bar, pop)) => (Some(bar), pop),
+            None => (None, None),
+        };
         let pane = div()
             .id(ElementId::Name(format!("pane-{}", id.get()).into()))
             .size_full()
@@ -6143,6 +6158,7 @@ impl Shell {
             .text_color(p.muted_foreground)
             .flex()
             .flex_col()
+            .children(sticky_bar)
             .child(
                 div()
                     .flex_1()
@@ -6158,7 +6174,8 @@ impl Shell {
                             .children(self.scroll_chrome(id, cx))
                             // 실행 중인 패인의 헤더만 터미널 위 오버레이로 남는다.
                             // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
-                            .children(pane_header.filter(|_| show_header)),
+                            .children(pane_header.filter(|_| show_header))
+                            .children(sticky_popover),
                     )
                     .children(self.render_pane_chat_overlay(id, window, cx)),
             )
@@ -6376,6 +6393,281 @@ impl Shell {
                 .into_any_element(),
             None => pane.into_any_element(),
         }
+    }
+
+    /// 제안 C: 터미널 패인 상단 고정 마지막 프롬프트 바(`Sticky Last Prompt Bar`) 및
+    /// 클릭 시 펼쳐지는 최근 5턴 히스토리 타임라인 팝오버를 그린다.
+    fn render_sticky_prompt_bar(
+        &self,
+        id: PaneId,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyElement, Option<AnyElement>)> {
+        let host = self.layout.host(id);
+        let session_id = self
+            .layout
+            .session(id)
+            .or_else(|| self.live.get(&id).and_then(|l| l.pane.session()))?;
+        let sidebar_ref = self.sidebar.read(cx);
+        let history = sidebar_ref
+            .session_prompt_history_on(host, session_id)?
+            .clone();
+        let single_line = history.single_line_summary()?;
+        let full_last = history
+            .display_last_prompt()
+            .unwrap_or_else(|| single_line.clone());
+        let now_ns = sidebar_ref.now_unix_ns();
+        let age_text = history
+            .latest_unix_ns()
+            .filter(|&ts| ts > 0)
+            .map(|ts| krill_app::jump::format_age_ns(ts, now_ns));
+        let expanded = self.expanded_prompt_panes.contains(&id);
+        let p = krill_app::ui::palette(cx);
+        let pane_num = id.get();
+        let turn_label = krill_app::i18n::catalog::sidebar::TURN_BADGE
+            .format(&[("n", &history.total_turns.to_string())]);
+        let history_btn_label = format!(
+            "{} ({}) {}",
+            krill_app::i18n::catalog::sidebar::PROMPT_HISTORY_BTN.get(),
+            history.turns.len(),
+            if expanded { "⌃" } else { "⌄" }
+        );
+        let copy_last = full_last.clone();
+
+        let bar = div()
+            .id(("sticky-prompt-bar", pane_num))
+            .debug_selector(move || format!("sticky-prompt-bar-{pane_num}"))
+            .w_full()
+            .min_w_0()
+            .px_2p5()
+            .py_1()
+            .bg(p.sidebar)
+            .border_b_1()
+            .border_color(p.border)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .cursor_pointer()
+            .hover(|s| s.bg(p.accent.opacity(0.35)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if !this.expanded_prompt_panes.remove(&id) {
+                    this.expanded_prompt_panes.insert(id);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        krill_app::ui::badge(p, krill_app::ui::BadgeTone::Accent, turn_label)
+                            .debug_selector(move || format!("sticky-prompt-turn-{pane_num}")),
+                    )
+                    .when_some(age_text, |d, age| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(krill_app::ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(age),
+                        )
+                    })
+                    .child(
+                        div()
+                            .debug_selector(move || format!("sticky-prompt-text-{pane_num}"))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(krill_app::ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .child(single_line),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(("sticky-prompt-copy", pane_num))
+                            .debug_selector(move || format!("sticky-prompt-copy-{pane_num}"))
+                            .label(krill_app::i18n::catalog::sidebar::PROMPT_COPY_BTN.get())
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_last.clone()));
+                                this.notice = Some(
+                                    krill_app::i18n::catalog::sidebar::PROMPT_COPIED
+                                        .get()
+                                        .to_owned(),
+                                );
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("sticky-prompt-toggle-{pane_num}"))
+                            .flex_none()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(krill_app::ui::RADIUS_XS)
+                            .text_size(krill_app::ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(history_btn_label),
+                    ),
+            )
+            .into_any_element();
+
+        let popover = expanded.then(|| {
+            let items = history.turns.into_iter().enumerate().map(|(idx, turn)| {
+                let item_turn_badge = krill_app::i18n::catalog::sidebar::TURN_BADGE
+                    .format(&[("n", &turn.turn.to_string())]);
+                let item_tone = if idx == 0 {
+                    krill_app::ui::BadgeTone::Accent
+                } else {
+                    krill_app::ui::BadgeTone::Neutral
+                };
+                let item_age = (turn.unix_ns > 0)
+                    .then(|| krill_app::jump::format_age_ns(turn.unix_ns, now_ns));
+                let copy_turn = turn.text.clone();
+                div()
+                    .id(ElementId::Name(
+                        format!("sticky-prompt-turn-item-{pane_num}-{idx}").into(),
+                    ))
+                    .debug_selector(move || format!("sticky-prompt-turn-item-{pane_num}-{idx}"))
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(krill_app::ui::RADIUS_SM)
+                    .bg(if idx == 0 {
+                        p.accent.opacity(0.45)
+                    } else {
+                        p.card
+                    })
+                    .border_1()
+                    .border_color(p.border)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(p.accent.opacity(0.65)))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_turn.clone()));
+                        this.notice = Some(
+                            krill_app::i18n::catalog::sidebar::PROMPT_COPIED
+                                .get()
+                                .to_owned(),
+                        );
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(krill_app::ui::badge(p, item_tone, item_turn_badge))
+                                    .when_some(item_age, |row, age| {
+                                        row.child(
+                                            div()
+                                                .text_size(krill_app::ui::TEXT_2XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(age),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(krill_app::ui::TEXT_2XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(
+                                        krill_app::i18n::catalog::sidebar::PROMPT_COPY_BTN.get(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(krill_app::ui::TEXT_XS)
+                            .text_color(p.popover_foreground)
+                            .child(turn.text),
+                    )
+            });
+
+            div()
+                .id(("sticky-prompt-popover", pane_num))
+                .debug_selector(move || format!("sticky-prompt-popover-{pane_num}"))
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .max_w(px(580.))
+                .occlude()
+                .rounded(krill_app::ui::RADIUS_MD)
+                .bg(p.popover)
+                .border_1()
+                .border_color(p.border)
+                .shadow_lg()
+                .p_2p5()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_XS)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.popover_foreground)
+                                .child(
+                                    krill_app::i18n::catalog::sidebar::PROMPT_TIMELINE_TITLE.get(),
+                                ),
+                        )
+                        .child(
+                            Button::new(("sticky-prompt-popover-close", pane_num))
+                                .debug_selector(move || {
+                                    format!("sticky-prompt-popover-close-{pane_num}")
+                                })
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.expanded_prompt_panes.remove(&id);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .children(items)
+                .into_any_element()
+        });
+
+        Some((bar, popover))
     }
 }
 

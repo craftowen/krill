@@ -1977,18 +1977,22 @@ impl Registry {
 
     /// OWE-737: 첫 프롬프트 hook(`UserPromptSubmit` 등)이 오면 세션 자동 제목을 기록하고,
     /// 현재 디렉터리가 기본 이름(`worktree-1`, `claude-1` 등)의 git 브랜치이면 슬러그로 개명한다.
+    /// 또한 매 턴 프롬프트 히스토리를 `session-prompts.json`에 기록한다.
     pub(crate) fn maybe_rename_from_hook(&self, id: SessionId, payload: &[u8]) {
         use krill_proto::os::ffi::OsStrExt as _;
         if self.agents.is_subagent_or_foreign_hook(id, payload) {
             return;
         }
-        let state_dir = self.state_dir();
-        if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
-            return;
-        }
         let Some(prompt) = krill_proto::git::extract_prompt_from_hook_payload(payload) else {
             return;
         };
+        let state_dir = self.state_dir();
+        if let Some(dir) = state_dir.as_deref() {
+            krill_proto::git::record_session_prompt(dir, id, &prompt, status::now_ns()).ok();
+        }
+        if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
+            return;
+        }
         let Some(slug) = krill_proto::git::prompt_branch_slug(&prompt) else {
             return;
         };
@@ -2739,6 +2743,13 @@ impl Registry {
         let before_end = tap.pulse().end;
         let was_working = self.status.get(session).state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        if submit
+            && !self.status.get(session).agent.is_empty()
+            && let Ok(text) = std::str::from_utf8(bytes)
+            && let Some(dir) = self.state_dir()
+        {
+            krill_proto::git::record_session_prompt(&dir, session, text, status::now_ns()).ok();
+        }
         if submit && wait_submit {
             let deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < deadline {

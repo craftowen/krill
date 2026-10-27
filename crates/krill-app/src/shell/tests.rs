@@ -10103,3 +10103,92 @@ fn jump_sessionless_remote_worktree_uses_its_host(cx: &mut TestAppContext) {
         });
     });
 }
+
+/// 제안 B + 제안 C: 상단 탭 구조화 호버 카드 및 터미널 패인 상단 고정 프롬프트 바(`Sticky Last Prompt Bar`)가
+/// 최신 프롬프트와 누적 턴 수를 표시하고, 클릭 시 최근 프롬프트 타임라인 팝오버와 클립보드 복사가 동작한다.
+#[gpui::test]
+fn sticky_last_prompt_bar_and_tab_hover_card_render_and_toggle_timeline(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("sticky-prompt-bar"));
+    let sid = SessionId(501);
+    let pane_id = cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            s.layout.set_session(pane, sid);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_now_unix_ns_for_test(Some(10_000_000_000_000), cx);
+                sb.record_local_prompt(sid, "Implement sticky last prompt bar", cx);
+                sb.set_now_unix_ns_for_test(Some(10_010_000_000_000), cx);
+                sb.record_local_prompt(sid, "Add 5-turn timeline popover and copy button", cx);
+                sb.set_now_unix_ns_for_test(Some(10_020_000_000_000), cx);
+                sb.record_local_prompt(sid, "ok proceed", cx);
+            });
+            cx.notify();
+            pane
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let pnum = pane_id.get();
+    let bar_sel: &'static str = Box::leak(format!("sticky-prompt-bar-{pnum}").into_boxed_str());
+    let turn_sel: &'static str = Box::leak(format!("sticky-prompt-turn-{pnum}").into_boxed_str());
+    let text_sel: &'static str = Box::leak(format!("sticky-prompt-text-{pnum}").into_boxed_str());
+    let copy_sel: &'static str = Box::leak(format!("sticky-prompt-copy-{pnum}").into_boxed_str());
+    let pop_sel: &'static str = Box::leak(format!("sticky-prompt-popover-{pnum}").into_boxed_str());
+    let item0_sel: &'static str =
+        Box::leak(format!("sticky-prompt-turn-item-{pnum}-0").into_boxed_str());
+    let item1_sel: &'static str =
+        Box::leak(format!("sticky-prompt-turn-item-{pnum}-1").into_boxed_str());
+    let close_sel: &'static str =
+        Box::leak(format!("sticky-prompt-popover-close-{pnum}").into_boxed_str());
+
+    assert!(
+        cx.debug_bounds(bar_sel).is_some(),
+        "terminal pane must render sticky prompt bar when session has prompt history"
+    );
+    assert!(cx.debug_bounds(turn_sel).is_some());
+    assert!(cx.debug_bounds(text_sel).is_some());
+    assert!(cx.debug_bounds(copy_sel).is_some());
+    assert!(cx.debug_bounds(pop_sel).is_none());
+
+    // 1. 상단 탭 호버 시 제안 B 호버 카드가 Turn 3 배지·병합 프롬프트·이전 턴과 함께 뜬다.
+    let tab_bounds = cx.debug_bounds("session-tab-0").expect("session-tab-0");
+    cx.simulate_mouse_move(tab_bounds.center(), None, Modifiers::default());
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tooltip:tab-hover-0").is_some(),
+        "hovering session tab must show structured hover card"
+    );
+    assert!(cx.debug_bounds("tooltip-turn:tab-hover-0:3").is_some());
+    assert!(cx.debug_bounds("tooltip-last-prompt:tab-hover-0").is_some());
+    assert!(cx.debug_bounds("tooltip-prev-prompt:tab-hover-0").is_some());
+
+    // 2. 상단 고정 바의 복사 버튼 클릭 시 병합된 마지막 프롬프트가 클립보드에 복사된다.
+    let copy_bounds = cx.debug_bounds(copy_sel).unwrap();
+    cx.simulate_click(copy_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("Add 5-turn timeline popover and copy button (→ ok proceed)".into())
+    );
+
+    // 3. 상단 고정 바 클릭 시 최근 프롬프트 타임라인 팝오버가 펼쳐지고 닫기 버튼으로 닫힌다.
+    let bar_bounds = cx.debug_bounds(bar_sel).unwrap();
+    cx.simulate_click(bar_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(pop_sel).is_some(),
+        "clicking sticky prompt bar must open timeline popover"
+    );
+    assert!(cx.debug_bounds(item0_sel).is_some());
+    assert!(cx.debug_bounds(item1_sel).is_some());
+
+    let close_bounds = cx.debug_bounds(close_sel).unwrap();
+    cx.simulate_click(close_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(pop_sel).is_none(),
+        "clicking close button must dismiss timeline popover"
+    );
+}

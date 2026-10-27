@@ -838,6 +838,13 @@ catalog! {
         MARK_READ => ("읽음으로 표시", "Mark as Read"),
         REMOVE_PROJECT => ("프로젝트 제거", "Remove Project"),
         REMOVE_PROJECT_CONFIRM => ("사이드바에서 프로젝트를 제거할까요? 파일과 실행 중인 세션은 유지됩니다.", "Remove this project from the sidebar? Files and running sessions are kept."),
+        LAST_PROMPT_LABEL => ("마지막 프롬프트", "Last prompt"),
+        PREV_PROMPT_PREFIX => ("이전", "Prev"),
+        PROMPT_HISTORY_BTN => ("히스토리", "History"),
+        PROMPT_COPY_BTN => ("복사", "Copy"),
+        PROMPT_COPIED => ("프롬프트 복사됨", "Prompt copied"),
+        PROMPT_TIMELINE_TITLE => ("최근 프롬프트 히스토리", "Recent Prompt History"),
+        TURN_BADGE => ("Turn {n}", "Turn {n}"),
     }
     link {
         RECONNECTING => ("세션 데몬에 다시 연결하는 중… 세션은 krill-holder가 보관하고 있습니다", "Reconnecting to the session daemon… krill-holder is keeping your sessions"),
