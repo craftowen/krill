@@ -165,7 +165,12 @@ impl Shell {
                             return;
                         };
                         let target = this.target_os(host, parent.as_os_str().as_bytes());
-                        let program = clone_program(target, url.as_bytes(), dir.as_bytes());
+                        let program = clone_program(
+                            target,
+                            url.as_bytes(),
+                            dir.as_bytes(),
+                            parent.as_os_str().as_bytes(),
+                        );
                         this.new_folder_tab_on(host.clone(), parent, program, cx);
                     }
                     add_project::Event::Create(host) => {
@@ -244,7 +249,12 @@ impl Shell {
             if let Ok(Ok(Some(paths))) = chosen.await
                 && let Some(parent) = paths.into_iter().next()
             {
-                let program = clone_program(TargetOs::local(), url.as_bytes(), dir.as_bytes());
+                let program = clone_program(
+                    TargetOs::local(),
+                    url.as_bytes(),
+                    dir.as_bytes(),
+                    parent.as_os_str().as_bytes(),
+                );
                 this.update(cx, |this, cx| {
                     this.new_local_project_tab(&parent, program, cx);
                 })
@@ -366,9 +376,13 @@ fn windows_project(args: &[&[u8]], destination: &[u8]) -> Program {
 }
 
 /// 저장소 복제. 성공하면 실제 프로젝트 폴더의 셸과 cwd 보고를 유지한다.
-fn clone_program(target: TargetOs, url: &[u8], dir: &[u8]) -> Program {
+fn clone_program(target: TargetOs, url: &[u8], dir: &[u8], parent: &[u8]) -> Program {
     match target {
-        TargetOs::Unix => unix_project(r#"git clone -- "$1" "$2" && cd -- "$2""#, &[url, dir], dir),
+        TargetOs::Unix => unix_project(
+            r#"cd -- "$3" && git clone -- "$1" "$2" && cd -- "$2""#,
+            &[url, dir, parent],
+            dir,
+        ),
         TargetOs::Windows => windows_project(&[b"clone", b"--", url, dir], dir),
     }
 }
@@ -419,7 +433,7 @@ fn project_destination(program: &Program) -> Option<Vec<u8>> {
     {
         args.last()?
     } else if program == b"/bin/sh"
-        && matches!(args.len(), 4 | 5)
+        && matches!(args.len(), 4..=6)
         && args.first()?.as_slice() == b"-c"
         && args.get(2)?.as_slice() == b"krill"
     {
@@ -469,7 +483,8 @@ mod tests {
     #[test]
     fn unix_targets_keep_the_login_shell_script_with_positional_args() {
         let url = b"https://example.com/a;rm -rf $HOME.git";
-        let Program::Custom { program, args } = clone_program(TargetOs::Unix, url, b"a") else {
+        let Program::Custom { program, args } = clone_program(TargetOs::Unix, url, b"a", b"/work")
+        else {
             panic!("custom program");
         };
         assert_eq!(program, b"/bin/sh");
@@ -477,6 +492,7 @@ mod tests {
         assert_eq!(args[2], b"krill");
         assert_eq!(args[3], url, "user input stays a positional argument");
         assert_eq!(args[4], b"a");
+        assert_eq!(args[5], b"/work");
         let Program::Custom { program, args } = init_program(TargetOs::Unix, b"/tmp/p q") else {
             panic!("custom program");
         };
@@ -488,7 +504,9 @@ mod tests {
     #[test]
     fn windows_project_shell_preserves_data_and_reports_the_project_directory() {
         let url = b"https://example.com/a;echo $(whoami).git";
-        let Program::Custom { program, args } = clone_program(TargetOs::Windows, url, b"a") else {
+        let Program::Custom { program, args } =
+            clone_program(TargetOs::Windows, url, b"a", b"C:\\work")
+        else {
             panic!("custom program");
         };
         assert_eq!(program, b"powershell.exe");
@@ -513,7 +531,7 @@ mod tests {
         assert_eq!(args[1], b"-NoExit");
         let launch = Create {
             account: None,
-            program: clone_program(TargetOs::Windows, url, b"p q"),
+            program: clone_program(TargetOs::Windows, url, b"p q", b"C:\\Users\\dev"),
             cwd: b"C:\\Users\\dev".to_vec(),
             cols: 80,
             rows: 24,
@@ -599,6 +617,7 @@ mod tests {
             TargetOs::Windows,
             original.as_os_str().as_bytes(),
             clone.as_bytes(),
+            root.as_os_str().as_bytes(),
         ));
         assert!(root.join(clone).join(".git").is_dir());
         assert!(cloned.contains(clone));
@@ -651,6 +670,7 @@ mod tests {
                 .args(args.into_iter().map(std::ffi::OsString::from_vec))
                 .current_dir(&root)
                 .env("SHELL", "/usr/bin/true")
+                .env("PWD", "/mismatched-holder-startup-pwd")
                 .output()
                 .unwrap()
         };
@@ -674,14 +694,41 @@ mod tests {
             TargetOs::Unix,
             original.as_os_str().as_bytes(),
             clone.as_bytes(),
+            root.as_os_str().as_bytes(),
         ));
         assert!(output.status.success());
         assert!(root.join(clone).join(".git").is_dir());
         assert!(String::from_utf8_lossy(&output.stdout).contains(&cwd_frame(&root.join(clone))));
+        let logical_parent = root.join("logical-parent");
+        std::os::unix::fs::symlink(&root, &logical_parent).unwrap();
+        let program = clone_program(
+            TargetOs::Unix,
+            original.as_os_str().as_bytes(),
+            b"symlink-clone",
+            logical_parent.as_os_str().as_bytes(),
+        );
+        let launch = Create {
+            account: None,
+            program: program.clone(),
+            cwd: logical_parent.as_os_str().as_bytes().to_vec(),
+            cols: 80,
+            rows: 24,
+        };
+        let output = run(program);
+        let logical_destination = logical_parent.join("symlink-clone");
+        assert!(root.join("symlink-clone/.git").is_dir());
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&cwd_frame(&logical_destination)));
+        assert_eq!(
+            completed_project(&launch, &logical_destination)
+                .unwrap()
+                .program,
+            Program::Login
+        );
         let output = run(clone_program(
             TargetOs::Unix,
             root.join("missing-repo").as_os_str().as_bytes(),
             b"never-created",
+            root.as_os_str().as_bytes(),
         ));
         assert!(!root.join("never-created").exists());
         assert!(!String::from_utf8_lossy(&output.stdout).contains("\u{1b}]7;"));
