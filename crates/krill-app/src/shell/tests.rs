@@ -912,7 +912,12 @@ fn folder_tab_and_agent_use_selected_directory(cx: &mut TestAppContext) {
         let old = this.layout.tabs()[0].focused;
         assert_eq!(this.folder(), folder);
         assert_eq!(this.layout.session(old), Some(krill_proto::SessionId(420)));
-        this.new_folder_tab(&this.folder(), Program::Agent { id: "codex".into() }, cx);
+        this.new_folder_tab_on(
+            this.launch_host.clone(),
+            &this.folder(),
+            Program::Agent { id: "codex".into() },
+            cx,
+        );
         let launch = this.launch_for(this.layout.active_tab().focused);
         assert_eq!(launch.program, Program::Agent { id: "codex".into() });
         assert_eq!(launch.cwd, folder.as_os_str().as_bytes());
@@ -1369,7 +1374,12 @@ fn sidebar_selection_sets_folder_for_open_in_and_new_agent(cx: &mut TestAppConte
                 this.layout.session(this.layout.active_tab().focused),
                 Some(krill_proto::SessionId(id))
             );
-            this.new_folder_tab(&this.folder(), Program::Agent { id: "codex".into() }, cx);
+            this.new_folder_tab_on(
+                this.launch_host.clone(),
+                &this.folder(),
+                Program::Agent { id: "codex".into() },
+                cx,
+            );
             assert_eq!(this.folder(), PathBuf::from(folder));
         });
     }
@@ -6978,7 +6988,8 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     // 탭 1 (a): 명시적 비-git 폴더 탭 (`/tmp/plain-folder`)
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.new_folder_tab(
+            s.new_folder_tab_on(
+                s.launch_host.clone(),
                 std::path::Path::new("/tmp/plain-folder"),
                 Program::Login,
                 cx,
@@ -6996,7 +7007,8 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     // 탭 2 (b): 워크트리 하위 디렉터리에서 열린 탭 (`/repo/main/crates/sub`)
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.new_folder_tab(
+            s.new_folder_tab_on(
+                s.launch_host.clone(),
                 std::path::Path::new("/repo/main/crates/sub"),
                 Program::Login,
                 cx,
@@ -7052,7 +7064,12 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     // 탭 5: 워크트리 루트 탭 (`/repo/feature`)
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.new_folder_tab(std::path::Path::new("/repo/feature"), Program::Login, cx);
+            s.new_folder_tab_on(
+                s.launch_host.clone(),
+                std::path::Path::new("/repo/feature"),
+                Program::Login,
+                cx,
+            );
         });
     });
     cx.run_until_parked();
@@ -7734,7 +7751,7 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
                 sb.select_worktree(Some(wt_b.clone()), cx);
             });
             let sb_snap = s.sidebar.read(cx);
-            s.sync_live_cwds(sb_snap);
+            assert!(s.sync_live_cwds(sb_snap).is_empty());
             // 폴더는 설정된 cwd 그대로(워크트리 루트 유지), 최신 라이브 cwd는 재스폰 보관으로 분리.
             assert_eq!(
                 s.layout.launch(p0a).map(|l| l.cwd.as_slice()),
@@ -8250,7 +8267,7 @@ fn jump_and_quick_open_are_mutually_exclusive(cx: &mut TestAppContext) {
     fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
     let (view, cx) = open(cx, state_path("palette-mutex"));
     view.update(cx, |s, cx| {
-        s.new_folder_tab(&dir, Program::Login, cx);
+        s.new_folder_tab_on(s.launch_host.clone(), &dir, Program::Login, cx);
     });
     cx.run_until_parked();
 

@@ -328,7 +328,12 @@ fn quick_open_finds_and_opens(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("files-quick"));
     let root = dir.0.clone();
     view.update(cx, |s, cx| {
-        s.new_folder_tab(&root, krill_proto::control::Program::Login, cx);
+        s.new_folder_tab_on(
+            s.launch_host.clone(),
+            &root,
+            krill_proto::control::Program::Login,
+            cx,
+        );
     });
     cx.run_until_parked();
 
