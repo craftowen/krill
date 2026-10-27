@@ -1087,3 +1087,91 @@ fn startup_loading_accepts_ime_paste_and_keys_and_delivers_to_first_session(
     got_p1.extend_from_slice(&read_input(&mut p1_peer));
     assert_eq!(got_p1, b"echo world done\r");
 }
+
+#[gpui::test]
+fn hidden_confirming_paste_and_following_keys_survive_other_tab_attach(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("hidden-confirming-queue"));
+    let original = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    let (initial, _initial_peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(original, krill_proto::SessionId(42), initial, cx)
+    });
+    let second = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.paste_bytes(b"echo first\necho second", window, cx);
+            shell.send(&typed(b"following keys"), Some(window), cx);
+            shell.new_tab_on_launch_host(cx);
+            assert!(
+                shell.live.contains_key(&original),
+                "pending confirmation keeps its Live identity across navigation"
+            );
+            shell.layout.active_tab().focused
+        })
+    });
+    // The hidden pane can finish a reattach while its confirmation is pending.
+    let (reattach, mut original_peer) = UnixStream::pair().unwrap();
+    original_peer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    view.update(cx, |shell, cx| {
+        let got = super::super::Got::Live {
+            session: krill_proto::SessionId(42),
+            linked: Ok(krill_app::pane::Linked {
+                reader: reattach.try_clone().unwrap(),
+                writer: krill_app::pane::Writer::spawn(reattach).unwrap(),
+                instance: 1,
+                launch: None,
+                features: krill_proto::input::FEAT_INPUT,
+                search: false,
+            }),
+            prior_cold: None,
+        };
+        assert!(
+            matches!(
+                shell.settled(original, Ok(got), cx),
+                super::super::Next::Read(_)
+            ),
+            "settling a hidden pending confirmation must retain its connection"
+        );
+    });
+    let (other, mut other_peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(second, krill_proto::SessionId(43), other, cx);
+        assert!(shell.paste_queue.has_pending_for(original));
+        shell.change(true, cx, |layout| layout.activate(0));
+        shell.refresh_pending_paste_banner(cx);
+    });
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.confirm_pending_paste(window, cx)));
+    assert_eq!(read_input(&mut original_peer), b"echo first\recho second");
+    assert_eq!(read_input(&mut original_peer), b"following keys");
+    assert_nothing_sent(&mut other_peer);
+    assert!(view.read_with(cx, |shell, _| !shell.paste_queue.has_pending_for(original)));
+}
+
+#[gpui::test]
+fn cold_read_only_pane_never_accepts_clipboard_confirmation(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("cold-clipboard-guard"));
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.active_tab().focused;
+            let mut live = super::super::Live::new(gpui::Task::ready(()));
+            live.pane
+                .show_cold(
+                    krill_proto::SessionId(42),
+                    krill_proto::control::Cold {
+                        screen: vec![krill_proto::screen::Op::Reset {
+                            cols: 80,
+                            lines: 24,
+                        }],
+                        history: Vec::new(),
+                    },
+                )
+                .unwrap();
+            shell.live.insert(pane, live);
+            assert!(shell.begin_clipboard_paste(window, cx).is_none());
+            shell.paste_bytes(b"echo first\necho second", window, cx);
+            assert!(!shell.paste_queue.has_pending_for(pane));
+            assert!(shell.security.pending_paste().is_none());
+        })
+    });
+}

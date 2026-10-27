@@ -4088,7 +4088,9 @@ impl Shell {
         self.live.retain(|p, live| {
             visible.contains(p)
                 || layout.pane_exists(*p)
-                    && (live.pane.keep_account_input() || live.pane.session().is_none())
+                    && (live.pane.keep_account_input()
+                        || live.pane.session().is_none()
+                        || paste_queue.has_pending_for(*p))
         });
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
@@ -4434,6 +4436,7 @@ impl Shell {
         // its session ID (or uncertain result) has reached the layout. Hidden
         // panes then release their connection instead of retaining a stream.
         if !self.layout.visible().contains(&pane)
+            && !self.paste_queue.has_pending_for(pane)
             && !self
                 .live
                 .get(&pane)

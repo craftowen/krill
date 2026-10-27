@@ -72,7 +72,8 @@ impl QueuedInput {
         shell.layout.pane_exists(self.pane)
             && shell.layout.host(self.pane) == &self.host
             && shell.live.get(&self.pane).is_some_and(|live| {
-                std::sync::Arc::ptr_eq(&self.creation, &live.creation)
+                !live.pane.is_cold()
+                    && std::sync::Arc::ptr_eq(&self.creation, &live.creation)
                     && self
                         .session
                         .is_none_or(|session| live.pane.session() == Some(session))
@@ -141,6 +142,9 @@ impl Shell {
         // Preserve first-attach buffering and bind every queue entry to the original Live and host.
         let host = self.layout.host(pane).clone();
         let live = self.ensure_input_live(pane)?;
+        if live.pane.is_cold() {
+            return None;
+        }
         let session = live.pane.session();
         let creation = std::sync::Arc::clone(&live.creation);
         let timeout = if self.layout.host(pane).is_remote() {
@@ -654,6 +658,9 @@ impl Shell {
         let Some(l) = self.ensure_input_live(pane) else {
             return;
         };
+        if l.pane.is_cold() {
+            return;
+        }
         let modes = l.pane.modes();
         match plan_paste(pane, text, modes) {
             PastePlan::Immediate(bytes) => {
