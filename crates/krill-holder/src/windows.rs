@@ -5,6 +5,7 @@ use crate::{
 };
 use krill_proto::{
     SessionId,
+    daemon::KRILLD_DUPLICATE,
     holder::{
         FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION,
         request_id,
@@ -190,11 +191,16 @@ impl Holder {
                 }
             }
         }
-        let dead = self
+        let exited = self
             .daemon
             .as_ref()
-            .is_some_and(|d| d.process.status().ok().flatten().is_some());
-        if dead {
+            .and_then(|d| d.process.status().ok().flatten());
+        if let Some(code) = exited {
+            if code == i32::from(KRILLD_DUPLICATE) && self.sessions.is_empty() {
+                // 건강한 데몬이 소켓을 쥐고 있다. 세션이 없어 잃을 것이 없으니 재기동하지 않고 끝낸다(Unix `reap`과 같다).
+                self.daemon = None;
+                return true;
+            }
             if self
                 .daemon
                 .as_ref()
@@ -541,4 +547,65 @@ fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
     word.ok_or(io::ErrorKind::InvalidData)?
         .parse()
         .map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn holder() -> Holder {
+        Holder {
+            path: "krilld.exe".into(),
+            args: Vec::new(),
+            sessions: Vec::new(),
+            api: Api::load(),
+            daemon: None,
+            streak: 0,
+            restart: Instant::now() + Duration::from_secs(60),
+            previous: None,
+            listener: None,
+        }
+    }
+
+    /// `cmd /c exit <code>`를 자식 krilld 자리에 둔다(bootstrap 링크는 읽지 않고 바로 끝난다).
+    fn exited_daemon(code: &str) -> io::Result<Daemon> {
+        let cmd =
+            std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+        let args: Vec<OsString> = ["/c", "exit", code].iter().map(OsString::from).collect();
+        let (process, link) = sys::child_link(OsStr::new(&cmd), &args)?;
+        let target = sys::duplicate_target(process.pid)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process.status()?.is_none() {
+            assert!(Instant::now() < deadline, "mock krilld did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Daemon {
+            process,
+            target,
+            link: Some(link),
+            started: Instant::now(),
+        })
+    }
+
+    /// foundation-01: 세션 없는 중복 holder는 `KRILLD_DUPLICATE`(3)에서 재기동 없이 끝난다(Unix `reap`과 같은 계약).
+    #[test]
+    fn empty_duplicate_holder_exits_instead_of_restarting() -> io::Result<()> {
+        let mut h = holder();
+        h.daemon = Some(exited_daemon("3")?);
+        assert!(h.poll());
+        assert!(h.daemon.is_none());
+        assert_eq!(h.streak, 0, "duplicate exit must not count as a crash");
+        Ok(())
+    }
+
+    #[test]
+    fn crash_exit_still_schedules_restart() -> io::Result<()> {
+        let mut h = holder();
+        h.daemon = Some(exited_daemon("1")?);
+        assert!(!h.poll());
+        assert!(h.daemon.is_none());
+        assert_eq!(h.streak, 1);
+        Ok(())
+    }
 }
