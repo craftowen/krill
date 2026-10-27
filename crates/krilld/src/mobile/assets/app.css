@@ -569,7 +569,6 @@ button.account-row:disabled{opacity:1}
 body:not([data-screen=session]) #notice{bottom:calc(16px + env(safe-area-inset-bottom) + var(--keyboard-inset,0px))}
 .log-error .log-glyph,.log-error strong{color:var(--status-blocked)}
 
-.session .accessory-row>.paste-key{display:grid;place-items:center;flex:none;margin:2px 4px 2px 0;padding:4px 8px;color:var(--foreground);border:1px solid var(--border)}
 
 
 .quick-actions-manager,.quick-actions-list{display:flex;flex-direction:column;gap:var(--space-sm);min-width:0}
@@ -652,3 +651,5 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 #mobile-app .session .command-dock>.accessory-row>.live-focus-target>.live-input-copy{display:none}
 #mobile-app .session .command-dock>.accessory-row>.live-focus-target>svg{width:20px;height:20px}
 #mobile-app .session .command-dock>.accessory-row>.live-focus-target:focus-visible{outline:2px solid var(--foreground);outline-offset:-2px}
+
+#mobile-app .session .command-dock>.accessory-row>.live-focus-target[aria-pressed=true]{background:var(--surface-raised);color:var(--foreground)}
