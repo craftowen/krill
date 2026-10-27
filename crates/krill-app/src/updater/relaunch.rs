@@ -199,7 +199,14 @@ pub(super) fn swap_with(
         // 어느 단계가 실패해도 원래 번들을 복원한 후에만 RolledBack을 기록한다.
         if prev.exists() {
             if app_bundle.exists() {
-                rollback_with(mode, app_bundle, state_dir, &error.to_string())?;
+                // 디스크 저널을 다시 읽지 않고 이 프로세스가 아는 단계로 백업 상태를 판정한다.
+                rollback_from(
+                    mode,
+                    app_bundle,
+                    state_dir,
+                    &error.to_string(),
+                    Backup::of(&journal.stage),
+                )?;
             } else {
                 fs::rename(&prev, app_bundle)?;
             }
@@ -286,8 +293,12 @@ fn prune_extraneous_entries(src: &Path, dst: &Path) -> io::Result<()> {
 /// - 번들이 없고 백업이 있으면 복원하고 `RolledBack`을 기록한다(진짜 롤백).
 /// - 번들이 있고 스테이징이 없으면 교체가 끝난 것이다. 성공한 교체를
 ///   `RolledBack`으로 오표기하지 않고(AS-09) 검증 단계로 이어간다.
-/// - 번들·스테이징이 둘 다 멀쩡하면 교체 전에 죽은 것이다. 복원할 게 없으니
+/// - 백업 단계(`MovingToPrev`)에서 죽었으면 번들은 그대로다. 불완전할 수 있는 `.prev`를 지우고
 ///   거짓 롤백 대화상자를 남기지 않고 저널을 버린다.
+/// - 교체 단계(`MovingStagingToTarget`)에서 스테이징이 남아 있으면 파일 일부만 바뀌었을 수 있다.
+///   완결된 `.prev`로 되돌리고 `RolledBack`을 기록한다(혼합 번들을 정상 설치로 오판하지 않는다).
+///   `.prev`가 없으면 복원할 수 없으므로 저널·스테이징을 그대로 두고 [`Error::NoBackup`]을 돌려준다
+///   (복원했다고 기록하지 않는다).
 ///
 /// Windows([`Mode::Rename`])는 설치 폴더가 사라지지 않으므로 단계로 판정한다. 옮기기 전(`MovingToPrev`)에
 /// 멈췄으면 `.prev`의 파일을 되돌리고 저널을 버린다. 새 파일을 놓다가(`MovingStagingToTarget`) 멈췄으면
@@ -331,19 +342,35 @@ pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journa
             journal.save(state_dir)?;
             return Ok(Some(journal));
         }
+        if journal.stage == Stage::MovingToPrev {
+            // 백업을 만들다 죽었다: 번들은 아직 손대지 않았고 `.prev`는 불완전할 수 있다.
+            // 불완전한 백업이 나중에 복원 원천으로 쓰이지 않도록 지우고 저널을 버린다.
+            if prev.exists() {
+                fs::remove_dir_all(&prev)?;
+            }
+            fs::remove_file(journal_path(state_dir)).ok();
+            return Ok(None);
+        }
+        // `MovingStagingToTarget`: `.prev`는 완결된 백업이다(백업이 끝난 뒤에만 이 단계를 저장한다).
         if journal.bundle.exists() && !staging.exists() {
             journal.stage = Stage::VerifyingLaunch;
             journal.save(state_dir)?;
             return Ok(Some(journal));
         }
-        if journal.bundle.exists() && staging.exists() {
-            fs::remove_file(journal_path(state_dir)).ok();
-            return Ok(None);
+        if journal.bundle.exists() && prev.exists() {
+            // 파일 단위 교체 도중 죽어 신·구 파일이 섞였을 수 있다. 완결된 백업으로 되돌린다.
+            rollback_from(
+                mode,
+                &journal.bundle,
+                state_dir,
+                "interrupted during bundle replacement",
+                Backup::of(&journal.stage),
+            )?;
+            return Journal::load(state_dir);
         }
-        journal.stage = Stage::RolledBack {
-            reason: "interrupted during bundle replacement".to_owned(),
-        };
-        journal.save(state_dir)?;
+        // 백업이 없어 복원할 수 없다. 저널·스테이징을 그대로 두고(다음 시작·업데이트 재시도에서 다시 본다)
+        // 복원했다고 기록하지 않는다.
+        return Err(Error::NoBackup(prev));
     }
     Ok(Some(journal))
 }
@@ -353,27 +380,61 @@ pub fn rollback(app_bundle: &Path, state_dir: &Path, reason: &str) -> Result<(),
     rollback_with(MODE, app_bundle, state_dir, reason)
 }
 
+/// 호출자가 아는 `.prev` 백업 상태. 백업 단계(`MovingToPrev`)에서 멈췄으면 `.prev`는 불완전할 수
+/// 있고 번들은 아직 손대지 않았다. 모르는 상태를 완결된 백업으로 가정하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backup {
+    Complete,
+    Partial,
+}
+
+impl Backup {
+    fn of(stage: &Stage) -> Self {
+        if *stage == Stage::MovingToPrev {
+            Self::Partial
+        } else {
+            Self::Complete
+        }
+    }
+}
+
 pub(super) fn rollback_with(
     mode: Mode,
     app_bundle: &Path,
     state_dir: &Path,
     reason: &str,
 ) -> Result<(), Error> {
+    // 저널을 읽을 수 없으면 백업 상태를 추정하지 않고 오류를 돌려준다.
+    // 저널이 없으면 진행 중인 업데이트가 없는 수동 롤백이라 `.prev`를 완결된 백업으로 본다.
+    let backup = Journal::load(state_dir)?.map_or(Backup::Complete, |j| Backup::of(&j.stage));
+    rollback_from(mode, app_bundle, state_dir, reason, backup)
+}
+
+fn rollback_from(
+    mode: Mode,
+    app_bundle: &Path,
+    state_dir: &Path,
+    reason: &str,
+    backup: Backup,
+) -> Result<(), Error> {
     let prev = prev_path(app_bundle);
     if !prev.exists() {
         return Err(Error::NoBackup(prev));
     }
+    let partial = backup == Backup::Partial;
     if mode == Mode::Rename {
-        // 옮기는 도중(`MovingToPrev`) 실패면 설치 폴더에 남은 것은 아직 안 옮긴 구 파일이라 지우지 않는다.
+        // 설치 폴더에 남은 것은 아직 안 옮긴 구 파일이라 지우지 않는다.
         // 그 뒤 단계면 설치 폴더의 파일은 새 버전이므로 치우고 구 파일을 되돌린다.
         let trash = trash_path(app_bundle);
-        let partial =
-            matches!(Journal::load(state_dir), Ok(Some(j)) if j.stage == Stage::MovingToPrev);
         if !partial {
             rename::clear(app_bundle, &trash)?;
         }
         rename::move_tree(&prev, app_bundle, &trash)?;
         fs::remove_dir_all(&prev).ok();
+    } else if partial && app_bundle.exists() {
+        // 불완전한 `.prev`를 번들에 동기화하면 아직 백업되지 않은 원본 파일이 prune으로 지워진다.
+        // 번들은 그대로 두고 백업만 버린다.
+        fs::remove_dir_all(&prev)?;
     } else if app_bundle.exists() {
         sync_bundle_in_place(&prev, app_bundle)?;
         fs::remove_dir_all(&prev)?;
@@ -468,7 +529,8 @@ pub fn relaunch_and_verify(
 
     child.kill().ok();
     child.wait().ok();
-    rollback(app_bundle, state_dir, &fail_reason)?;
+    // `swap_bundles`가 성공했으므로 `.prev`는 완결된 백업이다. 저널 읽기에 기대지 않는다.
+    rollback_from(MODE, app_bundle, state_dir, &fail_reason, Backup::Complete)?;
     let restored = spawn_bundle_app(app_bundle, state_dir, None)?;
     Ok(RelaunchOutcome::RolledBack {
         reason: fail_reason,
@@ -713,8 +775,8 @@ fn load_rollback(state_dir: PathBuf, recover: bool, window: &Window, cx: &mut Ap
     let handle = window.window_handle();
     let work_dir = state_dir.clone();
     let work = cx.background_spawn(async move {
-        if recover {
-            recover_journal(&work_dir).ok();
+        if recover && let Err(error) = recover_journal(&work_dir) {
+            tracing::warn!(%error, "update journal recovery failed");
         }
         Journal::load(&work_dir).ok().flatten()
     });
