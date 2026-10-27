@@ -65,8 +65,9 @@ async function testQuickActions(){
  f.ctx.rpc=async request=>{f.calls.push(request);return {quick_commands:request.commands};};
  const wire=h=>h.insertText=text=>{assert(!text.includes('\r'));seen.push([h.options.sessionId,text]);return true;};
  const first=f.mounts[0];wire(first);
- const open=h=>{h.options.onQuickActions();const body=new Element('div');f.sheets.at(-1).render(body);return body;},all=body=>body.descendants(),by=(body,label)=>all(body).find(n=>n.textContent===label&&n.tag==='button');
- let body=open(first);assert.equal(f.sheets.at(-1).title,'Quick actions');let cards=all(body).filter(n=>n.className==='quick-action-insert');assert.equal(cards[0].children[0].textContent,'Orchestrate');cards[0].action();assert.deepEqual(seen,[[7,'/krill-orchestration ']]);
+ const quick=f.buttons.find(b=>b.className==='icon-button session-quick-actions');assert.equal(quick.parentElement.tag,'header');assert.equal(quick.attrs['aria-haspopup'],'dialog');
+ const open=h=>{if(f.mounts.length>1){const title=f.root.descendants().find(n=>n.className==='ghost pane-title'&&n.parentElement.parentElement.contains(h.root));title?.action();}quick.action();const body=new Element('div');f.sheets.at(-1).render(body);return body;},all=body=>body.descendants(),by=(body,label)=>all(body).find(n=>n.textContent===label&&n.tag==='button');
+ let body=open(first);assert.equal(f.sheets.at(-1).title,'Quick actions');assert.equal(f.sheets.at(-1).length,0,'quick actions contain saved commands only');let cards=all(body).filter(n=>n.className==='quick-action-insert');assert.equal(cards[0].children[0].textContent,'Orchestrate');cards[0].action();assert.deepEqual(seen,[[7,'/krill-orchestration ']]);
  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();const second=f.mounts.at(-1);wire(second);
  // A quick-action activation also selects its pane when no pointer event ran first.
  body=open(first);all(body).find(n=>n.className==='quick-action-insert').action();body=open(second);all(body).find(n=>n.className==='quick-action-insert').action();assert.deepEqual(seen.slice(-2),[[7,'/krill-orchestration '],[8,'/krill-orchestration ']]);
@@ -108,7 +109,7 @@ async function testQuickActions(){
   assert.deepEqual(plain(race.state.snapshot.quick_commands),[{name:'Saved A',text:'echo a'}]);
   race.view.cleanup();
  }
- const fallback=fixture(undefined,{},false,{quickCommands:[{name:'Fallback',text:'saved prompt'}]});const fallbackBody=openFallback();function openFallback(){fallback.mounts[0].options.onQuickActions();const b=new Element('div');fallback.sheets.at(-1).render(b);return b;}assert(all(fallbackBody).some(n=>n.textContent==='Fallback'));fallback.view.cleanup();
+ const fallback=fixture(undefined,{},false,{quickCommands:[{name:'Fallback',text:'saved prompt'}]});const fallbackBody=openFallback();function openFallback(){fallback.buttons.find(b=>b.className==='icon-button session-quick-actions').action();const b=new Element('div');fallback.sheets.at(-1).render(b);return b;}assert(all(fallbackBody).some(n=>n.textContent==='Fallback'));fallback.view.cleanup();
  console.log('PASS saved quick actions snapshot/fallback, active split insertion without Enter, add/edit/delete RPC and preferences, offline local retention');
 }
 function testSplitContinuity(){
@@ -368,7 +369,7 @@ async function testHybridChatToggleAndQuestionCards(){
  const preparedFeed=root.descendants().find(n=>n.className==='chat-feed');
  const preparedQuestion=root.descendants().find(n=>n.className==='chat-card chat-question');
  buttons.find(b=>b.textContent==='Terminal actions').action();assert.equal(sheets.at(-1).entries[0].label,'Switch to Chat');sheets.at(-1).entries[0].action();assert.equal(toggleBtn.textContent,'Term');assert.equal(toggleBtn.getAttribute('aria-label'),'Term');assert.equal(state.preferences.sessionViewModes[7],'chat');assert.equal(mounts[0].visible,false);
- state.snapshot||={};state.snapshot.quick_commands=[{name:'Chat skill',text:'/ship-dev '}];buttons.find(b=>b.className==='btn chat-quick-actions-btn').action();const quickBody=el('div');sheets.at(-1).render(quickBody);const quick=quickBody.descendants().find(n=>n.className==='quick-action-insert'),beforeQuick=calls.filter(c=>c.action==='prompt').length;quick.action();assert.equal(root.descendants().find(n=>n.className==='chat-input').value,'/ship-dev ');assert.equal(state.drafts.get(7),'/ship-dev ');assert.equal(calls.filter(c=>c.action==='prompt').length,beforeQuick);
+ state.snapshot||={};state.snapshot.quick_commands=[{name:'Chat skill',text:'/ship-dev '}];assert(!root.descendants().some(n=>n.className==='btn chat-quick-actions-btn'),'chat uses the shared header quick actions');buttons.find(b=>b.className==='icon-button session-quick-actions').action();assert.equal(sheets.at(-1).entries.length,0,'terminal-only controls stay out of chat');const quickBody=el('div');sheets.at(-1).render(quickBody);const quick=quickBody.descendants().find(n=>n.className==='quick-action-insert'),beforeQuick=calls.filter(c=>c.action==='prompt').length;quick.action();assert.equal(root.descendants().find(n=>n.className==='chat-input').value,'/ship-dev ');assert.equal(state.drafts.get(7),'/ship-dev ');assert.equal(calls.filter(c=>c.action==='prompt').length,beforeQuick);
 
  await flush();
  assert(calls.some(c=>c.action==='chat_poll'&&c.session===7));

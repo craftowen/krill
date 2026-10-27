@@ -184,6 +184,8 @@
  "No changes": "변경 사항 없음",
  "Refresh": "새로 고침",
  "Retry": "다시 시도",
+ "Hide keyboard": "키보드 닫기",
+ "Match Desktop": "PC 화면에 맞추기",
  "Show keyboard": "키보드 열기",
  "Fit to Phone": "휴대폰 화면에 맞추기",
  "Attach photo": "사진 첨부",
