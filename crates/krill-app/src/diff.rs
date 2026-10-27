@@ -1163,6 +1163,13 @@ impl Panel {
             return;
         };
         let generation = self.begin_patch_load(index, cx);
+        if self.remote_host() {
+            // 원격 저장소의 상태·패치는 로컬 git으로 읽을 수 없다(같은 경로의 로컬 저장소는 다른 저장소다).
+            self.finish_patch_load(generation, Ok((String::new(), Vec::new())), cx);
+            self.message = text::PATCH_REMOTE_UNSUPPORTED.get().into();
+            cx.notify();
+            return;
+        }
         let (repo, comparison) = (self.repo.clone(), self.comparison);
         let probe = self.pending_diff_path.as_ref() == Some(&file.path)
             && file.staged.is_none()

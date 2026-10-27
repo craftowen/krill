@@ -822,6 +822,175 @@ fn crlf_hunk_and_line_patches_apply_on_real_repo() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// APP-F01: 원격 호스트 타깃의 `Daemon` 소스는 같은 절대 경로에 로컬 저장소가 있어도 로컬 git·휴지통을
+/// 건드리지 않고 실패로 닫힌다. 원격 krilld가 실행하는 Push/Pull/Sync 게이트(`has_remote`)는 열어 둔다.
+#[test]
+fn remote_daemon_source_fails_closed_without_touching_local_repo() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-remote-source-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let repo = dir.join("repo");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "scratch\n").unwrap();
+
+    let tracked = ChangedFile {
+        path: b"tracked.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let untracked = ChangedFile {
+        path: b"untracked.txt".to_vec(),
+        old_path: None,
+        status: *b"??",
+        staged: None,
+        unstaged: None,
+    };
+    let hunk = build_hunk_patch(
+        &super::super::raw_patch(&repo, &tracked, Comparison::Worktree).unwrap(),
+        0,
+    )
+    .unwrap();
+
+    let remote = Daemon(Some(HostTarget::remote(
+        "fixture",
+        dir.join("missing.sock"),
+    )));
+    assert!(remote.remote());
+    for err in [
+        remote.discard(&repo, &home, &tracked).unwrap_err(),
+        remote.discard(&repo, &home, &untracked).unwrap_err(),
+        remote.apply_patch(&repo, &hunk, true, false).unwrap_err(),
+        remote.apply_patch(&repo, &hunk, false, true).unwrap_err(),
+        remote.generate_commit_message(&repo).unwrap_err(),
+    ] {
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+    }
+    assert_eq!(remote.branch_sync(&repo), (0, 0));
+    assert!(remote.has_remote(&repo));
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+        "modified\n"
+    );
+    assert!(repo.join("untracked.txt").is_file());
+    assert!(git(&["diff", "--cached", "--name-only"]).trim().is_empty());
+
+    // 같은 경로의 로컬 타깃은 기본 구현(로컬 git)을 그대로 쓴다.
+    let local = Daemon(None);
+    assert!(!local.remote());
+    local.apply_patch(&repo, &hunk, true, false).unwrap();
+    assert_eq!(
+        git(&["diff", "--cached", "--name-only"]).trim(),
+        "tracked.txt"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// APP-F01: 원격 호스트 작업공간에서는 로컬 git을 쓰는 Discard·AI 커밋·PR 버튼을 그리지 않고,
+/// 파일을 선택해도 같은 경로의 로컬 저장소에서 `git diff`를 읽지 않는다. 전체 파일 Stage(원격 IPC)는 남는다.
+#[gpui::test]
+fn remote_workspace_hides_local_only_actions_and_skips_local_patch(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!(
+        "krill-remote-panel-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.join("file"), "a\n").unwrap();
+    git(&["add", "file"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(dir.join("file"), "b\n").unwrap();
+
+    let remote = HostTarget::remote("fixture", dir.join("missing.sock"));
+    let repo = dir.clone();
+    let (panel, cx) = cx.add_window_view(|window, cx| {
+        let mut p = Panel::unconnected(repo, cx);
+        p.visible = false;
+        p.connect(remote, cx);
+        p.changes = Changes {
+            files: vec![ChangedFile {
+                path: b"file".into(),
+                old_path: None,
+                status: *b".M",
+                staged: None,
+                unstaged: None,
+            }],
+            limited: false,
+        };
+        drop(p.render_editor(window, cx));
+        p
+    });
+    cx.run_until_parked();
+
+    assert!(cx.update(|_, cx| panel.read(cx).remote_host()));
+    assert!(cx.debug_bounds("git-discard-0").is_none());
+    assert!(cx.debug_bounds("git-stage-0").is_some());
+    assert!(cx.debug_bounds("git-ai-commit").is_none());
+    assert!(cx.debug_bounds("git-create-pr").is_none());
+    assert!(cx.debug_bounds("git-commit").is_some());
+
+    cx.update(|_, cx| panel.update(cx, |p, cx| p.select(0, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = panel.read(cx);
+        assert!(p.raw_patch.is_empty(), "{:?}", p.raw_patch);
+        assert_eq!(
+            p.message,
+            crate::i18n::catalog::diff::PATCH_REMOTE_UNSUPPORTED.get()
+        );
+        assert_eq!(p.hunk_count(), 0);
+    });
+    assert!(cx.debug_bounds("diff-stage-hunk").is_none());
+    assert!(cx.debug_bounds("diff-discard-hunk").is_none());
+    assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "b\n");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn line_patch_handles_no_newline_at_end_of_file_on_real_repo() {
     let dir = std::env::temp_dir().join(format!(
