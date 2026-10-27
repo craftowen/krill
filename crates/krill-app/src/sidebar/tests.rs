@@ -2475,6 +2475,84 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
     fs::remove_dir_all(dir).ok();
 }
 
+/// 제안 B: 사이드바 세션 행 호버 시 구조화된 멀티라인 호버 카드(`Turn N`, 세션 제목,
+/// 단답형 응답 병합된 마지막 프롬프트 상자, 이전 턴 요약)가 표시된다.
+#[gpui::test]
+fn session_row_hover_card_shows_last_prompt_turn_badge_and_previous_turn(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-prompt-hover", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sid = SessionId(11);
+    let t1 = 10_000_000_000_000_u64;
+    krill_proto::git::record_session_prompt(&dir, sid, "로그인 세션 만료 버그 수정해줘", t1)
+        .unwrap();
+    krill_proto::git::record_session_prompt(
+        &dir,
+        sid,
+        "쿠키 만료 회귀 테스트 추가해줘",
+        t1 + 10_000_000_000,
+    )
+    .unwrap();
+    krill_proto::git::record_session_prompt(&dir, sid, "ㅇㅇ 진행해", t1 + 20_000_000_000).unwrap();
+    let sidebar_file = dir.join("sidebar.bin");
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_file)));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut claude = session(11, AgentState::Working, Some("/repo/wt-1"));
+            claude.status.agent = "claude".into();
+            claude.status.since_unix_ns = t1 + 20_000_000_000;
+            let wt = PathBuf::from("/repo/wt-1");
+            s.snapshot = Snapshot {
+                sessions: vec![claude],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec![wt.clone()])]),
+            };
+            s.expanded_cards.insert(wt);
+            s.set_now_unix_ns_for_test(Some(t1 + 80_000_000_000), cx);
+            s.rebuild(cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let row_bounds = vcx
+        .debug_bounds("session-title-2")
+        .expect("session row title bounds");
+    vcx.simulate_mouse_move(row_bounds.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds("tooltip:sidebar-session-hover-11")
+            .is_some(),
+        "hovering sidebar session row must render structured hover card"
+    );
+    assert!(
+        vcx.debug_bounds("tooltip-turn:sidebar-session-hover-11:3")
+            .is_some(),
+        "hover card must display Turn 3 badge"
+    );
+    assert!(
+        vcx.debug_bounds("tooltip-last-prompt:sidebar-session-hover-11")
+            .is_some(),
+        "hover card must render last prompt surface box"
+    );
+    assert!(
+        vcx.debug_bounds(
+            "tooltip-prompt-text:sidebar-session-hover-11:쿠키 만료 회귀 테스트 추가해줘 (→ ㅇㅇ 진행해)"
+        )
+        .is_some(),
+        "hover card must merge short ack with substantive prompt"
+    );
+    assert!(
+        vcx.debug_bounds("tooltip-prev-prompt:sidebar-session-hover-11")
+            .is_some(),
+        "hover card must render previous turn summary line"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
 /// OWE-731: 그룹화(`Repo` / `WorkspaceStatus` / `PrStatus` / `None`)와 정렬(`Smart` / `Recent` / `Name`)이
 /// 워크트리 목록과 그룹 헤더(`Row::GroupHeader`)를 결정론적으로 재구성하며, 핀 고정 워크트리가 그룹 내 최상단에 온다.
 #[gpui::test]
@@ -6342,16 +6420,19 @@ fn exited_processes_leave_sidebar_dashboard_counts_and_unread(cx: &mut TestAppCo
         // Matching IDs on other hosts must be treated independently.
         let mut remote_done = session(1, AgentState::Done, None);
         remote_done.status.agent = "codex".into();
+        let mut remote_waiting = session(2, AgentState::Waiting, None);
+        remote_waiting.status.agent = "claude".into();
         sidebar.set_remote_snapshot_for_test(
             "remote",
             HostStatus::Connected,
             Snapshot {
-                sessions: vec![remote_done],
+                sessions: vec![remote_done, remote_waiting],
                 ..Snapshot::default()
             },
             cx,
         );
-        assert_eq!(sidebar.dashboard_sessions().len(), 2);
+        assert_eq!(sidebar.dashboard_sessions().len(), 3);
+        assert_eq!(sidebar.agent_counts(), (1, 0, 2));
     });
 }
 

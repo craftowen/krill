@@ -1681,7 +1681,7 @@ impl Registry {
         // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
-        let _commit = lock(&self.hook_commit);
+        let commit = lock(&self.hook_commit);
         let mut reply = holder
             .request(|req| ToHolder::Spawn {
                 req,
@@ -1736,6 +1736,17 @@ impl Registry {
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
+                drop(commit);
+                if let Some(state) = self.dir.as_deref() {
+                    use krill_proto::error_reporting::{self, Code, Event, Process};
+                    if let Ok(event) = Event::new(
+                        Process::Daemon,
+                        Code::SessionStartFailed,
+                        error_reporting::source_location(file!(), line!()),
+                    ) {
+                        error_reporting::record_at(state, event).ok();
+                    }
+                }
                 Err(Failure::from_holder_errno(errno))
             }
             _ => {
@@ -1977,18 +1988,22 @@ impl Registry {
 
     /// OWE-737: 첫 프롬프트 hook(`UserPromptSubmit` 등)이 오면 세션 자동 제목을 기록하고,
     /// 현재 디렉터리가 기본 이름(`worktree-1`, `claude-1` 등)의 git 브랜치이면 슬러그로 개명한다.
+    /// 또한 매 턴 프롬프트 히스토리를 `session-prompts.json`에 기록한다.
     pub(crate) fn maybe_rename_from_hook(&self, id: SessionId, payload: &[u8]) {
         use krill_proto::os::ffi::OsStrExt as _;
         if self.agents.is_subagent_or_foreign_hook(id, payload) {
             return;
         }
-        let state_dir = self.state_dir();
-        if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
-            return;
-        }
         let Some(prompt) = krill_proto::git::extract_prompt_from_hook_payload(payload) else {
             return;
         };
+        let state_dir = self.state_dir();
+        if let Some(dir) = state_dir.as_deref() {
+            krill_proto::git::record_session_prompt(dir, id, &prompt, status::now_ns()).ok();
+        }
+        if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
+            return;
+        }
         let Some(slug) = krill_proto::git::prompt_branch_slug(&prompt) else {
             return;
         };
@@ -2062,7 +2077,9 @@ impl Registry {
         }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         self.observe_webhook(id);
-        if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
+        let allow_status_hook = !is_subagent_or_foreign
+            || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
+        if allow_status_hook && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
             if status.state == control::AgentState::Working {
@@ -2739,6 +2756,13 @@ impl Registry {
         let before_end = tap.pulse().end;
         let was_working = self.status.get(session).state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        if submit
+            && !self.status.get(session).agent.is_empty()
+            && let Ok(text) = std::str::from_utf8(bytes)
+            && let Some(dir) = self.state_dir()
+        {
+            krill_proto::git::record_session_prompt(&dir, session, text, status::now_ns()).ok();
+        }
         if submit && wait_submit {
             let deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < deadline {

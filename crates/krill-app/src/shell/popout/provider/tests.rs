@@ -246,6 +246,12 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     assert!(
         visual
             .debug_bounds("status-provider-details-host")
+            .is_some(),
+        "시안 D는 팝오버를 열면 우측 인라인 상세 패널에 활성 계정을 바로 표시한다"
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-other")
             .is_none()
     );
     assert!(
@@ -522,6 +528,37 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
     assert!(
         visual.debug_bounds("status-provider-active-host").is_some(),
         "remote host badge must appear in provider popup header"
+    );
+    assert!(
+        visual.debug_bounds("status-provider-tab-local").is_some(),
+        "local host tab in Variant D header"
+    );
+    let tab_remote = visual
+        .debug_bounds("status-provider-tab-remote")
+        .expect("remote hosts tab in Variant D header");
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-hosts-view")
+            .is_none()
+    );
+    visual.simulate_click(tab_remote.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-hosts-view")
+            .is_some(),
+        "clicking remote tab switches popover body to remote hosts view"
+    );
+    let tab_local = visual
+        .debug_bounds("status-provider-tab-local")
+        .expect("local host tab after switching to remote tab");
+    visual.simulate_click(tab_local.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-hosts-view")
+            .is_none(),
+        "clicking local tab returns to master-detail account view"
     );
     let use_alt = visual
         .debug_bounds("status-provider-use-remote-alt")

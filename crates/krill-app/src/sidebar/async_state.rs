@@ -216,6 +216,7 @@ pub(super) struct DiskSnapshot {
     store: WorktreeStore,
     orchestration: OrchestrationStore,
     auto_titles: BTreeMap<SessionId, String>,
+    prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
     visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
     folder_updated_at: BTreeMap<PathBuf, u64>,
     worktree_created_at: BTreeMap<PathBuf, u64>,
@@ -317,6 +318,7 @@ impl DiskSnapshot {
             store,
             orchestration,
             auto_titles: load_auto_titles_from_sidebar_path(path),
+            prompt_histories: load_prompt_histories_from_sidebar_path(path),
             visuals,
             folder_updated_at,
             worktree_created_at,
@@ -463,7 +465,9 @@ impl Sidebar {
             || self.disk.folder_updated_at != data.folder_updated_at
             || self.disk.worktree_created_at != data.worktree_created_at
             || (self.path.is_some()
-                && (self.comments != data.comments || self.auto_titles != data.auto_titles))
+                && (self.comments != data.comments
+                    || self.auto_titles != data.auto_titles
+                    || self.prompt_histories != data.prompt_histories))
             || data.prefs.keys().any(|key| {
                 !self
                     .prefs
@@ -494,6 +498,7 @@ impl Sidebar {
         if self.path.is_some() {
             self.comments = data.comments;
             self.auto_titles = data.auto_titles;
+            self.prompt_histories = data.prompt_histories;
         }
         self.project_visuals = data.visuals;
         self.disk.folder_updated_at = data.folder_updated_at;

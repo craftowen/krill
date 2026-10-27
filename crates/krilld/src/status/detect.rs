@@ -140,36 +140,68 @@ impl Detector {
 
     fn title_state(&mut self, title: &str) -> Option<AgentState> {
         let title = title.trim();
+        if title == "π !" || title.starts_with("π ! ") {
+            return Some(AgentState::Waiting);
+        }
         let (glyph, rest) = (
             title.chars().next()?,
             title.chars().skip(1).collect::<String>(),
         );
-        // 글리프 뒤 구분 공백이 있어야 한다. 일반 명령·문장 속 기호를 상태로 보지 않는다.
-        if !rest.starts_with(char::is_whitespace) {
-            return (self.spinning_title.as_deref() == Some(title) && !title.is_empty())
-                .then_some(AgentState::Done);
-        }
         let rules = &self.rules;
-        if glyph == rules.done_glyph {
-            return Some(AgentState::Done);
+        if rest.starts_with(char::is_whitespace) {
+            if glyph == rules.done_glyph || glyph == '◇' {
+                return Some(AgentState::Done);
+            }
+            if rules.waiting_glyphs.contains(&glyph) {
+                return Some(AgentState::Waiting);
+            }
+            if rules.working_glyphs.contains(&glyph) {
+                return Some(AgentState::Working);
+            }
+            if rules.spinner_glyphs.contains(&glyph) {
+                // Codex도 스피너가 사라진 직후 제목의 본문은 유지한다.
+                self.spinning_title = Some(
+                    rest.trim_start_matches(|c: char| {
+                        c.is_whitespace()
+                            || rules.spinner_glyphs.contains(&c)
+                            || rules.spinner_separators.contains(&c)
+                    })
+                    .to_owned(),
+                );
+                return Some(AgentState::Working);
+            }
         }
-        if rules.working_glyphs.contains(&glyph) {
-            return Some(AgentState::Working);
+        if title_indicates_agent_waiting(title) {
+            return Some(AgentState::Waiting);
         }
-        if rules.spinner_glyphs.contains(&glyph) {
-            // Codex도 스피너가 사라진 직후 제목의 본문은 유지한다.
-            self.spinning_title = Some(
-                rest.trim_start_matches(|c: char| {
-                    c.is_whitespace()
-                        || rules.spinner_glyphs.contains(&c)
-                        || rules.spinner_separators.contains(&c)
-                })
-                .to_owned(),
-            );
-            return Some(AgentState::Working);
-        }
-        (self.spinning_title.as_deref() == Some(title)).then_some(AgentState::Done)
+        (self.spinning_title.as_deref() == Some(title) && !title.is_empty())
+            .then_some(AgentState::Done)
     }
+}
+
+fn title_indicates_agent_waiting(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    let has_waiting_keyword = lower.contains("action required") || lower.contains("permission");
+    if !has_waiting_keyword {
+        return false;
+    }
+    [
+        "claude",
+        "codex",
+        "agy",
+        "antigravity",
+        "gemini",
+        "cursor",
+        "opencode",
+        "copilot",
+        "aider",
+        "kimi",
+        "qwen",
+        "droid",
+        "hermes",
+    ]
+    .iter()
+    .any(|agent| lower.contains(agent))
 }
 
 #[cfg(test)]

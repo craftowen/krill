@@ -2468,3 +2468,46 @@ fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight
     holder_worker.join().unwrap();
     reader_worker.join().unwrap();
 }
+
+#[test]
+fn maybe_rename_from_hook_records_every_prompt_turn_while_preserving_first_title() {
+    let dir = std::env::temp_dir().join(format!("hook-prompts-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(77);
+
+    reg.maybe_rename_from_hook(
+        id,
+        br#"{"hook_event_name":"UserPromptSubmit","prompt":"Fix auth token expiry bug"}"#,
+    );
+    reg.maybe_rename_from_hook(
+        id,
+        br#"{"hook_event_name":"UserPromptSubmit","prompt":"Add regression test for expired cookie"}"#,
+    );
+    reg.maybe_rename_from_hook(
+        id,
+        br#"{"hook_event_name":"UserPromptSubmit","prompt":"ok proceed"}"#,
+    );
+
+    let titles = krill_proto::git::load_session_auto_titles(&dir);
+    assert_eq!(
+        titles.get(&id).map(String::as_str),
+        Some("fix-auth-token-expiry-bug"),
+        "first prompt auto-title must remain intact across subsequent turns"
+    );
+
+    let histories = krill_proto::git::load_session_prompt_histories(&dir);
+    let hist = histories.get(&id).expect("prompt history must be recorded");
+    assert_eq!(hist.total_turns, 3);
+    assert_eq!(hist.turns.len(), 3);
+    assert_eq!(
+        hist.display_last_prompt().as_deref(),
+        Some("Add regression test for expired cookie (→ ok proceed)")
+    );
+    assert_eq!(
+        hist.previous_turn().map(|t| (t.turn, t.text.as_str())),
+        Some((1, "Fix auth token expiry bug"))
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}

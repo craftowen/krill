@@ -1428,6 +1428,7 @@ impl Shell {
                 .text_color(color)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(move || debug_selector.clone());
             let detail_selector = format!(
                 "status-provider-{}-{}",
@@ -1502,6 +1503,7 @@ impl Shell {
                 .loading(self.usage_refresh.is_some())
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-usage-refresh".into()),
             "status-usage-refresh",
             provider_text::PROVIDER_REFRESH_USAGE.get(),
@@ -1527,6 +1529,7 @@ impl Shell {
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-ssh-switcher".into()),
             "status-ssh-switcher",
             ssh_tooltip,
@@ -1586,6 +1589,7 @@ impl Shell {
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-orchestration-menu".into()),
             "status-orchestration-menu",
             orch_tooltip,
@@ -1855,6 +1859,7 @@ impl Shell {
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-ports-menu".into()),
             "status-ports-menu",
             ports_tooltip,
@@ -1946,7 +1951,8 @@ impl Shell {
                                             .font_family(ui::FONT_MONO)
                                             .text_color(p.warning)
                                             .ghost()
-                                            .xsmall(),
+                                            .xsmall()
+                                            .h(ui::STATUS_BAR_BUTTON_HEIGHT),
                                         "status-checks-warning",
                                         warn_tooltip,
                                     )
@@ -1978,7 +1984,8 @@ impl Shell {
                                         .text_color(p.success)
                                         .debug_selector(|| "status-update-ready".into())
                                         .ghost()
-                                        .xsmall(),
+                                        .xsmall()
+                                        .h(ui::STATUS_BAR_BUTTON_HEIGHT),
                                     "status-update-ready",
                                     badge,
                                 )
@@ -2014,6 +2021,7 @@ impl Shell {
                                     )
                                     .ghost()
                                     .xsmall()
+                                    .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                                     .debug_selector(|| "float-terminal".into()),
                                 "float-terminal",
                                 float_tip,
@@ -2040,6 +2048,7 @@ impl Shell {
                                 )
                                 .ghost()
                                 .xsmall()
+                                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                                 .debug_selector(|| "dashboard-popout".into()),
                             "dashboard-popout",
                             dashboard_tip,
@@ -2568,11 +2577,6 @@ impl Render for Dashboard {
                                         } else {
                                             gpui::FontWeight::MEDIUM
                                         };
-                                        let dot_color = if is_read_completed {
-                                            p.muted_foreground.opacity(0.4)
-                                        } else {
-                                            ui::agent_state_color(state, cx)
-                                        };
                                         div()
                                             .id(gpui::SharedString::from(selector))
                                             .debug_selector(move || debug_sel.clone())
@@ -2611,13 +2615,12 @@ impl Render for Dashboard {
                                                             .font_weight(title_weight)
                                                             .child(name),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .size(ui::STATE_DOT)
-                                                            .flex_none()
-                                                            .rounded_full()
-                                                            .bg(dot_color),
-                                                    ),
+                                                    .child(ui::status::status_glyph(
+                                                        state,
+                                                        unread,
+                                                        ui::status::Size::Sm,
+                                                        cx,
+                                                    )),
                                             )
                                             .when_some(screen.clone(), |d, screen| {
                                                 d.child(

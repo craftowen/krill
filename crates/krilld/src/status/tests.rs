@@ -222,6 +222,48 @@ fn agy_sequence_snapshot() {
     assert_eq!(st.get(S1).agent, "agy");
 }
 
+#[test]
+fn subagent_waiting_and_resume_sequence() {
+    let ev = |n: u64, p: &str| event(380 + u32::try_from(n).unwrap(), n * 10, "claude", p);
+    let events = [
+        ev(1, r#"{"hook_event_name":"UserPromptSubmit"}"#),
+        ev(2, r#"{"hook_event_name":"SubagentStart","agent_id":"a1"}"#),
+        ev(
+            3,
+            r#"{"hook_event_name":"PreToolUse","agent_id":"a1","tool_name":"Bash"}"#,
+        ),
+        ev(
+            4,
+            r#"{"hook_event_name":"PermissionRequest","agent_id":"a1","tool_name":"Bash"}"#,
+        ),
+        ev(
+            5,
+            r#"{"hook_event_name":"PostToolUseFailure","agent_id":"a1","tool_name":"Bash"}"#,
+        ),
+        ev(
+            6,
+            r#"{"hook_event_name":"PreToolUse","agent_id":"a1","tool_name":"AskUserQuestion"}"#,
+        ),
+        ev(7, r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#),
+        ev(8, r#"{"hook_event_name":"Elicitation"}"#),
+        ev(9, r#"{"hook_event_name":"ElicitationResult"}"#),
+    ];
+    let st = Statuses::open(None);
+    assert_eq!(
+        replay(&st, &events),
+        r#"{"hook_event_name":"UserPromptSubmit"} => Working/Some(Hook)/High since=10 applied
+{"hook_event_name":"SubagentStart","agent_id":"a1"} => Working/Some(Hook)/High since=10 ignored
+{"hook_event_name":"PreToolUse","agent_id":"a1","tool_name":"Bash"} => Working/Some(Hook)/High since=10 ignored
+{"hook_event_name":"PermissionRequest","agent_id":"a1","tool_name":"Bash"} => Waiting/Some(Hook)/High since=40 applied
+{"hook_event_name":"PostToolUseFailure","agent_id":"a1","tool_name":"Bash"} => Working/Some(Hook)/High since=50 applied
+{"hook_event_name":"PreToolUse","agent_id":"a1","tool_name":"AskUserQuestion"} => Waiting/Some(Hook)/High since=60 applied
+{"hook_event_name":"SubagentStop","agent_id":"a1"} => Working/Some(Hook)/High since=70 applied
+{"hook_event_name":"Elicitation"} => Waiting/Some(Hook)/High since=80 applied
+{"hook_event_name":"ElicitationResult"} => Working/Some(Hook)/High since=90 applied
+"#
+    );
+}
+
 /// 프로세스 종료는 hook 상태를 이기고, 그 전에 시작한 hook 이벤트는 더 바꾸지 못한다.
 #[test]
 fn process_exit_wins_over_older_hooks() {
