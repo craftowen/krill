@@ -3772,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "krill-hosts",
  "krill-log",
@@ -3791,7 +3791,7 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -3826,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "krill-log",
  "krill-proto",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "krill-hosts"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "krill-proto",
  "postcard",
@@ -3850,7 +3850,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "iroh",
  "krill-log",
@@ -3869,7 +3869,7 @@ dependencies = [
 
 [[package]]
 name = "krill-log"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "log",
  "rustix",
@@ -3878,7 +3878,7 @@ dependencies = [
 
 [[package]]
 name = "krill-proto"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "postcard",
  "proptest",
@@ -3895,7 +3895,7 @@ dependencies = [
 
 [[package]]
 name = "krill-term"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "krill-proto",
  "unicode-width",
@@ -3903,7 +3903,7 @@ dependencies = [
 
 [[package]]
 name = "krilld"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "aes",
  "alacritty_terminal",
