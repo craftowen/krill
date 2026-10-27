@@ -17,8 +17,8 @@ pub const FEAT_ACCOUNT_CANCEL: u64 = 1 << 22;
 pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
 mod details;
 pub use details::{
-    AccountMeters, ProviderDetails, RESET_CREDITS_METER_KEY, RESET_CREDITS_METER_LABEL,
-    SessionHandoff, UsageMeter,
+    AccountMeters, ProviderDetails, RESET_CREDITS_EXPIRY_METER_PREFIX, RESET_CREDITS_METER_KEY,
+    RESET_CREDITS_METER_LABEL, SessionHandoff, UsageMeter, reset_credit_expiry_meter,
 };
 /// Create 계정 선택·고급 정책·이력·모델별 창(OWE-712 지휘자 배정).
 pub const FEAT_ACCOUNT_POLICY: u64 = 1 << 61;

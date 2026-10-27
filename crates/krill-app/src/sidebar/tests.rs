@@ -6950,3 +6950,72 @@ fn focusing_session_expands_collapsed_project_and_selects_session_row_across_hos
         assert_eq!(s.card_list.pending_reveal.get(), Some(idx));
     });
 }
+
+#[gpui::test]
+fn daemon_title_change_replaces_stale_screen_title(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(vcx, |sidebar, cx| {
+        let mut task = session(51, AgentState::Working, Some("/repo"));
+        task.status.title = Some("First task".into());
+        let snapshot = |task| Snapshot {
+            sessions: vec![task],
+            ..Snapshot::default()
+        };
+        sidebar.apply(
+            Ok((snapshot(task.clone()), Meta::new())),
+            BTreeMap::new(),
+            cx,
+        );
+        sidebar.set_title(task.id, "First screen title", cx);
+        assert_eq!(sidebar.session_label(&task).0, "First screen title");
+        task.status.title = Some("Second task".into());
+        sidebar.apply(
+            Ok((snapshot(task.clone()), Meta::new())),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(sidebar.session_label(&task).0, "Second task");
+        sidebar.set_custom_titles(BTreeMap::from([(task.id, "My tab".into())]), cx);
+        task.status.title = Some("Third task".into());
+        sidebar.apply(
+            Ok((snapshot(task.clone()), Meta::new())),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(sidebar.session_label(&task).0, "My tab");
+    });
+}
+
+#[gpui::test]
+fn transient_poll_errors_keep_diagnostics_without_warning_card(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(vcx, |sidebar, cx| {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+        ] {
+            sidebar.apply(Err(kind.into()), BTreeMap::new(), cx);
+            assert!(
+                sidebar.poll_error.is_some(),
+                "retain diagnostic for {kind:?}"
+            );
+            assert!(
+                sidebar.poll_error_notice().is_none(),
+                "retry silently for {kind:?}"
+            );
+        }
+        sidebar.apply(
+            Err(io::ErrorKind::PermissionDenied.into()),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(sidebar.poll_error_notice().is_some());
+        sidebar.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
+        assert!(sidebar.poll_error.is_none());
+    });
+}

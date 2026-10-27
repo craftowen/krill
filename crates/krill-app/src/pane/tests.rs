@@ -2012,3 +2012,98 @@ fn scroll_before_link_or_initial_update_fetches_once_screen_arrives() {
     assert_eq!(retry_req.view, 0);
     assert_ne!(retry_req.req, top_req.req);
 }
+
+/// A login shell may start an agent or switch providers without replacing its PTY.
+/// Reattachment must refresh launch metadata before opening the screen stream.
+#[test]
+fn reattach_refreshes_agent_launch_after_shell_hook_and_rebind() {
+    use krill_proto::screen::Attached;
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("pane-launch-refresh-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("screen.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected = vec![
+        None,
+        Some(AgentLaunch {
+            profile: "claude".into(),
+            permission: Permission::Manual,
+        }),
+        Some(AgentLaunch {
+            profile: "codex".into(),
+            permission: Permission::Yolo,
+        }),
+    ];
+    let launches = expected.clone();
+    let (release, keep_open) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let handshake = || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(
+                    &ipc::ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_SCREEN | FEAT_CONTROL | FEAT_AGENTS,
+                        build: "test".into(),
+                        instance_id: 7,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = read(&mut stream).unwrap();
+            ipc::ClientHello::decode(kind, &body).unwrap();
+            stream
+        };
+        for launch in launches {
+            // Hooks may introduce or replace AgentLaunch without changing the PTY ID.
+            let mut control = handshake();
+            let (kind, body) = read(&mut control).unwrap();
+            assert_eq!(
+                Request::decode(kind, &body).unwrap(),
+                Request::AgentLaunch {
+                    session: SessionId(42)
+                }
+            );
+            control
+                .write_all(&Reply::AgentLaunch(launch).encode().unwrap())
+                .unwrap();
+            drop(control);
+            let mut screen = handshake();
+            let (kind, body) = read(&mut screen).unwrap();
+            assert_eq!(
+                Attach::decode(kind, &body).unwrap(),
+                Attach {
+                    session: SessionId(42),
+                    stream: Stream::Screen { known: None }
+                }
+            );
+            screen
+                .write_all(
+                    &Attached {
+                        seq: Seq(0),
+                        revision: Revision(0),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            // Keep the subscription alive through client socket setup (macOS setsockopt).
+            keep_open.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    });
+    let target = HostTarget::remote("fixture", socket);
+    for launch in expected {
+        let linked = attach(&target, SessionId(42), None).unwrap();
+        assert_eq!(linked.instance, 7);
+        assert_eq!(linked.launch, launch);
+        drop(linked);
+        release.send(()).unwrap();
+    }
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

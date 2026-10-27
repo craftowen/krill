@@ -237,3 +237,15 @@ test('update start probes immediately once and completed probes suppress repeate
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true),doc=new EventTarget(),events=new EventTarget();doc.hidden=false;h.context.document=doc;h.context.addEventListener=events.addEventListener.bind(events);h.context.removeEventListener=events.removeEventListener.bind(events);
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/updates.js'),'utf8'),h.context);let probes=0;h.endpoint.probeUpdate=async()=>{probes++;return null;};const api=h.context.KrillMobile.updates.create({endpoint:h.endpoint});api.start();await flush();assert.equal(probes,1);api.start();events.dispatchEvent(new Event('pageshow'));events.dispatchEvent(new Event('online'));doc.dispatchEvent(new Event('visibilitychange'));await flush();assert.equal(probes,1);await h.tick(1000);events.dispatchEvent(new Event('online'));await flush();assert.equal(probes,2);await api.check();assert.equal(probes,3,'explicit discovery is never throttled');api.stop();h.transport.close();
 });
+
+test('resume keeps a healthy slow connection while the existing RPC deadline bounds refresh',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;h.transport.setActive(false);
+ const sent=socket.sent.length;h.transport.resume();await flush();assert.equal(socket.sent.length,sent+1);
+ await h.tick(2000);assert.equal(h.transport.ready,true);assert.equal(socket.closed,undefined);
+ h.transport.resume();await flush();assert.equal(socket.sent.length,sent+1,'lifecycle events share the pending snapshot');
+ h.response(socket,{sessions:[]});await flush();assert.equal(h.transport.ready,true);assert.equal(socket.closed,undefined);h.transport.close();
+});
+test('resume refresh still disconnects a truly stalled transport at the RPC deadline',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;h.transport.setActive(false);
+ h.transport.resume();await flush();await h.tick(15000);assert.equal(h.transport.ready,false);assert.equal(socket.closed,true);h.transport.close();
+});

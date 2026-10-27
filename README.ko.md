@@ -170,6 +170,8 @@ Mac 앱의 **설정 → 모바일 원격 제어**에서 QR 코드를 스캔하�
 
 바이너리 설치에는 Rust·소스 빌드가 필요하지 않습니다. 에이전트는 별도로 설치·인증해야 하며 구독·인증 정보는 포함되지 않습니다. Git 워크트리에는 Git이 필요합니다.
 
+사용 통계는 별도 동의창 없이 기본 활성화됩니다. 무작위 설치 ID·최초 실행·앱 실행·일별 입력 활동·버전·OS·아키텍처를 집계하며, 프롬프트·터미널 출력·명령·프로젝트 경로·계정 정보는 제외합니다. `krill telemetry disable` 또는 `DO_NOT_TRACK=1`로 수집을 끌 수 있습니다. 전송 상태와 운영자 설정은 [사용 통계 안내](services/telemetry/CLIENT.md)를 참고합니다. 오류 보고는 별도 설정이며 기본 꺼짐입니다.
+
 ### Apple Silicon Mac (`arm64`)
 
 Bash·`curl`·Python 3·macOS 기본 압축 및 서명 도구가 필요합니다. 설치기는 `/Applications/Krill.app`을 설치하고 `~/.local/bin/krill`을 연결한 뒤 앱을 엽니다:

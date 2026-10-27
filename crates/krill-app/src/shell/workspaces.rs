@@ -43,7 +43,10 @@ impl Shell {
                     && (sidebar
                         .session_on(host, session)
                         .is_some_and(sidebar::Session::is_exited)
-                        || sidebar.host_has_trees(host)
+                        // A local daemon restarting for an update may briefly
+                        // publish an incomplete list. Absence is not proof of
+                        // PTY exit; keep saved tabs until an explicit exit.
+                        || host.is_remote() && sidebar.host_has_trees(host)
                             && self.observed_sessions.contains(&(host.clone(), session))
                             && sidebar.session_on(host, session).is_none())
                     && !self.restoring_sessions.contains(&session)

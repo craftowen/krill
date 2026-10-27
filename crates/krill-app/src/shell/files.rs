@@ -1182,7 +1182,11 @@ impl Shell {
                 )
             })
             .children(self.preview_toggle(id, cx))
-            .children(Self::open_browser_button(id, &path))
+            .children(Self::open_browser_button(
+                id,
+                &path,
+                self.remote_target_for_pane(id),
+            ))
             .children(self.share_button(id, &path, cx))
             .when(is_split, |d| {
                 d.child(
@@ -1291,8 +1295,9 @@ impl Shell {
                     Shown::Image(view) => view.clone().into_any_element(),
                     Shown::Html { title, len } => {
                         let weak = cx.weak_entity();
-                        fview::html_preview(
+                        fview::html_preview_on(
                             &path,
+                            self.remote_target_for_pane(id),
                             title.as_deref(),
                             *len,
                             move |window, cx| {
@@ -1355,7 +1360,11 @@ impl Shell {
     }
 
     /// 열린 HTML 파일을 기본 웹 브라우저에서 여는 머리 버튼.
-    fn open_browser_button(id: PaneId, path: &Path) -> Option<Button> {
+    fn open_browser_button(
+        id: PaneId,
+        path: &Path,
+        remote: Option<(krill_app::hosts::HostId, krill_app::hosts::HostTarget)>,
+    ) -> Option<Button> {
         if !krill_app::file_format::is_html_path(path) {
             return None;
         }
@@ -1373,8 +1382,9 @@ impl Shell {
                 .tooltip(etext::OPEN_BROWSER_TOOLTIP.get())
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
-                    fview::spawn_open(
+                    fview::spawn_open_on(
                         path.clone(),
+                        remote.clone(),
                         krill_app::file_format::open_default_command,
                         cx,
                     );

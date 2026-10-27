@@ -8408,18 +8408,23 @@ impl SettingsView {
         if let Some(meters) = meters {
             for meter in &meters.meters {
                 let label = crate::accounts::display::meter_label(meter);
-                usage_cluster = usage_cluster.child(if let Some(value) = &meter.value {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(crate::ui::TEXT_2XS)
-                        .text_color(p.muted_foreground)
-                        .child(label)
-                        .child(value.clone())
-                } else {
-                    Self::render_usage_bar(&meter.key, &label, meter.window.as_ref(), brand, p)
-                });
+                usage_cluster = usage_cluster.child(
+                    if let Some(value) = crate::accounts::display::meter_value(
+                        meter,
+                        crate::accounts::display::now(),
+                    ) {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(crate::ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(label)
+                            .child(value.clone())
+                    } else {
+                        Self::render_usage_bar(&meter.key, &label, meter.window.as_ref(), brand, p)
+                    },
+                );
             }
             if meters.meters.is_empty() {
                 usage_cluster = usage_cluster.child(

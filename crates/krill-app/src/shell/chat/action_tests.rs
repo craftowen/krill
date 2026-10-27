@@ -28,7 +28,7 @@ fn question(multi: bool) -> ChatItem {
     }
 }
 
-fn permission() -> ChatItem {
+pub(super) fn permission() -> ChatItem {
     ChatItem {
         kind: ChatItemKind::Permission,
         tool_id: "permission-1".into(),
@@ -72,7 +72,7 @@ fn screen(shell: &mut Shell, pane: super::super::PaneId, text: &str, cx: &mut Co
     }
 }
 
-fn fixture<'a>(
+pub(super) fn fixture<'a>(
     cx: &'a mut TestAppContext,
     name: &str,
     item: &ChatItem,

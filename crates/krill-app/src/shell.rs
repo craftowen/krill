@@ -2239,7 +2239,7 @@ impl Shell {
                 Ok(paths) => this.connect_daemon_with_paths(paths, cx),
                 Err(e) => {
                     this.daemon_task = None;
-                    this.link = Link::Failed(daemon::Error::Io(e).to_string());
+                    this.link = Link::connect_failure(&daemon::Error::Io(e));
                     krill_app::errors::daemon_connection_failed(cx);
                     krill_app::orca_import::set_daemon_link_up(false, cx);
                     cx.notify();

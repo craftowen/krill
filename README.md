@@ -170,6 +170,8 @@ Works with **any CLI agent or TUI** — if it runs in a terminal, it gets persis
 
 Binary installation does **not** require Rust or a source build. Install and authenticate your chosen AI agent separately; Git is needed for Git worktrees. Krill does not include agent subscriptions or credentials.
 
+Usage metrics are enabled by default without a consent dialog: a random installation ID, first launch, app launches, daily interaction, version, OS, and architecture. Prompts, terminal output, commands, project paths, and account details are excluded. Run `krill telemetry disable` to stop collection; `DO_NOT_TRACK=1` also disables it. See [usage metrics](services/telemetry/CLIENT.md) for delivery status and operator setup. Error reporting has a separate, default-off setting.
+
 ### macOS (Apple Silicon `arm64`)
 
 The installer requires Bash, `curl`, Python 3, and the macOS system archive/signature tools. It installs `/Applications/Krill.app`, links the CLI at `~/.local/bin/krill`, and opens the app:

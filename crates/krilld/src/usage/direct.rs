@@ -287,7 +287,7 @@ fn fetch(
     // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
     // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
     if provider == ProviderKind::Claude
-        && let Some(count) = claude_reset_count(&token, get_text)
+        && let Some((count, expiries)) = claude_reset_credits(&token, get_text)
     {
         out.1.meters.push(krill_proto::usage::UsageMeter {
             key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
@@ -295,6 +295,7 @@ fn fetch(
             window: None,
             value: Some(count.to_string()),
         });
+        out.1.meters.extend(expiries);
     }
     Fetched::Usage(out.0, out.1)
 }
@@ -474,23 +475,66 @@ impl ClaudeResetProgram {
 
 /// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 두 프로브가 모두 실패하면
 /// `None`(기존 미터를 유지하고 다음 주기에 다시 시도한다).
-pub(super) fn claude_reset_count(
+#[cfg(test)]
+fn claude_reset_count(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
 ) -> Option<u64> {
+    claude_reset_credits(token, send).map(|(count, _)| count)
+}
+
+fn claude_reset_credits(
+    token: &str,
+    send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<(u64, Vec<krill_proto::usage::UsageMeter>)> {
+    let mut expiries = Vec::new();
     let juniper = claude_probe_config(token, ClaudeResetProbe::Juniper)
         .and_then(|cfg| send(&cfg))
-        .and_then(|body| parse_juniper_status(std::str::from_utf8(&body).ok()?))
+        .and_then(|body| {
+            let text = std::str::from_utf8(&body).ok()?;
+            let offered = parse_juniper_status(text)?;
+            if offered {
+                let json: serde_json::Value = serde_json::from_str(text).ok()?;
+                let block = json.get("juniper_tide")?;
+                expiries.push(krill_proto::usage::reset_credit_expiry_meter(
+                    0,
+                    1,
+                    reset_expiry(block),
+                ));
+            }
+            Some(offered)
+        })
         .map(u64::from);
     let cedar = claude_probe_config(token, ClaudeResetProbe::Cedar)
         .and_then(|cfg| send(&cfg))
-        .and_then(|body| parse_cedar_status(std::str::from_utf8(&body).ok()?, now_secs()));
-    match (juniper, cedar) {
+        .and_then(|body| parse_cedar_grants(std::str::from_utf8(&body).ok()?, now_secs()))
+        .map(|grants| {
+            let mut total = 0_u64;
+            for (count, expiry) in grants {
+                total = total.saturating_add(count);
+                expiries.push(krill_proto::usage::reset_credit_expiry_meter(
+                    expiries.len(),
+                    count,
+                    expiry,
+                ));
+            }
+            total
+        });
+    let count = match (juniper, cedar) {
         (Some(j), Some(c)) => Some(j.saturating_add(c)),
         (Some(j), None) => Some(j),
         (None, Some(c)) => Some(c),
         (None, None) => None,
-    }
+    }?;
+    Some((count, expiries))
+}
+
+fn reset_expiry(raw: &serde_json::Value) -> Option<i64> {
+    ["ends_at", "expires_at"]
+        .iter()
+        .find_map(|key| raw.get(key).and_then(super::resets))
+        .and_then(|at| krill_proto::time::parse_reset_epoch(&at))
+        .filter(|at| *at > 0)
 }
 
 /// 소진 시점에 제공 중인 프로그램. 바깥은 `None`(프로브 실패)과 제공 없음(`Some(None)`)을
@@ -545,15 +589,23 @@ fn parse_juniper_status(text: &str) -> Option<bool> {
 
 /// `cedar_ember` 블록의 사용 가능 grant 합. `None`은 읽을 수 없음이다.
 fn parse_cedar_status(text: &str, now: i64) -> Option<u64> {
+    Some(
+        parse_cedar_grants(text, now)?
+            .into_iter()
+            .fold(0_u64, |total, (left, _)| total.saturating_add(left)),
+    )
+}
+
+fn parse_cedar_grants(text: &str, now: i64) -> Option<Vec<(u64, Option<i64>)>> {
     let json: serde_json::Value = serde_json::from_str(text).ok()?;
     let block = json.get("cedar_ember")?;
     if block.is_null() {
-        return Some(0);
+        return Some(Vec::new());
     }
     if block.get("eligible").and_then(serde_json::Value::as_bool) == Some(false) {
-        return Some(0);
+        return Some(Vec::new());
     }
-    let mut total = 0_u64;
+    let mut grants = Vec::new();
     for grant in block.get("grants").and_then(serde_json::Value::as_array)? {
         if grant.get("usable_now").and_then(serde_json::Value::as_bool) != Some(true) {
             continue;
@@ -584,9 +636,13 @@ fn parse_cedar_status(text: &str, now: i64) -> Option<u64> {
                 continue;
             }
         }
-        total = total.saturating_add(left);
+        let expiry = reset_expiry(grant);
+        if expiry.is_some_and(|at| at <= now) {
+            continue;
+        }
+        grants.push((left, expiry));
     }
-    Some(total)
+    Some(grants)
 }
 
 /// 소진 경로용 Claude 토큰. 프로필·프로브·소진이 같은 자격증명을 쓴다.
@@ -2355,6 +2411,30 @@ mod tests {
             claude_offered_program("fixture-only", |_| None).is_none(),
             "probe failure must not look like no offer"
         );
+    }
+
+    #[test]
+    fn reset_credit_probes_preserve_each_usable_grants_expiry() {
+        let (count, meters) = claude_reset_credits("fixture-only", |config| {
+            let body = if config.contains("at_wall") {
+                r#"{"juniper_tide":{"eligible":true,"arm":"reset","available":true}}"#
+            } else {
+                r#"{"cedar_ember":{"eligible":true,"grants":[
+                    {"resets_left":2,"usable_now":true,"ends_at":"2099-01-01T00:00:00Z"},
+                    {"resets_left":1,"usable_now":true,"expires_at":"2099-02-01T00:00:00Z"},
+                    {"resets_left":9,"usable_now":true,"ends_at":"2000-01-01T00:00:00Z"},
+                    {"resets_left":8,"usable_now":true,"paused":true}
+                ]}}"#
+            };
+            Some(Zeroizing::new(body.as_bytes().to_vec()))
+        })
+        .unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(meters.len(), 3);
+        assert_eq!(meters[0].value.as_deref(), Some("unknown"));
+        assert_eq!(meters[1].value.as_deref(), Some("4070908800"));
+        assert_eq!(meters[2].value.as_deref(), Some("4073587200"));
+        assert_ne!(meters[0].key, meters[1].key);
     }
 
     #[test]

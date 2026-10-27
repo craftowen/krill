@@ -1054,11 +1054,13 @@ impl Shell {
                 let (local_res, remote_res) = cx
                     .background_executor()
                     .spawn(async move {
-                        let local =
-                            krill_app::accounts::request_ipc(&paths, &UsageRequest::ListAccounts);
+                        let local = krill_app::accounts::request_target_with_features(
+                            &krill_app::hosts::HostTarget::local(paths),
+                            &UsageRequest::ListAccounts,
+                        );
                         let mut remotes = Vec::with_capacity(remote_targets.len());
                         for (host, target) in remote_targets {
-                            if let Ok(snap) = krill_app::accounts::request_target(
+                            if let Ok(snap) = krill_app::accounts::request_target_with_features(
                                 &target,
                                 &UsageRequest::ListAccounts,
                             ) {
@@ -1070,10 +1072,20 @@ impl Shell {
                     .await;
                 let keep_going = this
                     .update(cx, |s, cx| {
-                        if let Ok(snap) = local_res {
+                        if let Ok((snap, features)) = local_res {
+                            s.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.set_session_account_features(
+                                    krill_app::hosts::HostId::Local,
+                                    features,
+                                    cx,
+                                );
+                            });
                             s.apply_accounts_snapshot(snap, cx);
                         }
-                        for (host, snap) in remote_res {
+                        for (host, (snap, features)) in remote_res {
+                            s.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.set_session_account_features(host.clone(), features, cx);
+                            });
                             s.apply_accounts_snapshot_for_host(host, snap, cx);
                         }
                     })

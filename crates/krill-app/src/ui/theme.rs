@@ -126,6 +126,9 @@ pub const SETTINGS_MODAL_WIDTH: Pixels = px(640.);
 pub const SETTINGS_NAV_WIDTH: Pixels = px(248.);
 /// 설정 화면 오른쪽 본문 열 최대 너비(1120px, 창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지, OWE-793).
 pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(1120.);
+
+/// Orca `--chat-content-max-width`: transcript and composer share a readable column.
+pub const CHAT_CONTENT_MAX_WIDTH: Rems = rems(46.);
 /// 토글 스위치 트랙 너비(Orca `Switch` `w-9` = 36px, OWE-793).
 pub const SWITCH_WIDTH: Pixels = px(36.);
 /// 토글 스위치 트랙 높이(Orca `Switch` `h-5` = 20px, OWE-793).
@@ -1634,6 +1637,7 @@ mod tests {
             "SETTINGS_MODAL_WIDTH",
             "SETTINGS_NAV_WIDTH",
             "SETTINGS_CONTENT_MAX_WIDTH",
+            "CHAT_CONTENT_MAX_WIDTH",
             "SWITCH_WIDTH",
             "SWITCH_HEIGHT",
             "SWITCH_THUMB",

@@ -409,7 +409,7 @@ button.account-row:disabled{opacity:1}
 #mobile-app .session.screen>.page-header :is(.mode-toggle,.split-toggle){min-height:36px;height:36px;min-width:0;padding:0 10px;border:0;border-radius:15px;background:var(--surface-raised);color:var(--foreground);font-size:calc(12px * var(--ui-scale,1));font-weight:500}
 #mobile-app .session-tabs{min-height:36px;height:36px;background:var(--surface-panel);border-bottom:1px solid var(--border);align-items:stretch}
 #mobile-app .session-tabs .tab-scroll{padding:0 4px;align-items:stretch}
-#mobile-app .session-tabs .session-tab{height:36px;min-height:36px;width:128px;min-width:96px;max-width:128px;padding:0 8px;gap:4px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted-foreground);font-size:calc(13px * var(--ui-scale,1))}
+#mobile-app .session-tabs .session-tab{height:100%;min-height:35px;width:128px;min-width:96px;max-width:128px;padding:0 8px;gap:4px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted-foreground);font-size:calc(13px * var(--ui-scale,1))}
 #mobile-app .session-tabs .session-tab svg{width:13px;height:13px}
 #mobile-app .session-tabs .session-tab[aria-selected=true]{border-bottom-color:var(--muted-foreground);color:var(--foreground);background:transparent}
 #mobile-app .session-tabs :is(.tab-add,.tab-quick){height:36px;min-height:36px;width:40px;min-width:40px;padding:0;border:0;border-radius:0;background:transparent;color:var(--muted-foreground);display:grid;place-items:center;flex:none}
@@ -646,3 +646,9 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 .terminal-question .question-choice{display:flex;align-items:center;gap:var(--space-sm);flex:none;min-height:var(--touch-target,44px);padding:var(--space-sm) var(--space-md);border:1px solid var(--border);border-radius:var(--radius-row);background:var(--surface-raised);color:var(--foreground);text-align:left;font-size:var(--font-body);white-space:normal;overflow-wrap:anywhere}
 .question-check{flex:none;font-family:var(--font-mono)}
 @media(min-width:600px) and (max-height:500px){.terminal-question{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:stretch}.question-label{grid-column:1/-1}}
+
+/* Direct input shares one toolbar with terminal keys; the TUI owns the visible composer. */
+#mobile-app .session .command-dock>.accessory-row>.live-focus-target{flex:none;width:var(--touch-target);min-width:var(--touch-target);height:var(--touch-target);min-height:var(--touch-target);padding:var(--space-sm);justify-content:center;border:0;background:transparent}
+#mobile-app .session .command-dock>.accessory-row>.live-focus-target>.live-input-copy{display:none}
+#mobile-app .session .command-dock>.accessory-row>.live-focus-target>svg{width:20px;height:20px}
+#mobile-app .session .command-dock>.accessory-row>.live-focus-target:focus-visible{outline:2px solid var(--foreground);outline-offset:-2px}

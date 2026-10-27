@@ -35,8 +35,8 @@ pub(super) fn advanced_notes(snap: &AccountsSnapshot, account: &AccountInfo) -> 
         notes.push(text::ACCOUNT_FORECAST.format(&[
             ("window", &f.window),
             (
-                "minutes",
-                &f.exhausts_at.saturating_sub(now).div_ceil(60).to_string(),
+                "hours",
+                &f.exhausts_at.saturating_sub(now).div_ceil(3600).to_string(),
             ),
             ("rate", &f.percent_per_hour.to_string()),
         ]));

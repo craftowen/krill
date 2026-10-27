@@ -726,18 +726,24 @@ fn render_detail_panel_ghost(
             profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
             for meter in &meters.meters {
                 let label = krill_app::accounts::display::meter_label(meter);
-                profile = profile.child(if let Some(value) = &meter.value {
-                    div()
-                        .flex()
-                        .justify_between()
-                        .gap_2()
-                        .child(label)
-                        .child(div().font_family(ui::FONT_MONO).child(value.clone()))
-                        .into_any_element()
-                } else {
-                    render_popover_usage_ghost_row(&label, meter.window.as_ref(), p)
-                        .into_any_element()
-                });
+                profile = profile.child(
+                    if let Some(value) = krill_app::accounts::display::meter_value(
+                        meter,
+                        krill_app::accounts::display::now(),
+                    ) {
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .justify_between()
+                            .gap_2()
+                            .child(label)
+                            .child(div().font_family(ui::FONT_MONO).child(value.clone()))
+                            .into_any_element()
+                    } else {
+                        render_popover_usage_ghost_row(&label, meter.window.as_ref(), p)
+                            .into_any_element()
+                    },
+                );
             }
         } else {
             for (label, window) in [
@@ -832,6 +838,83 @@ fn render_detail_panel_ghost(
         .child(detail)
 }
 
+/// 로컬과 같은 미터·갱신 상태를 각 호스트의 스냅샷에서 표시한다.
+/// 숨긴 탭도 이 렌더러를 써 탭 전환 전후 공간을 동일하게 예약한다.
+fn render_remote_account_usage(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+    prefix: &str,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let mut detail = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .text_size(ui::TEXT_XS)
+        .text_color(p.muted_foreground);
+    let status = krill_app::accounts::display::account(
+        account,
+        snap.status_for(&account.id),
+        krill_app::accounts::display::now(),
+    );
+    detail = detail.child(krill_app::accounts::display::render_status(
+        format!("{prefix}-status"),
+        &status,
+        p,
+    ));
+    if let Some(meters) = snap
+        .meters_for(&account.id)
+        .filter(|m| !m.meters.is_empty())
+    {
+        detail = detail.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
+        for meter in &meters.meters {
+            let label = krill_app::accounts::display::meter_label(meter);
+            if let Some(value) = krill_app::accounts::display::meter_value(
+                meter,
+                krill_app::accounts::display::now(),
+            ) {
+                detail = detail.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_between()
+                        .gap_2()
+                        .child(label)
+                        .child(div().font_family(ui::FONT_MONO).child(value)),
+                );
+            } else {
+                detail = detail.child(render_popover_usage_row(
+                    &label,
+                    format!("{prefix}-{}", meter.key),
+                    meter.window.as_ref(),
+                    window_bar_color(meter.window.as_ref(), p),
+                    p,
+                ));
+            }
+        }
+    } else {
+        for (label, window) in [
+            ("5h", account.usage.five_hour.as_ref()),
+            ("7d", account.usage.seven_day.as_ref()),
+        ] {
+            detail = detail.child(render_popover_usage_row(
+                label,
+                format!("{prefix}-{label}"),
+                window,
+                window_bar_color(window, p),
+                p,
+            ));
+        }
+    }
+    detail.children(
+        advanced_notes(snap, account)
+            .into_iter()
+            .map(|note| div().child(note)),
+    )
+}
+
 fn render_remote_hosts_tab_ghost(
     provider: ProviderKind,
     other_hosts: &[(
@@ -854,7 +937,7 @@ fn render_remote_hosts_tab_ghost(
                 .text_color(p.muted_foreground)
                 .child(provider_text::PROVIDER_REMOTE_HINT.get()),
         );
-    for (_, other_label, other_snap) in other_hosts {
+    for (other_host, other_label, other_snap) in other_hosts {
         let profiles: Vec<AccountInfo> = other_snap
             .accounts
             .iter()
@@ -919,27 +1002,54 @@ fn render_remote_hosts_tab_ghost(
             for profile in &profiles {
                 profile_list = profile_list.child(
                     div()
-                        .px_2()
-                        .py_1()
-                        .rounded(ui::RADIUS_XS)
+                        .w_full()
+                        .min_w_0()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1p5()
+                        .pb_2()
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(ui::TEXT_XS)
-                                .child(account_name(profile)),
+                                .px_2()
+                                .py_1()
+                                .rounded(ui::RADIUS_XS)
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .child(account_name(profile)),
+                                )
+                                .child(if profile.active {
+                                    ui::badge(
+                                        p,
+                                        ui::BadgeTone::Success,
+                                        account_text::ACCOUNT_IN_USE.get(),
+                                    )
+                                    .into_any_element()
+                                } else {
+                                    Button::new("ghost-remote-use")
+                                        .xsmall()
+                                        .primary()
+                                        .label(provider_text::PROVIDER_USE.get())
+                                        .into_any_element()
+                                }),
                         )
-                        .child(
-                            Button::new("ghost-remote-use")
-                                .xsmall()
-                                .primary()
-                                .label(provider_text::PROVIDER_USE.get()),
-                        ),
+                        .child(render_remote_account_usage(
+                            other_snap,
+                            profile,
+                            &format!(
+                                "status-provider-remote-{}-{}",
+                                other_host.as_key(),
+                                profile.id
+                            ),
+                            p,
+                        )),
                 );
             }
             host_card = host_card.child(profile_list);
@@ -1043,29 +1153,35 @@ fn render_details(
             profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
             for meter in &meters.meters {
                 let label = krill_app::accounts::display::meter_label(meter);
-                profile = profile.child(if let Some(value) = &meter.value {
-                    div()
-                        .flex()
-                        .justify_between()
-                        .gap_2()
-                        .child(label)
-                        .child(
-                            div()
-                                .font_family(ui::FONT_MONO)
-                                .text_color(p.foreground)
-                                .child(value.clone()),
+                profile = profile.child(
+                    if let Some(value) = krill_app::accounts::display::meter_value(
+                        meter,
+                        krill_app::accounts::display::now(),
+                    ) {
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .justify_between()
+                            .gap_2()
+                            .child(label)
+                            .child(
+                                div()
+                                    .font_family(ui::FONT_MONO)
+                                    .text_color(p.foreground)
+                                    .child(value.clone()),
+                            )
+                            .into_any_element()
+                    } else {
+                        render_popover_usage_row(
+                            &label,
+                            format!("status-provider-detail-{}-{}", account.id, meter.key),
+                            meter.window.as_ref(),
+                            window_bar_color(meter.window.as_ref(), p),
+                            p,
                         )
                         .into_any_element()
-                } else {
-                    render_popover_usage_row(
-                        &label,
-                        format!("status-provider-detail-{}-{}", account.id, meter.key),
-                        meter.window.as_ref(),
-                        window_bar_color(meter.window.as_ref(), p),
-                        p,
-                    )
-                    .into_any_element()
-                });
+                    },
+                );
             }
         } else {
             for (label, window) in [
@@ -1292,65 +1408,84 @@ fn render_remote_hosts_tab(
                 let remote_use_sel = remote_use_id.clone();
                 profile_list = profile_list.child(
                     div()
-                        .px_2()
-                        .py_1()
-                        .rounded(ui::RADIUS_XS)
-                        .bg(p.background.opacity(0.35))
+                        .w_full()
+                        .min_w_0()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1p5()
+                        .pb_2()
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(ui::TEXT_XS)
-                                .text_color(if profile.active {
-                                    p.foreground
-                                } else {
-                                    p.muted_foreground
-                                })
-                                .font_weight(if profile.active {
-                                    gpui::FontWeight::SEMIBOLD
-                                } else {
-                                    gpui::FontWeight::NORMAL
-                                })
-                                .child(item_label),
-                        )
-                        .child(if profile.active {
-                            ui::badge(
-                                p,
-                                ui::BadgeTone::Success,
-                                account_text::ACCOUNT_IN_USE.get(),
-                            )
-                            .into_any_element()
-                        } else {
-                            Button::new(gpui::SharedString::from(remote_use_id))
-                                .xsmall()
-                                .primary()
-                                .label(provider_text::PROVIDER_USE.get())
-                                .debug_selector(move || remote_use_sel.clone())
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    switch_weak
-                                        .update(cx, |shell, cx| {
-                                            shell.refresh_accounts_for_host(
-                                                switch_host.clone(),
-                                                UsageRequest::SwitchAccount {
-                                                    provider,
-                                                    account_id: account_id.clone(),
-                                                },
-                                                cx,
-                                            );
+                                .px_2()
+                                .py_1()
+                                .rounded(ui::RADIUS_XS)
+                                .bg(p.background.opacity(0.35))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(if profile.active {
+                                            p.foreground
+                                        } else {
+                                            p.muted_foreground
                                         })
-                                        .ok();
-                                    switch_menu
-                                        .update(cx, |_, cx| cx.emit(gpui::DismissEvent))
-                                        .ok();
-                                })
-                                .into_any_element()
-                        }),
+                                        .font_weight(if profile.active {
+                                            gpui::FontWeight::SEMIBOLD
+                                        } else {
+                                            gpui::FontWeight::NORMAL
+                                        })
+                                        .child(item_label),
+                                )
+                                .child(if profile.active {
+                                    ui::badge(
+                                        p,
+                                        ui::BadgeTone::Success,
+                                        account_text::ACCOUNT_IN_USE.get(),
+                                    )
+                                    .into_any_element()
+                                } else {
+                                    Button::new(gpui::SharedString::from(remote_use_id))
+                                        .xsmall()
+                                        .primary()
+                                        .label(provider_text::PROVIDER_USE.get())
+                                        .debug_selector(move || remote_use_sel.clone())
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            switch_weak
+                                                .update(cx, |shell, cx| {
+                                                    shell.refresh_accounts_for_host(
+                                                        switch_host.clone(),
+                                                        UsageRequest::SwitchAccount {
+                                                            provider,
+                                                            account_id: account_id.clone(),
+                                                        },
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                            switch_menu
+                                                .update(cx, |_, cx| cx.emit(gpui::DismissEvent))
+                                                .ok();
+                                        })
+                                        .into_any_element()
+                                }),
+                        )
+                        .child(render_remote_account_usage(
+                            other_snap,
+                            profile,
+                            &format!(
+                                "status-provider-remote-{}-{}",
+                                other_host.as_key(),
+                                profile.id
+                            ),
+                            p,
+                        )),
                 );
             }
             host_card = host_card.child(profile_list);

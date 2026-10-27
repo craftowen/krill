@@ -216,6 +216,20 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                     krill_proto::usage::RESET_CREDITS_METER_LABEL,
                     count.to_string(),
                 );
+                if count > 0 {
+                    let expiry = json
+                        .get("rate_limit_reset_credits")
+                        .and_then(|credits| {
+                            credits.get("expires_at").or_else(|| credits.get("ends_at"))
+                        })
+                        .and_then(super::resets)
+                        .and_then(|at| krill_proto::time::parse_reset_epoch(&at))
+                        .filter(|at| *at > 0);
+                    out.meters
+                        .push(krill_proto::usage::reset_credit_expiry_meter(
+                            0, count, expiry,
+                        ));
+                }
             }
             if let Some(review) = json.get("code_review_rate_limit") {
                 for key in ["primary_window", "secondary_window"] {
@@ -397,6 +411,20 @@ fn value_meter(out: &mut AccountMeters, key: &str, label: &str, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_reset_credit_expiry_is_metadata_not_a_usage_pool() {
+        for (raw, expected) in [
+            (r#","expires_at":"2099-01-01T00:00:00Z""#, "4070908800"),
+            ("", "unknown"),
+        ] {
+            let meters = parse(
+                ProviderKind::Codex,
+                &format!(r#"{{"rate_limit_reset_credits":{{"available_count":2{raw}}}}}"#),
+            );
+            assert_eq!(meters.meters[1].value.as_deref(), Some(expected));
+            assert_eq!(meters.effective_max(1), None);
+        }
+    }
     #[test]
     fn provider_meters_preserve_pools_credits_and_monthly_limits() {
         let agy = parse(

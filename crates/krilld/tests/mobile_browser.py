@@ -142,11 +142,11 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 (shots/'sessions-closed.txt').write_text(cli('ls'))
                 navigate('/orchestration')
                 browser('find','role','button','click','--name','Approve','--exact')
-                browser('fill','textarea[placeholder="Reply to worker"]','모바일 응답')
+                browser('fill','textarea[placeholder="Your reply"]','모바일 응답')
                 assert evaluate('new Promise(r=>setTimeout(()=>r(document.querySelector("#orchestration textarea")?.value),3100))')=='모바일 응답'
                 shot('orchestration')
                 browser('find','role','button','click','--name','Send reply','--exact')
-                wait('document.querySelector("#orchestration textarea")?.readOnly && document.querySelector("#orchestration textarea").value===""')
+                wait('!document.querySelector("#orchestration textarea") || (document.querySelector("#orchestration textarea").readOnly && document.querySelector("#orchestration textarea").value==="")')
                 wait('KrillMobile.store.snapshot.orchestration.questions.length===0')
                 navigate('/accounts')
                 wait('Array.from(document.querySelectorAll(".account-title")).some(e=>e.textContent==="Mobile fixture")')

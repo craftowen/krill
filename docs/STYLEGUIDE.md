@@ -194,6 +194,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
+  - 채팅 대화와 입력창은 `CHAT_CONTENT_MAX_WIDTH = 46rem`(줌 100%에서 736px)의 같은 중앙 열에 정렬한다. 좁은 칸에서는 가용 폭을 채우며 가로로 넘치지 않는다(Orca `--chat-content-max-width`).
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`
   - 세션 기록은 우측 패널의 탭으로 열며 `PANEL_DEFAULT_WIDTH`와 사용자가 조절한 패널 폭을 따른다. 목록은 남은 높이 전체를 스크롤 영역으로 사용하고, 바깥 클릭으로 닫지 않는다.

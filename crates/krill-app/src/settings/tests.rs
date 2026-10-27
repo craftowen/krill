@@ -1783,6 +1783,27 @@ fn resources_error_reporting_toggle_persists_separate_consent_and_revokes(cx: &m
     fs::remove_dir_all(d).unwrap();
 }
 
+#[gpui::test]
+fn resources_error_reporting_repeated_tab_does_not_invalidate_pending_read(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("error-reporting-read");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_tab(AdminTab::Resources, cx);
+            assert!(view.file_jobs.contains_key("error-reporting-read"));
+            let revision = view.error_reporting.revision;
+            view.set_tab(AdminTab::Resources, cx);
+            assert_eq!(view.error_reporting.revision, revision);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(view.read(cx).error_reporting.status.is_some()));
+    fs::remove_dir_all(d).unwrap();
+}
+
 // 설치 테스트마다 별도 영수증을 사용하며 환경변수는 변경하지 않는다.
 const CLAUDE_HOOK_COMMAND: &str =
     "if [ -n \"${MK_PANE_ID:-}\" ]; then exec 'krill' hook claude; else printf '{}\\n'; fi";

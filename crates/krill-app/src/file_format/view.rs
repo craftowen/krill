@@ -645,6 +645,18 @@ pub fn html_preview(
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    html_preview_on(path, None, title, len, on_edit, cx)
+}
+
+/// HTML metadata preview with host-scoped external actions.
+pub fn html_preview_on(
+    path: &Path,
+    remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
+    title: Option<&str>,
+    len: u64,
+    on_edit: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
     let pal = crate::ui::palette(cx);
     let open_label = crate::i18n::catalog::editor::OPEN_BROWSER.get();
     let edit_label = crate::i18n::catalog::editor::EDIT_CODE.get();
@@ -654,9 +666,17 @@ pub fn html_preview(
         .unwrap_or_default();
     let open_browser = {
         let path = path.to_path_buf();
+        let remote = remote.clone();
         crate::ui::primary("file-html-open-browser", open_label)
             .debug_selector(|| "file-html-open-browser".into())
-            .on_click(move |_, _, cx| spawn_open(path.clone(), super::open_default_command, cx))
+            .on_click(move |_, _, cx| {
+                spawn_open_on(
+                    path.clone(),
+                    remote.clone(),
+                    super::open_default_command,
+                    cx,
+                );
+            })
     };
     let edit_code = crate::ui::secondary("file-html-edit", edit_label)
         .debug_selector(|| "file-html-edit".into())
@@ -670,7 +690,9 @@ pub fn html_preview(
                 .get(),
         )
         .debug_selector(|| "file-reveal".into())
-        .on_click(move |_, _, cx| spawn_open(path.clone(), super::reveal_command, cx))
+        .on_click(move |_, _, cx| {
+            spawn_open_on(path.clone(), remote.clone(), super::reveal_command, cx);
+        })
     };
     div()
         .debug_selector(|| "file-html-preview".into())
