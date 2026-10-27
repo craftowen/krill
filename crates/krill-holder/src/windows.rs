@@ -552,7 +552,7 @@ fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+    use std::process::{Command, Stdio};
 
     fn holder() -> Holder {
         Holder {
@@ -568,18 +568,45 @@ mod tests {
         }
     }
 
-    /// `cmd /c exit <code>`를 자식 krilld 자리에 둔다(bootstrap 링크는 읽지 않고 바로 끝난다).
-    fn exited_daemon(code: &str) -> io::Result<Daemon> {
+    /// `cmd /d /c exit <code>`를 자식 krilld 자리에 둔다(bootstrap 링크는 읽지 않고 바로 끝난다).
+    /// `sys::child_link`는 인수마다 CRT 따옴표를 붙여 `"/c" "exit" "3"`이 되는데, cmd.exe는 CRT 규칙으로
+    /// 파싱하지 않아 `exit 3`이 실행되지 않았다(CI job 40502947206). `std::process::Command`는 공백 없는
+    /// 인수를 감싸지 않는다. 종료 상태가 요청한 값인지 holder `poll` 전에 확인한다.
+    fn exited_daemon(code: i32) -> io::Result<Daemon> {
         let cmd =
             std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
-        let args: Vec<OsString> = ["/c", "exit", code].iter().map(OsString::from).collect();
-        let (process, link) = sys::child_link(OsStr::new(&cmd), &args)?;
-        let target = sys::duplicate_target(process.pid)?;
+        let mut child = Command::new(cmd)
+            .args(["/d", "/c", "exit"])
+            .arg(code.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        while process.status()?.is_none() {
-            assert!(Instant::now() < deadline, "mock krilld did not exit");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => {
+                    // 시간 초과나 대기 오류: 자식을 거둔 뒤 알린다.
+                    child.kill().ok();
+                    child.wait().ok();
+                    outcome?;
+                    panic!("mock krilld did not exit within 10s");
+                }
+            }
+        };
+        assert_eq!(status.code(), Some(code), "mock krilld exit status");
+        let pid = child.id();
+        let process = Process {
+            handle: OwnedHandle::from(child),
+            pid,
+        };
+        assert_eq!(process.status()?, Some(code), "holder-side exit status");
+        let target = sys::duplicate_target(pid)?;
+        let (link, _peer) = Link::pair()?;
         Ok(Daemon {
             process,
             target,
@@ -592,7 +619,7 @@ mod tests {
     #[test]
     fn empty_duplicate_holder_exits_instead_of_restarting() -> io::Result<()> {
         let mut h = holder();
-        h.daemon = Some(exited_daemon("3")?);
+        h.daemon = Some(exited_daemon(3)?);
         assert!(h.poll());
         assert!(h.daemon.is_none());
         assert_eq!(h.streak, 0, "duplicate exit must not count as a crash");
@@ -602,7 +629,7 @@ mod tests {
     #[test]
     fn crash_exit_still_schedules_restart() -> io::Result<()> {
         let mut h = holder();
-        h.daemon = Some(exited_daemon("1")?);
+        h.daemon = Some(exited_daemon(1)?);
         assert!(!h.poll());
         assert!(h.daemon.is_none());
         assert_eq!(h.streak, 1);
