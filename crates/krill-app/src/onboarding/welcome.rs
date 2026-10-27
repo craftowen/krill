@@ -1273,6 +1273,7 @@ mod async_tests {
             shell: root.join("missing-shell").into_os_string(),
             krill: root.join("missing-krill"),
             state: root.join("state"),
+            default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
             home: root.join("home"),
             state_overridden: true,
         };

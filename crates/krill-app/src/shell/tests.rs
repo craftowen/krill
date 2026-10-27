@@ -8351,6 +8351,7 @@ fn owe903_onboarding_checks_open_as_in_window_modal(cx: &mut TestAppContext) {
         shell: "/bin/sh".into(),
         krill: root.join("krill"),
         state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
         home: root.clone(),
         state_overridden: true,
     };
@@ -8380,6 +8381,7 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
         shell: "/bin/sh".into(),
         krill: root.join("krill"),
         state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
         home: root.clone(),
         state_overridden: true,
     };

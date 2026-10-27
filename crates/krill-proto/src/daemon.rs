@@ -264,11 +264,17 @@ pub fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = state_dir_override() {
         return Some(PathBuf::from(dir));
     }
+    default_state_dir()
+}
+
+/// Native default state directory, ignoring `KRILL_STATE_DIR`.
+/// Windows uses `%LOCALAPPDATA%`, which can differ from the user profile directory.
+pub fn default_state_dir() -> Option<PathBuf> {
     #[cfg(not(windows))]
-    let home = std::env::var_os("HOME")?;
+    let base = std::env::var_os("HOME")?;
     #[cfg(windows)]
-    let home = std::env::var_os("LOCALAPPDATA")?;
-    Some(state_dir_in(Path::new(&home)))
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(state_dir_in(Path::new(&base)))
 }
 
 /// 데몬 기동에 필요한 경로.
