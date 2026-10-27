@@ -515,3 +515,112 @@ fn descendant_held_managed_stdio_does_not_extend_total_deadline() {
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
 }
+
+#[test]
+fn mkdir_and_upload_commands_preserve_space_containing_home() {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = PathBuf::from(format!("/tmp/m897-sp-{}-{seq}", std::process::id()));
+    std::fs::remove_dir_all(&base).ok();
+    let space_home = base.join("o remote");
+    std::fs::create_dir_all(&space_home).unwrap();
+    let home_str = space_home.display().to_string();
+    let spec = InstallSpec::new(&home_str, "0.2.9").unwrap();
+
+    let mkdir_args = vec!["-c".into(), mkdir_remote_command(&spec)];
+    let mkdir_out = run_piped_ssh_with_timeout(
+        OsStr::new("/bin/sh"),
+        &mkdir_args,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(
+        mkdir_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mkdir_out.stderr)
+    );
+    assert!(space_home.join(".krill/bin").is_dir());
+    assert!(space_home.join(".krill/tmp").is_dir());
+    assert!(!space_home.join(".krill/tmp/tmp").exists());
+    assert!(space_home.join("Library/LaunchAgents").is_dir());
+    assert!(!base.join("o").exists());
+
+    let remote_bin = format!("{}/krill", spec.bin_dir());
+    let upload_args = vec!["-c".into(), upload_remote_command(&remote_bin)];
+    let upload_out = run_piped_ssh_with_timeout(
+        OsStr::new("/bin/sh"),
+        &upload_args,
+        Some(b"space-safe-payload"),
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(
+        upload_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upload_out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(space_home.join(".krill/bin/krill")).unwrap(),
+        b"space-safe-payload"
+    );
+    assert!(!base.join("o").exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn install_roundtrip_succeeds_when_remote_home_contains_spaces() {
+    let fake = FakeSsh::new("install_space");
+    fake.set_uname("Darwin", "arm64");
+    fake.set_launchctl(0);
+    let space_home = fake.base.join("o remote");
+    std::fs::create_dir_all(&space_home).unwrap();
+    std::fs::write(fake.base.join("cfg_home"), space_home.display().to_string()).unwrap();
+
+    let opts = test_opts();
+    let home = space_home.display().to_string();
+    let spec = InstallSpec::new(&home, "0.2.9").unwrap();
+    let before = query_remote_info_with_program(&opts, &fake.ssh_bin()).unwrap();
+    assert_eq!(before.home, home);
+    assert_eq!(before.version, RemoteVersion::Missing);
+
+    let blobs = [
+        InstallBlob {
+            name: "krill",
+            bytes: b"bin-krill",
+        },
+        InstallBlob {
+            name: "krilld",
+            bytes: b"bin-krilld",
+        },
+        InstallBlob {
+            name: "krill-holder",
+            bytes: b"bin-holder",
+        },
+    ];
+    let payload = InstallPayload {
+        blobs: &blobs,
+        plist_xml: &spec.render_plist(),
+    };
+    let report =
+        install_remote_with_program(&opts, &fake.ssh_bin(), &spec, "aarch64", &payload, &before)
+            .unwrap();
+    assert_eq!(report.version, "0.2.9");
+    assert!(report.bootstrapped);
+    assert!(!fake.base.join("o").exists());
+    assert!(!space_home.join(".krill/tmp/tmp").exists());
+    assert_eq!(
+        std::fs::read(space_home.join(".krill/bin/krill")).unwrap(),
+        b"bin-krill"
+    );
+    assert_eq!(
+        std::fs::read(space_home.join(".krill/bin/krilld")).unwrap(),
+        b"bin-krilld"
+    );
+    assert_eq!(
+        std::fs::read(space_home.join(".krill/bin/krill-holder")).unwrap(),
+        b"bin-holder"
+    );
+    assert!(std::path::Path::new(&spec.plist_path()).is_file());
+    let after = query_remote_info_with_program(&opts, &fake.ssh_bin()).unwrap();
+    assert_eq!(after.version, RemoteVersion::Known("0.2.9".into()));
+}
