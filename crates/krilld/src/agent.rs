@@ -101,6 +101,26 @@ if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/
 fi
 unset _krill_self_zdotdir
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
+  # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
+  # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
+  __krill_opencode_xdg() {
+    if [ -n "${1-}" ]; then
+      if [ -z "${__krill_xdg_dir-}" ] || [ "${XDG_DATA_HOME-}" != "$__krill_xdg_dir/data" ]; then
+        if [ -n "${XDG_DATA_HOME+x}" ]; then typeset -g __krill_xdg_data="$XDG_DATA_HOME"; else unset __krill_xdg_data; fi
+        if [ -n "${XDG_STATE_HOME+x}" ]; then typeset -g __krill_xdg_state="$XDG_STATE_HOME"; else unset __krill_xdg_state; fi
+      fi
+      typeset -g __krill_xdg_dir="$1"
+      export XDG_DATA_HOME="$1/data" XDG_STATE_HOME="$1/state"
+    elif [ -n "${__krill_xdg_dir-}" ]; then
+      if [ "${XDG_DATA_HOME-}" = "$__krill_xdg_dir/data" ]; then
+        if [ -n "${__krill_xdg_data+x}" ]; then export XDG_DATA_HOME="$__krill_xdg_data"; else unset XDG_DATA_HOME; fi
+      fi
+      if [ "${XDG_STATE_HOME-}" = "$__krill_xdg_dir/state" ]; then
+        if [ -n "${__krill_xdg_state+x}" ]; then export XDG_STATE_HOME="$__krill_xdg_state"; else unset XDG_STATE_HOME; fi
+      fi
+      unset __krill_xdg_dir __krill_xdg_data __krill_xdg_state
+    fi
+  }
   __krill_sync_accounts() {
     if (( $+functions[__krill_flush_compdef] )); then
       __krill_flush_compdef
@@ -117,10 +137,13 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
       if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ] || [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME/.gemini/antigravity-cli" ]; then
         unset ANTIGRAVITY_CLI_HOME
       fi
-      if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
-        export XDG_DATA_HOME="$OPENCODE_CONFIG_DIR/data" XDG_STATE_HOME="$OPENCODE_CONFIG_DIR/state" OPENCODE_DB=opencode.db
+      # 호스트 기본 계정은 `host_default_dir`(`$HOME/.config/opencode`)이다. 옛 `.local/share` 경로도 호스트로 본다.
+      if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
+        __krill_opencode_xdg "$OPENCODE_CONFIG_DIR"
+        export OPENCODE_DB=opencode.db
         unset OPENCODE_CONFIG_DIR
       else
+        __krill_opencode_xdg
         unset OPENCODE_CONFIG_DIR OPENCODE_DB
       fi
     fi
