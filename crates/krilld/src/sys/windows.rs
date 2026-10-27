@@ -666,8 +666,8 @@ pub(crate) fn listener_socket(listener: &krill_proto::os::net::UnixListener) -> 
     unsafe { BorrowedSocket::borrow_raw(listener.as_raw_socket()) }
 }
 
-/// Cancel only the synchronous IO of this daemon's pipe reader, never the PTY itself.
-pub(crate) fn cancel_pipe_read(thread: BorrowedHandle<'_>) {
+/// Cancel the synchronous pipe IO (`ReadFile`/`WriteFile`) of one daemon thread, never the PTY itself.
+pub(crate) fn cancel_sync_io(thread: BorrowedHandle<'_>) {
     // SAFETY: borrowed live thread handle; cancellation does not close any handle.
     unsafe {
         windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());

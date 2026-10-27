@@ -105,6 +105,7 @@ fn turn<'a>(tap: &'a Tap, peer: Option<BorrowedFd<'_>>) -> io::Result<MutexGuard
     }
 }
 
+#[cfg(unix)]
 fn write_all(
     tap: &Tap,
     mut bytes: &[u8],
@@ -114,17 +115,8 @@ fn write_all(
     while !bytes.is_empty() {
         alive(tap, None)?;
         let result = {
-            #[cfg(unix)]
             let _live = tap.0.live();
-            #[cfg(unix)]
-            let result = write(&tap.0.master, bytes).map_err(io::Error::from);
-            #[cfg(windows)]
-            let result = {
-                use std::io::Write as _;
-                let handle = tap.0.master.input.try_clone()?;
-                std::fs::File::from(handle).write(bytes)
-            };
-            result
+            write(&tap.0.master, bytes).map_err(io::Error::from)
         };
         match result {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -137,25 +129,38 @@ fn write_all(
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                #[cfg(unix)]
-                {
-                    let mut fds = [PollFd::new(&tap.0.master, PollFlags::OUT)]
-                        .into_iter()
-                        .chain(peer.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::HUP)))
-                        .collect::<Vec<_>>();
-                    match poll(&mut fds, Some(&WAIT)) {
-                        Ok(_) | Err(Errno::INTR) => {}
-                        Err(err) => return Err(err.into()),
-                    }
+                let mut fds = [PollFd::new(&tap.0.master, PollFlags::OUT)]
+                    .into_iter()
+                    .chain(peer.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::HUP)))
+                    .collect::<Vec<_>>();
+                match poll(&mut fds, Some(&WAIT)) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(err) => return Err(err.into()),
                 }
-                #[cfg(windows)]
-                thread::sleep(Duration::from_millis(20));
                 alive(tap, peer)?;
             }
             Err(err) => return Err(err),
         }
     }
     Ok(())
+}
+
+/// Windows(daemon-02): 막히는 `WriteFile`은 세션 writer 스레드가 하고, 이 스레드는 20ms마다 세션 종료·연결 HUP만
+/// 본다. 취소되면 writer가 실제로 쓴 접두사만 장부에 적는다(큐에 넣은 바이트가 곧 쓴 바이트가 아니다).
+#[cfg(windows)]
+fn write_all(
+    tap: &Tap,
+    bytes: &[u8],
+    peer: Option<BorrowedFd<'_>>,
+    state: &mut State,
+) -> io::Result<()> {
+    alive(tap, None)?;
+    let (written, result) = tap.0.writer.write(bytes, || alive(tap, peer));
+    state.record(bytes.get(..written).unwrap_or_default());
+    if state.peer.is_none() && (state.paste || state.matched > 0) {
+        state.peer = peer.map(|fd| fd.try_clone_to_owned()).transpose()?;
+    }
+    result
 }
 
 pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {

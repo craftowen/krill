@@ -151,11 +151,12 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     }
 }
 
-/// PTY 리더를 모두 멈추고(읽은 묶음은 기록·세그먼트 봉인까지) 끝나기를 기다린다. 되돌릴 수 없다.
-/// 인계와 업그레이드([`crate::upgrade`])가 쓴다.
+/// PTY 리더를 모두 멈추고(읽은 묶음은 기록·세그먼트 봉인까지) 끝나기를 기다린다. 인계 뒤에는 되돌릴 수 없고,
+/// 업그레이드([`crate::upgrade`])가 인계 전에 중단되면 `session::end_halt`로 되돌린다.
+/// 기한은 멈추기 전에 잡는다: Windows 워커 취소도 같은 [`HALT_TIMEOUT`] 안에서 끝난다(daemon-02).
 pub(crate) fn halt_all(reg: &Registry) -> io::Result<()> {
-    crate::session::halt()?;
     let deadline = Instant::now() + HALT_TIMEOUT;
+    crate::session::halt(deadline)?;
     while !all_halted(reg) {
         if Instant::now() > deadline {
             return Err(io::ErrorKind::TimedOut.into());

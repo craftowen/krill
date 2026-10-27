@@ -692,7 +692,7 @@ fn reuse_live_session_delivers_prompt_and_reaps_all_runs_after_exit() {
             .is_closed()
     );
     let mut slave = File::from(pty.user);
-    set_nonblocking(&slave).unwrap();
+    crate::child::nonblocking(&slave).unwrap();
     let mut bytes = [0; 256];
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {

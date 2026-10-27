@@ -1870,3 +1870,104 @@ fn sync_claude_profile_hooks_preserve_existing_config() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// daemon-01: the zsh host check must name the same directory `host_default_dir` writes for the `OpenCode`
+/// host account, or a host selection is treated as an isolated profile.
+#[test]
+fn zsh_opencode_host_check_matches_host_default_dir() {
+    let home = Path::new("/fixture/home");
+    assert_eq!(
+        accounts::host_default_dir(home, ProviderKind::OpenCode),
+        home.join(".config").join("opencode")
+    );
+    assert!(
+        super::ZSH_ACCOUNT_SYNC_ENV
+            .contains(r#""$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode""#)
+    );
+    assert!(
+        super::ZSH_ACCOUNT_SYNC_ENV
+            .contains(r#""$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode""#)
+    );
+}
+
+/// daemon-01: switching `OpenCode` custom → host → removed in one managed zsh restores the shell's original
+/// `XDG_DATA_HOME`/`XDG_STATE_HOME` (set or unset) and keeps a value the user changed meanwhile.
+#[test]
+fn zsh_opencode_host_and_removal_restore_original_xdg_dirs() {
+    if !Path::new("/bin/zsh").exists() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("krill-zsh-xdg-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let sync = root.join("sync.zsh");
+    std::fs::write(&sync, super::ZSH_ACCOUNT_SYNC_ENV).unwrap();
+    let a = root.join("profile-a").display().to_string();
+    let b = root.join("profile-b").display().to_string();
+    let env_file = state.join("active-accounts.env");
+    let driver = r#"
+source "$1"
+p() { printf 'data=%s state=%s db=%s\n' "${XDG_DATA_HOME-UNSET}" "${XDG_STATE_HOME-UNSET}" "${OPENCODE_DB-UNSET}"; }
+set_env() { printf "export OPENCODE_CONFIG_DIR='%s'\n" "$1" > "$KRILL_STATE_DIR/active-accounts.env"; __krill_sync_accounts; }
+p
+set_env "$CUSTOM_B"; p
+set_env "$HOME/.config/opencode"; p
+set_env "$CUSTOM_A"; p
+set_env "$HOME/.local/share/opencode"; p
+set_env "$CUSTOM_A"; p
+: > "$KRILL_STATE_DIR/active-accounts.env"; __krill_sync_accounts; p
+set_env "$CUSTOM_A"; export XDG_DATA_HOME=/user/changed; : > "$KRILL_STATE_DIR/active-accounts.env"; __krill_sync_accounts; p
+"#;
+    let run = |baseline: Option<(&str, &str)>| {
+        std::fs::write(&env_file, format!("export OPENCODE_CONFIG_DIR='{a}'\n")).unwrap();
+        let mut cmd = Command::new("/bin/zsh");
+        cmd.args(["-f", "-c", driver, "daemon-01"])
+            .arg(&sync)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("ZDOTDIR", &home)
+            .env("KRILL_STATE_DIR", &state)
+            .env("CUSTOM_A", &a)
+            .env("CUSTOM_B", &b)
+            .stdin(Stdio::null());
+        if let Some((data, state)) = baseline {
+            cmd.env("XDG_DATA_HOME", data).env("XDG_STATE_HOME", state);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let custom = |dir: &str| format!("data={dir}/data state={dir}/state db=opencode.db\n");
+
+    // 1. Shell without XDG overrides: host and removal unset the profile-only exports.
+    let unset = "data=UNSET state=UNSET db=UNSET\n";
+    let expected = format!(
+        "{}{}{unset}{}{unset}{}{unset}data=/user/changed state=UNSET db=UNSET\n",
+        custom(&a),
+        custom(&b),
+        custom(&a),
+        custom(&a)
+    );
+    assert_eq!(run(None), expected);
+
+    // 2. Shell with its own XDG dirs: host and removal restore them; the user's later change survives.
+    let orig = "data=/orig/data state=/orig/state db=UNSET\n";
+    let expected = format!(
+        "{}{}{orig}{}{orig}{}{orig}data=/user/changed state=/orig/state db=UNSET\n",
+        custom(&a),
+        custom(&b),
+        custom(&a),
+        custom(&a)
+    );
+    assert_eq!(run(Some(("/orig/data", "/orig/state"))), expected);
+
+    std::fs::remove_dir_all(&root).ok();
+}
