@@ -450,13 +450,15 @@ async function testPipelinedHandshakeAndPolling(){
  // 폴링은 직전 etag를 since로 보내고, unchanged 응답이면 화면을 다시 그리지 않는다.
  assert.deepEqual(JSON.parse(new TextDecoder().decode(socket.sent[4].slice(7))),{action:'snapshot',since:'e1'});reply({unchanged:true,etag:'e1'});await flush();assert.equal(snapshots.length,1);
  const [[,slow]]=[...timers];assert.equal(slow.at-now,10000);
- // resume() 시 살아 있는 프리워밍 소켓은 그대로 두고, 정상 응답이 1.5초 안에 오면 재연결하지 않는다.
- t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);reply();await flush();assert.equal(snapshots.length,2);
- for(const [id,tm] of [...timers])if(tm.at<=now+1500){timers.delete(id);tm.fn();}await flush();assert.equal(sockets.length,4);
- // 1.5초 동안 응답이 없으면 좀비 소켓으로 판정해 즉시 reconnect()하며, 끊긴 refresh의 오류를 onError로 흘리지 않는다.
+ // A healthy snapshot slower than 1.5s retains the existing authenticated socket.
+ t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);
+ for(const [id,tm] of [...timers])if(tm.at<=now+2000){timers.delete(id);tm.fn();}await flush();assert.equal(socket.closed,undefined);
+ reply();await flush();assert.equal(snapshots.length,2);assert.equal(sockets.length,4);
+ // The normal RPC deadline still closes a genuinely stalled socket and retries.
  t.resume();await flush();assert.equal(socket.sent.length,7);
- const zombieTimer=[...timers.values()].find(tm=>tm.at===now+1500);assert(zombieTimer);
- zombieTimer.fn();await flush();
+ const rpcDeadline=[...timers.values()].find(tm=>tm.at===now+15000);assert(rpcDeadline);
+ rpcDeadline.fn();await flush();assert.equal(socket.closed,true);
+ for(const [id,tm] of [...timers])if(tm.at<=now){timers.delete(id);tm.fn();}await flush();
  assert.equal(socket.closed,true);assert.equal(sockets.length,5);assert.deepEqual(errors,[]);
  t.close();
 }

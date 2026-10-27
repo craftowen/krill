@@ -4,6 +4,18 @@ const test=require('node:test'),assert=require('node:assert/strict'),vm=require(
 const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/client.js'),'utf8');
 const enc=new TextEncoder(),flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 const deferred=()=>{let resolve;const promise=new Promise(done=>resolve=done);return {promise,resolve};};
+
+test('foreground resume keeps a healthy slow snapshot on its existing connection',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);
+ h.response(socket,{sessions:[]});await pending;
+ h.transport.resume(false);await flush();
+ await h.tick(2000);
+ assert.equal(h.transport.ready,true,'a snapshot within the RPC deadline is still in flight');
+ assert.equal(socket.closed,undefined);
+ h.response(socket,{sessions:[],etag:'fresh'});await flush();
+ assert.equal(h.transport.ready,true);
+ h.transport.close();
+});
 function harness(saved=null,href='https://phone.test/m/0123456789abcdef/',useEndpoint=false){
  let now=100000,nextTimer=0;const timers=new Map(),sockets=[],events=[],redirects=[],store=new Map(saved?[['krill-mobile-v2',JSON.stringify(saved)]]:[]),url=new URL(href);
  url.replace=href=>redirects.push(href);
