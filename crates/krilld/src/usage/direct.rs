@@ -883,21 +883,35 @@ fn credentials(
 }
 
 fn credential_utf8(raw: &[u8]) -> Option<Zeroizing<String>> {
+    let raw = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(raw);
     if let Ok(text) = std::str::from_utf8(raw)
         && !text.trim_end_matches('\0').contains('\0')
     {
         return Some(Zeroizing::new(text.trim_end_matches('\0').to_owned()));
     }
+    let (raw, big_endian) = if let Some(body) = raw.strip_prefix(&[0xfe, 0xff]) {
+        (body, true)
+    } else {
+        (raw.strip_prefix(&[0xff, 0xfe]).unwrap_or(raw), false)
+    };
     if raw.len() >= 2 && raw.len().is_multiple_of(2) {
-        let units: Vec<u16> = raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .copied()
-            .map(u16::from_le_bytes)
-            .collect();
-        let text = String::from_utf16(&units).ok()?;
-        return Some(Zeroizing::new(text.trim_end_matches('\0').to_owned()));
+        let units = Zeroizing::new(
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|unit| {
+                    if big_endian {
+                        u16::from_be_bytes(unit)
+                    } else {
+                        u16::from_le_bytes(unit)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let text = Zeroizing::new(String::from_utf16(&units).ok()?);
+        let text = text.trim_end_matches('\0');
+        return (!text.contains('\0')).then(|| Zeroizing::new(text.to_owned()));
     }
     None
 }
@@ -1501,17 +1515,22 @@ pub(crate) mod agy {
         if let Some(hit) = lock(&VERSION_TEXT_CACHE).get(&(exe.to_path_buf(), mtime, len)) {
             return hit.clone();
         }
-        let mut text = run_agy(
+        let text = run_agy(
             exe,
             &["--version".to_owned()],
             true,
             VERSION_TIMEOUT,
             64 * 1024,
         )
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
-        // 키 팽창 방지: 앞 64바이트만 쓴다(버전 표기는 앞에 있다).
-        text.truncate(64);
+        .and_then(|b| String::from_utf8(b).ok());
+        let Some(text) = text.filter(|s| parse_version(s).is_some()) else {
+            // A failed/partial cold-start probe says nothing about the installed
+            // version. Retry at the next usage poll instead of caching failure
+            // until the executable is replaced.
+            return String::new();
+        };
+        // 키 팽창 방지: 앞 64글자만 쓴다(버전 표기는 앞에 있다).
+        let text = text.chars().take(64).collect::<String>();
         let mut cache = lock(&VERSION_TEXT_CACHE);
         if cache.len() >= 64 {
             cache.pop_first();
@@ -1720,6 +1739,31 @@ pub(crate) mod agy {
         }
 
         #[test]
+        fn failed_version_probe_is_retried_without_reinstalling_agy() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root =
+                std::env::temp_dir().join(format!("agy-version-retry-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let ready = root.join("ready");
+            let exe = write_fake_agy(
+                &root,
+                "agy",
+                &format!(
+                    "#!/bin/sh\n[ -f '{}' ] || exit 1\nprintf 'agy 1.1.11\\n'\n",
+                    ready.display()
+                ),
+            );
+            assert!(!probe_version_for_tests(&exe));
+            std::fs::write(&ready, b"ready").unwrap();
+            assert!(
+                probe_version_for_tests(&exe),
+                "a transient launch failure must not disable usage until the binary changes"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn version_gate_parses_first_triplet_and_rejects_old_or_unknown() {
             let _serial = serial();
             reset_latch_for_tests();
@@ -1913,6 +1957,27 @@ fn agy_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_files_accept_windows_bom_encodings() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"fixture-bom-token"}}"#;
+        let mut utf8 = vec![0xef, 0xbb, 0xbf];
+        utf8.extend_from_slice(json.as_bytes());
+        let mut utf16le = vec![0xff, 0xfe];
+        let mut utf16be = vec![0xfe, 0xff];
+        for unit in json.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+            utf16be.extend_from_slice(&unit.to_be_bytes());
+        }
+        for (encoding, raw) in [("utf8", utf8), ("utf16le", utf16le), ("utf16be", utf16be)] {
+            let parsed = parse_credentials(ProviderKind::Claude, &raw);
+            assert_eq!(
+                parsed.map(|(token, _)| token.to_string()).as_deref(),
+                Some("fixture-bom-token"),
+                "{encoding}"
+            );
+        }
+    }
 
     /// 로그인 정보만 있는 기본 계정도 조회할 수 있다. HTTP 대신 로컬 fixture를 읽어
     /// 실제 OS curl 실행·stdin 설정 전달·응답 파싱을 네트워크 없이 검증한다.
