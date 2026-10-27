@@ -245,6 +245,9 @@ jobs:
           KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
         run: |
           $ErrorActionPreference = 'Stop'
+          $gitShell = & git var GIT_SHELL_PATH
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitShell)) { throw 'Native precheck regression requires Git for Windows sh' }
+          if (-not (Test-Path -LiteralPath $gitShell.Trim() -PathType Leaf)) { throw 'Git for Windows sh is missing' }
           function Test-KrillNative {
             param([string]$Package, [string[]]$TargetArgs, [string]$TestName)
             $testArgs = @('test', '--release', '--locked', '-p', $Package) + $TargetArgs + @($TestName, '--', '--exact')
