@@ -259,6 +259,7 @@ jobs:
           }
           Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::empty_duplicate_holder_exits_instead_of_restarting'
           Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::crash_exit_still_schedules_restart'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'sys::windows::tests::socket_disconnected_sees_eof_without_consuming_on_tcp_and_af_unix'
           Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::blocked_input_write_is_cancelled_by_peer_hup_and_reports_written_prefix'
           Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::query_replies_never_block_the_engine_on_a_full_input_pipe'
           Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::halt_deadline_and_resume_run_in_an_isolated_process'
