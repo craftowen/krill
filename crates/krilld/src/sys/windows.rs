@@ -16,6 +16,7 @@ use std::ptr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use windows_sys::Win32::Foundation::{
     ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
     LocalFree, WAIT_OBJECT_0,
@@ -26,7 +27,8 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, SIO_AF_UNIX_GETPEERPID, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl,
+    AF_INET, FIONREAD, SIO_AF_UNIX_GETPEERPID, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSAGetLastError,
+    WSAIoctl, ioctlsocket,
 };
 #[cfg(not(test))]
 use windows_sys::Win32::Security::Credentials::{
@@ -679,6 +681,55 @@ pub(crate) fn thread_finished(thread: BorrowedHandle<'_>) -> bool {
     unsafe { WaitForSingleObject(thread.as_raw_handle(), 0) == WAIT_OBJECT_0 }
 }
 
+/// Peer-disconnect probe for a blocked PTY input write (daemon-02): polled from the thread that holds
+/// the input turn, never read, never blocking. `WSAPoll` rejects `POLLHUP` in `events` (`WSAEINVAL`),
+/// so readability is requested and the hang-up, error and invalid-socket bits are taken from `revents`.
+/// A graceful FIN may surface only as "readable with nothing queued" (a zero-byte read) rather than
+/// `POLLHUP`; that state is sticky, whereas a queue that a concurrent reader drained between the two
+/// calls refills or goes idle, so the pair must agree three times before it counts. Queued frames are
+/// never a disconnect: the client's unread input is left for its own reader, so a FIN behind unread frames
+/// is seen only through `POLLHUP`. `recv(MSG_PEEK)` would be the one atomic probe, but it blocks on these
+/// blocking client sockets; a reader that refills the queue between every sample is therefore
+/// indistinguishable from EOF here.
+pub(crate) fn socket_disconnected(sock: BorrowedSocket<'_>) -> io::Result<bool> {
+    for _ in 0..3 {
+        let events = socket_events(sock)?;
+        if events.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+            return Ok(true);
+        }
+        if !events.contains(PollFlags::RDNORM) || socket_pending(sock)? > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `revents` of a zero-timeout readability poll (`WSAPoll`).
+fn socket_events(sock: BorrowedSocket<'_>) -> io::Result<PollFlags> {
+    let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::RDNORM)];
+    poll(
+        &mut fds,
+        Some(&Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    )?;
+    let [fd] = &fds;
+    Ok(fd.revents())
+}
+
+/// Bytes queued for `recv` (`FIONREAD`); zero once a graceful FIN is all that is left to read.
+fn socket_pending(sock: BorrowedSocket<'_>) -> io::Result<u32> {
+    let socket = SOCKET::try_from(sock.as_raw_socket()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let mut pending = 0_u32;
+    // SAFETY: borrowed live socket; FIONREAD writes only the queued byte count and consumes nothing.
+    if unsafe { ioctlsocket(socket, FIONREAD, &raw mut pending) } == SOCKET_ERROR {
+        // SAFETY: reads this thread's last Winsock error; no arguments.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    Ok(pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +829,68 @@ mod tests {
         assert_eq!(peer_uid(server.as_socket()).unwrap(), SAME_USER);
         drop((client, server, listener));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// daemon-02 input ledger: a live idle peer and queued frames are not a disconnect, the probe
+    /// consumes nothing, and a graceful close is reported once the queue is drained, on TCP and `AF_UNIX`.
+    #[test]
+    fn socket_disconnected_sees_eof_without_consuming_on_tcp_and_af_unix() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        disconnect_sequence("tcp", client, server);
+
+        let dir = std::env::temp_dir().join(format!("krilld-disconnect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        std::fs::remove_file(&path).ok();
+        let listener = krill_proto::os::net::UnixListener::bind(&path).unwrap();
+        let client = krill_proto::os::net::UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        disconnect_sequence("af_unix", client, server);
+        drop(listener);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn disconnect_sequence<S>(transport: &str, mut client: S, mut server: S)
+    where
+        S: std::os::windows::io::AsSocket + io::Read + io::Write,
+    {
+        let probe = |server: &S| socket_disconnected(server.as_socket()).unwrap();
+        let queued = |server: &S| socket_pending(server.as_socket()).unwrap();
+        // Live, idle peer.
+        assert!(!probe(&server), "{transport}: idle live peer");
+        // Queued frames stay queued and are not a disconnect.
+        client.write_all(b"queued frame").unwrap();
+        until(|| queued(&server) >= 12, "queued bytes");
+        assert!(!probe(&server), "{transport}: queued frames");
+        assert_eq!(queued(&server), 12, "{transport}: probe must not consume");
+        let mut buf = [0u8; 12];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"queued frame");
+        assert!(!probe(&server), "{transport}: drained live peer");
+        // Graceful close behind one more frame: the frame is still delivered, then EOF is sticky.
+        client.write_all(b"last").unwrap();
+        drop(client);
+        until(|| queued(&server) >= 4, "last frame");
+        eprintln!(
+            "{transport}: verdict with a queued frame and FIN = {}",
+            probe(&server)
+        );
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"last");
+        until(|| probe(&server), "EOF");
+        assert!(probe(&server), "{transport}: EOF must stay reported");
+        assert_eq!(server.read(&mut buf).unwrap(), 0, "{transport}: EOF read");
+    }
+
+    /// Spins until `ready`, failing after 5s so a wrong verdict cannot hang the suite.
+    fn until(mut ready: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

@@ -399,7 +399,7 @@ pub(super) fn resize(shared: &Shared, size: WinSize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::end_halt;
+    use super::super::{end_halt, halt};
     use super::*;
     use std::os::windows::io::AsSocket as _;
 
@@ -524,7 +524,8 @@ mod tests {
         let (master, mut input, _output) = pipes();
         let session = session(2, master);
         let tap = session.tap();
-        let (hup, peer) = loopback_pair();
+        let (mut hup, peer) = loopback_pair();
+        let mut peer_reader = peer.try_clone().unwrap();
         let mut body = b"\x1b[200~".to_vec();
         body.extend(vec![b'x'; 1 << 20]);
         body.extend_from_slice(b"\x1b[201~");
@@ -543,6 +544,16 @@ mod tests {
             matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "write must block on a full pipe"
         );
+        // Frames the client queues while connected are not a disconnect, and the probe leaves them unread.
+        hup.write_all(b"queued frame").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "queued client frames must not cancel the write"
+        );
+        let mut queued = [0u8; 12];
+        peer_reader.read_exact(&mut queued).unwrap();
+        assert_eq!(&queued, b"queued frame");
         drop(hup);
         let got = drain_until(
             &mut input,
