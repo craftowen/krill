@@ -877,6 +877,15 @@ mod tests {
             "{transport}: verdict with a queued frame and FIN = {}",
             probe(&server)
         );
+        if transport == "af_unix" {
+            until(|| probe(&server), "AF_UNIX close behind a queued frame");
+            assert_eq!(
+                queued(&server),
+                4,
+                "disconnect probe must leave the frame queued"
+            );
+            eprintln!("AF_UNIX queued FIN cancels before draining the frame");
+        }
         let mut buf = [0u8; 4];
         server.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"last");
