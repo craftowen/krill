@@ -69,13 +69,14 @@ function mountChat(root,opts){
  const history=el('div',undefined,'chat-actions chat-history'),historyText=el('span',undefined,'muted');
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
  const latestBtn=button(t('Back to latest'),()=>{
+  earlierEpoch++;earlierQueued=false;failedEarlier=false;autoBlocked=null;pollStatus.hidden=true;
   if(entry.live){entry.items=entry.live.items;entry.offset=entry.live.offset;entry.live=null;}
   following=true;renderItems();pollNow();
  },'ghost small');
  history.append(historyText,earlierBtn,latestBtn);
  const pollStatus=el('div',undefined,'chat-actions'),pollText=el('span',undefined,'muted');
  pollStatus.setAttribute('role','status');
- const retryBtn=button(t('Retry'),()=>pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
+ const retryBtn=button(t('Retry'),()=>failedEarlier?run(loadEarlier):pollNow(),'ghost small');pollStatus.append(pollText,retryBtn);pollStatus.hidden=true;
  const input=el('textarea',undefined,'chat-input');input.rows=1;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
  function sizeInput(){if(!input.style)return;input.style.height='auto';if(input.scrollHeight)input.style.height=Math.min(140,Math.max(28,input.scrollHeight))+'px';}
  input.value=drafts.get(sessionId)||'';
@@ -90,10 +91,21 @@ function mountChat(root,opts){
  let composing=false,disposed=false,pollTimer=null,inFlight=false,retryWithoutTail=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
+ let earlierEpoch=0,earlierQueued=false,autoBlocked=null,failedEarlier=false;
  let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
  // Only the reader moving up stops following; pins and late layout growth never do.
- let lastTop=0;feed.addEventListener('scroll',()=>{if(!visible)return;const top=feed.scrollTop,gap=feed.scrollHeight-top-feed.clientHeight;if(gap<=1)following=true;else if(top<lastTop-1)following=false;else if(gap<60)following=true;lastTop=top;});
- function pinLatest(){if(visible&&following&&!entry.live){feed.scrollTop=feed.scrollHeight||0;lastTop=feed.scrollTop;}}
+ let lastTop=0,lastHeight=0,lastViewport=feed.clientHeight;
+ function syncScroll(){lastTop=feed.scrollTop;lastHeight=feed.scrollHeight;lastViewport=feed.clientHeight;}
+ feed.addEventListener('scroll',()=>{
+  const top=feed.scrollTop,gap=feed.scrollHeight-top-feed.clientHeight;
+  // Layout clamps and our own pins/prepends are not a new request to read backwards.
+  const upward=top<lastTop-1&&lastHeight===feed.scrollHeight&&lastViewport===feed.clientHeight;
+  syncScroll();if(!canReadEarlier())return;
+  if(gap<=1)following=true;else if(upward)following=false;else if(gap<60)following=true;
+  if(top>120){autoBlocked=null;earlierQueued=false;}
+  else if(upward&&!following&&!earlierPending){earlierQueued=true;drainEarlier();}
+ });
+ function pinLatest(){if(visible&&following&&!entry.live)feed.scrollTop=feed.scrollHeight||0;syncScroll();}
  // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
  const resize=globalThis.ResizeObserver?new ResizeObserver(()=>pinLatest()):null;resize?.observe(feed);
  const cards=new Map(),toolRuns=new Map();let tailRun=null,renderedCount=0,renderedItems=null;
@@ -333,7 +345,7 @@ function mountChat(root,opts){
   const start=first?._pageStart||0;
   earlierBtn.hidden=!entry.pages.some(page=>page.start<start)&&!first?._clipped&&!(first&&start>0);
   earlierBtn.disabled=earlierPending;
-  latestBtn.hidden=!entry.live;
+  latestBtn.hidden=!entry.live&&!earlierPending;
   historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
   historyText.hidden=!entry.live;history.hidden=earlierBtn.hidden&&latestBtn.hidden;
   pinLatest();restoreReader(anchor);
@@ -451,18 +463,20 @@ function mountChat(root,opts){
  }
  async function pollNow(initial=false){
   // 숨은 Chat도 첫 내용을 받을 때까지는 받아 둔다(실패 2회까지). 연결 전에 마운트돼 첫 프리페치를 놓쳐도 ready 뒤 update()가 다시 받아, Chat을 누른 첫 프레임에 내용이 있다.
-  if(!active()||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
+  if(!active()||state.cached||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
+  const epoch=earlierEpoch,prefetch=!visible;
+  const current=()=>epoch===earlierEpoch&&active()&&!state.cached&&(visible||prefetch)&&!globalThis.document?.hidden&&globalThis.document?.visibilityState!=='hidden'&&state.connection?.phase==='ready';
   inFlight=true;
   try{
    // v0.1.37 이하 데몬은 latest를 모르는 필드로 거부한다. chat_tail이 없는 데몬이 그렇게 거부하면 처음부터 이어 읽는다(빈 화면으로 남기지 않는다).
    if(entry.noTail&&state.snapshot?.capabilities?.chat_tail===true)entry.noTail=false;
    const start=entry.offset;let latest=(!entry.initialized||refreshLatest)&&!entry.noTail,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest?{latest:true}:{}});
-   if(!active()||earlierPending||entry.live||!res)return;
+   if(!current()||earlierPending||entry.live||!res)return;
    let changed=entry.generation&&res.generation&&entry.generation!==res.generation;
    // Rebinding also opens at the tail. Keep the current paint until that window is ready.
    if(!latest&&!entry.noTail&&(res.reset||changed)){
     res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:0,latest:true});
-    if(!active()||earlierPending||entry.live||!res)return;
+    if(!current()||earlierPending||entry.live||!res)return;
     latest=true;changed=true;
    }
    const rItems=res.items||[],sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
@@ -479,39 +493,55 @@ function mountChat(root,opts){
    if(typeof res.next_offset==='number')entry.offset=res.next_offset;
    lastSuccess=entry.lastSuccess=Date.now();failures=0;pollStatus.hidden=true;
    if(reconciled||entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed&&!reconciled?before:undefined);updateStrip();restoreReader(anchor);pruneCache(state);
-  }catch(error){if(!active())return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
+  }catch(error){if(!current())return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(earlierQueued)drainEarlier();if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
  }
- async function loadEarlier(){
-  if(disposed||earlierPending||inFlight||!entry.items.length)return;
-  earlierPending=true;following=false;renderItems();
-  const anchor=Array.from(feed.children||[]).find(card=>(card.offsetTop||0)>=(feed.scrollTop||0))||feed.children?.[0];
-  const oldTop=anchor?.offsetTop||0,oldScroll=feed.scrollTop||0,first=entry.items[0];
+ function canReadEarlier(){return active()&&isVisible()&&!state.cached&&state.connection?.phase==='ready';}
+ function earlierPage(){
+  const first=entry.items[0];if(!first)return null;
   const page=first._clipped?entry.pages.find(page=>page.start===first._pageStart):entry.pages.filter(page=>page.start<first._pageStart).at(-1);
-  let start=page?.start;
-  const end=page?.next??first._pageStart;
-  if(start===undefined&&!end){earlierPending=false;renderItems();return;}
+  const start=page?.start,end=page?.next??first._pageStart;
+  return start===undefined&&!end?null:{first,start,end,key:`${entry.generation}:${start}:${end}:${first.id}`};
+ }
+ function drainEarlier(){
+  if(!earlierQueued||inFlight)return;
+  earlierQueued=false;
+  if(canReadEarlier()&&!following&&feed.scrollTop<=120)loadEarlier(true);
+ }
+ async function loadEarlier(automatic=false){
+  if(!canReadEarlier()||earlierPending||inFlight)return;
+  const page=earlierPage();if(!page||automatic&&autoBlocked===page.key)return;
+  const {first,end}=page;let {start}=page;
+  const epoch=++earlierEpoch,generation=entry.generation;
+  const current=()=>epoch===earlierEpoch&&canReadEarlier();
+  earlierQueued=false;earlierPending=true;failedEarlier=false;following=false;renderItems();
   try{
    const res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:start??0,end_offset:end,...start===undefined?{latest:true}:{}});
-   if(disposed)return;
-   if(res.next_offset!==end)throw new Error(t('Transcript changed. Return to latest and retry.'));
-   if(res.reset||(res.generation&&entry.generation&&res.generation!==entry.generation))throw new Error(t('Transcript changed. Return to latest and retry.'));
-   start=res.page_start??start;rememberPage(start,res.next_offset);
+   if(!current())return;
+   const responseStart=res?.page_start??start;
+   if(!res||res.next_offset!==end||res.reset||res.generation!==generation||entry.generation!==generation||!Number.isSafeInteger(responseStart)||responseStart<0||responseStart>=end||start!==undefined&&responseStart!==start)throw new Error(t('Transcript changed. Return to latest and retry.'));
+   // Capture the viewport after any scrolling during the RPC, before changing chrome/items.
+   following=false;const anchor=readerAnchor();
+   start=responseStart;rememberPage(start,res.next_offset);
    const items=normalizeItems(res,start),index=items.findIndex(item=>item.id===first.id);
    const prefix=index>=0?items.slice(0,index):items;
-   if(!entry.live)entry.live={items:entry.items.slice(),offset:entry.offset};
-   const seen=new Set(entry.items.map(item=>item.id));entry.items.unshift(...prefix.filter(item=>!seen.has(item.id)));trimItems(false);
+   const previous=entry.items,live=entry.live;
+   if(!live)entry.live={items:previous.slice(),offset:entry.offset};
+   const seen=new Set(previous.map(item=>item.id));entry.items=[...prefix.filter(item=>{if(seen.has(item.id))return false;seen.add(item.id);return true;}),...previous];trimItems(false);
+   const anchorKey=anchor?.node.dataset.chatId||[...toolRuns].find(([,group])=>group.details===anchor?.node)?.[0];
+   // If the reader moved past the retained window, defer the prepend rather than evict their card.
+   if(anchorKey&&!entry.items.some((item,index)=>itemKey(item,index)===anchorKey)){entry.items=previous;entry.live=live;trimItems(false);return;}
    if(first._clipped)delete first._clipped;
-   pollStatus.hidden=true;renderItems();
-   feed.scrollTop=oldScroll+((anchor?.offsetTop||0)-oldTop);
-  }catch(error){showPollError(error);}finally{earlierPending=false;if(!disposed)renderItems();}
+   failures=0;pollStatus.hidden=true;autoBlocked=null;renderItems();restoreReader(anchor);
+  }catch(error){if(current()){autoBlocked=page.key;failedEarlier=true;showPollError(error);}}
+  finally{earlierPending=false;if(active()){renderItems();if(epoch!==earlierEpoch&&canReadEarlier()&&!entry.live)pollNow();}}
  }
  function isVisible(){return visible&&!globalThis.document?.hidden&&globalThis.document?.visibilityState!=='hidden';}
  function schedule(){clearTimeout(pollTimer);pollTimer=null;if(!disposed&&isVisible())pollTimer=setTimeout(async()=>{await pollNow();schedule();},1500);}
- function visibilityChanged(){schedule();if(isVisible()){if(Date.now()-lastSuccess>3000)refreshLatest=true;pinLatest();pollNow();}}
+ function visibilityChanged(){if(!isVisible()){earlierEpoch++;earlierQueued=false;}schedule();if(isVisible()){if(Date.now()-lastSuccess>3000)refreshLatest=true;pinLatest();pollNow();}}
  globalThis.document?.addEventListener?.('visibilitychange',visibilityChanged);
  entry.notifyComposer=updateComposer;
  renderItems();updateStrip();updateComposer();pollNow(true);schedule();
- return {insertText,pollNow,setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){if(picker&&picker.scope!==scope())closeSuggestions();updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;closeSuggestions();discovery.clear();discovering.clear();disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
+ return {insertText,pollNow,setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){if(!canReadEarlier()){earlierEpoch++;earlierQueued=false;}if(picker&&picker.scope!==scope())closeSuggestions();updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;earlierEpoch++;earlierQueued=false;closeSuggestions();discovery.clear();discovering.clear();disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
 }
 M.chat={mount:mountChat,pruneCache,forgetSession};
 M.screens.chat=(root,ctx)=>{

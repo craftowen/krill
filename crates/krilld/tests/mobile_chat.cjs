@@ -39,6 +39,54 @@ async function historyRace(){
  const before=Array.from(f.entry.items,x=>x.id);assert.equal(f.entry.items[0].text,'Message 49');server.total=1060;live.resolve(server.page({offset:1050}));await flush();
  const after=Array.from(f.entry.items,x=>x.id);console.log('historyRace first/last:',f.entry.items[0].text,f.entry.items.at(-1).text);f.dispose();assert.deepEqual(after,before,'a live poll queued during earlier-page load must not mutate the historical view');
 }
+function scroll(feed,top){feed.scrollTop=top;feed.dispatchEvent(new Event('scroll'));}
+const historyPage=(start,end)=>({generation:'g1',agent:'claude',bound:true,page_start:start,next_offset:end,items:Array.from({length:end-start},(_,i)=>({id:`message${start+i}`,kind:'assistant',text:`Message ${start+i}`}))});
+const historyHandler=async req=>req.end_offset!==undefined?historyPage(Math.max(0,req.end_offset-10),req.end_offset):req.latest?historyPage(200,230):historyPage(req.offset,req.offset);
+async function automaticHistory(){
+ const f=fixture({handler:historyHandler});await flush();const feed=f.find('chat-feed');
+ assert.equal(f.calls.length,1,'initial tail does not eagerly backfill');feed.dispatchEvent(new Event('scroll'));assert.equal(f.calls.length,1,'bottom pin event does not backfill');
+ Object.defineProperty(feed,'scrollHeight',{configurable:true,value:300});scroll(feed,100);assert.equal(f.calls.length,1,'layout-induced scroll clamp does not backfill');delete feed.scrollHeight;
+ scroll(feed,500);const pending=deferred();f.handler=req=>req.end_offset!==undefined?pending.promise:historyHandler(req);
+ scroll(feed,119);scroll(feed,80);scroll(feed,30);scroll(feed,0);await flush();
+ assert.equal(f.calls.length,2,'burst of upward scroll events issues a single automatic request');assert.equal(f.calls.at(-1).end_offset,200);assert.equal(f.calls.at(-1).latest,true);assert.equal(f.button('Load earlier messages').disabled,true);
+ // The reader keeps moving while the page is in flight: preserve the partial card now visible.
+ scroll(feed,450);const anchor=feed.children[4],screenTop=anchor.offsetTop-feed.scrollTop;
+ pending.resolve(historyPage(190,200));await flush();assert.equal(anchor.offsetTop-feed.scrollTop,screenTop,'response preserves current partial-card anchor, not the request-time scroll position');assert.equal(feed.scrollTop,1450);assert.equal(feed.children[14],anchor);assert(f.entry.live);assert.equal(f.entry.live.items[0].id,'message200');
+ feed.dispatchEvent(new Event('scroll'));await flush();assert.equal(f.calls.length,2,'prepend-generated scroll event does not request another page');f.update();for(const [id,fn] of [...f.timers]){f.timers.delete(id);await fn();}assert.equal(f.calls.length,2,'reading history pauses live polling');
+ f.handler=historyHandler;scroll(feed,100);await flush();assert.equal(f.calls.length,3,'a new upward scroll reads the next page');assert.equal(f.calls.at(-1).end_offset,190);assert.equal(f.entry.items[0].id,'message180');assert.equal(new Set(f.entry.items.map(x=>x.id)).size,f.entry.items.length);
+ f.button('Back to latest').action();await flush();assert.equal(f.entry.items[0].id,'message200');assert.equal(feed.scrollTop,feed.scrollHeight);f.dispose();
+ const live=deferred(),queued=fixture({handler:historyHandler});await flush();const qfeed=queued.find('chat-feed');queued.handler=req=>req.end_offset!==undefined?historyHandler(req):live.promise;queued.update();await flush();scroll(qfeed,110);scroll(qfeed,20);assert.equal(queued.calls.length,2,'upward intent waits for an active live poll');
+ live.resolve(historyPage(230,231));await flush();assert.equal(queued.calls.length,3,'live poll finally drains the queued upward intent');assert.equal(queued.calls.at(-1).end_offset,200);assert.equal(queued.entry.items[0].id,'message190');queued.dispose();
+ const cancel=fixture({handler:historyHandler});await flush();const cfeed=cancel.find('chat-feed'),late=deferred();cancel.handler=req=>req.end_offset!==undefined?late.promise:historyHandler(req);scroll(cfeed,100);await flush();assert.equal(cancel.button('Back to latest').hidden,false,'latest is available during the first earlier request');cancel.button('Back to latest').action();late.resolve(historyPage(190,200));await flush();assert.equal(cancel.entry.live,undefined);assert.equal(cancel.entry.items[0].id,'message200');assert.equal(cfeed.scrollTop,cfeed.scrollHeight);assert.equal(cancel.calls.filter(c=>c.end_offset!==undefined).length,1);assert.equal(cancel.calls.length,3,'latest polling resumes after the cancelled page settles');cancel.dispose();
+ const nested=fixture({handler:historyHandler});await flush();scroll(nested.find('chat-feed'),100);await flush();const older=deferred();nested.handler=req=>req.end_offset!==undefined?older.promise:historyHandler(req);scroll(nested.find('chat-feed'),90);await flush();nested.button('Back to latest').action();older.resolve(historyPage(180,190));await flush();assert.equal(nested.entry.live,null);assert.equal(nested.entry.items[0].id,'message200','late second historical page cannot undo latest restore');nested.dispose();
+ const capped=fixture({handler:async()=>historyPage(200,1200)});await flush();const capFeed=capped.find('chat-feed'),capPending=deferred();capped.handler=()=>capPending.promise;scroll(capFeed,100);await flush();scroll(capFeed,99850);const capAnchor=capFeed.children[998],capTop=capAnchor.offsetTop-capFeed.scrollTop;capPending.resolve(historyPage(190,200));await flush();assert.equal(capped.entry.items.length,1000);assert.equal(capFeed.children[998],capAnchor);assert.equal(capAnchor.offsetTop-capFeed.scrollTop,capTop,'a delayed prepend cannot evict the reader moved to the clipped tail');assert.equal(capped.entry.items[0].id,'message200','prepend is deferred when the current reader would fall outside the cap');capped.dispose();
+ console.log('PASS automatic history: real scroll intent, no mount/layout/prepend backfill, burst single-flight, response-time anchor, live-poll queued intent, paused history and latest cancellation');
+}
+async function automaticHistoryFailures(){
+ const f=fixture({handler:historyHandler});await flush();const feed=f.find('chat-feed');let attempts=0;f.handler=async req=>{if(req.end_offset!==undefined){attempts++;throw Error('earlier unavailable');}return historyHandler(req);};
+ scroll(feed,110);await flush();assert.equal(attempts,1);assert.equal(f.entry.live,undefined);assert.equal(f.button('Load earlier messages').disabled,false);scroll(feed,70);scroll(feed,20);scroll(feed,0);f.update();await flush();assert.equal(attempts,1,'same-boundary failure cannot storm as upward events continue');
+ scroll(feed,400);scroll(feed,100);await flush();assert.equal(attempts,2,'moving away and back explicitly rearms automatic retry');f.handler=historyHandler;f.button('Retry').action();await flush();assert.equal(f.entry.items[0].id,'message190','error Retry retries the historical page');f.dispose();
+ const manual=fixture({handler:historyHandler});await flush();const mfeed=manual.find('chat-feed');manual.handler=async()=>{throw Error('busy');};scroll(mfeed,100);await flush();manual.handler=historyHandler;manual.button('Load earlier messages').action();await flush();assert.equal(manual.entry.items[0].id,'message190','manual fallback can retry a blocked automatic boundary');manual.dispose();
+ // Reject the whole page without changing items/pages/live, including missing generation.
+ for(const bad of [{next_offset:199},{generation:'g2'},{generation:undefined},{reset:true},{page_start:200},{page_start:-1}]){
+  const invalid=fixture({handler:historyHandler});await flush();const before=invalid.entry.items.slice(),pages=JSON.stringify(invalid.entry.pages);invalid.handler=async()=>({...historyPage(190,200),...bad});scroll(invalid.find('chat-feed'),100);await flush();assert.deepEqual(invalid.entry.items,before);assert.equal(JSON.stringify(invalid.entry.pages),pages);assert.equal(invalid.entry.live,undefined);assert.equal(invalid.button('Load earlier messages').disabled,false);invalid.dispose();
+ }
+ const duplicate=fixture({handler:historyHandler});await flush();duplicate.handler=async()=>({...historyPage(190,200),items:[historyPage(190,200).items[0],historyPage(190,200).items[0],historyPage(200,201).items[0]]});scroll(duplicate.find('chat-feed'),100);await flush();assert.equal(new Set(duplicate.entry.items.map(x=>x.id)).size,duplicate.entry.items.length,'duplicates inside an incoming page are dropped as well');duplicate.dispose();
+ console.log('PASS automatic history failures: no retry storm, move-away/manual/error retry, exact end/generation/start/reset validation and duplicate ID defense');
+}
+async function inactiveHistory(){
+ const modes={terminal:f=>f.setVisible(false),document:f=>{f.doc.hidden=true;f.doc.visibilityState='hidden';f.doc.dispatchEvent(new Event('visibilitychange'));},cached:f=>{f.state.cached=true;f.update();},offline:f=>{f.state.connection.phase='disconnected';f.update();},host:f=>{f.state.chatCache=new Map();f.state.drafts=new Map();},disposed:f=>f.dispose(),aborted:f=>f.ctx.signal={aborted:true}};
+ for(const [name,deactivate] of Object.entries(modes)){
+  const f=fixture({handler:historyHandler});await flush();const feed=f.find('chat-feed'),entry=f.entry;deactivate(f);scroll(feed,100);f.button('Load earlier messages').action();await flush();assert.equal(f.calls.length,1,`${name} does not request older pages`);assert.equal(entry.items[0].id,'message200');f.dispose();
+  const stale=fixture({handler:historyHandler});await flush();const pending=deferred(),sfeed=stale.find('chat-feed'),old=stale.entry;stale.handler=()=>pending.promise;scroll(sfeed,100);await flush();deactivate(stale);pending.resolve(historyPage(190,200));await flush();assert.equal(old.items[0].id,'message200',`${name} drops late older results`);assert.equal(old.live,undefined);assert.equal(stale.calls.length,2,`${name} does not issue a follow-up`);stale.dispose();
+  const live=fixture({handler:historyHandler});await flush();const waiting=deferred(),previous=live.entry;live.handler=()=>waiting.promise;live.update();await flush();deactivate(live);waiting.resolve(historyPage(230,231));await flush();assert.equal(previous.items.length,30,`${name} drops a late live delta as well`);assert.equal(previous.offset,230);live.dispose();
+ }
+ // Even a hidden-then-visible transition before completion fences the earlier request.
+ const revived=fixture({handler:historyHandler});await flush();const pending=deferred();revived.handler=req=>req.end_offset!==undefined?pending.promise:historyHandler(req);scroll(revived.find('chat-feed'),100);await flush();revived.setVisible(false);revived.setVisible(true);pending.resolve(historyPage(190,200));await flush();assert.equal(revived.entry.items[0].id,'message200');assert.equal(revived.entry.live,undefined);revived.dispose();
+ // Queued scroll intent is discarded when the pane is hidden before the live poll settles.
+ const queued=fixture({handler:historyHandler});await flush();const live=deferred();queued.handler=()=>live.promise;queued.update();await flush();scroll(queued.find('chat-feed'),100);queued.setVisible(false);live.resolve(historyPage(230,230));await flush();assert.equal(queued.calls.length,2);assert.equal(queued.entry.live,undefined);queued.dispose();
+ console.log('PASS inactive history: terminal/document hidden, cached, offline, changed host, disposed/aborted do not request/apply earlier pages; hidden cycle and queued intent fenced');
+}
 async function renderBudgets(){
  const f=fixture({visible:false});await flush();const initial=f.calls.length;for(let n=0;n<10;n++){f.update();for(const [id,fn] of [...f.timers]){f.timers.delete(id);await fn();}await flush();}assert.equal(f.calls.length,initial,'hidden repeated update/timer polls are zero');assert.equal(f.timers.size,0);f.setVisible(true);await flush();assert.equal(f.calls.length,initial+1,'visibility restore catches up once');assert.equal(f.timers.size,1);
  f.doc.hidden=true;f.doc.visibilityState='hidden';f.doc.dispatchEvent(new Event('visibilitychange'));assert.equal(f.timers.size,0);f.update();await flush();assert.equal(f.calls.length,initial+1);f.doc.hidden=false;f.doc.visibilityState='visible';f.doc.dispatchEvent(new Event('visibilitychange'));await flush();assert.equal(f.calls.length,initial+2,'document foreground catches up once');
@@ -203,8 +251,8 @@ async function main(){
  warm.setVisible(true);assert.equal(preparedFeed.scrollTop,preparedFeed.scrollHeight,'first visible frame is pinned to the latest message');await flush();
  warm.input('draft');warm.setVisible(false);warm.setVisible(true);await flush();
  assert.equal(warm.find('chat-feed'),preparedFeed);assert.equal(preparedFeed.children.at(-1),preparedLast);assert.equal(warm.find('chat-input').value,'draft');
- preparedFeed.scrollTop=0;preparedFeed.dispatchEvent(new Event('scroll'));warm.update();await flush();assert.equal(preparedFeed.scrollTop,0,'live poll respects reading position');
- const warmAnchor=preparedFeed.children[0];warm.button('Load earlier messages').action();await flush();
+ const warmAnchor=preparedFeed.children[0],warmCount=warm.calls.length;preparedFeed.scrollTop=0;preparedFeed.dispatchEvent(new Event('scroll'));warm.update();await flush();
+ assert.equal(warm.calls.length,warmCount+1,'upward scroll loads one earlier page without a button click');
  assert.equal(warm.calls.at(-1).latest,true);assert.equal(warm.calls.at(-1).end_offset,872);
  assert.equal(warm.entry.items[0].text,'Message 744');assert.equal(preparedFeed.children[128],warmAnchor);assert.equal(preparedFeed.scrollTop,12800);
  warm.button('Back to latest').action();await flush();assert.equal(warm.entry.items[0].text,'Message 872');assert.equal(preparedFeed.scrollTop,preparedFeed.scrollHeight);
@@ -215,6 +263,9 @@ async function main(){
  warm.dispose();
  console.log('PASS first response opens at latest, hidden prefetch survives mode flips, backward paging anchors and explicit latest pins');
  await historyRace();
+ await automaticHistory();
+ await automaticHistoryFailures();
+ await inactiveHistory();
  const tools=fixture();await flush();await tools.poll({generation:'g1',bound:true,next_offset:1,items:[{id:'user',kind:'user',text:'Please review'},{id:'call',kind:'tool_call',tool_name:'Read',file_path:'/work/a.rs',text:'Large tool arguments'},{id:'result',kind:'tool_result',text:'Long tool output'},{id:'answer',kind:'assistant',text:'Here is the answer'}]});
  const run=tools.find('chat-tool-run');assert(run);assert(!run.open);assert(!tools.find('chat-tool-call').open);assert(!tools.find('chat-tool-result').open);assert.equal(tools.find('chat-feed').children.length,3);assert(run.children[0].textContent.includes('Read'));
  run.open=true;tools.find('chat-tool-call').open=true;await tools.poll({generation:'g1',bound:true,next_offset:2,items:[{id:'more',kind:'assistant',text:'More context'}]});assert.equal(tools.find('chat-tool-run'),run);assert(run.open);assert(tools.find('chat-tool-call').open);tools.dispose();
