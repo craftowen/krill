@@ -1,6 +1,68 @@
 use super::*;
 
 #[gpui::test]
+fn restored_workspace_imports_late_sessions_without_sidebar_selection(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("workspace-no-selection-reconcile"));
+    let original = view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, SessionId(41));
+        s.layout.set_launch(
+            pane,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: b"/work/a".to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.select_worktree(None, cx);
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(&[41, 42], "/work/a"))),
+                cx,
+            );
+        });
+        pane
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert!(s.sidebar.read(cx).selected_workspace().is_none());
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![SessionId(41), SessionId(42)]
+        );
+        assert_eq!(s.layout.focused(), Some(original));
+        // An incomplete local list during daemon update must not erase either tab.
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(LiveSnapshot(live_snapshot(&[], "/work/a"))), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![SessionId(41), SessionId(42)]
+        );
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(&[41, 42, 43], "/work/a"))),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![SessionId(41), SessionId(42), SessionId(43)]
+        );
+        assert_eq!(s.layout.focused(), Some(original));
+        assert_eq!(s.workspace_tabs(cx).len(), 3);
+    });
+}
+
+#[gpui::test]
 fn closed_remote_tab_stays_closed_after_empty_and_stale_snapshots(cx: &mut TestAppContext) {
     use krill_app::hosts::HostStatus;
     let (view, cx) = open(cx, state_path("workspace-remote-close-relist"));

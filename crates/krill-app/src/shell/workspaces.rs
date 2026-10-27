@@ -91,7 +91,13 @@ impl Shell {
         }
         let sidebar = self.sidebar.read(cx);
         // Preserve explicit close intent across disconnected or stale relists.
-        let Some((host, folder)) = sidebar.selected_workspace() else {
+        let Some((host, folder)) = sidebar.selected_workspace().or_else(|| {
+            // A restored layout can be ready before sidebar selection is
+            // restored (or selection can be empty). Reconcile the workspace
+            // already on screen without requiring a sidebar click first.
+            self.tab_workspace(self.layout.active(), cx)
+                .map(|workspace| (workspace.host, workspace.folder))
+        }) else {
             return;
         };
         let workspace = Workspace {
