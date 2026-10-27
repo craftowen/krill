@@ -417,25 +417,31 @@ pub(super) fn discard_worktree_file(
     }
 }
 
+/// 줄을 종결자까지 그대로 잇는다. CRLF 파일의 diff 본문은 `+내용\r\n`이라 `\r`을 잃으면
+/// `git apply`가 "patch does not apply"로 거부한다(APP-F04). 마지막 줄만 `\n`을 보충한다.
+fn push_patch_line(buf: &mut String, line: &str) {
+    buf.push_str(line);
+    if !line.ends_with('\n') {
+        buf.push('\n');
+    }
+}
+
 pub fn extract_patch_header_and_hunks(raw_patch: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut hunks = Vec::new();
     let mut current_hunk: Option<String> = None;
-    for line in raw_patch.lines() {
+    for line in raw_patch.split_inclusive('\n') {
         if line.starts_with("@@ ") {
             if let Some(h) = current_hunk.take() {
                 hunks.push(h);
             }
             let mut h = String::new();
-            h.push_str(line);
-            h.push('\n');
+            push_patch_line(&mut h, line);
             current_hunk = Some(h);
         } else if let Some(ref mut h) = current_hunk {
-            h.push_str(line);
-            h.push('\n');
+            push_patch_line(h, line);
         } else {
-            header.push_str(line);
-            header.push('\n');
+            push_patch_line(&mut header, line);
         }
     }
     if let Some(h) = current_hunk {
@@ -497,7 +503,10 @@ pub fn build_line_patch(
     }
     let mut out_hunks = Vec::new();
     for hunk in &hunks {
-        let mut lines = hunk.lines();
+        // `\n`만 떼고 `\r`은 본문의 일부로 남긴다(CRLF 보존).
+        let mut lines = hunk
+            .split_inclusive('\n')
+            .map(|line| line.strip_suffix('\n').unwrap_or(line));
         let Some(hunk_header) = lines.next() else {
             continue;
         };

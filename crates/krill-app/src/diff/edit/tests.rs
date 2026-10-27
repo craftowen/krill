@@ -701,6 +701,127 @@ fn hunk_and_line_stage_unstage_discard_on_real_repo() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// APP-F04: 부분 패치 빌더는 줄 종결자를 바이트 그대로 보존해야 한다(`\r\n` 포함). 종결자 없는
+/// 마지막 줄만 `\n`을 보충한다(기존 LF 동작 유지).
+#[test]
+fn partial_patch_builders_preserve_crlf_bytes() {
+    let raw = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\r\n-two\r\n+TWO\r\n three\r\n";
+    let (header, hunks) = extract_patch_header_and_hunks(raw);
+    assert_eq!(
+        header,
+        "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n"
+    );
+    assert_eq!(
+        hunks,
+        ["@@ -1,3 +1,3 @@\n one\r\n-two\r\n+TWO\r\n three\r\n".to_owned()]
+    );
+    assert_eq!(build_hunk_patch(raw, 0).unwrap(), raw);
+    assert_eq!(build_line_patch(raw, false, 2, 2, true).unwrap(), raw);
+    assert_eq!(hunk_index_for_line(raw, 2, true), Some(0));
+
+    let no_trailing = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b";
+    assert_eq!(
+        build_hunk_patch(no_trailing, 0).unwrap(),
+        format!("{no_trailing}\n")
+    );
+}
+
+/// APP-F04: `core.autocrlf=false` 저장소의 CRLF 파일은 hunk·줄 단위 stage/unstage/discard가
+/// `git apply`에 그대로 받아들여져야 한다(`\r`을 잃으면 "patch does not apply").
+#[test]
+fn crlf_hunk_and_line_patches_apply_on_real_repo() {
+    /// 12줄 CRLF 문서. `edits`의 (줄 번호, 내용)만 바꾼다.
+    fn crlf_doc(edits: &[(usize, &str)]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for i in 1..=12 {
+            match edits.iter().find(|(line, _)| *line == i) {
+                Some((_, text)) => out.push_str(text),
+                None => write!(out, "line{i}").unwrap(),
+            }
+            out.push_str("\r\n");
+        }
+        out
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "krill-crlf-patch-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "core.autocrlf", "false"]);
+
+    let original = crlf_doc(&[]);
+    std::fs::write(dir.join("crlf.txt"), &original).unwrap();
+    git(&["add", "crlf.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let modified = crlf_doc(&[(2, "LINE2"), (12, "LINE12")]);
+    std::fs::write(dir.join("crlf.txt"), &modified).unwrap();
+
+    let file = ChangedFile {
+        path: b"crlf.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    assert!(wt_patch.contains("+LINE2\r\n"), "{wt_patch:?}");
+    let hunk0 = build_hunk_patch(&wt_patch, 0).unwrap();
+    assert!(hunk0.contains("-line2\r\n") && hunk0.contains("+LINE2\r\n"));
+    assert!(!hunk0.contains("LINE12"));
+
+    // 1. Stage hunk 0 only.
+    apply_git_patch(&dir, &hunk0, true, false).unwrap();
+    let staged = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(staged.contains("+LINE2\r\n"));
+    assert!(!staged.contains("LINE12"));
+
+    // 2. Unstage line 2 with a line patch on the index.
+    let unstage_line2 = build_line_patch(&staged, true, 2, 2, true).unwrap();
+    apply_git_patch(&dir, &unstage_line2, true, true).unwrap();
+    assert!(
+        super::super::raw_patch(&dir, &file, Comparison::Index)
+            .unwrap()
+            .trim()
+            .is_empty()
+    );
+
+    // 3. Stage line 12 (hunk 1) with a line patch.
+    let stage_line12 = build_line_patch(&wt_patch, false, 12, 12, true).unwrap();
+    apply_git_patch(&dir, &stage_line12, true, false).unwrap();
+    let staged = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(staged.contains("+LINE12\r\n"));
+    assert!(!staged.contains("LINE2\r"));
+
+    // 4. Discard hunk 0 in the worktree: line 2 restored, line 12 keeps its edit, CRLF intact.
+    apply_git_patch(&dir, &hunk0, false, true).unwrap();
+    let expected = crlf_doc(&[(12, "LINE12")]);
+    assert_eq!(
+        std::fs::read(dir.join("crlf.txt")).unwrap(),
+        expected.as_bytes()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn line_patch_handles_no_newline_at_end_of_file_on_real_repo() {
     let dir = std::env::temp_dir().join(format!(
