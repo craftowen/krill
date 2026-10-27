@@ -132,7 +132,7 @@ function mountChat(root,opts){
  function ownsEntry(){return state.chatCache===cacheMap&&state.drafts===drafts&&cacheMap.get(sessionId)===entry&&state.sessions?.has(sessionId);}
  function active(){return !disposed&&!ctx.signal?.aborted&&ownsEntry();}
  function scope(){
-  const sess=state.sessions?.get(sessionId),key=JSON.stringify([chatAgent(),sess?.cwd||'',sess?.provider||'',sess?.account_id||'',sess?.profile_id||'']);
+  const sess=state.sessions?.get(sessionId),key=JSON.stringify([chatAgent(),sess?.agent||'',sess?.foreground||'',sess?.cwd||'',sess?.groupKey||'',sess?.provider||'',sess?.account_id||'',sess?.profile_id||'',sess?.command_context??'']);
   // A scope epoch also fences A → B → A account/profile switches while a read/change is pending.
   if(entry.composerScope!==key){entry.composerScope=key;entry.composerEpoch=(entry.composerEpoch||0)+1;entry.model=null;discovery.clear();discovering.clear();closeSuggestions();}
   return `${entry.composerEpoch}:${key}`;
