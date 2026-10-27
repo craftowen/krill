@@ -3811,6 +3811,7 @@ dependencies = [
  "postcard",
  "proptest",
  "raw-window-handle",
+ "regex",
  "ring",
  "rustix",
  "rustix-openpty",

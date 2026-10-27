@@ -408,6 +408,7 @@ pub enum Error {
     Http(String),
     Unpack(String),
     NoBackup(PathBuf),
+    NoJournal,
     Io(io::Error),
 }
 
@@ -433,6 +434,7 @@ impl Clone for Error {
             Self::Http(v) => Self::Http(v.clone()),
             Self::Unpack(v) => Self::Unpack(v.clone()),
             Self::NoBackup(v) => Self::NoBackup(v.clone()),
+            Self::NoJournal => Self::NoJournal,
             Self::Io(v) => Self::Io(io::Error::new(v.kind(), v.to_string())),
         }
     }
@@ -467,6 +469,10 @@ impl fmt::Display for Error {
             Self::Http(m) => write!(f, "http transfer failed: {m}"),
             Self::Unpack(m) => write!(f, "archive unpack failed: {m}"),
             Self::NoBackup(p) => write!(f, "backup bundle not found for rollback: {}", p.display()),
+            Self::NoJournal => write!(
+                f,
+                "update journal not found; backup completeness unknown, rollback refused"
+            ),
             Self::Io(e) => write!(f, "updater I/O error: {e}"),
         }
     }
@@ -493,6 +499,7 @@ impl Error {
             Self::Http(m) => utext::UPDATE_ERR_NETWORK.format(&[("detail", m)]),
             Self::Unpack(m) => utext::UPDATE_ERR_UNPACK.format(&[("detail", m)]),
             Self::NoBackup(_) => utext::UPDATE_ERR_BACKUP.get().to_owned(),
+            Self::NoJournal => utext::UPDATE_ERR_JOURNAL.get().to_owned(),
             Self::Io(e) => utext::UPDATE_ERR_IO.format(&[("detail", &e.to_string())]),
         }
     }

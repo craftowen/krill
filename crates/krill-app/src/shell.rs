@@ -2280,7 +2280,11 @@ impl Shell {
         self.start_away_tracking(cx);
         self.sidebar
             .update(cx, |s, cx| s.connect(target.clone(), cx));
-        self.diff.update(cx, |d, cx| d.connect(target.clone(), cx));
+        // 활성 작업공간이 원격이면 Changes 패널을 이 Mac의 저장소에 붙이지 않는다(같은 경로의 로컬 저장소는
+        // 다른 저장소다, APP-F01·F05). 원격 타깃은 `sync_hosts`가 끝난 뒤 `sync_diff_workspace`가 잇는다.
+        if self.active_workspace(cx).host.is_local() {
+            self.diff.update(cx, |d, cx| d.connect(target.clone(), cx));
+        }
         self.sync_hosts(cx);
         self.start_link_hosts(cx);
         self.daemon_task = Some(cx.spawn(async move |this, cx| {
@@ -2693,8 +2697,11 @@ impl Shell {
         };
         let target = self.target_for_host(&ws.host);
         self.diff.update(cx, |d, cx| {
-            if let Some(target) = target {
-                d.connect(target, cx);
+            match target {
+                Some(target) => d.connect(target, cx),
+                // 원격 호스트인데 전송이 아직(시작 중) 없거나 더는(호스트 제거) 없다: 로컬 저장소에 붙은
+                // 채로 두지 않고 원격 모드로 닫아 둔다(APP-F01·F05). 로컬 호스트는 그대로 둔다.
+                None => d.disconnect_remote(&ws.host, cx),
             }
             if !folder.as_os_str().is_empty() {
                 d.set_repo(folder, cx);

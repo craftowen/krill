@@ -37,8 +37,30 @@ pub(super) trait EditSource: Send + Sync {
     fn generate_commit_message(&self, repo: &Path) -> io::Result<String> {
         generate_commit_message_from_repo(repo)
     }
+
+    fn apply_patch(
+        &self,
+        repo: &Path,
+        patch_text: &str,
+        cached: bool,
+        reverse: bool,
+    ) -> io::Result<()> {
+        apply_git_patch(repo, patch_text, cached, reverse)
+    }
 }
+
+fn remote_unsupported() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, text::REMOTE_UNSUPPORTED.get())
+}
+
 struct Daemon(Option<HostTarget>);
+impl Daemon {
+    /// 원격 호스트 타깃이면 `true`. 같은 절대 경로의 로컬 저장소가 있어도 다른 저장소이므로
+    /// 로컬 git·파일시스템을 쓰는 기본 구현을 쓰지 않는다(IPC에 없는 동작은 실패로 닫는다).
+    fn remote(&self) -> bool {
+        self.0.as_ref().is_some_and(|t| !t.allow_local_launch())
+    }
+}
 impl EditSource for Daemon {
     fn edit(&self, repo: &Path, edit: Edit) -> io::Result<()> {
         #[cfg(test)]
@@ -93,7 +115,46 @@ impl EditSource for Daemon {
         if self.0.is_none() && !repo.exists() {
             return true;
         }
+        // 원격 저장소의 remote 설정은 로컬 git으로 조사할 수 없다. Push/Pull/Sync 자체는 원격 krilld가
+        // 실행하므로 열어 두고, 원격이 없으면 그쪽 git 오류가 그대로 표시된다.
+        if self.remote() {
+            return true;
+        }
         repo_has_remote(repo)
+    }
+
+    fn discard(&self, repo: &Path, home: &Path, file: &ChangedFile) -> io::Result<()> {
+        if self.remote() {
+            return Err(remote_unsupported());
+        }
+        discard_worktree_file(repo, home, file)
+    }
+
+    fn branch_sync(&self, repo: &Path) -> (u64, u64) {
+        if self.remote() {
+            return (0, 0);
+        }
+        read_branch_sync(repo)
+    }
+
+    fn generate_commit_message(&self, repo: &Path) -> io::Result<String> {
+        if self.remote() {
+            return Err(remote_unsupported());
+        }
+        generate_commit_message_from_repo(repo)
+    }
+
+    fn apply_patch(
+        &self,
+        repo: &Path,
+        patch_text: &str,
+        cached: bool,
+        reverse: bool,
+    ) -> io::Result<()> {
+        if self.remote() {
+            return Err(remote_unsupported());
+        }
+        apply_git_patch(repo, patch_text, cached, reverse)
     }
 }
 
@@ -417,25 +478,31 @@ pub(super) fn discard_worktree_file(
     }
 }
 
+/// 줄을 종결자까지 그대로 잇는다. CRLF 파일의 diff 본문은 `+내용\r\n`이라 `\r`을 잃으면
+/// `git apply`가 "patch does not apply"로 거부한다(APP-F04). 마지막 줄만 `\n`을 보충한다.
+fn push_patch_line(buf: &mut String, line: &str) {
+    buf.push_str(line);
+    if !line.ends_with('\n') {
+        buf.push('\n');
+    }
+}
+
 pub fn extract_patch_header_and_hunks(raw_patch: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut hunks = Vec::new();
     let mut current_hunk: Option<String> = None;
-    for line in raw_patch.lines() {
+    for line in raw_patch.split_inclusive('\n') {
         if line.starts_with("@@ ") {
             if let Some(h) = current_hunk.take() {
                 hunks.push(h);
             }
             let mut h = String::new();
-            h.push_str(line);
-            h.push('\n');
+            push_patch_line(&mut h, line);
             current_hunk = Some(h);
         } else if let Some(ref mut h) = current_hunk {
-            h.push_str(line);
-            h.push('\n');
+            push_patch_line(h, line);
         } else {
-            header.push_str(line);
-            header.push('\n');
+            push_patch_line(&mut header, line);
         }
     }
     if let Some(h) = current_hunk {
@@ -497,7 +564,10 @@ pub fn build_line_patch(
     }
     let mut out_hunks = Vec::new();
     for hunk in &hunks {
-        let mut lines = hunk.lines();
+        // `\n`만 떼고 `\r`은 본문의 일부로 남긴다(CRLF 보존).
+        let mut lines = hunk
+            .split_inclusive('\n')
+            .map(|line| line.strip_suffix('\n').unwrap_or(line));
         let Some(hunk_header) = lines.next() else {
             continue;
         };
@@ -911,6 +981,11 @@ impl Panel {
         if self.editing.busy || self.editing.generating {
             return;
         }
+        if self.remote_host() {
+            self.editing.note = text::REMOTE_UNSUPPORTED.get().into();
+            cx.notify();
+            return;
+        }
         let Some(file) = self.changes.files.get(index).cloned() else {
             return;
         };
@@ -1066,11 +1141,12 @@ impl Panel {
         self.editing.busy = true;
         self.editing.note = text::BUSY.get().into();
         self.editing.failure = None;
+        let source = Arc::clone(&self.editing.source);
         let repo = self.repo.clone();
         self.editing.task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { apply_git_patch(&repo, &patch_text, cached, reverse) })
+                .spawn(async move { source.apply_patch(&repo, &patch_text, cached, reverse) })
                 .await;
             this.update(cx, |this, cx| {
                 this.editing.busy = false;
@@ -1248,6 +1324,12 @@ impl Panel {
     }
 
     pub(super) fn open_pr_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_host() {
+            // PR 대화상자는 로컬 git·gh를 쓴다. 원격 저장소에는 아직 경로가 없다.
+            self.editing.note = text::REMOTE_UNSUPPORTED.get().into();
+            cx.notify();
+            return;
+        }
         let branch =
             crate::pull_request::git_output(&self.repo, &["rev-parse", "--abbrev-ref", "HEAD"])
                 .map(|s| s.trim().to_owned())
@@ -1287,6 +1369,9 @@ impl Panel {
         let Some(file) = self.changes.files.get(index) else {
             return div().into_any_element();
         };
+        if self.remote_host() {
+            return div().into_any_element();
+        }
         let path = file.path.clone();
         let enabled = Self::matches_comparison(file, Comparison::Worktree);
         let label = text::DISCARD.get();
@@ -1422,6 +1507,8 @@ impl Panel {
             });
         }
         let busy = self.editing.busy || self.editing.generating;
+        // 원격 호스트: AI 커밋 메시지·PR 생성은 로컬 git을 쓰므로 표시하지 않는다.
+        let remote = self.remote_host();
         let sync_supported = self.editing.sync_supported();
         let has_remote = self.editing.has_remote();
         let remote_unknown = self.editing.has_remote.is_none();
@@ -1530,19 +1617,21 @@ impl Panel {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(
-                                Button::new("git-ai-commit")
-                                    .debug_selector(|| "git-ai-commit".into())
-                                    .xsmall()
-                                    .ghost()
-                                    .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
-                                    .tooltip(text::AI_GENERATE.get())
-                                    .accessibility_label(text::AI_GENERATE.get())
-                                    .disabled(busy)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.generate_commit_message(window, cx);
-                                    })),
-                            )
+                            .when(!remote, |d| {
+                                d.child(
+                                    Button::new("git-ai-commit")
+                                        .debug_selector(|| "git-ai-commit".into())
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
+                                        .tooltip(text::AI_GENERATE.get())
+                                        .accessibility_label(text::AI_GENERATE.get())
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.generate_commit_message(window, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("git-commit-push")
                                     .debug_selector(|| "git-commit-push".into())
@@ -1649,18 +1738,20 @@ impl Panel {
                                         this.run_git_action(Edit::Sync, cx);
                                     })),
                             )
-                            .child(
-                                Button::new("git-create-pr")
-                                    .debug_selector(|| "git-create-pr".into())
-                                    .xsmall()
-                                    .ghost()
-                                    .label(text::CREATE_PR.get())
-                                    .tooltip(text::CREATE_PR_TOOLTIP.get())
-                                    .disabled(busy)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_pr_dialog(window, cx);
-                                    })),
-                            ),
+                            .when(!remote, |d| {
+                                d.child(
+                                    Button::new("git-create-pr")
+                                        .debug_selector(|| "git-create-pr".into())
+                                        .xsmall()
+                                        .ghost()
+                                        .label(text::CREATE_PR.get())
+                                        .tooltip(text::CREATE_PR_TOOLTIP.get())
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_pr_dialog(window, cx);
+                                        })),
+                                )
+                            }),
                     )
                     .when(ahead > 0 || behind > 0, |d| {
                         d.child(

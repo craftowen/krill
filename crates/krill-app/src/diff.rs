@@ -36,7 +36,7 @@ use krill_proto::git::{ChangedFile, Changes, GitWatchReply, GitWatchRequest};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 
-use crate::hosts::HostTarget;
+use crate::hosts::{HostId, HostTarget};
 
 mod checks;
 pub use checks::PanelTab;
@@ -729,9 +729,13 @@ impl Panel {
 
     fn sync_history(&self, cx: &mut Context<Self>) {
         if let Some(history) = &self.history {
-            let open = self.visible && self.tab == PanelTab::History;
+            // 세션 히스토리는 이 Mac의 볼트를 작업공간 경로로 거른다. 원격 호스트 작업공간이면 같은 경로의
+            // 로컬 기록을 그 작업공간 것으로 보여 주지 않는다: 범위를 비우고 패널을 열지 않는다(APP-F01).
+            let remote = self.remote_host();
+            let open = self.visible && self.tab == PanelTab::History && !remote;
+            let scope = (!remote).then(|| self.repo.display().to_string());
             history.update(cx, |h, cx| {
-                h.update_scope_paths(Some(self.repo.display().to_string()), Vec::new(), cx);
+                h.update_scope_paths(scope, Vec::new(), cx);
                 if open != h.is_open() {
                     h.toggle(cx);
                 }
@@ -741,11 +745,58 @@ impl Panel {
 
     pub fn connect(&mut self, target: impl Into<HostTarget>, cx: &mut Context<Self>) {
         let target = target.into();
+        let source: Arc<dyn Source> = Arc::new(Socket::new(target.clone()));
+        self.connect_with(target, Some(source), cx);
+    }
+
+    /// 원격 호스트 작업공간인데 전송(SSH·iroh)이 아직 없거나 끊겼을 때. 로컬 저장소로 되돌아가지 않고
+    /// 원격 모드로 닫아 둔다: 같은 절대 경로의 로컬 저장소는 다른 저장소라 감시·검색·편집·체크·기록을
+    /// 모두 멈추고 연결 안내만 보여 준다. 전송이 생기면 [`Self::connect`]가 실제 타깃으로 바꾼다
+    /// (APP-F01·F05). 로컬 호스트에는 아무것도 하지 않는다.
+    pub fn disconnect_remote(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        let Some(id) = host.remote_id() else {
+            return;
+        };
+        self.connect_with(HostTarget::remote(id, PathBuf::new()), None, cx);
+    }
+
+    /// `source`가 없으면 전송이 없는 원격 호스트다: 감시를 돌리지 않고 연결 안내를 보여 준다.
+    fn connect_with(
+        &mut self,
+        target: HostTarget,
+        source: Option<Arc<dyn Source>>,
+        cx: &mut Context<Self>,
+    ) {
         let target_changed = self.explorer.target.as_ref() != Some(&target);
-        if !target_changed && self.source.is_some() {
+        if !target_changed && (self.source.is_some() || source.is_none()) {
             return;
         }
+        let previous_host = self.explorer.target.as_ref().map(HostTarget::host).cloned();
+        let host_changed = previous_host.as_ref() != Some(target.host());
         self.explorer.connect(target.clone());
+        if host_changed {
+            // 같은 경로라도 호스트가 다르면 다른 저장소다. 이전 호스트의 변경 목록·패치·검색 결과·PR 체크·
+            // 병합 확인·기록 범위를 남기지 않는다. 목록은 새 호스트의 첫 스냅샷이 올 때까지 비워 둔다.
+            self.watch_task = None;
+            self.changes = Changes::default();
+            self.loaded = false;
+            self.repo_error = None;
+            self.watch_gen = 0;
+            self.pending_diff_path = None;
+            if self.selected.take().is_some() {
+                self.invalidate_patch();
+                self.message = text::EMPTY.get().into();
+                self.displayed_patch = None;
+                self.state.update(cx, |s, cx| s.set_files([], cx));
+            }
+            let remote = self.remote_host();
+            self.search.set_remote(remote, self.tab == PanelTab::Search);
+            if self.tab == PanelTab::Search && !self.search.options.query.trim().is_empty() {
+                self.spawn_async_search(cx);
+            }
+            self.checks.reset();
+            self.sync_history(cx);
+        }
         if target_changed && self.explorer.loaded_root {
             let repo = self.explorer.repo.clone();
             self.explorer.set_repo(repo, false);
@@ -753,9 +804,38 @@ impl Panel {
                 self.ensure_explorer_loaded_async(cx);
             }
         }
-        self.editing.connect(target.clone());
-        self.refresh_branch_sync(cx);
-        self.connect_source(Arc::new(Socket::new(target)), cx);
+        self.editing.connect(target);
+        if let Some(source) = source {
+            self.refresh_branch_sync(cx);
+            self.connect_source(source, cx);
+        } else {
+            self.source = None;
+            self.watch_task = None;
+            self.mark_remote_disconnected();
+        }
+        if host_changed && previous_host.is_some() && self.visible && self.tab == PanelTab::Checks {
+            self.refresh_checks(cx);
+        }
+        cx.notify();
+    }
+
+    /// 원격 호스트 작업공간이면 `true`. 로컬 git·파일시스템을 읽거나 바꾸는 동작은 이때 실행하지
+    /// 않는다(IPC로 같은 동작을 보낼 수 없으면 명시적으로 지원하지 않는다고 표시한다, APP-F01·F05).
+    #[must_use]
+    pub fn remote_host(&self) -> bool {
+        self.explorer.remote_target().is_some()
+    }
+
+    /// 전송 없는 원격 호스트([`Self::disconnect_remote`])면 `true`: 감시 소스가 없고 연결 안내만 보인다.
+    fn remote_disconnected(&self) -> bool {
+        self.source.is_none() && self.remote_host()
+    }
+
+    /// 변경 목록 대신 "원격 호스트에 연결되지 않음" 빈 상태를 보인다(폴더가 바뀌어도 유지).
+    fn mark_remote_disconnected(&mut self) {
+        self.loaded = true;
+        self.changes = Changes::default();
+        self.repo_error = Some(text::REMOTE_DISCONNECTED.get().to_owned());
     }
 
     pub fn connect_source(&mut self, source: Arc<dyn Source>, cx: &mut Context<Self>) {
@@ -808,6 +888,9 @@ impl Panel {
         self.loaded = false;
         self.watch_gen = 0;
         self.force_next = false;
+        if self.remote_disconnected() {
+            self.mark_remote_disconnected();
+        }
         self.invalidate_patch();
         self.message = text::EMPTY.get().into();
         self.displayed_patch = None;
@@ -916,8 +999,11 @@ impl Panel {
         if self.editing.busy {
             return;
         }
+        // 전송이 없는 원격 작업공간(`disconnect_remote`)에 이 Mac의 데몬을 붙이면 같은 경로의 로컬
+        // 저장소를 읽게 된다. 원격이면 전송이 생길 때까지 감시를 시작하지 않는다(APP-F01·F05).
         #[cfg(not(test))]
         if self.source.is_none()
+            && !self.remote_host()
             && let Ok(target) = HostTarget::local_dev()
         {
             self.source = Some(Arc::new(Socket::new(target)));
@@ -1141,6 +1227,13 @@ impl Panel {
             return;
         };
         let generation = self.begin_patch_load(index, cx);
+        if self.remote_host() {
+            // 원격 저장소의 상태·패치는 로컬 git으로 읽을 수 없다(같은 경로의 로컬 저장소는 다른 저장소다).
+            self.finish_patch_load(generation, Ok((String::new(), Vec::new())), cx);
+            self.message = text::PATCH_REMOTE_UNSUPPORTED.get().into();
+            cx.notify();
+            return;
+        }
         let (repo, comparison) = (self.repo.clone(), self.comparison);
         let probe = self.pending_diff_path.as_ref() == Some(&file.path)
             && file.staged.is_none()
@@ -2218,6 +2311,23 @@ impl Render for Panel {
         let top_bar = self.render_top_bar(cx);
 
         if self.tab == PanelTab::History {
+            // 원격 호스트의 기록은 이 Mac의 볼트에 없다. 같은 경로의 로컬 기록을 보여 주지 않는다(APP-F01).
+            let body = if self.remote_host() {
+                Self::render_empty_state(
+                    "history-remote-unsupported",
+                    IconName::Search,
+                    text::HISTORY_REMOTE_UNSUPPORTED.get(),
+                    "",
+                    cx,
+                )
+                .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .children(self.history.clone())
+                    .into_any_element()
+            };
             return div()
                 .size_full()
                 .min_w_0()
@@ -2229,7 +2339,7 @@ impl Render for Panel {
                 .text_size(crate::ui::TEXT_SM)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
-                .child(div().flex_1().min_h_0().children(self.history.clone()));
+                .child(body);
         }
 
         if self.tab == PanelTab::Files {

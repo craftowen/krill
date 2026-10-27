@@ -20,6 +20,7 @@ gpui-component = { workspace = true, features = ["tree-sitter-rust"] }
 gpui-kit-assets = { workspace = true }
 raw-window-handle = { workspace = true }
 postcard = { workspace = true }
+regex = { workspace = true }
 rustix = { workspace = true }
 ring = { workspace = true }
 serde = { workspace = true }
