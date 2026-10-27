@@ -195,6 +195,9 @@ fn mobile_enter_mints_first_device_or_standalone_page_without_rotation(
                         pairing_offer("https://example.test/#pair=fixture", u64::MAX)
                     }
                     MobileRequest::ConnectedDevices => MobileReply::ConnectedDevices(Vec::new()),
+                    MobileRequest::Workflow(_) => {
+                        MobileReply::Workflow("{\"ok\":true,\"data\":{\"signed_in\":false}}".into())
+                    }
                     other => panic!("unexpected request: {other:?}"),
                 })
             }));
@@ -282,6 +285,9 @@ fn mobile_poll_renews_missing_failed_or_expired_standalone_offer(cx: &mut gpui::
                         active_offer: false,
                         devices: vec![device(1, 1)],
                     }),
+                    MobileRequest::Workflow(_) => Ok(MobileReply::Workflow(
+                        "{\"ok\":true,\"data\":{\"signed_in\":false}}".into(),
+                    )),
                     other => panic!("unexpected request: {other:?}"),
                 }
             }));
@@ -465,4 +471,36 @@ fn mobile_copy_buttons_copy_the_url_encoded_in_the_qr(cx: &mut gpui::TestAppCont
             assert_eq!(mobile.copied_url.as_deref(), Some(FIXTURE_TICKET));
         });
     }
+}
+
+#[gpui::test]
+fn relay_account_states_keep_card_and_buttons_in_place(cx: &mut gpui::TestAppContext) {
+    let (view, vcx) = offer_view(cx, true);
+    redraw(vcx, 480., 1.);
+    let bounds = |vcx: &mut gpui::VisualTestContext| {
+        [
+            "mobile-relay-account",
+            "mobile-relay-login",
+            "mobile-relay-logout",
+        ]
+        .map(|id| vcx.debug_bounds(id).expect("account control"))
+    };
+    let original = bounds(vcx);
+    for (pending, email) in [
+        (true, None),
+        (false, Some("a-long-account-email@example.test".to_owned())),
+        (false, None),
+    ] {
+        view.update(vcx, |view, cx| {
+            view.mobile.account.pending = pending;
+            view.mobile.account.email = email;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(bounds(vcx), original);
+    }
+    redraw(vcx, 360., 1.);
+    let [card, login, logout] = bounds(vcx);
+    assert!(inside(span(login), span(card)));
+    assert!(inside(span(logout), span(card)));
 }

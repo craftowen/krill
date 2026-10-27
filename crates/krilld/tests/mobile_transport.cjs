@@ -249,3 +249,28 @@ test('resume refresh still disconnects a truly stalled transport at the RPC dead
  const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;h.transport.setActive(false);
  h.transport.resume();await flush();await h.tick(15000);assert.equal(h.transport.ready,false);assert.equal(socket.closed,true);h.transport.close();
 });
+
+test('hosted discovery 401 blocks retries and offers Google login without clearing E2EE credentials',async()=>{
+ const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,undefined,true);let options;
+ h.context.fetch=async(_url,request)=>{options=request;return {status:401,ok:false};};
+ const {pending,socket}=await h.start();socket.emit('error');await pending;
+ assert.equal(h.context.KrillMobile.relayAccount.required,true);
+ assert.equal(options.credentials,'same-origin');
+ assert.equal(h.transport.state.phase,'auth_required');
+ assert.equal(h.transport.blocked,true);
+ assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).credential,saved.credential);
+ const count=h.sockets.length;await h.tick(30000);assert.equal(h.sockets.length,count);h.transport.close();
+});
+
+test('Google login keeps pairing fragment only in session storage and restores it once',()=>{
+ const h=harness(null,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'c'.repeat(32)),sessions=new Map(),navigations=[];
+ h.context.sessionStorage={getItem:key=>sessions.get(key)||null,setItem:(key,value)=>sessions.set(key,value),removeItem:key=>sessions.delete(key)};
+ h.context.location.assign=url=>navigations.push(url);
+ h.context.KrillMobile.transport.bootstrap();h.context.location.hash='';
+ h.context.KrillMobile.relayAccount.signIn();
+ assert.equal(navigations[0],'/auth?return_to=%2Fm%2F0123456789abcdef%2F');
+ assert.doesNotMatch(navigations[0],/pair|key|credential/);
+ assert.match(sessions.get('krill-relay-return'),/pair=aa/);
+ const endpoint=h.context.KrillMobile.transport.bootstrap();
+ assert.equal(endpoint.pair.ticket,'aa');assert.equal(sessions.size,0);
+});

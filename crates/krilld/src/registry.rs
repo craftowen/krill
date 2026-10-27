@@ -576,7 +576,11 @@ impl Registry {
                 let reply = if !allowed {
                     MobileReply::Failed("permission denied".into())
                 } else if let Some(gateway) = self.mobile.get() {
-                    gateway.request(request)
+                    if mobile {
+                        gateway.request(request)
+                    } else {
+                        gateway.request_local(request)
+                    }
                 } else {
                     MobileReply::Failed("mobile gateway unavailable".into())
                 };
