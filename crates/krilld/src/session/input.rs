@@ -5,10 +5,10 @@ use std::sync::TryLockError;
 
 use super::{BorrowedFd, Duration, MutexGuard, Tap, io, thread};
 use crate::os::AsFd as _;
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::io::Errno;
 #[cfg(unix)]
-use rustix::io::write;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+#[cfg(unix)]
+use rustix::io::{Errno, write};
 
 const START: &[u8] = b"\x1b[200~";
 const END: &[u8] = b"\x1b[201~";
@@ -59,6 +59,7 @@ impl State {
     }
 }
 
+#[cfg(unix)]
 fn disconnected(peer: BorrowedFd<'_>) -> io::Result<bool> {
     let mut fds = [PollFd::from_borrowed_fd(peer, PollFlags::HUP)];
     match poll(
@@ -72,6 +73,13 @@ fn disconnected(peer: BorrowedFd<'_>) -> io::Result<bool> {
         Err(Errno::INTR) => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Windows: `WSAPoll`은 요청 마스크의 `HUP`를 거부하고(WSAEINVAL) 정상 종료(FIN)는 `HUP` 없이 "읽을 수 있음"으로만
+/// 보일 수 있어, 소켓 전용 판정([`crate::sys::socket_disconnected`])을 쓴다. Unix의 `HUP` 폴링은 그대로다.
+#[cfg(windows)]
+fn disconnected(peer: BorrowedFd<'_>) -> io::Result<bool> {
+    crate::sys::socket_disconnected(peer)
 }
 
 fn alive(tap: &Tap, peer: Option<BorrowedFd<'_>>) -> io::Result<()> {
