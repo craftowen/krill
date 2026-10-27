@@ -88,9 +88,19 @@ fn plain(bytes: &[u8]) -> String {
     crate::term::printed_text(bytes)
 }
 
+pub(super) fn contains_phrase(output: &str, phrase: &str) -> bool {
+    // Native renderers may position each word with CSI column moves instead of printing spaces.
+    // The current screen still supplies exact target/layout authority; this only checks fresh text.
+    output
+        .split_whitespace()
+        .collect::<String>()
+        .contains(&phrase.split_whitespace().collect::<String>())
+}
+
 pub(super) fn fresh_confirmation(tap: &crate::session::Tap, from: u64, id: &str) -> bool {
     let output = fresh_text(tap, from);
-    output.contains(&format!("Model changed to {id} ")) && output.contains("for this session only")
+    contains_phrase(&output, &format!("Model changed to {id} "))
+        && contains_phrase(&output, "for this session only")
 }
 
 pub(super) fn latest_confirmation(screen: &Screen, id: &str) -> bool {
@@ -117,6 +127,13 @@ pub(super) fn latest_confirmation(screen: &Screen, id: &str) -> bool {
 mod tests {
     use super::*;
     use krill_proto::screen::{Cell, Cursor};
+    #[test]
+    fn cursor_positioned_words_are_fresh_confirmation_text() {
+        let printed = plain(b"\x1b[2GSet\x1b[6Gmodel\x1b[12Gto\x1b[15GOpus\x1b[20G5.5");
+        assert!(contains_phrase(&printed, "Set model to"));
+        assert!(!contains_phrase(&printed, "Model changed to"));
+        assert!(!contains_phrase("unrelated output", "Set model to"));
+    }
     fn screen(draft: &str) -> Screen {
         let lines = [
             ">_ OpenAI Codex (v0.164.0)",

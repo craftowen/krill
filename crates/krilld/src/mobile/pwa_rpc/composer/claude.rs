@@ -130,7 +130,7 @@ pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Va
         if after.0 > revision.0
             && composer(&screen, None)
             && confirmed(&screen, label)
-            && native::fresh_text(tap, seq.0).contains("Set model to")
+            && native::contains_phrase(&native::fresh_text(tap, seq.0), "Set model to")
         {
             return Ok(json!({"applied":true,"supported":true,"model":id}));
         }
