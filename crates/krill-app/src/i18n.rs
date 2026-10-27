@@ -198,6 +198,16 @@ catalog! {
         PREVIEW_SUBTITLE => ("호스팅된 공개 링크 및 로컬 원본 파일 요약입니다.", "Hosted public link and local source summary."),
         LOCAL_SOURCE => ("로컬 원본", "Local source"),
         SLUG_LABEL => ("슬러그", "Slug"),
+        RETENTION_TITLE => ("공유 기한", "Sharing period"),
+        RETENTION_DEFAULT => ("새 링크 기본 기한", "Default period for new links"),
+        RETENTION_HINT => ("선택한 날부터 기한을 다시 계산합니다. 내용 수정 시에도 이 기간을 유지합니다.", "The period starts when selected and renews on content updates."),
+        RETENTION_DEFAULT_HINT => ("기존 링크의 기한은 바뀌지 않습니다. 파일당 최대 10 MiB.", "Existing links keep their period. Up to 10 MiB per file."),
+        RETENTION_7 => ("7일", "7d"),
+        RETENTION_30 => ("30일", "30d"),
+        RETENTION_90 => ("90일", "90d"),
+        RETENTION_365 => ("1년", "1yr"),
+        RETENTION_DAYS => ("{days}일", "{days} days"),
+        RETENTION_NEVER => ("무기한", "Never"),
     }
     automations {
         TITLE => ("자동화", "Automations"),

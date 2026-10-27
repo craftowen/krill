@@ -684,3 +684,6 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 .chat-live-strip>[data-state=Offline]{color:var(--muted-foreground)}
 
 #mobile-app .chat-composer-bar>.composer-pill{min-width:0;max-width:calc(100% - 112px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Native IME preedit stays local and visible without resizing the TUI. */
+.terminal-preedit{position:absolute;z-index:2;left:var(--space-md);right:var(--space-md);bottom:var(--space-sm);width:max-content;max-width:calc(100% - 2 * var(--space-md));padding:var(--space-xs) var(--space-sm);border:1px solid var(--border);border-radius:var(--radius-row);background:var(--surface-raised);color:var(--foreground);font:var(--font-meta) var(--font-mono);text-decoration:underline;white-space:pre;overflow:hidden;pointer-events:none}

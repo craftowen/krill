@@ -135,6 +135,91 @@ fn display_labels_format_type_size_and_timestamps_like_orca() {
 }
 
 #[gpui::test]
+fn retention_changes_preserve_link_and_keep_previous_state_on_failure(cx: &mut TestAppContext) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let view = cx.new(|cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    cx.run_until_parked();
+    view.update(cx, |v, cx| {
+        v.retention_call = Arc::new(move |slug, days| {
+            seen.lock().unwrap().push((slug, days));
+            if days == 7 {
+                return Err("offline".into());
+            }
+            let mut item = page("one", None).artifacts.remove(0);
+            item.artifact.retention_days = Some(days);
+            item.artifact.expires_at = None;
+            Ok(item)
+        });
+        v.set_retention("one".into(), 0, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.items[0].artifact.retention_days, Some(0));
+        assert_eq!(v.items[0].share_url, "https://share.krill.page/a/one");
+        assert_eq!(
+            retention::expiration_label(&v.items[0].artifact),
+            text::RETENTION_NEVER.get()
+        );
+        assert!(v.retention_slug.is_none());
+    });
+    view.update(cx, |v, cx| v.set_retention("one".into(), 7, cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.error.as_deref(), Some("offline"));
+        assert_eq!(v.items[0].artifact.retention_days, Some(0));
+    });
+    view.update(cx, |v, cx| {
+        v.sharing_enabled = false;
+        v.set_retention("one".into(), 30, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[("one".into(), 0), ("one".into(), 7)]
+    );
+}
+
+#[gpui::test]
+fn retention_selection_keeps_control_bounds_and_persists_the_default(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-artifact-retention-ui-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(
+            Arc::new(|_| Ok(page("one", None))),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    vcx.simulate_resize(gpui::size(px(900.), px(900.)));
+    vcx.run_until_parked();
+    let before = vcx.debug_bounds("artifacts-default-retention").unwrap();
+    view.update(vcx, |v, cx| v.set_default_retention(0, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("artifacts-default-retention").unwrap(),
+        before
+    );
+    assert_eq!(
+        krill_proto::artifacts::default_retention_days(&dir).unwrap(),
+        0
+    );
+    view.update(vcx, |v, cx| v.select_slug(Some("one".into()), cx));
+    vcx.run_until_parked();
+    let drawer = vcx.debug_bounds("artifact-detail-drawer").unwrap();
+    let bounds = vcx.debug_bounds("artifact-retention").unwrap();
+    assert!(bounds.left() >= drawer.left());
+    assert!(bounds.right() <= drawer.right());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
 fn escape_clears_query_then_closes_drawer_then_emits_close_and_delete_removes_item(
     cx: &mut TestAppContext,
 ) {

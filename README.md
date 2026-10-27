@@ -133,7 +133,7 @@ Scan a QR code in **Settings → Mobile** to monitor live agent states and open 
 <td width="50%" valign="top">
 
 ### 6. 1-Click Sandboxed Artifacts (`share.krill.page`)
-Publish agent-generated HTML reports, architecture diagrams, and Markdown documents as a single sandboxed public link (90-day expiry, 2 MB limit) and update or revoke the same URL anytime with `krill artifacts share`.
+Publish agent-generated HTML reports, architecture diagrams, and Markdown documents as a single sandboxed public link (configurable expiry, including no expiry; 10 MiB limit) and update or revoke the same URL anytime with `krill artifacts share`.
 
 [Artifacts Guide →](docs/ARTIFACTS.md)
 

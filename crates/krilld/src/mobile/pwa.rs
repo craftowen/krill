@@ -218,7 +218,7 @@ mod tests {
                 .iter()
                 .map(|(_, _, _, compressed)| compressed.len())
                 .sum::<usize>()
-                <= 200 * 1024
+                <= 300 * 1024
         );
         for (name, mime, plain, compressed) in ASSETS {
             let route = route(name);

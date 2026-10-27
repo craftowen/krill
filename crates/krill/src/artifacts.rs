@@ -25,14 +25,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const USAGE: &str =
-    "usage: krill artifacts share <file> [--title <title>] [--api-url <url>] [--json]
-       krill artifacts update <file> [--title <title>] [--api-url <url>] [--json]
+    "usage: krill artifacts share <file> [--title <title>] [--expires-in <days|never>] [--api-url <url>] [--json]
+       krill artifacts update <file> [--title <title>] [--expires-in <days|never>] [--api-url <url>] [--json]
+       krill artifacts retention <slug> --expires-in <days|never> [--api-url <url>] [--json]
        krill artifacts unshare <file> [--api-url <url>] [--json]
        krill artifacts status <file> [--api-url <url>] [--json]
        krill artifacts list [--cursor <cursor>] [--api-url <url>] [--json]
        krill artifacts delete|rm <slug> [--api-url <url>] [--json]";
 const DEFAULT_API_URL: &str = "https://share.krill.page";
-const MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_BYTES: u64 = schema::MAX_CONTENT_BYTES;
 const TOKEN_FILE: &str = "artifact-token";
 const SHARES_FILE: &str = "artifact-shares.json";
 
@@ -44,6 +45,8 @@ struct Record {
     api_origin: String,
     #[serde(default)]
     expires_at: String,
+    #[serde(default)]
+    retention_days: Option<u16>,
 }
 
 type Shares = BTreeMap<String, Record>;
@@ -60,6 +63,7 @@ struct Opts {
     title: Option<String>,
     api_url: Option<String>,
     cursor: Option<String>,
+    retention_days: Option<u16>,
     json: bool,
 }
 
@@ -198,7 +202,13 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
         [v] => Ok(v.clone()),
         _ => Err(Error::Usage(format!("missing or extra <{what}>\n{USAGE}"))),
     };
+    if opts.retention_days.is_some() && !matches!(cmd.as_str(), "share" | "update" | "retention") {
+        return Err(Error::Usage(
+            "--expires-in is only valid for share, update, or retention".into(),
+        ));
+    }
     match cmd.as_str() {
+        "retention" => retention(ctx, &api, &one("slug")?, &opts),
         "share" => share(ctx, &api, &one("file")?, &opts, false),
         "update" => share(ctx, &api, &one("file")?, &opts, true),
         "unshare" => unshare(ctx, &api, &one("file")?, &opts),
@@ -222,6 +232,13 @@ fn parse(rest: &[String]) -> Result<Opts, Error> {
             "--json" => opts.json = true,
             "--title" => opts.title = Some(value("--title")?),
             "--api-url" => opts.api_url = Some(value("--api-url")?),
+            "--expires-in" => {
+                let raw = value("--expires-in")?;
+                opts.retention_days =
+                    Some(schema::parse_retention_days(&raw).ok_or_else(|| {
+                        Error::Usage("--expires-in must be 1..3650 days or never".into())
+                    })?);
+            }
             "--cursor" => opts.cursor = Some(value("--cursor")?),
             s if s.starts_with("--") => {
                 return Err(Error::Usage(format!("unknown flag {s}\n{USAGE}")));
@@ -267,7 +284,10 @@ fn share(
             next_steps: Some(SHARING_DISABLED_NEXT_STEPS),
         });
     }
-    let (key, body) = read_artifact(file, opts.title.as_deref())?;
+    let (key, mut body) = read_artifact(file, opts.title.as_deref())?;
+    if let Some(days) = opts.retention_days {
+        body["retentionDays"] = json!(days);
+    }
     let token = owner_token(&ctx.state_dir)?;
     let mut shares = load_shares(&ctx.state_dir)?;
     let existing = shares.get(&key).filter(|r| r.api_origin == api).cloned();
@@ -279,22 +299,36 @@ fn share(
     }
     if let Some(rec) = existing {
         let url = format!("{api}/v1/artifacts/{}", rec.slug);
-        let (status, resp) = request(ctx, "PUT", &url, &token, Some(&rec.edit_token), Some(&body))?;
+        let (status, resp) = request(
+            ctx,
+            "PUT",
+            &url,
+            &token,
+            Some(&rec.edit_token),
+            Some(&body.to_string()),
+        )?;
         if status != 404 || update_only {
             let v = expect_ok(status, &resp)?;
+            let requested_retention = opts.retention_days.or(rec.retention_days);
+            let retention_days = returned_retention(&v, None)?;
             let rec = Record {
                 share_url: str_field(&v, "shareUrl").unwrap_or(rec.share_url),
                 expires_at: v["artifact"]["expiresAt"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
+                retention_days: Some(retention_days),
                 ..rec
             };
             shares.insert(key, rec.clone());
             save_shares(&ctx.state_dir, &shares)?;
+            returned_retention(&v, requested_retention)?;
             return Ok(share_output(&rec, "updated", opts.json));
         }
         // 서버에서 만료·삭제됐다. 새로 만든다.
+    }
+    if opts.retention_days.is_none() {
+        body["retentionDays"] = json!(schema::default_retention_days(&ctx.state_dir)?);
     }
     let (status, resp) = request(
         ctx,
@@ -302,9 +336,10 @@ fn share(
         &format!("{api}/v1/artifacts"),
         &token,
         None,
-        Some(&body),
+        Some(&body.to_string()),
     )?;
     let v = expect_ok(status, &resp)?;
+    let retention_days = returned_retention(&v, None)?;
     let (Some(slug), Some(edit_token), Some(share_url)) = (
         v["artifact"]["slug"].as_str(),
         str_field(&v, "editToken"),
@@ -317,6 +352,7 @@ fn share(
         edit_token,
         share_url,
         api_origin: api.to_owned(),
+        retention_days: Some(retention_days),
         expires_at: v["artifact"]["expiresAt"]
             .as_str()
             .unwrap_or_default()
@@ -324,6 +360,12 @@ fn share(
     };
     shares.insert(key, rec.clone());
     save_shares(&ctx.state_dir, &shares)?;
+    returned_retention(
+        &v,
+        body["retentionDays"]
+            .as_u64()
+            .and_then(|days| u16::try_from(days).ok()),
+    )?;
     Ok(share_output(&rec, "created", opts.json))
 }
 
@@ -348,12 +390,65 @@ fn unshare(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Erro
     Ok(deleted_output(&rec.slug, opts.json))
 }
 
+/// 본문을 재업로드하지 않고 기존 링크의 보존 기간만 바꾼다.
+fn retention(ctx: &Ctx, api: &str, slug: &str, opts: &Opts) -> Result<String, Error> {
+    if !schema::sharing_enabled(&ctx.state_dir) {
+        return Err(Error::Coded {
+            code: SHARING_DISABLED_CODE.to_owned(),
+            message: "artifact sharing is disabled on this device".into(),
+            next_steps: Some(SHARING_DISABLED_NEXT_STEPS),
+        });
+    }
+    if slug.is_empty()
+        || !slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(Error::Usage("invalid artifact slug".into()));
+    }
+    let days = opts
+        .retention_days
+        .ok_or_else(|| Error::Usage("retention requires --expires-in <days|never>".into()))?;
+    let mut shares = load_shares(&ctx.state_dir)?;
+    let edit = shares
+        .values()
+        .find(|r| r.slug == slug && r.api_origin == api)
+        .map(|r| r.edit_token.as_str());
+    let token = owner_token(&ctx.state_dir)?;
+    let (status, resp) = request(
+        ctx,
+        "PATCH",
+        &format!("{api}/v1/artifacts/{slug}"),
+        &token,
+        edit,
+        Some(&json!({"retentionDays": days}).to_string()),
+    )?;
+    let result = expect_ok(status, &resp)?;
+    for rec in shares
+        .values_mut()
+        .filter(|r| r.slug == slug && r.api_origin == api)
+    {
+        result["artifact"]["expiresAt"]
+            .as_str()
+            .unwrap_or_default()
+            .clone_into(&mut rec.expires_at);
+        rec.retention_days = Some(days);
+    }
+    save_shares(&ctx.state_dir, &shares)?;
+    if opts.json {
+        Ok(result.to_string())
+    } else {
+        Ok(result["shareUrl"].as_str().unwrap_or_default().to_owned())
+    }
+}
+
 /// 네트워크 없이 로컬 공유 기록만 본다(에이전트·스크립트가 링크 유무와 게이트 상태를 확인할 때 쓴다).
 fn status(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Error> {
     let key = canonical(file)?;
     let shares = load_shares(&ctx.state_dir)?;
     let rec = shares.get(&key).filter(|r| r.api_origin == api);
     let st = LinkStatus {
+        retention_days: rec.and_then(|r| r.retention_days),
         shared: rec.is_some(),
         sharing_enabled: schema::sharing_enabled(&ctx.state_dir),
         slug: rec.map(|r| r.slug.clone()),
@@ -394,12 +489,17 @@ fn list(ctx: &Ctx, api: &str, opts: &Opts) -> Result<String, Error> {
                 .as_str()
                 .or_else(|| a["originalFileName"].as_str())
                 .unwrap_or("Untitled");
+            let expires = if a["retentionDays"].as_u64() == Some(0) {
+                "never"
+            } else {
+                a["expiresAt"].as_str().unwrap_or("?")
+            };
             format!(
                 "{}  {}  {}  expires {}",
                 a["slug"].as_str().unwrap_or("?"),
                 name,
                 it["shareUrl"].as_str().unwrap_or(""),
-                a["expiresAt"].as_str().unwrap_or("?"),
+                expires,
             )
         })
         .collect();
@@ -441,6 +541,7 @@ fn share_output(rec: &Record, change: &str, as_json: bool) -> String {
             "slug": rec.slug,
             "shareUrl": rec.share_url,
             "expiresAt": rec.expires_at,
+            "retentionDays": rec.retention_days,
         })
         .to_string()
     } else {
@@ -460,6 +561,21 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
     v[key].as_str().map(str::to_owned)
 }
 
+/// 구 서버가 기한 옵션을 무시한 경우 무기한 등으로 잘못 보고하지 않는다.
+fn returned_retention(value: &Value, requested: Option<u16>) -> Result<u16, Error> {
+    let actual = value["artifact"]["retentionDays"]
+        .as_u64()
+        .and_then(|days| u16::try_from(days).ok())
+        .unwrap_or(schema::DEFAULT_RETENTION_DAYS);
+    if requested.is_some_and(|days| days != actual) {
+        return Err(Error::coded(
+            "retention_unsupported",
+            "the server did not apply the requested sharing period; update the sharing server before retrying",
+        ));
+    }
+    Ok(actual)
+}
+
 fn canonical(file: &str) -> Result<String, Error> {
     let path = fs::canonicalize(file).map_err(|e| Error::Fail(format!("{file}: {e}")))?;
     path.into_os_string()
@@ -468,7 +584,7 @@ fn canonical(file: &str) -> Result<String, Error> {
 }
 
 /// 파일을 검증하고 (정규 경로, 요청 본문 JSON)을 돌려준다.
-fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, String), Error> {
+fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, Value), Error> {
     let key = canonical(file)?;
     let path = Path::new(&key);
     let ext = path
@@ -493,11 +609,17 @@ fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, String), Er
     if meta.len() > MAX_BYTES {
         return Err(Error::coded(
             "too_large",
-            format!("{file}: larger than 2 MiB"),
+            format!("{file}: larger than 10 MiB"),
         ));
     }
     let content =
         fs::read_to_string(path).map_err(|e| Error::coded("unreadable", format!("{file}: {e}")))?;
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+        return Err(Error::coded(
+            "too_large",
+            format!("{file}: larger than 10 MiB"),
+        ));
+    }
     if content.trim().is_empty() {
         return Err(Error::coded("empty", format!("{file}: file is empty")));
     }
@@ -510,7 +632,7 @@ fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, String), Er
     if let Some(t) = title {
         body["title"] = json!(t);
     }
-    Ok((key, body.to_string()))
+    Ok((key, body))
 }
 
 /// 상태 디렉터리의 영구 소유자 토큰. 없으면 OS CSPRNG 32바이트로 만든다(0600).
@@ -721,14 +843,20 @@ while [ $# -gt 0 ]; do
   shift
 done
 { echo "$method $url"; cat "$hdr"; } >> "$dir/log"
-[ "$method" = POST ] || [ "$method" = PUT ] && cat > "$dir/body"
+[ "$method" = POST ] || [ "$method" = PUT ] || [ "$method" = PATCH ] && cat > "$dir/body"
+period=$(sed -n 's/.*"retentionDays":\([0-9]*\).*/\1/p' "$dir/body" 2>/dev/null)
+[ -z "$period" ] || echo "$period" > "$dir/period"
+period=$(cat "$dir/period" 2>/dev/null)
+period=${period:-30}
 case "$method $url" in
   "POST http://localhost/v1/artifacts")
-    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://localhost/a/s1","editToken":"e1"}\n201' ;;
+    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01","retentionDays":%s},"shareUrl":"http://localhost/a/s1","editToken":"e1"}\n201' "$period" ;;
   "PUT http://localhost/v1/artifacts/s1")
-    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-02"},"shareUrl":"http://localhost/a/s1"}\n200' ;;
+    printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-02","retentionDays":%s},"shareUrl":"http://localhost/a/s1"}\n200' "$period" ;;
   "PUT http://localhost/v1/artifacts/gone")
     printf '{"code":"not_found"}\n404' ;;
+  "PATCH http://localhost/v1/artifacts/s1")
+    printf '{"artifact":{"slug":"s1","expiresAt":null,"retentionDays":0},"shareUrl":"http://localhost/a/s1"}\n200' ;;
   "DELETE http://localhost/v1/artifacts/"*)
     printf '\n204' ;;
   "GET http://localhost/v1/artifacts"*)
@@ -788,6 +916,104 @@ esac
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn periods_follow_defaults_allow_overrides_and_patch_without_source_file() {
+        let env = Env::new("retention");
+        let file = env.file("r.md", "# test");
+        schema::set_default_retention_days(&env.ctx.state_dir, 90).unwrap();
+        env.run(&["share", &file]).unwrap();
+        let body = || {
+            serde_json::from_str::<Value>(&fs::read_to_string(env.dir.join("body")).unwrap())
+                .unwrap()
+        };
+        assert_eq!(body()["retentionDays"], 90);
+        // Omitting the flag on an update preserves the server-side policy.
+        schema::set_default_retention_days(&env.ctx.state_dir, 7).unwrap();
+        env.run(&["update", &file]).unwrap();
+        assert!(body().get("retentionDays").is_none());
+        env.run(&["update", &file, "--expires-in", "365"]).unwrap();
+        assert_eq!(body()["retentionDays"], 365);
+        fs::remove_file(&file).unwrap();
+        env.run(&["retention", "s1", "--expires-in", "never", "--json"])
+            .unwrap();
+        assert_eq!(body(), json!({"retentionDays": 0}));
+        let record = env.shares().into_values().next().unwrap();
+        assert_eq!(record.retention_days, Some(0));
+        assert!(record.expires_at.is_empty());
+        assert!(env.log().contains("PATCH http://localhost/v1/artifacts/s1"));
+        assert!(env.log().contains("x-krill-edit-token: e1"));
+    }
+
+    #[test]
+    fn rejects_invalid_periods_and_disabled_retention_without_network() {
+        let env = Env::new("retention-invalid");
+        let file = env.file("r.md", "# test");
+        for raw in ["0", "-1", "3651", "1.5", "invalid", ""] {
+            assert!(matches!(
+                env.run(&["share", &file, "--expires-in", raw]),
+                Err(Error::Usage(_))
+            ));
+        }
+        assert!(matches!(
+            env.run(&["list", "--expires-in", "7"]),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            env.run(&["retention", "s1"]),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            env.run(&["retention", "../s1", "--expires-in", "7"]),
+            Err(Error::Usage(_))
+        ));
+        schema::disable_sharing(&env.ctx.state_dir).unwrap();
+        assert!(
+            matches!(env.run(&["retention", "s1", "--expires-in", "never"]), Err(Error::Coded { code, .. }) if code == SHARING_DISABLED_CODE)
+        );
+        assert!(env.log().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_server_cannot_silently_claim_no_expiry_and_the_link_stays_manageable() {
+        let env = Env::new("legacy-retention");
+        fs::write(&env.ctx.curl, r#"#!/bin/sh
+cat >/dev/null
+printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://localhost/a/s1","editToken":"e1"}\n201'
+"#).unwrap();
+        let file = env.file("r.md", "# test");
+        assert!(
+            matches!(env.run(&["share", &file, "--expires-in", "never"]),
+            Err(Error::Coded { code, .. }) if code == "retention_unsupported")
+        );
+        let status: LinkStatus =
+            serde_json::from_str(&env.run(&["status", &file, "--json"]).unwrap()).unwrap();
+        assert_eq!(status.retention_days, Some(30));
+        assert_eq!(status.share_url.as_deref(), Some("http://localhost/a/s1"));
+    }
+
+    #[test]
+    fn ten_mib_utf8_files_are_allowed_and_the_next_byte_is_rejected() {
+        let env = Env::new("ten-mib");
+        let file = env.file(
+            "big.html",
+            &"\"".repeat(usize::try_from(MAX_BYTES).unwrap()),
+        );
+        let (_, body) = read_artifact(&file, None).unwrap();
+        assert_eq!(
+            body["content"].as_str().unwrap().len(),
+            usize::try_from(MAX_BYTES).unwrap()
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        assert!(
+            matches!(read_artifact(&file, None), Err(Error::Coded { code, .. }) if code == "too_large")
+        );
     }
 
     #[test]
@@ -854,6 +1080,7 @@ esac
             share_url: "http://localhost/a/gone".into(),
             api_origin: "http://localhost".into(),
             expires_at: String::new(),
+            retention_days: None,
         };
         save_shares(&env.ctx.state_dir, &Shares::from([(key.clone(), stale)])).unwrap();
         assert_eq!(env.run(&["share", &f]).unwrap(), "http://localhost/a/s1");
@@ -1086,6 +1313,7 @@ esac
             share_url: String::new(),
             api_origin: "http://localhost".into(),
             expires_at: String::new(),
+            retention_days: None,
         };
         save_shares(&env.ctx.state_dir, &Shares::from([(key, rec)])).unwrap();
         let Err(e) = env.run(&["update", &f]) else {

@@ -158,14 +158,14 @@ async function main(){
  const attach=socket.sent.find(a=>a[4]===0x10),role=socket.sent.find(a=>a[4]===0x17);assert.deepEqual([...attach.slice(-2)],[0,0]);assert.deepEqual([...role.slice(5)],[0,2,0]);
  let count=inputs(socket).length;event(key(root,'backspace'),'pointerdown',{button:0,pointerId:1});await flush();assert.equal(inputs(socket).length,count+1);await advance(399);assert.equal(inputs(socket).length,count+1);await advance(1);assert.equal(inputs(socket).length,count+2);await advance(45);assert.equal(inputs(socket).length,count+3);event(key(root,'backspace'),'pointerup');await advance(500);assert.equal(inputs(socket).length,count+3);console.log('PASS repeat immediate / 400ms / 45ms and release');
  const capture=find(root,'live-capture');handle.focus();count=inputs(socket).length;event(capture,'compositionstart');capture.value='ㅎ';event(capture,'input',{isComposing:true});capture.value='한';event(capture,'input',{isComposing:true});assert.equal(inputs(socket).length,count);event(capture,'compositionend',{data:'한'});capture.value='한';event(capture,'input',{isComposing:false});await flush();assert.deepEqual(inputs(socket).slice(count),['한']);
- event(capture,'compositionstart');capture.value='한글';const pending=handle.sendKey('enter');event(capture,'compositionend',{data:'글'});await pending;assert.deepEqual(inputs(socket).slice(-2),['글','\r']);console.log('PASS Korean IME commit once and control-key ordering');
+ event(capture,'compositionstart');capture.value='한글';const pending=handle.sendKey('enter');event(capture,'compositionend',{data:'글'});await advance(0);await pending;handle.focus();assert.deepEqual(inputs(socket).slice(-2),['글','\r']);console.log('PASS Korean IME commit once and control-key ordering');
  // iOS 한글 키보드 모델: 조합 이벤트 없이 앞 음절을 지우고(deleteContentBackward) 새 음절을 넣는다. textarea를 비우지 않아야 다음 자모가 앞 글자와 합쳐진다.
  count=inputs(socket).length;handle.sendKey('escape');count++;const type=(value,inputType)=>{const before=event(capture,'beforeinput',{inputType});if(!before.defaultPrevented)capture.value=value;event(capture,'input',{inputType});return before;};
  for(const [value,inputType] of [['ㅎ','insertText'],['','deleteContentBackward'],['하','insertText'],['','deleteContentBackward'],['한','insertText'],['한ㄱ','insertText'],['한','deleteContentBackward'],['한그','insertText'],['한','deleteContentBackward'],['한글','insertText']]){assert.equal(type(value,inputType).defaultPrevented,false);assert.equal(capture.value,value);}
- await flush();assert.deepEqual(inputs(socket).slice(count),['ㅎ','\x7f','하','\x7f','한','ㄱ','\x7f','그','\x7f','글']);
- count=inputs(socket).length;capture.value='한글!';event(capture,'input');capture.value='한글?';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['!','\x7f?']);
+ await flush();assert.deepEqual(inputs(socket).slice(count),['한']);assert.equal(find(root,'terminal-preedit').textContent,'글');
+ count=inputs(socket).length;capture.value='한글!';event(capture,'input');capture.value='한글?';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['글!','\x7f?']);
  count=inputs(socket).length;await handle.sendKey('enter');assert.equal(capture.value,'');assert(type('','deleteContentBackward').defaultPrevented);event(capture,'keydown',{key:'Backspace'});await flush();assert.deepEqual(inputs(socket).slice(count),['\r','\x7f','\x7f']);
- capture.value='a';event(capture,'input');assert.equal(event(capture,'keydown',{key:'Backspace'}).defaultPrevented,false);await flush();count=inputs(socket).length;handle.toggleShift(true);capture.value='ab';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['B']);console.log('PASS iOS-style replace-in-place Hangul keeps textarea context, diff sends DEL+syllable, control keys reset context');
+ capture.value='a';event(capture,'input');assert.equal(event(capture,'keydown',{key:'Backspace'}).defaultPrevented,false);await flush();count=inputs(socket).length;handle.toggleShift(true);capture.value='ab';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['B']);console.log('PASS eventless WebKit Hangul keeps native context, holds tail without DEL repair, controls flush once');
  count=inputs(socket).length;event(capture,'compositionstart');handle.setInputMode('buffered');handle.setInputMode('direct');event(capture,'compositionend',{data:'늦음'});capture.value='늦음';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(capture.value,'');
  handle.focus();event(capture,'compositionstart');handle.unmount();event(capture,'compositionend',{data:'이전'});capture.value='이전';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(root.children.length,0);console.log('PASS generation discard on mode switch / unmount');
  ({root,handle,socket}=await mount());handle.setInputMode('buffered');let command=find(root,'command-input');command.value='echo 한글';event(command,'input');event(find(root,'buffered-command'),'submit');await flush();assert.equal(command.value,'echo 한글');let sent=socket.sent.at(-1),r=T.reader(sent.slice(5)),id=r.n();socket.frame(0x27,T.v(id),T.v(0));await flush();assert.equal(command.value,'');
@@ -433,33 +433,57 @@ async function testLivePreviewAndHeldIme(){
  socket.frame(0x27,T.v(id2),T.v(0));assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'hello'+longText);
  // P1-1: Repeated ready status with identical phase/message skips DOM write and onStatus callback.
  const statusCount=statuses.length;socket.screen('same size');await flush();assert.equal(statuses.length,statusCount);
- // P0-2: Hangul Held IME (300ms hold, committed prefix sent immediately, local Backspace, control key flush).
- socket.autoAck=true;handle.sendKey('escape');await flush();const base=inputs(socket).length;
+ // Native IME owns its entire preedit, including pauses and jamo Backspace.
+ socket.autoAck=true;handle.sendKey('escape');await flush();const base=inputs(socket).length,preedit=find(root,'terminal-preedit');
  event(capture,'compositionstart');
- capture.value='ㅎ';event(capture,'input',{isComposing:true});
- assert.equal(inputs(socket).length,base);assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'ㅎ');
- capture.value='한';event(capture,'input',{isComposing:true});
- assert.equal(inputs(socket).length,base);assert.equal(preview.textContent,'한');
- capture.value='한ㄱ';event(capture,'input',{isComposing:true});
- assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'한ㄱ');
- capture.value='한글';event(capture,'input',{isComposing:true});
- assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(preview.textContent,'한글');
- // Local Backspace on held syllable does not send DEL (\x7f) to server.
- assert(event(capture,'beforeinput',{inputType:'deleteContentBackward'}).defaultPrevented);
- await flush();assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(capture.value,'한');assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'한');
- capture.value='한글';event(capture,'input',{isComposing:true});assert.equal(preview.textContent,'한글');
- assert(event(capture,'keydown',{key:'Backspace'}).defaultPrevented);
- await flush();assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(capture.value,'한');assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'한');
- // 300ms timer flushes held syllable if composition continues without new input.
- capture.value='한글';event(capture,'input',{isComposing:true});
- await advance(299);assert.deepEqual(inputs(socket).slice(base),['한']);
- await advance(1);assert.deepEqual(inputs(socket).slice(base),['한','글']);
- event(capture,'compositionend',{data:'한글'});await flush();assert.deepEqual(inputs(socket).slice(base),['한','글']);
- // Control key / sendKey flushes held syllable before sending the control key.
- event(capture,'compositionstart');capture.value='한글마';event(capture,'input',{isComposing:true});
- assert.deepEqual(inputs(socket).slice(base),['한','글']);assert.equal(preview.textContent,'한글마');
- await handle.sendKey('enter');await flush();
- assert.deepEqual(inputs(socket).slice(base),['한','글','마','\r']);assert.equal(preview.dataset.preview,'false');
+ for(const text of ['ㅎ','하','한','한ㄱ','한글']){capture.value=text;event(capture,'input',{isComposing:true,inputType:'insertCompositionText'});assert.equal(preview.textContent,text);assert.equal(preedit.hidden,false);assert.equal(preedit.textContent,text);}
+ await advance(1500);assert.deepEqual(inputs(socket).slice(base),[],'a pause never commits native IME');
+ assert.equal(event(capture,'beforeinput',{inputType:'deleteContentBackward',isComposing:true}).defaultPrevented,false);
+ assert.equal(event(capture,'keydown',{key:'Backspace',isComposing:true}).defaultPrevented,false);
+ assert.equal(capture.value,'한글','the browser owns deletion');
+ for(const text of ['한그','한ㄱ','한']){capture.value=text;event(capture,'input',{isComposing:true});assert.equal(preedit.textContent,text);}
+ event(capture,'compositionend',{data:'unreliable'});await advance(0);assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(preedit.hidden,true);
+ // The Enter accepting IME must not insert a newline or submit a command.
+ await handle.sendKey('escape');handle.focus();const accepting=inputs(socket).length;event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'한'});assert.equal(api.updateBusy('1960'),true);assert.equal(event(capture,'keydown',{key:'Enter',keyCode:13}).defaultPrevented,true);assert.equal(event(capture,'beforeinput',{inputType:'insertLineBreak'}).defaultPrevented,true);await advance(0);assert.deepEqual(inputs(socket).slice(accepting),['한']);assert.equal(find(root,'paste-review'),undefined);
+ // Back-to-back commits cannot cancel the previous zero-delay finalization.
+ event(capture,'compositionstart');capture.value='한가';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'가'});
+ event(capture,'compositionstart');capture.value='한가나';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'나'});await advance(0);
+ assert.deepEqual(inputs(socket).slice(accepting),['한','가','나']);
+ // A late DOM edit after compositionend wins over stale event.data.
+ event(capture,'compositionstart');capture.value='한가나ㅎ';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'ㅎ'});capture.value='한가나한';event(capture,'input',{inputType:'insertFromComposition'});await advance(0);
+ assert.deepEqual(inputs(socket).slice(-1),['한']);
+ // Toolbar controls ask the native IME to finish, then send text before Enter.
+ event(capture,'compositionstart');capture.value='한가나한마';event(capture,'input',{isComposing:true});const enter=handle.sendKey('enter');
+ assert.equal(inputs(socket).at(-1),'한');event(capture,'compositionend',{data:'마'});await advance(0);await enter;
+ assert.deepEqual(inputs(socket).slice(-2),['마','\r']);assert.equal(preedit.hidden,true);
+ // Native final input arriving after that explicit control is never replayed.
+ capture.value='한가나한마';event(capture,'input',{inputType:'insertFromComposition'});await flush();assert.equal(inputs(socket).at(-1),'\r');assert.equal(capture.value,'');
+ handle.focus();const fallback=inputs(socket).length;
+ for(const value of ['ㅎ','하','한']){capture.value=value;event(capture,'input',{inputType:'insertText'});}
+ await advance(1500);assert.equal(inputs(socket).length,fallback);assert.equal(preedit.textContent,'한');
+ // Resyllabification and compound final consonants only send stable prefixes.
+ for(const value of ['하나','하나 ','하나 값','하나 갑사']){capture.value=value;event(capture,'input',{inputType:'insertText'});}
+ assert.deepEqual(inputs(socket).slice(fallback),['하','나 ','갑']);assert.equal(preedit.textContent,'사');
+ await handle.sendKey('enter');assert.deepEqual(inputs(socket).slice(-2),['사','\r']);
+ // A ten-key vowel dot can resegment the preceding final consonant too.
+ handle.focus();const dots=inputs(socket).length;for(const value of ['감','감ㆍ','가머','가머 ']){capture.value=value;event(capture,'input');}assert.deepEqual(inputs(socket).slice(dots),['가','머 ']);await handle.sendKey('enter');
+ // Decomposed jamo are held together, never split by Unicode codepoint.
+ handle.focus();const decomposed=inputs(socket).length;capture.value='한';event(capture,'input');await advance(1500);assert.equal(inputs(socket).length,decomposed);assert.equal(preedit.textContent,'한');
+ capture.value+=' ';event(capture,'input');await flush();assert.equal(inputs(socket).at(-1),'한 ');
+ // Cancellation and switching panes discard local preedit without sending it.
+ await handle.sendKey('escape');handle.focus();const cancelled=inputs(socket).length;event(capture,'compositionstart');capture.value='취소';event(capture,'input',{isComposing:true});capture.value='';event(capture,'compositionend',{data:''});await advance(0);assert.equal(inputs(socket).length,cancelled);assert.equal(preedit.hidden,true);
+ // Quick insertion/paste waits for native preedit instead of clearing it.
+ await handle.sendKey('escape');handle.focus();const quick=inputs(socket).length;event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});assert.equal(handle.insertText('/help'),true);assert.equal(capture.value,'한');assert.equal(inputs(socket).length,quick);event(capture,'compositionend',{data:'한'});await advance(0);assert.deepEqual(inputs(socket).slice(quick),['한','/help']);capture.value='한';event(capture,'input',{inputType:'insertFromComposition'});assert.deepEqual(inputs(socket).slice(quick),['한','/help']);handle.focus();
+ // Native final events may fire synchronously from blur while switching panes.
+ await handle.sendKey('escape');handle.focus();event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});const blur=capture.blur.bind(capture);capture.blur=()=>{blur();event(capture,'compositionend',{data:'한'});event(capture,'input',{inputType:'insertFromComposition'});};const switching=inputs(socket).length;handle.setInputActive(false);assert.equal(find(root,'command-input').value,'한');assert.equal(inputs(socket).length,switching);assert.doesNotMatch(find(root,'terminal-status').textContent,/Resume terminal input/);capture.blur=blur;handle.setInputActive(true);handle.setInputMode('direct');handle.focus();find(root,'command-input').value='';event(find(root,'command-input'),'input');
+ // End-pending quick insertion must not synchronously refocus and replay a late commit.
+ await handle.sendKey('escape');handle.focus();const endingQuick=inputs(socket).length;event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'한'});handle.insertText('/help');capture.value='한';event(capture,'input',{inputType:'insertFromComposition'});await handle.sendKey('enter');assert.deepEqual(inputs(socket).slice(endingQuick),['한','/help','\r']);
+ // An explicit key during end-finalization also blurs before disarming.
+ await handle.sendKey('escape');handle.focus();event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'한'});let endingBlurred=false;const originalBlur=capture.blur.bind(capture);capture.blur=()=>{endingBlurred=true;originalBlur();};await handle.sendKey('tab');assert.equal(endingBlurred,true);capture.blur=originalBlur;handle.focus();const afterEnding=inputs(socket).length;capture.value='x';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(afterEnding),['x']);
+ // A missing native end cannot leave composition stuck after focusing again.
+ await handle.sendKey('escape');handle.focus();event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});const interrupted=handle.sendKey('tab'),rejected=assert.rejects(interrupted,/Input target changed/);handle.focus();await rejected;const resumed=inputs(socket).length;capture.value='x';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(resumed),['x']);await handle.sendKey('escape');handle.focus();
+ // Switching the active pane preserves eventless preedit as an unsent draft.
+ capture.value='남겨';event(capture,'input');handle.setInputActive(false);assert.equal(find(root,'command-input').value,'겨');assert.equal(preedit.hidden,true);handle.setInputActive(true);assert.equal(handle.getInputMode(),'direct','temporary draft recovery never changes the chosen input mode');handle.setInputMode('direct');handle.focus();
  // invalidateInput() clears the reserved preview immediately.
  handle.focus();event(capture,'compositionstart');capture.value='가';event(capture,'input',{isComposing:true});
  assert.equal(preview.dataset.preview,'true');handle.setInputMode('buffered');assert.equal(preview.dataset.preview,'false');assert.equal(preview.textContent,'Tap to show keyboard');
@@ -483,7 +507,7 @@ async function testLivePreviewAndHeldIme(){
  event(p3,'touchmove',{touches:[{clientX:50,clientY:100},{clientX:250,clientY:300}]});
  event(p3,'touchend',{touches:[]});
  assert.equal(p3.scrollLeft,350);assert.equal(p3.scrollTop,600);h3.unmount();
- console.log('PASS Direct live-preview, Hangul held IME + local Backspace, unready contextBlocked guard, canvas style runs, pinch midpoint');
+ console.log('PASS native/eventless Hangul: pause, jamo deletion, boundaries, resyllabification, final DOM, controls/no replay, cancellation, preedit; unready contextBlocked guard, canvas style runs, pinch midpoint');
 }
 async function testTextLayer(){
  // 캔버스 위 투명 글자 층: 셀 폭 정렬, 바뀐 행 반영, 선택 중에는 고정했다가 선택이 풀리면 반영.
