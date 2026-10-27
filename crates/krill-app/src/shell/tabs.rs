@@ -119,10 +119,11 @@ impl Shell {
             .session(pane)
             .and_then(|id| self.sidebar.read(cx).session_on(host, id))
         {
-            return title.filter(|t| !t.trim().is_empty()).map_or_else(
-                || self.sidebar.read(cx).session_label_on(host, session).0,
-                |title| sidebar::session_label(session, Some(title)).0,
-            );
+            return self
+                .sidebar
+                .read(cx)
+                .session_label_on_with_title(host, session, title)
+                .0;
         }
         let launched = match self.layout.launch(pane).map(|l| &l.program) {
             Some(Program::Agent { id }) => self.agent_profile_name(launch_agent_id(id)),

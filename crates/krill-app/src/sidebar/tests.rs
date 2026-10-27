@@ -5378,6 +5378,49 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
             generic.status.title = Some("Claude Code".into());
             s.set_auto_title(generic.id, "fix-login-timeout", cx);
             assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
+            generic.status.title = Some("Windows PowerShell".into());
+            assert_eq!(
+                s.session_label(&generic).0,
+                "Windows PowerShell",
+                "a shell without an identified agent retains its title"
+            );
+            generic.status.agent = "claude".into();
+            assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
+            s.auto_titles.remove(&generic.id);
+            assert_eq!(
+                s.session_label(&generic).0,
+                "Windows PowerShell",
+                "an agent without a known prompt must not invent a title"
+            );
+            s.set_auto_title(generic.id, "fix-login-timeout", cx);
+
+            // The pane's cached generic OSC label must not hide a newer title
+            // reported by the remote daemon, or borrow a local title by ID.
+            let remote = HostId::Remote("windows".into());
+            let mut remote_session = generic.clone();
+            remote_session.status.title = Some("원격 대화 제목".into());
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("✳ Claude Code"))
+                    .0,
+                "원격 대화 제목"
+            );
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("⠂ 원격 터미널 제목"))
+                    .0,
+                "원격 터미널 제목"
+            );
+            remote_session.status.title = None;
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("✳ Claude Code"))
+                    .0,
+                "Claude Code"
+            );
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("Windows PowerShell"))
+                    .0,
+                "Windows PowerShell",
+                "a remote ID never borrows the local prompt title"
+            );
         });
     });
 }

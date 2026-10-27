@@ -4628,6 +4628,30 @@ fn agy_tab_titles_use_sidebar_titles_without_osc(cx: &mut TestAppContext) {
         {
             assert_eq!(s.pane_label(tab.focused, cx), expected);
         }
+        let pane = s.layout.tabs()[1].focused;
+        // A nonempty default OSC title must yield to the same prompt title as
+        // the sidebar, rather than freezing the tab at "Claude Code".
+        for raw in [
+            "Claude Code",
+            "✳ Claude Code",
+            "worktree-1",
+            r"관리자: C:\Windows\system32\WindowsPowerShell\v1.0\powershell.exe",
+            "Windows PowerShell",
+            "Administrator: pwsh",
+            "cmd",
+        ] {
+            s.titles.insert(pane, raw.into());
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_title(SessionId(82), raw, cx);
+            });
+            assert_eq!(s.pane_label(pane, cx), "첫 요청에서 만든 제목", "{raw}");
+        }
+        s.titles.insert(pane, "⠂ 실제 터미널 제목".into());
+        assert_eq!(s.pane_label(pane, cx), "실제 터미널 제목");
+        s.titles.insert(pane, "작업 powershell.exe review".into());
+        assert_eq!(s.pane_label(pane, cx), "작업 powershell.exe review");
+        s.layout.set_tab_title(1, Some("사용자가 지정한 제목"));
+        assert_eq!(s.tab_display_label(1, cx), "사용자가 지정한 제목");
     });
 }
 

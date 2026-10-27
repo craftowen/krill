@@ -391,6 +391,42 @@ pub fn session_label(session: &Session, title: Option<&str>) -> (String, String)
     (name, detail.join(" · "))
 }
 
+/// Windows console titles can retain the launcher's executable after an agent
+/// starts. Recognize only exact shell labels or drive-absolute shell paths.
+fn is_windows_shell_title(title: &str) -> bool {
+    let title = title.trim();
+    let title = title
+        .split_once(':')
+        .filter(|(prefix, _)| {
+            prefix.trim().eq_ignore_ascii_case("administrator") || prefix.trim() == "관리자"
+        })
+        .map_or(title, |(_, rest)| rest.trim());
+    let title = title
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(title);
+    if [
+        "Windows PowerShell",
+        "PowerShell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "cmd",
+        "cmd.exe",
+    ]
+    .iter()
+    .any(|shell| title.eq_ignore_ascii_case(shell))
+    {
+        return true;
+    }
+    matches!(title.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        && title.rsplit(['\\', '/']).next().is_some_and(|leaf| {
+            ["powershell.exe", "pwsh.exe", "cmd.exe"]
+                .iter()
+                .any(|shell| leaf.eq_ignore_ascii_case(shell))
+        })
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 fn rows(snapshot: &Snapshot, prefs: &Preferences, collapsed: &BTreeSet<PathBuf>) -> Vec<Row> {
@@ -4526,36 +4562,58 @@ impl Sidebar {
     }
 
     pub fn session_label(&self, session: &Session) -> (String, String) {
-        let custom_title = self
-            .custom_titles
-            .get(&session.id)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
-        // 칸이 열려 있으면 그 제목(즉시 반영), 아니면 krilld가 알려 준 제목. 에이전트 기본 제목은 자동 제목에 양보한다.
-        let explicit_title = self
-            .titles
-            .get(&session.id)
-            .and_then(|t| krill_proto::control::display_title(t))
-            .or_else(|| session.status.title.clone())
-            .filter(|t| {
-                !krill_proto::git::is_default_branch_or_worktree_name(t)
-                    && !t.eq_ignore_ascii_case("claude code")
-            });
-        let title = custom_title
-            .or(explicit_title.as_deref())
-            .or_else(|| self.auto_titles.get(&session.id).map(String::as_str))
-            .or_else(|| self.titles.get(&session.id).map(String::as_str));
-        session_label(session, title)
+        self.session_label_on_with_title(&HostId::Local, session, None)
     }
 
     #[must_use]
     pub fn session_label_on(&self, host: &HostId, session: &Session) -> (String, String) {
-        if host.is_local() {
-            self.session_label(session)
-        } else {
-            session_label(session, session.status.title.as_deref())
-        }
+        self.session_label_on_with_title(host, session, None)
+    }
+
+    /// Tabs and sidebar rows share title precedence, including a pane's newest
+    /// OSC title. Local custom/auto titles never cross into another host's IDs.
+    #[must_use]
+    pub fn session_label_on_with_title(
+        &self,
+        host: &HostId,
+        session: &Session,
+        pane_title: Option<&str>,
+    ) -> (String, String) {
+        let local = host.is_local();
+        let custom_title = local
+            .then(|| self.custom_titles.get(&session.id))
+            .flatten()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        let cached_title = local
+            .then(|| self.titles.get(&session.id))
+            .flatten()
+            .map(String::as_str);
+        let live_title = pane_title
+            .or(cached_title)
+            .and_then(krill_proto::control::display_title);
+        let auto_title = local
+            .then(|| self.auto_titles.get(&session.id))
+            .flatten()
+            .map(String::as_str)
+            .filter(|title| !title.trim().is_empty());
+        let has_agent_prompt = !session.status.agent.trim().is_empty() && auto_title.is_some();
+        let specific = |title: &&str| {
+            !(krill_proto::git::is_default_branch_or_worktree_name(title)
+                || title.eq_ignore_ascii_case("claude code")
+                || has_agent_prompt && is_windows_shell_title(title))
+        };
+        let explicit_title = live_title
+            .as_deref()
+            .filter(specific)
+            .or_else(|| session.status.title.as_deref().filter(specific));
+        let title = custom_title
+            .or(explicit_title)
+            .or(auto_title)
+            .or(live_title.as_deref())
+            .or(session.status.title.as_deref());
+        session_label(session, title)
     }
 
     /// 로컬 세션의 최근 프롬프트 턴 히스토리를 돌려준다.
