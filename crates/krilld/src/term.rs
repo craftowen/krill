@@ -80,12 +80,46 @@ impl EventListener for Events {
     }
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    #[default]
+    None,
+    Before2J,
+    BeforeClear,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ClearTrack {
+    #[default]
+    None,
+    After2J,
+    Cleared,
+    ClearedAfter2J,
+}
+
+impl ClearTrack {
+    fn break_2j(&mut self) {
+        if matches!(self, Self::After2J) {
+            *self = Self::None;
+        }
+    }
+
+    fn is_cleared(self) -> bool {
+        matches!(self, Self::Cleared | Self::ClearedAfter2J)
+    }
+
+    fn is_after_2j(self) -> bool {
+        matches!(self, Self::After2J | Self::ClearedAfter2J)
+    }
+}
+
 /// alacritty가 버리는 것을 원본 바이트에서 따로 본다: 모드 2031 상태와 셸의 cwd 보고.
 #[derive(Default)]
 struct RawScan {
     on: bool,
     alt: bool,
-    history_cleared: bool,
+    clear: ClearTrack,
+    stop: StopReason,
     /// alacritty가 아직 답하지 않은 `CSI ?2031$p`마다 질의 시점의 상태. DEC 2026 sync 안의 질의는 alacritty가
     /// 구간이 끝날 때 답하므로 큐로 둔다.
     asked: VecDeque<bool>,
@@ -94,6 +128,14 @@ struct RawScan {
 }
 
 impl Perform for RawScan {
+    fn print(&mut self, _c: char) {
+        self.clear.break_2j();
+    }
+
+    fn execute(&mut self, _byte: u8) {
+        self.clear.break_2j();
+    }
+
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
             return;
@@ -106,6 +148,9 @@ impl Perform for RawScan {
                         self.on = action == 'h';
                     } else if matches!(mode, 47 | 1047 | 1049) {
                         self.alt = action == 'h';
+                        self.clear.break_2j();
+                    } else if mode == 2026 && action == 'l' && self.clear.is_cleared() {
+                        self.stop = StopReason::BeforeClear;
                     }
                 }
             }
@@ -113,10 +158,33 @@ impl Perform for RawScan {
             ('p', [b'?', b'$']) if modes.next() == Some(Some(SCHEME_MODE)) => {
                 self.asked.push_back(self.on);
             }
-            ('J', []) if !self.alt && modes.any(|m| m == Some(3)) => {
-                self.history_cleared = true;
+            ('J', []) if !self.alt => {
+                let mut has_2 = false;
+                let mut has_3 = false;
+                for m in params.iter().filter_map(|p| p.first().copied()) {
+                    has_2 |= m == 2;
+                    has_3 |= m == 3;
+                }
+                if has_3 {
+                    self.clear = if self.clear.is_after_2j() && !has_2 {
+                        ClearTrack::ClearedAfter2J
+                    } else {
+                        ClearTrack::Cleared
+                    };
+                    self.stop = StopReason::BeforeClear;
+                } else if has_2 {
+                    if self.clear == ClearTrack::None {
+                        self.clear = ClearTrack::After2J;
+                        self.stop = StopReason::Before2J;
+                    }
+                } else {
+                    self.clear.break_2j();
+                }
             }
-            _ => {}
+            ('H' | 'f', []) => {}
+            _ => {
+                self.clear.break_2j();
+            }
         }
     }
 
@@ -124,7 +192,14 @@ impl Perform for RawScan {
         if byte == b'c' && intermediates.is_empty() {
             self.on = false; // RIS
             self.alt = false;
-            self.history_cleared = true;
+            self.clear = if self.clear.is_after_2j() {
+                ClearTrack::ClearedAfter2J
+            } else {
+                ClearTrack::Cleared
+            };
+            self.stop = StopReason::BeforeClear;
+        } else {
+            self.clear.break_2j();
         }
     }
 
@@ -146,6 +221,10 @@ impl Perform for RawScan {
         if let Some(cwd) = cwd.filter(|p| p.is_absolute()) {
             self.cwd = Some(cwd);
         }
+    }
+
+    fn terminated(&self) -> bool {
+        self.stop != StopReason::None
     }
 }
 
@@ -220,6 +299,8 @@ pub(crate) struct Engine {
     demoted: bool,
     /// 강등(`demote`)이나 자식이 보낸 `CSI 3 J`·`RIS` 직전의 핫 스크롤백(최신 행부터, 행별 RLE postcard).
     parked_hot: VecDeque<Box<[u8]>>,
+    /// Grid history before CSI 2 J, kept through an immediately following clear.
+    pre_2j_hot: Option<Vec<Vec<Cell>>>,
     /// 창 제목(OSC 0·2). [`MAX_TITLE`]에서 자른다.
     title: String,
     /// 살아 있는 바이트([`Feed::Live`])로 울린 벨 수.
@@ -372,6 +453,7 @@ impl Engine {
             hot,
             demoted: false,
             parked_hot: VecDeque::new(),
+            pre_2j_hot: None,
             title: String::new(),
             bells: 0,
             clips: 0,
@@ -389,25 +471,113 @@ impl Engine {
         // RawScan only observes escape sequences; printable ASCII and C0 controls
         // have no side effects while its parser has no pending sequence/codepoint.
         if !self.scan.mk_is_ground() || !bytes.is_ascii() || bytes.contains(&0x1b) {
-            self.scan.advance(&mut self.scheme, bytes);
-        }
-        let pre_clear = if self.hot > 0
-            && self.scheme.history_cleared
-            && !self.term.mode().contains(TermMode::ALT_SCREEN)
-            && self.history_len() > 0
-        {
-            let mut rows = self.history_rows(0, self.hot).1;
-            rows.reverse();
-            Some(rows)
-        } else {
-            None
-        };
-        self.parser.advance(&mut self.term, bytes);
-        if self.parser.sync_bytes_count() == 0 {
-            if let Some(rows) = pre_clear {
-                self.save_hot_rows(rows);
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                self.scheme.stop = StopReason::None;
+                let n = self.scan.advance_until_terminated(&mut self.scheme, rest);
+                match self.scheme.stop {
+                    StopReason::Before2J => {
+                        self.scheme.stop = StopReason::None;
+                        if let Some(prefix) = rest.get(..n.saturating_sub(1))
+                            && !prefix.is_empty()
+                        {
+                            self.parser.advance(&mut self.term, prefix);
+                        }
+                        self.pre_2j_hot =
+                            if self.hot > 0 && !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                                let mut rows = self.grid_history_rows(0, self.hot).1;
+                                rows.reverse();
+                                Some(rows)
+                            } else {
+                                None
+                            };
+                        if let Some(clear_byte) = rest.get(n.saturating_sub(1)..n) {
+                            self.parser.advance(&mut self.term, clear_byte);
+                        }
+                    }
+                    StopReason::BeforeClear => {
+                        let use_pre_2j = self.scheme.clear.is_after_2j();
+                        self.scheme.stop = StopReason::None;
+                        self.scheme.clear.break_2j();
+                        if let Some(prefix) = rest.get(..n.saturating_sub(1))
+                            && !prefix.is_empty()
+                        {
+                            self.parser.advance(&mut self.term, prefix);
+                        }
+                        let pre_clear = if use_pre_2j && let Some(rows) = self.pre_2j_hot.take() {
+                            Some(rows)
+                        } else if self.hot > 0
+                            && !self.term.mode().contains(TermMode::ALT_SCREEN)
+                            && self.history_len() > 0
+                        {
+                            let mut rows = self.grid_history_rows(0, self.hot).1;
+                            rows.reverse();
+                            Some(rows)
+                        } else {
+                            None
+                        };
+                        if let Some(clear_byte) = rest.get(n.saturating_sub(1)..n) {
+                            self.parser.advance(&mut self.term, clear_byte);
+                        }
+                        if self.parser.sync_bytes_count() == 0 {
+                            self.pre_2j_hot = None;
+                            if let Some(rows) = pre_clear {
+                                self.save_hot_rows(rows);
+                            }
+                            self.scheme.clear = ClearTrack::None;
+                        } else {
+                            self.pre_2j_hot = pre_clear;
+                            self.scheme.clear = ClearTrack::ClearedAfter2J;
+                        }
+                    }
+                    StopReason::None => {
+                        if !self.scheme.clear.is_after_2j() {
+                            self.pre_2j_hot = None;
+                        }
+                        let pre_clear = if self.scheme.clear.is_cleared() {
+                            if self.scheme.clear.is_after_2j()
+                                && let Some(rows) = self.pre_2j_hot.take()
+                            {
+                                Some(rows)
+                            } else if self.hot > 0
+                                && !self.term.mode().contains(TermMode::ALT_SCREEN)
+                                && self.history_len() > 0
+                            {
+                                let mut rows = self.grid_history_rows(0, self.hot).1;
+                                rows.reverse();
+                                Some(rows)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(chunk) = rest.get(..n) {
+                            self.parser.advance(&mut self.term, chunk);
+                        }
+                        if self.parser.sync_bytes_count() == 0 {
+                            if let Some(rows) = pre_clear {
+                                self.save_hot_rows(rows);
+                            }
+                            if self.scheme.clear.is_cleared() {
+                                self.scheme.clear = ClearTrack::None;
+                            }
+                        } else if self.scheme.clear.is_cleared() {
+                            self.pre_2j_hot = pre_clear;
+                            self.scheme.clear = ClearTrack::ClearedAfter2J;
+                        }
+                    }
+                }
+                rest = rest.get(n..).unwrap_or_default();
             }
-            self.scheme.history_cleared = false;
+        } else {
+            if !bytes.is_empty() {
+                self.scheme.clear.break_2j();
+                if !self.scheme.clear.is_after_2j() {
+                    self.pre_2j_hot = None;
+                }
+            }
+            self.parser.advance(&mut self.term, bytes);
         }
         let out = self.replies(feed, look);
         if temp_hot {
@@ -437,14 +607,21 @@ impl Engine {
         if temp_hot {
             self.term.set_options(config(self.hot));
         }
-        let pre_clear = if self.hot > 0
-            && self.scheme.history_cleared
-            && !self.term.mode().contains(TermMode::ALT_SCREEN)
-            && self.history_len() > 0
-        {
-            let mut rows = self.history_rows(0, self.hot).1;
-            rows.reverse();
-            Some(rows)
+        let pre_clear = if self.scheme.clear.is_cleared() {
+            if self.scheme.clear.is_after_2j()
+                && let Some(rows) = self.pre_2j_hot.take()
+            {
+                Some(rows)
+            } else if self.hot > 0
+                && !self.term.mode().contains(TermMode::ALT_SCREEN)
+                && self.history_len() > 0
+            {
+                let mut rows = self.grid_history_rows(0, self.hot).1;
+                rows.reverse();
+                Some(rows)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -452,7 +629,9 @@ impl Engine {
         if let Some(rows) = pre_clear {
             self.save_hot_rows(rows);
         }
-        self.scheme.history_cleared = false;
+        self.scheme.clear = ClearTrack::None;
+        self.scheme.stop = StopReason::None;
+        self.pre_2j_hot = None;
         let out = self.replies(feed, look);
         if temp_hot {
             if !self.term.mode().contains(TermMode::ALT_SCREEN) && self.history_len() > 0 {
@@ -663,13 +842,15 @@ impl Engine {
         self.demoted = source.demoted;
         self.parked_hot.clear();
         self.parked_hot.shrink_to_fit();
+        self.pre_2j_hot = None;
         self.title.clone_from(&source.title);
         self.bells = source.bells;
         self.clips = source.clips;
         self.clip.clone_from(&source.clip);
         self.scheme.on = source.scheme.on;
         self.scheme.alt = source.scheme.alt;
-        self.scheme.history_cleared = source.scheme.history_cleared;
+        self.scheme.clear = source.scheme.clear;
+        self.scheme.stop = source.scheme.stop;
         self.scheme.asked.clone_from(&source.scheme.asked);
         self.scheme.cwd.clone_from(&source.scheme.cwd);
     }
@@ -695,11 +876,17 @@ impl Engine {
         self.term.grid().history_size()
     }
 
+    pub(crate) fn has_history(&self) -> bool {
+        self.history_len() > 0 || !self.parked_hot.is_empty()
+    }
+
     /// 핫 스크롤백을 비운다. 보이는 화면·커서·모드는 그대로 둔다(OWE-873b).
     pub(crate) fn clear_history(&mut self) {
         self.parked_hot.clear();
         self.parked_hot.shrink_to_fit();
-        self.scheme.history_cleared = false;
+        self.pre_2j_hot = None;
+        self.scheme.clear = ClearTrack::None;
+        self.scheme.stop = StopReason::None;
         self.term.grid_mut().clear_history();
     }
 
@@ -715,13 +902,41 @@ impl Engine {
     /// 스크롤백을 오래된 행부터 꺼내고 비운다. 콜드 페이지 재생이 메모리를 일정하게 두려고 쓴다.
     pub(crate) fn take_history(&mut self) -> Vec<Vec<Cell>> {
         let n = self.history_len();
-        let (_, rows) = self.history_rows(0, n);
+        let (_, mut rows) = self.grid_history_rows(0, n);
+        if !self.parked_hot.is_empty() {
+            let mut parked = self
+                .parked_hot
+                .iter()
+                .filter_map(|b| unpack_row(b))
+                .collect::<Vec<_>>();
+            parked.truncate(self.hot.saturating_sub(rows.len()));
+            parked.reverse();
+            parked.append(&mut rows);
+            rows = parked;
+        }
         self.clear_history();
         rows
     }
 
     /// 핫 스크롤백 행 수와, 아래(화면 바로 위)에서 `skip`행 위부터 위로 최대 `count`행(오래된 행부터).
     pub(crate) fn history_rows(&self, skip: usize, count: usize) -> (usize, Vec<Vec<Cell>>) {
+        if !self.demoted && !self.parked_hot.is_empty() {
+            let hot = self.snapshot_hot_rows();
+            let total = hot.len();
+            let top = skip.saturating_add(count).min(total);
+            let rows = hot
+                .get(skip..top)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .cloned()
+                .collect();
+            return (total, rows);
+        }
+        self.grid_history_rows(skip, count)
+    }
+
+    fn grid_history_rows(&self, skip: usize, count: usize) -> (usize, Vec<Vec<Cell>>) {
         let grid = self.term.grid();
         let total = grid.history_size();
         let top = skip.saturating_add(count).min(total);
@@ -753,7 +968,7 @@ impl Engine {
             self.parked_hot.shrink_to_fit();
             return;
         }
-        let mut rows = self.history_rows(0, self.hot).1;
+        let mut rows = self.grid_history_rows(0, self.hot).1;
         rows.reverse();
         self.save_hot_rows(rows);
     }
@@ -763,7 +978,7 @@ impl Engine {
         if self.hot == 0 || self.term.mode().contains(TermMode::ALT_SCREEN) {
             return Vec::new();
         }
-        let mut rows = self.history_rows(0, self.hot).1;
+        let mut rows = self.grid_history_rows(0, self.hot).1;
         rows.reverse();
         if rows.len() < self.hot {
             let need = self.hot.saturating_sub(rows.len());

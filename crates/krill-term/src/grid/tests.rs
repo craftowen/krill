@@ -59,7 +59,11 @@ fn color_does_not_split_shaping_runs() {
         .map(|i| {
             styled(
                 'a',
-                Color::Rgb(Rgb { r: i, g: 0, b: 0 }),
+                Color::Rgb(Rgb {
+                    r: 200 + i,
+                    g: 180,
+                    b: 160,
+                }),
                 Color::Default,
                 Flags::default(),
             )
@@ -69,7 +73,14 @@ fn color_does_not_split_shaping_runs() {
     let s = &plan.segments[0];
     assert_eq!(s.runs.len(), 1);
     assert_eq!(s.colors.len(), 4);
-    assert_eq!(s.color_at(2), Some(Rgb { r: 2, g: 0, b: 0 }));
+    assert_eq!(
+        s.color_at(2),
+        Some(Rgb {
+            r: 202,
+            g: 180,
+            b: 160
+        })
+    );
 }
 
 #[test]
@@ -349,4 +360,196 @@ fn hidden_draws_background_only() {
     assert_eq!(texts, ["a b"]);
     let only_hidden = [styled('x', Color::Default, Color::Default, Flags::HIDDEN)];
     assert_eq!(plan_row(&only_hidden, &DEFAULT), RowPlan::default());
+}
+
+#[test]
+fn minimum_contrast_rescues_light_theme_white_and_agy_body_text() {
+    let paper = Theme {
+        foreground: Rgb {
+            r: 0x24,
+            g: 0x21,
+            b: 0x1d,
+        },
+        background: Rgb {
+            r: 0xfb,
+            g: 0xf9,
+            b: 0xf4,
+        },
+        cursor: Rgb {
+            r: 0xe5,
+            g: 0x48,
+            b: 0x2f,
+        },
+        ansi: [
+            Rgb {
+                r: 0x24,
+                g: 0x21,
+                b: 0x1d,
+            },
+            Rgb {
+                r: 0xc6,
+                g: 0x28,
+                b: 0x28,
+            },
+            Rgb {
+                r: 0x3f,
+                g: 0x7d,
+                b: 0x20,
+            },
+            Rgb {
+                r: 0x9a,
+                g: 0x6a,
+                b: 0x00,
+            },
+            Rgb {
+                r: 0x1f,
+                g: 0x5f,
+                b: 0xae,
+            },
+            Rgb {
+                r: 0x7b,
+                g: 0x3f,
+                b: 0xa8,
+            },
+            Rgb {
+                r: 0x0e,
+                g: 0x7c,
+                b: 0x86,
+            },
+            Rgb {
+                r: 0xbf,
+                g: 0xb8,
+                b: 0xa8,
+            },
+            Rgb {
+                r: 0x77,
+                g: 0x71,
+                b: 0x5f,
+            },
+            Rgb {
+                r: 0xe5,
+                g: 0x39,
+                b: 0x35,
+            },
+            Rgb {
+                r: 0x4e,
+                g: 0x9a,
+                b: 0x2a,
+            },
+            Rgb {
+                r: 0xb0,
+                g: 0x7d,
+                b: 0x00,
+            },
+            Rgb {
+                r: 0x2f,
+                g: 0x74,
+                b: 0xc9,
+            },
+            Rgb {
+                r: 0x95,
+                g: 0x50,
+                b: 0xc2,
+            },
+            Rgb {
+                r: 0x15,
+                g: 0x97,
+                b: 0xa0,
+            },
+            Rgb {
+                r: 0xec,
+                g: 0xe6,
+                b: 0xda,
+            },
+        ],
+    };
+    assert!(is_light_background(paper.background));
+
+    let agy_body = Rgb {
+        r: 0xe8,
+        g: 0xea,
+        b: 0xed,
+    };
+    let agy_muted = Rgb {
+        r: 0xbd,
+        g: 0xc1,
+        b: 0xc6,
+    };
+    let pure_white = Rgb {
+        r: 0xff,
+        g: 0xff,
+        b: 0xff,
+    };
+    let badge_bg = Rgb {
+        r: 0x30,
+        g: 0x30,
+        b: 0x30,
+    };
+    let cells = [
+        styled('a', Color::Rgb(agy_body), Color::Default, Flags::default()),
+        styled('b', Color::Rgb(agy_muted), Color::Default, Flags::default()),
+        styled(
+            'c',
+            Color::Rgb(pure_white),
+            Color::Default,
+            Flags::default(),
+        ),
+        styled('d', Color::Indexed(15), Color::Default, Flags::default()),
+        styled('─', Color::Rgb(agy_body), Color::Default, Flags::default()),
+        styled(
+            'e',
+            Color::Rgb(agy_body),
+            Color::Rgb(badge_bg),
+            Flags::default(),
+        ),
+    ];
+    let plan = plan_row(&cells, &paper);
+    let s = &plan.segments[0];
+    for &(byte_idx, fg) in &s.colors[..5] {
+        let ratio = contrast_ratio(fg, paper.background);
+        assert!(
+            ratio >= LIGHT_BG_MIN_CONTRAST,
+            "byte {byte_idx}: {fg:?} vs {:?} contrast {ratio} < {LIGHT_BG_MIN_CONTRAST}",
+            paper.background
+        );
+    }
+    // 어두운 인라인 코드 배지(#303030) 위의 밝은 글자(#e8eaed)는 이미 대비가 충분하므로 그대로 유지한다.
+    assert_eq!(s.colors[5].1, agy_body);
+}
+
+#[test]
+fn minimum_contrast_rescues_dark_bg_and_preserves_powerline_and_block_glyphs() {
+    assert!(!is_light_background(DEFAULT.background));
+    let near_dark = Rgb {
+        r: 0x26,
+        g: 0x2b,
+        b: 0x30,
+    };
+    let vibrant_blue = Rgb {
+        r: 0x24,
+        g: 0x72,
+        b: 0xc8,
+    };
+    let cells = [
+        styled('a', Color::Rgb(near_dark), Color::Default, Flags::default()),
+        styled(
+            'b',
+            Color::Rgb(vibrant_blue),
+            Color::Default,
+            Flags::default(),
+        ),
+        styled('█', Color::Rgb(near_dark), Color::Default, Flags::default()),
+        styled(
+            '\u{e0b0}',
+            Color::Rgb(near_dark),
+            Color::Default,
+            Flags::default(),
+        ),
+    ];
+    let plan = plan_row(&cells, &DEFAULT);
+    let s = &plan.segments[0];
+    assert!(contrast_ratio(s.colors[0].1, DEFAULT.background) >= DARK_BG_MIN_CONTRAST);
+    assert_eq!(s.colors[1].1, vibrant_blue);
+    assert_eq!(s.colors[2].1, near_dark);
+    assert_eq!(s.colors[3].1, near_dark);
 }

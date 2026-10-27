@@ -1915,3 +1915,100 @@ fn write_failure_of_a_session_request_has_unknown_outcome() {
     assert!(!is_unknown_outcome(&list), "{list:?}");
     assert_eq!(create.kind(), list.kind());
 }
+
+#[test]
+fn scroll_before_link_or_initial_update_fetches_once_screen_arrives() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+
+    // Case 1: User scrolls while connecting (before link) and again after link before first Update.
+    let mut pane = Pane::default();
+    pane.scroll(2);
+    pane.link(
+        SessionId(1),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    pane.scroll(1);
+    assert_eq!(pane.history.offset, 3);
+    assert_eq!(pane.scroll_offset(), 0);
+    assert!(sent(out(&mut pane)).is_empty());
+
+    // Initial Update arrives with 3 lines: must render live screen and immediately send HistoryViewRequest.
+    assert!(update(&mut pane, 1, snapshot(["live-a", "live-b", "live-c"])).redraw);
+    assert_eq!(
+        pane.shown().rows,
+        vec![row("live-a"), row("live-b"), row("live-c")]
+    );
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(req.view, 0);
+    assert_eq!(req.skip, 0);
+
+    let ready = HistoryViewRows {
+        req: req.req,
+        view: 3,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 0,
+        total: 10,
+        complete: false,
+        rows: vec![row("hist-3"), row("hist-2"), row("hist-1")],
+    };
+    assert!(feed(&mut pane, &ready.encode().unwrap()).redraw);
+    assert_eq!(pane.scroll_offset(), 3);
+    assert_eq!(
+        pane.shown().rows,
+        vec![row("hist-1"), row("hist-2"), row("hist-3")]
+    );
+
+    // Case 2: scroll_top() after an initial empty history response resets the stopped cache
+    // and fetches newly arrived scrollback rows.
+    let mut pane2 = Pane::default();
+    pane2.scroll_top();
+    pane2.link(
+        SessionId(2),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    assert!(update(&mut pane2, 1, snapshot(["live-a", "live-b", "live-c"])).redraw);
+    let frames = sent(out(&mut pane2));
+    let (kind, body) = frames.last().unwrap();
+    let top_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(top_req.view, 0);
+    let empty = HistoryViewRows {
+        req: top_req.req,
+        view: 4,
+        session: SessionId(2),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: None,
+        skip: 0,
+        total: 0,
+        complete: true,
+        rows: Vec::new(),
+    };
+    feed(&mut pane2, &empty.encode().unwrap());
+    assert_eq!(pane2.scroll_offset(), 0);
+
+    pane2.scroll_top();
+    let frames = sent(out(&mut pane2));
+    let (kind, body) = frames.last().unwrap();
+    let retry_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(retry_req.view, 0);
+    assert_ne!(retry_req.req, top_req.req);
+}

@@ -1039,6 +1039,13 @@ impl<W: Write> Pane<W> {
         if let Some((cols, rows)) = self.grid {
             notices.extend(self.fit(cols, rows));
         }
+        if self.out.is_some()
+            && self.view.screen.lines > 0
+            && self.history.stable.is_none()
+            && self.history.offset > 0
+        {
+            self.fetch();
+        }
         notices
     }
 
@@ -1177,8 +1184,16 @@ impl<W: Write> Pane<W> {
         if self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
             && self.history.prior.is_empty()
         {
-            self.history.offset = usize::MAX;
-            self.fetch();
+            self.scroll(isize::MAX);
+            if self
+                .history
+                .stable
+                .as_ref()
+                .is_none_or(|c| !c.is_stopped() && c.complete_total().is_none())
+            {
+                self.history.offset = usize::MAX;
+                self.fetch();
+            }
         } else {
             self.history.reset();
             self.request_top(Source::Cold { page: 0 }, None);
@@ -1308,7 +1323,7 @@ impl<W: Write> Pane<W> {
                     self.resync = false;
                     ev.bell = self.view.screen.bells != bells;
                     ev.redraw = true;
-                    if self.history.stable.is_some() {
+                    if self.history.stable.is_some() || self.history.offset > 0 {
                         self.fetch();
                     }
                     self.refresh();
@@ -1437,16 +1452,19 @@ impl<W: Write> Pane<W> {
             && (self.history.stable.is_some() || self.history.rows.is_empty())
             && self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
         {
-            if let Some(session) = self.session {
+            if lines > 0
+                && let Some(session) = self.session
+            {
                 let cache = self
                     .history
                     .stable
                     .get_or_insert_with(|| stable_history::Cache::new(session));
-                self.history.req = self.history.req.wrapping_add(1);
-                if let Some(req) = cache.next(self.history.offset, lines, self.history.req)
-                    && self.send(&req).is_err()
-                {
-                    self.unlink();
+                let next_req = self.history.req.wrapping_add(1);
+                if let Some(req) = cache.next(self.history.offset, lines, next_req) {
+                    self.history.req = next_req;
+                    if self.send(&req).is_err() {
+                        self.unlink();
+                    }
                 }
             }
             return;
