@@ -1,4 +1,5 @@
 //! Lazy Exposure HTTP/WS 게이트웨이. 세션 상태는 보관하지 않고 기존 Registry로 1:1 전달한다.
+mod relay_account;
 use super::devices::{Devices, decode_hex, hex};
 use super::e2ee::{Channel, Endpoint, invalid, random};
 use super::{net, ws};
@@ -173,11 +174,13 @@ pub(super) struct State {
     tunnel_token: Option<String>,
     tunnel_hostname: Option<String>,
     resolver: super::cloudflared::Resolver,
-    publication: super::tunnel::Publication,
+    pub(super) publication: super::tunnel::Publication,
     tunnel_failures: u32,
     tunnel_retry_at: Option<Instant>,
     tunnel_error: Option<io::Error>,
     dir: Option<PathBuf>,
+    pub(super) account: super::relay_auth::Account,
+    relay_owner: Option<String>,
     pub(super) ping: Duration,
     waker: Arc<Waker>,
 }
@@ -189,6 +192,8 @@ struct Intent {
     rid: String,
     #[serde(default)]
     key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +219,7 @@ impl Intent {
                 custom: None,
                 rid: String::new(),
                 key: String::new(),
+                relay_owner: None,
                 port: None,
                 tunnel_pid: None,
                 tunnel_url: None,
@@ -256,6 +262,7 @@ fn save_intent(s: &State) -> io::Result<()> {
         custom: s.custom.clone(),
         rid: s.publication.rid.clone(),
         key: s.publication.key.clone(),
+        relay_owner: s.relay_owner.clone(),
         port: s.saved_port,
         tunnel_pid: s.saved_tunnel_pid,
         tunnel_url: s.saved_tunnel_url.clone(),
@@ -355,11 +362,20 @@ impl Gateway {
         hello: ServerHello,
     ) -> io::Result<Arc<Self>> {
         let intent = Intent::load(dir)?;
-        let publication = super::tunnel::Publication {
+        let mut publication = super::tunnel::Publication {
             origin: mobile_origin(),
             rid: intent.rid,
             key: intent.key,
+            session: None,
         };
+        let account = super::relay_auth::Account {
+            session: super::relay_auth::Session::load(dir, &publication.origin, now_ms())
+                .unwrap_or_default(),
+            pending: None,
+            dir: dir.map(Path::to_path_buf),
+            generation: 0,
+        };
+        publication.session.clone_from(&account.session);
         let waker = Arc::new(Waker::new()?);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -389,6 +405,8 @@ impl Gateway {
                 tunnel_retry_at: None,
                 tunnel_error: None,
                 dir: dir.map(Path::to_path_buf),
+                account,
+                relay_owner: intent.relay_owner,
                 ping: PING,
                 waker: Arc::clone(&waker),
             }),
@@ -436,6 +454,22 @@ impl Gateway {
             format!("http://{address}")
         };
         Some(format!("{base}/?session={}", session.0))
+    }
+    /// Account management is available only to the local IPC path, never a paired phone.
+    pub(crate) fn request_local(&self, request: MobileRequest) -> MobileReply {
+        if let MobileRequest::Workflow(json) = &request
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
+            && let Some(action) = value.get("action").and_then(serde_json::Value::as_str)
+            && action.starts_with("relay_auth_")
+        {
+            let reply = match self.relay_account(action) {
+                Ok(data) => serde_json::json!({"ok":true,"data":data}),
+                Err(error) => serde_json::json!({"ok":false,"error":error.to_string()}),
+            };
+            self.shared.wake();
+            return MobileReply::Workflow(reply.to_string());
+        }
+        self.request(request)
     }
     pub fn request(&self, request: MobileRequest) -> MobileReply {
         if let MobileRequest::Workflow(json) = request {
@@ -492,6 +526,20 @@ impl Gateway {
                 rotate,
             } => {
                 reject_retired_mode(mode, custom_address.as_deref())?;
+                if mode == ConnectMode::Tunnel
+                    && relay_on(&state)
+                    && !named_tunnel_requested(&state, custom_address.as_deref())
+                    && !state
+                        .account
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.valid(&state.publication.origin, now))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Sign in with Google to use the relay",
+                    ));
+                }
                 configure(&mut state, mode, custom_address, now)?;
                 let ticket = state.devices.mint(now, rotate)?;
                 state.tunnel_retry_at = None;
@@ -567,6 +615,20 @@ impl Gateway {
                 custom_address,
             } => {
                 reject_retired_mode(mode, custom_address.as_deref())?;
+                if mode == ConnectMode::Tunnel
+                    && relay_on(&state)
+                    && !named_tunnel_requested(&state, custom_address.as_deref())
+                    && !state
+                        .account
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.valid(&state.publication.origin, now))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Sign in with Google to use the relay",
+                    ));
+                }
                 configure(&mut state, mode, custom_address, now)?;
                 reconcile(&mut state, now)?;
                 status(&state, now)
@@ -899,6 +961,9 @@ fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
             url: hostname.trim().to_owned(),
         });
     }
+    environment_named_tunnel()
+}
+fn environment_named_tunnel() -> Option<super::tunnel::NamedTunnel> {
     let token = std::env::var("KRILL_MOBILE_TUNNEL_TOKEN").ok()?;
     let hostname = std::env::var("KRILL_MOBILE_TUNNEL_HOSTNAME").ok()?;
     if token.trim().is_empty() || hostname.trim().is_empty() {
@@ -908,6 +973,25 @@ fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
         token: token.trim().to_owned(),
         url: hostname.trim().to_owned(),
     })
+}
+/// Match configure's prospective named settings before allowing a hosted relay QR.
+fn named_tunnel_requested(s: &State, custom: Option<&str>) -> bool {
+    if let Some(raw) = custom {
+        if raw.trim().is_empty() {
+            return environment_named_tunnel().is_some();
+        }
+        // configure validates token@hostname before changing state or exposing any route.
+        if raw.contains('@') {
+            return true;
+        }
+    }
+    (s.tunnel_token
+        .as_ref()
+        .is_some_and(|token| !token.is_empty())
+        && s.tunnel_hostname
+            .as_ref()
+            .is_some_and(|hostname| !hostname.is_empty()))
+        || environment_named_tunnel().is_some()
 }
 /// 운영 빌드는 늘 릴레이를 쓴다. 테스트 고정 터널(`tunnel_start`)만 릴레이 없이 돈다.
 fn relay_on(s: &State) -> bool {
@@ -928,8 +1012,25 @@ fn supervise_tunnel(s: &mut State) {
         return;
     }
     let named = named_tunnel(s);
+    if s.account.session.is_none() && relay_on(s) {
+        s.relay = None;
+    }
+    if s.account
+        .session
+        .as_ref()
+        .is_some_and(|session| !session.valid(&s.publication.origin, now_ms()))
+    {
+        s.relay = None;
+        s.account.session = None;
+        s.publication.session = None;
+        super::relay_auth::Session::remove(s.dir.as_deref()).ok();
+    }
     if named.is_none()
         && relay_on(s)
+        && s.account
+            .session
+            .as_ref()
+            .is_some_and(|session| session.valid(&s.publication.origin, now_ms()))
         && s.relay.is_none()
         && let Some(ctx) = s.relay_ctx.as_ref()
         && let Some(shared) = ctx.shared.upgrade()

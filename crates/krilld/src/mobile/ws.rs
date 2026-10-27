@@ -285,12 +285,16 @@ pub fn connect_client(
     host: &str,
     path: &str,
     bearer: &str,
+    session: &str,
 ) -> io::Result<()> {
+    if session.is_empty() || !session.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
     let raw_nonce = super::e2ee::random()?;
     let sec_key = base64(raw_nonce.get(..16).ok_or_else(invalid)?, false);
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {sec_key}\r\nAuthorization: Bearer {bearer}\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {sec_key}\r\nAuthorization: Bearer {bearer}\r\nx-krill-session: {session}\r\n\r\n"
     )?;
     stream.flush()?;
     let mut bytes = Vec::new();
@@ -307,8 +311,12 @@ pub fn connect_client(
     let status = lines.next().ok_or_else(invalid)?;
     if !status.starts_with("HTTP/1.1 101") {
         return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("relay upgrade failed: {status}"),
+            if status.starts_with("HTTP/1.1 401") || status.starts_with("HTTP/1.1 403") {
+                io::ErrorKind::PermissionDenied
+            } else {
+                io::ErrorKind::ConnectionRefused
+            },
+            "relay upgrade failed",
         ));
     }
     let mut headers = std::collections::HashMap::new();

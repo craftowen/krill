@@ -15,7 +15,7 @@ fn hello() -> ServerHello {
         instance_id: 1,
     }
 }
-fn start() -> (Arc<Registry>, Arc<Gateway>) {
+pub(super) fn start() -> (Arc<Registry>, Arc<Gateway>) {
     let r = Arc::new(Registry::new(None, None));
     r.start_mobile(hello()).unwrap();
     lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
@@ -1023,6 +1023,12 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
     let (rid, rkey) = {
         let mut s = lock(&g.shared.state);
         s.publication.origin = format!("http://127.0.0.1:{relay_port}");
+        s.account.session = Some(super::super::relay_auth::Session {
+            token: "test-session".into(),
+            expires_at_ms: u64::MAX,
+            email: "test@example.test".into(),
+            origin: s.publication.origin.clone(),
+        });
         s.relay_enabled = true;
         s.tunnel_start = Some(must_not_start_tunnel);
         (s.publication.rid.clone(), s.publication.key.clone())
@@ -1068,6 +1074,7 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
             super::super::pwa::asset_hash()
         )));
         assert!(headers.contains(&format!("Authorization: Bearer {rkey}\r\n")));
+        assert!(headers.contains("x-krill-session: test-session\r\n"));
         let ws_key = headers
             .lines()
             .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
@@ -1454,6 +1461,12 @@ fn missing_relay_pwa_fails_fast_without_quick_tunnel_fallback() {
     {
         let mut state = lock(&gateway.shared.state);
         state.publication.origin = format!("http://{}", listener.local_addr().unwrap());
+        state.account.session = Some(super::super::relay_auth::Session {
+            token: "test-session".into(),
+            expires_at_ms: u64::MAX,
+            email: "test@example.test".into(),
+            origin: state.publication.origin.clone(),
+        });
         state.relay_enabled = true;
         state.tunnel_start = Some(must_not_start_tunnel);
     }
@@ -1638,4 +1651,124 @@ fn cancel_qr_preserves_paired_device_and_authenticated_connection() {
             ..
         }
     ));
+}
+
+#[test]
+fn relay_account_requires_local_ipc_and_does_not_gate_direct_pairing() {
+    let (_registry, gateway) = start();
+    let request = || MobileRequest::Workflow("{\"action\":\"relay_auth_status\"}".into());
+    let MobileReply::Workflow(local) = gateway.request_local(request()) else {
+        panic!("local reply")
+    };
+    let local: serde_json::Value = serde_json::from_str(&local).unwrap();
+    assert_eq!(local["ok"], true);
+    assert_eq!(local["data"]["signed_in"], false);
+    let MobileReply::Workflow(remote) = gateway.request(request()) else {
+        panic!("remote reply")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&remote).unwrap()["ok"],
+        false
+    );
+    assert!(matches!(
+        gateway.request(MobileRequest::MintPairingTicket {
+            mode: ConnectMode::Lan,
+            custom_address: Some("127.0.0.1:0".into()),
+            rotate: true
+        }),
+        MobileReply::PairingOffer { .. }
+    ));
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.tunnel_start = None;
+    }
+    let MobileReply::Failed(message) = gateway.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    }) else {
+        panic!("relay must require sign-in")
+    };
+    assert!(message.contains("Google"));
+}
+
+#[test]
+fn relay_logout_invalidates_pending_approval_without_revoking_pairing() {
+    let (_registry, gateway) = start();
+    let (_, ticket) = offer(&gateway);
+    let device_id;
+    {
+        let mut state = lock(&gateway.shared.state);
+        device_id = state
+            .devices
+            .pair(&ticket.token, "kept phone", now_ms())
+            .unwrap()
+            .0
+            .device_id;
+        state.devices.mint(now_ms(), true).unwrap();
+        state.account.pending = Some(super::super::relay_auth::Pending {
+            code: "secret-code".into(),
+            verifier: "secret-verifier".into(),
+            next_poll_at_ms: 0,
+            expires_at_ms: u64::MAX,
+        });
+    }
+    let before = lock(&gateway.shared.state).account.generation;
+    let MobileReply::Workflow(reply) = gateway.request_local(MobileRequest::Workflow(
+        "{\"action\":\"relay_auth_logout\"}".into(),
+    )) else {
+        panic!("logout reply")
+    };
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["data"]["signed_in"], false);
+    assert!(!reply.to_string().contains("secret"));
+    let state = lock(&gateway.shared.state);
+    assert!(state.account.pending.is_none());
+    assert!(state.account.generation > before);
+    assert!(state.devices.ticket(now_ms()).is_none());
+    assert_eq!(state.devices.active_count(), 1);
+    assert!(state.devices.device_secret(&device_id).is_ok());
+}
+
+#[test]
+fn target_named_configuration_controls_google_gate_before_any_mutation() {
+    for mint in [false, true] {
+        let (_registry, gateway) = start();
+        lock(&gateway.shared.state).relay_enabled = true;
+        let request = |custom_address| {
+            if mint {
+                MobileRequest::MintPairingTicket {
+                    mode: ConnectMode::Tunnel,
+                    custom_address,
+                    rotate: true,
+                }
+            } else {
+                MobileRequest::SetConnectMode {
+                    mode: ConnectMode::Tunnel,
+                    custom_address,
+                }
+            }
+        };
+        let named = gateway.request(request(Some("fixture-token@krill.example.test".into())));
+        assert!(!matches!(named, MobileReply::Failed(_)), "{named:?}");
+        let original_ticket = lock(&gateway.shared.state)
+            .devices
+            .ticket(now_ms())
+            .cloned();
+        if environment_named_tunnel().is_none() {
+            let hosted = gateway.request(request(Some(String::new())));
+            assert!(matches!(hosted, MobileReply::Failed(message) if message.contains("Google")));
+        }
+        let invalid = gateway.request(request(Some("@invalid".into())));
+        assert!(
+            matches!(invalid, MobileReply::Failed(message) if message.contains("Named Tunnel"))
+        );
+        let state = lock(&gateway.shared.state);
+        assert_eq!(state.tunnel_token.as_deref(), Some("fixture-token"));
+        assert_eq!(state.tunnel_hostname.as_deref(), Some("krill.example.test"));
+        assert_eq!(
+            state.devices.ticket(now_ms()).map(|ticket| ticket.token),
+            original_ticket.map(|ticket| ticket.token)
+        );
+    }
 }

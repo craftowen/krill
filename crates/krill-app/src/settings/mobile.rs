@@ -4,6 +4,7 @@
 //! `.ref/orca/src/renderer/src/components/settings/{MobilePane,MobilePairingConnectionOptions,MobilePairingPathOption,MobilePairingQrSection,MobilePairedDevicesSection}.tsx`를
 //! 참고해 순수 Rust/gpui로 옮겼다.
 //! 출처·저작권: Copyright (c) 2026 Lovecast Inc. (MIT License, `.ref/orca/LICENSE`).
+mod account;
 use super::{SettingsView, layout};
 use crate::i18n::catalog::mobile as text;
 use gpui::{Context, FontWeight, SharedString, Task, Window, div, prelude::*, px};
@@ -41,6 +42,27 @@ pub struct Panel {
     pub call: Call,
     timer: Option<Task<()>>,
     generation: u64,
+    account: AccountView,
+}
+struct AccountView {
+    email: Option<String>,
+    required: bool,
+    pending: bool,
+    busy: bool,
+    generation: u64,
+    timer: Option<Task<()>>,
+}
+impl Default for AccountView {
+    fn default() -> Self {
+        Self {
+            email: None,
+            required: true,
+            pending: false,
+            busy: false,
+            generation: 0,
+            timer: None,
+        }
+    }
 }
 impl std::fmt::Debug for Panel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,6 +100,7 @@ impl Panel {
             call,
             timer: None,
             generation: 0,
+            account: AccountView::default(),
         }
     }
     pub fn pairing_pending(&self) -> bool {
@@ -204,6 +227,7 @@ impl SettingsView {
     /// 탭 진입 시 활성 오퍼를 복원하고, 첫 기기 연결·단독 페이지에서는 QR을 자동 발급한다.
     /// 진행 중인 요청이 있으면 그 결과가 오면 폴링이 시작되므로 중복 호출하지 않는다.
     pub(super) fn mobile_enter(&mut self, cx: &mut Context<Self>) {
+        self.mobile_account_poll(cx);
         if self.mobile.pending || self.mobile.pairing_pending() {
             return;
         }
@@ -211,6 +235,7 @@ impl SettingsView {
         let generation = self.mobile.generation;
         self.mobile.pending = true;
         self.mobile.error = None;
+        let relay_signed_in = !self.mobile.account.required || self.mobile.account.email.is_some();
         let auto_mint = self.mobile_page;
         let custom_address = self.mobile.address.clone();
         let call = Arc::clone(&self.mobile.call);
@@ -228,7 +253,9 @@ impl SettingsView {
                         }) => {
                             if *active_offer {
                                 Some(call(MobileRequest::CurrentPairingOffer))
-                            } else if auto_mint || devices.is_empty() {
+                            } else if (auto_mint || devices.is_empty())
+                                && (*mode != ConnectMode::Tunnel || relay_signed_in)
+                            {
                                 Some(call(MobileRequest::MintPairingTicket {
                                     mode: *mode,
                                     custom_address,
@@ -265,6 +292,7 @@ impl SettingsView {
         cx.notify();
     }
     fn mobile_poll(&mut self, cx: &mut Context<Self>) {
+        self.mobile_account_poll(cx);
         if self.mobile.timer.is_some() {
             return;
         }
@@ -279,7 +307,10 @@ impl SettingsView {
                                 || this.mobile.pairing_pending()
                                 || this.mobile.offer.is_some(),
                             this.mobile.offer.is_some(),
-                            this.mobile_page,
+                            this.mobile_page
+                                && (this.mobile.mode != ConnectMode::Tunnel
+                                    || !this.mobile.account.required
+                                    || this.mobile.account.email.is_some()),
                             this.mobile.mode,
                             this.mobile.address.clone(),
                         )
@@ -362,6 +393,15 @@ impl SettingsView {
         address: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if mode == ConnectMode::Tunnel
+            && self.mobile.account.required
+            && self.mobile.account.email.is_none()
+            && address.as_deref().is_none_or(|raw| !raw.contains('@'))
+        {
+            self.mobile.error = Some(text::ACCOUNT_REQUIRED.get().to_owned());
+            cx.notify();
+            return;
+        }
         if self.mobile.pending
             || (self.mobile.pairing_pending()
                 && self.mobile.mode == mode
@@ -398,6 +438,7 @@ impl SettingsView {
                 text::PAIR_SECTION.get(),
             ));
 
+        root = root.child(self.mobile_account_card(cx));
         let mode_options = [
             (
                 ConnectMode::Tunnel,
@@ -1025,6 +1066,7 @@ impl SettingsView {
                     )
                     .child(qr_box),
             )
+            .child(self.mobile_account_card(cx))
             .child(home_guide(p))
             .child(actions)
             .children(self.mobile.error.clone().map(|error| {

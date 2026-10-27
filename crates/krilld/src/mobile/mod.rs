@@ -7,6 +7,7 @@ pub mod net;
 pub mod pwa;
 mod pwa_rpc;
 pub mod relay;
+mod relay_auth;
 pub mod tunnel;
 mod workspaces;
 mod ws;
