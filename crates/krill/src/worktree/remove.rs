@@ -99,10 +99,10 @@ fn parse(args: &[OsString], remote: bool) -> Result<ParsedRemove, String> {
                 "remote worktree rm requires --repo <absolute path on the remote host>".to_owned(),
             );
         };
-        if !repo.as_os_str().as_bytes().starts_with(b"/") {
+        if !crate::remote::is_remote_absolute_path(repo.as_os_str().as_bytes()) {
             return Err("remote --repo must be an absolute path on the remote host".to_owned());
         }
-        if !path.as_os_str().as_bytes().starts_with(b"/") {
+        if !crate::remote::is_remote_absolute_path(path.as_os_str().as_bytes()) {
             return Err(
                 "remote worktree path must be an absolute path on the remote host".to_owned(),
             );

@@ -1293,7 +1293,7 @@ fn resolve_worker_cwd(cwd: Option<&str>, remote: bool) -> io::Result<PathBuf> {
         let cwd = cwd.ok_or_else(|| {
             bad_arg("remote worker-start requires --cwd <absolute path on the remote host>")
         })?;
-        if !cwd.starts_with('/') {
+        if !crate::remote::is_remote_absolute_path(cwd.as_bytes()) {
             return Err(bad_arg(
                 "remote --cwd must be an absolute path on the remote host",
             ));
