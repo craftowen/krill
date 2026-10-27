@@ -1469,6 +1469,14 @@ fn single_flight(
     }
     let mut owner = FlightOwner(flight.clone(), true);
     let result = work();
+    if result.is_err() {
+        krill_proto::error_reporting::capture(
+            krill_proto::error_reporting::Process::App,
+            krill_proto::error_reporting::Code::UpdateFailed,
+            file!(),
+            line!(),
+        );
+    }
     let mut state = flight
         .state
         .lock()

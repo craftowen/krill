@@ -17,6 +17,10 @@ toml_edit = { workspace = true }
 # 서명된 에이전트 규칙 검증(MK-091). 업데이터(MK-063)와 같은 ring이라 새 외부 의존성이 아니다.
 ring = { workspace = true }
 
+# Safe nonblocking/no-follow opens for local diagnostic files and run markers.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 # krill_proto::os::net Windows 구현(AF_UNIX 소켓, M11).
 [target.'cfg(windows)'.dependencies]
 uds_windows = { workspace = true }

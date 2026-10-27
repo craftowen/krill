@@ -59,6 +59,14 @@ fn main() -> ExitCode {
     tracing::info!("daemon starting");
     // 세션 panic은 `catch_unwind`가 잡지만(P4) 원인은 크래시 로그로 남긴다(MK-067).
     krill_proto::diag::install_panic_hook("krilld");
+    let _error_run = daemon::state_dir().and_then(|state| {
+        krill_proto::error_reporting::runs::RunGuard::start(
+            &state,
+            krill_proto::error_reporting::Process::Daemon,
+        )
+        .ok()
+        .flatten()
+    });
     // 실패해도 데몬은 뜬다: 해제 페이지가 늦게 돌아올 뿐 세션에는 영향이 없다.
     krilld::alloc::return_freed_pages().ok();
     // MK-066: 메모리 게이트가 의도적 회귀를 잡는지 확인하는 주입(`scripts/memory-gate.sh --inject`). 평소에는 빈 Vec.
@@ -98,6 +106,12 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             tracing::error!(kind = ?error.kind(), "listener failed");
+            krill_proto::error_reporting::capture(
+                krill_proto::error_reporting::Process::Daemon,
+                krill_proto::error_reporting::Code::DaemonListenerFailed,
+                file!(),
+                line!(),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -205,6 +219,12 @@ fn main() -> ExitCode {
                         Err(_) => tracing::warn!("schedule poll panicked; continuing"),
                         Ok(Err(error)) => {
                             tracing::warn!(kind = ?error.kind(), "schedule poll failed");
+                            krill_proto::error_reporting::capture(
+                                krill_proto::error_reporting::Process::Daemon,
+                                krill_proto::error_reporting::Code::SchedulerFailed,
+                                file!(),
+                                line!(),
+                            );
                         }
                         Ok(Ok(())) => {}
                     }

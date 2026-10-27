@@ -46,6 +46,23 @@ pub fn install_panic_hook(process: &'static str) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         write_crash(&dir, process, info).ok();
+        crate::error_reporting::runs::note_panic();
+        let component = match process {
+            "krill-app" => Some(crate::error_reporting::Process::App),
+            "krilld" => Some(crate::error_reporting::Process::Daemon),
+            _ => None,
+        };
+        if let Some(component) = component {
+            let (file, line) = info
+                .location()
+                .map_or(("", 0), |loc| (loc.file(), loc.line()));
+            crate::error_reporting::capture(
+                component,
+                crate::error_reporting::Code::Panic,
+                file,
+                line,
+            );
+        }
         prev(info);
     }));
 }

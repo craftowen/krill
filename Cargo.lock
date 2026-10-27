@@ -3883,6 +3883,7 @@ dependencies = [
  "proptest",
  "regex",
  "ring",
+ "rustix",
  "serde",
  "serde-saphyr",
  "serde_json",

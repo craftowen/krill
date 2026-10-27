@@ -2753,6 +2753,7 @@ pub struct SettingsView {
     ssh_keygen_confirm_host: Option<crate::ssh_hosts::SshHost>,
     skill_status: Option<SharedString>,
     doctor_status: Option<SharedString>,
+    error_reporting: crate::errors::Panel,
     history_status: Option<SharedString>,
     /// 기록 즉시 삭제 IPC 진행 중. UI 스레드를 막지 않고 백그라운드에서 돌린다(AS-01).
     history_clear_pending: bool,
@@ -3187,6 +3188,7 @@ impl SettingsView {
             ssh_keygen_confirm_host: None,
             skill_status: None,
             doctor_status: None,
+            error_reporting: crate::errors::Panel::default(),
             history_status: None,
             history_clear_pending: false,
             accounts_refresh_pending: false,
@@ -3600,6 +3602,9 @@ impl SettingsView {
         }
         if tab == AdminTab::Resources && self.space.report.is_none() && !self.space.scanning {
             self.scan_workspace_space(cx);
+        }
+        if tab == AdminTab::Resources {
+            self.refresh_error_reporting(cx);
         }
         cx.notify();
     }
@@ -5760,6 +5765,85 @@ impl SettingsView {
             },
             cx,
         );
+    }
+
+    fn refresh_error_reporting(&mut self, cx: &mut Context<Self>) {
+        if self.error_reporting.pending {
+            return;
+        }
+        let dir = state_dir(cx);
+        self.error_reporting.revision = self.error_reporting.revision.wrapping_add(1);
+        let revision = self.error_reporting.revision;
+        self.file_job(
+            "error-reporting-read",
+            move || dir.as_deref().map(krill_proto::error_reporting::status),
+            move |this, result, _| {
+                if this.error_reporting.revision != revision {
+                    return;
+                }
+                match result {
+                    Some(Ok(status)) => {
+                        this.error_reporting.status = Some(status);
+                        this.error_reporting.message = None;
+                    }
+                    _ => {
+                        this.error_reporting.message =
+                            Some(text::ERROR_REPORTS_FAILED.get().into());
+                    }
+                }
+            },
+            cx,
+        );
+    }
+
+    fn set_error_reporting(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.error_reporting.pending {
+            return;
+        }
+        let Some(dir) = state_dir(cx) else {
+            self.error_reporting.message = Some(text::ERROR_REPORTS_FAILED.get().into());
+            cx.notify();
+            return;
+        };
+        self.error_reporting.pending = true;
+        self.error_reporting.started = Some(std::time::Instant::now());
+        self.error_reporting.revision = self.error_reporting.revision.wrapping_add(1);
+        self.error_reporting.message = None;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            this.update(cx, |this, cx| {
+                if this.error_reporting.pending {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        self.file_job(
+            "error-reporting-toggle",
+            move || {
+                if enabled {
+                    krill_proto::error_reporting::enable(&dir)?;
+                } else {
+                    krill_proto::error_reporting::disable(&dir)?;
+                }
+                krill_proto::error_reporting::status(&dir)
+            },
+            |this, result, cx| {
+                this.error_reporting.pending = false;
+                this.error_reporting.started = None;
+                match result {
+                    Ok(status) => this.error_reporting.status = Some(status),
+                    Err(_) => {
+                        this.error_reporting.message =
+                            Some(text::ERROR_REPORTS_FAILED.get().into());
+                    }
+                }
+                crate::errors::refresh_run(cx);
+            },
+            cx,
+        );
+        cx.notify();
     }
 
     /// 7탭 기록 일시중지 토글. `Paused` ACK를 받은 뒤에만 `settings.toml`에 저장하고,
@@ -12729,6 +12813,46 @@ impl SettingsView {
             ))
             .child(info(text::RESOURCES_BUDGET.get()))
             .child(info(text::RESOURCES_SECURITY.get()))
+            .child(
+                row()
+                    .child(label(
+                        text::ERROR_REPORTS_TITLE.get(),
+                        text::ERROR_REPORTS_DESC.get(),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::switch(
+                                p,
+                                "admin-error-reporting-toggle",
+                                self.error_reporting
+                                    .status
+                                    .as_ref()
+                                    .is_some_and(|status| status.consented),
+                                self.error_reporting.pending
+                                    || self.error_reporting.status.is_none(),
+                                {
+                                    let view = cx.entity();
+                                    move |enabled, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_error_reporting(enabled, cx);
+                                        });
+                                    }
+                                },
+                            )
+                            .aria_label(text::ERROR_REPORTS_TITLE.get()),
+                        ),
+                    ),
+            )
+            .when_some(self.error_reporting.description(), |el, message| {
+                el.child(
+                    div()
+                        .id("admin-error-reporting-status")
+                        .debug_selector(|| "admin-error-reporting-status".into())
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(message),
+                )
+            })
             .child(
                 row()
                     .child(label(

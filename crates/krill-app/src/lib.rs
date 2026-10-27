@@ -15,6 +15,7 @@ pub mod detached;
 pub mod diff;
 pub mod echo;
 pub mod editor;
+pub mod errors;
 pub mod file_format;
 pub mod hosts;
 pub mod i18n;
