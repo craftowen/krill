@@ -1,3 +1,4 @@
+// Modified by Krill (2026-10-27): track both HLSL inputs for incremental builds.
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
@@ -60,6 +61,7 @@ mod shader_compilation {
         {
             let shader_path = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
                 .join("src/color_text_raster.hlsl");
+            println!("cargo:rerun-if-changed={}", shader_path.display());
             compile_shader_for_module(
                 "emoji_rasterization",
                 &out_dir,
