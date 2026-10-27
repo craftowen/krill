@@ -199,19 +199,16 @@ fn no_daemon_supported_cached(exe: &Path) -> bool {
 }
 
 pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
-    let Ok(mut child) = Command::new(exe)
-        .arg("--help")
+    let mut cmd = Command::new(exe);
+    cmd.arg("--help")
         .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    let Ok(mut child) = crate::child::spawn(crate::child::own_group(&mut cmd)) else {
         return false;
     };
     let Some(pipe) = child.stdout.take() else {
-        child.kill().ok();
-        child.wait().ok();
         return false;
     };
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -225,13 +222,10 @@ pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                child.kill().ok();
-                child.wait().ok();
-                break false;
-            }
+            _ => break false,
         }
     };
+    drop(child);
     if !ok {
         return false;
     }

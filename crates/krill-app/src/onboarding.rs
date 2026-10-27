@@ -209,10 +209,10 @@ pub fn login_path(shell: &OsStr) -> Option<OsString> {
         .map(OsString::from)
 }
 
-/// Windows has no POSIX login shell. Use the PATH inherited from Explorer.
+/// Windows has no POSIX login shell. Use the PATH inherited from Explorer plus standard per-user CLI folders.
 #[cfg(windows)]
 pub fn login_path(_shell: &OsStr) -> Option<OsString> {
-    std::env::var_os("PATH").filter(|path| !path.is_empty())
+    krill_proto::os::augment_windows_path(std::env::var_os("PATH").as_deref())
 }
 
 /// git·에이전트·`krill` CLI를 감지한다. 셸과 `--version`을 띄우므로 백그라운드에서 부른다.

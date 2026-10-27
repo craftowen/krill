@@ -905,7 +905,9 @@ fn find_codex_by_id(
         return None;
     }
     let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.take(256).flatten() {
+    let mut entries: Vec<_> = entries.take(65_536).flatten().collect();
+    entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    for entry in entries {
         if !budget.take() {
             break;
         }
@@ -2974,10 +2976,26 @@ mod performance_tests {
                 &filter,
                 &mut budget
             ),
-            Some((live, "live".into()))
+            Some((live.clone(), "live".into()))
         );
         // 2025 ended long before the session, so its folders were never opened.
         assert!(budget.remaining > 2000);
+
+        let mut stored_by_id = stored;
+        stored_by_id.session_id = Some("live".into());
+        let mut id_budget = ScanBudget::new();
+        assert_eq!(
+            resolve_transcript_uncached(
+                &roots,
+                VaultAgent::Codex,
+                &stored_by_id,
+                cwd,
+                &filter,
+                &mut id_budget
+            ),
+            Some((live, "live".into()))
+        );
+        assert!(id_budget.remaining > 2000);
         fs::remove_dir_all(dir).unwrap();
     }
 

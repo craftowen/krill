@@ -1051,7 +1051,15 @@ impl Indexer {
                 return;
             }
         };
-        for item in dir {
+        let mut items: Vec<_> = dir.collect();
+        if codex_rollout_only {
+            items.sort_unstable_by(|a, b| {
+                let a_name = a.as_ref().ok().map(fs::DirEntry::file_name);
+                let b_name = b.as_ref().ok().map(fs::DirEntry::file_name);
+                b_name.cmp(&a_name)
+            });
+        }
+        for item in items {
             if self.exhausted() {
                 break;
             }
