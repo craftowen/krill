@@ -417,10 +417,11 @@ impl Shell {
             return false;
         };
         let session = live.pane.session();
+        let creation = std::sync::Arc::clone(&live.creation);
         self.paste_queue.entries.push_back(QueuedInput {
             pane,
             host,
-            creation: std::sync::Arc::clone(&live.creation),
+            creation,
             session,
             kind: QueuedKind::Bytes(bytes.to_vec()),
         });
@@ -664,12 +665,13 @@ impl Shell {
             PastePlan::Warn(pending) => {
                 // 확인 대기 항목을 큐 뒤에 둬 그 뒤에 친 키가 앞지르지 않게 한다(APP-RUNTIME-002).
                 let session = l.pane.session();
+                let creation = std::sync::Arc::clone(&l.creation);
                 self.paste_queue.next = self.paste_queue.next.wrapping_add(1);
                 let id = self.paste_queue.next;
                 self.paste_queue.entries.push_back(QueuedInput {
                     pane,
                     host,
-                    creation: std::sync::Arc::clone(&l.creation),
+                    creation,
                     session,
                     kind: QueuedKind::Paste(id, PreparedPaste::Confirming(pending)),
                 });
