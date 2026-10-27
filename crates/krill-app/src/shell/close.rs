@@ -29,6 +29,15 @@ impl Creation {
         true
     }
 
+    /// 닫히지 않은 생성이 발행한 세션 ID. Create가 끝난 뒤 숨겨져 `settled`가 취소된 칸은 다시 보일 때 이 ID로
+    /// 같은 세션에 붙는다 — 레이아웃에 ID가 없다고 두 번째 PTY를 만들지 않는다(APP-RUNTIME-001).
+    pub(super) fn published(state: &std::sync::Mutex<Self>) -> Option<krill_proto::SessionId> {
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed { None } else { state.session }
+    }
+
     fn close(&mut self) -> Option<krill_proto::SessionId> {
         self.closed = true;
         self.session.take()

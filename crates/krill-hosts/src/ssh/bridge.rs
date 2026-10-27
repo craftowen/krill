@@ -218,6 +218,8 @@ fn classify(stdout: &str, stderr: &str, code: Option<i32>) -> io::Result<Option<
 pub(crate) struct Relay {
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// keepalive `krill __bridge --probe`가 보고한 원격 `std::env::consts::OS`(`windows` 등, 모르면 빈 문자열).
+    os: String,
 }
 
 #[cfg(unix)]
@@ -270,7 +272,13 @@ impl Relay {
             })?;
         let host = &opts.destination;
         let ready = match rx.recv_timeout(READY_TIMEOUT) {
-            Ok(seen) if seen.lines().any(|line| line.trim() == OK_LINE) => Ok(()),
+            Ok(seen) if seen.lines().any(|line| line.trim() == OK_LINE) => {
+                Ok(classify(&seen, "", None)
+                    .ok()
+                    .flatten()
+                    .map(|probe| probe.os)
+                    .unwrap_or_default())
+            }
             Ok(seen) => {
                 let status = child.wait()?;
                 let stderr = errors.join().unwrap_or_default();
@@ -290,11 +298,14 @@ impl Relay {
                 format!("ssh bridge to {host} timed out"),
             )),
         };
-        if let Err(e) = ready {
-            child.kill().ok();
-            child.wait().ok();
-            return Err(e);
-        }
+        let os = match ready {
+            Ok(os) => os,
+            Err(e) => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(e);
+            }
+        };
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);
         let opts = opts.clone();
@@ -308,6 +319,7 @@ impl Relay {
                 Self {
                     stopped,
                     worker: Some(worker),
+                    os,
                 },
             )),
             Err(e) => {
@@ -316,6 +328,11 @@ impl Relay {
                 Err(e)
             }
         }
+    }
+
+    /// 원격이 보고한 OS 이름(`windows` 등). 모르면 빈 문자열.
+    pub(crate) fn os(&self) -> &str {
+        &self.os
     }
 
     pub(crate) fn is_alive(&self) -> bool {

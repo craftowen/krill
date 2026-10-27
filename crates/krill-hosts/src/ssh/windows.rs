@@ -136,6 +136,11 @@ impl Tunnel {
             && !self.stopped.load(Ordering::Acquire)
             && self.worker.as_ref().is_some_and(|w| !w.is_finished())
     }
+    /// Windows 클라이언트는 원격 중계(`RemoteEndpoint::Bridge`)를 아직 열지 않으므로 항상 `None`.
+    #[expect(clippy::unused_self, reason = "Unix Tunnel과 같은 모양의 API")]
+    pub fn remote_os(&self) -> Option<&str> {
+        None
+    }
 }
 impl Drop for Tunnel {
     fn drop(&mut self) {

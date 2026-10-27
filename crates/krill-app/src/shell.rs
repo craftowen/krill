@@ -1276,14 +1276,21 @@ impl Shell {
                 }
                 let edited_while_loading = this.layout != baseline;
                 match loaded {
-                    Ok(mut layout) if this.layout == baseline => {
+                    Ok(mut layout) => {
                         if let Some(bounds) = bounds {
                             layout.set_window_bounds(bounds);
                         }
-                        this.sidebar_collapsed = layout.sidebar_collapsed;
-                        this.panel_collapsed = layout.panel_collapsed;
-                        let panel_tab = layout.panel_tab;
-                        this.layout = layout;
+                        // 로딩 중 사용자가 탭을 열거나 나눴어도 저장된 레이아웃을 버리지 않고 그 위에 합친다
+                        // (ARCHITECTURE §4.1 레이아웃 전체 복원, APP-RUNTIME-004).
+                        if edited_while_loading {
+                            let edited = std::mem::replace(&mut this.layout, layout);
+                            this.layout.absorb_startup_edits(&baseline, &edited);
+                        } else {
+                            this.layout = layout;
+                        }
+                        this.sidebar_collapsed = this.layout.sidebar_collapsed;
+                        this.panel_collapsed = this.layout.panel_collapsed;
+                        let panel_tab = this.layout.panel_tab;
                         this.sidebar
                             .update(cx, |s, cx| s.set_visible(!this.sidebar_collapsed, cx));
                         this.diff.update(cx, |d, cx| {
@@ -1450,7 +1457,7 @@ impl Shell {
     }
 
     /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
-    /// `layout.launches`의 폴더(워크트리 루트·`folder()`·Open in·새 에이전트 기준)는 건드리지 않는다.
+    /// 일반 cd는 `layout.launches`의 폴더를 바꾸지 않는다. 프로젝트 생성 작업은 실제 성공 cwd를 확인한 뒤 전환한다.
     /// 재부팅 뒤에도 살아남도록 꼬리(`LayoutTail.respawn_cwds`)로 영속한다.
     pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) {
         let mut changed = false;
@@ -1472,6 +1479,14 @@ impl Shell {
             let cwd_bytes = live_cwd.as_os_str().as_bytes();
             if self.layout.respawn_cwd(pane) != Some(cwd_bytes) {
                 changed |= self.layout.set_respawn_cwd(pane, cwd_bytes.to_vec());
+            }
+            if let Some(completed) = self
+                .layout
+                .launch(pane)
+                .and_then(|launch| folder::completed_project(launch, live_cwd))
+            {
+                self.layout.set_launch(pane, completed);
+                changed = true;
             }
         }
         if changed {
@@ -3948,10 +3963,12 @@ impl Shell {
             self.show(Some(notice), cx);
         }
         self.security.retain_panes(&visible);
+        self.refresh_pending_paste_banner(cx);
         if self.paths.is_none() && self.host_targets.is_empty() {
             return;
         }
         let mut any_terminal = false;
+        let mut recovered = false;
         for p in visible {
             if self
                 .layout
@@ -3978,9 +3995,18 @@ impl Shell {
             };
             match self.live.entry(p) {
                 Entry::Vacant(entry) => {
+                    let creation = Arc::clone(self.creations.entry(p).or_default());
+                    // 숨긴 사이 Create는 끝났지만 `settled`가 취소돼 레이아웃에 ID가 없는 칸: 발행된 ID로
+                    // 같은 세션에 다시 붙는다(APP-RUNTIME-001). 명시적으로 닫힌 생성은 돌려주지 않는다.
+                    if self.layout.session(p).is_none()
+                        && let Some(session) = close::Creation::published(&creation)
+                    {
+                        self.layout.set_session(p, session);
+                        recovered = true;
+                    }
                     let mut live = Live::new(Self::spawn_pane(p, target.clone(), None, cx));
                     live.target = Some(target);
-                    live.creation = Arc::clone(self.creations.entry(p).or_default());
+                    live.creation = creation;
                     entry.insert(live);
                     Self::redraw_after_grace(cx);
                 }
@@ -3999,6 +4025,9 @@ impl Shell {
                     }
                 }
             }
+        }
+        if recovered {
+            self.save();
         }
         if !any_terminal && let Some(state) = self.update_ready.take() {
             cx.background_spawn(async move {
@@ -4037,8 +4066,12 @@ impl Shell {
                 }
                 let Ok(Some((want, known, launch, creation, allow_cold_resume, uncertain))) = this
                     .read_with(cx, |t, _| {
-                        let want = t.layout.session(pane);
                         let l = t.live.get(&pane)?;
+                        // 레이아웃에 아직 없는 ID라도 이 칸이 이미 발행한 세션이면 그 세션에 붙는다(APP-RUNTIME-001).
+                        let want = t
+                            .layout
+                            .session(pane)
+                            .or_else(|| close::Creation::published(&l.creation));
                         let host = t.layout.host(pane);
                         let allow_cold_resume = want.is_some_and(|w| {
                             !t.observed_sessions.contains(&(host.clone(), w))

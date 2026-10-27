@@ -10434,3 +10434,116 @@ fn sticky_last_prompt_bar_and_tab_hover_card_render_and_toggle_timeline(cx: &mut
         "clicking close button must dismiss timeline popover"
     );
 }
+
+/// APP-RUNTIME-004: 저장된 레이아웃을 백그라운드에서 읽는 동안 사용자가 새 탭을 열면, 복원이 끝난 뒤 새 탭은 저장된
+/// 탭 뒤에 붙고 저장된 탭·분할·세션·호스트 매핑·사용자 제목은 메모리와 디스크 모두 그대로다(ARCHITECTURE §4.1).
+#[gpui::test]
+fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
+    let path = state_path("startup-edit-merge");
+    let mut saved = Layout::default();
+    let first_pane = saved.focused().unwrap();
+    saved.set_session(first_pane, SessionId(7));
+    saved.new_tab();
+    saved.split(Axis::Horizontal);
+    let remote_pane = saved.focused().unwrap();
+    saved.set_host(remote_pane, krill_app::hosts::HostId::Remote("box".into()));
+    saved.set_tab_title(1, Some("work"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut shell = Shell::new(Some(path.clone()), cx);
+        // 복원 작업이 실행되기 전(같은 프레임)에 Cmd+T와 같은 경로로 새 탭을 연다.
+        assert!(shell.layout_loading);
+        shell.new_tab_on_launch_host(cx);
+        shell.split_active(Axis::Vertical, cx);
+        assert_eq!(shell.layout.tabs().len(), 2);
+        shell
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).layout_loading));
+    let layout = layout_of(&view, cx);
+    assert_eq!(
+        layout.tabs().len(),
+        3,
+        "saved tabs + the tab opened while loading"
+    );
+    assert_eq!(layout.tabs()[0], saved.tabs()[0]);
+    assert_eq!(layout.tabs()[1], saved.tabs()[1]);
+    assert_eq!(layout.session(first_pane), Some(SessionId(7)));
+    assert_eq!(
+        layout.host(remote_pane),
+        &krill_app::hosts::HostId::Remote("box".into())
+    );
+    assert_eq!(layout.tab_title(1), Some("work"));
+    assert_eq!(layout.active(), 2, "the tab the user opened stays active");
+    let new_panes = layout.tab_panes(2);
+    assert_eq!(new_panes.len(), 2, "the split made while loading survives");
+    assert!(
+        new_panes
+            .iter()
+            .all(|p| !saved.tabs().iter().any(|t| t.root.contains(*p))),
+        "new panes must not reuse saved pane numbers"
+    );
+    let new_pane = layout.active_tab().focused;
+    assert!(new_panes.contains(&new_pane));
+    assert!(layout.launch(new_pane).is_some());
+    assert_eq!(Layout::load(&path).unwrap(), layout);
+}
+
+/// APP-RUNTIME-001: Create는 끝났는데(ID 발행) attach를 기다리는 사이 탭을 숨기면 `settled`가 취소돼 레이아웃에
+/// ID가 남지 않는다. 다시 보인 칸은 발행된 ID로 같은 세션에 붙어야 하며 두 번째 Create를 보내면 안 된다.
+#[gpui::test]
+fn reshown_pane_reattaches_published_session_instead_of_creating_again(cx: &mut TestAppContext) {
+    let layout = state_path("published-creation-recovery");
+    let dir = layout.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let requests = transient_daemon(&dir.join("k.sock"), 0, false);
+    let (view, cx) = open(cx, layout);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    run_pane_against(&view, cx, &dir, 4, |shell| {
+        shell
+            .live
+            .get(&pane)
+            .is_some_and(|live| live.pane.session() == Some(SessionId(41)))
+    });
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(creates(&requests), 1);
+
+    // 숨긴 뒤 다시 보이는 상태를 재현: Live(와 그 foreground Task)는 사라졌고, 레이아웃에는 ID가 없으며,
+    // 백그라운드 Create가 발행한 ID만 Creation에 남아 있다.
+    let creation = Arc::new(std::sync::Mutex::new(close::Creation::default()));
+    assert!(close::Creation::publish(&creation, SessionId(41)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.live.remove(&pane);
+            s.layout.clear_session(pane);
+            s.creations.insert(pane, Arc::clone(&creation));
+            s.sync(cx);
+            assert_eq!(
+                s.layout.session(pane),
+                Some(SessionId(41)),
+                "sync must recover the published ID before attaching"
+            );
+        });
+    });
+    run_pane_against(&view, cx, &dir, 4, |shell| {
+        shell
+            .live
+            .get(&pane)
+            .is_some_and(|live| live.pane.session() == Some(SessionId(41)))
+    });
+    assert_eq!(
+        creates(&requests),
+        1,
+        "the re-shown pane must attach to the published session, not create another PTY"
+    );
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(close::Creation::published(&creation), Some(SessionId(41)));
+}

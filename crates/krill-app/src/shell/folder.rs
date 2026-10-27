@@ -3,6 +3,7 @@
 //! 끝나면 그 폴더의 로그인 셸이 남아 사이드바가 실제 cwd로 프로젝트를 찾는다).
 
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use gpui::{AppContext as _, Context, Window};
@@ -167,10 +168,8 @@ impl Shell {
                         let Some(dir) = add_project::clone_dir(url) else {
                             return;
                         };
-                        let program = Self::shell_script(
-                            r#"git clone -- "$1" "$2" && cd -- "$2"; exec "${SHELL:-/bin/zsh}" -l"#,
-                            &[url.as_bytes(), dir.as_bytes()],
-                        );
+                        let target = this.target_os(host, parent.as_os_str().as_bytes());
+                        let program = clone_program(target, url.as_bytes(), dir.as_bytes());
                         this.new_folder_tab_on(host.clone(), parent, program, cx);
                     }
                     add_project::Event::Create(host) => {
@@ -179,14 +178,19 @@ impl Shell {
                         }
                     }
                     add_project::Event::CreateAt(host, path) => {
-                        let program = Self::shell_script(
-                            r#"mkdir -- "$1" && cd -- "$1" && git init; exec "${SHELL:-/bin/zsh}" -l"#,
-                            &[path.as_os_str().as_bytes()],
-                        );
-                        let parent = path.parent().map_or_else(
-                            || PathBuf::from("/"),
-                            std::path::Path::to_path_buf,
-                        );
+                        let path_bytes = path.as_os_str().as_bytes();
+                        let target = this.target_os(host, path_bytes);
+                        let program = init_program(target, path_bytes);
+                        // 새 칸의 cwd는 상위 폴더. Windows 경로는 이 앱(POSIX)의 `Path::parent`가 `\`를 모르므로
+                        // 바이트로 자른다.
+                        let parent = match target {
+                            TargetOs::Windows => PathBuf::from(std::ffi::OsString::from_vec(
+                                windows_parent(path_bytes).to_vec(),
+                            )),
+                            TargetOs::Unix => path
+                                .parent()
+                                .map_or_else(|| PathBuf::from("/"), std::path::Path::to_path_buf),
+                        };
                         this.new_folder_tab_on(host.clone(), &parent, program, cx);
                     }
                     add_project::Event::Close => {}
@@ -197,17 +201,23 @@ impl Shell {
         cx.notify();
     }
 
-    /// `sh -c script krill args…` — 사용자 입력은 위치 인자로만 넘겨 셸 해석을 피한다.
-    fn shell_script(script: &str, args: &[&[u8]]) -> Program {
-        let mut argv = vec![
-            b"-c".to_vec(),
-            script.as_bytes().to_vec(),
-            b"krill".to_vec(),
-        ];
-        argv.extend(args.iter().map(|a| a.to_vec()));
-        Program::Custom {
-            program: b"/bin/sh".to_vec(),
-            args: argv,
+    /// 새 세션이 실행될 OS. 로컬은 이 앱의 OS. 원격은 (1) SSH 중계 터널이 probe로 보고한 OS 문자열(중계 자체는
+    /// 전송 방식일 뿐이라 OS 증거로 쓰지 않는다), (2) 터널 항목이 없는 P2P 원격을 위해 사용자가 고른 경로의
+    /// Windows 문법(`C:\`·`C:/`·UNC). 소켓 포워딩 원격은 POSIX다.
+    fn target_os(&self, host: &krill_app::hosts::HostId, path: &[u8]) -> TargetOs {
+        let windows = match host {
+            krill_app::hosts::HostId::Local => cfg!(windows),
+            krill_app::hosts::HostId::Remote(id) => {
+                self.host_manager
+                    .remote_os(id)
+                    .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+                    || is_windows_path(path)
+            }
+        };
+        if windows {
+            TargetOs::Windows
+        } else {
+            TargetOs::Unix
         }
     }
 
@@ -229,10 +239,7 @@ impl Shell {
             if let Ok(Ok(Some(paths))) = chosen.await
                 && let Some(parent) = paths.into_iter().next()
             {
-                let program = Self::shell_script(
-                    r#"git clone -- "$1" "$2" && cd -- "$2"; exec "${SHELL:-/bin/zsh}" -l"#,
-                    &[url.as_bytes(), dir.as_bytes()],
-                );
+                let program = clone_program(TargetOs::local(), url.as_bytes(), dir.as_bytes());
                 this.update(cx, |this, cx| {
                     this.new_folder_tab(&parent, program, cx);
                     // OWE-852: 복제될 실제 저장소 루트(parent/dir)를 영속 등록한다.
@@ -252,10 +259,7 @@ impl Shell {
             if let Ok(Ok(Some(path))) = chosen.await
                 && let Some(parent) = path.parent()
             {
-                let program = Self::shell_script(
-                    r#"mkdir -- "$1" && cd -- "$1" && git init; exec "${SHELL:-/bin/zsh}" -l"#,
-                    &[path.as_os_str().as_bytes()],
-                );
+                let program = init_program(TargetOs::local(), path.as_os_str().as_bytes());
                 this.update(cx, |this, cx| {
                     this.new_folder_tab(parent, program, cx);
                     // OWE-852: 새로 만들 프로젝트 루트 자체를 영속 등록한다.
@@ -266,5 +270,331 @@ impl Shell {
             }
         })
         .detach();
+    }
+}
+
+/// Add Project 명령이 실행될 OS(APP-RUNTIME-006).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetOs {
+    Unix,
+    Windows,
+}
+
+impl TargetOs {
+    fn local() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// `sh -c script krill args…` — 사용자 입력은 위치 인자로만 넘겨 셸 해석을 피한다.
+fn shell_script(script: &str, args: &[&[u8]]) -> Program {
+    let mut argv = vec![
+        b"-c".to_vec(),
+        script.as_bytes().to_vec(),
+        b"krill".to_vec(),
+    ];
+    argv.extend(args.iter().map(|a| a.to_vec()));
+    Program::Custom {
+        program: b"/bin/sh".to_vec(),
+        args: argv,
+    }
+}
+
+/// Windows 경로 문법: 드라이브 루트(`C:\`·`C:/`) 또는 UNC(`\\server\share`). POSIX 경로는 `/`로 시작한다.
+fn is_windows_path(path: &[u8]) -> bool {
+    matches!(path, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        || path.starts_with(b"\\\\")
+}
+
+/// Windows 경로의 상위 폴더(`\`·`/` 모두 구분자). 드라이브 루트는 구분자를 남기고(`C:\`), 구분자가 없으면 그대로.
+fn windows_parent(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|b| matches!(b, b'\\' | b'/')) {
+        Some(0) | None => path,
+        Some(i) => {
+            let (parent, _) = path.split_at(i);
+            if parent.ends_with(b":") {
+                path.split_at(i.saturating_add(1)).0
+            } else {
+                parent
+            }
+        }
+    }
+}
+
+const PROJECT_MARKER: &str = "# krill-project-v1:";
+
+/// Windows 기본 셸에서 git을 실행하고 성공한 프로젝트 폴더에 남는다. 사용자 바이트는 Base64 데이터로만 넣어
+/// 따옴표·공백·PowerShell 연산자로 해석되지 않게 한다. 첫 줄의 hex 데이터는 복원 후에도 프로젝트 작업을 식별한다.
+fn windows_project(args: &[&[u8]], destination: &[u8]) -> Program {
+    let decode = |value: &[u8]| {
+        let encoded = super::security::base64_encode(value);
+        format!(
+            "$utf8.GetString([Convert]::FromBase64String('{}'))",
+            String::from_utf8_lossy(&encoded)
+        )
+    };
+    let data = args
+        .iter()
+        .map(|arg| decode(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut marker = String::with_capacity(destination.len().saturating_mul(2));
+    for byte in destination {
+        write!(&mut marker, "{byte:02x}").ok();
+    }
+    let destination = decode(destination);
+    let script = format!(
+        "{PROJECT_MARKER}{marker}\n& {{\n\
+         $ErrorActionPreference = 'Stop'\n\
+         $utf8 = [System.Text.UTF8Encoding]::new($false, $true)\n\
+         $gitArgs = @({data})\n\
+         & git @gitArgs\n\
+         if ($LASTEXITCODE -eq 0) {{\n\
+           Set-Location -LiteralPath ({destination})\n\
+           $uri = [Uri]::new((Get-Location).Path + '\\')\n\
+           [Console]::Write([string][char]27 + ']7;' + $uri.AbsoluteUri + [char]7)\n\
+         }}\n}}"
+    );
+    Program::Custom {
+        program: b"powershell.exe".to_vec(),
+        args: vec![
+            b"-NoLogo".to_vec(),
+            b"-NoExit".to_vec(),
+            b"-Command".to_vec(),
+            script.into_bytes(),
+        ],
+    }
+}
+
+/// 저장소 복제. 성공하면 실제 프로젝트 폴더의 셸과 cwd 보고를 유지한다.
+fn clone_program(target: TargetOs, url: &[u8], dir: &[u8]) -> Program {
+    match target {
+        TargetOs::Unix => shell_script(
+            r#"git clone -- "$1" "$2" && cd -- "$2"; exec "${SHELL:-/bin/zsh}" -l"#,
+            &[url, dir],
+        ),
+        TargetOs::Windows => windows_project(&[b"clone", b"--", url, dir], dir),
+    }
+}
+
+/// 새 프로젝트 폴더 생성 + `git init`(`git init <경로>`는 폴더를 만든다).
+fn init_program(target: TargetOs, path: &[u8]) -> Program {
+    match target {
+        TargetOs::Unix => shell_script(
+            r#"mkdir -- "$1" && cd -- "$1" && git init; exec "${SHELL:-/bin/zsh}" -l"#,
+            &[path],
+        ),
+        TargetOs::Windows => windows_project(&[b"init", b"--", path], path),
+    }
+}
+
+/// Git 작업이 실제 프로젝트로 이동한 뒤에만 영속 실행 폴더를 바꾼다. 실행 전에는 존재하는 상위 cwd가 필요하다.
+/// 일반 셸의 cd는 워크스페이스를 바꾸지 않는 기존 규칙을 유지한다.
+pub(super) fn completed_project(launch: &Create, live_cwd: &std::path::Path) -> Option<Create> {
+    let Program::Custom { program, args } = &launch.program else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case(b"powershell.exe")
+        || args.len() != 4
+        || args.first()?.as_slice() != b"-NoLogo"
+        || args.get(1)?.as_slice() != b"-NoExit"
+        || args.get(2)?.as_slice() != b"-Command"
+    {
+        return None;
+    }
+    let script = std::str::from_utf8(args.last()?).ok()?;
+    let hex = script.lines().next()?.strip_prefix(PROJECT_MARKER)?;
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if pairs.is_empty() || !remainder.is_empty() {
+        return None;
+    }
+    let destination: Option<Vec<u8>> = pairs
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect();
+    let destination = destination?;
+    let parent = PathBuf::from(std::ffi::OsString::from_vec(launch.cwd.clone()));
+    let folder = PathBuf::from(std::ffi::OsString::from_vec(destination.clone()));
+    let folder = if is_windows_path(&destination) {
+        folder
+    } else {
+        parent.join(folder)
+    };
+    if !krill_proto::path::equivalent(&folder, live_cwd) {
+        return None;
+    }
+    let mut completed = launch.clone();
+    completed.cwd = live_cwd.as_os_str().as_bytes().to_vec();
+    completed.program = Program::Login;
+    Some(completed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_targets_keep_the_login_shell_script_with_positional_args() {
+        let url = b"https://example.com/a;rm -rf $HOME.git";
+        let Program::Custom { program, args } = clone_program(TargetOs::Unix, url, b"a") else {
+            panic!("custom program");
+        };
+        assert_eq!(program, b"/bin/sh");
+        assert_eq!(args[0], b"-c");
+        assert_eq!(args[2], b"krill");
+        assert_eq!(args[3], url, "user input stays a positional argument");
+        assert_eq!(args[4], b"a");
+        let Program::Custom { program, args } = init_program(TargetOs::Unix, b"/tmp/p q") else {
+            panic!("custom program");
+        };
+        assert_eq!(program, b"/bin/sh");
+        assert_eq!(args.last().map(Vec::as_slice), Some(&b"/tmp/p q"[..]));
+    }
+
+    /// 사용자 URL·경로는 PowerShell 코드가 아니라 데이터이며 작업 뒤에는 셸이 남는다.
+    #[test]
+    fn windows_project_shell_preserves_data_and_reports_the_project_directory() {
+        let url = b"https://example.com/a;echo $(whoami).git";
+        let Program::Custom { program, args } = clone_program(TargetOs::Windows, url, b"a") else {
+            panic!("custom program");
+        };
+        assert_eq!(program, b"powershell.exe");
+        assert_eq!(args[1], b"-NoExit");
+        let script = std::str::from_utf8(args.last().unwrap()).unwrap();
+        assert!(!script.contains(std::str::from_utf8(url).unwrap()));
+        assert!(
+            script
+                .contains(&String::from_utf8(super::super::security::base64_encode(url)).unwrap())
+        );
+        assert!(script.contains("& git @gitArgs"));
+        assert!(script.contains("Set-Location -LiteralPath"));
+        assert!(script.contains("']7;'"));
+        let Program::Custom { program, args } =
+            init_program(TargetOs::Windows, b"C:\\Users\\dev\\p q")
+        else {
+            panic!("custom program");
+        };
+        assert_eq!(program, b"powershell.exe");
+        assert_eq!(args[1], b"-NoExit");
+        let launch = Create {
+            account: None,
+            program: clone_program(TargetOs::Windows, url, b"p q"),
+            cwd: b"C:\\Users\\dev".to_vec(),
+            cols: 80,
+            rows: 24,
+        };
+        assert!(completed_project(&launch, std::path::Path::new(r"C:\Users\dev")).is_none());
+        let completed =
+            completed_project(&launch, std::path::Path::new("c:/Users/dev/p q")).unwrap();
+        assert_eq!(completed.cwd, b"c:/Users/dev/p q");
+        assert_eq!(completed.program, Program::Login);
+        assert_eq!(
+            TargetOs::local(),
+            if cfg!(windows) {
+                TargetOs::Windows
+            } else {
+                TargetOs::Unix
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_commands_create_and_clone_with_literal_paths() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!(
+            "krill-project-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |program: Program| {
+            let Program::Custom { program, args } = program else {
+                panic!("custom program")
+            };
+            // 같은 초기화 코드를 유한하게 실행한다. 대화형 셸 유지는 위 테스트의 NoExit 인자로 고정한다.
+            let args: Vec<_> = args
+                .into_iter()
+                .filter(|arg| arg != b"-NoExit")
+                .map(std::ffi::OsString::from_vec)
+                .collect();
+            let mut child = Command::new(std::ffi::OsString::from_vec(program))
+                .args(args)
+                .current_dir(&root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!("Windows project command timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("\u{1b}]7;file:"));
+        };
+        let original = root.join("original ' $(New-Item PWNED) & x");
+        run(init_program(
+            TargetOs::Windows,
+            original.as_os_str().as_bytes(),
+        ));
+        assert!(original.join(".git").is_dir());
+        let clone = "clone ' $(New-Item PWNED) & x";
+        run(clone_program(
+            TargetOs::Windows,
+            original.as_os_str().as_bytes(),
+            clone.as_bytes(),
+        ));
+        assert!(root.join(clone).join(".git").is_dir());
+        assert!(!root.join("PWNED").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 터널 항목이 없는 P2P 원격도 사용자가 고른 경로 문법으로 Windows 대상을 가려낸다.
+    #[test]
+    fn windows_path_syntax_marks_a_windows_target() {
+        for path in [
+            &b"C:\\Users\\dev\\src"[..],
+            b"c:/Users/dev",
+            b"D:\\",
+            b"\\\\nas\\share\\projects",
+        ] {
+            assert!(is_windows_path(path), "{}", String::from_utf8_lossy(path));
+        }
+        for path in [
+            &b"/home/dev/src"[..],
+            b"/Users/dev",
+            b"",
+            b"relative\\dir",
+            b"C:relative",
+        ] {
+            assert!(!is_windows_path(path), "{}", String::from_utf8_lossy(path));
+        }
+        assert_eq!(windows_parent(b"C:\\Users\\dev\\proj"), b"C:\\Users\\dev");
+        assert_eq!(windows_parent(b"C:/Users/dev/proj"), b"C:/Users/dev");
+        assert_eq!(windows_parent(b"C:\\proj"), b"C:\\");
+        assert_eq!(windows_parent(b"\\\\nas\\share\\proj"), b"\\\\nas\\share");
+        assert_eq!(windows_parent(b"proj"), b"proj");
     }
 }

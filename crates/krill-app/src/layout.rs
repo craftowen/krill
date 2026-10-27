@@ -145,6 +145,21 @@ impl PaneTree {
         }
     }
 
+    /// 잎의 칸 번호를 `map`대로 바꾼다(없는 번호는 그대로).
+    fn remap(&mut self, map: &BTreeMap<PaneId, PaneId>) {
+        match self {
+            Self::Leaf(id) => {
+                if let Some(new) = map.get(id) {
+                    *id = *new;
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.remap(map);
+                second.remap(map);
+            }
+        }
+    }
+
     /// `target` 잎을 `f`의 결과로 바꾼다. 찾았으면 true.
     fn replace_leaf(&mut self, target: PaneId, f: &mut dyn FnMut(PaneId) -> PaneTree) -> bool {
         match self {
@@ -1023,6 +1038,68 @@ impl Layout {
         let id = PaneId(self.next_pane);
         self.next_pane = self.next_pane.saturating_add(1);
         id
+    }
+
+    /// 시작 복원이 끝나기 전 임시 기본 레이아웃(`baseline`) 위에서 사용자가 만든 변경을 복원한 레이아웃(`self`)에
+    /// 합친다. 저장된 탭·분할·세션·파일·호스트 매핑은 그대로 두고, 로딩 중 새로 만든 탭은 뒤에 덧붙이며 칸 번호는
+    /// 충돌하지 않게 다시 매긴다. 시작 placeholder와 같은 탭은 버린다(붙을 세션이 없는 빈 칸이다). 로딩 중 바꾼
+    /// 사이드바·패널 상태는 사용자 선택을 따른다. 로딩 중 만든 탭이 활성이었으면 그 탭이 활성으로 남는다.
+    pub fn absorb_startup_edits(&mut self, baseline: &Self, edited: &Self) {
+        let mut active = None;
+        for (index, tab) in edited.tabs.iter().enumerate() {
+            if baseline.tabs.contains(tab) {
+                continue;
+            }
+            let mut leaves = Vec::new();
+            tab.root.leaves(&mut leaves);
+            let mut map = BTreeMap::new();
+            for old in leaves {
+                let new = self.alloc_pane();
+                map.insert(old, new);
+                if let Some(v) = edited.sessions.get(&old) {
+                    self.sessions.insert(new, *v);
+                }
+                if let Some(v) = edited.launches.get(&old) {
+                    self.launches.insert(new, v.clone());
+                }
+                if let Some(v) = edited.hosts.get(&old) {
+                    self.hosts.insert(new, v.clone());
+                }
+                if let Some(v) = edited.files.get(&old) {
+                    self.files.insert(new, v.clone());
+                }
+                if let Some(v) = edited.file_states.get(&old) {
+                    self.file_states.insert(new, *v);
+                }
+                if let Some(v) = edited.respawn_cwds.get(&old) {
+                    self.respawn_cwds.insert(new, v.clone());
+                }
+            }
+            let mut tab = tab.clone();
+            tab.root.remap(&map);
+            if let Some(focused) = map.get(&tab.focused) {
+                tab.focused = *focused;
+            }
+            self.tabs.push(tab);
+            if index == edited.active {
+                active = Some(self.tabs.len().saturating_sub(1));
+            }
+        }
+        if edited.sidebar_collapsed != baseline.sidebar_collapsed {
+            self.sidebar_collapsed = edited.sidebar_collapsed;
+        }
+        if edited.panel_collapsed != baseline.panel_collapsed {
+            self.panel_collapsed = edited.panel_collapsed;
+        }
+        if edited.panel_tab != baseline.panel_tab {
+            self.panel_tab = edited.panel_tab;
+        }
+        if let Some(index) = active {
+            self.active = index;
+            self.record_mru(index);
+        } else {
+            self.sync_mru();
+        }
     }
 
     fn sync_mru(&mut self) {

@@ -8,7 +8,7 @@ use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use krill_app::keys;
 use krill_app::layout::PaneId;
-use krill_app::security::{LinkMenu, PastePlan, plan_paste, text as sec_text};
+use krill_app::security::{LinkMenu, PastePlan, PendingPaste, plan_paste, text as sec_text};
 use krill_proto::input::Now;
 
 use super::Shell;
@@ -50,11 +50,10 @@ struct QueuedInput {
     pane: PaneId,
     host: krill_app::hosts::HostId,
     creation: std::sync::Arc<std::sync::Mutex<super::close::Creation>>,
-    /// None holds input for this Live's first session, never a replacement Live.
+    /// 큐에 넣을 때 칸이 붙어 있던 세션. 첫 세션에 붙기 전이면 `None`이고 그 칸의 첫 세션에 전달된다(APP-RUNTIME-003).
     session: Option<krill_proto::SessionId>,
     kind: QueuedKind,
 }
-
 impl QueuedInput {
     fn targets(&self, shell: &Shell) -> bool {
         shell.layout.pane_exists(self.pane)
@@ -70,6 +69,8 @@ impl QueuedInput {
 enum PreparedPaste {
     Pending,
     Ready(Option<Vec<u8>>),
+    /// 여러 줄 붙여넣기 경고에 걸려 사용자 확인을 기다린다. 큐 머리에 남아 그 칸의 뒤 입력을 막는다(APP-RUNTIME-002).
+    Confirming(PendingPaste),
 }
 enum QueuedKind {
     Paste(u64, PreparedPaste),
@@ -124,6 +125,7 @@ impl Shell {
 
     fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {
         let pane = self.layout.focused()?;
+        // 첫 세션에 붙기 전에도 받는다(STYLEGUIDE §7.0): 준비된 바이트는 칸 저널에 보관됐다가 첫 세션에 간다.
         let live = self.live.get(&pane)?;
         let session = live.pane.session();
         let creation = std::sync::Arc::clone(&live.creation);
@@ -400,32 +402,81 @@ impl Shell {
         let Some(live) = self.live.get(&pane) else {
             return false;
         };
+        let session = live.pane.session();
         self.paste_queue.entries.push_back(QueuedInput {
             pane,
             host: self.layout.host(pane).clone(),
             creation: std::sync::Arc::clone(&live.creation),
-            session: live.pane.session(),
+            session,
             kind: QueuedKind::Bytes(bytes.to_vec()),
         });
         true
     }
 
     pub(super) fn cancel_pending_paste_for(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let exists = self.layout.pane_exists(pane);
+        // 확인을 기다리는 붙여넣기(배너)는 사용자가 결정할 때까지 남고, 그 뒤에 친 키는 순서를 지키려 큐에 남는다.
+        let confirming = exists
+            && self.paste_queue.entries.iter().any(|entry| {
+                entry.pane == pane
+                    && matches!(
+                        entry.kind,
+                        QueuedKind::Paste(_, PreparedPaste::Confirming(_))
+                    )
+            });
         let pending = std::mem::take(&mut self.paste_queue.entries);
         for entry in pending {
+            if !entry.targets(self) {
+                continue;
+            }
             if entry.pane != pane {
+                self.paste_queue.entries.push_back(entry);
+                continue;
+            }
+            let keep = match &entry.kind {
+                QueuedKind::Paste(_, PreparedPaste::Confirming(_)) => exists,
+                QueuedKind::Bytes(_) => confirming,
+                QueuedKind::Paste(..) => false,
+            };
+            if keep {
                 self.paste_queue.entries.push_back(entry);
                 continue;
             }
             // A focus change cancels clipboard navigation intent. Keystrokes
             // already submitted to the still-existing session keep their order.
-            if entry.targets(self)
+            if exists
                 && let QueuedKind::Bytes(bytes) = entry.kind
-                && let Some(live) = self.live.get_mut(&pane)
+                && let Some(live) = self
+                    .live
+                    .get_mut(&pane)
+                    .filter(|live| entry.session.is_none_or(|s| live.pane.session() == Some(s)))
             {
                 let notice = live.pane.input(&bytes, Now::get());
                 self.show(notice.as_ref(), cx);
             }
+        }
+        self.refresh_pending_paste_banner(cx);
+    }
+
+    /// 경고 배너(단일 슬롯)는 큐의 투영이다: 보이는 칸에서 그 칸의 첫 항목이 확인 대기인 것 중 가장 앞의 것.
+    /// 앞 붙여넣기가 확인되기 전에는 다음 경고를 띄우지 않으므로 페이로드가 덮어써지지 않는다.
+    pub(super) fn refresh_pending_paste_banner(&mut self, cx: &mut Context<Self>) {
+        let visible = self.layout.visible();
+        let mut seen = std::collections::BTreeSet::new();
+        let next = self.paste_queue.entries.iter().find_map(|entry| {
+            let first = seen.insert(entry.pane);
+            match &entry.kind {
+                QueuedKind::Paste(_, PreparedPaste::Confirming(pending))
+                    if first && visible.contains(&entry.pane) =>
+                {
+                    Some(pending.clone())
+                }
+                _ => None,
+            }
+        });
+        if self.security.pending_paste() != next.as_ref() {
+            self.security.set_pending_paste(next);
+            cx.notify();
         }
     }
 
@@ -446,7 +497,7 @@ impl Shell {
         &mut self,
         id: u64,
         payload: Option<Vec<u8>>,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         let mut found = false;
@@ -463,12 +514,14 @@ impl Shell {
         if !found {
             return;
         }
-        self.flush_clipboard_pastes(cx);
+        self.drain_paste_queue(cx);
+        let _ = window;
     }
 
-    /// Before attach, ready bytes enter Pane's bounded input journal just like
-    /// typing. At link, pin any unfinished preparation to that first session.
-    pub(super) fn flush_clipboard_pastes(&mut self, cx: &mut Context<Self>) {
+    /// 큐를 머리부터 비운다. 칸마다 준비 중(`Pending`)·확인 대기(`Confirming`) 항목 뒤는 보류한다.
+    /// 클립보드 결과는 포커스 칸일 때만 보내고(포커스 이동은 붙여넣기 의도 취소), 이미 제출한 키 입력은 포커스와
+    /// 무관하게 순서대로 보낸다. 닫힌 칸·다른 세션으로 바뀐 칸의 항목은 버린다.
+    fn drain_paste_queue(&mut self, cx: &mut Context<Self>) {
         let pending = std::mem::take(&mut self.paste_queue.entries);
         let mut blocked = std::collections::BTreeSet::new();
         for mut entry in pending {
@@ -478,48 +531,71 @@ impl Shell {
             entry.session = entry
                 .session
                 .or_else(|| self.live.get(&entry.pane)?.pane.session());
+            let Some(modes) = self
+                .live
+                .get(&entry.pane)
+                .filter(|_| self.layout.pane_exists(entry.pane))
+                .filter(|live| entry.session.is_none_or(|s| live.pane.session() == Some(s)))
+                .map(|live| live.pane.modes())
+            else {
+                continue;
+            };
             if blocked.contains(&entry.pane)
-                || matches!(entry.kind, QueuedKind::Paste(_, PreparedPaste::Pending))
+                || matches!(
+                    entry.kind,
+                    QueuedKind::Paste(_, PreparedPaste::Pending | PreparedPaste::Confirming(_))
+                )
             {
                 blocked.insert(entry.pane);
                 self.paste_queue.entries.push_back(entry);
                 continue;
             }
-            if self.page_open()
-                || self.dashboard.is_some()
-                || self.layout.focused() != Some(entry.pane)
-            {
-                continue;
-            }
-            let Some(live) = self
-                .live
-                .get_mut(&entry.pane)
-                .filter(|live| live.pane.session() == entry.session)
-            else {
-                continue;
-            };
             let bytes = match entry.kind {
                 QueuedKind::Bytes(bytes) => bytes,
-                QueuedKind::Paste(_, PreparedPaste::Ready(Some(bytes))) => {
-                    match plan_paste(entry.pane, &bytes, live.pane.modes()) {
+                QueuedKind::Paste(id, PreparedPaste::Ready(Some(bytes))) => {
+                    if self.page_open()
+                        || self.dashboard.is_some()
+                        || self.layout.focused() != Some(entry.pane)
+                    {
+                        continue;
+                    }
+                    match plan_paste(entry.pane, &bytes, modes) {
                         PastePlan::Immediate(bytes) => bytes,
                         PastePlan::Warn(pending) => {
-                            self.security.set_pending_paste(Some(pending));
-                            cx.notify();
+                            // 확인될 때까지 머리에 남아 뒤 입력을 막는다(APP-RUNTIME-002).
+                            entry.kind = QueuedKind::Paste(id, PreparedPaste::Confirming(pending));
+                            blocked.insert(entry.pane);
+                            self.paste_queue.entries.push_back(entry);
                             continue;
                         }
                     }
                 }
-                QueuedKind::Paste(_, PreparedPaste::Pending | PreparedPaste::Ready(None)) => {
-                    continue;
-                }
+                QueuedKind::Paste(
+                    _,
+                    PreparedPaste::Ready(None)
+                    | PreparedPaste::Pending
+                    | PreparedPaste::Confirming(_),
+                ) => continue,
             };
-            live.clear_selection();
-            live.echo.key_sent(std::time::Instant::now());
-            let notice = live.pane.input(&bytes, Now::get());
-            self.show(notice.as_ref(), cx);
-            cx.notify();
+            self.deliver_queued(entry.pane, &bytes, cx);
         }
+        self.refresh_pending_paste_banner(cx);
+    }
+
+    // Preserve the initial-attach flush contract introduced on main.
+    pub(super) fn flush_clipboard_pastes(&mut self, cx: &mut Context<Self>) {
+        self.drain_paste_queue(cx);
+    }
+
+    fn deliver_queued(&mut self, pane: PaneId, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(live) = self.live.get_mut(&pane) else {
+            return;
+        };
+        live.clear_selection();
+        live.echo.key_sent(std::time::Instant::now());
+        let notice = live.pane.input(bytes, Now::get());
+        self.show(notice.as_ref(), cx);
+        cx.notify();
     }
 
     /// 포커스 칸에 텍스트를 붙여넣는다(MK-033·MK-076).
@@ -540,38 +616,52 @@ impl Shell {
                 self.send(&out, Some(window), cx);
             }
             PastePlan::Warn(pending) => {
-                self.security.set_pending_paste(Some(pending));
+                // 확인 대기 항목을 큐 뒤에 둬 그 뒤에 친 키가 앞지르지 않게 한다(APP-RUNTIME-002).
+                let session = l.pane.session();
+                self.paste_queue.next = self.paste_queue.next.wrapping_add(1);
+                let id = self.paste_queue.next;
+                self.paste_queue.entries.push_back(QueuedInput {
+                    pane,
+                    host: self.layout.host(pane).clone(),
+                    creation: std::sync::Arc::clone(&l.creation),
+                    session,
+                    kind: QueuedKind::Paste(id, PreparedPaste::Confirming(pending)),
+                });
+                self.refresh_pending_paste_banner(cx);
                 cx.notify();
             }
         }
     }
 
+    /// 배너의 붙여넣기를 보낸다. 페이로드 → 그 뒤 큐에 쌓인 키 → 지금 조합 중인 IME 글자 순서(제출 순서)로 간다.
     pub(super) fn confirm_pending_paste(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.security.take_pending_paste() else {
+        let Some(pending) = self.take_confirming(cx) else {
+            self.drain_paste_queue(cx);
             return;
         };
+        self.deliver_queued(pending.pane, &pending.payload, cx);
         if self.layout.focused() == Some(pending.pane) {
-            let Some(l) = self.live.get_mut(&pending.pane) else {
-                cx.notify();
-                return;
-            };
-            let modes = l.pane.modes();
-            let mut out = l.ime.commit();
-            out.pty = keys::tui::text(&out.pty, modes);
-            out.pty.extend(pending.payload);
-            self.send(&out, Some(window), cx);
-        } else if let Some(l) = self.live.get_mut(&pending.pane) {
-            let n = l.pane.input(&pending.payload, Now::get());
-            self.show(n.as_ref(), cx);
-            cx.notify();
-        } else {
-            cx.notify();
+            self.commit_ime(pending.pane, Some(window), cx);
         }
+        self.drain_paste_queue(cx);
     }
 
+    /// 배너의 붙여넣기를 버린다. 그 뒤에 친 키는 순서대로 보낸다.
     pub(super) fn cancel_pending_paste(&mut self, cx: &mut Context<Self>) {
-        self.security.set_pending_paste(None);
+        let _ = self.take_confirming(cx);
+        self.drain_paste_queue(cx);
+    }
+
+    /// 배너에 보이는 확인 대기 항목을 큐에서 뺀다.
+    fn take_confirming(&mut self, cx: &mut Context<Self>) -> Option<PendingPaste> {
+        let shown = self.security.take_pending_paste()?;
         cx.notify();
+        let index = self.paste_queue.entries.iter().position(|entry| {
+            matches!(&entry.kind, QueuedKind::Paste(_, PreparedPaste::Confirming(p)) if *p == shown)
+        })?;
+        let entry = self.paste_queue.entries.remove(index)?;
+        // 배너를 띄운 뒤 같은 칸이 새 세션에 붙을 수 있다. 큐의 원래 세션과 일치할 때만 확인을 보낸다.
+        entry.targets(self).then_some(shown)
     }
 
     /// 맨 클릭한 링크의 팝오버를 클릭한 자리에 연다.
@@ -1193,7 +1283,7 @@ fn upload_bytes_to_remote(
     )
 }
 
-fn base64_encode(input: &[u8]) -> Vec<u8> {
+pub(super) fn base64_encode(input: &[u8]) -> Vec<u8> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(input.len().div_ceil(3).saturating_mul(4));
     for chunk in input.chunks(3) {
