@@ -445,7 +445,9 @@ fn forward(
     // macOS는 accept한 소켓이 리스너의 non-blocking을 물려받는다.
     socket.set_nonblocking(false)?;
     socket.set_read_timeout(Some(READ_POLL))?;
+    socket.set_write_timeout(Some(READ_POLL))?;
     let mut back = socket.try_clone()?;
+    let cancel = socket.try_clone()?;
     let mut child = Command::new(program)
         .args(relay_args(opts, control))
         .stdin(Stdio::piped())
@@ -485,7 +487,33 @@ fn forward(
             drop(stdin);
         });
         let from_remote = scope.spawn(|| {
-            io::copy(&mut stdout, &mut back).ok();
+            let mut buffer = vec![0; 64 * 1024];
+            'pump: while !stopped.load(Ordering::Acquire) {
+                let n = match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let mut offset = 0;
+                while offset < n {
+                    if stopped.load(Ordering::Acquire) {
+                        break 'pump;
+                    }
+                    match back.write(buffer.get(offset..n).unwrap_or_default()) {
+                        Ok(0) => break 'pump,
+                        Ok(written) => offset += written,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut
+                                    | io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(_) => break 'pump,
+                    }
+                }
+            }
             back.shutdown(std::net::Shutdown::Write).ok();
             finished.store(true, Ordering::Release);
         });
@@ -497,6 +525,16 @@ fn forward(
         }
         child.kill().ok();
         child.wait().ok();
+        if stopped.load(Ordering::Acquire) {
+            cancel.shutdown(std::net::Shutdown::Both).ok();
+        }
+        while !from_remote.is_finished() {
+            if stopped.load(Ordering::Acquire) {
+                cancel.shutdown(std::net::Shutdown::Both).ok();
+                break;
+            }
+            thread::sleep(POLL);
+        }
         finished.store(true, Ordering::Release);
         from_local.join().ok();
         from_remote.join().ok();
