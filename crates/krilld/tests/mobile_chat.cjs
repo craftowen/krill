@@ -21,14 +21,14 @@ function fixture(options={}){
  const doc=Object.assign(new EventTarget(),{hidden:false,visibilityState:'visible',createElementNS:(_,tag)=>new Element(tag),body:new Element('body'),execCommand:()=>true});
  const sandbox={Event,document:doc,isSecureContext:true,navigator:{clipboard:{writeText:async text=>{copied.push(text);}}},Date:options.Date||Date,setTimeout:(fn)=>{timers.set(++id,fn);return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{},ResizeObserver:options.ResizeObserver};
  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
- const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:options.phase||'ready'},drafts:new Map()};
+ const state={sessions:new Map([[7,{id:7,state:'Waiting',cwd:'/work'}]]),connection:{phase:options.phase||'ready'},drafts:new Map(),snapshot:{capabilities:options.capabilities||{}}};
  const root=new Element('root'),el=(...args)=>new Element(...args);
  let handler=options.handler|| (async request=>request.action==='chat_poll'?{generation:'g1',agent:'claude',bound:true,items:[],next_offset:request.offset}:{sent:true});
  let prepare=async()=>({mime:'image/jpeg',data:'encoded'});
  const ctx={el,state,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},rpc:async request=>{calls.push(request);return handler(request);},photo:(...args)=>prepare(...args),act(fn){const p=Promise.resolve().then(fn).catch(e=>errors.push(e));tasks.push(p);return p;},refresh:async()=>{},sheet(title,_,__,render){const body=el('body');render(body);sheets.push({title,body});}};
  let view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,visible:options.visible,onQuickActions:options.onQuickActions,onSwitchTerm:()=>term++});
  const find=cls=>root.descendants().find(n=>n.className===cls),button=label=>root.descendants().find(n=>n.tag==='button'&&n.textContent===label);
- return {insertText:text=>view.insertText(text),root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,copied,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
+ return {insertText:text=>view.insertText(text),root,state,ctx,calls,buttons,sheets,errors,tasks,find,button,timers,doc,copied,M:sandbox.KrillMobile,get term(){return term;},get entry(){return state.chatCache.get(7);},set handler(h){handler=h;},set prepare(h){prepare=h;},update(){view.update();},setVisible(v){view.setVisible(v);},remount(){view.unmount();view=sandbox.KrillMobile.chat.mount(root,{ctx,sessionId:7,onSwitchTerm:()=>term++});},dispose(){view.unmount();},input(text){const input=find('chat-input');input.value=text;input.selectionStart=input.selectionEnd=text.length;input.dispatchEvent(new Event('input'));},submit(){find('chat-composer').dispatchEvent(new Event('submit',{cancelable:true}));},async poll(data){handler=async req=>req.action==='chat_poll'?data:{sent:true};view.update();await flush();}};
 }
 function unitServer(f){let total=0;const page=q=>{const start=q.offset,end=Math.min(total,start+128,q.end_offset??Infinity);return {generation:'g1',items:Array.from({length:end-start},(_,i)=>({id:start+':'+i,kind:'assistant',text:'Message '+(start+i)})),next_offset:end,bound:true};};f.handler=async q=>page(q);return {page,set total(n){total=n;}};}
 async function historyRace(){
@@ -91,16 +91,8 @@ async function orcaComposerAndMeta(){
  assert.equal(metas[0].children[0].className,'icon-button chat-copy');assert.equal(metas[0].children[1].className,'chat-time');assert.equal(metas[0].children[1].attrs.datetime,'2026-10-24T03:48:10.000Z');
  assert.equal(metas[1].children.length,1,'a message without a record time shows only the copy button');
  assert.equal(f.find('chat-input').placeholder,'Message {0}','a known agent gets the per-agent placeholder (this fixture has no translator)');
- const entries=[];f.ctx.sheet=(title,items)=>entries.push(...items);
- const model=f.buttons.find(b=>b.className==='composer-pill');assert.equal(model.hidden,false);model.action();
- assert.deepEqual(Array.from(entries,e=>e.label),['Default (recommended)','Opus','Sonnet','Haiku']);
- entries[2].action();await flush();assert.deepEqual({...f.calls.at(-1)},{action:'prompt',session:7,text:'/model sonnet'});f.dispose();
- const codex=fixture();await flush();await codex.poll({generation:'g1',agent:'codex',bound:true,items:[],next_offset:0});
- codex.buttons.find(b=>b.className==='composer-pill').action();await flush();
- assert.deepEqual({...codex.calls.at(-1)},{action:'prompt',session:7,text:'/model'});assert.equal(codex.term,1,'Codex picks its model in the terminal picker');codex.dispose();
- const other=fixture();await flush();await other.poll({generation:'g1',agent:'agy',bound:true,items:[],next_offset:0});
- assert.equal(other.buttons.find(b=>b.className==='composer-pill').hidden,true,'agents without a known /model command get no Model button');other.dispose();
- console.log('PASS Orca composer: copy/time under messages, Model sends /model to Claude or opens the Codex picker in Term');
+ assert.equal(f.buttons.find(b=>b.className==='composer-pill').hidden,true,'old daemons do not get a fictional model action');f.dispose();
+ console.log('PASS Orca composer: copy/time under messages and capability-gated model action');
 }
 async function markdownFormatting(){
  const f=fixture();await flush();
@@ -146,7 +138,52 @@ async function stableLatestRefresh(){
  const readerTop=kept.getBoundingClientRect().top;f.handler=async()=>{throw Error('offline');};f.update();await flush();assert.equal(kept.getBoundingClientRect().top,readerTop);await f.poll({generation:'g2',bound:true,items:[],next_offset:1001});assert.equal(kept.getBoundingClientRect().top,readerTop);f.dispose();
  console.log('PASS CLS chat: latest merge retains cards/disclosure/following, updates content, trims and error chrome preserve reader anchor');
 }
+function key(f,value,options={}){const event=new Event('keydown',{cancelable:true});Object.assign(event,{key:value,...options});f.find('chat-input').dispatchEvent(event);return event;}
+async function composerDiscovery(){
+ const capabilities={command_catalog:true,mention_files:true,composer_models:true};
+ const f=fixture({capabilities});await flush();
+ let catalogs=0;const mention=deferred();
+ f.handler=async req=>{
+  if(req.action==='command_catalog'){catalogs++;return {supported:true,items:[{name:'review',text:'$review',kind:'Skill',description:'Review code'},{name:'help',text:'/help',kind:'Command',description:'CLI help'},{name:'unsafe',text:'/bad\nexecute',kind:'Command'}]};}
+  if(req.action==='mention_files')return mention.promise;
+  if(req.action==='composer_models')return {supported:true,current:'a',items:[{id:'a',label:'Model A'},{id:'b',label:'Model B'}]};
+  if(req.action==='set_model')return {applied:true};
+  return {bound:true,agent:'codex',items:[],next_offset:0};
+ };
+ f.input('/');await flush();assert.equal(f.find('chat-composer-options').children.length,2,'catalog includes installed skills and commands, drops control text');
+ assert.equal(f.find('chat-input').attrs['aria-expanded'],'true');
+ key(f,'ArrowDown');assert.equal(f.find('chat-composer-options').children[1].attrs['aria-selected'],'true');
+ const selected=key(f,'Enter');assert(selected.defaultPrevented);assert.equal(f.find('chat-input').value,'/help ');assert.equal(f.state.drafts.get(7),'/help ');assert(!f.calls.some(c=>c.action==='prompt'),'selection never sends');
+ f.input('/review');await flush();assert.equal(catalogs,1,'same provider/workspace catalog is cached');key(f,'Enter');assert.equal(f.find('chat-input').value,'$review ','provider invocation text is preserved');
+ f.input('/');await flush();f.find('chat-input').dispatchEvent(new Event('compositionstart'));assert.equal(f.find('chat-composer-suggestions').hidden,true);assert.equal(key(f,'Enter',{isComposing:true}).defaultPrevented,false);f.find('chat-input').dispatchEvent(new Event('compositionend'));await flush();key(f,'Escape');assert.equal(f.find('chat-composer-suggestions').hidden,true);
+ f.input('Inspect @src');for(const [id,fn] of [...f.timers]){if(id===1)continue;f.timers.delete(id);fn();}await flush();
+ mention.resolve({items:[{path:'src/a "quoted" file.js'},{path:'../escape'},{path:'/absolute'},{path:'line\nbreak'}],truncated:true});await flush();
+ assert.equal(f.find('chat-composer-options').children.length,1,'only safe relative paths are inserted');key(f,'Enter');assert.equal(f.find('chat-input').value,'Inspect '+JSON.stringify('src/a \"quoted\" file.js')+' ');assert(!f.calls.some(c=>c.action==='prompt'));
+ f.buttons.find(b=>b.className==='composer-pill').action();await flush();assert.equal(f.find('chat-composer-options').children.length,2);key(f,'ArrowDown');key(f,'Enter');await flush();assert.equal(f.term,0);assert.equal(f.buttons.find(b=>b.className==='composer-pill').textContent,'Model B');assert(f.calls.some(c=>c.action==='set_model'&&c.model==='b'));assert(!f.calls.some(c=>c.action==='prompt'),'model selection uses only explicit RPC');
+ f.dispose();
+ const unsupported=fixture({capabilities,handler:async req=>req.action==='composer_models'?{supported:false,items:[{id:'launch-only',label:'Launch only'}],reason:'No live control'}:{bound:true,agent:'codex',items:[],next_offset:0}});await flush();unsupported.buttons.find(b=>b.className==='composer-pill').action();await flush();assert.equal(unsupported.find('chat-composer-options').children.length,0);assert(unsupported.find('chat-composer-suggestions').descendants().some(n=>n.textContent==='No live control'));assert.equal(unsupported.term,0);unsupported.dispose();
+ const changing=deferred(),model=fixture({capabilities,handler:async req=>req.action==='composer_models'?{supported:true,items:[{id:'real',label:'Real model'}]}:req.action==='set_model'?changing.promise:{bound:true,agent:'codex',items:[],next_offset:0}});await flush();model.input('unsent draft');model.buttons.find(b=>b.className==='composer-pill').action();await flush();key(model,'Enter');await flush();assert.equal(model.buttons.find(b=>b.className==='composer-pill').textContent,'Model','pending request is not a model change');assert.equal(model.find('primary composer-send').disabled,true);assert.equal(model.find('chat-input').value,'unsent draft');changing.resolve({applied:false,reason:'Native composer busy'});await flush();assert.equal(model.buttons.find(b=>b.className==='composer-pill').textContent,'Model');assert(model.find('chat-composer-suggestions').descendants().some(n=>n.textContent==='Native composer busy'));assert.equal(model.find('primary composer-send').disabled,false);assert.equal(model.term,0);model.dispose();
+ const commandModel=fixture({capabilities,handler:async req=>req.action==='command_catalog'?{items:[{name:'model',text:'/model',kind:'Command'}]}:req.action==='composer_models'?{supported:true,items:[{id:'real',label:'Real model'}]}:{bound:true,agent:'codex',items:[],next_offset:0}});await flush();commandModel.input('/model');await flush();key(commandModel,'Enter');await flush();assert.equal(commandModel.find('chat-input').value,'');assert.equal(commandModel.find('chat-composer-options').children[0].children[0].textContent,'Real model');assert(!commandModel.calls.some(c=>c.action==='prompt'),'native /model selection routes inline');assert.equal(commandModel.term,0);key(commandModel,'Escape');commandModel.input('/model keep this draft');commandModel.find('chat-input').selectionStart=commandModel.find('chat-input').selectionEnd=6;commandModel.find('chat-input').dispatchEvent(new Event('input'));await flush();key(commandModel,'Enter');await flush();assert.equal(commandModel.find('chat-input').value,' keep this draft','inline model routing preserves text outside the unchanged trigger');key(commandModel,'Escape');assert.equal(commandModel.find('chat-input').value,' keep this draft');assert(!commandModel.calls.some(c=>c.action==='prompt'));commandModel.dispose();
+ const late=deferred(),race=fixture({capabilities});await flush();race.handler=req=>req.action==='command_catalog'?late.promise:Promise.resolve({bound:true,agent:'codex',items:[],next_offset:0});race.input('/');await flush();race.input('new draft');late.resolve({items:[{text:'$stale',name:'stale'}]});await flush();assert.equal(race.find('chat-composer-suggestions').hidden,true);assert.equal(race.find('chat-input').value,'new draft');race.dispose();
+ const detached=deferred(),host=fixture({capabilities});await flush();host.handler=req=>req.action==='command_catalog'?detached.promise:Promise.resolve({});host.input('/');await flush();host.state.chatCache=new Map();detached.resolve({items:[{text:'/stale',name:'stale'}]});await flush();assert.equal(host.find('chat-composer-options').children.length,0,'late old-host results do not populate choices');host.dispose();
+ console.log('PASS composer discovery: provider text, skills+commands, safe path text, keyboard/IME, no auto-send, cache/stale-host guards, truthful models without Term');
+}
+async function composerProgress(){
+ const f=fixture();await flush();const sent=deferred();f.handler=async req=>req.action==='prompt'?sent.promise:{generation:'g1',bound:true,agent:'claude',items:[],next_offset:0};
+ f.input('Review this');f.submit();assert.equal(f.find('chat-live-text').textContent,'Sending…');assert.equal(f.find('chat-send-receipt').hidden,false);assert(f.find('chat-send-receipt').textContent.includes('Review this'));await flush();sent.resolve({sent:true});await flush();assert.equal(f.find('chat-live-text').textContent,'Accepted. Awaiting agent response…');assert.equal(f.find('chat-input').value,'');
+ const sess=f.state.sessions.get(7);sess.state='Working';sess.state_since_unix_ns='2';f.update();await flush();assert.equal(f.find('chat-live-text').textContent,'Working');
+ await f.poll({generation:'g1',bound:true,agent:'claude',items:[{id:'u',kind:'user',text:'Review this'},{id:'t',kind:'tool_call',tool_name:'read_file',file_path:'src/main.rs'}],next_offset:3});assert.equal(f.find('chat-send-receipt').hidden,true,'actual transcript confirmation removes provisional acknowledgement');assert(f.find('chat-live-text').textContent.includes('read_file'));
+ sess.state='Waiting';sess.state_since_unix_ns='3';f.update();await flush();assert.equal(f.find('chat-live-text').textContent,'Waiting for input');sess.state='Done';sess.state_since_unix_ns='4';f.update();await flush();assert.equal(f.find('chat-live-text').textContent,'Completed');
+ f.state.connection.phase='disconnected';f.update();assert.equal(f.find('chat-live-text').textContent,'Offline. Reconnect to update activity.');f.dispose();
+ const failure=fixture();await flush();failure.handler=async req=>{if(req.action==='prompt')throw Error('timeout');return {items:[],next_offset:0};};failure.input('keep draft');failure.submit();await flush();assert.equal(failure.state.drafts.get(7),'keep draft');assert.equal(failure.find('chat-input').value,'keep draft');assert.equal(failure.find('chat-send-receipt').hidden,false);assert.equal(failure.find('chat-live-text').textContent,'Send not confirmed. Draft kept; check activity before retrying.');assert.equal(failure.find('primary composer-send').disabled,false);failure.dispose();
+ const refreshed=fixture();await flush();refreshed.ctx.refresh=async()=>{throw Error('snapshot failed');};refreshed.input('accepted request');refreshed.submit();await flush();assert.equal(refreshed.find('chat-input').value,'');assert.equal(refreshed.find('chat-live-text').textContent,'Accepted. Awaiting agent response…','refresh failure does not relabel an accepted prompt as send failure');refreshed.dispose();
+ const stale=fixture();await flush();stale.state.sessions.get(7).state='Done';stale.input('new work');stale.submit();await flush();await stale.poll({generation:'g1',bound:true,items:[{id:'newtool',kind:'tool_call',tool_name:'search'}],next_offset:1});stale.update();await flush();assert.notEqual(stale.find('chat-live-text').textContent,'Completed','a stale pre-send Done snapshot is not completion evidence');stale.dispose();
+ const queued=fixture();await flush();queued.input('old host');queued.submit();queued.state.chatCache=new Map();await flush();assert(!queued.calls.some(c=>c.action==='prompt'),'host replacement before the queued action fences the send');queued.dispose();
+ console.log('PASS composer progress: immediate provisional acknowledgement, accepted vs observed work/tool/wait/done/offline, transcript reconciliation and failure draft retry');
+}
 async function main(){
+ await composerDiscovery();
+ await composerProgress();
  await quickActions();
  await markdownFormatting();
  await orcaComposerAndMeta();

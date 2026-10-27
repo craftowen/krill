@@ -80,10 +80,11 @@ function mountChat(root,opts){
  function sizeInput(){if(!input.style)return;input.style.height='auto';if(input.scrollHeight)input.style.height=Math.min(140,Math.max(28,input.scrollHeight))+'px';}
  input.value=drafts.get(sessionId)||'';
  function insertText(text){
+  if(!active())return false;
   const clean=String(text??'').replace(/\r\n?/g,'\n').replace(/^\n+|\n+$/g,'');if(!clean)return false;
   const value=input.value,start=typeof input.selectionStart==='number'?input.selectionStart:value.length,end=typeof input.selectionEnd==='number'?input.selectionEnd:start;
   input.value=value.slice(0,start)+clean+value.slice(end);input.selectionStart=input.selectionEnd=start+clean.length;
-  entry.draftVersion=(entry.draftVersion||0)+1;drafts.set(sessionId,input.value);sizeInput();input.focus?.();return true;
+  entry.draftVersion=(entry.draftVersion||0)+1;drafts.set(sessionId,input.value);sizeInput();closeSuggestions();input.focus?.();return true;
  }
 
  let composing=false,disposed=false,pollTimer=null,inFlight=false,retryWithoutTail=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false,visible=opts.visible!==false,following=true;
@@ -96,9 +97,9 @@ function mountChat(root,opts){
  // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
  const resize=globalThis.ResizeObserver?new ResizeObserver(()=>pinLatest()):null;resize?.observe(feed);
  const cards=new Map(),toolRuns=new Map();let tailRun=null,renderedCount=0,renderedItems=null;
- input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);sizeInput();});
- input.addEventListener('compositionstart',()=>composing=true);
- input.addEventListener('compositionend',()=>composing=false);
+ input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);sizeInput();suggest();});
+ input.addEventListener('compositionstart',()=>{composing=true;closeSuggestions();});
+ input.addEventListener('compositionend',()=>{composing=false;suggest();});
  const attachment=el('div',undefined,'chat-actions');attachment.setAttribute('role','status');
  const attachBtn=button(t('Photo'),()=>{
   if(entry.photo||entry.sending)return;
@@ -108,19 +109,109 @@ function mountChat(root,opts){
  // Orca 컴포저: 둥근 카드 안에 입력, 아래 줄에 사진(+)·모델·전송(↑)을 둔다.
  const sendBtn=el('button',undefined,'primary composer-send');sendBtn.type='submit';sendBtn.setAttribute('aria-label',t('Send'));if(ctx.icon)sendBtn.append(ctx.icon('arrowUp'));else sendBtn.textContent=t('Send');
  const modelBtn=button(t('Model'),()=>chooseModel(),'composer-pill');
+ const suggestions=el('div',undefined,'chat-composer-suggestions'),choiceList=el('div',undefined,'chat-composer-options');choiceList.id=`chat-composer-options-${sessionId}`;suggestions.hidden=true;choiceList.setAttribute('role','listbox');choiceList.setAttribute('aria-label',t('Commands, skills and files'));
+ const receipt=el('div',undefined,'chat-send-receipt');receipt.hidden=true;
  const bar=el('div',undefined,'chat-composer-bar'),box=el('div',undefined,'chat-composer-box');bar.append(attachBtn);
  if(typeof opts.onQuickActions==='function'){const quick=button(t('Quick actions'),()=>opts.onQuickActions(),'btn chat-quick-actions-btn');quick.type='button';quick.setAttribute('aria-label',t('Quick actions'));quick.title=t('Quick actions');const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d','m5 6 6 6-6 6m8 0h6');path.setAttribute('fill','none');path.setAttribute('stroke','currentColor');path.setAttribute('stroke-width','2');svg.append(path);quick.replaceChildren(svg);bar.append(quick);}
  bar.append(modelBtn,el('span',undefined,'composer-spacer'),sendBtn);
- box.append(input,bar);composer.append(attachment,box);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
- // 모델 전환은 에이전트 자체의 /model 명령으로 보낸다. Claude는 별칭으로 바로 바꾸고, Codex·Gemini는 터미널의 선택 화면에서 고른다.
- const modelChoices={claude:[['default','Default (recommended)'],['opus','Opus'],['sonnet','Sonnet'],['haiku','Haiku']]},modelPicker=new Set(['codex','gemini']);
+ box.append(suggestions,input,bar);composer.append(receipt,attachment,box);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
+ // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
  function chatAgent(){return M.sessionAgent?.({...state.sessions?.get(sessionId),...(entry.agent?{agent:entry.agent}:{})})||entry.agent||'';}
- function chooseModel(){
-  const agent=chatAgent(),choices=modelChoices[agent];
-  if(choices){ctx.sheet(t('Model'),choices.map(([id,label])=>({label:t(label),action:()=>run(async()=>{await ctx.rpc({action:'prompt',session:sessionId,text:`/model ${id}`});entry.model={agent,id,label};if(!disposed&&!ctx.signal?.aborted)syncAgent();})})),t('Sends /model to {0}.',agentName(agent)));return;}
-  run(async()=>{await ctx.rpc({action:'prompt',session:sessionId,text:'/model'});onSwitchTerm?.();});
+ function active(){return !disposed&&!ctx.signal?.aborted&&state.chatCache===cacheMap&&state.drafts===drafts&&state.sessions?.has(sessionId);}
+ function scope(){const sess=state.sessions?.get(sessionId);return `${chatAgent()}\n${sess?.cwd||''}`;}
+ function capability(name){return state.snapshot?.capabilities?.[name]===true;}
+ const discovery=new Map(),discovering=new Map();let suggestVersion=0,suggestTimer=null,picker=null,choices=[],choiceIndex=0,modelPending=false;
+ function closeSuggestions(){suggestVersion++;clearTimeout(suggestTimer);suggestTimer=null;picker=null;choices=[];suggestions.hidden=true;input.setAttribute('aria-expanded','false');input.setAttribute('aria-activedescendant','');}
+ function paintChoices(items,message){
+  choices=items;choiceIndex=0;suggestions.replaceChildren();choiceList.replaceChildren();suggestions.hidden=false;
+  const head=el('div',undefined,'chat-actions'),close=button(t('Close suggestions'),()=>{closeSuggestions();input.focus?.();},'ghost small');close.type='button';head.append(el('span',t(picker?.kind==='models'?'Model':picker?.kind==='files'?'Workspace files':'Commands and skills'),'muted'),close);suggestions.append(head);input.setAttribute('aria-expanded','true');
+  if(message)suggestions.append(el('p',message,'muted'));
+  for(const [index,item] of items.entries()){
+   const node=button('',()=>selectChoice(index),'ghost chat-composer-option');node.type='button';node.tabIndex=-1;node.id=`chat-option-${sessionId}-${index}`;node.setAttribute('role','option');
+   node.append(el('span',item.label,'chat-composer-option-label'));if(item.detail)node.append(el('span',item.detail,'muted'));
+   node.addEventListener('pointerdown',event=>event.preventDefault());choiceList.append(node);item.node=node;
+  }
+  suggestions.append(choiceList);markChoice();
  }
- function syncAgent(){const agent=chatAgent(),label=entry.model?.agent===agent?t(entry.model.label):t('Model');if(modelBtn.textContent!==label){modelBtn.textContent=label;modelBtn.setAttribute('aria-label',label);}modelBtn.hidden=!modelChoices[agent]&&!modelPicker.has(agent);const text=agent?t('Message {0}',agentName(agent)):t('Message agent (Bracketed Paste)…');if(input.placeholder!==text)input.placeholder=text;}
+ function markChoice(){for(const [i,item] of choices.entries())item.node.setAttribute('aria-selected',String(i===choiceIndex));input.setAttribute('aria-activedescendant',choices[choiceIndex]?.node.id||'');choices[choiceIndex]?.node.scrollIntoView?.({block:'nearest'});}
+ async function discover(action,query=''){
+  const key=`${scope()}\n${action}\n${query}`,cached=discovery.get(key);if(action!=='composer_models'&&cached&&Date.now()-cached.at<30000)return cached.data;
+  let request=discovering.get(key);if(!request){request=ctx.rpc({action,session:sessionId,...action==='mention_files'?{query}:{}});discovering.set(key,request);}
+  let data;try{data=await request;}finally{if(discovering.get(key)===request)discovering.delete(key);}
+  if(active()&&action!=='composer_models'){discovery.set(key,{at:Date.now(),data});while(discovery.size>20)discovery.delete(discovery.keys().next().value);}return data;
+ }
+ function trigger(){
+  const end=typeof input.selectionStart==='number'?input.selectionStart:input.value.length;
+  if(typeof input.selectionEnd==='number'&&input.selectionEnd!==end)return null;
+  const before=input.value.slice(0,end),slash=before.match(/^\/([^\s]*)$/),mention=before.match(/(?:^|\s)@([^\s@]*)$/);
+  if(slash)return {kind:'commands',query:slash[1],start:0,end};
+  if(mention)return {kind:'files',query:mention[1],start:end-mention[1].length-1,end};return null;
+ }
+ function suggest(){
+  closeSuggestions();if(!active()||composing||!visible)return;const token=trigger();if(!token)return;
+  const action=token.kind==='commands'?'command_catalog':'mention_files';if(!capability(action))return;
+  const version=suggestVersion,context=scope(),draft=input.value;picker={...token,scope:context};
+  paintChoices([],t('Searching…'));
+  const load=async()=>{try{
+   const data=await discover(action,token.kind==='files'?token.query:'');
+   if(!active()||version!==suggestVersion||context!==scope()||draft!==input.value)return;
+   let items;
+   if(token.kind==='commands'){
+    const query=token.query.toLocaleLowerCase();items=(data?.items||[]).filter(item=>typeof item.text==='string'&&!/[\r\n\x00-\x1f\x7f]/.test(item.text)&&`${item.name} ${item.text} ${item.description}`.toLocaleLowerCase().includes(query)).slice(0,80).map(item=>({label:item.text,detail:[t(item.kind||'Command'),item.description].filter(Boolean).join(' · '),text:item.text}));
+   }else items=(data?.items||[]).filter(item=>typeof item.path==='string'&&item.path&&!/^(?:[\/\\]|[a-z]:)/i.test(item.path)&&!item.path.split(/[\/\\]/).includes('..')&&!/[\x00-\x1f\x7f]/.test(item.path)).slice(0,80).map(item=>({label:item.path,detail:t('Insert file path as text'),text:JSON.stringify(item.path)}));
+   paintChoices(items,!items.length?t('No matches'):data.truncated?t('More results available. Keep typing.'):undefined);
+  }catch(error){if(active()&&version===suggestVersion)paintChoices([],t('Search unavailable. Try again.'));}};
+  if(token.kind==='files')suggestTimer=setTimeout(load,150);else load();
+ }
+ function selectChoice(index){
+  const choice=choices[index],token=picker;if(!choice||!token||!active()||composing)return;
+  if(token.scope!==scope()){closeSuggestions();return;}
+  if(token.kind==='models'){applyModel(choice);return;}
+  const current=trigger();if(!current||current.start!==token.start||current.end!==token.end||current.kind!==token.kind||current.query!==token.query){closeSuggestions();return;}
+  if(choice.text==='/model'&&capability('composer_models')){openModelCommand(token.start,token.end);return;}
+  input.selectionStart=token.start;input.selectionEnd=token.end;insertText(choice.text+' ');
+ }
+ input.setAttribute('aria-controls',choiceList.id);input.setAttribute('aria-haspopup','listbox');input.setAttribute('aria-autocomplete','list');input.setAttribute('aria-expanded','false');
+ input.addEventListener('click',()=>{if(picker?.kind!=='models')suggest();});
+ input.addEventListener('keydown',event=>{
+  if(composing||event.isComposing||event.keyCode===229||suggestions.hidden)return;
+  if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeSuggestions();}
+  else if((event.key==='ArrowDown'||event.key==='ArrowUp')&&choices.length){event.preventDefault();event.stopPropagation();choiceIndex=(choiceIndex+(event.key==='ArrowDown'?1:choices.length-1))%choices.length;markChoice();}
+  else if(event.key==='Enter'){event.preventDefault();event.stopPropagation();if(choices.length)selectChoice(choiceIndex);}
+ });
+ function openModelCommand(start,end){
+  input.value=input.value.slice(0,start)+input.value.slice(end);input.selectionStart=input.selectionEnd=start;
+  entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);sizeInput();chooseModel();
+ }
+ async function chooseModel(){
+  if(!active()||modelPending)return;if(picker?.kind==='models'){closeSuggestions();return;}closeSuggestions();
+  if(!capability('composer_models'))return;
+  const version=suggestVersion,context=scope();picker={kind:'models',scope:context};paintChoices([],t('Loading models…'));input.focus?.();
+  try{
+   const data=await discover('composer_models');if(!active()||version!==suggestVersion||scope()!==context)return;
+   const models=data?.supported?(data.items||data.models||[]).filter(item=>typeof item.id==='string'&&item.id):[];
+   const current=models.find(item=>item.id===data.current);if(current){entry.model={agent:chatAgent(),scope:context,id:current.id,label:current.label||current.name||current.id};syncAgent();}
+   paintChoices(models.map(item=>({id:item.id,label:item.label||item.name||item.id,detail:item.id===data.current?t('Current model'):undefined})),models.length?undefined:t(data?.reason||'Model selection is unavailable for this session.'));
+  }catch(error){if(active()&&version===suggestVersion)paintChoices([],t('Model selection is unavailable for this session.'));}
+ }
+ async function applyModel(choice){
+  if(modelPending||entry.sending||!active()||state.connection?.phase!=='ready')return;
+  modelPending=true;const context=scope(),version=suggestVersion;paintChoices([],t('Requesting model change…'));updateComposer();
+  try{
+   const result=await ctx.rpc({action:'set_model',session:sessionId,model:choice.id});
+   if(!active()||scope()!==context)return;
+   discovery.clear();
+   if(result?.applied===true){const id=typeof result.model==='string'?result.model:choice.id;entry.model={agent:chatAgent(),scope:context,id,label:id===choice.id?choice.label:id};if(version===suggestVersion)closeSuggestions();}
+   else if(version===suggestVersion)paintChoices([],t(result?.reason||'Model change was not confirmed.'));
+  }catch(error){if(active()&&version===suggestVersion)paintChoices([],t('Model change was not confirmed.'));}
+  finally{modelPending=false;if(active())updateComposer();}
+ }
+ function syncAgent(){
+  const agent=chatAgent(),label=entry.model?.agent===agent&&entry.model.scope===scope()?entry.model.label:t('Model');
+  if(modelBtn.textContent!==label){modelBtn.textContent=label;modelBtn.setAttribute('aria-label',label);}
+  modelBtn.hidden=!agent||!capability('composer_models');modelBtn.disabled=modelPending||entry.sending||state.connection?.phase!=='ready';
+  const text=agent?t('Message {0}',agentName(agent)):t('Message agent (Bracketed Paste)…');if(input.placeholder!==text)input.placeholder=text;
+ }
  function copyText(text,node){
   run(async()=>{
    // 클립보드 권한이 거부되면(일부 웹뷰) 선택 복사로 한 번 더 시도한다.
@@ -150,10 +241,11 @@ function mountChat(root,opts){
  // act owns product-level error presentation; local operations retain their own visible status.
  function run(fn){if(ctx.act)ctx.act(fn);else Promise.resolve().then(fn).catch(e=>ctx.error?.(e));}
  function updateComposer(sent){
+  updateStrip();
   // Completion belongs to the shared draft version, including a newly mounted composer.
   if(sent&&(entry.draftVersion||0)===sent.version&&input.value===sent.text)input.value='';
   sizeInput();
-  sendBtn.disabled=entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error';
+  sendBtn.disabled=modelPending||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error';
   attachBtn.disabled=entry.sending||!!entry.photo;
   attachment.replaceChildren();
   const photo=entry.photo;if(!photo)return;
@@ -179,20 +271,23 @@ function mountChat(root,opts){
   entry.notifyComposer?.();
  }
  composer.addEventListener('submit',e=>{
-  e.preventDefault();if(composing||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error')return;
+  e.preventDefault();if(!active()||e.isComposing||composing||modelPending||!suggestions.hidden||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error')return;
   const text=input.value,photo=entry.photo,version=entry.draftVersion||0;
+  if(text.trim()==='/model'&&!photo&&capability('composer_models')){openModelCommand(0,text.length);return;}
   if(!text.trim()&&!photo)return;
-  entry.sending=true;updateComposer();
+  entry.progress={phase:'sending',text,photo:!!photo,canConfirm:entry.loaded&&entry.bound,generation:entry.generation,lastState:state.sessions?.get(sessionId)?.state,stamp:state.sessions?.get(sessionId)?.state_since_unix_ns,ids:new Set((entry.live?.items||entry.items).map(item=>item.id))};entry.sending=true;closeSuggestions();updateComposer();updateStrip();
   run(async()=>{
    try{
+    if(!active())return;
     await ctx.rpc({action:'prompt',session:sessionId,text,...(photo?{photo:photo.prepared}:{})});
+    entry.progress.phase='accepted';entry.notifyComposer?.();
     // A later mount or edit owns the current draft; an older RPC must never erase it.
     if((entry.draftVersion||0)===version&&drafts.get(sessionId)===text){
      drafts.delete(sessionId);entry.notifyComposer?.({version,text});
     }
     if(photo&&entry.photo===photo)entry.photo=null;
     if(!disposed){await pollNow();await ctx.refresh?.();}
-   }finally{entry.sending=false;entry.notifyComposer?.();}
+   }catch(error){if(entry.progress.phase==='sending'){entry.progress.phase='error';entry.progress.error=String(error?.message||error);}throw error;}finally{entry.sending=false;entry.notifyComposer?.();}
   });
  });
  shell.append(history,pollStatus,feed,strip,composer);root.replaceChildren(shell);
@@ -294,10 +389,35 @@ function mountChat(root,opts){
   });
  }
  function updateStrip(){
-  const sess=state.sessions?.get(sessionId),hidden=!['Waiting','Blocked'].includes(sess?.state),anchor=strip.hidden!==hidden?readerAnchor():null;stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';syncAgent();
-  // 헤더가 연결·모드를 보이므로 하단 줄은 사용자가 답해야 할 때만 띄운다.
-  strip.hidden=hidden;
-  stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));restoreReader(anchor);
+  const sess=state.sessions?.get(sessionId),progress=entry.progress;
+  const currentItems=entry.live?.items||entry.items;
+  if(progress?.canConfirm&&!progress.confirmed&&progress.generation===entry.generation&&currentItems.some(item=>item.kind==='user'&&!progress.ids.has(item.id)&&item.text===progress.text))progress.confirmed=true;
+  receipt.hidden=!progress||!!progress.confirmed;
+  if(!receipt.hidden){const label=t(progress.phase==='sending'?'Sending…':progress.phase==='error'?'Send not confirmed':'Accepted. Awaiting agent response…'),snippet=progress.text||t('Photo');receipt.textContent=`${label} · ${snippet.length>240?snippet.slice(0,240)+'…':snippet}`;}
+  let status=sess?.state||'Unknown',message=sess?.lines?.at(-1)||'';
+  if(state.connection?.phase!=='ready'){status='Offline';message=t('Offline. Reconnect to update activity.');}
+  else if(progress){
+   if(sess?.state!==progress.lastState){progress.stateChanged=true;progress.lastState=sess?.state;}
+   const changed=progress.stateChanged||sess?.state_since_unix_ns&&sess.state_since_unix_ns!==progress.stamp;
+   if(progress.phase==='sending'){status='Sending';message=t('Sending…');}
+   else if(progress.phase==='error'){status='Blocked';message=t('Send not confirmed. Draft kept; check activity before retrying.');}
+   else if(sess?.exited){status='Exited';message=t('Session ended.');}
+   else if(changed&&['Waiting','Blocked','Done'].includes(sess?.state))message=t(sess.state==='Done'?'Completed':sess.state==='Waiting'?'Waiting for input':'Agent blocked');
+   else if(sess?.state==='Working'){status='Working';message=t('Working');}
+   else{status='Accepted';message=t('Accepted. Awaiting agent response…');}
+   if(progress.phase!=='sending'&&progress.phase!=='error'&&!['Waiting','Blocked','Done','Exited'].includes(status)){
+    const latest=progress.generation===entry.generation?currentItems.findLast(item=>!progress.ids.has(item.id)&&item.kind!=='user'):null;
+    if(latest){
+     if(latest.kind==='tool_call'){status='Working';message=[t('Tool activity'),latest.tool_name,latest.title||latest.file_path].filter(Boolean).join(' · ');}
+     else if(latest.kind==='tool_result'&&latest.is_error){status='Blocked';message=t('Tool error');}
+     else if(latest.kind==='question'||latest.kind==='permission'){status='Waiting';message=t('Waiting for input');}
+     else if(status!=='Working')message=t('Response received');
+    }
+   }
+  }
+  const hidden=!progress&&state.connection?.phase==='ready'&&!['Waiting','Blocked','Working'].includes(status),anchor=strip.hidden!==hidden?readerAnchor():null;
+  stripBadge.textContent=t(status);stripBadge.dataset.state=status;stripText.textContent=message;strip.hidden=hidden;
+  strip.setAttribute('role','status');strip.setAttribute('aria-live','polite');syncAgent();restoreReader(anchor);
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start,_retainedBytes:JSON.stringify(item).length*2}));}
  function clearTranscript(){entry.items=[];entry.retainedBytes=0;entry.disclosures?.clear();entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();resize?.disconnect();resize?.observe(feed);}
@@ -318,6 +438,7 @@ function mountChat(root,opts){
  function showPollError(error){
   const anchor=readerAnchor();failures++;pollStatus.hidden=false;
   const when=lastSuccess?new Date(lastSuccess).toTimeString().slice(0,8):t('never');
+  updateStrip();
   pollText.textContent=`${t('Chat history update failed')} (${failures}). ${t('Last updated')}: ${when}. ${t('Retry or check Term.')} ${String(error?.message||error||'')}`;restoreReader(anchor);
  }
  function sameItem(a,b){
@@ -330,18 +451,18 @@ function mountChat(root,opts){
  }
  async function pollNow(initial=false){
   // 숨은 Chat도 첫 내용을 받을 때까지는 받아 둔다(실패 2회까지). 연결 전에 마운트돼 첫 프리페치를 놓쳐도 ready 뒤 update()가 다시 받아, Chat을 누른 첫 프레임에 내용이 있다.
-  if(disposed||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
+  if(!active()||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
   inFlight=true;
   try{
    // v0.1.37 이하 데몬은 latest를 모르는 필드로 거부한다. chat_tail이 없는 데몬이 그렇게 거부하면 처음부터 이어 읽는다(빈 화면으로 남기지 않는다).
    if(entry.noTail&&state.snapshot?.capabilities?.chat_tail===true)entry.noTail=false;
    const start=entry.offset;let latest=(!entry.initialized||refreshLatest)&&!entry.noTail,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest?{latest:true}:{}});
-   if(disposed||earlierPending||entry.live||!res)return;
+   if(!active()||earlierPending||entry.live||!res)return;
    let changed=entry.generation&&res.generation&&entry.generation!==res.generation;
    // Rebinding also opens at the tail. Keep the current paint until that window is ready.
    if(!latest&&!entry.noTail&&(res.reset||changed)){
     res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:0,latest:true});
-    if(disposed||earlierPending||entry.live||!res)return;
+    if(!active()||earlierPending||entry.live||!res)return;
     latest=true;changed=true;
    }
    const rItems=res.items||[],sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
@@ -358,7 +479,7 @@ function mountChat(root,opts){
    if(typeof res.next_offset==='number')entry.offset=res.next_offset;
    lastSuccess=entry.lastSuccess=Date.now();failures=0;pollStatus.hidden=true;
    if(reconciled||entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed&&!reconciled?before:undefined);updateStrip();restoreReader(anchor);pruneCache(state);
-  }catch(error){if(disposed)return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
+  }catch(error){if(!active())return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
  }
  async function loadEarlier(){
   if(disposed||earlierPending||inFlight||!entry.items.length)return;
@@ -390,7 +511,7 @@ function mountChat(root,opts){
  globalThis.document?.addEventListener?.('visibilitychange',visibilityChanged);
  entry.notifyComposer=updateComposer;
  renderItems();updateStrip();updateComposer();pollNow(true);schedule();
- return {insertText,pollNow,setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
+ return {insertText,pollNow,setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){if(picker&&picker.scope!==scope())closeSuggestions();updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;closeSuggestions();discovery.clear();discovering.clear();disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
 }
 M.chat={mount:mountChat,pruneCache,forgetSession};
 M.screens.chat=(root,ctx)=>{
