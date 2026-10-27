@@ -220,7 +220,7 @@ mod tests {
                 .sum::<usize>()
                 <= 200 * 1024
         );
-        for (name, mime, plain, _) in ASSETS {
+        for (name, mime, plain, compressed) in ASSETS {
             let route = route(name);
             let mut response = Vec::new();
             serve(&mut response, &route, false).unwrap();
@@ -230,6 +230,24 @@ mod tests {
             let mut response = Vec::new();
             serve(&mut response, &route, true).unwrap();
             assert!(String::from_utf8_lossy(&response).contains("Content-Encoding: gzip"));
+            assert!(compressed.len() >= 18, "{name}.gz too short");
+            assert_eq!(&compressed[..3], &[0x1f, 0x8b, 0x08], "{name}.gz magic");
+            let crc = u32::from_le_bytes(
+                compressed[compressed.len() - 8..compressed.len() - 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let isize = u32::from_le_bytes(compressed[compressed.len() - 4..].try_into().unwrap());
+            assert_eq!(
+                crc,
+                crc32fast::hash(plain),
+                "{name}.gz CRC32 out of sync with {name}"
+            );
+            assert_eq!(
+                isize,
+                u32::try_from(plain.len()).unwrap(),
+                "{name}.gz ISIZE out of sync with {name}"
+            );
         }
         let js = String::from_utf8_lossy(APP);
         assert!(!js.contains("crypto.subtle"));
