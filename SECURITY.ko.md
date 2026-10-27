@@ -29,7 +29,7 @@
 
 신고 범위는 `crates/` Rust 코드, `packaging/install.sh`·`packaging/release.sh`, GitHub Actions 워크플로입니다.
 
-알려진 한계: 로컬·ad-hoc 서명 및 미공증 macOS 앱을 설치하기 위해 문서에 안내한 Gatekeeper 우회 자체는 권한 상승 취약점으로 보지 않습니다. 직접 빌드를 원하면 [소스 빌드](docs/GETTING_STARTED.ko.md#macos-소스-빌드)를 사용합니다. 이 한계가 다른 설치기·업데이터 취약점을 제외하지는 않습니다.
+알려진 한계: 로컬·ad-hoc 서명 및 미공증 macOS 앱을 설치하기 위해 문서에 안내한 Gatekeeper 우회 자체는 권한 상승 취약점으로 보지 않습니다. 직접 빌드를 원하면 [소스 빌드](GETTING_STARTED.ko.md#macos-소스-빌드)를 사용합니다. 이 한계가 다른 설치기·업데이터 취약점을 제외하지는 않습니다.
 
 ## 비밀·진단 정보
 

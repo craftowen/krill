@@ -237,6 +237,31 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked -p krill-app -p krill -p krilld -p krill-holder -p krill-link
 
+      - name: Verify native Windows audit regressions
+        shell: powershell
+        timeout-minutes: 25
+        env:
+          KRILL_STATE_DIR: ${{ runner.temp }}/krill-audit-native
+          KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Test-KrillNative {
+            param([string]$Package, [string[]]$TargetArgs, [string]$TestName)
+            $testArgs = @('test', '--release', '--locked', '-p', $Package) + $TargetArgs + @($TestName, '--', '--exact')
+            $inventory = & cargo @testArgs --list
+            if ($LASTEXITCODE -ne 0) { throw "Native test inventory failed: $Package $TestName" }
+            if ($inventory -notcontains ($TestName + ': test')) { throw "Required native regression is missing: $Package $TestName" }
+            & cargo @testArgs --nocapture --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "Native regression failed: $Package $TestName" }
+          }
+          Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::empty_duplicate_holder_exits_instead_of_restarting'
+          Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::crash_exit_still_schedules_restart'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::blocked_input_write_is_cancelled_by_peer_hup_and_reports_written_prefix'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::query_replies_never_block_the_engine_on_a_full_input_pipe'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::halt_deadline_and_resume_run_in_an_isolated_process'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'registry::schedule::windows_tests::precheck_passes_exit_zero_and_reports_status_output_and_timeout'
+          Test-KrillNative -Package krill-app -TargetArgs @('--bin', 'krill-app') -TestName 'shell::folder::tests::windows_project_commands_create_and_clone_with_literal_paths'
+
       # ConPTY B안 파일은 저장소에 없다. nupkg 해시를 확인하고, 안의 두 파일 해시는 bundle.ps1이 다시 확인한다.
       - name: Fetch pinned ConPTY package
         shell: powershell
@@ -345,6 +370,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v8
         with:
           name: krill-windows-${{ needs.build-windows.outputs.version }}-attempt-${{ github.run_attempt }}

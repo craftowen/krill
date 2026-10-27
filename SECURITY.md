@@ -29,7 +29,7 @@ The response target is **within 7 days**. Please delay disclosure of technical d
 
 In scope: Rust code in `crates/`, `packaging/install.sh`, `packaging/release.sh`, and GitHub Actions workflows.
 
-Known limitation: the documented Gatekeeper bypass used to install a locally/ad-hoc signed, unnotarized macOS build is not itself treated as a privilege-escalation vulnerability. Use the [source-build path](docs/GETTING_STARTED.md#build-from-source-on-macos) if you prefer to build locally. This does not exclude unrelated installer or updater vulnerabilities.
+Known limitation: the documented Gatekeeper bypass used to install a locally/ad-hoc signed, unnotarized macOS build is not itself treated as a privilege-escalation vulnerability. Use the [source-build path](GETTING_STARTED.md#build-from-source-on-macos) if you prefer to build locally. This does not exclude unrelated installer or updater vulnerabilities.
 
 ## Secrets and diagnostics
 
