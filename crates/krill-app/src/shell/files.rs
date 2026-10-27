@@ -308,6 +308,8 @@ struct FileTab {
     comparison: Option<FileComparison>,
     recovery: Option<ReloadRecovery>,
     path: PathBuf,
+    /// 본문을 읽어 온 호스트. 칸의 호스트가 달라지면 본문을 재사용하지 않는다(APP-F01 후속).
+    host: krill_app::hosts::HostId,
     staged_image: Option<PathBuf>,
     revision: u64,
     saving: bool,
@@ -333,6 +335,8 @@ enum Body {
     Placeholder(Kind, u64),
     Unopenable(Unopenable),
     Failed(String),
+    /// 전송이 없는 원격 호스트의 파일: 읽지 않았다(같은 경로의 로컬 파일을 보이면 안 된다). 전송이 생기면 다시 읽는다.
+    Offline,
 }
 
 /// 지금 보이는 미리보기.
@@ -455,6 +459,24 @@ impl FileTab {
         self.doc.as_ref().is_some_and(Doc::is_dirty)
     }
 
+    /// 전송이 없는 원격 파일 칸. 디스크를 읽지 않았으므로 문서·편집 상태가 없다.
+    fn offline(host: krill_app::hosts::HostId, path: PathBuf) -> Self {
+        Self {
+            comparison: None,
+            recovery: None,
+            path,
+            host,
+            staged_image: None,
+            revision: 0,
+            saving: false,
+            preview_generation: 0,
+            selection_pin: false,
+            doc: None,
+            body: Body::Offline,
+            error: None,
+        }
+    }
+
     #[cfg(test)]
     #[cfg(unix)]
     fn editor(&self) -> Option<&gpui::Entity<EditorState>> {
@@ -514,7 +536,55 @@ fn not_text(opened: &Opened) -> String {
     }
 }
 
+/// 파일 칸의 호스트를 세 갈래로 가른다(APP-F01 후속). `remote_target_for_pane`의 `None`은 로컬과
+/// 전송이 없는 원격을 구분하지 못해, 호출자가 같은 경로의 로컬 파일을 읽고 쓰는 쪽으로 흘렀다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum FileHost {
+    Local,
+    /// 전송이 있는 원격 호스트: 원격 파일 시스템 RPC로만 읽고 쓴다(타깃은 커서 Box).
+    Remote(krill_app::hosts::HostId, Box<krill_app::hosts::HostTarget>),
+    /// 전송이 없는(시작 중·끊김·제거된) 원격 호스트: 어떤 로컬 디스크 IO도 하지 않는다.
+    Unavailable(krill_app::hosts::HostId),
+}
+
+impl FileHost {
+    /// 원격 파일 시스템 호출에 넘길 (호스트, 전송). 로컬은 `Ok(None)`, 전송이 없는 원격은 `Err`라서
+    /// 호출자가 `None`을 로컬로 오해할 수 없다.
+    pub(super) fn transport(
+        &self,
+    ) -> Result<
+        Option<(krill_app::hosts::HostId, krill_app::hosts::HostTarget)>,
+        &krill_app::hosts::HostId,
+    > {
+        match self {
+            Self::Local => Ok(None),
+            Self::Remote(host, target) => Ok(Some((host.clone(), target.as_ref().clone()))),
+            Self::Unavailable(host) => Err(host),
+        }
+    }
+}
+
 impl Shell {
+    pub(super) fn file_host_for_pane(&self, pane: PaneId) -> FileHost {
+        let host = self.layout.host(pane);
+        if !host.is_remote() {
+            return FileHost::Local;
+        }
+        match self.target_for_host(host) {
+            Some(target) => FileHost::Remote(host.clone(), Box::new(target)),
+            None => FileHost::Unavailable(host.clone()),
+        }
+    }
+
+    /// 전송이 없는 원격 칸의 디스크 작업을 거부했다: 버퍼·dirty는 그대로 두고 오류 띠만 띄운다.
+    fn mark_remote_unavailable(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if let Some(tab) = self.files.tabs.get_mut(&pane) {
+            tab.error = Some(etext::REMOTE_DISCONNECTED_KEPT.get().to_owned());
+            self.files.cache_count = usize::MAX;
+            cx.notify();
+        }
+    }
+
     pub(super) fn file_actions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
         root.on_action(cx.listener(|this, _: &SaveFile, _, cx| {
             if let Some(pane) = this.layout.focused() {
@@ -666,13 +736,22 @@ impl Shell {
     pub(super) fn open_file_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         use krill_proto::os::ffi::OsStrExt as _;
         let ws = self.active_workspace(cx);
-        let ws_folder = (!ws.folder.as_os_str().is_empty()).then_some(ws.folder);
+        // `open_file`과 같은 호스트 판정: 포커스된 칸의 호스트, 없으면 활성 작업공간의 호스트.
+        // 탭이 없는 원격 작업공간에서도 로컬로 떨어지지 않는다(APP-F01 후속).
+        let host = self
+            .layout
+            .focused()
+            .filter(|_| !self.page_open() && self.dashboard.is_none())
+            .map_or_else(|| ws.host.clone(), |p| self.layout.host(p).clone());
+        let ws_folder = (ws.host == host)
+            .then_some(ws.folder)
+            .filter(|f| !f.as_os_str().is_empty());
         self.close_settings(None, cx);
         self.diff
             .update(cx, krill_app::diff::Panel::clear_selection);
         let tabs = self.workspace_tabs(cx);
         self.change(true, cx, move |l| {
-            let pane = l.open_file_preview_in(path, &tabs);
+            let pane = l.open_file_preview_on(host, path, &tabs);
             if l.launch(pane).is_none_or(|c| c.cwd.is_empty())
                 && let Some(folder) = ws_folder
             {
@@ -1154,6 +1233,7 @@ impl Shell {
         let path = self.layout.file(id).map(Path::to_owned).unwrap_or_default();
         let tab = self.files.tabs.get(&id);
         let dirty = tab.is_some_and(FileTab::is_dirty);
+        let file_host = self.file_host_for_pane(id);
         let header = div()
             .min_h(krill_app::ui::PANE_HEADER_HEIGHT)
             .flex_wrap()
@@ -1190,12 +1270,8 @@ impl Shell {
                 )
             })
             .children(self.preview_toggle(id, cx))
-            .children(Self::open_browser_button(
-                id,
-                &path,
-                self.remote_target_for_pane(id),
-            ))
-            .children(self.share_button(id, &path, cx))
+            .children(Self::open_browser_button(id, &path, &file_host))
+            .children(self.share_button(id, &path, &file_host, cx))
             .when(is_split, |d| {
                 d.child(
                     Button::new(("file-pane-close", id.get()))
@@ -1287,6 +1363,14 @@ impl Shell {
                 .child(msg)
                 .into_any_element()
         };
+        // 전송이 없는 원격 파일: 같은 경로의 로컬 파일을 읽거나 열지 않고 연결 안내만 보인다.
+        let offline = || {
+            div()
+                .size_full()
+                .debug_selector(|| "file-offline".into())
+                .child(notice(etext::REMOTE_DISCONNECTED.get().to_owned()))
+                .into_any_element()
+        };
         let body = if let Some(comparison) = tab.and_then(|tab| tab.comparison.as_ref()) {
             self.render_file_comparison(id, comparison, cx)
         } else {
@@ -1301,20 +1385,26 @@ impl Shell {
                     }
                     Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
                     Shown::Image(view) => view.clone().into_any_element(),
-                    Shown::Html { title, len } => {
-                        let weak = cx.weak_entity();
-                        fview::html_preview_on(
-                            &path,
-                            self.remote_target_for_pane(id),
-                            title.as_deref(),
-                            *len,
-                            move |window, cx| {
-                                weak.update(cx, |this, cx| this.set_preview(id, false, window, cx))
+                    Shown::Html { title, len } => match file_host.transport() {
+                        // 브라우저 열기·Finder 보기가 같은 경로의 로컬 파일로 가므로 띄우지 않는다.
+                        Err(_) => offline(),
+                        Ok(remote) => {
+                            let weak = cx.weak_entity();
+                            fview::html_preview_on(
+                                &path,
+                                remote,
+                                title.as_deref(),
+                                *len,
+                                move |window, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        this.set_preview(id, false, window, cx);
+                                    })
                                     .ok();
-                            },
-                            cx,
-                        )
-                    }
+                                },
+                                cx,
+                            )
+                        }
+                    },
                 },
                 Some(Body::Text { state, .. }) => div()
                     .size_full()
@@ -1323,9 +1413,11 @@ impl Shell {
                     .into_any_element(),
                 Some(Body::Image(view)) => view.clone().into_any_element(),
                 Some(Body::Table(view)) => view.clone().into_any_element(),
-                Some(Body::Placeholder(kind, len)) => {
-                    fview::placeholder_on(&path, self.remote_target_for_pane(id), *kind, *len, cx)
-                }
+                Some(Body::Placeholder(kind, len)) => match file_host.transport() {
+                    Err(_) => offline(),
+                    Ok(remote) => fview::placeholder_on(&path, remote, *kind, *len, cx),
+                },
+                Some(Body::Offline) => offline(),
                 Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
                 Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
                 None => notice(String::new()),
@@ -1368,14 +1460,12 @@ impl Shell {
     }
 
     /// 열린 HTML 파일을 기본 웹 브라우저에서 여는 머리 버튼.
-    fn open_browser_button(
-        id: PaneId,
-        path: &Path,
-        remote: Option<(krill_app::hosts::HostId, krill_app::hosts::HostTarget)>,
-    ) -> Option<Button> {
+    fn open_browser_button(id: PaneId, path: &Path, host: &FileHost) -> Option<Button> {
         if !krill_app::file_format::is_html_path(path) {
             return None;
         }
+        // 전송이 없는 원격 파일은 같은 경로의 로컬 파일을 열게 되므로 버튼을 두지 않는다.
+        let remote = host.transport().ok()?;
         let path = path.to_path_buf();
         Some(
             Button::new(("file-open-browser", id.get()))
@@ -1401,8 +1491,15 @@ impl Shell {
     }
 
     /// 열린 HTML·Markdown 파일을 아티팩트(공개 링크)로 공유하는 머리 버튼.
-    fn share_button(&self, id: PaneId, path: &Path, cx: &mut Context<Self>) -> Option<Button> {
-        if !krill_proto::artifacts::is_shareable_path(path) {
+    fn share_button(
+        &self,
+        id: PaneId,
+        path: &Path,
+        host: &FileHost,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        // 공유 CLI는 이 기기의 파일만 읽는다: 원격 칸에 두면 같은 경로의 로컬 파일이 올라간다.
+        if *host != FileHost::Local || !krill_proto::artifacts::is_shareable_path(path) {
             return None;
         }
         let busy = self.files.sharing.contains(&id);
@@ -1441,6 +1538,12 @@ impl Shell {
             return;
         };
         if self.files.sharing.contains(&id) {
+            return;
+        }
+        if self.file_host_for_pane(id) != FileHost::Local {
+            // 버튼이 없어도(지연된 클릭 등) 원격 칸의 공유는 로컬 파일을 올리므로 거부한다.
+            self.notice = Some(atext::SHARE_REMOTE_UNSUPPORTED.get().to_owned());
+            cx.notify();
             return;
         }
         if self.files.tabs.get(&id).is_some_and(FileTab::is_dirty) {
@@ -1784,6 +1887,25 @@ impl Shell {
         self.files
             .loading
             .retain(|pane, (_, path)| self.layout.file(*pane) == Some(path.as_path()));
+        // 전송이 없어 읽지 못한 칸은 전송이 생기면, 다른 호스트에서 읽은 칸은 칸의 호스트가 바뀌면 버리고
+        // 다시 읽는다(디스크 IO 없이 맵 조회만). 읽어 온 본문은 읽어 온 호스트에만 속한다(APP-F01 후속).
+        let stale: Vec<PaneId> = self
+            .files
+            .tabs
+            .iter()
+            .filter(|(pane, tab)| {
+                (self.layout.file(**pane).is_some() && *self.layout.host(**pane) != tab.host)
+                    || (matches!(tab.body, Body::Offline)
+                        && !matches!(self.file_host_for_pane(**pane), FileHost::Unavailable(_)))
+            })
+            .map(|(pane, _)| *pane)
+            .collect();
+        for pane in stale {
+            if let Some(tab) = self.files.tabs.remove(&pane) {
+                self.files.forget(&tab);
+            }
+            self.files.cache_count = usize::MAX;
+        }
         for pane in self.layout.visible() {
             if let Some(path) = self.layout.file(pane).map(Path::to_owned)
                 && !self.files.tabs.contains_key(&pane)
@@ -2009,11 +2131,18 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let host = self.layout.host(pane).clone();
+        let Ok(remote) = self.file_host_for_pane(pane).transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일을 읽지 않는다. 전송이 생기면 `sync_files`가 다시 읽는다.
+            self.files.tabs.insert(pane, FileTab::offline(host, path));
+            self.files.cache_count = usize::MAX;
+            cx.notify();
+            return;
+        };
         self.files.next_request = self.files.next_request.wrapping_add(1);
         let generation = self.files.next_request;
         self.files.loading.insert(pane, (generation, path.clone()));
         let saved = self.layout.file_state(pane);
-        let remote = self.remote_target_for_pane(pane);
         #[cfg(test)]
         let gate = self.files.next_io.take();
         cx.spawn_in(window, async move |this, cx| {
@@ -2029,13 +2158,17 @@ impl Shell {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                if this.layout.file(pane) != Some(path.as_path())
-                    || this.files.loading.get(&pane) != Some(&(generation, path.clone()))
-                {
+                if this.files.loading.get(&pane) != Some(&(generation, path.clone())) {
                     return;
                 }
                 this.files.loading.remove(&pane);
-                let mut tab = Self::load_file_tab(pane, path.clone(), saved, window, cx, loaded);
+                // 읽는 동안 칸의 파일·호스트가 바뀌었으면 다른 호스트에서 읽은 내용을 보이지 않는다.
+                if this.layout.file(pane) != Some(path.as_path()) || *this.layout.host(pane) != host
+                {
+                    return;
+                }
+                let mut tab =
+                    Self::load_file_tab(pane, path.clone(), saved, host, window, cx, loaded);
                 if this.files.goto.as_ref().is_some_and(|(p, _, _)| *p == path)
                     && let Body::Text { shown, .. } = &mut tab.body
                 {
@@ -2062,10 +2195,12 @@ impl Shell {
         pane: PaneId,
         path: PathBuf,
         saved: Option<layout::SavedFileState>,
+        host: krill_app::hosts::HostId,
         window: &mut Window,
         cx: &mut Context<Self>,
         loaded: PreparedFile,
     ) -> FileTab {
+        let local = host.is_local();
         let PreparedFile {
             opened,
             preview: prepared,
@@ -2123,6 +2258,7 @@ impl Shell {
                     comparison: None,
                     recovery: None,
                     path: path.clone(),
+                    host,
                     staged_image: None,
                     revision: 0,
                     saving: false,
@@ -2152,11 +2288,15 @@ impl Shell {
             Ok((Opened::Placeholder(kind, len), stamp)) => (Body::Placeholder(kind, len), stamp),
             Ok((Opened::Unopenable(reason), stamp)) => (Body::Unopenable(reason), stamp),
             Err(e) => {
-                krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                // 원격 읽기 실패를 이 기기의 디스크 접근 권한 문제로 안내하지 않는다.
+                if local {
+                    krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                }
                 return FileTab {
                     comparison: None,
                     recovery: None,
                     path: path.clone(),
+                    host,
                     staged_image: None,
                     revision: 0,
                     saving: false,
@@ -2173,6 +2313,7 @@ impl Shell {
             comparison: None,
             recovery: None,
             path: path.clone(),
+            host,
             staged_image,
             revision: 0,
             saving: false,
@@ -2263,7 +2404,7 @@ impl Shell {
 
     /// Save a snapshot off-thread. Edits made while fsync runs stay dirty.
     pub(super) fn save_file(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Task<bool> {
-        let remote = self.remote_target_for_pane(pane);
+        let file_host = self.file_host_for_pane(pane);
         let Some(tab) = self.files.tabs.get_mut(&pane) else {
             return Task::ready(false);
         };
@@ -2273,6 +2414,12 @@ impl Shell {
         if tab.saving {
             return Task::ready(false);
         }
+        let Ok(remote) = file_host.transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일에 쓰지 않는다. 버퍼·dirty는 그대로, 닫기·종료도 멈춘다.
+            self.mark_remote_unavailable(pane, cx);
+            return Task::ready(false);
+        };
+        let local = remote.is_none();
         tab.saving = true;
         let mut snapshot = doc.clone();
         let path = doc.path().to_owned();
@@ -2350,7 +2497,9 @@ impl Shell {
                         false
                     }
                     Err(SaveError::Io(e)) => {
-                        krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                        if local {
+                            krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                        }
                         tab.error = Some(etext::SAVE_FAILED.format(&[("error", &e.to_string())]));
                         false
                     }
@@ -2366,11 +2515,17 @@ impl Shell {
     }
 
     fn keep_file(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        let remote = self.remote_target_for_pane(pane).map(|(_, target)| target);
+        let file_host = self.file_host_for_pane(pane);
         let Some(tab) = self.files.tabs.get(&pane) else {
             return;
         };
         let Some(doc) = &tab.doc else { return };
+        let Ok(remote) = file_host.transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일 지문을 '내 편집 유지'의 기준으로 삼지 않는다.
+            self.mark_remote_unavailable(pane, cx);
+            return;
+        };
+        let remote = remote.map(|(_, target)| target);
         let path = doc.path().to_owned();
         let revision = tab.revision;
         let before = doc.clone();
@@ -2426,6 +2581,13 @@ impl Shell {
             return;
         }
         let Some(doc) = &tab.doc else { return };
+        let Ok(remote) = self.file_host_for_pane(pane).transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일을 읽어 버퍼를 덮지 않는다.
+            self.mark_remote_unavailable(pane, cx);
+            return;
+        };
+        let host = self.layout.host(pane).clone();
+        let local = remote.is_none();
         let path = doc.path().to_owned();
         let before = doc.clone();
         let revision = tab.revision;
@@ -2438,7 +2600,6 @@ impl Shell {
         self.files.loading.insert(pane, (generation, path.clone()));
         let saved = self.layout.file_state(pane);
         let previewing = matches!(&tab.body, Body::Text { shown: Some(_), .. });
-        let remote = self.remote_target_for_pane(pane);
         #[cfg(test)]
         let gate = self.files.next_io.take();
         cx.spawn_in(window, async move |this, cx| {
@@ -2470,6 +2631,7 @@ impl Shell {
                     || tab.saving
                     || tab.doc.as_ref() != Some(&before)
                     || this.layout.file(pane) != Some(path.as_path())
+                    || *this.layout.host(pane) != host
                 {
                     return;
                 }
@@ -2479,7 +2641,8 @@ impl Shell {
                             .released
                             .push(tab.staged_image.clone().unwrap_or_else(|| path.clone()));
                     }
-                    let fresh = Self::load_file_tab(pane, path, saved, window, cx, loaded);
+                    let fresh =
+                        Self::load_file_tab(pane, path, saved, host.clone(), window, cx, loaded);
                     this.files.tabs.insert(pane, fresh);
                     this.files.cache_count = usize::MAX;
                     cx.notify();
@@ -2533,7 +2696,9 @@ impl Shell {
                         tab.error = Some(not_text(&other));
                     }
                     Err(e) => {
-                        krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                        if local {
+                            krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                        }
                         tab.error = Some(etext::OPEN_FAILED.format(&[("error", &e.to_string())]));
                     }
                 }
@@ -2569,10 +2734,9 @@ impl Shell {
                                 || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
                         })
                         .filter_map(|(p, t)| {
-                            let remote = this.remote_target_for_pane(*p).map(|(_, target)| target);
-                            if this.layout.host(*p).is_remote() && remote.is_none() {
-                                return None;
-                            }
+                            // 전송이 없는 원격 칸은 같은 경로의 로컬 파일을 stat하지 않는다.
+                            let remote = this.file_host_for_pane(*p).transport().ok()?;
+                            let remote = remote.map(|(_, target)| target);
                             Some((*p, t.revision, t.doc.clone()?, remote))
                         })
                         .collect::<Vec<_>>();
