@@ -53,7 +53,7 @@ function toolStep(name){
  return /^(read|view|notebookread|read_file)$/i.test(n)?'Read {0} file(s)':/edit|write|patch/i.test(n)?'Changed {0} file(s)':/grep|glob|search|find|^ls$/i.test(n)?'Searched {0} time(s)':/bash|shell|exec|command/i.test(n)?'Ran {0} command(s)':'Did {0} other step(s)';
 }
 const cacheLimit=8,cacheByteLimit=8*1024*1024,pageLimit=2048,itemByteLimit=2*1024*1024;
-const pinned=(state,id,e)=>e.mounts>0||e.sending||e.photo||e.live||!!state.drafts?.get(id);
+const pinned=(state,id,e)=>e.mounts>0||e.sending||e.modelPending||e.photo||e.live||!!state.drafts?.get(id);
 function pruneCache(state){const cache=state.chatCache;if(!cache)return;let bytes=0;for(const e of cache.values())bytes+=e.retainedBytes||0;for(const [id,e] of cache){if(cache.size<=cacheLimit&&bytes<=cacheByteLimit)break;if(!pinned(state,id,e)){cache.delete(id);bytes-=e.retainedBytes||0;}}}
 function forgetSession(state,id){const e=state.chatCache?.get(id);if(e&&!pinned(state,id,e))state.chatCache.delete(id);}
 function mountChat(root,opts){
@@ -129,10 +129,16 @@ function mountChat(root,opts){
  box.append(suggestions,input,bar);composer.append(receipt,attachment,box);globalThis.MkKeyboard?.keepFocus(composer,ctx.signal);
  // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
  function chatAgent(){return M.sessionAgent?.({...state.sessions?.get(sessionId),...(entry.agent?{agent:entry.agent}:{})})||entry.agent||'';}
- function active(){return !disposed&&!ctx.signal?.aborted&&state.chatCache===cacheMap&&state.drafts===drafts&&state.sessions?.has(sessionId);}
- function scope(){const sess=state.sessions?.get(sessionId);return `${chatAgent()}\n${sess?.cwd||''}`;}
+ function ownsEntry(){return state.chatCache===cacheMap&&state.drafts===drafts&&cacheMap.get(sessionId)===entry&&state.sessions?.has(sessionId);}
+ function active(){return !disposed&&!ctx.signal?.aborted&&ownsEntry();}
+ function scope(){
+  const sess=state.sessions?.get(sessionId),key=JSON.stringify([chatAgent(),sess?.cwd||'',sess?.provider||'',sess?.account_id||'',sess?.profile_id||'']);
+  // A scope epoch also fences A → B → A account/profile switches while a read/change is pending.
+  if(entry.composerScope!==key){entry.composerScope=key;entry.composerEpoch=(entry.composerEpoch||0)+1;entry.model=null;discovery.clear();discovering.clear();closeSuggestions();}
+  return `${entry.composerEpoch}:${key}`;
+ }
  function capability(name){return state.snapshot?.capabilities?.[name]===true;}
- const discovery=new Map(),discovering=new Map();let suggestVersion=0,suggestTimer=null,picker=null,choices=[],choiceIndex=0,modelPending=false;
+ const discovery=new Map(),discovering=new Map();let suggestVersion=0,suggestTimer=null,picker=null,choices=[],choiceIndex=0;
  function closeSuggestions(){suggestVersion++;clearTimeout(suggestTimer);suggestTimer=null;picker=null;choices=[];suggestions.hidden=true;input.setAttribute('aria-expanded','false');input.setAttribute('aria-activedescendant','');}
  function paintChoices(items,message){
   choices=items;choiceIndex=0;suggestions.replaceChildren();choiceList.replaceChildren();suggestions.hidden=false;
@@ -147,10 +153,10 @@ function mountChat(root,opts){
  }
  function markChoice(){for(const [i,item] of choices.entries())item.node.setAttribute('aria-selected',String(i===choiceIndex));input.setAttribute('aria-activedescendant',choices[choiceIndex]?.node.id||'');choices[choiceIndex]?.node.scrollIntoView?.({block:'nearest'});}
  async function discover(action,query=''){
-  const key=`${scope()}\n${action}\n${query}`,cached=discovery.get(key);if(action!=='composer_models'&&cached&&Date.now()-cached.at<30000)return cached.data;
+  const context=scope(),key=`${context}\n${action}\n${query}`,cached=discovery.get(key);if(action!=='composer_models'&&cached&&Date.now()-cached.at<30000)return cached.data;
   let request=discovering.get(key);if(!request){request=ctx.rpc({action,session:sessionId,...action==='mention_files'?{query}:{}});discovering.set(key,request);}
   let data;try{data=await request;}finally{if(discovering.get(key)===request)discovering.delete(key);}
-  if(active()&&action!=='composer_models'){discovery.set(key,{at:Date.now(),data});while(discovery.size>20)discovery.delete(discovery.keys().next().value);}return data;
+  if(active()&&scope()===context&&action!=='composer_models'){discovery.set(key,{at:Date.now(),data});while(discovery.size>20)discovery.delete(discovery.keys().next().value);}return data;
  }
  function trigger(){
   const end=typeof input.selectionStart==='number'?input.selectionStart:input.value.length;
@@ -162,9 +168,10 @@ function mountChat(root,opts){
  function suggest(){
   closeSuggestions();if(!active()||composing||!visible)return;const token=trigger();if(!token)return;
   const action=token.kind==='commands'?'command_catalog':'mention_files';if(!capability(action))return;
-  const version=suggestVersion,context=scope(),draft=input.value;picker={...token,scope:context};
+  const context=scope(),version=suggestVersion,draft=input.value;picker={...token,scope:context};
   paintChoices([],t('Searching…'));
   const load=async()=>{try{
+   if(!active()||version!==suggestVersion||context!==scope()||draft!==input.value)return;
    const data=await discover(action,token.kind==='files'?token.query:'');
    if(!active()||version!==suggestVersion||context!==scope()||draft!==input.value)return;
    let items;
@@ -172,7 +179,7 @@ function mountChat(root,opts){
     const query=token.query.toLocaleLowerCase();items=(data?.items||[]).filter(item=>typeof item.text==='string'&&!/[\r\n\x00-\x1f\x7f]/.test(item.text)&&`${item.name} ${item.text} ${item.description}`.toLocaleLowerCase().includes(query)).slice(0,80).map(item=>({label:item.text,detail:[t(item.kind||'Command'),item.description].filter(Boolean).join(' · '),text:item.text}));
    }else items=(data?.items||[]).filter(item=>typeof item.path==='string'&&item.path&&!/^(?:[\/\\]|[a-z]:)/i.test(item.path)&&!item.path.split(/[\/\\]/).includes('..')&&!/[\x00-\x1f\x7f]/.test(item.path)).slice(0,80).map(item=>({label:item.path,detail:t('Insert file path as text'),text:JSON.stringify(item.path)}));
    paintChoices(items,!items.length?t('No matches'):data.truncated?t('More results available. Keep typing.'):undefined);
-  }catch(error){if(active()&&version===suggestVersion)paintChoices([],t('Search unavailable. Try again.'));}};
+  }catch(error){if(active()&&version===suggestVersion&&context===scope())paintChoices([],t('Search unavailable. Try again.'));}};
   if(token.kind==='files')suggestTimer=setTimeout(load,150);else load();
  }
  function selectChoice(index){
@@ -196,32 +203,32 @@ function mountChat(root,opts){
   entry.draftVersion=(entry.draftVersion||0)+1;input.value?drafts.set(sessionId,input.value):drafts.delete(sessionId);sizeInput();chooseModel();
  }
  async function chooseModel(){
-  if(!active()||modelPending)return;if(picker?.kind==='models'){closeSuggestions();return;}closeSuggestions();
+  if(!active()||entry.modelPending)return;if(picker?.kind==='models'){closeSuggestions();return;}closeSuggestions();
   if(!capability('composer_models'))return;
-  const version=suggestVersion,context=scope();picker={kind:'models',scope:context};paintChoices([],t('Loading models…'));input.focus?.();
+  const context=scope(),version=suggestVersion;entry.model=null;syncAgent();picker={kind:'models',scope:context};paintChoices([],t('Loading models…'));input.focus?.();
   try{
    const data=await discover('composer_models');if(!active()||version!==suggestVersion||scope()!==context)return;
    const models=data?.supported?(data.items||data.models||[]).filter(item=>typeof item.id==='string'&&item.id):[];
-   const current=models.find(item=>item.id===data.current);if(current){entry.model={agent:chatAgent(),scope:context,id:current.id,label:current.label||current.name||current.id};syncAgent();}
+   const current=models.find(item=>item.id===data.current);entry.model=current?{agent:chatAgent(),scope:context,id:current.id,label:current.label||current.name||current.id}:null;syncAgent();
    paintChoices(models.map(item=>({id:item.id,label:item.label||item.name||item.id,detail:item.id===data.current?t('Current model'):undefined})),models.length?undefined:t(data?.reason||'Model selection is unavailable for this session.'));
-  }catch(error){if(active()&&version===suggestVersion)paintChoices([],t('Model selection is unavailable for this session.'));}
+  }catch(error){if(active()&&version===suggestVersion&&scope()===context)paintChoices([],t('Model selection is unavailable for this session.'));}
  }
  async function applyModel(choice){
-  if(modelPending||entry.sending||!active()||state.connection?.phase!=='ready')return;
-  modelPending=true;const context=scope(),version=suggestVersion;paintChoices([],t('Requesting model change…'));updateComposer();
+  if(entry.modelPending||entry.sending||!active()||state.connection?.phase!=='ready')return;
+  const context=scope(),version=suggestVersion,operation={scope:context};entry.modelPending=operation;paintChoices([],t('Requesting model change…'));updateComposer();
   try{
    const result=await ctx.rpc({action:'set_model',session:sessionId,model:choice.id});
-   if(!active()||scope()!==context)return;
+   if(!ownsEntry()||entry.modelPending!==operation||scope()!==context)return;
    discovery.clear();
-   if(result?.applied===true){const id=typeof result.model==='string'?result.model:choice.id;entry.model={agent:chatAgent(),scope:context,id,label:id===choice.id?choice.label:id};if(version===suggestVersion)closeSuggestions();}
-   else if(version===suggestVersion)paintChoices([],t(result?.reason||'Model change was not confirmed.'));
-  }catch(error){if(active()&&version===suggestVersion)paintChoices([],t('Model change was not confirmed.'));}
-  finally{modelPending=false;if(active())updateComposer();}
+   if(result?.applied===true){const id=typeof result.model==='string'?result.model:choice.id;entry.model={agent:chatAgent(),scope:context,id,label:id===choice.id?choice.label:id};if(active()&&version===suggestVersion)closeSuggestions();}
+   else if(active()&&version===suggestVersion)paintChoices([],t(result?.reason||'Model change was not confirmed.'));
+  }catch(error){if(active()&&entry.modelPending===operation&&scope()===context&&version===suggestVersion)paintChoices([],t('Model change was not confirmed.'));}
+  finally{if(entry.modelPending===operation){entry.modelPending=null;if(ownsEntry())entry.notifyComposer?.();}}
  }
  function syncAgent(){
-  const agent=chatAgent(),label=entry.model?.agent===agent&&entry.model.scope===scope()?entry.model.label:t('Model');
+  const context=scope(),agent=chatAgent(),label=entry.model?.agent===agent&&entry.model.scope===context?entry.model.label:t('Model');
   if(modelBtn.textContent!==label){modelBtn.textContent=label;modelBtn.setAttribute('aria-label',label);}
-  modelBtn.hidden=!agent||!capability('composer_models');modelBtn.disabled=modelPending||entry.sending||state.connection?.phase!=='ready';
+  modelBtn.hidden=!agent||!capability('composer_models');modelBtn.disabled=!!entry.modelPending||entry.sending||state.connection?.phase!=='ready';
   const text=agent?t('Message {0}',agentName(agent)):t('Message agent (Bracketed Paste)…');if(input.placeholder!==text)input.placeholder=text;
  }
  function copyText(text,node){
@@ -257,7 +264,7 @@ function mountChat(root,opts){
   // Completion belongs to the shared draft version, including a newly mounted composer.
   if(sent&&(entry.draftVersion||0)===sent.version&&input.value===sent.text)input.value='';
   sizeInput();
-  sendBtn.disabled=modelPending||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error';
+  sendBtn.disabled=!!entry.modelPending||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error';
   attachBtn.disabled=entry.sending||!!entry.photo;
   attachment.replaceChildren();
   const photo=entry.photo;if(!photo)return;
@@ -283,7 +290,7 @@ function mountChat(root,opts){
   entry.notifyComposer?.();
  }
  composer.addEventListener('submit',e=>{
-  e.preventDefault();if(!active()||e.isComposing||composing||modelPending||!suggestions.hidden||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error')return;
+  e.preventDefault();if(!active()||e.isComposing||composing||entry.modelPending||!suggestions.hidden||entry.sending||entry.photo?.status==='pending'||entry.photo?.status==='error')return;
   const text=input.value,photo=entry.photo,version=entry.draftVersion||0;
   if(text.trim()==='/model'&&!photo&&capability('composer_models')){openModelCommand(0,text.length);return;}
   if(!text.trim()&&!photo)return;
