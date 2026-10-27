@@ -337,6 +337,7 @@ const PROJECT_MARKER: &str = "# krill-project-v1:";
 
 /// Windows 기본 셸에서 git을 실행하고 성공한 프로젝트 폴더에 남는다. 사용자 바이트는 Base64 데이터로만 넣어
 /// 따옴표·공백·PowerShell 연산자로 해석되지 않게 한다. 첫 줄의 hex 데이터는 복원 후에도 프로젝트 작업을 식별한다.
+/// 네이티브 stderr의 안내문은 종료 코드로 판정하고, cwd는 콘솔 유무와 무관하게 원시 UTF-8로 보고한다.
 fn windows_project(args: &[&[u8]], destination: &[u8]) -> Program {
     let decode = |value: &[u8]| {
         let encoded = super::security::base64_encode(value);
@@ -356,12 +357,18 @@ fn windows_project(args: &[&[u8]], destination: &[u8]) -> Program {
         "{marker}\n& {{\n\
          $ErrorActionPreference = 'Stop'\n\
          $utf8 = [System.Text.UTF8Encoding]::new($false, $true)\n\
-         [Console]::OutputEncoding = $utf8\n\
+         try {{ [Console]::OutputEncoding = $utf8 }} catch {{}}\n\
          $gitArgs = @({data})\n\
+         $ErrorActionPreference = 'Continue'\n\
          & git @gitArgs\n\
-         if ($LASTEXITCODE -eq 0) {{\n\
+         $gitStatus = $LASTEXITCODE\n\
+         $ErrorActionPreference = 'Stop'\n\
+         if ($gitStatus -eq 0) {{\n\
            Set-Location -LiteralPath ({destination})\n\
-           [Console]::Write([string][char]27 + ']9;9;' + (Get-Location).ProviderPath + [char]7)\n\
+           $osc = $utf8.GetBytes([string][char]27 + ']9;9;' + (Get-Location).ProviderPath + [char]7)\n\
+           $out = [Console]::OpenStandardOutput()\n\
+           $out.Write($osc, 0, $osc.Length)\n\
+           $out.Flush()\n\
          }}\n}}"
     );
     Program::Custom {
