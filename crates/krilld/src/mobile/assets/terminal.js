@@ -3,6 +3,14 @@
 // Icons: Lucide (ISC), Copyright (c) Lucide Contributors, from gpui-kit-assets.
 
 
+(()=>{
+ const doc=globalThis.document,options={capture:true,passive:false};
+ for(const type of ['touchstart','touchmove'])doc?.addEventListener?.(type,e=>{if(e.touches.length>1)e.preventDefault();},options);
+
+ for(const type of ['gesturestart','gesturechange'])doc?.addEventListener?.(type,e=>e.preventDefault(),options);
+})();
+
+
 
 globalThis.MkKeyboard=(()=>{
  const vv=globalThis.visualViewport,doc=globalThis.document,raf=globalThis.requestAnimationFrame?.bind(globalThis)||(fn=>setTimeout(fn,16)),listeners=new Set(),field=n=>!!n?.matches?.('input,textarea,[contenteditable]:not([contenteditable=false])');let inset=0,frame=0,resized=false;
@@ -88,6 +96,32 @@ globalThis.MkTerminalCodec=(()=>{
 
  const phoneLike=()=>!!globalThis.matchMedia?.('(pointer: coarse)')?.matches||(globalThis.innerWidth||Infinity)<600;
  const snap=value=>SCALES.reduce((best,n)=>Math.abs(n-value)<Math.abs(best-value)?n:best,1);
+
+
+ function questionMenu(rows){
+  const lines=rows.map(row=>row.filter(c=>!(c.flags&16)).map(c=>c.flags&256?' ':c.text).join('').replace(/^\s*[│┃]\s?/, '').replace(/\s*[│┃]\s*$/, '').trimEnd()),items=[];
+  for(let y=0;y<lines.length;y++){
+   const m=/^(\s*)([❯›>→])?\s*(?:(\d{1,2})[.)]\s+(\S.*)|(\[[ xX✓]\]|[☐☑])\s+(\S.*))$/.exec(lines[y]);if(!m)continue;
+   let label=m[4]||m[6],box=m[5];const check=/^(\[[ xX✓]\]|[☐☑])\s+(\S.*)$/.exec(label);if(check){box=check[1];label=check[2];}
+   items.push({label,number:m[3]?Number(m[3]):null,focused:!!m[2],checked:box?/[xX✓☑]/.test(box):null,line:y,indent:lines[y].indexOf(label)});
+  }
+
+  const first=items.findLastIndex(item=>item.number===1);if(first>0)items.splice(0,first);
+  if(items.length<2||items.length>12||items.filter(i=>i.focused).length!==1)return null;
+  const multiple=items.every(i=>i.checked!==null);if(!multiple&&items.some(i=>i.checked!==null))return null;
+  if(items.some((item,i)=>item.number!==null&&item.number!==i+1))return null;
+  const hint=/(?:enter|return|↵|엔터)/i,action=/(?:select|confirm|submit|continue|선택|확인|제출|계속)/i;
+  const last=items.at(-1),after=lines.slice(last.line+1);while(after.length&&(!after[0].trim()||!hint.test(after[0])&&after[0].search(/\S/)>=last.indent)){const line=after.shift();if(line.trim())last.label+=' '+line.trim();}
+  const tail=after.filter(line=>line.trim()&&!/^[\s─━╭╮╰╯┌┐└┘┴┬┼+\-]+$/.test(line));
+  if(!tail.some(line=>hint.test(line)&&action.test(line)))return null;
+  if(tail.some(line=>!/(?:enter|return|esc|tab|arrow|space|↑|↓|←|→|↵|엔터|선택|취소)/i.test(line)))return null;
+  if(!multiple&&tail.some(line=>/space.*select|스페이스.*선택/i.test(line)))return null;
+  for(let i=0;i<items.length-1;i++)for(const line of lines.slice(items[i].line+1,items[i+1].line)){
+   if(!line.trim())continue;if(line.search(/\S/)<items[i].indent)return null;items[i].label+=' '+line.trim();
+  }
+  const active=items.findIndex(i=>i.focused),choices=items.map(({label,checked})=>({label,checked})),context=lines.slice(Math.max(0,items[0].line-4),items[0].line);
+  return {choices,active,multiple,key:JSON.stringify([context,choices,active])};
+ }
  class Terminal {
   constructor(root,options){
    if(!root||!Number.isSafeInteger(options.sessionId)||options.sessionId<=0||typeof options.connect!=='function')throw Error('Invalid terminal mount');
@@ -102,7 +136,7 @@ globalThis.MkTerminalCodec=(()=>{
   }
   listen(el,event,fn,extra={}){el.addEventListener(event,fn,{...extra,signal:this.abort.signal});}
   guard(action){const generation=this.generation;try{Promise.resolve(action()).catch(e=>{if(!this.disposed&&generation===this.generation)this.error(e);});}catch(e){if(generation===this.generation)this.error(e);}}
-  status(phase,message,error){if(this.disposed)return;const waiting=phase==='ready'&&this.inputWaiting;message=translate(waiting?'Waiting for input confirmation…':message);this.phase=phase;this.root.dataset.phase=waiting?'input-pending':phase;this.updateLiveInput();if(this.lastStatusPhase===phase&&this.lastStatusMessage===message&&!error)return;this.lastStatusPhase=error?null:phase;this.lastStatusMessage=error?null:message;this.statusEl.textContent=message;this.statusEl.setAttribute('role',error?'alert':'status');this.options.onStatus?.({phase,message,error,fit:this.fit,inputMode:this.inputMode,fontScale:this.fontScale,typing:!!this.wasTyping});}
+  status(phase,message,error){if(this.disposed)return;const waiting=phase==='ready'&&this.inputWaiting;message=translate(waiting?'Waiting for input confirmation…':message);this.phase=phase;this.root.dataset.phase=waiting?'input-pending':phase;this.updateLiveInput();this.syncQuestion();if(this.lastStatusPhase===phase&&this.lastStatusMessage===message&&!error)return;this.lastStatusPhase=error?null:phase;this.lastStatusMessage=error?null:message;this.statusEl.textContent=message;this.statusEl.setAttribute('role',error?'alert':'status');this.options.onStatus?.({phase,message,error,fit:this.fit,inputMode:this.inputMode,fontScale:this.fontScale,typing:!!this.wasTyping});}
   error(e){this.status('error',e.message||String(e),e);}
   build(){
    this.root.classList.add('terminal-mount');this.frame=make('div','terminal-frame');this.port=make('div','terminal-scroll');this.port.tabIndex=0;
@@ -134,8 +168,9 @@ globalThis.MkTerminalCodec=(()=>{
     for(const picker of [images,files])this.listen(picker,'change',()=>{const file=picker.files?.[0];if(file)this.guard(()=>this.options.onPhoto(file));picker.value='';});
    }
    if(this.options.onEditKeys){const edit=button('accessory-key edit-keys','Edit terminal keys','edit');keybar.append(edit);this.listen(edit,'click',()=>this.options.onEditKeys());}
-   inputRow.append(this.capture);this.dock.append(accessory,inputRow);this.root.append(this.frame,this.dock);
-   let lastTop=0;this.listen(this.historyButton,'click',()=>this.guard(()=>this.loadHistory()));this.listen(this.port,'scroll',()=>{const top=this.port.scrollTop,up=top<lastTop&&!this.alt,refresh=up&&this.stick&&this.historyLoadedVersion!==this.historyVersion;if(top>lastTop&&this.nearWindowBottom()){lastTop=top;this.returnToLive();return;}const now=this.now(),elapsed=now-(this.historyScrollAt??now);this.historyVelocity=up&&elapsed>0?(lastTop-top)/elapsed:0;this.historyScrollAt=now;lastTop=top;this.stick=this.atBottom(1);this.latestButton.hidden=this.stick;if(refresh||up&&top<this.historyThreshold())this.guard(()=>this.loadHistory(false,refresh));},{passive:true});
+   this.question=make('section','terminal-question');this.question.hidden=true;this.question.setAttribute('aria-label',translate('Choose an answer'));this.question.dataset.testid='terminal-question';
+   inputRow.append(this.capture);this.dock.append(this.question,accessory,inputRow);this.root.append(this.frame,this.dock);
+   let lastTop=0;this.listen(this.historyButton,'click',()=>this.guard(()=>this.loadHistory()));this.listen(this.port,'scroll',()=>{const top=this.port.scrollTop,up=top<lastTop&&!this.alt,refresh=up&&this.stick&&this.historyLoadedVersion!==this.historyVersion;if(top>lastTop&&this.nearWindowBottom()){lastTop=top;this.returnToLive();return;}const now=this.now(),elapsed=now-(this.historyScrollAt??now);this.historyVelocity=up&&elapsed>0?(lastTop-top)/elapsed:0;this.historyScrollAt=now;lastTop=top;this.stick=this.atBottom(1);this.latestButton.hidden=this.stick;this.syncQuestion();if(refresh||up&&top<this.historyThreshold())this.guard(()=>this.loadHistory(false,refresh));},{passive:true});
    for(const b of [this.fitButton,this.directButton,this.shiftButton,this.pasteButton,this.historyButton])this.listen(b,'pointerdown',e=>e.preventDefault());this.listen(this.pasteButton,'click',()=>this.pasteClipboard());this.listen(this.shiftButton,'click',()=>this.toggleShift());
    this.listen(this.fitButton,'click',()=>this.guard(()=>this.fitToPhone()));this.listen(this.directButton,'click',()=>this.setInputMode(this.inputMode==='direct'?'buffered':'direct'));
    this.listen(this.dismiss,'click',()=>{this.capture.blur();this.command.blur();});this.listen(this.live,'click',()=>this.focus());
@@ -145,12 +180,42 @@ globalThis.MkTerminalCodec=(()=>{
    let pan;this.listen(this.port,'wheel',e=>{if(Math.abs(e.deltaY)>=Math.abs(e.deltaX)&&e.deltaY&&this.wheelRemote(e)){e.preventDefault();return;}if(e.deltaY>0&&this.nearWindowBottom()){this.returnToLive();return;}if(!this.alt&&e.deltaY<0&&(this.atBottom()&&this.historyLoadedVersion!==this.historyVersion||this.port.scrollTop<this.historyThreshold()))this.guard(()=>this.loadHistory(false,this.atBottom()&&this.historyLoadedVersion!==this.historyVersion));if(!this.fit&&Math.abs(e.deltaX)>Math.abs(e.deltaY)){e.preventDefault();this.port.scrollLeft+=e.deltaX;}},{passive:false});
    let pinch;const distance=touches=>Math.hypot((touches[0].clientX??touches[0].x??0)-(touches[1].clientX??touches[1].x??0),(touches[0].clientY??touches[0].y??0)-(touches[1].clientY??touches[1].y??0));
    const midpoint=touches=>{const r=this.port.getBoundingClientRect?.()||{left:0,top:0};return {x:((touches[0].clientX??touches[0].x??0)+(touches[1].clientX??touches[1].x??0))/2-(r.left||0),y:((touches[0].clientY??touches[0].y??0)+(touches[1].clientY??touches[1].y??0))/2-(r.top||0)};};
-   this.listen(this.port,'touchstart',e=>{this.stopMomentum();const t=e.touches[0];pan=e.touches.length===1?{x:t.clientX,y:t.clientY,left:this.port.scrollLeft,axis:null,live:this.atBottom(),tui:this.ownsLive(),unscrollable:this.port.scrollHeight>0&&this.port.clientHeight>0&&this.port.scrollHeight<=this.port.clientHeight,lastY:t.clientY,rem:0,dir:0,samples:[{t:this.now(),x:t.clientX,y:t.clientY}]}:null;this.touching=!!pan;if(e.touches.length===2){const mid=midpoint(e.touches);pinch={distance:distance(e.touches),scale:this.fontScale,midX:mid.x,midY:mid.y};this.previewScale=this.fontScale;this.pinching=true;}},{passive:true});
+   this.listen(this.port,'touchstart',e=>{this.stopMomentum();const t=e.touches[0];pan=e.touches.length===1?{x:t.clientX,y:t.clientY,left:this.port.scrollLeft,axis:null,touch:true,live:this.atBottom(),tui:this.ownsLive(t),unscrollable:this.port.scrollHeight>0&&this.port.clientHeight>0&&this.port.scrollHeight<=this.port.clientHeight,lastY:t.clientY,rem:0,dir:0,samples:[{t:this.now(),x:t.clientX,y:t.clientY}]}:null;this.touching=!!pan;if(e.touches.length===2){const mid=midpoint(e.touches);pinch={distance:distance(e.touches),scale:this.fontScale,midX:mid.x,midY:mid.y};this.previewScale=this.fontScale;this.pinching=true;}},{passive:true});
    this.listen(this.port,'touchmove',e=>{if(pinch&&e.touches.length===2){e.preventDefault();const mid=midpoint(e.touches);pinch.midX=mid.x;pinch.midY=mid.y;this.previewScale=Math.max(.5,Math.min(2,pinch.scale*distance(e.touches)/pinch.distance));for(const el of [this.canvas,this.textLayer]){el.style.transformOrigin='top left';el.style.transform=`scale(${this.previewScale/this.fontScale})`;}return;}if(!pan||e.touches.length!==1)return;const p=e.touches[0],dx=p.clientX-pan.x,dy=p.clientY-pan.y,stepY=p.clientY-pan.lastY,now=this.now();pan.samples.push({t:now,x:p.clientX,y:p.clientY});pan.samples=pan.samples.filter(s=>now-s.t<=80);
+
+
+    if(!pan.axis&&pan.tui&&this.remoteRoute()&&e.cancelable)e.preventDefault();
 
     if(!pan.axis&&Math.hypot(dx,dy)>6){pan.axis=this.lockAxis(dx,dy);if(pan.axis==='y'&&pan.tui){pan.route=this.claimRoute();pan.epoch=this.modeEpoch;}}if(pan.route&&pan.epoch!==this.modeEpoch)pan.axis='done';
     if(pan.axis==='x'){if(e.cancelable)e.preventDefault();this.port.scrollLeft=pan.left-dx;}else if(pan.axis==='y'&&pan.route){const d=p.clientY-pan.lastY;pan.lastY=p.clientY;pan.point=p;pan.reported=this.remoteScroll(d,p,pan)!==null;if(pan.reported&&e.cancelable)e.preventDefault();}else if(pan.axis==='y'){pan.lastY=p.clientY;if((pan.unscrollable&&!this.alt||this.alt&&this.fit&&this.historyElement.hidden)&&this.port.scrollHeight>this.port.clientHeight){if(e.cancelable)e.preventDefault();this.port.scrollTop=Math.max(0,Math.min(this.port.scrollHeight-this.port.clientHeight,(this.port.scrollTop||0)-stepY));}if(dy<-6&&!pan.pulled&&this.nearWindowBottom()){pan.pulled=true;this.returnToLive();}else if(dy>6&&!pan.pulled&&!this.alt&&(pan.live||this.port.scrollTop<this.historyThreshold())){pan.pulled=true;this.stick=false;this.latestButton.hidden=false;this.guard(()=>this.loadHistory(false,pan.live&&this.historyLoadedVersion!==this.historyVersion));}}},{passive:false});
    const finish=e=>{const g=pan;pan=null;this.touching=false;if(g&&e?.type==='touchend')this.fling(g);this.flushText();if(!pinch)return;const {scale:prevScale,midX,midY}=pinch,left=this.port.scrollLeft,top=this.port.scrollTop;pinch=null;this.canvas.style.transform=this.textLayer.style.transform='';this.setFontScale(this.previewScale||this.fontScale);const ratio=this.fontScale/prevScale;if(ratio!==1){this.port.scrollLeft=Math.max(0,(left+midX)*ratio-midX);this.port.scrollTop=Math.max(0,(top+midY)*ratio-midY);this.stick=false;}setTimeout(()=>{this.pinching=false;},0);};this.listen(this.port,'touchend',finish);this.listen(this.port,'touchcancel',finish);
+  }
+  questionEnabled(){return this.ready&&this.screenComplete&&!this.disposed&&!this.retired&&this.inputActive!==false&&this.isVisible()&&!this.contextBlocked&&!this.pasteReview&&!this.composing&&!this.bufferedComposing&&!this.pendingInputs.size&&!this.questionPending&&!this.historyWindowed&&this.stick;}
+  syncQuestion(){
+   if(!this.question)return;const menu=this.ready&&this.screenComplete?questionMenu(this.model.rows):null;this.liveQuestion=menu;
+   if(!menu){if(this.screenComplete)this.questionSentKey=null;this.question.hidden=true;return;}
+   const hidden=!this.isVisible()||this.inputActive===false||this.historyWindowed||!this.stick||this.contextBlocked||!this.ready,visibilityChanged=this.question.hidden!==hidden;this.question.hidden=hidden;
+   const renderKey=JSON.stringify([menu.key,this.inputGeneration,this.modeEpoch]);
+   const layoutChanged=visibilityChanged||renderKey!==this.questionRenderKey;
+   if(renderKey!==this.questionRenderKey){this.questionRenderKey=renderKey;const generation=this.inputGeneration,epoch=this.modeEpoch,nodes=[make('small','question-label',translate(menu.multiple?'Select answers, then submit':'Choose an answer'))];
+    const add=(label,index,checked)=>{const b=make('button','question-choice',label);b.type='button';b.setAttribute('aria-label',label);b.title=label;b.dataset.testid=index===null?'question-submit':`question-choice-${index+1}`;if(checked!==null){b.setAttribute('role','checkbox');b.setAttribute('aria-checked',String(checked));b.prepend(make('span','question-check',checked?'☑':'☐'));}b.addEventListener('pointerdown',e=>e.preventDefault());b.addEventListener('click',()=>this.guard(()=>this.answerQuestion(menu.key,index,generation,epoch)));nodes.push(b);};
+    menu.choices.forEach((choice,index)=>add(choice.label,index,choice.checked));if(menu.multiple)add(translate('Submit answers'),null,null);this.question.replaceChildren(...nodes);
+   }
+   const disabled=!this.questionEnabled()||this.questionSentKey===menu.key;for(const b of this.question.children)if(b.tagName.toLowerCase()==='button')b.disabled=disabled;
+
+
+   if(layoutChanged&&this.stick)this.port.scrollTop=this.port.scrollHeight;
+  }
+  async answerQuestion(key,index,generation,epoch){
+   const current=this.screenComplete?questionMenu(this.model.rows):null;
+   if(!this.questionEnabled()||generation!==this.inputGeneration||epoch!==this.modeEpoch||current?.key!==key||this.questionSentKey===key)return;
+   if(index!==null&&(!Number.isInteger(index)||!current.choices[index]))return;
+   this.questionSentKey=key;this.questionPending=true;this.syncQuestion();
+
+
+   const delta=index===null?0:index-current.active,prefix=this.termModes?.flags&1?'\x1bO':'\x1b[',bytes=(prefix+(delta<0?'A':'B')).repeat(Math.abs(delta))+(current.multiple&&index!==null?' ':'\r');
+   for(const name of ['shift','ctrl','alt'])this.toggleModifier(name,false);
+   this.resetCapture();try{await this.input(bytes,{reveal:false});}finally{this.questionPending=false;this.syncQuestion();}
   }
   now(){return globalThis.performance?.now?.()??Date.now();}
 
@@ -159,18 +224,21 @@ globalThis.MkTerminalCodec=(()=>{
 
   claimRoute(){if(this.modifiers?.shift&&this.modeRoute()){this.toggleModifier('shift',false);return null;}return this.remoteRoute();}
 
-  canvasEdges(){const p=this.port,top=this.historyElement.hidden?0:this.canvas.offsetTop||0,raw=top+this.model.lines*(this.cellHeight||18)-(p.clientHeight||0),lo=Math.min(top,raw);return {lo,hi:Math.max(lo,Math.min(Math.max(top,raw),(p.scrollHeight||0)-(p.clientHeight||0)))};}
-  ownsLive(){return !this.canvas.hidden&&(this.historyElement.hidden||(this.port.scrollTop||0)>=this.canvasEdges().lo-1);}
+
+  canvasEdges(){const p=this.port,max=Math.max(0,(p.scrollHeight||0)-(p.clientHeight||0)),top=this.historyElement.hidden?0:this.canvas.offsetTop||0,raw=top+this.model.lines*(this.cellHeight||18)-(p.clientHeight||0),lo=Math.max(0,Math.min(top,raw,max));return {lo,hi:Math.max(lo,Math.min(Math.max(top,raw),max))};}
+
+  ownsLive(point){if(this.canvas.hidden)return false;if(this.historyElement.hidden)return true;if((this.port.scrollTop||0)<this.canvasEdges().lo-1)return false;const rect=this.canvas.getBoundingClientRect?.();return !rect||!Number.isFinite(point?.clientY)||point.clientY>=rect.top;}
   nearWindowBottom(){const p=this.port;return !!this.historyWindowed&&!this.alt&&p.scrollHeight-p.scrollTop-p.clientHeight<(this.cellHeight||18)*2;}
   wheelStep(){return Math.max(8,(this.cellHeight||18)/1.25);}
 
   lockAxis(dx,dy){const p=this.port,wide=p.scrollWidth===undefined?!this.fit:p.scrollWidth>p.clientWidth+1;return wide&&Math.abs(dx)>1.25*Math.abs(dy)?'x':'y';}
 
-  remoteScroll(d,point,g,max=100){if(!d)return true;const dir=Math.sign(d);if(dir!==g.dir){g.rem=0;g.dir=dir;}const {lo,hi}=this.canvasEdges(),s=this.port.scrollTop||0;if(dir>0?s>lo+.5:s<hi-.5){if(this.alt&&this.fit&&this.historyElement.hidden){this.port.scrollTop=Math.max(lo,Math.min(hi,s-d));return true;}return null;}if(s<lo-.5)this.port.scrollTop=lo;
+
+  remoteScroll(d,point,g,max=100){if(!d)return true;const dir=Math.sign(d);if(dir!==g.dir){g.rem=0;g.dir=dir;}const {lo,hi}=this.canvasEdges(),s=this.port.scrollTop||0;if(dir>0?s>lo+.5:s<hi-.5){if(g.touch||this.alt&&this.fit&&this.historyElement.hidden){this.port.scrollTop=Math.max(lo,Math.min(hi,s-d));d-=s-this.port.scrollTop;if(Math.abs(d)<.5)return true;}else return null;}if(s<lo-.5)this.port.scrollTop=lo;
    const step=this.wheelStep();g.rem+=d;let n=Math.trunc(g.rem/step);g.rem-=n*step;if(Math.abs(n)>max){n=dir*max;g.rem=0;}return !n||this.report(this.wheelBytes(g.route,n,point));}
   wheelBytes(route,n,point){const k=Math.min(Math.abs(n),100),up=n>0;if(route==='arrows')return ((this.termModes?.flags&1?'\x1bO':'\x1b[')+(up?'A':'B')).repeat(k);const r=this.canvas.getBoundingClientRect?.()||{left:0,top:0},m=this.model,at=(v,max)=>Math.max(1,Math.min(max,Math.floor(v)+1));return `\x1b[<${up?64:65};${at(((point?.clientX??0)-r.left)/(this.cellWidth||8),m.cols)};${at(((point?.clientY??0)-r.top)/(this.cellHeight||18),m.lines)}M`.repeat(k);}
 
-  wheelRemote(e){const now=this.now();let g=this.wheelGesture;if(!g||now>g.until)g=this.wheelGesture={route:this.ownsLive()?this.claimRoute():null,rem:0,dir:0,epoch:this.modeEpoch};g.until=now+200;if(!g.route||g.epoch!==this.modeEpoch)return false;const unit=e.deltaMode===1?this.cellHeight||18:e.deltaMode===2?this.port.clientHeight||0:1;return this.remoteScroll(-e.deltaY*unit,e,g)!==null;}
+  wheelRemote(e){const now=this.now();let g=this.wheelGesture;if(!g||now>g.until)g=this.wheelGesture={route:this.ownsLive(e)?this.claimRoute():null,rem:0,dir:0,epoch:this.modeEpoch};g.until=now+200;if(!g.route||g.epoch!==this.modeEpoch)return false;const unit=e.deltaMode===1?this.cellHeight||18:e.deltaMode===2?this.port.clientHeight||0:1;return this.remoteScroll(-e.deltaY*unit,e,g)!==null;}
 
   report(text){if(this.disposed||this.retired||!this.ready||this.inputActive===false||!this.isVisible()||this.contextBlocked||this.pasteReview)return false;if(this.historyWindowed)this.returnToLive();const bytes=C.enc.encode(text);if(!bytes.length||bytes.length>65536)return false;try{this.send(0x13,C.concat(T.v(++this.inputId),T.v(bytes.length),bytes));}catch(e){this.error(e);return false;}return true;}
 
@@ -181,7 +249,7 @@ globalThis.MkTerminalCodec=(()=>{
     if(!ok||Math.abs(m.v)<.02||now-start>1800)this.stopMomentum();else m.id=raf(tick);};m.id=raf(tick);}
   stopMomentum(){const m=this.momentum;if(!m)return;this.momentum=null;(globalThis.cancelAnimationFrame||clearTimeout)(m.id);this.flushText();}
 
-  applyModes(){const key=this.modesSupported?(this.termModes?.flags??0)&0xdf:-1;if(key===this.modeKey)return;this.modeKey=key;this.modeEpoch=(this.modeEpoch||0)+1;this.stopMomentum();this.wheelGesture=null;const alt=key>=0&&!!(key&64),was=this.alt;this.alt=alt;this.root.dataset.alt=String(alt);if(alt===was)return;
+  applyModes(){const key=this.modesSupported?(this.termModes?.flags??0)&0xdf:-1;if(key===this.modeKey)return;this.modeKey=key;this.modeEpoch=(this.modeEpoch||0)+1;this.stopMomentum();this.wheelGesture=null;const alt=key>=0&&!!(key&64),was=this.alt;this.alt=alt;this.root.dataset.alt=String(alt);this.screenComplete=false;this.syncQuestion();if(alt===was)return;
    if(alt){clearTimeout(this.historyWarmTimer);this.historyWarmTimer=null;if(this.historyPending&&!this.historyPending.reveal){this.historyPending=null;this.historyReplacing=false;this.historyButton.disabled=this.historyEnd;this.historyStatus.textContent=translate(this.historyEnd?'Beginning of saved output':'Scroll up for earlier output');}this.historyElement.hidden=this.historyControls.hidden=true;this.canvas.hidden=this.textLayer.hidden=false;this.port.scrollTop=0;this.stick=true;this.latestButton.hidden=true;return;}
 
    this.historyElement.hidden=false;if(this.historyWindowed){this.returnToLive();return;}this.historyControls.hidden=!this.historyRows.length;this.canvas.hidden=this.textLayer.hidden=false;if(this.stick)this.scrollBottom();this.maybeLoadInitialHistory();}
@@ -268,8 +336,8 @@ globalThis.MkTerminalCodec=(()=>{
 
    clearTimeout(this.heldTimer);this.heldTimer=null;this.held='';this.inputActive=false;
    this.capture.blur();if(this.composing){const before=[...this.sent||''],after=[...this.capture.value];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;const text=after.slice(same).join(''),prefix=this.command.value;this.bufferedVersion=(this.bufferedVersion||0)+1;this.inactiveComposition={prefix,text,version:this.bufferedVersion};this.command.value=prefix+text;this.command.value?drafts.set(this.stateKey,this.command.value):drafts.delete(this.stateKey);this.setInputMode('buffered');}else this.invalidateInput();this.bufferedComposing=false;
-  }this.inputActive=active;}
-  invalidateInput(){this.inputGeneration++;this.inputArmed=false;this.composing=false;this.cancelPaste();this.resetCapture();this.capture.blur();this.command.blur();this.stopRepeat();this.stopMomentum();this.deferredKeys.splice(0).forEach(p=>p.reject(Error('Input target changed')));}
+  }this.inputActive=active;this.syncQuestion();}
+  invalidateInput(){this.inputGeneration++;this.inputArmed=false;this.composing=false;this.cancelPaste();this.resetCapture();this.capture.blur();this.command.blur();this.stopRepeat();this.stopMomentum();this.deferredKeys.splice(0).forEach(p=>p.reject(Error('Input target changed')));this.syncQuestion();}
 
   toggleModifier(name,force){if(name!=='shift')this.flushHeld();const mods=this.modifiers||={};mods[name]=typeof force==='boolean'?force:!mods[name];if(name==='shift')this.shiftArmed=mods.shift;this.modifierButtons?.[name]?.setAttribute('aria-pressed',String(!!mods[name]));return !!mods[name];}
   toggleShift(force){return this.toggleModifier('shift',force);}
@@ -295,7 +363,7 @@ globalThis.MkTerminalCodec=(()=>{
 
   atBottom(slack=this.cellHeight||18){const p=this.port;return (!this.historyWindowed||this.alt)&&p.scrollHeight-p.scrollTop-p.clientHeight<slack;}
   returnToLive(){if(this.historyWindowed){this.resetHistory();this.guard(()=>this.loadHistory());}this.scrollBottom();}
-  scrollBottom(){this.port.scrollTop=this.port.scrollHeight;this.stick=true;this.latestButton.hidden=true;}
+  scrollBottom(){this.port.scrollTop=this.port.scrollHeight;this.stick=true;this.latestButton.hidden=true;this.syncQuestion();}
   async open(){
    const generation=this.generation;let result;try{result=await this.options.connect({sessionId:this.session});}catch(e){if(generation===this.generation)this.disconnect('disconnected',e.message);return;}
    const {socket,credentials,channel:warmChannel,messages}=result||{};if(this.disposed||generation!==this.generation){socket?.close();return;}if(!socket||!credentials){this.error(Error('Invalid terminal connection factory'));return;}
@@ -311,7 +379,7 @@ globalThis.MkTerminalCodec=(()=>{
     if(bytes.length<5||new DataView(bytes.buffer,bytes.byteOffset).getUint32(0,true)!==bytes.length-4)throw Error('Invalid screen frame');const body=bytes.slice(5),r=T.reader(body);
     switch(bytes[4]){
      case 0x20:this.attached={seq:r.u(),revision:r.u()};break;
-     case 0x21:{try{const result=T.update(body,this.model);for(const y of result.dirty)this.dirty.add(y);if(result.done){this.historyVersion=(this.historyVersion||0)+1;clearTimeout(this.connectionTimer);const first=!this.ready;this.ready=true;this.previewPending=false;this.updatePreview();this.maybeLoadInitialHistory();if(first&&this.autoFit&&!this.fit&&this.isVisible())this.guard(()=>this.fitToPhone(true,false));this.schedule();if(uncertainInputs.has(this.stateKey)){this.recoverButton.hidden=false;this.status('ready','Input delivery is uncertain; input will not be resent.');}else if(!this.contextBlocked)this.status('ready',`${this.model.cols} × ${this.model.lines}`);if(this.model.title!==this.title){this.title=this.model.title;this.options.onTitle?.(this.title||'');}}}catch(error){this.send(0x11);throw error;}break;}
+     case 0x21:{try{this.screenComplete=false;const result=T.update(body,this.model);if(!result.done)this.syncQuestion();for(const y of result.dirty)this.dirty.add(y);if(result.done){this.screenComplete=true;this.historyVersion=(this.historyVersion||0)+1;clearTimeout(this.connectionTimer);const first=!this.ready;this.ready=true;this.previewPending=false;this.updatePreview();this.maybeLoadInitialHistory();if(first&&this.autoFit&&!this.fit&&this.isVisible())this.guard(()=>this.fitToPhone(true,false));this.schedule();if(uncertainInputs.has(this.stateKey)){this.recoverButton.hidden=false;this.status('ready','Input delivery is uncertain; input will not be resent.');}else if(!this.contextBlocked)this.status('ready',`${this.model.cols} × ${this.model.lines}`);if(this.model.title!==this.title){this.title=this.model.title;this.options.onTitle?.(this.title||'');}this.syncQuestion();}}catch(error){this.send(0x11);throw error;}break;}
      case 0x26:this.receiveHistory(T.history(body));break;
      case 0x27:{const id=r.n(),result=r.n(2),pending=this.pendingInputs.get(id);if(!pending)break;this.pendingInputs.delete(id);clearTimeout(pending.timer);clearTimeout(pending.slowTimer);if(result){this.inputWaiting=false;const error=Error('Terminal input rejected. Resume input, then re-enter rejected text; it will not be resent.');this.contextBlocked=true;this.invalidateInput();this.recoverButton.hidden=false;pending.reject(error);this.error(error);}else{pending.resolve();if(!this.pendingInputs.size){this.inputWaiting=false;this.previewPending=false;this.updatePreview();if(!this.contextBlocked)this.status('ready',`${this.model.cols} × ${this.model.lines}`);}}break;}
      case 0x2b:{if(!this.modesSupported)break;this.termModes={kitty:r.byte(),flags:r.n(65535)};r.end();this.applyModes();break;}
@@ -330,7 +398,7 @@ globalThis.MkTerminalCodec=(()=>{
   send(kind,body){if(!this.socket||this.socket.readyState!==1||!this.channel)throw Error('Terminal disconnected');this.socket.send(this.channel.seal(T.frame(kind,body)));}
 
   revealCursor(){const c=this.model.cursor,p=this.port;if(this.disposed||!c?.visible)return;const top=(this.canvas.offsetTop||0)+c.line*this.cellHeight,bottom=top+this.cellHeight;if(top<p.scrollTop)p.scrollTop=top;else if(bottom>p.scrollTop+p.clientHeight)p.scrollTop=bottom-p.clientHeight;}
-  input(text){if(this.disposed||this.retired||!this.ready)return Promise.reject(Error('Wait for the live terminal to connect'));if(this.inputActive===false||!this.isVisible()||this.contextBlocked||this.pasteReview)return Promise.reject(Error('Resume terminal input before sending'));if(this.historyWindowed)this.returnToLive();this.revealCursor();const bytes=C.enc.encode(text),id=++this.inputId;if(bytes.length>65536)return Promise.reject(Error('Input is too large (maximum 64 KiB)'));return new Promise((resolve,reject)=>{const pending={resolve,reject,slowTimer:setTimeout(()=>{if(this.pendingInputs.has(id)&&!this.contextBlocked){this.inputWaiting=true;this.status('ready','Waiting for input confirmation…');}},1000),timer:setTimeout(()=>{if(this.pendingInputs.has(id))this.disconnect('disconnected','Input confirmation timed out');},10000)};this.pendingInputs.set(id,pending);try{this.send(0x13,C.concat(T.v(id),T.v(bytes.length),bytes));}catch(e){this.pendingInputs.delete(id);clearTimeout(pending.timer);clearTimeout(pending.slowTimer);this.contextBlocked=true;this.invalidateInput();this.recoverButton.hidden=false;reject(e);}});}
+  input(text,{reveal=true}={}){if(this.disposed||this.retired||!this.ready)return Promise.reject(Error('Wait for the live terminal to connect'));if(this.inputActive===false||!this.isVisible()||this.contextBlocked||this.pasteReview)return Promise.reject(Error('Resume terminal input before sending'));if(this.historyWindowed)this.returnToLive();if(reveal)this.revealCursor();const bytes=C.enc.encode(text),id=++this.inputId;if(bytes.length>65536)return Promise.reject(Error('Input is too large (maximum 64 KiB)'));return new Promise((resolve,reject)=>{const pending={resolve,reject,slowTimer:setTimeout(()=>{if(this.pendingInputs.has(id)&&!this.contextBlocked){this.inputWaiting=true;this.status('ready','Waiting for input confirmation…');}},1000),timer:setTimeout(()=>{if(this.pendingInputs.has(id))this.disconnect('disconnected','Input confirmation timed out');},10000)};this.pendingInputs.set(id,pending);if(this.liveQuestion)this.questionSentKey=this.liveQuestion.key;this.syncQuestion();try{this.send(0x13,C.concat(T.v(id),T.v(bytes.length),bytes));}catch(e){this.pendingInputs.delete(id);clearTimeout(pending.timer);clearTimeout(pending.slowTimer);this.contextBlocked=true;this.invalidateInput();this.recoverButton.hidden=false;reject(e);}});}
   role(body){return new Promise((resolve,reject)=>{const pending={resolve,reject,timer:setTimeout(()=>{this.socket?.close();this.disconnect('disconnected','Terminal resize timed out');},5000)};this.pendingRoles.push(pending);try{this.send(0x17,body);}catch(e){this.pendingRoles.pop();clearTimeout(pending.timer);reject(e);}});}
   async fitToPhone(enabled=!this.fit,save=true){if(!this.ready)throw Error('Wait for the live terminal to connect');if(this.fitPending||enabled===this.fit)return;const generation=this.generation;this.fitPending=true;this.fitButton.disabled=true;try{if(enabled)await this.resize(true);else await this.role(Uint8Array.from([0,2,0]));if(this.disposed||generation!==this.generation)return;this.fit=enabled;this.root.dataset.fit=String(enabled);this.fitButton.setAttribute('aria-pressed',String(enabled));this.fitButton.replaceChildren(icon(enabled?'smartphone':'monitor'));if(enabled)this.port.scrollLeft=0;if(save){this.autoFit=enabled;this.options.onPreferenceChange?.({fitToPhone:enabled});}if(!this.contextBlocked)this.status('ready',`${this.model.cols} × ${this.model.lines}`);}finally{this.fitPending=false;this.fitButton.disabled=false;this.queueFit();}}
 

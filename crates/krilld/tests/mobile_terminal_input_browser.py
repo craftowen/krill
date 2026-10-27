@@ -73,6 +73,53 @@ globalThis.handle=null;mountCase();
             browser('set', 'viewport', '390', '844')
             browser('open', f'http://127.0.0.1:{server.server_port}/')
             wait('document.querySelector(".terminal-mount")?.dataset.phase==="ready"')
+            # Exercise the two dock toggles through actual browser clicks.
+            browser('click', '.direct-toggle')
+            assert evaluate('handle.getInputMode()') == 'buffered'
+            assert evaluate('document.querySelector(".command-input").getClientRects().length>0')
+            browser('fill', '.command-input', 'keep this draft')
+            browser('click', '.direct-toggle')
+            assert evaluate('handle.getInputMode()') == 'direct'
+            assert evaluate('!document.querySelector(".command-input").getClientRects().length')
+            assert evaluate('document.querySelector(".live-focus-target").getClientRects().length>0')
+            browser('click', '.direct-toggle')
+            assert evaluate('document.querySelector(".command-input").value') == 'keep this draft'
+            browser('fill', '.command-input', '')
+            browser('click', '.direct-toggle')
+            browser('click', '.display-mode')
+            assert evaluate('document.querySelector(".display-mode").disabled')
+            assert evaluate('socket.sent.filter(a=>a[4]===0x17).at(-1)[5]') == 1
+            evaluate('socket.frame(0x2c,MkTerminalCodec.v(0));true')
+            wait('document.querySelector(".display-mode").ariaPressed==="true"')
+            browser('click', '.display-mode')
+            assert evaluate('[...socket.sent.filter(a=>a[4]===0x17).at(-1).slice(5)]') == [0, 2, 0]
+            evaluate('socket.frame(0x2c,MkTerminalCodec.v(0));true')
+            wait('document.querySelector(".display-mode").ariaPressed==="false"')
+            # Touch questions against the real DOM, adapter and mobile CSS.
+            for width, height in [(320, 740), (390, 844), (844, 390)]:
+                browser('set', 'viewport', str(width), str(height))
+                evaluate(f'mountCase({width+5000});true')
+                wait('document.querySelector(".terminal-mount").dataset.phase==="ready"')
+                evaluate('socket.question(["Which approach should we use?", "› 1. Keep the existing service (Recommended)", "  2. Create a new service", "  3. 직접 입력해서 다른 방법을 설명합니다", "Press enter to confirm or esc to cancel"]);true')
+                wait('!document.querySelector(".terminal-question").hidden')
+                box=evaluate('''(()=>{const p=document.querySelector('.terminal-question'),r=p.getBoundingClientRect(),buttons=[...p.querySelectorAll('button')];return {width:innerWidth,height:innerHeight,left:r.left,right:r.right,top:r.top,bottom:r.bottom,overflow:document.documentElement.scrollWidth>innerWidth,touch:buttons.every(b=>b.getBoundingClientRect().height>=44),text:buttons.map(b=>b.textContent)}})()''')
+                assert not box['overflow'] and box['touch'] and box['left']>=0 and box['right']<=width and box['bottom']<=height, box
+                browser('screenshot', str(evidence / f'{width}-question.png'))
+                browser('click', '[data-testid="question-choice-3"]')
+                wait('sentInputs().length===1')
+                assert evaluate('sentInputs()')==['\x1b[B\x1b[B\r']
+                assert evaluate('document.activeElement!==capture')
+                assert evaluate('[...document.querySelectorAll(".question-choice")].every(b=>b.disabled)')
+                evaluate('socket.question(["Pick features", "❯ ☐ Search", "  ☑ Export", "Space to select · Enter to submit"]);true')
+                browser('click', '[data-testid="question-choice-1"]')
+                assert evaluate('sentInputs().at(-1)')==' '
+                evaluate('socket.question(["Pick features", "❯ ☑ Search", "  ☑ Export", "Space to select · Enter to submit"]);true')
+                browser('screenshot', str(evidence / f'{width}-multi-question.png'))
+                browser('click', '[data-testid="question-submit"]')
+                assert evaluate('sentInputs().at(-1)')=='\r'
+            browser('set', 'viewport', '390', '844')
+            evaluate('mountCase(7);true')
+            wait('document.querySelector(".terminal-mount").dataset.phase==="ready"')
             expected = ['escape', 'tab', 'enter', 'shiftTab', 'space', 'backspace',
                         'delete', 'arrowUp', 'arrowDown', 'arrowLeft', 'arrowRight']
             assert evaluate('[...document.querySelector(".keybar").children].slice(2,13).map(n=>n.dataset.keyId)') == expected
@@ -194,7 +241,7 @@ globalThis.handle=null;mountCase();
             evaluate('socket.frame(0x27,MkTerminalCodec.v(1),MkTerminalCodec.v(0));true')
             wait('document.querySelector(".command-input").value===""')
             (evidence / 'measurements.json').write_text(json.dumps(measurements, indent=2) + '\n')
-            print('PASS Chromium: Orca key order/icon, English, Hangul composition, backspace, Enter, '
+            print('PASS Chromium: dock mode clicks, Orca key order/icon, English, Hangul composition, backspace, Enter, '
                   'stable delayed-ACK geometry, simulated keyboard, reconnect/no replay, duplicate submit')
         except Exception:
             state = evaluate('({inputs:sentInputs().slice(0,30),inputCount:sentInputs().length,events:inputEvents,capture:capture.value,active:document.activeElement?.className,phase:document.querySelector(".terminal-mount").dataset.phase,body:document.body.innerText})')
