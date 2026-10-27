@@ -34,7 +34,7 @@ class SourceInstallTests(unittest.TestCase):
         self.prefix = self.root / "installation"
         self.fake = self.root / "tools"
         self.fake.mkdir()
-        executable(self.fake / "uname", "#!/bin/sh\necho Darwin\n")
+        executable(self.fake / "uname", '#!/bin/sh\nif [ "$1" = -m ]; then echo arm64; else echo Darwin; fi\n')
         self.artifacts = []
         for name in NAMES:
             artifact = self.target / name
@@ -128,19 +128,24 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
                     git.mkdir()
                 else:
                     git.write_text("gitdir: /fake/worktree")
-                result = self.install()
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("dirty checkout, refusing", result.stderr)
-                self.assertFalse((self.root / "cargo-call").exists())
-                if git.is_dir():
-                    git.rmdir()
-                else:
-                    git.unlink()
+                try:
+                    result = self.install()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("dirty checkout, refusing", result.stderr)
+                    self.assertFalse((self.root / "cargo-call").exists())
+                finally:
+                    if git.is_dir():
+                        git.rmdir()
+                    else:
+                        git.unlink()
 
     def test_git_status_failure_stops_before_build(self):
         (self.source / ".git").mkdir()
-        executable(self.fake / "git", "#!/bin/sh\nexit 4\n")
-        self.assertNotEqual(self.install().returncode, 0)
+        call = self.root / "git-call"
+        executable(self.fake / "git", '#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_GIT_CALL"\nexit 4\n')
+        result = self.install(FAKE_GIT_CALL=str(call))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(call.read_text().splitlines(), ["-C", str(self.source), "status", "--porcelain"])
         self.assertFalse((self.root / "cargo-call").exists())
 
     def test_intel_release_is_unsupported_before_network_or_install(self):
@@ -149,7 +154,7 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
                                  "--prefix", str(self.prefix), "--app-dir", str(self.root / "apps")],
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Intel macOS is not a supported release platform", result.stderr)
+        self.assertIn("Krill supports Apple Silicon Macs only", result.stderr)
         self.assertFalse(self.prefix.exists())
         self.assertFalse((self.root / "apps").exists())
 
