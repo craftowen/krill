@@ -75,6 +75,39 @@ async function testQuickActions(){
  await by(body,'Delete').action({stopPropagation(){}});assert.equal(f.state.preferences.quickCommands.length,2);assert.equal(f.calls.at(-1).commands.length,2);
  let errors=[];f.ctx.error=e=>errors.push(e);f.ctx.rpc=async()=>{throw Error('offline');};by(body,'+ Add').action();fields=all(body);fields.find(n=>n.tag==='input').value='Offline';fields.find(n=>n.tag==='textarea').value='kept locally';await by(body,'Save').action();assert.equal(errors.length,1);assert.equal(f.state.preferences.quickCommands.at(-1).name,'Offline');assert(!f.calls.some(q=>q.action==='prompt'));
  f.view.cleanup();
+ // REMOTE-005: delayed save_quick_commands completion or failure from Host A after abort / switch to Host B must never clobber Host B or show a toast on Host B.
+ {
+  const plain=v=>JSON.parse(JSON.stringify(v));
+  const race=fixture([{id:7,state:'Working'}],{host:{display_name:'Host A'},quick_commands:[]},false),Q=race.sandbox.KrillMobile.quickCommands;
+  let activeHost='host-a',resolveA,rejectA2;const toastErrors=[];
+  race.ctx.sessionKey=id=>`${activeHost}\n${id}`;race.ctx.error=e=>toastErrors.push(e);
+  const cmdA=[{name:'Host A',text:'echo a'}],cmdB=[{name:'Host B',text:'echo b'}];
+  race.ctx.rpc=()=>new Promise(r=>{resolveA=r;});
+  const pendingResolve=Q.save(race.ctx,cmdA);
+  race.abort.abort();activeHost='host-b';race.state.snapshot={host:{display_name:'Host B'},quick_commands:cmdB};Q.read(race.ctx);
+  resolveA({quick_commands:[{name:'Host A normalized',text:'echo a'}]});await pendingResolve;
+  assert.deepEqual(plain(race.state.snapshot.quick_commands),cmdB,'aborted Host A save cannot overwrite Host B snapshot');
+  assert.deepEqual(plain(race.state.preferences.quickCommands),cmdB,'aborted Host A save cannot overwrite active quickCommands');
+  assert.deepEqual(plain(race.state.preferences.quickCommandsByHost['host-b\nquickCommands']),cmdB);
+  const liveAbort=new AbortController();race.ctx.signal=liveAbort.signal;activeHost='host-a';race.state.snapshot={host:{display_name:'Host A'},quick_commands:cmdA};
+  race.ctx.rpc=()=>new Promise((_,rej)=>{rejectA2=rej;});
+  const pendingReject=Q.save(race.ctx,cmdA);
+  activeHost='host-b';race.state.snapshot={host:{display_name:'Host B'},quick_commands:cmdB};
+  rejectA2(Error('network down'));await pendingReject;
+  assert.equal(toastErrors.length,0,'stale Host A failure cannot surface error toast on Host B');
+  assert.deepEqual(plain(race.state.snapshot.quick_commands),cmdB);
+  // Offline Host C with no snapshot quick_commands does not inherit Host A/B scoped cache.
+  activeHost='host-c';race.state.snapshot={host:{display_name:'Host C'}};
+  assert.deepEqual(plain(Q.read(race.ctx)),[],'unvisited offline host does not inherit another host quickCommands');
+  // Same-host concurrent snapshot refresh still receives authoritative saved quick_commands.
+  activeHost='host-a';race.state.snapshot={host:{display_name:'Host A'},quick_commands:[]};
+  let resolveSame;race.ctx.rpc=()=>new Promise(r=>{resolveSame=r;});
+  const pendingSame=Q.save(race.ctx,cmdA);
+  race.state.snapshot={host:{display_name:'Host A'},quick_commands:cmdA};
+  resolveSame({quick_commands:[{name:'Saved A',text:'echo a'}]});await pendingSame;
+  assert.deepEqual(plain(race.state.snapshot.quick_commands),[{name:'Saved A',text:'echo a'}]);
+  race.view.cleanup();
+ }
  const fallback=fixture(undefined,{},false,{quickCommands:[{name:'Fallback',text:'saved prompt'}]});const fallbackBody=openFallback();function openFallback(){fallback.mounts[0].options.onQuickActions();const b=new Element('div');fallback.sheets.at(-1).render(b);return b;}assert(all(fallbackBody).some(n=>n.textContent==='Fallback'));fallback.view.cleanup();
  console.log('PASS saved quick actions snapshot/fallback, active split insertion without Enter, add/edit/delete RPC and preferences, offline local retention');
 }
