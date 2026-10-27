@@ -101,12 +101,23 @@ pub(super) fn load(
         scan.root(&global.join("commands"), false, "/", "Global");
     }
     if matches!(agent, "agy" | "antigravity") {
-        scan.root(
-            &home.join(".gemini/antigravity/skills"),
-            true,
-            skill_prefix,
-            "Global",
-        );
+        if let Some(config) = config {
+            for rel in [
+                ".gemini/antigravity-cli/skills",
+                ".gemini/config/skills",
+                ".gemini/antigravity/skills",
+            ] {
+                scan.root(&config.join(rel), true, skill_prefix, "Global");
+            }
+        }
+        for rel in [
+            ".gemini/antigravity-cli/skills",
+            ".gemini/config/skills",
+            ".gemini/antigravity/skills",
+            ".agents/skills",
+        ] {
+            scan.root(&home.join(rel), true, skill_prefix, "Global");
+        }
         scan.root(
             &home.join(".gemini/antigravity/global_workflows"),
             false,

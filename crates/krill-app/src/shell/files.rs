@@ -893,9 +893,9 @@ impl Shell {
                         lookup.found.clone_from(&found);
                         if let Some(link) = found {
                             let under_pointer = pointer.is_some_and(|(position, command)| {
-                                command
-                                    && this.live.get(&key.pane).is_some_and(|live| {
-                                        cell_at(&live.painted, &live.pane.shown(), position)
+                                this.live.get(&key.pane).is_some_and(|live| {
+                                    (command || !live.pane.modes().mouse())
+                                        && cell_at(&live.painted, &live.pane.shown(), position)
                                             .is_some_and(|(col, line)| {
                                                 line == key.line
                                                     && (col == key.column
@@ -905,7 +905,7 @@ impl Shell {
                                                                 .saturating_add(link.cols))
                                                             .contains(&col))
                                             })
-                                    })
+                                })
                             });
                             if under_pointer {
                                 this.files.hover = Some((
@@ -1032,8 +1032,8 @@ impl Shell {
         krill_app::terminal::url_link_target(&screen, &l.painted, position)
     }
 
-    /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
-    /// ⌘ 없이도 맨 클릭으로 팝오버가 뜨는 링크에는 밑줄을 긋는다.
+    /// 마우스를 움직이면 클릭 가능한 링크(OSC 8·평문 URL·파일 및 이미지 경로)에 밑줄과 포인터 커서를 표시한다(OWE-867).
+    /// 마우스 보고가 켜진 TUI에서는 ⌘를 누른 동안에만 링크로 동작한다.
     pub(super) fn update_path_hover(
         &mut self,
         pane: PaneId,
@@ -1041,11 +1041,16 @@ impl Shell {
         cmd: bool,
         cx: &mut Context<Self>,
     ) {
-        if !cmd {
+        let clickable = cmd
+            || self
+                .live
+                .get(&pane)
+                .is_some_and(|l| !l.pane.modes().mouse());
+        if !clickable {
             self.files.link_generation = self.files.link_generation.wrapping_add(1);
             self.files.link_lookup = None;
         }
-        let next = if cmd {
+        let next = if clickable {
             let osc_or_url = self.live.get(&pane).and_then(|l| {
                 let screen = l.pane.shown();
                 krill_app::terminal::osc_link_highlight(&screen, &l.painted, position).or_else(
@@ -1070,7 +1075,7 @@ impl Shell {
                 })
                 .map(|h| (pane, h))
         } else {
-            self.click_link_at(pane, position).map(|(h, _)| (pane, h))
+            None
         };
         if self.files.hover != next {
             self.files.hover = next;

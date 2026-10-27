@@ -28,6 +28,7 @@ function fixture(){
   close(){if(this.readyState===3)return;this.readyState=3;this.dispatchEvent(new Event('close'));}
   handshake(features=(1n<<56n)|8192n|4096n|5n){const T=MkTerminalCodec;this.message(JSON.stringify({version:2,challenge:''}));this.message(new TextEncoder().encode('{}'));this.frame(1,T.v(1),T.v(1),T.v(features));this.frame(0x2c,T.v(0));}
   screen(text='Krill · live terminal'){const T=MkTerminalCodec,C=MkCrypto,chars=[...text],cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));this.frame(0x21,T.v(1),T.v(1),T.v(1),T.v(4),T.v(0),T.v(80),T.v(24),T.v(2),T.v(0),T.v(chars.length),...chars.map(cell),T.v(3),T.v(1),T.v(2),T.v(1),T.v(4),T.text('Terminal #7'));}
+  question(lines,done=true){const T=MkTerminalCodec,C=MkCrypto,cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),rows=lines.map((text,y)=>C.concat(T.v(2),T.v(y),T.v([...text].length),...[...text].map(cell)));this.frame(0x21,T.v(1),T.v(1),T.v(done?1:0),T.v(rows.length+1),T.v(0),T.v(80),T.v(24),...rows);}
  };
  globalThis.mountFixture=(root,sessionId=7,extra={})=>KrillMobile.terminal.mount(root,{sessionId,connect:()=>({socket:new FakeSocket(),credentials:{device_id:'fixture',credential:''}}),...extra});
 }
@@ -78,8 +79,49 @@ async function testLivePreview(){
  const again=await mount(1951,{preferences:{inputMode:'direct',fitToPhone:false}});assert.deepEqual(inputs(again.socket),[]);assert.equal(find(again.root,'live-input-copy').children[1].dataset.preview,'false');again.handle.unmount();
  console.log('PASS Orca dock order/icon, stable live preview through delayed ACK/output/viewport, IME no duplicate commit, backspace, Enter and reconnect no replay');
 }
+async function testPageZoom(){
+ const doc=context.document;
+ for(const type of ['touchstart','touchmove']){
+  assert.equal(event(doc,type,{touches:[{}]}).defaultPrevented,false,'one finger keeps native scrolling');
+  assert.equal(event(doc,type,{touches:[{},{}]}).defaultPrevented,true,'two fingers cannot zoom the page outside the terminal');
+ }
+ for(const type of ['gesturestart','gesturechange'])assert.equal(event(doc,type).defaultPrevented,true,'Safari native page zoom is cancelled');
+ let scale;const {root,handle}=await mount(1952,{preferences:{fitToPhone:false},onPreferenceChange:p=>{scale=p.textScale;}}),port=find(root,'terminal-scroll'),dock=find(root,'command-dock');
+ const touches=distance=>[{clientX:100,clientY:100},{clientX:100+distance,clientY:100}];
+ // The document capture guard must leave the terminal's own listeners reachable.
+ const start=new Event('touchstart',{cancelable:true});start.touches=touches(100);doc.dispatchEvent(start);port.dispatchEvent(start);
+ const move=new Event('touchmove',{cancelable:true});move.touches=touches(150);doc.dispatchEvent(move);port.dispatchEvent(move);
+ assert(move.defaultPrevented);event(port,'touchend',{touches:[]});assert.equal(scale,1.5,'pinch still changes only terminal text');assert.equal(dock.style.transform,undefined);handle.unmount();
+ console.log('PASS page/Safari zoom blocked, single-finger scroll retained, terminal pinch still changes text only');
+}
+async function testQuestions(){
+ const {root,handle,socket}=await mount(1960,{preferences:{fitToPhone:false}}),panel=find(root,'terminal-question');
+ const choices=()=>panel.children.filter(n=>n.tagName==='button'),menu=['Which approach?', '› 1. Use the existing service (Recommended)', '     Keeps current credentials', '  2. Create a new service', '  3. 직접 입력', '     다른 방법을 설명합니다', 'Press enter to confirm or esc to cancel'];
+ assert.equal(panel.hidden,true);socket.question(menu);assert.equal(panel.hidden,false);assert.equal(choices().length,3);assert.match(choices()[0].textContent,/Keeps current credentials/);assert.match(choices()[2].textContent,/다른 방법/);
+ let focused=0;find(root,'live-capture').addEventListener('focus',()=>focused++);const old=choices()[2];event(old,'click');event(old,'click');await flush();assert.deepEqual(inputs(socket),['\x1b[B\x1b[B\r']);assert(choices().every(b=>b.disabled));assert.equal(focused,0,'answers do not open the software keyboard');
+ socket.frame(0x27,T.v(1),T.v(0));await flush();event(old,'click');assert.equal(inputs(socket).length,1,'ACK alone cannot resubmit the same visible question');
+ socket.question(['Apply the change?', '  1. Yes', '  2. Always allow', '❯ 3. No', 'Enter to select · Esc to cancel']);event(old,'click');assert.equal(inputs(socket).length,1,'detached answer from a previous question is inert');
+ socket.autoAck=true;event(choices()[0],'click');await flush();assert.equal(inputs(socket).at(-1),'\x1b[A\x1b[A\r');
+ socket.frame(0x2b,Uint8Array.of(0),T.v(1));socket.question(['Choose a plan', '❯ 1. Basic', '  2. Advanced', 'Enter to select']);event(choices()[1],'click');await flush();assert.equal(inputs(socket).at(-1),'\x1bOB\r','application cursor mode uses SS3');
+ socket.question(['Pick features', '❯ ☐ Search', '  ☑ Export', 'Space to select · Enter to submit']);assert.equal(choices().length,3);assert.equal(choices()[0].getAttribute('aria-checked'),'false');assert.equal(choices()[1].getAttribute('aria-checked'),'true');event(choices()[1],'click');await flush();assert.equal(inputs(socket).at(-1),'\x1bOB ');assert(choices().every(b=>b.disabled));
+ socket.question(['Pick features', '  ☐ Search', '❯ ☐ Export', 'Space to select · Enter to submit']);assert.equal(choices()[1].getAttribute('aria-checked'),'false');event(choices().at(-1),'click');await flush();assert.equal(inputs(socket).at(-1),'\r','multi-select submits only with the explicit button');
+ const invalid=[['1. Documentation','2. More documentation','Enter to select'],['❯ 1. Yes','2. No'],['❯ 1. Yes','3. No','Enter to select'],['❯ 1. Yes','2. No','Space to select · Enter to submit'],['❯ 1. Yes','2. No','Enter to select','$ echo done'],['❯ 1. [ ] Yes','2. No','Enter to submit'],['❯ 1. Only','Enter to select'],['❯ 1. First',...Array.from({length:12},(_,i)=>`${i+2}. Option`),'Enter to select']];
+ for(const lines of invalid){socket.question(lines);assert.equal(panel.hidden,true,lines.join('\n'));}
+ socket.question(menu);const prior=choices()[1],before=inputs(socket).length;socket.question(menu,false);assert.equal(panel.hidden,true);event(prior,'click');assert.equal(inputs(socket).length,before,'partial screen frames cannot answer');socket.question(menu);
+ handle.setInputActive(false);event(prior,'click');assert.equal(inputs(socket).length,before);handle.setInputActive(true);event(prior,'click');assert.equal(inputs(socket).length,before,'old input generation is inert');
+ const fresh=choices()[1];context.document.visibilityState='hidden';event(fresh,'click');assert.equal(inputs(socket).length,before);context.document.visibilityState='visible';
+ const port=find(root,'terminal-scroll');port.clientHeight=400;port.scrollHeight=1000;port.scrollTop=100;event(port,'scroll');assert.equal(panel.hidden,true);event(fresh,'click');assert.equal(inputs(socket).length,before);event(find(root,'terminal-latest'),'click');assert.equal(panel.hidden,false);
+ const capture=find(root,'live-capture');handle.focus();event(capture,'compositionstart');event(choices()[0],'click');assert.equal(inputs(socket).length,before,'IME composition is never interrupted by answer buttons');event(capture,'compositionend',{data:''});await flush();
+ socket.autoAck=false;const pending=handle.sendKey('arrowDown');assert(choices().every(b=>b.disabled));event(choices()[0],'click');assert.equal(inputs(socket).length,before+1);socket.frame(0x27,T.v(before+1),T.v(0));await pending;
+ // Deterministic malformed-menu fuzz: bounded wire input, no throws or actions.
+ let seed=17;for(let n=0;n<100;n++){seed=(seed*1664525+1013904223)>>>0;const junk=Array.from({length:seed%12},(_,i)=>`${['', '❯ ', '☐ ', '> '][(seed>>>i)%4]}${i+2}${['.', ')', ':'][seed%3]} ${String.fromCodePoint(0xAC00+seed%1000)} <img>`);socket.question(junk);assert.equal(panel.hidden,true);}
+ socket.question(menu);socket.close();event(choices()[0],'click');assert.equal(inputs(socket).length,before+1);assert.equal(panel.hidden,true);handle.unmount();
+ console.log('PASS live question touch answers: Claude/Codex arrows+Enter, wrapped labels, SS3, checkboxes+submit, duplicate/stale/partial/history/hidden/IME/pending/disconnect guards and malformed-menu fuzz');
+}
 async function main(){
  await testInsertText();
+ await testQuestions();
+ await testPageZoom();
  await testHiddenPaint();
  await testLivePreview();
  for(const n of [0,1,127,128,300,65535,Number.MAX_SAFE_INTEGER]){const r=T.reader(T.v(n));assert.equal(r.n(),n);r.end();}assert.throws(()=>T.reader(T.v(128)).n(127),/Screen limit/);assert.throws(()=>T.reader(T.v(128)).n(128-1),/Screen limit/);assert.throws(()=>T.reader(T.v(1n<<53n)).n(),/Screen limit/);assert.throws(()=>T.reader(Uint8Array.of(128)).n(),/Truncated/);
@@ -219,7 +261,7 @@ async function main(){
  await testTextLayer();
  await testLivePreviewAndHeldIme();
  // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
- context.performance={now:()=>clock};try{await testTuiScrollRouting();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
+ context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
  console.log('All terminal adapter regression checks passed.');
 }
 async function testInitialAndQueuedHistoryScroll(){
@@ -254,6 +296,24 @@ async function testInitialAndQueuedHistoryScroll(){
  console.log('PASS hidden session preloads history on setVisible(true), queued refresh fires after in-flight load, unscrollable touchstart scrolls after history arrives');
 }
 // 대체 화면(TUI)은 셸 기록을 접고 위·아래 쓸기를 모두 TUI에 보고한다. 보고는 입력 ACK·커서·라이브 복귀와 분리하고, 늦은 기록 응답은 TUI 화면을 건드리지 않는다.
+async function testShortCanvasScroll(){
+ for(const fit of [false,true])for(const flags of [120,64|128])for(const gap of [1,16,304]){
+  const {root,handle,socket}=await mount(2100+gap+flags+(fit?1000:0),{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll');let top=0;
+  port.clientHeight=432+gap;port.scrollHeight=port.clientHeight;
+  Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
+  socket.frame(0x2b,Uint8Array.of(0),T.v(flags));
+  if(fit){const pending=handle.fitToPhone(true);socket.frame(0x2c,T.v(0));await pending;}
+  const drag=(start,end)=>{event(port,'touchstart',{touches:[{clientX:150,clientY:start}]});const e=event(port,'touchmove',{touches:[{clientX:150,clientY:end}]});event(port,'touchend',{touches:[]});assert(e.defaultPrevented,'a short canvas must deliver the gesture to the TUI');};
+  const base=inputs(socket).length;drag(100,160);drag(300,240);const sent=inputs(socket).slice(base).join('');
+  if(flags===120)assert.match(sent,/^(\x1b\[<64;\d+;\d+M){4}(\x1b\[<65;\d+;\d+M){4}$/);
+  else assert.equal(sent,'\x1b[A'.repeat(4)+'\x1b[B'.repeat(4));
+  const wheelBase=inputs(socket).length;assert(event(port,'wheel',{deltaX:0,deltaY:-30,deltaMode:0}).defaultPrevented);
+  if(flags===120)assert.match(inputs(socket).slice(wheelBase).join(''),/^(\x1b\[<64;\d+;\d+M){2}$/);
+  else assert.equal(inputs(socket).slice(wheelBase).join(''),'\x1b[A'.repeat(2));
+  assert.equal(top,0,'DOM cannot scroll into the gap below the canvas');handle.unmount();
+ }
+ console.log('PASS short canvases route both scroll directions to SGR/DEC 1007, fitted and original size, with clamped DOM scroll positions');
+}
 async function testTuiScrollRouting(){
  const {root,handle,socket}=await mount(2001),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history'),grid=find(root,'terminal-grid'),controls=find(root,'terminal-history-controls'),latest=find(root,'terminal-latest'),preview=find(root,'live-input-copy').children[1];let top=0;port.clientHeight=432;
  Object.defineProperty(grid,'offsetTop',{get:()=>hist.hidden?0:(controls.hidden?0:32)+hist.children.length*18});Object.defineProperty(port,'scrollHeight',{get:()=>grid.offsetTop+(grid.hidden?0:432)});Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
@@ -279,11 +339,48 @@ async function testTuiScrollRouting(){
  port.clientHeight=432;top=0;
  modes(4|16);assert.equal(root.dataset.alt,'false');assert.equal(hist.hidden,false);assert.equal(controls.hidden,false);assert.equal(top,1832,'leaving ALT follows live output again');
  base=inputs(socket).length;drag(100,160);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}$/,'inline mouse TUI owns a gesture that starts on live output');assert.equal(requests().length,n);
+ // At the bottom, a short live canvas can share the viewport with history.
+ // Ownership follows the finger/wheel position, not just the viewport offset.
+ grid.getBoundingClientRect=()=>({top:250,left:0});base=inputs(socket).length;
+ e=drag(100,160);assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','visible history keeps a native drag even at the live scroll offset');
+ await advance(201);e=event(port,'wheel',{deltaX:0,deltaY:-30,clientX:150,clientY:100});assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','wheel over visible history stays local');
+ await advance(201);e=event(port,'wheel',{deltaX:0,deltaY:-30,clientX:150,clientY:300});assert(e.defaultPrevented);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){2}$/);
+ delete grid.getBoundingClientRect;
  port.scrollTop=500;event(port,'scroll');base=inputs(socket).length;e=drag(100,160);assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','a gesture started in shell history stays native');
  modes(4|16|64|128);const m=requests().length;handle.loadHistory(true);assert.equal(requests().length,m+1,'explicit reveal is still allowed in ALT');reply(100,0,100);assert.equal(hist.hidden,false);handle.unmount();assert.equal(root.dataset.alt,undefined);
  console.log('PASS ALT folds shell history, both directions reach the TUI (SGR, Codex 30|64, 1007 arrows, SS3), report path skips ACK/cursor, wheel deltaMode, Shift bypass, late replies ignored, inline live gestures');
 }
 // 손가락 스크롤 물리: 첫 이동 반영, 방향 반전 즉시 반응, 지수 감속 관성과 중단 조건, 넘침 있을 때만 가로 잠금, 터치 중 글자 층 보류.
+async function testShortCanvasScroll(){
+ // Fit rounds rows down, so even a fraction of a cell leaves the canvas shorter
+ // than its viewport. Real scrollTop cannot enter the negative logical range.
+ for(const fit of [false,true])for(const flags of [20,84,192,193])for(const extra of [1,8,320]){
+  const {root,handle,socket}=await mount(2100+flags+extra,{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll');let top=0;
+  port.clientHeight=432+extra;port.scrollHeight=port.clientHeight;Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
+  if(fit){const pending=handle.fitToPhone(true);socket.frame(0x2c,T.v(0));await pending;}
+  socket.frame(0x2b,Uint8Array.of(0),T.v(flags));const n=inputs(socket).length;
+  const touch=(type,y)=>event(port,type,{touches:y==null?[]:[{clientX:150,clientY:y}]});
+  touch('touchstart',100);touch('touchmove',130);touch('touchend');touch('touchstart',150);touch('touchmove',120);touch('touchend');
+  const bytes=inputs(socket).slice(n).join('');
+  if(flags&16)assert.match(bytes,/^(\x1b\[<64;\d+;\d+M){2}(\x1b\[<65;\d+;\d+M){2}$/);
+  else assert.equal(bytes,(flags&1?'\x1bOA':'\x1b[A').repeat(2)+(flags&1?'\x1bOB':'\x1b[B').repeat(2));
+  assert.equal(top,0,'unscrollable canvas reports remotely without inventing negative scrollTop');handle.unmount();
+ }
+ console.log('PASS short canvas (1/8/320px gap), Fit on/off, inline/ALT SGR and normal/application 1007 arrows scroll both directions');
+ // A TUI gesture scrolls the visible canvas locally before reporting only the
+ // remaining distance. Its first tiny move must already reserve the gesture.
+ for(const fit of [false,true]){
+  const {root,handle,socket}=await mount(2600+Number(fit),{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll');let top=232;
+  port.clientHeight=200;port.scrollHeight=432;Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,232));}});
+  if(fit){const pending=handle.fitToPhone(true);socket.frame(0x2c,T.v(0));await pending;}
+  socket.frame(0x2b,Uint8Array.of(0),T.v(84));top=232;const n=inputs(socket).length;
+  const touch=(type,y)=>event(port,type,{touches:y==null?[]:[{clientX:150,clientY:y}]});
+  touch('touchstart',100);assert(touch('touchmove',102).defaultPrevented,'reserve TUI before the 6px axis threshold');assert(touch('touchmove',110).defaultPrevented);assert.equal(top,222);assert.equal(inputs(socket).length,n);
+  assert(touch('touchmove',420).defaultPrevented);assert.equal(top,0);assert.match(inputs(socket).slice(n).join(''),/^(\x1b\[<64;\d+;\d+M){6}$/,'232px local + 88px remote keeps the boundary remainder');
+  touch('touchmove',400);assert.equal(top,20,'reversing immediately scrolls the canvas locally');touch('touchcancel');const before=inputs(socket).length;await advance(200);assert.equal(inputs(socket).length,before,'cancelled gestures never fling');handle.unmount();
+ }
+ console.log('PASS routed touch reserves first tiny move, scrolls canvas then reports boundary remainder, reverses locally and cancels without momentum');
+}
 async function testScrollPhysics(){
  const {root,handle,socket}=await mount(2002),port=find(root,'terminal-scroll'),layer=find(root,'terminal-text');port.clientHeight=432;port.scrollLeft=0;await advance(16);
  const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]}),up=()=>(inputs(socket).join('').match(/\x1b\[<64;/g)||[]).length,down=()=>(inputs(socket).join('').match(/\x1b\[<65;/g)||[]).length;
@@ -326,11 +423,11 @@ async function testLivePreviewAndHeldIme(){
  // P0-1: Reserved input preview keeps terminal geometry and text through screen/ACK changes.
  let statuses=[];const {root,handle,socket}=await mount(1960,{preferences:{inputMode:'direct'},onStatus:s=>statuses.push(s)});
  const dock=find(root,'command-dock'),preview=find(root,'live-input-copy').children[1],capture=find(root,'live-capture');
- assert.equal(dock.children[0],find(root,'accessory-row'));assert.equal(dock.children.length,2);
+ assert.equal(dock.children[0],find(root,'terminal-question'));assert.equal(dock.children[0].hidden,true);assert.equal(dock.children[1],find(root,'accessory-row'));assert.equal(dock.children.length,3);
  assert.equal(preview.getAttribute('aria-live'),'polite');assert.equal(preview.dataset.preview,'false');
  handle.focus();capture.value='hello';event(capture,'input');
  assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'hello');
- socket.screen('echo hello');await flush();assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'hello');assert.equal(dock.children.length,2);
+ socket.screen('echo hello');await flush();assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'hello');assert.equal(dock.children.length,3);
  const longText='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ';
  capture.value='hello'+longText;event(capture,'input');
  assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'hello'+longText);
@@ -486,7 +583,7 @@ async function testFailurePaths(){
  event(editor,'compositionstart');event(review,'submit');assert.equal(inputs(socket).length,before);event(editor,'compositionend');editor.value='edited\nsecond';event(review,'submit');await flush();assert.equal(inputs(socket).at(-1),'edited\rsecond');
  handle.focus();capture.value='cancel\nthis';event(capture,'input',{inputType:'insertFromPaste'});const cancelled=root.children.at(-1).children.at(-1);event(cancelled.children[2],'click');event(cancelled,'submit');await flush();assert.equal(inputs(socket).length,before+1);
  // Missing initial modes is safe even if the server advertises the feature.
- handle.unmount();({root,handle,socket}=await mount(702,{preferences:{inputMode:'direct'}}));handle.focus();capture=find(root,'live-capture');capture.value='unknown\nmode';event(capture,'input',{inputType:'insertFromPaste'});assert.equal(inputs(socket).length,0);assert.equal(root.children.at(-1).children.at(-1).tagName,'form');handle.setInputMode('buffered');assert.equal(root.children.at(-1).children.length,2);handle.unmount();
+ handle.unmount();({root,handle,socket}=await mount(702,{preferences:{inputMode:'direct'}}));handle.focus();capture=find(root,'live-capture');capture.value='unknown\nmode';event(capture,'input',{inputType:'insertFromPaste'});assert.equal(inputs(socket).length,0);assert.equal(root.children.at(-1).children.at(-1).tagName,'form');handle.setInputMode('buffered');assert.equal(root.children.at(-1).children.length,3);handle.unmount();
  // A server that did not negotiate modes cannot enable automatic paste framing.
  root=new Element('div');handle=context.mountFixture(root,703,{preferences:{inputMode:'direct'}});await flush();socket=context.sockets.at(-1);socket.handshake(4096n|5n);socket.screen();socket.frame(0x2b,Uint8Array.of(0),T.v(32));handle.focus();capture=find(root,'live-capture');capture.value='legacy\nmode';event(capture,'input',{inputType:'insertFromPaste'});assert.equal(inputs(socket).length,0);handle.unmount();
  console.log('PASS TR-A03/16 negotiated bracketed paste, CRLF/control sanitization, multiline review/IME/cancel, unsupported/unknown modes and image-only pickers');

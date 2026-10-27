@@ -851,25 +851,106 @@ fn credentials(
     let raw = if provider == ProviderKind::Claude {
         let user = claude_keychain_user();
         let mut dirs = vec![dir.to_path_buf()];
-        if let Ok(canonical) = dir.canonicalize()
-            && canonical != dir
+        for candidate in [
+            krill_proto::os::canonicalize(dir).ok(),
+            dir.canonicalize().ok(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            dirs.push(canonical);
+            if !dirs.contains(&candidate) {
+                dirs.push(candidate);
+            }
         }
+        let accounts: &[&str] = if user == "claude-code-user" {
+            &["claude-code-user"]
+        } else {
+            &[user.as_str(), "claude-code-user"]
+        };
         dirs.iter()
-            .find_map(|dir| keychain(&claude_service((!host).then_some(dir.as_path()))?, &user))
-            .or_else(|| read_file(&dir.join(".credentials.json")))?
+            .find_map(|dir| {
+                let service = claude_service((!host).then_some(dir.as_path()))?;
+                accounts
+                    .iter()
+                    .find_map(|account| keychain(&service, account))
+            })
+            .or_else(|| read_file(&dir.join(".credentials.json")))
+            .or_else(|| read_file(&dir.join("credentials.json")))?
     } else {
         read_file(&dir.join("auth.json"))?
     };
     parse_credentials(provider, &raw)
 }
 
+fn credential_utf8(raw: &[u8]) -> Option<Zeroizing<String>> {
+    if let Ok(text) = std::str::from_utf8(raw)
+        && !text.trim_end_matches('\0').contains('\0')
+    {
+        return Some(Zeroizing::new(text.trim_end_matches('\0').to_owned()));
+    }
+    if raw.len() >= 2 && raw.len().is_multiple_of(2) {
+        let units: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
+            .collect();
+        let text = String::from_utf16(&units).ok()?;
+        return Some(Zeroizing::new(text.trim_end_matches('\0').to_owned()));
+    }
+    None
+}
+
+fn decode_base64(input: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let mut bits = 0_u32;
+    let mut count = 0_u32;
+    let mut pad = 0_u8;
+    let mut out = Zeroizing::new(Vec::with_capacity(input.len() * 3 / 4));
+    for byte in input.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            pad = pad.saturating_add(1);
+            if pad > 2 {
+                return None;
+            }
+            continue;
+        }
+        if pad > 0 {
+            return None;
+        }
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(val);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push(u8::try_from((bits >> count) & 0xff).ok()?);
+        }
+        if u64::try_from(out.len()).ok()? > MAX_BYTES {
+            return None;
+        }
+    }
+    if count >= 6 {
+        return None;
+    }
+    Some(out)
+}
+
 fn parse_credentials(
     provider: ProviderKind,
     raw: &[u8],
 ) -> Option<(Zeroizing<String>, Option<String>)> {
-    let mut json: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let text = credential_utf8(raw)?;
+    let mut json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let (token_path, account_path) = if provider == ProviderKind::Claude {
         ("/claudeAiOauth/accessToken", "")
     } else {
@@ -889,6 +970,7 @@ fn parse_credentials(
 /// Claude Code가 키체인 항목 account로 쓰는 사용자 이름.
 pub(crate) fn claude_keychain_user() -> String {
     std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .filter(|s| {
             !s.is_empty()
@@ -904,7 +986,8 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
         return Some("Claude Code-credentials".into());
     };
     let path = dir.to_str()?;
-    // macOS 파일명은 분해형일 수 있어 Claude의 NFC 해시 규약에 맞춘다.
+    // macOS 파일명은 분해형일 수 있어 Claude의 NFC 해시 규약에 맞춘다. Windows·Linux는 이미 NFC다.
+    #[cfg(target_os = "macos")]
     let normalized = if path.is_ascii() {
         path.as_bytes().to_vec()
     } else {
@@ -915,6 +998,8 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
         )?
         .to_vec()
     };
+    #[cfg(not(target_os = "macos"))]
+    let normalized = path.as_bytes().to_vec();
     let digest = format!("{:x}", Sha256::digest(&normalized));
     Some(format!(
         "Claude Code-credentials-{}",
@@ -935,10 +1020,17 @@ fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
     let stdout = Zeroizing::new(output.stdout);
     (output.status.success() && u64::try_from(stdout.len()).ok()? <= MAX_BYTES).then_some(stdout)
 }
-// Windows go-keyring은 자격 증명 관리자에 `service:account` 이름의 일반 자격 증명으로 둔다(agy 로그인).
+// Windows 자격 증명 관리자: go-keyring(`service:account`), keytar/Bun(`service/account`), keyring-rs(`account.service`) 순으로 찾는다.
 #[cfg(all(not(test), windows))]
 fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
-    crate::sys::generic_credential(&format!("{service}:{account}"))
+    [
+        format!("{service}:{account}"),
+        format!("{service}/{account}"),
+        format!("{account}.{service}"),
+        service.to_owned(),
+    ]
+    .into_iter()
+    .find_map(|target| crate::sys::generic_credential(&target))
 }
 #[cfg(test)]
 fn keychain(_: &str, _: &str) -> Option<Zeroizing<Vec<u8>>> {
@@ -1025,9 +1117,10 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
 }
 
 fn parse_antigravity_auth(raw: &[u8]) -> Option<AuthStatus> {
-    let text = std::str::from_utf8(raw).ok()?.trim();
+    let raw_text = credential_utf8(raw)?;
+    let text = raw_text.trim();
     let decoded = if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
-        pipe_command("/usr/bin/base64", &["--decode"], encoded.as_bytes())?
+        decode_base64(encoded)?
     } else if let Some(encoded) = text.strip_prefix("go-keyring-encoded:") {
         let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
         if !remainder.is_empty() {
@@ -1545,18 +1638,12 @@ pub(crate) mod agy {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        // krilld는 콘솔 없이(DETACHED_PROCESS) 돈다. 막지 않으면 agy가 조회마다 콘솔 창을 띄운다.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
         if ssh_connection {
             cmd.env("SSH_CONNECTION", "krill");
         } else {
             cmd.env_remove("SSH_CONNECTION");
         }
-        let mut child = cmd.spawn().ok()?;
+        let mut child = crate::child::spawn(crate::child::own_group(&mut cmd)).ok()?;
         let stdout = child.stdout.take()?;
         let reader = std::thread::Builder::new()
             .name("agy-read".into())
@@ -1572,19 +1659,13 @@ pub(crate) mod agy {
         let ok = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if Instant::now() >= deadline => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    break false;
-                }
+                Ok(None) if Instant::now() >= deadline => break false,
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                _ => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    break false;
-                }
+                _ => break false,
             }
         };
+        // Drop the job/group before joining stdout so lingering grandchild helpers cannot block EOF.
+        drop(child);
         if !ok {
             return None;
         }
@@ -2001,14 +2082,21 @@ mod tests {
         );
         assert!(parse_antigravity_auth(b"invalid").is_none());
         assert!(parse_antigravity_auth(b"go-keyring-encoded:7").is_none());
-        // go-keyring base64 풀기는 /usr/bin/base64에 맡긴다(Unix 전용 경로).
-        #[cfg(unix)]
-        {
-            let encoded = pipe_command("/usr/bin/base64", &[], raw).unwrap();
-            let mut wrapped = b"go-keyring-base64:".to_vec();
-            wrapped.extend_from_slice(&encoded);
-            assert!(parse_antigravity_auth(&wrapped).unwrap().logged_in);
-        }
+        let wrapped =
+            b"go-keyring-base64:eyJhdXRoX21ldGhvZCI6Im9hdXRoIiwidG9rZW4iOnsiYWNjZXNzX3Rva2VuIjoiZml4dHVyZS1vbmx5In19\n";
+        assert!(parse_antigravity_auth(wrapped).unwrap().logged_in);
+        let utf16_claude: Vec<u8> = br#"{"claudeAiOauth":{"accessToken":"utf16-token"}}"#
+            .iter()
+            .flat_map(|&b| [b, 0])
+            .collect();
+        assert_eq!(
+            parse_credentials(ProviderKind::Claude, &utf16_claude)
+                .unwrap()
+                .0
+                .as_str(),
+            "utf16-token"
+        );
+        #[cfg(target_os = "macos")]
         assert_eq!(
             claude_service(Some(Path::new("/tmp/é"))),
             claude_service(Some(Path::new("/tmp/e\u{301}")))

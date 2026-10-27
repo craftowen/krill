@@ -88,6 +88,23 @@ fn discovers_project_and_global_skills_commands_with_cli_invocation_and_preceden
             .iter()
             .any(|i| i["text"] == "/shared-check")
     );
+    f.file(
+        "home/.gemini/antigravity-cli/skills/deep-research/SKILL.md",
+        "---\nname: deep-research\ndescription: Deep research pipeline\n---",
+    );
+    f.file(
+        "agy-profile/.gemini/config/skills/profile-skill/SKILL.md",
+        "---\nname: profile-skill\ndescription: Profile skill\n---",
+    );
+    let agy = load(
+        &f.0.join("home"),
+        &f.0.join("repo/sub"),
+        "agy",
+        Some(&f.0.join("agy-profile")),
+    );
+    let agy_items = agy["items"].as_array().unwrap();
+    assert!(agy_items.iter().any(|i| i["text"] == "/deep-research"));
+    assert!(agy_items.iter().any(|i| i["text"] == "/profile-skill"));
     let inside_home = f.0.join("home/notes/sub");
     fs::create_dir_all(&inside_home).unwrap();
     let from_home_subdir = load(&f.0.join("home"), &inside_home, "claude", None);

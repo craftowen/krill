@@ -475,20 +475,50 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
     let hover = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).path_hover(pane));
 
     cx.simulate_mouse_move(at(9.), None, Modifiers::default());
-    assert_eq!(hover(cx), None, "⌘ 없이는 밑줄이 없다");
-    cx.simulate_mouse_move(at(9.), None, cmd);
+    cx.run_until_parked();
     let underline = Some(Highlight {
         line: 1,
         column: 6,
         cols: 15,
     });
+    assert_eq!(
+        hover(cx),
+        underline,
+        "마우스 보고가 꺼져 있으면 ⌘ 없이 마우스만 올려도 밑줄과 포인터 커서가 표시된다"
+    );
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::Msg as _;
+        use krill_proto::term_modes::Modes;
+        let frame = Modes {
+            flags: Modes::MOUSE_CLICK,
+            ..Modes::default()
+        }
+        .encode()
+        .unwrap();
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.simulate_mouse_move(at(9.), None, Modifiers::default());
+    assert_eq!(
+        hover(cx),
+        None,
+        "마우스 보고가 켜진 TUI에서는 ⌘ 없이는 밑줄이 없다"
+    );
+    cx.simulate_mouse_move(at(9.), None, cmd);
     assert_eq!(hover(cx), underline);
     cx.simulate_modifiers_change(Modifiers::default());
-    assert_eq!(hover(cx), None, "⌘을 떼면 사라진다");
+    assert_eq!(hover(cx), None, "마우스 보고 중 ⌘을 떼면 사라진다");
     cx.simulate_modifiers_change(cmd);
     assert_eq!(hover(cx), underline, "움직이지 않고 ⌘만 눌러도 나타난다");
     cx.simulate_mouse_move(at(25.), None, cmd);
     assert_eq!(hover(cx), None, "없는 파일은 링크가 아니다");
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::Msg as _;
+        use krill_proto::term_modes::Modes;
+        let frame = Modes::default().encode().unwrap();
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
 
     cx.simulate_mouse_down(at(9.), MouseButton::Left, cmd);
     cx.simulate_mouse_up(at(9.), MouseButton::Left, cmd);
@@ -2137,8 +2167,9 @@ fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppC
         ..Modifiers::default()
     };
 
-    // 1. ⌘+호버 시 원격 ProbePaths를 거쳐 밑줄이 뜨고, 같은 경로의 옆 열로 움직여도 재조회 없이 밑줄이 유지된다.
-    cx.simulate_mouse_move(at(5.), None, cmd);
+    // 1. ⌘ 없이 마우스만 올려도 원격 ProbePaths를 거쳐 밑줄(및 포인터 커서)이 뜨고,
+    // 같은 경로의 옆 열로 움직여도 재조회 없이 밑줄이 유지된다.
+    cx.simulate_mouse_move(at(5.), None, Modifiers::default());
     cx.run_until_parked();
     let expected_hl = Some(Highlight {
         line: 1,
@@ -2152,7 +2183,7 @@ fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppC
     let calls_after_hover = probe_calls.load(Ordering::SeqCst);
     assert_eq!(calls_after_hover, 1);
 
-    cx.simulate_mouse_move(at(12.), None, cmd);
+    cx.simulate_mouse_move(at(12.), None, Modifiers::default());
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_, cx| view.read(cx).path_hover(pane)),
@@ -2162,6 +2193,12 @@ fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppC
         probe_calls.load(Ordering::SeqCst),
         calls_after_hover,
         "같은 링크 범위 안 열 이동은 원격 ProbePaths를 다시 호출하지 않는다"
+    );
+    cx.simulate_mouse_move(at(12.), None, cmd);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
     );
 
     // 2. 원격 터미널에서 이미지를 일반 클릭(⌘ 없이)해도 원격 호스트의 이미지 탭으로 열린다.

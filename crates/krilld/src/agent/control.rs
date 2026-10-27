@@ -335,6 +335,12 @@ impl Control {
         }))
     }
 
+    /// 서브에이전트·팀원의 명시적 훅(`agent_id`·`parent_session_id`·`teammate_id`·`is_subagent`·`Subagent*`·`Teammate*`)인지 판정한다.
+    pub fn is_explicit_subagent_hook(payload: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(payload)
+            .is_ok_and(|p| is_explicit_subagent_payload(&p))
+    }
+
     /// 서브에이전트·팀원 훅이거나 이미 바인딩된 부모 `session_id`와 다른 보조 프로세스(`claude -p` 등)의
     /// 외래 훅인지 판정한다(#30067, #29429, #28966).
     pub fn is_subagent_or_foreign_hook(&self, session: SessionId, payload: &[u8]) -> bool {

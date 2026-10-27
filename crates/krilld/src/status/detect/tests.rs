@@ -352,3 +352,40 @@ fn screen_menu_overrides_terminal_title_and_hook_working() {
     st.inferred(ID, e, 40);
     assert_eq!(st.get(ID).state, AgentState::Working);
 }
+
+#[test]
+fn orca_title_waiting_working_and_done_glyphs() {
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    for (rev, title, expected) in [
+        (1, "✋ Action Required (Gemini)", AgentState::Waiting),
+        (2, "▲ Qoder permission", AgentState::Waiting),
+        (3, "π ! My Project", AgentState::Waiting),
+        (4, "✦ Thinking (krill)", AgentState::Working),
+        (5, "⏲ Working (krill)", AgentState::Working),
+        (6, "◇ Ready (krill)", AgentState::Done),
+        (7, "Claude — Action Required", AgentState::Waiting),
+        (8, "Antigravity: Permission Needed", AgentState::Waiting),
+    ] {
+        let e = detector
+            .observe(title, "…", rev, &AgentStatus::UNKNOWN, now)
+            .unwrap_or_else(|| panic!("expected evidence for {title}"));
+        assert_eq!(
+            (e.state, e.source, e.confidence),
+            (expected, Source::Title, Confidence::Medium),
+            "title={title}"
+        );
+    }
+    // 에이전트 이름이 없는 일반 창 제목의 permission 단어는 오탐하지 않는다.
+    assert!(
+        detector
+            .observe(
+                "chmod permission denied",
+                "…",
+                9,
+                &AgentStatus::UNKNOWN,
+                now
+            )
+            .is_none()
+    );
+}

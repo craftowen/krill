@@ -109,6 +109,9 @@ pub struct ScreenRules {
     /// 완료 글리프(구분 공백 뒤).
     #[serde(default = "default_done_glyph")]
     pub done_glyph: char,
+    /// 확인 필요(권한 요청) 글리프(구분 공백 뒤, Gemini `✋`·Qoder `▲`).
+    #[serde(default = "default_waiting_glyphs")]
+    pub waiting_glyphs: Vec<char>,
     /// 작업 중 글리프.
     #[serde(default = "default_working_glyphs")]
     pub working_glyphs: Vec<char>,
@@ -137,9 +140,18 @@ fn default_waiting_phrases() -> Vec<String> {
         "do you want to proceed",
         "do you want to make this edit",
         "do you want to create",
+        "do you want to approve",
         "would you like to proceed",
         "would you like to run",
         "allow this",
+        "run this command",
+        "accept this file edit",
+        "approval required",
+        "requested permission",
+        "yes, grant permission",
+        "yes, run command",
+        "yes, accept this change",
+        "yes, allow",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -155,8 +167,9 @@ fn default_waiting_combo() -> Vec<String> {
 
 fn default_select_prefixes() -> Vec<String> {
     [
-        "❯ 1.", "› 1.", "> 1.", "❯ 2.", "› 2.", "> 2.", "❯ 3.", "› 3.", "> 3.", "1. Yes",
-        "1. Allow", "❯ Yes", "› Yes", "> Yes", "❯ No", "› No", "> No",
+        "❯ 1.", "› 1.", "> 1.", "❯ 2.", "› 2.", "> 2.", "❯ 3.", "› 3.", "> 3.", "1. Yes", "2. Yes",
+        "3. Yes", "1. No", "2. No", "3. No", "1. Allow", "❯ Yes", "› Yes", "> Yes", "❯ No", "› No",
+        "> No",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -171,8 +184,12 @@ fn default_done_glyph() -> char {
     '✳'
 }
 
+fn default_waiting_glyphs() -> Vec<char> {
+    ['✋', '▲'].to_vec()
+}
+
 fn default_working_glyphs() -> Vec<char> {
-    ['◐', '◑', '◒', '◓'].to_vec()
+    ['◐', '◑', '◒', '◓', '✦', '⏲'].to_vec()
 }
 
 fn default_spinner_glyphs() -> Vec<char> {
@@ -192,6 +209,7 @@ impl Default for ScreenRules {
             select_prefixes: default_select_prefixes(),
             prompt_lines: default_prompt_lines(),
             done_glyph: default_done_glyph(),
+            waiting_glyphs: default_waiting_glyphs(),
             working_glyphs: default_working_glyphs(),
             spinner_glyphs: default_spinner_glyphs(),
             spinner_separators: default_spinner_separators(),
@@ -333,7 +351,8 @@ fn check_limits(payload: &RulesPayload) -> Result<(), RulesError> {
     {
         return Err(RulesError::OverLimit);
     }
-    if screen.working_glyphs.len() > MAX_GLYPH_ENTRIES
+    if screen.waiting_glyphs.len() > MAX_GLYPH_ENTRIES
+        || screen.working_glyphs.len() > MAX_GLYPH_ENTRIES
         || screen.spinner_glyphs.len() > MAX_GLYPH_ENTRIES
         || screen.spinner_separators.len() > MAX_GLYPH_ENTRIES
     {

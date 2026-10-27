@@ -181,6 +181,20 @@ fn builtin_screen_rules_match_previous_behavior() {
         rules.menu_hit("enter to select, esc to cancel\n❯ 1. Yes"),
         Some(MenuHit::Waiting)
     );
+    assert_eq!(
+        rules.menu_hit("⚠ Approval Required\nRequested Permission: command\n❯ 1. Yes, grant permission\n  2. No, deny permission"),
+        Some(MenuHit::Waiting)
+    );
+    assert_eq!(
+        rules.menu_hit(
+            "Accept this file edit?\n1. Yes, accept this change\n2. No, reject this change"
+        ),
+        Some(MenuHit::Waiting)
+    );
+    assert_eq!(
+        rules.menu_hit("Run this command?\n1. Yes, run command\n2. No, suggest changes (esc)"),
+        Some(MenuHit::Waiting)
+    );
     assert!(rules.menu_hit("explaining: trust this folder").is_none());
     assert!(rules.is_prompt("❯"));
     assert!(rules.is_prompt(">"));

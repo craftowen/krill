@@ -370,7 +370,7 @@ impl Panel {
             .items_center()
             .gap_1()
             .px_1()
-            .py_0p5()
+            .h(crate::ui::STATUS_BAR_BUTTON_HEIGHT)
             .rounded(crate::ui::RADIUS_XS)
             .cursor_pointer()
             .text_size(crate::ui::TEXT_XS)

@@ -283,7 +283,7 @@ catalog! {
     }
     other_os {
         REVEAL => ("파일 탐색기에서 보기", "Show in File Explorer"),
-        SUMMARY_LOCAL => ("터미널 기록은 이 컴퓨터에만 저장되고, 텔레메트리는 없습니다.", "Terminal history stays on this computer. There is no telemetry."),
+        SUMMARY_LOCAL => ("터미널 기록은 이 컴퓨터에만 저장됩니다. 오류 보고는 별도로 동의한 경우에만 보냅니다.", "Terminal history stays on this computer. Error reports are sent only with separate consent."),
         HOST_LOCAL => ("내 컴퓨터", "My computer"),
         THEME_DESC => ("앱과 터미널의 라이트·다크 모양입니다. 시스템은 OS 설정을 따릅니다.", "Light or dark look for the app and terminals. System follows the OS setting."),
         NOTIFICATIONS_DESC => ("에이전트 입력 대기·완료 알림을 보냅니다.", "Notify when an agent waits for input or finishes."),
@@ -367,6 +367,15 @@ catalog! {
         PROVIDER_RESET_USAGE_NO_CREDIT ["status.provider.reset_usage_no_credit"] => ("사용 가능한 초기화 크레딧이 없습니다", "No reset credits available"),
         PROVIDER_SHOW_IN_STATUS_BAR ["status.provider.show_in_status_bar"] => ("하단바에 표시", "Show in Status Bar"),
         PROVIDER_STATUS_BAR_SECTION ["status.provider.status_bar_section"] => ("하단바 프로바이더 표시", "Status Bar Providers"),
+        PROVIDER_TAB_LOCAL => ("{host} ({count})", "{host} ({count})"),
+        PROVIDER_TAB_REMOTE => ("원격 기기 ({count})", "Remote ({count})"),
+        PROVIDER_REMOTE_HINT => ("원격 호스트의 활성 계정을 확인하고 전환합니다.", "Review and switch the active account on each remote host."),
+        PROVIDER_SWITCH_NOW => ("이 계정으로 즉시 전환", "Switch to this account"),
+        PROVIDER_ACTIVE_NOW => ("현재 이 계정으로 작업 중", "Currently active account"),
+        PROVIDER_USAGE_PLENTY => ("여유", "Plenty"),
+        PROVIDER_USAGE_GOOD => ("양호", "Good"),
+        PROVIDER_USAGE_WARN => ("주의", "Caution"),
+        PROVIDER_USAGE_CRITICAL => ("한도 임박", "Near limit"),
     }
     jump {
         PLACEHOLDER => ("채팅, 터미널, 워크스페이스, 작업, 설정 및 동작 검색...", "Search chats, terminals, workspaces, tasks, settings, and actions..."),
@@ -1460,6 +1469,13 @@ catalog! {
         RECORDING_ACTIVE => ("기록 중", "Recording"),
         RECORDING_PAUSED => ("일시중지", "Paused"),
         RECORDING_TITLE => ("세션 히스토리 기록", "Session history recording"),
+        ERROR_REPORTS_TITLE => ("오류 보고 보내기", "Send error reports"),
+        ERROR_REPORTS_DESC => ("켜면 이후 발생한 오류 코드·Krill 소스 위치·버전·OS 정보와 응답 지연 구간을 서버에 보냅니다. macOS 크래시에서는 예외·신호 종류만 추출합니다. 프롬프트·터미널 출력·계정 정보·원본 로그는 보내지 않습니다. 끄면 전송 대기 항목을 지웁니다.", "When enabled, sends new error codes, Krill source locations, version and OS information, and responsiveness buckets. macOS crash reports contribute only exception and signal types. Prompts, terminal output, account information, and raw logs are excluded. Turning this off clears pending reports."),
+        ERROR_REPORTS_ON => ("켜짐 · 전송 대기 {count}건", "On · {count} pending reports"),
+        ERROR_REPORTS_OFF => ("꺼짐 · 오류 보고를 보내지 않습니다", "Off · No error reports are sent"),
+        ERROR_REPORTS_SAVING => ("오류 보고 설정 저장 중…", "Saving error reporting setting…"),
+        ERROR_REPORTS_VETO => ("{variable} 설정으로 오류 보고가 중지되어 있습니다", "Error reporting is stopped by {variable}"),
+        ERROR_REPORTS_FAILED => ("오류 보고 설정을 확인하거나 저장하지 못했습니다. 다시 시도해 주세요.", "Could not read or save the error reporting setting. Please try again."),
         RECORDING_UPDATE_NEEDED => ("데몬 업데이트 필요 — 기록 일시중지가 지원되지 않습니다", "Daemon update needed — history pause is not supported"),
         RECORDING_DELETE_TITLE => ("저장된 히스토리 지금 삭제", "Delete saved history now"),
         RECORDING_DELETE_NOW => ("지금 삭제", "Delete now"),
@@ -2780,6 +2796,18 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         crate::settings::AdminTab::Resources,
         catalog::settings::RECORDING_TITLE,
         &["기록", "히스토리", "history", "recording"],
+    ),
+    (
+        crate::settings::AdminTab::Resources,
+        catalog::settings::ERROR_REPORTS_TITLE,
+        &[
+            "오류 보고",
+            "크래시",
+            "개인정보",
+            "error reporting",
+            "crash",
+            "privacy",
+        ],
     ),
     (
         crate::settings::AdminTab::Resources,

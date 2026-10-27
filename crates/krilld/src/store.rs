@@ -1250,9 +1250,12 @@ fn replay_harvest_report(
     let mut size = seg.header.size;
     let mut reap = |engine: &mut Engine| {
         if let Some(h) = harvest.as_deref_mut()
-            && engine.history_len() > 0
+            && engine.has_history()
         {
-            h(engine.take_history());
+            let batch = engine.take_history();
+            if !batch.is_empty() {
+                h(batch);
+            }
         }
     };
     if seq <= cleared_seq {

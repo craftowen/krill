@@ -530,12 +530,12 @@ impl Shell {
                                             .items_center()
                                             .gap_1()
                                             .text_color(p.muted_foreground)
-                                            .child(
-                                                div()
-                                                    .size(krill_app::ui::STATE_DOT)
-                                                    .rounded_full()
-                                                    .bg(p.agent_question),
-                                            )
+                                            .child(krill_app::ui::status::status_glyph(
+                                                krill_proto::control::AgentState::Waiting,
+                                                false,
+                                                krill_app::ui::status::Size::Sm,
+                                                cx,
+                                            ))
                                             .child(
                                                 div()
                                                     .font_family(krill_app::ui::FONT_MONO)

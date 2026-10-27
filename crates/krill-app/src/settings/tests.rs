@@ -1732,6 +1732,57 @@ fn resources_tab_recording_toggle_reverts_without_daemon(cx: &mut TestAppContext
     fs::remove_dir_all(d).unwrap();
 }
 
+/// The resource-page control owns a separate consent and clears queued reports
+/// when switched off. It never starts an uploader in the test application.
+#[gpui::test]
+fn resources_error_reporting_toggle_persists_separate_consent_and_revokes(cx: &mut TestAppContext) {
+    use krill_proto::error_reporting::{self, Code, Event, Process};
+
+    let d = dir("error-reporting");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| view.set_tab(AdminTab::Resources, cx));
+    });
+    vcx.run_until_parked();
+    assert!(!error_reporting::status(&d).unwrap().consented);
+    let toggle = vcx
+        .debug_bounds("admin-error-reporting-toggle")
+        .expect("missing error reporting control");
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let status = error_reporting::status(&d).unwrap();
+    assert!(status.consented);
+    assert!(!d.join(krill_proto::telemetry::CONSENT_FILE).exists());
+    if status.enabled {
+        let event = Event::new(Process::App, Code::UpdateFailed, None).unwrap();
+        assert!(error_reporting::record_at(&d, event).unwrap());
+        assert_eq!(error_reporting::status(&d).unwrap().pending, 1);
+    }
+    let toggle = vcx
+        .debug_bounds("admin-error-reporting-toggle")
+        .expect("missing enabled error reporting control");
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let status = error_reporting::status(&d).unwrap();
+    assert!(!status.consented);
+    assert!(!status.enabled);
+    assert_eq!(status.pending, 0);
+    vcx.update(|_, cx| {
+        assert!(!view.read(cx).error_reporting.pending);
+        assert!(
+            !view
+                .read(cx)
+                .error_reporting
+                .status
+                .as_ref()
+                .unwrap()
+                .consented
+        );
+    });
+    fs::remove_dir_all(d).unwrap();
+}
+
 // 설치 테스트마다 별도 영수증을 사용하며 환경변수는 변경하지 않는다.
 const CLAUDE_HOOK_COMMAND: &str =
     "if [ -n \"${MK_PANE_ID:-}\" ]; then exec 'krill' hook claude; else printf '{}\\n'; fi";

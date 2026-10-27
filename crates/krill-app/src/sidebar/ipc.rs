@@ -638,7 +638,7 @@ pub(super) struct ExternalCache {
 /// `claude agents --json` 재조회 최소 간격.
 const EXTERNAL_TTL: Duration = Duration::from_secs(30);
 /// `claude agents --json` 실행 상한. 넘기면 빈 목록으로 fail-open한다.
-const EXTERNAL_TIMEOUT: Duration = Duration::from_secs(10);
+const EXTERNAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// `claude agents --json` stdout 상한(`krill_proto::agent::external::MAX_INPUT` 준수).
 const EXTERNAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 

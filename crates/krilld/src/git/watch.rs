@@ -67,13 +67,32 @@ pub struct Watch {
     q: Arc<GitQueue>,
     repo: PathBuf,
     visible: bool,
-    watcher: Option<RecommendedWatcher>,
-    setup: Option<Receiver<Result<RecommendedWatcher, String>>>,
+    watcher: Option<ActiveWatcher>,
+    setup: Option<Receiver<Result<ActiveWatcher, String>>>,
     events: Receiver<()>,
     pace: Pace,
     cancel: Arc<AtomicBool>,
     pending: Option<Receiver<Result<Changes, String>>>,
     latest: Option<Result<Arc<Changes>, String>>,
+}
+
+const STAT_POLL_INTERVAL: Duration = Duration::from_millis(400);
+const STAT_ENTRY_BUDGET: usize = 1024;
+const STAT_MAX_DEPTH: usize = 8;
+
+struct ActiveWatcher {
+    _watcher: RecommendedWatcher,
+    stop: Arc<AtomicBool>,
+    poller: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ActiveWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.poller.take() {
+            handle.thread().unpark();
+        }
+    }
 }
 
 impl std::fmt::Debug for Watch {
@@ -254,7 +273,7 @@ impl Drop for Watch {
     }
 }
 
-const MAX_WATCHES: usize = 8;
+const MAX_WATCHES: usize = 16;
 const STALE_WATCH: Duration = Duration::from_secs(5);
 
 struct HubEntry {
@@ -445,9 +464,10 @@ fn register(
     tx: SyncSender<()>,
     repo: &Path,
     metadata: Vec<PathBuf>,
-) -> Result<RecommendedWatcher, String> {
+) -> Result<ActiveWatcher, String> {
     let roots = metadata.clone();
     let watched_repo = repo.to_path_buf();
+    let notify_tx = tx.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let relevant = event.map_or(true, |e| {
             e.need_rescan()
@@ -456,7 +476,7 @@ fn register(
                     .any(|path| relevant(path, &watched_repo, &roots))
         });
         if relevant {
-            tx.try_send(()).ok();
+            notify_tx.try_send(()).ok();
         }
     })
     .map_err(|e| e.to_string())?;
@@ -465,9 +485,9 @@ fn register(
     paths
         .add(repo, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
-    for root in metadata {
+    for root in &metadata {
         paths
-            .add(&root, RecursiveMode::NonRecursive)
+            .add(root, RecursiveMode::NonRecursive)
             .map_err(|e| e.to_string())?;
         for (leaf, mode) in [
             ("logs", RecursiveMode::NonRecursive),
@@ -480,7 +500,129 @@ fn register(
         }
     }
     paths.commit().map_err(|e| e.to_string())?;
-    Ok(watcher)
+    let stop = Arc::new(AtomicBool::new(false));
+    let poller_stop = Arc::clone(&stop);
+    let polled_repo = repo.to_path_buf();
+    let mut prev = fingerprint(&polled_repo, &metadata);
+    let poller = thread::Builder::new()
+        .name("git-watch-stat".into())
+        .spawn(move || {
+            crate::alloc::mobile_thread().ok();
+            while !poller_stop.load(Ordering::Acquire) {
+                thread::park_timeout(STAT_POLL_INTERVAL);
+                if poller_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let next = fingerprint(&polled_repo, &metadata);
+                if next != prev {
+                    prev = next;
+                    tx.try_send(()).ok();
+                }
+            }
+        })
+        .ok();
+    Ok(ActiveWatcher {
+        _watcher: watcher,
+        stop,
+        poller,
+    })
+}
+
+fn fingerprint(repo: &Path, metadata: &[PathBuf]) -> u64 {
+    let mut budget = STAT_ENTRY_BUDGET;
+    let mut acc = 0_u64;
+    visit_dir(repo, 0, true, &mut budget, &mut acc);
+    for root in metadata {
+        for leaf in ["HEAD", "index", "packed-refs", "config"] {
+            if budget == 0 {
+                break;
+            }
+            let path = root.join(leaf);
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                budget -= 1;
+                acc = acc.wrapping_add(hash_entry(&path, &meta));
+            }
+        }
+        for (dir_leaf, max_depth) in [("logs", 1_usize), ("worktrees", 4), ("refs", 4)] {
+            if budget == 0 {
+                break;
+            }
+            let path = root.join(dir_leaf);
+            if path.is_dir() {
+                visit_dir(
+                    &path,
+                    STAT_MAX_DEPTH - max_depth,
+                    false,
+                    &mut budget,
+                    &mut acc,
+                );
+            }
+        }
+    }
+    acc
+}
+
+fn visit_dir(dir: &Path, depth: usize, skip_ignored: bool, budget: &mut usize, acc: &mut u64) {
+    if *budget == 0 || depth > STAT_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        let name = entry.file_name();
+        if skip_ignored
+            && [
+                ".git",
+                "node_modules",
+                "target",
+                "dist",
+                "build",
+                ".next",
+                ".venv",
+            ]
+            .iter()
+            .any(|s| name == *s)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        *budget -= 1;
+        *acc = acc.wrapping_add(hash_entry(&path, &meta));
+        if meta.is_dir() && depth < STAT_MAX_DEPTH {
+            visit_dir(&path, depth + 1, skip_ignored, budget, acc);
+        }
+    }
+}
+
+fn hash_entry(path: &Path, meta: &fs::Metadata) -> u64 {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for &b in path.as_os_str().as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^= meta.len();
+    h = h.wrapping_mul(0x0100_0000_01b3);
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    h ^= mtime.as_secs();
+    h = h.wrapping_mul(0x0100_0000_01b3);
+    h ^= u64::from(mtime.subsec_nanos());
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 // Resolve .git and commondir using files rather than starting git during watcher setup.

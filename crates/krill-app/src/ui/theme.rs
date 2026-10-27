@@ -98,8 +98,10 @@ pub const fn transparent() -> Hsla {
 pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(32.);
 /// 사이드바 빈 상태 상하 여백(Orca `py-6`).
 pub const SIDEBAR_EMPTY_PY: Pixels = px(24.);
-/// 하단 상태 바 높이(Orca `h-6` = 24px).
-pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
+/// 터미널 영역을 넓히는 하단 상태 바 높이(20px).
+pub const STATUS_BAR_HEIGHT: Pixels = px(20.);
+/// 하단 상태 바 버튼 높이(18px, 바 안에 위아래 여유를 둔다).
+pub const STATUS_BAR_BUTTON_HEIGHT: Pixels = px(18.);
 /// Space reserved for status actions, refresh, gaps and window padding at 100% UI zoom.
 pub const STATUS_USAGE_CONTROLS_WIDTH: Pixels = px(480.);
 /// Budget per expanded provider, including both usage windows and reset countdowns.

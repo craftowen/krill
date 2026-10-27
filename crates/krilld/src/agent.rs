@@ -1989,8 +1989,8 @@ fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
         return false;
     }
     let profile = root.join("profile/.gemini");
-    let Ok(mut child) = Command::new(exe)
-        .arg(format!("--gemini_dir={}", profile.display()))
+    let mut cmd = Command::new(exe);
+    cmd.arg(format!("--gemini_dir={}", profile.display()))
         .args(["mcp", "list"])
         .env("HOME", root.join("home"))
         .env("SSH_CONNECTION", "krill")
@@ -2000,9 +2000,8 @@ fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    let Ok(mut child) = crate::child::spawn(crate::child::own_group(&mut cmd)) else {
         std::fs::remove_dir_all(root).ok();
         return false;
     };
@@ -2011,13 +2010,10 @@ fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                child.kill().ok();
-                child.wait().ok();
-                break false;
-            }
+            _ => break false,
         }
     };
+    drop(child);
     std::fs::remove_dir_all(root).ok();
     supported
 }

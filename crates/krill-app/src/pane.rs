@@ -179,8 +179,9 @@ pub fn clear_scrollback(target: impl Into<HostTarget>, session: SessionId) -> io
     if features & FEAT_CLEAR_SCROLLBACK == 0 {
         return Ok(false);
     }
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // macOS는 피어가 이미 닫은 소켓의 setsockopt를 EINVAL로 거부한다(OWE-487). 닫힘은 다음 읽기·쓰기에서 드러난다.
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     s.write_all(&Request::ClearScrollback { session }.encode()?)?;
     let (k, b) = read(&mut s)?;
     match Reply::decode(k, &b)? {
@@ -245,7 +246,7 @@ pub fn find_session_in(
 ) -> io::Result<Option<Found>> {
     let target = target.into();
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     known_session(&target, &mut s, features, session, true)
 }
 
@@ -300,7 +301,7 @@ fn ensure_session_inner(
 ) -> io::Result<Found> {
     prepare_status_hook(target, &create.program);
     let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if let Some(id) = want {
         if let Some(session) =
             hibernation::wake(&mut |req| call(&mut s, req), features, id, create)?
@@ -354,8 +355,11 @@ fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
 fn account_handoff(target: &HostTarget, old: SessionId) -> io::Result<Option<SessionId>> {
     use krill_proto::usage::{UsageReply, UsageRequest};
     let mut connection = target.connect(&hello()).map_err(connect_error)?;
-    connection.stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    connection.stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    connection.stream.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    connection
+        .stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .ok();
     connection
         .stream
         .write_all(&UsageRequest::ListAccounts.encode()?)?;
@@ -421,7 +425,7 @@ pub fn resume_session_in(
     let target = target.into();
     prepare_status_hook(&target, &create.program);
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -496,8 +500,8 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
         return Ok(None); // 이전 데몬에는 새 variant를 보내지 않는다.
     }
     let mut stream = conn.stream;
-    stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    stream.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     stream.write_all(&request.encode()?)?;
     let (kind, body) = read(&mut stream)?;
     match Reply::decode(kind, &body)? {
@@ -539,7 +543,7 @@ impl Writer {
     }
 
     fn spawn_for(mut s: UnixStream, target: Option<HostTarget>) -> io::Result<Self> {
-        s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
         let (tx, rx) = mpsc::sync_channel::<PendingWrite>(WRITE_QUEUE_FRAMES);
         let bytes = Arc::new(AtomicUsize::new(0));
         thread::Builder::new()
@@ -624,7 +628,7 @@ pub fn attach(
         }
         .encode()?,
     )?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     let (k, b) = read(&mut s)?;
     if k == kind::REFUSED {
         return Err(io::Error::new(
@@ -633,7 +637,7 @@ pub fn attach(
         ));
     }
     krill_proto::screen::Attached::decode(k, &b)?;
-    s.set_read_timeout(None)?;
+    s.set_read_timeout(None).ok();
     let writer = Writer::spawn_for(s.try_clone()?, Some(target))?;
     Ok(Linked {
         reader: s,
@@ -1035,6 +1039,13 @@ impl<W: Write> Pane<W> {
         if let Some((cols, rows)) = self.grid {
             notices.extend(self.fit(cols, rows));
         }
+        if self.out.is_some()
+            && self.view.screen.lines > 0
+            && self.history.stable.is_none()
+            && self.history.offset > 0
+        {
+            self.fetch();
+        }
         notices
     }
 
@@ -1173,8 +1184,16 @@ impl<W: Write> Pane<W> {
         if self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
             && self.history.prior.is_empty()
         {
-            self.history.offset = usize::MAX;
-            self.fetch();
+            self.scroll(isize::MAX);
+            if self
+                .history
+                .stable
+                .as_ref()
+                .is_none_or(|c| !c.is_stopped() && c.complete_total().is_none())
+            {
+                self.history.offset = usize::MAX;
+                self.fetch();
+            }
         } else {
             self.history.reset();
             self.request_top(Source::Cold { page: 0 }, None);
@@ -1304,7 +1323,7 @@ impl<W: Write> Pane<W> {
                     self.resync = false;
                     ev.bell = self.view.screen.bells != bells;
                     ev.redraw = true;
-                    if self.history.stable.is_some() {
+                    if self.history.stable.is_some() || self.history.offset > 0 {
                         self.fetch();
                     }
                     self.refresh();
@@ -1433,16 +1452,19 @@ impl<W: Write> Pane<W> {
             && (self.history.stable.is_some() || self.history.rows.is_empty())
             && self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
         {
-            if let Some(session) = self.session {
+            if lines > 0
+                && let Some(session) = self.session
+            {
                 let cache = self
                     .history
                     .stable
                     .get_or_insert_with(|| stable_history::Cache::new(session));
-                self.history.req = self.history.req.wrapping_add(1);
-                if let Some(req) = cache.next(self.history.offset, lines, self.history.req)
-                    && self.send(&req).is_err()
-                {
-                    self.unlink();
+                let next_req = self.history.req.wrapping_add(1);
+                if let Some(req) = cache.next(self.history.offset, lines, next_req) {
+                    self.history.req = next_req;
+                    if self.send(&req).is_err() {
+                        self.unlink();
+                    }
                 }
             }
             return;

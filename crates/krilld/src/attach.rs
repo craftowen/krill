@@ -199,6 +199,7 @@ pub(crate) fn run_as(
     role: Role,
     frame_min: Duration,
 ) -> io::Result<()> {
+    crate::alloc::mobile_thread().ok();
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let Some(tap) = tap else {
@@ -225,9 +226,7 @@ pub(crate) fn run_as(
         .spawn({
             let (tap, conn) = (tap.clone(), Arc::clone(&conn));
             move || {
-                if matches!(role, Role::InteractiveWithSize { .. }) {
-                    crate::alloc::mobile_thread().ok();
-                }
+                crate::alloc::mobile_thread().ok();
                 let r = match attach.stream {
                     Stream::Screen { known } => {
                         // 화면 구독 동안 핫 스크롤백을 쌓는다(MK-035). 놓으면 유예 뒤 강등.

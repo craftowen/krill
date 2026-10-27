@@ -1343,7 +1343,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3772,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "krill-hosts",
  "krill-log",
@@ -3791,7 +3791,7 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -3825,7 +3825,7 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "krill-log",
  "krill-proto",
@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "krill-hosts"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "krill-proto",
  "postcard",
@@ -3849,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "iroh",
  "krill-log",
@@ -3868,7 +3868,7 @@ dependencies = [
 
 [[package]]
 name = "krill-log"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "log",
  "rustix",
@@ -3877,12 +3877,13 @@ dependencies = [
 
 [[package]]
 name = "krill-proto"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "postcard",
  "proptest",
  "regex",
  "ring",
+ "rustix",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -3893,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "krill-term"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "krill-proto",
  "unicode-width",
@@ -3901,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "krilld"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "aes",
  "alacritty_terminal",
@@ -7539,7 +7540,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -9845,27 +9846,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.14.2"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "057cfd910cfac363a0ada849592624b4c9ff2e10bef504c3433810d78ed96f93"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.1.0"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd44c6a7284e91f3717755b24315a302edd9153a01f753c3cba3d765e8eafac"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.1+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

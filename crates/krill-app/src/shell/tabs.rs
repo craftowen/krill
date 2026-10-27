@@ -106,8 +106,8 @@ impl Shell {
             .map(|p| p.name.as_str())
     }
 
-    /// 탭·패인 헤더 제목. 데몬 스냅샷에 세션이 있으면 사이드바와 같은 규칙(`sidebar::session_label`:
-    /// 터미널 제목 → 에이전트 → 폴더 → "세션 n")을 쓰고, 아직 없으면 제목 → 실행한 에이전트 이름 → "새 터미널".
+    /// 탭·패인 헤더 제목. 터미널 제목이 비어 있으면 사이드바의 대화·자동 제목을 쓴다.
+    /// 세션이 아직 없으면 제목 → 실행한 에이전트 이름 → "새 터미널" 순서로 고른다.
     pub(super) fn pane_label(&self, pane: PaneId, cx: &App) -> String {
         if let Some(path) = self.layout.file(pane) {
             return krill_app::editor::file_name(path);
@@ -119,7 +119,10 @@ impl Shell {
             .session(pane)
             .and_then(|id| self.sidebar.read(cx).session_on(host, id))
         {
-            return sidebar::session_label(session, title).0;
+            return title.filter(|t| !t.trim().is_empty()).map_or_else(
+                || self.sidebar.read(cx).session_label_on(host, session).0,
+                |title| sidebar::session_label(session, Some(title)).0,
+            );
         }
         let launched = match self.layout.launch(pane).map(|l| &l.program) {
             Some(Program::Agent { id }) => self.agent_profile_name(launch_agent_id(id)),

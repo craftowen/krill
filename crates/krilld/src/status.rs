@@ -125,7 +125,15 @@ impl Statuses {
         let mut next = lock(&self.map).clone();
         let mut n = 0;
         for &(session, e) in events {
-            let Some(state) = normalize(&e.payload) else {
+            let state = if let Some(state) = normalize(&e.payload) {
+                state
+            } else if next
+                .get(&session)
+                .is_some_and(|r| r.status.state == AgentState::Waiting)
+                && subagent_clears_waiting(&e.payload)
+            {
+                AgentState::Working
+            } else {
                 continue;
             };
             let r = next.entry(session).or_insert_with(|| Record {
@@ -329,21 +337,18 @@ struct Fields {
 /// | `SessionEnd`, Cursor `sessionEnd` | exited |
 pub fn normalize(payload: &[u8]) -> Option<AgentState> {
     let f: Fields = serde_json::from_slice(payload).ok()?;
-    if f.is_subagent
+    let is_subagent = f.is_subagent
         || f.agent_id.as_deref().is_some_and(|s| !s.is_empty())
         || f.parent_session_id
             .as_deref()
             .is_some_and(|s| !s.is_empty())
-        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty())
-    {
-        return None;
-    }
+        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty());
     let tool = f
         .tool_name
         .as_deref()
         .or_else(|| f.tool_call.as_ref()?.name.as_deref());
     let asks = tool.is_some_and(asks_user);
-    Some(match f.hook_event_name.as_deref()? {
+    let state = match f.hook_event_name.as_deref()? {
         "Stop" if f.fully_idle == Some(false) => return None,
         "SessionStart" | "sessionStart" | "Stop" | "StopFailure" | "Interrupt" | "AfterAgent"
         | "PostInvocation" | "stop" => AgentState::Done,
@@ -351,6 +356,8 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
         "UserPromptSubmit"
         | "PreToolUse"
         | "PostToolUse"
+        | "PostToolUseFailure"
+        | "ElicitationResult"
         | "BeforeAgent"
         | "BeforeTool"
         | "AfterTool"
@@ -358,7 +365,7 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
         | "beforeSubmitPrompt"
         | "afterShellExecution"
         | "afterMCPExecution" => AgentState::Working,
-        "PermissionRequest" => AgentState::Waiting,
+        "PermissionRequest" | "Elicitation" | "AskUserQuestion" => AgentState::Waiting,
         "Notification"
             if matches!(
                 f.notification_type.as_deref(),
@@ -369,7 +376,43 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
         }
         "SessionEnd" | "sessionEnd" => AgentState::Exited,
         _ => return None,
-    })
+    };
+    if is_subagent {
+        return (state == AgentState::Waiting).then_some(AgentState::Waiting);
+    }
+    Some(state)
+}
+
+/// 서브에이전트가 띄운 권한·질문(`Waiting`)이 끝났음을 뜻하는 서브에이전트 후속 이벤트인가(Orca `claude-roster-state` 준용).
+fn subagent_clears_waiting(payload: &[u8]) -> bool {
+    let Ok(f) = serde_json::from_slice::<Fields>(payload) else {
+        return false;
+    };
+    let is_subagent = f.is_subagent
+        || f.agent_id.as_deref().is_some_and(|s| !s.is_empty())
+        || f.parent_session_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty());
+    let Some(event) = f.hook_event_name.as_deref() else {
+        return false;
+    };
+    if matches!(event, "SubagentStop" | "TeammateIdle") {
+        return true;
+    }
+    if !is_subagent {
+        return false;
+    }
+    let tool = f
+        .tool_name
+        .as_deref()
+        .or_else(|| f.tool_call.as_ref().and_then(|t| t.name.as_deref()));
+    let asks = tool.is_some_and(asks_user);
+    match event {
+        "PostToolUse" | "PostToolUseFailure" | "AfterTool" | "ElicitationResult" => true,
+        "PreToolUse" | "BeforeTool" => !asks,
+        _ => false,
+    }
 }
 
 /// 사람에게 묻는 도구(Claude `AskUserQuestion`·`ExitPlanMode`, Codex `request_user_input`, Antigravity `ask_question`·`ask_permission`, `OpenCode` `question`). 대소문자·구분자 무시.

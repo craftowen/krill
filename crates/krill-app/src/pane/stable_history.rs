@@ -53,7 +53,10 @@ impl Cache {
         self.complete
     }
     pub(super) fn can_compose(&self, lines: usize) -> bool {
-        (self.shown.saturating_sub(lines)..self.shown).all(|i| self.rows.contains_key(&i))
+        self.shown == 0
+            || (lines > 0
+                && (self.shown.saturating_sub(lines)..self.shown)
+                    .all(|i| self.rows.contains_key(&i)))
     }
     pub(super) fn can_compose_at(&self, wanted: usize) -> bool {
         let wanted = self.complete.map_or(wanted, |total| wanted.min(total));
@@ -81,9 +84,14 @@ impl Cache {
     pub(super) fn show(&mut self, wanted: usize, lines: usize) {
         self.wanted = self.complete.map_or(wanted, |total| wanted.min(total));
         self.lines = lines;
-        if (self.wanted.saturating_sub(lines)..self.wanted).all(|i| self.rows.contains_key(&i)) {
+        if self.wanted == 0
+            || (lines > 0
+                && (self.wanted.saturating_sub(lines)..self.wanted)
+                    .all(|i| self.rows.contains_key(&i)))
+        {
             self.shown = self.wanted;
-        } else if self.wanted > self.shown
+        } else if lines > 0
+            && self.wanted > self.shown
             && self.wanted.saturating_sub(self.shown) <= 128usize.saturating_add(lines)
             && self.can_compose(lines)
         {
@@ -102,7 +110,7 @@ impl Cache {
         req: u32,
     ) -> Option<HistoryViewRequest> {
         self.show(wanted, lines);
-        if self.stopped || self.pending.is_some() || wanted == 0 {
+        if self.stopped || self.pending.is_some() || wanted == 0 || lines == 0 {
             return None;
         }
         let target_start = self.wanted.saturating_sub(lines);
@@ -222,7 +230,7 @@ impl Cache {
         }
         let before = self.shown;
         self.show(self.wanted, self.lines);
-        if self.shown < self.wanted && skip <= self.shown {
+        if self.lines > 0 && self.shown < self.wanted && skip <= self.shown {
             let partial = incoming_end.min(self.wanted);
             if partial > self.shown
                 && (partial.saturating_sub(self.lines)..partial).all(|i| self.rows.contains_key(&i))
@@ -501,5 +509,23 @@ mod tests {
         }
         assert_eq!(cache.visible(), 100);
         assert!(!cache.stopped);
+    }
+
+    #[test]
+    fn zero_lines_before_initial_screen_does_not_corrupt_shown_or_issue_premature_request() {
+        let mut cache = Cache::new(SessionId(1));
+        assert!(cache.can_compose(0));
+        assert!(cache.next(5, 0, 1).is_none());
+        assert_eq!(cache.visible(), 0);
+        assert!(!cache.is_pending());
+        assert!(cache.can_compose(24));
+
+        let req = cache.next(5, 24, 1).unwrap();
+        assert_eq!(req.view, 0);
+        assert_eq!(req.skip, 0);
+        assert!(cache.accept(reply(req)));
+        assert_eq!(cache.visible(), 5);
+        assert!(!cache.can_compose(0));
+        assert!(cache.can_compose(24));
     }
 }

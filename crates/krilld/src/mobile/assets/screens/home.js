@@ -15,7 +15,7 @@
   const catalog=new Map((snapshot?.workspaces||[]).map(w=>[w.key,w]));let groups=source;
   if(!groups){groups=new Map([...catalog].map(([key,w])=>[key,{...w,repoKey:w.repo_key,sessions:[]} ]));for(const session of snapshot?.sessions||[]){const key=groupKey(session);let g=groups.get(key);if(!g){g={key,path:session.group_path||session.cwd,repoKey:session.repo_key,sessions:[]};groups.set(key,g);}g.sessions.push(session);}}
   const result=[];for(const g of groups.values()){
-   const sessions=g.sessions||[],kept=sessions.filter(s=>!(s.exited&&!s.worktree_key&&!s.cwd));
+   const sessions=g.sessions||[],kept=sessions.filter(s=>!s.exited&&s.state!=='Exited');
    // Path-backed legacy groups remain usable without the newer workspace catalog.
    if(!kept.length&&!catalog.has(g.key)&&(sessions.length||!g.path&&!g.repoKey&&!g.pinned))continue;
    result.push(kept.length===sessions.length?g:{...g,sessions:kept});

@@ -6420,16 +6420,19 @@ fn exited_processes_leave_sidebar_dashboard_counts_and_unread(cx: &mut TestAppCo
         // Matching IDs on other hosts must be treated independently.
         let mut remote_done = session(1, AgentState::Done, None);
         remote_done.status.agent = "codex".into();
+        let mut remote_waiting = session(2, AgentState::Waiting, None);
+        remote_waiting.status.agent = "claude".into();
         sidebar.set_remote_snapshot_for_test(
             "remote",
             HostStatus::Connected,
             Snapshot {
-                sessions: vec![remote_done],
+                sessions: vec![remote_done, remote_waiting],
                 ..Snapshot::default()
             },
             cx,
         );
-        assert_eq!(sidebar.dashboard_sessions().len(), 2);
+        assert_eq!(sidebar.dashboard_sessions().len(), 3);
+        assert_eq!(sidebar.agent_counts(), (1, 0, 2));
     });
 }
 

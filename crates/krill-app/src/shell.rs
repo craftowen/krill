@@ -2232,6 +2232,7 @@ impl Shell {
                 Err(e) => {
                     this.daemon_task = None;
                     this.link = Link::Failed(daemon::Error::Io(e).to_string());
+                    krill_app::errors::daemon_connection_failed(cx);
                     krill_app::orca_import::set_daemon_link_up(false, cx);
                     cx.notify();
                 }
@@ -2258,6 +2259,7 @@ impl Shell {
                 Err(e) => {
                     tracing::warn!(error = %e, "initial daemon connection failed; retrying");
                     let link = Link::connect_failure(&e);
+                    cx.update(krill_app::errors::daemon_connection_failed);
                     if this.update(cx, |this, cx| this.set_link(link, cx)).is_err() {
                         return;
                     }

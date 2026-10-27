@@ -1022,4 +1022,40 @@ mod tests {
         drop(rec);
         fs::remove_dir_all(path).ok();
     }
+
+    #[test]
+    fn single_chunk_csi_3j_harvest_matches_restored_hot_suffix() {
+        let (path, store, mut rec) = fixture("single-chunk-csi-3j");
+        let mut chunk = Vec::new();
+        for n in 0..30 {
+            writeln!(chunk, "pre-{n:03}\r").unwrap();
+        }
+        chunk.extend_from_slice(b"\x1b[2J\x1b[3J\x1b[H");
+        for n in 0..30 {
+            writeln!(chunk, "post-{n:03}\r").unwrap();
+        }
+        rec.append(&chunk);
+        rec.seal();
+
+        let restored = store.history(SessionId(701)).unwrap().restore().unwrap();
+        let mut hot_rows = restored.history();
+        hot_rows.reverse();
+        assert_eq!(hot_rows.len(), 14);
+        let hot = hot_rows
+            .iter()
+            .map(|row| postcard::to_stdvec(row).unwrap().into_boxed_slice())
+            .collect::<Vec<_>>();
+
+        let frozen = store
+            .stable_manifest(SessionId(701), rec.seq(), &|| false)
+            .unwrap();
+        let plain = frozen.index(&[], &|| false).unwrap();
+        assert_eq!(plain[0].total, hot.len());
+        let indexed = frozen.index(&hot, &|| false).unwrap();
+        assert_eq!(indexed[0].covered, hot.len());
+        assert_eq!(indexed[0].total, 0);
+
+        drop(rec);
+        fs::remove_dir_all(path).ok();
+    }
 }

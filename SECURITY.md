@@ -33,4 +33,4 @@ Known limitation: the documented Gatekeeper bypass used to install a locally/ad-
 
 ## Secrets and diagnostics
 
-Krill applies redaction rules to diagnostic bundles and crash logs (`[REDACTED]`; see [the diagnostic implementation](crates/krill-proto/src/diag.rs)). Review logs and bundles before sharing them; redaction is not a guarantee that every secret is removed. Treat a missed sensitive pattern as a security report. Never commit the updater's distribution-signing private key.
+Krill applies redaction rules when creating diagnostic bundles (`[REDACTED]`; see [the diagnostic implementation](crates/krill-proto/src/diag.rs)). Original local panic logs can contain unredacted messages and paths. Review logs and bundles before sharing them; redaction is not a guarantee that every secret is removed. The separate, default-off [error reporting feature](docs/agents/error-reporting.md) sends only a closed metadata schema and does not upload those original files. Treat a missed sensitive pattern as a security report. Never commit the updater's distribution-signing private key.

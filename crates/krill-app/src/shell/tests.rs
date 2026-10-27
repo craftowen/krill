@@ -4562,6 +4562,75 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
     }
 }
 
+/// OSC 제목이 없는 agy 탭도 데몬의 대화 제목·첫 프롬프트 제목을 표시한다.
+#[gpui::test]
+fn agy_tab_titles_use_sidebar_titles_without_osc(cx: &mut TestAppContext) {
+    use krill_proto::control::AgentStatus;
+    use std::sync::Arc;
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let sessions = vec![
+        sidebar::Session {
+            id: SessionId(81),
+            status: AgentStatus {
+                agent: "agy".into(),
+                title: Some("상단 탭 제목 수정".into()),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: Some("/repo".into()),
+            account: None,
+        },
+        sidebar::Session {
+            id: SessionId(82),
+            status: AgentStatus {
+                agent: "agy".into(),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: Some("/repo".into()),
+            account: None,
+        },
+    ];
+    let (view, cx) = open(cx, state_path("agy-tab-titles"));
+    cx.simulate_keystrokes("cmd-t");
+    view.update(cx, |s, cx| {
+        for (tab, session) in s.layout.tabs().to_vec().iter().zip(&sessions) {
+            s.layout.set_session(tab.focused, session.id);
+            // 화면 프레임이 OSC 없이 도착하면 빈 제목이 캐시에 들어간다.
+            s.titles.insert(tab.focused, String::new());
+        }
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(
+                Arc::new(Memory(sidebar::Snapshot {
+                    sessions: sessions.clone(),
+                    trees: BTreeMap::new(),
+                })),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_auto_title(SessionId(82), "첫 요청에서 만든 제목", cx);
+        });
+        for (tab, expected) in s
+            .layout
+            .tabs()
+            .iter()
+            .zip(["상단 탭 제목 수정", "첫 요청에서 만든 제목"])
+        {
+            assert_eq!(s.pane_label(tab.focused, cx), expected);
+        }
+    });
+}
+
 /// OWE-870: 사용자 지정 탭 제목은 자동 제목을 덮어쓰고 `layout.bin`에 영속된다.
 /// 비우면 자동 제목으로 복귀한다.
 #[gpui::test]
