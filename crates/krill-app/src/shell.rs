@@ -823,7 +823,14 @@ impl Shell {
             s
         });
         let sidebar_tabs = cx.observe(&sidebar, |this, sidebar, cx| {
-            this.sync_live_cwds(sidebar.read(cx));
+            let projects = this.sync_live_cwds(sidebar.read(cx));
+            if !projects.is_empty() {
+                sidebar.update(cx, |sidebar, cx| {
+                    for path in projects {
+                        sidebar.register_project(path, cx);
+                    }
+                });
+            }
             // Orca `activeWorktreeId` 패리티: 워크스페이스 선택이 바뀌면 다음 Cmd+T·새 에이전트의
             // 실행 위치도 그 호스트를 따른다. 메뉴에서 직접 고른 실행 위치는 선택이 다시 바뀔 때까지 둔다.
             if let Some(selected) = sidebar.read(cx).selected_workspace()
@@ -1600,8 +1607,9 @@ impl Shell {
     /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
     /// 일반 cd는 `layout.launches`의 폴더를 바꾸지 않는다. 프로젝트 생성 작업은 실제 성공 cwd를 확인한 뒤 전환한다.
     /// 재부팅 뒤에도 살아남도록 꼬리(`LayoutTail.respawn_cwds`)로 영속한다.
-    pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) {
+    pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) -> Vec<PathBuf> {
         let mut changed = false;
+        let mut projects = std::collections::BTreeSet::new();
         let panes: Vec<PaneId> = (0..self.layout.tabs().len())
             .flat_map(|i| self.layout.tab_panes(i))
             .collect();
@@ -1610,6 +1618,7 @@ impl Shell {
                 continue;
             };
             let host = self.layout.host(pane);
+            let is_local = host.is_local();
             let Some(live_cwd) = sidebar
                 .session_on(host, sid)
                 .and_then(|s| s.cwd.as_deref())
@@ -1626,6 +1635,9 @@ impl Shell {
                 .launch(pane)
                 .and_then(|launch| folder::completed_project(launch, live_cwd))
             {
+                if is_local {
+                    projects.insert(live_cwd.to_path_buf());
+                }
                 self.layout.set_launch(pane, completed);
                 changed = true;
             }
@@ -1633,6 +1645,7 @@ impl Shell {
         if changed {
             self.save();
         }
+        projects.into_iter().collect()
     }
 
     /// 칸이 사이드바의 로컬 git 워크트리에 속할 때만 그 워크트리 루트 경로를 돌려준다.
