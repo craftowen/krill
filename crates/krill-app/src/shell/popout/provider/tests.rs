@@ -182,6 +182,14 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
             vec![host, saved, profile("other", Some("other@example.com"))];
         std::sync::Arc::make_mut(&mut s.accounts_snapshot)
+            .statuses
+            .push(krill_proto::usage::AccountStatusInfo {
+                account_id: "other".into(),
+                status: AccountStatus::Error,
+                updated_at: None,
+                detail: Some("usage API returned HTTP 403".into()),
+            });
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot)
             .details
             .accounts
             .push(AccountMeters {
@@ -245,6 +253,13 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .is_some(),
         "사용량이 없는 계정은 모름·갱신 기록 상태를 보여 준다"
     );
+    let diagnostic = visual
+        .debug_bounds("status-provider-account-codex-other-status-detail")
+        .expect("failed usage must expose its diagnostic in the account card");
+    assert!(diagnostic.size.width > gpui::px(0.));
+    assert!(diagnostic.origin.x >= other.origin.x);
+    assert!(diagnostic.right() <= other.right());
+    assert!(diagnostic.bottom() <= other.bottom());
     assert!(
         row.bottom() < other.origin.y,
         "계정 영역 사이에 간격이 있다"

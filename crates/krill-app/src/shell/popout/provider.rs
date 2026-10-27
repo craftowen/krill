@@ -716,11 +716,19 @@ fn render_detail_panel_ghost(
         profile = profile.child(
             div()
                 .flex()
-                .items_center()
-                .gap_2()
+                .flex_col()
+                .gap_1()
                 .text_size(ui::TEXT_2XS)
-                .child(ui::badge(p, ui::BadgeTone::Muted, status.label))
-                .child(div().child(status.updated)),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::badge(p, ui::BadgeTone::Muted, status.label))
+                        .child(div().child(status.updated)),
+                )
+                // Match display::render_status's reserved diagnostic line.
+                .child(div().h_4()),
         );
         if let Some(meters) = snap.meters_for(&account.id) {
             profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));

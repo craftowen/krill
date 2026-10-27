@@ -144,7 +144,7 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
         .spawn(move || {
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
-                    .unwrap_or(Fetched::Failed);
+                    .unwrap_or(Fetched::Failed(Failure::Internal));
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -171,11 +171,12 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                         mark_rate_limited(&mut lock(&CACHE), &job, now);
                         None
                     }
-                    Fetched::Failed => {
+                    Fetched::Failed(reason) => {
+                        tracing::warn!(provider = job.1.as_str(), reason = %reason.detail(), "direct usage refresh failed");
                         let mut retry = lock(&RETRY);
                         let streak = retry.get(&job).map_or(0, |r| r.1).saturating_add(1);
                         retry.insert(job.clone(), (Instant::now() + failure_wait(streak), streak));
-                        mark_failed(&mut lock(&CACHE), &job, now);
+                        mark_failed(&mut lock(&CACHE), &job, now, reason);
                         None
                     }
                 };
@@ -192,18 +193,37 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     }
 }
 
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "테스트 빌드의 fetch는 네트워크 없이 Failed만 돌려준다"
-    )
-)]
 enum Fetched {
     Usage(Usage, krill_proto::usage::AccountMeters),
     /// HTTP 429와 Retry-After. 같은 토큰을 다른 도구(Claude Code·Orca)와 함께 쓰면 자주 걸린다.
     RateLimited(Option<Duration>),
-    Failed,
+    Failed(Failure),
+}
+
+/// Closed diagnostic vocabulary: never retain credentials, response text or paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Failure {
+    Credentials,
+    Request,
+    Transport,
+    Http(u16),
+    Response,
+    Internal,
+}
+
+impl Failure {
+    fn detail(self) -> String {
+        match self {
+            Self::Credentials => "사용량 자격증명 읽기 실패".into(),
+            Self::Request => "사용량 요청 구성 실패".into(),
+            Self::Transport => "사용량 API 연결·전송 실패".into(),
+            Self::Http(401) => "사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요".into(),
+            Self::Http(403) => "사용량 API 접근 거절(HTTP 403)".into(),
+            Self::Http(code) => format!("사용량 API 응답 오류(HTTP {code})"),
+            Self::Response => "사용량 API 응답 해석 실패".into(),
+            Self::Internal => "사용량 조회 작업 실패".into(),
+        }
+    }
 }
 
 /// 실행 중인 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
@@ -258,7 +278,12 @@ fn mark_rate_limited(
 
 /// 일시적인 조회 실패가 마지막 수치를 지우지 않게 하되, 성공 시각과 오류를 보존한다.
 /// 오래된 실패 값에는 일반 캐시 TTL을 적용한다(429의 하루 유예와 다름).
-fn mark_failed(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key, now: Option<u64>) {
+fn mark_failed(
+    cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>,
+    key: &Key,
+    now: Option<u64>,
+    reason: Failure,
+) {
     cache.retain(|_, (at, usage)| alive(*at, usage));
     if let Some((at, usage)) = cache.get_mut(key)
         && alive(*at, usage)
@@ -266,7 +291,7 @@ fn mark_failed(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key, no
     {
         usage.stale = true;
         usage.error = Some("갱신 실패".into());
-        usage.detail = Some("사용량 갱신 실패 — 마지막 성공 값".into());
+        usage.detail = Some(format!("{} — 마지막 성공 값", reason.detail()));
         return;
     }
     cache.insert(
@@ -275,7 +300,7 @@ fn mark_failed(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key, no
             Instant::now(),
             ProfileUsage {
                 error: Some("갱신 실패".into()),
-                detail: Some("사용량 갱신 실패".into()),
+                detail: Some(reason.detail()),
                 updated_at: now,
                 ..ProfileUsage::default()
             },
@@ -286,7 +311,7 @@ fn mark_failed(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key, no
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
 #[cfg(test)]
 fn fetch(_: ProviderKind, _: &Path, _: bool, _: &Path, _: Option<&Path>) -> Fetched {
-    Fetched::Failed
+    Fetched::Failed(Failure::Internal)
 }
 
 #[cfg(not(test))]
@@ -298,33 +323,56 @@ fn fetch(
     state: Option<&Path>,
 ) -> Fetched {
     let Some((token, account)) = credentials(provider, dir, host, home, state) else {
-        return Fetched::Failed;
+        return Fetched::Failed(Failure::Credentials);
     };
-    let mut limited = None;
-    let out = query(provider, &token, account.as_deref(), |config| {
-        let (code, retry_after, body) = curl_response(config)?;
-        if code == 429 {
-            limited = Some(retry_after);
-        }
-        (200..300).contains(&code).then_some(body)
-    });
-    let Some(mut out) = out else {
-        return limited.map_or(Fetched::Failed, Fetched::RateLimited);
+    let (usage, mut meters) = match fetch_usage(provider, &token, account.as_deref(), curl_response)
+    {
+        Fetched::Usage(usage, meters) => (usage, meters),
+        failure => return failure,
     };
     // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
     // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
     if provider == ProviderKind::Claude
         && let Some((count, expiries)) = claude_reset_credits(&token, get_text)
     {
-        out.1.meters.push(krill_proto::usage::UsageMeter {
+        meters.meters.push(krill_proto::usage::UsageMeter {
             key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
             label: krill_proto::usage::RESET_CREDITS_METER_LABEL.into(),
             window: None,
             value: Some(count.to_string()),
         });
-        out.1.meters.extend(expiries);
+        meters.meters.extend(expiries);
     }
-    Fetched::Usage(out.0, out.1)
+    Fetched::Usage(usage, meters)
+}
+
+type HttpResponse = (u16, Option<Duration>, Zeroizing<Vec<u8>>);
+
+fn fetch_usage(
+    provider: ProviderKind,
+    token: &str,
+    account: Option<&str>,
+    send: impl FnOnce(&str) -> Option<HttpResponse>,
+) -> Fetched {
+    let mut failure = Failure::Request;
+    let mut limited = None;
+    let out = query(provider, token, account, |config| {
+        failure = Failure::Transport;
+        let (code, retry_after, body) = send(config)?;
+        if code == 429 {
+            limited = Some(retry_after);
+        }
+        if !(200..300).contains(&code) {
+            failure = Failure::Http(code);
+            return None;
+        }
+        failure = Failure::Response;
+        Some(body)
+    });
+    match out {
+        Some((usage, meters)) => Fetched::Usage(usage, meters),
+        None => limited.map_or(Fetched::Failed(failure), Fetched::RateLimited),
+    }
 }
 
 /// curl GET 전송. 설정·본문에 비밀(토큰)은 로그에 남기지 않는다.
@@ -2057,6 +2105,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn direct_usage_failure_diagnostics_distinguish_stages_without_body_or_tokens() {
+        let reason = |result: Fetched| match result {
+            Fetched::Failed(reason) => reason,
+            _ => panic!("expected failed usage"),
+        };
+        let token = "fixture-token-never-in-diagnostic";
+        let body = b"fixture-response-never-in-diagnostic";
+        for code in [401, 403, 500] {
+            let failure = reason(fetch_usage(ProviderKind::Claude, token, None, |_| {
+                Some((code, None, body.to_vec().into()))
+            }));
+            assert_eq!(failure, Failure::Http(code));
+            assert!(failure.detail().contains(&code.to_string()));
+            assert!(!failure.detail().contains(token));
+            assert!(!failure.detail().contains("fixture-response"));
+        }
+        assert_eq!(
+            reason(fetch_usage(ProviderKind::Claude, token, None, |_| None)),
+            Failure::Transport
+        );
+        assert_eq!(
+            reason(fetch_usage(ProviderKind::Claude, token, None, |_| Some((
+                200,
+                None,
+                body.to_vec().into()
+            )))),
+            Failure::Response
+        );
+        assert_eq!(
+            reason(fetch_usage(
+                ProviderKind::Claude,
+                "bad\ntoken",
+                None,
+                |_| panic!("invalid credentials must not reach transport")
+            )),
+            Failure::Request
+        );
+        assert!(
+            matches!(fetch_usage(ProviderKind::Claude, token, None, |_| Some((429, Some(Duration::from_secs(123)), body.to_vec().into()))), Fetched::RateLimited(Some(wait)) if wait == Duration::from_secs(123))
+        );
+        assert!(
+            matches!(fetch_usage(ProviderKind::Claude, token, None, |_| Some((200, None, br#"{"five_hour":{"utilization":42}}"#.to_vec().into()))), Fetched::Usage(usage, _) if usage.five_hour.as_ref().unwrap().percent == 42)
+        );
+    }
+
+    #[test]
+    fn direct_usage_failure_detail_reaches_host_account_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("usage-diagnostic-snapshot-{}", std::process::id()));
+        let home = root.join("home");
+        let state = root.join("state");
+        let dir = accounts::host_default_dir(&home, ProviderKind::Claude);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = (home.clone(), ProviderKind::Claude, dir);
+        for reason in [
+            Failure::Credentials,
+            Failure::Request,
+            Failure::Transport,
+            Failure::Http(401),
+            Failure::Http(403),
+            Failure::Response,
+            Failure::Internal,
+        ] {
+            mark_failed(&mut lock(&CACHE), &key, Some(123), reason);
+            let snap = accounts::refresh_accounts_with(&home, Some(&state), false);
+            let status = snap.status_for("claude-host").unwrap();
+            assert_eq!(status.status, krill_proto::usage::AccountStatus::Error);
+            assert_eq!(status.detail.as_deref(), Some(reason.detail().as_str()));
+            assert_eq!(status.updated_at, Some(123));
+            assert!(
+                snap.accounts
+                    .iter()
+                    .find(|a| a.id == "claude-host")
+                    .unwrap()
+                    .usage
+                    .is_empty()
+            );
+        }
+        lock(&CACHE).remove(&key);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_claude_sources_do_not_mask_current_file_credentials() {
         let root =
             std::env::temp_dir().join(format!("claude-source-fallback-{}", std::process::id()));
@@ -2112,7 +2243,7 @@ mod tests {
         };
         let mut cache = BTreeMap::from([(key.clone(), (at, good.clone()))]);
         for now in [200, 300] {
-            mark_failed(&mut cache, &key, Some(now));
+            mark_failed(&mut cache, &key, Some(now), Failure::Internal);
             let (kept_at, kept) = &cache[&key];
             assert_eq!(*kept_at, at);
             assert_eq!(kept.usage, good.usage);
@@ -2124,7 +2255,7 @@ mod tests {
         let expired_at = at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
         cache.get_mut(&key).unwrap().0 = expired_at;
         assert!(!alive(expired_at, &cache[&key].1));
-        mark_failed(&mut cache, &key, Some(400));
+        mark_failed(&mut cache, &key, Some(400), Failure::Internal);
         assert!(cache[&key].1.usage.is_empty());
         assert_eq!(cache[&key].1.updated_at, Some(400));
         assert_eq!(cache[&key].1.error.as_deref(), Some("갱신 실패"));
@@ -2697,7 +2828,7 @@ mod tests {
         assert_eq!(*kept_at, at);
         assert!(kept.stale && kept.updated_at == Some(100) && kept.usage == good.usage);
         // 성공 → 일시 실패 → 429에서도 성공 수치·시각은 그대로 남는다.
-        mark_failed(&mut cache, &key, Some(200));
+        mark_failed(&mut cache, &key, Some(200), Failure::Internal);
         assert!(cache[&key].1.error.is_some());
         mark_rate_limited(&mut cache, &key, Some(201));
         let (kept_at, kept) = &cache[&key];
@@ -2707,7 +2838,7 @@ mod tests {
         assert!(kept.stale && kept.error.is_none());
         assert!(kept.detail.as_deref().is_some_and(|s| s.contains("429")));
         // 실패 수치의 정상 TTL이 지난 뒤에는 429가 값을 되살리면 안 된다.
-        mark_failed(&mut cache, &key, Some(202));
+        mark_failed(&mut cache, &key, Some(202), Failure::Internal);
         cache.get_mut(&key).unwrap().0 =
             at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
         mark_rate_limited(&mut cache, &key, Some(203));
