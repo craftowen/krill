@@ -1094,7 +1094,7 @@ fn hidden_confirming_paste_and_following_keys_survive_other_tab_attach(cx: &mut 
     let original = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
     let (initial, _initial_peer) = UnixStream::pair().unwrap();
     view.update(cx, |shell, cx| {
-        shell.attach_test(original, krill_proto::SessionId(42), initial, cx)
+        shell.attach_test(original, krill_proto::SessionId(42), initial, cx);
     });
     let second = cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
@@ -1144,7 +1144,23 @@ fn hidden_confirming_paste_and_following_keys_survive_other_tab_attach(cx: &mut 
     cx.update(|window, cx| view.update(cx, |shell, cx| shell.confirm_pending_paste(window, cx)));
     assert_eq!(read_input(&mut original_peer), b"echo first\recho second");
     assert_eq!(read_input(&mut original_peer), b"following keys");
-    assert_nothing_sent(&mut other_peer);
+    // Returning to the original tab may release the other tab's idle connection.
+    // Both EOF and an empty open connection prove that no bytes went to that PTY.
+    other_peer.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        match other_peer.read(&mut [0]) {
+            Ok(0) => break,
+            Ok(_) => panic!("confirmation reached the other tab"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("other peer read failed: {error}"),
+        }
+    }
     assert!(view.read_with(cx, |shell, _| !shell.paste_queue.has_pending_for(original)));
 }
 
@@ -1172,6 +1188,6 @@ fn cold_read_only_pane_never_accepts_clipboard_confirmation(cx: &mut TestAppCont
             shell.paste_bytes(b"echo first\necho second", window, cx);
             assert!(!shell.paste_queue.has_pending_for(pane));
             assert!(shell.security.pending_paste().is_none());
-        })
+        });
     });
 }
