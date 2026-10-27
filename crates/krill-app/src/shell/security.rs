@@ -44,6 +44,19 @@ impl PasteQueue {
     pub(super) fn has_pending_for(&self, pane: PaneId) -> bool {
         self.entries.iter().any(|entry| entry.pane == pane)
     }
+
+    pub(super) fn pending_panes(&self) -> std::collections::BTreeSet<PaneId> {
+        self.entries.iter().map(|entry| entry.pane).collect()
+    }
+
+    /// 칸이 첫 세션을 배정받으면 그 전에 들어온 `session == None` 항목을 모두 그 첫 세션에 묶는다(APP-RUNTIME-003).
+    pub(super) fn bind_first_session(&mut self, pane: PaneId, session: krill_proto::SessionId) {
+        for entry in &mut self.entries {
+            if entry.pane == pane && entry.session.is_none() {
+                entry.session = Some(session);
+            }
+        }
+    }
 }
 
 struct QueuedInput {
@@ -111,8 +124,8 @@ impl Shell {
 
     fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {
         let pane = self.layout.focused()?;
-        // 첫 세션에 붙기 전에도 받는다(STYLEGUIDE §7.0): 준비된 바이트는 칸 저널에 보관됐다가 첫 세션에 간다.
-        let session = self.live.get(&pane)?.pane.session();
+        // 첫 세션·레이아웃 복원을 기다리는 동안에도 받는다(STYLEGUIDE §7.0): 준비된 바이트는 칸 저널에 보관됐다가 첫 세션에 간다.
+        let session = self.ensure_input_live(pane)?.pane.session();
         let timeout = if self.layout.host(pane).is_remote() {
             REMOTE_PASTE_PREPARATION_TIMEOUT
         } else {
@@ -380,7 +393,7 @@ impl Shell {
         {
             return false;
         }
-        let Some(live) = self.live.get(&pane) else {
+        let Some(live) = self.ensure_input_live(pane) else {
             return false;
         };
         let session = live.pane.session();
@@ -469,6 +482,34 @@ impl Shell {
         }
     }
 
+    /// 칸이 첫 세션(`session`)에 닿았을 때 아직 세션이 없던 붙여넣기 큐 항목을 그 세션으로 고정한다.
+    pub(super) fn bind_paste_queue_first_session(
+        &mut self,
+        pane: PaneId,
+        had_session: bool,
+        session: krill_proto::SessionId,
+    ) {
+        if !had_session {
+            self.paste_queue.bind_first_session(pane, session);
+        }
+    }
+
+    /// 재시작·세션 교체로 칸의 이전 세션이 끝났을 때, 새 세션(`keep`)과 맞지 않는 붙여넣기 큐와 경고 배너를 정리한다.
+    pub(super) fn drop_stale_pastes_for_pane(
+        &mut self,
+        pane: PaneId,
+        keep: Option<krill_proto::SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.paste_queue.entries.len();
+        self.paste_queue
+            .entries
+            .retain(|entry| entry.pane != pane || keep.is_some() && entry.session == keep);
+        if self.paste_queue.entries.len() != before {
+            self.refresh_pending_paste_banner(cx);
+        }
+    }
+
     fn complete_clipboard_paste(
         &mut self,
         id: u64,
@@ -478,7 +519,7 @@ impl Shell {
     ) {
         let mut found = false;
         for entry in &mut self.paste_queue.entries {
-            if let QueuedKind::Paste(request, ready) = &mut entry.kind
+            if let QueuedKind::Paste(request, ready @ PreparedPaste::Pending) = &mut entry.kind
                 && *request == id
             {
                 *ready = PreparedPaste::Ready(payload);
@@ -497,7 +538,7 @@ impl Shell {
     /// 큐를 머리부터 비운다. 칸마다 준비 중(`Pending`)·확인 대기(`Confirming`) 항목 뒤는 보류한다.
     /// 클립보드 결과는 포커스 칸일 때만 보내고(포커스 이동은 붙여넣기 의도 취소), 이미 제출한 키 입력은 포커스와
     /// 무관하게 순서대로 보낸다. 닫힌 칸·다른 세션으로 바뀐 칸의 항목은 버린다.
-    fn drain_paste_queue(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn drain_paste_queue(&mut self, cx: &mut Context<Self>) {
         let pending = std::mem::take(&mut self.paste_queue.entries);
         let mut blocked = std::collections::BTreeSet::new();
         for mut entry in pending {
@@ -569,7 +610,7 @@ impl Shell {
         let Some(pane) = self.layout.focused() else {
             return;
         };
-        let Some(l) = self.live.get_mut(&pane) else {
+        let Some(l) = self.ensure_input_live(pane) else {
             return;
         };
         let modes = l.pane.modes();

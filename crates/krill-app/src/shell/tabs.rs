@@ -704,6 +704,22 @@ impl Shell {
         });
     }
 
+    pub(super) fn shift_closed_tabs_after_restore(&mut self, saved_tab_count: usize, cx: &App) {
+        if self.closed_tabs.is_empty() || saved_tab_count == 0 {
+            return;
+        }
+        let saved_workspaces: Vec<Option<workspaces::Workspace>> = (0..saved_tab_count)
+            .map(|i| self.tab_workspace(i, cx))
+            .collect();
+        for closed in &mut self.closed_tabs {
+            let prepended = saved_workspaces
+                .iter()
+                .filter(|ws| ws.as_ref() == Some(&closed.workspace))
+                .count();
+            closed.position = closed.position.saturating_add(prepended);
+        }
+    }
+
     /// OWE-734: 탭 닫기 요청. 고정된 탭(`pinned`)이면 확인 모달을 띄우고, 아니면 바로 닫는다.
     pub(super) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.layout.tabs().len() {

@@ -10293,8 +10293,9 @@ fn sticky_last_prompt_bar_and_tab_hover_card_render_and_toggle_timeline(cx: &mut
     );
 }
 
-/// APP-RUNTIME-004: 저장된 레이아웃을 백그라운드에서 읽는 동안 사용자가 새 탭을 열면, 복원이 끝난 뒤 새 탭은 저장된
-/// 탭 뒤에 붙고 저장된 탭·분할·세션·호스트 매핑·사용자 제목은 메모리와 디스크 모두 그대로다(ARCHITECTURE §4.1).
+/// APP-RUNTIME-004: 저장된 레이아웃을 백그라운드에서 읽는 동안 사용자가 새 탭을 열면, 복원이 끝난 뒤 초기 칸들의
+/// `PaneId`는 그대로 유지된 채 저장된 탭 뒤에 붙고, 저장된 탭·분할·세션·호스트 매핑·사용자 제목은 충돌 없는 새
+/// `PaneId`로 옮겨 메모리와 디스크 모두 그대로 보존된다(ARCHITECTURE §4.1).
 #[gpui::test]
 fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
     let path = state_path("startup-edit-merge");
@@ -10315,6 +10316,7 @@ fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
         bind_keys(cx);
         krill_app::settings::init_at(state_dir, cx);
     });
+    let mut early_panes = Vec::new();
     let (view, cx) = cx.add_window_view(|_, cx| {
         let mut shell = Shell::new(Some(path.clone()), cx);
         // 복원 작업이 실행되기 전(같은 프레임)에 Cmd+T와 같은 경로로 새 탭을 연다.
@@ -10322,9 +10324,11 @@ fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
         shell.new_tab_on_launch_host(cx);
         shell.split_active(Axis::Vertical, cx);
         assert_eq!(shell.layout.tabs().len(), 2);
+        early_panes = shell.layout.tab_panes(1);
         shell
     });
     cx.run_until_parked();
+    view.update(cx, |s, _| s.flush_layout());
     assert!(!cx.update(|_, cx| view.read(cx).layout_loading));
     let layout = layout_of(&view, cx);
     assert_eq!(
@@ -10332,22 +10336,29 @@ fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
         3,
         "saved tabs + the tab opened while loading"
     );
-    assert_eq!(layout.tabs()[0], saved.tabs()[0]);
-    assert_eq!(layout.tabs()[1], saved.tabs()[1]);
-    assert_eq!(layout.session(first_pane), Some(SessionId(7)));
+    let restored_tab0 = layout.tab_panes(0);
+    assert_eq!(restored_tab0.len(), 1);
+    assert_eq!(layout.session(restored_tab0[0]), Some(SessionId(7)));
+
+    let restored_tab1 = layout.tab_panes(1);
+    assert_eq!(restored_tab1.len(), 2);
+    assert_eq!(layout.tabs()[1].focused, restored_tab1[1]);
     assert_eq!(
-        layout.host(remote_pane),
+        layout.host(restored_tab1[1]),
         &krill_app::hosts::HostId::Remote("box".into())
     );
     assert_eq!(layout.tab_title(1), Some("work"));
     assert_eq!(layout.active(), 2, "the tab the user opened stays active");
     let new_panes = layout.tab_panes(2);
-    assert_eq!(new_panes.len(), 2, "the split made while loading survives");
+    assert_eq!(
+        new_panes, early_panes,
+        "early panes keep their exact PaneId identity and split"
+    );
     assert!(
         new_panes
             .iter()
-            .all(|p| !saved.tabs().iter().any(|t| t.root.contains(*p))),
-        "new panes must not reuse saved pane numbers"
+            .all(|p| !restored_tab0.contains(p) && !restored_tab1.contains(p)),
+        "restored saved panes and kept early panes must have disjoint PaneIds"
     );
     let new_pane = layout.active_tab().focused;
     assert!(new_panes.contains(&new_pane));
@@ -10394,4 +10405,128 @@ fn reshown_pane_reattaches_published_session_instead_of_creating_again(cx: &mut 
     );
     assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
     assert_eq!(close::Creation::published(&creation), Some(SessionId(41)));
+}
+
+/// APP-RUNTIME-004: `layout_loading` 중 시작한 탭 이름 변경(`tab_rename`), 고정 탭 닫기 확인(`confirm_close_tab`),
+/// 우클릭 메뉴(`tab_context_menu`), 실행 중 탭 닫기 확인(`pending_running_close`)이 `restore_layout` 뒤에도
+/// 복원된 저장본 탭(0, 1)을 잘못 건드리지 않고 원래 초기 탭으로 정확히 이어진다.
+#[gpui::test]
+fn startup_tab_rename_and_close_dialogs_target_kept_early_tabs_after_restore(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("startup-tab-ui-remap");
+    let mut saved = Layout::default();
+    let s0 = saved.focused().unwrap();
+    saved.set_session(s0, SessionId(7));
+    saved.set_tab_title(0, Some("saved-zero"));
+    saved.new_tab();
+    let s1 = saved.focused().unwrap();
+    saved.set_session(s1, SessionId(8));
+    saved.set_tab_title(1, Some("saved-one"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
+        let shell = Shell::new_with_restore_gate(Some(path.clone()), gate, cx);
+        assert!(shell.layout_loading);
+        shell
+    });
+
+    let (pane_pinned, pane_renamed, pane_running) = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            assert!(shell.layout_loading);
+            shell.new_tab_on_launch_host(cx); // index 1
+            let p1 = shell.layout.focused().unwrap();
+            assert!(shell.layout.toggle_pin_tab(1));
+
+            shell.new_tab_on_launch_host(cx); // index 2
+            let p2 = shell.layout.focused().unwrap();
+
+            shell.new_tab_on_launch_host(cx); // index 3
+            let p3 = shell.layout.focused().unwrap();
+
+            shell.request_close_tab(1, cx);
+            assert_eq!(shell.confirm_close_tab, Some(1));
+
+            shell.begin_tab_rename(2, window, cx);
+            shell
+                .tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| {
+                    input.set_value("early-renamed", window, cx);
+                });
+            shell.open_tab_context_menu(1, point(px(12.), px(16.)), cx);
+            shell.pending_running_close = Some((PendingRunningClose::Tab(3), false));
+            (p1, p2, p3)
+        })
+    });
+    cx.run_until_parked();
+
+    // 이제 저장된 2개 탭(0, 1)이 복원되며 초기 탭 [1, 2, 3]은 [2, 3, 4]로 배치된다.
+    release.send(()).unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.layout_loading);
+        assert_eq!(shell.layout.tabs().len(), 5);
+        assert_eq!(shell.confirm_close_tab, Some(2));
+        assert_eq!(shell.tab_context_menu, Some((2, point(px(12.), px(16.)))));
+        assert!(matches!(
+            shell.pending_running_close,
+            Some((PendingRunningClose::Tab(4), false))
+        ));
+        assert_eq!(
+            shell.tab_rename.as_ref().map(|r| r.pane),
+            Some(pane_renamed)
+        );
+    });
+
+    // 실행 중 닫기 확인(index 4 = pane_running)과 고정 탭 닫기 확인(index 2 = pane_pinned)을 차례로 실행하고,
+    // 모달 포커스 복원이 끝난 뒤 탭 이름 인라인 입력에 포커스를 두고 Enter로 확정한다.
+    view.update(cx, |shell, cx| {
+        shell.tab_context_menu = None;
+        shell.confirm_running_close(cx);
+        shell.confirm_close_pinned_tab(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell
+                .tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.focus(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let final_layout = layout_of(&view, cx);
+    assert_eq!(final_layout.tabs().len(), 3);
+    assert_eq!(final_layout.tab_title(0), Some("saved-zero"));
+    assert_eq!(final_layout.tab_title(1), Some("saved-one"));
+    assert_eq!(final_layout.tab_title(2), Some("early-renamed"));
+    assert!(final_layout.pane_exists(pane_renamed));
+    assert!(!final_layout.pane_exists(pane_pinned));
+    assert!(!final_layout.pane_exists(pane_running));
+    assert_eq!(
+        final_layout.session(final_layout.tab_panes(0)[0]),
+        Some(SessionId(7))
+    );
+    assert_eq!(
+        final_layout.session(final_layout.tab_panes(1)[0]),
+        Some(SessionId(8))
+    );
 }

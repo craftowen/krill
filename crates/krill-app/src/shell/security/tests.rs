@@ -585,3 +585,302 @@ fn remote_host_target_uploads_clipboard_bytes_without_ssh_cli() {
     assert_eq!(std::fs::read(&uploaded_path).unwrap(), payload);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[expect(clippy::unwrap_used, reason = "테스트 헬퍼")]
+fn make_test_linked(sock: UnixStream) -> krill_app::pane::Linked {
+    let reader = sock.try_clone().unwrap();
+    krill_app::pane::Linked {
+        reader,
+        writer: krill_app::pane::Writer::spawn(sock).unwrap(),
+        instance: 1,
+        launch: None,
+        features: krill_proto::input::FEAT_INPUT,
+        search: false,
+    }
+}
+
+/// APP-RUNTIME-003: 첫 세션이 붙기 전(`session == None`)에 시작한 느린 붙여넣기(`Pending`)와 여러 줄 경고(`Confirming`)는
+/// `Shell::linked` 시점에 첫 세션 ID로 묶이며, 이후 `restart`·세션 재바인딩으로 두 번째 세션이 붙어도 절대 새지 않는다.
+#[gpui::test]
+fn pre_attach_pending_and_confirming_pastes_bind_to_first_session_and_never_leak(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("paste-bind-first-session"));
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+
+    // 1. 첫 세션 연결 전에 느린 클립보드 붙여넣기(Pending)와 뒤따르는 키 입력을 넣는다.
+    let pending_id = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let id = shell
+                .begin_clipboard_paste(window, cx)
+                .expect("pre-attach clipboard paste must be accepted");
+            shell.send(&typed(b"after-slow\r"), Some(window), cx);
+            assert!(
+                shell
+                    .paste_queue
+                    .entries
+                    .iter()
+                    .all(|e| e.pane == pane && e.session.is_none())
+            );
+            id
+        })
+    });
+
+    // Shell::linked로 첫 세션(41)에 붙으면 아직 Pending인 항목도 즉시 Some(SessionId(41))에 묶인다.
+    let (first_sock, mut first_peer) = UnixStream::pair().unwrap();
+    let _first_next = view.update(cx, |shell, cx| {
+        let next = shell.linked(
+            pane,
+            krill_proto::SessionId(41),
+            make_test_linked(first_sock),
+            cx,
+        );
+        assert!(
+            shell
+                .paste_queue
+                .entries
+                .iter()
+                .all(|e| e.session == Some(krill_proto::SessionId(41))),
+            "Shell::linked must promote pre-attach None entries to Some(first_session)"
+        );
+        next
+    });
+    assert_nothing_sent(&mut first_peer);
+
+    // 1-a. restart 없이 같은 Live가 두 번째 세션(42)에 붙더라도, 첫 세션(41)으로 고정된 큐는 42에 절대 들어가지 않는다.
+    let (direct_sock, mut direct_peer) = UnixStream::pair().unwrap();
+    direct_peer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let _direct_next = view.update(cx, |shell, cx| {
+        shell.linked(
+            pane,
+            krill_proto::SessionId(42),
+            make_test_linked(direct_sock),
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(pending_id, Some(b"echo leaked\r".to_vec()), window, cx);
+            shell.send(&typed(b"second-only\r"), Some(window), cx);
+        });
+    });
+    assert_eq!(read_input(&mut direct_peer), b"second-only\r");
+    assert_nothing_sent(&mut direct_peer);
+
+    // 1-b. 다시 Pending 붙여넣기가 걸린 상태에서 restart가 돌면 큐가 즉시 정리되고 다음 세션(43)은 깨끗하다.
+    let pending_restart_id = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let id = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.send(&typed(b"dropped-on-restart\r"), Some(window), cx);
+            id
+        })
+    });
+    let (restart_sock, mut restart_peer) = UnixStream::pair().unwrap();
+    restart_peer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let _restart_next = view.update(cx, |shell, cx| {
+        shell.restart(pane, cx);
+        assert!(!shell.paste_queue.has_pending_for(pane));
+        let _ = shell.ensure_input_live(pane);
+        shell.linked(
+            pane,
+            krill_proto::SessionId(43),
+            make_test_linked(restart_sock),
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(
+                pending_restart_id,
+                Some(b"echo restart-leaked\r".to_vec()),
+                window,
+                cx,
+            );
+            shell.send(&typed(b"third-only\r"), Some(window), cx);
+        });
+    });
+    assert_eq!(read_input(&mut restart_peer), b"third-only\r");
+    assert_nothing_sent(&mut restart_peer);
+
+    // 2. 새 탭에서 첫 세션 전에 여러 줄 붙여넣기(Confirming)가 걸린 뒤 계정/콜드 재바인딩으로 세션이 바뀌는 경로.
+    let pane2 = view.update(cx, |shell, cx| {
+        shell.new_tab_on_launch_host(cx);
+        shell.layout.active_tab().focused
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.paste_bytes(b"echo one\necho two", window, cx);
+            shell.send(&typed(b"queued-behind-warn\r"), Some(window), cx);
+            assert!(shell.security.pending_paste().is_some());
+        });
+    });
+    let (s51, mut peer51) = UnixStream::pair().unwrap();
+    let _next51 = view.update(cx, |shell, cx| {
+        shell.layout.set_session(pane2, krill_proto::SessionId(51));
+        let next = shell.linked(pane2, krill_proto::SessionId(51), make_test_linked(s51), cx);
+        assert!(
+            shell
+                .paste_queue
+                .entries
+                .iter()
+                .filter(|e| e.pane == pane2)
+                .all(|e| e.session == Some(krill_proto::SessionId(51)))
+        );
+        next
+    });
+    assert_nothing_sent(&mut peer51);
+
+    // 두 번째 세션(52)으로 교체된 뒤 배너 확인을 눌러도 51의 여러 줄 페이로드는 52에 전달되지 않는다.
+    let (s52, mut peer52) = UnixStream::pair().unwrap();
+    peer52
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let _next52 = view.update(cx, |shell, cx| {
+        for rebound in shell.layout.rebind_session(
+            &krill_app::hosts::HostId::Local,
+            krill_proto::SessionId(51),
+            krill_proto::SessionId(52),
+        ) {
+            shell.drop_stale_pastes_for_pane(rebound, Some(krill_proto::SessionId(52)), cx);
+        }
+        shell.linked(pane2, krill_proto::SessionId(52), make_test_linked(s52), cx)
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            assert!(shell.security.pending_paste().is_none());
+            shell.confirm_pending_paste(window, cx);
+            shell.send(&typed(b"clean-52\r"), Some(window), cx);
+        });
+    });
+    assert_eq!(read_input(&mut peer52), b"clean-52\r");
+    assert_nothing_sent(&mut peer52);
+}
+
+/// APP-RUNTIME-003 + 004: `layout_loading` 중(보이는 터미널 칸에 아직 데몬 연결이 없을 때) 입력한
+/// 한글 IME·클립보드 붙여넣기·키 입력은 버려지지 않고, 레이아웃 복원 뒤에도 같은 `PaneId`의 첫 세션에
+/// 제출 순서대로 도착하며 복원된 기존 세션에는 한 바이트도 섞이지 않는다(STYLEGUIDE §7.0).
+#[gpui::test]
+fn startup_loading_accepts_ime_paste_and_keys_and_delivers_to_first_session(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("startup-early-input-paste-ime");
+    let mut saved = krill_app::layout::Layout::default();
+    let saved_pane_orig = saved.focused().unwrap();
+    saved.set_session(saved_pane_orig, krill_proto::SessionId(7));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::shell::bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let shell = crate::shell::Shell::new_with_restore_gate(Some(path.clone()), gate, cx);
+        assert!(shell.layout_loading);
+        shell.focus.focus(window, cx);
+        shell
+    });
+
+    // 1. 초기 placeholder 탭(PaneId(0))과 초기 Cmd+T 탭(PaneId(1)) 모두 layout_loading 중 입력을 받는다.
+    let (placeholder_pane, early_new_pane, paste_req) = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            assert!(shell.layout_loading);
+            let p0 = shell.layout.focused().unwrap();
+            assert!(
+                gpui::EntityInputHandler::selected_text_range(shell, false, window, cx).is_some(),
+                "terminal text input must stay enabled during layout_loading"
+            );
+            gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                shell,
+                None,
+                "한",
+                Some(0..1),
+                window,
+                cx,
+            );
+            gpui::EntityInputHandler::replace_text_in_range(shell, None, "한글 ", window, cx);
+            shell.send(&typed(b"pwd\r"), Some(window), cx);
+
+            shell.new_tab_on_launch_host(cx);
+            let p1 = shell.layout.focused().unwrap();
+            gpui::EntityInputHandler::replace_text_in_range(shell, None, "echo ", window, cx);
+            let req = shell
+                .begin_clipboard_paste(window, cx)
+                .expect("Cmd+V during layout_loading must queue onto focused pane");
+            shell.send(&typed(b" done\r"), Some(window), cx);
+            (p0, p1, req)
+        })
+    });
+
+    // 2. 레이아웃 복원 완료: 저장된 탭(0) + 입력이 걸린 초기 탭 두 개(1, 2)가 모두 보존되고 초기 PaneId도 그대로다.
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    let restored_saved_pane = view.read_with(cx, |shell, _| {
+        assert!(!shell.layout_loading);
+        assert_eq!(shell.layout.tabs().len(), 3);
+        assert_eq!(shell.layout.tab_panes(1), vec![placeholder_pane]);
+        assert_eq!(shell.layout.tab_panes(2), vec![early_new_pane]);
+        assert_eq!(shell.layout.active(), 2);
+        let saved_pane = shell.layout.tab_panes(0)[0];
+        assert_eq!(
+            shell.layout.session(saved_pane),
+            Some(krill_proto::SessionId(7))
+        );
+        saved_pane
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(paste_req, Some(b"world".to_vec()), window, cx);
+        });
+    });
+
+    let (saved_sock, mut saved_peer) = UnixStream::pair().unwrap();
+    let (p0_sock, mut p0_peer) = UnixStream::pair().unwrap();
+    let (p1_sock, mut p1_peer) = UnixStream::pair().unwrap();
+    p0_peer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    p1_peer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (_saved_next, _p0_next, _p1_next) = view.update(cx, |shell, cx| {
+        let _ = shell.ensure_input_live(restored_saved_pane);
+        let s_next = shell.linked(
+            restored_saved_pane,
+            krill_proto::SessionId(7),
+            make_test_linked(saved_sock),
+            cx,
+        );
+        let p0_next = shell.linked(
+            placeholder_pane,
+            krill_proto::SessionId(101),
+            make_test_linked(p0_sock),
+            cx,
+        );
+        let p1_next = shell.linked(
+            early_new_pane,
+            krill_proto::SessionId(102),
+            make_test_linked(p1_sock),
+            cx,
+        );
+        (s_next, p0_next, p1_next)
+    });
+
+    assert_nothing_sent(&mut saved_peer);
+    let mut got_p0 = read_input(&mut p0_peer);
+    got_p0.extend_from_slice(&read_input(&mut p0_peer));
+    assert_eq!(got_p0, "한글 pwd\r".as_bytes());
+
+    let mut got_p1 = read_input(&mut p1_peer);
+    got_p1.extend_from_slice(&read_input(&mut p1_peer));
+    got_p1.extend_from_slice(&read_input(&mut p1_peer));
+    assert_eq!(got_p1, b"echo world done\r");
+}

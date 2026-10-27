@@ -1080,6 +1080,11 @@ impl<W: Write> Pane<W> {
             || self.account_input == AccountInput::Delivering && self.journal.has_pending_input()
     }
 
+    /// 아직 데몬이 확인하지 않은 보류·미확정 입력이 저널에 남아 있으면 `true`.
+    pub fn has_pending_input(&self) -> bool {
+        self.journal.has_pending_input()
+    }
+
     /// A cancelled switch may continue on the original account. A failed switch drops the held
     /// bytes with a notice, so prompts intended for the new account never reach the original
     /// one, and the pane goes back to the preserved original session. The daemon keeps failed

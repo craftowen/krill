@@ -409,6 +409,31 @@ impl NavHistory {
         }
         self.index = self.entries.len().saturating_sub(1);
     }
+
+    fn prune_missing_panes(&mut self, layout: &Layout) {
+        let mut new_entries = Vec::with_capacity(self.entries.len());
+        let mut new_index = 0usize;
+        for (idx, entry) in self.entries.drain(..).enumerate() {
+            let keep = match &entry {
+                NavEntry::Workspace {
+                    pane,
+                    session: None,
+                    ..
+                } => layout.pane_exists(*pane),
+                _ => true,
+            };
+            if keep {
+                if idx <= self.index {
+                    new_index = new_entries.len();
+                }
+                new_entries.push(entry);
+            } else if idx < self.index {
+                new_index = new_entries.len().saturating_sub(1);
+            }
+        }
+        self.entries = new_entries;
+        self.index = new_index.min(self.entries.len().saturating_sub(1));
+    }
 }
 
 pub fn bind_keys(cx: &mut App) {
@@ -721,6 +746,8 @@ pub struct Shell {
     pub(super) chat: chat::ChatState,
     /// 터미널 상단 고정 프롬프트 바(제안 C)에서 최근 턴 히스토리 타임라인 팝오버를 펼친 패인 집합.
     pub(super) expanded_prompt_panes: HashSet<PaneId>,
+    /// 시작 복원된 터미널 탭들의 대표 칸 큐(상한 64). 초기 Cmd+T로 현재 활성이 `$HOME`이어도 늦게 도착한 데몬 세션을 놓치지 않는다.
+    startup_reconcile_panes: Vec<PaneId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -741,6 +768,28 @@ enum PendingFocus {
 impl Shell {
     /// 저장된 레이아웃으로 시작한다. 없거나 읽을 수 없으면 기본 레이아웃.
     pub fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        Self::new_inner(
+            path,
+            #[cfg(all(test, unix))]
+            None,
+            cx,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn new_with_restore_gate(
+        path: Option<PathBuf>,
+        gate: tokio::sync::oneshot::Receiver<()>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(path, Some(gate), cx)
+    }
+
+    fn new_inner(
+        path: Option<PathBuf>,
+        #[cfg(all(test, unix))] restore_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         if cx.has_global::<gpui_component::Theme>() {
             let mode = match krill_app::settings::current(cx).theme {
                 krill_app::settings::ThemeChoice::Light => gpui_component::ThemeMode::Light,
@@ -1217,6 +1266,7 @@ impl Shell {
             nav_history: NavHistory::default(),
             chat: chat::ChatState::default(),
             expanded_prompt_panes: HashSet::new(),
+            startup_reconcile_panes: Vec::new(),
         };
         // Unexpected entity release still hands the latest state to the
         // app-owned writer before Saver::drop disconnects it.
@@ -1230,15 +1280,29 @@ impl Shell {
         shell.refresh_local_state(cx);
         shell.orch_poll = Some(Self::poll_orchestration(cx));
         if let Some(path) = restore_path {
-            shell.restore_layout(path, cx);
+            shell.restore_layout(
+                path,
+                #[cfg(all(test, unix))]
+                restore_gate,
+                cx,
+            );
         }
         shell
     }
 
     /// Restore without holding the UI executor over filesystem reads or migration.
-    fn restore_layout(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn restore_layout(
+        &mut self,
+        path: PathBuf,
+        #[cfg(all(test, unix))] gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        cx: &mut Context<Self>,
+    ) {
         let baseline = self.layout.clone();
         cx.spawn(async move |this, cx| {
+            #[cfg(all(test, unix))]
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
             let (loaded, writable) = cx
                 .background_executor()
                 .spawn(async move {
@@ -1264,20 +1328,97 @@ impl Shell {
                 if let Some(bounds) = bounds {
                     baseline.set_window_bounds(bounds);
                 }
-                let edited_while_loading = this.layout != baseline;
+                let mut retained_panes = this.files.retained_startup_panes();
+                for (&pane, live) in &this.live {
+                    if live.pane.has_pending_input()
+                        || live.ime.is_composing()
+                        || live.ime.pending().is_some()
+                    {
+                        retained_panes.insert(pane);
+                    }
+                }
+                retained_panes.extend(this.paste_queue.pending_panes());
+                if let Some(rename) = &this.tab_rename {
+                    retained_panes.insert(rename.pane);
+                }
+                let mut retained_tabs = std::collections::BTreeSet::new();
+                if let Some(idx) = this.confirm_close_tab {
+                    retained_tabs.insert(idx);
+                }
+                if let Some((idx, _)) = this.tab_context_menu {
+                    retained_tabs.insert(idx);
+                }
+                match &this.pending_running_close {
+                    Some((PendingRunningClose::Tab(idx), _)) => {
+                        retained_tabs.insert(*idx);
+                    }
+                    Some((PendingRunningClose::Pane(pane), _)) => {
+                        retained_panes.insert(*pane);
+                    }
+                    None => {}
+                }
+                let edited_while_loading = this.layout != baseline
+                    || !retained_panes.is_empty()
+                    || !retained_tabs.is_empty();
                 match loaded {
                     Ok(mut layout) => {
                         if let Some(bounds) = bounds {
                             layout.set_window_bounds(bounds);
                         }
-                        // 로딩 중 사용자가 탭을 열거나 나눴어도 저장된 레이아웃을 버리지 않고 그 위에 합친다
-                        // (ARCHITECTURE §4.1 레이아웃 전체 복원, APP-RUNTIME-004).
+                        let saved_tab_count = layout.tabs().len();
+                        let saved_active = layout.active();
+                        // 로딩 중 사용자가 탭을 열거나 파일·입력·이름 편집을 시작했어도 저장된 레이아웃을 버리지 않고
+                        // 초기 칸 번호를 보존한 채 그 위에 합친다(ARCHITECTURE §4.1, APP-RUNTIME-004).
                         if edited_while_loading {
                             let edited = std::mem::replace(&mut this.layout, layout);
-                            this.layout.absorb_startup_edits(&baseline, &edited);
+                            let tab_map = this.layout.absorb_startup_edits(
+                                &baseline,
+                                &edited,
+                                &retained_panes,
+                                &retained_tabs,
+                            );
+                            this.confirm_close_tab = this
+                                .confirm_close_tab
+                                .and_then(|idx| tab_map.get(&idx).copied());
+                            this.tab_context_menu = this
+                                .tab_context_menu
+                                .and_then(|(idx, pos)| tab_map.get(&idx).map(|&new| (new, pos)));
+                            this.pending_running_close = this
+                                .pending_running_close
+                                .take()
+                                .and_then(|(target, dont_ask)| match target {
+                                    PendingRunningClose::Tab(idx) => tab_map
+                                        .get(&idx)
+                                        .map(|&new| (PendingRunningClose::Tab(new), dont_ask)),
+                                    PendingRunningClose::Pane(pane) => this
+                                        .layout
+                                        .pane_exists(pane)
+                                        .then_some((PendingRunningClose::Pane(pane), dont_ask)),
+                                });
+                            if this
+                                .tab_rename
+                                .as_ref()
+                                .is_some_and(|r| !this.layout.pane_exists(r.pane))
+                            {
+                                this.tab_rename = None;
+                            }
+                            this.shift_closed_tabs_after_restore(saved_tab_count, cx);
                         } else {
                             this.layout = layout;
+                            this.confirm_close_tab = None;
+                            this.tab_context_menu = None;
+                            this.pending_running_close = None;
+                            this.tab_rename = None;
                         }
+                        let layout_ref = &this.layout;
+                        this.titles.retain(|p, _| layout_ref.pane_exists(*p));
+                        this.expanded_prompt_panes
+                            .retain(|p| layout_ref.pane_exists(*p));
+                        this.live.retain(|p, _| layout_ref.pane_exists(*p));
+                        this.creations.retain(|p, _| layout_ref.pane_exists(*p));
+                        this.nav_history.prune_missing_panes(&this.layout);
+                        this.cancel_closed_pastes(cx);
+                        this.enqueue_startup_workspaces(saved_tab_count, saved_active);
                         this.sidebar_collapsed = this.layout.sidebar_collapsed;
                         this.panel_collapsed = this.layout.panel_collapsed;
                         let panel_tab = this.layout.panel_tab;
@@ -3423,6 +3564,7 @@ impl Shell {
                     }
                     changed |= !panes.is_empty();
                     for pane in panes {
+                        self.drop_stale_pastes_for_pane(pane, Some(to), cx);
                         if let Some(live) = self.live.get_mut(&pane) {
                             live.cut();
                             input_notices.extend(live.pane.handoff_account(to));
@@ -3915,10 +4057,15 @@ impl Shell {
         let visible = self.layout.visible();
         self.restore_hidden_sessions(&visible, cx);
         let layout = &self.layout;
+        let paste_queue = &self.paste_queue;
         self.creations.retain(|p, _| layout.pane_exists(*p));
         self.outcome_unknown.retain(|p, _| layout.pane_exists(*p));
         self.live.retain(|p, live| {
-            visible.contains(p) || layout.pane_exists(*p) && live.pane.keep_account_input()
+            visible.contains(p)
+                || layout.pane_exists(*p)
+                    && (live.pane.keep_account_input()
+                        || live.pane.session().is_none()
+                            && (live.pane.has_pending_input() || paste_queue.has_pending_for(*p)))
         });
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
@@ -3947,9 +4094,20 @@ impl Shell {
         if self.paths.is_none() && self.host_targets.is_empty() {
             return;
         }
+        let mut to_connect = visible;
+        for (&pane, live) in &self.live {
+            if !to_connect.contains(&pane)
+                && self.layout.pane_exists(pane)
+                && live.suspended
+                && live.pane.session().is_none()
+                && (live.pane.has_pending_input() || self.paste_queue.has_pending_for(pane))
+            {
+                to_connect.push(pane);
+            }
+        }
         let mut any_terminal = false;
         let mut recovered = false;
-        for p in visible {
+        for p in to_connect {
             if self
                 .layout
                 .session(p)
@@ -3993,13 +4151,26 @@ impl Shell {
                 Entry::Occupied(mut entry) => {
                     let live = entry.get_mut();
                     if live.suspended || live.target.as_ref().is_some_and(|old| old != &target) {
+                        let was_suspended = live.suspended;
+                        if self.layout.session(p).is_none()
+                            && let Some(session) = close::Creation::published(&live.creation)
+                        {
+                            self.layout.set_session(p, session);
+                            recovered = true;
+                        }
                         live.cut();
                         let notice = live.pane.unlink();
                         live.task = Self::spawn_pane(p, target.clone(), None, cx);
                         live.target = Some(target.clone());
                         live.suspended = false;
                         live.error = None;
+                        if was_suspended {
+                            live.born = Instant::now();
+                        }
                         self.show(notice.as_ref(), cx);
+                        if was_suspended {
+                            Self::redraw_after_grace(cx);
+                        }
                     } else if live.target.is_none() {
                         live.target = Some(target);
                     }
@@ -4264,11 +4435,20 @@ impl Shell {
             Err(e) => Err(e),
         };
         let got = got.and_then(|(session, linked, prior_cold)| {
-            if let Some((cold_session, cold)) = prior_cold
-                && let Some(l) = self.live.get_mut(&pane)
-                && !l.pane.is_cold()
-            {
-                l.pane.show_cold(cold_session, cold).ok();
+            let had_session = self
+                .live
+                .get(&pane)
+                .and_then(|l| l.pane.session())
+                .is_some();
+            if let Some((cold_session, cold)) = prior_cold {
+                self.bind_paste_queue_first_session(pane, had_session, cold_session);
+                if let Some(l) = self.live.get_mut(&pane)
+                    && !l.pane.is_cold()
+                {
+                    l.pane.show_cold(cold_session, cold).ok();
+                }
+            } else {
+                self.bind_paste_queue_first_session(pane, had_session, session);
             }
             let fresh = self.layout.session(pane) != Some(session);
             if fresh {
@@ -4343,6 +4523,12 @@ impl Shell {
         cold: krill_proto::control::Cold,
         cx: &mut Context<Self>,
     ) -> Next {
+        let had_session = self
+            .live
+            .get(&pane)
+            .and_then(|l| l.pane.session())
+            .is_some();
+        self.bind_paste_queue_first_session(pane, had_session, session);
         let show = self.live.get_mut(&pane).map(|l| {
             let result = l.pane.show_cold(session, cold);
             (result, l.pane.screen().title.clone())
@@ -4367,7 +4553,8 @@ impl Shell {
             self.save();
             self.refresh_detached(cx);
         }
-        // 읽기 전용 옛 화면이라 낙관적 확정 글자를 지운다(OWE-615 원인 1).
+        // 읽기 전용 옛 화면이라 낙관적 확정 글자와 준비 중·확인 대기 붙여넣기를 지운다(OWE-615 원인 1, APP-RUNTIME-003).
+        self.drop_stale_pastes_for_pane(pane, None, cx);
         if let Some(l) = self.live.get_mut(&pane) {
             l.ime.clear_pending();
             l.error = self.outcome_unknown.get(&pane).cloned();
@@ -4388,6 +4575,7 @@ impl Shell {
     ///
     /// 잠정 결정 의존: OWE-397 [MK-032] 콜드 복원 뷰. 거부되면 이 함수를 새 세션 생성으로 되돌린다.
     fn restart(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.drop_stale_pastes_for_pane(pane, None, cx);
         if let Some(target) = self
             .target_for_pane(pane)
             .filter(|_| self.layout.visible().contains(&pane))
@@ -4402,6 +4590,9 @@ impl Shell {
                 .or_else(|| self.layout.session(pane));
             let task = Self::spawn_pane(pane, target.clone(), old, cx);
             if let Some(l) = self.live.get_mut(&pane) {
+                if l.pane.session().is_none() {
+                    l.pane = pane::Pane::default();
+                }
                 l.error = None;
                 l.ime.clear_pending();
                 l.task = task;
@@ -4430,16 +4621,20 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Next {
         self.start_pane_liveness(cx);
-        let Some(l) = self.live.get_mut(&pane) else {
+        let Some(had_session) = self.live.get(&pane).map(|l| l.pane.session().is_some()) else {
             return Next::Gone;
         };
+        self.bind_paste_queue_first_session(pane, had_session, session);
         self.outcome_unknown.remove(&pane);
-        l.error = None;
         if let Some(launch) = &linked.launch
             && self.layout.host(pane).is_local()
         {
             krill_app::onboarding::actions::note_agent_session(&launch.profile, cx);
         }
+        let Some(l) = self.live.get_mut(&pane) else {
+            return Next::Gone;
+        };
+        l.error = None;
         l.launch = linked.launch;
         l.sock = linked.reader.try_clone().ok();
         let notices = l.pane.link(
@@ -4461,6 +4656,7 @@ impl Shell {
         for n in &notices {
             self.show(Some(n), cx);
         }
+        self.drain_paste_queue(cx);
         cx.notify();
         Next::Read(linked.reader)
     }
@@ -4650,7 +4846,7 @@ impl Shell {
             cx.notify();
             return true;
         }
-        let Some(l) = self.live.get_mut(&pane) else {
+        let Some(l) = self.ensure_input_live(pane) else {
             return false;
         };
         l.clear_selection();
@@ -4659,6 +4855,30 @@ impl Shell {
         self.show(n.as_ref(), cx);
         cx.notify();
         n.is_none()
+    }
+
+    fn is_terminal_pane(&self, pane: PaneId) -> bool {
+        self.layout.pane_exists(pane) && self.layout.file(pane).is_none()
+    }
+
+    /// 세션 연결이 시작되기 전(`layout_loading` 중이거나 `target` 준비 전)에도 보이는 터미널 칸의
+    /// 키·IME·붙여넣기 입력을 저널·큐에 보관할 수 있게 보류(`suspended = true`) 상태의 [`Live`]를 만든다.
+    fn ensure_input_live(&mut self, pane: PaneId) -> Option<&mut Live> {
+        if !self.is_terminal_pane(pane) {
+            return None;
+        }
+        if !self.live.contains_key(&pane) {
+            let mut live = Live::new(Task::ready(()));
+            live.suspended = true;
+            live.creation = Arc::clone(self.creations.entry(pane).or_default());
+            self.live.insert(pane, live);
+        }
+        self.live.get_mut(&pane)
+    }
+
+    fn ensure_focused_input_live(&mut self) -> Option<&mut Live> {
+        let pane = self.layout.focused()?;
+        self.ensure_input_live(pane)
     }
 
     fn focused_live(&mut self) -> Option<&mut Live> {
@@ -4775,11 +4995,18 @@ impl Shell {
         }
         // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·←·→만 Ctrl+U·A·E로 보낸다.
         let ks = &e.keystroke;
-        let Some(l) = self.focused_live() else { return };
+        let Some(pane) = self.layout.focused().filter(|&p| self.is_terminal_pane(p)) else {
+            return;
+        };
+        let (composing, modes) = self
+            .live
+            .get(&pane)
+            .map_or((false, krill_proto::term_modes::Modes::default()), |l| {
+                (l.ime.is_composing(), l.pane.modes())
+            });
         ime_trace(format_args!(
-            "key_down {ks:?} held={} composing={}",
+            "key_down {ks:?} held={} composing={composing}",
             e.is_held,
-            l.ime.is_composing()
         ));
         let event = if e.is_held {
             keys::tui::Event::Repeat
@@ -4787,10 +5014,12 @@ impl Shell {
             keys::tui::Event::Press
         };
         let meta = krill_app::settings::option_as_meta(cx);
-        let Some(bytes) =
-            keys::tui::key(ks, l.pane.modes(), event).or_else(|| keys::tui::meta(ks, meta))
+        let Some(bytes) = keys::tui::key(ks, modes, event).or_else(|| keys::tui::meta(ks, meta))
         else {
             return; // 글자 키는 IME 확정 텍스트(replace_text_in_range)로 온다
+        };
+        let Some(l) = self.ensure_input_live(pane) else {
+            return;
         };
         // 조합 중 Backspace·방향키 등은 IME가 `handleEvent:` 안에서 먼저 처리하고, 처리했으면
         // `doCommandBySelector:`가 오지 않아 여기까지 오지 않는다. 여기 온 키는 IME가 처리하지
@@ -4799,7 +5028,7 @@ impl Shell {
         // 삭제·이동·전송 뒤 내용은 예측할 수 없다. 확정 글자를 계속 덧그리면
         // PTY에서는 지운 글자가 화면에 남으므로 이후에는 실제 그리드를 따른다.
         l.ime.clear_pending();
-        out.pty = keys::tui::text(&out.pty, l.pane.modes());
+        out.pty = keys::tui::text(&out.pty, modes);
         out.pty.extend(bytes);
         self.send_in_key(&out, Some(window), cx);
         cx.stop_propagation();
@@ -7898,7 +8127,19 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.start_pane_liveness(cx);
-        let mut l = Live::new(Task::ready(()));
+        let had_session = self
+            .live
+            .get(&pane)
+            .and_then(|l| l.pane.session())
+            .is_some();
+        self.bind_paste_queue_first_session(pane, had_session, session);
+        let creation = Arc::clone(self.creations.entry(pane).or_default());
+        let l = self.live.entry(pane).or_insert_with(|| {
+            let mut live = Live::new(Task::ready(()));
+            live.creation = creation;
+            live
+        });
+        l.suspended = false;
         l.pane.link(
             session,
             1,
@@ -7906,7 +8147,7 @@ impl Shell {
             krill_proto::input::FEAT_INPUT,
             Now::get(),
         );
-        self.live.insert(pane, l);
+        self.drain_paste_queue(cx);
         cx.notify();
     }
 }
@@ -7936,7 +8177,14 @@ impl EntityInputHandler for Shell {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let range = self.focused_live()?.ime.selected_range_utf16();
+        let pane = self
+            .layout
+            .focused()
+            .filter(|&p| self.is_terminal_pane(p))?;
+        let range = self
+            .live
+            .get(&pane)
+            .map_or(0..0, |l| l.ime.selected_range_utf16());
         ime_trace(format_args!("selectedRange -> {range:?}"));
         Some(UTF16Selection {
             range,
@@ -7958,8 +8206,9 @@ impl EntityInputHandler for Shell {
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         ime_trace(format_args!("unmarkText"));
         let Some(l) = self.focused_live() else { return };
+        let modes = l.pane.modes();
         let mut out = l.ime.unmark();
-        out.pty = keys::tui::text(&out.pty, l.pane.modes());
+        out.pty = keys::tui::text(&out.pty, modes);
         self.send(&out, Some(window), cx);
     }
 
@@ -7971,9 +8220,15 @@ impl EntityInputHandler for Shell {
         cx: &mut Context<Self>,
     ) {
         ime_trace(format_args!("insertText {text:?} replace={range:?}"));
-        let Some(l) = self.focused_live() else { return };
+        if text.is_empty() && self.focused_live().is_none() {
+            return;
+        }
+        let Some(l) = self.ensure_focused_input_live() else {
+            return;
+        };
+        let modes = l.pane.modes();
         let mut out = l.ime.insert(text);
-        out.pty = keys::tui::text(&out.pty, l.pane.modes());
+        out.pty = keys::tui::text(&out.pty, modes);
         self.send(&out, Some(window), cx);
     }
 
@@ -7988,7 +8243,12 @@ impl EntityInputHandler for Shell {
         ime_trace(format_args!(
             "setMarkedText {new_text:?} sel={new_selected_range:?} replace={range:?}"
         ));
-        let Some(l) = self.focused_live() else { return };
+        if new_text.is_empty() && self.focused_live().is_none() {
+            return;
+        }
+        let Some(l) = self.ensure_focused_input_live() else {
+            return;
+        };
         l.ime.set_marked(new_text, new_selected_range);
         cx.notify();
     }

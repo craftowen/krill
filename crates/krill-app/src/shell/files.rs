@@ -278,6 +278,14 @@ impl Default for Files {
 }
 
 impl Files {
+    pub(super) fn retained_startup_panes(&self) -> std::collections::BTreeSet<PaneId> {
+        self.tabs
+            .keys()
+            .chain(self.loading.keys())
+            .copied()
+            .collect()
+    }
+
     pub(super) fn close_quick_open(&mut self) {
         self.quick_open = None;
         self.quick_generation = self.quick_generation.wrapping_add(1);
