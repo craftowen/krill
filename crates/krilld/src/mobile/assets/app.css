@@ -653,3 +653,34 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 #mobile-app .session .command-dock>.accessory-row>.live-focus-target:focus-visible{outline:2px solid var(--foreground);outline-offset:-2px}
 
 #mobile-app .session .command-dock>.accessory-row>.live-focus-target[aria-pressed=true]{background:var(--surface-raised);color:var(--foreground)}
+
+/* Installed command discovery shares the saved quick-action controls. */
+.quick-actions-header{flex-wrap:wrap}
+.quick-catalog{display:flex;flex-direction:column;gap:var(--space-sm);min-width:0}
+.quick-catalog>.quick-actions-header{align-items:center;justify-content:space-between}
+.quick-catalog>.quick-actions-header>strong{flex:1;min-width:0;overflow-wrap:anywhere}
+.quick-catalog>label{display:flex;flex-direction:column;gap:var(--space-sm);min-width:0;font-size:var(--font-meta)}
+.quick-catalog>label>select,.quick-catalog-search{width:100%;min-width:0}
+.quick-catalog-status{min-height:3em;font-size:var(--font-meta)}
+.quick-catalog .quick-action-card>button{min-height:44px;max-width:40%;flex:none;white-space:normal;overflow-wrap:anywhere;padding:var(--space-sm)}
+.quick-catalog .quick-action-insert p{padding:0;font-size:var(--font-meta);overflow-wrap:anywhere}
+
+/* Keep discovery beside the draft, using the shared mobile tokens. */
+.chat-composer-box{position:relative}
+.chat-composer-suggestions{position:absolute;inset-inline:0;bottom:calc(100% + var(--space-sm));z-index:3;max-height:min(42dvh,22rem);overflow:auto;overscroll-behavior:contain;padding:var(--space-sm);border:1px solid var(--border);border-radius:var(--radius-card);background:var(--surface-panel);color:var(--foreground);font-size:var(--font-meta)}
+.chat-composer-suggestions>.chat-actions{justify-content:space-between;flex-wrap:nowrap;min-height:var(--touch-target)}
+.chat-composer-suggestions>p{padding:var(--space-sm)}
+.chat-composer-options{display:flex;flex-direction:column}
+.chat-composer-option{width:100%;min-height:var(--touch-target);display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:var(--space-xs);padding:var(--space-sm);border-radius:var(--radius-row);text-align:start;overflow-wrap:anywhere}
+.chat-composer-option[aria-selected=true]{background:var(--surface-raised)}
+.chat-composer-option-label{font-family:var(--font-mono);color:var(--foreground)}
+.chat-composer-option>.muted{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+/* Reserve activity/acknowledgement height before asynchronous state changes. */
+.chat-view>.chat-live-strip{height:36px;min-height:36px;flex:none}
+.chat-view>.chat-live-strip[hidden]{display:flex!important;visibility:hidden}
+.chat-send-receipt{height:24px;min-height:24px;line-height:24px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted-foreground);font-size:var(--font-meta)}
+.chat-send-receipt[hidden]{display:block!important;visibility:hidden}
+.chat-live-strip>[data-state=Done]{color:var(--status-done)}
+.chat-live-strip>[data-state=Offline]{color:var(--muted-foreground)}
+
+#mobile-app .chat-composer-bar>.composer-pill{min-width:0;max-width:calc(100% - 112px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

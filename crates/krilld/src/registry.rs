@@ -2579,6 +2579,28 @@ impl Registry {
         self.session_screen_and_bracketed_paste(id).1
     }
 
+    /// An existing live tap only; mobile model control must never spawn/resume a replacement.
+    pub(crate) fn mobile_composer_tap(&self, id: SessionId) -> io::Result<Tap> {
+        let state = lock(&self.state);
+        let entry = state.sessions.get(&id).ok_or(io::ErrorKind::NotFound)?;
+        if state.exited.contains_key(&id)
+            || entry.session.is_closed()
+            || self.agents.account_binding_retiring(id)
+            || matches!(
+                self.status.get(id).state,
+                control::AgentState::Working
+                    | control::AgentState::Waiting
+                    | control::AgentState::Blocked
+                    | control::AgentState::Exited
+            )
+        {
+            return Err(io::Error::other(
+                "Wait for the running agent to become idle",
+            ));
+        }
+        Ok(entry.session.tap())
+    }
+
     /// 활성 세션의 현재 평문 화면과 Bracketed Paste 모드 여부를 함께 반환한다(OWE-944·OWE-946).
     pub(crate) fn session_screen_and_bracketed_paste(&self, id: SessionId) -> (String, bool) {
         let st = lock(&self.state);

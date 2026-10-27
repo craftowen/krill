@@ -927,6 +927,15 @@ impl Tap {
         input::write_input(self, bytes, peer)
     }
 
+    pub(crate) fn guarded_command(
+        &self,
+        revision: u64,
+        command: &[u8],
+        accepts: impl Fn(&Screen, bool) -> bool,
+    ) -> io::Result<()> {
+        input::guarded_command(self, revision, command, accepts)
+    }
+
     /// 입력 연결이 프레임 사이에서 닫혀도 열린 붙여넣기의 종료 표지를 보충한다.
     pub(crate) fn finish_input(&self) {
         input::finish_input(self);
