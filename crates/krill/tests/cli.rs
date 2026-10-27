@@ -1679,3 +1679,176 @@ fn search_literal_help_queries_an_isolated_daemon() {
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(report["hits"], serde_json::json!([]));
 }
+
+/// foundation-02: 1MiB 프레임을 넘는 유효 orchestration 상태의 온라인 읽기(페이지 스냅샷·N-1 fallback).
+mod orchestration_frame_bound {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc::{ClientHello, FEATURES, PROTO_MAX, PROTO_MIN, ServerHello, read_frame};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore, frame_limit_error,
+    };
+
+    /// 검증자 재현과 같은 fixture: 활성 task 12개 × 100,000B 설명(1.2MB JSON, 1MiB 프레임 초과)을
+    /// 실제 holder/krilld 아래의 온라인 CLI가 디스크와 바이트 동일하게 읽는다.
+    #[test]
+    fn oversized_orchestration_state_lists_online_identically_to_disk() {
+        let d = Daemon::new("orch-paged");
+        let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "run-create",
+            "--title",
+            "verify_core independent synthetic snapshot",
+            "--json",
+        ]))
+        .unwrap();
+        let run = run["id"].as_str().unwrap();
+        let descriptions: Vec<String> = (0..12_u8)
+            .map(|i| String::from_utf8(vec![b'A' + i; 100_000]).unwrap())
+            .collect();
+        for (i, description) in descriptions.iter().enumerate() {
+            d.ok(&[
+                "orchestration",
+                "task-create",
+                "--run",
+                run,
+                "--title",
+                &format!("fixture-{i}"),
+                "--desc",
+                description,
+            ]);
+        }
+        let state = fs::metadata(d.dir.join("orchestration.json"))
+            .unwrap()
+            .len();
+        assert!(state > 1 << 20 && state <= 2 << 20, "{state} bytes");
+        let online: Vec<serde_json::Value> =
+            serde_json::from_str(&d.ok(&["orchestration", "task-list", "--run", run, "--json"]))
+                .unwrap();
+        let disk = OrchestrationStore::load(&d.dir).unwrap();
+        assert_eq!(online.len(), 12);
+        assert_eq!(disk.tasks.len(), 12);
+        for ((task, expected), stored) in online.iter().zip(&descriptions).zip(&disk.tasks) {
+            assert_eq!(task["description"].as_str().unwrap(), expected);
+            assert_eq!(&stored.description, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(&disk.tasks).unwrap(),
+            serde_json::Value::Array(online)
+        );
+        d.ok(&["orchestration", "run-list", "--json"]);
+        d.ok(&["orchestration", "worker-list", "--json"]);
+        let inbox: Vec<serde_json::Value> =
+            serde_json::from_str(&d.ok(&["orchestration", "inbox", "--all", "--json"])).unwrap();
+        assert!(inbox.is_empty());
+    }
+
+    /// 페이지 스냅샷을 모르는 구(N-1) 로컬 데몬이 단일 프레임을 못 보내면(이전 빌드: EOF, 현재 빌드:
+    /// 프레임 상한 명시 오류) 로컬 CLI는 데몬이 읽는 바로 그 orchestration.json을 읽기 전용으로 읽는다.
+    #[test]
+    fn prior_local_daemon_snapshot_overflow_falls_back_to_disk_read_only() {
+        for explicit in [false, true] {
+            let tag = if explicit {
+                "orch-n1-error"
+            } else {
+                "orch-n1-eof"
+            };
+            let dir = std::env::temp_dir().join(format!("mk045-{}-{tag}", std::process::id()));
+            fs::remove_dir_all(&dir).ok();
+            fs::create_dir_all(dir.join("run")).unwrap();
+            let mut store = OrchestrationStore::default();
+            let run = store.create_run("prior daemon", None).unwrap();
+            store
+                .create_task(&run.id, "visible-from-disk", "", vec![])
+                .unwrap();
+            store.save(&dir).unwrap();
+            let before = fs::read(dir.join("orchestration.json")).unwrap();
+            let (listener, stop, server) = prior_daemon(&dir, explicit);
+            let out = Command::new(MK)
+                .args(["orchestration", "task-list", "--json"])
+                .env("KRILL_STATE_DIR", &dir)
+                .output()
+                .unwrap();
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            drop(listener);
+            assert!(
+                out.status.success(),
+                "{tag}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(tasks.len(), 1, "{tag}");
+            assert_eq!(tasks[0]["title"], "visible-from-disk");
+            assert_eq!(
+                fs::read(dir.join("orchestration.json")).unwrap(),
+                before,
+                "{tag}: fallback must be read-only"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `FEAT_ORCH_SNAPSHOT_PAGE`를 모르는 데몬 흉내. 연결마다 Hello를 마친 뒤 첫 요청(`SnapshotV2`)에
+    /// EOF(이전 빌드) 또는 프레임 상한 명시 오류(현재 빌드)로 답한다.
+    fn prior_daemon(
+        dir: &Path,
+        explicit: bool,
+    ) -> (Arc<UnixListener>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = Arc::new(UnixListener::bind(dir.join("run/krilld.sock")).unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let listener = Arc::clone(&listener);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            thread::spawn(move || serve_prior(socket, explicit));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        (listener, stop, server)
+    }
+
+    fn serve_prior(mut socket: UnixStream, explicit: bool) {
+        socket.set_nonblocking(false).ok();
+        socket.set_read_timeout(Some(WAIT)).ok();
+        let hello = ServerHello {
+            proto_min: PROTO_MIN,
+            proto_max: PROTO_MAX,
+            features: FEATURES & !FEAT_ORCH_SNAPSHOT_PAGE,
+            build: "prior-daemon-fixture".into(),
+            instance_id: 7,
+        };
+        if socket.write_all(&hello.encode().unwrap()).is_err() {
+            return;
+        }
+        let Ok(Some((kind, body))) = read_frame(&mut socket) else {
+            return;
+        };
+        ClientHello::decode(kind, &body).unwrap();
+        while let Ok(Some((kind, body))) = read_frame(&mut socket) {
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Orchestration(OrchAction::SnapshotV2)
+            ));
+            if !explicit {
+                return; // 이전 빌드: 인코딩 실패로 응답 없이 스트림을 닫는다.
+            }
+            let reply = Reply::Orchestration(OrchResponse::Error(frame_limit_error(1_204_357)));
+            socket.write_all(&reply.encode().unwrap()).unwrap();
+        }
+    }
+}
