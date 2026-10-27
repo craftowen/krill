@@ -1841,16 +1841,29 @@ impl OrchestrationStore {
             }
         };
         let Some(mut delivery) = delivery else {
-            let history = if unread_only {
+            let mut history: Vec<OrchMessage> = if unread_only {
                 Vec::new()
             } else {
-                self.messages
+                // 확인済み 이력도 응답 하나가 프레임에 드는 만큼만 돌려준다(건수 50 + 바이트 예산). 홀로도
+                // 안 드는 레거시 메시지는 본문을 자르지 않고 건너뛴다(페이지 스냅샷으로 읽는다).
+                let acked: Vec<&OrchMessage> = self
+                    .messages
                     .iter()
-                    .filter(|m| m.acked && matches(m))
+                    .filter(|m| m.acked && matches(m) && wire_len(m) <= MAX_SINGLE_DELIVERY_BYTES)
                     .take(50)
-                    .cloned()
-                    .collect()
+                    .collect();
+                let fit = fits_in_delivery(acked.iter().copied());
+                acked.iter().take(fit).map(|m| (*m).clone()).collect()
             };
+            // 메타데이터를 포함한 최종 응답 검사: 안 들어가면 뒤쪽 메시지를 빼지, 본문을 자르지 않는다.
+            while !history.is_empty()
+                && !response_fits_frame(&OrchResponse::Delivery {
+                    delivery: None,
+                    messages: history.clone(),
+                })
+            {
+                history.pop();
+            }
             return Ok((None, history));
         };
         // 응답이 한 프레임에 들어가는 앞머리만 전달·확인한다. 넘치는 나머지(바이트 예산 도입 전의
@@ -6008,6 +6021,49 @@ mod frame_bound_tests {
         assert_eq!(seen.len(), 40);
         assert!(batches >= 3, "{batches}");
         assert!(store.messages.iter().all(|m| m.acked));
+    }
+
+    #[test]
+    fn acknowledged_history_reply_is_byte_bounded_and_keeps_durable_bodies() {
+        let mut store = unacked(40, 32 * 1024);
+        let (_, seen) = drain(&mut store);
+        assert_eq!(seen.len(), 40);
+        // 예산 도입 전에 확인된 1.1MB 레거시 메시지: 이력에서 건너뛰고 본문은 그대로 둔다.
+        store.messages.push(OrchMessage {
+            id: "msg-big-acked".into(),
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+            from: "worker".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Status,
+            summary: "big".into(),
+            body: "y".repeat(1_100_000),
+            reply_to: None,
+            acked: true,
+            created_at_ms: 1,
+        });
+        let before = store.clone();
+        // 기본 `check`(미확인 전용 아님)는 확인済み 이력을 돌려주며, 한 프레임에 들어가야 한다.
+        let (delivery, history) = store
+            .check_delivery(Some("coordinator"), &[], false, false, None, None)
+            .unwrap();
+        assert!(delivery.is_none());
+        assert!(
+            !history.is_empty() && history.len() < 40,
+            "{}",
+            history.len()
+        );
+        assert!(history.iter().all(|m| m.acked && m.id != "msg-big-acked"));
+        let reply = Reply::Orchestration(OrchResponse::Delivery {
+            delivery: None,
+            messages: history,
+        });
+        assert!(reply.encode().unwrap().len() <= MAX_FRAME.saturating_add(4));
+        assert_eq!(
+            store, before,
+            "history reads never mutate or truncate durable bodies"
+        );
     }
 
     #[test]
