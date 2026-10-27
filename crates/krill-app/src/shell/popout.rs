@@ -2193,6 +2193,18 @@ impl SidebarCard {
 
 type PreviewMap = std::collections::BTreeMap<(krill_app::hosts::HostId, SessionId), String>;
 
+/// Keep animation ticks local to the glyph instead of notifying the whole dashboard.
+struct DashboardStatus {
+    state: AgentState,
+    unread: bool,
+}
+
+impl Render for DashboardStatus {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui::status::status_glyph(self.state, self.unread, ui::status::Size::Sm, cx)
+    }
+}
+
 pub(crate) struct Dashboard {
     owner: WeakEntity<Shell>,
     sidebar: Entity<sidebar::Sidebar>,
@@ -2615,12 +2627,10 @@ impl Render for Dashboard {
                                                             .font_weight(title_weight)
                                                             .child(name),
                                                     )
-                                                    .child(ui::status::status_glyph(
+                                                    .child(cx.new(|_| DashboardStatus {
                                                         state,
                                                         unread,
-                                                        ui::status::Size::Sm,
-                                                        cx,
-                                                    )),
+                                                    })),
                                             )
                                             .when_some(screen.clone(), |d, screen| {
                                                 d.child(
