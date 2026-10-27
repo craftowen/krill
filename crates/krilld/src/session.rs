@@ -12,7 +12,10 @@
 //!   넣고 구독자를 깨운다([`Tap`]). 깨우기만 하고 기다리지 않는다. 디스크에 먼저 쓰므로 링에서 밀려난 원본은
 //!   (기록했다면) 디스크에 있다.
 //! - krilld 간 인계([`crate::rejoin`]): [`halt`]가 이 프로세스의 리더를 모두 읽기 경계에서 멈추고 세그먼트를 봉인한다.
-//!   멈춘 리더는 세션을 닫힌 것으로 알리지 않는다(세션은 다음 krilld가 이어 읽는다).
+//!   멈춘 리더는 세션을 닫힌 것으로 알리지 않는다(세션은 다음 krilld가 이어 읽는다). 업그레이드가 인계 전에 중단되면
+//!   [`end_halt`]가 멈춘 세션마다 같은 엔진·master로 새 리더를 띄운다(PTY를 읽는 스레드는 늘 하나).
+//! - Windows PTY 쓰기(질의 응답·입력)는 세션별 writer 스레드가 한다(`windows::Writer`): 엔진 잠금은 가득 찬
+//!   파이프를 기다리지 않고, 막힌 `WriteFile`은 `CancelSynchronousIo`로 끊는다(daemon-02).
 //! - 숨긴 세션 강등(MK-035): 화면 구독자([`Viewer`])가 없는 채로 [`PARK_GRACE`]가 지나면 엔진의 핫 스크롤백·파서
 //!   버퍼를 돌려준다(화면·모드는 유지). 구독자가 생기면 바로 다시 쌓는다. 버린 행은 세그먼트 콜드 페이지로 읽으므로
 //!   디스크에 기록하지 않는 세션은 강등하지 않는다.
@@ -30,7 +33,7 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -68,8 +71,14 @@ pub(crate) const RING: usize = 256 * 1_024;
 /// 화면 구독자가 모두 떠난 뒤 강등까지 기다리는 시간. 탭을 오가는 동안 강등·복원이 반복되지 않게 한다.
 pub const PARK_GRACE: Duration = Duration::from_secs(10);
 
-/// [`halt`] 이후 리더는 읽지 않고 끝난다.
+/// [`halt`] 이후 리더는 읽지 않고 끝난다. [`end_halt`]가 되돌린다(업그레이드 중단).
 static HALTED: AtomicBool = AtomicBool::new(false);
+/// 리더의 '멈춘다' 결정과 [`end_halt`]의 되돌리기를 직렬화한다. 결정한 리더는 세션에 표시(`Shared::halted`)를 남기고,
+/// 되돌리기는 표시가 있는 세션만 새 리더로 잇는다(이중 리더 없음, 리더 없는 세션 없음).
+static HALT_GATE: Mutex<()> = Mutex::new(());
+/// 이 프로세스의 세션 전부(약한 참조). [`end_halt`]가 레지스트리와 무관하게 멈춘 리더를 찾는다
+/// (레지스트리에 넣기 전에 멈춘 새 세션도 놓치지 않는다).
+static SESSIONS: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
 /// 리더가 master와 함께 poll하는 파이프(읽는 쪽, 쓰는 쪽). [`halt`]가 한 바이트를 쓰고 아무도 읽지 않아 모든 리더의
 /// poll이 깨어 있는 채로 남는다. 프로세스에 하나.
 #[cfg(unix)]
@@ -95,7 +104,10 @@ pub(crate) mod pty {
 
     pub(super) fn halt_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         let (r, w) = io::pipe()?;
-        Ok((r.into(), w.into()))
+        let r = OwnedFd::from(r);
+        // 되돌리기([`super::end_halt`])가 깨우기 바이트를 막히지 않고 비운다.
+        nonblocking(&r)?;
+        Ok((r, w.into()))
     }
 
     pub(super) fn nonblocking(master: &OwnedFd) -> io::Result<()> {
@@ -125,25 +137,108 @@ pub(crate) mod pty {
     }
 }
 
-/// 이 프로세스의 PTY 리더를 모두 멈춘다(krilld 간 인계). 리더는 읽은 묶음을 기록까지 마친 뒤 세그먼트를 봉인하고
-/// 끝난다. 되돌릴 수 없다. 끝났는지는 [`Session::is_closed`]로 본다.
-#[cfg_attr(
-    windows,
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "Unix halt can fail creating/writing its wake pipe"
-    )
-)]
-pub(crate) fn halt() -> io::Result<()> {
+/// 이 프로세스의 PTY 리더를 모두 멈춘다(krilld 간 인계·업그레이드). 리더는 읽은 묶음을 기록까지 마친 뒤 세그먼트를
+/// 봉인하고 끝난다. 끝났는지는 [`Session::is_closed`]로 본다. 업그레이드가 인계 전에 중단되면 [`end_halt`]로 되돌린다.
+/// Windows는 파이프 워커 취소를 `deadline`까지 반복하고 그 뒤는 `TimedOut`이다(Unix는 `deadline`을 쓰지 않는다).
+pub(crate) fn halt(deadline: Instant) -> io::Result<()> {
     HALTED.store(true, Ordering::SeqCst);
     #[cfg(unix)]
     {
+        let _ = deadline;
         let (_, w) = halt_pipe()?;
         write(w, &[0])?;
     }
     #[cfg(windows)]
-    windows::halt();
+    windows::halt(deadline)?;
     Ok(())
+}
+
+/// 리더가 멈출지 결정한다. 멈추면 세션에 표시한다([`end_halt`]가 이 표시로 새 리더를 띄운다).
+fn halt_decided(shared: &Shared) -> bool {
+    if !HALTED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let _gate = lock(&HALT_GATE);
+    let halted = HALTED.load(Ordering::SeqCst);
+    if halted {
+        shared.halted.store(true, Ordering::SeqCst);
+    }
+    halted
+}
+
+/// [`halt`]를 되돌린다(업그레이드가 인계 전에 중단됐을 때, daemon-04). 멈춘 리더가 있던 세션마다 같은 엔진·master로
+/// 새 리더를 띄워 봉인한 세그먼트 끝에서 이어 기록한다. 아직 멈추지 않은 리더는 그대로 계속 읽는다(두 번째 리더를
+/// 띄우지 않는다). 다시 띄우지 못한 세션 수를 돌려준다.
+pub(crate) fn end_halt() -> usize {
+    let halted: Vec<Arc<Shared>> = {
+        let _gate = lock(&HALT_GATE);
+        #[cfg(unix)]
+        if let Ok((r, _)) = halt_pipe() {
+            // 깨우기 바이트를 비운다(HALTED를 내리기 전에: 그 뒤 poll이 계속 깨어 있으면 리더가 공회전한다).
+            let mut sink = [0u8; 64];
+            while read(r, &mut sink).is_ok_and(|n| n > 0) {}
+        }
+        HALTED.store(false, Ordering::SeqCst);
+        let mut sessions = lock(&SESSIONS);
+        sessions.retain(|s| s.strong_count() != 0);
+        sessions
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|s| s.halted.swap(false, Ordering::SeqCst))
+            .collect()
+    };
+    let mut failed = 0;
+    for shared in halted {
+        if let Err(e) = resume(&shared) {
+            failed += 1;
+            tracing::warn!(session = shared.id.0, kind = ?e.kind(), "halted pty reader did not resume");
+        }
+    }
+    failed
+}
+
+/// 멈춘 리더를 같은 엔진·master로 잇는다. 이전 리더가 봉인을 마치고 끝난 뒤에 띄운다(PTY를 읽는 스레드는 늘 하나).
+fn resume(shared: &Arc<Shared>) -> io::Result<()> {
+    let mut reader = lock(&shared.reader);
+    if let Some(old) = reader.take() {
+        old.join().ok();
+    }
+    let (seq, size) = {
+        let live = shared.live();
+        (live.seq, live.size)
+    };
+    let rec = match shared
+        .store
+        .as_ref()
+        .map(|store| store.recorder(shared.id, size))
+    {
+        None => None,
+        Some(Ok(rec)) if rec.seq() == seq => Some(rec),
+        // 봉인 끝이 엔진 seq보다 앞이면(기록 실패 뒤) 디스크에 없는 구간을 Gap으로 표시하고 잇는다.
+        Some(Ok(rec)) if rec.seq() < seq => Some(rec.recover_after_panic(seq, size)?),
+        Some(Ok(_)) => {
+            tracing::warn!(
+                session = shared.id.0,
+                "recorder ahead of engine; resuming without recording"
+            );
+            None
+        }
+        Some(Err(e)) => {
+            tracing::warn!(session = shared.id.0, kind = ?e.kind(), "recorder unavailable; resuming without recording");
+            None
+        }
+    };
+    *reader = Some(spawn_reader(Arc::clone(shared), rec, None)?);
+    Ok(())
+}
+
+/// 리더가 끝난 이유.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exit {
+    /// 슬레이브가 모두 닫혔다(세션 종료).
+    Eof,
+    /// [`halt`]로 멈췄다(세션은 살아 있다).
+    Halted,
 }
 
 /// 엔진이 panic해서 화면에 반영하지 못한 원본 바이트 구간(`start`는 세션 시작부터 읽은 바이트 수).
@@ -214,6 +309,13 @@ struct Shared {
     master: Master,
     #[cfg(windows)]
     holder: Option<Arc<crate::holder::Holder>>,
+    /// PTY 입력 쓰기 스레드(daemon-02). 질의 응답은 큐에 넣기만 하고, 입력은 완료·취소를 기다린다.
+    #[cfg(windows)]
+    writer: windows::Writer,
+    /// 리더가 [`halt`]로 멈췄다([`halt_decided`]). [`end_halt`]가 내리고 새 리더를 띄운다.
+    halted: AtomicBool,
+    /// PTY 리더 스레드. [`end_halt`]가 멈춘 리더를 새 스레드로 바꾼다.
+    reader: Mutex<Option<JoinHandle<io::Result<Exit>>>>,
     look: Arc<Appearance>,
     out: Mutex<Out>,
     changed: Condvar,
@@ -291,7 +393,6 @@ impl Drop for Viewer {
 pub struct Session {
     id: SessionId,
     shared: Arc<Shared>,
-    reader: JoinHandle<io::Result<()>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -314,10 +415,8 @@ impl Session {
     ) -> io::Result<Self> {
         #[cfg(unix)]
         pty::nonblocking(&master)?;
-        #[cfg(unix)]
-        let halt = halt_pipe()?.0.as_fd();
         #[cfg(windows)]
-        let pipe = windows::Reader::start(&master)?;
+        let writer = windows::Writer::start(&master)?;
         // krilld가 재기동했으면 seq는 디스크 마지막 세그먼트 끝에서 이어진다.
         let seq = rec.as_ref().map_or(0, Recorder::seq);
         let shared = Arc::new(Shared {
@@ -345,6 +444,10 @@ impl Session {
             master,
             #[cfg(windows)]
             holder,
+            #[cfg(windows)]
+            writer,
+            halted: AtomicBool::new(false),
+            reader: Mutex::new(None),
             look,
             out: Mutex::new(Out {
                 ring: VecDeque::new(),
@@ -359,34 +462,15 @@ impl Session {
                 .filter(|r| r.store().recording())
                 .map(|r| Arc::clone(r.store())),
         });
-        let reader = thread::Builder::new()
-            .name(format!("pty-{}", id.0))
-            .spawn({
-                let shared = Arc::clone(&shared);
-                move || {
-                    crate::alloc::mobile_thread().ok();
-                    if let Some(r) = &rec {
-                        rebuild(&shared, r, size);
-                    }
-                    #[cfg(unix)]
-                    let source = halt;
-                    #[cfg(windows)]
-                    let source = pipe;
-                    let r = read_loop(&shared, source, rec);
-                    if !HALTED.load(Ordering::SeqCst)
-                        && panic::catch_unwind(AssertUnwindSafe(|| {
-                            shared.publish(&[], 0, true);
-                        }))
-                        .is_err()
-                    {
-                        tracing::warn!("pty close publish panicked");
-                    }
-                    r
-                }
-            })?;
+        {
+            let mut sessions = lock(&SESSIONS);
+            sessions.retain(|s| s.strong_count() != 0);
+            sessions.push(Arc::downgrade(&shared));
+        }
+        *lock(&shared.reader) = Some(spawn_reader(Arc::clone(&shared), rec, Some(size))?);
         // 아무도 붙지 않은 채 시작한 세션(CLI 생성·krilld 재기동)도 같은 규칙으로 강등한다.
         park_later(&shared, 0);
-        Ok(Self { id, shared, reader })
+        Ok(Self { id, shared })
     }
 
     pub fn id(&self) -> SessionId {
@@ -408,7 +492,7 @@ impl Session {
         let theme = self.shared.look.theme();
         let live = self.shared.live();
         if let Some(notice) = live.engine.scheme_notice(&theme) {
-            write_reply(&self.shared.master, notice.as_bytes());
+            write_reply(&self.shared, notice.as_bytes());
         }
     }
 
@@ -427,16 +511,24 @@ impl Session {
         lock(&self.shared.gaps).clone()
     }
 
-    /// PTY가 닫혀(EOF) 리더가 끝났는지.
+    /// 리더가 끝났는지: PTY가 닫혔거나(EOF) [`halt`]로 멈췄다.
     pub fn is_closed(&self) -> bool {
-        self.reader.is_finished()
+        lock(&self.shared.reader)
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
     }
 
     /// 리더가 끝날 때까지 기다리고 끝난 이유를 돌려준다.
     pub fn wait(self) -> io::Result<()> {
-        self.reader
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("pty reader panicked outside catch_unwind")))
+        let reader = lock(&self.shared.reader).take();
+        reader.map_or(Ok(()), |reader| {
+            reader
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(io::Error::other("pty reader panicked outside catch_unwind"))
+                })
+                .map(|_| ())
+        })
     }
 }
 
@@ -880,7 +972,7 @@ fn guarded(
         resized = live.resized.take();
     }
     let ok = if let Some(reply) = live.update_engine(f) {
-        write_reply(&shared.master, reply.as_bytes());
+        write_reply(shared, reply.as_bytes());
         true
     } else {
         // 복구 엔진은 현재 크기·강등 여부로 생성하며 원본은 기존 Gap 경로로 남긴다.
@@ -927,17 +1019,47 @@ fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
 
 #[cfg(unix)]
 type Source<'a> = BorrowedFd<'a>;
+/// 리더 스레드가 소유하고 되돌리기 경합 때 새 워커로 바꾼다(`read_loop`가 끝나면 취소·join).
 #[cfg(windows)]
-type Source<'a> = windows::Reader;
+type Source<'a> = &'a mut windows::Reader;
 
-#[cfg_attr(
-    windows,
-    expect(
-        clippy::needless_pass_by_value,
-        reason = "Own Reader so every loop exit cancels and joins the pipe worker"
-    )
-)]
-fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
+/// 리더 스레드를 띄운다. `rebuild_size`가 있으면 디스크 마지막 세그먼트로 화면을 되살린 뒤 읽는다(새 세션·재기동);
+/// 없으면 살아 있는 엔진을 그대로 잇는다([`end_halt`]). 정지로 끝난 리더는 세션을 닫힌 것으로 알리지 않는다.
+fn spawn_reader(
+    shared: Arc<Shared>,
+    rec: Option<Recorder>,
+    rebuild_size: Option<WinSize>,
+) -> io::Result<JoinHandle<io::Result<Exit>>> {
+    #[cfg(unix)]
+    let source = halt_pipe()?.0.as_fd();
+    #[cfg(windows)]
+    let source = windows::Reader::start(&shared.master)?;
+    thread::Builder::new()
+        .name(format!("pty-{}", shared.id.0))
+        .spawn(move || {
+            crate::alloc::mobile_thread().ok();
+            if let (Some(size), Some(r)) = (rebuild_size, &rec) {
+                rebuild(&shared, r, size);
+            }
+            #[cfg(windows)]
+            let mut source = source;
+            #[cfg(unix)]
+            let r = read_loop(&shared, source, rec);
+            #[cfg(windows)]
+            let r = read_loop(&shared, &mut source, rec);
+            if !matches!(r, Ok(Exit::Halted))
+                && panic::catch_unwind(AssertUnwindSafe(|| {
+                    shared.publish(&[], 0, true);
+                }))
+                .is_err()
+            {
+                tracing::warn!("pty close publish panicked");
+            }
+            r
+        })
+}
+
+fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<Exit> {
     let look = &*shared.look;
     let mut buf = vec![0u8; BATCH];
     let mut seq = shared.live().seq;
@@ -946,11 +1068,11 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
         // Unix has not read ahead. Windows must drain the bounded pipe queue
         // through EOF after cancellation before sealing, or handover loses bytes.
         #[cfg(unix)]
-        if HALTED.load(Ordering::SeqCst) {
+        if halt_decided(shared) {
             if let Some(r) = &mut rec {
                 seal(shared, r);
             }
-            return Ok(());
+            return Ok(Exit::Halted);
         }
         let deadline = shared.live().engine.sync_deadline();
         if deadline.is_some_and(|at| at <= Instant::now()) {
@@ -973,10 +1095,22 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
                 continue;
             }
         }) else {
+            #[cfg(windows)]
+            if source.halted() {
+                if halt_decided(shared) {
+                    if let Some(r) = &mut rec {
+                        seal(shared, r);
+                    }
+                    return Ok(Exit::Halted);
+                }
+                // 되돌리기가 먼저 끝났다: 취소된 워커를 새로 띄우고 계속 읽는다(리더는 이 스레드 하나뿐이다).
+                *source = windows::Reader::start(&shared.master)?;
+                continue;
+            }
             if let Some(r) = &mut rec {
                 seal(shared, r);
             }
-            return Ok(()); // EOF
+            return Ok(Exit::Eof);
         };
         errors = 0;
         let Some(bytes) = buf.get(..n) else { continue };
@@ -1149,9 +1283,9 @@ fn read_batch(master: &OwnedFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
 
 /// 질의 응답을 PTY 입력으로 쓴다. 리더를 멈추지 않으려고 기다리지 않는다.
 #[cfg(unix)]
-fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
+fn write_reply(shared: &Shared, mut bytes: &[u8]) {
     while !bytes.is_empty() {
-        match write(master, bytes) {
+        match write(&shared.master, bytes) {
             Ok(n) if n > 0 => bytes = bytes.get(n..).unwrap_or_default(),
             Err(Errno::INTR) => {}
             // ponytail: 입력 큐가 가득하면(에이전트가 stdin을 안 읽음, EAGAIN) 남은 응답을 버린다. 응답은 질의당 수십
@@ -1161,15 +1295,11 @@ fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
     }
 }
 
+/// 질의 응답을 writer 스레드 큐에 넣는다. 엔진 잠금 안에서 파이프를 기다리지 않는다(daemon-02); 큐가 차면
+/// Unix의 EAGAIN 정책처럼 응답을 버린다.
 #[cfg(windows)]
-fn write_reply(master: &Master, bytes: &[u8]) {
-    use std::io::Write as _;
-    if !bytes.is_empty() {
-        // A borrowed handle becomes a File only through an owned duplicate.
-        if let Ok(handle) = master.input.try_clone() {
-            std::fs::File::from(handle).write_all(bytes).ok();
-        }
-    }
+fn write_reply(shared: &Shared, bytes: &[u8]) {
+    shared.writer.reply(bytes);
 }
 
 #[cfg(test)]
