@@ -9940,6 +9940,7 @@ fn run_pane_against(
     cx: &mut VisualTestContext,
     dir: &std::path::Path,
     rounds: usize,
+    ready: impl Fn(&Shell) -> bool,
 ) {
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
@@ -9951,6 +9952,35 @@ fn run_pane_against(
             s.sync(cx);
         });
     });
+    // Socket workers use real time, while retry timers use the simulated clock.
+    // Observe completion before testing repeated disconnects: eight simulated
+    // ticks are not evidence that a real handshake has finished on a CI host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        cx.run_until_parked();
+        if view.read_with(cx, |shell, _| ready(shell)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pane fixture did not settle: {:?}",
+            view.read_with(cx, |shell, _| (
+                shell.layout_loading,
+                shell
+                    .layout
+                    .focused()
+                    .and_then(|pane| shell.layout.session(pane)),
+                shell
+                    .live
+                    .values()
+                    .filter_map(|live| live.error.clone())
+                    .collect::<Vec<_>>()
+            ))
+        );
+        // Pump both clocks without pretending the socket worker has completed.
+        std::thread::sleep(Duration::from_millis(10));
+        cx.executor().advance_clock(Duration::from_millis(50));
+    }
     for _ in 0..rounds {
         // The daemon uses real socket threads. Give them this retry interval before
         // advancing the simulated clock; otherwise eight ticks can finish before
@@ -9978,7 +10008,13 @@ fn pane_recovers_after_transient_daemon_eof_with_one_session(cx: &mut TestAppCon
     let requests = transient_daemon(&dir.join("k.sock"), 3, false);
     let (view, cx) = open(cx, layout);
     let pane = layout_of(&view, cx).active_tab().focused;
-    run_pane_against(&view, cx, &dir, 8);
+    run_pane_against(&view, cx, &dir, 8, |shell| {
+        shell.layout.session(pane) == Some(SessionId(41))
+            && shell
+                .live
+                .get(&pane)
+                .is_some_and(|live| live.error.is_none())
+    });
     assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
     assert_eq!(creates(&requests), 1);
     cx.update(|_, cx| {
@@ -9998,7 +10034,9 @@ fn lost_create_reply_is_not_replayed(cx: &mut TestAppContext) {
     let requests = transient_daemon(&dir.join("k.sock"), 0, true);
     let (view, cx) = open(cx, layout);
     let pane = layout_of(&view, cx).active_tab().focused;
-    run_pane_against(&view, cx, &dir, 8);
+    run_pane_against(&view, cx, &dir, 8, |shell| {
+        shell.outcome_unknown.contains_key(&pane)
+    });
     let unconfirmed = Some(text::START_UNCONFIRMED.get());
     let error = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| view.read(cx).live.get(&pane).and_then(|l| l.error.clone()))
