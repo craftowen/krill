@@ -1432,6 +1432,68 @@ fn remote_workspace_search_fails_closed_and_host_switch_clears_results(
     assert!(cx.debug_bounds("search-remote-unsupported").is_some());
 }
 
+/// APP-F06: 단어 단위(`-w`) 검색은 `rg`의 반쪽 경계 의미를 따른다 — 패턴이 비단어 문자로 시작·끝나도
+/// (`foo()`·`--flag`·`$VAR`·`.env`·`@user`) 매치 앞뒤가 단어 문자가 아니면 찾고, 교대는 경계에 맞는
+/// 더 긴 대안(`foobar`)을 고르며, 위치·길이(하이라이트)가 두 엔진에서 같다. 기대값은 설치된
+/// `rg 15.2 --json -w`의 실측이다.
+#[test]
+fn workspace_search_whole_word_matches_ripgrep_half_boundaries() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.0.join("words.txt"),
+        "call foo() here\nfoo()x\nxfoo()\n--flag and --flagged\n$VAR $VARIANT\nfoo foobar foo\nfoofoo\nCafé café CAFÉ\n한글 한글날\nbar_foo foo_bar\n.env .envrc\n@user @username\n",
+    )
+    .unwrap();
+
+    for run_fn in [search_worktree, search_worktree_fallback] {
+        let hits = |query: &str, use_regex: bool, case_sensitive: bool| -> Vec<(u32, u32, u32)> {
+            let res = run_fn(
+                &repo.0,
+                &SearchOptions {
+                    query: query.to_owned(),
+                    use_regex,
+                    case_sensitive,
+                    whole_word: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+            res.files
+                .iter()
+                .flat_map(|f| f.matches.iter().map(|m| (m.line, m.column, m.match_length)))
+                .collect()
+        };
+        assert_eq!(hits(r"foo\(\)", true, true), [(1, 6, 5)]);
+        assert_eq!(hits("foo()", false, true), [(1, 6, 5)]);
+        assert_eq!(hits("--flag", false, true), [(4, 1, 6)]);
+        assert_eq!(hits("$VAR", false, true), [(5, 1, 4)]);
+        assert_eq!(
+            hits("foo|foobar", true, true),
+            [(1, 6, 3), (2, 1, 3), (6, 1, 3), (6, 5, 6), (6, 12, 3)]
+        );
+        assert_eq!(
+            hits("foo", false, true),
+            [(1, 6, 3), (2, 1, 3), (6, 1, 3), (6, 12, 3)]
+        );
+        assert_eq!(
+            hits("café", false, false),
+            [(8, 1, 4), (8, 6, 4), (8, 11, 4)]
+        );
+        assert_eq!(
+            hits("(?i)café", true, true),
+            [(8, 1, 4), (8, 6, 4), (8, 11, 4)]
+        );
+        assert_eq!(hits("café", false, true), [(8, 6, 4)]);
+        assert_eq!(hits("한글", false, true), [(9, 1, 2)]);
+        assert!(
+            hits("bar", false, true).is_empty(),
+            "underscore is a word char"
+        );
+        assert_eq!(hits(".env", false, true), [(11, 1, 4)]);
+        assert_eq!(hits("@user", false, true), [(12, 1, 5)]);
+    }
+}
+
 #[gpui::test]
 fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx: &mut gpui::TestAppContext,

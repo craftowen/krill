@@ -478,7 +478,10 @@ impl LineMatcher {
             regex::escape(&options.query)
         };
         if options.whole_word {
-            pattern = format!(r"\b(?:{pattern})\b");
+            // `rg -w`와 같은 반쪽 단어 경계: 매치 앞 글자가 단어 문자가 아니고(또는 줄 시작) 뒤 글자가 단어
+            // 문자가 아니면(또는 줄 끝) 된다. `\b`는 패턴이 비단어 문자로 시작·끝나면(`foo()`·`--flag`·`$VAR`)
+            // 거꾸로 단어 문자를 요구해 rg와 어긋났다(APP-F06). 교대(`foo|foobar`)는 엔진이 경계까지 맞춰 고른다.
+            pattern = format!(r"\b{{start-half}}(?:{pattern})\b{{end-half}}");
         }
         regex::RegexBuilder::new(&pattern)
             .case_insensitive(!options.case_sensitive)
