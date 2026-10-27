@@ -280,12 +280,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
                     .iter()
                     .flat_map(|r| r.worktrees.iter())
                     .map(|w| String::from_utf8_lossy(w).into_owned())
-                    .filter(|w| {
-                        cwd == *w
-                            || cwd
-                                .strip_prefix(w.as_str())
-                                .is_some_and(|rest| rest.starts_with('/'))
-                    })
+                    .filter(|w| crate::remote::is_path_within(&cwd, w.as_str()))
                     .max_by_key(String::len)
             })
             .unwrap_or_default();
@@ -295,11 +290,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
                 .into_owned();
         }
         if let Some(filter) = &worktree_filter {
-            let matches_wt = worktree == *filter
-                || cwd == *filter
-                || cwd
-                    .strip_prefix(filter.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'));
+            let matches_wt = worktree == *filter || crate::remote::is_path_within(&cwd, filter);
             if !matches_wt {
                 continue;
             }
@@ -415,7 +406,7 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
                 if target.is_remote() {
                     // 원격 경로는 원격 호스트 기준이다. 로컬에서 canonicalize하면 안 된다.
                     let bytes = given.as_bytes().to_vec();
-                    if !bytes.starts_with(b"/") {
+                    if !crate::remote::is_remote_absolute_path(&bytes) {
                         return Err(remote_usage(
                             "remote --cwd must be an absolute path on the remote host",
                         ));
@@ -601,7 +592,7 @@ fn parse_fork_args(
                 let given = iter.next().ok_or_else(usage)?;
                 if remote {
                     let bytes = given.as_bytes().to_vec();
-                    if !bytes.starts_with(b"/") {
+                    if !crate::remote::is_remote_absolute_path(&bytes) {
                         return Err(remote_usage(
                             "remote --cwd must be an absolute path on the remote host",
                         ));

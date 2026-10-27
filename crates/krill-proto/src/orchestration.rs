@@ -17,6 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+mod offline;
+pub use offline::offline_archive_configured;
+
 pub const ORCH_FILE: &str = "orchestration.json";
 pub const ORCH_LOCK: &str = "orchestration.lock";
 pub const COMMENTS_FILE: &str = "worktree-comments.toml";
