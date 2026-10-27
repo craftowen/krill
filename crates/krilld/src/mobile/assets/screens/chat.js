@@ -210,7 +210,7 @@ function mountChat(root,opts){
    const data=await discover('composer_models');if(!active()||version!==suggestVersion||scope()!==context)return;
    const models=data?.supported?(data.items||data.models||[]).filter(item=>typeof item.id==='string'&&item.id):[];
    const current=models.find(item=>item.id===data.current);entry.model=current?{agent:chatAgent(),scope:context,id:current.id,label:current.label||current.name||current.id}:null;syncAgent();
-   paintChoices(models.map(item=>({id:item.id,label:item.label||item.name||item.id,detail:item.id===data.current?t('Current model'):undefined})),models.length?undefined:t(data?.reason||'Model selection is unavailable for this session.'));
+   paintChoices(models.map(item=>({id:item.id,label:item.label||item.name||item.id,detail:item.id===data.current?t('Current model'):undefined})),models.length?(data.note?t(data.note):undefined):t(data?.reason||'Model selection is unavailable for this session.'));
   }catch(error){if(active()&&version===suggestVersion&&scope()===context)paintChoices([],t('Model selection is unavailable for this session.'));}
  }
  async function applyModel(choice){

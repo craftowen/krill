@@ -119,7 +119,7 @@
  const viewKey=(id,device)=>JSON.stringify([id,device]);
 
  const hostViewPins=new WeakSet(),hostViewLimit=8,hostViewByteLimit=32*1024*1024;
- function hostViewPinned(view){return hostViewPins.has(view)||[...view.drafts?.values()||[]].some(Boolean)||[...view.chatCache?.values()||[]].some(e=>e.mounts>0||e.sending||e.photo||e.live);}
+ function hostViewPinned(view){return hostViewPins.has(view)||[...view.drafts?.values()||[]].some(Boolean)||[...view.chatCache?.values()||[]].some(e=>e.mounts>0||e.sending||e.modelPending||e.photo||e.live);}
  function hostViewWeight(view){let bytes=0;for(const value of view.titles?.values()||[])bytes+=String(value).length*2;for(const entry of view.chatCache?.values()||[])bytes+=(entry.retainedBytes||0)+(entry.pages?.length||0)*16+(entry.disclosures?.size||0)*64;return bytes;}
  function pruneHostViews(activeKey=activeView&&viewKey(activeView.id,activeView.device)){let bytes=0;for(const [key,view] of hostViews){if(key!==activeKey&&!hostViewPinned(view))M.chat?.pruneCache?.(view);bytes+=hostViewWeight(view);}for(const [key,view] of hostViews){if(hostViews.size<=hostViewLimit&&bytes<=hostViewByteLimit)break;if(key!==activeKey&&!hostViewPinned(view)){hostViews.delete(key);bytes-=hostViewWeight(view);}}}
  function rememberHostView(id,device){if(!id||!device)return;const view={drafts:state.drafts,chatCache:state.chatCache,titles:state.titles,ui:{...state.ui}},selection=globalThis.getSelection?.();if(M.terminal?.updateBusy?.(sessionScope()+"\n")||selection&&!selection.isCollapsed&&root.contains?.(selection.anchorNode)||document.querySelector('.chat-opt[aria-pressed=true],.file-row[aria-pressed=true]'))hostViewPins.add(view);const key=viewKey(id,device);hostViews.delete(key);hostViews.set(key,view);}
@@ -148,7 +148,7 @@
  const updates=M.update=M.updates.create({endpoint,resume:()=>transport.resume(),
   blocked:()=>!credentials||!!pairing||transport.blocked,
   busy:()=>productPending>0||(transport.updateBusy||pool.updateBusy)||dialog.open||!!scanner||M.terminal.updateBusy("")||
-   [...hostViews.values()].some(v=>v.drafts.size||[...v.chatCache?.values()||[]].some(e=>e.sending||e.photo||e.live))||[...state.chatCache?.values()||[]].some(e=>e.sending||e.photo||e.live)||!!document.querySelector('.chat-opt[aria-pressed=true],.file-row[aria-pressed=true]')||
+   [...hostViews.values()].some(v=>v.drafts.size||[...v.chatCache?.values()||[]].some(e=>e.sending||e.modelPending||e.photo||e.live))||[...state.chatCache?.values()||[]].some(e=>e.sending||e.modelPending||e.photo||e.live)||!!document.querySelector('.chat-opt[aria-pressed=true],.file-row[aria-pressed=true]')||
    (editable(document.activeElement)&&!!document.activeElement.value)||
    [...document.querySelectorAll('textarea,input,select,[contenteditable=true]')].some(n=>!n.readOnly&&editable(n)&&!n.matches('.chat-input,.command-input,.live-capture,input[type=search],select')&&(n.isContentEditable||!!n.value)),
   capture:()=>({drafts:[...state.drafts],terminalDrafts:M.terminal.snapshotDrafts().filter(row=>Array.isArray(row)&&row.length===2&&typeof row[0]==='string'&&typeof row[1]==='string'),ui:{...state.ui},view:M.updates.captureView(document),disclosures:[...state.chatCache||[]].map(([id,entry])=>[id,[...entry.disclosures||[]]])}),
