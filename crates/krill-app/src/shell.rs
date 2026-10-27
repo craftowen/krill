@@ -1266,14 +1266,21 @@ impl Shell {
                 }
                 let edited_while_loading = this.layout != baseline;
                 match loaded {
-                    Ok(mut layout) if this.layout == baseline => {
+                    Ok(mut layout) => {
                         if let Some(bounds) = bounds {
                             layout.set_window_bounds(bounds);
                         }
-                        this.sidebar_collapsed = layout.sidebar_collapsed;
-                        this.panel_collapsed = layout.panel_collapsed;
-                        let panel_tab = layout.panel_tab;
-                        this.layout = layout;
+                        // 로딩 중 사용자가 탭을 열거나 나눴어도 저장된 레이아웃을 버리지 않고 그 위에 합친다
+                        // (ARCHITECTURE §4.1 레이아웃 전체 복원, APP-RUNTIME-004).
+                        if edited_while_loading {
+                            let edited = std::mem::replace(&mut this.layout, layout);
+                            this.layout.absorb_startup_edits(&baseline, &edited);
+                        } else {
+                            this.layout = layout;
+                        }
+                        this.sidebar_collapsed = this.layout.sidebar_collapsed;
+                        this.panel_collapsed = this.layout.panel_collapsed;
+                        let panel_tab = this.layout.panel_tab;
                         this.sidebar
                             .update(cx, |s, cx| s.set_visible(!this.sidebar_collapsed, cx));
                         this.diff.update(cx, |d, cx| {

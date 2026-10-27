@@ -1164,3 +1164,76 @@ fn file_tabs_and_previews_keep_identical_paths_on_different_hosts_separate() {
     assert_eq!(layout.host(remote_preview), &remote);
     assert!(layout.is_valid());
 }
+
+/// APP-RUNTIME-004: 시작 복원이 끝나기 전 임시 기본 레이아웃에서 연 탭은 복원한 레이아웃 뒤에 붙고, 저장된 탭·분할·
+/// 세션·호스트·파일 매핑은 그대로다. 기본 레이아웃과 같은 placeholder 탭은 버리고 칸 번호는 충돌하지 않게 다시 매긴다.
+#[test]
+fn startup_edits_are_appended_to_the_restored_layout() {
+    let mut saved = Layout::default();
+    saved.set_session(PaneId(0), SessionId(7));
+    saved.new_tab();
+    saved.split(Axis::Horizontal);
+    saved.set_host(PaneId(2), HostId::Remote("box".into()));
+    saved.set_tab_title(1, Some("work"));
+    let file = saved.open_file(PathBuf::from("/tmp/notes.txt"));
+    let expected_tabs = saved.tabs().to_vec();
+
+    let baseline = Layout::default();
+    let mut edited = baseline.clone();
+    // 로딩 중 Cmd+T: 임시 레이아웃의 두 번째 칸 번호(1)는 저장본의 칸 1과 겹친다.
+    edited.new_tab();
+    let early = edited.focused().unwrap();
+    assert_eq!(early, PaneId(1));
+    edited.set_launch(
+        early,
+        Create {
+            account: None,
+            program: Program::Login,
+            cwd: b"/work".to_vec(),
+            cols: 80,
+            rows: 24,
+        },
+    );
+    edited.set_host(early, HostId::Remote("box".into()));
+    edited.sidebar_collapsed = true;
+
+    let mut merged = saved.clone();
+    merged.absorb_startup_edits(&baseline, &edited);
+    assert_eq!(&merged.tabs()[..expected_tabs.len()], &expected_tabs[..]);
+    assert_eq!(merged.tabs().len(), expected_tabs.len() + 1);
+    assert_eq!(merged.session(PaneId(0)), Some(SessionId(7)));
+    assert_eq!(merged.session(PaneId(1)), None);
+    assert_eq!(merged.host(PaneId(2)), &HostId::Remote("box".into()));
+    assert_eq!(merged.tab_title(1), Some("work"));
+    assert_eq!(merged.file(file), Some(Path::new("/tmp/notes.txt")));
+    let appended = merged.tabs().last().unwrap();
+    let PaneTree::Leaf(new_pane) = appended.root else {
+        panic!("appended tab should be a single pane");
+    };
+    assert!(
+        !expected_tabs.iter().any(|t| t.root.contains(new_pane)),
+        "appended pane must not reuse a saved pane number"
+    );
+    assert_eq!(appended.focused, new_pane);
+    assert_eq!(
+        merged.launch(new_pane).map(|c| c.cwd.as_slice()),
+        Some(&b"/work"[..])
+    );
+    assert_eq!(merged.host(new_pane), &HostId::Remote("box".into()));
+    assert_eq!(merged.active(), expected_tabs.len());
+    assert!(merged.sidebar_collapsed);
+    assert_eq!(merged.panes().len(), expected_tabs.len() + 2);
+
+    // 아무것도 하지 않았으면(placeholder 탭만) 저장본이 그대로다.
+    let mut untouched = saved.clone();
+    untouched.absorb_startup_edits(&baseline, &baseline);
+    assert_eq!(untouched, saved);
+
+    // placeholder 탭을 닫기만 한 경우(보이는 탭 없음)도 저장본의 활성 탭을 유지한다.
+    let mut closed = baseline.clone();
+    closed.close_tab(0);
+    let mut kept = saved.clone();
+    kept.absorb_startup_edits(&baseline, &closed);
+    assert_eq!(kept.tabs(), saved.tabs());
+    assert_eq!(kept.active(), saved.active());
+}
