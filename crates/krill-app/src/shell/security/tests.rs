@@ -8,6 +8,125 @@ use krill_proto::screen::Msg as _;
 
 use crate::shell::tests::{open, state_path};
 
+fn link_waiting_pane(
+    shell: &mut super::Shell,
+    pane: krill_app::layout::PaneId,
+    session: krill_proto::SessionId,
+    socket: UnixStream,
+    cx: &mut gpui::Context<super::Shell>,
+) -> std::io::Result<()> {
+    assert!(matches!(
+        shell.linked(
+            pane,
+            session,
+            krill_app::pane::Linked {
+                reader: socket.try_clone()?,
+                writer: krill_app::pane::Writer::spawn(socket)?,
+                instance: 1,
+                launch: None,
+                features: krill_proto::input::FEAT_INPUT,
+                search: false,
+            },
+            cx
+        ),
+        super::super::Next::Read(_)
+    ));
+    Ok(())
+}
+
+#[gpui::test]
+fn first_attach_paste_rejects_changed_host_live_and_session(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+    use krill_proto::SessionId;
+
+    for change in ["none", "host", "live", "session", "focus"] {
+        let (view, cx) = open(cx, state_path(&format!("early-paste-{change}")));
+        let (pane, request) = cx.update(|window, cx| {
+            view.update(cx, |shell, cx| {
+                let pane = shell.layout.active_tab().focused;
+                shell
+                    .live
+                    .insert(pane, super::super::Live::new(gpui::Task::ready(())));
+                (pane, shell.begin_clipboard_paste(window, cx).unwrap())
+            })
+        });
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        cx.update(|window, cx| {
+            view.update(cx, |shell, cx| {
+                match change {
+                    "none" => {}
+                    "host" => shell.layout.set_host(pane, HostId::Remote("other".into())),
+                    "live" => {
+                        shell
+                            .live
+                            .insert(pane, super::super::Live::new(gpui::Task::ready(())));
+                    }
+                    "session" => {
+                        // Bind the request before clipboard IO finishes, then change PTYs.
+                        let (first, _peer) = UnixStream::pair().unwrap();
+                        link_waiting_pane(shell, pane, SessionId(41), first, cx).unwrap();
+                    }
+                    "focus" => shell.on_window_active_changed(false, cx),
+                    _ => unreachable!(),
+                }
+                link_waiting_pane(shell, pane, SessionId(42), ours, cx).unwrap();
+                shell.complete_clipboard_paste(request, Some(b"stale url".to_vec()), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        if change == "none" {
+            theirs
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (kind, body) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
+            assert_eq!(Input::decode(kind, &body).unwrap().bytes, b"stale url");
+            continue;
+        }
+        theirs.set_nonblocking(true).unwrap();
+        assert_eq!(
+            theirs.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "{change}"
+        );
+    }
+}
+
+#[gpui::test]
+fn windows_ctrl_v_before_first_attach_keeps_url_and_following_typing(cx: &mut TestAppContext) {
+    cx.update(super::super::bind_windows_paste);
+    let (view, cx) = open(cx, state_path("windows-early-url-paste"));
+    let pane = view.update(cx, |shell, _| {
+        let pane = shell.layout.active_tab().focused;
+        shell
+            .live
+            .insert(pane, super::super::Live::new(gpui::Task::ready(())));
+        pane
+    });
+    let url = "https://example.com/한글?q=clipboard";
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.into()));
+    cx.simulate_keystrokes("ctrl-v");
+    cx.simulate_input("x");
+    cx.run_until_parked();
+    // The preparation deadline must not erase a ready paste while attach is slow.
+    cx.executor()
+        .advance_clock(super::PASTE_PREPARATION_TIMEOUT);
+    cx.run_until_parked();
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    view.update(cx, |shell, cx| {
+        link_waiting_pane(shell, pane, krill_proto::SessionId(42), ours, cx).unwrap();
+    });
+    let received = (0..2)
+        .map(|_| {
+            let (kind, body) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
+            Input::decode(kind, &body).unwrap().bytes
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(received, [url.as_bytes().to_vec(), b"x".to_vec()]);
+}
+
 #[gpui::test]
 fn windows_ctrl_v_pastes_url_without_relying_on_agent_clipboard_support(cx: &mut TestAppContext) {
     // Register the actual Windows binding on the in-memory Mac test platform.

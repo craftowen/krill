@@ -3921,7 +3921,9 @@ impl Shell {
         self.creations.retain(|p, _| layout.pane_exists(*p));
         self.outcome_unknown.retain(|p, _| layout.pane_exists(*p));
         self.live.retain(|p, live| {
-            visible.contains(p) || layout.pane_exists(*p) && live.pane.keep_account_input()
+            visible.contains(p)
+                || layout.pane_exists(*p)
+                    && (live.pane.keep_account_input() || live.pane.session().is_none())
         });
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
@@ -4220,6 +4222,28 @@ impl Shell {
     /// 붙기 시도가 끝났다. `got`은 세션 정하기의 결과와, 정했다면 그 세션에 붙기의 결과. 정한 세션은 붙기가 실패해도
     /// 레이아웃에 적는다 — 안 적으면 다음 시도가 세션을 또 만든다(OWE-506). 콜드 기록이면 읽기 전용 화면을 띄운다(MK-032).
     fn settled(&mut self, pane: PaneId, got: std::io::Result<Got>, cx: &mut Context<Self>) -> Next {
+        let next = self.settled_inner(pane, got, cx);
+        // Keep an in-flight first Create/Attach alive across tab switches until
+        // its session ID (or uncertain result) has reached the layout. Hidden
+        // panes then release their connection instead of retaining a stream.
+        if !self.layout.visible().contains(&pane)
+            && !self
+                .live
+                .get(&pane)
+                .is_some_and(|live| live.pane.keep_account_input())
+        {
+            self.live.remove(&pane);
+            return Next::Gone;
+        }
+        next
+    }
+
+    fn settled_inner(
+        &mut self,
+        pane: PaneId,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
         self.restarting_panes.remove(&pane);
         let got = match got {
             Ok(Got::Cold(session, cold)) => return self.cold(pane, session, cold, cx),
@@ -4446,6 +4470,7 @@ impl Shell {
         for n in &notices {
             self.show(Some(n), cx);
         }
+        self.flush_clipboard_pastes(cx);
         cx.notify();
         Next::Read(linked.reader)
     }

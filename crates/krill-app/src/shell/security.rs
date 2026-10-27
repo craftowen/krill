@@ -48,8 +48,24 @@ impl PasteQueue {
 
 struct QueuedInput {
     pane: PaneId,
-    session: krill_proto::SessionId,
+    host: krill_app::hosts::HostId,
+    creation: std::sync::Arc<std::sync::Mutex<super::close::Creation>>,
+    /// None holds input for this Live's first session, never a replacement Live.
+    session: Option<krill_proto::SessionId>,
     kind: QueuedKind,
+}
+
+impl QueuedInput {
+    fn targets(&self, shell: &Shell) -> bool {
+        shell.layout.pane_exists(self.pane)
+            && shell.layout.host(self.pane) == &self.host
+            && shell.live.get(&self.pane).is_some_and(|live| {
+                std::sync::Arc::ptr_eq(&self.creation, &live.creation)
+                    && self
+                        .session
+                        .is_none_or(|session| live.pane.session() == Some(session))
+            })
+    }
 }
 enum PreparedPaste {
     Pending,
@@ -108,7 +124,10 @@ impl Shell {
 
     fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {
         let pane = self.layout.focused()?;
-        let session = self.live.get(&pane)?.pane.session()?;
+        let live = self.live.get(&pane)?;
+        let session = live.pane.session();
+        let creation = std::sync::Arc::clone(&live.creation);
+        let host = self.layout.host(pane).clone();
         let timeout = if self.layout.host(pane).is_remote() {
             REMOTE_PASTE_PREPARATION_TIMEOUT
         } else {
@@ -121,6 +140,8 @@ impl Shell {
         let id = self.paste_queue.next;
         self.paste_queue.entries.push_back(QueuedInput {
             pane,
+            host,
+            creation,
             session,
             kind: QueuedKind::Paste(id, PreparedPaste::Pending),
         });
@@ -376,12 +397,14 @@ impl Shell {
         {
             return false;
         }
-        let Some(session) = self.live.get(&pane).and_then(|l| l.pane.session()) else {
+        let Some(live) = self.live.get(&pane) else {
             return false;
         };
         self.paste_queue.entries.push_back(QueuedInput {
             pane,
-            session,
+            host: self.layout.host(pane).clone(),
+            creation: std::sync::Arc::clone(&live.creation),
+            session: live.pane.session(),
             kind: QueuedKind::Bytes(bytes.to_vec()),
         });
         true
@@ -396,12 +419,9 @@ impl Shell {
             }
             // A focus change cancels clipboard navigation intent. Keystrokes
             // already submitted to the still-existing session keep their order.
-            if self.layout.pane_exists(pane)
+            if entry.targets(self)
                 && let QueuedKind::Bytes(bytes) = entry.kind
-                && let Some(live) = self
-                    .live
-                    .get_mut(&pane)
-                    .filter(|live| live.pane.session() == Some(entry.session))
+                && let Some(live) = self.live.get_mut(&pane)
             {
                 let notice = live.pane.input(&bytes, Now::get());
                 self.show(notice.as_ref(), cx);
@@ -426,12 +446,12 @@ impl Shell {
         &mut self,
         id: u64,
         payload: Option<Vec<u8>>,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) {
         let mut found = false;
         for entry in &mut self.paste_queue.entries {
-            if let QueuedKind::Paste(request, ready) = &mut entry.kind
+            if let QueuedKind::Paste(request, ready @ PreparedPaste::Pending) = &mut entry.kind
                 && *request == id
             {
                 *ready = PreparedPaste::Ready(payload);
@@ -443,17 +463,21 @@ impl Shell {
         if !found {
             return;
         }
+        self.flush_clipboard_pastes(cx);
+    }
+
+    /// Before attach, ready bytes enter Pane's bounded input journal just like
+    /// typing. At link, pin any unfinished preparation to that first session.
+    pub(super) fn flush_clipboard_pastes(&mut self, cx: &mut Context<Self>) {
         let pending = std::mem::take(&mut self.paste_queue.entries);
         let mut blocked = std::collections::BTreeSet::new();
-        for entry in pending {
-            if !self.layout.pane_exists(entry.pane)
-                || self
-                    .live
-                    .get(&entry.pane)
-                    .is_none_or(|live| live.pane.session() != Some(entry.session))
-            {
+        for mut entry in pending {
+            if !entry.targets(self) {
                 continue;
             }
+            entry.session = entry
+                .session
+                .or_else(|| self.live.get(&entry.pane)?.pane.session());
             if blocked.contains(&entry.pane)
                 || matches!(entry.kind, QueuedKind::Paste(_, PreparedPaste::Pending))
             {
@@ -470,7 +494,7 @@ impl Shell {
             let Some(live) = self
                 .live
                 .get_mut(&entry.pane)
-                .filter(|live| live.pane.session() == Some(entry.session))
+                .filter(|live| live.pane.session() == entry.session)
             else {
                 continue;
             };
@@ -496,7 +520,6 @@ impl Shell {
             self.show(notice.as_ref(), cx);
             cx.notify();
         }
-        let _ = window;
     }
 
     /// 포커스 칸에 텍스트를 붙여넣는다(MK-033·MK-076).

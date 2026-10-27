@@ -1040,6 +1040,50 @@ fn detached_session_reopens_in_new_tab(cx: &mut TestAppContext) {
 /// OWE-506: 세션을 만든 뒤 붙기만 실패하면 그 세션을 레이아웃에 적는다. 안 적으면 다시 시도할 때 `want`가 비어 세션을
 /// 또 만든다.
 #[gpui::test]
+fn hiding_first_attach_keeps_creation_until_session_is_recorded(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("hidden-first-attach"));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        let live = Live::new(Task::ready(()));
+        let creation = Arc::clone(&live.creation);
+        assert!(close::Creation::publish(&creation, SessionId(108)));
+        s.live.insert(pane, live);
+        s.creations.insert(pane, Arc::clone(&creation));
+        s.layout.new_tab();
+        s.sync(cx);
+        assert!(
+            s.live.contains_key(&pane),
+            "hiding must not cancel the pending Create/Attach continuation"
+        );
+        s.layout.activate(0);
+        s.sync(cx);
+        assert!(
+            Arc::ptr_eq(&s.live[&pane].creation, &creation),
+            "showing must reuse the same pending creation"
+        );
+        s.layout.activate(1);
+        let next = s.settled(
+            pane,
+            Ok(Got::Live {
+                session: SessionId(108),
+                linked: Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "attach delayed",
+                )),
+                prior_cold: None,
+            }),
+            cx,
+        );
+        assert!(matches!(next, Next::Gone));
+        assert_eq!(s.layout.session(pane), Some(SessionId(108)));
+        assert!(
+            !s.live.contains_key(&pane),
+            "settled hidden panes must release their screen connection"
+        );
+    });
+}
+
+#[gpui::test]
 fn attach_failure_after_create_keeps_session(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("attach-fail"));
     let s = krill_proto::SessionId(9);
