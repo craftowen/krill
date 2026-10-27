@@ -489,6 +489,8 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-shift-c", CopyClean, ctx),
         krill_app::keys::bind("cmd-v", Paste, ctx),
     ]);
+    #[cfg(target_os = "windows")]
+    bind_windows_paste(cx);
     // macOS gpui는 ⇧+[ / ⇧+]를 { / }로 정규화하며 Shift 플래그를 지운다.
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -501,6 +503,14 @@ pub fn bind_keys(cx: &mut App) {
     sidebar::bind_keys(cx);
     cx.on_action(|_: &Quit, cx| files::quit_app(cx));
     security::bind_keys(cx);
+}
+
+/// Windows users expect Ctrl+V to paste text even when the foreground TUI
+/// interprets the raw control byte as an image-paste command (for example Gemini).
+/// Keep Ctrl+Shift+V available as well; child text inputs retain their own binding.
+#[cfg(any(target_os = "windows", all(test, unix)))]
+fn bind_windows_paste(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT))]);
 }
 
 /// 드래그 중인 분할선. 분할은 활성 탭 루트에서의 경로로 가리킨다.

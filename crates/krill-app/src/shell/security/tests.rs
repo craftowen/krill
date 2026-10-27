@@ -9,6 +9,27 @@ use krill_proto::screen::Msg as _;
 use crate::shell::tests::{open, state_path};
 
 #[gpui::test]
+fn windows_ctrl_v_pastes_url_without_relying_on_agent_clipboard_support(cx: &mut TestAppContext) {
+    // Register the actual Windows binding on the in-memory Mac test platform.
+    cx.update(super::super::bind_windows_paste);
+    let (view, cx) = open(cx, state_path("windows-url-paste"));
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(42), ours, cx);
+    });
+    let url = "https://example.com/path?q=한글&from=clipboard";
+    cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.to_owned())));
+    cx.simulate_keystrokes("ctrl-v");
+    cx.run_until_parked();
+    let (kind, body) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
+    assert_eq!(Input::decode(kind, &body).unwrap().bytes, url.as_bytes());
+}
+
+#[gpui::test]
 fn slow_pastes_keep_keystrokes_in_submission_order(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("async-paste-order"));
     let (ours, mut theirs) = UnixStream::pair().unwrap();
