@@ -122,7 +122,14 @@ impl Shell {
             return self
                 .sidebar
                 .read(cx)
-                .session_label_on_with_title(host, session, title)
+                // Local screen titles already enter the sidebar through
+                // on_frame. Its cache expires when the daemon title changes;
+                // overriding it with this pane's older copy freezes hidden tabs.
+                .session_label_on_with_title(
+                    host,
+                    session,
+                    host.is_remote().then_some(title).flatten(),
+                )
                 .0;
         }
         let launched = match self.layout.launch(pane).map(|l| &l.program) {

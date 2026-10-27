@@ -4567,6 +4567,60 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
     }
 }
 
+#[gpui::test]
+fn daemon_title_change_replaces_hidden_tab_screen_cache(cx: &mut TestAppContext) {
+    use krill_proto::control::AgentStatus;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("tab-title-refresh"));
+    let snapshot = |title: &str| sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(51),
+            status: AgentStatus {
+                title: Some(title.into()),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: Some("/repo".into()),
+            account: None,
+        }],
+        ..Default::default()
+    };
+    let pane = view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, SessionId(51));
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(snapshot("First task"))), cx);
+        });
+        pane
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.titles.insert(pane, "First screen title".into());
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_title(SessionId(51), "First screen title", cx);
+        });
+        assert_eq!(s.pane_label(pane, cx), "First screen title");
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(snapshot("Second task"))), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.titles[&pane], "First screen title",
+            "hidden pane has no new frames"
+        );
+        assert_eq!(s.pane_label(pane, cx), "Second task");
+        s.layout.set_tab_title(s.layout.active(), Some("My title"));
+        assert_eq!(s.tab_display_label(s.layout.active(), cx), "My title");
+    });
+}
+
 /// OSC 제목이 없는 agy 탭도 데몬의 대화 제목·첫 프롬프트 제목을 표시한다.
 #[gpui::test]
 fn agy_tab_titles_use_sidebar_titles_without_osc(cx: &mut TestAppContext) {
@@ -4652,8 +4706,14 @@ fn agy_tab_titles_use_sidebar_titles_without_osc(cx: &mut TestAppContext) {
             assert_eq!(s.pane_label(pane, cx), "첫 요청에서 만든 제목", "{raw}");
         }
         s.titles.insert(pane, "⠂ 실제 터미널 제목".into());
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_title(SessionId(82), "⠂ 실제 터미널 제목", cx);
+        });
         assert_eq!(s.pane_label(pane, cx), "실제 터미널 제목");
         s.titles.insert(pane, "작업 powershell.exe review".into());
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_title(SessionId(82), "작업 powershell.exe review", cx);
+        });
         assert_eq!(s.pane_label(pane, cx), "작업 powershell.exe review");
         s.layout.set_tab_title(1, Some("사용자가 지정한 제목"));
         assert_eq!(s.tab_display_label(1, cx), "사용자가 지정한 제목");
