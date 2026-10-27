@@ -240,6 +240,12 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         .debug_bounds("status-provider-account-codex-other")
         .unwrap();
     assert!(
+        visual
+            .debug_bounds("status-provider-account-codex-other-status")
+            .is_some(),
+        "사용량이 없는 계정은 모름·갱신 기록 상태를 보여 준다"
+    );
+    assert!(
         row.bottom() < other.origin.y,
         "계정 영역 사이에 간격이 있다"
     );

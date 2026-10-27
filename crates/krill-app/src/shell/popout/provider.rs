@@ -1724,8 +1724,8 @@ pub(super) fn provider_usage_menu(
                     body_snap.status_for(&account.id),
                     krill_app::accounts::display::now(),
                 );
-                let status_visible =
-                    !matches!(status.status, AccountStatus::Ok | AccountStatus::Unknown);
+                // 값이 없을 때도 모름·갱신 시각을 보여 원인 없는 대시만 남기지 않는다.
+                let status_visible = status.status != AccountStatus::Ok;
 
                 let hover_id = account.id.clone();
                 let hover_menu = body_menu.clone();

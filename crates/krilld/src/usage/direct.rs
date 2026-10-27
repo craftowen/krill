@@ -62,7 +62,7 @@ pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<
 /// 정상 값은 `CACHE_TTL`, 429로 오래됨 처리된 값은 마지막 성공 시각부터 하루까지 쓴다.
 fn alive(at: Instant, usage: &ProfileUsage) -> bool {
     at.elapsed()
-        < if usage.stale {
+        < if usage.stale && usage.error.is_none() {
             MAX_RATE_LIMIT_WAIT
         } else {
             CACHE_TTL
@@ -149,45 +149,41 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
-            let usage = match result {
-                Fetched::Usage(usage, meters) => {
-                    lock(&RETRY).remove(&job);
-                    super::meters::remember(&job.0, job.1, &job.2, meters);
-                    Some(ProfileUsage {
-                        usage,
-                        updated_at: now,
-                        ..ProfileUsage::default()
-                    })
+            // 조회 중 사용자가 끈 경우에는 오류·429를 포함해 캐시를 갱신하지 않는다.
+            if accounts::load_file(&job.0, state.as_deref()).direct_usage {
+                let usage = match result {
+                    Fetched::Usage(usage, meters) => {
+                        lock(&RETRY).remove(&job);
+                        super::meters::remember(&job.0, job.1, &job.2, meters);
+                        Some(ProfileUsage {
+                            usage,
+                            updated_at: now,
+                            ..ProfileUsage::default()
+                        })
+                    }
+                    // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
+                    Fetched::RateLimited(wait) => {
+                        let mut retry = lock(&RETRY);
+                        let streak = retry.get(&job).map_or(0, |r| r.1);
+                        let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
+                        retry.insert(job.clone(), (Instant::now() + wait, streak));
+                        drop(retry);
+                        mark_rate_limited(&mut lock(&CACHE), &job, now);
+                        None
+                    }
+                    Fetched::Failed => {
+                        let mut retry = lock(&RETRY);
+                        let streak = retry.get(&job).map_or(0, |r| r.1).saturating_add(1);
+                        retry.insert(job.clone(), (Instant::now() + failure_wait(streak), streak));
+                        mark_failed(&mut lock(&CACHE), &job, now);
+                        None
+                    }
+                };
+                if let Some(usage) = usage {
+                    let mut cache = lock(&CACHE);
+                    cache.retain(|_, (at, u)| alive(*at, u));
+                    cache.insert(job.clone(), (Instant::now(), usage));
                 }
-                // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
-                Fetched::RateLimited(wait) => {
-                    let mut retry = lock(&RETRY);
-                    let streak = retry.get(&job).map_or(0, |r| r.1);
-                    let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
-                    retry.insert(job.clone(), (Instant::now() + wait, streak));
-                    drop(retry);
-                    mark_rate_limited(&mut lock(&CACHE), &job, now);
-                    None
-                }
-                Fetched::Failed => {
-                    let mut retry = lock(&RETRY);
-                    let streak = retry.get(&job).map_or(0, |r| r.1).saturating_add(1);
-                    retry.insert(job.clone(), (Instant::now() + failure_wait(streak), streak));
-                    Some(ProfileUsage {
-                        error: Some("갱신 실패".into()),
-                        detail: Some("사용량 갱신 실패".into()),
-                        updated_at: now,
-                        ..ProfileUsage::default()
-                    })
-                }
-            };
-            // 조회 중 사용자가 끈 경우에는 결과도 버린다.
-            if let Some(usage) = usage
-                && accounts::load_file(&job.0, state.as_deref()).direct_usage
-            {
-                let mut cache = lock(&CACHE);
-                cache.retain(|_, (at, u)| alive(*at, u));
-                cache.insert(job.clone(), (Instant::now(), usage));
             }
             lock(&PENDING).remove(&job);
         });
@@ -238,7 +234,11 @@ fn mark_rate_limited(
     now: Option<u64>,
 ) {
     match cache.get_mut(key) {
-        Some((_, u)) if u.error.is_none() && !u.usage.is_empty() => u.stale = true,
+        Some((at, u)) if alive(*at, u) && !u.usage.is_empty() => {
+            u.stale = true;
+            u.error = None;
+            u.detail = Some("사용량 API 요청 제한(429) — 마지막 성공 값".into());
+        }
         _ => {
             cache.insert(
                 key.clone(),
@@ -254,6 +254,33 @@ fn mark_rate_limited(
             );
         }
     }
+}
+
+/// 일시적인 조회 실패가 마지막 수치를 지우지 않게 하되, 성공 시각과 오류를 보존한다.
+/// 오래된 실패 값에는 일반 캐시 TTL을 적용한다(429의 하루 유예와 다름).
+fn mark_failed(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key, now: Option<u64>) {
+    cache.retain(|_, (at, usage)| alive(*at, usage));
+    if let Some((at, usage)) = cache.get_mut(key)
+        && alive(*at, usage)
+        && !usage.usage.is_empty()
+    {
+        usage.stale = true;
+        usage.error = Some("갱신 실패".into());
+        usage.detail = Some("사용량 갱신 실패 — 마지막 성공 값".into());
+        return;
+    }
+    cache.insert(
+        key.clone(),
+        (
+            Instant::now(),
+            ProfileUsage {
+                error: Some("갱신 실패".into()),
+                detail: Some("사용량 갱신 실패".into()),
+                updated_at: now,
+                ..ProfileUsage::default()
+            },
+        ),
+    );
 }
 
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
@@ -904,38 +931,53 @@ fn credentials(
             .filter(|s| !s.is_empty())?;
         return Some((Zeroizing::new(env_key), None));
     }
-    let raw = if provider == ProviderKind::Claude {
-        let user = claude_keychain_user();
-        let mut dirs = vec![dir.to_path_buf()];
-        for candidate in [
-            krill_proto::os::canonicalize(dir).ok(),
-            dir.canonicalize().ok(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !dirs.contains(&candidate) {
-                dirs.push(candidate);
-            }
+    if provider == ProviderKind::Claude {
+        return claude_credentials(dir, host, keychain);
+    }
+    parse_credentials(provider, &read_file(&dir.join("auth.json"))?)
+}
+
+/// 읽혔다는 이유만으로 자격증명 소스를 확정하지 않는다. 오래되거나 깨진 키체인 항목·
+/// 파일이 현재 CLI가 저장한 정상 파일을 가리지 않게 소스별로 파싱한다.
+fn claude_credentials(
+    dir: &Path,
+    host: bool,
+    read_keychain: impl Fn(&str, &str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<(Zeroizing<String>, Option<String>)> {
+    let user = claude_keychain_user();
+    let mut dirs = vec![dir.to_path_buf()];
+    for candidate in [
+        krill_proto::os::canonicalize(dir).ok(),
+        dir.canonicalize().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !dirs.contains(&candidate) {
+            dirs.push(candidate);
         }
-        let accounts: &[&str] = if user == "claude-code-user" {
-            &["claude-code-user"]
-        } else {
-            &[user.as_str(), "claude-code-user"]
-        };
-        dirs.iter()
-            .find_map(|dir| {
-                let service = claude_service((!host).then_some(dir.as_path()))?;
-                accounts
-                    .iter()
-                    .find_map(|account| keychain(&service, account))
-            })
-            .or_else(|| read_file(&dir.join(".credentials.json")))
-            .or_else(|| read_file(&dir.join("credentials.json")))?
+    }
+    let accounts: &[&str] = if user == "claude-code-user" {
+        &["claude-code-user"]
     } else {
-        read_file(&dir.join("auth.json"))?
+        &[user.as_str(), "claude-code-user"]
     };
-    parse_credentials(provider, &raw)
+    dirs.iter()
+        .find_map(|dir| {
+            let service = claude_service((!host).then_some(dir.as_path()))?;
+            accounts.iter().find_map(|account| {
+                let raw = read_keychain(&service, account)?;
+                parse_credentials(ProviderKind::Claude, &raw)
+            })
+        })
+        .or_else(|| {
+            [".credentials.json", "credentials.json"]
+                .iter()
+                .find_map(|name| {
+                    let raw = read_file(&dir.join(name))?;
+                    parse_credentials(ProviderKind::Claude, &raw)
+                })
+        })
 }
 
 fn credential_utf8(raw: &[u8]) -> Option<Zeroizing<String>> {
@@ -2015,6 +2057,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_claude_sources_do_not_mask_current_file_credentials() {
+        let root =
+            std::env::temp_dir().join(format!("claude-source-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let primary = root.join(".credentials.json");
+        let fallback = root.join("credentials.json");
+        let valid = br#"{"claudeAiOauth":{"accessToken":"current-fixture-only"}}"#;
+        std::fs::write(&fallback, valid).unwrap();
+        for broken in [
+            b"not json".as_slice(),
+            b"{}",
+            br#"{"claudeAiOauth":{}}"#,
+            br#"{"claudeAiOauth":{"accessToken":""}}"#,
+        ] {
+            std::fs::write(&primary, broken).unwrap();
+            let found =
+                claude_credentials(&root, true, |_, _| Some(broken.to_vec().into())).unwrap();
+            assert_eq!(&*found.0, "current-fixture-only");
+            assert_eq!(std::fs::read(&primary).unwrap(), broken);
+            assert_eq!(std::fs::read(&fallback).unwrap(), valid);
+        }
+        // 정상 키체인은 기존 우선순위를 유지한다.
+        let from_keychain = claude_credentials(&root, true, |_, _| {
+            Some(
+                br#"{"claudeAiOauth":{"accessToken":"keychain-fixture-only"}}"#
+                    .to_vec()
+                    .into(),
+            )
+        })
+        .unwrap();
+        assert_eq!(&*from_keychain.0, "keychain-fixture-only");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_refresh_retains_last_good_value_and_success_time_until_normal_ttl() {
+        let key = (
+            PathBuf::from("/failed-home"),
+            ProviderKind::Claude,
+            PathBuf::from("/failed-home/.claude"),
+        );
+        let at = Instant::now();
+        let good = ProfileUsage {
+            usage: Usage {
+                five_hour: Some(Window {
+                    percent: 42,
+                    resets_at: None,
+                }),
+                seven_day: None,
+            },
+            updated_at: Some(100),
+            ..ProfileUsage::default()
+        };
+        let mut cache = BTreeMap::from([(key.clone(), (at, good.clone()))]);
+        for now in [200, 300] {
+            mark_failed(&mut cache, &key, Some(now));
+            let (kept_at, kept) = &cache[&key];
+            assert_eq!(*kept_at, at);
+            assert_eq!(kept.usage, good.usage);
+            assert_eq!(kept.updated_at, Some(100));
+            assert!(kept.stale);
+            assert_eq!(kept.error.as_deref(), Some("갱신 실패"));
+        }
+        // 반복 실패는 마지막 성공 시각을 갱신하거나 정상 TTL을 하루로 늘리지 않는다.
+        let expired_at = at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
+        cache.get_mut(&key).unwrap().0 = expired_at;
+        assert!(!alive(expired_at, &cache[&key].1));
+        mark_failed(&mut cache, &key, Some(400));
+        assert!(cache[&key].1.usage.is_empty());
+        assert_eq!(cache[&key].1.updated_at, Some(400));
+        assert_eq!(cache[&key].1.error.as_deref(), Some("갱신 실패"));
+    }
+
+    #[test]
+    fn completion_after_direct_usage_disabled_does_not_reinsert_failure() {
+        let root =
+            std::env::temp_dir().join(format!("usage-disabled-completion-{}", std::process::id()));
+        let home = root.join("home");
+        let state = root.join("state");
+        let key = (home.clone(), ProviderKind::Claude, home.join(".claude"));
+        accounts::save_file(
+            &home,
+            Some(&state),
+            &accounts::AccountsFile {
+                direct_usage: false,
+                ..accounts::AccountsFile::default()
+            },
+        )
+        .unwrap();
+        lock(&PENDING).insert(key.clone());
+        // 테스트 fetch는 실제 자격증명을 읽지 않고 실패한다. 완료 처리 시 설정이 꺼져 있다.
+        spawn(&key, true, Some(state));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&PENDING).contains(&key) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!lock(&CACHE).contains_key(&key));
+        assert!(!lock(&RETRY).contains_key(&key));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn credential_files_accept_windows_bom_encodings() {
         let json = r#"{"claudeAiOauth":{"accessToken":"fixture-bom-token"}}"#;
         let mut utf8 = vec![0xef, 0xbb, 0xbf];
@@ -2551,20 +2696,24 @@ mod tests {
         let (kept_at, kept) = &cache[&key];
         assert_eq!(*kept_at, at);
         assert!(kept.stale && kept.updated_at == Some(100) && kept.usage == good.usage);
-        cache.insert(
-            key.clone(),
-            (
-                at,
-                ProfileUsage {
-                    error: Some("갱신 실패".into()),
-                    ..good
-                },
-            ),
-        );
-        mark_rate_limited(&mut cache, &key, Some(200));
+        // 성공 → 일시 실패 → 429에서도 성공 수치·시각은 그대로 남는다.
+        mark_failed(&mut cache, &key, Some(200));
+        assert!(cache[&key].1.error.is_some());
+        mark_rate_limited(&mut cache, &key, Some(201));
+        let (kept_at, kept) = &cache[&key];
+        assert_eq!(*kept_at, at);
+        assert_eq!(kept.usage, good.usage);
+        assert_eq!(kept.updated_at, Some(100));
+        assert!(kept.stale && kept.error.is_none());
+        assert!(kept.detail.as_deref().is_some_and(|s| s.contains("429")));
+        // 실패 수치의 정상 TTL이 지난 뒤에는 429가 값을 되살리면 안 된다.
+        mark_failed(&mut cache, &key, Some(202));
+        cache.get_mut(&key).unwrap().0 =
+            at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
+        mark_rate_limited(&mut cache, &key, Some(203));
         // 정상 값이 없으면 지어낸 값 없이 요청 제한 오류(조회 오류 표시)로 남는다.
         let (_, limited) = &cache[&key];
-        assert!(limited.usage.is_empty() && limited.updated_at == Some(200));
+        assert!(limited.usage.is_empty() && limited.updated_at == Some(203));
         assert_eq!(limited.error.as_deref(), Some("요청 제한"));
         cache.clear();
         mark_rate_limited(&mut cache, &key, None);
