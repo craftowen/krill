@@ -52,3 +52,21 @@ fn close_does_not_wait_for_creation_lock_and_keeps_late_cleanup(cx: &mut TestApp
         }]
     );
 }
+
+/// APP-RUNTIME-001: 발행된 세션 ID는 명시적으로 닫기 전까지 읽을 수 있고, 닫힌 뒤에는 돌려주지 않는다.
+#[test]
+fn published_id_is_readable_until_explicit_close() {
+    let creation = std::sync::Mutex::new(Creation::default());
+    assert_eq!(Creation::published(&creation), None);
+    assert!(Creation::publish(&creation, krill_proto::SessionId(5)));
+    assert_eq!(
+        Creation::published(&creation),
+        Some(krill_proto::SessionId(5))
+    );
+    assert_eq!(
+        creation.lock().unwrap().close(),
+        Some(krill_proto::SessionId(5))
+    );
+    assert_eq!(Creation::published(&creation), None);
+    assert!(!Creation::publish(&creation, krill_proto::SessionId(6)));
+}

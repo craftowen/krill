@@ -10354,3 +10354,44 @@ fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
     assert!(layout.launch(new_pane).is_some());
     assert_eq!(Layout::load(&path).unwrap(), layout);
 }
+
+/// APP-RUNTIME-001: Create는 끝났는데(ID 발행) attach를 기다리는 사이 탭을 숨기면 `settled`가 취소돼 레이아웃에
+/// ID가 남지 않는다. 다시 보인 칸은 발행된 ID로 같은 세션에 붙어야 하며 두 번째 Create를 보내면 안 된다.
+#[gpui::test]
+fn reshown_pane_reattaches_published_session_instead_of_creating_again(cx: &mut TestAppContext) {
+    let layout = state_path("published-creation-recovery");
+    let dir = layout.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let requests = transient_daemon(&dir.join("k.sock"), 0, false);
+    let (view, cx) = open(cx, layout);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    run_pane_against(&view, cx, &dir, 4);
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(creates(&requests), 1);
+
+    // 숨긴 뒤 다시 보이는 상태를 재현: Live(와 그 foreground Task)는 사라졌고, 레이아웃에는 ID가 없으며,
+    // 백그라운드 Create가 발행한 ID만 Creation에 남아 있다.
+    let creation = Arc::new(std::sync::Mutex::new(close::Creation::default()));
+    assert!(close::Creation::publish(&creation, SessionId(41)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.live.remove(&pane);
+            s.layout.clear_session(pane);
+            s.creations.insert(pane, Arc::clone(&creation));
+            s.sync(cx);
+            assert_eq!(
+                s.layout.session(pane),
+                Some(SessionId(41)),
+                "sync must recover the published ID before attaching"
+            );
+        });
+    });
+    run_pane_against(&view, cx, &dir, 4);
+    assert_eq!(
+        creates(&requests),
+        1,
+        "the re-shown pane must attach to the published session, not create another PTY"
+    );
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(close::Creation::published(&creation), Some(SessionId(41)));
+}

@@ -3947,6 +3947,7 @@ impl Shell {
             return;
         }
         let mut any_terminal = false;
+        let mut recovered = false;
         for p in visible {
             if self
                 .layout
@@ -3973,9 +3974,18 @@ impl Shell {
             };
             match self.live.entry(p) {
                 Entry::Vacant(entry) => {
+                    let creation = Arc::clone(self.creations.entry(p).or_default());
+                    // 숨긴 사이 Create는 끝났지만 `settled`가 취소돼 레이아웃에 ID가 없는 칸: 발행된 ID로
+                    // 같은 세션에 다시 붙는다(APP-RUNTIME-001). 명시적으로 닫힌 생성은 돌려주지 않는다.
+                    if self.layout.session(p).is_none()
+                        && let Some(session) = close::Creation::published(&creation)
+                    {
+                        self.layout.set_session(p, session);
+                        recovered = true;
+                    }
                     let mut live = Live::new(Self::spawn_pane(p, target.clone(), None, cx));
                     live.target = Some(target);
-                    live.creation = Arc::clone(self.creations.entry(p).or_default());
+                    live.creation = creation;
                     entry.insert(live);
                     Self::redraw_after_grace(cx);
                 }
@@ -3994,6 +4004,9 @@ impl Shell {
                     }
                 }
             }
+        }
+        if recovered {
+            self.save();
         }
         if !any_terminal && let Some(state) = self.update_ready.take() {
             cx.background_spawn(async move {
@@ -4032,8 +4045,12 @@ impl Shell {
                 }
                 let Ok(Some((want, known, launch, creation, allow_cold_resume, uncertain))) = this
                     .read_with(cx, |t, _| {
-                        let want = t.layout.session(pane);
                         let l = t.live.get(&pane)?;
+                        // 레이아웃에 아직 없는 ID라도 이 칸이 이미 발행한 세션이면 그 세션에 붙는다(APP-RUNTIME-001).
+                        let want = t
+                            .layout
+                            .session(pane)
+                            .or_else(|| close::Creation::published(&l.creation));
                         let host = t.layout.host(pane);
                         let allow_cold_resume = want.is_some_and(|w| {
                             !t.observed_sessions.contains(&(host.clone(), w))
