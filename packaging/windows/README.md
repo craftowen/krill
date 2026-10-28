@@ -16,7 +16,8 @@ Krill-<ver>-windows-x64.zip
 ```
 
 `Krill.json`은 macOS `Info.plist`와 같은 키를 쓰는 JSON이다. 업데이터는 이 파일이 있는 exe 폴더를 설치 폴더로 본다.
-`conpty.dll`·`OpenConsole.exe`가 없으면 holder는 kernel32 축소 모드로 동작한다(OWE-826 §7).
+새 터미널 세션에는 고정된 `conpty.dll`·`x64\OpenConsole.exe`가 모두 필요하다. 누락되거나 해시가 다른 패키지는
+생성·업데이트를 거부한다. 기존 inbox 세션의 재연결은 보존하지만 새 세션에서 불투명한 OS HPCON 구조를 역참조하지 않는다.
 
 ## ConPTY 파일 받기 (저장소에 넣지 않음)
 
