@@ -6073,9 +6073,11 @@ mod source_discovery_tests {
         let fallback = root.join("home/AppData/Roaming");
         fs::create_dir_all(custom.join("orca")).unwrap();
         fs::create_dir_all(fallback.join("Orca/profiles/default")).unwrap();
-        assert_eq!(
-            discover_orca_dir([custom.clone(), fallback.clone()]),
-            fallback.join("Orca")
+        // macOS의 대소문자 무시 파일시스템에서는 `orca`와 `Orca`가 같은 폴더다.
+        assert!(
+            discover_orca_dir([custom.clone(), fallback.clone()])
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&fallback.join("Orca").to_string_lossy())
         );
         fs::write(custom.join("orca/orca-profile-index.json"), "{}").unwrap();
         assert_eq!(
