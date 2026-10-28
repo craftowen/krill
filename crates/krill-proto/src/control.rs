@@ -77,6 +77,8 @@ pub const FEAT_AGENTS: u64 = 1 << 31;
 pub const FEAT_SESSION_FORK: u64 = 1 << 34;
 /// krilld 업그레이드 요청(MK-062, 지휘자 배정). [`Request::Upgrade`]·[`Reply::Upgrade`] 한 쌍.
 pub const FEAT_UPGRADE: u64 = 1 << 36;
+/// Windows 업그레이드 시 활성 세션의 holder를 교체하지 않는다. 기존 Upgrade DTO는 그대로 쓴다.
+pub const FEAT_WINDOWS_UPGRADE: u64 = 1 << 28;
 /// 설정 응답의 프로필 수 상한.
 pub const MAX_AGENT_PROFILES: usize = 256;
 /// 프로필 id·표시 이름의 UTF-8 바이트 상한.

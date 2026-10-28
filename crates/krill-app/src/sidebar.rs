@@ -3785,7 +3785,7 @@ impl Sidebar {
     }
 
     /// 워크트리 삭제 확인 모달을 연다(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않는다.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn request_delete_worktree(
         &mut self,
         path: PathBuf,

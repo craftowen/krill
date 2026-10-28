@@ -2,6 +2,8 @@ use std::process::Command;
 
 use super::*;
 
+mod upgrade;
+
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mk025-{}-{name}", std::process::id()));
     std::fs::remove_dir_all(&d).ok();
