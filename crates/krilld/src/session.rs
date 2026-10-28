@@ -3,6 +3,7 @@
 //! - 리더는 절대 잠들어 모으지 않는다. 직전 read가 PTY 한 번 분량(1,024B)으로 꽉 찼을 때만 최대
 //!   [`SPIN`] 동안 다시 읽어 묶는다(ARCHITECTURE §4.2, perf-first #1).
 //! - DEC 2026 sync는 vte가 알려 주는 마감 시각을 `poll` 타임아웃으로 한 번만 건다. 폴링 없음(perf-first #7).
+//!   강등된 세션의 grid 캐시 정리 시각(OWE-1114)도 같은 타임아웃에 함께 건다.
 //! - 엔진 호출은 세션 단위 `catch_unwind`로 감싼다(CONVENTIONS P4). panic한 묶음은 Gap으로 기록하고 엔진을
 //!   새로 만든 뒤 계속 읽는다. 다른 세션 스레드와 PTY는 영향이 없다.
 //! - 질의 응답은 krilld만 한다(AGENTS 3, MK-020). 엔진이 만든 응답을 리더가 엔진 잠금 안에서 바로 PTY에 쓴다.
@@ -952,12 +953,22 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             }
             return Ok(());
         }
-        let deadline = shared.live().engine.sync_deadline();
-        if deadline.is_some_and(|at| at <= Instant::now()) {
+        let (sync_at, trim_at) = {
+            let live = shared.live();
+            (live.engine.sync_deadline(), live.engine.trim_deadline())
+        };
+        let now = Instant::now();
+        if sync_at.is_some_and(|at| at <= now) {
             let (_, rev, _) = guarded(shared, 0, |e| e.end_sync(Feed::Live, look));
             shared.publish(&[], rev, false);
             continue;
         }
+        if trim_at.is_some_and(|at| at <= now) {
+            // 화면은 그대로라 발행하지 않는다.
+            shared.live().update_engine(Engine::trim);
+            continue;
+        }
+        let deadline = sync_at.into_iter().chain(trim_at).min();
         let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         #[cfg(unix)]
         let ready = read_ready(&shared.master, source, &mut buf, timeout);
