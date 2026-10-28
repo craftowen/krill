@@ -223,10 +223,12 @@ pub fn file_link_target(
     if !uri.starts_with("file://") {
         return None;
     }
-    let path = gpui::http_client::Url::parse(uri)
-        .ok()?
-        .to_file_path()
-        .ok()?;
+    let url = gpui::http_client::Url::parse(uri).ok()?;
+    // Windows converts remote file:// hosts to UNC paths; reveal only local files.
+    if url.host_str().is_some_and(|host| host != "localhost") {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
     if uri
         .chars()
         .chain(path.to_string_lossy().chars())

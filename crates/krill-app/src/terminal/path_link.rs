@@ -574,7 +574,9 @@ impl Cache {
                     }))
         }) {
             let mut is_file = |path: &PathBuf| {
-                if *budget == 0 {
+                // Win32 ignores a trailing dot: do not consume sentence punctuation
+                // as part of an existing filename before the trimmed candidate is tried.
+                if *budget == 0 || cfg!(windows) && path.to_string_lossy().ends_with('.') {
                     return false;
                 }
                 *budget -= 1;

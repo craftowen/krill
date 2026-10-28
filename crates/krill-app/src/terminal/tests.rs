@@ -161,6 +161,19 @@ fn file_links_only_produce_local_reveal_paths() {
         cols: 4,
         uri: String::new(),
     });
+    #[cfg(windows)]
+    for uri in [
+        "file:///C:/Users/test%20app.txt",
+        "file://localhost/C:/Users/test%20app.txt",
+    ] {
+        screen.links[0][0].uri = uri.into();
+        assert_eq!(link_target(&screen, &painted, point(px(5.), px(5.))), None);
+        assert_eq!(
+            file_link_target(&screen, &painted, point(px(5.), px(5.))),
+            Some(std::path::PathBuf::from(r"C:\Users\test app.txt"))
+        );
+    }
+    #[cfg(unix)]
     for uri in [
         "file:///tmp/test%20app.command",
         "file://localhost/tmp/test%20app.command",
