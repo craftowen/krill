@@ -115,6 +115,14 @@ pub fn quote_path(path: &[u8], shell: ShellFamily) -> Option<Vec<u8>> {
     match shell {
         ShellFamily::Posix => Some(shell_quote(path)),
         ShellFamily::PowerShell => {
+            // PowerShell treats curly single quotes as string delimiters too.
+            // Refuse these filenames instead of changing their literal spelling.
+            if ["‘", "’"]
+                .iter()
+                .any(|quote| path.windows(quote.len()).any(|w| w == quote.as_bytes()))
+            {
+                return None;
+            }
             let mut out = vec![b'\''];
             for &b in path {
                 out.push(b);
@@ -131,7 +139,12 @@ pub fn quote_path(path: &[u8], shell: ShellFamily) -> Option<Vec<u8>> {
             } else {
                 b"\"%!$`"
             };
-            if path.iter().any(|b| forbidden.contains(b)) {
+            if path.iter().any(|b| forbidden.contains(b))
+                || shell == ShellFamily::WindowsUnknown
+                    && ["“", "”"]
+                        .iter()
+                        .any(|quote| path.windows(quote.len()).any(|w| w == quote.as_bytes()))
+            {
                 return None;
             }
             Some([b"\"", path, b"\""].concat())
@@ -268,6 +281,40 @@ mod tests {
     }
 
     #[test]
+    fn powershell_unicode_delimiters_are_refused_without_altering_posix_paths() {
+        for quote in ["‘", "’", "“", "”"] {
+            let path = format!(r"C:\tmp\smart{quote} ; New-Item injected; #.png");
+            let family = if matches!(quote, "‘" | "’") {
+                ShellFamily::PowerShell
+            } else {
+                ShellFamily::WindowsUnknown
+            };
+            assert!(quote_path(path.as_bytes(), family).is_none());
+            assert!(quote_path(path.as_bytes(), ShellFamily::Posix).is_some());
+            if matches!(quote, "“" | "”") {
+                for shell in [
+                    ShellFamily::Posix,
+                    ShellFamily::PowerShell,
+                    ShellFamily::WindowsUnknown,
+                ] {
+                    assert!(
+                        dropped_with_policy(
+                            [path.as_bytes()],
+                            DropPolicy {
+                                shell,
+                                image_attachments: true,
+                                windows_images: true,
+                            }
+                        )
+                        .is_none()
+                    );
+                }
+            }
+        }
+        assert!(quote_path(r"C:\tmp\한글.txt".as_bytes(), ShellFamily::PowerShell).is_some());
+    }
+
+    #[test]
     fn image_attachments_have_no_shell_quote_splice_or_trailing_space() {
         let policy = DropPolicy {
             shell: ShellFamily::Posix,
@@ -317,7 +364,10 @@ mod tests {
                 let quoted = String::from_utf8(quote_path(path, family).unwrap()).unwrap();
                 let mut cmd = Command::new(shell);
                 if family == ShellFamily::Cmd {
-                    cmd.args(["/D", "/V:OFF", "/C", &format!("type {quoted}")]);
+                    use std::os::windows::process::CommandExt as _;
+                    // /C consumes cmd syntax, not a CRT-escaped argv element.
+                    cmd.args(["/D", "/V:OFF", "/C"])
+                        .raw_arg(format!("type {quoted}"));
                 } else {
                     cmd.args([
                         "-NoProfile",
@@ -327,7 +377,7 @@ mod tests {
                     ]);
                 }
                 let output = cmd.output().unwrap();
-                assert!(output.status.success(), "{shell}: {output:?}");
+                assert!(output.status.success(), "{shell}: {quoted}: {output:?}");
                 assert_eq!(
                     String::from_utf8_lossy(&output.stdout).trim(),
                     "literal-path",
