@@ -342,6 +342,37 @@ fn demote_drops_hot_history_keeps_screen_and_modes() {
     assert_eq!(e.history_len(), 200);
 }
 
+/// OWE-1114: 강등 중 출력은 묶음마다 grid를 자르지 않고 정리를 한 번 예약한다. 이어지는 출력이 예약을 미루지 않고,
+/// 정리·강등·승격이 예약을 지운다. 새 행은 여전히 쌓지 않는다.
+#[test]
+fn demoted_output_defers_grid_trim_once() {
+    let look = fresh();
+    let mut e = Engine::new(SIZE);
+    e.demote(&look);
+    assert_eq!(e.trim_deadline(), None);
+    let lines = "line\r\n".repeat(200);
+    e.feed(lines.as_bytes(), Feed::Live, &look);
+    let first = e.trim_deadline();
+    assert!(first.is_some(), "demoted output schedules a trim");
+    e.feed(lines.as_bytes(), Feed::Live, &look);
+    assert_eq!(
+        e.trim_deadline(),
+        first,
+        "more output keeps the first deadline"
+    );
+    assert_eq!(e.history_len(), 0);
+    e.trim();
+    assert_eq!(e.trim_deadline(), None);
+    e.feed(lines.as_bytes(), Feed::Live, &look);
+    e.demote(&look);
+    assert_eq!(e.trim_deadline(), None, "demote truncates now");
+    e.feed(lines.as_bytes(), Feed::Live, &look);
+    e.promote(&look);
+    assert_eq!(e.trim_deadline(), None, "promote keeps the cache");
+    e.feed(lines.as_bytes(), Feed::Live, &look);
+    assert_eq!(e.history_len(), 200);
+}
+
 /// 핫 스크롤백 상한은 [`HOT_LINES`]를 넘지 못하고, 강등을 풀면 만들 때의 상한으로 돌아간다.
 #[test]
 fn hot_history_is_capped_and_restored_on_promote() {
