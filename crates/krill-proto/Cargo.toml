@@ -23,6 +23,7 @@ rustix = { workspace = true }
 
 # krill_proto::os::net Windows 구현(AF_UNIX 소켓, M11).
 [target.'cfg(windows)'.dependencies]
+base64 = { workspace = true }
 uds_windows = { workspace = true }
 same-file = { workspace = true }
 

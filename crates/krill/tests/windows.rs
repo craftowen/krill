@@ -297,6 +297,29 @@ fn statusline_install_chains_user_command_through_git_bash_and_records_usage() {
 }
 
 #[test]
+fn codex_command_hook_preserves_windows_executable_metacharacters() {
+    use std::os::windows::process::CommandExt as _;
+    let home = temp_home("codex-hook-command");
+    let dir = home.join("한글 O'wen %PATH% $cash & safe");
+    fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("krill.exe");
+    fs::copy(KRILL, &exe).unwrap();
+    let command =
+        krill_proto::agent::hooks::command(&exe, krill_proto::agent::hooks::Agent::Codex).unwrap();
+    let out = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c"])
+        .raw_arg(format!("\"{command}\""))
+        .env_remove("MK_PANE_ID")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn agent_list_and_doctor_find_npm_cli_before_path_refresh() {
     let home = temp_home("npm-path-refresh");
     let roaming = home.join("AppData/Roaming");

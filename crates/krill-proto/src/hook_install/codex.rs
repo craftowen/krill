@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(not(windows))]
+use std::process::Command;
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -70,7 +72,7 @@ impl Plan {
                     .get("key")
                     .and_then(Value::as_str)
                     .ok_or_else(|| error("missing Codex hook key"))?;
-                if !key.starts_with("/<session-flags>/config.toml:") {
+                if hooks::codex_session_event(key).is_none() {
                     continue;
                 }
                 let hash = hook
@@ -233,6 +235,24 @@ impl Drop for Rpc {
 
 impl Rpc {
     fn start(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<Self> {
+        #[cfg(windows)]
+        let inherited = std::env::var_os("PATH");
+        #[cfg(windows)]
+        let augmented = crate::os::augment_windows_path(search.or(inherited.as_deref()));
+        #[cfg(windows)]
+        let search = augmented.as_deref();
+        #[cfg(windows)]
+        let mut codex = crate::os::background_command(
+            search
+                .and_then(|path| crate::agent::which("codex", path))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "codex executable not found in PATH",
+                    )
+                })?,
+        );
+        #[cfg(not(windows))]
         let mut codex = Command::new("codex");
         if let Some(search) = search {
             codex.env("PATH", search);
@@ -358,6 +378,35 @@ impl Rpc {
         Err(error(
             "Codex did not return a version for the user config layer",
         ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_starts_npm_batch_shim_from_the_selected_path() {
+        let root = std::env::temp_dir().join(format!("krill hook 한글 {}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let bin = root.join("npm bin");
+        let home = root.join("profile");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            bin.join("codex.cmd"),
+            concat!(
+                "@echo off\r\n",
+                "if not \"%~1\"==\"app-server\" exit /b 12\r\n",
+                "set /p krill_request=\r\n",
+                "echo {\"id\":0,\"result\":{}}\r\n",
+                "set /p krill_notice=\r\n",
+            ),
+        )
+        .unwrap();
+        let rpc = Rpc::start(&home, "fixture command", Some(bin.as_os_str())).unwrap();
+        drop(rpc);
+        std::fs::remove_dir_all(root).ok();
     }
 }
 

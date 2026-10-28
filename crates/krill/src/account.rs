@@ -221,6 +221,8 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
     // 호스트 기본 계정은 env 없이 다룬다(Claude는 env가 있으면 다른 키체인 항목을 쓴다).
     let dir = (!account.host_default).then(|| std::path::Path::new(&account.profile_dir));
     let path = std::env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    let path = krill_proto::os::augment_windows_path(Some(&path)).unwrap_or(path);
     let status = login_command(provider, dir, &path)?
         .status()
         .map_err(|e| e.to_string())?;

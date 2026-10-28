@@ -2168,8 +2168,9 @@ fn codex_hooks(
                     }
                     snake.push(ch.to_ascii_lowercase());
                 }
-                let key = format!("/<session-flags>/config.toml:{snake}:0:0");
-                added.contains_key(&key)
+                added
+                    .keys()
+                    .any(|key| hooks::codex_session_event(key).is_some_and(|event| event == snake))
             })
             .flat_map(|event| {
                 [

@@ -12,6 +12,7 @@ repository = "https://github.com/craftowen/krill"
 homepage = "https://krill.page"
 
 [workspace.dependencies]
+base64 = "0.22.1"
 same-file = "1.0.6"
 krill-proto = { path = "crates/krill-proto" }
 krill-term = { path = "crates/krill-term" }
