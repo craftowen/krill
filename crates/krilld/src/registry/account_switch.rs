@@ -1311,6 +1311,14 @@ impl Registry {
             committed: false,
         };
         self.agents.watch_account_resume(new);
+        #[cfg(windows)]
+        let codex_resume = (provider == ProviderKind::Codex)
+            .then(|| {
+                prepared_transcript
+                    .path()
+                    .and_then(|p| identity::CodexResume::new(p).ok())
+            })
+            .flatten();
         let (launch, sid, applied) = crate::agent::resume_in(
             profile,
             stored.permission,
@@ -1377,7 +1385,11 @@ impl Registry {
             {
                 next_identity_probe = Instant::now() + Duration::from_millis(200);
                 let observed = resume_identity(|| {
-                    let observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    let mut observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    #[cfg(windows)]
+                    if observed.is_none() && let Some(watch) = &codex_resume {
+                        observed = watch.observe(new_pid, tap.foreground())?;
+                    }
                     if observed.is_none() && provider == ProviderKind::Claude {
                         identity::discover_claude(&claude_homes, new_pid, tap.foreground())
                     } else {

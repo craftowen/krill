@@ -90,6 +90,69 @@ pub(in crate::registry) struct Identity {
     pub home: PathBuf,
 }
 
+/// Codex 0.165 queues `SessionStart` until the next turn. Its per-thread writer lock
+/// proves an idle resume without injecting a prompt or trusting launch argv alone.
+#[cfg(windows)]
+pub(super) struct CodexResume {
+    file: PathBuf,
+    lock: PathBuf,
+    users: crate::sys::FileUsers,
+}
+
+#[cfg(windows)]
+impl CodexResume {
+    pub(super) fn new(file: &Path) -> io::Result<Self> {
+        let found = from_paths(ProviderKind::Codex, [file.to_path_buf()])?
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let lock = found
+            .home
+            .join("thread-writer-locks")
+            .join(format!("{}.lock", found.id));
+        Ok(Self {
+            file: file.to_path_buf(),
+            users: crate::sys::FileUsers::new(&lock)?,
+            lock,
+        })
+    }
+
+    pub(super) fn observe(
+        &self,
+        root: u32,
+        foreground: Option<u32>,
+    ) -> io::Result<Option<Identity>> {
+        let Ok(start) = crate::sys::start_us(root) else {
+            return Ok(None);
+        };
+        if !std::fs::symlink_metadata(&self.lock)
+            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+        {
+            return Ok(None);
+        }
+        let mut eligible = process_pids(root, foreground);
+        eligible.extend(descendant_pids(root, foreground));
+        let owners = self.users.processes()?;
+        if owners.is_empty()
+            || !owners.iter().all(|(pid, at)| {
+                eligible.contains(pid) && crate::sys::start_us(*pid).ok() == Some(*at)
+            })
+        {
+            return Ok(None);
+        }
+        // A stale file or an unheld open descriptor cannot confirm writer ownership.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.lock)?;
+        if !matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+            return Ok(None);
+        }
+        if crate::sys::start_us(root).ok() != Some(start) {
+            return Ok(None);
+        }
+        from_paths(ProviderKind::Codex, [self.file.clone()])
+    }
+}
+
 /// Inspect only the foreground ancestry belonging to this PTY and its root process.
 /// Files opened by background helpers or sibling panes cannot bind the conversation.
 pub(in crate::registry) fn discover(

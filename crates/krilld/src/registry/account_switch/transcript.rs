@@ -58,6 +58,11 @@ pub(super) struct PreparedTranscript {
 }
 
 impl PreparedTranscript {
+    #[cfg(windows)]
+    pub(super) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub(super) fn verify(&self) -> io::Result<()> {
         if self.provider == ProviderKind::Antigravity {
             // Only the conversation database makes an Antigravity conversation resumable.
