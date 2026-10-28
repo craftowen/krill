@@ -1188,3 +1188,98 @@ fn hidden_restore_ignores_visible_remote_id_collision(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+fn hidden_restore_retries_when_reconnect_passes_during_attempt(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // 옛 연결의 List가 끊긴 뒤, 그 실패를 반영하는 UI 콜백보다 Down→Up이 먼저 지나갔다.
+    // 그 재접속은 아직 진행 중인 칸을 못 봤으므로, 늦게 온 실패는 다음 재접속을 기다리지 않고 지금 다시 시도한다.
+    let (socket, counts) = fake_restore_daemon("flap", FakeDaemon::ListEofs(1)).unwrap();
+    let old = SessionId(941);
+    let (view, cx) = open(cx, state_path("reboot-restore-inflight-reconnect"));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, old);
+        s.layout.deactivate();
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.restore_hidden_sessions(&[], cx);
+    });
+    // List EOF까지만 진행하고 완료 콜백 앞에서 멈춘다.
+    for _ in 0..1000 {
+        if counts[0].load(SeqCst) == 1 {
+            break;
+        }
+        assert!(cx.executor().tick(), "List EOF에 닿아야 한다");
+    }
+    assert_eq!(counts[0].load(SeqCst), 1);
+    view.update(cx, |s, cx| {
+        assert!(s.restoring_sessions.contains(&old), "완료 콜백은 아직이다");
+        s.set_link(Link::Down, cx);
+        s.set_link(Link::Up, cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    assert_eq!(
+        counts[1].load(SeqCst),
+        1,
+        "추가 재접속 없이 지금 세대에서 Resume까지 가야 한다"
+    );
+    // 세대당 한 번: 같은 Up 상태의 sync로는 더 시도하지 않는다.
+    let lists = counts[0].load(SeqCst);
+    sync_four_times(&view, cx);
+    assert_eq!(counts[0].load(SeqCst), lists);
+    assert_eq!(counts[1].load(SeqCst), 1);
+}
+
+#[gpui::test]
+fn visible_remote_pane_attaches_while_same_id_local_restores(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    // 복원 중 집합은 로컬 ID다. 숫자가 같은 보이는 원격 칸의 연결 시작을 막으면 안 된다.
+    let (socket, _) = fake_restore_daemon("remote-attach", FakeDaemon::ListEofs(0)).unwrap();
+    let connects = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&connects);
+    let host = HostId::Remote("server".into());
+    let target = krill_hosts::HostTarget::remote_with_connector(
+        "server",
+        PathBuf::from("/unused"),
+        krill_hosts::RemoteConnector::new(
+            move || {
+                count.fetch_add(1, SeqCst);
+                Err(std::io::ErrorKind::NotConnected.into())
+            },
+            |_, _| {},
+        ),
+    );
+    let (view, cx) = open(cx, state_path("reboot-restore-remote-attach"));
+    let remote = view.update(cx, |s, cx| {
+        let remote = s.layout.active_tab().focused;
+        let old = SessionId(944);
+        s.layout.set_host(remote, host.clone());
+        s.layout.set_session(remote, old);
+        s.host_targets.insert(host, target);
+        s.layout.new_tab();
+        let local = s.layout.active_tab().focused;
+        s.layout.set_session(local, old);
+        s.layout.activate(0);
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.sync(cx);
+        assert!(s.restoring_sessions.contains(&old));
+        remote
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    view.read_with(cx, |s, _| {
+        assert!(s.live.contains_key(&remote), "원격 칸이 붙기 시작해야 한다");
+    });
+    assert_eq!(connects.load(SeqCst), 1);
+}
