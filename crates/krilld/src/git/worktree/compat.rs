@@ -5,7 +5,7 @@ use krill_proto::os::fs::OpenOptionsExt as _;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -196,13 +196,16 @@ struct ImportedProjectsFile {
 #[serde(default)]
 struct ImportedProjectHooks {
     path: String,
+    worktree_base_path: Option<String>,
+    host_id: Option<String>,
+    archived: bool,
     hook_mode: Option<String>,
     setup_script: Option<String>,
     symlink_paths: Vec<String>,
 }
 
-fn repo_hook_config(repo_top: &Path) -> Option<ImportedProjectHooks> {
-    let state_dir = krill_proto::daemon::state_dir()?;
+fn repo_hook_config(repo_top: &Path, state_dir: Option<&Path>) -> Option<ImportedProjectHooks> {
+    let state_dir = state_dir?;
     let raw = read(&state_dir.join("projects.toml")).ok()??;
     let parsed: ImportedProjectsFile = toml::from_str(&raw).ok()?;
     let mut aliases = vec![repo_top.to_string_lossy().into_owned()];
@@ -229,7 +232,22 @@ fn repo_hook_config(repo_top: &Path) -> Option<ImportedProjectHooks> {
     parsed
         .projects
         .into_iter()
-        .find(|p| aliases.iter().any(|c| c == &p.path))
+        .find(|p| !p.archived && p.host_id.is_none() && aliases.iter().any(|c| c == &p.path))
+}
+
+pub(super) fn project_destination(
+    top: &Path,
+    state_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let main = match discover(top) {
+        Some(Discovered::Repo { root, .. }) => root,
+        _ => top.to_path_buf(),
+    };
+    let Some(raw) = repo_hook_config(&main, state_dir).and_then(|p| p.worktree_base_path) else {
+        return Ok(None);
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    krill_proto::worktree_location::resolve(&raw, &main, home.as_deref()).map_err(|e| e.to_string())
 }
 
 pub(super) fn read_config(top: &Path) -> Result<Config, String> {
@@ -250,7 +268,7 @@ pub(super) fn read_config_with_state(
     };
     let store = state_dir.and_then(|dir| krill_proto::orchestration::WorktreeStore::load(dir).ok());
     let top_key = top.to_string_lossy();
-    let imported = repo_hook_config(top);
+    let imported = repo_hook_config(top, state_dir);
 
     // 네이티브 setup/archive가 우선한다. 빈 문자열도 명시적인 재정의다.
     // setup: 네이티브 > 가져온 프로젝트(override) > Krill 저장소별 설정 > orca.yaml > 가져온 프로젝트.

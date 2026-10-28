@@ -84,6 +84,7 @@ struct Holder {
     streak: u32,
     restart: Instant,
     previous: Option<OsString>,
+    upgrading: bool,
     listener: Option<OwnedSocket>,
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
@@ -101,6 +102,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         streak: 0,
         restart: Instant::now(),
         previous: None,
+        upgrading: false,
         listener: None,
     };
     if let Some((metadata, handles, mut ack, listener)) = sys::take_handoff()? {
@@ -190,43 +192,31 @@ impl Holder {
                 }
             }
         }
-        let dead = self
-            .daemon
-            .as_ref()
-            .is_some_and(|d| d.process.status().ok().flatten().is_some());
-        if dead {
-            if self
-                .daemon
-                .as_ref()
-                .is_some_and(|d| d.started.elapsed() >= Duration::from_secs(1))
-            {
-                self.streak = 0;
-                self.previous = None;
-            }
-            self.daemon = None;
-            self.failed();
-        }
+        // Drain notifications (especially HoldListener) even if the daemon has
+        // already exited. Dropping its link first would discard queued packets.
+        // Observe exit before the final drain: a live peer may write after a
+        // drain, so it must be retained until the next poll observes its exit.
+        let exited = self.daemon.as_ref().and_then(|d| {
+            d.process
+                .status()
+                .ok()
+                .flatten()
+                .map(|status| (status, d.started.elapsed()))
+        });
         let packets = self
             .daemon
             .as_mut()
             .and_then(|d| d.link.as_mut())
-            .map(|link| {
-                let mut packets = Vec::new();
-                let alive = link.fill_nowait()?;
-                if !alive {
-                    return Err(io::ErrorKind::UnexpectedEof.into());
-                }
-                while let Some(p) = link.try_next()? {
-                    packets.push(p);
-                }
-                Ok::<_, io::Error>(packets)
-            });
+            .map(Link::drain_nowait);
         match packets {
-            Some(Ok(packets)) => {
+            Some(Ok((packets, alive))) => {
                 for p in packets {
                     if self.request(p) {
                         return true;
                     }
+                }
+                if !alive && let Some(d) = &mut self.daemon {
+                    d.link = None;
                 }
             }
             Some(Err(_)) => {
@@ -235,6 +225,11 @@ impl Holder {
                 }
             }
             None => {}
+        }
+        if let Some((status, uptime)) = exited
+            && self.daemon_exited(status, uptime)
+        {
+            return true;
         }
         for s in &mut self.sessions {
             if s.deadline.is_some_and(|t| Instant::now() >= t) {
@@ -254,6 +249,26 @@ impl Holder {
         }
         for m in events {
             self.send(&m, None).ok();
+        }
+        false
+    }
+    fn daemon_exited(&mut self, status: i32, uptime: Duration) -> bool {
+        if status == i32::from(krill_proto::daemon::KRILLD_DUPLICATE) && self.sessions.is_empty() {
+            return true;
+        }
+        let upgrading = std::mem::take(&mut self.upgrading);
+        if uptime >= Duration::from_secs(1) && !upgrading {
+            self.streak = 0;
+            self.previous = None;
+        }
+        self.daemon = None;
+        if upgrading {
+            // The old daemon's deliberate exit is not a crash, nor proof that
+            // the new executable is stable. Retain rollback until it runs.
+            self.streak = 0;
+            self.restart = Instant::now();
+        } else {
+            self.failed();
         }
         false
     }
@@ -411,8 +426,16 @@ impl Holder {
             }
             ToHolder::UpgradeKrilld { path, .. } => {
                 let path = text(path)?;
-                self.previous = Some(std::mem::replace(&mut self.path, path));
+                self.previous = Some(if path == self.path {
+                    // The updater moved the old image to <install>.prev; the
+                    // original path now names the new executable, not rollback.
+                    backup_path(&self.path)
+                } else {
+                    self.path.clone()
+                });
+                self.path = path;
                 self.streak = 0;
+                self.upgrading = true;
             }
             ToHolder::HoldListener { info, .. } => {
                 self.listener = Some(sys::restore_socket(&info)?);
@@ -430,7 +453,9 @@ impl Holder {
         Ok(Some(FromHolder::Done { req }))
     }
     fn upgrade(&mut self, path: &std::ffi::OsStr, req: u32) -> io::Result<()> {
-        if self.api.inbox() && !self.sessions.is_empty() {
+        // Live ConPTY ownership stays with this process during app updates,
+        // including bundled OpenConsole mode. Only an empty holder may hand off.
+        if !self.sessions.is_empty() {
             return Err(io::Error::from_raw_os_error(16));
         }
         if self.sessions.iter().any(|s| s.deadline.is_some()) {
@@ -537,8 +562,180 @@ fn text(bytes: Vec<u8>) -> io::Result<OsString> {
     Ok(s.into())
 }
 
+fn backup_path(path: &std::ffi::OsStr) -> OsString {
+    let original = std::path::Path::new(path);
+    let Some((parent, name)) = original.parent().zip(original.file_name()) else {
+        return path.to_owned();
+    };
+    let mut prev = parent.as_os_str().to_owned();
+    prev.push(".prev");
+    let backup = std::path::PathBuf::from(prev).join(name);
+    if backup.is_file() {
+        backup.into_os_string()
+    } else {
+        path.to_owned()
+    }
+}
+
 fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
     word.ok_or(io::ErrorKind::InvalidData)?
         .parse()
         .map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holder() -> Holder {
+        Holder {
+            path: "old-krilld.exe".into(),
+            args: Vec::new(),
+            sessions: Vec::new(),
+            api: Api::load(),
+            daemon: None,
+            streak: 0,
+            restart: Instant::now(),
+            previous: None,
+            upgrading: false,
+            listener: None,
+        }
+    }
+
+    #[test]
+    fn planned_daemon_exit_retains_rollback_and_has_no_crash_backoff() {
+        for uptime in [Duration::ZERO, Duration::from_secs(2)] {
+            let mut h = holder();
+            h.handle(
+                ToHolder::UpgradeKrilld {
+                    req: 1,
+                    path: b"new-krilld.exe".to_vec(),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(h.upgrading);
+            assert!(!h.daemon_exited(0, uptime));
+            assert!(!h.upgrading);
+            assert_eq!(h.streak, 0);
+            assert_eq!(
+                h.previous.as_deref(),
+                Some(std::ffi::OsStr::new("old-krilld.exe"))
+            );
+            assert!(h.restart <= Instant::now());
+            for _ in 0..3 {
+                h.failed();
+            }
+            assert_eq!(h.path, "old-krilld.exe");
+        }
+    }
+
+    #[test]
+    fn stable_daemon_crash_clears_only_stale_rollback() {
+        let mut h = holder();
+        h.previous = Some("older-krilld.exe".into());
+        h.streak = 2;
+        assert!(!h.daemon_exited(1, Duration::from_secs(2)));
+        assert!(h.previous.is_none());
+        assert_eq!(h.streak, 1);
+    }
+
+    #[test]
+    fn same_path_update_rolls_back_to_the_previous_install_image() {
+        let root =
+            std::env::temp_dir().join(format!("krill-holder-rollback-{}", std::process::id()));
+        let current = root.join("Krill/krilld.exe");
+        let previous = root.join("Krill.prev/krilld.exe");
+        for path in [&current, &previous] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let mut h = holder();
+        h.path = current.as_os_str().to_owned();
+        h.handle(
+            ToHolder::UpgradeKrilld {
+                req: 1,
+                path: current.as_os_str().as_encoded_bytes().to_vec(),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(h.previous.as_deref(), Some(previous.as_os_str()));
+        assert!(!h.daemon_exited(0, Duration::from_secs(2)));
+        for _ in 0..3 {
+            h.failed();
+        }
+        assert_eq!(h.path, previous.as_os_str());
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_duplicate_holder_stops_instead_of_restarting() {
+        let mut h = holder();
+        assert!(h.daemon_exited(
+            i32::from(krill_proto::daemon::KRILLD_DUPLICATE),
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn queued_listener_is_kept_before_reaping_dead_daemon() {
+        use std::os::windows::process::CommandExt as _;
+        use std::process::Stdio;
+
+        // WSADuplicateSocket preserves either family; this test checks both a
+        // live poll followed by a late final write and a dead peer at pipe EOF.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/K"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let process = Process {
+            handle: child.as_handle().try_clone_to_owned().unwrap(),
+            pid: child.id(),
+        };
+        let (link, peer) = Link::pair().unwrap();
+        peer.send(
+            &ToHolder::UpgradeKrilld {
+                req: 1,
+                path: b"next-krilld.exe".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+        let mut h = holder();
+        h.daemon = Some(Daemon {
+            process,
+            target: sys::duplicate_target(std::process::id()).unwrap(),
+            link: Some(link),
+            started: Instant::now(),
+        });
+        assert!(!h.poll());
+        assert!(h.upgrading);
+        assert!(h.daemon.is_some(), "live daemon must stay attached");
+
+        let info = sys::duplicate_socket(listener.as_socket(), std::process::id()).unwrap();
+        peer.send(
+            &ToHolder::HoldListener { req: 2, info }.encode().unwrap(),
+            &[],
+        )
+        .unwrap();
+        drop(peer);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(!h.poll());
+        assert!(
+            h.listener.is_some(),
+            "daemon exit discarded its final HoldListener"
+        );
+        assert!(h.daemon.is_none());
+        drop((h, listener));
+    }
 }

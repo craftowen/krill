@@ -75,7 +75,7 @@
 |---|---|---|---|---|
 | 앱 크래시·종료·업데이트 | 산다 | 무손실(링·세그먼트 범위 안), 넘치면 Gap 표시. 레이아웃 전체 복원(창 크기·위치·전체화면, 사이드바 펼침·선택, 탭·분할·포커스, 파일 커서·미리보기, 우측 패널 열림·탭·폭, 원격 호스트 매핑) 후 같은 세션 ID에 재연결 | 핵심 보장(OWE-842) | 산다·무손실(OWE-836: 헤드리스 앱 `taskkill /F` 1,000회 × inbox·번들, SHA-256 일치·Gap 0). 업데이트는 rename 교체(OWE-837), GUI 실행 중 교체 뒤 업그레이드 요청은 미확인 |
 | krilld 크래시(첫 1회) | 산다(holder가 fd 보유) | krilld가 PTY에서 읽었지만 세그먼트에 쓰기 전 바이트는 **잃을 수 있다** → 재기동 후 Gap 표시 | 첫 크래시는 즉시 재기동, 반복 크래시만 백오프 | 산다(holder가 핸들 보유·재전달). 읽고 저장 전 바이트는 잃을 수 있고 Gap 표시(OWE-836: 30회 × 2모드, 18만~22만 줄 중 0~50줄) |
-| krilld 업그레이드 | 산다 | 리더 정지·세그먼트 봉인 후 교체라 무손실(읽지 않은 출력은 커널 PTY 버퍼에서 새 krilld가 읽음) | MK-062: 앱이 새 빌드일 때만 요청(다운그레이드 금지, 같은 버전 개발 빌드는 소스 해시가 다르면 교체), holder exec 핸드오프 → 새 krilld 즉시 기동, 세대 하나 | krilld 재기동 경로의 세션 유지는 실측(OWE-833: 번들 모드 krilld 교체 후 같은 셸). 업그레이드 요청 경로 자체는 미확인. holder 교체: 번들(OpenConsole) 모드는 세션 보유 중 가능(ConptyPack 핸드오프, OWE-832), inbox 축소 모드는 세션이 있으면 거절(EBUSY) |
+| krilld 업그레이드 | 산다 | 리더 정지·세그먼트 봉인 후 교체라 무손실(읽지 않은 출력은 커널 PTY 버퍼에서 새 krilld가 읽음) | MK-062: 앱이 새 빌드일 때만 요청(다운그레이드 금지, 같은 버전 개발 빌드는 소스 해시가 다르면 교체), holder exec 핸드오프 → 새 krilld 즉시 기동, 세대 하나 | krilld 재기동 경로의 세션 유지는 실측(OWE-833: 번들 모드 krilld 교체 후 같은 셸). 업그레이드 요청 경로의 실기 재검증은 대기 중. 업데이트 정책은 활성 세션의 holder를 유지하고 krilld만 교체한다. holder는 모드와 무관하게 세션을 보유하면 교체를 거절(EBUSY)한다. 이를 지원하지 않는 구 데몬에는 세션 목록 조회와 무관하게 Upgrade를 보류한다(조회 직후 Spawn 경합 방지). 구 런타임은 OS 재시작 등 자연 종료 뒤 새 바이너리로 기동된다 |
 | holder만 크래시 | 산다(krilld도 fd 보유) | 무손실 | 종료 코드는 잃음(kqueue NOTE_EXIT로 종료만 감지). 개발 빌드는 클라이언트가 감시 연결의 상실 통보·초기 고아 상태를 보고 새 holder를 띄워 재결합(MK-018·OWE-493). 서명 경로는 MK-106 | 산다·무손실. krilld가 ConPTY·세션 프로세스·Job·IOCP 사본을 보유하고, 표준 앱·CLI 재접속이 새 holder를 띄워 Adopt한다. 기존 세션 PID 유지·실시간/재생 해시 일치·Gap 0, 재결합 후 새 세션 생성·크기 변경 요청·종료 및 정리 후 holder·krilld 잔여 0 확인(OWE-913: inbox·번들 각 5회). 재결합 전에는 새 세션 `NoHolder` |
 | holder·krilld 동시 소실, 재부팅 | 죽는다 | 레이아웃은 위와 같이 복원. 죽은 세션 자리마다 최신 cwd(셸 내부 `cd` 반영, 폴더·`launches`와 분리 보관)·셸 설정으로 새 터미널을 자동 재스폰하고 이전 세그먼트 화면·스크롤백을 새 세션 위쪽 히스토리로 보존(재스폰 실패·holder 없음 때만 읽기 전용 콜드 화면). 에이전트 세션은 `Request::Resume`으로 대화 재개 | OWE-842 | 죽는다. 마지막 화면 읽기 전용 복원(OWE-836). 재부팅·로그오프는 미확인 |
 | 맥 잠자기 | 산다 | 무손실 | 깨어난 뒤 자동 재접속 | 미확인(잠자기·절전 미측정) |
@@ -131,6 +131,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_CLIPBOARD | `1 << 33` | `krill_proto::clipboard` (OSC 52 쓰기 통지, OWE-398 지휘자 배정) |
 | FEAT_SESSION_FORK | `1 << 34` | `krill_proto::control` (에이전트 세션 포크 `Program::Agent { id: "fork:<spec>" }`, MK-182·OWE-736 지휘자 배정; 미협상 피어에 요청 금지) |
 | FEAT_UPGRADE | `1 << 36` | `krill_proto::control` (krilld 업그레이드 요청 `Request::Upgrade`/`Reply::Upgrade` 한 쌍, MK-062 지휘자 배정) |
+| FEAT_WINDOWS_UPGRADE | `1 << 29` | `krill_proto::control` (Windows 활성 세션의 holder를 유지하는 데몬 업그레이드. 미협상 구 데몬에는 Upgrade 요청 보류(런타임 자연 종료 뒤 새 바이너리 기동). window-error 지휘자 배정) |
 | FEAT_RESOURCES | `1 << 38` | `krill_proto::resources` (Resource Manager `Request::Resources`/`Reply::Resources` 한 쌍, OWE-436 지휘자 배정) |
 | FEAT_GIT_SYNC | `1 << 41` | `krill_proto::ipc` (Git 원격 동기화 `Edit::Push`·`Pull`·`Sync`·`CommitAndPush`, MK-184·OWE-738 지휘자 배정; 구 피어에는 전송 금지) |
 | FEAT_RESUME_HISTORY | `1 << 30` | `krill_proto::control` (재개 전 세그먼트·마지막 화면의 지연 HISTORY 페이지, 지휘자 배정 2026-10-23; 미협상 피어는 기존 임시 prior 유지, 새 kind·DTO 없음) |

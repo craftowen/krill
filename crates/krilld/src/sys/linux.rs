@@ -98,6 +98,17 @@ pub(crate) fn open_vnode_paths(pid: u32) -> Vec<PathBuf> {
         .collect()
 }
 
+/// 프로세스 argv(`/proc/<pid>/cmdline`).
+pub(crate) fn process_args(pid: u32) -> io::Result<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    Ok(raw
+        .strip_suffix(&[0])
+        .unwrap_or(&raw)
+        .split(|&b| b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
 /// 프로세스 이름. 명령줄을 읽지 않고 커널의 짧은 실행 이름(`/proc/<pid>/comm`)만 사용한다.
 pub(crate) fn process_name(pid: u32) -> io::Result<String> {
     let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))?;
