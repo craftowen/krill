@@ -58,7 +58,7 @@ fn chat_composer_shift_enter_inserts_newline_enter_sends_one_bracketed_prompt(
         1,
         "pending submit must be coalesced"
     );
-    cx.executor().advance_clock(Duration::from_millis(59));
+    cx.executor().advance_clock(Duration::from_millis(19));
     cx.run_until_parked();
     assert_eq!(sent.lock().unwrap().len(), 1);
     cx.executor().advance_clock(Duration::from_millis(2));
@@ -70,6 +70,8 @@ fn chat_composer_shift_enter_inserts_newline_enter_sends_one_bracketed_prompt(
             b"\r".to_vec()
         ]
     );
+    cx.executor().advance_clock(Duration::from_millis(21));
+    cx.run_until_parked();
     assert!(input.read_with(cx, |state, _| state.value()).is_empty());
     cx.simulate_keystrokes("enter");
     assert_eq!(sent.lock().unwrap().len(), 2, "empty Enter must not submit");
@@ -152,6 +154,8 @@ fn chat_delayed_submit_keeps_edited_draft_and_never_retargets_a_new_host(cx: &mu
         vec![b"\x1b[200~first\nmessage\x1b[201~".to_vec(), b"\r".to_vec()]
     );
     assert_eq!(input.read_with(cx, |state, _| state.value()), "new draft");
+    cx.executor().advance_clock(Duration::from_millis(21));
+    cx.run_until_parked();
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
             input.update(cx, |state, cx| {
@@ -239,4 +243,115 @@ fn chat_multiline_transport_failure_preserves_draft_and_prevents_blind_replay(
         input.read_with(cx, |state, _| state.value()),
         "retry\ncarefully"
     );
+}
+
+#[gpui::test]
+fn chat_multiline_waits_for_both_pty_write_acks_and_preserves_rejected_paste(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::{Input, InputAck, InputResult};
+    use krill_proto::screen::Msg as _;
+    use std::io::Read as _;
+    for denied in [false, true] {
+        let (view, cx, _, _) = fixture(
+            cx,
+            &format!("chat-ack-{denied}"),
+            &permission(),
+            "deploy production (y/n)",
+        );
+        let (input, mut peer, pane) = cx.update(|window, cx| {
+            view.update(cx, |shell, cx| {
+                shell.chat.send_input = None;
+                let pane = shell.layout.focused().unwrap();
+                shell.on_frame(
+                    pane,
+                    krill_proto::term_modes::TERM_MODES,
+                    &postcard::to_stdvec(&Modes {
+                        kitty: 0,
+                        flags: Modes::BRACKETED_PASTE,
+                    })
+                    .unwrap(),
+                    cx,
+                );
+                let peer = shell.live[&pane]
+                    .sock
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .unwrap();
+                let input = shell.ensure_chat_input(SESSION, window, cx);
+                input.update(cx, |state, cx| state.set_value("first\nsecond", window, cx));
+                shell.submit_chat_prompt(SESSION, window, cx);
+                (input, peer, pane)
+            })
+        });
+        cx.run_until_parked();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (kind, body) = krill_proto::ipc::read_frame(&mut peer).unwrap().unwrap();
+        let paste = Input::decode(kind, &body).unwrap();
+        assert_eq!(paste.bytes, b"\x1b[200~first\nsecond\x1b[201~");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            input.read_with(cx, |state, _| state.value()),
+            "first\nsecond"
+        );
+        peer.set_nonblocking(true).unwrap();
+        assert!(
+            peer.read(&mut [0; 64]).is_err(),
+            "elapsed time alone cannot send Enter"
+        );
+        peer.set_nonblocking(false).unwrap();
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::input::kind::INPUT_ACK,
+                &postcard::to_stdvec(&InputAck {
+                    id: paste.id,
+                    result: if denied {
+                        InputResult::Denied
+                    } else {
+                        InputResult::Applied
+                    },
+                })
+                .unwrap(),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(Duration::from_millis(21));
+        cx.run_until_parked();
+        if denied {
+            assert!(view.read_with(cx, |shell, _| shell.chat.prompt_review.contains(&SESSION)));
+            assert_eq!(
+                input.read_with(cx, |state, _| state.value()),
+                "first\nsecond"
+            );
+            peer.set_nonblocking(true).unwrap();
+            assert!(peer.read(&mut [0; 64]).is_err());
+            continue;
+        }
+        let (kind, body) = krill_proto::ipc::read_frame(&mut peer).unwrap().unwrap();
+        let submit = Input::decode(kind, &body).unwrap();
+        assert_eq!(submit.bytes, b"\r");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.value()),
+            "first\nsecond",
+            "Enter also needs an ACK"
+        );
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::input::kind::INPUT_ACK,
+                &postcard::to_stdvec(&InputAck {
+                    id: submit.id,
+                    result: InputResult::Applied,
+                })
+                .unwrap(),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(Duration::from_millis(21));
+        cx.run_until_parked();
+        assert!(input.read_with(cx, |state, _| state.value()).is_empty());
+    }
 }

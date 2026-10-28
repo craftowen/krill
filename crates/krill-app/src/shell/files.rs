@@ -1198,7 +1198,12 @@ impl Shell {
                 .is_some_and(|l| l.painted.get().0.contains(&position))
         });
         match pane {
-            Some(pane) => self.update_path_hover(pane, position, e.modifiers.platform, cx),
+            Some(pane) => self.update_path_hover(
+                pane,
+                position,
+                krill_app::keys::link_modifier(e.modifiers),
+                cx,
+            ),
             None if self.files.hover.is_some() => {
                 self.files.hover = None;
                 cx.notify();

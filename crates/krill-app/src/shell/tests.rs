@@ -1389,9 +1389,9 @@ fn sidebar_selection_sets_folder_for_open_in_and_new_agent(cx: &mut TestAppConte
 #[gpui::test]
 fn new_session_buttons_are_a_named_group(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("a11y-agents"));
-    let (role, label) = cx.update(|_, cx| {
+    let (role, label) = cx.update(|window, cx| {
         view.update(cx, |s, cx| {
-            let group = s.render_agents(cx);
+            let group = s.render_agents(window, cx);
             let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
             gpui::Element::write_a11y_info(&group, &mut node);
             (
@@ -10814,5 +10814,231 @@ fn startup_tab_rename_and_close_dialogs_target_kept_early_tabs_after_restore(
     assert_eq!(
         final_layout.session(final_layout.tab_panes(1)[0]),
         Some(SessionId(8))
+    );
+}
+
+#[gpui::test]
+fn input_policy_altgr_prefers_text_and_does_not_leak_kitty_release(cx: &mut TestAppContext) {
+    use krill_proto::screen::Msg as _;
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+    use std::io::Read as _;
+    let (view, cx) = open(cx, state_path("input-policy-altgr"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).focused().unwrap();
+    cx.update(|_, cx| {
+        cx.bind_keys([KeyBinding::new("ctrl-alt-t", NewTab, Some(KEY_CONTEXT))]);
+        view.update(cx, |shell, cx| {
+            shell.attach_test(pane, SessionId(678), ours, cx);
+        });
+    });
+    for kitty in [0, 31] {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                TERM_MODES,
+                &postcard::to_stdvec(&Modes { kitty, flags: 0 }).unwrap(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let before = layout_of(&view, cx).tabs().len();
+        let mut keystroke = gpui::Keystroke::parse("ctrl-alt-t").unwrap();
+        keystroke.key_char = Some("þ".into());
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: true,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+        assert_eq!(
+            layout_of(&view, cx).tabs().len(),
+            before,
+            "AltGr text must bypass the app binding"
+        );
+        peer.set_nonblocking(true).unwrap();
+        assert!(
+            peer.read(&mut [0; 64]).is_err(),
+            "AltGr must not leak Ctrl+Alt or release bytes"
+        );
+        cx.simulate_input("þ");
+        cx.run_until_parked();
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+        let input = krill_proto::input::Input::decode(kind, &body).unwrap();
+        assert_eq!(
+            input.bytes,
+            keys::tui::text("þ".as_bytes(), Modes { kitty, flags: 0 })
+        );
+    }
+    let before = layout_of(&view, cx).tabs().len();
+    cx.simulate_event(gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke::parse("ctrl-alt-t").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        layout_of(&view, cx).tabs().len(),
+        before + 1,
+        "a real Ctrl+Alt shortcut remains available"
+    );
+}
+
+#[gpui::test]
+fn input_policy_tab_workspace_indices_and_effective_menu_hints(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("input-policy-hints"));
+    cx.update(|window, cx| {
+        let bindings = cx.key_bindings();
+        let bindings = bindings.borrow();
+        for index in 1..=9 {
+            let workspace = if cfg!(target_os = "macos") {
+                format!("cmd-{index}")
+            } else {
+                format!("ctrl-{index}")
+            };
+            let workspace = gpui::Keystroke::parse(&workspace).unwrap();
+            let tab = gpui::Keystroke::parse(&keys::tab_index_key(index)).unwrap();
+            assert_ne!(workspace, tab);
+            let index_bindings: Vec<_> = bindings
+                .bindings()
+                .filter(|binding| {
+                    binding.match_keystrokes(std::slice::from_ref(&workspace)) == Some(false)
+                })
+                .collect();
+            assert!(
+                index_bindings
+                    .iter()
+                    .any(|b| b.action().name().contains("ActivateWorkspace"))
+            );
+            assert!(
+                !index_bindings
+                    .iter()
+                    .any(|b| b.action().name().contains("ActivateTab"))
+            );
+        }
+        assert!(keys::shortcut_label(window, &CloseTab).is_some());
+        assert!(keys::shortcut_label(window, &Jump).is_some());
+    });
+    cx.update(|_, cx| {
+        cx.clear_key_bindings();
+        cx.bind_keys([
+            KeyBinding::new("ctrl-f8", CloseTab, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-f9", Jump, Some(KEY_CONTEXT)),
+        ]);
+        view.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| {
+        let format = |key| gpui::Keystroke::parse(key).unwrap().to_string();
+        assert_eq!(
+            keys::shortcut_label(window, &CloseTab).unwrap(),
+            format("ctrl-f8")
+        );
+        assert_eq!(
+            keys::shortcut_label(window, &Jump).unwrap(),
+            format("ctrl-f9")
+        );
+    });
+    cx.update(|_, cx| {
+        cx.clear_key_bindings();
+        view.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| {
+        assert!(keys::shortcut_label(window, &CloseTab).is_none());
+        assert!(keys::shortcut_label(window, &Jump).is_none());
+    });
+}
+
+#[gpui::test]
+fn input_policy_link_modifier_drives_tui_hover_modifiers_and_direct_click(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Link as ScreenLink, Op, Revision, Seq, encode_update};
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+    let (view, cx) = open(cx, state_path("input-link-modifier"));
+    let pane = layout_of(&view, cx).focused().unwrap();
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, SessionId(911), ours, cx);
+        shell.on_frame(
+            pane,
+            TERM_MODES,
+            &postcard::to_stdvec(&Modes {
+                kitty: 0,
+                flags: Modes::MOUSE_CLICK | Modes::SGR_MOUSE,
+            })
+            .unwrap(),
+            cx,
+        );
+        for frame in encode_update(
+            Revision(1),
+            Seq(0),
+            vec![
+                Op::Reset { cols: 20, lines: 4 },
+                Op::Links {
+                    line: 0,
+                    links: vec![ScreenLink {
+                        column: 0,
+                        cols: 4,
+                        uri: "https://example.test/input".into(),
+                    }],
+                },
+            ],
+        )
+        .unwrap()
+        {
+            let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+            shell.on_frame(pane, kind, &body, cx);
+        }
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = view.read_with(cx, |shell, _| shell.live[&pane].painted.get());
+    let position = point(
+        bounds.origin.x + cell.width / 2.,
+        bounds.origin.y + cell.height / 2.,
+    );
+    let hover =
+        |cx: &mut VisualTestContext| view.read_with(cx, |shell, _| shell.files.hover.is_some());
+    let modifier = if cfg!(target_os = "macos") {
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        }
+    } else {
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
+    };
+    let wrong = if cfg!(target_os = "macos") {
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
+    } else {
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        }
+    };
+    cx.simulate_mouse_move(position, None, wrong);
+    cx.run_until_parked();
+    assert!(!hover(cx));
+    cx.simulate_mouse_move(position, None, modifier);
+    cx.run_until_parked();
+    assert!(hover(cx), "mouse-move must use the platform link modifier");
+    cx.simulate_modifiers_change(Modifiers::default());
+    cx.run_until_parked();
+    assert!(!hover(cx));
+    cx.simulate_modifiers_change(modifier);
+    cx.run_until_parked();
+    assert!(hover(cx), "modifier changes must use the same gesture");
+    assert_eq!(cx.opened_url(), None);
+    cx.simulate_click(position, modifier);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.test/input")
     );
 }

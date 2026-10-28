@@ -1112,35 +1112,33 @@ impl Shell {
             pos.y - ui::SPACE_2
         };
 
-        let menu_item = |id: &'static str,
-                         label: &'static str,
-                         enabled: bool,
-                         shortcut: Option<&'static str>| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .role(gpui::Role::MenuItem)
-                .aria_label(label)
-                .tab_index(0)
-                .tab_stop(enabled)
-                .focus_visible(|d| d.bg(p.accent).border_1().border_color(p.ring))
-                .px_2()
-                .py_1()
-                .rounded(ui::RADIUS_SM)
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .text_size(ui::TEXT_SM)
-                .when(enabled, |d| {
-                    d.cursor_pointer()
-                        .text_color(p.popover_foreground)
-                        .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-                })
-                .when(!enabled, |d| d.text_color(p.muted_foreground).opacity(0.5))
-                .child(div().flex_1().min_w_0().truncate().child(label))
-                .children(shortcut.map(|sc| ui::keycap(p, sc)))
-        };
+        let menu_item =
+            |id: &'static str, label: &'static str, enabled: bool, shortcut: Option<String>| {
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(label)
+                    .tab_index(0)
+                    .tab_stop(enabled)
+                    .focus_visible(|d| d.bg(p.accent).border_1().border_color(p.ring))
+                    .px_2()
+                    .py_1()
+                    .rounded(ui::RADIUS_SM)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_SM)
+                    .when(enabled, |d| {
+                        d.cursor_pointer()
+                            .text_color(p.popover_foreground)
+                            .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+                    })
+                    .when(!enabled, |d| d.text_color(p.muted_foreground).opacity(0.5))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .children(shortcut.map(|sc| ui::keycap(p, sc)))
+            };
 
         let pin_label = if is_pinned {
             text::UNPIN_TAB.get()
@@ -1357,11 +1355,7 @@ impl Shell {
                         "tab-menu-close",
                         text::CLOSE_TAB_MENU.get(),
                         !is_pinned,
-                        Some(if cfg!(target_os = "macos") {
-                            "⌘W"
-                        } else {
-                            "Ctrl+Alt+W"
-                        }),
+                        krill_app::keys::shortcut_label(window, &super::CloseTab),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab_context_menu = None;

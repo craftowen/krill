@@ -217,7 +217,6 @@ impl Ime {
 
     /// `firstRectForCharacterRange:` — 후보창을 붙일 셀. preedit 안 UTF-16 위치 `start`까지의 칸 수만큼 오른쪽.
     /// 에코 대기 중인 확정 글자가 같은 줄에 있으면 그 폭만큼 더 오른쪽이다(원인 1).
-    /// ponytail: 줄 끝을 넘으면 다음 줄로 접지 않는다. 오버레이가 줄을 넘는 입력이 보고되면 접는다.
     pub fn candidate_anchor(&self, start_utf16: usize) -> CellPoint {
         let mut utf16 = 0;
         let columns: usize = self
@@ -234,6 +233,28 @@ impl Ime {
             line: origin.line,
             column: origin.column + columns,
         }
+    }
+
+    /// Keep preedit and its caret inside the visible row, even after a resize.
+    pub fn overlay_in_columns(&self, columns: usize) -> Option<Overlay<'_>> {
+        self.overlay().map(|mut overlay| {
+            overlay.origin.column = overlay
+                .origin
+                .column
+                .min(columns.saturating_sub(overlay.columns.saturating_add(1)));
+            overlay
+        })
+    }
+
+    /// Candidate windows use the same shifted origin as the painted preedit.
+    pub fn candidate_anchor_in_columns(&self, start_utf16: usize, columns: usize) -> CellPoint {
+        let mut anchor = self.candidate_anchor(start_utf16);
+        if let Some(overlay) = self.overlay_in_columns(columns) {
+            let offset = anchor.column.saturating_sub(self.shifted_origin().column);
+            anchor.column = overlay.origin.column.saturating_add(offset);
+        }
+        anchor.column = anchor.column.min(columns.saturating_sub(1));
+        anchor
     }
 
     /// `markedRange` — 조합 중 글자의 UTF-16 범위.
@@ -312,4 +333,28 @@ fn char_width(ch: char) -> usize {
 
 fn utf16_len(s: &str) -> usize {
     s.chars().map(char::len_utf16).sum()
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_and_preedit_share_edge_fit_for_pending_wide_text_and_resize() {
+        let mut ime = Ime::default();
+        ime.set_cursor(CellPoint { line: 3, column: 7 }, true);
+        assert_eq!(ime.insert("한").pty, "한".as_bytes());
+        ime.set_marked("글😀", None);
+        let overlay = ime.overlay_in_columns(8).unwrap();
+        assert_eq!(overlay.columns, 4);
+        assert_eq!(overlay.origin, CellPoint { line: 3, column: 3 });
+        assert_eq!(ime.candidate_anchor_in_columns(0, 8), overlay.origin);
+        assert_eq!(ime.candidate_anchor_in_columns(1, 8).column, 5);
+        assert_eq!(ime.candidate_anchor_in_columns(3, 8).column, 7);
+        assert_eq!(ime.candidate_anchor_in_columns(3, 2).column, 1);
+        assert_eq!(ime.overlay_in_columns(2).unwrap().origin.column, 0);
+        assert_eq!(ime.candidate_anchor_in_columns(3, 0).column, 0);
+        assert_eq!(ime.candidate_anchor_in_columns(3, 0).line, 3);
+        assert_eq!(ime.commit().pty, "글😀".as_bytes());
+    }
 }

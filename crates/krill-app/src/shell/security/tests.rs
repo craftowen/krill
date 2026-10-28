@@ -1191,3 +1191,99 @@ fn cold_read_only_pane_never_accepts_clipboard_confirmation(cx: &mut TestAppCont
         });
     });
 }
+
+#[gpui::test]
+fn input_policy_drop_routes_explicit_shells_and_image_attachments(cx: &mut TestAppContext) {
+    use krill_proto::control::{Create, Program};
+    let (view, cx) = open(cx, state_path("drop-policy-routing"));
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(713), ours, cx);
+    });
+    for (program, path, expected) in [
+        (
+            Program::Custom {
+                program: b"powershell.exe".to_vec(),
+                args: vec![],
+            },
+            r"C:\tmp\it's (a b).txt",
+            br"'C:\tmp\it''s (a b).txt' ".as_slice(),
+        ),
+        (
+            Program::Custom {
+                program: b"cmd.exe".to_vec(),
+                args: vec![],
+            },
+            r"C:\tmp\it's (a b).txt",
+            br#""C:\tmp\it's (a b).txt" "#,
+        ),
+        (
+            Program::Agent { id: "codex".into() },
+            "/tmp/it's (a b).png",
+            b"\x1b[200~/tmp/it\\'s\\ \\(a\\ b\\).png\x1b[201~",
+        ),
+    ] {
+        cx.update(|window, cx| {
+            view.update(cx, |shell, cx| {
+                shell.layout.set_launch(
+                    pane,
+                    Create {
+                        program,
+                        cwd: vec![],
+                        cols: 80,
+                        rows: 24,
+                        account: None,
+                    },
+                );
+                let paths =
+                    gpui::ExternalPaths([std::path::PathBuf::from(path)].into_iter().collect());
+                shell.paste_dropped_paths(&paths, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (kind, body) = krill_proto::ipc::read_frame(&mut peer).unwrap().unwrap();
+        assert_eq!(Input::decode(kind, &body).unwrap().bytes, expected);
+    }
+}
+
+#[gpui::test]
+fn input_policy_late_preparation_cannot_reuse_a_changed_shell_or_attachment_policy(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::control::{Create, Program};
+    let (view, cx) = open(cx, state_path("drop-policy-changed"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            shell.attach_test(pane, krill_proto::SessionId(714), ours, cx);
+            let request = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.layout.set_launch(
+                pane,
+                Create {
+                    program: Program::Custom {
+                        program: b"pwsh.exe".to_vec(),
+                        args: vec![],
+                    },
+                    cwd: vec![],
+                    cols: 80,
+                    rows: 24,
+                    account: None,
+                },
+            );
+            shell.complete_attachment_paste(
+                request,
+                Some(b"/tmp/old\\ image.png".to_vec()),
+                true,
+                window,
+                cx,
+            );
+            assert!(shell.paste_queue.entries.is_empty());
+        });
+    });
+    cx.run_until_parked();
+    peer.set_nonblocking(true).unwrap();
+    assert!(peer.read(&mut [0; 64]).is_err());
+}

@@ -45,7 +45,7 @@ mod away;
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::Shutdown;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -487,15 +487,15 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-7", ActivateWorkspace7, ctx),
         krill_app::keys::bind("cmd-8", ActivateWorkspace8, ctx),
         krill_app::keys::bind("cmd-9", ActivateWorkspace9, ctx),
-        KeyBinding::new("ctrl-1", ActivateTab1, ctx),
-        KeyBinding::new("ctrl-2", ActivateTab2, ctx),
-        KeyBinding::new("ctrl-3", ActivateTab3, ctx),
-        KeyBinding::new("ctrl-4", ActivateTab4, ctx),
-        KeyBinding::new("ctrl-5", ActivateTab5, ctx),
-        KeyBinding::new("ctrl-6", ActivateTab6, ctx),
-        KeyBinding::new("ctrl-7", ActivateTab7, ctx),
-        KeyBinding::new("ctrl-8", ActivateTab8, ctx),
-        KeyBinding::new("ctrl-9", ActivateTab9, ctx),
+        KeyBinding::new(&keys::tab_index_key(1), ActivateTab1, ctx),
+        KeyBinding::new(&keys::tab_index_key(2), ActivateTab2, ctx),
+        KeyBinding::new(&keys::tab_index_key(3), ActivateTab3, ctx),
+        KeyBinding::new(&keys::tab_index_key(4), ActivateTab4, ctx),
+        KeyBinding::new(&keys::tab_index_key(5), ActivateTab5, ctx),
+        KeyBinding::new(&keys::tab_index_key(6), ActivateTab6, ctx),
+        KeyBinding::new(&keys::tab_index_key(7), ActivateTab7, ctx),
+        KeyBinding::new(&keys::tab_index_key(8), ActivateTab8, ctx),
+        KeyBinding::new(&keys::tab_index_key(9), ActivateTab9, ctx),
         krill_app::keys::bind("cmd-b", ToggleSidebar, ctx),
         krill_app::keys::bind("cmd-shift-0", FocusSidebar, ctx),
         krill_app::keys::bind("cmd-shift-e", ToggleExplorer, ctx),
@@ -679,6 +679,7 @@ pub struct Shell {
     system_appearance: Option<Subscription>,
     security: krill_app::security::State,
     paste_queue: security::PasteQueue,
+    character_input_keys: BTreeSet<String>,
     /// 가운데 영역 파일(에디터) 탭(MK-119).
     files: files::Files,
     #[cfg(test)]
@@ -1229,6 +1230,7 @@ impl Shell {
             status_menus_open: 0,
             security: krill_app::security::State::default(),
             paste_queue: security::PasteQueue::default(),
+            character_input_keys: BTreeSet::new(),
             files: files::Files::default(),
             #[cfg(test)]
             close_call: None,
@@ -4430,6 +4432,9 @@ impl Shell {
                         return None;
                     }
                     let n = l.pane.unlink();
+                    if let Some(session) = t.layout.session(pane) {
+                        t.chat.review_pending_prompt(session);
+                    }
                     t.show(n.as_ref(), cx);
                     Some(())
                 });
@@ -4815,6 +4820,11 @@ impl Shell {
         if let Some(text) = ev.clipboard {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        if ev.notice.is_some()
+            && let Some(session) = self.layout.session(pane)
+        {
+            self.chat.review_pending_prompt(session);
+        }
         self.show(ev.notice.as_ref(), cx);
         !ev.closed
     }
@@ -5054,6 +5064,13 @@ impl Shell {
             }
             return;
         }
+        // AltGr/dead-key text must reach the platform input handler, including
+        // Kitty modes. Remember it so a later release cannot leak a Ctrl+Alt key.
+        if e.prefer_character_input {
+            self.character_input_keys.insert(e.keystroke.key.clone());
+            return;
+        }
+        self.character_input_keys.remove(&e.keystroke.key);
         // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·←·→만 Ctrl+U·A·E로 보낸다.
         let ks = &e.keystroke;
         let Some(pane) = self.layout.focused().filter(|&p| self.is_terminal_pane(p)) else {
@@ -5075,7 +5092,9 @@ impl Shell {
             keys::tui::Event::Press
         };
         let meta = krill_app::settings::option_as_meta(cx);
-        let Some(bytes) = keys::tui::key(ks, modes, event).or_else(|| keys::tui::meta(ks, meta))
+        let Some(bytes) =
+            keys::tui::key_with_policy(ks, modes, event, self.input_policy_for(pane, cx))
+                .or_else(|| keys::tui::meta(ks, meta))
         else {
             return; // 글자 키는 IME 확정 텍스트(replace_text_in_range)로 온다
         };
@@ -5096,6 +5115,9 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, e: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.character_input_keys.remove(&e.keystroke.key) {
+            return;
+        }
         // AS-12: `on_key_down`과 같이 포커스를 검사한다. 검색 바·Jump·사이드바 입력 중에
         // 올라온 Release가 버블링돼 터미널 PTY로 새는 것을 막는다(kitty 플래그 2 보고 모드).
         if self.page_open() || self.dashboard.is_some() || !self.focus.is_focused(window) {
@@ -6399,11 +6421,14 @@ impl Shell {
                 el.highlight = l.pane.highlight();
                 el.highlights = l.pane.highlights().to_vec();
                 el.link = self.path_hover(id);
-                el.preedit = focused.then(|| l.ime.overlay()).flatten().map(|o| Preedit {
-                    origin: o.origin,
-                    text: o.text.to_owned(),
-                    columns: o.columns,
-                });
+                el.preedit = focused
+                    .then(|| l.ime.overlay_in_columns(usize::from(l.pane.screen().cols)))
+                    .flatten()
+                    .map(|o| Preedit {
+                        origin: o.origin,
+                        text: o.text.to_owned(),
+                        columns: o.columns,
+                    });
                 // 확정 뒤 에코 대기 글자는 화면에 아직 없어도 그린다(OWE-615 원인 1).
                 el.pending = focused.then(|| l.ime.pending()).flatten().map(|p| Preedit {
                     origin: p.origin,
@@ -6558,7 +6583,7 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
-                    if e.modifiers.platform {
+                    if keys::link_modifier(e.modifiers) {
                         this.change(true, cx, |l| l.focus(id));
                         let action = if e.modifiers.alt {
                             terminal_menu::FileAction::OpenDefault
@@ -6732,7 +6757,7 @@ impl Shell {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
-                this.update_path_hover(id, e.position, e.modifiers.platform, cx);
+                this.update_path_hover(id, e.position, keys::link_modifier(e.modifiers), cx);
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
                 {
@@ -7786,7 +7811,7 @@ impl Render for Shell {
                                 .flex()
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))
-                                .child(self.render_agents(cx))
+                                .child(self.render_agents(window, cx))
                                 .child(
                                     div().flex_1().min_h_0().child(
                                         self.sidebar
@@ -8323,7 +8348,9 @@ impl EntityInputHandler for Shell {
     ) -> Option<Bounds<Pixels>> {
         let l = self.focused_live()?;
         let (bounds, cell) = l.painted.get();
-        let at = l.ime.candidate_anchor(range_utf16.start);
+        let at = l
+            .ime
+            .candidate_anchor_in_columns(range_utf16.start, usize::from(l.pane.screen().cols));
         let n = |v: usize| f32::from(u16::try_from(v).unwrap_or(u16::MAX));
         Some(Bounds::new(
             point(

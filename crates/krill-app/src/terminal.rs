@@ -583,13 +583,30 @@ impl Element for TerminalElement {
                             * f32::from(u16::try_from(run.origin.line).unwrap_or(u16::MAX)),
                 );
                 window.paint_quad(fill(
-                    Bounds::new(row, size(cols(run.columns), cell.height)),
+                    Bounds::new(
+                        row,
+                        size(
+                            cols(run.columns.min(
+                                usize::from(self.screen.cols).saturating_sub(run.origin.column),
+                            )),
+                            cell.height,
+                        ),
+                    ),
                     background,
                 ));
                 for (offset, text, group_cols) in run.groups() {
                     // 확정 셀과 같은 강제 폭(2칸 글자는 2칸, 아니면 1칸)으로 같은 자리에 그린다.
                     let force = cell.width
                         * f32::from(u16::try_from(group_cols.max(1)).unwrap_or(u16::MAX));
+                    if run
+                        .origin
+                        .column
+                        .saturating_add(offset)
+                        .saturating_add(group_cols)
+                        > usize::from(self.screen.cols)
+                    {
+                        continue;
+                    }
                     let x =
                         row.x + cell.width * f32::from(u16::try_from(offset).unwrap_or(u16::MAX));
                     let layout = window.text_system().layout_line(
@@ -635,7 +652,11 @@ impl Element for TerminalElement {
             }
             // 마지막 글자 끝(조합 중이면 preedit 끝, 아니면 확정 대기 끝)에 그리드와 같은 모양 커서.
             let (caret_column, caret_line) = match (&self.preedit, &self.pending) {
-                (Some(p), _) | (None, Some(p)) => (p.origin.column + p.columns, p.origin.line),
+                (Some(p), _) | (None, Some(p)) => (
+                    (p.origin.column + p.columns)
+                        .min(usize::from(self.screen.cols).saturating_sub(1)),
+                    p.origin.line,
+                ),
                 (None, None) => return,
             };
             let caret = |v: usize| f32::from(u16::try_from(v).unwrap_or(u16::MAX));

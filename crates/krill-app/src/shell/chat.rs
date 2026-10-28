@@ -136,6 +136,12 @@ pub(crate) struct ChatState {
 }
 
 impl ChatState {
+    pub(super) fn review_pending_prompt(&mut self, session: SessionId) {
+        if self.prompt_tasks.contains_key(&session) {
+            self.prompt_review.insert(session);
+        }
+    }
+
     pub(crate) fn set_session_chat_view(&mut self, session: SessionId, chat: bool) {
         self.overrides.insert(session, chat);
         if chat {
@@ -710,11 +716,10 @@ impl Shell {
             .live
             .get(&pane)
             .map_or_else(Default::default, |live| live.pane.modes());
-        // Use the same paste plan as terminal handoff: newlines belong inside
-        // a bracketed paste, with a single submit after the closing marker.
-        // Refuse multiline on an unbracketed terminal and preserve the draft.
+        // Use the terminal consumer's paste plan, then submit separately.
+        // Unknown unbracketed consumers retain the multiline draft for review.
         let krill_app::security::PastePlan::Immediate(mut bytes) =
-            krill_app::security::plan_paste(pane, text.as_bytes(), modes)
+            self.plan_terminal_paste(pane, text.as_bytes(), modes, cx)
         else {
             self.chat.multiline_blocked.insert(session);
             cx.notify();
