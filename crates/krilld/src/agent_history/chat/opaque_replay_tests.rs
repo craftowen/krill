@@ -101,3 +101,159 @@ mod recheck_stable_boundary {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod multipart_boundaries {
+    use super::*;
+
+    fn fixture(label: &str, counts: &[usize]) -> (PathBuf, PathBuf, rusqlite::Connection) {
+        let root =
+            std::env::temp_dir().join(format!("krill-multipart-{label}-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("opencode.db");
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,data TEXT,time_created INTEGER); CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT,data TEXT,time_created INTEGER); CREATE INDEX part_message ON part(message_id); INSERT INTO session VALUES('s','/workspace');").unwrap();
+        let tx = db.transaction().unwrap();
+        for (m, count) in counts.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO message VALUES(?1,'s','{\"role\":\"assistant\"}',?2)",
+                rusqlite::params![format!("m{m:06}"), i64::try_from(m).unwrap()],
+            )
+            .unwrap();
+            for i in 0..*count {
+                tx.execute(
+                    "INSERT INTO part VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![
+                        format!("p{m}-{i:04}"),
+                        format!("m{m:06}"),
+                        format!(r#"{{"type":"text","text":"part-{m}-{i}"}}"#),
+                        i64::try_from(i).unwrap()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        (root, path, db)
+    }
+
+    #[test]
+    fn independent_latest_mixed_part_records_replays_without_omission() {
+        let (root, path, db) = fixture("independent", &[100, 50, 1]);
+        let seed = poll_transcript_file(VaultAgent::OpenCode, "s", &path, 0);
+        let (latest, start) = latest_page(seed, None).unwrap();
+        assert!(latest.bound && !latest.reset);
+        let replay = replay_page(latest.clone(), start, latest.next_offset).unwrap();
+        assert!(replay.bound && !replay.reset);
+        assert_eq!(
+            replay.items, latest.items,
+            "every item from observed latest must replay"
+        );
+        assert_eq!(replay.next_offset, latest.next_offset);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asymmetric_groups_keep_atomic_forward_tail_history_and_append_boundaries() {
+        for (case, counts) in [
+            vec![100, 50, 1],
+            vec![1, 50, 100],
+            vec![64, 64, 1],
+            vec![1, 128, 1],
+            vec![129, 1, 50],
+            vec![1, 50, 129],
+            vec![64, 64, 0],
+            vec![0, 129, 0, 1, 0],
+            vec![0, 100, 0, 50, 0, 1, 0],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (root, path, db) = fixture(&case.to_string(), counts);
+            let expected: Vec<_> = counts
+                .iter()
+                .enumerate()
+                .flat_map(|(m, count)| (0..*count).map(move |i| format!("part-{m}-{i}")))
+                .collect();
+            let seed = poll_transcript_file(VaultAgent::OpenCode, "s", &path, 0);
+            let mut forward = Vec::new();
+            let mut observed = Vec::new();
+            let mut cursor = 0;
+            loop {
+                let page = poll_transcript_file(VaultAgent::OpenCode, "s", &path, cursor);
+                assert!(page.bound && !page.reset);
+                assert_atomic_budget(&page);
+                let replay = replay_page(page.clone(), cursor, page.next_offset).unwrap();
+                assert_eq!(replay, page);
+                forward.extend(page.items.iter().map(|item| item.text.clone()));
+                observed.push((cursor, page.clone()));
+                cursor = page.next_offset;
+                if cursor >= OPENCODE_END {
+                    break;
+                }
+            }
+            assert_eq!(forward, expected);
+            let (latest, mut start) = latest_page(seed.clone(), None).unwrap();
+            assert_atomic_budget(&latest);
+            assert_eq!(
+                replay_page(latest.clone(), start, latest.next_offset).unwrap(),
+                latest
+            );
+            let mut backwards = latest.items.clone();
+            while start > 0 {
+                let (page, next_start) = latest_page(seed.clone(), Some(start)).unwrap();
+                assert!(next_start < start);
+                assert_eq!(page.next_offset, start);
+                assert_atomic_budget(&page);
+                assert_eq!(replay_page(page.clone(), next_start, start).unwrap(), page);
+                let mut items = page.items;
+                items.extend(backwards);
+                backwards = items;
+                start = next_start;
+            }
+            assert_eq!(
+                backwards
+                    .iter()
+                    .map(|item| item.text.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            db.execute("INSERT INTO message VALUES('z','s','{\"role\":\"user\",\"content\":\"appended\"}',1000)", []).unwrap();
+            for (start, page) in observed {
+                assert_eq!(
+                    replay_page(page.clone(), start, page.next_offset).unwrap(),
+                    page
+                );
+            }
+            // A former live-end token stays immutable in both replay and latest-before.
+            let end = latest.next_offset;
+            let (historical, historical_start) = latest_page(seed, Some(end)).unwrap();
+            assert_eq!(historical.items, latest.items);
+            assert_eq!(historical.next_offset, end);
+            assert_eq!(
+                replay_page(historical.clone(), historical_start, end).unwrap(),
+                historical
+            );
+            let appended = poll_transcript_file(VaultAgent::OpenCode, "s", &path, cursor);
+            assert!(appended.bound && !appended.reset);
+            assert_eq!(appended.items.len(), 1);
+            assert_eq!(appended.items[0].text, "appended");
+            drop(db);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn assert_atomic_budget(page: &ChatPollSnapshot) {
+        if page.items.len() > MAX_CHAT_ITEMS {
+            let message = page.items.first().unwrap().text.split('-').nth(1).unwrap();
+            assert!(
+                page.items
+                    .iter()
+                    .all(|item| item.text.split('-').nth(1) == Some(message)),
+                "only one atomic message may exceed the item budget"
+            );
+        }
+    }
+}

@@ -701,10 +701,20 @@ fn poll_opencode_database(
     let mut remaining = MAX_SKIP_BYTES;
     let mut digest = session.prefix_digest;
     for (record, proof) in session.messages.into_iter().zip(session.message_digests) {
-        if consumed >= end || page.items.len() >= MAX_CHAT_ITEMS {
+        if consumed >= end {
             break;
         }
-        parse_opencode_message_record(&record, None, &mut page.items, &mut remaining);
+        let mut items = Vec::new();
+        parse_opencode_message_record(&record, None, &mut items, &mut remaining);
+        // Keep whole messages on either side of the page boundary, just as latest
+        // and byte-backed pages do. A single large message may exceed the soft cap.
+        if !items.is_empty()
+            && !page.items.is_empty()
+            && page.items.len().saturating_add(items.len()) > MAX_CHAT_ITEMS
+        {
+            break;
+        }
+        page.items.extend(items);
         consumed = consumed.saturating_add(1);
         digest = proof;
     }
@@ -790,6 +800,9 @@ fn latest_opencode_database(
     {
         let mut items = Vec::new();
         parse_opencode_message_record(&record, None, &mut items, &mut remaining);
+        if count > 0 && count.saturating_add(items.len()) > MAX_CHAT_ITEMS {
+            break;
+        }
         count = count.saturating_add(items.len());
         records.push(items);
         if count >= MAX_CHAT_ITEMS {
