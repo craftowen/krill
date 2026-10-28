@@ -15,7 +15,7 @@
 
 <p align="center">
   <strong>Run many CLI coding agents side by side in a native app — no Electron, no web view.</strong><br/>
-  Claude Code, Codex, Antigravity, Cursor, and OpenCode each get a Git worktree and terminal, with a queue of the agents waiting on you and diff review. In our 10-terminal benchmark (2026-10-25, Krill 0.2.2 vs Orca 1.4.237) Krill used <strong>85.9 MiB</strong> instead of <strong>1,274.9 MiB</strong>, about 1/15th; it was slower in one 20-terminal output test (see below).
+  Claude Code, Codex, Antigravity, Cursor, and OpenCode each get a Git worktree and terminal, with a queue of the agents waiting on you and diff review. In our latest 10-terminal benchmark (2026-10-28, Krill 0.2.20 vs Orca 1.4.242, screen on) Krill used <strong>153.3 MiB</strong> instead of <strong>1,153.6 MiB</strong>, about 1/7th; it was slower when many terminals printed at once (see below).
 </p>
 
 <p align="center">
@@ -32,7 +32,23 @@ Agent workspaces like [Orca](https://github.com/stablyai/orca) already keep term
 
 The difference is **resource efficiency and process architecture**. Orca is built on Electron (Chromium + Node.js), spawning separate main, GPU, renderer, and daemon processes while keeping a terminal instance in the renderer for every open tab. Krill delivers the same parallel-agent workflow as a **single Rust (`gpui`) UI process with no Electron or web view**, attaching UI render state only to visible panes while keeping terminal state in a single lightweight daemon (`krilld`) backed by a panic-free PTY parent (`krill-holder`).
 
-### Measured Benchmark: Krill 0.2.2 vs. Orca 1.4.237 (2026-10-25)
+### Re-measured: Krill 0.2.20 vs. Orca 1.4.242 (2026-10-28, screen on)
+
+Same harness and machine as the 2026-10-25 run below, but with the display **on** (windows visible) and a busy machine (load average 11–52 during runs). Krill auto-updated from 0.2.19 to 0.2.20 after the first run; every 10- and 20-terminal Krill run used 0.2.20. 3-run medians.
+
+| Metric (10 terminals) | Krill 0.2.20 | Orca 1.4.242 | Krill vs. Orca |
+|---|---:|---:|---|
+| Memory (`phys_footprint`, all app + daemon processes) | **153.3 MiB** | 1,153.6 MiB | about 1/7th |
+| Idle CPU (30 s average, screen on) | **1.9%** | 12.9% | about 1/7th |
+| Install size (`.app` bundle) | **95.6 MiB** | 704.7 MiB | about 1/7th |
+| CPU time to process 10 × 2.8 MB of output | 23.2 s | **8.6 s** | **Krill used 2.7× more** |
+| Wall-clock to process that output | 10.3 s | **3.9 s** | **Krill 2.6× slower** |
+
+- 20 terminals: memory 309.4 vs 1,347.6 MiB; output processing 21.6 s vs 5.6 s wall-clock (Krill slower). 1 terminal: 125.4 vs 853.7 MiB, output on par (0.41 s each).
+- The output-processing cost is in `krilld` while the desktop app is attached (123–138 CPU-seconds at 20 terminals); the same `krilld` without a GUI client used 2.6 s. This is a regression since 0.2.2 and is being fixed. Krill's results also varied a lot between runs (10 terminals: 1.2–34.8 CPU-seconds).
+- With the screen on, `krill-app` itself used about 111 MiB (it was 30 MiB with the screen locked in the earlier run), which is why the memory ratio is lower than 1/15.
+
+### Earlier run: Measured Benchmark: Krill 0.2.2 vs. Orca 1.4.237 (2026-10-25)
 
 Measured on the same **Mac mini (Apple M6, 32 GB, macOS 27.0.1)** using unmodified `/Applications` release builds, fresh isolated profiles, identical `1200×760pt` windows (`1176×746` actual), and 3-run medians across 18/18 valid runs (each terminal printing 20,000 lines / ~2.8 MB of Korean, ANSI color, and >120-column text; screen locked):
 
