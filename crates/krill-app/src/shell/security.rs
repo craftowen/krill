@@ -34,6 +34,8 @@ pub(crate) struct RemoteUploadTarget {
     pub ssh_host: Option<krill_app::ssh_hosts::SshHost>,
     pub host_target: Option<krill_app::hosts::HostTarget>,
     pub prefer_target_ipc: bool,
+    /// Remote daemon runs on Windows: no `/bin/sh`, so stage via PowerShell + `RemoteFs`.
+    pub windows: bool,
 }
 
 #[derive(Default)]
@@ -438,10 +440,21 @@ impl Shell {
                 if ssh_host.is_none() && host_target.is_none() {
                     return None;
                 }
+                let windows = self
+                    .layout
+                    .session(pane)
+                    .and_then(|session| {
+                        self.sidebar
+                            .read(cx)
+                            .session_on(self.layout.host(pane), session)
+                    })
+                    .and_then(|session| session.status.root_shell.as_deref())
+                    .is_some_and(|root| root.os == krill_proto::control::ShellOs::Windows);
                 Some(RemoteUploadTarget {
                     ssh_host,
                     host_target,
                     prefer_target_ipc: id.starts_with("iroh:"),
+                    windows,
                 })
             }
             krill_app::hosts::HostId::Local => None,
@@ -1518,6 +1531,7 @@ pub(crate) fn clipboard_paste_payload_for_host(
         ssh_host: Some(h),
         host_target: None,
         prefer_target_ipc: false,
+        windows: false,
     });
     clipboard_paste_payload_for_target(item, target.as_ref())
 }
@@ -1627,6 +1641,10 @@ fn upload_bytes_to_remote_target(
     filename: &str,
     bytes: &[u8],
 ) -> Option<String> {
+    if target.windows {
+        // SSH upload relies on a POSIX shell (`mktemp`/`cat`); only the daemon RPC works here.
+        return upload_bytes_via_windows_target(target.host_target.as_ref()?, filename, bytes);
+    }
     if target.prefer_target_ipc {
         if let Some(ht) = &target.host_target
             && let Some(path) =
@@ -1695,10 +1713,11 @@ pub(super) fn base64_encode(input: &[u8]) -> Vec<u8> {
 
 fn run_custom_and_wait_marker(
     stream: &mut krill_proto::os::net::UnixStream,
+    program: &[u8],
+    cwd: &[u8],
     args: Vec<Vec<u8>>,
-    marker_prefix: &str,
-    marker_suffix: &str,
-    error_marker: &str,
+    // Script prints `<marker>_OK:<value>:END` on success, `<marker>_ERR` on failure.
+    marker: &str,
     deadline: std::time::Instant,
 ) -> Option<String> {
     use krill_proto::control::{CaptureFormat, Create, Program, Reply, Request};
@@ -1709,10 +1728,10 @@ fn run_custom_and_wait_marker(
     let create = Request::Create(Create {
         account: None,
         program: Program::Custom {
-            program: b"/bin/sh".to_vec(),
+            program: program.to_vec(),
             args,
         },
-        cwd: b"/tmp".to_vec(),
+        cwd: cwd.to_vec(),
         cols: 1024,
         rows: 24,
     });
@@ -1741,11 +1760,11 @@ fn run_custom_and_wait_marker(
             Ok(Reply::Captured { bytes: cap, .. }) => {
                 let text = String::from_utf8_lossy(&cap);
                 let flat: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
-                if flat.contains(error_marker) {
+                if flat.contains(&format!("{marker}_ERR")) {
                     break;
                 }
-                if let Some((_, after)) = flat.split_once(marker_prefix)
-                    && let Some((inner, _)) = after.split_once(marker_suffix)
+                if let Some((_, after)) = flat.split_once(&format!("{marker}_OK:"))
+                    && let Some((inner, _)) = after.split_once(":END")
                 {
                     result = Some(inner.trim().to_owned());
                     break;
@@ -1828,15 +1847,15 @@ pub(crate) fn upload_bytes_via_target(
     );
     let remote_path = run_custom_and_wait_marker(
         &mut stream,
+        b"/bin/sh",
+        b"/tmp",
         vec![
             b"-c".to_vec(),
             create_script.into_bytes(),
             b"sh".to_vec(),
             first_b64,
         ],
-        "KRILL_PASTE_OK:",
-        ":END",
-        "KRILL_PASTE_ERR",
+        "KRILL_PASTE",
         deadline,
     )?;
     if !remote_path.starts_with('/') || remote_path.contains(['\n', '\r', '\0']) {
@@ -1856,6 +1875,8 @@ pub(crate) fn upload_bytes_via_target(
         let chunk_b64 = base64_encode(chunk);
         run_custom_and_wait_marker(
             &mut stream,
+            b"/bin/sh",
+            b"/tmp",
             vec![
                 b"-c".to_vec(),
                 append_script.clone(),
@@ -1863,14 +1884,73 @@ pub(crate) fn upload_bytes_via_target(
                 remote_path.as_bytes().to_vec(),
                 chunk_b64,
             ],
-            "KRILL_APPEND_OK:",
-            ":END",
-            "KRILL_APPEND_ERR",
+            "KRILL_APPEND",
             deadline,
         )?;
     }
 
     Some(remote_path)
+}
+
+/// Windows daemon: PowerShell creates a private temp folder, then the bytes go through the
+/// OS-neutral `RemoteFs` atomic write (chunked), avoiding command-line length limits.
+fn upload_bytes_via_windows_target(
+    target: &krill_app::hosts::HostTarget,
+    filename: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    use krill_proto::control::{FEAT_CLI, FEAT_CONTROL};
+    use krill_proto::ipc::ClientRole;
+
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let filename = sanitize_remote_filename(filename);
+    let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-clipboard");
+    let conn = target.connect(&hello).ok()?;
+    let required = FEAT_CONTROL | FEAT_CLI;
+    if conn.negotiated.features & required != required {
+        return None;
+    }
+    let mut stream = conn.stream;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    let dir = run_custom_and_wait_marker(
+        &mut stream,
+        b"powershell.exe",
+        b"",
+        windows_temp_dir_args(),
+        "KRILL_PASTE",
+        std::time::Instant::now() + Duration::from_secs(15),
+    )?;
+    let dir = dir.trim_end_matches(['\\', '/']);
+    if dir.is_empty() || dir.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let path = format!("{dir}\\{filename}");
+    krill_app::remote_fs::save_atomic_bytes(target, std::path::Path::new(&path), bytes, None)
+        .ok()?;
+    Some(path)
+}
+
+/// `-EncodedCommand` (UTF-16LE Base64) sidesteps Windows command-line quoting entirely.
+fn windows_temp_dir_args() -> Vec<Vec<u8>> {
+    const SCRIPT: &str = "try { \
+        $d = Join-Path ([IO.Path]::GetTempPath()) ('krill-paste-' + [guid]::NewGuid().ToString('N').Substring(0, 12)); \
+        [void](New-Item -ItemType Directory -Path $d -ErrorAction Stop); \
+        [Console]::Out.Write('KRILL_PASTE_OK:' + $d + ':END') \
+    } catch { [Console]::Out.Write('KRILL_PASTE_ERR') }; Start-Sleep -Seconds 3";
+    let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    vec![
+        b"-NoProfile".to_vec(),
+        b"-NonInteractive".to_vec(),
+        b"-ExecutionPolicy".to_vec(),
+        b"Bypass".to_vec(),
+        b"-EncodedCommand".to_vec(),
+        base64_encode(&utf16),
+    ]
 }
 
 fn upload_bytes_with_program(
