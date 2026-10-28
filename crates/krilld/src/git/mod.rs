@@ -324,13 +324,27 @@ fn argument_bytes(args: &[OsString]) -> usize {
     })
 }
 
+/// 맨이름 프로그램을 `PATH` 디렉터리에서 절대 경로로 풀어 준다. std는 `PATH`를 바꾼 맨이름 실행을 `posix_spawn`으로
+/// 못 하고 `fork`+`exec`로 돌리는데, 다중 스레드 데몬의 fork 자식이 exec 전에 죽어(2026-10-27 12:04 `krilld` SIGABRT,
+/// "crashed on child side of fork pre-exec") 데몬째 사라진 적이 있다. 못 찾으면 원래 이름을 그대로 쓴다.
+fn resolve_program(program: &Path, path: &OsStr) -> PathBuf {
+    if program.components().count() != 1 {
+        return program.to_path_buf();
+    }
+    std::env::split_paths(path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| program.to_path_buf())
+}
+
 fn command(program: &Path, repo: &Path, args: &[OsString]) -> Command {
-    let mut cmd = Command::new(program);
+    let path = OsStr::from_bytes(crate::shell::login_path());
+    let mut cmd = Command::new(resolve_program(program, path));
     crate::child::own_group(&mut cmd)
         .args(FIXED_ARGS)
         .args(args)
         .current_dir(repo)
-        .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
+        .env("PATH", path)
         .envs(FIXED_ENV)
         .stdin(Stdio::null());
     for var in CLEARED_ENV {
@@ -492,3 +506,22 @@ mod tests;
 
 #[cfg(test)]
 mod platform_tests;
+
+#[cfg(all(test, unix))]
+mod resolve_tests {
+    use super::*;
+
+    #[test]
+    fn bare_names_resolve_against_the_given_path_and_paths_are_kept() {
+        let found = resolve_program(Path::new("sh"), OsStr::new("/nonexistent:/bin"));
+        assert_eq!(found, Path::new("/bin/sh"));
+        assert_eq!(
+            resolve_program(Path::new("nope-krill"), OsStr::new("/bin")),
+            Path::new("nope-krill")
+        );
+        assert_eq!(
+            resolve_program(Path::new("/usr/bin/git"), OsStr::new("/bin")),
+            Path::new("/usr/bin/git")
+        );
+    }
+}
