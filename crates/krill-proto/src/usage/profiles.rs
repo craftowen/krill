@@ -1,7 +1,7 @@
 //! Krill이 만든 계정 프로필 폴더(OWE-704). krilld와 앱의 로컬 경로가 같은 규칙을 쓴다.
 //!
 //! 지우는 대신 휴지통(`~/.Trash`)으로 옮긴다. 로그인 정보·대화 기록이 든 사용자 데이터라
-//! 실수해도 Finder에서 되돌릴 수 있어야 한다. 관리 루트(`~/.config/krill/profiles/<provider>/<이름>`)
+//! macOS에서는 Finder로 되돌리고, Windows에서는 이 사설 보관 경로에서 원래 위치로 옮겨 복원한다. 관리 루트(`~/.config/krill/profiles/<provider>/<이름>`)
 //! 밖의 폴더(사용자가 직접 지정한 `~/.claude` 등)는 절대 옮기지 않는다. 파일 탐색기의 휴지통 이동은
 //! 워크트리 안으로 범위를 좁힌 별도 함수 [`move_path_to_trash`]를 쓴다.
 
@@ -354,7 +354,8 @@ pub fn move_to_trash(home: &Path, dir: &Path) -> io::Result<PathBuf> {
     rename_into_trash(home, dir, &format!("krill-{provider}-{name}"))
 }
 
-/// 파일 탐색기 전용: 워크트리 `root` 안의 파일·폴더를 `~/.Trash/<이름>`(겹치면 ` 2`, ` 3` …)으로 옮긴다.
+/// 파일 탐색기 전용: macOS는 `~/.Trash/<이름>`, Windows는 시스템 Recycle Bin으로 옮긴다.
+/// Windows 성공 반환값은 복구 UI 위치인 `shell:RecycleBinFolder`다. UNC/reparse point는 거부한다.
 /// 루트 자체, 루트 밖(`..`·심볼릭 링크 부모로 빠져나가는 경로 포함)은 `InvalidInput`으로 거부한다.
 /// 계정 프로필 폴더는 [`move_to_trash`]만 쓴다.
 pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<PathBuf> {
@@ -374,7 +375,79 @@ pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<P
     }
     path.symlink_metadata()?;
     let name = path.file_name().ok_or_else(invalid)?.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let _ = (home, name);
+        recycle_windows_path(path)
+    }
+    #[cfg(not(windows))]
     rename_into_trash(home, path, &name)
+}
+
+/// File explorer deletion uses the OS recovery surface on Windows. Account data is
+/// deliberately retained in the private ~/.Trash archive by `move_to_trash` instead.
+#[cfg(windows)]
+fn recycle_windows_path(path: &Path) -> io::Result<PathBuf> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let system_root =
+        std::env::var_os("SystemRoot").ok_or_else(|| io::Error::other("SystemRoot is not set"))?;
+    let powershell =
+        PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let script = r"$ErrorActionPreference='Stop'
+try {
+  Add-Type -AssemblyName Microsoft.VisualBasic
+  $p=$env:KRILL_RECYCLE_PATH
+  if ($p.StartsWith('\\') -or ([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'Recycle Bin is not available for network paths or reparse points'
+  }
+  if ([IO.Directory]::Exists($p)) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+  } else {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+  }
+  exit 0
+} catch { exit 1 }
+";
+    let mut child = crate::os::background_command(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("KRILL_RECYCLE_PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() || path.symlink_metadata().is_ok() {
+                    return Err(io::Error::other(
+                        "Windows Recycle Bin operation failed; no permanent-delete fallback",
+                    ));
+                }
+                return Ok(PathBuf::from("shell:RecycleBinFolder"));
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(15) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(result.err().unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Windows Recycle Bin operation timed out",
+                    )
+                }));
+            }
+        }
+    }
 }
 
 fn rename_into_trash(home: &Path, src: &Path, base: &str) -> io::Result<PathBuf> {
