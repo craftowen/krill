@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 const MAX_SESSIONS: usize = 256;
 const MAX_MESSAGES: usize = 2048;
 const MAX_PARTS: usize = 4096;
+const MAX_PREFIX_ROWS: usize = 100_000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) struct Session {
@@ -199,6 +200,7 @@ fn read_window(
         };
         let mut message_count = 0usize;
         let mut part_count = 0usize;
+        let mut page_part_count = 0usize;
         for session in &mut batch.sessions {
             if id.is_some() {
                 session.message_count = u64::try_from(db.query_row(
@@ -228,7 +230,7 @@ fn read_window(
             while let Some(row) = rows.next()? {
                 if message_count
                     >= if page_size.is_some() {
-                        100_000
+                        MAX_PREFIX_ROWS
                     } else {
                         MAX_MESSAGES
                     }
@@ -267,7 +269,18 @@ fn read_window(
                     ])?;
                     let mut parts = Vec::new();
                     while let Some(row) = rows.next()? {
-                        if part_count >= MAX_PARTS
+                        let visible = position >= offset
+                            && page_size.is_none_or(|size| {
+                                position < offset.saturating_add(u64::try_from(size).unwrap_or(128))
+                            });
+                        if parts.len() >= MAX_PARTS
+                            || part_count
+                                >= if page_size.is_some() {
+                                    MAX_PREFIX_ROWS
+                                } else {
+                                    MAX_PARTS
+                                }
+                            || (visible && page_part_count >= MAX_PARTS)
                             || batch.bytes >= MAX_BYTES
                             || Instant::now() >= deadline
                         {
@@ -275,6 +288,9 @@ fn read_window(
                             break;
                         }
                         part_count = part_count.saturating_add(1);
+                        if visible {
+                            page_part_count = page_part_count.saturating_add(1);
+                        }
                         let data: String = row.get(0)?;
                         batch.bytes = batch.bytes.saturating_add(data.len());
                         digest.update(b"part");
@@ -316,6 +332,8 @@ mod tests {
     use super::*;
     use crate::agent_history::{chat, vault};
     use krill_proto::agent_history::{SearchQuery, VaultAgent};
+
+    mod prefix_budget;
 
     fn fixture(name: &str) -> (PathBuf, PathBuf, Connection) {
         let root = std::env::temp_dir().join(format!(
