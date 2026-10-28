@@ -471,6 +471,39 @@ pub struct AgentStatus {
     /// `title` 꼬리 뒤 세 번째 꼬리로만 오가 구버전과 상호 호환한다.
     #[serde(default, skip)]
     pub subagents: Vec<Subagent>,
+    /// Observed root shell and host OS; fourth States extension, never inferred by the client.
+    #[serde(default, skip)]
+    pub root_shell: Option<Box<RootShell>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootShell {
+    pub os: ShellOs,
+    #[serde(deserialize_with = "root_program")]
+    pub program: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellOs {
+    Unix,
+    Windows,
+}
+
+fn root_program<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Text;
+    impl serde::de::Visitor<'_> for Text {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("root program under 257 bytes")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+            if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+                return Err(E::custom("invalid root program"));
+            }
+            Ok(value.to_owned())
+        }
+    }
+    d.deserialize_str(Text)
 }
 
 /// 세션 안에서 돌고 있는 서브에이전트 하나. 필드는 끝에만 붙인다.
@@ -520,6 +553,7 @@ impl AgentStatus {
         foreground: None,
         title: None,
         subagents: Vec::new(),
+        root_shell: None,
     };
 }
 
@@ -1056,7 +1090,8 @@ impl Msg for Reply {
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::States(rows) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            let has_subagents = rows.iter().any(|r| !r.status.subagents.is_empty());
+            let has_root = rows.iter().any(|r| r.status.root_shell.is_some());
+            let has_subagents = has_root || rows.iter().any(|r| !r.status.subagents.is_empty());
             let has_title = has_subagents || rows.iter().any(|r| r.status.title.is_some());
             if has_title || rows.iter().any(|r| r.status.foreground.is_some()) {
                 for row in rows {
@@ -1077,6 +1112,14 @@ impl Msg for Reply {
                 for row in rows {
                     body.extend(
                         postcard::to_stdvec(&row.status.subagents)
+                            .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            if has_root {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(&row.status.root_shell)
                             .map_err(crate::ipc::Error::Codec)?,
                     );
                 }
@@ -1146,6 +1189,24 @@ impl Msg for Reply {
                             ));
                         }
                         row.status.subagents = subagents;
+                        tail = next;
+                    }
+                }
+                if !tail.is_empty() {
+                    for row in rows.iter_mut() {
+                        let (root, next) =
+                            postcard::take_from_bytes::<Option<Box<RootShell>>>(tail)
+                                .map_err(crate::ipc::Error::Codec)?;
+                        if root.as_ref().is_some_and(|r| {
+                            r.program.is_empty()
+                                || r.program.len() > 256
+                                || r.program.chars().any(char::is_control)
+                        }) {
+                            return Err(crate::ipc::Error::Codec(
+                                postcard::Error::DeserializeBadEncoding,
+                            ));
+                        }
+                        row.status.root_shell = root;
                         tail = next;
                     }
                 }

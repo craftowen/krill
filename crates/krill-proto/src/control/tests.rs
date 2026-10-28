@@ -114,6 +114,7 @@ fn fixtures_v1() {
                         foreground: None,
                         title: None,
                         subagents: Vec::new(),
+                        root_shell: None,
                     },
                 },
             ])),
@@ -1060,6 +1061,7 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
                 foreground: None,
                 title: None,
                 subagents: Vec::new(),
+                root_shell: None,
             },
         },
     ];
@@ -1235,4 +1237,42 @@ fn capture_since_is_appended_and_distinguishes_empty_from_unchanged() {
     };
     let encoded = postcard::to_stdvec(&too_large).unwrap();
     assert!(postcard::from_bytes::<Reply>(&encoded).is_err());
+}
+
+#[test]
+fn states_root_shell_tail_is_bounded_and_preserves_old_frames() {
+    let base = Reply::States(vec![SessionStatus {
+        session: SessionId(1),
+        status: AgentStatus::UNKNOWN,
+    }]);
+    let old = base.encode().unwrap();
+    let old_body = &old[5..];
+    assert_eq!(Reply::decode(kind::REPLY, old_body).unwrap(), base);
+    let Reply::States(mut rows) = base.clone() else {
+        unreachable!()
+    };
+    rows[0].status.root_shell = Some(Box::new(RootShell {
+        os: ShellOs::Windows,
+        program: "powershell".into(),
+    }));
+    let reply = Reply::States(rows.clone());
+    let frame = reply.encode().unwrap();
+    assert_eq!(Reply::decode(kind::REPLY, &frame[5..]).unwrap(), reply);
+    // The N-1 decoder consumes foreground/title/subagent extensions, then ignores
+    // the root shell extension. Its base postcard representation stays identical.
+    let (old_reply, mut tail) = postcard::take_from_bytes::<Reply>(&frame[5..]).unwrap();
+    assert_eq!(old_reply, base);
+    for _ in 0..2 {
+        tail = postcard::take_from_bytes::<Option<String>>(tail).unwrap().1;
+    }
+    tail = postcard::take_from_bytes::<Vec<Subagent>>(tail).unwrap().1;
+    assert_eq!(
+        postcard::from_bytes::<Option<Box<RootShell>>>(tail).unwrap(),
+        rows[0].status.root_shell
+    );
+    for invalid in [String::new(), "a".repeat(257), "pwsh\ncmd".into()] {
+        rows[0].status.root_shell.as_mut().unwrap().program = invalid;
+        let frame = Reply::States(rows.clone()).encode().unwrap();
+        assert!(Reply::decode(kind::REPLY, &frame[5..]).is_err());
+    }
 }
