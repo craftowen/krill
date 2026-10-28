@@ -2798,6 +2798,8 @@ pub struct SettingsView {
     /// 에이전트 탭에서 인자·환경변수 편집기를 펼친 에이전트 id 집합(OWE-796). 기본 접힘.
     agent_expanded: std::collections::BTreeSet<&'static str>,
     /// 사이드바 설정 검색 입력(OWE-656). 창이 필요해 처음 그릴 때 만든다.
+    search_focus: search::SearchFocus,
+    search_pending: bool,
     search: Option<(
         gpui::Entity<gpui_component::input::InputState>,
         Subscription,
@@ -3219,6 +3221,8 @@ impl SettingsView {
             identities: Default::default(),
             agent_edits: std::collections::BTreeMap::new(),
             agent_expanded: std::collections::BTreeSet::new(),
+            search_focus: search::SearchFocus::new(cx),
+            search_pending: false,
             search: None,
             shortcuts: shortcuts::Recorder::default(),
             workflow_form: None,
@@ -3599,6 +3603,8 @@ impl SettingsView {
 
     pub fn set_tab(&mut self, tab: AdminTab, cx: &mut Context<Self>) {
         self.tab = tab;
+        self.search_focus.title = search::first_setting(&self.search_query(cx), tab);
+        self.search_pending = !self.search_query(cx).trim().is_empty();
         if let Some(view) = &self.remote_krill {
             view.update(cx, |view, cx| {
                 view.set_visible(self.visible && tab == AdminTab::RemoteKrill, cx);
@@ -5965,8 +5971,9 @@ impl SettingsView {
         .detach();
     }
 
-    fn render_general_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_general_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        let search_focus = self.search_focus.clone();
         let p = crate::ui::palette(cx);
         let theme_button = |id: &'static str, label: &'static str, choice: ThemeChoice| {
             layout::segment(p, id, label, s.theme == choice)
@@ -6034,7 +6041,8 @@ impl SettingsView {
                 .debug_selector(move || id.into())
                 .when(notif_disabled, |d| d.opacity(0.5))
         };
-        let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
+        let label =
+            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         div()
             .flex()
             .flex_col()
@@ -7248,9 +7256,11 @@ impl SettingsView {
     ) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let themes_section = self.render_terminal_themes_section(s, window, cx);
+        let search_focus = self.search_focus.clone();
         let p = crate::ui::palette(cx);
         let row = || layout::row(p);
-        let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
+        let label =
+            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         let font_size = s.terminal_font_size();
         let font_pt = format!("{font_size}pt");
         let editor_font_pt = format!("{}pt", s.editor_font_size());
@@ -9780,7 +9790,7 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_2p5()
-            .child(layout::label(
+            .child(self.search_focus.label(
                 p,
                 text::DEFAULT_AGENT_TITLE.get(),
                 Some(text::DEFAULT_AGENT_DESC.get()),
@@ -9815,7 +9825,7 @@ impl SettingsView {
             edit(cx, move |s| s.default_view_mode = DefaultViewMode::Chat);
         });
         let default_view_mode_row = layout::row(p)
-            .child(layout::label(
+            .child(self.search_focus.label(
                 p,
                 text::DEFAULT_VIEW_MODE_TITLE.get(),
                 Some(text::DEFAULT_VIEW_MODE_DESC.get()),
@@ -9854,11 +9864,10 @@ impl SettingsView {
             edit(cx, move |s| s.yolo_mode = false);
         });
         let yolo_row = layout::row(p)
-            .child(layout::label(
-                p,
-                text::YOLO_TITLE.get(),
-                Some(text::YOLO_DESC.get()),
-            ))
+            .child(
+                self.search_focus
+                    .label(p, text::YOLO_TITLE.get(), Some(text::YOLO_DESC.get())),
+            )
             .child(
                 layout::controls().child(
                     layout::segmented_control(p, [yolo_seg, manual_seg])
@@ -9870,7 +9879,7 @@ impl SettingsView {
         // 유휴 동면은 `settings.toml` + 상태 디렉터리의 `hibernation.enabled` 표식으로 데몬에
         // 전달한다(OWE-655). 표식 동기화는 `edit`·`reload`가 맡는다.
         let hib_row = layout::row(p)
-            .child(layout::label(
+            .child(self.search_focus.label(
                 p,
                 text::HIBERNATION_TITLE.get(),
                 Some(text::HIBERNATION_DESC.get()),
@@ -9890,7 +9899,7 @@ impl SettingsView {
 
         // 끄면 Krill이 설치한 훅을 되돌리고, 다시 켜면 설치된 에이전트에 바로 설치한다.
         let hooks_row = layout::row(p)
-            .child(layout::label(
+            .child(self.search_focus.label(
                 p,
                 text::AGENT_HOOKS_TITLE.get(),
                 Some(text::AGENT_HOOKS_DESC.get()),
@@ -9918,7 +9927,7 @@ impl SettingsView {
             );
 
         let auto_setup_row = layout::row(p)
-            .child(layout::label(
+            .child(self.search_focus.label(
                 p,
                 text::AUTO_SETUP_ALL_TITLE.get(),
                 Some(text::AUTO_SETUP_ALL_DESC.get()),
@@ -10016,7 +10025,7 @@ impl SettingsView {
     fn render_agent_extra_rows(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<gpui::Div> {
         let p = crate::ui::palette(cx);
         let auto_rename_row = layout::row(p)
-            .child(layout::label(
+            .child(self.search_focus.label(
                 p,
                 text::AUTO_RENAME_BRANCH.get(),
                 Some(text::AUTO_RENAME_BRANCH_DESC.get()),
@@ -10054,7 +10063,7 @@ impl SettingsView {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(layout::label(
+                    .child(self.search_focus.label(
                         p,
                         text::PROMPT_CACHE_TIMER.get(),
                         Some(text::PROMPT_CACHE_TIMER_DESC.get()),
@@ -10089,7 +10098,7 @@ impl SettingsView {
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .child(layout::label(
+                        .child(self.search_focus.label(
                             p,
                             text::PROMPT_CACHE_TTL.get(),
                             Some(text::PROMPT_CACHE_TTL_DESC.get()),
@@ -10104,7 +10113,7 @@ impl SettingsView {
         let view = cx.entity();
         let mut workspace_trust_section = div().w_full().min_w_0().flex().flex_col().gap_2().child(
             layout::row(p)
-                .child(layout::label(
+                .child(self.search_focus.label(
                     p,
                     text::WORKSPACE_TRUST_PRESET.get(),
                     Some(text::WORKSPACE_TRUST_PRESET_DESC.get()),
@@ -10222,7 +10231,7 @@ impl SettingsView {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(layout::label(
+                    .child(self.search_focus.label(
                         p,
                         text::AGENTS_PROFILES_TITLE.get(),
                         Some(text::AGENTS_PROFILES_DESC.get()),
@@ -13037,6 +13046,8 @@ impl SettingsView {
 impl SettingsView {
     /// 사이드바 검색 입력을 비우고 전체 탭 목록과 현재 탭 본문을 복원한다(OWE-795).
     pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_focus.title = None;
+        self.search_pending = false;
         if let Some((input, _)) = &self.search {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
@@ -13379,6 +13390,7 @@ impl Render for SettingsView {
             .text_color(p.muted_foreground)
             .child(text::TITLE.get());
 
+        self.search_focus.rendered.set(false);
         let content_column = if matches.is_empty() {
             div()
                 .id("admin-content-column")
@@ -13437,7 +13449,7 @@ impl Render for SettingsView {
         } else {
             let page_header = Self::render_page_header(current_tab, None, cx);
             let body = match current_tab {
-                AdminTab::General => Self::render_general_tab(&s, cx),
+                AdminTab::General => self.render_general_tab(&s, cx),
                 AdminTab::Terminal => self.render_terminal_tab(&s, window, cx),
                 AdminTab::Accounts => self.render_accounts_tab(window, cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
@@ -13451,7 +13463,12 @@ impl Render for SettingsView {
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
             }
             .w_full()
-            .min_w_0();
+            .min_w_0()
+            .id("admin-tab-body")
+            .when(
+                !self.search_focus.rendered.get() && self.search_pending,
+                |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
+            );
 
             div()
                 .id("admin-content-column")
@@ -13477,6 +13494,16 @@ impl Render for SettingsView {
                 }))
         };
 
+        if self.search_pending {
+            self.search_pending = false;
+            if self.search_focus.rendered.get() {
+                window.focus(&self.search_focus.focus, cx);
+            } else {
+                window.focus(&self.focus, cx);
+            }
+            self.search_focus.anchor.scroll_to(window, cx);
+            window.on_next_frame(|window, _| window.refresh());
+        }
         div()
             .id("admin-center")
             .debug_selector(|| "admin-center".into())
@@ -13669,6 +13696,7 @@ impl Render for SettingsView {
                             .min_h_0()
                             .min_w_0()
                             .overflow_y_scroll()
+                            .track_scroll(&self.search_focus.scroll)
                             .px_8()
                             .py_6()
                             .child(content_column),

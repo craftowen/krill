@@ -10297,3 +10297,32 @@ fn hidden_status_providers_parse_roundtrip_and_toggle() {
     assert!(s.hidden_status_providers.is_empty());
     assert!(!s.to_toml().contains("hidden_status_providers"));
 }
+
+#[gpui::test]
+fn settings_search_enter_scrolls_and_focuses_matching_row(cx: &mut TestAppContext) {
+    let d = dir("search-anchor");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(500.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| view.update(cx, |view, cx| view.focus_search(window, cx)));
+    vcx.simulate_input("font");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.tab, AdminTab::Terminal);
+        assert_eq!(view.search_focus.title, Some(text::TERMINAL_FONT));
+        assert!(view.search_focus.rendered.get());
+        assert!(view.search_focus.focus.is_focused(window));
+        assert!(
+            view.search_focus.scroll.offset().y < px(0.),
+            "matching font row must scroll past theme previews"
+        );
+    });
+    fs::remove_dir_all(d).ok();
+}
