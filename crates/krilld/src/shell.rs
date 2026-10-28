@@ -681,7 +681,11 @@ mod windows_tests {
         let login = Shell::Login.launch_with_lang(None, env.clone(), None);
         let shell = String::from_utf8(login.argv[0].clone()).unwrap();
         eprintln!("login shell: {shell}");
-        assert_eq!(login.argv.len(), 1);
+        // Only the UTF-8/cwd bootstrap follows the shell itself.
+        assert_eq!(
+            login.argv[1..],
+            super::windows_interactive(vec![login.argv[0].clone()], &mut login.env.clone())[1..]
+        );
         assert!(
             std::path::Path::new(&shell).is_absolute() || shell.eq_ignore_ascii_case("cmd.exe")
         );
