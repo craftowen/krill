@@ -598,6 +598,13 @@ mod engine_tests {
             save_file(&home, Some(&state), &file).unwrap();
             let mut runtime = policy::Runtime::default();
             let now = now_epoch();
+            // Use the same reset window as the fixture, even if its file writes
+            // crossed a second boundary before the historical sample is made.
+            let cached: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(home.join("active").join(CLAUDE_CACHE)).unwrap(),
+            )
+            .unwrap();
+            let reset = cached["five_hour"]["resets_at"].as_i64().unwrap();
             let past = AccountInfo {
                 id: "active".into(),
                 provider: ProviderKind::Claude,
@@ -610,7 +617,7 @@ mod engine_tests {
                 usage: Snapshot {
                     five_hour: Some(ProtoWindow {
                         percent: 20,
-                        resets_at: Some((now + 4000).to_string()),
+                        resets_at: Some(reset.to_string()),
                     }),
                     seven_day: None,
                 },
