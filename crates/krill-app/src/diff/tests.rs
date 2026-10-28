@@ -3144,3 +3144,78 @@ fn panel_tab_arrows_move_focus_and_native_space_keeps_selection(cx: &mut gpui::T
         assert!(view.read(cx).tab_focus[0].is_focused(window));
     });
 }
+
+#[gpui::test]
+fn explorer_range_drag_and_os_drop_use_local_transfer_queue(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::plain();
+    std::fs::create_dir(repo.0.join("dest")).unwrap();
+    std::fs::write(repo.0.join("b.txt"), "b").unwrap();
+    std::fs::write(repo.0.join("c.txt"), "c").unwrap();
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo.0.clone(), cx));
+    panel.update(cx, |panel, cx| panel.set_tab(PanelTab::Files, cx));
+    cx.run_until_parked();
+    let b = cx.debug_bounds("explorer-item-b.txt").unwrap().center();
+    let c = cx.debug_bounds("explorer-item-c.txt").unwrap().center();
+    cx.simulate_click(b, Modifiers::default());
+    cx.simulate_click(
+        c,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    let dest = cx.debug_bounds("explorer-item-dest").unwrap().center();
+    cx.simulate_mouse_down(b, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(
+        gpui::point(b.x + px(20.), b.y),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(dest, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(repo.0.join("dest/b.txt").is_file());
+    assert!(repo.0.join("dest/c.txt").is_file());
+    assert!(!repo.0.join("b.txt").exists());
+    assert!(!repo.0.join("c.txt").exists());
+    let external = Repo::plain();
+    let source = external.0.join("import.txt");
+    std::fs::write(&source, "import").unwrap();
+    let dest = cx.debug_bounds("explorer-item-dest").unwrap().center();
+    cx.simulate_event(gpui::FileDropEvent::Entered {
+        position: dest,
+        paths: gpui::ExternalPaths(vec![source.clone()].into()),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::FileDropEvent::Submit { position: dest });
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(repo.0.join("dest/import.txt")).unwrap(),
+        "import"
+    );
+    assert!(
+        source.is_file(),
+        "OS drop imports without deleting its source"
+    );
+    let second = external.0.join("second.txt");
+    std::fs::write(&second, "second").unwrap();
+    cx.simulate_event(gpui::FileDropEvent::Entered {
+        position: dest,
+        paths: gpui::ExternalPaths(vec![source.clone(), second.clone()].into()),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::FileDropEvent::Submit { position: dest });
+    cx.run_until_parked();
+    assert!(
+        !repo.0.join("dest/second.txt").exists(),
+        "a conflicting batch stops and keeps later sources"
+    );
+    assert!(second.is_file());
+    assert!(
+        cx.update(|_, cx| panel.read(cx).explorer.error.is_some()),
+        "a later success must not erase a batch failure"
+    );
+}
