@@ -754,6 +754,43 @@ mod windows_bootstrap_tests {
             );
         }
     }
+
+    /// Agents started from the default PowerShell (agy runs `powershell -NoProfile` with piped
+    /// stdout) inherit the console code page. At the Korean default 949 their tool output is not
+    /// UTF-8, so the bootstrap must switch the console itself, not only PowerShell's variables.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_keeps_noprofile_child_pipe_output_utf8_under_codepage_949() {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let root = std::env::temp_dir().join(format!("krill-shell-cp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("emit.ps1");
+        std::fs::write(
+            &script,
+            "Write-Output ([string][char]0xD55C + [char]0xAE00 + '-notion.md')\r\n",
+        )
+        .unwrap();
+        let mut argv = windows_interactive(vec![b"powershell.exe".to_vec()], &mut Vec::new());
+        assert_eq!(argv.remove(1), b"-NoExit");
+        let bootstrap = String::from_utf8(argv.pop().unwrap()).unwrap();
+        // A fresh hidden console stands in for the session ConPTY at its Korean default.
+        let output = std::process::Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-Command"])
+            .arg(format!(
+                "chcp.com 949 > $null; {bootstrap}; & powershell -NoProfile -File '{}'",
+                script.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).as_deref(),
+            Ok("한글-notion.md\r\n")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 #[cfg(test)]

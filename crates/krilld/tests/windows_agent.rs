@@ -140,3 +140,38 @@ fn agent_launch_uses_native_helper_instead_of_powershell() {
     assert!(!launch.argv.iter().any(|arg| arg == b"-l" || arg == b"-c"));
     assert!(PathBuf::from(std::str::from_utf8(&launch.argv[0]).unwrap()).is_absolute());
 }
+
+/// Korean Windows consoles start at OEM code page 949. agy runs `powershell -NoProfile`
+/// with piped stdout, which encodes with the console code page; CP949 bytes then poison
+/// its conversation (`string_value contains invalid UTF-8`). The launcher must switch the
+/// session console to UTF-8 before the agent starts.
+#[test]
+fn agent_console_keeps_noprofile_powershell_pipe_output_utf8_under_codepage_949() {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let root = std::env::temp_dir().join(format!("krill-agent-cp-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("emit.ps1");
+    // ASCII source: the Korean text exists only inside PowerShell, as agy's tool output does.
+    std::fs::write(
+        &script,
+        "Write-Output ([string][char]0xD55C + [char]0xAE00 + '-notion.md')\r\n",
+    )
+    .unwrap();
+    // A fresh hidden console stands in for the session ConPTY at its Korean default.
+    let output = Command::new("cmd.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .raw_arg(format!(
+            "/d /s /c \"chcp 949 >nul && \"{}\" --agent-exec hint powershell -NoProfile -File \"{}\"\"",
+            env!("CARGO_BIN_EXE_krilld"),
+            script.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).as_deref(),
+        Ok("한글-notion.md\r\n")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
