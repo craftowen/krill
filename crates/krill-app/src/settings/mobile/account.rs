@@ -101,6 +101,7 @@ impl SettingsView {
                                 }
                                 Err(_) => {}
                             }
+                            this.mobile_resume_after_login(cx);
                             cx.notify();
                         })
                         .is_err()
@@ -112,7 +113,16 @@ impl SettingsView {
             }
         }));
     }
-    fn mobile_account_action(&mut self, logout: bool, cx: &mut Context<Self>) {
+    fn mobile_resume_after_login(&mut self, cx: &mut Context<Self>) {
+        if self.mobile.account.connect_after_login && self.mobile.account.email.is_some() {
+            self.mobile.account.connect_after_login = false;
+            self.mobile_pair(ConnectMode::Tunnel, self.mobile.address.clone(), cx);
+        }
+    }
+    pub(super) fn mobile_account_action(&mut self, logout: bool, cx: &mut Context<Self>) {
+        if logout {
+            self.mobile.account.connect_after_login = false;
+        }
         if self.mobile.account.busy {
             return;
         }
@@ -154,8 +164,12 @@ impl SettingsView {
                             this.mobile.error = Some(text::ACCOUNT_REVOKE_FAILED.get().to_owned());
                         }
                     }
-                    Err(_) => this.mobile.error = Some(text::ACCOUNT_ERROR.get().to_owned()),
+                    Err(_) => {
+                        this.mobile.account.connect_after_login = false;
+                        this.mobile.error = Some(text::ACCOUNT_ERROR.get().to_owned());
+                    }
                 }
+                this.mobile_resume_after_login(cx);
                 this.mobile_account_poll(cx);
                 cx.notify();
             })

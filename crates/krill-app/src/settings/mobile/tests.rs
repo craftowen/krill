@@ -529,3 +529,87 @@ fn transient_google_approval_poll_failure_keeps_polling_after_page_is_hidden(
     });
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
+
+#[gpui::test]
+fn relay_click_starts_desktop_sign_in_and_resumes_pairing_once(cx: &mut gpui::TestAppContext) {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    cx.update(gpui_component::init);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let approved = Arc::new(AtomicBool::new(false));
+    let record = requests.clone();
+    let signed_in = approved.clone();
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut view = SettingsView::new(cx);
+        view.visible = false;
+        view.mobile = Panel::new(Arc::new(move |request| {
+            record.lock().unwrap().push(request.clone());
+            Ok(match request {
+                MobileRequest::Workflow(json) => {
+                    let action: serde_json::Value = serde_json::from_str(&json).unwrap();
+                    let data = if action["action"] == "relay_auth_start" {
+                        serde_json::json!({"requires_sign_in":true,"signed_in":false,"pending":true})
+                    } else {
+                        serde_json::json!({"requires_sign_in":true,"signed_in":signed_in.load(Ordering::Relaxed),"pending":!signed_in.load(Ordering::Relaxed),"email":"desktop@example.test"})
+                    };
+                    MobileReply::Workflow(serde_json::json!({"ok":true,"data":data}).to_string())
+                }
+                MobileRequest::MintPairingTicket { .. } => pairing_offer("https://example.test/#pair=fixture", u64::MAX),
+                MobileRequest::Status => MobileReply::GatewayStatus { listening:true, bind_addrs:Vec::new(), mode:ConnectMode::Tunnel, tunnel_url:None, active_offer:false, devices:Vec::new() },
+                MobileRequest::ConnectedDevices => MobileReply::ConnectedDevices(Vec::new()),
+                MobileRequest::CurrentPairingOffer => pairing_offer("https://example.test/#pair=fixture", u64::MAX),
+                other => panic!("unexpected request: {other:?}"),
+            })
+        }));
+        view.mobile_account_poll(cx);
+        view
+    });
+    vcx.run_until_parked();
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "opening the page must not start sign-in"
+    );
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.mobile_pair(ConnectMode::Tunnel, None, cx)
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        requests.lock().unwrap().iter().any(
+            |r| matches!(r, MobileRequest::Workflow(json) if json.contains("relay_auth_start"))
+        )
+    );
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MobileRequest::MintPairingTicket { .. }))
+    );
+    approved.store(true, Ordering::Relaxed);
+    vcx.executor().advance_clock(Duration::from_secs(5));
+    vcx.run_until_parked();
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MobileRequest::MintPairingTicket { .. }))
+            .count(),
+        1
+    );
+    vcx.executor().advance_clock(Duration::from_secs(5));
+    vcx.run_until_parked();
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MobileRequest::MintPairingTicket { .. }))
+            .count(),
+        1
+    );
+}

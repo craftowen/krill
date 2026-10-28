@@ -46,6 +46,7 @@ pub struct Panel {
     account: AccountView,
 }
 struct AccountView {
+    connect_after_login: bool,
     email: Option<String>,
     required: bool,
     pending: bool,
@@ -56,6 +57,7 @@ struct AccountView {
 impl Default for AccountView {
     fn default() -> Self {
         Self {
+            connect_after_login: false,
             email: None,
             required: true,
             pending: false,
@@ -412,10 +414,15 @@ impl SettingsView {
             && self.mobile.account.email.is_none()
             && address.as_deref().is_none_or(|raw| !raw.contains('@'))
         {
-            self.mobile.error = Some(text::ACCOUNT_REQUIRED.get().to_owned());
-            cx.notify();
+            self.mobile.mode = mode;
+            self.mobile.address = address;
+            self.mobile.account.connect_after_login = true;
+            if !self.mobile.account.pending {
+                self.mobile_account_action(false, cx);
+            }
             return;
         }
+        self.mobile.account.connect_after_login = false;
         if self.mobile.pending
             || (self.mobile.pairing_pending()
                 && self.mobile.mode == mode

@@ -46,59 +46,10 @@
         },
       };
     },
-    relayAccount = (M.relayAccount = {
-      required: !1,
-      accountMismatch: !1,
-      signIn() {
-        const path = location.pathname + location.search;
-        rememberRelayReturn();
-        location.assign("/auth?return_to=" + encodeURIComponent(path));
-      },
-      async logout() {
-        rememberRelayReturn();
-        const session = await fetch("/auth/session", {
-          credentials: "same-origin",
-          cache: "no-store",
-        });
-        if (session.status === 401) {
-          ((relayAccount.required = !0), location.reload());
-          return;
-        }
-        if (!session.ok) throw Error("Could not sign out. Try again.");
-        const data = await session.json();
-        if (
-          !(
-            await fetch("/auth/logout", {
-              method: "POST",
-              credentials: "same-origin",
-              cache: "no-store",
-              headers: {
-                "Content-Type": "application/json",
-                "x-krill-csrf": data.csrf_token,
-              },
-              body: "{}",
-            })
-          ).ok
-        )
-          throw Error("Could not sign out. Try again.");
-        ((relayAccount.required = !0), location.reload());
-      },
-    }),
-    relayFetch = async (url, { isCurrent, ...options } = {}) => {
-      const response = await fetch(url, {
-        ...options,
-        credentials: "same-origin",
-      });
-      return (
-        (response.status === 401 || response.status === 403) &&
-          !options.signal?.aborted &&
-          (!isCurrent || isCurrent()) &&
-          ((relayAccount.required = !0),
-          (relayAccount.accountMismatch = response.status === 403),
-          globalThis.dispatchEvent?.(new Event("krill-relay-auth-required"))),
-        response
-      );
-    },
+    // Mobile clients prove their paired device key to krilld. Google sessions
+    // belong to the desktop host and must never gate a phone connection.
+    relayFetch = (url, { isCurrent, ...options } = {}) =>
+      fetch(url, { ...options, credentials: "omit" }),
     AUTH = /^([0-9a-f]{32,128})\.([0-9a-f]{64})(?:\.([0-9a-f]{32}))?$/,
     handoff = (c) => {
       const token = [c?.device_id, c?.credential, c?.rid]
@@ -107,29 +58,9 @@
       return AUTH.test(token) ? token : null;
     };
   function clearRelayReturn() {
-    relayAccount.fragment = null;
     try {
       globalThis.sessionStorage?.removeItem("krill-relay-return");
     } catch {}
-  }
-  function rememberRelayReturn() {
-    const path = location.pathname + location.search;
-    try {
-      if (relayAccount.fragment && !globalThis.sessionStorage)
-        throw Error("No session storage");
-      globalThis.sessionStorage?.setItem(
-        "krill-relay-return",
-        JSON.stringify({
-          path,
-          fragment: relayAccount.fragment || location.hash,
-          at: Date.now(),
-        }),
-      );
-    } catch {
-      throw Error(
-        "Could not preserve pairing. Allow session storage and try again.",
-      );
-    }
   }
   function directSocket(value) {
     const origin = new URL(value),
@@ -216,8 +147,7 @@
       location.pathname +
         (parameters.size ? "?" + parameters : "") +
         (consumed ? "" : location.hash),
-    ),
-      (relayAccount.fragment = pair ? returnedFragment : null));
+    ));
     let credentials = pair ? null : saved,
       directOrigin = location.origin,
       destinationFixed = fixed,
@@ -685,8 +615,7 @@
                   ticket: ticket2,
                   secret: secret2,
                   use() {
-                    ((relayAccount.fragment = u.hash),
-                      (pairingPending = !0),
+                    ((pairingPending = !0),
                       (updatePending = !1),
                       (destinationFixed = !1),
                       (directOrigin = u.origin));
@@ -717,8 +646,7 @@
             ticket: ticket2,
             secret: secret2,
             use() {
-              ((relayAccount.fragment = u.hash),
-                (pairingPending = !0),
+              ((pairingPending = !0),
                 (updatePending = !1),
                 (destinationFixed = !0),
                 (url = validUrl(next) ? next : null),
@@ -1707,10 +1635,7 @@
               diagnosticsTrace: trace,
             });
             if (!isCurrent()) return;
-            if (relayAccount.required)
-              ((authBlocked = !0),
-                (e = Error("Sign in with Google to use the relay.")));
-            else if (located) stopped = !0;
+            if (located) stopped = !0;
             else
               try {
                 (socketUrl() === attempted &&
@@ -1726,14 +1651,7 @@
               : (authBlocked = !0)),
             options.onError?.(e),
             disconnect(e),
-            status(
-              relayAccount.required ? "auth_required" : "disconnected",
-              relayAccount.required
-                ? relayAccount.accountMismatch
-                  ? "This desktop uses a different Google account. Open Settings, sign out of Google, then sign in with the account used on this desktop."
-                  : "Sign in with Google to use the relay."
-                : failed?.message || e.message,
-            ));
+            status("disconnected", failed?.message || e.message            ));
         } finally {
           (connectController === controller && (connectController = null),
             controller.abort(),

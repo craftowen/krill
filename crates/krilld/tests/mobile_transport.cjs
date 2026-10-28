@@ -262,83 +262,21 @@ test('HTTPS relay pages explain the Tailscale HTTP backup instead of dialing mix
  const direct=harness(saved,'http://100.64.1.2:1234/',true);assert.equal(direct.endpoint.socketUrl(),'ws://100.64.1.2:1234/ws');direct.transport.close();
 });
 
-test('hosted discovery 401 blocks retries and offers Google login without clearing E2EE credentials',async()=>{
+for(const status of [401,403])test(`hosted discovery ${status} never asks the phone to sign in or discards pairing`,async()=>{
  const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,undefined,true);let options;
- h.context.fetch=async(_url,request)=>{options=request;return {status:401,ok:false};};
+ h.context.fetch=async(_url,request)=>{options=request;return {status,ok:false};};
  const {pending,socket}=await h.start();socket.emit('error');await pending;
- assert.equal(h.context.KrillMobile.relayAccount.required,true);
- assert.equal(options.credentials,'same-origin');
- assert.equal(h.transport.state.phase,'auth_required');
- assert.equal(h.transport.blocked,true);
+ assert.equal(h.context.KrillMobile.relayAccount,undefined);
+ assert.equal(options.credentials,'omit');
+ assert.equal(h.transport.state.phase,'disconnected');
+ assert.equal(h.transport.blocked,false);
+ assert.doesNotMatch(h.transport.state.message,/Google|sign in/i);
  assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).credential,saved.credential);
- const count=h.sockets.length;await h.tick(30000);assert.equal(h.sockets.length,count);h.transport.close();
-});
-
-test('Google login keeps pairing fragment only in session storage and restores it once',()=>{
- const h=harness(null,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'c'.repeat(32)),sessions=new Map(),navigations=[];
- h.context.sessionStorage={getItem:key=>sessions.get(key)||null,setItem:(key,value)=>sessions.set(key,value),removeItem:key=>sessions.delete(key)};
- h.context.location.assign=url=>navigations.push(url);
- h.context.KrillMobile.transport.bootstrap();h.context.location.hash='';
- h.context.KrillMobile.relayAccount.signIn();
- assert.equal(navigations[0],'/auth?return_to=%2Fm%2F0123456789abcdef%2F');
- assert.doesNotMatch(navigations[0],/pair|key|credential/);
- assert.match(sessions.get('krill-relay-return'),/pair=aa/);
- const endpoint=h.context.KrillMobile.transport.bootstrap();
- assert.equal(endpoint.pair.ticket,'aa');assert.equal(sessions.size,0);
-});
-
-test('hosted discovery 403 stops retries and explains how to switch Google accounts',async()=>{
- const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,undefined,true);
- h.context.fetch=async()=>({status:403,ok:false});
- const {pending,socket}=await h.start();socket.emit('error');await pending;
- assert.equal(h.context.KrillMobile.relayAccount.required,true);
- assert.equal(h.context.KrillMobile.relayAccount.accountMismatch,true);
- assert.equal(h.transport.state.phase,'auth_required');
- assert.equal(h.transport.blocked,true);
- assert.match(h.transport.state.message,/different Google account/);
- assert.match(h.transport.state.message,/Settings/);
- assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).credential,saved.credential);
- const count=h.sockets.length;await h.tick(30000);assert.equal(h.sockets.length,count);
+ assert.deepEqual(h.redirects,[]);
  h.transport.close();
 });
 
-for(const status of [200,401])test(`Google account switch preserves an unconsumed QR across logout (${status}) and login`,async()=>{
- const h=harness(null,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'c'.repeat(32),true),sessions=new Map(),navigations=[];
- h.context.sessionStorage={getItem:key=>sessions.get(key)||null,setItem:(key,value)=>sessions.set(key,value),removeItem:key=>sessions.delete(key)};
- h.context.location.hash='';let reloads=0;
- h.context.location.reload=()=>reloads++;
- h.context.location.assign=url=>navigations.push(url);
- h.context.fetch=async url=>url==='/auth/session'?{ok:status===200,status,json:async()=>({csrf_token:'test-csrf'})}:{ok:true};
- await h.context.KrillMobile.relayAccount.logout();
- assert.equal(reloads,1);
- assert.match(sessions.get('krill-relay-return'),/pair=aa/);
- let endpoint=h.context.KrillMobile.transport.bootstrap();
- assert.equal(endpoint.pair.ticket,'aa');assert.equal(endpoint.pair.secret,'bb');assert.equal(sessions.size,0);
- h.context.KrillMobile.relayAccount.signIn();
- assert.doesNotMatch(navigations[0],/pair|key|credential/);
- endpoint=h.context.KrillMobile.transport.bootstrap();
- assert.equal(endpoint.pair.ticket,'aa');assert.equal(endpoint.pair.secret,'bb');assert.equal(sessions.size,0);
- h.transport.close();
-});
-
-test('Google account switch keeps the fresh QR in memory if session storage cannot preserve it',async()=>{
- const h=harness(null,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'c'.repeat(32),true);let requests=0;
- h.context.fetch=async()=>{requests++;return {ok:true};};
- await assert.rejects(h.context.KrillMobile.relayAccount.logout(),/Could not preserve pairing/);
- assert.equal(requests,0);
- assert.equal(h.endpoint.pair.ticket,'aa');assert.equal(h.endpoint.pair.secret,'bb');
- h.transport.close();
-});
-
-for(const action of ['cancel','select'])test(`Google account switch cannot restore a QR after ${action} returns to a saved desktop`,async()=>{
- const saved={device_id:'saved',credential:'b'.repeat(64),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'d'.repeat(32),true),sessions=new Map();
- h.context.sessionStorage={getItem:key=>sessions.get(key)||null,setItem:(key,value)=>sessions.set(key,value),removeItem:key=>sessions.delete(key)};
- h.context.location.hash='';h.context.location.reload=()=>{};
- h.context.fetch=async url=>url==='/auth/session'?{ok:true,status:200,json:async()=>({csrf_token:'test-csrf'})}:{ok:true};
- if(action==='cancel')h.endpoint.restoreSaved();else h.endpoint.selectHost(h.endpoint.profiles()[0].id);
- await h.context.KrillMobile.relayAccount.logout();
- assert.doesNotMatch(sessions.get('krill-relay-return'),/pair=|key=/);
- const restored=h.context.KrillMobile.transport.bootstrap();
- assert.equal(restored.pair,null);assert.equal(restored.credentials.device_id,saved.device_id);
- h.transport.close();
+test('mobile client has no Google account entry points',()=>{
+ assert.doesNotMatch(source,/\/auth(?:[/?"']|$)|krill-relay-auth-required|Sign in with Google/);
+ for(const file of ['app.js','screens/settings.js'])assert.doesNotMatch(fs.readFileSync(path.join(__dirname,'../src/mobile/assets',file),'utf8'),/relayAccount|krill-relay-auth-required/);
 });

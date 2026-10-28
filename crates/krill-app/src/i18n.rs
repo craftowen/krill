@@ -331,7 +331,7 @@ catalog! {
         ACCOUNT_LOGOUT => ("로그아웃", "Sign out"),
         ACCOUNT_REQUIRED => ("릴레이를 사용하려면 Google로 로그인하세요.", "Sign in with Google to use the relay."),
         ACCOUNT_WAITING => ("브라우저에서 기기 승인을 완료하세요.", "Approve this device in your browser."),
-        ACCOUNT_LOCAL => ("로컬 터미널과 Tailscale은 로그인 없이 사용할 수 있습니다.", "Local terminals and Tailscale are available without signing in."),
+        ACCOUNT_LOCAL => ("모바일은 로그인 없이 QR 코드로 연결합니다.", "Connect your phone by QR code without signing in."),
         ACCOUNT_REVOKE_FAILED => ("이 기기에서 로그아웃했습니다. 서버 세션 회수는 확인하지 못했습니다.", "Signed out on this device. Server session revocation could not be confirmed."),
         PREPARING => ("모바일 연결 준비 중…", "Preparing mobile connection…"),
         PREPARING_DESC => ("백그라운드에서 연결하고 있습니다. 다른 연결 방식을 선택하거나 앱을 계속 사용할 수 있습니다.", "Connecting in the background. You can choose another connection mode or keep using the app."),

@@ -127,6 +127,8 @@ Let a coordinator agent break down dependent tasks (`krill orchestration run-cre
 ### 5. Mobile E2EE Companion (PWA)
 Scan a QR code in **Settings → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
 
+Sign in with Google on your desktop when you choose the hosted relay. Your phone opens the PWA without signing in and authenticates with its QR pairing or saved device key.
+
 [Mobile Setup →](https://krill.page/en/docs)
 
 </td>
