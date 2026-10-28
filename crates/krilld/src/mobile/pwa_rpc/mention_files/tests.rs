@@ -36,10 +36,12 @@ fn safe_relative_names_only_no_bodies_secrets_builds_or_traversal() {
         "config/auth.json",
         "private.key",
         "config/credentials.json",
-        "notes/line\nbreak",
     ] {
         f.file(name);
     }
+    #[cfg(unix)]
+    f.file("notes/line\nbreak");
+    assert!(!safe_name("line\nbreak"));
     let value = load(&f.0, "").unwrap();
     assert_eq!(
         value["items"],
@@ -48,6 +50,10 @@ fn safe_relative_names_only_no_bodies_secrets_builds_or_traversal() {
     assert!(!value.to_string().contains("private body"));
     assert_eq!(
         load(&f.0, "HELLO").unwrap()["items"],
+        json!([{"path":"src/hello.rs"}])
+    );
+    assert_eq!(
+        load(&f.0, "src/").unwrap()["items"],
         json!([{"path":"src/hello.rs"}])
     );
     for query in ["../", "/tmp", "foo/../", "C:\\files", "a\nb"] {

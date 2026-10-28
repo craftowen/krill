@@ -1583,7 +1583,7 @@ fn cache_git_summary(
 fn mobile_git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command
-        .current_dir(cwd)
+        .current_dir(krill_proto::os::shell_path(cwd))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     for key in [
@@ -1608,6 +1608,8 @@ fn git_root(cwd: &Path) -> io::Result<PathBuf> {
     .map_err(|_| io::Error::other("Not a Git repository"))?;
     // Git terminates this path with a newline; spaces in a repository name are significant.
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    #[cfg(windows)]
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     fs::canonicalize(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
 }
 
@@ -1660,7 +1662,13 @@ fn git_relative_path(root: &Path, cwd: &Path, raw: &str, files: &[String]) -> Op
     if relative.as_os_str().is_empty() {
         return None;
     }
-    relative.to_str().map(str::to_owned)
+    relative.to_str().map(|path| {
+        if cfg!(windows) {
+            path.replace('\\', "/")
+        } else {
+            path.to_owned()
+        }
+    })
 }
 
 fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
@@ -1763,14 +1771,14 @@ fn untracked_patch(root: &Path, path: &str) -> io::Result<String> {
     Ok(patch)
 }
 fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Vec<u8>> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = crate::child::spawn(
+        crate::child::own_group(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )?;
     let result = (|| {
-        let mut pipe = child.stdout.take().ok_or_else(invalid)?;
-        crate::child::nonblocking(&pipe)?;
+        let mut pipe = crate::child::PipeReader::new(child.stdout.take().ok_or_else(invalid)?)?;
         let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         let mut buffer = [0; 8192];
@@ -1806,8 +1814,7 @@ fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io
             thread::sleep(Duration::from_millis(5));
         }
     })();
-    child.kill().ok();
-    child.wait().ok();
+    drop(child); // Process owns the child group/Job, including descendants on timeout.
     result
 }
 
@@ -3001,6 +3008,33 @@ mod tests {
             bounded_command(&mut slow, Duration::from_millis(10), 10)
                 .unwrap_err()
                 .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_subprocess_output_and_time_are_bounded() {
+        use std::os::windows::process::CommandExt as _;
+
+        let command = |script: &str| {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/C"]).raw_arg(script);
+            command
+        };
+        assert_eq!(
+            bounded_command(&mut command("echo hello"), Duration::from_secs(5), 7).unwrap(),
+            b"hello\r\n"
+        );
+        assert!(bounded_command(&mut command("echo hello"), Duration::from_secs(5), 6).is_err());
+        assert_eq!(
+            bounded_command(
+                &mut command("for /L %i in (0,0,1) do @rem waiting"),
+                Duration::from_millis(30),
+                10
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::TimedOut
         );
     }

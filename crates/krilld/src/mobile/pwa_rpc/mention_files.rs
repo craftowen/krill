@@ -40,7 +40,11 @@ fn safe_name(name: &str) -> bool {
 
 fn relative_file(root: &Path, path: &Path) -> Option<String> {
     let text = path.to_str()?;
-    if text.len() > MAX_PATH || text.contains(['\\', ':']) || path.as_os_str().is_empty() {
+    if text.len() > MAX_PATH
+        || text.contains(':')
+        || (cfg!(unix) && text.contains('\\'))
+        || path.as_os_str().is_empty()
+    {
         return None;
     }
     let mut candidate = root.to_owned();
@@ -144,10 +148,11 @@ impl Scan<'_> {
     }
 
     fn add(&mut self, path: &Path) {
-        if path
-            .to_str()
-            .is_some_and(|p| p.to_lowercase().contains(self.query))
-            && let Some(path) = relative_file(self.root, path)
+        if path.to_str().is_some_and(|p| {
+            p.replace(std::path::MAIN_SEPARATOR, "/")
+                .to_lowercase()
+                .contains(self.query)
+        }) && let Some(path) = relative_file(self.root, path)
         {
             self.paths.insert(path);
         }

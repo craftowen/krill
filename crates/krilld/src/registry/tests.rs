@@ -2618,3 +2618,34 @@ fn oversized_orchestration_snapshot_answers_explicitly_and_pages_losslessly() {
     thread.join().unwrap();
     fs::remove_dir_all(dir).ok();
 }
+
+#[cfg(windows)]
+#[test]
+fn spawn_cwd_uses_shell_compatible_paths_without_requiring_them_to_exist() {
+    for (input, expected) in [
+        (r"\\?\C:\Users\한글 QA\project", r"C:\Users\한글 QA\project"),
+        (r"\\?\UNC\server\share\project", r"\\server\share\project"),
+        (r"C:\Users\한글 QA\project", r"C:\Users\한글 QA\project"),
+        (r"\\?\C:\special.\project", r"\\?\C:\special.\project"),
+        (r"\\?\C:\special \project", r"\\?\C:\special \project"),
+        (r"\\?\C:\CON\project", r"\\?\C:\CON\project"),
+        (r"\\.\pipe\krill", r"\\.\pipe\krill"),
+        (
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+        ),
+    ] {
+        let mut cwd = input.as_bytes().to_vec();
+        sanitize_spawn_cwd(&mut cwd);
+        assert_eq!(cwd, expected.as_bytes(), "{input}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn spawn_cwd_preserves_long_verbatim_paths() {
+    let path = format!(r"\\?\C:\{}", "long-directory\\".repeat(30));
+    let mut cwd = path.as_bytes().to_vec();
+    sanitize_spawn_cwd(&mut cwd);
+    assert_eq!(cwd, path.as_bytes());
+}

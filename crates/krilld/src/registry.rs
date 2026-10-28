@@ -3646,6 +3646,14 @@ fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
             *cwd = cleaned.into_bytes();
         }
     }
+    #[cfg(windows)]
+    {
+        use krill_proto::os::ffi::OsStrExt as _;
+        // Canonical paths arrive from the CLI and persisted layouts. cmd.exe rejects
+        // verbatim drive paths as UNC and otherwise starts in C:\Windows instead.
+        let path = krill_proto::os::shell_path(Path::new(std::ffi::OsStr::from_bytes(cwd)));
+        *cwd = path.into_os_string().into_encoded_bytes();
+    }
 }
 
 /// holder Spawn이 ENOENT로 실패했을 때:
