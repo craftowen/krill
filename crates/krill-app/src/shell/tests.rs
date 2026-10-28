@@ -11042,3 +11042,53 @@ fn input_policy_link_modifier_drives_tui_hover_modifiers_and_direct_click(cx: &m
         Some("https://example.test/input")
     );
 }
+
+#[gpui::test]
+fn ports_keep_same_session_and_url_on_different_hosts(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("ports-host-identity"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        let panes = s
+            .layout
+            .tabs()
+            .iter()
+            .map(|tab| tab.focused)
+            .collect::<Vec<_>>();
+        assert_eq!(panes.len(), 2);
+        for (index, pane) in panes.iter().enumerate() {
+            let host = krill_app::hosts::HostId::Remote(format!("host-{index}"));
+            s.layout.set_host(*pane, host.clone());
+            let sid = 42;
+            let (ours, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut live = Live::new(Task::ready(()));
+            live.pane.link(
+                krill_proto::SessionId(sid),
+                1,
+                pane::Writer::spawn(ours).unwrap(),
+                krill_proto::input::FEAT_INPUT,
+                Now::get(),
+            );
+            s.live.insert(*pane, live);
+            let screen = s.live[pane].pane.shown();
+            let entries =
+                krill_proto::orchestration::extract_local_urls(sid, "http://localhost:3000", false);
+            s.ports_cache.borrow_mut().insert(
+                (host, sid),
+                super::popout::PortCache::from_result(&screen, String::new(), entries),
+            );
+        }
+        let detected = s.detected_ports();
+        assert_eq!(
+            detected.len(),
+            2,
+            "same URL on two owners must produce two menu items"
+        );
+        assert_ne!(detected[0].0, detected[1].0);
+        // Disconnecting a host must not fall through to opening a local loopback URL.
+        s.open_terminal_url(panes[0], "http://localhost:3000", cx);
+        assert!(s.notice.is_some());
+        s.layout.set_host(panes[0], krill_app::hosts::HostId::Local);
+        assert_eq!(s.detected_ports().len(), 1, "stale host cache is excluded");
+    });
+}

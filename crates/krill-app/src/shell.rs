@@ -729,7 +729,7 @@ pub struct Shell {
         std::collections::HashSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
-    ports_cache: std::cell::RefCell<HashMap<u64, popout::PortCache>>,
+    ports_cache: std::cell::RefCell<HashMap<(krill_app::hosts::HostId, u64), popout::PortCache>>,
     /// 인앱 설정 페이지(`SettingsView`, Orca `activeView === 'settings'` 패리티).
     pub(super) settings: Option<gpui::Entity<krill_app::settings::SettingsView>>,
     pub(super) artifacts: Option<gpui::Entity<krill_app::artifacts::View>>,
@@ -1489,22 +1489,22 @@ impl Shell {
                     let mut previous = HashMap::new();
                     let screens = this
                         .live
-                        .values()
-                        .filter_map(|live| {
-                            let id = live.pane.session()?.0;
+                        .iter()
+                        .filter_map(|(pane, live)| {
+                            let id = (this.layout.host(*pane).clone(), live.pane.session()?.0);
                             let screen = live.pane.shown();
                             if cache.get(&id).is_some_and(|entry| entry.matches(&screen)) {
                                 return None;
                             }
                             if let Some(old) = cache.remove(&id) {
-                                previous.insert(id, old.into_data());
+                                previous.insert(id.clone(), old.into_data());
                             }
                             Some((id, screen))
                         })
                         .collect::<Vec<_>>();
                     let old_ports = previous
                         .iter()
-                        .map(|(id, (_, entries))| (*id, entries.clone()))
+                        .map(|(id, (_, entries))| (id.clone(), entries.clone()))
                         .collect::<HashMap<_, _>>();
                     (this.state_dir(cx), screens, previous, old_ports)
                 }) else {
@@ -1512,7 +1512,7 @@ impl Shell {
                 };
                 let copies = screens
                     .iter()
-                    .map(|(id, screen)| (*id, (**screen).clone()))
+                    .map(|(id, screen)| (id.clone(), (**screen).clone()))
                     .collect::<Vec<_>>();
                 let (snapshot, prompts, ports) = cx
                     .background_executor()
@@ -1528,7 +1528,9 @@ impl Shell {
                         let ports = copies
                             .into_iter()
                             .map(|(id, screen)| {
-                                (id, popout::detect_ports(id, &screen, previous.remove(&id)))
+                                let result =
+                                    popout::detect_ports(id.1, &screen, previous.remove(&id));
+                                (id, result)
                             })
                             .collect::<HashMap<_, _>>();
                         (snapshot, prompts, ports)
@@ -1550,19 +1552,20 @@ impl Shell {
                         }
                         let mut cache = this.ports_cache.borrow_mut();
                         cache.retain(|id, entry| {
-                            let retained = this
-                                .live
-                                .values()
-                                .any(|live| live.pane.session().is_some_and(|sid| sid.0 == *id));
+                            let retained = this.live.iter().any(|(pane, live)| {
+                                this.layout.host(*pane) == &id.0
+                                    && live.pane.session().is_some_and(|sid| sid.0 == id.1)
+                            });
                             changed |= !retained && !entry.entries().is_empty();
                             retained
                         });
                         cache.extend(ports.into_iter().filter_map(|(id, (text, entries))| {
-                            let (_, screen) = screens.iter().find(|(sid, _)| *sid == id)?;
+                            let (_, screen) = screens.iter().find(|(sid, _)| sid == &id)?;
                             this.live
-                                .values()
-                                .any(|live| {
-                                    live.pane.session().is_some_and(|sid| sid.0 == id)
+                                .iter()
+                                .any(|(pane, live)| {
+                                    this.layout.host(*pane) == &id.0
+                                        && live.pane.session().is_some_and(|sid| sid.0 == id.1)
                                         && Rc::ptr_eq(screen, &live.pane.shown())
                                 })
                                 .then(|| {
@@ -2808,9 +2811,18 @@ impl Shell {
     /// 원격 호스트 패인의 루프백 URL(`localhost`, `127.0.0.1`, `0.0.0.0`, `[::1]`)이면
     /// 로컬 포워딩 리스너(유휴 10분 뒤 자동 해제)를 먼저 준비하고 포워딩된 로컬 URL로 연다.
     pub(super) fn open_terminal_url(&mut self, pane: PaneId, uri: &str, cx: &mut Context<Self>) {
-        if let Some((host, target)) = self.remote_target_for_pane(pane)
-            && let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(uri)
+        if let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(uri)
+            && self.layout.host(pane).is_remote()
         {
+            let Some((host, target)) = self.remote_target_for_pane(pane) else {
+                self.notice = Some(format!(
+                    "{}: {}",
+                    self.layout.host(pane),
+                    std::io::Error::from(std::io::ErrorKind::NotConnected)
+                ));
+                cx.notify();
+                return;
+            };
             let uri = uri.to_owned();
             cx.spawn(async move |this, cx| {
                 let forwarded = cx
