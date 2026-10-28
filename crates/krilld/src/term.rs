@@ -54,6 +54,8 @@ use crate::appearance::Appearance;
 /// 핫 스크롤백 행 수의 고정 상한이자 기본값(ARCHITECTURE §4, AGENTS 메모리 예산). 넘는 행은 세그먼트(MK-024)가 맡는다.
 /// [`Engine::with_history`]로 더 작게 둘 수는 있어도 이보다 크게 둘 수는 없다.
 pub const HOT_LINES: usize = 1_000;
+/// 강등 중 출력이 이어질 때 grid 캐시(alacritty가 한 번에 늘리는 1,000행)를 버리는 간격(OWE-1114).
+const TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 모드 2031(Contour 색 구성 알림).
 const SCHEME_MODE: u16 = 2031;
@@ -297,6 +299,9 @@ pub(crate) struct Engine {
     hot: usize,
     /// 강등 중인지 여부.
     demoted: bool,
+    /// 강등 중 출력으로 grid에 남은 캐시 행을 버릴 시각(OWE-1114). 묶음마다 자르면 alacritty가 다음 묶음에서
+    /// 1,000행을 다시 할당해 출력이 몰릴 때 CPU가 40배 넘게 든다.
+    trim_at: Option<Instant>,
     /// 강등(`demote`)이나 자식이 보낸 `CSI 3 J`·`RIS` 직전의 핫 스크롤백(최신 행부터, 행별 RLE postcard).
     parked_hot: VecDeque<Box<[u8]>>,
     /// Grid history before CSI 2 J, kept through an immediately following clear.
@@ -452,6 +457,7 @@ impl Engine {
             cli_boundary: crate::cli::Boundary::default(),
             hot,
             demoted: false,
+            trim_at: None,
             parked_hot: VecDeque::new(),
             pre_2j_hot: None,
             title: String::new(),
@@ -588,12 +594,31 @@ impl Engine {
                 self.save_hot();
             }
             self.set_history(0, look);
-            self.term.grid_mut().truncate();
+            self.trim_later();
         } else if !self.parked_hot.is_empty() && self.history_len() >= self.hot {
             self.parked_hot.clear();
             self.parked_hot.shrink_to_fit();
         }
         out
+    }
+
+    /// 강등 중 출력 뒤 grid 캐시를 [`TRIM_DELAY`] 안에 한 번 자르도록 예약한다. 이미 예약돼 있으면 미루지 않아
+    /// 출력이 계속돼도 캐시가 그 간격보다 오래 남지 않는다.
+    fn trim_later(&mut self) {
+        self.trim_at
+            .get_or_insert_with(|| Instant::now() + TRIM_DELAY);
+    }
+
+    /// 예약된 grid 캐시 정리 시각. 없으면 `None`.
+    pub(crate) fn trim_deadline(&self) -> Option<Instant> {
+        self.trim_at
+    }
+
+    /// 예약된 grid 캐시 정리를 지금 한다. 강등이 풀렸으면 캐시를 그대로 쓴다.
+    pub(crate) fn trim(&mut self) {
+        if self.trim_at.take().is_some() && self.demoted {
+            self.term.grid_mut().truncate();
+        }
     }
 
     /// 열린 sync(DEC 2026) 구간이 강제로 반영돼야 하는 시각. 없으면 `None`.
@@ -638,7 +663,7 @@ impl Engine {
                 self.save_hot();
             }
             self.set_history(0, look);
-            self.term.grid_mut().truncate();
+            self.trim_later();
         } else if !self.parked_hot.is_empty() && self.history_len() >= self.hot {
             self.parked_hot.clear();
             self.parked_hot.shrink_to_fit();
@@ -657,6 +682,7 @@ impl Engine {
             self.demoted = true;
         }
         self.set_history(0, look);
+        self.trim_at = None;
         // `set_options`만으로는 alacritty가 캐시 1,000행을 남긴다(비공개 MK-009 스파이크 기록 원인 3).
         // ponytail: 대체 화면 중에는 기본 화면 grid가 비활성이라 공개 API로 truncate할 수 없어 캐시가 최대 1,000행
         // 남는다. 대체 화면을 오래 쓰는 에이전트가 문제가 되면 좁은 포크(MK-006)로 비활성 grid도 자른다.
@@ -669,6 +695,7 @@ impl Engine {
     /// 강등을 푼다: 핫 스크롤백을 다시 만들 때의 상한(≤ [`HOT_LINES`])까지 쌓는다(이전 행은 콜드 페이지로).
     pub(crate) fn promote(&mut self, look: &Appearance) {
         self.demoted = false;
+        self.trim_at = None;
         self.set_history(self.hot, look);
     }
 
