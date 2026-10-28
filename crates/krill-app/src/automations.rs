@@ -3529,7 +3529,7 @@ mod tests {
             schedule: vec![Schedule {
                 id: "daily-audit".into(),
                 cron: "0 9 * * 1-5".into(),
-                cwd: "/tmp".into(),
+                cwd: dir.to_string_lossy().into_owned(),
                 command: vec!["claude".into(), "-p".into()],
                 prompt: "Audit repository".into(),
                 precheck: None,
@@ -3546,7 +3546,7 @@ mod tests {
             session: None,
             status: Some(0),
             error: None,
-            cwd: Some("/tmp".into()),
+            cwd: Some(dir.to_string_lossy().into_owned()),
             output: Some("All checks passed.".into()),
             ..ScheduleRun::default()
         };

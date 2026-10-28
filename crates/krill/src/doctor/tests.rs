@@ -278,7 +278,14 @@ fn missing_git_is_warn_with_copy_fix() {
     let checks = super::checks::decide(&f);
     let c = checks.iter().find(|c| c.id == "git").unwrap();
     assert_eq!(c.status, Status::Warn);
-    assert_eq!(c.fix.value, "xcode-select --install");
+    assert_eq!(
+        c.fix.value,
+        if cfg!(windows) {
+            "winget install --id Git.Git -e"
+        } else {
+            "xcode-select --install"
+        }
+    );
 }
 
 #[test]

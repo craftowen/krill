@@ -217,6 +217,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use krill_proto::os::ffi::OsStrExt as _;
+    #[cfg(unix)]
     use std::process::Command;
 
     #[test]

@@ -495,7 +495,7 @@ mod tests {
                  [[projects]]\npath = \"{}\"\n\n\
                  [[projects]]\npath = \"/old\"\narchived = true\n\n\
                  [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
-                git_repo.display()
+                git_repo.to_string_lossy().replace('\\', "\\\\")
             ),
         )
         .unwrap();

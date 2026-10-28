@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn fallback_name_itself_never_warns() {
-        let eff = effective_font_with("Menlo", |_| None);
+        let eff = effective_font_with(FALLBACK_FAMILY, |_| None);
         assert_eq!(eff.family.as_ref(), FALLBACK_FAMILY);
         assert!(!eff.replaced);
     }

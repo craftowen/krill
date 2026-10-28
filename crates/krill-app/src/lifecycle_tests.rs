@@ -105,6 +105,7 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
         ] {
             assert!(cx.is_action_available(action));
         }
+        #[cfg(target_os = "macos")]
         let bound = |action: &dyn gpui::Action| {
             cx.key_bindings()
                 .borrow()
@@ -117,11 +118,14 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
                 })
                 .collect::<Vec<_>>()
         };
-        assert!(bound(&HideApp).contains(&"cmd-h".to_owned()));
-        // `unparse`는 fn-ctrl-alt-cmd-shift- 순이라 `cmd-alt-h`는 `alt-cmd-h`가 된다.
-        assert!(bound(&HideOthers).contains(&"alt-cmd-h".to_owned()));
-        assert!(bound(&MinimizeWindow).contains(&"cmd-m".to_owned()));
-        assert!(bound(&ToggleFullscreen).contains(&"ctrl-cmd-f".to_owned()));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(bound(&HideApp).contains(&"cmd-h".to_owned()));
+            // `unparse`는 fn-ctrl-alt-cmd-shift- 순이라 `cmd-alt-h`는 `alt-cmd-h`가 된다.
+            assert!(bound(&HideOthers).contains(&"alt-cmd-h".to_owned()));
+            assert!(bound(&MinimizeWindow).contains(&"cmd-m".to_owned()));
+            assert!(bound(&ToggleFullscreen).contains(&"ctrl-cmd-f".to_owned()));
+        }
     });
 }
 
@@ -239,6 +243,7 @@ fn secure_keyboard_toggle_preserves_app_and_file_menus(cx: &mut gpui::TestAppCon
             .collect();
         for expected in [
             ("설정…", false),
+            #[cfg(target_os = "macos")]
             (krill_app::security::text::SECURE_KEYBOARD_MENU.get(), true),
             ("Krill 종료", false),
             ("새 창", false),
@@ -333,10 +338,13 @@ fn language_switch_rebuilds_native_menus_and_keeps_the_security_check(
                     .any(|menu| menu.name.as_ref() == catalog::general::FILE.get())
             );
             let items: Vec<_> = menus.iter().flat_map(|menu| &menu.items).collect();
-            assert!(items.iter().any(|item| matches!(item,
-                gpui::OwnedMenuItem::Action { name, checked: true, .. }
-                if name.as_str() == catalog::security::SECURE_KEYBOARD_MENU.get()
-            )));
+            let secure_checked = items.iter().any(|item| {
+                matches!(item,
+                    gpui::OwnedMenuItem::Action { name, checked: true, .. }
+                    if name.as_str() == catalog::security::SECURE_KEYBOARD_MENU.get()
+                )
+            });
+            assert_eq!(secure_checked, cfg!(target_os = "macos"));
             for key in [
                 catalog::general::SETTINGS_MENU,
                 catalog::general::QUIT,
@@ -368,8 +376,28 @@ fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
                 .map(|b| b.action().name())
                 .collect()
         };
-        assert_eq!(actions_for("cmd-n", cx), ["shell::NewWorktree"]);
-        assert_eq!(actions_for("cmd-shift-n", cx), ["shell::NewWorktree"]);
+        assert_eq!(
+            actions_for(
+                if cfg!(target_os = "macos") {
+                    "cmd-n"
+                } else {
+                    "ctrl-shift-n"
+                },
+                cx
+            ),
+            ["shell::NewWorktree"]
+        );
+        assert_eq!(
+            actions_for(
+                if cfg!(target_os = "macos") {
+                    "cmd-shift-n"
+                } else {
+                    "ctrl-alt-shift-n"
+                },
+                cx
+            ),
+            ["shell::NewWorktree"]
+        );
 
         let first = open_shell(cx, Some(path.clone())).unwrap();
         let second = new_window(cx).unwrap();

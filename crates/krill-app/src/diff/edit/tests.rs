@@ -160,7 +160,11 @@ fn stage_unstage_discard_multiline_commit_cmd_enter_failure_and_retry(cx: &mut T
             .unwrap()
             .update(cx, |input, cx| input.focus(window, cx));
     });
-    cx.simulate_keystrokes("cmd-enter");
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
     cx.run_until_parked();
     panel.read_with(cx, |p, cx| {
         assert!(
@@ -533,6 +537,14 @@ fn discard_worktree_file_restores_tracked_changes_and_trashes_untracked_files() 
             .unwrap()
             .success()
     );
+    assert!(
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&repo)
@@ -627,6 +639,14 @@ fn hunk_and_line_stage_unstage_discard_on_real_repo() {
         .current_dir(&dir)
         .status()
         .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&dir)

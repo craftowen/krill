@@ -372,7 +372,11 @@ mod tests {
         cx.run_until_parked();
         view.update(cx, |s, cx| s.scroll_to_row(90, cx));
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
         cx.simulate_input("스크롤 후에도 편집");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();

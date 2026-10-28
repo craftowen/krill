@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -163,6 +164,7 @@ fn temp_dir(name: &str) -> PathBuf {
     d
 }
 
+#[cfg(target_os = "macos")]
 fn pmset_assertions_output(cx: &TestAppContext) -> String {
     // 이 실제 OS 통합 검사에서만 적용 완료 배리어를 기다린다.
     let (done, applied) = mpsc::channel();
@@ -183,6 +185,7 @@ fn pmset_assertions_output(cx: &TestAppContext) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+#[cfg(target_os = "macos")]
 fn has_our_sleep_assertion(pmset_out: &str) -> bool {
     let pid_token = format!("pid {}", std::process::id());
     pmset_out.lines().any(|line| {
@@ -316,6 +319,7 @@ fn waiting_blocked_done_notifications_badge_and_click(cx: &mut TestAppContext) {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(target_os = "macos")]
 #[gpui::test]
 fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
     let _guard = SERIAL
