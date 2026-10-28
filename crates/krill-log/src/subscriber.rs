@@ -154,4 +154,15 @@ mod tests {
         assert!(repeats.admit(2, 0).is_some(), "other events are unaffected");
         assert_eq!(repeats.admit(1, WINDOW_MS), Some(10 - REPEATS_PER_WINDOW));
     }
+
+    /// 2026-10-27 실측 폭주(25,433줄, 약 10시간)를 같은 형태로 재생해 남는 줄 수를 잰다.
+    #[test]
+    fn display_link_flood_replay_keeps_only_a_handful_of_lines() {
+        let mut repeats = Repeats::default();
+        let ten_hours_ms = 10 * 3600 * 1000u128;
+        let kept = (0..25_433u128)
+            .filter(|n| repeats.admit(7, n * ten_hours_ms / 25_433).is_some())
+            .count();
+        assert!(kept <= 3 * 601, "kept {kept} of 25433");
+    }
 }

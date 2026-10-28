@@ -150,10 +150,19 @@ fn main() -> std::process::ExitCode {
                     let incoming_state = state.clone();
                     cx.background_spawn(async move {
                         let executable = krill_app::hosts::link::executable();
-                        if let Err(error) =
-                            krill_link::service::ensure_default_server(&executable, &incoming_state)
-                        {
-                            tracing::warn!(%error, "failed to start incoming access");
+                        // 부팅 직후엔 launchd가 느려 10초 시작 제한을 넘길 수 있다. 한 번 실패해도 두 번 더 시도하고
+                        // 마지막 실패만 경고로 남긴다.
+                        for attempt in 0..3 {
+                            match krill_link::service::ensure_default_server(
+                                &executable,
+                                &incoming_state,
+                            ) {
+                                Ok(()) => break,
+                                Err(error) if attempt == 2 => {
+                                    tracing::warn!(%error, "failed to start incoming access");
+                                }
+                                Err(_) => std::thread::sleep(std::time::Duration::from_secs(30)),
+                            }
                         }
                     })
                     .detach();
