@@ -110,12 +110,26 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         Ok(shell) => shell,
         Err(e) => return failed(format!("precheck failed: {e}")),
     };
+    let mut process = Command::new(&shell);
+    #[cfg(windows)]
+    if let Some(bin) = shell.parent() {
+        // Git's `cmd` PATH entry does not expose sh utilities such as sleep and grep.
+        let mut paths = vec![bin.to_owned()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = match std::env::join_paths(paths) {
+            Ok(path) => path,
+            Err(e) => return failed(format!("precheck PATH failed: {e}")),
+        };
+        process.env("PATH", path);
+    }
     // `spawn` kills descendants on drop (Unix process group, Windows Job) on every exit path below.
     let mut child = match spawn(
-        own_group(&mut Command::new(shell))
+        own_group(&mut process)
             .arg("-c")
             .arg(command)
-            .current_dir(cwd)
+            .current_dir(krill_proto::os::shell_path(cwd))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
