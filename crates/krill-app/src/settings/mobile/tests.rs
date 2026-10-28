@@ -556,10 +556,9 @@ fn relay_click_starts_desktop_sign_in_and_resumes_pairing_once(cx: &mut gpui::Te
                     };
                     MobileReply::Workflow(serde_json::json!({"ok":true,"data":data}).to_string())
                 }
-                MobileRequest::MintPairingTicket { .. } => pairing_offer("https://example.test/#pair=fixture", u64::MAX),
+                MobileRequest::MintPairingTicket { .. } | MobileRequest::CurrentPairingOffer => pairing_offer("https://example.test/#pair=fixture", u64::MAX),
                 MobileRequest::Status => MobileReply::GatewayStatus { listening:true, bind_addrs:Vec::new(), mode:ConnectMode::Tunnel, tunnel_url:None, active_offer:false, devices:Vec::new() },
                 MobileRequest::ConnectedDevices => MobileReply::ConnectedDevices(Vec::new()),
-                MobileRequest::CurrentPairingOffer => pairing_offer("https://example.test/#pair=fixture", u64::MAX),
                 other => panic!("unexpected request: {other:?}"),
             })
         }));
@@ -573,8 +572,8 @@ fn relay_click_starts_desktop_sign_in_and_resumes_pairing_once(cx: &mut gpui::Te
     );
     vcx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.mobile_pair(ConnectMode::Tunnel, None, cx)
-        })
+            view.mobile_pair(ConnectMode::Tunnel, None, cx);
+        });
     });
     vcx.run_until_parked();
     assert!(

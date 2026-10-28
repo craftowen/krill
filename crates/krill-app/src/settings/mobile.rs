@@ -46,7 +46,7 @@ pub struct Panel {
     account: AccountView,
 }
 struct AccountView {
-    connect_after_login: bool,
+    connect_after_login: Option<ConnectMode>,
     email: Option<String>,
     required: bool,
     pending: bool,
@@ -57,7 +57,7 @@ struct AccountView {
 impl Default for AccountView {
     fn default() -> Self {
         Self {
-            connect_after_login: false,
+            connect_after_login: None,
             email: None,
             required: true,
             pending: false,
@@ -416,13 +416,14 @@ impl SettingsView {
         {
             self.mobile.mode = mode;
             self.mobile.address = address;
-            self.mobile.account.connect_after_login = true;
+            self.mobile.account.connect_after_login = Some(mode);
             if !self.mobile.account.pending {
                 self.mobile_account_action(false, cx);
             }
+            cx.notify();
             return;
         }
-        self.mobile.account.connect_after_login = false;
+        self.mobile.account.connect_after_login = None;
         if self.mobile.pending
             || (self.mobile.pairing_pending()
                 && self.mobile.mode == mode

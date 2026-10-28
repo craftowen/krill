@@ -114,14 +114,15 @@ impl SettingsView {
         }));
     }
     fn mobile_resume_after_login(&mut self, cx: &mut Context<Self>) {
-        if self.mobile.account.connect_after_login && self.mobile.account.email.is_some() {
-            self.mobile.account.connect_after_login = false;
-            self.mobile_pair(ConnectMode::Tunnel, self.mobile.address.clone(), cx);
+        if self.mobile.account.email.is_some()
+            && let Some(mode) = self.mobile.account.connect_after_login.take()
+        {
+            self.mobile_pair(mode, self.mobile.address.clone(), cx);
         }
     }
     pub(super) fn mobile_account_action(&mut self, logout: bool, cx: &mut Context<Self>) {
         if logout {
-            self.mobile.account.connect_after_login = false;
+            self.mobile.account.connect_after_login = None;
         }
         if self.mobile.account.busy {
             return;
@@ -150,24 +151,21 @@ impl SettingsView {
                     return;
                 }
                 this.mobile.account.busy = false;
-                match result {
-                    Ok(data) => {
-                        this.mobile.accept_account(&data);
-                        if let Some(url) = data
-                            .get("verification_uri_complete")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            this.mobile.account.pending = true;
-                            cx.open_url(url);
-                        }
-                        if data.get("revoked").and_then(serde_json::Value::as_bool) == Some(false) {
-                            this.mobile.error = Some(text::ACCOUNT_REVOKE_FAILED.get().to_owned());
-                        }
+                if let Ok(data) = result {
+                    this.mobile.accept_account(&data);
+                    if let Some(url) = data
+                        .get("verification_uri_complete")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        this.mobile.account.pending = true;
+                        cx.open_url(url);
                     }
-                    Err(_) => {
-                        this.mobile.account.connect_after_login = false;
-                        this.mobile.error = Some(text::ACCOUNT_ERROR.get().to_owned());
+                    if data.get("revoked").and_then(serde_json::Value::as_bool) == Some(false) {
+                        this.mobile.error = Some(text::ACCOUNT_REVOKE_FAILED.get().to_owned());
                     }
+                } else {
+                    this.mobile.account.connect_after_login = None;
+                    this.mobile.error = Some(text::ACCOUNT_ERROR.get().to_owned());
                 }
                 this.mobile_resume_after_login(cx);
                 this.mobile_account_poll(cx);
