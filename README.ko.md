@@ -148,7 +148,7 @@ PC에서 릴레이 연결을 선택하면 Google 로그인으로 이어집니다
 - **GUI 없이 동작하는 `krill` CLI &amp; SSH 원격 호스트** — 단일 바이너리가 데몬에 직접 붙어 세션 생성·입출력·`attach`·맥락 인계(`krill handoff`)를 수행하며, 지원되는 원격 Mac 호스트(`krill --host user@host`)도 제어합니다.
 - **계정 전환 및 자동 로테이션 (`krill account`)** — 에이전트 계정을 전환하고 사용량 한도 도달 시 자동으로 다음 계정으로 전환(`auto-switch`)합니다.
 - **UTC Cron 예약 실행 (`krill schedule`)** — 반복 에이전트 작업을 스케줄에 맞춰 자동 실행합니다([스케줄링 문서](docs/SCHEDULING.md)).
-- **31종 터미널 테마 &amp; 퍼스트클래스 한글 IME** — **Krill Deep** 및 30종의 기본 테마(Ghostty·Warp 테마 가져오기 지원)와 전용 한글 조합 상태기계(`krill-term`)를 내장합니다.
+- **45종 터미널 테마 &amp; 퍼스트클래스 한글 IME** — **Krill Deep**을 포함한 Krill 테마 15종과 Orca 호환 기본 테마 30종(Ghostty·Warp 테마 가져오기 지원)와 전용 한글 조합 상태기계(`krill-term`)를 내장합니다.
 - **빠른 열기 &amp; 워크스페이스 컨텍스트** — 워크트리, 세션, 파일, 로컬 서버 포트(`krill ports`), 참고 URL(`krill reference`)을 빠르게 탐색합니다.
 
 ---
