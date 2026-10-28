@@ -7599,13 +7599,7 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
                     },
                 ];
                 Ok(match request {
-                    MobileRequest::Workflow(_) => MobileReply::Workflow(
-                        serde_json::json!({"ok": true, "data": {
-                            "requires_sign_in": true, "signed_in": true,
-                            "email": "mobile-test@example.test"
-                        }})
-                        .to_string(),
-                    ),
+                    MobileRequest::Workflow(_) => MobileReply::Workflow(serde_json::json!({"ok":true,"data":{"requires_sign_in":true,"signed_in":true,"email":"fixture@example.test","pending":false}}).to_string()),
                     MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
                         url: format!("https://example.test/?pair=owe802&mode={mode:?}#key=secret"),
                         host: "example.test".into(),
@@ -8608,13 +8602,7 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
         view.update(cx, |v, cx| {
             v.mobile = mobile::Panel::new(std::sync::Arc::new(|request| {
                 Ok(match request {
-                    MobileRequest::Workflow(_) => MobileReply::Workflow(
-                        serde_json::json!({"ok": true, "data": {
-                            "requires_sign_in": true, "signed_in": true,
-                            "email": "mobile-test@example.test"
-                        }})
-                        .to_string(),
-                    ),
+                    MobileRequest::Workflow(_) => MobileReply::Workflow(serde_json::json!({"ok":true,"data":{"requires_sign_in":true,"signed_in":true,"email":"fixture@example.test","pending":false}}).to_string()),
                     MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
                         url: format!("http://127.0.0.1:1234/#pair={mode:?}"),
                         host: "127.0.0.1".into(),
@@ -8715,13 +8703,7 @@ fn mobile_pairing_path_selection_does_not_block_settings(cx: &mut TestAppContext
         view.update(cx, |v, cx| {
             v.mobile = mobile::Panel::new(std::sync::Arc::new(|request| {
                 Ok(match request {
-                    MobileRequest::Workflow(_) => MobileReply::Workflow(
-                        serde_json::json!({"ok": true, "data": {
-                            "requires_sign_in": true, "signed_in": true,
-                            "email": "mobile-test@example.test"
-                        }})
-                        .to_string(),
-                    ),
+                    MobileRequest::Workflow(_) => MobileReply::Workflow(serde_json::json!({"ok":true,"data":{"requires_sign_in":true,"signed_in":true,"email":"fixture@example.test","pending":false}}).to_string()),
                     MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
                         url: format!("http://127.0.0.1:1234/#pair={mode:?}"),
                         host: "127.0.0.1".into(),

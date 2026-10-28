@@ -29,6 +29,7 @@ pub(super) const RPC_STACK: usize = 512 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 /// 수락 스레드가 일이 없어도 깨어 reconcile(터널 감시·백오프)하는 최대 간격.
 const RECONCILE: Duration = Duration::from_secs(1);
+const NETWORK_RECHECK: Duration = Duration::from_secs(10);
 /// Cloudflare는 양방향 무전송 WS를 끊는다(Quick Tunnel 실측 약 125초). 이 주기로 ping하고,
 /// 응답 없는 주기가 `IDLE_PINGS`번 이어지면(LTE 전환 등으로 죽은 연결) 닫는다.
 const PING: Duration = Duration::from_secs(30);
@@ -157,7 +158,10 @@ pub(super) struct State {
     pub(super) devices: Devices,
     mode: ConnectMode,
     custom: Option<String>,
+    /// QR 선택과 독립적으로 유지하는 Tailscale 백업 주소.
+    tailscale_address: Option<String>,
     interfaces: Vec<NetworkInterface>,
+    network_checked: Instant,
     selected: Option<SocketAddrV4>,
     listeners: Vec<TcpListener>,
     pub(super) connections: HashMap<u64, Connection>,
@@ -188,6 +192,8 @@ pub(super) struct State {
 struct Intent {
     mode: ConnectMode,
     custom: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tailscale_address: Option<String>,
     #[serde(default)]
     rid: String,
     #[serde(default)]
@@ -217,6 +223,7 @@ impl Intent {
             .unwrap_or_else(|| Self {
                 mode: ConnectMode::Tunnel,
                 custom: None,
+                tailscale_address: None,
                 rid: String::new(),
                 key: String::new(),
                 relay_owner: None,
@@ -236,6 +243,9 @@ impl Intent {
         if intent.mode == ConnectMode::Lan && !loopback {
             intent.mode = ConnectMode::Tunnel;
             intent.custom = None;
+        }
+        if intent.mode == ConnectMode::Tailscale && intent.tailscale_address.is_none() {
+            intent.tailscale_address.clone_from(&intent.custom);
         }
         if decode_hex::<16>(&intent.rid).is_err() || decode_hex::<32>(&intent.key).is_err() {
             intent.rid = hex(&random()?.into_iter().take(16).collect::<Vec<_>>());
@@ -260,6 +270,7 @@ fn save_intent(s: &State) -> io::Result<()> {
     let intent = Intent {
         mode: s.mode,
         custom: s.custom.clone(),
+        tailscale_address: s.tailscale_address.clone(),
         rid: s.publication.rid.clone(),
         key: s.publication.key.clone(),
         relay_owner: s.relay_owner.clone(),
@@ -383,7 +394,9 @@ impl Gateway {
                 devices: Devices::open(dir)?,
                 mode: intent.mode,
                 custom: intent.custom,
+                tailscale_address: intent.tailscale_address,
                 interfaces: net::detect()?,
+                network_checked: Instant::now(),
                 selected: None,
                 listeners: Vec::new(),
                 connections: HashMap::new(),
@@ -436,10 +449,10 @@ impl Gateway {
             return None;
         }
         let address = state.selected?;
-        let base = if state.mode == ConnectMode::Tunnel {
-            if relay_pairing(&state) {
-                fixed_base(&state)
-            } else if let Some(tunnel) = state.tunnel.as_ref()
+        let base = if relay_pairing(&state) {
+            fixed_base(&state)
+        } else if state.mode == ConnectMode::Tunnel {
+            if let Some(tunnel) = state.tunnel.as_ref()
                 && let Some(url) = tunnel.ready_url()
             {
                 if tunnel.fixed() {
@@ -451,6 +464,15 @@ impl Gateway {
                 return None;
             }
         } else {
+            if state.mode == ConnectMode::Tailscale
+                && (!net::tailscale(*address.ip())
+                    || !state
+                        .listeners
+                        .iter()
+                        .any(|listener| listener.local_addr().ok() == Some(address.into())))
+            {
+                return None;
+            }
             format!("http://{address}")
         };
         Some(format!("{base}/?session={}", session.0))
@@ -641,7 +663,12 @@ impl Gateway {
             MobileRequest::CurrentPairingOffer => pairing_offer(&state, now)?,
             MobileRequest::Status => {
                 let (mode, custom) = (state.mode, state.custom.clone());
-                configure(&mut state, mode, custom, now)?;
+                // A disconnected tailnet cannot prevent relay recovery or status.
+                if let Err(error) = configure(&mut state, mode, custom, now)
+                    && error.kind() != io::ErrorKind::AddrNotAvailable
+                {
+                    return Err(error);
+                }
                 reconcile(&mut state, now)?;
                 status(&state, now)
             }
@@ -673,10 +700,10 @@ impl Drop for Gateway {
         let mut state = lock(&self.shared.state);
         state.stopped = true;
         let now = now_ms();
-        let keep_tunnel = state.dir.is_some()
-            && state.mode == ConnectMode::Tunnel
+        let keep_gateway = state.dir.is_some()
+            && state.mode != ConnectMode::Lan
             && (state.devices.active_count() > 0 || state.devices.ticket(now).is_some());
-        if keep_tunnel {
+        if keep_gateway {
             sync_tunnel_intent(&mut state);
             if let Some(tunnel) = state.tunnel.as_ref() {
                 tunnel.set_persist(true);
@@ -739,29 +766,60 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
             next_custom = None;
         }
     }
+    // Validate before mutating live transports: an unavailable backup must never
+    // tear down an authenticated relay session.
+    let interfaces = net::detect()?;
+    s.network_checked = Instant::now();
+    let selected = match net::select(&interfaces, mode, next_custom.as_deref()) {
+        Ok(selected) => selected,
+        Err(error) => {
+            s.interfaces = interfaces;
+            return Err(error);
+        }
+    };
     let reissue = s.devices.ticket(now).is_some();
     let intent_changed = s.mode != mode || s.custom != next_custom || named_changed;
-    if intent_changed {
-        s.devices.clear_ticket();
-        close(s);
-        s.selected = None;
+    if named_changed {
+        if let Some(mut tunnel) = s.tunnel.take() {
+            tunnel.terminate();
+        } else if let Some(pid) = s.saved_tunnel_pid {
+            super::tunnel::kill_pid(pid);
+        }
+        s.saved_tunnel_pid = None;
+        s.saved_tunnel_url = None;
+        s.tunnel_retry_at = None;
+        s.tunnel_failures = 0;
     }
-    let interfaces = net::detect()?;
-    let selected = net::select(&interfaces, mode, next_custom.as_deref())?;
+    // The enum selects which QR to show. Relay and the tailnet listener have
+    // independent lifetimes; switching QR must not close accepted sockets.
     if intent_changed || s.selected.is_some_and(|a| a.ip() != selected.ip()) {
         s.devices.clear_ticket();
-        close(s);
-        s.selected = None;
         if reissue {
             s.devices.mint(now, true)?;
         }
     }
+    let current_port = s
+        .listeners
+        .first()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port());
+    let port = if selected.port() != 0 && current_port != Some(selected.port()) {
+        s.listeners.clear();
+        s.waker.quiesce();
+        if let Some(mut tunnel) = s.tunnel.take() {
+            tunnel.terminate();
+        }
+        selected.port()
+    } else {
+        current_port.unwrap_or(selected.port())
+    };
+    if mode == ConnectMode::Tailscale {
+        s.tailscale_address.clone_from(&next_custom);
+    }
     s.mode = mode;
     s.custom = next_custom;
     s.interfaces = interfaces;
-    if s.selected.is_none() {
-        s.selected = Some(selected);
-    }
+    s.selected = Some(SocketAddrV4::new(*selected.ip(), port));
     if intent_changed {
         save_intent(s)?;
     }
@@ -770,8 +828,32 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
 fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let ticket = state.devices.ticket(now).ok_or_else(invalid)?;
     let address = state.selected.ok_or_else(invalid)?;
-    let host = address.ip().to_string();
+    let host = if state.mode == ConnectMode::Tunnel {
+        state
+            .listeners
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .find_map(|address| match address.ip() {
+                std::net::IpAddr::V4(ip) if net::tailscale(ip) => Some(ip.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        address.ip().to_string()
+    };
     let port = address.port();
+    if state.mode == ConnectMode::Tailscale
+        && (!net::tailscale(*address.ip())
+            || !state
+                .listeners
+                .iter()
+                .any(|listener| listener.local_addr().ok() == Some(address.into())))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "Tailscale 백업 주소를 열 수 없습니다 — Tailscale 연결을 확인하세요",
+        ));
+    }
     let relay_only = state.mode == ConnectMode::Tunnel && relay_pairing(state);
     let base = if state.mode == ConnectMode::Tunnel {
         if relay_only {
@@ -903,16 +985,34 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
         s.selected = None;
         return Ok(());
     }
+    if s.network_checked.elapsed() >= NETWORK_RECHECK {
+        s.network_checked = Instant::now();
+        if let Ok(interfaces) = net::detect() {
+            s.interfaces = interfaces;
+        }
+    }
+    if s.mode == ConnectMode::Tailscale
+        && let Ok(address) = net::select(&s.interfaces, s.mode, s.custom.as_deref())
+        && let Some(selected) = s.selected.as_mut()
+    {
+        selected.set_ip(*address.ip());
+    }
     if !s.listeners.is_empty() {
+        sync_direct_listener(s);
         supervise_tunnel(s);
         return Ok(());
     }
     let selected = match s.selected {
         Some(a) => a,
-        None => net::select(&s.interfaces, s.mode, s.custom.as_deref())?,
+        None => net::select(&s.interfaces, s.mode, s.custom.as_deref()).or_else(|error| {
+            if s.mode == ConnectMode::Tailscale && error.kind() == io::ErrorKind::AddrNotAvailable {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            } else {
+                Err(error)
+            }
+        })?,
     };
-    let loopback = if s.mode == ConnectMode::Tunnel
-        && selected.port() == 0
+    let loopback = if selected.port() == 0
         && let Some(saved_port) = s.saved_port.filter(|p| *p > 0)
     {
         if let Ok(l) = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, saved_port)) {
@@ -931,16 +1031,56 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     };
     let port = loopback.local_addr()?.port();
     loopback.set_nonblocking(true)?;
-    let mut listeners = vec![loopback];
-    if s.mode != ConnectMode::Tunnel && *selected.ip() != Ipv4Addr::LOCALHOST {
-        let external = TcpListener::bind(SocketAddrV4::new(*selected.ip(), port))?;
-        external.set_nonblocking(true)?;
-        listeners.push(external);
-    }
     s.selected = Some(SocketAddrV4::new(*selected.ip(), port));
-    s.listeners = listeners;
+    s.listeners = vec![loopback];
+    s.saved_port = Some(port);
+    save_intent(s)?;
+    sync_direct_listener(s);
     supervise_tunnel(s);
     Ok(())
+}
+/// Keep the tailnet endpoint warm even while relay is preferred. Bind failure
+/// only removes the backup; relay remains usable and the next reconcile retries.
+fn sync_direct_listener(s: &mut State) {
+    let Some(port) = s.selected.map(|address| address.port()) else {
+        return;
+    };
+    let target = (s.mode != ConnectMode::Lan)
+        .then(|| {
+            net::select(
+                &s.interfaces,
+                ConnectMode::Tailscale,
+                s.tailscale_address.as_deref(),
+            )
+            .ok()
+            .filter(|address| {
+                s.interfaces.iter().any(|interface| {
+                    interface.address.parse::<Ipv4Addr>().ok() == Some(*address.ip())
+                })
+            })
+            .map(|address| SocketAddrV4::new(*address.ip(), port))
+        })
+        .flatten();
+    let previous_count = s.listeners.len();
+    s.listeners.retain(|listener| {
+        listener.local_addr().is_ok_and(|address| {
+            address.ip().is_loopback() || Some(address) == target.map(Into::into)
+        })
+    });
+    // poll holds cloned descriptors; release them before rebinding a new address.
+    if previous_count != s.listeners.len() {
+        s.waker.quiesce();
+    }
+    if let Some(target) = target
+        && !s
+            .listeners
+            .iter()
+            .any(|listener| listener.local_addr().ok() == Some(target.into()))
+        && let Ok(listener) = TcpListener::bind(target)
+        && listener.set_nonblocking(true).is_ok()
+    {
+        s.listeners.push(listener);
+    }
 }
 fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
     if let (Some(token), Some(hostname)) = (&s.tunnel_token, &s.tunnel_hostname)
@@ -1004,7 +1144,7 @@ fn relay_only(s: &State) -> bool {
 }
 /// 외부 접속은 릴레이로 한다. 명시적 Named Tunnel만 터널을 띄우고, 터널 실패는 지수 백오프로 재시도한다.
 fn supervise_tunnel(s: &mut State) {
-    if s.mode != ConnectMode::Tunnel {
+    if s.mode == ConnectMode::Lan {
         if let Some(mut tunnel) = s.tunnel.take() {
             tunnel.terminate();
         }
@@ -1025,8 +1165,7 @@ fn supervise_tunnel(s: &mut State) {
         s.publication.session = None;
         super::relay_auth::Session::remove(s.dir.as_deref()).ok();
     }
-    if named.is_none()
-        && relay_on(s)
+    if relay_on(s)
         && s.account
             .session
             .as_ref()
@@ -1042,6 +1181,9 @@ fn supervise_tunnel(s: &mut State) {
             &ctx.hello,
         )
         .ok();
+    }
+    if s.mode != ConnectMode::Tunnel {
+        return;
     }
     if named.is_none() && relay_on(s) {
         // 이전 버전이 띄워 둔 퀵 터널(입양 대기 PID 포함)을 정리한다.
@@ -1300,7 +1442,7 @@ fn serve(
     socket.set_nodelay(true)?;
     let origin = {
         let state = lock(&shared.state);
-        (state.mode == ConnectMode::Tunnel).then(|| state.publication.origin.clone())
+        Some(state.publication.origin.clone())
     };
     if !ws::upgrade(&mut socket, origin.as_deref())? {
         return Ok(());

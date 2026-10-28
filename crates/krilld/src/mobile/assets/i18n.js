@@ -59,6 +59,7 @@
  "Already saved": "이미 저장됨",
  "Add to quick actions": "퀵액션에 추가",
  "Loading installed skills…": "설치된 스킬을 불러오는 중…",
+ "This desktop uses a different Google account. Open Settings, sign out of Google, then sign in with the account used on this desktop.": "이 데스크톱과 Google 계정이 다릅니다. 설정에서 Google 계정을 로그아웃한 뒤 데스크톱에서 사용한 계정으로 로그인하세요.",
  "Sign in with Google": "Google로 로그인",
  "Sign in with Google to use the relay.": "릴레이를 사용하려면 Google로 로그인하세요.",
  "Sign out of Google": "Google 계정 로그아웃",

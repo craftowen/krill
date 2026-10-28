@@ -83,7 +83,10 @@ fn receive(stream: &mut TcpStream) -> io::Result<(u8, Vec<u8>)> {
     Ok((opcode & 0x0f, body))
 }
 fn websocket(port: u16) -> (TcpStream, [u8; 32]) {
-    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    websocket_address(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+}
+fn websocket_address(address: SocketAddrV4) -> (TcpStream, [u8; 32]) {
+    let mut s = TcpStream::connect(address).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     s.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
@@ -129,7 +132,20 @@ impl Client {
         device_id: Option<String>,
         secret: &[u8; 32],
     ) -> Self {
-        let (mut s, challenge) = websocket(port);
+        Self::auth_address(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            token,
+            device_id,
+            secret,
+        )
+    }
+    fn auth_address(
+        address: SocketAddrV4,
+        token: Option<[u8; 32]>,
+        device_id: Option<String>,
+        secret: &[u8; 32],
+    ) -> Self {
+        let (mut s, challenge) = websocket_address(address);
         let nonce = random().unwrap();
         let mut salt = [0; 64];
         for (a, b) in salt.iter_mut().zip(challenge.into_iter().chain(nonce)) {
@@ -215,11 +231,14 @@ fn lazy_binding_expiry_and_mode_rotation() {
     let (port, first) = offer(&g);
     assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok());
     let s = lock(&g.shared.state);
-    assert_eq!(s.listeners.len(), 1);
+    assert!(!s.listeners.is_empty());
     assert!(
         s.listeners
             .iter()
-            .all(|l| l.local_addr().unwrap().ip().is_loopback())
+            .all(|l| match l.local_addr().unwrap().ip() {
+                std::net::IpAddr::V4(ip) => ip.is_loopback() || net::tailscale(ip),
+                std::net::IpAddr::V6(_) => false,
+            })
     );
     drop(s);
     // 설정 변경은 이전 QR을 즉시 폐기하고 새로운 티켓을 발급한다.
@@ -245,6 +264,56 @@ fn lazy_binding_expiry_and_mode_rotation() {
     assert!(s.listeners.is_empty());
     drop(s);
     assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+}
+
+#[test]
+fn invalid_backup_selection_preserves_live_connection_ticket_and_port() {
+    let (_registry, gateway) = start();
+    let (port, ticket) = offer(&gateway);
+    let mut phone = Client::pair(port, &ticket);
+    phone.ipc();
+    let before = {
+        let mut state = lock(&gateway.shared.state);
+        state.devices.mint(now_ms(), true).unwrap().token
+    };
+    assert!(matches!(
+        gateway.request(MobileRequest::SetConnectMode {
+            mode: ConnectMode::Tailscale,
+            custom_address: Some("127.0.0.1:0".into()),
+        }),
+        MobileReply::Failed(_)
+    ));
+    {
+        let state = lock(&gateway.shared.state);
+        assert_eq!(state.mode, ConnectMode::Tunnel);
+        assert_eq!(state.selected.unwrap().port(), port);
+        assert_eq!(state.devices.ticket(now_ms()).unwrap().token, before);
+        assert_eq!(state.devices.active_count(), 1);
+    }
+    phone.write(&control::Request::List.encode().unwrap());
+    let (kind, body) = phone.read().unwrap();
+    assert_eq!(
+        control::Reply::decode(kind, &body).unwrap(),
+        control::Reply::Sessions(Vec::new())
+    );
+}
+
+#[test]
+fn restored_tailscale_without_an_interface_keeps_relay_gateway_alive_without_localhost_qr() {
+    let (_registry, gateway) = start();
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.mode = ConnectMode::Tailscale;
+        state.interfaces.clear();
+        state.devices.mint(now_ms(), true).unwrap();
+        reconcile(&mut state, now_ms()).unwrap();
+        assert!(
+            !state.listeners.is_empty(),
+            "loopback transport must be ready for relay recovery"
+        );
+        assert!(pairing_offer(&state, now_ms()).is_err());
+    }
+    assert!(gateway.deep_link(krill_proto::SessionId(9)).is_none());
 }
 #[test]
 fn authenticated_ws_pair_bridge_reconnect_replay_and_revoke() {
@@ -704,6 +773,48 @@ fn connect_mode_survives_daemon_restart() {
     drop(g);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn tailscale_preference_restart_preserves_port_backup_address_and_device_credential() {
+    let dir = std::env::temp_dir().join(format!("mk-mobile-backup-restart-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let registry = Arc::new(Registry::new(None, None));
+    let gateway = Gateway::start(Arc::downgrade(&registry), Some(&dir), hello()).unwrap();
+    lock(&gateway.shared.state).tunnel_start = Some(super::super::tunnel::Tunnel::fixture);
+    let (port, ticket) = offer(&gateway);
+    let mut phone = Client::pair(port, &ticket);
+    phone.ipc();
+    let (device, credential) = (phone.device.clone(), phone.credential);
+    assert!(matches!(
+        gateway.request(MobileRequest::SetConnectMode {
+            mode: ConnectMode::Tailscale,
+            custom_address: Some("100.127.255.254:0".into()),
+        }),
+        MobileReply::GatewayStatus { .. }
+    ));
+    drop(phone);
+    drop(gateway);
+    let intent = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(intent.port, Some(port));
+    assert_eq!(
+        intent.tailscale_address.as_deref(),
+        Some("100.127.255.254:0")
+    );
+    let gateway = Gateway::start(Arc::downgrade(&registry), Some(&dir), hello()).unwrap();
+    until(|| !lock(&gateway.shared.state).listeners.is_empty());
+    assert_eq!(lock(&gateway.shared.state).selected.unwrap().port(), port);
+    let mut phone = Client::reconnect(port, &device, &credential);
+    phone.ipc();
+    phone.write(&control::Request::List.encode().unwrap());
+    let (kind, body) = phone.read().unwrap();
+    assert_eq!(
+        control::Reply::decode(kind, &body).unwrap(),
+        control::Reply::Sessions(Vec::new())
+    );
+    drop(phone);
+    drop(gateway);
+    std::fs::remove_dir_all(dir).unwrap();
+}
 #[test]
 fn manual_loopback_bind_survives_restart_with_multiple_interfaces() {
     let dir = std::env::temp_dir().join(format!("mk-mobile-loopback-{}", std::process::id()));
@@ -878,11 +989,7 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
     );
     let mut state = lock(&gateway.shared.state);
     state.tunnel = Some(super::super::tunnel::Tunnel::fixture(port).unwrap());
-    for mode in [
-        ConnectMode::Tunnel,
-        ConnectMode::Lan,
-        ConnectMode::Tailscale,
-    ] {
+    for mode in [ConnectMode::Tunnel, ConnectMode::Lan] {
         state.mode = mode;
         let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
             panic!("페어링 응답 없음");
@@ -892,6 +999,11 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
         assert!(!url.contains("?pair="));
         assert!(!url.contains("&r="));
     }
+    state.mode = ConnectMode::Tailscale;
+    assert!(
+        pairing_offer(&state, now_ms()).is_err(),
+        "never advertise localhost as a tailnet backup"
+    );
     state.mode = ConnectMode::Tunnel;
     // 준비 확인 전 터널은 고정 출처를 쓰지 않고 찍힌 터널 URL로 강등한다.
     state.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
@@ -1335,6 +1447,64 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
     let (kind, close5_payload) = read_mux_for(&mut host_ws, 5);
     assert_eq!(kind, MUX_CLOSE);
     assert_eq!(close5_payload, 1002_u16.to_be_bytes());
+
+    // Changing the QR preference keeps the relay and authenticated direct
+    // sockets alive, even when the selected tailnet interface is unavailable.
+    let port = {
+        let state = lock(&g.shared.state);
+        state.selected.unwrap().port()
+    };
+    let credential = decode_hex::<32>(auth_1.credential.as_deref().unwrap()).unwrap();
+    let address = {
+        let state = lock(&g.shared.state);
+        state
+            .listeners
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .find_map(|address| match address {
+                std::net::SocketAddr::V4(address) if net::tailscale(*address.ip()) => Some(address),
+                _ => None,
+            })
+            .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    };
+    let credential_hash = digest::digest(&digest::SHA256, &credential);
+    let mut direct = Client::auth_address(
+        address,
+        None,
+        Some(auth_1.device_id.clone()),
+        &credential_hash.as_ref().try_into().unwrap(),
+    );
+    direct.ipc();
+    assert!(matches!(
+        g.request(MobileRequest::SetConnectMode {
+            mode: ConnectMode::Tailscale,
+            custom_address: Some("100.127.255.254:0".into()),
+        }),
+        MobileReply::GatewayStatus { .. }
+    ));
+    {
+        let state = lock(&g.shared.state);
+        assert_eq!(state.selected.unwrap().port(), port);
+        assert!(relay_pairing(&state));
+    }
+    direct.write(&control::Request::List.encode().unwrap());
+    let (kind, body) = direct.read().unwrap();
+    assert_eq!(
+        control::Reply::decode(kind, &body).unwrap(),
+        control::Reply::Sessions(Vec::new())
+    );
+    assert!(
+        g.deep_link(krill_proto::SessionId(43))
+            .unwrap()
+            .contains("/m/")
+    );
+    assert!(matches!(
+        g.request(MobileRequest::SetConnectMode {
+            mode: ConnectMode::Tunnel,
+            custom_address: None,
+        }),
+        MobileReply::GatewayStatus { .. }
+    ));
 
     // conn_id = 1은 여전히 살아 있어 RPC(List) 응답을 정상 수신한다.
     let list_sealed = chan_1

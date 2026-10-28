@@ -33,6 +33,7 @@ pub struct Panel {
     pub devices: Vec<PairedMobileDevice>,
     pub interfaces: Vec<NetworkInterface>,
     pub connected: BTreeSet<String>,
+    backup_address: Option<String>,
     pub pending: bool,
     /// 연결 준비만 별도로 추적해 다른 경로 선택·기기 관리·앱 이동을 막지 않는다.
     pairing: PairingState,
@@ -93,6 +94,7 @@ impl Panel {
             devices: Vec::new(),
             interfaces: Vec::new(),
             connected: BTreeSet::new(),
+            backup_address: None,
             pending: false,
             pairing: PairingState::Idle,
             error: None,
@@ -151,13 +153,25 @@ impl Panel {
                 }
                 self.interfaces = interfaces;
             }
-            MobileReply::GatewayStatus { mode, devices, .. } => {
+            MobileReply::GatewayStatus {
+                mode,
+                devices,
+                bind_addrs,
+                ..
+            } => {
                 self.mode = if mode == ConnectMode::Lan {
                     ConnectMode::Tunnel
                 } else {
                     mode
                 };
                 self.devices = devices;
+                self.backup_address = bind_addrs.into_iter().find(|value| {
+                    value
+                        .parse::<std::net::SocketAddrV4>()
+                        .is_ok_and(|address| {
+                            (u32::from(*address.ip()) & 0xffc0_0000) == 0x6440_0000
+                        })
+                });
             }
             MobileReply::Devices(devices) => {
                 self.devices = devices;
@@ -517,6 +531,13 @@ impl SettingsView {
         root = root
             .child(mode_card)
             .child(layout::label(p, text::MODE_IMMEDIATE.get(), None));
+        if let Some(address) = &self.mobile.backup_address {
+            root = root.child(layout::label(
+                p,
+                format!("{} · {address}", text::TAILSCALE.get()),
+                None,
+            ));
+        }
 
         if !self.mobile.interfaces.is_empty() && self.mobile.mode == ConnectMode::Tailscale {
             let mut interfaces = layout::card(p).flex().flex_wrap().gap_1p5();
@@ -1057,6 +1078,13 @@ impl SettingsView {
                                     .child(text::PAGE_DESC.get()),
                             )
                             .child(modes)
+                            .children(self.mobile.backup_address.as_ref().map(|address| {
+                                layout::label(
+                                    p,
+                                    format!("{} · {address}", text::TAILSCALE.get()),
+                                    None,
+                                )
+                            }))
                             .child(
                                 div()
                                     .text_size(crate::ui::TEXT_XS)

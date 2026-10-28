@@ -30,6 +30,9 @@ impl Panel {
             self.account.required = required;
         }
         if let Some(signed_in) = data.get("signed_in").and_then(serde_json::Value::as_bool) {
+            if signed_in && self.error.as_deref() == Some(text::ACCOUNT_ERROR.get()) {
+                self.error = None;
+            }
             self.account.email = signed_in.then(|| {
                 data.get("email")
                     .and_then(serde_json::Value::as_str)
@@ -92,7 +95,8 @@ impl SettingsView {
                             match result {
                                 Ok(data) => this.mobile.accept_account(&data),
                                 Err(_) if pending => {
-                                    this.mobile.account.pending = false;
+                                    // The daemon owns approval expiry. A failed IPC/poll
+                                    // must not abandon an approval while this page is hidden.
                                     this.mobile.error = Some(text::ACCOUNT_ERROR.get().to_owned());
                                 }
                                 Err(_) => {}
