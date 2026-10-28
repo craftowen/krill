@@ -74,7 +74,13 @@ fn synchronize(
 ) {
     let report = sync_builtin_skills(&directories(home, profile, launch, account));
     for error in report.failures {
-        tracing::warn!(%error, "built-in skill synchronization skipped an agent target");
+        // 프로필 skills가 사용자 스킬 폴더로 가는 심볼릭 링크면 그 폴더가 따로 동기화된다. 의도된 구성이라 경고하지 않는다
+        // (2026-10-26부터 codex 프로필에서 매 동기화마다 800여 줄).
+        if error.contains("must not traverse a symlink") {
+            tracing::debug!(%error, "built-in skill synchronization skipped a linked agent target");
+        } else {
+            tracing::warn!(%error, "built-in skill synchronization skipped an agent target");
+        }
     }
 }
 

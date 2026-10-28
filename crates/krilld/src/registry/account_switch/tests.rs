@@ -1669,7 +1669,14 @@ fn stale_provider_handoff_is_cancelled_and_rejected_before_reading_transcripts()
             .all(|entry| entry.unwrap().file_name() == "auth.json")
     );
     drop(reg);
-    fs::remove_dir_all(root).unwrap();
+    // 취소된 인계의 백그라운드 정리가 끝나기 전에 지우면 DirectoryNotEmpty가 난다(8회 반복 중 2회 재현).
+    for attempt in 0..50 {
+        match fs::remove_dir_all(&root) {
+            Ok(()) => break,
+            Err(error) if attempt == 49 => panic!("{error}"),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 #[expect(clippy::unwrap_used, reason = "deterministic account fixture setup")]
