@@ -1319,7 +1319,7 @@ impl Registry {
             Some(&session_id),
             account.as_ref(),
         )
-        .map_err(|e| super::os(&e))?;
+        .map_err(|e| prepare_failure("resume_launch", &e))?;
         if applied.as_ref().is_none_or(|a| a.id != account_id) {
             self.discard_settings(new);
             return Err(Failure::Denied);
@@ -1336,7 +1336,7 @@ impl Registry {
                 cwd.clone(),
                 applied,
             )
-            .map_err(|e| super::os(&e))?;
+            .map_err(|e| prepare_failure("replacement_identity", &e))?;
         if let Some(dir) = state_dir.as_deref() {
             let raw = serde_json::to_vec(&Prepared {
                 from: old,
@@ -1345,7 +1345,7 @@ impl Registry {
             })
             .map_err(|_| Failure::BadRequest)?;
             accounts::write_atomic_0600(&replacement_journal(dir, new), &raw)
-                .map_err(|e| super::os(&e))?;
+                .map_err(|e| prepare_failure("replacement_journal", &e))?;
         }
         let (new, _) = self.spawn_holder(
             holder,

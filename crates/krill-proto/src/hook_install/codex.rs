@@ -366,7 +366,7 @@ impl Rpc {
                 && layer
                     .pointer("/name/file")
                     .and_then(Value::as_str)
-                    .is_some_and(|s| Path::new(s) == path)
+                    .is_some_and(|s| same_config_path(Path::new(s), path))
             {
                 return layer
                     .get("version")
@@ -379,6 +379,19 @@ impl Rpc {
             "Codex did not return a version for the user config layer",
         ))
     }
+}
+
+/// Codex reports ordinary Windows paths while selected account homes are canonical
+/// (`\\?\C:\...`). Compare existing parents too, including for a not-yet-created config.
+fn same_config_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || (left.file_name().is_some()
+            && left.file_name() == right.file_name()
+            && left
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .zip(right.parent().and_then(|p| p.canonicalize().ok()))
+                .is_some_and(|(left, right)| left == right))
 }
 
 #[cfg(all(test, windows))]
@@ -405,6 +418,35 @@ mod windows_tests {
         )
         .unwrap();
         let rpc = Rpc::start(&home, "fixture command", Some(bin.as_os_str())).unwrap();
+        drop(rpc);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rpc_matches_canonical_account_home_to_native_config_layer() {
+        let root = std::env::temp_dir().join(format!("krill config 한글 {}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let bin = root.join("npm bin");
+        let home = root.join("profile");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+        // A new profile need not have a config file yet. Its parent is the identity.
+        let canonical = home.canonicalize().unwrap().join("config.toml");
+        assert_ne!(config, canonical);
+        let reply = json!({"id":1,"result":{"layers":[{"name":{"type":"user","file":config},"version":"native-version"}]}});
+        let second_reply = json!({"id":2,"result":reply["result"]});
+        std::fs::write(
+            bin.join("codex.cmd"),
+            format!(
+                "@echo off\r\nset /p krill_request=\r\necho {{\"id\":0,\"result\":{{}}}}\r\nset /p krill_notice=\r\nset /p krill_read=\r\necho {reply}\r\nset /p krill_again=\r\necho {second_reply}\r\nset /p krill_done=\r\n"
+            ),
+        )
+        .unwrap();
+        let mut rpc = Rpc::start(&home, "fixture command", Some(bin.as_os_str())).unwrap();
+        assert_eq!(rpc.version(&canonical).unwrap(), "native-version");
+        std::fs::create_dir(root.join("another")).unwrap();
+        assert!(rpc.version(&root.join("another/config.toml")).is_err());
         drop(rpc);
         std::fs::remove_dir_all(root).ok();
     }
