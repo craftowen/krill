@@ -800,7 +800,6 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
-            this.state.character_input_keys.borrow_mut().clear();
             this.state.cursor_visible.store(true, Ordering::Relaxed);
         }
 

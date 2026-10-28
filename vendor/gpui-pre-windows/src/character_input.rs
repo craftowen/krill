@@ -18,10 +18,6 @@ impl CharacterInputKeys {
     pub(crate) fn release(&mut self, key: u16) -> bool {
         self.0.remove(&key)
     }
-
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
-    }
 }
 
 #[cfg(test)]
@@ -40,7 +36,7 @@ mod tests {
     }
 
     #[test]
-    fn simultaneous_oem_keys_and_focus_reset_do_not_swallow_actions() {
+    fn simultaneous_oem_keys_and_new_presses_do_not_swallow_actions() {
         let mut keys = CharacterInputKeys::default();
         keys.press(0xba, false, true);
         keys.press(0xbb, false, true);
@@ -48,9 +44,10 @@ mod tests {
         assert!(!keys.release(0x41));
         assert!(keys.release(0xbb));
         assert!(keys.release(0xba));
+        // Focus can leave and return before the key is released. Keep the
+        // pending physical identity; a fresh keydown clears any missed release.
         keys.press(0xba, false, true);
-        keys.clear();
-        assert!(!keys.release(0xba));
+        assert!(keys.release(0xba));
         keys.press(0xba, false, true);
         keys.press(0xba, false, false); // missed release followed by new action
         assert!(!keys.release(0xba));
