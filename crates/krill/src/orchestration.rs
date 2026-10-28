@@ -1874,7 +1874,7 @@ fn cmd_reply(state_dir: &Path, args: &[String]) -> io::Result<()> {
 
 fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut msg_id = None;
-    let mut from = "coordinator".to_owned();
+    let mut from = None;
     let mut body = None;
     let mut json = false;
     let mut it = args.iter();
@@ -1885,7 +1885,7 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 msg_id = Some(id.clone());
             }
             "--from" => {
-                from.clone_from(it.next().ok_or_else(|| bad_arg("missing --from"))?);
+                from = Some(it.next().ok_or_else(|| bad_arg("missing --from"))?.clone());
             }
             "--body" | "--answer" => body = it.next().cloned(),
             "--json" => json = true,
@@ -1897,6 +1897,13 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     let msg_id = msg_id.ok_or_else(|| bad_arg("missing <msg-id>"))?;
     let body = body.ok_or_else(|| bad_arg("missing --body"))?;
+    let from = match from {
+        Some(explicit) => explicit,
+        None => match caller_session_id() {
+            Some(sid) => inferred_reply_sender(&ctx.load_store()?, u64::from(sid))?,
+            None => "coordinator".to_owned(),
+        },
+    };
     let reply = match ctx.try_ipc(
         &OrchAction::ReplyMessage {
             question_id: msg_id.clone(),
@@ -1906,7 +1913,11 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Duration::from_secs(2),
     )? {
         Some(OrchResponse::Message(m)) => m,
-        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(&msg_id, &from, &body))?,
+        Some(OrchResponse::Error(e)) => return Err(bad_arg(e)),
+        None => {
+            OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(&msg_id, &from, &body))?
+        }
+        Some(_) => return Err(io::Error::other("unexpected orchestration reply response")),
     };
     if json {
         print_json(&reply)?;
@@ -1914,6 +1925,27 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         println!("{}\treply->{}\t{}", reply.id, reply.to, reply.body);
     }
     Ok(())
+}
+
+fn inferred_reply_sender(store: &OrchestrationStore, sid: u64) -> io::Result<String> {
+    let mut workers = store
+        .dispatches
+        .iter()
+        .filter(|d| d.session_id == Some(sid) && d.status == DispatchStatus::Active);
+    if let Some(worker) = workers.next() {
+        if workers.any(|other| other.worker_name != worker.worker_name) {
+            return Err(bad_arg(
+                "session has multiple worker identities; specify --from",
+            ));
+        }
+        return Ok(worker.worker_name.clone());
+    }
+    if store.dispatches.iter().any(|d| d.session_id == Some(sid)) {
+        return Err(bad_arg(
+            "worker dispatch has settled; specify --from explicitly",
+        ));
+    }
+    Ok("coordinator".to_owned())
 }
 
 #[cfg(test)]
@@ -2997,6 +3029,26 @@ mod tests {
             krill_proto::orchestration::DispatchReleaseState::Released
         );
         std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn reply_sender_uses_worker_session_binding_and_rejects_settled_identity() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("reply sender", None)?;
+        store.start_worker(
+            &run.id,
+            None,
+            "actual-worker",
+            "codex",
+            Some(42),
+            "/tmp",
+            "p",
+        )?;
+        assert_eq!(inferred_reply_sender(&store, 42)?, "actual-worker");
+        assert_eq!(inferred_reply_sender(&store, 99)?, "coordinator");
+        store.dispatches[0].status = DispatchStatus::Succeeded;
+        assert!(inferred_reply_sender(&store, 42).is_err());
+        Ok(())
     }
 
     #[test]
