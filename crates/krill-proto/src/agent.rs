@@ -137,6 +137,37 @@ pub fn canonical_id(id: &str) -> &str {
     }
 }
 
+/// Identify a configured executable without changing the command that is launched.
+/// Windows wrappers and separators are recognized on every client platform.
+#[must_use]
+pub fn executable_id(program: &str) -> &str {
+    let name = program.trim().rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|ext| {
+            let split = name.len().checked_sub(ext.len())?;
+            name.get(split..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(ext))?;
+            name.get(..split)
+        })
+        .unwrap_or(name);
+    for id in ["claude", "codex", "agy", "opencode"] {
+        if name.eq_ignore_ascii_case(id) {
+            return id;
+        }
+    }
+    if name.eq_ignore_ascii_case("antigravity-cli") {
+        return "agy";
+    }
+    if name.eq_ignore_ascii_case("open-code") {
+        return "opencode";
+    }
+    if name.eq_ignore_ascii_case("claude-code") || name.eq_ignore_ascii_case("claudecode") {
+        return "claude";
+    }
+    canonical_id(name)
+}
+
 /// UI·단축키(`⌥⌘1~4`) 및 설정 목록에서 내장 에이전트의 표준 표시 순서.
 #[must_use]
 pub fn profile_rank(id: &str) -> u8 {
@@ -647,3 +678,20 @@ pub fn capture(mut cmd: Command, timeout: Duration) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod executable_identity_tests {
+    use super::*;
+    #[test]
+    fn provider_identity_accepts_windows_wrappers_without_rewriting_program() {
+        for program in [r"C:\Tools\Claude.EXE", "/tools/claude.cmd", "CLAUDE.bat"] {
+            assert_eq!(executable_id(program), "claude");
+            assert_eq!(
+                crate::usage::ProviderKind::parse(program),
+                Some(crate::usage::ProviderKind::Claude)
+            );
+        }
+        assert_eq!(executable_id(r"\\server\cli\Antigravity.cmd"), "agy");
+        assert_eq!(executable_id("claude.exe.backup"), "claude.exe.backup");
+    }
+}

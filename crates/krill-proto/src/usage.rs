@@ -183,7 +183,7 @@ impl ProviderKind {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        match crate::agent::executable_id(s).to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
             "codex" | "openai" => Some(Self::Codex),
             "opencode" | "open-code" => Some(Self::OpenCode),

@@ -605,7 +605,7 @@ pub(crate) fn resume_account_in(
     session_id: Option<&str>,
 ) -> Option<LaunchAccount> {
     use krill_proto::agent_history::{VaultAgent, VaultTarget};
-    let program = Path::new(profile.program()?).file_name()?.to_str()?;
+    let program = krill_proto::agent::executable_id(profile.program()?);
     let provider = ProviderKind::parse(program)?;
     let file = accounts::load_file(home, state);
     // 프로필의 프로그램이 바뀌었으면(다른 프로바이더) 기록을 쓰지 않는다.
@@ -669,7 +669,7 @@ pub(crate) fn account_for_stored_in(
     state: Option<&Path>,
     stored: &control::StoredLaunch,
 ) -> Option<LaunchAccount> {
-    let program = Path::new(profile.program()?).file_name()?.to_str()?;
+    let program = krill_proto::agent::executable_id(profile.program()?);
     let provider = ProviderKind::parse(program)?;
     let file = accounts::load_file(home, state);
     if let Some(account) = stored.account.as_ref().filter(|a| {
@@ -754,7 +754,7 @@ pub(crate) fn account_for_stored_in(
 
 /// 지금 활성 계정. 호스트 기본이면 `dir`이 빈 기록이라 이후 계정을 바꿔도 재개는 기본 프로필로 간다.
 fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
-    let provider = ProviderKind::parse(Path::new(program).file_name()?.to_str()?)?;
+    let provider = ProviderKind::parse(program)?;
     let home = accounts::default_home();
     let (id, dir) = match accounts::active_account_info(&home, state, program) {
         Some((_, active)) => (active.id, active.profile_dir),
@@ -2215,3 +2215,35 @@ fn wrap_account(
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod executable_account_regressions {
+    use super::*;
+    #[test]
+    fn windows_executable_profiles_keep_recorded_resume_account() {
+        let mut profile = krill_proto::agent::Agents::load(None)
+            .unwrap()
+            .profiles
+            .get("claude")
+            .unwrap()
+            .clone();
+        let recorded = LaunchAccount {
+            id: "claude-selected".into(),
+            env_key: "CLAUDE_CONFIG_DIR".into(),
+            dir: String::new(),
+        };
+        for program in [r"C:\Tools\Claude.EXE", r"C:\Tools\claude.cmd"] {
+            profile.launch = vec![program.into()];
+            assert_eq!(
+                resume_account_in(
+                    Path::new("/nonexistent-krill-fixture"),
+                    &profile,
+                    None,
+                    Some(&recorded),
+                    None
+                ),
+                Some(recorded.clone())
+            );
+        }
+    }
+}

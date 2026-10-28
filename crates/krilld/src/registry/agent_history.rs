@@ -45,12 +45,10 @@ impl Registry {
         let id = target.agent.profile();
         let profile = agents.profiles.get(id).ok_or(Failure::UnknownAgent)?;
         // 기본 프로필이 다른 프로그램이면 그 프로그램에 대화 ID를 넘기지 않는다.
-        if profile.program().is_none_or(|p| {
-            Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_none_or(|n| krill_proto::agent::canonical_id(n) != id)
-        }) {
+        if profile
+            .program()
+            .is_none_or(|p| krill_proto::agent::executable_id(p) != id)
+        {
             return Err(Failure::UnknownAgent);
         }
         let session = self.next_id();
