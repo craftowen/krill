@@ -54,6 +54,17 @@ fn main() -> ExitCode {
     if argument == "--agent-exec" {
         return krilld::agent::run_windows_agent(std::env::args_os().skip(2));
     }
+    #[cfg(windows)]
+    if argument == "--shell-exec" {
+        return krilld::run_windows_shell(std::env::args_os().skip(2));
+    }
+    #[cfg(windows)]
+    if argument == "--console-members" {
+        return std::env::args()
+            .nth(2)
+            .and_then(|pid| pid.parse().ok())
+            .map_or(ExitCode::from(2), krilld::run_console_probe);
+    }
     let path = PathBuf::from(argument);
     krill_log::init(krill_log::Component::Daemon).ok();
     tracing::info!("daemon starting");

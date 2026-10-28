@@ -58,7 +58,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> ExitCode {
     {
         command.env("SSH_CONNECTION", "krill");
     }
-    if let Err(error) = crate::sys::protect_agent_launcher() {
+    if let Err(error) =
+        crate::sys::console_utf8().and_then(|()| crate::sys::protect_agent_launcher())
+    {
         writeln!(io::stderr().lock(), "agent console setup failed: {error}").ok();
         return ExitCode::FAILURE;
     }

@@ -89,7 +89,10 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
         let evidence = t
             .detector
             .observe(title, screen, *rev, &status, Instant::now());
-        if let Some(pid) = tap.foreground() {
+        let foreground = tap.foreground();
+        #[cfg(windows)]
+        let foreground = foreground.or_else(|| crate::sys::session_agent_process(root));
+        if let Some(pid) = foreground {
             let mut identity = crate::sys::start_us(pid).ok();
             let name = if let Some((cached_pid, cached_start, at, name)) = &t.name
                 && *cached_pid == pid
@@ -105,9 +108,10 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                 t.name = identity.map(|start| (pid, start, Instant::now(), name.clone()));
                 name
             };
+            let name = name.to_ascii_lowercase();
             let agent = matches!(
                 name.as_str(),
-                "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity"
+                "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity" | "pi"
             ) || (pid != root
                 && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
                     || evidence.is_some_and(|e| e.source == krill_proto::control::Source::Title)
@@ -123,7 +127,10 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                             t.process = Some((pid, start));
                             reg.with_status(id, |s| s.started(id));
                         }
-                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                        Err(e)
+                            if e.raw_os_error() == Some(libc::ESRCH)
+                                || cfg!(windows) && e.raw_os_error() == Some(87) =>
+                        {
                             reg.with_status(id, |s| s.exited(id));
                         }
                         Err(_) => {}

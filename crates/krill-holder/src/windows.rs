@@ -355,6 +355,20 @@ impl Holder {
                     return Err(io::Error::from_raw_os_error(17));
                 }
                 let argv = argv.into_iter().map(text).collect::<io::Result<Vec<_>>>()?;
+                // Rust's Command implements cmd batch escaping. The helper inherits
+                // this session's Job and ConPTY, as the agent launcher already does.
+                let argv = if argv.first().is_some_and(|path| {
+                    std::path::Path::new(path).extension().is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                    })
+                }) {
+                    std::iter::once(self.path.clone())
+                        .chain(std::iter::once(OsString::from("--shell-exec")))
+                        .chain(argv)
+                        .collect()
+                } else {
+                    argv
+                };
                 let (path, args) = argv.split_first().ok_or(io::ErrorKind::InvalidInput)?;
                 let env = env
                     .into_iter()

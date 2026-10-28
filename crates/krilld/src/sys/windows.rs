@@ -56,6 +56,7 @@ use super::{AUDIT_TOKEN_LEN, CodeSign, User};
 mod child;
 mod foreground;
 pub(crate) use child::{CommandJob, pipe_available};
+pub use foreground::run_probe as run_console_probe;
 pub(crate) use foreground::session_agent_process;
 
 /// Windows에는 UID가 없어 "이 프로세스와 같은 사용자 SID"를 이 값 하나로 나타낸다([`crate::os::euid`]).
@@ -76,6 +77,25 @@ pub(crate) fn protect_agent_launcher() -> io::Result<()> {
     }
     // SAFETY: static nonpanicking callback, registered for this helper process's lifetime only.
     if unsafe { SetConsoleCtrlHandler(Some(agent_launcher_control), 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The trampoline is already attached to its session's `ConPTY`. Codepages are
+/// console state, so initialization here affects the child without another console.
+pub(crate) fn console_utf8() -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP, SetConsoleOutputCP};
+    // SAFETY: a zero codepage means this invocation has no attached console.
+    if unsafe { GetConsoleCP() } == 0 {
+        return Ok(());
+    }
+    // SAFETY: UTF-8 is a supported codepage for the current attached console.
+    if unsafe { SetConsoleCP(65001) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: same current session console; no shared daemon console is modified.
+    if unsafe { SetConsoleOutputCP(65001) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
