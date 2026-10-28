@@ -12,6 +12,9 @@ use krill_proto::control::{AgentState, AgentStatus, Confidence, Source};
 /// 화면 규칙은 출력이 잠깐 멎은 뒤에만 적용한다(부분 재그리기를 대화상자 소실로 오인하지 않는다).
 pub const QUIET: Duration = Duration::from_millis(300);
 
+/// 대화상자를 한 번도 못 본 Claude hook waiting을 떠도는 hook으로 보는 유예. 실제 대화상자는 이 안에 그려진다.
+pub const STRAY_WAITING: Duration = Duration::from_secs(5);
+
 /// 제목·화면으로 얻은 상태. 프로세스 종료와 hook은 별도 경로다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Evidence {
@@ -35,6 +38,8 @@ pub struct Detector {
     /// Codex의 일반 제목은 idle 때 글리프가 없다. 스피너를 실제 본 세션에서만 Done으로 해석한다.
     spinning_title: Option<String>,
     dialog_waiting_since: Option<u64>,
+    /// 대화상자 없이 관찰 중인 hook waiting(`since_unix_ns`)과 처음 본 시각.
+    stray_waiting: Option<(u64, Instant)>,
     rules: ScreenRules,
 }
 
@@ -52,6 +57,7 @@ impl Detector {
             changed: None,
             spinning_title: None,
             dialog_waiting_since: None,
+            stray_waiting: None,
             rules,
         }
     }
@@ -87,11 +93,45 @@ impl Detector {
             MenuHit::Blocked => AgentState::Blocked,
             MenuHit::Waiting => AgentState::Waiting,
         });
+        let title_state = self.title_state(title);
         if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
             && matches!(status.source, Some(Source::Hook | Source::Screen))
         {
             if menu.is_some() {
                 self.dialog_waiting_since = Some(status.since_unix_ns);
+            }
+            // 턴이 끝난 뒤 들어온 보조 프로세스 hook 등으로 대화상자 없는 waiting이 남으면 다음 hook까지
+            // '확인 필요'에 갇힌다. Claude는 대화상자가 입력줄을 대신하므로 빈 입력줄이 계속 보이면 푼다.
+            // ponytail: Claude만. 다른 에이전트는 질문 UI가 메뉴 규칙에 다 잡히는지 확인한 뒤 넓힌다.
+            if status.source == Some(Source::Hook)
+                && status.agent == "claude"
+                && self.dialog_waiting_since != Some(status.since_unix_ns)
+            {
+                let first = match self.stray_waiting {
+                    Some((since, at)) if since == status.since_unix_ns => at,
+                    _ => {
+                        self.stray_waiting = Some((status.since_unix_ns, now));
+                        now
+                    }
+                };
+                if quiet
+                    && menu.is_none()
+                    && self.rules.is_prompt(screen)
+                    && now.saturating_duration_since(first) >= STRAY_WAITING
+                {
+                    self.stray_waiting = None;
+                    let state = if title_state == Some(AgentState::Working) {
+                        AgentState::Working
+                    } else {
+                        AgentState::Done
+                    };
+                    return Some(Evidence {
+                        state,
+                        source: Source::Screen,
+                        confidence: Confidence::Low,
+                        dismissed_since: Some(status.since_unix_ns),
+                    });
+                }
             }
             if quiet
                 && menu.is_none()
@@ -109,8 +149,8 @@ impl Detector {
             }
         } else {
             self.dialog_waiting_since = None;
+            self.stray_waiting = None;
         }
-        let title_state = self.title_state(title);
         if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
             && status.source == Some(Source::Screen)
             && !quiet

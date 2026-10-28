@@ -207,6 +207,62 @@ fn unknown_title_and_unseen_dialog_do_not_clear_hook_waiting() {
     );
 }
 
+/// 대화상자 없이 들어온 Claude waiting hook은 빈 입력줄이 유예 동안 이어지면 풀리고, 대화상자를 본 대기는 남는다.
+#[test]
+fn stray_claude_waiting_without_dialog_clears_after_grace() {
+    for (title, cleared) in [
+        ("✳ Claude Code", AgentState::Done),
+        ("⠋ Claude Code", AgentState::Working),
+    ] {
+        let st = Statuses::open(None);
+        let hook = crate::status::tests::event(
+            1,
+            10,
+            "claude",
+            r#"{"hook_event_name":"PermissionRequest"}"#,
+        );
+        st.hook(&[(ID, &hook)]).unwrap();
+        let mut detector = Detector::default();
+        let now = Instant::now();
+        let idle = "────\n❯ \n────";
+        // 유예 전에는 제목 근거가 나와도 hook waiting이 이긴다.
+        for at in [now, now + QUIET] {
+            if let Some(e) = detector.observe(title, idle, 1, &st.get(ID), at) {
+                st.inferred(ID, e, 15);
+            }
+            assert_eq!(st.get(ID).state, AgentState::Waiting);
+        }
+        let e = detector
+            .observe(title, idle, 1, &st.get(ID), now + STRAY_WAITING)
+            .unwrap();
+        st.inferred(ID, e, 20);
+        let status = st.get(ID);
+        assert_eq!(
+            (status.state, status.source),
+            (cleared, Some(Source::Screen))
+        );
+    }
+
+    // 대화상자가 떠 있으면 아무리 오래 대기해도 그대로다.
+    let st = Statuses::open(None);
+    let hook = crate::status::tests::event(
+        1,
+        10,
+        "claude",
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+    );
+    st.hook(&[(ID, &hook)]).unwrap();
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let dialog = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+    for at in [now, now + STRAY_WAITING * 2] {
+        if let Some(e) = detector.observe("✳ Claude Code", dialog, 1, &st.get(ID), at) {
+            st.inferred(ID, e, 20);
+        }
+    }
+    assert_eq!(st.get(ID).state, AgentState::Waiting);
+}
+
 /// 새 waiting hook이 도착한 뒤 이전 대화상자 소실 근거로 새 대기를 지우지 않는다.
 #[test]
 fn dismissal_does_not_clear_a_new_waiting_episode() {
