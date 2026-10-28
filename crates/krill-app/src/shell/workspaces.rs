@@ -329,6 +329,7 @@ impl Shell {
                         .is_none()
             })
             .collect();
+        let generation = self.restore_generation;
         for (pane_id, old) in candidates {
             if !self.restoring_sessions.insert(old) {
                 continue;
@@ -377,7 +378,11 @@ impl Shell {
                                 )
                         }
                     };
-                    if retry {
+                    // 시도 중에 재접속이 지나갔으면 그 재접속은 이 칸을 못 봤다. 지금 세대에서 한 번 다시 시도한다.
+                    let reconnected = retry && this.restore_generation != generation;
+                    if reconnected {
+                        this.restore_attempted.remove(&old);
+                    } else if retry {
                         this.restore_on_reconnect.insert(old);
                     }
                     if let Err(e) = &got
@@ -413,6 +418,10 @@ impl Shell {
                         this.layout.host(*p).is_local() && this.layout.session(*p) == Some(session)
                     }) {
                         this.sync(cx);
+                    }
+                    if reconnected {
+                        let visible = this.layout.visible();
+                        this.restore_hidden_sessions(&visible, cx);
                     }
                     cx.notify();
                 })
