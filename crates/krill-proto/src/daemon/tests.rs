@@ -673,3 +673,24 @@ fn windows_paths_choose_flat_then_exact_version_holder() {
     assert_eq!(exe_near(&root, "krill-holder"), holder);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(windows)]
+#[test]
+fn short_socket_override_keeps_long_state_and_isolates_installations() {
+    let a = PathBuf::from(format!(
+        r"C:\Users\{}\AppData\Local\Krill",
+        "한글".repeat(50)
+    ));
+    let root = std::ffi::OsStr::new(r"C:\ks\private-user");
+    let socket = socket_path_in(&a, Some(root)).unwrap();
+    assert!(socket.starts_with(root));
+    assert!(socket.as_os_str().as_encoded_bytes().len() + 4 < SUN_PATH_MAX);
+    assert_eq!(socket_path_in(&a, Some(root)).unwrap(), socket);
+    assert_ne!(
+        socket_path_in(&a.join("another"), Some(root)).unwrap(),
+        socket
+    );
+    assert_eq!(socket_path_in(&a, None).unwrap(), a.join("run/krilld.sock"));
+    assert!(socket_path_in(&a, Some("relative".as_ref())).is_err());
+    assert!(socket_path_in(&a, Some(format!(r"C:\{}", "long".repeat(30)).as_ref())).is_err());
+}

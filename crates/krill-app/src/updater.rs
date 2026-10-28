@@ -1884,7 +1884,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
         }
         // 교체 뒤 구 holder·krilld에 새 실행 파일로 업그레이드를 요청한다(기존 IPC). Windows inbox 축소 모드는
         // 세션이 있으면 holder가 거절(EBUSY)해 구 holder가 다음 기동까지 남는다(OWE-832).
-        let socket = state_dir.join("run/krilld.sock");
+        let socket = krill_proto::daemon::socket_path(&state_dir)?;
         let helpers = if cfg!(windows) {
             app_bundle.clone()
         } else {

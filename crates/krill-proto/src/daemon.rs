@@ -281,6 +281,58 @@ pub fn default_state_dir() -> Option<PathBuf> {
     Some(state_dir_in(Path::new(&base)))
 }
 
+/// Windows users with long profiles may select a short, private socket directory
+/// using `KRILL_SOCKET_DIR`. Persistent state remains in `LOCALAPPDATA/Krill`.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows validates the socket directory override"
+    )
+)]
+pub fn socket_path(state: &Path) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        socket_path_in(state, std::env::var_os("KRILL_SOCKET_DIR").as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(state.join("run/krilld.sock"))
+    }
+}
+
+#[cfg(windows)]
+fn socket_path_in(state: &Path, root: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    let Some(root) = root else {
+        return Ok(state.join("run/krilld.sock"));
+    };
+    let root = Path::new(root);
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KRILL_SOCKET_DIR must be an absolute, private directory",
+        ));
+    }
+    // Scope the endpoint to the state directory even when one override serves
+    // multiple installations. Do not expose the profile path in the filename.
+    let state = std::path::absolute(state)?;
+    let hash = ring::digest::digest(&ring::digest::SHA256, state.as_os_str().as_encoded_bytes());
+    let mut name = String::from("krilld-");
+    for byte in hash.as_ref().iter().take(12) {
+        use std::fmt::Write as _;
+        write!(name, "{byte:02x}").map_err(io::Error::other)?;
+    }
+    name.push_str(".sock");
+    let path = root.join(name);
+    if path.as_os_str().as_encoded_bytes().len().saturating_add(4) >= SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KRILL_SOCKET_DIR is too long; choose a shorter private directory",
+        ));
+    }
+    Ok(path)
+}
+
 /// 데몬 기동에 필요한 경로.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -313,7 +365,7 @@ impl Paths {
         let exe = executable_path(&exe);
         let bin = exe.parent().ok_or(io::ErrorKind::NotFound)?;
         Ok(Self {
-            socket: state.join("run/krilld.sock"),
+            socket: socket_path(state)?,
             holder: find_exe(bin, apps, "krill-holder"),
             krilld: find_exe(bin, apps, "krilld"),
         })
@@ -324,7 +376,7 @@ impl Paths {
 /// launchers and shell integrations, without a lossy Unicode round trip. Other
 /// device namespaces stay verbatim (stripping them would change their meaning).
 #[cfg(windows)]
-pub(crate) fn executable_path(path: &Path) -> PathBuf {
+pub fn executable_path(path: &Path) -> PathBuf {
     use std::path::{Component, Prefix};
     let mut components = path.components();
     let base = match components.next() {
@@ -490,7 +542,7 @@ impl fmt::Display for Error {
         match self {
             Self::PathTooLong(p) => write!(
                 f,
-                "socket path too long (must be under {} bytes): {}",
+                "socket path too long (must be under {} bytes): {}; choose a short KRILL_STATE_DIR or, on Windows, a private KRILL_SOCKET_DIR",
                 SUN_PATH_MAX.saturating_sub(4),
                 p.display()
             ),

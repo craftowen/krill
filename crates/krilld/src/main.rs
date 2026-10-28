@@ -351,7 +351,8 @@ fn main() -> ExitCode {
 /// 다른 소켓으로 뜬 데몬(테스트·수동 실행)이 같은 상태 폴더의 `mobile-gateway.json`을 쓰면
 /// 실사용 데몬의 터널을 죽이고 같은 릴레이 ID로 붙는다.
 fn owns_mobile(socket: &Path) -> bool {
-    daemon::state_dir().is_some_and(|dir| dir.join("run/krilld.sock") == socket)
+    daemon::state_dir()
+        .is_some_and(|dir| daemon::socket_path(&dir).is_ok_and(|path| path == socket))
 }
 
 /// 환경 변수 `KRILL_TEST_BALLAST_MB`(메비바이트 단위)만큼을 0이 아닌 값으로 채워 쥔다(dirty 페이지라 footprint에 잡힌다). 없거나 잘못된 값이면 빈 Vec.
