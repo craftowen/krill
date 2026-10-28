@@ -625,34 +625,10 @@ fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
     }
 }
 
-/// Windows: `tasklist`로 PID가 사라질 때까지 기다린다(unsafe FFI는 platform 모듈 밖에 두지 않는다, AGENTS 5).
-// ponytail: tasklist 한 번에 수십 ms. 대기는 업데이트 때 한 번뿐이라 OpenProcess+WaitForSingleObject로 바꾸지 않는다.
+/// Wait on a process handle: tool failures cannot masquerade as process exit.
 #[cfg(windows)]
 fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let filter = format!("PID eq {raw_pid}");
-    let needle = format!("\"{raw_pid}\"");
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
-    loop {
-        let out = crate::platform::background_command("tasklist")
-            .args(["/FI", &filter, "/NH", "/FO", "CSV"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .output()?;
-        if !String::from_utf8_lossy(&out.stdout).contains(&needle) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "old app did not exit; replacement aborted",
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
+    crate::platform::wait_process_exit(raw_pid, timeout)
 }
 
 #[cfg(not(any(unix, windows)))]
