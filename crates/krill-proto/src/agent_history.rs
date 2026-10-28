@@ -2,6 +2,9 @@
 //! 스캔·새로고침 한 번당 디스크를 한 번 읽으며 감시·주기 작업은 없다.
 use serde::{Deserialize, Serialize};
 
+mod paths;
+pub use paths::{is_absolute_history_path, normalize_path_for_comparison, path_inside_or_equal};
+
 /// 지휘자 배정. `FEAT_CONTROL`과 함께 협상해야 한다.
 pub const FEAT_AGENT_HISTORY: u64 = 1 << 50;
 /// AI Vault 전문 검색·재개(`Action::Search`·`Action::ResumeVault`/`Response::Searched`, MK-181·OWE-735 지휘자 배정).

@@ -822,7 +822,8 @@ pub(crate) fn valid_transcript_path(path: &str) -> bool {
             .any(|c| matches!(c, std::path::Component::ParentDir))
         && (p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
             ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
-        }) || is_agy_conversation_db_path(path))
+        }) || p.file_name().is_some_and(|name| name == "opencode.db")
+            || is_agy_conversation_db_path(path))
 }
 
 fn extract_hook_transcript_path(p: &serde_json::Value) -> Option<&str> {

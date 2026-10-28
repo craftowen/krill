@@ -185,7 +185,7 @@ pub(crate) fn replay_page(
     let agent = VaultAgent::parse(&snapshot.agent)
         .ok_or_else(|| std::io::Error::other("unknown chat transcript agent"))?;
     let path = Path::new(&snapshot.transcript_path);
-    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json") {
+    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json" || e == "db") {
         return Ok(poll_opencode_session(
             &snapshot.agent,
             &snapshot.session_id,
@@ -216,7 +216,10 @@ pub(crate) fn latest_page(
     let agent = VaultAgent::parse(&snapshot.agent)
         .ok_or_else(|| std::io::Error::other("unknown chat transcript agent"))?;
     let path = Path::new(&snapshot.transcript_path);
-    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json") {
+    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "db") {
+        return latest_opencode_database(&snapshot, before);
+    }
+    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json" || e == "db") {
         let mut page = load_opencode_session(
             &snapshot.agent,
             &snapshot.session_id,
@@ -312,7 +315,7 @@ fn poll_transcript_file_until(
     let agent_str = bounded(agent.profile(), MAX_TEXT);
     let sid_str = bounded(session_id, MAX_TEXT);
 
-    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json") {
+    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json" || e == "db") {
         return poll_opencode_session(&agent_str, &sid_str, path, &path_str, offset, end_offset);
     }
 
@@ -497,6 +500,9 @@ fn poll_opencode_session(
     offset: u64,
     limit: Option<u64>,
 ) -> ChatPollSnapshot {
+    if path.extension().is_some_and(|e| e == "db") {
+        return poll_opencode_database(agent, sid, path, path_str, offset, limit);
+    }
     let mut page = load_opencode_session(agent, sid, path, path_str);
     if !page.bound {
         page.reset = offset > 0;
@@ -526,6 +532,158 @@ fn poll_opencode_session(
     };
     page.reset = reset;
     page
+}
+
+// Database cursors address message rows, so bounded pages can traverse conversations
+// larger than an export budget. End fingerprints notice rewrites; no wire fields change.
+const DB_ROW_MASK: u64 = (1 << 32) - 1;
+
+fn database_end(path: &Path, total: u64) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    crate::agent::control::cache::stamp(path).hash(&mut hash);
+    crate::agent::control::cache::stamp(&path.with_extension("db-wal")).hash(&mut hash);
+    OPENCODE_END | ((hash.finish() & ((1 << 20) - 1)) << 32) | (total & DB_ROW_MASK)
+}
+
+fn poll_opencode_database(
+    agent: &str,
+    sid: &str,
+    path: &Path,
+    path_str: &str,
+    offset: u64,
+    limit: Option<u64>,
+) -> ChatPollSnapshot {
+    let mut page = ChatPollSnapshot {
+        agent: agent.into(),
+        session_id: sid.into(),
+        transcript_path: path_str.into(),
+        ..Default::default()
+    };
+    let was_end = offset >= OPENCODE_END;
+    let mut start = if was_end {
+        offset & DB_ROW_MASK
+    } else {
+        offset
+    };
+    let Ok(mut batch) = super::opencode_sqlite::read_page(path, sid, start) else {
+        page.reset = offset > 0;
+        return page;
+    };
+    if batch.truncated || batch.skipped {
+        page.reset = offset > 0;
+        return page;
+    }
+    let Some(session) = batch.sessions.first() else {
+        page.reset = offset > 0;
+        return page;
+    };
+    let total = session.message_count;
+    if total > DB_ROW_MASK {
+        page.reset = offset > 0;
+        return page;
+    }
+    let end_cursor = database_end(path, total);
+    // Appends continue after the last message row. Same-count edits and truncation reset.
+    let reset = start > total
+        || (was_end && offset != end_cursor && start == total)
+        || limit.is_some_and(|end| end >= OPENCODE_END && end != end_cursor);
+    if reset {
+        start = 0;
+        let Ok(fresh) = super::opencode_sqlite::read_page(path, sid, 0) else {
+            page.reset = true;
+            return page;
+        };
+        batch = fresh;
+    }
+    if batch.truncated || batch.skipped {
+        page.reset = offset > 0;
+        return page;
+    }
+    let Some(session) = batch.sessions.into_iter().next() else {
+        page.reset = offset > 0;
+        return page;
+    };
+    let mut consumed = start;
+    let end = limit
+        .filter(|n| *n < OPENCODE_END)
+        .unwrap_or(total)
+        .min(total);
+    let mut remaining = MAX_SKIP_BYTES;
+    for record in session.messages {
+        if consumed >= end || page.items.len() >= MAX_CHAT_ITEMS {
+            break;
+        }
+        parse_opencode_message_record(&record, None, &mut page.items, &mut remaining);
+        consumed = consumed.saturating_add(1);
+    }
+    page.next_offset = if consumed >= total && limit.is_none_or(|n| n >= OPENCODE_END) {
+        database_end(path, total)
+    } else {
+        consumed
+    };
+    page.bound = true;
+    page.reset = reset;
+    page
+}
+
+fn latest_opencode_database(
+    snapshot: &ChatPollSnapshot,
+    before: Option<u64>,
+) -> std::io::Result<(ChatPollSnapshot, u64)> {
+    let path = Path::new(&snapshot.transcript_path);
+    let meta = super::opencode_sqlite::read_page(path, &snapshot.session_id, 0)
+        .map_err(std::io::Error::other)?;
+    if meta.truncated || meta.skipped {
+        return Err(std::io::Error::other("incomplete OpenCode database page"));
+    }
+    let total = meta
+        .sessions
+        .first()
+        .ok_or_else(|| std::io::Error::other("missing OpenCode session"))?
+        .message_count;
+    let end = before.unwrap_or(total).min(total);
+    let start = end.saturating_sub(u64::try_from(MAX_CHAT_ITEMS).unwrap_or(128));
+    let batch = super::opencode_sqlite::read_page(path, &snapshot.session_id, start)
+        .map_err(std::io::Error::other)?;
+    if batch.truncated || batch.skipped {
+        return Err(std::io::Error::other("incomplete OpenCode database page"));
+    }
+    let session = batch
+        .sessions
+        .into_iter()
+        .next()
+        .ok_or_else(|| std::io::Error::other("missing OpenCode session"))?;
+    let take = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
+    let mut records = Vec::new();
+    let mut count = 0usize;
+    let mut remaining = MAX_SKIP_BYTES;
+    for record in session
+        .messages
+        .into_iter()
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let mut items = Vec::new();
+        parse_opencode_message_record(&record, None, &mut items, &mut remaining);
+        count = count.saturating_add(items.len());
+        records.push(items);
+        if count >= MAX_CHAT_ITEMS {
+            break;
+        }
+    }
+    let start = end.saturating_sub(u64::try_from(records.len()).unwrap_or(0));
+    let mut page = snapshot.clone();
+    page.items = records.into_iter().rev().flatten().collect();
+    page.next_offset = if before.is_some() {
+        end
+    } else {
+        database_end(path, total)
+    };
+    page.reset = false;
+    page.bound = true;
+    Ok((page, start))
 }
 
 fn load_opencode_session(agent: &str, sid: &str, path: &Path, path_str: &str) -> ChatPollSnapshot {
@@ -867,6 +1025,13 @@ fn find_transcript_by_id(
             None
         }
         VaultAgent::OpenCode => {
+            for path in super::opencode_sqlite::candidates(root) {
+                if super::opencode_sqlite::read(&path, Some(sid), false)
+                    .is_ok_and(|batch| !batch.sessions.is_empty())
+                {
+                    return Some(path);
+                }
+            }
             for base in opencode_candidate_bases(root) {
                 for ext in ["jsonl", "json"] {
                     let direct = base.join(format!("{sid}.{ext}"));
@@ -1013,6 +1178,24 @@ fn find_newest_transcript_by_cwd(
             }
         }
         VaultAgent::OpenCode => {
+            for path in super::opencode_sqlite::candidates(root) {
+                if !budget.take() {
+                    break;
+                }
+                if let Ok(batch) = super::opencode_sqlite::read(&path, None, false) {
+                    for session in batch.sessions {
+                        if normalize_path(&session.cwd) == norm_cwd
+                            && !filter.claimed_ids.contains(&session.id)
+                            && filter
+                                .min_birth_secs
+                                .is_none_or(|birth| session.created >= birth.saturating_sub(2))
+                            && best.as_ref().is_none_or(|b| session.modified > b.0)
+                        {
+                            best = Some((session.modified, path.clone(), session.id));
+                        }
+                    }
+                }
+            }
             for base in opencode_candidate_bases(root) {
                 if let Ok(files) = fs::read_dir(&base) {
                     for file in files.take(128).flatten() {

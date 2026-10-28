@@ -122,39 +122,11 @@ pub fn highlight_spans(text: &str, query: &str) -> Vec<(String, bool)> {
     spans
 }
 
-fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/private/tmp")
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("/tmp{rest}");
-    }
-    if let Some(rest) = trimmed.strip_prefix("/private/var")
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("/var{rest}");
-    }
-    trimmed.to_owned()
-}
-
 fn path_matches_scope(cwd: &str, filter_paths: &[String]) -> bool {
-    if filter_paths.is_empty() {
-        return true;
-    }
-    let norm = normalize_path(cwd);
-    filter_paths.iter().any(|f| {
-        let f_norm = normalize_path(f);
-        if f_norm.is_empty() {
-            return true;
-        }
-        norm == f_norm
-            || norm
-                .strip_prefix(f_norm.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
+    filter_paths.is_empty()
+        || filter_paths.iter().any(|root| {
+            root.is_empty() || krill_proto::agent_history::path_inside_or_equal(cwd, root)
+        })
 }
 
 /// 성공한 새 세션만 셸에 알려 새 탭을 만든다. 실패하면 기존 탭은 그대로다.
@@ -426,17 +398,16 @@ impl Panel {
     /// 현재 범위·에이전트·검색어 필터가 적용된 결과 목록을 돌려준다.
     #[must_use]
     pub fn visible_hits(&self) -> Vec<VaultHit> {
-        let fallback;
-        let base = if let Some(vault) = &self.vault {
-            &vault.hits
-        } else {
-            fallback = self
-                .data
-                .as_ref()
-                .map(|d| d.entries.iter().map(VaultHit::from).collect::<Vec<_>>())
-                .unwrap_or_default();
-            &fallback
-        };
+        // Search is evaluated against complete messages on the daemon host. A snippet cannot
+        // reproduce keyword matches, and local filesystem rules cannot classify remote paths.
+        if let Some(vault) = &self.vault {
+            return vault.hits.clone();
+        }
+        let base = self
+            .data
+            .as_ref()
+            .map(|d| d.entries.iter().map(VaultHit::from).collect::<Vec<_>>())
+            .unwrap_or_default();
         if base.is_empty() {
             return Vec::new();
         }

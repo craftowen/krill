@@ -207,8 +207,15 @@ fn vault_panel_filters_by_scope_and_agent_and_one_click_resumes(cx: &mut TestApp
                 truncated: false,
                 skipped: false,
             }),
-            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
-                hits: hits_for_call.clone(),
+            Request::AgentHistory(Action::Search(q)) => Response::Searched(SearchSnapshot {
+                hits: hits_for_call
+                    .iter()
+                    .filter(|hit| {
+                        (q.agents.is_empty() || q.agents.contains(&hit.agent))
+                            && path_matches_scope(&hit.cwd, &q.paths)
+                    })
+                    .cloned()
+                    .collect(),
                 truncated: false,
                 skipped: false,
             }),
@@ -504,4 +511,20 @@ fn history_rows_are_virtualized_and_same_count_replacements_refresh(cx: &mut gpu
     });
     cx.run_until_parked();
     panel.read_with(cx, |panel, _| assert_eq!(panel.list_hits[0].id, "replaced"));
+}
+
+#[test]
+fn server_search_hits_survive_incomplete_snippets_and_remote_path_spelling() {
+    let mut panel = Panel::new(Arc::new(|_| unreachable!()));
+    panel.query = "alpha beta".into();
+    panel.scope = VaultScope::Workspace;
+    panel.workspace_path = Some(r"C:\Repo".into());
+    let mut hit = VaultHit::from(&sample());
+    hit.cwd = "c:/repo/sub".into();
+    hit.snippet = "alpha".into();
+    panel.vault = Some(SearchSnapshot {
+        hits: vec![hit.clone()],
+        ..Default::default()
+    });
+    assert_eq!(panel.visible_hits(), vec![hit]);
 }
