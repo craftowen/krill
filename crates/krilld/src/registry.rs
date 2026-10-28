@@ -492,6 +492,7 @@ impl Registry {
         mobile: bool,
         admission: Option<admission::Permit>,
     ) -> io::Result<()> {
+        crate::alloc::mobile_thread().ok();
         // macOS는 닫힌 피어의 LOCAL_PEERPID도 EINVAL로 거부하므로 ServerHello를 보내기 전에 피어를 읽는다.
         let mut peer = if mobile {
             Peer {

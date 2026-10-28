@@ -69,6 +69,7 @@ fn main() -> ExitCode {
     });
     // 실패해도 데몬은 뜬다: 해제 페이지가 늦게 돌아올 뿐 세션에는 영향이 없다.
     krilld::alloc::return_freed_pages().ok();
+    krilld::alloc::mobile_thread().ok();
     // MK-066: 메모리 게이트가 의도적 회귀를 잡는지 확인하는 주입(`scripts/memory-gate.sh --inject`). 평소에는 빈 Vec.
     let _ballast = std::hint::black_box(ballast());
     #[cfg(unix)]
@@ -143,7 +144,9 @@ fn main() -> ExitCode {
         let (r, path, done) = (Arc::clone(&registry), path.clone(), done.clone());
         let reader = thread::Builder::new()
             .name("holder".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
                 r.run_holder(link);
                 if rejoin::orphan(&r, &path).is_ok() {
                     done.send(()).ok();
@@ -156,7 +159,11 @@ fn main() -> ExitCode {
     let r = Arc::clone(&registry);
     if thread::Builder::new()
         .name("agent-status".to_owned())
-        .spawn(move || r.monitor_status())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            krilld::alloc::mobile_thread().ok();
+            r.monitor_status();
+        })
         .is_err()
     {
         return ExitCode::FAILURE;
@@ -167,7 +174,9 @@ fn main() -> ExitCode {
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("spool".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
                 loop {
                     thread::sleep(krilld::status::SPOOL_POLL);
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -209,7 +218,9 @@ fn main() -> ExitCode {
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("scheduler".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
                 loop {
                     // 한 번의 panic으로 스케줄러가 영구 정지하지 않게 격리한다(K-06).
                     // `poll_schedules`의 오류는 이미 안에서 처리하고 `io::Result`로만 나온다.
@@ -238,7 +249,9 @@ fn main() -> ExitCode {
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("usage-tick".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
                 let mut seen = None;
                 let mut quota_tick = std::time::Instant::now();
                 loop {
@@ -276,7 +289,9 @@ fn main() -> ExitCode {
     }
     let accept = thread::Builder::new()
         .name("accept".to_owned())
+        .stack_size(256 * 1024)
         .spawn(move || {
+            krilld::alloc::mobile_thread().ok();
             // 여기서 닫는 연결은 Hello 없이 끝나 클라이언트에는 EOF로만 보인다. 상태가 바뀔 때만 남긴다.
             let mut rejected = None;
             let mut spawn_error = None;
@@ -308,7 +323,11 @@ fn main() -> ExitCode {
                 let (hello, r) = (hello.clone(), Arc::clone(&registry));
                 match thread::Builder::new()
                     .name("conn".to_owned())
-                    .spawn(move || r.serve_admitted(s, &hello, permit).ok())
+                    .stack_size(256 * 1024)
+                    .spawn(move || {
+                        krilld::alloc::mobile_thread().ok();
+                        r.serve_admitted(s, &hello, permit).ok()
+                    })
                 {
                     Ok(_) => spawn_error = None,
                     Err(error) => {

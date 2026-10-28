@@ -157,7 +157,9 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
             let (shared, owned, done) = (Arc::clone(cache), path.to_owned(), Arc::clone(&flight));
             let spawned = std::thread::Builder::new()
                 .name("krilld-sidebar-lookup".into())
+                .stack_size(128 * 1024)
                 .spawn(move || {
+                    crate::alloc::mobile_thread().ok();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         discover_cached(&shared, &owned)
                     }))
@@ -173,6 +175,7 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
                     }
                     *lock(&done.result) = DiscoveryResult::Ready(result);
                     done.ready.notify_all();
+                    crate::alloc::purge();
                 });
             if spawned.is_err() {
                 return state.last.get(path).cloned();

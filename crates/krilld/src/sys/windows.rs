@@ -736,6 +736,8 @@ fn socket_pending(sock: BorrowedSocket<'_>) -> io::Result<u32> {
     Ok(pending)
 }
 
+pub(crate) fn release_malloc_cache() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

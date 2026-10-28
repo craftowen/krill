@@ -97,6 +97,7 @@ function testImeDefersSnapshotUpdates(){
  console.log('PASS IME composition defers snapshot screen updates and catches up once');
 }
 async function testQuickActions(){
+ await testQuickActionReconnectAndReorder();testSecondarySummaryReconnect();
  const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'}],{quick_commands:[{name:'Orchestrate',text:'/krill-orchestration '},{name:'Git status',text:'git status'}]},true),seen=[];
  f.ctx.rpc=async request=>{f.calls.push(request);return {quick_commands:request.commands};};
  const wire=h=>h.insertText=text=>{assert(!text.includes('\r'));seen.push([h.options.sessionId,text]);return true;};
@@ -147,6 +148,33 @@ async function testQuickActions(){
  }
  const fallback=fixture(undefined,{},false,{quickCommands:[{name:'Fallback',text:'saved prompt'}]});const fallbackBody=openFallback();function openFallback(){fallback.buttons.find(b=>b.className==='icon-button session-quick-actions').action();const b=new Element('div');fallback.sheets.at(-1).render(b);return b;}assert(all(fallbackBody).some(n=>n.textContent==='Fallback'));fallback.view.cleanup();
  console.log('PASS saved quick actions snapshot/fallback, active split insertion without Enter, add/edit/delete RPC and preferences, offline local retention');
+}
+async function testQuickActionReconnectAndReorder(){
+ const commands=[{name:'First',text:'one'},{name:'Second',text:'two'},{name:'Third',text:'three'}],f=fixture(undefined,{quick_commands:commands}),Q=f.sandbox.KrillMobile.quickCommands;
+ let host='A';f.ctx.sessionKey=id=>host+':'+id;f.ctx.rpc=async request=>{f.calls.push(request);return {quick_commands:request.commands};};
+ const body=new Element('div'),editor=Q.mount(body,f.ctx),controls=()=>body.descendants().filter(n=>n.className==='quick-action-controls'),plain=v=>JSON.parse(JSON.stringify(v));
+ assert.deepEqual(controls().map(row=>row.children.map(b=>b.attrs['aria-label'])),Array(3).fill(['Move up','Move down','Edit','Delete']));
+ assert.equal(controls()[0].children[0].disabled,true);assert.equal(controls()[2].children[1].disabled,true);
+ await controls()[0].children[1].action();assert.deepEqual(plain(Q.read(f.ctx)).map(c=>c.name),['Second','First','Third']);
+ await controls()[1].children[0].action();assert.deepEqual(plain(Q.read(f.ctx)),commands);
+ f.ctx.rpc=async()=>{throw Error('offline');};await controls()[1].children[1].action();const offline=plain(Q.read(f.ctx));assert.deepEqual(offline.map(c=>c.name),['First','Third','Second']);
+ f.state.snapshot={quick_commands:commands};editor.update();assert.deepEqual(plain(Q.read(f.ctx)),offline,'reconnect snapshot cannot replace unsynced reorder');assert.deepEqual(plain(f.state.snapshot.quick_commands),offline);
+ host='B';f.state.snapshot={quick_commands:[{name:'Other desktop',text:'other'}]};assert.equal(Q.read(f.ctx)[0].name,'Other desktop','dirty edits stay in their host scope');
+ host='A';f.state.snapshot={quick_commands:commands};assert.deepEqual(plain(Q.read(f.ctx)),offline);
+ f.ctx.rpc=async request=>({quick_commands:request.commands});await Q.save(f.ctx,offline);f.state.snapshot={quick_commands:[{name:'Desktop update',text:'synced'}]};assert.equal(Q.read(f.ctx)[0].name,'Desktop update','successful save clears dirty override');
+ f.view.cleanup();console.log('PASS quick action reorder boundaries, RPC order, offline reorder retained through reconnect and host switches, successful sync clears override');
+}
+function testSecondarySummaryReconnect(){
+ const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),primary=f.mounts[0],summary=f.root.descendants().find(n=>n.className==='session-summary');let transportReconnects=0;f.ctx.transport.reconnect=()=>transportReconnects++;
+ primary.options.onStatus({phase:'ready'});f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();const secondary=f.mounts[1];
+ assert.equal(summary.dataset.reconnectable,'true','connecting active secondary overrides ready primary');secondary.options.onStatus({phase:'error',message:'Secondary unavailable'});assert.equal(summary.children[1].textContent,'Secondary unavailable');
+ summary.action();assert.equal(transportReconnects,0,'active secondary retry leaves host transport alone');assert(secondary.unmounted);assert(!primary.unmounted);assert.equal(f.mounts.length,3);assert.equal(f.mounts.at(-1).options.sessionId,8);
+ const replacement=f.mounts.at(-1);replacement.options.onStatus({phase:'ready'});assert.equal(summary.dataset.reconnectable,undefined);
+ primary.options.onStatus({phase:'error',message:'Primary unavailable'});assert.equal(summary.dataset.reconnectable,undefined,'inactive primary cannot mark active ready secondary offline');
+ const primaryPane=f.root.descendants().find(n=>n.className==='terminal-pane primary-pane');primaryPane.dispatchEvent(new Event('pointerdown'));assert.equal(summary.children[1].textContent,'Primary unavailable');assert.equal(summary.dataset.reconnectable,'true');
+ const secondaryPane=f.root.descendants().find(n=>n.className==='terminal-pane secondary-pane');secondaryPane.dispatchEvent(new Event('pointerdown'));assert.equal(summary.dataset.reconnectable,undefined);
+ f.state.connection.phase='disconnected';f.view.update();summary.action();assert.equal(transportReconnects,1,'host outage retries host transport');f.view.cleanup();assert.equal(f.timers.size,0);
+ console.log('PASS active split summary status/messages, pane activation and secondary-only reconnect without restarting primary or host');
 }
 function testSplitContinuity(){
  for(const direction of ['auto','columns','rows'])for(const active of [0,1]){

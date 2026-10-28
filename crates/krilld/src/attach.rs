@@ -223,6 +223,7 @@ pub(crate) fn run_as(
     )?;
     let writer = thread::Builder::new()
         .name(format!("attach-{}", attach.session.0))
+        .stack_size(128 * 1024)
         .spawn({
             let (tap, conn) = (tap.clone(), Arc::clone(&conn));
             move || {
@@ -250,6 +251,7 @@ pub(crate) fn run_as(
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("attach writer panicked")));
     tap.finish_input();
+    crate::alloc::purge();
     r.and(w)
 }
 

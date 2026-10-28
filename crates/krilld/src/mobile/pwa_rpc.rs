@@ -328,10 +328,12 @@ impl Backend {
             Ok(data) => json!({"ok":true,"data":data}),
             Err(e) => json!({"ok":false,"error":e.to_string()}),
         };
-        serde_json::to_string(&value)
+        let out = serde_json::to_string(&value)
             .ok()
             .filter(|text| text.len() < ipc::MAX_FRAME.saturating_sub(32))
-            .unwrap_or_else(|| "{\"ok\":false,\"error\":\"response unavailable\"}".into())
+            .unwrap_or_else(|| "{\"ok\":false,\"error\":\"response unavailable\"}".into());
+        crate::alloc::purge();
+        out
     }
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
@@ -713,10 +715,12 @@ impl Backend {
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         let worker = thread::Builder::new()
             .name("mobile-rpc".into())
-            .stack_size(super::gateway::RPC_STACK)
+            .stack_size(128 * 1024)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
-                registry.serve_mobile(server, &hello).ok()
+                let out = registry.serve_mobile(server, &hello).ok();
+                crate::alloc::purge();
+                out
             })?;
         let mut wire = Wire {
             socket: socket.try_clone()?,
@@ -899,6 +903,7 @@ impl Backend {
             .chars()
             .take(16)
             .collect();
+        drop(bytes);
         if let Some(object) = data.as_object_mut() {
             object.insert("etag".into(), etag.clone().into());
         }
@@ -1255,7 +1260,9 @@ impl Backend {
             scheduled.extend(stale.iter().cloned());
             let spawned = thread::Builder::new()
                 .name("mobile-git-swr".into())
+                .stack_size(128 * 1024)
                 .spawn(move || {
+                    crate::alloc::mobile_thread().ok();
                     let queue = crate::git::queue().ok();
                     let mut pending = deferred;
                     pending.extend(stale.into_iter().map(|cwd| {
@@ -1280,6 +1287,7 @@ impl Backend {
                         crate::session::lock(&inflight).remove(&cwd);
                         revision.fetch_add(1, Ordering::Relaxed);
                     }
+                    crate::alloc::purge();
                 });
             if spawned.is_err() {
                 let mut inflight = crate::session::lock(&self.git_inflight);

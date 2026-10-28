@@ -1,12 +1,13 @@
 //! One daemon deadline worker; deadlines hold no PTY/session ownership.
 use std::sync::Weak;
+use std::time::Duration;
 
 use super::{
     Arc, Condvar, Instant, Mutex, OnceLock, PARK_GRACE, PoisonError, Shared, lock, thread,
 };
 
 struct Deadline {
-    session: Weak<Shared>,
+    session: Option<Weak<Shared>>,
     epoch: u64,
     at: Instant,
 }
@@ -17,26 +18,47 @@ struct Deadlines {
     changed: Condvar,
 }
 
-pub(super) fn schedule(session: &Arc<Shared>, epoch: u64) {
+fn ensure_timer() -> Option<Arc<Deadlines>> {
     static TIMER: OnceLock<Mutex<Option<Arc<Deadlines>>>> = OnceLock::new();
-    let timer = {
-        let mut current = lock(TIMER.get_or_init(Mutex::default));
-        if current.is_none() {
-            let timer = Arc::new(Deadlines::default());
-            let worker = Arc::clone(&timer);
-            if thread::Builder::new()
-                .name("park".into())
-                .spawn(move || run(&worker))
-                .is_err()
-            {
-                return;
-            }
-            *current = Some(timer);
+    let mut current = lock(TIMER.get_or_init(Mutex::default));
+    if current.is_none() {
+        let timer = Arc::new(Deadlines::default());
+        let worker = Arc::clone(&timer);
+        if thread::Builder::new()
+            .name("park".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                crate::alloc::mobile_thread().ok();
+                run(&worker);
+            })
+            .is_err()
+        {
+            return None;
         }
-        let Some(timer) = current.as_ref() else {
-            return;
-        };
-        Arc::clone(timer)
+        *current = Some(timer);
+    }
+    current.as_ref().map(Arc::clone)
+}
+
+pub(crate) fn purge_soon() {
+    let Some(timer) = ensure_timer() else {
+        return;
+    };
+    let mut pending = lock(&timer.pending);
+    if pending.iter().any(|d| d.session.is_none()) {
+        return;
+    }
+    pending.push(Deadline {
+        session: None,
+        epoch: 0,
+        at: Instant::now() + Duration::from_millis(10),
+    });
+    timer.changed.notify_one();
+}
+
+pub(super) fn schedule(session: &Arc<Shared>, epoch: u64) {
+    let Some(timer) = ensure_timer() else {
+        return;
     };
     let mut pending = lock(&timer.pending);
     {
@@ -48,9 +70,13 @@ pub(super) fn schedule(session: &Arc<Shared>, epoch: u64) {
         }
     }
     // Replace this session's old deadline, and discard dead sessions on every insertion.
-    pending.retain(|d| d.session.strong_count() > 0 && !d.session.ptr_eq(&Arc::downgrade(session)));
+    pending.retain(|d| {
+        d.session
+            .as_ref()
+            .is_none_or(|s| s.strong_count() > 0 && !s.ptr_eq(&Arc::downgrade(session)))
+    });
     pending.push(Deadline {
-        session: Arc::downgrade(session),
+        session: Some(Arc::downgrade(session)),
         epoch,
         at: Instant::now() + PARK_GRACE,
     });
@@ -81,9 +107,13 @@ fn run(timer: &Deadlines) {
         }
         let deadline = pending.swap_remove(index);
         drop(pending);
-        if let Some(session) = deadline.session.upgrade() {
-            // park() rechecks viewers and epoch under the live lock.
-            session.park(deadline.epoch);
+        if let Some(weak) = deadline.session {
+            if let Some(session) = weak.upgrade() {
+                // park() rechecks viewers and epoch under the live lock.
+                session.park(deadline.epoch);
+            }
+        } else {
+            crate::alloc::purge();
         }
     }
 }

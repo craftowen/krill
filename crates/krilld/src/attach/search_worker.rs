@@ -65,7 +65,9 @@ impl Worker {
         let pending = Arc::clone(&queue);
         let worker = thread::Builder::new()
             .name(format!("search-{}", tap.id().0))
+            .stack_size(256 * 1024)
             .spawn(move || {
+                crate::alloc::mobile_thread().ok();
                 let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
                     while let Some((req, generation)) = pending.next() {
                         let cancelled = || pending.generation.load(Ordering::Acquire) != generation;

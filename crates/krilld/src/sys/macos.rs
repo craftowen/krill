@@ -541,6 +541,17 @@ pub(crate) fn exclude_from_backup(dir: BorrowedFd<'_>) -> io::Result<()> {
     }
 }
 
+/// C 라이브러리(libzstd 등)가 시스템 malloc zone에 남긴 빈 캐시 페이지를 OS에 돌려준다.
+pub(crate) fn release_malloc_cache() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+    }
+    // SAFETY: zone이 NULL이면 모든 기본 malloc zone에서 goal(0 = 가능한 만큼)만큼 빈 캐시 페이지를 비운다.
+    unsafe {
+        malloc_zone_pressure_relief(ptr::null_mut(), 0);
+    }
+}
+
 /// APFS copy-on-write 복사. 지원하지 않는 볼륨 등의 오류는 호출자가 일반 복사로 처리한다.
 /// 심링크는 따라가지 않고, 이미 있는 목적지는 덮어쓰지 않는다.
 pub(crate) fn clone_file(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {

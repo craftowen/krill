@@ -1364,6 +1364,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
                     tracing::debug!(kind=?error.kind(), "mobile connection ended");
                 }
                 drop(guard);
+                crate::alloc::purge();
             })
             .is_err()
         {
@@ -1592,12 +1593,20 @@ fn bridge(
             crate::alloc::mobile_thread().ok();
             let result = (|| -> io::Result<()> {
                 while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
+                    let large = body.len() > 8 * 1024;
                     let frame = ipc::encode_frame(kind, &body)?;
+                    drop(body);
                     let sealed = lock(&c).seal(&frame)?;
+                    drop(frame);
                     ws::write(&mut *lock(&w), ws::BINARY, &sealed)?;
+                    drop(sealed);
+                    if large {
+                        crate::alloc::purge();
+                    }
                 }
                 Ok(())
             })();
+            crate::alloc::purge();
             lock(&w).shutdown(Shutdown::Both).ok();
             result
         })?;
@@ -1613,6 +1622,7 @@ fn bridge(
             if let Ok(done) = done {
                 done.shutdown(Shutdown::Both).ok();
             }
+            crate::alloc::purge();
             result
         });
     let result = if worker.is_ok() {

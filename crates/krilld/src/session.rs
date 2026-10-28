@@ -24,6 +24,7 @@ mod capture_since;
 mod history_view;
 mod input;
 mod park;
+pub(crate) use park::purge_soon;
 mod recovery;
 #[cfg(windows)]
 mod windows;
@@ -356,6 +357,8 @@ impl Shared {
         *lock(&self.capture) = None;
         if live.update_engine(demote).is_some() {
             live.parked = true;
+            drop(live);
+            crate::alloc::purge();
         } else {
             let revision = live.revision;
             drop(live);
@@ -1045,6 +1048,7 @@ fn spawn_reader(
     let source = windows::Reader::start(&shared.master)?;
     thread::Builder::new()
         .name(format!("pty-{}", shared.id.0))
+        .stack_size(256 * 1024)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
             if let (Some(size), Some(r)) = (rebuild_size, &rec) {

@@ -226,6 +226,8 @@ pub(crate) fn clone_file(_src: &std::path::Path, _dst: &std::path::Path) -> io::
     Err(io::ErrorKind::Unsupported.into())
 }
 
+pub(crate) fn release_malloc_cache() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

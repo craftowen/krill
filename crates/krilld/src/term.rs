@@ -907,6 +907,7 @@ impl Engine {
         self.scheme.clear = ClearTrack::None;
         self.scheme.stop = StopReason::None;
         self.term.grid_mut().clear_history();
+        self.term.grid_mut().truncate();
     }
 
     /// Orca/xterm clear처럼 현재 커서 행만 맨 위에 남긴다. PTY나 모드에는 쓰지 않는다.
@@ -935,6 +936,40 @@ impl Engine {
         }
         self.clear_history();
         rows
+    }
+
+    /// 콜드 페이지 구간 `[start, end)`에 속하는 스크롤백 행만 추출하고 스크롤백을 비운다.
+    pub(crate) fn take_history_window(
+        &mut self,
+        at: &mut usize,
+        start: usize,
+        end: usize,
+        out: &mut Vec<Vec<Cell>>,
+    ) {
+        if !self.parked_hot.is_empty() {
+            for row in self.take_history() {
+                if (start..end).contains(at) {
+                    out.push(row);
+                }
+                *at = at.saturating_add(1);
+            }
+            return;
+        }
+        let n = self.history_len();
+        let batch_start = *at;
+        let batch_end = batch_start.saturating_add(n);
+        if start < end && start < batch_end && batch_start < end {
+            let grid = self.term.grid();
+            let from = start.saturating_sub(batch_start);
+            let to = end.saturating_sub(batch_start).min(n);
+            for i in from..to {
+                if let Ok(k) = i32::try_from(n - i) {
+                    out.push(capture_row(&grid[Line(-k)], self.term.colors()).0);
+                }
+            }
+        }
+        *at = batch_end;
+        self.clear_history();
     }
 
     /// 핫 스크롤백 행 수와, 아래(화면 바로 위)에서 `skip`행 위부터 위로 최대 `count`행(오래된 행부터).
