@@ -36,6 +36,7 @@ const DEFAULT_API_URL: &str = "https://share.krill.page";
 const MAX_BYTES: u64 = schema::MAX_CONTENT_BYTES;
 const TOKEN_FILE: &str = "artifact-token";
 const SHARES_FILE: &str = "artifact-shares.json";
+const PENDING_FILE: &str = "artifact-pending.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Record {
@@ -207,6 +208,9 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
             "--expires-in is only valid for share, update, or retention".into(),
         ));
     }
+    // Hold the lock through the HTTP operation and the following read/modify/write.
+    // A per-write lock would still lose another process's newly received edit token.
+    let _lock = artifact_lock(&ctx.state_dir, "artifact-shares.lock")?;
     match cmd.as_str() {
         "retention" => retention(ctx, &api, &one("slug")?, &opts),
         "share" => share(ctx, &api, &one("file")?, &opts, false),
@@ -330,13 +334,33 @@ fn share(
     if opts.retention_days.is_none() {
         body["retentionDays"] = json!(schema::default_retention_days(&ctx.state_dir)?);
     }
-    let (status, resp) = request(
+    // Persist before sending: a lost POST response must be recoverable on the next
+    // invocation. The server scopes this key to the owner and returns a fresh edit
+    // token for the same artifact on retry.
+    let intent = serde_json::to_string(&(api, &key)).map_err(|e| Error::Fail(e.to_string()))?;
+    let mut pending: BTreeMap<String, String> = match fs::read(ctx.state_dir.join(PENDING_FILE)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Fail(format!("{PENDING_FILE} is corrupt: {e}")))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let recovering = pending.contains_key(&intent);
+    let idempotency = if let Some(key) = pending.get(&intent) {
+        key.clone()
+    } else {
+        let key = random_token()?;
+        pending.insert(intent.clone(), key.clone());
+        save_json(&ctx.state_dir, PENDING_FILE, &pending)?;
+        key
+    };
+    let (status, resp) = request_with_idempotency(
         ctx,
         "POST",
         &format!("{api}/v1/artifacts"),
         &token,
         None,
         Some(&body.to_string()),
+        Some(&idempotency),
     )?;
     let v = expect_ok(status, &resp)?;
     let retention_days = returned_retention(&v, None)?;
@@ -360,6 +384,13 @@ fn share(
     };
     shares.insert(key, rec.clone());
     save_shares(&ctx.state_dir, &shares)?;
+    pending.remove(&intent);
+    save_json(&ctx.state_dir, PENDING_FILE, &pending)?;
+    if recovering {
+        // The server may have accepted an earlier version before losing its reply.
+        // Now that its edit token is recovered, apply the current file explicitly.
+        return share(ctx, api, file, opts, true);
+    }
     returned_retention(
         &v,
         body["retentionDays"]
@@ -637,6 +668,7 @@ fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, Value), Err
 
 /// 상태 디렉터리의 영구 소유자 토큰. 없으면 OS CSPRNG 32바이트로 만든다(0600).
 fn owner_token(dir: &Path) -> Result<String, Error> {
+    let _lock = artifact_lock(dir, "artifact-token.lock")?;
     let path = dir.join(TOKEN_FILE);
     match fs::read_to_string(&path) {
         Ok(t) if !t.trim().is_empty() => return Ok(t.trim().to_owned()),
@@ -644,6 +676,20 @@ fn owner_token(dir: &Path) -> Result<String, Error> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
+    let token = random_token()?;
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    Ok(token)
+}
+
+fn random_token() -> Result<String, Error> {
     let mut bytes = [0u8; 32];
     #[cfg(not(windows))]
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -658,23 +704,7 @@ fn owner_token(dir: &Path) -> Result<String, Error> {
         write!(t, "{b:02x}").ok();
         t
     });
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            f.write_all(token.as_bytes())?;
-            Ok(token)
-        }
-        // 동시에 다른 호출이 먼저 만들었다.
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            Ok(fs::read_to_string(&path)?.trim().to_owned())
-        }
-        Err(e) => Err(e.into()),
-    }
+    Ok(token)
 }
 
 fn load_shares(dir: &Path) -> Result<Shares, Error> {
@@ -686,11 +716,30 @@ fn load_shares(dir: &Path) -> Result<Shares, Error> {
     }
 }
 
-// ponytail: 잠금 없음. 동시 share 두 개가 겹치면 나중 쓰기가 이긴다(편집 토큰 하나 유실 가능). 문제가 되면 schedule.rs식 lock 파일.
-fn save_shares(dir: &Path, shares: &Shares) -> Result<(), Error> {
-    let text = serde_json::to_string_pretty(shares).map_err(|e| Error::Fail(e.to_string()))?;
+/// OS advisory locks are released even when the CLI is killed. Never unlink the
+/// lock file: waiting processes must continue locking the same file identity.
+fn artifact_lock(dir: &Path, name: &str) -> io::Result<fs::File> {
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let tmp = dir.join(format!("{SHARES_FILE}.{}.tmp", std::process::id()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join(name))?;
+    file.lock()?;
+    Ok(file)
+}
+
+// Caller holds artifact-shares.lock across the entire transaction.
+fn save_shares(dir: &Path, shares: &Shares) -> Result<(), Error> {
+    save_json(dir, SHARES_FILE, shares)
+}
+
+fn save_json(dir: &Path, name: &str, value: &impl Serialize) -> Result<(), Error> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| Error::Fail(e.to_string()))?;
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     let result = (|| {
         let mut f = OpenOptions::new()
             .write(true)
@@ -700,7 +749,7 @@ fn save_shares(dir: &Path, shares: &Shares) -> Result<(), Error> {
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_data()?;
-        fs::rename(&tmp, dir.join(SHARES_FILE))
+        fs::rename(&tmp, dir.join(name))
     })();
     if result.is_err() {
         fs::remove_file(&tmp).ok();
@@ -717,7 +766,22 @@ fn request(
     edit_token: Option<&str>,
     body: Option<&str>,
 ) -> Result<(u16, String), Error> {
+    request_with_idempotency(ctx, method, url, token, edit_token, body, None)
+}
+
+fn request_with_idempotency(
+    ctx: &Ctx,
+    method: &str,
+    url: &str,
+    token: &str,
+    edit_token: Option<&str>,
+    body: Option<&str>,
+    idempotency: Option<&str>,
+) -> Result<(u16, String), Error> {
     let mut headers = format!("Authorization: Bearer {token}\n");
+    if let Some(key) = idempotency {
+        writeln!(headers, "Idempotency-Key: {key}").ok();
+    }
     if let Some(edit) = edit_token {
         writeln!(headers, "x-krill-edit-token: {edit}").ok();
     }
@@ -916,6 +980,54 @@ esac
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn concurrent_shares_preserve_both_edit_tokens() {
+        let env = Env::new("concurrent-shares");
+        let first = env.file("first.md", "first");
+        let second = env.file("second.md", "second");
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| env.run(&["share", &first]));
+            let b = scope.spawn(|| env.run(&["share", &second]));
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+        });
+        let shares = env.shares();
+        assert_eq!(shares.len(), 2);
+        assert!(shares.values().all(|record| record.edit_token == "e1"));
+    }
+
+    #[test]
+    fn lost_create_response_reuses_durable_intent_and_applies_current_file() {
+        let env = Env::new("lost-response");
+        let file = env.file("lost.md", "old");
+        let failing = MOCK.replace(
+            "case \"$method $url\" in",
+            "[ \"$method\" != POST ] || exit 7\ncase \"$method $url\" in",
+        );
+        fs::write(&env.ctx.curl, failing).unwrap();
+        assert!(env.run(&["share", &file]).is_err());
+        assert!(env.shares().is_empty());
+        let first_key = env
+            .log()
+            .lines()
+            .find_map(|line| line.strip_prefix("Idempotency-Key: ").map(str::to_owned))
+            .unwrap();
+        assert_eq!(first_key.len(), 64);
+        fs::write(&file, "new").unwrap();
+        fs::write(&env.ctx.curl, MOCK).unwrap();
+        env.run(&["share", &file]).unwrap();
+        let log = env.log();
+        let keys: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.strip_prefix("Idempotency-Key: "))
+            .collect();
+        assert_eq!(keys, [first_key.as_str(), first_key.as_str()]);
+        assert!(log.contains("PUT http://localhost/v1/artifacts/s1"));
+        let body: Value = serde_json::from_slice(&fs::read(env.dir.join("body")).unwrap()).unwrap();
+        assert_eq!(body["content"], "new");
+        assert_eq!(env.shares().len(), 1);
     }
 
     #[test]
@@ -1327,7 +1439,7 @@ printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://lo
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod windows_random_tests {
     #[test]
     fn artifact_owner_token_uses_os_random_and_is_reused() {
@@ -1338,5 +1450,29 @@ mod windows_random_tests {
         assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(super::owner_token(&dir).unwrap(), token);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn concurrent_first_owner_token_is_never_empty_or_changed() {
+        let dir = std::env::temp_dir().join(format!("artifact-token-race-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let barrier = std::sync::Barrier::new(12);
+        let tokens = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..12)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        super::owner_token(&dir).unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(tokens[0].len(), 64);
+        assert!(tokens.iter().all(|token| token == &tokens[0]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
