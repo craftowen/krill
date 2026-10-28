@@ -307,9 +307,6 @@ fn mobile_poll_renews_missing_failed_or_expired_standalone_offer(cx: &mut gpui::
                         active_offer: false,
                         devices: vec![device(1, 1)],
                     }),
-                    MobileRequest::Workflow(_) => Ok(MobileReply::Workflow(
-                        "{\"ok\":true,\"data\":{\"signed_in\":false}}".into(),
-                    )),
                     other => panic!("unexpected request: {other:?}"),
                 }
             }));
