@@ -153,7 +153,7 @@ fn finish(
     Reply::WorktreeCreated(worktree)
 }
 
-/// `req.repo`에 워크트리를 `<root>/<레포 이름>/<이름>`으로 만든다. `trust`는 setup 신뢰 파일.
+/// 프로젝트에 지정한 위치 또는 `<root>/<레포 이름>/<이름>`에 만든다. `trust`는 setup 신뢰 파일.
 ///
 /// # Errors
 /// 사람이 읽을 이유(git 실패는 git의 stderr).
@@ -240,7 +240,8 @@ pub fn create_with_pool(
     )?;
 
     let repo_name = top.file_name().ok_or("repository has no name")?;
-    let dir = root.join(repo_name);
+    let dir =
+        compat::project_destination(&top, trust.parent())?.unwrap_or_else(|| root.join(repo_name));
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`).
     let dir = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
