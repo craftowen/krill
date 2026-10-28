@@ -14,6 +14,50 @@ const MAX_PARTS: usize = 4096;
 const MAX_PREFIX_ROWS: usize = 100_000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
+fn scan_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = test_clock::now() {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+mod test_clock {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CLOCK: Cell<Option<(Instant, usize)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn now() -> Option<Instant> {
+        CLOCK.with(|clock| {
+            clock.get().map(|(at, remaining)| {
+                clock.set(Some((at, remaining.saturating_sub(1))));
+                if remaining == 0 {
+                    at + Duration::from_secs(1)
+                } else {
+                    at
+                }
+            })
+        })
+    }
+
+    /// Hold time for data-contract tests, or expire after a deterministic number
+    /// of checks. Real SQLite/JSON work and every row/byte/part bound still run.
+    pub(super) fn run<T>(checks: usize, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<(Instant, usize)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CLOCK.with(|clock| clock.set(self.0));
+            }
+        }
+        let _restore = Restore(CLOCK.with(|clock| clock.replace(Some((Instant::now(), checks)))));
+        f()
+    }
+}
+
 pub(super) struct Session {
     pub id: String,
     pub cwd: String,
@@ -107,8 +151,8 @@ fn read_window(
     )?;
     db.busy_timeout(Duration::from_millis(50))?;
     db.set_limit(Limit::SQLITE_LIMIT_LENGTH, 1024 * 1024)?;
-    let deadline = Instant::now() + Duration::from_millis(200);
-    db.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+    let deadline = scan_now() + Duration::from_millis(200);
+    db.progress_handler(1000, Some(move || scan_now() >= deadline))?;
     db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN;")?;
     let schema = columns(&db, "session")?;
     needs(&schema, &["id", "directory"])?;
@@ -141,7 +185,7 @@ fn read_window(
     while let Some(row) = rows.next()? {
         if batch.sessions.len() >= MAX_SESSIONS
             || batch.bytes >= MAX_BYTES
-            || Instant::now() >= deadline
+            || scan_now() >= deadline
         {
             batch.truncated = true;
             break;
@@ -198,6 +242,11 @@ fn read_window(
         } else {
             "rowid"
         };
+        // Reuse one statement while hashing the prefix. Preparing it for every
+        // message adds avoidable work to the fixed scan deadline.
+        let part_sql =
+            format!("SELECT data FROM part WHERE message_id=?1 ORDER BY {part_order} LIMIT ?2");
+        let mut part_stmt = with_parts.then(|| db.prepare(&part_sql)).transpose()?;
         let mut message_count = 0usize;
         let mut part_count = 0usize;
         let mut page_part_count = 0usize;
@@ -235,7 +284,7 @@ fn read_window(
                         MAX_MESSAGES
                     }
                     || batch.bytes >= MAX_BYTES
-                    || Instant::now() >= deadline
+                    || scan_now() >= deadline
                 {
                     batch.truncated = true;
                     break;
@@ -259,10 +308,7 @@ fn read_window(
                     continue;
                 };
                 object.insert("id".into(), Value::String(message_id.clone()));
-                if with_parts {
-                    let mut stmt = db.prepare(&format!(
-                        "SELECT data FROM part WHERE message_id=?1 ORDER BY {part_order} LIMIT ?2"
-                    ))?;
+                if let Some(stmt) = &mut part_stmt {
                     let mut rows = stmt.query(rusqlite::params![
                         message_id,
                         i64::try_from(MAX_PARTS.saturating_add(1)).unwrap_or(4097)
@@ -282,7 +328,7 @@ fn read_window(
                                 }
                             || (visible && page_part_count >= MAX_PARTS)
                             || batch.bytes >= MAX_BYTES
-                            || Instant::now() >= deadline
+                            || scan_now() >= deadline
                         {
                             batch.truncated = true;
                             break;
@@ -318,7 +364,7 @@ fn read_window(
             }
         }
     }
-    batch.truncated |= batch.bytes > MAX_BYTES || Instant::now() >= deadline;
+    batch.truncated |= batch.bytes > MAX_BYTES || scan_now() >= deadline;
     Ok(batch)
 }
 
