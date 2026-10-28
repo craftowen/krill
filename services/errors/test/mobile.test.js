@@ -11,7 +11,7 @@ const id = n => n.toString(16).padStart(32, '0');
 const event = (n = 1, change = {}) => ({event_id: id(n), process: 'krill-mobile', kind: 'operation_error',
   error_code: 'mobile_connect_failed', release: 'web', build_id: '0123456789abcdef', os: 'ios', arch: 'other',
   source_loc: null, hang_bucket_ms: null, native: null, diagnostics: {phase: 'socket_open', route: 'relay',
-    reason: 'websocket_closed', attempt_id: id(21), page_id: id(22), elapsed_ms: 1000, retry_count: 1,
+    reason: 'websocket_closed', attempt_id: id(21), elapsed_ms: 1000, retry_count: 1,
     online: true, visibility: 'visible', browser: 'safari', ws_code: 1006,
     stack_frames: [{source_file: 'client.js', line: 12, column: 4}],
     breadcrumbs: [{phase: 'discovery', reason: 'http_error', elapsed_ms: 100, http_status: 503}]}, ...change});
@@ -55,6 +55,28 @@ test('mobile commits sanitized details, canonical duplicate, and exposes filtera
   const stats = await (await admin(env, '/api/stats')).json();
   assert.deepEqual(stats.groups, [{kind: 'operation_error', error_code: e.error_code, process: 'krill-mobile', rows: 1}]);
   assert.deepEqual(stats.releases, [{release: 'web', rows: 1}]);
+});
+
+test('legacy page identifiers are discarded before storage and duplicate acknowledgement', async t => {
+  const env = environment(t), expected = event();
+  const legacy = {...expected, diagnostics: {...expected.diagnostics, page_id: id(22)}};
+  assert.equal((await send(env, [legacy])).status, 200);
+  assert.deepEqual(JSON.parse(rows(env)[0].event_json), expected);
+  const response = await send(env, [{...legacy, diagnostics: {...legacy.diagnostics, page_id: id(23)}}]);
+  assert.deepEqual(await response.json(), {schema_version: 1, accepted_ids: [], duplicate_ids: [id(1)]});
+  const detail = await admin(env, `/api/events/${id(1)}`);
+  assert.deepEqual((await detail.json()).event, expected);
+});
+
+test('mobile privacy preference headers stop ingestion before storage', async t => {
+  const env = environment(t);
+  for (const headers of [{dnt: '1'}, {'sec-gpc': '1'}, {dnt: '1', 'sec-gpc': '1'}]) {
+    const response = await send(env, [event()], {headers});
+    cors(response);
+    assert.equal(response.status, 403);
+  }
+  assert.equal(rows(env).length, 0);
+  assert.equal((await send(env, [event()], {headers: {dnt: '0'}})).status, 200);
 });
 
 test('all mobile codes, OS and allowlisted diagnostics accept their exact boundary values', async t => {

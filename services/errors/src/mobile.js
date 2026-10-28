@@ -57,6 +57,9 @@ export function validateMobile(value) {
     seen.add(e.event_id);
     const event = canonicalFields(e, FIELDS);
     event.diagnostics = canonicalFields(e.diagnostics, Object.keys(DIAGNOSTICS));
+    // Older browser bundles sent a page-scoped identifier. It is unnecessary
+    // for operational diagnostics; validate legacy input but never retain it.
+    delete event.diagnostics.page_id;
     if (event.diagnostics.breadcrumbs) event.diagnostics.breadcrumbs = event.diagnostics.breadcrumbs
       .map(c => canonicalFields(c, Object.keys(CRUMB)));
     if (event.diagnostics.stack_frames) event.diagnostics.stack_frames = event.diagnostics.stack_frames
@@ -90,6 +93,9 @@ export function mobileCors(request) {
 export function mobileAdmission(request) {
   const origin = request.headers.get('origin');
   if (origin !== null && !allowedOrigin(origin)) throw new HttpError(403, 'origin not allowed');
+  if (request.method !== 'OPTIONS'
+    && (request.headers.get('dnt') === '1' || request.headers.get('sec-gpc') === '1'))
+    throw new HttpError(403, 'reporting disabled by privacy preference');
   if (request.headers.has('cookie') || request.headers.has('authorization'))
     throw new HttpError(400, 'credentials unsupported');
   if (request.method !== 'OPTIONS') return null;

@@ -59,7 +59,7 @@ try {
   const mobile = {...e, event_id: '00000000000000000000000000000010', process: 'krill-mobile',
     error_code: 'mobile_connect_failed', release: 'web', build_id: '0123456789abcdef', os: 'ios', arch: 'other',
     diagnostics: {phase: 'socket_open', route: 'relay', reason: 'websocket_closed', ws_code: 1006,
-      attempt_id: '00000000000000000000000000000020', page_id: '00000000000000000000000000000021',
+      attempt_id: '00000000000000000000000000000020',
       elapsed_ms: 1200, online: true, stack_frames: [{source_file: 'client.js', line: 12, column: 4}],
       breadcrumbs: [{phase: 'discovery', reason: 'http_error', http_status: 502, elapsed_ms: 200}]}};
   const checkCors = response => {
