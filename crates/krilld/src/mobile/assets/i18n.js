@@ -2,6 +2,10 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Send error reports": "오류 보고 보내기",
+ "Do Not Track is enabled. Error reporting is off.": "추적 방지 설정에 따라 오류 보고가 꺼져 있습니다.",
+ "Off by default. Sends technical failures after you enable it. No terminal content, addresses or credentials. Turning off clears pending reports.": "기본값은 꺼짐입니다. 켠 뒤 발생한 기술적 오류만 전송하며 터미널 내용·주소·인증 정보는 포함하지 않습니다. 끄면 대기 중인 보고도 삭제됩니다.",
+
  "Skill": "스킬",
  "Global": "전역",
  "Claude also saves this as the default for new sessions.": "Claude는 이 모델을 새 세션의 기본값으로도 저장합니다.",

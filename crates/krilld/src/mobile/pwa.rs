@@ -3,7 +3,7 @@ use ring::digest;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 23] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 24] = [
     (
         "index.html",
         "text/html; charset=utf-8",
@@ -39,6 +39,12 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 23] = [
         "text/javascript; charset=utf-8",
         include_bytes!("assets/storage.js"),
         include_bytes!("assets/storage.js.gz"),
+    ),
+    (
+        "diagnostics.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/diagnostics.js"),
+        include_bytes!("assets/diagnostics.js.gz"),
     ),
     (
         "client.js",
@@ -203,7 +209,7 @@ pub(super) fn serve_request(
     );
     write!(
         writer,
-        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n{encoding}Cache-Control: no-store\r\nVary: Accept-Encoding\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n{encoding}Cache-Control: no-store\r\nVary: Accept-Encoding\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; connect-src 'self' ws: wss: https://errors.krill.page; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     writer.write_all(body)
