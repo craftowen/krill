@@ -251,7 +251,37 @@ async function composerProgress(){
  const queued=fixture();await flush();queued.input('old host');queued.submit();queued.state.chatCache=new Map();await flush();assert(!queued.calls.some(c=>c.action==='prompt'),'host replacement before the queued action fences the send');queued.dispose();
  console.log('PASS composer progress: immediate provisional acknowledgement, accepted vs observed work/tool/wait/done/offline, transcript reconciliation and failure draft retry');
 }
+async function opaqueCursorReplay(){
+ // Actual mounted mobile code, with the independently observed decreasing token pair.
+ const end=5160216417328039,partial=2908416603642792;
+ assert(Number.isSafeInteger(end)&&Number.isSafeInteger(partial)&&partial<end);
+ const rows=(start,count)=>Array.from({length:count},(_,i)=>({id:`${start}:${i}`,kind:'assistant',text:`Record ${start}:${i}`}));
+ const f=fixture({handler:async()=>({generation:'g1',agent:'opencode',bound:true,page_start:0,next_offset:end,items:rows(0,1)})});await flush();
+ await f.poll({generation:'g1',agent:'opencode',bound:true,next_offset:partial,items:rows(end,128)});
+ assert.deepEqual(Array.from(f.entry.pages,p=>[p.start,p.next]),[[0,end],[end,partial]]);
+ // Clip inside the decreasing-token page. Exact replay must restore its missing rows.
+ for(let n=0;n<7;n++)await f.poll({generation:'g1',agent:'opencode',bound:true,next_offset:partial+n+1,items:rows(partial+n,128)});
+ const first=f.entry.items[0];assert.equal(first._pageStart,end);assert(first._clipped);
+ f.handler=async req=>{assert.equal(req.offset,end);assert.equal(req.end_offset,partial);return {generation:'g1',bound:true,page_start:end,next_offset:partial,items:rows(end,128)};};
+ f.button('Load earlier messages').action();await flush();assert.equal(f.errors.length,0);assert.equal(f.entry.items[0].id,`${end}:0`);assert(f.entry.live);
+ // Then replay the old end after later appends; it remains byte-for-byte the observed end.
+ f.handler=async req=>{assert.equal(req.offset,0);assert.equal(req.end_offset,end);return {generation:'g1',bound:true,page_start:0,next_offset:end,items:rows(0,1)};};
+ f.button('Load earlier messages').action();await flush();assert.equal(f.entry.items[0].id,'0:0');assert.equal(f.root.descendants().find(n=>n.attrs.role==='status'&&n.children.some(c=>c.textContent==='Retry')).hidden,true);assert.equal(new Set(f.entry.items.map(i=>i.id)).size,f.entry.items.length);
+ f.handler=async req=>({generation:'g1',agent:'opencode',bound:true,next_offset:req.offset,items:[]});f.button('Back to latest').action();await flush();
+ // A bounded read that fails closed discards stale state and restarts from latest.
+ let calls=0;f.handler=async req=>{calls++;return req.latest?{generation:'g1',agent:'opencode',bound:true,page_start:0,next_offset:end,items:rows(0,1)}:{generation:'g1',bound:false,reset:true,next_offset:0,items:[]};};
+ f.update();await flush();assert.equal(calls,2);assert.equal(f.entry.items.length,1);assert.equal(f.entry.offset,end);assert.equal(f.entry.pages.length,1);f.dispose();
+ // Eviction/deadline on the first earlier read must leave a usable escape to a
+ // fresh latest boundary, without discarding the current paint until it succeeds.
+ const stale=fixture({handler:async()=>({generation:'g1',agent:'opencode',bound:true,page_start:partial,next_offset:end,items:rows(partial,2)})});await flush();
+ const old=stale.entry.items.slice();stale.handler=async()=>({generation:'g1',bound:false,reset:true,next_offset:0,items:[]});
+ stale.button('Load earlier messages').action();await flush();assert.deepEqual(stale.entry.items,old);assert.equal(stale.entry.live,undefined);assert.equal(stale.button('Back to latest').hidden,false);
+ stale.handler=async req=>{assert(req.latest);assert.equal(req.offset,0);return {generation:'g1',agent:'opencode',bound:true,page_start:100,next_offset:end+1,items:rows(100,2)};};
+ stale.button('Back to latest').action();await flush();assert.equal(stale.entry.items[0].id,'100:0');assert.deepEqual(Array.from(stale.entry.pages,p=>[p.start,p.next]),[[100,end+1]]);stale.dispose();
+ console.log('PASS opaque SQLite tokens: decreasing end-to-partial remembered, clipped replay, immutable old end, live resource reset and expired-history latest recovery');
+}
 async function main(){
+ await opaqueCursorReplay();
  await composerDiscovery();
  await composerRaces();
  await composerProgress();

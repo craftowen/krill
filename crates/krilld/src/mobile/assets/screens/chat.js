@@ -69,6 +69,7 @@ function mountChat(root,opts){
  const history=el('div',undefined,'chat-actions chat-history'),historyText=el('span',undefined,'muted');
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
  const latestBtn=button(t('Back to latest'),()=>{
+  if(failedEarlier){refreshLatest=true;resetHistory=true;}
   earlierEpoch++;earlierQueued=false;failedEarlier=false;autoBlocked=null;pollStatus.hidden=true;
   if(entry.live){entry.items=entry.live.items;entry.offset=entry.live.offset;entry.live=null;}
   following=true;renderItems();pollNow();
@@ -92,7 +93,7 @@ function mountChat(root,opts){
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
  let earlierEpoch=0,earlierQueued=false,autoBlocked=null,failedEarlier=false;
- let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
+ let resetHistory=false,refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
  // Only the reader moving up stops following; pins and late layout growth never do.
  let lastTop=0,lastHeight=0,lastViewport=feed.clientHeight;
  function syncScroll(){lastTop=feed.scrollTop;lastHeight=feed.scrollHeight;lastViewport=feed.clientHeight;}
@@ -350,9 +351,9 @@ function mountChat(root,opts){
   }
   const first=entry.items[0];
   const start=first?._pageStart||0;
-  earlierBtn.hidden=!entry.pages.some(page=>page.start<start)&&!first?._clipped&&!(first&&start>0);
+  earlierBtn.hidden=!(entry.pages.findIndex(page=>page.start===start)>0)&&!first?._clipped&&!(first&&start>0);
   earlierBtn.disabled=earlierPending;
-  latestBtn.hidden=!entry.live&&!earlierPending;
+  latestBtn.hidden=!entry.live&&!earlierPending&&!failedEarlier;
   historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
   historyText.hidden=!entry.live;history.hidden=earlierBtn.hidden&&latestBtn.hidden;
   pinLatest();restoreReader(anchor);
@@ -440,7 +441,16 @@ function mountChat(root,opts){
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start,_retainedBytes:JSON.stringify(item).length*2}));}
  function clearTranscript(){entry.items=[];entry.retainedBytes=0;entry.disclosures?.clear();entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();resize?.disconnect();resize?.observe(feed);}
- function rememberPage(start,next){if(!(next>start))return;const pages=entry.pages,last=pages.at(-1);if(last&&start>last.start)pages.push({start,next});else if(!pages.some(p=>p.start===start)){let at=0;while(at<pages.length&&pages[at].start<start)at++;pages.splice(at,0,{start,next});}if(pages.length>pageLimit){const first=entry.items[0]?._pageStart??start;while(pages.length>pageLimit){if(pages[0].next<=first)pages.shift();else pages.pop();}}}
+ // Pages are chronological links. Cursor numbers may decrease between live pages.
+ function rememberPage(start,next){
+  if(!Number.isSafeInteger(start)||!Number.isSafeInteger(next)||start<0||next<0||start===next)return;
+  const pages=entry.pages;if(!pages.some(p=>p.start===start)){
+   const after=pages.findIndex(p=>p.start===next),before=pages.findIndex(p=>p.next===start);
+   pages.splice(after>=0?after:before>=0?before+1:pages.length,0,{start,next});
+  }
+  while(pages.length>pageLimit){const first=entry.items[0]?._pageStart??start,index=pages.findIndex(p=>p.start===first);if(index>0)pages.shift();else pages.pop();}
+ }
+
  function trimItems(fromStart){
   let bytes=entry.items.reduce((n,item)=>n+(item._retainedBytes||0),0),count=0;
   while(entry.items.length-count>1&&(entry.items.length-count>itemLimit||bytes>itemByteLimit)){const item=entry.items[fromStart?count:entry.items.length-1-count];bytes-=item._retainedBytes||0;count++;}
@@ -486,12 +496,12 @@ function mountChat(root,opts){
     if(!current()||earlierPending||entry.live||!res)return;
     latest=true;changed=true;
    }
-   const rItems=res.items||[],sameTail=latest&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
-   const reset=Boolean(res.reset||changed),metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
+   const rItems=res.items||[],sameTail=latest&&!resetHistory&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
+   const reset=Boolean(res.reset||changed||latest&&resetHistory),metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
    const hadItems=entry.items.length,wasLoaded=entry.loaded,anchor=!sameTail&&(rItems.length||metaChanged)||!pollStatus.hidden?readerAnchor():null;
    if(reset){clearTranscript();following=true;}
    entry.generation=res.generation||entry.generation;entry.agent=res.agent||'';entry.bound=!!res.bound;
-   entry.initialized=entry.bound;entry.loaded=true;refreshLatest=false;
+   entry.initialized=entry.bound;entry.loaded=true;refreshLatest=false;resetHistory=false;
    const effectiveStart=res.page_start??(res.reset?0:start);
    const incoming=normalizeItems(res,effectiveStart),before=entry.items.length;
    let reconciled=false;
@@ -505,7 +515,7 @@ function mountChat(root,opts){
  function canReadEarlier(){return active()&&isVisible()&&!state.cached&&state.connection?.phase==='ready';}
  function earlierPage(){
   const first=entry.items[0];if(!first)return null;
-  const page=first._clipped?entry.pages.find(page=>page.start===first._pageStart):entry.pages.filter(page=>page.start<first._pageStart).at(-1);
+  const page=first._clipped?entry.pages.find(page=>page.start===first._pageStart):entry.pages[entry.pages.findIndex(page=>page.start===first._pageStart)-1];
   const start=page?.start,end=page?.next??first._pageStart;
   return start===undefined&&!end?null:{first,start,end,key:`${entry.generation}:${start}:${end}:${first.id}`};
  }
@@ -525,7 +535,7 @@ function mountChat(root,opts){
    const res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:start??0,end_offset:end,...start===undefined?{latest:true}:{}});
    if(!current())return;
    const responseStart=res?.page_start??start;
-   if(!res||res.next_offset!==end||res.reset||res.generation!==generation||entry.generation!==generation||!Number.isSafeInteger(responseStart)||responseStart<0||responseStart>=end||start!==undefined&&responseStart!==start)throw new Error(t('Transcript changed. Return to latest and retry.'));
+   if(!res||res.next_offset!==end||res.reset||res.generation!==generation||entry.generation!==generation||!Number.isSafeInteger(responseStart)||responseStart<0||responseStart===end||start!==undefined&&responseStart!==start)throw new Error(t('Transcript changed. Return to latest and retry.'));
    // Capture the viewport after any scrolling during the RPC, before changing chrome/items.
    following=false;const anchor=readerAnchor();
    start=responseStart;rememberPage(start,res.next_offset);

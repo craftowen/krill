@@ -4,6 +4,9 @@
 //! 4대 에이전트(`claude`·`codex`·`agy`·`opencode`)의 대화를 단일 `ChatItem` 스키마
 //! (`User`·`Assistant`·`Reasoning`·`ToolCall`·`ToolResult`·`Question`·`Permission`)로 정규화한다.
 
+#[cfg(test)]
+mod opaque_replay_tests;
+
 use crate::session::lock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -30,7 +33,8 @@ use super::vault::{
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
 const MAX_POLL_BYTES: u64 = 512 * 1024;
 const MAX_SKIP_BYTES: u64 = 64 * 1024 * 1024;
-// End cursors carry a fingerprint; historical boundaries are item indexes. Both fit JS numbers.
+// OpenCode JSON end fingerprints and SQLite proof tokens fit JS-safe integers.
+// Tokens are opaque: only byte/raw-row cursors have numeric ordering.
 const OPENCODE_END: u64 = 1 << 52;
 
 /// Global per-resolution work budget shared by recursive directory walks.
@@ -176,15 +180,18 @@ pub(crate) fn replay_page(
     offset: u64,
     end_offset: u64,
 ) -> std::io::Result<ChatPollSnapshot> {
-    if end_offset <= offset {
-        return Err(std::io::Error::other("invalid chat page boundary"));
-    }
     if snapshot.reset || !snapshot.bound {
         return Ok(snapshot);
     }
     let agent = VaultAgent::parse(&snapshot.agent)
         .ok_or_else(|| std::io::Error::other("unknown chat transcript agent"))?;
     let path = Path::new(&snapshot.transcript_path);
+    let database = agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "db");
+    // SQLite validates decoded proof positions in its read transaction. Its end
+    // token may be numerically smaller than the start after an append.
+    if end_offset == offset || (!database && end_offset < offset) {
+        return Err(std::io::Error::other("invalid chat page boundary"));
+    }
     if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json" || e == "db") {
         return Ok(poll_opencode_session(
             &snapshot.agent,
@@ -622,6 +629,10 @@ fn poll_opencode_database(
         ..Default::default()
     };
     let proof = database_proof(path, sid, offset);
+    if limit.is_some() && offset >= DB_PARTIAL && proof.is_none() {
+        page.reset = true;
+        return page;
+    }
     let mut start = proof.map_or(offset, |(rows, _)| rows);
     let mut reset = offset > 0 && limit.is_none() && proof.is_none();
     if reset {
@@ -631,6 +642,10 @@ fn poll_opencode_database(
         .filter(|end| *end >= DB_PARTIAL)
         .and_then(|end| database_proof(path, sid, end));
     if limit.is_some_and(|end| end >= DB_PARTIAL) && end_proof.is_none() {
+        page.reset = true;
+        return page;
+    }
+    if limit.is_some_and(|end| end_proof.map_or(end, |(rows, _)| rows) <= start) {
         page.reset = true;
         return page;
     }
@@ -693,7 +708,11 @@ fn poll_opencode_database(
         consumed = consumed.saturating_add(1);
         digest = proof;
     }
-    page.next_offset = if limit.is_some_and(|n| n < DB_PARTIAL) {
+    page.next_offset = if limit.is_some() && consumed == end {
+        // A verified historical boundary is immutable, even if it used to be the
+        // live end and new rows now follow it. Preserve its exact observed token.
+        limit.unwrap_or(consumed)
+    } else if limit.is_some_and(|n| n < DB_PARTIAL) {
         consumed
     } else {
         let Some(cursor) = database_cursor(path, sid, consumed, digest, consumed >= total) else {
@@ -722,10 +741,26 @@ fn latest_opencode_database(
         .first()
         .ok_or_else(|| std::io::Error::other("missing OpenCode session"))?
         .message_count;
-    let end = before.unwrap_or(total).min(total);
+    let proof = before
+        .filter(|end| *end >= DB_PARTIAL)
+        .map(|end| {
+            database_proof(path, &snapshot.session_id, end)
+                .ok_or_else(|| std::io::Error::other("expired OpenCode database boundary"))
+        })
+        .transpose()?;
+    let end = proof
+        .map(|(rows, _)| rows)
+        .or(before)
+        .unwrap_or(total)
+        .min(total);
     let start = end.saturating_sub(u64::try_from(MAX_CHAT_ITEMS).unwrap_or(128));
-    let batch = super::opencode_sqlite::read_page(path, &snapshot.session_id, start)
-        .map_err(std::io::Error::other)?;
+    let batch = super::opencode_sqlite::read_page_verified(
+        path,
+        &snapshot.session_id,
+        start,
+        proof.map(|(rows, _)| rows),
+    )
+    .map_err(std::io::Error::other)?;
     if batch.truncated || batch.skipped {
         return Err(std::io::Error::other("incomplete OpenCode database page"));
     }
@@ -734,7 +769,9 @@ fn latest_opencode_database(
         .into_iter()
         .next()
         .ok_or_else(|| std::io::Error::other("missing OpenCode session"))?;
-    if session.message_count != total {
+    if session.message_count != total
+        || proof.is_some_and(|(_, digest)| session.verified_end != Some(digest))
+    {
         return Err(std::io::Error::other(
             "OpenCode database changed during history read; retry",
         ));
@@ -763,7 +800,11 @@ fn latest_opencode_database(
     let mut page = snapshot.clone();
     page.items = records.into_iter().rev().flatten().collect();
     page.next_offset = if before.is_some() {
-        end
+        if proof.is_some() {
+            before.unwrap_or(end)
+        } else {
+            end
+        }
     } else {
         let digest = session
             .message_digests
