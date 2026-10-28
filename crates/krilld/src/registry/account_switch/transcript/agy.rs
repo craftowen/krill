@@ -348,7 +348,27 @@ impl Staged {
         fs::create_dir_all(scratch)?;
         let staged = Self(scratch.join(format!("{}.tmp", unique_suffix())));
         fs::copy(source, &staged.0)?;
-        File::open(&staged.0)?.sync_all()?;
+        #[cfg(windows)]
+        {
+            // Only this private copy becomes writable, so the selected account
+            // can append turns and failed staging can be removed on Windows.
+            let mut permissions = fs::metadata(&staged.0)?.permissions();
+            if permissions.readonly() {
+                #[expect(
+                    clippy::permissions_set_readonly_false,
+                    reason = "Windows attribute on our owned staging copy; Unix permissions are preserved"
+                )]
+                permissions.set_readonly(false);
+                fs::set_permissions(&staged.0, permissions)?;
+            }
+        }
+        // FlushFileBuffers requires write access on Windows. Unix also permits
+        // syncing a read-only copy, whose permissions fs::copy preserves.
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        options.write(true);
+        options.open(&staged.0)?.sync_all()?;
         Ok(staged)
     }
 
@@ -522,6 +542,36 @@ mod tests {
 
     fn os_error(result: io::Result<Bridge>) -> Option<i32> {
         result.err().and_then(|e| e.raw_os_error())
+    }
+
+    #[test]
+    fn readonly_source_is_preserved_and_its_staged_copy_is_removed() {
+        let f = Fixture::new("readonly");
+        Fixture::write_db(&f.source, b"readonly source");
+        let source = Fixture::db(&f.source);
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).unwrap();
+        let staged = Staged::copy(&source, &f.target.join("scratch")).unwrap();
+        let scratch = staged.path().to_owned();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&scratch).unwrap());
+        assert!(fs::metadata(&source).unwrap().permissions().readonly());
+        #[cfg(windows)]
+        assert!(!fs::metadata(&scratch).unwrap().permissions().readonly());
+        #[cfg(unix)]
+        assert!(fs::metadata(&scratch).unwrap().permissions().readonly());
+        drop(staged);
+        assert!(!scratch.exists());
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&source).unwrap().permissions();
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows-only cleanup of this test's source file"
+            )]
+            permissions.set_readonly(false);
+            fs::set_permissions(source, permissions).unwrap();
+        }
     }
 
     #[test]

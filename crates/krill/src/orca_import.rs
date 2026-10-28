@@ -1645,7 +1645,7 @@ fn find_registered_account<'a>(
 /// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
 /// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
 fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
-    let mut parts = dir.split('/');
+    let mut parts = dir.split(['/', '\\']);
     let leaf = parts.next_back()?;
     let uuid = parts.next_back()?;
     let parent = parts.next_back()?;
@@ -5458,7 +5458,7 @@ mod tests {
             "automations".to_owned(),
             serde_json::json!([
                 { "id": "current", "name": "Current Job", "prompt": "audit", "agentId": "codex", "rrule": "15 3 * * 1-5", "dtstart": 1_792_850_000_123_u64, "enabled": false,
-                  "runContext": { "path": "/tmp/current" }, "precheck": { "command": "git diff --quiet", "timeoutSeconds": 120 }, "workspaceMode": "new_per_run", "baseBranch": "dev", "reuseSession": true, "extraAgentArgs": "--model gpt", "missedRunGraceMinutes": 720 },
+                  "runContext": { "path": opts.home.join("current") }, "precheck": { "command": "git diff --quiet", "timeoutSeconds": 120 }, "workspaceMode": "new_per_run", "baseBranch": "dev", "reuseSession": true, "extraAgentArgs": "--model gpt", "missedRunGraceMinutes": 720 },
                 { "id": "float-date", "name": "Float", "prompt": "review", "dtstart": 1.5, "rrule": "FREQ=HOURLY;BYMINUTE=5", "precheck": "exit 0", "reuseSession": true },
                 { "id": "malformed", "prompt": 99 },
                 { "id": "null-date", "prompt": "null date", "dtstart": null, "rrule": "FREQ=DAILY;BYHOUR=10" },
@@ -5480,7 +5480,7 @@ mod tests {
         assert_eq!(entry.name.as_deref(), Some("Current Job"));
         assert!(!entry.enabled);
         assert_eq!(entry.cron, "15 3 * * 1-5");
-        assert_eq!(entry.cwd, "/tmp/current");
+        assert_eq!(Path::new(&entry.cwd), opts.home.join("current"));
         assert_eq!(entry.agent.as_deref(), Some("codex"));
         assert_eq!(entry.command, ["codex"]);
         assert_eq!(entry.precheck.as_deref(), Some("git diff --quiet"));
