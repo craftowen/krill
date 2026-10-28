@@ -970,7 +970,7 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let socket = dir.join("run/krilld.sock");
+                    let socket = krill_proto::daemon::socket_path(&dir)?;
                     if !socket.exists()
                         || krill_proto::os::net::UnixStream::connect(&socket).is_err()
                     {

@@ -728,7 +728,9 @@ fn probe_daemon_handshake(state_dir: Option<&Path>) -> bool {
     let Some(dir) = state_dir else {
         return false;
     };
-    let sock = dir.join("run").join("krilld.sock");
+    let Ok(sock) = krill_proto::daemon::socket_path(dir) else {
+        return false;
+    };
     if !sock.exists() {
         return false;
     }

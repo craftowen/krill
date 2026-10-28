@@ -997,7 +997,7 @@ impl OrchestrationStore {
         use crate::ipc::ClientRole;
         use crate::screen::Msg as _;
 
-        let socket = state_dir.join("run/krilld.sock");
+        let socket = crate::daemon::socket_path(state_dir)?;
         let hello = crate::daemon::client_hello(ClientRole::Cli, "krill-orch");
         let Ok(mut conn) = crate::daemon::handshake(&socket, &hello, Duration::from_secs(2)) else {
             return Ok(None);

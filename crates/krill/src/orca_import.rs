@@ -1294,9 +1294,12 @@ fn import_accounts_domain_inner(
         return summary;
     }
 
-    let socket = opts.state_dir.join("run").join("krilld.sock");
+    let socket = daemon::socket_path(&opts.state_dir).map_err(|error| error.to_string());
     let auto_start = should_auto_start_daemon(opts.dry_run);
-    match daemon_usage_request(&socket, &UsageRequest::ListAccounts, auto_start) {
+    match socket.and_then(|socket| {
+        daemon_usage_request(&socket, &UsageRequest::ListAccounts, auto_start)
+            .map(|snapshot| (socket, snapshot))
+    }) {
         Err(e) if !opts.dry_run => {
             // AS-03: 데몬 자동 기동까지 실패해 연결할 수 없으면 로컬 파일(accounts.toml)을 직접 쓰지 않고
             // '데몬 필요' 사유로 accounts 도메인을 스킵한 뒤 다른 도메인만 진행한다.
@@ -1352,7 +1355,7 @@ fn import_accounts_domain_inner(
             }
             return summary;
         }
-        Ok(mut snap) => {
+        Ok((socket, mut snap)) => {
             for cand in planned {
                 if let Some(existing) = find_registered_account(&snap, &cand) {
                     let kept_id = existing.id.clone();
@@ -1987,11 +1990,13 @@ fn import_sessions_domain(
         .collect();
     let mut conn = None;
     if !opts.dry_run {
-        let socket = opts.state_dir.join("run").join("krilld.sock");
+        let socket = daemon::socket_path(&opts.state_dir).map_err(|error| error.to_string());
         let mut hello = daemon::client_hello(ClientRole::Cli, "krill import orca");
         let required = FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_AI_VAULT;
         hello.features |= required;
-        match connect_daemon(&socket, &hello, should_auto_start_daemon(false)) {
+        match socket
+            .and_then(|socket| connect_daemon(&socket, &hello, should_auto_start_daemon(false)))
+        {
             Ok(c) if c.negotiated.features & required == required => conn = Some(c),
             Ok(_) => {
                 summary.skipped = true;

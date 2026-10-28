@@ -2069,7 +2069,22 @@ pub(crate) fn pane_env_in(
     session: krill_proto::SessionId,
     state: Option<&Path>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pane_env_with_socket(
+        session,
+        state,
+        std::env::var_os("KRILL_SOCKET_DIR").as_deref(),
+    )
+}
+
+fn pane_env_with_socket(
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    socket_dir: Option<&std::ffi::OsStr>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut env = vec![(b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes())];
+    if let Some(socket_dir) = socket_dir {
+        env.push((b"KRILL_SOCKET_DIR".to_vec(), socket_dir.as_bytes().to_vec()));
+    }
     if let Ok(executable) = mk_bin() {
         env.push((
             b"KRILL_CLI".to_vec(),

@@ -1971,3 +1971,50 @@ set_env "$CUSTOM_A"; export XDG_DATA_HOME=/user/changed; : > "$KRILL_STATE_DIR/a
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn pane_env_propagates_only_explicit_socket_override() {
+    let env = pane_env_with_socket(
+        krill_proto::SessionId(7),
+        Some(Path::new("/state")),
+        Some(OsStr::new("/private/socket-root")),
+    );
+    assert!(env.contains(&kv("KRILL_SOCKET_DIR", "/private/socket-root")));
+    assert!(env.contains(&kv("KRILL_STATE_DIR", "/state")));
+    assert_eq!(env.len(), 4); // Pane ID, CLI, state, socket root; no arbitrary parent env.
+    // Preserve invalid overrides too: consumers must report them, never use the old endpoint.
+    let env = pane_env_with_socket(
+        krill_proto::SessionId(7),
+        None,
+        Some(OsStr::new("relative")),
+    );
+    assert!(env.contains(&kv("KRILL_SOCKET_DIR", "relative")));
+}
+
+#[test]
+fn pane_env_inherits_socket_override_from_process() {
+    const CHILD: &str = "KRILL_PANE_ENV_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let env = pane_env_in(krill_proto::SessionId(11), Some(Path::new("/state")));
+        assert!(env.contains(&kv("KRILL_SOCKET_DIR", "private-socket-root")));
+        assert!(!env.iter().any(|(key, _)| key == b"UNRELATED_SECRET"));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agent::tests::pane_env_inherits_socket_override_from_process",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("KRILL_SOCKET_DIR", "private-socket-root")
+        .env("UNRELATED_SECRET", "must-not-propagate")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("1 passed")
+    );
+}

@@ -125,6 +125,7 @@ const PATH_PROBE: &str = "/usr/bin/printf '\\n__MK_PATH__='; /usr/bin/printenv P
 /// `XPC_*`·`__CFBundleIdentifier`는 부모 잡을 가리키는 값이라 넘기지 않는다.
 const KEEP: &[&[u8]] = &[
     b"TMPDIR",
+    b"KRILL_SOCKET_DIR",
     b"SSH_AUTH_SOCK",
     b"__CF_USER_TEXT_ENCODING",
     b"COMMAND_MODE",
@@ -750,5 +751,29 @@ mod windows_bootstrap_tests {
                 explicit
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_environment_tests {
+    use super::*;
+
+    #[test]
+    fn socket_override_survives_filtered_shell_environment() {
+        let inherited = vec![
+            (
+                b"KRILL_SOCKET_DIR".to_vec(),
+                b"private-socket-root".to_vec(),
+            ),
+            (b"UNRELATED_SECRET".to_vec(), b"do-not-inherit".to_vec()),
+        ];
+        let launch = Shell::Login.launch_with_lang(None, inherited, None);
+        assert!(launch.env.contains(&(
+            b"KRILL_SOCKET_DIR".to_vec(),
+            b"private-socket-root".to_vec()
+        )));
+        assert!(!launch.env.iter().any(|(key, _)| key == b"UNRELATED_SECRET"));
+        #[cfg(windows)]
+        assert!(keep(b"krill_socket_dir"));
     }
 }

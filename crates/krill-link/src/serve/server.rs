@@ -350,7 +350,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
     let state_dir = opts.state_dir.clone();
     let instance_lock =
         acquire_instance_lock(&state_dir.join("run/link-serve.lock")).map_err(Error::Io)?;
-    let krilld_sock = opts.effective_krilld_socket();
+    let krilld_sock = opts.effective_krilld_socket().map_err(Error::Io)?;
     let cfg = LinkConfig::load(&state_dir)?;
     let identity = DeviceIdentity::load_or_create(&state_dir)?;
     let initial_allowed = load_allowed_node_set(&state_dir)?;
