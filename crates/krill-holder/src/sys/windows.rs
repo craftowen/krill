@@ -222,11 +222,14 @@ impl Api {
     pub fn load() -> Self {
         static API: std::sync::OnceLock<Api> = std::sync::OnceLock::new();
         *API.get_or_init(|| {
-            Self::bundle().unwrap_or(Self {
-                create: winconsole::CreatePseudoConsole,
-                resize: winconsole::ResizePseudoConsole,
-                close: winconsole::ClosePseudoConsole,
-                pack: None,
+            Self::bundle().unwrap_or_else(|error| {
+                tracing::warn!(%error, "bundled ConPTY unavailable; only legacy inbox adoption is supported");
+                Self {
+                    create: winconsole::CreatePseudoConsole,
+                    resize: winconsole::ResizePseudoConsole,
+                    close: winconsole::ClosePseudoConsole,
+                    pack: None,
+                }
             })
         })
     }
@@ -306,10 +309,19 @@ pub struct Console {
 }
 impl Console {
     pub fn create(api: Api, size: WinSize) -> io::Result<Self> {
+        // Preserve adoption of existing inbox sessions, but never dereference a new
+        // opaque OS HPCON. Only the packaging-pinned bundled ABI is supported here.
+        if api.inbox() {
+            tracing::error!("new sessions require bundled conpty.dll and x64/OpenConsole.exe");
+            // Preserve a meaningful Windows error across the existing errno-only
+            // SpawnFailed contract; a synthetic ErrorKind would become access denied.
+            return Err(io::Error::from_raw_os_error(126)); // ERROR_MOD_NOT_FOUND
+        }
         let (input, writer) = pipe()?;
         let (reader, output) = pipe()?;
         let mut h = 0;
-        // SAFETY: pipe ends and output are live. Bundled flag 0x8 enables passthrough (OWE-826).
+        // SAFETY: pipe ends and output are live. Pinned conpty.h defines 0x08 as
+        // PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES; it does not enable VT passthrough.
         hr(unsafe {
             (api.create)(
                 coord(size)?,
@@ -319,8 +331,8 @@ impl Console {
                 &raw mut h,
             )
         })?;
-        // SAFETY: winconpty.h defines the ABI as signal/reference/conhost process handles.
-        // Inbox layout remains an OS compatibility dependency (OWE-826); never use it for pack.
+        // SAFETY: the packaging-pinned bundled winconpty.h ABI has these three fields;
+        // the undocumented inbox HPCON path was rejected before creation.
         let fields = unsafe { *(h as *const [HANDLE; 3]) };
         let copies = fields
             .into_iter()
@@ -1016,6 +1028,29 @@ pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_inbox_session_is_rejected_before_calling_an_opaque_backend() {
+        static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        extern "system" fn forbidden_create(
+            _: COORD,
+            _: HANDLE,
+            _: HANDLE,
+            _: u32,
+            _: *mut HPCON,
+        ) -> i32 {
+            CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            -1
+        }
+        let api = Api {
+            create: forbidden_create,
+            resize: winconsole::ResizePseudoConsole,
+            close: winconsole::ClosePseudoConsole,
+            pack: None,
+        };
+        let error = Console::create(api, WinSize { cols: 80, rows: 24 }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(126));
+        assert!(!CALLED.load(std::sync::atomic::Ordering::SeqCst));
+    }
     #[test]
     fn failed_send_reclaims_remote_copy() -> io::Result<()> {
         let target = duplicate_target(std::process::id())?;

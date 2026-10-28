@@ -19,6 +19,11 @@ Krill-<ver>-windows-x64.zip
 새 터미널 세션에는 고정된 `conpty.dll`·`x64\OpenConsole.exe`가 모두 필요하다. 누락되거나 해시가 다른 패키지는
 생성·업데이트를 거부한다. 기존 inbox 세션의 재연결은 보존하지만 새 세션에서 불투명한 OS HPCON 구조를 역참조하지 않는다.
 
+Windows 사용자 프로필·`LOCALAPPDATA`가 길어 AF_UNIX 경로 한도를 넘으면, 사용자만 접근할 수 있는 짧은
+절대 디렉터리를 만들고 `KRILL_SOCKET_DIR`로 지정한다(예: `C:\ks\owen`). 앱과 CLI를 같은 환경에서 실행한다.
+소켓 이름은 상태 디렉터리별 해시로 구분하며 영구 데이터는 기존 `LOCALAPPDATA\Krill`에 둔다.
+`KRILL_STATE_DIR`를 짧게 지정하는 기존 우회도 지원한다.
+
 ## ConPTY 파일 받기 (저장소에 넣지 않음)
 
 | 항목 | 값 |

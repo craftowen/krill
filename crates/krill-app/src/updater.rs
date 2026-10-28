@@ -708,8 +708,8 @@ pub fn validate_bundle_layout(app_bundle: &Path) -> Result<Vec<PathBuf>, Error> 
     Ok(binaries)
 }
 
-/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개)를 확인하고 실행 파일 목록을 돌려준다.
-/// `krill-link.exe`·`conpty.dll`·`x64\OpenConsole.exe`는 선택이다(없으면 holder는 kernel32 축소 모드).
+/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개, 번들 ConPTY)를 확인하고 실행 파일 목록을 돌려준다.
+/// `krill-link.exe`는 선택이다. 새 세션은 고정된 번들 `ConPTY` ABI를 요구한다.
 pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut binaries = Vec::new();
     for name in [
@@ -733,7 +733,43 @@ pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
             dir.display()
         )));
     }
+    for name in ["conpty.dll", "x64/OpenConsole.exe"] {
+        if !dir.join(name).is_file() {
+            return Err(Error::BundleStructure(format!(
+                "missing {name} in {}",
+                dir.display()
+            )));
+        }
+    }
     Ok(binaries)
+}
+
+#[cfg(test)]
+#[test]
+fn windows_install_layout_requires_both_conpty_components() {
+    let dir = std::env::temp_dir().join(format!("krill-conpty-layout-{}", std::process::id()));
+    fs::create_dir_all(dir.join("x64")).unwrap();
+    for name in [
+        "Krill.json",
+        "krill-holder.exe",
+        "krilld.exe",
+        "krill.exe",
+        "krill-app.exe",
+        "conpty.dll",
+        "x64/OpenConsole.exe",
+    ] {
+        fs::write(dir.join(name), b"fixture").unwrap();
+    }
+    assert_eq!(validate_install_layout(&dir).unwrap().len(), 4);
+    for name in ["conpty.dll", "x64/OpenConsole.exe"] {
+        fs::remove_file(dir.join(name)).unwrap();
+        assert!(matches!(
+            validate_install_layout(&dir),
+            Err(Error::BundleStructure(_))
+        ));
+        fs::write(dir.join(name), b"fixture").unwrap();
+    }
+    fs::remove_dir_all(dir).unwrap();
 }
 
 impl CodeVerifier for CodesignVerifier {
