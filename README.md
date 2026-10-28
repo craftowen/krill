@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <strong>Parallel AI coding agents in pure Rust — 1/15th the memory of Orca (Electron).</strong><br/>
-  Run Claude Code, Codex, Antigravity, Cursor, and OpenCode side-by-side in isolated Git worktrees with persistent sessions — using <strong>85.9 MiB RAM</strong> instead of <strong>1,274.9 MiB</strong> at 10 terminals.
+  <strong>Run many CLI coding agents side by side in a native app — no Electron, no web view.</strong><br/>
+  Claude Code, Codex, Antigravity, Cursor, and OpenCode each get a Git worktree and terminal, with a queue of the agents waiting on you and diff review. In our 10-terminal benchmark (2026-10-25, Krill 0.2.2 vs Orca 1.4.237) Krill used <strong>85.9 MiB</strong> instead of <strong>1,274.9 MiB</strong>, about 1/15th; it was slower in one 20-terminal output test (see below).
 </p>
 
 <p align="center">

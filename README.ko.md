@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <strong>순수 Rust로 구현한 병렬 AI 에이전트 워크스페이스 — Orca(Electron) 대비 메모리 15분의 1.</strong><br/>
-  Claude Code, Codex, Antigravity, Cursor, OpenCode를 격리된 Git 워크트리에서 세션 유실 없이 실행하세요 — 터미널 10개 기준 <strong>1,274.9 MiB</strong> 대신 <strong>85.9 MiB</strong>만 씁니다.
+  <strong>코딩 에이전트 여러 개를 나란히 돌리는 네이티브 앱 — Electron도 웹뷰도 없습니다.</strong><br/>
+  Claude Code, Codex, Antigravity, Cursor, OpenCode마다 Git 워크트리와 터미널을 따로 주고, 나를 기다리는 에이전트 목록과 diff 리뷰를 함께 제공합니다. 2026-10-25 터미널 10개 벤치마크(Krill 0.2.2 vs Orca 1.4.237)에서 Krill은 <strong>1,274.9 MiB</strong> 대신 <strong>85.9 MiB</strong>, 약 15분의 1을 썼습니다. 터미널 20개 출력 테스트 하나에서는 Krill이 더 느렸습니다(아래 표 참고).
 </p>
 
 <p align="center">
