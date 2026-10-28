@@ -123,11 +123,18 @@ impl Shell {
                 .session_on(self.layout.host(pane), session)
         });
         let foreground = status.and_then(|session| session.status.foreground.as_deref());
+        let observed = status.and_then(|session| session.status.root_shell.as_deref());
         let shell = foreground
             .and_then(family)
+            .or_else(|| observed.and_then(|root| family(&root.program)))
             .or(custom_shell)
             .unwrap_or_else(|| {
-                if self.layout.host(pane).is_remote() {
+                if let Some(root) = observed {
+                    match root.os {
+                        krill_proto::control::ShellOs::Windows => ShellFamily::WindowsUnknown,
+                        krill_proto::control::ShellOs::Unix => ShellFamily::Unknown,
+                    }
+                } else if self.layout.host(pane).is_remote() {
                     ShellFamily::Unknown
                 } else if cfg!(windows) {
                     ShellFamily::WindowsUnknown
@@ -136,11 +143,11 @@ impl Shell {
                 }
             });
         let attachment_agent =
-            |id: &str| matches!(krill_proto::agent::canonical_id(id), "claude" | "codex");
+            |id: &str| matches!(krill_proto::agent::executable_id(id), "claude" | "codex");
         let image_attachments = match launch {
             Some(Program::Agent { id }) => krill_proto::agent::decode_agent_program_id(id)
                 .is_ok_and(|(id, _)| attachment_agent(id)),
-            _ => foreground.is_some_and(|name| attachment_agent(name.trim_end_matches(".exe"))),
+            _ => foreground.is_some_and(attachment_agent),
         };
         DropPolicy {
             shell,
@@ -155,34 +162,55 @@ impl Shell {
     ) -> krill_term::paste::InputPolicy {
         use krill_proto::control::Program;
         use krill_term::paste::InputPolicy;
-        if !cfg!(windows) || self.layout.host(pane).is_remote() {
+        let status = self.layout.session(pane).and_then(|session| {
+            self.sidebar
+                .read(cx)
+                .session_on(self.layout.host(pane), session)
+        });
+        let windows = status
+            .and_then(|session| session.status.root_shell.as_deref())
+            .map_or(
+                cfg!(windows) && !self.layout.host(pane).is_remote(),
+                |root| root.os == krill_proto::control::ShellOs::Windows,
+            );
+        if !windows {
+            return InputPolicy::ByteStream;
+        }
+        if status
+            .and_then(|session| session.status.root_shell.as_deref())
+            .is_some_and(|root| {
+                matches!(
+                    krill_proto::agent::executable_id(&root.program)
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "wsl" | "wslhost" | "ssh"
+                )
+            })
+        {
+            // The daemon's OS does not describe the consumer behind a nested
+            // WSL/SSH byte stream. Never apply native console input-record rules.
             return InputPolicy::ByteStream;
         }
         let policy = |name: &str| {
-            let name = name
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(name)
-                .to_ascii_lowercase();
-            match krill_proto::agent::canonical_id(name.trim_end_matches(".exe")) {
+            let name = krill_proto::agent::executable_id(name).to_ascii_lowercase();
+            match name.as_str() {
                 "codex" => InputPolicy::WindowsCodex,
                 "pi" => InputPolicy::WindowsPi,
                 _ => InputPolicy::ByteStream,
             }
         };
-        if let Some(foreground) = self
-            .layout
-            .session(pane)
-            .and_then(|session| {
-                self.sidebar
-                    .read(cx)
-                    .session_on(self.layout.host(pane), session)
-            })
-            .and_then(|session| session.status.foreground.as_deref())
-        {
+        if let Some(foreground) = status.and_then(|session| session.status.foreground.as_deref()) {
             let detected = policy(foreground);
             if detected != InputPolicy::ByteStream {
                 return detected;
+            }
+            if matches!(
+                krill_proto::agent::executable_id(foreground)
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "cmd" | "pwsh" | "powershell" | "bash" | "zsh" | "sh" | "fish" | "wsl" | "ssh"
+            ) {
+                return InputPolicy::ByteStream;
             }
         }
         match self.layout.launch(pane).map(|launch| &launch.program) {

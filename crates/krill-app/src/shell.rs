@@ -5371,7 +5371,12 @@ impl Shell {
                 .is_some_and(|l| {
                     let screen = l.pane.shown();
                     screen.cursor.visible
-                        && krill_app::terminal::effective_cursor(screen.cursor_style, default).blink
+                        && krill_app::terminal::effective_cursor(
+                            screen.cursor_style,
+                            screen.cursor_explicit,
+                            default,
+                        )
+                        .blink
                 });
         if !blink {
             self.cursor_blink = None;
@@ -6423,6 +6428,7 @@ impl Shell {
                 el.opacity = krill_app::settings::terminal_opacity_alpha(cx);
                 el.cursor = krill_app::terminal::effective_cursor(
                     el.screen.cursor_style,
+                    el.screen.cursor_explicit,
                     krill_app::settings::terminal_cursor(cx),
                 );
                 el.cursor_hidden = focused && self.cursor_blink.as_ref().is_some_and(|b| b.1);

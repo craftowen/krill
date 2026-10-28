@@ -1287,3 +1287,110 @@ fn input_policy_late_preparation_cannot_reuse_a_changed_shell_or_attachment_poli
     peer.set_nonblocking(true).unwrap();
     assert!(peer.read(&mut [0; 64]).is_err());
 }
+
+#[gpui::test]
+fn input_policy_uses_observed_remote_shell_and_os_without_local_platform_guesses(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_proto::control::{AgentStatus, Create, Program, RootShell, ShellOs};
+    use krill_term::paste::{InputPolicy, ShellFamily};
+    let (view, cx) = open(cx, state_path("observed-remote-input-policy"));
+    for (os, program, foreground, expected_shell, expected_input) in [
+        (
+            ShellOs::Windows,
+            "pwsh.exe",
+            "C:\\tools\\CODEX.CMD",
+            ShellFamily::PowerShell,
+            InputPolicy::WindowsCodex,
+        ),
+        (
+            ShellOs::Windows,
+            "cmd.exe",
+            "PI.EXE",
+            ShellFamily::Cmd,
+            InputPolicy::WindowsPi,
+        ),
+        (
+            ShellOs::Unix,
+            "zsh",
+            "codex",
+            ShellFamily::Posix,
+            InputPolicy::ByteStream,
+        ),
+        (
+            ShellOs::Unix,
+            "nu",
+            "",
+            ShellFamily::Unknown,
+            InputPolicy::ByteStream,
+        ),
+        (
+            ShellOs::Windows,
+            "codex.exe",
+            "powershell.exe",
+            ShellFamily::PowerShell,
+            InputPolicy::ByteStream,
+        ),
+        (
+            ShellOs::Windows,
+            "wsl.exe",
+            "codex",
+            ShellFamily::WindowsUnknown,
+            InputPolicy::ByteStream,
+        ),
+    ] {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            let session = krill_proto::SessionId(777);
+            shell.layout.set_session(pane, session);
+            shell
+                .layout
+                .set_host(pane, HostId::Remote("observed".into()));
+            shell.layout.set_launch(
+                pane,
+                Create {
+                    program: Program::Agent { id: "codex".into() },
+                    cwd: vec![],
+                    cols: 80,
+                    rows: 24,
+                    account: None,
+                },
+            );
+            shell.sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_remote_snapshot_for_test(
+                    "observed",
+                    HostStatus::Connected,
+                    krill_app::sidebar::Snapshot {
+                        sessions: vec![krill_app::sidebar::Session {
+                            id: session,
+                            status: AgentStatus {
+                                foreground: (!foreground.is_empty()).then(|| foreground.to_owned()),
+                                root_shell: Some(Box::new(RootShell {
+                                    os,
+                                    program: program.into(),
+                                })),
+                                ..AgentStatus::UNKNOWN
+                            },
+                            cwd: None,
+                            worktree: None,
+                            account: None,
+                        }],
+                        trees: std::collections::BTreeMap::default(),
+                    },
+                    cx,
+                );
+            });
+            assert_eq!(
+                shell.drop_policy_for(pane, cx).shell,
+                expected_shell,
+                "{program}/{foreground}"
+            );
+            assert_eq!(
+                shell.input_policy_for(pane, cx),
+                expected_input,
+                "{program}/{foreground}"
+            );
+        });
+    }
+}

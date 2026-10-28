@@ -365,15 +365,23 @@ fn effective_cursor_uses_setting_only_when_program_is_silent() {
         shape: CursorShape::Bar,
         blink: true,
     };
-    assert_eq!(effective_cursor(CursorStyle::default(), setting), setting);
+    assert_eq!(
+        effective_cursor(CursorStyle::default(), false, setting),
+        setting
+    );
+    assert_eq!(
+        effective_cursor(CursorStyle::default(), true, setting),
+        CursorStyle::default()
+    );
     let program = CursorStyle {
         shape: CursorShape::Underline,
         blink: false,
     };
-    assert_eq!(effective_cursor(program, setting), program);
+    assert_eq!(effective_cursor(program, true, setting), program);
+    assert_eq!(effective_cursor(program, false, setting), program);
     // 설정도 기본값이면 지금과 같은 깜박이지 않는 블록.
     assert_eq!(
-        effective_cursor(CursorStyle::default(), CursorStyle::default()),
+        effective_cursor(CursorStyle::default(), false, CursorStyle::default()),
         CursorStyle::default()
     );
 }

@@ -108,10 +108,10 @@ fn text_run(family: &SharedString, len: usize, bold: bool, italic: bool) -> Text
 }
 
 /// 프로그램이 DECSCUSR로 커서를 지정하지 않았으면(기본값 그대로) 설정 기본 커서를 쓴다(OWE-658).
-// ponytail: 화면은 "미지정"과 "DECSCUSR 2(깜박이지 않는 블록)"를 구분하지 못해 둘 다 설정값을 따른다.
-// 구분이 필요하면 krill-proto `CursorStyle`에 지정 여부를 싣는다(와이어 변경).
-pub fn effective_cursor(program: CursorStyle, default: CursorStyle) -> CursorStyle {
-    if program == CursorStyle::default() {
+/// The explicit marker distinguishes a requested steady block from an implicit
+/// default. A legacy daemon has no marker; retain its non-default style fallback.
+pub fn effective_cursor(program: CursorStyle, explicit: bool, default: CursorStyle) -> CursorStyle {
+    if !explicit && program == CursorStyle::default() {
         default
     } else {
         program
@@ -157,6 +157,7 @@ impl Render for Terminal {
         element.opacity = crate::settings::terminal_opacity_alpha(cx);
         element.cursor = effective_cursor(
             self.screen.cursor_style,
+            self.screen.cursor_explicit,
             crate::settings::terminal_cursor(cx),
         );
         element
