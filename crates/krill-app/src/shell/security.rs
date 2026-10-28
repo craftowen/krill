@@ -68,6 +68,7 @@ struct QueuedInput {
     session: Option<krill_proto::SessionId>,
     kind: QueuedKind,
     attachment: bool,
+    files: bool,
     drop_policy: Option<DropPolicy>,
 }
 impl QueuedInput {
@@ -95,6 +96,14 @@ enum QueuedKind {
 }
 
 impl Shell {
+    fn mark_file_paste(&mut self, id: u64) {
+        for entry in &mut self.paste_queue.entries {
+            if matches!(entry.kind, QueuedKind::Paste(request, _) if request == id) {
+                entry.files = true;
+            }
+        }
+    }
+
     fn drop_policy_for(&self, pane: PaneId, cx: &App) -> DropPolicy {
         use krill_proto::control::Program;
         let family = |name: &str| {
@@ -144,14 +153,31 @@ impl Shell {
             });
         let attachment_agent =
             |id: &str| matches!(krill_proto::agent::executable_id(id), "claude" | "codex");
-        let image_attachments = match launch {
-            Some(Program::Agent { id }) => krill_proto::agent::decode_agent_program_id(id)
-                .is_ok_and(|(id, _)| attachment_agent(id)),
-            _ => foreground.is_some_and(attachment_agent),
+        let image_attachments = if foreground.and_then(family).is_some() {
+            // An interactive tool shell owns the input while the provider waits.
+            false
+        } else {
+            match launch {
+                Some(Program::Agent { id }) => krill_proto::agent::decode_agent_program_id(id)
+                    .is_ok_and(|(id, _)| attachment_agent(id)),
+                _ => foreground.is_some_and(attachment_agent),
+            }
         };
         DropPolicy {
             shell,
             image_attachments,
+            windows_images: observed.map_or(
+                cfg!(windows) && !self.layout.host(pane).is_remote(),
+                |root| {
+                    root.os == krill_proto::control::ShellOs::Windows
+                        && !matches!(
+                            krill_proto::agent::executable_id(&root.program)
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "wsl" | "wslhost" | "ssh"
+                        )
+                },
+            ),
         }
     }
 
@@ -314,6 +340,7 @@ impl Shell {
             session,
             kind: QueuedKind::Paste(id, PreparedPaste::Pending),
             attachment: false,
+            files: false,
             drop_policy: Some(drop_policy),
         });
         let handle = window.window_handle();
@@ -445,6 +472,9 @@ impl Shell {
             let item = read.await.ok().flatten();
             #[cfg(not(test))]
             let item = augment_clipboard_item_from_pasteboard(item);
+            if item.as_ref().is_some_and(clipboard_has_files) {
+                this.update(cx, |this, _| this.mark_file_paste(id)).ok();
+            }
             let attachment = item
                 .as_ref()
                 .is_some_and(|item| clipboard_is_attachment(item, policy));
@@ -503,6 +533,7 @@ impl Shell {
                 policy,
             );
             if let Some(id) = self.begin_clipboard_paste(window, cx) {
+                self.mark_file_paste(id);
                 self.complete_attachment_paste(id, text, attachment, window, cx);
             }
             return;
@@ -517,6 +548,7 @@ impl Shell {
         let item = gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::ExternalPaths(paths.clone())],
         };
+        self.mark_file_paste(id);
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let attachment = clipboard_is_attachment(&item, policy);
@@ -569,6 +601,9 @@ impl Shell {
             .focused()
             .map_or_else(DropPolicy::default, |pane| self.drop_policy_for(pane, cx));
         let item = item.clone();
+        if clipboard_has_files(&item) {
+            self.mark_file_paste(id);
+        }
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let attachment = clipboard_is_attachment(&item, policy);
@@ -620,6 +655,7 @@ impl Shell {
             session,
             kind: QueuedKind::Bytes(bytes.to_vec()),
             attachment: false,
+            files: false,
             drop_policy: None,
         });
         true
@@ -759,20 +795,22 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let mut found = false;
-        for entry in &mut self.paste_queue.entries {
-            if let QueuedKind::Paste(request, ready @ PreparedPaste::Pending) = &mut entry.kind
-                && *request == id
-            {
-                *ready = PreparedPaste::Ready(payload);
-                found = true;
-                break;
-            }
-        }
         // Expired/cancelled requests cannot reinsert payloads into the stream.
-        if !found {
+        let Some(index) = self.paste_queue.entries.iter().position(|entry| {
+            matches!(entry.kind, QueuedKind::Paste(request, PreparedPaste::Pending) if request == id)
+        }) else {
             return;
+        };
+        let entry = &self.paste_queue.entries[index];
+        if payload.is_none()
+            && entry.files
+            && entry.targets(self)
+            && self.layout.focused() == Some(entry.pane)
+        {
+            self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
+            cx.notify();
         }
+        self.paste_queue.entries[index].kind = QueuedKind::Paste(id, PreparedPaste::Ready(payload));
         self.drain_paste_queue(cx);
         let _ = window;
     }
@@ -822,6 +860,10 @@ impl Shell {
                         .drop_policy
                         .is_some_and(|policy| policy != self.drop_policy_for(entry.pane, cx))
                     {
+                        if entry.files {
+                            self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
+                            cx.notify();
+                        }
                         continue;
                     }
                     let mut modes = modes;
@@ -906,6 +948,7 @@ impl Shell {
                     session,
                     kind: QueuedKind::Paste(id, PreparedPaste::Confirming(pending)),
                     attachment: false,
+                    files: false,
                     drop_policy: Some(drop_policy),
                 });
                 self.refresh_pending_paste_banner(cx);
@@ -1238,6 +1281,14 @@ impl Shell {
                     )),
             )
     }
+}
+
+fn clipboard_has_files(item: &gpui::ClipboardItem) -> bool {
+    item.entries().iter().any(|entry| match entry {
+        gpui::ClipboardEntry::ExternalPaths(paths) => !paths.paths().is_empty(),
+        gpui::ClipboardEntry::Image(image) => !image.bytes.is_empty(),
+        gpui::ClipboardEntry::String(_) => false,
+    })
 }
 
 fn clipboard_is_attachment(item: &gpui::ClipboardItem, policy: DropPolicy) -> bool {

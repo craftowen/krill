@@ -722,6 +722,7 @@ catalog! {
         LINK_OPEN => ("브라우저에서 열기", "Open in browser"),
         PASTE_CONFIRM => ("붙여넣기", "Paste"),
         PASTE_CANCEL => ("취소", "Cancel"),
+        FILE_PASTE_FAILED => ("파일 경로를 붙여넣지 못했습니다. 터미널의 셸과 경로를 확인하고 다시 시도하세요.", "Could not paste the file path. Check the terminal shell and path, then try again."),
         PASTE_WARNING => ("⚠ 여러 줄 붙여넣기 경고 ({lines}줄): 이 프로그램은 bracketed paste를 쓰지 않아 줄바꿈이 바로 실행될 수 있습니다 — {preview}", "⚠ Multiline paste warning ({lines} lines): this program does not use bracketed paste, so newlines may execute immediately — {preview}"),
     }
     crash {

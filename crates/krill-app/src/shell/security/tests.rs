@@ -1394,3 +1394,137 @@ fn input_policy_uses_observed_remote_shell_and_os_without_local_platform_guesses
         });
     }
 }
+
+// Regressions for native attachment formatting, shell handoff and refused file drops.
+#[expect(clippy::unwrap_used, reason = "test fixture opens one focused pane")]
+fn observed_status_for_attachment_regression(
+    shell: &mut super::Shell,
+    root: &str,
+    foreground: &str,
+    cx: &mut gpui::Context<super::Shell>,
+) -> krill_app::layout::PaneId {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_proto::control::{AgentStatus, Create, Program, RootShell, ShellOs};
+    let pane = shell.layout.focused().unwrap();
+    let session = krill_proto::SessionId(979);
+    shell.layout.set_session(pane, session);
+    shell
+        .layout
+        .set_host(pane, HostId::Remote("verify-input".into()));
+    shell.layout.set_launch(
+        pane,
+        Create {
+            program: Program::Agent { id: "codex".into() },
+            cwd: vec![],
+            cols: 80,
+            rows: 24,
+            account: None,
+        },
+    );
+    shell.sidebar.update(cx, |sidebar, cx| {
+        sidebar.set_remote_snapshot_for_test(
+            "verify-input",
+            HostStatus::Connected,
+            krill_app::sidebar::Snapshot {
+                sessions: vec![krill_app::sidebar::Session {
+                    id: session,
+                    status: AgentStatus {
+                        foreground: Some(foreground.into()),
+                        root_shell: Some(Box::new(RootShell {
+                            os: ShellOs::Windows,
+                            program: root.into(),
+                        })),
+                        ..AgentStatus::UNKNOWN
+                    },
+                    cwd: None,
+                    worktree: None,
+                    account: None,
+                }],
+                trees: std::collections::BTreeMap::default(),
+            },
+            cx,
+        );
+    });
+    pane
+}
+
+#[gpui::test]
+fn native_codex_image_uses_windows_paths_under_git_bash(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("verifier-codex-git-bash-image"));
+    view.update(cx, |shell, cx| {
+        let pane = observed_status_for_attachment_regression(shell, "bash.exe", "codex.exe", cx);
+        assert_eq!(
+            shell.input_policy_for(pane, cx),
+            krill_term::paste::InputPolicy::WindowsCodex
+        );
+        let policy = shell.drop_policy_for(pane, cx);
+        let formatted =
+            krill_term::paste::dropped_with_policy([br"C:\tmp\it's (a b).png".as_slice()], policy)
+                .unwrap();
+        assert_eq!(
+            formatted, br#""C:\tmp\it's (a b).png""#,
+            "Native Windows consumer must not receive POSIX escapes of path separators"
+        );
+    });
+}
+
+#[gpui::test]
+fn foreground_shell_does_not_keep_codex_image_attachment_contract(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("verifier-codex-child-shell-image"));
+    view.update(cx, |shell, cx| {
+        let pane =
+            observed_status_for_attachment_regression(shell, "codex.exe", "powershell.exe", cx);
+        assert_eq!(
+            shell.input_policy_for(pane, cx),
+            krill_term::paste::InputPolicy::ByteStream
+        );
+        assert!(
+            !shell.drop_policy_for(pane, cx).image_attachments,
+            "Shell child cannot parse the provider's forced bracketed image paste"
+        );
+    });
+}
+
+#[gpui::test]
+fn refused_shell_path_has_user_feedback(cx: &mut TestAppContext) {
+    use krill_proto::control::{Create, Program};
+    let (view, cx) = open(cx, state_path("verifier-rejected-drop-feedback"));
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.attach_test(pane, krill_proto::SessionId(976), ours, cx);
+            shell.layout.set_launch(
+                pane,
+                Create {
+                    program: Program::Custom {
+                        program: b"cmd.exe".to_vec(),
+                        args: vec![],
+                    },
+                    cwd: vec![],
+                    cols: 80,
+                    rows: 24,
+                    account: None,
+                },
+            );
+            shell.notice = None;
+            let paths = gpui::ExternalPaths(
+                [std::path::PathBuf::from(r"C:\tmp\%TEMP%.txt")]
+                    .into_iter()
+                    .collect(),
+            );
+            shell.paste_dropped_paths(&paths, window, cx);
+            assert!(!shell.paste_queue.has_pending_for(pane));
+            assert_nothing_sent(&mut peer);
+            assert!(
+                shell.notice.is_some(),
+                "Refused file paths disappear without feedback"
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("notice").is_some(),
+        "Refused paths must show a visible notice"
+    );
+}

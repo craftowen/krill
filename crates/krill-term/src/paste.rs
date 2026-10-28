@@ -83,6 +83,8 @@ pub enum ShellFamily {
 pub struct DropPolicy {
     pub shell: ShellFamily,
     pub image_attachments: bool,
+    /// Native Windows attachment consumers can run under a POSIX parent shell.
+    pub windows_images: bool,
 }
 
 pub fn is_image_path(path: &[u8]) -> bool {
@@ -158,7 +160,7 @@ pub fn dropped_with_policy<'a>(
         if index > 0 {
             out.push(b' ');
         }
-        if attachments && policy.shell == ShellFamily::Posix {
+        if attachments && policy.shell == ShellFamily::Posix && !policy.windows_images {
             if path.iter().any(|b| *b < 0x20 || *b == 0x7f) {
                 return None;
             }
@@ -169,7 +171,9 @@ pub fn dropped_with_policy<'a>(
                 out.push(b);
             }
         } else {
-            let shell = if attachments && policy.shell == ShellFamily::PowerShell {
+            let shell = if attachments
+                && (policy.windows_images || policy.shell == ShellFamily::PowerShell)
+            {
                 ShellFamily::WindowsUnknown
             } else {
                 policy.shell
@@ -268,6 +272,7 @@ mod tests {
         let policy = DropPolicy {
             shell: ShellFamily::Posix,
             image_attachments: true,
+            windows_images: false,
         };
         assert_eq!(
             dropped_with_policy([b"/tmp/it's (a b).PNG".as_slice()], policy).unwrap(),
@@ -283,6 +288,17 @@ mod tests {
         );
         assert!(dropped_with_policy([b"/a\n.png".as_slice()], policy).is_none());
         assert!(!is_image_path(b"/folder.png/plain"));
+        assert_eq!(
+            dropped_with_policy(
+                [br"C:\tmp\it's a b.png".as_slice()],
+                DropPolicy {
+                    windows_images: true,
+                    ..policy
+                },
+            )
+            .unwrap(),
+            br#""C:\tmp\it's a b.png""#,
+        );
     }
 
     #[cfg(windows)]
