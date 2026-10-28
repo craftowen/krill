@@ -1,4 +1,5 @@
 //! Windows holder: `ConPTY`와 세션 Job을 보관하고 자식 krilld를 재기동한다.
+pub use crate::sys::{Process as DetachedProcess, spawn_detached};
 use crate::{
     link::{Link, Packet},
     sys::{self, Api, Console, Job, Process},
@@ -715,8 +716,8 @@ mod tests {
     fn same_path_update_rolls_back_to_the_previous_install_image() {
         let root =
             std::env::temp_dir().join(format!("krill-holder-rollback-{}", std::process::id()));
-        let current = root.join("Krill/krilld.exe");
-        let previous = root.join("Krill.prev/krilld.exe");
+        let current = root.join("Krill").join("krilld.exe");
+        let previous = root.join("Krill.prev").join("krilld.exe");
         for path in [&current, &previous] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"fixture").unwrap();

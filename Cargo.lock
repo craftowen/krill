@@ -3865,6 +3865,7 @@ name = "krill-link"
 version = "0.2.20"
 dependencies = [
  "iroh",
+ "krill-holder",
  "krill-log",
  "krill-proto",
  "postcard",

@@ -442,6 +442,10 @@ pub struct Process {
     pub pid: u32,
 }
 impl Process {
+    /// Stop this owned child process; dropping the handle alone leaves it running.
+    pub fn terminate(&self) -> io::Result<()> {
+        terminate(self)
+    }
     pub fn status(&self) -> io::Result<Option<i32>> {
         // SAFETY: borrowed process handle, nonblocking wait.
         match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
@@ -942,13 +946,18 @@ impl Console {
 /// Bootstrap is short-lived: its inherited std/SSH handles die before returning
 /// to the caller. Only this raw `CreateProcess` call creates the resident holder.
 pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
+    spawn_detached(std::env::current_exe()?.as_os_str(), args, true).map(|_| ())
+}
+
+/// Start without inheriting any handles, including captured stdout in ancestors.
+/// Only the holder bootstrap needs to escape a caller's Job.
+pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::Result<Process> {
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, STARTUPINFOW,
     };
-    let app = std::env::current_exe()?;
-    let path = wide(app.as_os_str())?;
-    let mut command = quote(app.as_os_str());
+    let command_path = wide(path)?;
+    let mut command = quote(path);
     for arg in args {
         command.push(32);
         command.extend(quote(arg));
@@ -960,8 +969,10 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     let mut in_job = 0;
     // SAFETY: current process pseudo handle and valid output storage; null means any Job.
     let current = unsafe { GetCurrentProcess() };
-    // SAFETY: current is our process pseudo handle and in_job is valid output storage.
-    cvt(unsafe { IsProcessInJob(current, null_mut(), &raw mut in_job) })?;
+    if break_away {
+        // SAFETY: current is our process pseudo handle and output storage is live.
+        cvt(unsafe { IsProcessInJob(current, null_mut(), &raw mut in_job) })?;
+    }
     let flags = DETACHED_PROCESS
         | CREATE_NEW_PROCESS_GROUP
         | if in_job != 0 {
@@ -979,7 +990,7 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     // default environment/cwd. A restrictive Job rejects breakaway: never retry in it.
     cvt(unsafe {
         CreateProcessW(
-            path.as_ptr(),
+            command_path.as_ptr(),
             command.as_mut_ptr(),
             null(),
             null(),
@@ -993,10 +1004,13 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     })?;
     // SAFETY: successful CreateProcessW returned two exclusive handles. Closing
     // them does not terminate the independent holder process.
-    let _process = unsafe { owned(info.hProcess) }?;
+    let process = unsafe { owned(info.hProcess) }?;
     // SAFETY: independent exclusive initial thread handle from CreateProcessW.
     let _thread = unsafe { owned(info.hThread) }?;
-    Ok(())
+    Ok(Process {
+        handle: process,
+        pid: info.dwProcessId,
+    })
 }
 
 #[cfg(test)]
