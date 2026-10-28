@@ -367,8 +367,13 @@ fn ensure_session_attempt(
             Ok(Found::Live(session, true))
         }
         Reply::Failed(f) => Err(failure_to_io_error(f)),
-        _ => Err(io::ErrorKind::InvalidData.into()),
+        _ => Err(unexpected_reply()),
     }
+}
+
+/// 세션을 만드는 요청에 디코딩은 됐지만 해석할 수 없는 답이 왔다. 만들어졌는지 모르니 결과 불명으로 다룬다.
+fn unexpected_reply() -> io::Error {
+    unknown_outcome(io::ErrorKind::InvalidData.into())
 }
 
 fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
@@ -470,7 +475,7 @@ pub fn resume_session_in(
     match call(&mut s, &req)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => Ok(session),
         Reply::Failed(f) => Err(failure_to_io_error(f)),
-        _ => Err(io::ErrorKind::InvalidData.into()),
+        _ => Err(unexpected_reply()),
     }
 }
 
