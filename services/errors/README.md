@@ -18,6 +18,69 @@ Reusing an ID with different content returns HTTP 400 and rolls back the entire 
 
 Quota-limited events remain unacknowledged. A partially admitted batch returns 200 with only committed/duplicate IDs and `Retry-After: 60`; a fully quota-limited batch returns 429. Edge throttling returns 429. Missing, malformed or failing rate bindings fail closed with 503. The binding uses one shared route key per Cloudflare location, at 60 requests per minute; it processes no IP/device identifier. The edge limit is approximate and does not replace transactional quotas or account-level request limits.
 
+## Mobile browser reports
+
+`POST https://errors.krill.page/v1/mobile-events` accepts the same versioned batch envelope and returns the exact ACK above. The browser sends directly to this receiver even when it cannot reach the desktop. Mobile and native ingestion share the existing events table, ID namespace, edge admission key, transactional quotas, retention and cleanup. No new migration is required. The native `/v1/events` schema and its absence of CORS remain unchanged; each endpoint rejects the other endpoint's event schema.
+
+Error reporting is separate from usage telemetry and defaults to off. The mobile client must obtain explicit, persistent browser opt-in, respect Do Not Track, and clear pending reports when disabled. Sanitized in-memory diagnostics recorded before opt-in are not permission to persist or send old reports. This public receiver validates report contents; it cannot independently verify a browser's consent setting.
+
+Every mobile event requires exactly these fields (all three native-only fields must be explicit `null`):
+
+```json
+{
+  "event_id":"00000000000000000000000000000001",
+  "process":"krill-mobile",
+  "kind":"operation_error",
+  "error_code":"mobile_connect_failed",
+  "release":"web",
+  "build_id":"0123456789abcdef",
+  "os":"ios",
+  "arch":"other",
+  "source_loc":null,
+  "hang_bucket_ms":null,
+  "native":null,
+  "diagnostics":{
+    "phase":"socket_open",
+    "route":"relay",
+    "reason":"websocket_closed",
+    "attempt_id":"00000000000000000000000000000002",
+    "page_id":"00000000000000000000000000000003",
+    "elapsed_ms":1200,
+    "ws_code":1006,
+    "breadcrumbs":[{"phase":"discovery","reason":"http_error","elapsed_ms":200,"http_status":502}]
+  }
+}
+```
+
+`event_id`, `attempt_id` and `page_id` are 32 lowercase hexadecimal characters; page/attempt IDs are random browser page-lifetime values, not durable device identifiers. `build_id` is the PWA's 16-character lowercase hexadecimal asset hash or `unversioned`. `os` is `ios`, `android`, `macos`, `windows`, `linux` or `other`. Error codes are `mobile_connect_failed`, `mobile_discovery_failed`, `mobile_auth_failed`, `mobile_rpc_failed`, `mobile_runtime_error`, `mobile_unhandled_rejection` and `mobile_asset_failed`; kind is always `operation_error`.
+
+`diagnostics` is a required closed object; every field inside it is optional, and present values must satisfy this table (null is not a value):
+
+| Field | Allowed value |
+| --- | --- |
+| `phase` | `idle`, `discovery`, `socket_open`, `challenge`, `authentication`, `ipc`, `snapshot`, `rpc`, `runtime`, `resource` |
+| `route` | `relay`, `tunnel`, `tailscale`, `direct`, `unknown` |
+| `reason` | `websocket_error`, `websocket_closed`, `timeout`, `http_error`, `auth_required`, `auth_rejected`, `protocol_error`, `network_offline`, `runtime_error`, `unhandled_rejection`, `resource_error`, `unknown` |
+| `attempt_id`, `page_id` | Lowercase hex32 |
+| `elapsed_ms` | Integer 0–300000 |
+| `retry_count` | Integer 0–10000 |
+| `online` | Boolean |
+| `visibility` | `visible`, `hidden`, `prerender`, `unknown` |
+| `browser` | `safari`, `chrome`, `firefox`, `edge`, `other` |
+| `ws_code` | Integer 1000–4999, only when observed |
+| `http_status` | Integer 100–599, only when observed |
+| `error_name` | `Error`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `URIError`, `EvalError`, `DOMException`, `Unknown` |
+| `source_file` | `index.html`, `app.js`, `client.js`, `diagnostics.js`, `crypto.js`, `storage.js`, `terminal.js`, `updates.js`, `i18n.js`, `qr.js`, `sw.js`, `screens/home.js`, `screens/session.js`, `screens/chat.js`, `screens/settings.js`, `screens/workspaces.js`, `screens/details.js` |
+| `line`, `column` | Integer 0–1000000 |
+| `breadcrumbs` | At most 12 closed objects, each requiring `phase`, `reason`, `elapsed_ms`, optionally `ws_code`, `http_status`, with the same bounds/enums |
+| `stack_frames` | At most 8 closed objects, each requiring `source_file`, `line`, `column`, with the same allowlist/bounds; no raw stack or URLs |
+
+Unknown/nested free-text fields are rejected, including raw URLs, referrers, user agents, account/device identifiers, relay IDs, authentication tokens, credentials, QR contents, terminal text, error messages and raw stacks. Allowed source filenames never include a URL, query, fragment or local path. Request headers and origins are not stored. Limits remain 16 events per batch, 4 KiB canonical JSON per event and 64 KiB streamed request body. Canonical ordering includes diagnostics and breadcrumb fields so reordered keys deduplicate correctly.
+
+Only `/v1/mobile-events` supports CORS. Allowed origins are the exact `https://krill-mobile.pages.dev` origin and canonical HTTP(S) origins for `localhost`, IPv4 loopback `127.0.0.0/8`, IPv6 loopback `[::1]`, and Tailscale IPv4 `100.64.0.0/10`, including nondefault ports. Quick tunnel origins matching `https://<label>.trycloudflare.com` are also allowed, where the single label consists of lowercase letters, digits and interior hyphens; these require HTTPS and no explicit port. Private LAN addresses, other arbitrary domains (including Pages previews and Tailscale DNS names), `null`, URL credentials and noncanonical spellings are rejected rather than reflected. No wildcard or credentialed CORS is provided. Browser requests must use `credentials: 'omit'`; cookies and Authorization headers are rejected on this path. No-Origin non-browser requests can use mobile ingestion but receive no allow-origin header.
+
+`OPTIONS` preflight allows `POST` with `Content-Type` only and a 600-second preflight lifetime. All responses on the mobile path, including validation, method, size, content-type, admission and internal failures, carry `Vary: Origin`; allowed origins also receive `Access-Control-Allow-Origin` and expose `Retry-After`. Untrusted origins receive 403 without reflection. Native ingestion, health and administrator APIs receive no CORS headers. The PWA host and desktop-hosted `/m/*` pages must permit `https://errors.krill.page` in their `connect-src` Content Security Policy before browser reports can reach the receiver.
+
 ## Admission and retention
 
 The migration installs these policies in the singleton `limits` row:
@@ -41,6 +104,8 @@ Queries hide events at or before the 30-day cutoff even before physical deletion
 `GET /api/events` and `GET /api/stats` require `Authorization: Bearer <ADMIN_TOKEN>`. The server-only secret must be 32–256 characters and is compared using fixed-length digests and constant-time comparison. Missing configuration returns 503, and missing/wrong credentials return 401. Responses use `Cache-Control: no-store` and have no cross-origin access headers.
 
 - `/api/events?limit=50`: limit 1–100, default 50. Returns `{schema_version, events:[{received_at,event}], next_cursor}` in descending receipt-time/ID order. Pass the opaque `next_cursor` as `cursor` for the next page. Optional exact filters: `process`, `kind`, `error_code`, `release`. Unknown/repeated query parameters are rejected.
+- Filter values include the native values plus `process=krill-mobile`, the seven mobile error codes and `release=web`. For example, `/api/events?process=krill-mobile&release=web&error_code=mobile_connect_failed` returns full sanitized diagnostics, including timing, route and breadcrumbs when reported.
+- `/api/events/<event_id>`: exact lowercase hex32 ID, no query parameters. Returns `{schema_version,received_at,event}` with full sanitized diagnostics. Authentication is required before lookup; missing, expired and future-dated events return 404, malformed IDs/queries return 400. Details use the same retention boundary as list queries.
 - `/api/stats?days=30`: days 1–30, default 30 UTC calendar days including today. Returns `{schema_version,as_of_unix,timezone,days,retention_days,totals,timeline,groups,releases,storage,daily_usage,limits}`. Totals count admitted reports, grouped by kind/code/process, with the top 20 releases. Storage includes expired rows pending deletion. These counts do not estimate distinct users, terminal sessions lost, or every occurrence suppressed by the client.
 
 The Worker does not log report bodies, headers, IPs, SQL errors or credentials. Wrangler disables request observability and Logpush. Hosting infrastructure can still process connection metadata under its own configuration. Public ingestion can exhaust admission quotas; account request/cost limits remain an operator responsibility.
@@ -67,6 +132,6 @@ npm test
 npm run test:http
 ```
 
-The SQLite suite covers transaction rollback, lost commit replies, on-disk reopen/deduplication, strict schema/privacy validation, streaming limits, daily/storage row and byte quotas, authentication, pagination, expiry and bounded cleanup. `test:http` starts an isolated local Wrangler/workerd/D1 instance, applies the migration, exercises HTTP contracts and cron, and removes its temporary database. It never contacts the deployed receiver. Wrangler must be on PATH.
+The SQLite suite covers transaction rollback, lost commit replies, on-disk reopen/deduplication, strict native/mobile schema/privacy validation, streaming limits, shared daily/storage row and byte quotas, authentication, pagination, detail lookup, expiry, bounded cleanup, exact-origin preflight and CORS on errors. `test:http` starts an isolated local Wrangler/workerd/D1 instance, applies the migration, exercises native and mobile HTTP contracts (including preflight, diagnostics persistence, duplicate/collision behavior, filters/detail lookup, privacy and error CORS) and cron, and removes its temporary database. It never contacts the deployed receiver. Wrangler must be on PATH.
 
 If an installed workerd predates the configured compatibility date, upgrade Wrangler or explicitly set `ERRORS_LOCAL_COMPATIBILITY_DATE=2026-09-28 npm run test:http` for local contract checks. This override is local to the test process and does not alter the deployment config; record the tested date separately from production verification. `ERRORS_WRANGLER` can select another installed Wrangler executable.

@@ -55,7 +55,60 @@ try {
   assert.equal(stats.totals.rows, 1); assert.equal(stats.daily_usage.rows, 1); assert.equal(stats.storage.stored_rows, 1);
   assert.equal((await fetch(`${base}/__scheduled?cron=*/15+*+*+*+*`)).status, 200);
   assert.equal((await post([{...second, message: 'must reject private text'}])).status, 400);
-  console.log(`PASS local workerd/D1 HTTP (compatibility date: ${compat || 'wrangler config'}): health, exact ACK, durable duplicate, collision rollback, admin auth/events/stats, cron, closed schema`);
+  const origin = 'https://krill-mobile.pages.dev';
+  const mobile = {...e, event_id: '00000000000000000000000000000010', process: 'krill-mobile',
+    error_code: 'mobile_connect_failed', release: 'web', build_id: '0123456789abcdef', os: 'ios', arch: 'other',
+    diagnostics: {phase: 'socket_open', route: 'relay', reason: 'websocket_closed', ws_code: 1006,
+      attempt_id: '00000000000000000000000000000020', page_id: '00000000000000000000000000000021',
+      elapsed_ms: 1200, online: true, stack_frames: [{source_file: 'client.js', line: 12, column: 4}],
+      breadcrumbs: [{phase: 'discovery', reason: 'http_error', http_status: 502, elapsed_ms: 200}]}};
+  const checkCors = response => {
+    assert.equal(response.headers.get('access-control-allow-origin'), origin);
+    assert.equal(response.headers.get('access-control-allow-credentials'), null);
+    assert.equal(response.headers.get('vary'), 'Origin');
+  };
+  response = await fetch(`${base}/v1/mobile-events`, {method: 'OPTIONS', headers: {origin,
+    'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type'}});
+  assert.equal(response.status, 204); checkCors(response);
+  assert.equal(response.headers.get('access-control-allow-methods'), 'POST');
+  assert.equal(response.headers.get('access-control-allow-headers'), 'Content-Type');
+  const tunnel = 'https://sample-random-123.trycloudflare.com';
+  response = await fetch(`${base}/v1/mobile-events`, {method: 'OPTIONS', headers: {origin: tunnel,
+    'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type'}});
+  assert.equal(response.status, 204); assert.equal(response.headers.get('access-control-allow-origin'), tunnel);
+  const mobilePost = (events, options = {}) => fetch(`${base}/v1/mobile-events`, {method: 'POST',
+    headers: {'content-type': 'application/json', origin}, body: JSON.stringify({schema_version: 1, events}), ...options});
+  response = await mobilePost([mobile]); assert.equal(response.status, 200); checkCors(response);
+  assert.deepEqual(await response.json(), {schema_version: 1, accepted_ids: [mobile.event_id], duplicate_ids: []});
+  response = await mobilePost([mobile]); checkCors(response);
+  assert.deepEqual(await response.json(), {schema_version: 1, accepted_ids: [], duplicate_ids: [mobile.event_id]});
+  const mobileSecond = {...mobile, event_id: '00000000000000000000000000000011'};
+  response = await mobilePost([mobileSecond, {...mobile, diagnostics: {}}]);
+  assert.equal(response.status, 400); checkCors(response);
+  response = await fetch(`${base}/api/events?process=krill-mobile&release=web&error_code=mobile_connect_failed`, {headers});
+  assert.equal(response.headers.get('access-control-allow-origin'), null);
+  const mobileEvents = await response.json(); assert.equal(mobileEvents.events.length, 1);
+  assert.deepEqual(mobileEvents.events[0].event, mobile);
+  response = await fetch(`${base}/api/events/${mobile.event_id}`, {headers});
+  const detail = await response.json(); assert.deepEqual(detail.event, mobile);
+  assert.equal(typeof detail.received_at, 'number');
+  assert.equal((await fetch(`${base}/api/events/${mobile.event_id}`)).status, 401);
+  assert.equal((await fetch(`${base}/api/events/${mobileSecond.event_id}`, {headers})).status, 404);
+  for (const [options, status] of [[{body: '{'}, 400], [{method: 'PUT'}, 405],
+    [{headers: {origin, 'content-type': 'text/plain'}}, 415], [{body: ' '.repeat(65537)}, 413],
+    [{headers: {origin, 'content-type': 'application/json', authorization: 'Bearer private'}}, 400]]) {
+    response = await mobilePost([mobileSecond], options); assert.equal(response.status, status); checkCors(response);
+  }
+  response = await mobilePost([mobileSecond], {headers: {origin: 'https://private.test', 'content-type': 'application/json'}});
+  assert.equal(response.status, 403); assert.equal(response.headers.get('access-control-allow-origin'), null);
+  assert.equal((await response.text()).includes('private.test'), false);
+  response = await mobilePost([{...mobileSecond, diagnostics: {...mobile.diagnostics, url: 'https://private.test/token'}}]);
+  assert.equal(response.status, 400); checkCors(response);
+  response = await post([mobileSecond]); assert.equal(response.status, 400);
+  assert.equal(response.headers.get('access-control-allow-origin'), null);
+  const combined = await (await fetch(`${base}/api/stats`, {headers})).json();
+  assert.equal(combined.totals.rows, 2); assert.equal(combined.daily_usage.rows, 2);
+  console.log(`PASS local workerd/D1 HTTP (compatibility date: ${compat || 'wrangler config'}): native regression; mobile preflight/ACK/duplicate/collision/storage/filter/detail; privacy, CORS success/errors, native schema isolation; admin auth/stats, cron`);
 } finally {
   if (child && child.exitCode === null) {
     const exited = new Promise(resolve => child.once('exit', resolve));

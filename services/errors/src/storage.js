@@ -59,6 +59,13 @@ export async function listEvents(db, now, options) {
     next_cursor: rows.length > options.limit ? `${last.received_at}:${last.event_id}` : null,
   };
 }
+export async function eventDetail(db, now, id) {
+  const result = await batch(db, [db.prepare(`SELECT received_at, event_json FROM events
+    WHERE event_id = ? AND received_at > ? AND received_at <= ?`).bind(id, now - RETENTION, now)]);
+  const row = result[0].results[0];
+  if (!row) throw new HttpError(404, 'not found');
+  return {schema_version: 1, received_at: row.received_at, event: JSON.parse(row.event_json)};
+}
 export async function stats(db, now, days) {
   const start = Math.max(now - RETENTION, (Math.floor(now / 86400) - days + 1) * 86400 - 1);
   const within = 'received_at > ? AND received_at <= ?';

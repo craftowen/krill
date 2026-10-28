@@ -1,6 +1,7 @@
 import {timingSafeEqual} from 'node:crypto';
 import {CODES, HEX32, HttpError, KINDS, PROCESSES, readBody, validate, validRelease} from './validation.js';
-import {cleanup, health, ingest, listEvents, stats} from './storage.js';
+import {cleanup, eventDetail, health, ingest, listEvents, stats} from './storage.js';
+import {MOBILE_CODES, mobileAdmission, mobileCors, validateMobile} from './mobile.js';
 const SECURITY = {
   'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
   'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
@@ -35,8 +36,8 @@ function eventOptions(url) {
   for (const key of ['process', 'kind', 'error_code', 'release']) {
     const value = url.searchParams.get(key);
     if (value === null) continue;
-    const valid = key === 'process' ? PROCESSES.includes(value) : key === 'kind' ? KINDS.includes(value)
-      : key === 'error_code' ? Object.hasOwn(CODES, value) : validRelease(value);
+    const valid = key === 'process' ? [...PROCESSES, 'krill-mobile'].includes(value) : key === 'kind' ? KINDS.includes(value)
+      : key === 'error_code' ? Object.hasOwn(CODES, value) || MOBILE_CODES.includes(value) : value === 'web' || validRelease(value);
     if (!valid) throw new HttpError(400, 'invalid query');
     options[key] = value;
   }
@@ -52,7 +53,13 @@ function eventOptions(url) {
 }
 export async function handle(request, env, now = Math.floor(Date.now() / 1000)) {
   const url = new URL(request.url);
-  if (url.pathname === '/v1/events') {
+  const mobile = url.pathname === '/v1/mobile-events';
+  if (url.pathname === '/v1/events' || mobile) {
+    if (mobile) {
+      const preflight = mobileAdmission(request);
+      if (url.search) throw new HttpError(400, 'query parameters unsupported');
+      if (preflight) return new Response(null, {status: 204, headers: {...SECURITY, ...preflight}});
+    }
     if (request.method !== 'POST') return json({error: 'method not allowed'}, 405, {allow: 'POST'});
     if (url.search) throw new HttpError(400, 'query parameters unsupported');
     if (typeof env.INGEST_RATE_LIMITER?.limit !== 'function')
@@ -61,7 +68,7 @@ export async function handle(request, env, now = Math.floor(Date.now() / 1000)) 
     const rate = await env.INGEST_RATE_LIMITER.limit({key: 'v1/events'});
     if (rate?.success === false) return json({error: 'rate limited'}, 429, {'retry-after': '60'});
     if (rate?.success !== true) throw new HttpError(503, 'rate limiter unavailable');
-    const events = validate(await readBody(request));
+    const events = (mobile ? validateMobile : validate)(await readBody(request));
     const ack = await ingest(env.DB, events, now);
     const count = ack.accepted_ids.length + ack.duplicate_ids.length;
     if (!count) return json({error: 'admission quota exceeded'}, 429, {'retry-after': '60'});
@@ -72,10 +79,16 @@ export async function handle(request, env, now = Math.floor(Date.now() / 1000)) 
     if (url.search) throw new HttpError(400, 'query parameters unsupported');
     return json(await health(env.DB));
   }
-  if (url.pathname === '/api/events' || url.pathname === '/api/stats') {
+  if (url.pathname === '/api/events' || url.pathname === '/api/stats' || url.pathname.startsWith('/api/events/')) {
     if (request.method !== 'GET') return json({error: 'method not allowed'}, 405, {allow: 'GET'});
     if (!await authorized(request, env.ADMIN_TOKEN))
       return json({error: 'unauthorized'}, 401, {'www-authenticate': 'Bearer'});
+    if (url.pathname.startsWith('/api/events/')) {
+      parameters(url, []);
+      const id = url.pathname.slice('/api/events/'.length);
+      if (!HEX32.test(id)) throw new HttpError(400, 'invalid event id');
+      return json(await eventDetail(env.DB, now, id));
+    }
     if (url.pathname === '/api/events') return json(await listEvents(env.DB, now, eventOptions(url)));
     parameters(url, ['days']);
     return json(await stats(env.DB, now, integer(url.searchParams.get('days'), 30, 30)));
@@ -84,12 +97,17 @@ export async function handle(request, env, now = Math.floor(Date.now() / 1000)) 
 }
 export default {
   async fetch(request, env) {
-    try { return await handle(request, env); }
+    let response;
+    try { response = await handle(request, env); }
     catch (error) {
       // Never log/reflect SQL, credentials, request headers, report bodies or paths.
-      return json({error: error instanceof HttpError ? error.message : 'service unavailable'},
+      response = json({error: error instanceof HttpError ? error.message : 'service unavailable'},
         error instanceof HttpError ? error.status : 503);
     }
+    if (new URL(request.url).pathname === '/v1/mobile-events') {
+      for (const [key, value] of Object.entries(mobileCors(request))) response.headers.set(key, value);
+    }
+    return response;
   },
   async scheduled(controller, env) {
     await cleanup(env.DB, Math.floor(controller.scheduledTime / 1000));
