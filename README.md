@@ -30,7 +30,7 @@
 
 Agent workspaces like [Orca](https://github.com/stablyai/orca) already keep terminal sessions alive across app restarts and manage Git worktrees. **Session survival across app restarts is table stakes — not the differentiator.**
 
-The difference is **resource efficiency and process architecture**. Orca is built on Electron (Chromium + Node.js), spawning separate main, GPU, renderer, and daemon processes while keeping a terminal instance in the renderer for every open tab. Krill delivers the same parallel-agent workflow in **pure Rust (`gpui`)**, attaching UI render state only to visible panes while keeping terminal state in a single lightweight daemon (`krilld`) backed by a panic-free PTY parent (`krill-holder`).
+The difference is **resource efficiency and process architecture**. Orca is built on Electron (Chromium + Node.js), spawning separate main, GPU, renderer, and daemon processes while keeping a terminal instance in the renderer for every open tab. Krill delivers the same parallel-agent workflow as a **single Rust (`gpui`) UI process with no Electron or web view**, attaching UI render state only to visible panes while keeping terminal state in a single lightweight daemon (`krilld`) backed by a panic-free PTY parent (`krill-holder`).
 
 ### Measured Benchmark: Krill 0.2.2 vs. Orca 1.4.237 (2026-10-25)
 
@@ -146,7 +146,7 @@ Publish agent-generated HTML reports, architecture diagrams, and Markdown docume
 - **Headless `krill` CLI &amp; Remote SSH Hosts** — Drive every session, worktree, and orchestration run without the GUI (`krill ls`, `new`, `send`, `read`, `wait`, `attach`, `handoff`) or across supported remote Mac hosts (`krill --host user@host`).
 - **Account Switcher &amp; Auto-Switch (`krill account`)** — Switch agent accounts or automatically rotate accounts when usage rate limits are reached.
 - **Scheduled Agent Runs (`krill schedule`)** — Run recurring agent tasks on a UTC cron schedule ([Scheduling docs](docs/SCHEDULING.md)).
-- **31 Terminal Themes &amp; First-Class Korean IME** — Ships with **Krill Deep** plus 30 built-in themes (and Ghostty/Warp theme import) and a dedicated Hangul IME composition state machine.
+- **45 Terminal Themes &amp; First-Class Korean IME** — Ships with 15 Krill themes (including **Krill Deep**) plus 30 Orca-compatible built-in themes (and Ghostty/Warp theme import) and a dedicated Hangul IME composition state machine.
 - **Quick Open &amp; Workspace Context** — Search across worktrees, sessions, files, detected local server ports (`krill ports`), and attached reference URLs (`krill reference`).
 
 ---
