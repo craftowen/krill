@@ -299,7 +299,9 @@ impl Shell {
 
     /// 숨은 로컬 칸도 재부팅 복원 대상이다. 화면 스트림은 열지 않아 MK-035 예산을 유지한다.
     pub(super) fn restore_hidden_sessions(&mut self, visible: &[PaneId], cx: &mut Context<Self>) {
-        if self.role != WindowRole::Main {
+        // 재부팅 직후엔 앱이 krilld보다 먼저 떠서 이른 재개가 연결 실패로 끝나고 다시 시도되지 않았다
+        // (2026-10-28: 앱 기동 뒤 데몬 수신까지 약 8초). 감시 연결이 붙으면(`set_link`) 다시 불린다.
+        if self.role != WindowRole::Main || self.link != Link::Up {
             return;
         }
         let Some(target) = self.local_target() else {
@@ -358,11 +360,20 @@ impl Shell {
                 this.update(cx, |this, cx| {
                     this.restoring_sessions.remove(&old);
                     // 재개 요청이 닿았는지 모르면, 보이게 된 칸도 다시 재개하지 않고 아는 세션만 찾는다.
+                    let unknown = got.as_ref().is_err_and(pane::is_unknown_outcome);
                     if let Err(e) = &got
-                        && pane::is_unknown_outcome(e)
+                        && unknown
                     {
                         this.outcome_unknown
                             .insert(pane_id, super::start_error_text(e));
+                    }
+                    // 정상 종료(closed)된 세션은 데몬이 재개를 거부하므로 그 워크트리는 계속 숨는다.
+                    if (unknown || matches!(got, Ok(Some(_))))
+                        && let Some(workspace) = this.pane_workspace(pane_id, cx)
+                    {
+                        this.sidebar.update(cx, |s, cx| {
+                            s.reveal_restored_worktree(workspace.folder, cx);
+                        });
                     }
                     let session = match got {
                         Ok(Some(new)) => {

@@ -2950,6 +2950,48 @@ fn workspace_filters_card_properties_compact_layout_and_persistence(cx: &mut Tes
     fs::remove_dir_all(dir).ok();
 }
 
+/// 재부팅 복원(2026-10-28): 데몬이 아직 새 세션을 목록에 올리지 않아 살아 있는 세션이 없어도, 자동 재개한 칸의
+/// 워크트리는 수면 숨김(`hide_sleeping`)에서 보인다. 정상 종료 세션만 있어 재개되지 않은 워크트리와 사용자가 재운
+/// 워크트리는 계속 숨는다.
+#[gpui::test]
+fn restored_worktree_stays_visible_while_hiding_sleeping(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo = PathBuf::from("/reboot-repo");
+    let restored = repo.join("restored");
+    let closed_only = repo.join("closed-only");
+    let slept = repo.join("slept");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([(
+                    repo.clone(),
+                    vec![
+                        repo.clone(),
+                        restored.clone(),
+                        closed_only.clone(),
+                        slept.clone(),
+                    ],
+                )]),
+            };
+            s.shown_external.insert(repo.clone());
+            s.toggle_hide_sleeping(cx);
+            s.sleep_worktree(slept.clone(), cx);
+            s.reveal_restored_worktree(restored.clone(), cx);
+            s.reveal_restored_worktree(slept.clone(), cx);
+        });
+    });
+    let rows = cx.update(|_, cx| view.read(cx).rows.clone());
+    let has = |target: &Path| {
+        rows.iter()
+            .any(|r| matches!(r, Row::Worktree(p) if p == target))
+    };
+    assert!(has(&restored), "restored worktree must stay visible");
+    assert!(!has(&closed_only), "closed-only worktree must stay hidden");
+    assert!(!has(&slept), "user-slept worktree must stay hidden");
+}
+
 #[gpui::test]
 fn setup_script_prompt_card_enables_and_dismisses_in_sidebar(cx: &mut TestAppContext) {
     let dir = std::env::temp_dir().join(format!("mk-owe728-sidebar-prompt-{}", std::process::id()));
