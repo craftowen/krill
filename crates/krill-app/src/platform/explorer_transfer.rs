@@ -69,7 +69,9 @@ fn run(
     checkpoint: &mut impl FnMut(Stage, &Path),
 ) -> io::Result<PathBuf> {
     let target_parts = relative(directory.strip_prefix(root).map_err(|_| denied())?)?;
-    let root_path = root.canonicalize()?;
+    // Directory::absolute traverses NOFOLLOW, including the repository root.
+    // Unix alone maps the two verified macOS OS aliases before strict traversal.
+    let root_path = root.to_path_buf();
     // A repository alias itself must not anchor transfers inside Git metadata.
     if root_path
         .components()
@@ -96,6 +98,11 @@ fn run(
     checkpoint(Stage::BeforeOpen, source);
     let node = source_parent.open_node(name, !import)?;
     checkpoint(Stage::Opened, source);
+    #[cfg(unix)]
+    {
+        source_parent.verify_node(name, &node)?;
+        destination_parent.verify_position()?;
+    }
     let meta = node.metadata()?;
     if !meta.is_file() && !meta.is_dir() {
         return Err(denied());
@@ -148,12 +155,29 @@ fn copy_node(
     *budget = budget
         .checked_sub(1)
         .ok_or_else(|| io::Error::other("Explorer import entry limit exceeded"))?;
+    #[cfg(unix)]
+    {
+        source_parent.verify_node(name, &node)?;
+        target_parent.verify_position()?;
+    }
     let meta = node.metadata()?;
     if meta.is_file() {
         let mut output = target_parent.create_file(name)?;
+        #[cfg(unix)]
+        {
+            source_parent.verify_node(name, &node)?;
+            target_parent.verify_node(name, &output)?;
+        }
         io::copy(&mut node, &mut output)?;
+        #[cfg(unix)]
+        {
+            source_parent.verify_node(name, &node)?;
+            target_parent.verify_node(name, &output)?;
+        }
     } else if meta.is_dir() {
         let source = source_parent.child(name, node);
+        #[cfg(unix)]
+        let source = source?;
         let target = target_parent.create_dir(name)?;
         for name in source.names()? {
             let name = name?;
@@ -172,6 +196,11 @@ fn copy_node(
                 depth + 1,
                 checkpoint,
             )?;
+        }
+        #[cfg(unix)]
+        {
+            source.verify_position()?;
+            target.verify_position()?;
         }
     } else {
         return Err(denied());
@@ -391,6 +420,7 @@ mod tests {
         assert!(source.join("original/file").exists());
         assert!(!root.join("dst/source/child/file").exists());
     }
+    #[cfg(windows)]
     #[test]
     fn pinned_source_and_destination_resist_swaps_after_open() {
         for directory in [false, true] {
@@ -420,11 +450,6 @@ mod tests {
                             swapped.is_err(),
                             "open source must deny rename/delete sharing"
                         );
-                        #[cfg(unix)]
-                        {
-                            swapped.unwrap();
-                            link(&secret, &source, directory);
-                        }
                     }
                     if stage == Stage::Commit {
                         let swapped = fs::rename(root.join("dst"), root.join("pinned-dst"));
@@ -433,19 +458,12 @@ mod tests {
                             swapped.is_err(),
                             "open destination must deny rename/delete sharing"
                         );
-                        #[cfg(unix)]
-                        {
-                            swapped.unwrap();
-                            link(&external, &root.join("dst"), true);
-                        }
                     }
                 },
             )
             .unwrap();
             #[cfg(windows)]
             let imported = root.join("dst/source");
-            #[cfg(unix)]
-            let imported = root.join("pinned-dst/source");
             let imported = if directory {
                 imported.join("file")
             } else {
@@ -492,3 +510,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "explorer_transfer/namespace_tests.rs"]
+mod namespace_tests;
