@@ -1273,6 +1273,73 @@ fn states_root_shell_tail_is_bounded_and_preserves_old_frames() {
     for invalid in [String::new(), "a".repeat(257), "pwsh\ncmd".into()] {
         rows[0].status.root_shell.as_mut().unwrap().program = invalid;
         let frame = Reply::States(rows.clone()).encode().unwrap();
-        assert!(Reply::decode(kind::REPLY, &frame[5..]).is_err());
+        assert_eq!(Reply::decode(kind::REPLY, &frame[5..]).unwrap(), base);
+        // Still reject invalid metadata arriving from an unvalidated peer.
+        let mut body = postcard::to_stdvec(&base).unwrap();
+        body.extend(postcard::to_stdvec(&Option::<String>::None).unwrap());
+        body.extend(postcard::to_stdvec(&Option::<String>::None).unwrap());
+        body.extend(postcard::to_stdvec(&Vec::<Subagent>::new()).unwrap());
+        body.extend(postcard::to_stdvec(&rows[0].status.root_shell).unwrap());
+        assert!(Reply::decode(kind::REPLY, &body).is_err());
+    }
+}
+
+#[test]
+fn invalid_observed_root_metadata_does_not_poison_other_rows_or_status() {
+    let valid = [
+        "a".repeat(256),
+        "한".repeat(85),
+        "🦀".repeat(64),
+        "sh name'quoted".into(),
+    ];
+    let invalid = [
+        String::new(),
+        "a".repeat(257),
+        "한".repeat(86),
+        "🦀".repeat(65),
+        "sh\ncmd".into(),
+        "sh\rcmd".into(),
+        "sh\0cmd".into(),
+        "sh\u{85}cmd".into(),
+    ];
+    for name in valid.iter().chain(&invalid) {
+        let accepted = valid.contains(name);
+        assert_eq!(
+            RootShell::new(ShellOs::Unix, name.clone()).is_some(),
+            accepted
+        );
+        let mut rows = vec![
+            SessionStatus {
+                session: SessionId(1),
+                status: AgentStatus::UNKNOWN,
+            },
+            SessionStatus {
+                session: SessionId(2),
+                status: AgentStatus::UNKNOWN,
+            },
+        ];
+        rows[0].status.root_shell = RootShell::new(ShellOs::Windows, "pwsh".into()).map(Box::new);
+        rows[1].status.agent = "claude".into();
+        rows[1].status.title = Some("working".into());
+        // Public struct literals are possible: the encoder also omits only invalid metadata.
+        rows[1].status.root_shell = Some(Box::new(RootShell {
+            os: ShellOs::Unix,
+            program: name.clone(),
+        }));
+        let frame = Reply::States(rows.clone()).encode().unwrap();
+        if !accepted {
+            rows[1].status.root_shell = None;
+        }
+        assert_eq!(
+            Reply::decode(kind::REPLY, &frame[5..]).unwrap(),
+            Reply::States(rows.clone())
+        );
+        let (Reply::States(old_rows), _) = postcard::take_from_bytes::<Reply>(&frame[5..]).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(old_rows.len(), 2);
+        assert_eq!(old_rows[1].status.agent, "claude");
+        assert!(old_rows.iter().all(|row| row.status.root_shell.is_none()));
     }
 }

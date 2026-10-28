@@ -1916,17 +1916,17 @@ impl Registry {
                     status.root_shell = (!exited)
                         .then(|| crate::sys::process_name(root).ok())
                         .flatten()
-                        .filter(|name| !name.is_empty() && name.len() <= 256)
-                        .map(|program| {
-                            Box::new(krill_proto::control::RootShell {
-                                os: if cfg!(windows) {
+                        .and_then(|program| {
+                            krill_proto::control::RootShell::new(
+                                if cfg!(windows) {
                                     krill_proto::control::ShellOs::Windows
                                 } else {
                                     krill_proto::control::ShellOs::Unix
                                 },
                                 program,
-                            })
-                        });
+                            )
+                        })
+                        .map(Box::new);
                     let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
                         || status.agent.eq_ignore_ascii_case("antigravity")
                         || status.foreground.as_deref().is_some_and(|fg| {

@@ -483,6 +483,18 @@ pub struct RootShell {
     pub program: String,
 }
 
+impl RootShell {
+    /// Observed process names are optional metadata. Unsupported names must not
+    /// make a complete States reply undecodable.
+    pub fn new(os: ShellOs, program: String) -> Option<Self> {
+        valid_root_program(&program).then_some(Self { os, program })
+    }
+}
+
+fn valid_root_program(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShellOs {
     Unix,
@@ -497,7 +509,7 @@ fn root_program<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Err
             f.write_str("root program under 257 bytes")
         }
         fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
-            if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+            if !valid_root_program(value) {
                 return Err(E::custom("invalid root program"));
             }
             Ok(value.to_owned())
@@ -1119,8 +1131,13 @@ impl Msg for Reply {
             if has_root {
                 for row in rows {
                     body.extend(
-                        postcard::to_stdvec(&row.status.root_shell)
-                            .map_err(crate::ipc::Error::Codec)?,
+                        postcard::to_stdvec(
+                            &row.status
+                                .root_shell
+                                .as_deref()
+                                .filter(|root| valid_root_program(&root.program)),
+                        )
+                        .map_err(crate::ipc::Error::Codec)?,
                     );
                 }
             }
