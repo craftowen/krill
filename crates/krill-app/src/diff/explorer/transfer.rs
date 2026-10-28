@@ -1,7 +1,8 @@
 //! 로컬 탐색기 이동·가져오기. 덮어쓰기·원본 심볼릭 링크 추적·실패 시 원본 삭제를 하지 않는다.
-use std::fs::{self, OpenOptions};
+#[cfg(test)]
+use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use super::{Explorer, Operation};
 
@@ -34,67 +35,6 @@ impl gpui::Render for Drag {
     }
 }
 
-fn denied() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "invalid Explorer transfer path",
-    )
-}
-
-fn within(root: &Path, path: &Path) -> io::Result<()> {
-    let relative = path.strip_prefix(root).map_err(|_| denied())?;
-    if relative
-        .components()
-        .any(|part| !matches!(part, Component::Normal(name) if name != ".git"))
-    {
-        return Err(denied());
-    }
-    if !path.canonicalize()?.starts_with(root.canonicalize()?) {
-        return Err(denied());
-    }
-    Ok(())
-}
-
-/// 독점 생성으로 복사하며 기존 대상과 원본을 보존한다.
-/// 부분 가져오기는 남겨 두고 오류에 대상 경로를 알린다.
-fn copy_new(source: &Path, destination: &Path, budget: &mut usize, depth: usize) -> io::Result<()> {
-    if depth > 64 {
-        return Err(io::Error::other("Explorer import depth limit exceeded"));
-    }
-    *budget = budget
-        .checked_sub(1)
-        .ok_or_else(|| io::Error::other("Explorer import entry limit exceeded"))?;
-    let meta = source.symlink_metadata()?;
-    if meta.is_symlink() {
-        return Err(denied());
-    }
-    if meta.is_dir() {
-        fs::create_dir(destination)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            if entry.file_name() == ".git" {
-                return Err(denied());
-            }
-            copy_new(
-                &entry.path(),
-                &destination.join(entry.file_name()),
-                budget,
-                depth + 1,
-            )?;
-        }
-    } else if meta.is_file() {
-        let mut input = fs::File::open(source)?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)?;
-        io::copy(&mut input, &mut output)?;
-    } else {
-        return Err(denied());
-    }
-    Ok(())
-}
-
 impl Explorer {
     pub(super) fn transfer_path(
         &mut self,
@@ -105,46 +45,14 @@ impl Explorer {
         if self.remote_target().is_some() {
             return Err(io::ErrorKind::Unsupported.into());
         }
-        within(&self.repo, directory)?;
-        if !directory.is_dir() {
-            return Err(denied());
-        }
-        let name = source
-            .file_name()
-            .filter(|name| *name != ".git")
-            .ok_or_else(denied)?;
-        let destination = directory.join(name);
-        // OS 드롭을 자신의 자식에 복사하면 새 대상을 다시 읽으며 재귀하므로 거부한다.
-        if directory
-            .canonicalize()?
-            .starts_with(source.canonicalize()?)
-        {
-            return Err(denied());
-        }
-        if !import && destination == source {
-            return Ok(destination);
-        }
-        if destination.symlink_metadata().is_ok() {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
-        if import {
-            let mut budget = super::MAX_FILTER_ENTRIES;
-            copy_new(source, &destination, &mut budget, 0).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "import failed: {error}; partial destination may remain at {}",
-                        destination.display()
-                    ),
-                )
-            })?;
-        } else {
-            within(&self.repo, source)?;
-            if source == self.repo || source.symlink_metadata()?.is_symlink() {
-                return Err(denied());
-            }
-            // 다른 볼륨으로 rename이 실패해도 원본을 보존한다. 복사 후 삭제하지 않는다.
-            fs::rename(source, &destination)?;
+        let destination = crate::platform::explorer_transfer::transfer(
+            &self.repo,
+            source,
+            directory,
+            import,
+            super::MAX_FILTER_ENTRIES,
+        )?;
+        if !import {
             self.expanded.retain(|path| !path.starts_with(source));
         }
         self.expanded.insert(directory.to_path_buf());
@@ -189,7 +97,7 @@ mod tests {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
         fn path(&self) -> &Path {
             &self.0

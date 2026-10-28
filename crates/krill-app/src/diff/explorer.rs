@@ -53,12 +53,17 @@ pub struct DirEntry {
 }
 
 /// `uniform_list`에 그려지는 평탄화된 파일 트리 행.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent cached file attributes and UI row states"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeRow {
     pub name: String,
     pub path: PathBuf,
     pub relative_path: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub depth: usize,
     pub expanded: bool,
     pub ignored: bool,
@@ -920,6 +925,7 @@ impl Explorer {
                 path: entry.path.clone(),
                 relative_path: entry.relative_path.clone(),
                 is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
                 depth,
                 expanded,
                 ignored,
@@ -947,6 +953,7 @@ impl Explorer {
                 path: entry.path.clone(),
                 relative_path: entry.relative_path.clone(),
                 is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
                 depth,
                 expanded,
                 ignored,
@@ -1091,6 +1098,16 @@ fn read_dir_entries(repo: &Path, dir: &Path) -> Vec<DirEntry> {
         let path = entry.path();
         let (is_dir, is_symlink) = entry.file_type().map_or((false, false), |ft| {
             let is_symlink = ft.is_symlink();
+            #[cfg(windows)]
+            let is_symlink = {
+                use std::os::windows::fs::MetadataExt as _;
+                is_symlink
+                    || entry.metadata().is_ok_and(|meta| {
+                        meta.file_attributes()
+                            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                            != 0
+                    })
+            };
             (ft.is_dir() || (is_symlink && path.is_dir()), is_symlink)
         });
         let relative_path = path
@@ -2237,6 +2254,7 @@ impl Panel {
                     f32::from(u16::try_from(row.depth).unwrap_or(16).min(16)) * 14.0 + 8.0;
                 let row_path = row.path.clone();
                 let is_dir = row.is_dir;
+                let transfer_allowed = self.explorer.remote_target().is_none() && !row.is_symlink;
                 let weak = cx.weak_entity();
                 let menu_row = row.clone();
                 let repo = self.explorer.repo.clone();
@@ -2338,7 +2356,7 @@ impl Panel {
                                 cx.notify();
                             }
                         }))
-                        .when(self.explorer.remote_target().is_none(), |d| {
+                        .when(transfer_allowed, |d| {
                             let drag_path = row.path.clone();
                             let paths = if self.explorer.selection.contains(&drag_path) {
                                 self.explorer.selected_paths()
@@ -2381,6 +2399,11 @@ impl Panel {
                                         );
                                     },
                                 ))
+                        })
+                        .when(row.is_symlink, |d| {
+                            // Do not let a refused link-row drop bubble to the root target.
+                            d.on_drop::<transfer::Drag>(|_, _, cx| cx.stop_propagation())
+                                .on_drop::<gpui::ExternalPaths>(|_, _, cx| cx.stop_propagation())
                         })
                         .context_menu(move |menu, _, cx| {
                             row_context_menu(menu, &weak, &menu_row, &repo, cx)
@@ -2694,6 +2717,7 @@ mod selection_tests {
                 path: PathBuf::from("/repo").join(name),
                 relative_path: name.into(),
                 is_dir: name == "folder",
+                is_symlink: false,
                 depth: usize::from(name.contains('/')),
                 expanded: true,
                 ignored: false,

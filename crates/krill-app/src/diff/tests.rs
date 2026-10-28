@@ -1147,6 +1147,7 @@ fn explorer_keyboard_navigation_clamps_and_finds_parent() {
             name: "src".to_owned(),
             path: repo.0.join("src"),
             relative_path: "src".to_owned(),
+            is_symlink: false,
             is_dir: true,
             depth: 0,
             expanded: true,
@@ -1156,6 +1157,7 @@ fn explorer_keyboard_navigation_clamps_and_finds_parent() {
             name: "a.rs".to_owned(),
             path: repo.0.join("src/a.rs"),
             relative_path: "src/a.rs".to_owned(),
+            is_symlink: false,
             is_dir: false,
             depth: 1,
             expanded: false,
@@ -1165,6 +1167,7 @@ fn explorer_keyboard_navigation_clamps_and_finds_parent() {
             name: "b.txt".to_owned(),
             path: repo.0.join("b.txt"),
             relative_path: "b.txt".to_owned(),
+            is_symlink: false,
             is_dir: false,
             depth: 0,
             expanded: false,
@@ -3218,4 +3221,30 @@ fn explorer_range_drag_and_os_drop_use_local_transfer_queue(cx: &mut gpui::TestA
         cx.update(|_, cx| panel.read(cx).explorer.error.is_some()),
         "a later success must not erase a batch failure"
     );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn explorer_link_row_drop_is_rejected_without_bubbling_to_root(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::plain();
+    std::fs::create_dir(repo.0.join(".git")).unwrap();
+    std::os::unix::fs::symlink(repo.0.join(".git"), repo.0.join("alias")).unwrap();
+    let external = Repo::plain();
+    let source = external.0.join("never-import.txt");
+    std::fs::write(&source, "original").unwrap();
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo.0.clone(), cx));
+    panel.update(cx, |panel, cx| panel.set_tab(PanelTab::Files, cx));
+    cx.run_until_parked();
+    let alias = cx.debug_bounds("explorer-item-alias").unwrap().center();
+    cx.simulate_event(gpui::FileDropEvent::Entered {
+        position: alias,
+        paths: gpui::ExternalPaths(vec![source.clone()].into()),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::FileDropEvent::Submit { position: alias });
+    cx.run_until_parked();
+    assert!(!repo.0.join(".git/never-import.txt").exists());
+    assert!(!repo.0.join("never-import.txt").exists());
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "original");
 }
