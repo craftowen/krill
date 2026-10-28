@@ -82,30 +82,211 @@ pub fn migrate_long_codex_profile_if_needed(
     slug: &str,
     current_dir: &Path,
 ) -> PathBuf {
+    // Read-only callers keep the original, working home when migration fails. Startup
+    // and registration use the fallible variant and report the error to their caller.
+    try_migrate_long_codex_profile(home, slug, current_dir)
+        .unwrap_or_else(|_| current_dir.to_path_buf())
+}
+
+/// Preserve all legacy content and publish the short home only after a verified copy.
+/// The original is never renamed or deleted. Existing unrelated targets are rejected.
+pub fn try_migrate_long_codex_profile(
+    home: &Path,
+    slug: &str,
+    current_dir: &Path,
+) -> io::Result<PathBuf> {
     let legacy_codex_root = managed_root(home).join(ProviderKind::Codex.as_str());
-    if current_dir.as_os_str().len() <= MAX_CODEX_HOME_BYTES
+    if !cfg!(unix)
+        || current_dir.as_os_str().len() <= MAX_CODEX_HOME_BYTES
         || !current_dir.starts_with(&legacy_codex_root)
     {
-        return current_dir.to_path_buf();
+        return Ok(current_dir.to_path_buf());
     }
+    if !is_managed(home, current_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid legacy Codex home",
+        ));
+    }
+    let source = current_dir.canonicalize()?;
     let target = short_codex_profile_dir(home, slug);
-    if current_dir.is_dir() && std::fs::create_dir_all(&target).is_ok() {
-        #[cfg(unix)]
+    let marker_name = ".krill-legacy-source";
+    if source.join(marker_name).symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "legacy Codex home contains a reserved migration marker",
+        ));
+    }
+    let marker = target.join(marker_name);
+    if target.symlink_metadata().is_ok() {
+        if !target.symlink_metadata()?.is_dir()
+            || std::fs::read(&marker)? != source.as_os_str().as_encoded_bytes()
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).ok();
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Codex home belongs to another profile",
+            ));
         }
-        if let Ok(entries) = std::fs::read_dir(current_dir) {
-            for entry in entries.flatten() {
-                let src = entry.path();
-                let dst = target.join(entry.file_name());
-                if src.is_file() && !dst.exists() {
-                    std::fs::copy(&src, &dst).ok();
-                }
-            }
+        return Ok(target);
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing Codex parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let migration_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(target.with_extension("migration-lock"))?;
+    migration_lock.try_lock().map_err(io::Error::other)?;
+    // Another participating process may have completed before this lock was acquired.
+    if target.symlink_metadata().is_ok() {
+        return try_migrate_long_codex_profile(home, slug, current_dir);
+    }
+    // create_dir deliberately rejects stale staging directories, so retries cannot silently
+    // reuse a partial copy. The user's original home stays usable on every failure.
+    let staging = target.with_extension(format!("migrating-{}", std::process::id()));
+    std::fs::create_dir(&staging)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let result = (|| {
+        let before = codex_tree_stamp(&source, 0)?;
+        copy_codex_tree(&source, &staging, &source, 0)?;
+        if before != codex_tree_stamp(&source, 0)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Codex home changed during migration; retry after the agent stops",
+            ));
+        }
+        std::fs::write(
+            staging.join(marker_name),
+            source.as_os_str().as_encoded_bytes(),
+        )?;
+        // A concurrently created target must never be replaced, including an empty directory.
+        if target.symlink_metadata().is_ok() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        std::fs::rename(&staging, &target)?;
+        Ok(target)
+    })();
+    if result.is_err() {
+        std::fs::remove_dir_all(&staging).ok();
+    }
+    result
+}
+
+type CodexTreeStamp = Vec<(PathBuf, u64, std::time::SystemTime)>;
+
+fn codex_tree_stamp(source: &Path, depth: usize) -> io::Result<CodexTreeStamp> {
+    if depth > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex home nesting too deep",
+        ));
+    }
+    let mut entries = vec![(
+        source.to_path_buf(),
+        0,
+        source.symlink_metadata()?.modified()?,
+    )];
+    for entry in std::fs::read_dir(source)? {
+        let path = entry?.path();
+        let meta = path.symlink_metadata()?;
+        if meta.is_dir() {
+            entries.extend(codex_tree_stamp(&path, depth.saturating_add(1))?);
+        } else {
+            entries.push((path, meta.len(), meta.modified()?));
+        }
+        if entries.len() > 100_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Codex migration entry budget exceeded",
+            ));
         }
     }
-    target
+    entries.sort();
+    Ok(entries)
+}
+
+fn copy_codex_tree(source: &Path, target: &Path, original: &Path, depth: usize) -> io::Result<()> {
+    if depth > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex home nesting too deep",
+        ));
+    }
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = target.join(entry.file_name());
+        let meta = src.symlink_metadata()?;
+        if meta.is_dir() {
+            std::fs::create_dir(&dst)?;
+            copy_codex_tree(&src, &dst, original, depth.saturating_add(1))?;
+            std::fs::set_permissions(&dst, meta.permissions())?;
+        } else if meta.is_file() {
+            std::fs::copy(&src, &dst)?;
+            if !same_file_contents(&src, &dst)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Codex source changed during copy",
+                ));
+            }
+        } else if meta.file_type().is_symlink() {
+            // External shared stores keep their identity. Internal absolute links would
+            // depend on an orphaned legacy home, so leave that migration to the user.
+            let link = std::fs::read_link(&src)?;
+            let resolved = if link.is_absolute() {
+                link.clone()
+            } else {
+                src.parent()
+                    .ok_or_else(|| io::Error::other("invalid Codex link"))?
+                    .join(&link)
+            }
+            .canonicalize()?;
+            if resolved.starts_with(original) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy Codex home has an internal absolute link",
+                ));
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(resolved, dst)?;
+            #[cfg(not(unix))]
+            return Err(io::ErrorKind::Unsupported.into());
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported Codex home entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_file_contents(source: &Path, target: &Path) -> io::Result<bool> {
+    use std::io::Read as _;
+    let mut a = std::fs::File::open(source)?;
+    let mut b = std::fs::File::open(target)?;
+    let mut left = [0u8; 8192];
+    let mut right = [0u8; 8192];
+    loop {
+        let n = a.read(&mut left)?;
+        b.read_exact(
+            right
+                .get_mut(..n)
+                .ok_or_else(|| io::Error::other("invalid copy size"))?,
+        )?;
+        if left.get(..n) != right.get(..n) {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(b.read(&mut right)? == 0);
+        }
+    }
 }
 
 /// `dir`이 관리 루트 바로 아래 `<provider>/<이름>` 폴더인가. `..`·심볼릭 링크는 아니다.
@@ -361,6 +542,7 @@ mod tests {
         std::fs::remove_dir_all(h).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_short_profile_dir_stays_within_socket_budget_and_migrates() {
         let realistic_home = Path::new("/Users/alexanderhamilton");
@@ -398,5 +580,74 @@ mod tests {
                 .any(|o| o.dir == migrated.display().to_string())
         );
         std::fs::remove_dir_all(h).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod migration_regression_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_migration_preserves_nested_data_and_fails_without_switching() {
+        let home = std::env::temp_dir().join(format!("krill-legacy-copy-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let source = managed_root(&home).join("codex/account-with-a-very-long-legacy-home-name");
+        std::fs::create_dir_all(source.join("sessions/day")).unwrap();
+        std::fs::create_dir_all(source.join("rules")).unwrap();
+        std::fs::write(source.join("auth.json"), "original credentials").unwrap();
+        std::fs::write(
+            source.join("sessions/day/conversation.jsonl"),
+            "original conversation",
+        )
+        .unwrap();
+        std::fs::write(source.join("rules/private.md"), "private rules").unwrap();
+        let target = try_migrate_long_codex_profile(&home, "nested", &source).unwrap();
+        assert_eq!(
+            std::fs::read(target.join("rules/private.md")).unwrap(),
+            b"private rules"
+        );
+        assert_eq!(
+            std::fs::read(target.join("sessions/day/conversation.jsonl")).unwrap(),
+            b"original conversation"
+        );
+        std::fs::write(target.join("auth.json"), "new credentials").unwrap();
+        assert_eq!(
+            try_migrate_long_codex_profile(&home, "nested", &source).unwrap(),
+            target
+        );
+        assert_eq!(
+            std::fs::read(target.join("auth.json")).unwrap(),
+            b"new credentials"
+        );
+        assert_eq!(
+            std::fs::read(source.join("auth.json")).unwrap(),
+            b"original credentials"
+        );
+        let external = home.join("shared-history");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("record"), "shared data").unwrap();
+        std::os::unix::fs::symlink("../../../../../shared-history", source.join("external"))
+            .unwrap();
+        let with_link = try_migrate_long_codex_profile(&home, "links", &source).unwrap();
+        assert_eq!(
+            with_link.join("external").canonicalize().unwrap(),
+            external.canonicalize().unwrap()
+        );
+        let blocked = short_codex_profile_dir(&home, "blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("auth.json"), "someone else").unwrap();
+        assert!(try_migrate_long_codex_profile(&home, "blocked", &source).is_err());
+        assert_eq!(
+            migrate_long_codex_profile_if_needed(&home, "blocked", &source),
+            source
+        );
+        let socket_path = PathBuf::from(format!("/tmp/kcs-{}", std::process::id()));
+        std::fs::remove_file(&socket_path).ok();
+        let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::fs::rename(socket_path, source.join("live.sock")).unwrap();
+        assert!(try_migrate_long_codex_profile(&home, "incomplete", &source).is_err());
+        assert!(!short_codex_profile_dir(&home, "incomplete").exists());
+        drop(socket);
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

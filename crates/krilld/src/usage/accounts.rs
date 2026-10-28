@@ -1758,18 +1758,22 @@ pub fn add_account(
         let mut file = file;
         let resolved_dir = if profile_dir.trim().is_empty() {
             file.accounts.iter().find(|a| a.id == id).map_or_else(
-                || krill_proto::usage::profiles::default_profile_dir(home, provider, &slug),
+                || {
+                    Ok(krill_proto::usage::profiles::default_profile_dir(
+                        home, provider, &slug,
+                    ))
+                },
                 |existing| {
                     let current = PathBuf::from(&existing.profile_dir);
                     if provider == ProviderKind::Codex {
-                        krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(
+                        krill_proto::usage::profiles::try_migrate_long_codex_profile(
                             home, &slug, &current,
                         )
                     } else {
-                        current
+                        Ok(current)
                     }
                 },
-            )
+            )?
         } else if let Some(stripped) = profile_dir.trim().strip_prefix("~/") {
             home.join(stripped)
         } else {
