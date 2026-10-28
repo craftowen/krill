@@ -128,3 +128,30 @@ fn opencode_and_agy_keep_their_account_isolation() {
 fn missing_agent_is_not_resolved_to_a_shell() {
     assert!(command(OsStr::new("krill-no-such-agent-20261023"), env()).is_none());
 }
+
+#[test]
+fn codex_trust_preset_uses_the_native_project_path() {
+    let root = std::env::temp_dir().join(format!("krill trust 한글 {}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let profile = root.join("account");
+    let workspace = root.join("한국어 프로젝트");
+    for dir in [&home, &profile, &workspace] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let config = profile.join("config.toml");
+    std::fs::write(&config, "# user settings\nmodel = 'mine'\n").unwrap();
+    assert!(crate::agent::pre_trust_codex_in(&home, Some(&profile), &workspace).unwrap());
+    assert!(!crate::agent::pre_trust_codex_in(&home, Some(&profile), &workspace).unwrap());
+    let text = std::fs::read_to_string(&config).unwrap();
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    let native = krill_proto::os::canonicalize(&workspace).unwrap();
+    assert_eq!(
+        value["projects"][native.to_str().unwrap()]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert_eq!(value["projects"].as_table().unwrap().len(), 1);
+    assert_eq!(value["model"].as_str(), Some("mine"));
+    assert!(text.contains("# user settings"));
+    std::fs::remove_dir_all(root).unwrap();
+}

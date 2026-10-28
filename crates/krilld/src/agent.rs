@@ -1476,7 +1476,8 @@ pub(crate) fn pre_trust_codex_in_with_hook(
     if is_too_broad_to_pre_trust(home, cwd) {
         return Ok(false);
     }
-    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    // Codex uses ordinary Windows paths as trust lookup keys, without `\\?\`.
+    let canon = krill_proto::os::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let Some(project_path) = canon.to_str().filter(|s| !s.is_empty()) else {
         return Ok(false);
     };
