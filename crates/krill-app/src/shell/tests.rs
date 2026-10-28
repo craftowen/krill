@@ -11044,6 +11044,31 @@ fn input_policy_link_modifier_drives_tui_hover_modifiers_and_direct_click(cx: &m
 }
 
 #[gpui::test]
+fn tab_menu_keyboard_down_enter_activates_first_item(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-menu-keyboard"));
+    cx.run_until_parked();
+    let tab = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_some());
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(
+            !view.read(cx).tab_menu_focus.is_focused(window),
+            "Down must leave the container and focus a menu item"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).is_tab_pinned(0));
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+}
+
+#[gpui::test]
 fn ports_keep_same_session_and_url_on_different_hosts(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("ports-host-identity"));
     cx.simulate_keystrokes("cmd-t");

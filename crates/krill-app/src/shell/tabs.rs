@@ -1275,6 +1275,21 @@ impl Shell {
                         this.tab_context_menu = None;
                         cx.stop_propagation();
                         cx.notify();
+                    } else if matches!(event.keystroke.key.as_str(), "down" | "up" | "home" | "end")
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                    {
+                        if matches!(event.keystroke.key.as_str(), "home" | "end") {
+                            window.focus(&this.tab_menu_focus, cx);
+                        }
+                        if matches!(event.keystroke.key.as_str(), "up" | "end") {
+                            window.focus_prev(cx);
+                        } else {
+                            window.focus_next(cx);
+                        }
+                        cx.stop_propagation();
+                        window.prevent_default();
                     } else if event.keystroke.key == "tab"
                         && !event.keystroke.modifiers.control
                         && !event.keystroke.modifiers.alt
@@ -1319,7 +1334,7 @@ impl Shell {
                 .child(
                     div()
                         .id("tab-menu-pin")
-                        .role(gpui::Role::Button)
+                        .role(gpui::Role::MenuItem)
                         .tab_index(0)
                         .focus_visible(|d| d.border_1().border_color(p.ring))
                         .debug_selector(|| "tab-menu-pin".into())
