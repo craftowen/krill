@@ -32,6 +32,29 @@ fn value(command: &Command, name: &str) -> Option<OsString> {
 }
 
 #[test]
+fn custom_batch_commands_use_the_trampoline_without_changing_native_programs() {
+    for program in [r"C:\Users\한글 O'wen\claude.cmd", r"C:\tools\agent.BAT"] {
+        let login = Launch {
+            argv: [program, "has space", "percent% ^ ! & |", "", "trailing\\"]
+                .map(|arg| arg.as_bytes().to_vec())
+                .to_vec(),
+            env: env(),
+        };
+        let launch = wrap_shell(login.clone());
+        assert_eq!(launch.argv[1], b"--agent-exec");
+        assert_eq!(launch.argv[3..], login.argv);
+        assert_eq!(launch.env, login.env);
+    }
+    for program in [r"C:\tools\node.exe", "powershell.exe"] {
+        let login = Launch {
+            argv: vec![program.as_bytes().to_vec()],
+            env: env(),
+        };
+        assert_eq!(wrap_shell(login.clone()), login);
+    }
+}
+
+#[test]
 fn windows_wrapper_keeps_argv_literal_and_accepts_later_session_flags() {
     let args = vec![
         "codex".into(),

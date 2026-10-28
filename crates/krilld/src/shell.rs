@@ -196,6 +196,8 @@ impl Shell {
         if matches!(self, Self::Custom { .. }) {
             set_path(&mut launch, login_path());
         }
+        #[cfg(windows)]
+        let launch = crate::agent::wrap_windows_shell(launch);
         launch
     }
 

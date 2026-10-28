@@ -14,6 +14,23 @@ use krill_proto::usage::ProviderKind;
 
 use crate::shell::Launch;
 
+/// Batch files need Rust's `Command` batch quoting rather than the holder's CRT argv encoding.
+pub(crate) fn wrap_shell(mut login: Launch) -> Launch {
+    let batch = login.argv.first().is_some_and(|program| {
+        std::path::Path::new(OsStr::from_bytes(program))
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    });
+    if !batch {
+        return login;
+    }
+    let args = std::mem::take(&mut login.argv);
+    let mut launch = wrap(login, "command not found", Vec::new());
+    launch.argv.extend(args);
+    launch
+}
+
 pub(super) fn wrap(login: Launch, hint: &str, args: Vec<String>) -> Launch {
     // The running daemon is also the helper, so upgrades cannot select a different installation.
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("krilld.exe"));

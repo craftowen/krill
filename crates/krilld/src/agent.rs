@@ -33,6 +33,8 @@ mod skills;
 mod windows;
 #[cfg(windows)]
 pub use windows::run as run_windows_agent;
+#[cfg(windows)]
+pub(crate) use windows::wrap_shell as wrap_windows_shell;
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
 // ponytail: POSIX 문법이라 fish·nu 같은 로그인 셸에서는 깨진다. 지원하려면 그때 `/bin/zsh -l -i -c`로 감싼다.
