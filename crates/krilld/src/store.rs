@@ -52,9 +52,9 @@ const RESUME: u64 = 256 << 10;
 /// 원본 n바이트를 쓸 때 압축·청크·헤더·Gap 레코드에 더 드는 최대 바이트(zstd 블록 헤더는 128KiB당 3B).
 const OVERHEAD: u64 = 256;
 /// zstd 레벨(ARCHITECTURE §3 zstd 하나, T2 D8 zstd-3).
-const LEVEL: i32 = 3;
+const LEVEL: i32 = 1;
 /// zstd 창 1MiB = 봉인 크기. 더 크게 잡아도 한 세그먼트 안에서만 참조하니 이득이 없다.
-const WINDOW_LOG: u32 = 20;
+const WINDOW_LOG: u32 = 17;
 /// 재생 때 스크롤백을 거두는 간격. 이 안에서 [`HOT_LINES`](crate::HOT_LINES)행 넘게 밀려나면 넘친 행은 페이지에서 빠진다.
 // ponytail: 256B로 1,000행을 넘기려면 `CSI n S` 반복 같은 병적 입력뿐이다. 실제로 잘리면 간격을 줄이거나 재생 Term 상한을 키운다.
 pub(crate) type CheckpointFn<'a> = &'a mut dyn FnMut(usize, usize, &Engine);
