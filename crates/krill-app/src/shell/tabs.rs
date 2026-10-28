@@ -11,6 +11,40 @@ use krill_proto::control::AgentState;
 
 use super::*;
 
+/// Enumerate only enabled tab stops in the rendered menu. GPUI's global
+/// `focus_prev` from the container can select a control behind the popover.
+fn navigate_menu(
+    menu: &gpui::FocusHandle,
+    key: &str,
+    count: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let current = window.focused(cx);
+    menu.focus(window, cx);
+    let mut items = Vec::new();
+    for _ in 0..count {
+        window.focus_next(cx);
+        let Some(next) = window.focused(cx) else {
+            break;
+        };
+        if !menu.contains_focused(window, cx) || items.contains(&next) {
+            break;
+        }
+        items.push(next);
+    }
+    let index = current.and_then(|handle| items.iter().position(|item| *item == handle));
+    let target = match key {
+        "home" => items.first(),
+        "end" => items.last(),
+        "up" => items.get(index.map_or(items.len().saturating_sub(1), |i| {
+            if i == 0 { items.len() - 1 } else { i - 1 }
+        })),
+        _ => items.get(index.map_or(0, |i| (i + 1) % items.len())),
+    };
+    target.unwrap_or(menu).focus(window, cx);
+}
+
 /// 탭 안에서 편집하는 이름과 입력 이벤트 구독.
 pub(super) struct TabRename {
     pub(super) pane: PaneId,
@@ -1112,8 +1146,17 @@ impl Shell {
             pos.y - ui::SPACE_2
         };
 
+        // Pin plus color swatches are always enabled. Other actual builders add
+        // themselves below; navigation never needs to visit a global tab stop.
+        let item_count = std::rc::Rc::new(std::cell::Cell::new(
+            2 + krill_app::layout::TabColor::ALL.len(),
+        ));
+        let key_item_count = item_count.clone();
         let menu_item =
             |id: &'static str, label: &'static str, enabled: bool, shortcut: Option<String>| {
+                if enabled {
+                    item_count.set(item_count.get() + 1);
+                }
                 div()
                     .id(id)
                     .debug_selector(move || id.into())
@@ -1270,7 +1313,7 @@ impl Shell {
                 .track_focus(&self.tab_menu_focus)
                 .role(gpui::Role::Menu)
                 .tab_group()
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         this.tab_context_menu = None;
                         cx.stop_propagation();
@@ -1280,14 +1323,13 @@ impl Shell {
                         && !event.keystroke.modifiers.alt
                         && !event.keystroke.modifiers.platform
                     {
-                        if matches!(event.keystroke.key.as_str(), "home" | "end") {
-                            window.focus(&this.tab_menu_focus, cx);
-                        }
-                        if matches!(event.keystroke.key.as_str(), "up" | "end") {
-                            window.focus_prev(cx);
-                        } else {
-                            window.focus_next(cx);
-                        }
+                        navigate_menu(
+                            &this.tab_menu_focus,
+                            &event.keystroke.key,
+                            key_item_count.get(),
+                            window,
+                            cx,
+                        );
                         cx.stop_propagation();
                         window.prevent_default();
                     } else if event.keystroke.key == "tab"
@@ -1295,11 +1337,12 @@ impl Shell {
                         && !event.keystroke.modifiers.alt
                         && !event.keystroke.modifiers.platform
                     {
-                        if event.keystroke.modifiers.shift {
-                            window.focus_prev(cx);
+                        let key = if event.keystroke.modifiers.shift {
+                            "up"
                         } else {
-                            window.focus_next(cx);
-                        }
+                            "down"
+                        };
+                        navigate_menu(&this.tab_menu_focus, key, key_item_count.get(), window, cx);
                         cx.stop_propagation();
                         window.prevent_default();
                     }

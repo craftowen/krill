@@ -11117,3 +11117,70 @@ fn ports_keep_same_session_and_url_on_different_hosts(cx: &mut TestAppContext) {
         assert_eq!(s.detected_ports().len(), 1, "stale host cache is excluded");
     });
 }
+
+#[gpui::test]
+fn tab_menu_home_end_arrows_space_escape_skip_disabled(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-menu-boundaries"));
+    cx.run_until_parked();
+    let tab = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    let first = cx.update(|w, cx| w.focused(cx).unwrap());
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let second = cx.update(|w, cx| w.focused(cx).unwrap());
+    assert_ne!(first, second);
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(first, cx.update(|w, cx| w.focused(cx).unwrap()));
+    cx.simulate_keystrokes("end");
+    cx.run_until_parked();
+    let last = cx.update(|w, cx| {
+        assert!(view.read(cx).tab_menu_focus.contains_focused(w, cx));
+        w.focused(cx).unwrap()
+    });
+    assert_ne!(first, last);
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(first, cx.update(|w, cx| w.focused(cx).unwrap()));
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(last, cx.update(|w, cx| w.focused(cx).unwrap()));
+    // A sole unpinned session has exactly pin, rename, close and the color
+    // swatches. Close-other/right/left/editors are visible but disabled.
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    let mut stops = vec![cx.update(|w, cx| w.focused(cx).unwrap())];
+    loop {
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let handle = cx.update(|w, cx| {
+            assert!(view.read(cx).tab_menu_focus.contains_focused(w, cx));
+            w.focused(cx).unwrap()
+        });
+        if handle == first {
+            break;
+        }
+        assert!(!stops.contains(&handle));
+        stops.push(handle);
+        assert!(stops.len() < 30);
+    }
+    assert_eq!(stops.len(), 4 + krill_app::layout::TabColor::ALL.len());
+    cx.simulate_keystrokes("space");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("space").unwrap(),
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).is_tab_pinned(0));
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab shift-tab escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+    cx.update(|w, cx| assert!(!view.read(cx).tab_menu_focus.is_focused(w)));
+}
