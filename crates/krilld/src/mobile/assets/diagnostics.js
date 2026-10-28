@@ -1,4 +1,4 @@
-// Browser-only, opt-in operational diagnostics. Never serialize exceptions or URLs.
+// Browser-only automatic operational diagnostics. Never serialize exceptions or URLs.
 (() => {
   const M = (globalThis.KrillMobile ||= {});
   if (M.diagnostics) return;
@@ -77,15 +77,45 @@
       return null;
     }
   };
-  const page = id(),
-    dnt = () =>
-      [navigator.doNotTrack, globalThis.doNotTrack].some(
-        (v) => v === "1" || v === "yes",
-      );
-  let consent = false;
-  try {
-    consent = localStorage.getItem(KEY) === "on";
-  } catch {}
+  const privacySignal = () =>
+    navigator.globalPrivacyControl === true ||
+    [navigator.doNotTrack, globalThis.doNotTrack].some(
+      (v) => v === "1" || v === "yes",
+    );
+  // Reserve the preference before collecting. Empty string is an explicit off:
+  // replacing any saved value with it cannot grow a full localStorage origin.
+  // Never remove this key on opt-out: an absent key means automatic collection.
+  function saveChoice(value) {
+    const saved = value ? "1" : "";
+    try {
+      localStorage.setItem(KEY, saved);
+      return localStorage.getItem(KEY) === saved;
+    } catch {
+      // Reclaim only our diagnostic queue, never pairing or other user storage.
+      try {
+        localStorage.removeItem(OUTBOX);
+        localStorage.setItem(KEY, saved);
+        return localStorage.getItem(KEY) === saved;
+      } catch {
+        return false;
+      }
+    }
+  }
+  function readChoice() {
+    try {
+      const saved = localStorage.getItem(KEY);
+      if (saved === "" || saved === "off" || saved === "0") {
+        if (saved !== "") saveChoice(false);
+        return false;
+      }
+      if (saved === "1") return true;
+      if (saved === null || saved === "on") return saveChoice(true);
+    } catch {}
+    // If storage is blocked or too full to reserve a preference, do not collect.
+    // Collection requires space for a persistent opt-out.
+    return false;
+  }
+  let consent = readChoice();
   let queue = [],
     recent = [],
     seen = new Map(),
@@ -93,7 +123,7 @@
     inflight = null,
     retryNotBefore = 0,
     epoch = 0;
-  const enabled = () => consent && !dnt();
+  const enabled = () => consent && !privacySignal();
   const build =
     /^\/m\/([0-9a-f]{16})\//.exec(location.pathname)?.[1] || "unversioned";
   const ua = navigator.userAgent || "",
@@ -137,8 +167,8 @@
       ["column", 0, 1000000],
     ])
       if (number(input[key], min, max)) out[key] = input[key];
-    for (const key of ["attempt_id", "page_id"])
-      if (/^[0-9a-f]{32}$/.test(input[key])) out[key] = input[key];
+    if (/^[0-9a-f]{32}$/.test(input.attempt_id))
+      out.attempt_id = input.attempt_id;
     if (Array.isArray(input.stack_frames))
       out.stack_frames = input.stack_frames
         .slice(0, 8)
@@ -156,7 +186,7 @@
         }));
     return out;
   }
-  // Rebuild disk input using the same allowlists; never trust stored event objects.
+  // Rebuild every outgoing event through the same closed allowlists.
   function canonical(event) {
     if (
       !event ||
@@ -166,7 +196,6 @@
       return null;
     const input = event.diagnostics || {},
       diagnostics = fields(input);
-    if (!/^[0-9a-f]{32}$/.test(diagnostics.page_id || "")) return null;
     if (typeof input.online === "boolean") diagnostics.online = input.online;
     if (
       ["visible", "hidden", "prerender", "unknown"].includes(input.visibility)
@@ -202,49 +231,10 @@
       ? clean
       : null;
   }
-  function persist() {
+  function discardLegacyOutbox() {
     try {
-      if (enabled() && queue.length)
-        localStorage.setItem(
-          OUTBOX,
-          JSON.stringify({
-            schema_version: 1,
-            items: queue,
-            retry_at: retryNotBefore,
-          }),
-        );
-      else localStorage.removeItem(OUTBOX);
+      localStorage.removeItem(OUTBOX);
     } catch {}
-  }
-  function restore() {
-    try {
-      if (enabled()) {
-        const raw = localStorage.getItem(OUTBOX);
-        if (raw && raw.length <= 160000) {
-          const saved = JSON.parse(raw);
-          if (number(saved.retry_at, 0, Date.now() + 1800000))
-            retryNotBefore = saved.retry_at;
-          if (saved.schema_version === 1 && Array.isArray(saved.items))
-            queue = saved.items
-              .slice(-32)
-              .filter(
-                (q) =>
-                  q &&
-                  number(q.at, 0, Date.now()) &&
-                  Date.now() - q.at < 1800000 &&
-                  number(q.tries, 0, 3),
-              )
-              .map((q) => ({
-                event: canonical(q.event),
-                at: q.at,
-                tries: q.tries,
-              }))
-              .filter((q) => q.event);
-        }
-      }
-    } catch {}
-    persist();
-    schedule();
   }
   function crumb(input) {
     const f = fields(input),
@@ -266,21 +256,13 @@
     queue = [];
     retryNotBefore = 0;
     seen.clear();
-    persist();
+    discardLegacyOutbox();
   }
   function setEnabled(value) {
     clear();
-    consent = value === true && !dnt();
-    try {
-      localStorage.setItem(KEY, consent ? "on" : "off");
-    } catch {
-      // Removing the key preserves default-off even when replacing "on" with
-      // the longer "off" value would exceed the browser's storage quota.
-      if (!consent)
-        try {
-          localStorage.removeItem(KEY);
-        } catch {}
-    }
+    const requested = value === true && !privacySignal();
+    const saved = saveChoice(requested);
+    consent = requested && saved;
     return enabled();
   }
   function schedule(delay = 0) {
@@ -309,7 +291,6 @@
       .filter((q) => Date.now() - q.at < 1800000 && q.tries < 4)
       .map((q) => ({ ...q, event: canonical(q.event) }))
       .filter((q) => q.event);
-    persist();
     if (!queue.length) return;
     if (Date.now() < retryNotBefore) {
       schedule();
@@ -321,7 +302,6 @@
     inflight = controller;
     const timeout = setTimeout(() => controller.abort(), 8000);
     for (const item of batch) item.tries++;
-    persist();
     try {
       const response = await fetch(ENDPOINT, {
         method: "POST",
@@ -365,7 +345,6 @@
       clearTimeout(timeout);
       if (version === epoch) {
         inflight = null;
-        persist();
         if (!enabled()) clear();
         else
           schedule(
@@ -380,7 +359,7 @@
       const clean = fields(input);
       recent.push({ code, ...clean });
       recent = recent.slice(-32);
-      if (!enabled() || !page) return;
+      if (!enabled()) return;
       if (inflight?.signal.aborted) return;
       const now = Date.now();
       for (const [key, at] of seen) if (now - at > 60000) seen.delete(key);
@@ -403,7 +382,6 @@
       if (seen.size > 128) seen.delete(seen.keys().next().value);
       const diagnostics = {
         ...clean,
-        page_id: page,
         online: navigator.onLine !== false,
         visibility: ["visible", "hidden", "prerender"].includes(
           document.visibilityState,
@@ -431,7 +409,6 @@
       if (new TextEncoder().encode(JSON.stringify(event)).length > 4096) return;
       queue.push({ event, at: now, tries: 0 });
       queue = queue.slice(-32);
-      persist();
       schedule();
     } catch {
       /* Diagnostics must never interfere with the application. */
@@ -501,8 +478,8 @@
   M.diagnostics = {
     enabled,
     setEnabled,
-    get dnt() {
-      return dnt();
+    get privacySignal() {
+      return privacySignal();
     },
     attempt,
     report,
@@ -551,10 +528,7 @@
   globalThis.addEventListener?.("online", () => schedule());
   globalThis.addEventListener?.("storage", (event) => {
     if (event.key !== KEY && event.key !== null) return;
-    let value = false;
-    try {
-      value = localStorage.getItem(KEY) === "on";
-    } catch {}
+    const value = readChoice();
     if (!value) {
       consent = false;
       clear();
@@ -563,5 +537,5 @@
       consent = true;
     }
   });
-  restore();
+  discardLegacyOutbox();
 })();

@@ -1,6 +1,6 @@
 # Error receiver
 
-Cloudflare Worker + D1 receiver for Krill's existing, independently opt-in error reports. This service does not change consent or collect raw logs. Usage telemetry is a separate service.
+Cloudflare Worker + D1 receiver for Krill's native opt-in and mobile automatic technical error reports. This service does not change consent or collect raw logs. Usage telemetry is a separate service.
 
 ## Wire contract
 
@@ -22,7 +22,7 @@ Quota-limited events remain unacknowledged. A partially admitted batch returns 2
 
 `POST https://errors.krill.page/v1/mobile-events` accepts the same versioned batch envelope and returns the exact ACK above. The browser sends directly to this receiver even when it cannot reach the desktop. Mobile and native ingestion share the existing events table, ID namespace, edge admission key, transactional quotas, retention and cleanup. No new migration is required. The native `/v1/events` schema and its absence of CORS remain unchanged; each endpoint rejects the other endpoint's event schema.
 
-Error reporting is separate from usage telemetry and defaults to off. The mobile client must obtain explicit, persistent browser opt-in, respect Do Not Track, and clear pending reports when disabled. Sanitized in-memory diagnostics recorded before opt-in are not permission to persist or send old reports. This public receiver validates report contents; it cannot independently verify a browser's consent setting.
+Mobile technical error reporting is separate from usage telemetry and runs automatically unless a saved opt-out, Do Not Track or Global Privacy Control disables it. The browser persists only its reporting preference, using tiny values with backward-compatible legacy choices; a full/blocked origin that cannot reserve this preference fails closed. It never persists reports or identifiers. The queue is bounded to 32 events, 30 minutes and four attempts, with Retry-After kept in memory; reload/close discards unsent reports, and legacy disk outboxes are deleted. Disabling aborts the diagnostic request and clears the queue; re-enabling never sends errors observed while off. There is no installation or page identifier. The [collection notice](https://krill.page/privacy#mobile-errors) is linked in Settings and About. Native reporting remains opt-in. This public receiver validates report contents; it cannot independently verify the browser setting.
 
 Every mobile event requires exactly these fields (all three native-only fields must be explicit `null`):
 
@@ -44,7 +44,6 @@ Every mobile event requires exactly these fields (all three native-only fields m
     "route":"relay",
     "reason":"websocket_closed",
     "attempt_id":"00000000000000000000000000000002",
-    "page_id":"00000000000000000000000000000003",
     "elapsed_ms":1200,
     "ws_code":1006,
     "breadcrumbs":[{"phase":"discovery","reason":"http_error","elapsed_ms":200,"http_status":502}]
@@ -52,7 +51,7 @@ Every mobile event requires exactly these fields (all three native-only fields m
 }
 ```
 
-`event_id`, `attempt_id` and `page_id` are 32 lowercase hexadecimal characters; page/attempt IDs are random browser page-lifetime values, not durable device identifiers. `build_id` is the PWA's 16-character lowercase hexadecimal asset hash or `unversioned`. `os` is `ios`, `android`, `macos`, `windows`, `linux` or `other`. Error codes are `mobile_connect_failed`, `mobile_discovery_failed`, `mobile_auth_failed`, `mobile_rpc_failed`, `mobile_runtime_error`, `mobile_unhandled_rejection` and `mobile_asset_failed`; kind is always `operation_error`.
+`event_id` and `attempt_id` are 32 lowercase hexadecimal characters. Event IDs support deduplication; the random connection-attempt ID correlates failures within a connection attempt. Neither is persisted by the browser. The automatic client omits `page_id`; the receiver validates and discards that optional legacy field before storage for compatibility. `build_id` is the PWA's 16-character lowercase hexadecimal asset hash or `unversioned`. `os` is `ios`, `android`, `macos`, `windows`, `linux` or `other`. Error codes are `mobile_connect_failed`, `mobile_discovery_failed`, `mobile_auth_failed`, `mobile_rpc_failed`, `mobile_runtime_error`, `mobile_unhandled_rejection` and `mobile_asset_failed`; kind is always `operation_error`.
 
 `diagnostics` is a required closed object; every field inside it is optional, and present values must satisfy this table (null is not a value):
 
@@ -61,7 +60,7 @@ Every mobile event requires exactly these fields (all three native-only fields m
 | `phase` | `idle`, `discovery`, `socket_open`, `challenge`, `authentication`, `ipc`, `snapshot`, `rpc`, `runtime`, `resource` |
 | `route` | `relay`, `tunnel`, `tailscale`, `direct`, `unknown` |
 | `reason` | `websocket_error`, `websocket_closed`, `timeout`, `http_error`, `auth_required`, `auth_rejected`, `protocol_error`, `network_offline`, `runtime_error`, `unhandled_rejection`, `resource_error`, `unknown` |
-| `attempt_id`, `page_id` | Lowercase hex32 |
+| `attempt_id`, legacy `page_id` | Lowercase hex32; automatic client never sends `page_id`, and the receiver discards legacy page IDs before storage |
 | `elapsed_ms` | Integer 0–300000 |
 | `retry_count` | Integer 0–10000 |
 | `online` | Boolean |

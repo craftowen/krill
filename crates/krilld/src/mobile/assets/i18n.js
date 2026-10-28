@@ -2,9 +2,13 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
- "Send error reports": "오류 보고 보내기",
- "Do Not Track is enabled. Error reporting is off.": "추적 방지 설정에 따라 오류 보고가 꺼져 있습니다.",
- "Off by default. Sends technical failures after you enable it. No terminal content, addresses or credentials. Turning off clears pending reports.": "기본값은 꺼짐입니다. 켠 뒤 발생한 기술적 오류만 전송하며 터미널 내용·주소·인증 정보는 포함하지 않습니다. 끄면 대기 중인 보고도 삭제됩니다.",
+ "Automatic technical error collection": "기술적 오류 자동 수집",
+ "Your browser privacy signal is enabled. Error collection is off.": "브라우저의 추적 방지 설정에 따라 오류 수집이 꺼져 있습니다.",
+ "Automatic technical error reports help fix connection failures. No terminal content, addresses or credentials. Reports stay in memory until sent or this page closes. You can turn reporting off here.": "연결 문제를 해결하기 위해 기술적 오류를 자동 보고합니다. 터미널 내용·주소·인증 정보는 포함하지 않습니다. 보고는 전송되거나 이 페이지를 닫을 때까지 메모리에만 보관합니다. 여기서 오류 보고를 끌 수 있습니다.",
+ "Error collection notice": "오류 수집 안내",
+ "Technical errors are collected automatically to diagnose connection and app failures. You can turn collection off in Settings.": "연결과 앱 문제를 진단하기 위해 기술적 오류를 자동 수집합니다. 설정에서 수집을 끌 수 있습니다.",
+ "Reports include connection stages, observed status codes, timings, coarse browser and OS categories, and public asset locations. Unsent reports stay only in memory for up to 30 minutes and are discarded when this page closes or reloads.": "보고에는 연결 단계, 확인된 상태 코드, 소요 시간, 브라우저·운영체제 종류, 공개 앱 파일의 오류 위치가 포함됩니다. 전송 전 보고는 최대 30분간 메모리에만 보관하며 페이지를 닫거나 새로고침하면 삭제됩니다.",
+ "No terminal content, URLs, raw error text or credentials are included. Browser Do Not Track and Global Privacy Control stop collection.": "터미널 내용·URL·원문 오류 메시지·인증 정보는 포함하지 않습니다. 브라우저의 Do Not Track 또는 Global Privacy Control이 켜져 있으면 수집을 중단합니다.",
  "Paired device was revoked. Scan a new QR code.": "페어링된 기기의 접근 권한이 해제되었습니다. 새 QR 코드를 스캔하세요.",
  "Pairing link expired or was already used. Scan a new QR code.": "페어링 링크가 만료되었거나 이미 사용되었습니다. 새 QR 코드를 스캔하세요.",
  "Access denied. Scan a new QR code from desktop Settings → Mobile.": "접근이 거부되었습니다. 데스크톱 설정 → 모바일에서 새 QR 코드를 스캔하세요.",

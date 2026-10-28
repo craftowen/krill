@@ -16,6 +16,8 @@ const KEY = "krill-mobile-error-reporting-v1",
 function harness({
   store = new Map(),
   dnt,
+  gpc,
+  capacity = Infinity,
   href = "https://krill-mobile.pages.dev/m/0123456789abcdef/#secret-qr",
   quota = false,
   initialNow = 2000000,
@@ -45,15 +47,22 @@ function harness({
         userAgent: "iPhone Safari account-private-ua",
         onLine: true,
         doNotTrack: dnt,
+        globalPrivacyControl: gpc,
       },
       location: new URL(href),
       document: { visibilityState: "visible" },
       history: { replaceState() {} },
       localStorage: {
-        getItem: (k) => store.get(k) || null,
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
         setItem: (k, v) => {
           if (quota) throw Error("quota");
-          store.set(k, v);
+          const updated = new Map(store).set(k, String(v));
+          const size = [...updated].reduce(
+            (n, [key, value]) => n + key.length + value.length,
+            0,
+          );
+          if (size > capacity) throw Error("quota");
+          store.set(k, String(v));
         },
         removeItem: (k) => {
           if (quota) throw Error("quota");
@@ -211,32 +220,53 @@ const event = (h, extra = {}) =>
     reason: "runtime_error",
     ...extra,
   });
-test("default-off and explicit consent never retroactively send; consent survives reload; DNT wins", async () => {
+test("automatic collection needs no settings visit; saved opt-out survives reload and no past errors replay", async () => {
   const h = harness();
+  assert.equal(h.diagnostics.enabled(), true);
+  assert.equal(h.store.get(KEY), "1");
   event(h);
-  assert.equal(h.diagnostics.recent.length, 1);
-  await h.tick();
-  assert.equal(h.requests.length, 0);
-  assert.equal(h.store.has(OUTBOX), false);
-  h.diagnostics.setEnabled(true);
-  await h.tick();
-  assert.equal(h.requests.length, 0);
-  event(h);
-  assert(h.store.has(OUTBOX));
   await h.tick();
   assert.equal(h.events().length, 1);
-  assert.equal(h.store.has(OUTBOX), false);
-  assert.equal(harness({ store: h.store }).diagnostics.enabled(), true);
-  const d = harness({ store: h.store, dnt: "1" });
-  assert.equal(d.diagnostics.enabled(), false);
-  assert.equal(d.diagnostics.setEnabled(true), false);
-  event(d);
-  await d.tick();
-  assert.equal(d.requests.length, 0);
+  h.diagnostics.setEnabled(false);
+  assert.equal(h.store.get(KEY), "");
+  const off = harness({ store: h.store });
+  assert.equal(off.diagnostics.enabled(), false);
+  event(off);
+  await off.tick();
+  assert.equal(off.requests.length, 0);
+  off.diagnostics.setEnabled(true);
+  await off.tick();
+  assert.equal(off.requests.length, 0);
+  event(off);
+  await off.tick();
+  assert.equal(off.requests.length, 1);
 });
-test("error then close1006 reports directly before desktop auth, preserves route and actual code", async () => {
+for (const saved of ["off", "", "0", "on", "1", "corrupt"])
+  test(`saved preference ${JSON.stringify(saved)} migrates without reversing explicit off`, () => {
+    const h = harness({ store: new Map([[KEY, saved]]) });
+    assert.equal(h.diagnostics.enabled(), ["on", "1"].includes(saved));
+    if (saved !== "corrupt")
+      assert.equal(h.store.get(KEY), ["on", "1"].includes(saved) ? "1" : "");
+  });
+for (const signal of [
+  { dnt: "1" },
+  { dnt: "yes" },
+  { gpc: true },
+  { dnt: "1", gpc: true },
+])
+  test(`browser privacy signal ${JSON.stringify(signal)} wins over default and saved on`, async () => {
+    for (const store of [new Map(), new Map([[KEY, "on"]])]) {
+      const h = harness({ ...signal, store });
+      assert.equal(h.diagnostics.enabled(), false);
+      assert.equal(h.diagnostics.setEnabled(true), false);
+      event(h);
+      await h.tick();
+      assert.equal(h.requests.length, 0);
+      assert.equal(h.store.has(OUTBOX), false);
+    }
+  });
+test("error then close1006 reports automatically before desktop auth, preserves route and actual code", async () => {
   const h = harness();
-  h.diagnostics.setEnabled(true);
   const t = h.transport(),
     { pending, socket } = await h.start(t);
   socket.emit("error");
@@ -544,44 +574,34 @@ test("bounded retry deduplicates event IDs, collector failures never recurse, AC
   assert.equal(h.requests.length, 3);
   assert.equal(h.diagnostics.recent.length, 2);
 });
-test("outbox survives reload, canonicalizes contaminated disk payload, enforces TTL and retry bounds", async () => {
+test("reports and identifiers stay in memory; reload discards legacy disk outbox without sending it", async () => {
   const h = harness();
-  h.diagnostics.setEnabled(true);
   h.setCollector(async () => {
     throw Error();
   });
-  event(h);
+  event(h, {
+    page_id: "a".repeat(32),
+    stack_frames: [{ source_file: "app.js", line: 2, column: 3 }],
+  });
+  assert.equal(h.store.has(OUTBOX), false);
   await h.tick();
-  const disk = JSON.parse(h.store.get(OUTBOX));
-  disk.items[0].event.secret = "credential-secret";
-  disk.items[0].event.diagnostics.raw_stack = "raw secret";
-  disk.items[0].event.diagnostics.stack_frames = [
-    { source_file: "app.js", line: 2, column: 3, secret: "credential-secret" },
-    { source_file: "https://evil.test/app.js", line: 2, column: 3 },
-  ];
-  disk.items.push({ ...disk.items[0], at: 0 }, { ...disk.items[0], tries: 4 });
-  h.store.set(OUTBOX, JSON.stringify(disk));
-  const restored = harness({ store: h.store });
-  await restored.tick();
-  assert.equal(
-    restored.events().length,
-    1,
-    "expired entries and retry4 entries drop",
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.page_id, undefined);
+  assert.deepEqual([...h.store.keys()], [KEY]);
+  // A legacy persisted report must be deleted, even if it is otherwise valid.
+  h.store.set(
+    OUTBOX,
+    JSON.stringify({
+      schema_version: 1,
+      items: [{ event: h.events()[0], at: 2000000, tries: 0 }],
+      retry_at: 2000000,
+    }),
   );
-  assert.doesNotMatch(
-    JSON.stringify(restored.events()),
-    /credential-secret|raw_stack|evil/,
-  );
-  assert.deepEqual(restored.events()[0].diagnostics.stack_frames, [
-    { source_file: "app.js", line: 2, column: 3 },
-  ]);
-  const stale = JSON.parse(JSON.stringify(disk));
-  stale.items[0].at = 0;
-  stale.items = stale.items.slice(0, 1);
-  h.store.set(OUTBOX, JSON.stringify(stale));
-  const expired = harness({ store: h.store });
-  await expired.tick();
-  assert.equal(expired.events().length, 0);
+  const reloaded = harness({ store: h.store });
+  assert.equal(reloaded.store.has(OUTBOX), false);
+  await reloaded.tick(2000);
+  assert.equal(reloaded.events().length, 0);
+  assert.equal(reloaded.timers.size, 0);
 });
 test("queue max32; event4KiB, request64KiB, breadcrumbs12, stack8 and closed fields", async () => {
   const h = harness();
@@ -608,7 +628,7 @@ test("queue max32; event4KiB, request64KiB, breadcrumbs12, stack8 and closed fie
         secret: "secret",
       })),
     });
-  assert.equal(JSON.parse(h.store.get(OUTBOX)).items.length, 32);
+  assert.equal(h.store.has(OUTBOX), false);
   await h.tick();
   await h.tick(2000);
   assert.equal(h.events().length, 32);
@@ -626,7 +646,7 @@ test("queue max32; event4KiB, request64KiB, breadcrumbs12, stack8 and closed fie
   }
   assert.doesNotMatch(JSON.stringify(h.events()), /secret|https:/);
 });
-test("withdraw aborts active request and clears persistent queue/retry; late ACK cannot resurrect it", async () => {
+test("withdraw aborts active request and clears memory queue/retry; late ACK cannot resurrect it", async () => {
   const h = harness();
   h.diagnostics.setEnabled(true);
   let resolve, signal;
@@ -680,7 +700,7 @@ test("cross-tab opt-out aborts active request and clears outbox; quota failures 
   assert.doesNotThrow(() => q.diagnostics.setEnabled(true));
   assert.doesNotThrow(() => event(q));
   await q.tick();
-  assert.equal(q.events().length, 1);
+  assert.equal(q.events().length, 0);
   assert.doesNotThrow(() => q.diagnostics.setEnabled(false));
 });
 test("collector timeout aborts only diagnostics and retry budget terminates", async () => {
@@ -705,10 +725,11 @@ test("collector timeout aborts only diagnostics and retry budget terminates", as
   assert.equal(h.diagnostics.recent.length, 1);
 });
 
-test("disconnected Settings control uses diagnostics consent directly, with English/Korean and DNT state", () => {
-  for (const dnt of [undefined, "1"])
+test("disconnected Settings control uses automatic diagnostics directly, with English/Korean and privacy signal state", () => {
+  for (const signal of [{}, { dnt: "1" }, { gpc: true }])
     for (const lang of ["en", "ko"]) {
-      const h = harness({ dnt });
+      const h = harness(signal),
+        blocked = signal.dnt === "1" || signal.gpc === true;
       vm.runInContext(read("i18n.js"), h.context);
       h.context.KrillMobile.i18n.configure(lang);
       vm.runInContext(read("screens/settings.js"), h.context);
@@ -759,39 +780,63 @@ test("disconnected Settings control uses diagnostics consent directly, with Engl
         nodes = descendants(root),
         toggle = nodes.find((n) => n.dataset.focusKey === "error-reporting");
       assert(toggle);
-      assert.equal(toggle.checked, false);
-      assert.equal(toggle.disabled, dnt === "1");
+      assert.equal(toggle.checked, !blocked);
+      assert.equal(toggle.disabled, blocked);
       assert.equal(
         toggle.attrs["aria-label"],
-        lang === "ko" ? "오류 보고 보내기" : "Send error reports",
+        lang === "ko"
+          ? "기술적 오류 자동 수집"
+          : "Automatic technical error collection",
       );
-      if (!dnt) {
+      const notice = nodes.find(
+        (n) => n.href === "https://krill.page/privacy#mobile-errors",
+      );
+      assert(notice);
+      assert.equal(
+        notice.text,
+        lang === "ko" ? "오류 수집 안내" : "Error collection notice",
+      );
+      assert.equal(notice.referrerPolicy, "no-referrer");
+      assert.equal(notice.rel, "noreferrer");
+      const about = el("main");
+      h.context.KrillMobile.screens.settings(about, {
+        ...ctx,
+        route: { subpage: "about" },
+      });
+      const aboutNodes = descendants(about);
+      assert(
+        aboutNodes.some(
+          (n) => n.href === "https://krill.page/privacy#mobile-errors",
+        ),
+      );
+      assert(
+        aboutNodes.some((n) =>
+          n.text.includes(lang === "ko" ? "메모리에만" : "only in memory"),
+        ),
+      );
+      if (!blocked) {
         toggle.checked = true;
         toggle.listeners.change();
         assert.equal(h.diagnostics.enabled(), true);
-        assert.equal(h.store.get(KEY), "on");
+        assert.equal(h.store.get(KEY), "1");
         toggle.checked = false;
         toggle.listeners.change();
         assert.equal(h.diagnostics.enabled(), false);
-        assert.equal(h.store.get(KEY), "off");
+        assert.equal(h.store.get(KEY), "");
       }
     }
 });
 
-test("recent diagnostics callers cannot mutate the queued sanitized payload; DNT reload clears pending disk reports", async () => {
+test("recent diagnostics cannot mutate queued reports; DNT reload never restores prior errors", async () => {
   const h = harness();
-  h.diagnostics.setEnabled(true);
   event(h, { stack_frames: [{ source_file: "app.js", line: 1, column: 2 }] });
-  const original = JSON.parse(h.store.get(OUTBOX)).items[0].event.event_id;
   h.diagnostics.recent[0].stack_frames[0].source_file = "private-secret";
   await h.tick();
   assert.equal(h.events()[0].diagnostics.stack_frames[0].source_file, "app.js");
-  assert.equal(h.events()[0].event_id, original);
   assert.doesNotMatch(JSON.stringify(h.events()), /private-secret/);
   event(h, { line: 2 });
-  assert(h.store.has(OUTBOX));
+  assert.equal(h.store.has(OUTBOX), false);
   const off = harness({ store: h.store, dnt: "1" });
-  assert.equal(off.store.has(OUTBOX), false);
   await off.tick();
   assert.equal(off.events().length, 0);
 });
@@ -821,9 +866,8 @@ test("late close preserves an observable server cooldown code after opaque onerr
   t.close();
 });
 
-test("429 Retry-After preserves retry budget and persists cooldown across reload", async () => {
+test("429 Retry-After holds the memory retry budget; reload cannot restore reports or cooldown", async () => {
   const h = harness();
-  h.diagnostics.setEnabled(true);
   h.setCollector(async () => ({
     ok: false,
     status: 429,
@@ -832,15 +876,20 @@ test("429 Retry-After preserves retry budget and persists cooldown across reload
   event(h);
   await h.tick();
   assert.equal(h.requests.length, 1);
-  assert.equal(JSON.parse(h.store.get(OUTBOX)).items[0].tries, 1);
+  assert.equal(h.store.has(OUTBOX), false);
   await h.tick(59000);
   assert.equal(h.requests.length, 1);
-  const restored = harness({ store: h.store, initialNow: 2059000 });
-  await restored.tick();
-  assert.equal(restored.requests.length, 0);
-  await restored.tick(1000);
-  assert.equal(restored.requests.length, 1);
-  assert.equal(restored.store.has(OUTBOX), false);
+  const reloaded = harness({ store: h.store, initialNow: 2059000 });
+  await reloaded.tick(60000);
+  assert.equal(reloaded.requests.length, 0);
+  await h.tick(1000);
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.events()[0].event_id, h.events()[1].event_id);
+  await h.tick(60000);
+  await h.tick(60000);
+  await h.tick(60000);
+  assert.equal(h.requests.length, 4);
+  assert.equal(h.timers.size, 0);
 });
 test("partial ACK removes only accepted reports and Retry-After delays the remainder and newly queued errors", async () => {
   const h = harness();
@@ -858,11 +907,7 @@ test("partial ACK removes only accepted reports and Retry-After delays the remai
   event(h, { line: 2 });
   await h.tick();
   const first = h.events().map((e) => e.event_id);
-  assert.equal(JSON.parse(h.store.get(OUTBOX)).items.length, 1);
-  assert.equal(
-    JSON.parse(h.store.get(OUTBOX)).items[0].event.event_id,
-    first[1],
-  );
+  assert.equal(h.store.has(OUTBOX), false);
   event(h, { line: 3 });
   await h.tick(59000);
   assert.equal(h.requests.length, 1);
@@ -904,13 +949,89 @@ test("long Retry-After expires reports at TTL instead of retaining or sending th
   assert.equal(h.timers.size, 0);
 });
 
-test("quota on opt-out setting replacement removes the on key so reload stays disabled", () => {
-  const h = harness();
-  h.diagnostics.setEnabled(true);
-  h.context.localStorage.setItem = () => {
-    throw Error("quota");
-  };
+test("full origin quota permits opt-out after default-on reserve and legacy on migration; reload and other tabs stay off", async () => {
+  for (const saved of [undefined, "on", "1"]) {
+    const store = new Map([["unrelated", "private-pairing-data"]]);
+    if (saved !== undefined) store.set(KEY, saved);
+    const h = harness({ store });
+    // Fill the origin after automatic collection reserved its tiny preference.
+    const capacity = [...store].reduce(
+      (n, [k, v]) => n + k.length + v.length,
+      0,
+    );
+    const tab = harness({ store, capacity });
+    assert.equal(tab.diagnostics.enabled(), true);
+    tab.diagnostics.setEnabled(false);
+    assert.equal(store.get(KEY), "");
+    assert.equal(store.get("unrelated"), "private-pairing-data");
+    assert.equal(harness({ store, capacity }).diagnostics.enabled(), false);
+    h.emit("storage", { key: KEY });
+    assert.equal(h.diagnostics.enabled(), false);
+    event(h);
+    await h.tick();
+    assert.equal(h.requests.length, 0);
+  }
+});
+test("already-full origin with no preference fails closed and preserves unrelated storage across reload", async () => {
+  const store = new Map([["unrelated", "private"]]);
+  for (let n = 0; n < 2; n++) {
+    const h = harness({ store, capacity: 16 });
+    assert.equal(h.diagnostics.enabled(), false);
+    h.diagnostics.setEnabled(false);
+    event(h);
+    await h.tick();
+    assert.equal(h.requests.length, 0);
+    assert.equal(store.get("unrelated"), "private");
+  }
+});
+test("only diagnostics outbox may be reclaimed to reserve preference on a full origin", () => {
+  const store = new Map([
+    ["unrelated", "private"],
+    [OUTBOX, "x".repeat(100)],
+  ]);
+  const h = harness({ store, capacity: 160 });
+  assert.equal(h.diagnostics.enabled(), true);
   h.diagnostics.setEnabled(false);
-  assert.notEqual(h.store.get(KEY), "on");
-  assert.equal(harness({ store: h.store }).diagnostics.enabled(), false);
+  assert.equal(store.get(KEY), "");
+  assert.equal(store.get("unrelated"), "private");
+  assert.equal(store.has(OUTBOX), false);
+});
+test("blocked storage never enables automatic or explicit collection", async () => {
+  const h = harness({ quota: true });
+  assert.equal(h.diagnostics.enabled(), false);
+  assert.equal(h.diagnostics.setEnabled(true), false);
+  event(h);
+  await h.tick();
+  assert.equal(h.requests.length, 0);
+});
+
+test("global DNT disables collection and a changed GPC signal drops queued reports before send", async () => {
+  const h = harness();
+  h.context.doNotTrack = "1";
+  event(h);
+  await h.tick();
+  assert.equal(h.requests.length, 0);
+  h.context.doNotTrack = "0";
+  event(h, { line: 2 });
+  assert.equal(h.store.has(OUTBOX), false);
+  h.context.navigator.globalPrivacyControl = true;
+  await h.tick();
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.store.has(OUTBOX), false);
+});
+test("cross-tab saved legacy off is migrated and queue is cleared, while explicit re-enable does not replay", async () => {
+  const h = harness();
+  event(h);
+  h.store.set(KEY, "off");
+  h.emit("storage", { key: KEY });
+  assert.equal(h.store.get(KEY), "");
+  assert.equal(h.store.has(OUTBOX), false);
+  await h.tick();
+  assert.equal(h.requests.length, 0);
+  h.store.set(KEY, "on");
+  h.emit("storage", { key: KEY });
+  assert.equal(h.diagnostics.enabled(), true);
+  assert.equal(h.store.get(KEY), "1");
+  await h.tick();
+  assert.equal(h.requests.length, 0);
 });
