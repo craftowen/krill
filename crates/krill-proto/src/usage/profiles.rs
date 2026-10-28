@@ -119,13 +119,31 @@ pub fn try_migrate_long_codex_profile(
     }
     let marker = target.join(marker_name);
     if target.symlink_metadata().is_ok() {
-        if !target.symlink_metadata()?.is_dir()
-            || std::fs::read(&marker)? != source.as_os_str().as_encoded_bytes()
-        {
-            return Err(io::Error::new(
+        let conflict = || {
+            io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "Codex home belongs to another profile",
-            ));
+                "Codex migration source or target changed; stop both agents, compare the legacy and short homes, then reconcile or register the intended home explicitly (both homes preserved)",
+            )
+        };
+        if !target.symlink_metadata()?.is_dir() {
+            return Err(conflict());
+        }
+        let marker_meta = marker.symlink_metadata().map_err(|_| conflict())?;
+        if !marker_meta.is_file() || marker_meta.len() > 16 * 1024 {
+            return Err(conflict());
+        }
+        let provenance: CodexMigrationProvenance =
+            serde_json::from_slice(&std::fs::read(&marker).map_err(|_| conflict())?)
+                .map_err(|_| conflict())?;
+        let before = codex_tree_stamp(&source, 0)?;
+        if provenance.version != 1
+            || provenance.source != source.as_os_str().as_encoded_bytes()
+            || provenance.digest != codex_content_digest(&source, None)?
+            || provenance.digest != codex_content_digest(&target, Some(marker_name))?
+            || before != codex_tree_stamp(&source, 0)?
+            || provenance.digest != codex_content_digest(&source, None)?
+        {
+            return Err(conflict());
         }
         return Ok(target);
     }
@@ -154,8 +172,12 @@ pub fn try_migrate_long_codex_profile(
     }
     let result = (|| {
         let before = codex_tree_stamp(&source, 0)?;
+        let digest = codex_content_digest(&source, None)?;
         copy_codex_tree(&source, &staging, &source, 0)?;
-        if before != codex_tree_stamp(&source, 0)? {
+        if before != codex_tree_stamp(&source, 0)?
+            || digest != codex_content_digest(&source, None)?
+            || digest != codex_content_digest(&staging, None)?
+        {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Codex home changed during migration; retry after the agent stops",
@@ -163,7 +185,12 @@ pub fn try_migrate_long_codex_profile(
         }
         std::fs::write(
             staging.join(marker_name),
-            source.as_os_str().as_encoded_bytes(),
+            serde_json::to_vec(&CodexMigrationProvenance {
+                version: 1,
+                source: source.as_os_str().as_encoded_bytes().to_vec(),
+                digest,
+            })
+            .map_err(io::Error::other)?,
         )?;
         // A concurrently created target must never be replaced, including an empty directory.
         if target.symlink_metadata().is_ok() {
@@ -176,6 +203,89 @@ pub fn try_migrate_long_codex_profile(
         std::fs::remove_dir_all(&staging).ok();
     }
     result
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CodexMigrationProvenance {
+    version: u8,
+    source: Vec<u8>,
+    digest: Vec<u8>,
+}
+
+// A content manifest survives a crash between publication and account registration.
+// Relative names, entry kinds and streamed file hashes bind both trees to that snapshot.
+fn codex_content_digest(root: &Path, marker: Option<&str>) -> io::Result<Vec<u8>> {
+    use ring::digest::{Context, SHA256};
+    use std::io::Read as _;
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        count: &mut usize,
+        marker: Option<&str>,
+        hash: &mut Context,
+    ) -> io::Result<()> {
+        if depth > 64 {
+            return Err(io::Error::other("Codex home nesting too deep"));
+        }
+        let mut entries = std::fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if dir == root && marker.is_some_and(|name| entry.file_name() == name) {
+                continue;
+            }
+            *count = count.saturating_add(1);
+            if *count > 100_000 {
+                return Err(io::Error::other("Codex migration entry budget exceeded"));
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(root).map_err(io::Error::other)?;
+            let name = rel.as_os_str().as_encoded_bytes();
+            hash.update(
+                &u64::try_from(name.len())
+                    .map_err(io::Error::other)?
+                    .to_le_bytes(),
+            );
+            hash.update(name);
+            let meta = path.symlink_metadata()?;
+            if meta.is_dir() {
+                hash.update(b"dir");
+                visit(root, &path, depth.saturating_add(1), count, marker, hash)?;
+            } else if meta.is_file() {
+                hash.update(b"file");
+                let mut content = Context::new(&SHA256);
+                let mut file = std::fs::File::open(&path)?;
+                let mut buf = [0; 8192];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    content.update(
+                        buf.get(..n)
+                            .ok_or_else(|| io::Error::other("invalid read size"))?,
+                    );
+                }
+                hash.update(content.finish().as_ref());
+            } else if meta.file_type().is_symlink() {
+                hash.update(b"link");
+                let link = path.canonicalize()?;
+                let name = link.as_os_str().as_encoded_bytes();
+                hash.update(
+                    &u64::try_from(name.len())
+                        .map_err(io::Error::other)?
+                        .to_le_bytes(),
+                );
+                hash.update(name);
+            } else {
+                return Err(io::Error::other("unsupported Codex home entry"));
+            }
+        }
+        Ok(())
+    }
+    let mut hash = Context::new(&SHA256);
+    visit(root, root, 0, &mut 0, marker, &mut hash)?;
+    Ok(hash.finish().as_ref().to_vec())
 }
 
 type CodexTreeStamp = Vec<(PathBuf, u64, std::time::SystemTime)>;
@@ -657,70 +767,4 @@ mod tests {
 }
 
 #[cfg(all(test, unix))]
-mod migration_regression_tests {
-    use super::*;
-
-    #[test]
-    fn legacy_migration_preserves_nested_data_and_fails_without_switching() {
-        let home = std::env::temp_dir().join(format!("krill-legacy-copy-{}", std::process::id()));
-        std::fs::remove_dir_all(&home).ok();
-        let source = managed_root(&home).join("codex/account-with-a-very-long-legacy-home-name");
-        std::fs::create_dir_all(source.join("sessions/day")).unwrap();
-        std::fs::create_dir_all(source.join("rules")).unwrap();
-        std::fs::write(source.join("auth.json"), "original credentials").unwrap();
-        std::fs::write(
-            source.join("sessions/day/conversation.jsonl"),
-            "original conversation",
-        )
-        .unwrap();
-        std::fs::write(source.join("rules/private.md"), "private rules").unwrap();
-        let target = try_migrate_long_codex_profile(&home, "nested", &source).unwrap();
-        assert_eq!(
-            std::fs::read(target.join("rules/private.md")).unwrap(),
-            b"private rules"
-        );
-        assert_eq!(
-            std::fs::read(target.join("sessions/day/conversation.jsonl")).unwrap(),
-            b"original conversation"
-        );
-        std::fs::write(target.join("auth.json"), "new credentials").unwrap();
-        assert_eq!(
-            try_migrate_long_codex_profile(&home, "nested", &source).unwrap(),
-            target
-        );
-        assert_eq!(
-            std::fs::read(target.join("auth.json")).unwrap(),
-            b"new credentials"
-        );
-        assert_eq!(
-            std::fs::read(source.join("auth.json")).unwrap(),
-            b"original credentials"
-        );
-        let external = home.join("shared-history");
-        std::fs::create_dir_all(&external).unwrap();
-        std::fs::write(external.join("record"), "shared data").unwrap();
-        std::os::unix::fs::symlink("../../../../../shared-history", source.join("external"))
-            .unwrap();
-        let with_link = try_migrate_long_codex_profile(&home, "links", &source).unwrap();
-        assert_eq!(
-            with_link.join("external").canonicalize().unwrap(),
-            external.canonicalize().unwrap()
-        );
-        let blocked = short_codex_profile_dir(&home, "blocked");
-        std::fs::create_dir_all(&blocked).unwrap();
-        std::fs::write(blocked.join("auth.json"), "someone else").unwrap();
-        assert!(try_migrate_long_codex_profile(&home, "blocked", &source).is_err());
-        assert_eq!(
-            migrate_long_codex_profile_if_needed(&home, "blocked", &source),
-            source
-        );
-        let socket_path = PathBuf::from(format!("/tmp/kcs-{}", std::process::id()));
-        std::fs::remove_file(&socket_path).ok();
-        let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        std::fs::rename(socket_path, source.join("live.sock")).unwrap();
-        assert!(try_migrate_long_codex_profile(&home, "incomplete", &source).is_err());
-        assert!(!short_codex_profile_dir(&home, "incomplete").exists());
-        drop(socket);
-        std::fs::remove_dir_all(home).unwrap();
-    }
-}
+mod migration_tests;
