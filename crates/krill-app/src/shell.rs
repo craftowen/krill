@@ -3606,12 +3606,7 @@ impl Shell {
                 if let Some(to) = handoff.to.filter(|to| *to != handoff.from) {
                     let panes = self.layout.rebind_session(&host, handoff.from, to);
                     if !panes.is_empty() {
-                        let was_active = self.chat.active_sessions.remove(&handoff.from);
-                        if let Some(chat) = self.chat.overrides.remove(&handoff.from) {
-                            self.chat.set_session_chat_view(to, chat);
-                        } else if was_active {
-                            self.chat.set_session_chat_view(to, true);
-                        }
+                        // View choices stay on the rebound panes, scoped to their host.
                         self.chat.logs.remove(&handoff.from);
                     }
                     changed |= !panes.is_empty();

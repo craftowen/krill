@@ -88,7 +88,9 @@ pub(super) fn install(shell: &mut Shell, window: &mut gpui::Window, cx: &mut Con
             },
         ]
     };
-    shell.chat.active_sessions.insert(session);
+    if let Some(pane) = shell.layout.focused() {
+        shell.layout.set_chat_view(pane, true);
+    }
     shell.apply_chat_poll_for_host(
         session,
         krill_app::hosts::HostId::Local,

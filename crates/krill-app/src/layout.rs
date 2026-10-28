@@ -25,6 +25,8 @@ const FILE_NAME: &str = "layout.bin";
 /// 6: 탭 핀 고정·9색 태그(OWE-734 `Tab.pinned`, `Tab.color`), v2~v5는 [`LegacyLayout`]으로 읽는다.
 /// 7: 탭 사용자 지정 제목(OWE-870 `Tab.custom_title`), v6은 [`LegacyLayoutV6`]으로 읽는다.
 const FORMAT_VERSION: u8 = 7;
+/// Optional preferences after `FocusTail`; old readers ignore this suffix.
+const CHAT_VIEWS_TAG: &[u8] = b"KCV1";
 /// 손상·악성 파일의 깊은 중첩이 역직렬화 재귀로 스택을 넘지 않게 하는 상한.
 /// 탭 10개 × 분할 4개는 수백 바이트다.
 const MAX_FILE_BYTES: u64 = 16 * 1024;
@@ -431,6 +433,9 @@ pub struct Layout {
     mru: MruState,
     #[serde(skip)]
     zoomed: Vec<PaneId>,
+    /// Explicit Chat/Terminal choices survive app updates, scoped to the saved pane/host.
+    #[serde(skip)]
+    chat_views: BTreeMap<PaneId, bool>,
 }
 
 /// v5까지의 디스크 `Tab`(OWE-734 `pinned`·`color` 이전).
@@ -529,6 +534,7 @@ impl From<LegacyLayoutV6> for Layout {
             last_seen_unix_ns: 0,
             mru: MruState::default(),
             zoomed: Vec::new(),
+            chat_views: BTreeMap::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -573,6 +579,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             last_seen_unix_ns: 0,
             mru: MruState::default(),
             zoomed: Vec::new(),
+            chat_views: BTreeMap::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -605,6 +612,7 @@ impl Default for Layout {
                 ..MruState::default()
             },
             zoomed: Vec::new(),
+            chat_views: BTreeMap::new(),
         }
     }
 }
@@ -612,6 +620,17 @@ impl Default for Layout {
 impl Layout {
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
+    }
+
+    /// None follows the global default; Some(false) explicitly keeps Terminal.
+    pub fn chat_view(&self, pane: PaneId) -> Option<bool> {
+        self.chat_views.get(&pane).copied()
+    }
+
+    pub fn set_chat_view(&mut self, pane: PaneId, chat: bool) {
+        if self.pane_exists(pane) && !self.files.contains_key(&pane) {
+            self.chat_views.insert(pane, chat);
+        }
     }
 
     pub fn active(&self) -> usize {
@@ -760,8 +779,15 @@ impl Layout {
 
     /// 칸에 세션을 붙인다. 닫힌 칸·파일 칸이면 무시한다.
     pub fn set_session(&mut self, pane: PaneId, session: SessionId) {
-        if self.panes().contains(&pane) && !self.files.contains_key(&pane) {
-            self.sessions.insert(pane, session);
+        if self.panes().contains(&pane)
+            && !self.files.contains_key(&pane)
+            && self
+                .sessions
+                .insert(pane, session)
+                .is_some_and(|old| old != session)
+        {
+            // A different terminal gets its own default. Explicit account handoff uses rebind_session.
+            self.chat_views.remove(&pane);
         }
     }
 
@@ -1032,6 +1058,8 @@ impl Layout {
         self.file_states.retain(|p, _| self.files.contains_key(p));
         self.respawn_cwds.retain(|p, _| live.contains(p));
         self.zoomed.retain(|p| live.contains(p));
+        self.chat_views
+            .retain(|p, _| live.contains(p) && !self.files.contains_key(p));
     }
 
     fn alloc_pane(&mut self) -> PaneId {
@@ -1812,6 +1840,10 @@ impl Layout {
             && self.window_bounds.is_none_or(SavedWindowBounds::is_valid)
             && self.file_states.keys().all(|p| self.files.contains_key(p))
             && self.respawn_cwds.keys().all(|p| seen.contains(p))
+            && self
+                .chat_views
+                .keys()
+                .all(|p| seen.contains(p) && !self.files.contains_key(p))
     }
 
     /// 손상 백업(`.corrupt`)을 만들지 않고 저장 파일에서 창 위치·크기만 미리 읽는다.
@@ -1877,8 +1909,21 @@ impl Layout {
                         // 7-필드 꼬리가 아니면 6-필드(`last_seen` 이전), 그다음 중간 커밋의 5-필드 꼬리로 읽는다.
                         let tail_and_focus = postcard::take_from_bytes::<LayoutTail>(rest);
                         if let Ok((_, focus_bytes)) = &tail_and_focus
-                            && let Ok(focus) = postcard::from_bytes::<FocusTail>(focus_bytes)
+                            && let Ok((focus, preferences)) =
+                                postcard::take_from_bytes::<FocusTail>(focus_bytes)
                         {
+                            // A bad optional preference must not discard live tabs or sessions.
+                            if let Some(bytes) = preferences.strip_prefix(CHAT_VIEWS_TAG)
+                                && let Ok(views) =
+                                    postcard::from_bytes::<BTreeMap<PaneId, bool>>(bytes)
+                            {
+                                l.chat_views = views
+                                    .into_iter()
+                                    .filter(|(pane, _)| {
+                                        l.pane_exists(*pane) && !l.files.contains_key(pane)
+                                    })
+                                    .collect();
+                            }
                             l.mru.order = focus.order;
                             // 불일치하는 선택 상태 때문에 세션 레이아웃을 버리지 않는다.
                             for tab in &l.tabs {
@@ -1922,16 +1967,23 @@ impl Layout {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut body = postcard::to_stdvec(self).map_err(io::Error::other)?;
         let tail = self.tail();
-        let focus = (self.tabs.len() > 1 || !self.zoomed.is_empty()).then(|| FocusTail {
-            order: self.mru_order(),
-            zoomed: self.zoomed.clone(),
-        });
+        let focus = (self.tabs.len() > 1 || !self.zoomed.is_empty() || !self.chat_views.is_empty())
+            .then(|| FocusTail {
+                order: self.mru_order(),
+                zoomed: self.zoomed.clone(),
+            });
         if !self.hosts.is_empty() || tail != LayoutTail::default() || focus.is_some() {
             body.extend(postcard::to_stdvec(&self.hosts).map_err(io::Error::other)?);
             if tail != LayoutTail::default() || focus.is_some() {
                 body.extend(postcard::to_stdvec(&tail).map_err(io::Error::other)?);
                 if let Some(focus) = focus {
                     body.extend(postcard::to_stdvec(&focus).map_err(io::Error::other)?);
+                    if !self.chat_views.is_empty() {
+                        body.extend(CHAT_VIEWS_TAG);
+                        body.extend(
+                            postcard::to_stdvec(&self.chat_views).map_err(io::Error::other)?,
+                        );
+                    }
                 }
             }
         }
@@ -2111,3 +2163,6 @@ mod leaf_mru_tests {
         assert_eq!(merged.file(restored_file), Some(Path::new("saved.md")));
     }
 }
+
+#[cfg(test)]
+mod view_tests;

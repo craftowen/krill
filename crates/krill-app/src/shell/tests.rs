@@ -39,10 +39,10 @@ fn cursor_blink_stops_when_hidden_or_inactive_and_restarts_visible(cx: &mut Test
             s.on_window_active_changed(true, cx);
             assert!(s.cursor_blink.as_ref().is_some_and(|(_, hidden)| !hidden));
 
-            s.chat.active_sessions.insert(krill_proto::SessionId(41));
+            s.layout.set_chat_view(pane, true);
             s.sync_cursor_blink(true, cx);
             assert!(s.cursor_blink.is_none());
-            s.chat.active_sessions.clear();
+            s.layout.set_chat_view(pane, false);
             s.sync_cursor_blink(true, cx);
             assert!(s.cursor_blink.is_some());
 

@@ -42,7 +42,7 @@ impl Shell {
                     .await;
                 let finished = this
                     .update_in(cx, |this, window, cx| {
-                        let same_origin = this.is_session_chat_view(session, cx)
+                        let same_origin = this.is_pane_chat_view(pane, cx)
                             && !this.chat.prompt_review.contains(&session)
                             && this.layout.host(pane) == &host
                             && this.layout.session(pane) == Some(session)

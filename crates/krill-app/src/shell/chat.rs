@@ -111,8 +111,6 @@ enum ChatFocus {
 
 #[derive(Default)]
 pub(crate) struct ChatState {
-    pub active_sessions: BTreeSet<SessionId>,
-    pub overrides: BTreeMap<SessionId, bool>,
     poll_timer: Option<Task<()>>,
     poll_failed: BTreeSet<SessionId>,
     lists: BTreeMap<(PaneId, SessionId), ChatList>,
@@ -139,15 +137,6 @@ impl ChatState {
     pub(super) fn review_pending_prompt(&mut self, session: SessionId) {
         if self.prompt_tasks.contains_key(&session) {
             self.prompt_review.insert(session);
-        }
-    }
-
-    pub(crate) fn set_session_chat_view(&mut self, session: SessionId, chat: bool) {
-        self.overrides.insert(session, chat);
-        if chat {
-            self.active_sessions.insert(session);
-        } else {
-            self.active_sessions.remove(&session);
         }
     }
 }
@@ -280,15 +269,21 @@ use body::{ChatBodySegment, parse_chat_segments};
 
 impl Shell {
     pub(super) fn is_session_chat_view(&self, session: SessionId, cx: &gpui::App) -> bool {
-        self.chat
-            .overrides
-            .get(&session)
-            .copied()
-            .unwrap_or_else(|| {
-                self.chat.active_sessions.contains(&session)
-                    || krill_app::settings::default_view_mode(cx)
-                        == krill_app::settings::DefaultViewMode::Chat
-            })
+        let pane = self
+            .layout
+            .focused()
+            .filter(|pane| self.layout.session(*pane) == Some(session));
+        pane.is_some_and(|pane| self.is_pane_chat_view(pane, cx))
+    }
+
+    fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
+        if self.layout.session(pane).is_none() {
+            return false;
+        }
+        if let Some(chat) = self.layout.chat_view(pane) {
+            return chat;
+        }
+        krill_app::settings::default_view_mode(cx) == krill_app::settings::DefaultViewMode::Chat
     }
 
     pub(super) fn is_active_chat_view_in(&self, cx: &gpui::App) -> bool {
@@ -299,10 +294,10 @@ impl Shell {
     /// 현재 포커스된 칸의 세션이 명시적 Chat 뷰 모드인지 반환한다(테스트/내부 호환용).
     #[cfg(test)]
     pub(super) fn is_active_chat_view(&self) -> bool {
-        self.active_session_id().is_some_and(|id| {
-            self.chat.active_sessions.contains(&id)
-                || self.chat.overrides.get(&id).copied().unwrap_or(false)
-        })
+        self.layout
+            .focused()
+            .and_then(|pane| self.layout.chat_view(pane))
+            .unwrap_or(false)
     }
 
     pub(super) fn active_session_id(&self) -> Option<SessionId> {
@@ -325,6 +320,15 @@ impl Shell {
         });
     }
 
+    fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
+        if self.layout.session(pane).is_none() {
+            return;
+        }
+        self.layout.set_chat_view(pane, chat);
+        self.save();
+        cx.notify();
+    }
+
     /// `[Chat | Term]` 모드를 토글한다(OWE-946 / MK-243).
     pub(super) fn toggle_chat_view(&mut self, cx: &mut Context<Self>) {
         self.diff
@@ -333,7 +337,9 @@ impl Shell {
             return;
         };
         let chat = !self.is_session_chat_view(session, cx);
-        self.chat.set_session_chat_view(session, chat);
+        if let Some(pane) = self.layout.focused() {
+            self.set_pane_chat_view(pane, chat, cx);
+        }
         self.chat.focus_pending = Some(if chat {
             ChatFocus::Composer(session)
         } else {
@@ -427,7 +433,7 @@ impl Shell {
         session: SessionId,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.task.is_some() || !self.is_session_chat_view(session, cx) {
+        if self.chat.task.is_some() || !self.is_pane_chat_view(pane, cx) {
             return;
         }
         self.ensure_chat_poll_timer(cx);
@@ -465,7 +471,7 @@ impl Shell {
                 this.chat.task = None;
                 if this.layout.host(pane) == &host
                     && this.layout.session(pane) == Some(session)
-                    && this.is_session_chat_view(session, cx)
+                    && this.is_pane_chat_view(pane, cx)
                     && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
                 {
                     if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
