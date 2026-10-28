@@ -10,6 +10,8 @@
 //!    원본 SHA-256·줄 무손실, 새 세션 생성·크기 변경·종료, 잔여 프로세스 0을 확인한다.
 //! 4. [`big_output_and_alt_screen_hash`]: 수 MB 출력(`type`)과 대체 화면 TUI에서 실시간 원본과 재생 원본의 SHA-256이
 //!    같고, 생성한 줄이 빠짐없이 화면 출력에 있다.
+//! 5. [`upgrade::rename_update_keeps_live_holder`]: 번들 `ConPTY` 격리 설치 폴더를 업데이터처럼 파일 단위로 교체한 뒤
+//!    업그레이드를 요청하면 holder·세션 PID는 그대로, krilld만 새 이미지로 바뀌고 출력·입력·새 세션이 산다.
 //!
 //! `ConPTY`는 자식이 쓴 바이트를 그대로 넘기지 않고 다시 그린 VT를 내보낸다. 그래서 바이트 해시는 "krilld가 PTY에서
 //! 읽은 원본"(실시간 구독 ↔ 링·세그먼트 재생)끼리 비교하고, 생성기와의 비교는 줄 단위(번호·검사 꼬리표)로 한다.
@@ -199,7 +201,9 @@ impl Rig {
 
     /// [`Rig::launch`]와 같되 이번에 holder를 새로 띄웠는지도 준다.
     fn launch_full(&mut self) -> (u32, u32, bool) {
-        let (mut child, rx) = spawn("launch", &self.dir, &[]);
+        // 자식도 이 Rig의 holder·krilld 경로로 띄운다(업그레이드 시나리오는 격리 설치 폴더를 쓴다).
+        let bin = self.paths.holder.parent().unwrap().display().to_string();
+        let (mut child, rx) = spawn("launch", &self.dir, &[("KRILL_E2E_BIN", bin)]);
         let words = next(&rx, "KRILLD");
         assert!(child.wait().unwrap().success());
         let krilld: u32 = words[1].parse().unwrap();
@@ -1240,3 +1244,6 @@ fn big_output_and_alt_screen_hash() {
     assert_eq!(lost, 0, "lines lost");
     assert!(alt_left, "alt screen not restored: {primary}");
 }
+
+#[path = "win_survival_e2e/upgrade.rs"]
+mod upgrade;

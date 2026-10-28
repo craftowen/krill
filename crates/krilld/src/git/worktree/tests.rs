@@ -151,6 +151,81 @@ fn korean_name_and_collision_suffix() {
 }
 
 #[test]
+fn project_destination_applies_from_main_and_linked_worktrees() {
+    let f = Fixture::new("project-location", "");
+    fs::create_dir_all(f.trust.parent().unwrap()).unwrap();
+    let repo = fs::canonicalize(&f.repo).unwrap();
+    let repo_path = repo.to_str().unwrap();
+    let document = toml::toml! {
+        [[projects]]
+        path = repo_path
+        worktree_base_path = ".worktrees/작업 폴더"
+    };
+    fs::write(
+        f.trust.parent().unwrap().join("projects.toml"),
+        document.to_string(),
+    )
+    .unwrap();
+    let (first, _) = f.created("first", Setup::Skip);
+    assert_eq!(path(&first), repo.join(".worktrees/작업 폴더/first"));
+    let child = NewWorktree {
+        repo: first.path.clone(),
+        name: "second".into(),
+        base: None,
+        setup: Setup::Skip,
+    };
+    let Outcome::Created {
+        worktree: second, ..
+    } = create(&f.queue, &child, &f.root, &f.trust).unwrap()
+    else {
+        panic!("unexpected setup prompt");
+    };
+    assert_eq!(path(&second), repo.join(".worktrees/작업 폴더/second"));
+    assert!(
+        !f.root.exists(),
+        "custom destination must not create the default directory"
+    );
+
+    // Clearing the project override only changes future creations.
+    fs::write(f.trust.parent().unwrap().join("projects.toml"), "").unwrap();
+    let (default, _) = f.created("default", Setup::Skip);
+    assert_eq!(
+        path(&default),
+        fs::canonicalize(&f.root).unwrap().join("레포/default")
+    );
+    assert!(path(&first).is_dir());
+    assert!(path(&second).is_dir());
+}
+
+#[test]
+fn invalid_project_destination_fails_without_default_fallback() {
+    let f = Fixture::new("invalid-project-location", "");
+    fs::create_dir_all(f.trust.parent().unwrap()).unwrap();
+    let repo = fs::canonicalize(&f.repo).unwrap();
+    let repo_path = repo.to_str().unwrap();
+    for destination in [".git/worktrees", "blocked"] {
+        fs::write(repo.join("blocked"), "file").unwrap();
+        let document = toml::toml! {
+            [[projects]]
+            path = repo_path
+            worktree_base_path = destination
+        };
+        fs::write(
+            f.trust.parent().unwrap().join("projects.toml"),
+            document.to_string(),
+        )
+        .unwrap();
+        assert!(f.create("task", Setup::Skip).is_err());
+        assert!(!f.root.exists());
+        assert!(
+            !f.git(&["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == "task")
+        );
+    }
+}
+
+#[test]
 fn bad_names_and_bases_are_refused() {
     let f = Fixture::new("bad", "");
     for name in ["", "  ", "-x", ".hidden", "a/b", "a..b", "x.lock"] {

@@ -209,3 +209,18 @@ pub(crate) fn tcgetpgrp(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
     let pgrp = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
     (pgrp > 0).then(|| u32::try_from(pgrp).ok()).flatten()
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn process_args_reads_a_childs_argv() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let args = super::process_args(child.id());
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(args.unwrap(), ["sleep", "30"]);
+    }
+}

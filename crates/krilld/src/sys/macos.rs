@@ -241,6 +241,59 @@ pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
     Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
+/// 프로세스 argv(`KERN_PROCARGS2`). 같은 UID 프로세스만 조회된다.
+pub(crate) fn process_args(pid: u32) -> io::Result<Vec<String>> {
+    let pid = c_int::try_from(pid).map_err(io::Error::other)?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: 출력 버퍼가 null이면 커널은 필요한 크기만 `size`에 쓴다.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            ptr::null_mut(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0_u8; size];
+    // SAFETY: `buf`는 `size` 바이트짜리 쓰기 가능한 버퍼다.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(size);
+    parse_procargs2(&buf)
+}
+
+/// `KERN_PROCARGS2` 버퍼: `argc`(i32) · 실행 경로\0 · \0 패딩 · argv\0 × argc · 환경변수.
+fn parse_procargs2(buf: &[u8]) -> io::Result<Vec<String>> {
+    let (argc, rest) = buf
+        .split_first_chunk::<4>()
+        .ok_or(io::ErrorKind::InvalidData)?;
+    let argc = usize::try_from(i32::from_ne_bytes(*argc)).map_err(io::Error::other)?;
+    Ok(rest
+        .split(|&b| b == 0)
+        .skip(1)
+        .skip_while(|s| s.is_empty())
+        .take(argc)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
 /// 프로세스 이름. 명령줄을 읽지 않고 커널의 짧은 실행 이름만 사용한다.
 pub(crate) fn process_name(pid: u32) -> io::Result<String> {
     // SAFETY: `proc_bsdshortinfo`는 정수 필드만 있고 PROC_PIDT_SHORTBSDINFO의 출력 구조체다.

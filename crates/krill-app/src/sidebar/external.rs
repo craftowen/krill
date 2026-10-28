@@ -17,6 +17,9 @@ use serde::Deserialize;
 
 use super::Sidebar;
 
+mod location;
+pub use location::{project_worktree_locations, save_project_worktree_location};
+
 pub const COMMENTS_FILE: &str = krill_proto::orchestration::COMMENTS_FILE;
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -644,6 +647,10 @@ fn slugify_project_id(name: &str) -> String {
 
 fn write_projects_file(path: &Path, value: &toml::Value) -> io::Result<()> {
     let body = toml::to_string(value).map_err(io::Error::other)?;
+    write_projects_body(path, &body)
+}
+
+fn write_projects_body(path: &Path, body: &str) -> io::Result<()> {
     if u64::try_from(body.len()).map_or(true, |n| n > MAX_PROJECTS_BYTES) {
         return Err(io::Error::new(
             io::ErrorKind::QuotaExceeded,
@@ -717,6 +724,8 @@ struct ImportedProject {
     kind: Option<String>,
     #[serde(default)]
     host_id: Option<String>,
+    #[serde(default)]
+    worktree_base_path: Option<String>,
     #[serde(default)]
     pinned: bool,
     #[serde(default)]
