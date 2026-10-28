@@ -6078,17 +6078,13 @@ mod source_discovery_tests {
         let fallback = root.join("home/AppData/Roaming");
         fs::create_dir_all(custom.join("orca")).unwrap();
         fs::create_dir_all(fallback.join("Orca/profiles/default")).unwrap();
-        // macOS의 대소문자 무시 파일시스템에서는 `orca`와 `Orca`가 같은 폴더다.
-        assert!(
-            discover_orca_dir([custom.clone(), fallback.clone()])
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&fallback.join("Orca").to_string_lossy())
-        );
+        let discovered = discover_orca_dir([custom.clone(), fallback.clone()]);
+        assert!(same_file::is_same_file(&discovered, fallback.join("Orca")).unwrap());
+        assert!(discovered.join("profiles/default").is_dir());
         fs::write(custom.join("orca/orca-profile-index.json"), "{}").unwrap();
-        assert_eq!(
-            discover_orca_dir([custom.clone(), fallback]),
-            custom.join("orca")
-        );
+        let discovered = discover_orca_dir([custom.clone(), fallback]);
+        assert!(same_file::is_same_file(&discovered, custom.join("orca")).unwrap());
+        assert!(discovered.join("orca-profile-index.json").is_file());
         // from_env preserves explicit --orca-dir and KRILL_ORCA_DIR before discovery.
         fs::remove_dir_all(root).unwrap();
     }

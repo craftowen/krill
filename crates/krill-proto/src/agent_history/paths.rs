@@ -15,13 +15,14 @@ pub fn is_absolute_history_path(path: &str) -> bool {
     path.starts_with('/') || windows_path(path)
 }
 
-/// Normalize Windows spelling only for syntactically Windows paths. POSIX case and
+/// Normalize separators and ASCII case for syntactically Windows paths. Unresolved
+/// or foreign Unicode aliases (for example Σ/ς) deliberately remain distinct: only
+/// the native filesystem can decide their identity. POSIX case and
 /// Unicode bytes remain distinct, including when the client runs on Windows.
 #[must_use]
 pub fn normalize_path_for_comparison(path: &str) -> String {
-    let path = path.trim();
     let mut normalized = if windows_path(path) {
-        let normalized = path.replace('\\', "/").to_lowercase();
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
         if let Some(rest) = normalized.strip_prefix("//?/unc/") {
             format!("//{rest}")
         } else {
@@ -62,6 +63,13 @@ pub fn normalize_path_for_comparison(path: &str) -> String {
 /// on case-sensitive remote hosts or volumes.
 #[must_use]
 pub fn path_inside_or_equal(candidate: &str, root: &str) -> bool {
+    #[cfg(windows)]
+    if windows_path(candidate)
+        && windows_path(root)
+        && let Some(inside) = native_windows_scope(candidate, root)
+    {
+        return inside;
+    }
     let candidate_key = normalize_path_for_comparison(candidate);
     let root_key = normalize_path_for_comparison(root);
     if root_key.is_empty() {
@@ -91,6 +99,22 @@ pub fn path_inside_or_equal(candidate: &str, root: &str) -> bool {
     false
 }
 
+// Existing directory identities override lexical case folding, including on Windows
+// directories with case sensitivity enabled. Missing leaf names use their nearest
+// existing ancestor. Errors opening the root leave conservative lexical fallback.
+#[cfg(windows)]
+fn native_windows_scope(candidate: &str, root: &str) -> Option<bool> {
+    let root = same_file::Handle::from_path(root).ok()?;
+    for ancestor in std::path::Path::new(candidate).ancestors() {
+        if let Ok(resolved) = ancestor.canonicalize() {
+            return Some(resolved.ancestors().any(|parent| {
+                same_file::Handle::from_path(parent).is_ok_and(|handle| handle == root)
+            }));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +136,56 @@ mod tests {
         assert!(path_inside_or_equal("c:/work/app", r"C:\"));
         assert!(!path_inside_or_equal("d:/work/app", r"C:\"));
         assert!(!path_inside_or_equal("/work/app-old", "/work/app"));
+    }
+
+    #[test]
+    fn unresolved_windows_unicode_is_conservative_and_posix_bytes_stay_distinct() {
+        assert!(!path_inside_or_equal(
+            "C:/__krill_unresolved__/i\u{307}/child",
+            "C:/__krill_unresolved__/İ"
+        ));
+        assert!(!path_inside_or_equal(
+            "C:/__krill_unresolved__/ς/child",
+            "C:/__krill_unresolved__/Σ"
+        ));
+        assert!(!path_inside_or_equal(
+            "C:/__krill_unresolved__/é/child",
+            "C:/__krill_unresolved__/e\u{301}"
+        ));
+        assert!(!path_inside_or_equal("/remote/Σ/child", "/remote/ς"));
+        assert!(!path_inside_or_equal("/remote/name ", "/remote/name"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_windows_unicode_and_case_sensitive_names_use_native_identity() {
+        let dir = std::env::temp_dir().join(format!("krill-vault-native-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (a, b) in [
+            ("Σ", "ς"),
+            ("İ", "i\u{307}"),
+            ("é", "e\u{301}"),
+            ("Case", "case"),
+        ] {
+            let left = dir.join(a);
+            let right = dir.join(b);
+            std::fs::create_dir_all(left.join("child")).unwrap();
+            std::fs::create_dir_all(&right).unwrap();
+            let identical = same_file::is_same_file(&left, &right).unwrap();
+            assert_eq!(
+                path_inside_or_equal(
+                    &left.join("child").display().to_string(),
+                    &right.display().to_string()
+                ),
+                identical
+            );
+        }
+        std::fs::create_dir_all(dir.join("Outside/sub")).unwrap();
+        assert!(!path_inside_or_equal(
+            &dir.join("Case/../Outside/sub").display().to_string(),
+            &dir.join("Case").display().to_string()
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "macos")]

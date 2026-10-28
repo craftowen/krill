@@ -502,8 +502,8 @@ impl ParsedQuery {
         let mut paths: Vec<String> = req
             .paths
             .iter()
-            .map(|p| normalize_path(p))
             .filter(|p| !p.is_empty())
+            .cloned()
             .collect();
         let mut terms = Vec::new();
         for token in req.query.split_whitespace() {
@@ -517,9 +517,10 @@ impl ParsedQuery {
                 .strip_prefix("path:")
                 .or_else(|| token.strip_prefix("repo:"))
             {
-                let norm = normalize_path(rest);
-                if !norm.is_empty() {
-                    paths.push(norm);
+                // Native identity lookup needs the original spelling, particularly
+                // in Windows directories with case sensitivity enabled.
+                if !rest.is_empty() {
+                    paths.push(rest.to_owned());
                 }
                 continue;
             }
@@ -2964,5 +2965,37 @@ mod path_scope_regressions {
             ..Default::default()
         });
         assert!(!parsed.matches_path("/work/app"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn native_query_scope_keeps_case_sensitive_filesystem_identity() {
+        let root =
+            std::env::temp_dir().join(format!("krill-vault-query-case-{}", std::process::id()));
+        let upper = root.join("Case");
+        let lower = root.join("case");
+        std::fs::create_dir_all(upper.join("sub")).unwrap();
+        std::fs::create_dir_all(lower.join("sub")).unwrap();
+        let same = same_file::is_same_file(&upper, &lower).unwrap();
+        for requested in [&upper, &lower] {
+            for query in [
+                SearchQuery {
+                    paths: vec![requested.display().to_string()],
+                    ..Default::default()
+                },
+                SearchQuery {
+                    query: format!("path:{}", requested.display()),
+                    ..Default::default()
+                },
+            ] {
+                let parsed = ParsedQuery::parse(&query);
+                assert!(parsed.matches_path(&requested.join("sub").display().to_string()));
+                let other = if requested == &upper { &lower } else { &upper };
+                assert_eq!(
+                    parsed.matches_path(&other.join("sub").display().to_string()),
+                    same
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
