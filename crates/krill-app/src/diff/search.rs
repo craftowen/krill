@@ -521,26 +521,123 @@ pub(crate) enum RgError {
 }
 
 fn find_rg_binary() -> Option<PathBuf> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("rg");
-            if candidate.is_file() {
-                return Some(candidate);
+    find_rg_binary_in(
+        std::env::var_os("PATH").as_deref(),
+        if cfg!(windows) {
+            &[]
+        } else {
+            &[
+                "/opt/homebrew/bin/rg",
+                "/usr/local/bin/rg",
+                "/usr/bin/rg",
+                "/opt/local/bin/rg",
+            ]
+        },
+    )
+}
+
+// Windows는 PATHEXT의 셸 래퍼 대신 네이티브 실행파일을 직접 실행한다.
+// 환경을 인자로 받아 테스트가 프로세스 전역 환경을 바꾸지 않게 한다.
+fn find_rg_binary_in(path: Option<&std::ffi::OsStr>, fallbacks: &[&str]) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "rg.exe" } else { "rg" };
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(name))
+        .chain(fallbacks.iter().map(PathBuf::from))
+        .find(|candidate| rg_executable(candidate))
+}
+
+fn rg_executable(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
+#[cfg(test)]
+mod rg_discovery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "krill-rg-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+        fn binary(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             }
+            path
         }
     }
-    for fixed in [
-        "/opt/homebrew/bin/rg",
-        "/usr/local/bin/rg",
-        "/usr/bin/rg",
-        "/opt/local/bin/rg",
-    ] {
-        let candidate = PathBuf::from(fixed);
-        if candidate.is_file() {
-            return Some(candidate);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
         }
     }
-    None
+
+    #[test]
+    fn rg_discovery_native_name_and_path_precedence() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let native = if cfg!(windows) { "rg.exe" } else { "rg" };
+        first.binary(if cfg!(windows) { "rg" } else { "rg.exe" });
+        first.binary("rg.cmd");
+        let selected = second.binary(native);
+        let path = std::env::join_paths([&first.0, &second.0]).unwrap();
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), Some(selected));
+        let preferred = first.binary(native);
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), Some(preferred));
+    }
+
+    #[test]
+    fn rg_discovery_missing_directory_and_explicit_fallback() {
+        let fixture = Fixture::new();
+        let native = if cfg!(windows) { "rg.exe" } else { "rg" };
+        fs::create_dir(fixture.0.join(native)).unwrap();
+        let path = std::env::join_paths([&fixture.0]).unwrap();
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), None);
+        assert_eq!(find_rg_binary_in(None, &[]), None);
+        let fallback = fixture.binary("fallback-rg");
+        assert_eq!(
+            find_rg_binary_in(Some(&path), &[fallback.to_str().unwrap()]),
+            Some(fallback)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rg_discovery_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new();
+        let binary = fixture.binary("rg");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([&fixture.0]).unwrap();
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), None);
+    }
 }
 
 #[expect(
