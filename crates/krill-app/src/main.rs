@@ -328,11 +328,15 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
     }
 }
 
-/// OWE-842: 저장된 위치가 지금 연결된 어느 화면과도 겹치지 않으면(모니터를 뗀 경우) 저장 크기로
+/// OWE-842: 저장된 위치에 드래그할 제목 영역이 남아 있지 않으면 저장 크기로
 /// 주 화면 가운데에 연다(`Bounds::centered`가 화면 크기로 줄인다). 창 모드는 유지한다.
 fn on_screen(saved: WindowBounds, cx: &App) -> WindowBounds {
     let b = saved.get_bounds();
-    if cx.displays().iter().any(|d| d.bounds().intersects(&b)) {
+    if cx
+        .displays()
+        .iter()
+        .any(|d| has_visible_title_area(b, d.bounds()))
+    {
         return saved;
     }
     let b = Bounds::centered(None, b.size, cx);
@@ -341,6 +345,21 @@ fn on_screen(saved: WindowBounds, cx: &App) -> WindowBounds {
         WindowBounds::Maximized(_) => WindowBounds::Maximized(b),
         WindowBounds::Fullscreen(_) => WindowBounds::Fullscreen(b),
     }
+}
+
+/// A one-pixel intersection, or a visible bottom edge with the title bar above
+/// every screen, cannot provide a usable window recovery target. Use logical
+/// pixels so a display's scale factor does not change the required drag area.
+fn has_visible_title_area(window: Bounds<gpui::Pixels>, display: Bounds<gpui::Pixels>) -> bool {
+    let title_height = krill_app::ui::TITLEBAR_HEIGHT
+        .min(window.size.height)
+        .min(display.size.height);
+    let drag_width = px(240.).min(window.size.width).min(display.size.width);
+    let left = window.origin.x.max(display.origin.x);
+    let right = (window.origin.x + window.size.width).min(display.origin.x + display.size.width);
+    right - left >= drag_width
+        && window.origin.y >= display.origin.y
+        && window.origin.y + title_height <= display.origin.y + display.size.height
 }
 
 #[expect(

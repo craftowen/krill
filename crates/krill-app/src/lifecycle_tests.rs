@@ -430,3 +430,17 @@ fn saved_window_bounds_off_every_display_open_centered(cx: &mut gpui::TestAppCon
         assert!(b.size.width <= display.size.width && b.size.height <= display.size.height);
     });
 }
+
+#[test]
+fn saved_window_needs_a_reachable_title_bar_on_one_display() {
+    let display = Bounds::new(gpui::point(px(0.), px(0.)), size(px(1200.), px(800.)));
+    let at = |x, y| Bounds::new(gpui::point(px(x), px(y)), size(px(900.), px(600.)));
+    assert!(!has_visible_title_area(at(1199., 50.), display));
+    assert!(!has_visible_title_area(at(-899., 50.), display));
+    assert!(!has_visible_title_area(at(50., -20.), display));
+    assert!(!has_visible_title_area(at(50., 799.), display));
+    assert!(has_visible_title_area(at(50., 50.), display));
+    assert!(has_visible_title_area(at(960., 50.), display));
+    let left_monitor = Bounds::new(gpui::point(px(-1200.), px(-100.)), display.size);
+    assert!(has_visible_title_area(at(-1000., -50.), left_monitor));
+}
