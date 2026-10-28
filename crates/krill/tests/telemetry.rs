@@ -1,4 +1,4 @@
-//! MK-089: `krill telemetry status|enable|disable` 통합 테스트. 기본 꺼짐·동의 파일 왕복·
+//! MK-089: `krill telemetry status|enable|disable` 통합 테스트. 기본 활성·명시적 비활성화·
 //! 환경 거부를 격리된 상태 디렉터리에서 확인한다. 네트워크를 쓰지 않는다.
 
 #![expect(
@@ -48,11 +48,11 @@ fn stdout(o: &std::process::Output) -> String {
 }
 
 #[test]
-fn default_is_off_and_status_is_read_only() {
+fn default_is_on_and_status_is_read_only() {
     let state = state_dir();
     let out = telemetry(&state, &["status"], &[]);
     assert!(out.status.success(), "{out:?}");
-    assert!(stdout(&out).contains("off"), "{out:?}");
+    assert!(stdout(&out).contains(" on"), "{out:?}");
     // `status`는 파일을 만들지 않는다(읽기 전용).
     assert!(!state.exists(), "status created {state:?}");
     fs::remove_dir_all(&state).ok();
@@ -63,7 +63,7 @@ fn enable_disable_roundtrip() {
     let state = state_dir();
     let out = telemetry(&state, &["enable"], &[]);
     assert!(out.status.success(), "{out:?}");
-    assert!(state.join("telemetry.enabled").is_file());
+    assert!(!state.join("telemetry.disabled").exists());
     let out = telemetry(&state, &["status"], &[]);
     assert!(out.status.success(), "{out:?}");
     assert!(stdout(&out).contains(" on"), "{out:?}");
@@ -72,7 +72,11 @@ fn enable_disable_roundtrip() {
     let out = telemetry(&state, &["status"], &[]);
     assert!(out.status.success(), "{out:?}");
     assert!(stdout(&out).contains("off"), "{out:?}");
-    assert!(!state.join("telemetry.enabled").exists());
+    assert!(state.join("telemetry.disabled").is_file());
+    let out = telemetry(&state, &["enable"], &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout(&out).contains(" on"), "{out:?}");
+    assert!(!state.join("telemetry.disabled").exists());
     fs::remove_dir_all(&state).ok();
 }
 

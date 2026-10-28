@@ -1,89 +1,120 @@
-//! `krill telemetry status|enable|disable`(MK-089): 텔레메트리 opt-in 동의 파일 관리.
-//! 상태 디렉터리의 동의 파일만 읽고 쓴다. 네트워크를 쓰지 않는다.
-
+//! Default-enabled app usage analytics controls and bounded background uploader.
+mod transport;
+use krill_proto::{
+    daemon,
+    telemetry::{self, Env, Outcome, Status},
+};
 use std::ffi::OsString;
+use std::io;
+use std::path::Path;
 use std::process::ExitCode;
 
-use krill_proto::daemon;
-use krill_proto::telemetry::{self, Consent, Reason};
-
-const USAGE: &str = "usage: krill telemetry status|enable|disable";
-
+const USAGE: &str = "usage: krill telemetry status|enable|disable|flush [--json]";
 pub fn run(args: &[OsString]) -> ExitCode {
-    // 서브커맨드 자리만 도움말로 본다(status|enable|disable 고정이라 값 오인 없음).
-    let help_here = matches!(
-        args.first().and_then(|a| a.to_str()),
-        Some("-h" | "--help" | "help")
-    ) || matches!(args.get(1).and_then(|a| a.to_str()), Some("-h" | "--help"));
-    if help_here {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    let args: Vec<String> = args
+    let args: Vec<_> = args
         .iter()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["status"] => status(),
-        ["enable"] => flip(true),
-        ["disable"] => flip(false),
-        _ => {
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn status() -> ExitCode {
-    let Some(state) = daemon::state_dir() else {
-        println!("telemetry  off (no state directory; nothing is sent)");
-        return ExitCode::SUCCESS;
-    };
-    match telemetry::consent(Some(&state), &telemetry::Env::live()) {
-        Consent::Enabled => {
-            println!("telemetry  on (opt-in; stop with `krill telemetry disable`)");
-        }
-        Consent::Disabled(Reason::NoConsentFile) => {
-            println!("telemetry  off (default; start with `krill telemetry enable`)");
-        }
-        Consent::Disabled(Reason::EnvVeto(var)) => {
-            println!("telemetry  off ({var} is set; nothing is sent)");
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn flip(want_on: bool) -> ExitCode {
-    let Some(state) = daemon::state_dir() else {
-        eprintln!("telemetry: HOME is not set");
-        return ExitCode::FAILURE;
-    };
-    let result = if want_on {
-        telemetry::enable(&state)
-    } else {
-        telemetry::disable(&state)
-    };
-    if let Err(e) = result {
-        eprintln!("telemetry: {e}");
-        return ExitCode::FAILURE;
-    }
-    if want_on
-        && let Some(var) = telemetry::consent(Some(&state), &telemetry::Env::live()).veto_var()
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
     {
-        println!("telemetry  off ({var} is set; consent saved and takes effect once it is unset)");
+        println!(
+            "{USAGE}\nEnabled on install. Disable deletes the pending queue. DO_NOT_TRACK, KRILL_TELEMETRY_DISABLED and CI override enable.\nOnly install ID, event ID, app version, OS, architecture, UTC timestamp and first_open/app_opened/active_day are sent.\nError reporting remains separately opt-in (`krill errors`)."
+        );
+        return ExitCode::SUCCESS;
+    }
+    let Some(command) = args.first() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    if !matches!(command.as_str(), "status" | "enable" | "disable" | "flush")
+        || args.iter().skip(1).any(|arg| arg != "--json")
+    {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    let json = args.iter().any(|arg| arg == "--json");
+    let Some(state) = daemon::state_dir() else {
+        eprintln!("telemetry: state directory unavailable");
+        return ExitCode::FAILURE;
+    };
+    match execute(&state, command, json) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("telemetry: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+fn execute(state: &Path, command: &str, json: bool) -> io::Result<ExitCode> {
+    match command {
+        "enable" => telemetry::enable(state)?,
+        "disable" => telemetry::disable(state)?,
+        "flush" => {
+            let endpoint = std::env::var(telemetry::ENDPOINT_VAR)
+                .unwrap_or_else(|_| telemetry::ENDPOINT.to_owned());
+            let endpoint = transport::Endpoint::parse(&endpoint).map_err(io::Error::other)?;
+            let curl = transport::system_curl();
+            let report =
+                telemetry::flush_with(state, &Env::live(), telemetry::now_unix(), |body| {
+                    match transport::post(&curl, &endpoint, body, transport::DEADLINE) {
+                        transport::Reply::Http { status, body } => Ok((status, body)),
+                        transport::Reply::Transport => Err(io::Error::other("upload failed")),
+                    }
+                })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).map_err(io::Error::other)?
+                );
+            } else {
+                println!(
+                    "telemetry  {:?}; accepted {}, pending {}",
+                    report.outcome, report.accepted, report.pending
+                );
+            }
+            return Ok(if report.outcome == Outcome::Deferred {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+        _ => {}
+    }
+    let status = telemetry::status_with(state, &Env::live())?;
+    print_status(&status, json)?;
+    Ok(ExitCode::SUCCESS)
+}
+fn print_status(status: &Status, json: bool) -> io::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(status).map_err(io::Error::other)?
+        );
     } else {
-        return status();
+        println!(
+            "telemetry  {}; pending {}; last delivery {:?}; last success {}; next retry {}{}",
+            if status.enabled {
+                "on (default; stop with `krill telemetry disable`)"
+            } else {
+                "off"
+            },
+            status.pending,
+            status.last_outcome,
+            status
+                .last_success_unix
+                .map_or_else(|| "never".to_owned(), |value| value.to_string()),
+            status
+                .next_attempt_unix
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            status
+                .veto
+                .as_ref()
+                .map_or_else(String::new, |var| format!("; veto {var}"))
+        );
     }
-    ExitCode::SUCCESS
+    Ok(())
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn help_returns_zero() {
-        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
-        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
-        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
-    }
-}
+mod tests;

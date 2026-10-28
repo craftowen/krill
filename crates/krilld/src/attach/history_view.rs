@@ -12,16 +12,22 @@ pub(super) struct Service {
     serial: u64,
     view: Option<View>,
 }
+enum SourceKind {
+    Hot,
+    Cold { gen_idx: usize, page: usize },
+    PriorScreen { rows: Vec<Box<[u8]>> },
+}
 struct SourceInfo {
     total: usize,
     covered: usize,
     identity: HistoryIdentity,
+    kind: SourceKind,
 }
 struct View {
     token: u64,
     epoch: [u64; 3],
     hot: Vec<Box<[u8]>>,
-    manifest: Option<Manifest>,
+    manifests: Vec<Manifest>,
     info: Vec<Option<SourceInfo>>,
     indexed: bool,
 }
@@ -78,15 +84,16 @@ impl Service {
                     digest.update(u64::try_from(row.len()).unwrap_or(u64::MAX).to_le_bytes());
                     digest.update(row);
                 }
-                let manifest = tap
+                let manifests = tap
                     .store()
-                    .map(|store| store.stable_manifest(tap.id(), cutoff, cancelled))
-                    .transpose()?;
+                    .map(|store| store.stable_manifests(tap.id(), cutoff, cancelled))
+                    .transpose()?
+                    .unwrap_or_default();
                 self.serial = self
                     .serial
                     .checked_add(1)
                     .ok_or(io::ErrorKind::OutOfMemory)?;
-                let pages = manifest.as_ref().map_or(0, Manifest::len);
+                let pages = manifests.iter().map(Manifest::len).sum::<usize>();
                 let hot_id = HistoryIdentity {
                     session: tap.id(),
                     source: Source::Hot,
@@ -99,13 +106,14 @@ impl Service {
                     total: hot.len(),
                     covered: 0,
                     identity: hot_id,
+                    kind: SourceKind::Hot,
                 }));
                 info.extend((0..pages).map(|_| None));
                 Ok(View {
                     token: self.serial,
                     epoch,
                     hot,
-                    manifest,
+                    manifests,
                     info,
                     indexed: false,
                 })
@@ -149,20 +157,30 @@ impl View {
         count: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<crate::store::stable::Range> {
-        let manifest = self.manifest.as_ref().ok_or(io::ErrorKind::NotFound)?;
-        let page = manifest
-            .len()
-            .checked_sub(index)
-            .ok_or(io::ErrorKind::NotFound)?;
-        let covered = self
+        let info = self
             .info
-            .iter()
-            .skip(1)
-            .take(index.saturating_sub(1))
-            .filter_map(Option::as_ref)
-            .map(|info| info.covered)
-            .sum::<usize>();
-        let hot = self.hot.get(covered..).filter(|rows| !rows.is_empty());
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(io::ErrorKind::NotFound)?;
+        let SourceKind::Cold { gen_idx, page } = info.kind else {
+            return Err(io::ErrorKind::NotFound.into());
+        };
+        let manifest = self.manifests.get(gen_idx).ok_or(io::ErrorKind::NotFound)?;
+        let hot = if gen_idx == 0 {
+            let covered = self
+                .info
+                .iter()
+                .skip(1)
+                .take(index.saturating_sub(1))
+                .filter_map(Option::as_ref)
+                .map(|info| info.covered)
+                .sum::<usize>();
+            self.hot
+                .get(covered..covered.saturating_add(info.covered))
+                .filter(|rows| !rows.is_empty())
+        } else {
+            None
+        };
         manifest.range(page, skip, count, hot, cancelled)
     }
     fn range(
@@ -173,14 +191,28 @@ impl View {
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<()> {
         if !self.indexed && requested >= u64::try_from(self.hot.len()).unwrap_or(u64::MAX) {
-            if let Some(manifest) = &self.manifest {
-                let index = manifest.index(&self.hot, cancelled)?;
-                for (slot, entry) in self.info.iter_mut().skip(1).zip(index.into_iter().rev()) {
-                    *slot = Some(SourceInfo {
+            self.info.truncate(1);
+            for (gen_idx, manifest) in self.manifests.iter().enumerate() {
+                let hot_ref: &[Box<[u8]>] = if gen_idx == 0 { &self.hot } else { &[] };
+                let (index, prior_screen) =
+                    manifest.index_with_screen(hot_ref, gen_idx > 0, cancelled)?;
+                if let Some(screen) = prior_screen
+                    && !screen.rows.is_empty()
+                {
+                    self.info.push(Some(SourceInfo {
+                        identity: screen.entry.identity,
+                        total: screen.entry.total,
+                        covered: screen.entry.covered,
+                        kind: SourceKind::PriorScreen { rows: screen.rows },
+                    }));
+                }
+                for (page, entry) in index.into_iter().enumerate().rev() {
+                    self.info.push(Some(SourceInfo {
                         identity: entry.identity,
                         total: entry.total,
                         covered: entry.covered,
-                    });
+                        kind: SourceKind::Cold { gen_idx, page },
+                    }));
                 }
             }
             self.indexed = true;
@@ -201,7 +233,10 @@ impl View {
                 .ok_or(io::ErrorKind::InvalidData)?;
             let total = u64::try_from(info.total).map_err(io::Error::other)?;
             let end = base.saturating_add(total);
-            let oldest = index + 1 == self.info.len();
+            let oldest = self.info.get(index + 1..).is_none_or(|rest| {
+                rest.iter()
+                    .all(|slot| slot.as_ref().is_some_and(|next| next.total == 0))
+            });
             if oldest && target >= end {
                 target = end
                     .saturating_sub(u64::try_from(count).unwrap_or(u64::MAX))
@@ -214,24 +249,35 @@ impl View {
                 reply.total = end;
                 reply.complete = oldest;
                 reply.identity = Some(info.identity.clone());
-                if index == 0 {
-                    reply.rows = self
-                        .hot
-                        .iter()
-                        .skip(skip)
-                        .take(count)
-                        .map(|row| postcard::from_bytes(row).map_err(io::Error::other))
-                        .collect::<io::Result<Vec<_>>>()?;
-                } else {
-                    let expected = info.identity.clone();
-                    let loaded = self.cold(index, skip, count, cancelled)?;
-                    if loaded.identity != expected
-                        || loaded.total != info.total
-                        || loaded.covered != info.covered
-                    {
-                        return Err(io::ErrorKind::InvalidData.into());
+                match &info.kind {
+                    SourceKind::Hot => {
+                        reply.rows = self
+                            .hot
+                            .iter()
+                            .skip(skip)
+                            .take(count)
+                            .map(|row| postcard::from_bytes(row).map_err(io::Error::other))
+                            .collect::<io::Result<Vec<_>>>()?;
                     }
-                    reply.rows = loaded.rows;
+                    SourceKind::PriorScreen { rows } => {
+                        reply.rows = rows
+                            .iter()
+                            .skip(skip)
+                            .take(count)
+                            .map(|row| postcard::from_bytes(row).map_err(io::Error::other))
+                            .collect::<io::Result<Vec<_>>>()?;
+                    }
+                    SourceKind::Cold { .. } => {
+                        let expected = info.identity.clone();
+                        let loaded = self.cold(index, skip, count, cancelled)?;
+                        if loaded.identity != expected
+                            || loaded.total != info.total
+                            || loaded.covered != info.covered
+                        {
+                            return Err(io::ErrorKind::InvalidData.into());
+                        }
+                        reply.rows = loaded.rows;
+                    }
                 }
                 return Ok(());
             }

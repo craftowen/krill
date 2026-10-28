@@ -797,13 +797,17 @@ fn serve_enforces_peer_signing_policy() {
 }
 
 #[test]
-fn telemetry_publisher_requires_consent_and_respects_environment_vetoes() {
+fn telemetry_publisher_defaults_on_and_respects_opt_out_and_environment_vetoes() {
     use krill_proto::telemetry::{self, Env, Event};
     let dir = std::env::temp_dir().join(format!("mk089-publish-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
     let registry = Registry::new(None, Some(&dir));
     let event = Event::AppOpened(telemetry::AppOpened {});
     let mut transport = telemetry::Recorder::default();
+    assert!(registry.emit_telemetry_to(&Env::default(), event.clone(), &mut transport));
+    assert_eq!(transport.sent.len(), 1);
+    transport.sent.clear();
+    telemetry::disable(&dir).unwrap();
     assert!(!registry.emit_telemetry_to(&Env::default(), event.clone(), &mut transport));
     assert!(transport.sent.is_empty());
     telemetry::enable(&dir).unwrap();
@@ -2006,4 +2010,508 @@ fn negotiated_remote_fs_enforces_scope_and_observer_permissions() {
         thread.join().unwrap();
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() {
+    use crate::holder::link::Link;
+    use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+    use std::io::Write as _;
+
+    let dir = std::env::temp_dir().join(format!("close-blocks-resume-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (krilld_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, link, kept, _) =
+        crate::holder::Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+
+    let reg = Arc::new(Registry::new(Some((holder, kept)), Some(&dir)));
+    let reg_for_reader = Arc::clone(&reg);
+    let reader_worker = std::thread::spawn(move || {
+        reg_for_reader.holder.as_ref().unwrap().run(link, |_, _| {});
+    });
+    let holder_worker = std::thread::spawn(move || {
+        let pkt = holder_link.recv().unwrap().unwrap();
+        match ToHolder::decode(pkt.frame()).unwrap() {
+            ToHolder::Release { req, .. } | ToHolder::Terminate { req, .. } => {
+                holder_link
+                    .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                    .unwrap();
+            }
+            other => panic!("unexpected holder request across Close/Resume: {other:?}"),
+        }
+    });
+
+    let id = SessionId(42);
+    let (master, mut pty_child) = UnixStream::pair().unwrap();
+    let session = reg
+        .start(id, OwnedFd::from(master), WinSize { cols: 80, rows: 24 })
+        .unwrap();
+    pty_child.write_all(b"closed session output\r\n").unwrap();
+    drop(pty_child);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !session.is_closed() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    {
+        let mut st = lock(&reg.state);
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: 1234,
+                cwd: dir.clone(),
+            },
+        );
+        st.exited.insert(id, 0);
+    }
+
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    assert_eq!(
+        reg.handle(&full, Request::Close { session: id }, &mut HashMap::new()),
+        Reply::Closed
+    );
+    assert!(dir.join("sessions/42.noindex/closed").is_file());
+    assert_eq!(
+        reg.handle(&full, Request::Cold { session: id }, &mut HashMap::new()),
+        Reply::Failed(Failure::NoSession)
+    );
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Resume {
+                session: id,
+                create: Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: Vec::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+            },
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::NoSession)
+    );
+
+    drop(reg);
+    holder_worker.join().unwrap();
+    reader_worker.join().unwrap();
+
+    // 데몬 재기동 뒤에도 디스크의 closed 표식이 남아 Cold/Resume 부활을 막는다.
+    let reloaded = Registry::new(None, Some(&dir));
+    assert_eq!(
+        reloaded.handle(&full, Request::Cold { session: id }, &mut HashMap::new()),
+        Reply::Failed(Failure::NoSession)
+    );
+    assert_eq!(
+        reloaded.handle(
+            &full,
+            Request::Resume {
+                session: id,
+                create: Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: Vec::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+            },
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::NoSession)
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
+    use crate::holder::link::Link;
+    use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+    use std::os::fd::AsFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // The fake holder has no OS process. Low fake PIDs can name real CI processes,
+    // whose live cwd would override the initial fallback being tested here.
+    const FIRST_FAKE_PID: u32 = u32::MAX - 1;
+    const SECOND_FAKE_PID: u32 = u32::MAX;
+
+    let dir = std::env::temp_dir().join(format!("mk-spawn-fallback-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let parent_dir = dir.join("workspace-parent");
+    std::fs::create_dir_all(&parent_dir).unwrap();
+    let missing_child = parent_dir.join("deleted-worktree");
+    let polluted_cwd = format!(
+        "{}::workspace:2de7222e-4069-4b91-bb07-3e05a9808a9f",
+        parent_dir.display()
+    );
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, link_for_reader, kept, _) =
+        crate::holder::Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = std::sync::Arc::new(Registry::new(Some((holder, kept)), Some(&dir)));
+    let reg_reader = std::sync::Arc::clone(&reg);
+    let reader_worker = std::thread::spawn(move || {
+        reg_reader
+            .holder
+            .as_ref()
+            .unwrap()
+            .run(link_for_reader, |_, _| {});
+    });
+
+    let expected_parent = parent_dir.as_os_str().as_bytes().to_vec();
+    let expected_missing = missing_child.as_os_str().as_bytes().to_vec();
+    let holder_worker = std::thread::spawn(move || {
+        // 1) ::workspace:<uuid> 오염 경로는 첫 Spawn 전에 정규 폴더로 벗겨진다.
+        let pkt1 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req: req1,
+            id: id1,
+            cwd: cwd1,
+            ..
+        } = ToHolder::decode(pkt1.frame()).unwrap()
+        else {
+            panic!("expected first Spawn");
+        };
+        assert_eq!(cwd1, expected_parent);
+        let (m1, _p1) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req: req1,
+                    id: id1,
+                    pid: FIRST_FAKE_PID,
+                }
+                .encode()
+                .unwrap(),
+                &[m1.as_fd()],
+            )
+            .unwrap();
+
+        // 2) 삭제된 하위 폴더가 ENOENT를 내면 존재하는 상위 폴더(parent_dir)로 즉시 재시도한다.
+        let pkt2 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req: req2,
+            cwd: cwd2,
+            ..
+        } = ToHolder::decode(pkt2.frame()).unwrap()
+        else {
+            panic!("expected second Spawn");
+        };
+        assert_eq!(cwd2, expected_missing);
+        holder_link
+            .send(
+                &FromHolder::Failed {
+                    req: req2,
+                    errno: libc::ENOENT,
+                }
+                .encode()
+                .unwrap(),
+                &[],
+            )
+            .unwrap();
+
+        let pkt3 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req: req3,
+            id: id3,
+            cwd: cwd3,
+            ..
+        } = ToHolder::decode(pkt3.frame()).unwrap()
+        else {
+            panic!("expected retry Spawn");
+        };
+        assert_eq!(cwd3, expected_parent);
+        let (m3, _p3) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req: req3,
+                    id: id3,
+                    pid: SECOND_FAKE_PID,
+                }
+                .encode()
+                .unwrap(),
+                &[m3.as_fd()],
+            )
+            .unwrap();
+    });
+
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let r1 = reg.handle(
+        &full,
+        Request::Create(Create {
+            account: None,
+            program: Program::Login,
+            cwd: polluted_cwd.into_bytes(),
+            cols: 80,
+            rows: 24,
+        }),
+        &mut HashMap::new(),
+    );
+    assert!(
+        matches!(
+            r1,
+            Reply::Created {
+                pid: FIRST_FAKE_PID,
+                ..
+            }
+        ),
+        "{r1:?}"
+    );
+
+    let r2 = reg.handle(
+        &full,
+        Request::Create(Create {
+            account: None,
+            program: Program::Login,
+            cwd: missing_child.as_os_str().as_bytes().to_vec(),
+            cols: 80,
+            rows: 24,
+        }),
+        &mut HashMap::new(),
+    );
+    let Reply::Created {
+        session: s2,
+        pid: SECOND_FAKE_PID,
+    } = r2
+    else {
+        panic!("expected Created on fallback retry, got {r2:?}");
+    };
+    assert_eq!(
+        reg.session_cwd(s2)
+            .and_then(|p| std::fs::canonicalize(p).ok()),
+        std::fs::canonicalize(&parent_dir).ok()
+    );
+
+    drop(reg);
+    holder_worker.join().unwrap();
+    reader_worker.join().unwrap();
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight_closing() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, link_for_reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let (m1, _p1) = UnixStream::pair().unwrap();
+    let (m2, _p2) = UnixStream::pair().unwrap();
+    let s1 = SessionId(11);
+    let s2 = SessionId(12);
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![
+                Kept {
+                    id: s1,
+                    pid: 101,
+                    status: None,
+                    master: OwnedFd::from(m1),
+                },
+                Kept {
+                    id: s2,
+                    pid: 102,
+                    status: None,
+                    master: OwnedFd::from(m2),
+                },
+            ],
+        )),
+        None,
+    ));
+    let reg_reader = Arc::clone(&reg);
+    let reader_worker = std::thread::spawn(move || {
+        reg_reader
+            .holder
+            .as_ref()
+            .unwrap()
+            .run(link_for_reader, |id, status| {
+                reg_reader.on_exited(id, status);
+            });
+    });
+
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+
+    // 1) Terminate 왕복 도중 세션이 이미 종료되어 holder가 오류(예: Windows conhost 종료 뒤 errno=5)를 돌려줘도,
+    //    그사이 exited가 기록됐으면 Release·정리 후 Closed로 끝난다.
+    let reg_exited = Arc::clone(&reg);
+    let holder_worker = std::thread::spawn(move || {
+        let pkt1 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req: req1, id: id1 } = ToHolder::decode(pkt1.frame()).unwrap()
+        else {
+            panic!("expected first Terminate");
+        };
+        assert_eq!(id1, s1);
+        reg_exited.on_exited(s1, 0);
+        // on_exited가 notify로 보낸 Release를 읽는다.
+        let rel1 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Release {
+            req: rel_req1,
+            id: rel_id1,
+        } = ToHolder::decode(rel1.frame()).unwrap()
+        else {
+            panic!("expected Release from on_exited");
+        };
+        assert_eq!(rel_id1, s1);
+        holder_link
+            .send(&FromHolder::Done { req: rel_req1 }.encode().unwrap(), &[])
+            .unwrap();
+        holder_link
+            .send(
+                &FromHolder::Failed {
+                    req: req1,
+                    errno: 5,
+                }
+                .encode()
+                .unwrap(),
+                &[],
+            )
+            .unwrap();
+
+        // 2) 이미 closing 중인 세션(s2)에 중복 Close가 들어와 실패하더라도 기존 closing 표시는 지우지 않는다.
+        let pkt2 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req: req2, id: id2 } = ToHolder::decode(pkt2.frame()).unwrap()
+        else {
+            panic!("expected second Terminate");
+        };
+        assert_eq!(id2, s2);
+        holder_link
+            .send(
+                &FromHolder::Failed {
+                    req: req2,
+                    errno: 5,
+                }
+                .encode()
+                .unwrap(),
+                &[],
+            )
+            .unwrap();
+        // 뒤이어 s2가 실제로 종료되면 on_exited가 Release를 보낸다.
+        let rel3 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Release {
+            req: rel_req3,
+            id: rel_id3,
+        } = ToHolder::decode(rel3.frame()).unwrap()
+        else {
+            panic!("expected Release for s2");
+        };
+        assert_eq!(rel_id3, s2);
+        holder_link
+            .send(&FromHolder::Done { req: rel_req3 }.encode().unwrap(), &[])
+            .unwrap();
+    });
+
+    assert_eq!(
+        reg.handle(&full, Request::Close { session: s1 }, &mut HashMap::new()),
+        Reply::Closed
+    );
+    assert!(!lock(&reg.state).sessions.contains_key(&s1));
+
+    lock(&reg.state).closing.insert(s2);
+    assert_eq!(
+        reg.handle(&full, Request::Close { session: s2 }, &mut HashMap::new()),
+        Reply::Failed(Failure::Os(5))
+    );
+    assert!(
+        lock(&reg.state).closing.contains(&s2),
+        "duplicate failed close must not clear existing closing mark"
+    );
+    reg.on_exited(s2, 0);
+    assert!(!lock(&reg.state).sessions.contains_key(&s2));
+
+    drop(reg);
+    holder_worker.join().unwrap();
+    reader_worker.join().unwrap();
+}
+
+#[test]
+fn maybe_rename_from_hook_records_every_prompt_turn_while_preserving_first_title() {
+    let dir = std::env::temp_dir().join(format!("hook-prompts-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(77);
+
+    reg.maybe_rename_from_hook(
+        id,
+        br#"{"hook_event_name":"UserPromptSubmit","prompt":"Fix auth token expiry bug"}"#,
+    );
+    reg.maybe_rename_from_hook(
+        id,
+        br#"{"hook_event_name":"UserPromptSubmit","prompt":"Add regression test for expired cookie"}"#,
+    );
+    reg.maybe_rename_from_hook(
+        id,
+        br#"{"hook_event_name":"UserPromptSubmit","prompt":"ok proceed"}"#,
+    );
+
+    let titles = krill_proto::git::load_session_auto_titles(&dir);
+    assert_eq!(
+        titles.get(&id).map(String::as_str),
+        Some("fix-auth-token-expiry-bug"),
+        "first prompt auto-title must remain intact across subsequent turns"
+    );
+
+    let histories = krill_proto::git::load_session_prompt_histories(&dir);
+    let hist = histories.get(&id).expect("prompt history must be recorded");
+    assert_eq!(hist.total_turns, 3);
+    assert_eq!(hist.turns.len(), 3);
+    assert_eq!(
+        hist.display_last_prompt().as_deref(),
+        Some("Add regression test for expired cookie (→ ok proceed)")
+    );
+    assert_eq!(
+        hist.previous_turn().map(|t| (t.turn, t.text.as_str())),
+        Some((1, "Fix auth token expiry bug"))
+    );
+
+    fs::remove_dir_all(&dir).ok();
 }

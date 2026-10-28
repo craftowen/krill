@@ -132,16 +132,23 @@ impl Shell {
                     return;
                 }
                 match loaded.opened {
-                    Ok((Opened::Text(_, disk), stamp)) => {
+                    Ok((Opened::Text(kind, disk), stamp)) => {
+                        let language = editor::language(kind, &path);
                         let draft = cx.new(|cx| {
-                            EditorState::new(window, cx)
+                            let mut ed = EditorState::new(window, cx)
+                                .language(language)
                                 .line_number(true)
-                                .default_value(draft)
+                                .default_value(draft);
+                            editor::syntax::install(&mut ed, language, cx);
+                            ed
                         });
                         let disk = cx.new(|cx| {
-                            EditorState::new(window, cx)
+                            let mut ed = EditorState::new(window, cx)
+                                .language(language)
                                 .line_number(true)
-                                .default_value(disk)
+                                .default_value(disk);
+                            editor::syntax::install(&mut ed, language, cx);
+                            ed
                         });
                         tab.comparison = Some(FileComparison {
                             draft: draft.clone(),

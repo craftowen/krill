@@ -88,7 +88,7 @@ pub enum SortBy {
     #[default]
     Recent,
     Name,
-    /// Orca Manual처럼 생성 시각 내림차순(새 워크트리가 위, 활동해도 순서 고정).
+    /// 수동으로 옮긴 순서, 나머지는 생성 시각 내림차순(활동해도 순서 고정).
     /// sidebar.bin·모바일(`krilld::mobile::workspaces`)이 변형 인덱스를 읽으므로 끝에만 추가한다.
     Created,
 }
@@ -424,7 +424,7 @@ impl PrGroup {
                 crate::pull_request::Status::Draft
                 | crate::pull_request::Status::NoPr
                 | crate::pull_request::Status::Missing
-                | crate::pull_request::Status::Failed,
+                | crate::pull_request::Status::Failed(_),
             ) => Self::DraftOrNoPr,
             None => {
                 if has_checkpoint_pr {
@@ -538,6 +538,7 @@ pub(super) struct WorktreeContext<'a> {
     pub pending_worktrees: &'a [super::PendingWorktree],
     pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
     /// 사용자가 끌어다 놓아 정한 프로젝트 순서. 없는 프로젝트는 그 뒤에 이름순으로 온다.
+    pub worktree_order: Option<&'a [PathBuf]>,
     pub project_order: Option<&'a [PathBuf]>,
 }
 
@@ -722,7 +723,14 @@ pub(super) fn sort_worktrees(
             }
             SortBy::Name => Reverse(0),
         };
-        (rank, recent_key, name, *a)
+        let manual = if sort_by == SortBy::Created {
+            ctx.worktree_order
+                .and_then(|order| order.iter().position(|p| p == *a))
+                .unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        (manual, rank, recent_key, name, *a)
     });
 }
 
@@ -773,7 +781,7 @@ pub(super) fn rows_with_options<'a>(
 ) -> Vec<Row> {
     let mut out = Vec::new();
     let mut sessions_by_wt: BTreeMap<&Path, Vec<&'a Session>> = BTreeMap::new();
-    for s in &snapshot.sessions {
+    for s in snapshot.sessions.iter().filter(|s| !s.is_exited()) {
         if let Some(wt) = s.worktree.as_deref() {
             sessions_by_wt.entry(wt).or_default().push(s);
         }
@@ -1106,7 +1114,11 @@ pub(super) fn rows_with_options<'a>(
     }
 
     let mut folders: BTreeMap<&PathBuf, Vec<Row>> = BTreeMap::new();
-    for s in snapshot.sessions.iter().filter(|s| s.worktree.is_none()) {
+    for s in snapshot
+        .sessions
+        .iter()
+        .filter(|s| !s.is_exited() && s.worktree.is_none())
+    {
         if let Some(cwd) = &s.cwd
             && !is_removed(cwd)
         {
@@ -1122,10 +1134,13 @@ pub(super) fn rows_with_options<'a>(
             out.extend(sessions);
         }
     }
+    if options.group_by == GroupBy::Repo {
+        super::order_project_rows(&mut out, ctx.project_order.unwrap_or_default());
+    }
     let loose: Vec<_> = snapshot
         .sessions
         .iter()
-        .filter(|s| s.worktree.is_none() && s.cwd.is_none())
+        .filter(|s| !s.is_exited() && s.worktree.is_none() && s.cwd.is_none())
         .collect();
     if !loose.is_empty() {
         out.push(Row::Loose);
@@ -1199,6 +1214,38 @@ impl LocalRowsCache {
 }
 
 impl Sidebar {
+    /// Use the same status and checkpoint fallbacks as the rendered host rows.
+    pub(super) fn group_for_path(&self, host: &HostId, path: &Path) -> Option<GroupKey> {
+        match self.options.group_by {
+            GroupBy::WorkspaceStatus => {
+                let status = if host.is_local() {
+                    let mut derived = self.local_rows_cache.borrow_mut();
+                    derived.refresh(self);
+                    derived.statuses.get(path).copied()
+                } else {
+                    self.worktree_statuses.get(path).copied()
+                };
+                Some(GroupKey::WorkspaceStatus(
+                    status.unwrap_or(WorkspaceStatus::Todo),
+                ))
+            }
+            GroupBy::PrStatus => {
+                let checkpoint = if host.is_local() {
+                    let mut derived = self.local_rows_cache.borrow_mut();
+                    derived.refresh(self);
+                    derived.checkpoint_prs.contains(path)
+                } else {
+                    false
+                };
+                Some(GroupKey::PrStatus(PrGroup::from_status(
+                    self.prs.get(path),
+                    checkpoint,
+                )))
+            }
+            GroupBy::Repo | GroupBy::None => None,
+        }
+    }
+
     pub(super) fn local_rows(&self) -> Vec<Row> {
         let mut derived = self.local_rows_cache.borrow_mut();
         derived.refresh(self);
@@ -1229,9 +1276,10 @@ impl Sidebar {
             pending_worktrees: &pending,
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
+            worktree_order: Some(&self.worktree_order),
         };
         rows_with_options(
-            &self.snapshot,
+            &self.profiles.snapshot(&HostId::Local, &self.snapshot),
             &self.prefs,
             &self.collapsed,
             &self.collapsed_groups,
@@ -1301,10 +1349,13 @@ impl Sidebar {
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
+            worktree_order: Some(&self.worktree_order),
             ..WorktreeContext::default()
         };
         rows_with_options(
-            &remote.snapshot,
+            &self
+                .profiles
+                .snapshot(&HostId::Remote(remote.id.clone()), &remote.snapshot),
             &self.prefs,
             collapsed,
             &self.collapsed_groups,
@@ -1567,7 +1618,7 @@ impl Sidebar {
                     .map_or_else(|| id.clone(), |r| r.label.clone()),
             ),
             HostId::Local => (self.options.group_by != GroupBy::Repo
-                && !self.remote_hosts.is_empty())
+                && self.has_connected_remote_hosts())
             .then(|| {
                 text::HOST_LOCAL
                     .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
@@ -1729,7 +1780,7 @@ fn build_options_menu(
     }
     let has_hosts = this
         .upgrade()
-        .is_some_and(|s| !s.read(cx).remote_hosts.is_empty());
+        .is_some_and(|s| s.read(cx).has_connected_remote_hosts());
     let has_projects = this
         .upgrade()
         .is_some_and(|s| !s.read(cx).filterable_project_repos().is_empty());
@@ -1845,6 +1896,7 @@ fn add_options_submenu(
                             sidebar
                                 .remote_hosts
                                 .iter()
+                                .filter(|h| h.status == HostStatus::Connected)
                                 .map(|h| (HostId::Remote(h.id.clone()), h.label.clone())),
                         )
                         .collect::<Vec<_>>();
@@ -1912,11 +1964,16 @@ fn render_options_submenu(
                     .to_owned(),
                 status_label: host_status_label(s.local_status),
             })
-            .chain(s.remote_hosts.iter().map(|h| HostMenuEntry {
-                id: HostId::Remote(h.id.clone()),
-                label: h.label.clone(),
-                status_label: host_status_label(h.status),
-            }))
+            .chain(
+                s.remote_hosts
+                    .iter()
+                    .filter(|h| h.status == HostStatus::Connected)
+                    .map(|h| HostMenuEntry {
+                        id: HostId::Remote(h.id.clone()),
+                        label: h.label.clone(),
+                        status_label: host_status_label(h.status),
+                    }),
+            )
             .collect::<Vec<_>>();
             render_hosts_panel(sidebar, menu, &s.options.filters, &hosts, p)
         }

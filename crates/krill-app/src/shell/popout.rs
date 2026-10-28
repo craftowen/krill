@@ -755,11 +755,10 @@ fn status_alert_icon(p: &ui::Palette) -> gpui_component::Icon {
         .text_color(p.muted_foreground)
 }
 
-/// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간. `short`면 가장 큰 단위만(`9h 3m` → `9h`).
+/// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간(5시간은 분까지, 주간은 남은 시간까지).
 fn status_window_parts(
     win: Option<&krill_proto::usage::Window>,
     now: u64,
-    short: bool,
 ) -> (Option<u8>, Option<String>) {
     let Some(win) = win else {
         return (None, None);
@@ -770,15 +769,10 @@ fn status_window_parts(
         .map(|ts| krill_app::settings::classify_reset(ts, now));
     match reset {
         Some(krill_app::settings::ResetDue::Stale) => (None, Some("now".into())),
-        Some(krill_app::settings::ResetDue::Future(left)) => {
-            let full = status_reset_duration(left);
-            let reset = if short {
-                full.split(' ').next().unwrap_or_default().to_owned()
-            } else {
-                full
-            };
-            (Some(win.percent.min(100)), Some(reset))
-        }
+        Some(krill_app::settings::ResetDue::Future(left)) => (
+            Some(win.percent.min(100)),
+            Some(status_reset_duration(left)),
+        ),
         _ => (Some(win.percent.min(100)), None),
     }
 }
@@ -790,7 +784,7 @@ fn status_window_segment(
     short: bool,
     p: &ui::Palette,
 ) -> gpui::Div {
-    let (pct, reset) = status_window_parts(win, now, short);
+    let (pct, reset) = status_window_parts(win, now);
     let bar = if short {
         ui::SPACE_4
     } else {
@@ -860,8 +854,11 @@ fn has_provider_pill(
     }) && (remote || krill_app::accounts::installed::is_installed(cx, provider))
 }
 
-/// Codex banked reset 크레딧 수. 미터가 없으면 `None`(행 자체를 그리지 않는다).
-fn reset_credit_count(snap: &AccountsSnapshot, account: &AccountInfo) -> Option<u64> {
+/// Codex banked reset 및 Claude 주간 세션·프로모션 리셋 크레딧 수. 미터가 아직 없으면 `None`.
+pub(in crate::shell) fn reset_credit_count(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+) -> Option<u64> {
     snap.meters_for(&account.id)?
         .meters
         .iter()
@@ -872,8 +869,9 @@ fn reset_credit_count(snap: &AccountsSnapshot, account: &AccountInfo) -> Option<
         .ok()
 }
 
-/// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex 전용 2단계 확인).
+/// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex·Claude 2단계 확인).
 /// 1단계 행을 누르면 무장하고 메뉴가 닫히고, 다시 열면 안내·실행·취소 행이 보인다.
+/// 미터가 아직 조회되지 않았더라도(`None`) 소진 시점에 실시간 프로브·차감할 수 있게 활성화한다.
 fn append_reset_credit_rows(
     mut menu: PopupMenu,
     snap: &AccountsSnapshot,
@@ -886,12 +884,10 @@ fn append_reset_credit_rows(
     if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return menu;
     }
-    let Some(account) = active else {
+    let Some(account) = active.filter(|a| !krill_app::accounts::orca_managed(a)) else {
         return menu;
     };
-    let Some(credits) = reset_credit_count(snap, account) else {
-        return menu;
-    };
+    let credits = reset_credit_count(snap, account);
     let account_id = account.id.clone();
     let armed = reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
     if armed {
@@ -955,29 +951,7 @@ fn append_reset_credit_rows(
                     .ok();
             }),
         );
-    } else if credits > 0 {
-        let arm_weak = weak.clone();
-        menu = menu.item(
-            PopupMenuItem::element(move |_, cx| {
-                let p = ui::palette(cx);
-                div()
-                    .id("status-provider-reset-usage")
-                    .debug_selector(|| "status-provider-reset-usage".into())
-                    .w(px(264.))
-                    .py_0p5()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.foreground)
-                    .child(provider_text::PROVIDER_RESET_USAGE.get())
-            })
-            .on_click(move |_, _, cx| {
-                arm_weak
-                    .update(cx, |shell, _| {
-                        shell.reset_armed = Some((provider, account_id.clone()));
-                    })
-                    .ok();
-            }),
-        );
-    } else {
+    } else if credits == Some(0) {
         menu = menu.item(
             PopupMenuItem::element(|_, cx| {
                 let p = ui::palette(cx);
@@ -991,6 +965,39 @@ fn append_reset_credit_rows(
                     .child(provider_text::PROVIDER_RESET_USAGE_NONE.get())
             })
             .disabled(true),
+        );
+    } else {
+        let arm_weak = weak.clone();
+        menu = menu.item(
+            PopupMenuItem::element(move |_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage")
+                    .debug_selector(|| "status-provider-reset-usage".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.foreground)
+                    .child(provider_text::PROVIDER_RESET_USAGE.get())
+                    .children(credits.filter(|c| *c > 0).map(|c| {
+                        div()
+                            .font_family(ui::FONT_MONO)
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(c.to_string())
+                    }))
+            })
+            .on_click(move |_, _, cx| {
+                arm_weak
+                    .update(cx, |shell, _| {
+                        shell.reset_armed = Some((provider, account_id.clone()));
+                    })
+                    .ok();
+            }),
         );
     }
     menu
@@ -1047,11 +1054,13 @@ impl Shell {
                 let (local_res, remote_res) = cx
                     .background_executor()
                     .spawn(async move {
-                        let local =
-                            krill_app::accounts::request_ipc(&paths, &UsageRequest::ListAccounts);
+                        let local = krill_app::accounts::request_target_with_features(
+                            &krill_app::hosts::HostTarget::local(paths),
+                            &UsageRequest::ListAccounts,
+                        );
                         let mut remotes = Vec::with_capacity(remote_targets.len());
                         for (host, target) in remote_targets {
-                            if let Ok(snap) = krill_app::accounts::request_target(
+                            if let Ok(snap) = krill_app::accounts::request_target_with_features(
                                 &target,
                                 &UsageRequest::ListAccounts,
                             ) {
@@ -1063,10 +1072,20 @@ impl Shell {
                     .await;
                 let keep_going = this
                     .update(cx, |s, cx| {
-                        if let Ok(snap) = local_res {
+                        if let Ok((snap, features)) = local_res {
+                            s.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.set_session_account_features(
+                                    krill_app::hosts::HostId::Local,
+                                    features,
+                                    cx,
+                                );
+                            });
                             s.apply_accounts_snapshot(snap, cx);
                         }
-                        for (host, snap) in remote_res {
+                        for (host, (snap, features)) in remote_res {
+                            s.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.set_session_account_features(host.clone(), features, cx);
+                            });
                             s.apply_accounts_snapshot_for_host(host, snap, cx);
                         }
                     })
@@ -1341,10 +1360,11 @@ impl Shell {
         let status_providers: Vec<_> = status_providers
             .into_iter()
             .filter(|provider| {
-                has_provider_pill(&snap, *provider, account_host.is_remote(), cx)
-                    || account_hosts
-                        .iter()
-                        .any(|(h, _, s)| h.is_remote() && has_provider_pill(s, *provider, true, cx))
+                krill_app::settings::status_provider_visible(*provider, cx)
+                    && (has_provider_pill(&snap, *provider, account_host.is_remote(), cx)
+                        || account_hosts.iter().any(|(h, _, s)| {
+                            h.is_remote() && has_provider_pill(s, *provider, true, cx)
+                        }))
             })
             .collect();
         let expanded = expanded_usage_fits(
@@ -1420,6 +1440,7 @@ impl Shell {
                 .text_color(color)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(move || debug_selector.clone());
             let detail_selector = format!(
                 "status-provider-{}-{}",
@@ -1494,6 +1515,7 @@ impl Shell {
                 .loading(self.usage_refresh.is_some())
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-usage-refresh".into()),
             "status-usage-refresh",
             provider_text::PROVIDER_REFRESH_USAGE.get(),
@@ -1519,6 +1541,7 @@ impl Shell {
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-ssh-switcher".into()),
             "status-ssh-switcher",
             ssh_tooltip,
@@ -1578,6 +1601,7 @@ impl Shell {
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-orchestration-menu".into()),
             "status-orchestration-menu",
             orch_tooltip,
@@ -1757,10 +1781,10 @@ impl Shell {
                     }
                     if let Some((sid, ref text_body)) = active_handoff_text {
                         let body_codex = format!(
-                            "[MK SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: codex\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
+                            "[KRILL SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: codex\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
                         );
                         let body_claude = format!(
-                            "[MK SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: claude\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
+                            "[KRILL SESSION HANDOFF]\nSource session: s{sid}\nTarget agent: claude\n--- Recent terminal context ---\n{text_body}\n--- End context ---\n"
                         );
                         let weak_codex = weak.clone();
                         let weak_claude = weak.clone();
@@ -1847,6 +1871,7 @@ impl Shell {
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
+                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                 .debug_selector(|| "status-ports-menu".into()),
             "status-ports-menu",
             ports_tooltip,
@@ -1938,7 +1963,8 @@ impl Shell {
                                             .font_family(ui::FONT_MONO)
                                             .text_color(p.warning)
                                             .ghost()
-                                            .xsmall(),
+                                            .xsmall()
+                                            .h(ui::STATUS_BAR_BUTTON_HEIGHT),
                                         "status-checks-warning",
                                         warn_tooltip,
                                     )
@@ -1970,7 +1996,8 @@ impl Shell {
                                         .text_color(p.success)
                                         .debug_selector(|| "status-update-ready".into())
                                         .ghost()
-                                        .xsmall(),
+                                        .xsmall()
+                                        .h(ui::STATUS_BAR_BUTTON_HEIGHT),
                                     "status-update-ready",
                                     badge,
                                 )
@@ -2006,6 +2033,7 @@ impl Shell {
                                     )
                                     .ghost()
                                     .xsmall()
+                                    .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                                     .debug_selector(|| "float-terminal".into()),
                                 "float-terminal",
                                 float_tip,
@@ -2032,6 +2060,7 @@ impl Shell {
                                 )
                                 .ghost()
                                 .xsmall()
+                                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
                                 .debug_selector(|| "dashboard-popout".into()),
                             "dashboard-popout",
                             dashboard_tip,
@@ -2042,9 +2071,10 @@ impl Shell {
                     .child(self.resources.clone()),
             )
             // 하-4: 상태바 우클릭 메뉴. 상태바에 이미 있는 동작과 설정 열기만 담는다.
-            .context_menu(move |m, _, _| {
+            .context_menu(move |mut m, _, cx| {
                 let weak = weak.clone();
-                m.action_context(focus.clone())
+                m = m
+                    .action_context(focus.clone())
                     .item(
                         PopupMenuItem::element(|_, _| {
                             div()
@@ -2059,6 +2089,26 @@ impl Shell {
                         }),
                     )
                     .separator()
+                    .label(provider_text::PROVIDER_STATUS_BAR_SECTION.get());
+                for provider in ProviderKind::ALL {
+                    let visible = krill_app::settings::status_provider_visible(provider, cx);
+                    m = m.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .debug_selector(move || {
+                                    format!("status-bar-menu-provider-{}", provider.as_str())
+                                })
+                                .child(provider.display_name())
+                        })
+                        .checked(visible)
+                        .on_click(move |_, _, cx| {
+                            krill_app::settings::set_status_provider_visible(
+                                provider, !visible, cx,
+                            );
+                        }),
+                    );
+                }
+                m.separator()
                     .menu_with_disabled(
                         text::FLOAT_MENU.get(),
                         Box::new(FloatTerminal),
@@ -2154,6 +2204,18 @@ impl SidebarCard {
 }
 
 type PreviewMap = std::collections::BTreeMap<(krill_app::hosts::HostId, SessionId), String>;
+
+/// Keep animation ticks local to the glyph instead of notifying the whole dashboard.
+struct DashboardStatus {
+    state: AgentState,
+    unread: bool,
+}
+
+impl Render for DashboardStatus {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui::status::status_glyph(self.state, self.unread, ui::status::Size::Sm, cx)
+    }
+}
 
 pub(crate) struct Dashboard {
     owner: WeakEntity<Shell>,
@@ -2539,11 +2601,6 @@ impl Render for Dashboard {
                                         } else {
                                             gpui::FontWeight::MEDIUM
                                         };
-                                        let dot_color = if is_read_completed {
-                                            p.muted_foreground.opacity(0.4)
-                                        } else {
-                                            ui::agent_state_color(state, cx)
-                                        };
                                         div()
                                             .id(gpui::SharedString::from(selector))
                                             .debug_selector(move || debug_sel.clone())
@@ -2582,13 +2639,10 @@ impl Render for Dashboard {
                                                             .font_weight(title_weight)
                                                             .child(name),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .size(ui::STATE_DOT)
-                                                            .flex_none()
-                                                            .rounded_full()
-                                                            .bg(dot_color),
-                                                    ),
+                                                    .child(cx.new(|_| DashboardStatus {
+                                                        state,
+                                                        unread,
+                                                    })),
                                             )
                                             .when_some(screen.clone(), |d, screen| {
                                                 d.child(

@@ -487,7 +487,7 @@ impl Panel {
             .items_center()
             .justify_center()
             .px_1()
-            .py_0p5()
+            .h(crate::ui::STATUS_BAR_BUTTON_HEIGHT)
             .text_size(crate::ui::TEXT_XS)
             .text_color(if self.open {
                 p.foreground

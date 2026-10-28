@@ -62,6 +62,8 @@ async function tailFollow(){
  Object.defineProperty(feed,'scrollHeight',{value:5000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,5000,'late code/image/disclosure growth keeps a following reader at the bottom');delete feed.scrollHeight;
  reopen.resolve(page(0,30));await flush();
  feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));assert.equal(feed.scrollTop,2900,'scroll near the tail keeps following');
+ // Scrolling up by 15px within the bottom 60px band must disengage following immediately so ResizeObserver / new messages do not snap back to bottom.
+ feed.scrollTop=feed.scrollHeight-feed.clientHeight-15;feed.dispatchEvent(new Event('scroll'));Object.defineProperty(feed,'scrollHeight',{value:5500,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,2885,'upward scroll within bottom 60px disengages following');delete feed.scrollHeight;
  feed.scrollTop=400;feed.dispatchEvent(new Event('scroll'));Object.defineProperty(feed,'scrollHeight',{value:6000,configurable:true});ro.fn([]);assert.equal(feed.scrollTop,400,'late growth never drags a reader who scrolled up');delete feed.scrollHeight;
  await f.poll(page(30,32));assert.equal(feed.children.length,32);assert.equal(feed.scrollTop,400,'new messages do not pull a reader who scrolled up');
  feed.scrollTop=feed.scrollHeight-feed.clientHeight;feed.dispatchEvent(new Event('scroll'));await f.poll(page(32,33));assert.equal(feed.scrollTop,feed.scrollHeight,'returning to the bottom resumes following');
@@ -107,7 +109,7 @@ async function markdownFormatting(){
  const nodes=f.find('chat-md').descendants(),byTag=tag=>nodes.filter(n=>n.tag===tag);
  assert.deepEqual(byTag('strong').map(n=>n.children.map(c=>c.textContent).join('')),['실패 지점은 확인했지만, 복구는 아직 못 했습니다.','셸을 쓰지 않는 자바스크립트 한 줄','두 번째','통과','확인 결과']);
  assert.equal(byTag('code')[0].textContent,'pwd');
- assert.equal(byTag('ol').length,1);assert.equal(byTag('ol')[0].className,'chat-ol');assert.equal(byTag('li').length,2);
+ assert.equal(byTag('ol').length,1);assert.equal(byTag('ol')[0].className,'chat-ol');assert.equal(byTag('ul').length,1);assert.equal(byTag('li').length,3);assert.equal(byTag('ol')[0].children.filter(n=>n.tag==='li').length,2);
  assert.equal(byTag('blockquote').length,1);assert.equal(byTag('blockquote')[0].className,'chat-quote');assert(byTag('blockquote')[0].descendants().some(n=>n.tag==='code'&&n.textContent==='코드'));
  assert.equal(byTag('table').length,1);assert.equal(byTag('table')[0].className,'chat-table');assert.equal(byTag('th').length,2);assert.equal(byTag('td').length,2);
  assert.equal(byTag('em').length,1);
@@ -206,7 +208,7 @@ async function main(){
  await f.poll({generation:'g1',items:[{id:'a',kind:'assistant',text:'delta'}],next_offset:20,bound:true});
  assert.equal(f.find('chat-card chat-question'),card);assert.equal(custom.value,'keep notes');assert.equal(details.open,true);assert.equal(f.button('Safe').attrs['aria-pressed'],'true');
  f.button('Confirm in Term').action();assert.equal(f.term,1);assert(!f.calls.some(c=>['approve','answer_question'].includes(c.action)));
- await f.poll({generation:'g1',items:[],next_offset:3,reset:true,bound:false});assert.equal(f.root.descendants().filter(n=>n.tag==='article').length,0);assert.equal(f.entry.items.length,0);assert.equal(f.entry.bound,false);assert.equal(f.entry.agent,'');f.dispose();
+ await f.poll({generation:'g1',items:[],next_offset:3,reset:true,bound:false});assert.equal(f.root.descendants().filter(n=>n.tag==='article').length,0);assert.equal(f.entry.items.length,0);assert.equal(f.entry.bound,false);assert.equal(f.entry.agent,'');assert.equal(f.find('chat-empty').children[0].textContent,'Enter a new message');f.dispose();
  console.log('PASS TR-A01/06/07 historical cards direct to Term, Copy answer copies draft, DOM notes/selection/expansion survive, empty reset clears immediately');
  f=fixture();await flush();f.handler=async()=>{throw new Error('history unavailable');};f.update();await flush();const status=f.root.descendants().find(n=>n.attrs.role==='status'&&n.children.some(c=>c.textContent==='Retry'));assert.equal(status.hidden,false);assert.match(status.children[0].textContent,/history unavailable/);assert.match(status.children[0].textContent,/\d\d:\d\d:\d\d/);
  f.handler=async req=>({generation:'g1',items:[],next_offset:req.offset,bound:true});f.button('Retry').action();await flush();assert.equal(status.hidden,true);f.dispose();

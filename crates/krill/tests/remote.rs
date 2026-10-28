@@ -487,14 +487,34 @@ fn remote_new_rejects_relative_cwd_and_preserves_sessions_on_worktree_error() {
         .code(),
         Some(2)
     );
-    // --worktree is a new worktree name. A non-repository --cwd is an execution
-    // failure (1), while missing/relative remote --cwd is a usage error (2).
-    let output = r.run(&[
+    // Folder workspaces may open in a non-Git directory on the remote host.
+    let id = r.ok(&[
         "--host",
         HOST,
         "new",
         "--cwd",
         r.daemon_dir.to_str().unwrap(),
+        "--worktree",
+        "folder",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'remote-folder-ready\\n'; exec sleep 600",
+    ]);
+    let id = id.trim();
+    r.wait_text(id, "remote-folder-ready");
+    assert_eq!(r.remote_sessions(), 1);
+    assert!(!r.local_dir.join("run/krilld.sock").exists());
+
+    // An absent absolute cwd is still an execution failure (1). The existing
+    // remote session must survive; missing/relative cwd remains usage error (2).
+    let missing = r.daemon_dir.join("missing");
+    let output = r.run(&[
+        "--host",
+        HOST,
+        "new",
+        "--cwd",
+        missing.to_str().unwrap(),
         "--worktree",
         "wt",
         "--",
@@ -506,7 +526,8 @@ fn remote_new_rejects_relative_cwd_and_preserves_sessions_on_worktree_error() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(r.remote_sessions(), 0);
+    assert_eq!(r.remote_sessions(), 1);
+    r.wait_text(id, "remote-folder-ready");
 }
 
 #[test]

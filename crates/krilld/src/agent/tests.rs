@@ -221,6 +221,31 @@ fn codex_hooks_follow_complete_receipt_only() {
     want.extend(hooks::codex_args("fixed 'cmd'"));
     want.extend(codex.launch[1..].iter().cloned());
     assert_eq!(hooked.launch, want);
+    let filtered = serde_json::json!({"agent":"codex","complete":true,"codex":{
+    "command":"fixed 'cmd'","added":{
+        "/<session-flags>/config.toml:permission_request:0:0":{"trusted_hash":"sha256:permission"},
+        "/<session-flags>/config.toml:post_tool_use:0:0":{"trusted_hash":"sha256:post"}
+    }}});
+    std::fs::write(hooks::receipt(&dir, Agent::Codex), filtered.to_string()).unwrap();
+    let filtered = codex_hooks(codex, Some(&dir), &[]).unwrap().unwrap();
+    assert!(
+        filtered
+            .launch
+            .iter()
+            .any(|a| a.starts_with("hooks.PermissionRequest="))
+    );
+    assert!(
+        filtered
+            .launch
+            .iter()
+            .any(|a| a.starts_with("hooks.PostToolUse="))
+    );
+    assert!(
+        !filtered
+            .launch
+            .iter()
+            .any(|a| a.starts_with("hooks.PreToolUse="))
+    );
     assert!(
         codex_hooks(&agents.profiles["claude"], Some(&dir), &[])
             .unwrap()
@@ -1812,4 +1837,36 @@ fn zsh_wrapper_handles_compdef_before_compinit_without_error() {
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sync_claude_profile_hooks_preserve_existing_config() {
+    let dir = std::env::temp_dir().join(format!("krill-profile-hook-sync-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let host_home = dir.join("host");
+    let claude_acc = dir.join("claude-acc");
+    std::fs::create_dir_all(host_home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&claude_acc).unwrap();
+
+    let host_claude = krill_proto::agent::hooks::install_claude_json(
+        Some(r#"{"theme":"dark"}"#),
+        "if [ -n \"${MK_PANE_ID:-}\" ]; then exec '/usr/local/bin/krill' hook claude; else printf '{}\\n'; fi",
+    )
+    .unwrap();
+    std::fs::write(host_home.join(".claude/settings.json"), &host_claude).unwrap();
+    std::fs::write(
+        claude_acc.join("settings.json"),
+        "{\n  \"model\": \"opus\"\n}\n",
+    )
+    .unwrap();
+
+    assert!(super::sync_claude_profile_hooks_in(&host_home, &claude_acc).unwrap());
+    assert!(!super::sync_claude_profile_hooks_in(&host_home, &claude_acc).unwrap());
+    let synced_claude: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(claude_acc.join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(synced_claude["model"], "opus");
+    assert!(synced_claude["hooks"]["PreToolUse"].is_array());
+
+    std::fs::remove_dir_all(&dir).ok();
 }

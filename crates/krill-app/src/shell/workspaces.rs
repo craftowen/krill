@@ -8,10 +8,16 @@ use std::path::Path;
 #[cfg(all(test, unix))]
 mod tests;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub(super) struct Workspace {
     pub(super) host: HostId,
     pub(super) folder: PathBuf,
+}
+
+impl PartialEq for Workspace {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host && krill_proto::path::equivalent(&self.folder, &other.folder)
+    }
 }
 
 impl Shell {
@@ -21,9 +27,70 @@ impl Shell {
         if self.layout_loading || self.role != WindowRole::Main {
             return;
         }
+        let connected: Vec<_> = self.sidebar.read(cx).connected_sessions().collect();
+        for (host, session) in connected {
+            self.observed_sessions.insert((host, session));
+        }
+        let stale_panes: Vec<PaneId> = (0..self.layout.tabs().len())
+            .flat_map(|i| self.layout.tab_panes(i))
+            .filter(|&pane| {
+                let Some(session) = self.layout.session(pane) else {
+                    return false;
+                };
+                let host = self.layout.host(pane);
+                let sidebar = self.sidebar.read(cx);
+                sidebar.host_connected(host)
+                    && (sidebar
+                        .session_on(host, session)
+                        .is_some_and(sidebar::Session::is_exited)
+                        // A local daemon restarting for an update may briefly
+                        // publish an incomplete list. Absence is not proof of
+                        // PTY exit; keep saved tabs until an explicit exit.
+                        || host.is_remote() && sidebar.host_has_trees(host)
+                            && self.observed_sessions.contains(&(host.clone(), session))
+                            && sidebar.session_on(host, session).is_none())
+                    && !self.restoring_sessions.contains(&session)
+                    && !self.restarting_panes.contains(&pane)
+                    && !self
+                        .accounts_for_host(host)
+                        .details
+                        .handoffs
+                        .iter()
+                        .any(|h| h.from == session || h.to == Some(session))
+            })
+            .collect();
+        if !stale_panes.is_empty() {
+            for &pane in &stale_panes {
+                if let Some(session) = self.layout.session(pane) {
+                    let host = self.layout.host(pane).clone();
+                    self.workspace_closing.insert((host.clone(), session));
+                    self.observed_sessions.remove(&(host, session));
+                }
+            }
+            self.close_with_policy(close::Policy::Preserve, cx, |layout| {
+                let focused = layout.focused().filter(|p| !stale_panes.contains(p));
+                for index in (0..layout.tabs().len()).rev() {
+                    for pane in layout.tab_panes(index) {
+                        if stale_panes.contains(&pane) {
+                            layout.activate(index);
+                            layout.focus(pane);
+                            layout.close_pane();
+                        }
+                    }
+                }
+                if let Some(focused) = focused {
+                    for index in 0..layout.tabs().len() {
+                        if layout.tab_panes(index).contains(&focused) {
+                            layout.activate(index);
+                            layout.focus(focused);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let sidebar = self.sidebar.read(cx);
-        // An empty/disconnected snapshot is not proof that a close completed.
-        // Retain explicit close intent across relists, including stale replies.
+        // Preserve explicit close intent across disconnected or stale relists.
         let Some((host, folder)) = sidebar.selected_workspace() else {
             return;
         };
@@ -33,8 +100,10 @@ impl Shell {
         };
         // Create can appear in the daemon list before its reply reaches the
         // launching pane. Wait for that pane's ID before importing missing IDs.
+        // A pane whose Create reply was lost never receives it, so import instead.
         if self.live.keys().any(|pane| {
             self.layout.session(*pane).is_none()
+                && !self.outcome_unknown.contains_key(pane)
                 && self.layout.file(*pane).is_none()
                 && self.pane_workspace(*pane, cx).as_ref() == Some(&workspace)
         }) {
@@ -94,6 +163,15 @@ impl Shell {
         folder: &Path,
         cx: &mut Context<Self>,
     ) {
+        let cleaned = host
+            .is_local()
+            .then(|| folder.to_str())
+            .flatten()
+            .and_then(|s| {
+                krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !folder.exists())
+            })
+            .map(PathBuf::from);
+        let folder = cleaned.as_deref().unwrap_or(folder);
         if self.layout_loading {
             self.restore_workspace = Some((host, folder.to_path_buf()));
             return;
@@ -134,6 +212,9 @@ impl Shell {
             .filter_map(|p| self.layout.session(p).map(|id| (p, id)))
             .filter(|(_, id)| {
                 !visible_sessions.contains(id)
+                    && !self.observed_sessions.contains(&(HostId::Local, *id))
+                    && !self.workspace_closing.contains(&(HostId::Local, *id))
+                    && !self.restore_attempted.contains(id)
                     && self
                         .sidebar
                         .read(cx)
@@ -145,9 +226,10 @@ impl Shell {
             if !self.restoring_sessions.insert(old) {
                 continue;
             }
+            self.restore_attempted.insert(old);
             let mut launch = self.launch_for(pane_id);
             if let Some(cwd) = self.layout.respawn_cwd(pane_id) {
-                launch.cwd = cwd.to_vec();
+                super::apply_respawn_cwd(&mut launch.cwd, cwd, false);
             }
             let target = target.clone();
             let creation = Arc::clone(self.creations.entry(pane_id).or_default());
@@ -158,13 +240,8 @@ impl Shell {
                         if !pane::supports_resume_history(&target)? {
                             return Ok(None);
                         }
-                        let found = pane::ensure_session_in(&target, Some(old), &launch)?;
-                        let (session, created) = match found {
-                            pane::Found::Live(id, created) => (id, created),
-                            pane::Found::Cold(id, _) => {
-                                (pane::resume_session_in(&target, Some(id), &launch)?, true)
-                            }
-                        };
+                        let (session, created) =
+                            pane::ensure_live_session_in(&target, Some(old), &launch)?;
                         if created && !close::Creation::publish(&creation, session) {
                             close::send(
                                 &krill_app::resources::daemon_call_for(Some(target)),
@@ -177,8 +254,16 @@ impl Shell {
                     .await;
                 this.update(cx, |this, cx| {
                     this.restoring_sessions.remove(&old);
+                    // 재개 요청이 닿았는지 모르면, 보이게 된 칸도 다시 재개하지 않고 아는 세션만 찾는다.
+                    if let Err(e) = &got
+                        && pane::is_unknown_outcome(e)
+                    {
+                        this.outcome_unknown
+                            .insert(pane_id, super::start_error_text(e));
+                    }
                     let session = match got {
                         Ok(Some(new)) => {
+                            this.observed_sessions.insert((HostId::Local, new));
                             if new != old {
                                 this.layout.rebind_session(&HostId::Local, old, new);
                                 this.save();
@@ -286,8 +371,9 @@ impl Shell {
             .unwrap_or(folder);
         self.launch_host = host.clone();
         let target = self.layout.mru_order().into_iter().find(|&index| {
-            self.tab_workspace(index, cx)
-                .is_some_and(|w| w.host == host && w.folder == folder)
+            self.tab_workspace(index, cx).is_some_and(|w| {
+                w.host == host && krill_proto::path::equivalent(&w.folder, &folder)
+            })
         });
         if let Some(index) = target {
             self.dashboard = None;

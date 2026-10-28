@@ -37,7 +37,9 @@ mod hooks;
 mod ipc;
 pub mod lineage;
 pub mod options;
+mod path_identity;
 mod pr;
+mod profiles;
 mod startup;
 mod view;
 mod viewport;
@@ -127,6 +129,15 @@ pub struct Session {
     pub cwd: Option<PathBuf>,
     /// 실행 당시 계정 표시용(OWE-707). 셸·구 기록이면 `None`이라 배지를 숨긴다.
     pub account: Option<krill_proto::control::SessionAccount>,
+}
+
+impl Session {
+    /// 에이전트 `SessionEnd` hook과 달리 루트 프로세스 종료가 확인된 세션.
+    #[must_use]
+    pub fn is_exited(&self) -> bool {
+        self.status.state == AgentState::Exited
+            && self.status.source == Some(krill_proto::control::Source::Process)
+    }
 }
 
 /// 워크트리 행에 붙는 git 정보. 모르면 `None`(UI가 숨긴다).
@@ -308,7 +319,10 @@ fn track_unread(
     new: &[Session],
     focused: Option<SessionId>,
 ) {
-    unread.retain(|id| new.iter().any(|s| s.id == *id));
+    unread.retain(|id| {
+        new.iter()
+            .any(|s| s.id == *id && s.status.state != AgentState::Exited)
+    });
     for s in new {
         let before = old.iter().find(|o| o.id == s.id).map(|o| o.status.state);
         let state = s.status.state;
@@ -343,6 +357,7 @@ fn windows_style(path: &Path) -> bool {
     let bytes = path.as_os_str().as_encoded_bytes();
     matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
         || bytes.starts_with(br"\\")
+        || bytes.starts_with(b"//")
 }
 
 fn windows_parts(path: &str) -> impl Iterator<Item = &str> {
@@ -351,12 +366,7 @@ fn windows_parts(path: &str) -> impl Iterator<Item = &str> {
 
 /// `path`가 `root` 아래(같은 경로 포함)인지. Windows 경로는 구분자(`\`·`/`)와 대소문자를 가리지 않는다.
 pub(crate) fn path_within(path: &Path, root: &Path) -> bool {
-    if !windows_style(root) {
-        return path.starts_with(root);
-    }
-    let (path, root) = (path.to_string_lossy(), root.to_string_lossy());
-    let mut parts = windows_parts(&path);
-    windows_parts(&root).all(|r| parts.next().is_some_and(|p| p.eq_ignore_ascii_case(r)))
+    krill_proto::path::within(path, root)
 }
 
 /// 세션 행의 이름과 보조 문구. 이름은 터미널 제목 → 에이전트 → 폴더 이름 → "세션 n" 순서로 고른다.
@@ -380,6 +390,43 @@ pub fn session_label(session: &Session, title: Option<&str>) -> (String, String)
         .filter(|d| *d != name)
         .collect();
     (name, detail.join(" · "))
+}
+
+/// Windows console titles can retain the launcher's executable after an agent
+/// starts. Recognize only exact shell labels or drive-absolute shell paths.
+fn is_windows_shell_title(title: &str) -> bool {
+    let title = title.trim();
+    let title = title
+        .split_once(':')
+        .filter(|(prefix, _)| {
+            prefix.trim().eq_ignore_ascii_case("administrator")
+                || prefix.trim() == crate::i18n::WINDOWS_ADMIN_TITLE_KO
+        })
+        .map_or(title, |(_, rest)| rest.trim());
+    let title = title
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(title);
+    if [
+        "Windows PowerShell",
+        "PowerShell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "cmd",
+        "cmd.exe",
+    ]
+    .iter()
+    .any(|shell| title.eq_ignore_ascii_case(shell))
+    {
+        return true;
+    }
+    matches!(title.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        && title.rsplit(['\\', '/']).next().is_some_and(|leaf| {
+            ["powershell.exe", "pwsh.exe", "cmd.exe"]
+                .iter()
+                .any(|shell| leaf.eq_ignore_ascii_case(shell))
+        })
 }
 
 #[cfg(test)]
@@ -494,13 +541,14 @@ impl UiExpansionState {
     }
 }
 
-/// 마지막 `Vec<PathBuf>`는 사용자가 끌어다 놓아 정한 프로젝트 순서(5번째 구간). postcard는 구조체 끝 필드 추가를
+/// 두 `Vec<PathBuf>`는 수동 프로젝트 순서(5번째)와 워크트리 순서(6번째 구간)다. postcard는 구조체 끝 필드 추가를
 /// 옛 파일에서 못 읽으므로 구간을 따로 덧붙인다. 옛 앱은 남는 바이트를 무시한다.
 type PersistedSidebarState = (
     Preferences,
     WorkspaceOptions,
     lineage::LineageState,
     UiExpansionState,
+    Vec<PathBuf>,
     Vec<PathBuf>,
 );
 
@@ -540,38 +588,142 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
     let (prefs, rest) =
         postcard::take_from_bytes::<Preferences>(body).map_err(|e| invalid(&e.to_string()))?;
     if rest.is_empty() {
-        return Ok((
+        return Ok(sanitize_persisted_sidebar_state((
             prefs,
             WorkspaceOptions::default(),
             lineage::LineageState::default(),
             UiExpansionState::default(),
             Vec::new(),
-        ));
+            Vec::new(),
+        )));
     }
     let (opts, rest) =
         postcard::take_from_bytes::<WorkspaceOptions>(rest).map_err(|e| invalid(&e.to_string()))?;
     if rest.is_empty() {
-        return Ok((
+        return Ok(sanitize_persisted_sidebar_state((
             prefs,
             opts,
             lineage::LineageState::default(),
             UiExpansionState::default(),
             Vec::new(),
-        ));
+            Vec::new(),
+        )));
     }
     let (lin, rest) = postcard::take_from_bytes::<lineage::LineageState>(rest)
         .map_err(|e| invalid(&e.to_string()))?;
     if rest.is_empty() {
-        return Ok((prefs, opts, lin, UiExpansionState::default(), Vec::new()));
+        return Ok(sanitize_persisted_sidebar_state((
+            prefs,
+            opts,
+            lin,
+            UiExpansionState::default(),
+            Vec::new(),
+            Vec::new(),
+        )));
     }
     let (ui, rest) =
         postcard::take_from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?;
-    let order = if rest.is_empty() {
+    let (order, rest) = if rest.is_empty() {
+        (Vec::new(), rest)
+    } else {
+        postcard::take_from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
+    };
+    let worktree_order = if rest.is_empty() {
         Vec::new()
     } else {
         postcard::from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
     };
-    Ok((prefs, opts, lin, ui, order))
+    Ok(sanitize_persisted_sidebar_state((
+        prefs,
+        opts,
+        lin,
+        ui,
+        order,
+        worktree_order,
+    )))
+}
+
+fn clean_persisted_path(p: PathBuf) -> PathBuf {
+    if let Some(s) = p.to_str()
+        && let Some(base) = krill_proto::orchestration::strip_workspace_instance(s)
+        && !p.exists()
+    {
+        return PathBuf::from(base);
+    }
+    p
+}
+
+fn sanitize_persisted_sidebar_state(
+    (prefs, mut opts, mut lin, mut ui, order, worktree_order): PersistedSidebarState,
+) -> PersistedSidebarState {
+    let mut clean_prefs = Preferences::default();
+    for (k, mut v) in prefs {
+        let ck = clean_persisted_path(k);
+        if krill_proto::orchestration::strip_workspace_instance(&v.name).is_some() {
+            v.name.clear();
+        }
+        clean_prefs.entry(ck).or_insert(v);
+    }
+    opts.filters.repos = opts
+        .filters
+        .repos
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    let mut clean_parents = BTreeMap::new();
+    for (c, p) in lin.parents {
+        let cc = clean_persisted_path(c);
+        let cp = clean_persisted_path(p);
+        if cc != cp {
+            clean_parents.entry(cc).or_insert(cp);
+        }
+    }
+    lin.parents = clean_parents;
+    lin.collapsed_lineage = lin
+        .collapsed_lineage
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    lin.sleeping_worktrees = lin
+        .sleeping_worktrees
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    ui.collapsed = ui.collapsed.into_iter().map(clean_persisted_path).collect();
+    ui.expanded_cards = ui
+        .expanded_cards
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    ui.selected_worktree = ui.selected_worktree.map(clean_persisted_path);
+    ui.shown_external = ui
+        .shown_external
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    ui.removed_projects = ui
+        .removed_projects
+        .into_iter()
+        .map(clean_persisted_path)
+        .collect();
+    let mut clean_order = Vec::with_capacity(order.len());
+    for p in order {
+        let cp = clean_persisted_path(p);
+        if !clean_order.contains(&cp) {
+            clean_order.push(cp);
+        }
+    }
+    (
+        clean_prefs,
+        opts,
+        lin,
+        ui,
+        clean_order,
+        worktree_order
+            .into_iter()
+            .map(clean_persisted_path)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -584,6 +736,7 @@ fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
         &lineage::LineageState::default(),
         &UiExpansionState::default(),
         &[],
+        &[],
     )
 }
 
@@ -594,9 +747,10 @@ fn save_state(
     lin: &lineage::LineageState,
     ui: &UiExpansionState,
     order: &[PathBuf],
+    worktree_order: &[PathBuf],
 ) -> io::Result<()> {
     let mut bytes = postcard::to_stdvec(prefs).map_err(io::Error::other)?;
-    let need_ui = !ui.is_empty() || !order.is_empty();
+    let need_ui = !ui.is_empty() || !order.is_empty() || !worktree_order.is_empty();
     let need_lin = !lin.is_empty() || need_ui;
     if opts.is_customized() || need_lin {
         bytes.extend(postcard::to_stdvec(opts).map_err(io::Error::other)?);
@@ -604,8 +758,12 @@ fn save_state(
             bytes.extend(postcard::to_stdvec(lin).map_err(io::Error::other)?);
             if need_ui {
                 bytes.extend(postcard::to_stdvec(ui).map_err(io::Error::other)?);
-                if !order.is_empty() {
+                if !order.is_empty() || !worktree_order.is_empty() {
                     bytes.extend(postcard::to_stdvec(order).map_err(io::Error::other)?);
+                    if !worktree_order.is_empty() {
+                        bytes
+                            .extend(postcard::to_stdvec(worktree_order).map_err(io::Error::other)?);
+                    }
                 }
             }
         }
@@ -672,6 +830,15 @@ pub struct CloseSession(pub SessionId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContinueSession(pub SessionId);
 
+/// The menu owns its clicked target, independently of pane focus and row indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchSessionAccount {
+    pub host: HostId,
+    pub session: SessionId,
+    pub provider: krill_proto::usage::ProviderKind,
+    pub account_id: String,
+}
+
 /// OWE-854: 사이드바 세션 행 메뉴의 '이름 변경'. 셸이 그 세션의 탭을 열고 탭 이름 변경(OWE-870)을 띄운다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenameSession(pub SessionId);
@@ -710,8 +877,9 @@ pub struct Sidebar {
     remote_manager: Option<HostManager>,
     remote_info: BTreeMap<String, krill_hosts::HostConnectionInfo>,
     collapsed_hosts: BTreeSet<HostId>,
-    /// 사용자가 끌어다 놓아 정한 프로젝트(저장소) 순서(`sidebar.bin` 5번째 구간).
+    /// 사용자가 끌어다 놓아 정한 프로젝트(저장소·폴더) 순서(`sidebar.bin` 5번째 구간).
     project_order: Vec<PathBuf>,
+    worktree_order: Vec<PathBuf>,
     row_hosts: Vec<HostId>,
     action_host: Option<HostId>,
     prs: BTreeMap<PathBuf, crate::pull_request::Status>,
@@ -768,7 +936,8 @@ pub struct Sidebar {
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
-    poll_error: Option<String>,
+    /// 두 번째 값은 자동 재시도 중인 일시적 연결 오류 여부다.
+    poll_error: Option<(String, bool)>,
     /// Open in 실패처럼 사용자가 닫을 때까지 남기는 알림.
     notice: Option<String>,
     task: Option<Task<()>>,
@@ -795,6 +964,8 @@ pub struct Sidebar {
     titles: BTreeMap<SessionId, String>,
     /// 첫 프롬프트 훅에서 자동 생성된 세션 제목(`session-titles.json`, OWE-737).
     auto_titles: BTreeMap<SessionId, String>,
+    /// 세션별 최근 프롬프트 턴 히스토리(`session-prompts.json`).
+    prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
     /// 활성 Claude 프롬프트 캐시 카운트다운의 마지막 1초 틱(`now_ns / 1e9`, OWE-737).
     last_cache_tick_sec: Option<u64>,
     last_activity_minute: Option<u64>,
@@ -804,6 +975,8 @@ pub struct Sidebar {
     focused: Option<SessionId>,
     /// 로컬 스냅샷 행 선택과 이미 동기화된 포커스 세션.
     focused_synced: Option<SessionId>,
+    /// 셸의 포커스 칸 세션이 속한 호스트.
+    focused_host: HostId,
     /// 보지 않은 사이 완료·대기로 바뀐 세션(OWE-662).
     unread: BTreeSet<SessionId>,
     /// 에이전트 대시보드에서 사용자가 클릭해 확인한 완료(`Done | Exited`) 세션과 읽은 순서.
@@ -812,12 +985,15 @@ pub struct Sidebar {
     next_read_done_seq: u64,
     /// 워크트리 행 메뉴·단축키에서 띄울 에이전트 프로필 목록.
     agents: Vec<AgentProfile>,
+    profiles: profiles::State,
     /// 사이드바 열이 펼쳐져 있는지.
     visible: bool,
     /// 창이 활성 상태인지.
     active: bool,
     /// 키보드 탐색 위치(행 인덱스).
     cursor: Option<usize>,
+    /// 연결이 잠시 사라져도 동명 경로가 있는 다른 호스트로 커서를 옮기지 않는다.
+    cursor_anchor: Option<(HostId, Row)>,
     focus: Option<FocusHandle>,
     /// Enter·Esc 뒤 돌려줄 포커스(셸).
     back: Option<FocusHandle>,
@@ -837,6 +1013,7 @@ impl EventEmitter<NewSession> for Sidebar {}
 impl EventEmitter<OpenWorkspace> for Sidebar {}
 impl EventEmitter<CloseSession> for Sidebar {}
 impl EventEmitter<ContinueSession> for Sidebar {}
+impl EventEmitter<SwitchSessionAccount> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
@@ -882,6 +1059,38 @@ fn project_key(row: &Row) -> Option<((bool, String), &PathBuf)> {
         Row::Folder(p) => Some(((false, basename(p).to_lowercase()), p)),
         _ => None,
     }
+}
+
+/// Non-project groups retain their leading position; unordered projects follow
+/// saved ones in their existing order.
+fn project_rank(row: &Row, order: &[PathBuf]) -> usize {
+    project_key(row).map_or(0, |(_, path)| {
+        order
+            .iter()
+            .position(|p| p == path)
+            .map_or(usize::MAX, |i| i + 1)
+    })
+}
+
+/// Sort complete project blocks, keeping worktrees and sessions with their header.
+fn order_project_rows(rows: &mut Vec<Row>, order: &[PathBuf]) {
+    if order.is_empty() {
+        return;
+    }
+    let Some(first) = rows.iter().position(|r| project_key(r).is_some()) else {
+        return;
+    };
+    let mut chunks: Vec<Vec<Row>> = Vec::new();
+    for row in rows.drain(first..) {
+        if starts_chunk(&row) || chunks.is_empty() {
+            chunks.push(Vec::new());
+        }
+        if let Some(chunk) = chunks.last_mut() {
+            chunk.push(row);
+        }
+    }
+    chunks.sort_by_key(|chunk| chunk.first().map_or(0, |r| project_rank(r, order)));
+    rows.extend(chunks.into_iter().flatten());
 }
 
 impl ProjectMerge {
@@ -953,19 +1162,29 @@ impl ProjectMerge {
         projects
     }
 
-    /// 프로젝트 → 프로젝트 없는 호스트 상태 줄 → 작업 폴더 모르는 세션 순으로 편다.
+    /// 프로젝트 → 작업 폴더 모르는 세션 순으로 편다.
     #[expect(
         clippy::type_complexity,
         reason = "rows, row hosts and merged headers are built together"
     )]
     fn finish(
-        self,
-        idle: Vec<(HostId, Row)>,
+        mut self,
+        order: &[PathBuf],
     ) -> (
         Vec<Row>,
         Vec<HostId>,
         BTreeMap<usize, Vec<(HostId, PathBuf)>>,
     ) {
+        // Sort whole projects after merging PCs so remote-only projects and folders
+        // can move between local repositories without separating their children.
+        if !order.is_empty() {
+            self.chunks.sort_by_key(|chunk| {
+                chunk
+                    .rows
+                    .first()
+                    .map_or(0, |(_, row)| project_rank(row, order))
+            });
+        }
         let mut rows = Vec::new();
         let mut hosts = Vec::new();
         let mut merged = BTreeMap::new();
@@ -981,7 +1200,6 @@ impl ProjectMerge {
             start += chunk.rows.len();
             chunk.rows.into_iter().for_each(&mut push);
         }
-        idle.into_iter().for_each(&mut push);
         if !self.loose.is_empty() {
             push((HostId::Local, Row::Loose));
             self.loose.into_iter().for_each(&mut push);
@@ -1022,6 +1240,15 @@ fn load_auto_titles_from_sidebar_path(sidebar_path: Option<&Path>) -> BTreeMap<S
     krill_proto::git::load_session_auto_titles(dir)
 }
 
+fn load_prompt_histories_from_sidebar_path(
+    sidebar_path: Option<&Path>,
+) -> BTreeMap<SessionId, krill_proto::git::SessionPromptHistory> {
+    let Some(dir) = sidebar_path.and_then(Path::parent) else {
+        return BTreeMap::new();
+    };
+    krill_proto::git::load_session_prompt_histories(dir)
+}
+
 impl Sidebar {
     pub fn new(path: Option<PathBuf>) -> Self {
         // Construction runs inside cx.new: all persisted state is loaded later on the executor.
@@ -1042,6 +1269,7 @@ impl Sidebar {
             remote_info: BTreeMap::new(),
             collapsed_hosts: ui.collapsed_hosts,
             project_order: Vec::new(),
+            worktree_order: Vec::new(),
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -1105,19 +1333,23 @@ impl Sidebar {
             custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
             auto_titles: BTreeMap::new(),
+            prompt_histories: BTreeMap::new(),
             last_cache_tick_sec: None,
             last_activity_minute: None,
             now_override_ns: None,
             focused: None,
             focused_synced: None,
+            focused_host: HostId::Local,
             unread: BTreeSet::new(),
             read_done: BTreeMap::new(),
             next_read_done_seq: 0,
             agents: Vec::new(),
+            profiles: profiles::State::default(),
             disk: async_state::State::default(),
             visible: true,
             active: true,
             cursor: None,
+            cursor_anchor: None,
             hovered_worktree: None,
             focus: None,
             back: None,
@@ -1201,33 +1433,35 @@ impl Sidebar {
     /// 재삽입으로 누적되지 않게 한다. 사용자 접힘·핀·부모·이름 설정은 건드리지 않는다.
     fn prune_stale_worktree_state(&mut self) {
         use std::collections::BTreeSet;
-        let mut live: BTreeSet<&Path> = BTreeSet::new();
+        let mut live: BTreeSet<PathBuf> = BTreeSet::new();
         for wts in self.snapshot.trees.values() {
             for wt in wts {
-                live.insert(wt.as_path());
+                live.insert(krill_proto::path::identity(wt));
             }
         }
         for s in &self.snapshot.sessions {
             if let Some(wt) = s.worktree.as_deref() {
-                live.insert(wt);
+                live.insert(krill_proto::path::identity(wt));
             }
         }
         self.worktree_statuses
-            .retain(|path, _| live.contains(path.as_path()));
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
         self.worktree_updated_at
-            .retain(|path, _| live.contains(path.as_path()));
-        self.issues.retain(|path, _| live.contains(path.as_path()));
-        self.ports.retain(|path, _| live.contains(path.as_path()));
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
+        self.issues
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
+        self.ports
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
         self.worktree_hosts
-            .retain(|path, _| live.contains(path.as_path()));
+            .retain(|path, _| live.contains(&krill_proto::path::identity(path)));
         self.automation_worktrees
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
         self.cli_worktrees
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
         self.recently_created_worktrees
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
         self.manually_folded_cards
-            .retain(|path| live.contains(path.as_path()));
+            .retain(|path| live.contains(&krill_proto::path::identity(path)));
     }
 
     /// 외부 파일(`projects.toml`, `worktree-comments.toml`) 변경을 즉시 반영해 사이드바 트리를 다시 그린다.
@@ -1369,10 +1603,16 @@ impl Sidebar {
     pub fn has_projects(&self) -> bool {
         !self.snapshot.trees.is_empty()
             || !self.snapshot.sessions.is_empty()
-            || self
-                .remote_hosts
-                .iter()
-                .any(|r| !r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
+            || self.remote_hosts.iter().any(|r| {
+                r.status == HostStatus::Connected
+                    && (!r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
+            })
+    }
+
+    pub(super) fn has_connected_remote_hosts(&self) -> bool {
+        self.remote_hosts
+            .iter()
+            .any(|r| r.status == HostStatus::Connected)
     }
 
     /// 마지막으로 선택·활성화된 워크트리/폴더 경로.
@@ -1395,6 +1635,11 @@ impl Sidebar {
             if self.host_connected(&host) {
                 return Some((host, path));
             }
+            return None;
+        }
+        if let Some((host, _)) = &self.cursor_anchor
+            && !self.host_connected(host)
+        {
             return None;
         }
         // 커서 밖 선택(복원된 상태 등)은 스냅샷에서 소유 호스트를 찾는다.
@@ -1422,14 +1667,40 @@ impl Sidebar {
         None
     }
 
-    fn host_connected(&self, host: &HostId) -> bool {
+    #[must_use]
+    pub fn host_connected(&self, host: &HostId) -> bool {
         match host {
-            HostId::Local => true,
+            HostId::Local => self.local_status == HostStatus::Connected,
             HostId::Remote(id) => self
                 .remote_hosts
                 .iter()
                 .any(|r| &r.id == id && r.status == HostStatus::Connected),
         }
+    }
+
+    #[must_use]
+    pub fn host_has_trees(&self, host: &HostId) -> bool {
+        !self.snapshot_for(host).trees.is_empty()
+    }
+
+    /// 현재 연결된 모든 호스트의 세션 목록을 `(HostId, SessionId)`로 순회한다.
+    pub fn connected_sessions(&self) -> impl Iterator<Item = (HostId, SessionId)> + '_ {
+        let local = (self.local_status == HostStatus::Connected)
+            .then(|| self.snapshot.sessions.iter().map(|s| (HostId::Local, s.id)))
+            .into_iter()
+            .flatten();
+        let remote = self
+            .remote_hosts
+            .iter()
+            .filter(|r| r.status == HostStatus::Connected)
+            .flat_map(|r| {
+                let host = HostId::Remote(r.id.clone());
+                r.snapshot
+                    .sessions
+                    .iter()
+                    .map(move |s| (host.clone(), s.id))
+            });
+        local.chain(remote)
     }
 
     /// 테스트에서 원격 호스트 스냅샷·상태를 직접 주입한다.
@@ -1477,6 +1748,7 @@ impl Sidebar {
             self.disk.startup.touch("selected");
         }
         if self.selected_worktree != path || !self.disk.initialized {
+            self.cursor_anchor = None;
             self.selected_worktree = path;
             self.persist(cx);
         }
@@ -1763,6 +2035,7 @@ impl Sidebar {
                                 let host_id = HostId::Remote(id.clone());
                                 s.prune_read_done_for_host(&host_id, cx);
                             } else {
+                                s.remote_probed_repos.remove(&id);
                                 let status = s
                                     .remote_info
                                     .get(&id)
@@ -1877,7 +2150,39 @@ impl Sidebar {
 
     /// 지정한 호스트의 스냅샷에서 세션을 찾는다.
     pub fn session_on(&self, host: &HostId, id: SessionId) -> Option<&Session> {
-        self.snapshot_for(host).sessions.iter().find(|s| s.id == id)
+        self.snapshot_for(host)
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .or_else(|| self.profiles.fallback(host, id))
+    }
+
+    /// 화면 스트림의 CLOSED를 폴링보다 먼저 반영해 종료 알림·행을 정리한다.
+    pub fn mark_session_exited_on(&mut self, host: &HostId, id: SessionId, cx: &mut Context<Self>) {
+        self.profiles.remove_fallback(host, id);
+        let snapshot = match host {
+            HostId::Local => Some(&mut self.snapshot),
+            HostId::Remote(host) => self
+                .remote_hosts
+                .iter_mut()
+                .find(|remote| remote.id == *host)
+                .map(|remote| &mut remote.snapshot),
+        };
+        if let Some(session) = snapshot.and_then(|snapshot| {
+            snapshot
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == id)
+        }) {
+            session.status.state = AgentState::Exited;
+            session.status.source = Some(krill_proto::control::Source::Process);
+            session.status.foreground = None;
+        }
+        if host.is_local() {
+            self.unread.remove(&id);
+            crate::alert::dismiss(id, cx);
+        }
+        self.rebuild(cx);
     }
 
     /// 세션이 속한 호스트(로컬 또는 원격)를 찾는다.
@@ -1955,8 +2260,8 @@ impl Sidebar {
             match s.status.state {
                 AgentState::Waiting | AgentState::Blocked => waiting += 1,
                 AgentState::Working => working += 1,
-                AgentState::Done | AgentState::Exited => done += 1,
-                AgentState::Unknown => {}
+                AgentState::Done => done += 1,
+                AgentState::Exited | AgentState::Unknown => {}
             }
         }
         (waiting, working, done)
@@ -2089,8 +2394,32 @@ impl Sidebar {
 
     /// OWE-662: 셸이 포커스 칸의 세션을 알린다. 그 세션의 미확인 표시를 끈다.
     pub fn set_focused(&mut self, session: Option<SessionId>, cx: &mut Context<Self>) {
-        let changed = self.focused != session;
+        self.set_focused_on(HostId::Local, session, cx);
+    }
+
+    /// 셸이 포커스 칸의 호스트·세션을 알린다. 접혀 있는 저장소·워크트리를 펼치고 해당 세션 행을 선택·노출한다.
+    pub fn set_focused_on(
+        &mut self,
+        host: HostId,
+        session: Option<SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        let next_host = if session.is_some() {
+            host
+        } else {
+            HostId::Local
+        };
+        let changed =
+            self.focused != session || (session.is_some() && self.focused_host != next_host);
         self.focused = session;
+        self.focused_host = next_host;
+        if !self.focused_host.is_local() {
+            self.focused_synced = None;
+            if changed {
+                self.reveal_focused(cx);
+            }
+            return;
+        }
         let cleared = session.is_some_and(|id| self.unread.remove(&id));
         if let Some(id) = session {
             if changed || self.focused_synced != Some(id) {
@@ -2101,6 +2430,9 @@ impl Sidebar {
                     self.write_state(cx);
                 }
                 self.sync_focused_row(id, changed, cx);
+                if changed {
+                    self.reveal_focused(cx);
+                }
             }
         } else {
             self.focused_synced = None;
@@ -2249,75 +2581,202 @@ impl Sidebar {
         }
     }
 
+    fn focused_row_index(
+        &self,
+        host: &HostId,
+        focused_id: SessionId,
+        target_wt: Option<&Path>,
+    ) -> Option<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .position(|(i, r)| {
+                self.row_host(i) == host && matches!(r, Row::Session(s, true) if s.id == focused_id)
+            })
+            .or_else(|| {
+                self.rows.iter().enumerate().position(|(i, r)| {
+                    self.row_host(i) == host
+                        && matches!(r, Row::Session(s, _) if s.id == focused_id)
+                })
+            })
+            .or_else(|| {
+                let wt = target_wt?;
+                self.rows.iter().enumerate().position(|(i, r)| {
+                    self.row_host(i) == host
+                        && matches!(r, Row::Worktree(p) | Row::Folder(p) if p == wt)
+                })
+            })
+    }
+
     /// 현재 포커스된 세션(또는 그 워크트리) 행으로 스크롤·선택한다.
     pub fn reveal_focused(&mut self, cx: &mut Context<Self>) {
         let Some(focused_id) = self.focused else {
             return;
         };
-        let target_wt = self.folder(focused_id).map(Path::to_path_buf);
-        let mut uncollapsed = false;
-        let mut prefer_session = false;
+        let focused_host = self.focused_host.clone();
+        let target_wt = self
+            .folder_on(&focused_host, focused_id)
+            .map(Path::to_path_buf);
+        let mut uncollapsed = self.collapsed_hosts.remove(&focused_host);
         if let Some(wt) = &target_wt {
             if self.collapsed.remove(wt) {
                 uncollapsed = true;
             }
-            if self.expand_lineage_ancestors(wt) {
-                uncollapsed = true;
+            if focused_host.is_local() {
+                if self.expand_lineage_ancestors(wt) {
+                    uncollapsed = true;
+                }
+                if self.prefs.get(wt).is_some_and(|p| p.pinned)
+                    && self.collapsed_groups.remove(&GroupKey::Pinned)
+                {
+                    uncollapsed = true;
+                }
             }
             let session_count = self
-                .snapshot
+                .snapshot_for(&focused_host)
                 .sessions
                 .iter()
                 .filter(|s| s.worktree.as_deref() == Some(wt.as_path()))
                 .count();
-            if session_count >= 2 {
+            if session_count > 0 {
                 self.manually_folded_cards.remove(wt);
                 if self.expanded_cards.insert(wt.clone()) {
                     uncollapsed = true;
                 }
             }
-            prefer_session = session_count == 0 || self.expanded_cards.contains(wt);
             let is_claude_wt = external::is_claude_worktree(wt);
             let parent_repos: Vec<PathBuf> = self
-                .snapshot
+                .snapshot_for(&focused_host)
                 .trees
                 .iter()
                 .filter(|&(repo, trees)| repo == wt || trees.iter().any(|t| t == wt))
                 .map(|(repo, _)| repo.clone())
                 .collect();
-            for repo in parent_repos {
-                if self.collapsed.remove(&repo) {
+            for repo in &parent_repos {
+                if self.collapsed.remove(repo) {
                     uncollapsed = true;
                 }
-                if is_claude_wt && self.shown_external.insert(repo) {
+                if is_claude_wt && self.shown_external.insert(repo.clone()) {
                     uncollapsed = true;
                 }
             }
+            if !focused_host.is_local() && self.options.group_by == GroupBy::Repo {
+                let candidate_projects: Vec<&Path> = if parent_repos.is_empty() {
+                    vec![wt.as_path()]
+                } else {
+                    parent_repos.iter().map(PathBuf::as_path).collect()
+                };
+                for project_path in candidate_projects {
+                    let key = basename(project_path).to_ascii_lowercase();
+                    let matching_collapsed: Vec<PathBuf> = self
+                        .collapsed
+                        .iter()
+                        .filter(|p| basename(p).to_ascii_lowercase() == key)
+                        .cloned()
+                        .collect();
+                    for path in matching_collapsed {
+                        if self.collapsed.remove(&path) {
+                            uncollapsed = true;
+                        }
+                    }
+                }
+            }
+            if !self.collapsed_groups.is_empty() {
+                let key = self.group_for_path(&focused_host, wt);
+                if key.is_some_and(|key| self.collapsed_groups.remove(&key)) {
+                    uncollapsed = true;
+                }
+            }
+            if !focused_host.is_local() && self.options.group_by == GroupBy::Repo {
+                let candidate_projects: Vec<&Path> = if parent_repos.is_empty() {
+                    vec![wt.as_path()]
+                } else {
+                    parent_repos.iter().map(PathBuf::as_path).collect()
+                };
+                for project_path in candidate_projects {
+                    let key = basename(project_path).to_ascii_lowercase();
+                    let matching_collapsed: Vec<PathBuf> = self
+                        .collapsed
+                        .iter()
+                        .filter(|p| basename(p).to_ascii_lowercase() == key)
+                        .cloned()
+                        .collect();
+                    for path in matching_collapsed {
+                        if self.collapsed.remove(&path) {
+                            uncollapsed = true;
+                        }
+                    }
+                }
+            }
+            if !self.collapsed_groups.is_empty() {
+                match self.options.group_by {
+                    GroupBy::WorkspaceStatus => {
+                        let status = if focused_host.is_local() {
+                            self.worktree_statuses
+                                .get(wt)
+                                .copied()
+                                .or_else(|| {
+                                    self.disk
+                                        .store
+                                        .statuses
+                                        .get(wt.to_string_lossy().as_ref())
+                                        .and_then(|v| {
+                                            krill_proto::orchestration::WorkspaceStatus::parse(v)
+                                                .ok()
+                                        })
+                                })
+                                .unwrap_or(krill_proto::orchestration::WorkspaceStatus::Todo)
+                        } else {
+                            krill_proto::orchestration::WorkspaceStatus::Todo
+                        };
+                        if self
+                            .collapsed_groups
+                            .remove(&GroupKey::WorkspaceStatus(status))
+                        {
+                            uncollapsed = true;
+                        }
+                    }
+                    GroupBy::PrStatus => {
+                        let pr_group = if focused_host.is_local() {
+                            let has_cp = self
+                                .disk
+                                .store
+                                .prs
+                                .get(wt.to_string_lossy().as_ref())
+                                .is_some_and(|&pr| pr > 0);
+                            options::PrGroup::from_status(self.prs.get(wt), has_cp)
+                        } else {
+                            options::PrGroup::from_status(None, false)
+                        };
+                        if self.collapsed_groups.remove(&GroupKey::PrStatus(pr_group)) {
+                            uncollapsed = true;
+                        }
+                    }
+                    GroupBy::Repo | GroupBy::None => {}
+                }
+            }
         }
-        if target_wt.is_some() && self.selected_worktree != target_wt {
+        let selected_changed = if target_wt.is_some() && self.selected_worktree != target_wt {
             self.selected_worktree.clone_from(&target_wt);
-        }
+            true
+        } else {
+            false
+        };
         if uncollapsed {
             self.persist(cx);
-        } else if target_wt.is_some() {
-            self.write_state(cx);
+        } else {
+            if selected_changed {
+                self.write_state(cx);
+            }
+            if target_wt.is_some()
+                && self
+                    .focused_row_index(&focused_host, focused_id, target_wt.as_deref())
+                    .is_none()
+            {
+                self.rebuild(cx);
+            }
         }
-        let session_idx = prefer_session
-            .then(|| {
-                self.rows.iter().enumerate().position(|(i, r)| {
-                    self.row_host(i).is_local()
-                        && matches!(r, Row::Session(s, _) if s.id == focused_id)
-                })
-            })
-            .flatten();
-        let idx = session_idx.or_else(|| {
-            self.rows.iter().position(|r| match r {
-                Row::Worktree(p) | Row::Folder(p) => target_wt.as_ref() == Some(p),
-                Row::Session(s, _) => s.id == focused_id,
-                _ => false,
-            })
-        });
-        if let Some(i) = idx {
+        if let Some(i) = self.focused_row_index(&focused_host, focused_id, target_wt.as_deref()) {
             self.cursor = Some(i);
             self.sync_viewport();
             self.scroll_row_into_view(i, ScrollStrategy::Nearest);
@@ -2396,16 +2855,18 @@ impl Sidebar {
             .sessions
             .iter()
             .filter(|s| {
-                if s.status.state == AgentState::Exited {
+                if s.is_exited() {
                     return false;
                 }
                 let Some(path) = s.worktree.as_deref().or(s.cwd.as_deref()) else {
                     return false;
                 };
-                self.workspace_for_path_on(host, path)
-                    .as_deref()
-                    .unwrap_or(path)
-                    == folder
+                path_identity::same(
+                    self.workspace_for_path_on(host, path)
+                        .as_deref()
+                        .unwrap_or(path),
+                    folder,
+                )
             })
             .map(|s| s.id)
             .collect()
@@ -2453,7 +2914,8 @@ impl Sidebar {
         }
     }
 
-    pub(super) fn now_unix_ns(&self) -> u64 {
+    #[must_use]
+    pub fn now_unix_ns(&self) -> u64 {
         self.now_override_ns.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2502,104 +2964,112 @@ impl Sidebar {
     }
 
     fn host_indent(&self) -> f32 {
-        if self.remote_hosts.is_empty() || self.options.group_by == GroupBy::Repo {
+        if !self.has_connected_remote_hosts() || self.options.group_by == GroupBy::Repo {
             0.
         } else {
             HOST_CHILD_INDENT
         }
     }
 
-    pub(super) fn project_visual(&self, path: &Path) -> Option<&external::ProjectVisualMeta> {
-        if let Some(v) = self.project_visuals.get(path) {
-            return Some(v);
-        }
-        if let Some(v) = self.remote_visuals.get(path) {
+    fn lookup_visual<'a>(
+        map: &'a BTreeMap<PathBuf, external::ProjectVisualMeta>,
+        path: &Path,
+    ) -> Option<&'a external::ProjectVisualMeta> {
+        if let Some(v) = map.get(path) {
             return Some(v);
         }
         let name = basename(path);
         if name.is_empty() {
             return None;
         }
-        self.project_visuals
-            .iter()
+        map.iter()
             .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
             .map(|(_, v)| v)
-            .or_else(|| {
-                self.remote_visuals
-                    .iter()
-                    .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
-                    .map(|(_, v)| v)
-            })
     }
 
     pub(super) fn project_icon(&self, path: &Path) -> Option<&crate::ui::icons::ProjectIcon> {
-        self.project_visual(path).and_then(|v| v.icon.as_ref())
+        let local = Self::lookup_visual(&self.project_visuals, path).and_then(|v| v.icon.as_ref());
+        let remote = Self::lookup_visual(&self.remote_visuals, path).and_then(|v| v.icon.as_ref());
+        match (local, remote) {
+            (
+                Some(crate::ui::icons::ProjectIcon::Image(lp)),
+                Some(r @ crate::ui::icons::ProjectIcon::Image(rp)),
+            ) if lp
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("url-"))
+                && rp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("remote-")) =>
+            {
+                Some(r)
+            }
+            (Some(l), _) => Some(l),
+            (None, r) => r,
+        }
     }
 
     pub(super) fn project_badge_color(&self, path: &Path) -> Option<&str> {
-        self.project_visual(path)
+        Self::lookup_visual(&self.project_visuals, path)
             .and_then(|v| v.badge_color.as_deref())
+            .or_else(|| {
+                Self::lookup_visual(&self.remote_visuals, path)
+                    .and_then(|v| v.badge_color.as_deref())
+            })
     }
 
     pub(super) fn project_header_name(&self, path: &Path) -> String {
-        self.project_visual(path)
+        Self::lookup_visual(&self.project_visuals, path)
             .and_then(|v| v.display_name.as_deref())
+            .or_else(|| {
+                Self::lookup_visual(&self.remote_visuals, path)
+                    .and_then(|v| v.display_name.as_deref())
+            })
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map_or_else(|| basename(path), str::to_owned)
     }
 
-    /// 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정).
-    /// 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
+    /// 연결된 원격 호스트만 목록에 띄운다(연결 안 된 호스트와 그 프로젝트는 숨기고, 호스트 관리는 설정에서 한다).
     fn live_remote_hosts(&self) -> impl Iterator<Item = &RemoteHost> {
         self.remote_hosts.iter().filter(|r| {
-            self.options
-                .filters
-                .contains_host(&HostId::Remote(r.id.clone()))
-                && (r.status == HostStatus::Connected
-                    || !r.snapshot.sessions.is_empty()
-                    || !r.snapshot.trees.is_empty()
-                    || self.remote_info.contains_key(&r.id))
+            r.status == HostStatus::Connected
+                && self
+                    .options
+                    .filters
+                    .contains_host(&HostId::Remote(r.id.clone()))
         })
     }
 
     /// Orca처럼 프로젝트가 맨 위 단계다. 여러 PC에 같은 프로젝트가 있으면 한 머리줄 아래로 합치고
-    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. PC별 상태 줄은 다시 연결이 필요한
-    /// 프로젝트 없는 호스트에만 남기고, 작업 폴더를 모르는 세션은 모든 PC 것을 끝에 한 묶음으로 둔다.
+    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. 작업 폴더를 모르는 세션은 끝에 한 묶음으로 둔다.
     fn rebuild_by_project(&mut self) {
         let mut merge = ProjectMerge::default();
         if self.options.filters.contains_host(&HostId::Local) {
             merge.absorb(&HostId::Local, self.local_rows());
         }
-        let mut idle = Vec::new();
         for remote in self.live_remote_hosts() {
             let host = HostId::Remote(remote.id.clone());
             let collapsed = merge.aligned_collapsed(&self.collapsed, &remote.snapshot);
-            let projects = merge.absorb(&host, self.remote_rows(remote, &collapsed));
-            if !projects && remote.status != HostStatus::Connected {
-                idle.push((
-                    host.clone(),
-                    Row::HostHeader {
-                        host,
-                        label: remote.label.clone(),
-                        status: remote.status,
-                        sessions: remote.snapshot.sessions.len(),
-                    },
-                ));
-            }
+            merge.absorb(&host, self.remote_rows(remote, &collapsed));
         }
-        let (rows, row_hosts, merged) = merge.finish(idle);
+        let (rows, row_hosts, merged) = merge.finish(&self.project_order);
         self.rows = rows;
         self.row_hosts = row_hosts;
         self.merged_projects = merged;
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let cursor_item = self.cursor.and_then(|i| {
-            self.rows
-                .get(i)
-                .map(|row| (self.row_host(i).clone(), row.clone()))
-        });
+        self.reconcile_path_identity();
+        let cursor_item = self
+            .cursor
+            .and_then(|i| {
+                self.rows
+                    .get(i)
+                    .map(|row| (self.row_host(i).clone(), row.clone()))
+            })
+            .or_else(|| self.cursor_anchor.take());
         self.status_summary = (
             self.snapshot
                 .sessions
@@ -2610,13 +3080,14 @@ impl Sidebar {
                 self.snapshot
                     .sessions
                     .iter()
+                    .filter(|s| !s.is_exited())
                     .map(|s| s.status.state)
                     .collect(),
             ),
         );
         self.ensure_external_polling(cx);
         self.merged_projects.clear();
-        if self.remote_hosts.is_empty() {
+        if !self.has_connected_remote_hosts() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
                 self.local_rows()
             } else {
@@ -2636,7 +3107,12 @@ impl Sidebar {
                         .get()
                         .to_owned(),
                     status: self.local_status,
-                    sessions: self.snapshot.sessions.len(),
+                    sessions: self
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .filter(|s| !s.is_exited())
+                        .count(),
                 });
                 row_hosts.push(HostId::Local);
                 if !self.collapsed_hosts.contains(&HostId::Local) {
@@ -2651,7 +3127,12 @@ impl Sidebar {
                     host: host.clone(),
                     label: remote.label.clone(),
                     status: remote.status,
-                    sessions: remote.snapshot.sessions.len(),
+                    sessions: remote
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .filter(|s| !s.is_exited())
+                        .count(),
                 });
                 row_hosts.push(host.clone());
                 if !self.collapsed_hosts.contains(&host) {
@@ -2681,6 +3162,7 @@ impl Sidebar {
             .cursor
             .map(|i| i.min(self.rows.len().saturating_sub(1)))
             .filter(|_| !self.rows.is_empty());
+        self.cursor_anchor = cursor_item.filter(|_| self.cursor.is_none());
         self.index_lineage();
         self.sync_viewport();
         self.card_list.invalidate_heights();
@@ -2736,7 +3218,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let auto_titles = self.auto_titles.clone();
-        self.apply_with_auto_titles(result, comments, auto_titles, cx);
+        let prompt_histories = self.prompt_histories.clone();
+        self.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
     }
 
     fn apply_with_auto_titles(
@@ -2744,10 +3227,12 @@ impl Sidebar {
         result: io::Result<(Snapshot, Meta)>,
         comments: BTreeMap<PathBuf, String>,
         auto_titles: BTreeMap<SessionId, String>,
+        prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok((snapshot, meta)) => {
+                let profiles_changed = self.profiles.observe(&HostId::Local, &snapshot);
                 if self.relink == Relink::AwaitingList {
                     self.relink = Relink::Steady;
                     cx.emit(Relisted(snapshot.sessions.len()));
@@ -2756,10 +3241,12 @@ impl Sidebar {
                 let status_changed = self.local_status != HostStatus::Connected;
                 self.local_status = HostStatus::Connected;
 
-                if snapshot != self.snapshot
+                if profiles_changed
+                    || snapshot != self.snapshot
                     || meta != self.meta
                     || comments != self.comments
                     || auto_titles != self.auto_titles
+                    || prompt_histories != self.prompt_histories
                     || self.poll_error.is_some()
                     || status_changed
                     || crate::alert::needs_snapshot(cx)
@@ -2768,18 +3255,29 @@ impl Sidebar {
                         &mut self.unread,
                         &self.snapshot.sessions,
                         &snapshot.sessions,
-                        self.focused,
+                        self.focused.filter(|_| self.focused_host.is_local()),
                     );
+                    // Screen streams are dropped for hidden tabs. Once the
+                    // daemon publishes a changed title, an older screen cache
+                    // must not keep masking it indefinitely.
+                    self.titles.retain(|id, _| {
+                        let previous = self.snapshot.sessions.iter().find(|s| s.id == *id);
+                        let current = snapshot.sessions.iter().find(|s| s.id == *id);
+                        previous.map(|s| &s.status.title) == current.map(|s| &s.status.title)
+                    });
                     self.snapshot = snapshot;
                     self.prune_read_done_for_host(&HostId::Local, cx);
                     self.meta = meta;
                     self.comments = comments;
                     self.auto_titles = auto_titles;
+                    self.prompt_histories = prompt_histories;
                     let auto_changed = self.include_imported_snapshot();
                     self.poll_error = None;
                     let live = &self.snapshot.sessions;
                     self.titles.retain(|id, _| live.iter().any(|s| s.id == *id));
                     self.auto_titles
+                        .retain(|id, _| live.iter().any(|s| s.id == *id));
+                    self.prompt_histories
                         .retain(|id, _| live.iter().any(|s| s.id == *id));
                     // OWE-898: 사라진 워크트리의 파생 상태가 폴링마다 누적되지 않게
                     // 라이브 집합에 없는 키를 정리한다(사용자 접힘·핀·부모 설정은 유지).
@@ -2797,7 +3295,7 @@ impl Sidebar {
                     } else {
                         self.rebuild(cx);
                     }
-                    if let Some(focused_id) = self.focused
+                    if let Some(focused_id) = self.focused.filter(|_| self.focused_host.is_local())
                         && let Some(wt) = self
                             .folder_on(&HostId::Local, focused_id)
                             .map(Path::to_path_buf)
@@ -2847,8 +3345,20 @@ impl Sidebar {
                 } else {
                     e.to_string()
                 };
-                if self.poll_error.as_ref() != Some(&msg) || status_changed {
-                    self.poll_error = Some(msg);
+                let transient = matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::Interrupted
+                );
+                let next_error = Some((msg, transient));
+                if self.poll_error != next_error || status_changed {
+                    self.poll_error = next_error;
                     if status_changed && !self.remote_hosts.is_empty() {
                         self.rebuild(cx);
                     } else {
@@ -2891,13 +3401,15 @@ impl Sidebar {
                     return;
                 };
                 let sp = sidebar_path.clone();
-                let (result, comments, auto_titles, fallback) = bg
+                let (result, comments, auto_titles, prompt_histories, fallback) = bg
                     .spawn(async move {
                         let mut comments = source.comments();
                         if comments.is_empty() {
                             comments = external::load_comments_from_sidebar_path(sp.as_deref());
                         }
                         let auto_titles = load_auto_titles_from_sidebar_path(sp.as_deref());
+                        let prompt_histories =
+                            load_prompt_histories_from_sidebar_path(sp.as_deref());
                         let state_dir = sp
                             .as_deref()
                             .and_then(Path::parent)
@@ -2905,13 +3417,23 @@ impl Sidebar {
                             .map(Path::to_path_buf);
                         let result = source.fetch().map(|mut snapshot| {
                             external::include_claude_worktrees(&mut snapshot.trees);
-                            let mut meta = source.meta(&snapshot.trees);
+                            let mut imported_meta = Meta::default();
                             if let Some(ref dir) = state_dir {
                                 external::include_imported_projects(
                                     dir,
                                     &mut snapshot.trees,
-                                    &mut meta,
+                                    &mut imported_meta,
                                 );
+                            }
+                            let mut meta = source.meta(&snapshot.trees);
+                            for (key, value) in imported_meta {
+                                let entry = meta.entry(key).or_default();
+                                if entry.branch.is_none() {
+                                    entry.branch = value.branch;
+                                }
+                                if entry.dirty.is_none() {
+                                    entry.dirty = value.dirty;
+                                }
                             }
                             (snapshot, meta)
                         });
@@ -2930,7 +3452,7 @@ impl Sidebar {
                         } else {
                             None
                         };
-                        (result, comments, auto_titles, fallback)
+                        (result, comments, auto_titles, prompt_histories, fallback)
                     })
                     .await;
                 let next_delay = this.update(cx, |s, cx| {
@@ -2945,7 +3467,7 @@ impl Sidebar {
                         s.meta.extend(meta);
                         s.rebuild(cx);
                     }
-                    s.apply_with_auto_titles(result, comments, auto_titles, cx);
+                    s.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
                     s.is_visible().then(|| s.poll_interval())
                 });
                 forced = false;
@@ -2991,8 +3513,9 @@ impl Sidebar {
             removed_projects: self.removed_projects.clone(),
         };
         let order = self.project_order.clone();
+        let worktree_order = self.worktree_order.clone();
         self.enqueue_disk_write(
-            move || save_state(&path, &prefs, &opts, &lin, &ui, &order),
+            move || save_state(&path, &prefs, &opts, &lin, &ui, &order, &worktree_order),
             cx,
         );
     }
@@ -3207,7 +3730,12 @@ impl Sidebar {
         self.snapshot_for(host)
             .sessions
             .iter()
-            .find(|s| s.worktree.as_deref().or(s.cwd.as_deref()) == Some(folder))
+            .find(|s| {
+                s.worktree
+                    .as_deref()
+                    .or(s.cwd.as_deref())
+                    .is_some_and(|p| path_identity::same(p, folder))
+            })
             .map(|s| s.id)
     }
 
@@ -3306,16 +3834,73 @@ impl Sidebar {
         }
     }
 
-    /// 프로젝트(저장소) `from`을 `to` 자리로 옮긴다(Orca처럼 끌어다 놓기). 지금 보이는 순서를 통째로 저장한다.
+    /// 같은 표시 그룹·계보의 형제 카드 순서를 고정한다. 자동 정렬을 다시 선택하면 그 정렬을 따른다.
+    pub fn move_worktree(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        let positions = |path: &Path| {
+            self.rows.iter().enumerate().find_map(|(i, row)| {
+                (matches!(row, Row::Worktree(p) if p == path) && self.row_host(i).is_local())
+                    .then_some(i)
+            })
+        };
+        let (Some(from_index), Some(to_index)) = (positions(from), positions(to)) else {
+            return;
+        };
+        let group = |index: usize| {
+            self.rows.iter().take(index).rposition(|row| {
+                matches!(
+                    row,
+                    Row::Repository(_) | Row::GroupHeader { .. } | Row::HiddenWorktrees(..)
+                )
+            })
+        };
+        let parents = self.merged_parents();
+        if from_index == to_index
+            || group(from_index) != group(to_index)
+            || parents.get(from) != parents.get(to)
+        {
+            return;
+        }
+        let bucket = group(from_index);
+        let mut order: Vec<_> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                Row::Worktree(path)
+                    if self.row_host(i).is_local()
+                        && group(i) == bucket
+                        && parents.get(path) == parents.get(from) =>
+                {
+                    Some(path.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let (Some(i), Some(j)) = (
+            order.iter().position(|p| p == from),
+            order.iter().position(|p| p == to),
+        ) else {
+            return;
+        };
+        let moved = order.remove(i);
+        order.insert(j, moved);
+        // Retain hidden/filtered cards and the manual order in other groups.
+        for path in &self.worktree_order {
+            if !order.contains(path) {
+                order.push(path.clone());
+            }
+        }
+        self.worktree_order = order;
+        self.options.sort_by = SortBy::Created;
+        self.persist(cx);
+    }
+
+    /// 프로젝트(저장소·폴더) `from`을 `to` 자리로 옮기고 보이는 순서를 저장한다.
     pub fn move_project(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
         let mut order: Vec<PathBuf> = self
             .rows
             .iter()
-            .zip(&self.row_hosts)
-            .filter_map(|(row, host)| match row {
-                Row::Repository(p) if host.is_local() => Some(p.clone()),
-                _ => None,
-            })
+            .filter_map(|row| project_key(row).map(|(_, path)| path.clone()))
             .collect();
         let (Some(i), Some(j)) = (
             order.iter().position(|p| p == from),
@@ -3432,45 +4017,60 @@ impl Sidebar {
         format!("{} {}", text::SESSION.get(), session.id.0)
     }
 
-    /// MK-057 Jump 팔레트 항목: 세션마다 제목·에이전트·상태·경과 시간·현재 탭/워크트리·저장소/워크트리 칩을 채운다.
+    /// Jump는 표시 행·필터와 무관하게 이미 받은 연결된 호스트 스냅샷만 읽는다.
+    fn jump_snapshots(&self) -> impl Iterator<Item = (HostId, &str, &Snapshot)> {
+        std::iter::once((
+            HostId::Local,
+            crate::i18n::catalog::jump::LOCAL_MAC.get(),
+            &self.snapshot,
+        ))
+        .chain(
+            self.remote_hosts
+                .iter()
+                .filter(|r| r.status == HostStatus::Connected)
+                .map(|r| (HostId::Remote(r.id.clone()), r.label.as_str(), &r.snapshot)),
+        )
+    }
+
+    /// MK-057: 연결된 모든 호스트의 세션을 호스트 식별자·검색 인덱스와 함께 만든다.
     pub fn jump_items(&self) -> Vec<Item> {
         let focused_id = self.focused;
-        let focused_folder = focused_id
-            .and_then(|id| self.folder(id))
-            .map(Path::to_path_buf);
+        let focused_host = &self.focused_host;
+        let focused_folder = focused_id.and_then(|id| self.folder_on(focused_host, id));
         let now_ns = self.now_unix_ns();
-        let host_label = crate::i18n::catalog::jump::LOCAL_MAC.get().to_owned();
-        let mut items: Vec<(u64, Item)> = self
-            .snapshot
-            .sessions
-            .iter()
-            .map(|s| {
-                let (title, detail) = self.session_label(s);
+        let mut items = Vec::new();
+        for (host, host_label, snapshot) in self.jump_snapshots() {
+            // 세션마다 전체 워크트리 목록을 다시 훑지 않는다.
+            let mut tree_repos = BTreeMap::new();
+            for (repo, trees) in &snapshot.trees {
+                tree_repos.entry(repo.as_path()).or_insert(repo.as_path());
+                for tree in trees {
+                    tree_repos.entry(tree.as_path()).or_insert(repo.as_path());
+                }
+            }
+            for s in &snapshot.sessions {
+                let (title, detail) = self.session_label_on(&host, s);
                 let agent =
                     crate::ui::status::infer_agent_from_status(&s.status, &title).to_owned();
                 let folder_path = s.worktree.as_deref().or(s.cwd.as_deref());
                 let (repo_name, worktree_name) = if let Some(wt) = s.worktree.as_deref() {
-                    let repo_path = self
-                        .snapshot
-                        .trees
-                        .iter()
-                        .find(|(repo, trees)| {
-                            repo.as_path() == wt || trees.iter().any(|t| t.as_path() == wt)
-                        })
-                        .map_or(wt, |(repo, _)| repo.as_path());
-                    (basename(repo_path), self.name(wt))
+                    let repo_path = tree_repos.get(wt).copied().unwrap_or(wt);
+                    (basename(repo_path), self.name_on(&host, wt))
                 } else if let Some(cwd) = s.cwd.as_deref() {
-                    (basename(cwd), self.name(cwd))
+                    (basename(cwd), self.name_on(&host, cwd))
                 } else {
                     (String::new(), String::new())
                 };
-                let is_current_tab = focused_id == Some(s.id);
-                let is_current_worktree = !is_current_tab
+                let is_current_tab = &host == focused_host && focused_id == Some(s.id);
+                let is_current_worktree = &host == focused_host
+                    && !is_current_tab
                     && folder_path.is_some()
-                    && folder_path == focused_folder.as_deref();
+                    && folder_path == focused_folder;
                 let age = if s.status.since_unix_ns > 0 {
                     crate::jump::format_age_ns(s.status.since_unix_ns, now_ns)
-                } else if let Some(&ts) = folder_path.and_then(|p| self.worktree_updated_at.get(p))
+                } else if let Some(&ts) = folder_path
+                    .filter(|_| host.is_local())
+                    .and_then(|p| self.worktree_updated_at.get(p))
                 {
                     crate::jump::format_age_secs(ts, now_ns / 1_000_000_000)
                 } else {
@@ -3486,17 +4086,27 @@ impl Sidebar {
                 item.title = title;
                 item.agent = agent;
                 item.state = Some(s.status.state);
-                item.unread = self.unread.contains(&s.id);
+                item.unread = host.is_local() && self.unread.contains(&s.id);
                 item.age = age;
                 item.is_current_tab = is_current_tab;
                 item.is_current_worktree = is_current_worktree;
-                item.host_label.clone_from(&host_label);
+                item.host = host.clone();
+                host_label.clone_into(&mut item.host_label);
+                item.cwd = s
+                    .cwd
+                    .as_deref()
+                    .or(s.worktree.as_deref())
+                    .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+                item.worktree_path = s
+                    .worktree
+                    .as_deref()
+                    .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
                 item.repo_name = repo_name;
                 item.worktree_name = worktree_name;
                 item.rebuild_search_chars();
-                (s.status.since_unix_ns, item)
-            })
-            .collect();
+                items.push((s.status.since_unix_ns, item));
+            }
+        }
         items.sort_by_key(|(since_ns, item)| {
             (
                 !item.is_current_tab,
@@ -3511,128 +4121,141 @@ impl Sidebar {
     /// Jump 팔레트 '최근 작업 공간' 섹션 항목(git 워크트리 + 열린 폴더 워크스페이스).
     pub fn jump_worktrees(&self) -> Vec<crate::jump::WorktreeItem> {
         let focused_id = self.focused;
+        let focused_host = &self.focused_host;
         let focused_folder = focused_id
-            .and_then(|id| self.folder(id))
+            .and_then(|id| self.folder_on(focused_host, id))
             .map(Path::to_path_buf);
         let now_ns = self.now_unix_ns();
         let now_secs = now_ns / 1_000_000_000;
-        let host_label = crate::i18n::catalog::jump::LOCAL_MAC.get().to_owned();
-        let mut seen = BTreeSet::new();
         let mut entries: Vec<(u64, crate::jump::WorktreeItem)> = Vec::new();
 
-        let mut push_path = |path: &Path, repo_path: &Path, is_primary: bool| {
-            if !seen.insert(path.to_path_buf()) {
-                return;
+        for (host, host_label, snapshot) in self.jump_snapshots() {
+            let mut seen = BTreeSet::new();
+            let mut sessions_by_path: BTreeMap<&Path, Vec<&Session>> = BTreeMap::new();
+            for session in &snapshot.sessions {
+                if let Some(path) = session.worktree.as_deref().or(session.cwd.as_deref()) {
+                    sessions_by_path.entry(path).or_default().push(session);
+                }
             }
-            let pref_name = self
-                .prefs
-                .get(path)
-                .filter(|v| !v.name.is_empty())
-                .map(|v| v.name.as_str())
-                .filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n));
-            let name = pref_name.map_or_else(|| basename(path), str::to_owned);
-            let repo_name = basename(repo_path);
-            let branch = self.branch(path).unwrap_or_default().to_owned();
-            let is_current = focused_folder.as_deref() == Some(path);
-            let sessions_in_wt: Vec<&Session> = self
-                .snapshot
-                .sessions
-                .iter()
-                .filter(|s| {
-                    s.worktree.as_deref() == Some(path)
-                        || (s.worktree.is_none() && s.cwd.as_deref() == Some(path))
-                })
-                .collect();
-            let session_id = focused_id
-                .filter(|id| sessions_in_wt.iter().any(|s| s.id == *id))
-                .or_else(|| sessions_in_wt.first().map(|s| s.id));
-            let unread = sessions_in_wt.iter().any(|s| self.unread.contains(&s.id));
-            let pairs: Vec<_> = sessions_in_wt
-                .iter()
-                .filter(|s| {
-                    !crate::ui::status::infer_agent_from_status(
-                        &s.status,
-                        s.status.title.as_deref().unwrap_or_default(),
-                    )
-                    .is_empty()
-                        || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
-                })
-                .map(|s| {
-                    (
-                        s.status.state,
-                        crate::ui::status::infer_agent_from_status(
+            let mut push_path = |path: &Path, repo_path: &Path, is_primary: bool| {
+                if !seen.insert(path.to_path_buf()) {
+                    return;
+                }
+                let pref_name = self
+                    .prefs
+                    .get(path)
+                    .filter(|v| host.is_local() && !v.name.is_empty())
+                    .map(|v| v.name.as_str())
+                    .filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n));
+                let name = pref_name.map_or_else(|| basename(path), str::to_owned);
+                let repo_name = basename(repo_path);
+                let branch = if host.is_local() {
+                    self.branch(path)
+                } else {
+                    self.branch_on(&host, path)
+                }
+                .unwrap_or_default()
+                .to_owned();
+                let is_current = &host == focused_host && focused_folder.as_deref() == Some(path);
+                let sessions_in_wt = sessions_by_path.get(path).map_or(&[][..], Vec::as_slice);
+                let session_id = focused_id
+                    .filter(|_| &host == focused_host)
+                    .filter(|id| sessions_in_wt.iter().any(|s| s.id == *id))
+                    .or_else(|| sessions_in_wt.first().map(|s| s.id));
+                let unread =
+                    host.is_local() && sessions_in_wt.iter().any(|s| self.unread.contains(&s.id));
+                let pairs: Vec<_> = sessions_in_wt
+                    .iter()
+                    .filter(|s| {
+                        !crate::ui::status::infer_agent_from_status(
                             &s.status,
                             s.status.title.as_deref().unwrap_or_default(),
-                        ),
-                    )
-                })
-                .collect();
-            let state = crate::ui::status::summarize(&pairs)
-                .groups
-                .first()
-                .map(|g| g.state)
-                .or_else(|| (!sessions_in_wt.is_empty()).then_some(AgentState::Done));
-            let latest_session_ns = sessions_in_wt
-                .iter()
-                .map(|s| s.status.since_unix_ns)
-                .max()
-                .unwrap_or(0);
-            let updated_secs = if latest_session_ns > 0 {
-                latest_session_ns / 1_000_000_000
-            } else if let Some(&ts) = self.worktree_updated_at.get(path) {
-                ts
-            } else {
-                self.disk.folder_updated_at.get(path).copied().unwrap_or(0)
-            };
-            let age = if latest_session_ns > 0 {
-                crate::jump::format_age_ns(latest_session_ns, now_ns)
-            } else if updated_secs > 0 {
-                crate::jump::format_age_secs(updated_secs, now_secs)
-            } else if !sessions_in_wt.is_empty() {
-                crate::i18n::catalog::jump::AGE_UNDER_MIN.get().to_owned()
-            } else {
-                String::new()
-            };
-            let sort_ts = if latest_session_ns > 0 {
-                latest_session_ns
-            } else {
-                updated_secs.saturating_mul(1_000_000_000)
-            };
-            entries.push((
-                sort_ts,
-                crate::jump::WorktreeItem::new(
+                        )
+                        .is_empty()
+                            || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
+                    })
+                    .map(|s| {
+                        (
+                            s.status.state,
+                            crate::ui::status::infer_agent_from_status(
+                                &s.status,
+                                s.status.title.as_deref().unwrap_or_default(),
+                            ),
+                        )
+                    })
+                    .collect();
+                let state = crate::ui::status::summarize(&pairs)
+                    .groups
+                    .first()
+                    .map(|g| g.state)
+                    .or_else(|| (!sessions_in_wt.is_empty()).then_some(AgentState::Done));
+                let latest_session_ns = sessions_in_wt
+                    .iter()
+                    .map(|s| s.status.since_unix_ns)
+                    .max()
+                    .unwrap_or(0);
+                let updated_secs = if latest_session_ns > 0 {
+                    latest_session_ns / 1_000_000_000
+                } else if let Some(&ts) = self
+                    .worktree_updated_at
+                    .get(path)
+                    .filter(|_| host.is_local())
+                {
+                    ts
+                } else if host.is_local() {
+                    self.disk.folder_updated_at.get(path).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let age = if latest_session_ns > 0 {
+                    crate::jump::format_age_ns(latest_session_ns, now_ns)
+                } else if updated_secs > 0 {
+                    crate::jump::format_age_secs(updated_secs, now_secs)
+                } else if !sessions_in_wt.is_empty() {
+                    crate::i18n::catalog::jump::AGE_UNDER_MIN.get().to_owned()
+                } else {
+                    String::new()
+                };
+                let sort_ts = if latest_session_ns > 0 {
+                    latest_session_ns
+                } else {
+                    updated_secs.saturating_mul(1_000_000_000)
+                };
+                let mut item = crate::jump::WorktreeItem::new(
                     path.to_path_buf(),
                     session_id,
                     name,
                     branch,
                     repo_name,
-                    host_label.clone(),
+                    host_label.to_owned(),
                     age,
                     state,
                     unread,
                     is_primary,
                     is_current,
-                ),
-            ));
-        };
+                );
+                item.host = host.clone();
+                entries.push((sort_ts, item));
+            };
 
-        for (repo, trees) in &self.snapshot.trees {
-            let show_ext = self.shown_external.contains(repo);
-            for wt in trees {
-                if !show_ext
-                    && external::is_claude_worktree(wt)
-                    && focused_folder.as_ref() != Some(wt)
-                {
-                    continue;
+            for (repo, trees) in &snapshot.trees {
+                let show_ext = self.shown_external.contains(repo);
+                for wt in trees {
+                    if !show_ext
+                        && external::is_claude_worktree(wt)
+                        && focused_folder.as_ref() != Some(wt)
+                    {
+                        continue;
+                    }
+                    push_path(wt, repo, wt == repo);
                 }
-                push_path(wt, repo, wt == repo);
             }
-        }
-        for s in &self.snapshot.sessions {
-            if s.worktree.is_none()
-                && let Some(cwd) = s.cwd.as_deref()
-            {
-                push_path(cwd, cwd, false);
+            for s in &snapshot.sessions {
+                if s.worktree.is_none()
+                    && let Some(cwd) = s.cwd.as_deref()
+                {
+                    push_path(cwd, cwd, false);
+                }
             }
         }
 
@@ -3859,20 +4482,21 @@ impl Sidebar {
     }
 
     pub(super) fn name_on(&self, host: &HostId, path: &Path) -> String {
-        let pref_name = self.custom_worktree_name(path);
+        let pref_name = host
+            .is_local()
+            .then(|| self.custom_worktree_name(path))
+            .flatten();
         if let Some(custom) =
             pref_name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n))
         {
             return custom.to_owned();
         }
-        let branch = self
-            .meta_for(host)
-            .get(path)
-            .and_then(|t| t.branch.as_deref());
         if self.snapshot_for(host).trees.contains_key(path) {
-            return branch.map_or_else(|| basename(path), str::to_owned);
+            return self
+                .branch_on(host, path)
+                .map_or_else(|| basename(path), str::to_owned);
         }
-        if let Some(branch) = branch {
+        if let Some(branch) = self.branch_on(host, path) {
             if !krill_proto::git::is_default_branch_or_worktree_name(branch) {
                 return branch.to_owned();
             }
@@ -3901,10 +4525,13 @@ impl Sidebar {
             .get(path)
             .map(|v| v.name.trim())
             .filter(|s| !s.is_empty())?;
-        if self.snapshot.trees.contains_key(path) {
-            let folder = basename(path);
+        let folder = basename(path);
+        if name.eq_ignore_ascii_case(&folder) {
+            return None;
+        }
+        if self.snapshot.trees.contains_key(path) || self.disk.imported.trees.contains_key(path) {
             let header = self.project_header_name(path);
-            if name.eq_ignore_ascii_case(&folder) || name.eq_ignore_ascii_case(&header) {
+            if name.eq_ignore_ascii_case(&header) {
                 return None;
             }
         }
@@ -3937,12 +4564,21 @@ impl Sidebar {
     /// 데몬 스냅샷 폴링 실패 문구(셸 우하단 토스트 동기화용).
     #[must_use]
     pub fn poll_error(&self) -> Option<&str> {
-        self.poll_error.as_deref()
+        self.poll_error.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    /// 자동 재시도 중인 연결 오류는 팝업 없이 복구하고, 조치가 필요한 오류만 알린다.
+    #[must_use]
+    pub fn poll_error_notice(&self) -> Option<&str> {
+        self.poll_error
+            .as_ref()
+            .and_then(|(msg, transient)| (!transient).then_some(msg.as_str()))
     }
 
     pub fn set_poll_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
-        if self.poll_error != error {
-            self.poll_error = error;
+        let next = error.map(|msg| (msg, false));
+        if self.poll_error != next {
+            self.poll_error = next;
             cx.notify();
         }
     }
@@ -3999,6 +4635,7 @@ impl Sidebar {
                 self.snapshot
                     .sessions
                     .iter()
+                    .filter(|s| s.status.state != AgentState::Exited)
                     .cloned()
                     .map(|s| (HostId::Local, s)),
             );
@@ -4013,6 +4650,7 @@ impl Sidebar {
                     .snapshot
                     .sessions
                     .iter()
+                    .filter(|s| s.status.state != AgentState::Exited)
                     .cloned()
                     .map(|s| (host.clone(), s)),
             );
@@ -4021,36 +4659,124 @@ impl Sidebar {
     }
 
     pub fn session_label(&self, session: &Session) -> (String, String) {
-        let custom_title = self
-            .custom_titles
-            .get(&session.id)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
-        // 칸이 열려 있으면 그 제목(즉시 반영), 아니면 krilld가 알려 준 제목. 에이전트 기본 제목은 자동 제목에 양보한다.
-        let explicit_title = self
-            .titles
-            .get(&session.id)
-            .and_then(|t| krill_proto::control::display_title(t))
-            .or_else(|| session.status.title.clone())
-            .filter(|t| {
-                !krill_proto::git::is_default_branch_or_worktree_name(t)
-                    && !t.eq_ignore_ascii_case("claude code")
-            });
-        let title = custom_title
-            .or(explicit_title.as_deref())
-            .or_else(|| self.auto_titles.get(&session.id).map(String::as_str))
-            .or_else(|| self.titles.get(&session.id).map(String::as_str));
-        session_label(session, title)
+        self.session_label_on_with_title(&HostId::Local, session, None)
     }
 
     #[must_use]
     pub fn session_label_on(&self, host: &HostId, session: &Session) -> (String, String) {
-        if host.is_local() {
-            self.session_label(session)
-        } else {
-            session_label(session, session.status.title.as_deref())
+        self.session_label_on_with_title(host, session, None)
+    }
+
+    /// Tabs and sidebar rows share title precedence, including a pane's newest
+    /// OSC title. Local custom/auto titles never cross into another host's IDs.
+    #[must_use]
+    pub fn session_label_on_with_title(
+        &self,
+        host: &HostId,
+        session: &Session,
+        pane_title: Option<&str>,
+    ) -> (String, String) {
+        let local = host.is_local();
+        let custom_title = local
+            .then(|| self.custom_titles.get(&session.id))
+            .flatten()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        let cached_title = local
+            .then(|| self.titles.get(&session.id))
+            .flatten()
+            .map(String::as_str);
+        let live_title = pane_title
+            .or(cached_title)
+            .and_then(krill_proto::control::display_title);
+        let auto_title = local
+            .then(|| self.auto_titles.get(&session.id))
+            .flatten()
+            .map(String::as_str)
+            .filter(|title| !title.trim().is_empty());
+        let has_agent_prompt = !session.status.agent.trim().is_empty() && auto_title.is_some();
+        let specific = |title: &&str| {
+            !(krill_proto::git::is_default_branch_or_worktree_name(title)
+                || title.eq_ignore_ascii_case("claude code")
+                || has_agent_prompt && is_windows_shell_title(title))
+        };
+        let explicit_title = live_title
+            .as_deref()
+            .filter(specific)
+            .or_else(|| session.status.title.as_deref().filter(specific));
+        let title = custom_title
+            .or(explicit_title)
+            .or(auto_title)
+            .or(live_title.as_deref())
+            .or(session.status.title.as_deref());
+        session_label(session, title)
+    }
+
+    /// 로컬 세션의 최근 프롬프트 턴 히스토리를 돌려준다.
+    #[must_use]
+    pub fn session_prompt_history(
+        &self,
+        id: SessionId,
+    ) -> Option<&krill_proto::git::SessionPromptHistory> {
+        self.prompt_histories.get(&id)
+    }
+
+    /// 호스트 구분을 포함해 세션의 최근 프롬프트 턴 히스토리를 돌려준다(현재는 로컬 호스트 지원).
+    #[must_use]
+    pub fn session_prompt_history_on(
+        &self,
+        host: &HostId,
+        id: SessionId,
+    ) -> Option<&krill_proto::git::SessionPromptHistory> {
+        host.is_local()
+            .then(|| self.prompt_histories.get(&id))
+            .flatten()
+    }
+
+    /// 하이브리드 채팅 등 앱 내부에서 프롬프트를 전송했을 때 즉시 메모리·디스크 히스토리에 반영한다.
+    pub fn record_local_prompt(
+        &mut self,
+        session: SessionId,
+        prompt: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let now_ns = self.now_unix_ns();
+        let changed = self
+            .prompt_histories
+            .entry(session)
+            .or_default()
+            .record_turn(prompt, now_ns);
+        if !changed {
+            return;
         }
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
+            let owned = prompt.to_owned();
+            cx.background_executor()
+                .spawn(async move {
+                    krill_proto::git::record_session_prompt(&dir, session, &owned, now_ns).ok();
+                })
+                .detach();
+        }
+        cx.notify();
+    }
+
+    /// 백그라운드 폴링(사이드바 접힘 상태 포함)에서 읽어 온 프롬프트 히스토리를 동기화한다.
+    pub fn sync_prompt_histories(
+        &mut self,
+        mut histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.snapshot.sessions.is_empty() {
+            let live = &self.snapshot.sessions;
+            histories.retain(|id, _| live.iter().any(|s| s.id == *id));
+        }
+        if self.prompt_histories == histories {
+            return false;
+        }
+        self.prompt_histories = histories;
+        cx.notify();
+        true
     }
 
     /// OWE-662: 로컬 호스트 워크트리 세션의 상태 묶음과 미확인 세션이 있는지.
@@ -4072,7 +4798,7 @@ impl Sidebar {
             .snapshot_for(host)
             .sessions
             .iter()
-            .filter(|s| s.worktree.as_deref() == Some(tree))
+            .filter(|s| !s.is_exited() && s.worktree.as_deref() == Some(tree))
             .collect();
         let unread = host.is_local() && sessions.iter().any(|s| self.unread.contains(&s.id));
         let pairs: Vec<_> = sessions
@@ -4107,3 +4833,6 @@ use krill_proto::daemon::Paths;
 #[cfg(unix)]
 #[path = "sidebar/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod project_order_tests;

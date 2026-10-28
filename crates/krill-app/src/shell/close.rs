@@ -231,7 +231,18 @@ impl Shell {
             self.close_daemon_session(host, session, cx);
             return;
         }
-        self.close_layout(cx, |layout| {
+        self.close_session_panes(host, session, Policy::Terminate, cx);
+    }
+
+    /// 같은 호스트·세션을 표시하는 모든 칸을 닫고 다른 세션의 포커스는 유지한다.
+    pub(super) fn close_session_panes(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        policy: Policy,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_with_policy(policy, cx, |layout| {
             let focused = layout.focused();
             for index in (0..layout.tabs().len()).rev() {
                 for pane in layout.tab_panes(index) {

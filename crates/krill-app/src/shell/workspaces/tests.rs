@@ -413,6 +413,7 @@ fn selecting_workspace_reconciles_detached_and_late_sessions_preserving_layout(
         let mut snapshot = live_snapshot(&[101, 102, 103, 103], "/work/a");
         let mut exited = live_session(104, "/work/a");
         exited.status.state = krill_proto::control::AgentState::Exited;
+        exited.status.source = Some(krill_proto::control::Source::Process);
         snapshot.sessions.push(exited);
         s.sidebar.update(cx, |sidebar, cx| {
             sidebar.connect_source(Arc::new(LiveSnapshot(snapshot)), cx);
@@ -678,4 +679,234 @@ fn reboot_empty_sidebar_opens_saved_agent_workspace_without_creating_shell(
     assert_eq!(layout.session(panes[1]), Some(SessionId(101)));
     assert!(layout.visible().contains(&panes[1]));
     assert_eq!(layout.sessions(), saved.sessions());
+}
+
+#[gpui::test]
+fn closing_remote_session_is_not_readded_after_interleaved_snapshots_and_externally_closed_session_closes_tab(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostStatus;
+    let (view, cx) = open(cx, state_path("workspace-remote-close-loop"));
+    let remote = HostId::Remote("macmini".into());
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "macmini",
+                HostStatus::Connected,
+                live_snapshot(&[41, 42], "/work/krill"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    click_host_card(&view, cx, &remote);
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.layout.sessions_for_host(&remote),
+            vec![SessionId(41), SessionId(42)]
+        );
+        let (tab, _) = s.tab_pane_for_session_on(&remote, SessionId(42)).unwrap();
+        s.do_close_tab(tab, cx);
+        // 종료 직후 스냅샷에서 Exited로 잠깐 바뀌거나 일시 누락된 뒤 지연된 옛 스냅샷이 다시 도착해도
+        // 닫은 원격 세션(42)이 새 Program::Login 탭으로 부활하면 안 된다.
+        let mut exited_snap = live_snapshot(&[41], "/work/krill");
+        let mut s42 = live_session(42, "/work/krill");
+        s42.status.state = krill_proto::control::AgentState::Exited;
+        exited_snap.sessions.push(s42);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test("macmini", HostStatus::Connected, exited_snap, cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "macmini",
+                HostStatus::Connected,
+                live_snapshot(&[41, 42], "/work/krill"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(s.layout.sessions_for_host(&remote), vec![SessionId(41)]);
+        // 원격 클라이언트 등 외부에서 세션 41을 종료해 스냅샷에서 완전히 사라지면
+        // 남아 있던 탭도 함께 정리되고 숨은 세션 복원(restore_hidden_sessions)도 돌지 않는다.
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "macmini",
+                HostStatus::Connected,
+                live_snapshot(&[], "/work/krill"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| {
+        assert!(s.layout.sessions_for_host(&remote).is_empty());
+        assert_eq!(s.closed_sessions, vec![SessionId(42)]);
+    });
+}
+
+/// 종료 스냅샷은 비활성 탭도 정리한다. 호스트별 같은 ID와 셸 안의 `SessionEnd` 이벤트는 보존한다.
+#[gpui::test]
+fn exited_snapshot_closes_hidden_tab_without_trees_or_prior_observation(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostStatus;
+    use krill_proto::control::{AgentState, Source};
+    let (view, cx) = open(cx, state_path("workspace-exited-snapshot"));
+    let remote = HostId::Remote("studio".into());
+    let (local, ended, hook) = view.update(cx, |s, cx| {
+        let local = s.layout.active_tab().focused;
+        s.change(true, cx, |layout| {
+            layout.set_session(local, SessionId(41));
+            layout.new_tab();
+            layout.set_host(layout.active_tab().focused, remote.clone());
+            layout.set_session(layout.active_tab().focused, SessionId(41));
+        });
+        let ended = s.layout.active_tab().focused;
+        s.change(true, cx, |layout| {
+            layout.new_tab();
+            layout.set_host(layout.active_tab().focused, remote.clone());
+            layout.set_session(layout.active_tab().focused, SessionId(42));
+        });
+        let hook = s.layout.active_tab().focused;
+        s.change(true, cx, |layout| layout.activate(0));
+        assert!(
+            !s.observed_sessions
+                .contains(&(remote.clone(), SessionId(41)))
+        );
+        let mut exited = live_session(41, "/work/krill");
+        exited.status.state = AgentState::Exited;
+        exited.status.source = Some(Source::Process);
+        let mut hook_exited = live_session(42, "/work/krill");
+        hook_exited.status.state = AgentState::Exited;
+        hook_exited.status.source = Some(Source::Hook);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Connected,
+                sidebar::Snapshot {
+                    sessions: vec![exited, hook_exited],
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        (local, ended, hook)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(!s.layout.pane_exists(ended));
+        assert!(s.layout.pane_exists(hook));
+        assert_eq!(s.layout.session(local), Some(SessionId(41)));
+        assert_eq!(s.layout.focused(), Some(local));
+        assert!(s.workspace_closing.contains(&(remote, SessionId(41))));
+    });
+}
+
+#[gpui::test]
+fn windows_workspace_aliases_share_tabs_and_new_tab_keeps_active_cwd(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("windows-workspace-identity"));
+    view.update(cx, |s, cx| {
+        s.sidebar
+            .update(cx, |sidebar, cx| sidebar.select_worktree(None, cx));
+        s.change(true, cx, |layout| {
+            let pane = layout.active_tab().focused;
+            layout.set_launch(
+                pane,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: r"\\?\C:\Users\Owen\간단작업".as_bytes().to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+        });
+        let original = s.layout.active();
+        // No selected sidebar workspace yet: the active launch still owns the cwd.
+        s.new_tab_on_launch_host(cx);
+        assert_eq!(s.layout.tabs().len(), 2);
+        let added = s.layout.active_tab().focused;
+        assert_eq!(
+            s.layout.launch(added).unwrap().cwd,
+            r"\\?\C:\Users\Owen\간단작업".as_bytes()
+        );
+        s.change(true, cx, |layout| {
+            let mut launch = layout.launch(added).unwrap().clone();
+            launch.cwd = "c:/users/owen/간단작업/".as_bytes().to_vec();
+            layout.set_launch(added, launch);
+        });
+        assert_eq!(s.workspace_tabs(cx), [original, s.layout.active()]);
+        s.open_workspace_on(HostId::Local, PathBuf::from(r"C:\USERS\OWEN\간단작업"), cx);
+        assert_eq!(s.layout.tabs().len(), 2);
+        let local = Workspace {
+            host: HostId::Local,
+            folder: PathBuf::from(r"C:\Users\Owen\간단작업"),
+        };
+        let remote = Workspace {
+            host: HostId::Remote("windows".into()),
+            folder: local.folder.clone(),
+        };
+        assert_ne!(local, remote);
+        assert_ne!(
+            Workspace {
+                host: HostId::Local,
+                folder: "/Repo".into()
+            },
+            Workspace {
+                host: HostId::Local,
+                folder: "/repo".into()
+            }
+        );
+    });
+}
+
+/// Actorjin(Windows): 새 세션(에이전트)도 지금 워크트리의 탭들 바로 옆에 열린다. 다른 워크스페이스 탭이 전체 목록
+/// 사이에 있어도, 사이드바 선택이 아직 없고 경로 표기가 달라도 새 워크스페이스·목록을 시작하지 않는다.
+#[gpui::test]
+fn new_agent_session_opens_beside_tabs_of_the_same_windows_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("windows-agent-same-workspace"));
+    view.update(cx, |s, cx| {
+        s.sidebar
+            .update(cx, |sidebar, cx| sidebar.select_worktree(None, cx));
+        let login = |cwd: &str| Create {
+            account: None,
+            program: Program::Login,
+            cwd: cwd.as_bytes().to_vec(),
+            cols: 80,
+            rows: 24,
+        };
+        s.change(true, cx, |layout| {
+            let first = layout.active_tab().focused;
+            layout.set_launch(first, login(r"\\?\C:\Users\Owen\간단작업"));
+            layout.new_tab();
+            let other = layout.active_tab().focused;
+            layout.set_launch(other, login(r"C:\Users\Owen\다른작업"));
+            layout.activate(0);
+        });
+        assert_eq!(s.workspace_tabs(cx), [0]);
+
+        s.new_agent("codex".into(), cx);
+        let added = s.layout.active_tab().focused;
+        let launch = s.layout.launch(added).unwrap().clone();
+        assert_eq!(launch.program, Program::Agent { id: "codex".into() });
+        assert_eq!(launch.cwd, r"\\?\C:\Users\Owen\간단작업".as_bytes());
+        assert_eq!(s.layout.host(added), &HostId::Local);
+        // 새 세션은 같은 워크스페이스의 마지막 탭 바로 옆(화면상 두 번째)이고 활성이다.
+        assert_eq!(s.workspace_tabs(cx), [0, s.layout.active()]);
+
+        // 같은 폴더의 다른 표기로 시작한 칸에서 열어도 같은 탭 목록에 붙는다.
+        s.change(true, cx, |layout| {
+            let mut alias = layout.launch(added).unwrap().clone();
+            alias.cwd = "c:/users/owen/간단작업/".as_bytes().to_vec();
+            layout.set_launch(added, alias);
+        });
+        s.new_agent("claude".into(), cx);
+        assert_eq!(s.layout.tabs().len(), 4);
+        let tabs = s.workspace_tabs(cx);
+        assert_eq!(tabs.len(), 3, "{tabs:?}");
+        assert_eq!(tabs.last(), Some(&s.layout.active()));
+    });
 }

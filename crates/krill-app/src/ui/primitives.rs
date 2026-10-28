@@ -560,6 +560,156 @@ pub fn button_with_tooltip_when(
     }
 }
 
+/// 사이드바 세션 행·상단 탭 호버 시 표시할 구조화된 멀티라인 세션 맥락 카드 명세(제안 B).
+#[derive(Debug, Clone)]
+pub struct SessionHoverCardSpec {
+    pub id: SharedString,
+    pub title: SharedString,
+    pub agent: SharedString,
+    pub state_line: SharedString,
+    pub total_turns: u32,
+    pub last_prompt: Option<SharedString>,
+    pub last_prompt_age: Option<SharedString>,
+    pub prev_turn: Option<(u32, SharedString)>,
+}
+
+/// 사이드바 세션 행 및 상단 탭의 구조화된 멀티라인 호버 카드 뷰를 생성한다(제안 B).
+pub fn session_hover_card_view(
+    spec: SessionHoverCardSpec,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> gpui::AnyView {
+    gpui_component::tooltip::Tooltip::element(move |_, cx| {
+        let p = super::theme::palette(cx);
+        let id = spec.id.clone();
+        let title = spec.title.clone();
+        let title_id = id.clone();
+        let title_val = title.clone();
+        let header_meta = if spec.agent.is_empty() {
+            spec.state_line.clone()
+        } else if spec.state_line.is_empty() {
+            spec.agent.clone()
+        } else {
+            format!("{} · {}", spec.agent, spec.state_line).into()
+        };
+        let total_turns = spec.total_turns;
+        let turn_id = id.clone();
+
+        div()
+            .debug_selector(move || format!("tooltip:{id}"))
+            .max_w(px(340.))
+            .min_w(px(210.))
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .py_0p5()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(header_meta),
+                    )
+                    .when(total_turns > 0, |d| {
+                        let turn_label = crate::i18n::catalog::sidebar::TURN_BADGE
+                            .format(&[("n", &total_turns.to_string())]);
+                        d.child(
+                            badge(p, BadgeTone::Accent, turn_label).debug_selector(move || {
+                                format!("tooltip-turn:{turn_id}:{total_turns}")
+                            }),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("tooltip-title:{title_id}:{title_val}"))
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(TEXT_XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.popover_foreground)
+                    .child(title),
+            )
+            .when_some(spec.last_prompt.clone(), |d, prompt| {
+                let prompt_box_id = spec.id.clone();
+                let prompt_text_id = spec.id.clone();
+                let prompt_text_val = prompt.clone();
+                let age = spec.last_prompt_age.clone();
+                d.child(
+                    div()
+                        .debug_selector(move || format!("tooltip-last-prompt:{prompt_box_id}"))
+                        .w_full()
+                        .min_w_0()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(RADIUS_SM)
+                        .bg(p.accent.opacity(0.45))
+                        .border_1()
+                        .border_color(p.border)
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .text_size(TEXT_2XS)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(p.muted_foreground)
+                                .child(crate::i18n::catalog::sidebar::LAST_PROMPT_LABEL.get())
+                                .when_some(age, gpui::ParentElement::child),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || {
+                                    format!(
+                                        "tooltip-prompt-text:{prompt_text_id}:{prompt_text_val}"
+                                    )
+                                })
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_size(TEXT_XS)
+                                .text_color(p.popover_foreground)
+                                .child(prompt),
+                        ),
+                )
+            })
+            .when_some(spec.prev_turn.clone(), |d, (prev_num, prev_text)| {
+                let prev_id = spec.id.clone();
+                let prev_turn_badge = crate::i18n::catalog::sidebar::TURN_BADGE
+                    .format(&[("n", &prev_num.to_string())]);
+                let single_line_prev = prev_text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let summary = format!(
+                    "{} ({prev_turn_badge}): \"{single_line_prev}\"",
+                    crate::i18n::catalog::sidebar::PREV_PROMPT_PREFIX.get()
+                );
+                d.child(
+                    div()
+                        .debug_selector(move || format!("tooltip-prev-prompt:{prev_id}"))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .child(summary),
+                )
+            })
+    })
+    .build(window, cx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

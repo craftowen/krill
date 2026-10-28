@@ -13,7 +13,6 @@
  };
  async function digest(bytes,signal){
   if(signal?.aborted)throw Error('Update cancelled');
-  if(globalThis.crypto?.subtle){const result=await crypto.subtle.digest('SHA-256',bytes);return C.hex(new Uint8Array(result)).slice(0,16);}
   if(globalThis.Worker)return new Promise((resolve,reject)=>{let worker;const stop=()=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);worker?.terminate();},abort=()=>{stop();reject(Error('Update cancelled'));},timer=setTimeout(abort,15000);try{worker=new Worker('updates.js');worker.onmessage=event=>{stop();if(event.data?.hash)resolve(event.data.hash);else reject(Error('Update hash failed'));};worker.onerror=()=>{stop();reject(Error('Update hash failed'));};signal?.addEventListener('abort',abort,{once:true});worker.postMessage(bytes.buffer,[bytes.buffer]);}catch(error){stop();reject(error);}});
   // Older browsers still verify the bounded bundle rather than accepting unchecked assets.
   return C.hex(C.sha256(bytes)).slice(0,16);
@@ -54,7 +53,7 @@
  }
  function create(options){
   const {endpoint}=options,current=/^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname)?.[1];
-  let timer,applyTimer,work,controller,stopped=false,navigating=false,pending=null,holds=0,composing=false,lastInput=Date.now();
+  let timer,applyTimer,work,controller,started=false,stopped=false,navigating=false,pending=null,holds=0,composing=false,lastInput=Date.now(),lastCheck=-Infinity;
   const identity=()=>endpoint.updateIdentity?.(),enabled=()=>!!(current&&identity()&&!stopped&&!navigating&&!options.blocked?.());
   const idle=()=>enabled()&&!!navigator.serviceWorker?.controller&&!document.hidden&&!composing&&!holds&&Date.now()-lastInput>=1500&&!options.busy?.();
   const schedule=()=>{clearTimeout(timer);if(!stopped)timer=setTimeout(()=>{check();schedule();},30000);};
@@ -87,7 +86,7 @@
     pending=found;retry();
    }catch{}finally{clearTimeout(timeout);}
   }
-  function check(){if(!enabled()||document.hidden)return Promise.resolve();if(work)return work;work=run().finally(()=>work=null);return work;}
+  function check(){if(!enabled()||document.hidden)return Promise.resolve();if(work)return work;lastCheck=Date.now();work=run().finally(()=>work=null);return work;}
   function invalidate(){controller?.abort();pending=null;clearTimeout(applyTimer);}
   function restore(){
    try{const raw=sessionStorage.getItem(KEY);if(!raw)return;const record=JSON.parse(raw);
@@ -95,9 +94,9 @@
     options.restore(record.state);
    }catch{}finally{try{sessionStorage.removeItem(KEY);}catch{}}
   }
-  const activity=()=>{lastInput=Date.now();},resume=()=>{if(!document.hidden){check();retry();}},startComposition=()=>{composing=true;activity();},endComposition=()=>{composing=false;activity();};
+  const activity=()=>{lastInput=Date.now();},resume=()=>{if(!document.hidden){if(Date.now()-lastCheck>=1000)check();retry();}},startComposition=()=>{composing=true;activity();},endComposition=()=>{composing=false;activity();};
   const events=[['input',activity],['pointerdown',activity],['keydown',activity],['compositionstart',startComposition],['compositionend',endComposition],['visibilitychange',resume]];
-  function start(){endpoint.setUpdateHandler?.(check);for(const [name,fn] of events)document.addEventListener(name,fn,true);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);navigator.serviceWorker?.addEventListener?.('controllerchange',resume);schedule();check();}
+  function start(){if(started||stopped)return;started=true;endpoint.setUpdateHandler?.(check);for(const [name,fn] of events)document.addEventListener(name,fn,true);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);navigator.serviceWorker?.addEventListener?.('controllerchange',resume);schedule();check();}
   function stop(){stopped=true;invalidate();clearTimeout(timer);endpoint.setUpdateHandler?.(null);for(const [name,fn] of events)document.removeEventListener(name,fn,true);globalThis.removeEventListener('pageshow',resume);globalThis.removeEventListener('online',resume);navigator.serviceWorker?.removeEventListener?.('controllerchange',resume);}
   return {start,stop,check,invalidate,restore,hold(){holds++;let released=false;return ()=>{if(!released){released=true;holds--;activity();}};}};
  }

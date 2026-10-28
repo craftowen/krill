@@ -45,6 +45,89 @@ pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBu
     Ok(path)
 }
 
+/// Append standard per-user Windows CLI install folders (`%USERPROFILE%\.local\bin`,
+/// `%LOCALAPPDATA%\agy\bin`, `%APPDATA%\npm`, etc.) that exist on disk when Explorer's
+/// inherited `PATH` omits them (e.g. CLIs installed via PowerShell `$PROFILE` or before relogin).
+#[must_use]
+pub fn augment_windows_path(path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let user_profile = std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| user_profile.as_ref().map(|h| h.join(r"AppData\Local")));
+    let app_data = std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| user_profile.as_ref().map(|h| h.join(r"AppData\Roaming")));
+    augment_windows_path_with(
+        path,
+        user_profile.as_deref(),
+        local_app_data.as_deref(),
+        app_data.as_deref(),
+    )
+}
+
+/// Testable implementation of [`augment_windows_path`] with explicit root directories.
+#[must_use]
+pub fn augment_windows_path_with(
+    path: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::path::Path>,
+    local_app_data: Option<&std::path::Path>,
+    app_data: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    let mut entries: Vec<std::path::PathBuf> = path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    let mut candidates = Vec::new();
+    if let Some(home) = user_profile {
+        candidates.extend([
+            home.join(".local").join("bin"),
+            home.join(".opencode").join("bin"),
+            home.join(".cargo").join("bin"),
+            home.join("scoop").join("shims"),
+        ]);
+    }
+    if let Some(local) = local_app_data {
+        candidates.extend([
+            local.join("agy").join("bin"),
+            local.join("Programs").join("Antigravity").join("bin"),
+            local.join("Programs").join("cursor-agent"),
+            local.join("cursor-agent"),
+            local.join("Microsoft").join("WinGet").join("Links"),
+        ]);
+    }
+    if let Some(roaming) = app_data {
+        candidates.push(roaming.join("npm"));
+    }
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    for cand in candidates {
+        if !cand.is_dir() {
+            continue;
+        }
+        let cand_norm = norm(&cand);
+        if !entries.iter().any(|existing| norm(existing) == cand_norm) {
+            entries.push(cand);
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    std::env::join_paths(entries).ok().or_else(|| {
+        path.filter(|p| !p.is_empty())
+            .map(std::ffi::OsStr::to_owned)
+    })
+}
+
 #[cfg(unix)]
 pub use std::os::unix::{ffi, fs, net};
 
@@ -126,5 +209,36 @@ pub mod ffi {
                 Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned().into(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn augment_windows_path_appends_existing_cli_dirs_without_duplicating() {
+        let root = std::env::temp_dir().join(format!("krill-win-path-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("user");
+        let local = root.join("local");
+        let roaming = root.join("roaming");
+        let claude_bin = home.join(".local/bin");
+        let agy_bin = local.join("agy/bin");
+        let npm_bin = roaming.join("npm");
+        let base_bin = root.join("system32");
+        for dir in [&claude_bin, &agy_bin, &npm_bin, &base_bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let initial = std::env::join_paths([&base_bin, &claude_bin]).unwrap();
+        let augmented =
+            augment_windows_path_with(Some(&initial), Some(&home), Some(&local), Some(&roaming))
+                .unwrap();
+        let split: Vec<_> = std::env::split_paths(&augmented).collect();
+        assert_eq!(split.first(), Some(&base_bin));
+        assert_eq!(split.iter().filter(|p| *p == &claude_bin).count(), 1);
+        assert!(split.contains(&agy_bin));
+        assert!(split.contains(&npm_bin));
+        std::fs::remove_dir_all(root).ok();
     }
 }

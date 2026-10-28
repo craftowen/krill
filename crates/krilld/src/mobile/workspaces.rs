@@ -5,10 +5,12 @@ use krill_proto::os::ffi::OsStrExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -169,6 +171,13 @@ fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
     (u64::try_from(bytes.len()).ok()? <= limit).then_some(bytes)
 }
 fn normalize(path: &Path) -> PathBuf {
+    let cleaned = path
+        .to_str()
+        .and_then(|s| {
+            krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !path.exists())
+        })
+        .map(PathBuf::from);
+    let path = cleaned.as_deref().unwrap_or(path);
     // 데스크톱 이관 경로와 동일한 macOS /tmp·/var·/etc 별칭 처리.
     if ["/tmp", "/var", "/etc", "/private"]
         .iter()
@@ -204,7 +213,23 @@ fn git_dir(tree: &Path) -> PathBuf {
         .unwrap_or(dot)
 }
 fn git_remote_slug(tree: &Path) -> Option<String> {
-    let config = String::from_utf8(read(&git_dir(tree).join("config"), 16384)?).ok()?;
+    type RemoteCache = HashMap<PathBuf, (Option<SystemTime>, Option<String>)>;
+    static CACHE: LazyLock<Mutex<RemoteCache>> = LazyLock::new(Mutex::default);
+    let config = git_dir(tree).join("config");
+    let modified = fs::metadata(&config).and_then(|m| m.modified()).ok();
+    let mut cache = crate::session::lock(&CACHE);
+    if let Some((stamp, slug)) = cache.get(&config)
+        && *stamp == modified
+    {
+        return slug.clone();
+    }
+    let slug = read(&config, 16384)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| remote_slug(&text));
+    cache.insert(config, (modified, slug.clone()));
+    slug
+}
+fn remote_slug(config: &str) -> Option<String> {
     for line in config.lines() {
         let Some(url) = line.trim().strip_prefix("url") else {
             continue;
@@ -336,11 +361,20 @@ impl Catalog {
             let repo = main_worktree(&tree)
                 .or_else(|| catalog.repo_for(&tree))
                 .unwrap_or_else(|| tree.clone());
+            if repo != tree
+                && repo.is_dir()
+                && fs::metadata(&tree).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             catalog.insert(&repo, &tree);
-            if !project.display_name.trim().is_empty() {
+            let dn = project.display_name.trim();
+            let clean_dn = krill_proto::orchestration::strip_workspace_instance(dn).is_none();
+            if !dn.is_empty() && clean_dn {
                 catalog
                     .repo_labels
-                    .insert(repo.clone(), project.display_name.trim().to_owned());
+                    .entry(repo.clone())
+                    .or_insert_with(|| dn.to_owned());
             }
             if let Some(icon) = project.repo_icon.as_ref()
                 && !icon.value.trim().is_empty()
@@ -361,13 +395,17 @@ impl Catalog {
                     .entry(repo.clone())
                     .or_insert_with(|| color.trim().to_owned());
             }
-            if !project.display_name.trim().is_empty() || project.pinned {
+            if (!dn.is_empty() && clean_dn) || project.pinned {
                 catalog
                     .preferences
                     .entry(tree)
                     .or_insert_with(|| Preference {
                         pinned: project.pinned,
-                        name: project.display_name.trim().to_owned(),
+                        name: if clean_dn {
+                            dn.to_owned()
+                        } else {
+                            String::new()
+                        },
                     });
             }
         }
@@ -392,6 +430,12 @@ impl Catalog {
                 .map(|r| catalog.repo_for(&r).unwrap_or(r))
                 .or_else(|| catalog.repo_for(&tree))
                 .unwrap_or_else(|| tree.clone());
+            if repo != tree
+                && repo.is_dir()
+                && fs::metadata(&tree).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             catalog.insert(&repo, &tree);
             let name = meta.display_name.as_deref().unwrap_or_default().trim();
             if !name.is_empty() || meta.pinned {
@@ -418,6 +462,12 @@ impl Catalog {
                 .map(|r| catalog.repo_for(&r).unwrap_or(r))
                 .or_else(|| catalog.repo_for(&tree))
                 .unwrap_or_else(|| tree.clone());
+            if repo != tree
+                && repo.is_dir()
+                && fs::metadata(&tree).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             catalog.insert(&repo, &tree);
             if let Some(branch) = &meta.branch {
                 catalog.branches.insert(tree, branch.clone());
@@ -524,6 +574,40 @@ impl Catalog {
             "external":tree != repo && is_claude_worktree(tree),
             "external_shown":self.view.shown_external.contains(repo)})
     }
+    fn worktree_label(
+        &self,
+        tree: &Path,
+        repo: &Path,
+        auto_titles: &BTreeMap<PathBuf, String>,
+    ) -> String {
+        let pref = self.preferences.get(tree);
+        let branch = self.branches.get(tree);
+        let repo_label = self.repo_labels.get(repo).map(String::as_str);
+        let tree_label = label(tree);
+        let name = pref
+            .map(|p| p.name.trim())
+            .filter(|s| !s.is_empty())
+            .filter(|n| {
+                tree != repo
+                    || (!n.eq_ignore_ascii_case(&tree_label)
+                        && !repo_label.is_some_and(|r| n.eq_ignore_ascii_case(r)))
+            });
+        let custom = name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n));
+        let short_branch = || branch.map(|b| b.rsplit('/').next().unwrap_or(b).replace('-', " "));
+        if let Some(name) = custom {
+            name.to_owned()
+        } else if tree == repo {
+            branch.cloned().unwrap_or_else(|| label(tree))
+        } else if branch.is_some_and(|b| !krill_proto::git::is_default_branch_or_worktree_name(b)) {
+            short_branch().unwrap_or_default()
+        } else if let Some(auto) = auto_titles.get(tree) {
+            auto.clone()
+        } else {
+            name.map(str::to_owned)
+                .or_else(short_branch)
+                .unwrap_or_else(|| label(tree).replace('-', " "))
+        }
+    }
     /// 데스크톱 사이드바와 같은 워크트리 순서·들여쓰기·아이콘을 낸다.
     /// `ranks`는 워크트리 경로별 스마트 순위(0 승인대기 최우선, 4 유휴)다.
     /// PC 사이드바에서 숨는 워크트리도 데이터는 남긴다(세션 열기·검색용).
@@ -535,6 +619,11 @@ impl Catalog {
     ) -> Vec<Value> {
         // 데스크톱 `sort_worktrees`와 같은 키: 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
         // `sort_by`는 `SortBy` 변형 인덱스(0 스마트·1 최근·2 이름·3 생성순)다.
+        let tree_repos: BTreeMap<PathBuf, PathBuf> = self
+            .repositories
+            .iter()
+            .flat_map(|r| r.worktrees.iter().map(|t| (path(t), path(&r.repo))))
+            .collect();
         let sort_key = |t: &PathBuf, sort_by: u32| {
             let rank = if sort_by == 0 {
                 let state = ranks.get(t).copied().unwrap_or(4);
@@ -555,7 +644,11 @@ impl Catalog {
                 !self.preferences.get(t).is_some_and(|v| v.pinned),
                 rank,
                 Reverse(recent),
-                worktree_sort_name(t, &self.preferences, &self.branches),
+                self.worktree_label(
+                    t,
+                    tree_repos.get(t).map_or(t.as_path(), PathBuf::as_path),
+                    auto_titles,
+                ),
                 t.clone(),
             )
         };
@@ -597,37 +690,7 @@ impl Catalog {
                     .map(move |(tree, depth)| {
                         let pref = self.preferences.get(&tree);
                         let branch = self.branches.get(&tree);
-                        let repo_label = self.repo_labels.get(&repo).map(String::as_str);
-                        let tree_label = label(&tree);
-                        let name = pref
-                            .map(|p| p.name.trim())
-                            .filter(|s| !s.is_empty())
-                            .filter(|n| {
-                                tree != repo
-                                    || (!n.eq_ignore_ascii_case(&tree_label)
-                                        && !repo_label.is_some_and(|r| n.eq_ignore_ascii_case(r)))
-                            });
-                        let custom = name.filter(|n| {
-                            !krill_proto::git::is_default_branch_or_worktree_name(n)
-                        });
-                        let short_branch = || {
-                            branch.map(|b| b.rsplit('/').next().unwrap_or(b).replace('-', " "))
-                        };
-                        let title = if let Some(name) = custom {
-                            name.to_owned()
-                        } else if tree == repo {
-                            branch.cloned().unwrap_or_else(|| label(&tree))
-                        } else if branch.is_some_and(|b| {
-                            !krill_proto::git::is_default_branch_or_worktree_name(b)
-                        }) {
-                            short_branch().unwrap_or_default()
-                        } else if let Some(auto) = auto_titles.get(&tree) {
-                            auto.clone()
-                        } else {
-                            name.map(str::to_owned)
-                                .or_else(short_branch)
-                                .unwrap_or_else(|| label(&tree).replace('-', " "))
-                        };
+                        let title = self.worktree_label(&tree, &repo, auto_titles);
                         let raw = tree.as_os_str().as_bytes().to_vec();
                         json!({"key":hex(&raw),"repo_key":hex(&r.repo),"path":tree.to_string_lossy(),
                     "label":title,
@@ -661,19 +724,6 @@ fn created_ms(path: &Path) -> Option<u64> {
     let created = fs::metadata(path).ok()?.created().ok()?;
     let since = created.duration_since(std::time::UNIX_EPOCH).ok()?;
     u64::try_from(since.as_millis()).ok()
-}
-/// 데스크톱 `worktree_sort_name`: 사용자 이름 → 전체 브랜치 → 폴더 이름.
-fn worktree_sort_name(
-    path: &Path,
-    prefs: &BTreeMap<PathBuf, Preference>,
-    branches: &BTreeMap<PathBuf, String>,
-) -> String {
-    prefs
-        .get(path)
-        .filter(|v| !v.name.is_empty())
-        .map(|v| v.name.clone())
-        .or_else(|| branches.get(path).cloned())
-        .unwrap_or_else(|| label(path))
 }
 /// sidebar.bin v1 꼬리에서 환경설정·계보 부모·프로젝트 순서·정렬 기준·잠재움·숨긴 프로젝트를 꺼낸다. 형식 불일치는 기본값으로 강등한다.
 fn decode_sidebar_tail(body: &[u8]) -> SidebarTail {
@@ -821,6 +871,37 @@ fn order_lineage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_name_sort_uses_the_displayed_branch_leaf_and_auto_title() {
+        let repo = PathBuf::from("/sort-repo");
+        let alpha = repo.join("alpha");
+        let zeta = repo.join("zeta");
+        let mut catalog = Catalog {
+            sort_by: 2,
+            ..Catalog::default()
+        };
+        catalog.repositories.push(RepositoryTrees {
+            repo: repo.as_os_str().as_bytes().to_vec(),
+            worktrees: [&repo, &alpha, &zeta]
+                .iter()
+                .map(|p| p.as_os_str().as_bytes().to_vec())
+                .collect(),
+        });
+        catalog
+            .branches
+            .insert(alpha.clone(), "z-prefix/alpha".into());
+        catalog
+            .branches
+            .insert(zeta.clone(), "a-prefix/zeta".into());
+        let rows = catalog.workspaces_json(&BTreeMap::new(), &BTreeMap::new(), &BTreeSet::new());
+        assert_eq!(rows[1]["label"], "alpha");
+        assert_eq!(rows[2]["label"], "zeta");
+        catalog.branches.insert(zeta.clone(), "worktree".into());
+        let titles = BTreeMap::from([(zeta, "aardvark".into())]);
+        let rows = catalog.workspaces_json(&titles, &BTreeMap::new(), &BTreeSet::new());
+        assert_eq!(rows[1]["label"], "aardvark");
+    }
 
     #[test]
     fn registered_worktrees_and_lineage_survive_without_sessions() {
@@ -1120,7 +1201,7 @@ value = "🚀"
     }
 
     #[test]
-    fn shared_desktop_sort_uses_checkpoint_recency_unread_and_full_branch() {
+    fn shared_desktop_sort_uses_checkpoint_recency_unread_and_display_label() {
         let dir = std::env::temp_dir().join(format!("krill-ws-shared-sort-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -1152,7 +1233,7 @@ value = "🚀"
         for (sort_by, expected) in [
             (0, vec!["/r", "/r/a-new", "/r/m-unread", "/r/z-old"]),
             (1, vec!["/r", "/r/a-new", "/r/z-old", "/r/m-unread"]),
-            (2, vec!["/r", "/r/z-old", "/r/m-unread", "/r/a-new"]),
+            (2, vec!["/r", "/r/a-new", "/r/m-unread", "/r/z-old"]),
         ] {
             write_sidebar_tail(&dir, &[], &BTreeMap::new(), sort_by);
             let mut catalog = Catalog::load(Some(&dir), &repositories);
@@ -1329,6 +1410,38 @@ value = "🚀"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["label"], "이름");
         assert_eq!(rows[0]["depth"], 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repository_remote_slug_cache_observes_config_creation_edit_and_removal() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-ws-remote-cache-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        let config = dir.join(".git/config");
+        fs::remove_file(&config).ok();
+        assert_eq!(git_remote_slug(&dir), None);
+        fs::write(
+            &config,
+            "[remote \"origin\"]\nurl = https://github.com/first/repo.git\n",
+        )
+        .unwrap();
+        assert_eq!(git_remote_slug(&dir).as_deref(), Some("first/repo"));
+        let modified = fs::metadata(&config).unwrap().modified().unwrap();
+        fs::write(
+            &config,
+            "[remote \"origin\"]\nurl = git@github.com:second/repo.git\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(git_remote_slug(&dir).as_deref(), Some("second/repo"));
+        fs::remove_file(&config).unwrap();
+        assert_eq!(git_remote_slug(&dir), None);
         fs::remove_dir_all(dir).unwrap();
     }
 

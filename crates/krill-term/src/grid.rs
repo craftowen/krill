@@ -92,7 +92,124 @@ pub fn resolve(theme: &Theme, color: Color, foreground: bool) -> Rgb {
     }
 }
 
-/// (글자색, 배경) RGB. `INVERSE`면 바꾸고, `DIM`이면 바꾼 뒤의 글자색을 배경 쪽으로 섞는다.
+/// 라이트 배경(배경 밝기가 검정보다 흰색에 가까움)의 최소 전경·배경 명암비(WCAG AA, Orca `LIGHT_BG_MIN_CONTRAST`).
+pub const LIGHT_BG_MIN_CONTRAST: f32 = 4.5;
+/// 다크 배경의 최소 전경·배경 명암비(WCAG AA 큰 글자, Orca `DARK_BG_MIN_CONTRAST`).
+/// 다크 테마의 채도 높은 기본 ANSI 색(≥ 3.0:1)은 건드리지 않으면서 배경에 묻히는 어두운 본문 글자를 끌어올린다.
+pub const DARK_BG_MIN_CONTRAST: f32 = 3.0;
+
+fn channel_luminance(v: u8) -> f32 {
+    let n = f32::from(v) / 255.0;
+    if n <= 0.03928 {
+        n / 12.92
+    } else {
+        ((n + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// WCAG 2.0 상대 휘도(0.0..=1.0).
+#[must_use]
+pub fn relative_luminance(c: Rgb) -> f32 {
+    0.2126 * channel_luminance(c.r)
+        + 0.7152 * channel_luminance(c.g)
+        + 0.0722 * channel_luminance(c.b)
+}
+
+fn contrast_ratio_lum(l1: f32, l2: f32) -> f32 {
+    let lighter = l1.max(l2);
+    let darker = l1.min(l2);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// 두 RGB 색의 WCAG 명암비(1.0..=21.0).
+#[must_use]
+pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
+    contrast_ratio_lum(relative_luminance(a), relative_luminance(b))
+}
+
+/// 배경이 흰색보다 검정과 더 큰 대비를 이루면 라이트 배경으로 판정한다(Orca `isTerminalBackgroundLight`).
+#[must_use]
+pub fn is_light_background(bg: Rgb) -> bool {
+    let lum = relative_luminance(bg);
+    contrast_ratio_lum(0.0, lum) >= contrast_ratio_lum(1.0, lum)
+}
+
+fn min_contrast_for_theme(theme: &Theme, dim: bool) -> f32 {
+    let base = if is_light_background(theme.background) {
+        LIGHT_BG_MIN_CONTRAST
+    } else {
+        DARK_BG_MIN_CONTRAST
+    };
+    if dim { base * 0.5 } else { base }
+}
+
+/// 블록 요소(`U+2580..=U+259F`)와 Powerline 기호(`U+E0A0..=U+E0D7`)는 인접 칸 배경과 맞닿는 면으로 쓰이므로
+/// 전경색 명암비 보정에서 제외한다(xterm `treatGlyphAsBackgroundColor`).
+fn treat_glyph_as_background(ch: char) -> bool {
+    matches!(ch, '\u{2580}'..='\u{259f}' | '\u{e0a0}'..='\u{e0d7}')
+}
+
+fn reduce_luminance(bg_l: f32, mut fg: Rgb, ratio: f32) -> Rgb {
+    let mut cr = contrast_ratio_lum(relative_luminance(fg), bg_l);
+    while cr < ratio && (fg.r > 0 || fg.g > 0 || fg.b > 0) {
+        fg.r = fg.r.saturating_sub(fg.r.div_ceil(10));
+        fg.g = fg.g.saturating_sub(fg.g.div_ceil(10));
+        fg.b = fg.b.saturating_sub(fg.b.div_ceil(10));
+        cr = contrast_ratio_lum(relative_luminance(fg), bg_l);
+    }
+    fg
+}
+
+fn increase_luminance(bg_l: f32, mut fg: Rgb, ratio: f32) -> Rgb {
+    let mut cr = contrast_ratio_lum(relative_luminance(fg), bg_l);
+    while cr < ratio && (fg.r < 255 || fg.g < 255 || fg.b < 255) {
+        fg.r = fg.r.saturating_add((255 - fg.r).div_ceil(10));
+        fg.g = fg.g.saturating_add((255 - fg.g).div_ceil(10));
+        fg.b = fg.b.saturating_add((255 - fg.b).div_ceil(10));
+        cr = contrast_ratio_lum(relative_luminance(fg), bg_l);
+    }
+    fg
+}
+
+/// 전경색 `fg`가 배경색 `bg`와 최소 명암비 `ratio`를 넘도록 휘도를 보정한다(xterm `ensureContrastRatio`).
+#[must_use]
+pub fn ensure_contrast(fg: Rgb, bg: Rgb, ratio: f32) -> Rgb {
+    let bg_l = relative_luminance(bg);
+    let fg_l = relative_luminance(fg);
+    if contrast_ratio_lum(bg_l, fg_l) >= ratio {
+        return fg;
+    }
+    if fg_l < bg_l {
+        let a = reduce_luminance(bg_l, fg, ratio);
+        let a_ratio = contrast_ratio_lum(bg_l, relative_luminance(a));
+        if a_ratio < ratio {
+            let b = increase_luminance(bg_l, fg, ratio);
+            if a_ratio > contrast_ratio_lum(bg_l, relative_luminance(b)) {
+                a
+            } else {
+                b
+            }
+        } else {
+            a
+        }
+    } else {
+        let a = increase_luminance(bg_l, fg, ratio);
+        let a_ratio = contrast_ratio_lum(bg_l, relative_luminance(a));
+        if a_ratio < ratio {
+            let b = reduce_luminance(bg_l, fg, ratio);
+            if a_ratio > contrast_ratio_lum(bg_l, relative_luminance(b)) {
+                a
+            } else {
+                b
+            }
+        } else {
+            a
+        }
+    }
+}
+
+/// (글자색, 배경) RGB. `INVERSE`면 바꾸고, `DIM`이면 바꾼 뒤의 글자색을 배경 쪽으로 섞은 뒤,
+/// 배경 대비 최소 명암비(라이트 4.5 / 다크 3.0, `DIM`은 절반)를 보장한다.
 fn colors(theme: &Theme, cell: &Cell) -> (Rgb, Rgb) {
     let fg = resolve(theme, cell.fg, true);
     let bg = resolve(theme, cell.bg, false);
@@ -101,16 +218,22 @@ fn colors(theme: &Theme, cell: &Cell) -> (Rgb, Rgb) {
     } else {
         (fg, bg)
     };
-    if !cell.flags.contains(Flags::DIM) {
+    let dim = cell.flags.contains(Flags::DIM);
+    let fg = if dim {
+        let mix = |f: u8, b: u8| u8::try_from((2 * u16::from(f) + u16::from(b)) / 3).unwrap_or(f);
+        Rgb {
+            r: mix(fg.r, bg.r),
+            g: mix(fg.g, bg.g),
+            b: mix(fg.b, bg.b),
+        }
+    } else {
+        fg
+    };
+    if treat_glyph_as_background(cell.ch) {
         return (fg, bg);
     }
-    let mix = |f: u8, b: u8| u8::try_from((2 * u16::from(f) + u16::from(b)) / 3).unwrap_or(f);
-    let dim = Rgb {
-        r: mix(fg.r, bg.r),
-        g: mix(fg.g, bg.g),
-        b: mix(fg.b, bg.b),
-    };
-    (dim, bg)
+    let min_ratio = min_contrast_for_theme(theme, dim);
+    (ensure_contrast(fg, bg, min_ratio), bg)
 }
 
 /// 구간 끝에 바로 붙는 같은 색 칸이면 늘리고, 아니면 새 구간.
@@ -175,7 +298,11 @@ pub fn plan_row(row: &[Cell], theme: &Theme) -> RowPlan {
                 if cell.flags.contains(Flags::UNDERLINE) || cell.flags.contains(Flags::LINK) {
                     let color = match cell.underline {
                         Color::Default => fg,
-                        c => resolve(theme, c, true),
+                        c => ensure_contrast(
+                            resolve(theme, c, true),
+                            bg,
+                            min_contrast_for_theme(theme, cell.flags.contains(Flags::DIM)),
+                        ),
                     };
                     extend(&mut plan.underlines, column, width, color);
                 }

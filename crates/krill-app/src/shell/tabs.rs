@@ -106,8 +106,8 @@ impl Shell {
             .map(|p| p.name.as_str())
     }
 
-    /// 탭·패인 헤더 제목. 데몬 스냅샷에 세션이 있으면 사이드바와 같은 규칙(`sidebar::session_label`:
-    /// 터미널 제목 → 에이전트 → 폴더 → "세션 n")을 쓰고, 아직 없으면 제목 → 실행한 에이전트 이름 → "새 터미널".
+    /// 탭·패인 헤더 제목. 터미널 제목이 비어 있으면 사이드바의 대화·자동 제목을 쓴다.
+    /// 세션이 아직 없으면 제목 → 실행한 에이전트 이름 → "새 터미널" 순서로 고른다.
     pub(super) fn pane_label(&self, pane: PaneId, cx: &App) -> String {
         if let Some(path) = self.layout.file(pane) {
             return krill_app::editor::file_name(path);
@@ -119,7 +119,11 @@ impl Shell {
             .session(pane)
             .and_then(|id| self.sidebar.read(cx).session_on(host, id))
         {
-            return sidebar::session_label(session, title).0;
+            return self
+                .sidebar
+                .read(cx)
+                .session_label_on_with_title(host, session, title)
+                .0;
         }
         let launched = match self.layout.launch(pane).map(|l| &l.program) {
             Some(Program::Agent { id }) => self.agent_profile_name(launch_agent_id(id)),
@@ -219,9 +223,51 @@ impl Shell {
                     .as_ref()
                     .filter(|r| tab.root.contains(r.pane))
                     .map(|r| r.input.clone());
+                let tab_hover_spec = if self.layout.file(pane).is_none() {
+                    let sidebar_ref = self.sidebar.read(cx);
+                    let now_ns = sidebar_ref.now_unix_ns();
+                    let prompt_history = self
+                        .layout
+                        .session(pane)
+                        .and_then(|sid| sidebar_ref.session_prompt_history_on(host, sid));
+                    let since_ns = session.map_or(0, |s| s.status.since_unix_ns);
+                    let state_with_age = if since_ns > 0 {
+                        format!(
+                            "{} ({})",
+                            state_text.trim_end(),
+                            krill_app::jump::format_age_ns(since_ns, now_ns)
+                        )
+                    } else {
+                        state_text.trim_end().to_owned()
+                    };
+                    Some(ui::SessionHoverCardSpec {
+                        id: format!("tab-hover-{i}").into(),
+                        title: label.clone().into(),
+                        agent: agent.to_owned().into(),
+                        state_line: state_with_age.into(),
+                        total_turns: prompt_history.map_or(0, |h| h.total_turns),
+                        last_prompt: prompt_history
+                            .and_then(krill_proto::git::SessionPromptHistory::display_last_prompt)
+                            .map(Into::into),
+                        last_prompt_age: prompt_history
+                            .and_then(krill_proto::git::SessionPromptHistory::latest_unix_ns)
+                            .filter(|&ts| ts > 0)
+                            .map(|ts| krill_app::jump::format_age_ns(ts, now_ns).into()),
+                        prev_turn: prompt_history
+                            .and_then(krill_proto::git::SessionPromptHistory::previous_turn)
+                            .map(|t| (t.turn, t.text.clone().into())),
+                    })
+                } else {
+                    None
+                };
                 Tab::new()
                     .when(rename_input.is_none(), |t| {
                         t.label(SharedString::from(label.clone()))
+                    })
+                    .when_some(tab_hover_spec, |t, spec| {
+                        t.tooltip(move |window, cx| {
+                            ui::session_hover_card_view(spec.clone(), window, cx)
+                        })
                     })
                     .when_some(rename_input, |t, input| {
                         t.child(
@@ -560,9 +606,9 @@ impl Shell {
                     .child(ui::button_with_tooltip(
                         Button::new("toggle-chat-view")
                             .label(if self.is_active_chat_view_in(cx) {
-                                "Term"
+                                text::VIEW_TERM.get()
                             } else {
-                                "Chat"
+                                text::VIEW_CHAT.get()
                             })
                             .ghost()
                             .xsmall()
@@ -572,7 +618,7 @@ impl Shell {
                                 this.toggle_chat_view_with_focus(window, cx);
                             })),
                         "toggle-chat-view",
-                        "Toggle Chat / Terminal view",
+                        text::TOGGLE_CHAT_VIEW.get(),
                     ))
                     .child(ui::button_with_tooltip(
                         Button::new("toggle-panel")

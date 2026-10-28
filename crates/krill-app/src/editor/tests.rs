@@ -106,6 +106,11 @@ fn open_maps_each_format_to_its_viewer() {
     let svg = write("i.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>");
     assert_eq!(preview(kind_of(&svg)), Some(Preview::Svg));
 
+    let html = write("page.html", b"<!DOCTYPE html><title>Demo</title>");
+    assert_eq!(kind_of(&html), Kind::Text { language: "html" });
+    assert_eq!(preview(kind_of(&html)), Some(Preview::Html));
+    assert_eq!(language(kind_of(&html), &html), "html");
+
     // 1x1 PNG 헤더: 크기만 읽고 텍스트로 열지 않는다.
     let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
     png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
@@ -407,4 +412,58 @@ fn quick_open_walks_plain_folder_skipping_hidden() {
     fs::write(dir.0.join(".hidden/z"), "x").unwrap();
     let files = quick_open::list(&dir.0);
     assert_eq!(files, vec![PathBuf::from("a/x.txt")]);
+}
+
+#[test]
+fn html_syntax_highlights_tags_attributes_style_and_script_and_extracts_title() {
+    let src = concat!(
+        "<!DOCTYPE html>\n",
+        "<!-- header comment -->\n",
+        "<html lang=\"ko\">\n",
+        "<head>\n",
+        "  <title>  2차 교육:\n  Aside & 달세ERP  </title>\n",
+        "  <style>body { color: #ff00aa; font-size: 16px; }</style>\n",
+        "</head>\n",
+        "<body>\n",
+        "  <script>const count = 42; console.log(\"ready\");</script>\n",
+        "</body>\n",
+        "</html>\n",
+    );
+    assert_eq!(
+        syntax::html_title(src).as_deref(),
+        Some("2차 교육: Aside & 달세ERP")
+    );
+    assert_eq!(syntax::html_title("<html><title>   </title></html>"), None);
+
+    let tokens = syntax::tokenize_for("html", src);
+    let has = |needle: &str, expected_kind: &str| {
+        tokens
+            .iter()
+            .any(|(range, kind)| *kind == expected_kind && src.get(range.clone()) == Some(needle))
+    };
+    assert!(has("<!DOCTYPE html>", "keyword"), "{tokens:?}");
+    assert!(has("<!-- header comment -->", "comment"), "{tokens:?}");
+    assert!(has("html", "tag"), "{tokens:?}");
+    assert!(has("lang", "attribute"), "{tokens:?}");
+    assert!(has("\"ko\"", "string"), "{tokens:?}");
+    assert!(
+        has("color", "property"),
+        "embedded <style> CSS property: {tokens:?}"
+    );
+    assert!(
+        has("#ff00aa", "constant"),
+        "embedded <style> CSS hex color: {tokens:?}"
+    );
+    assert!(
+        has("const", "keyword"),
+        "embedded <script> JS keyword: {tokens:?}"
+    );
+    assert!(
+        has("42", "number"),
+        "embedded <script> JS number: {tokens:?}"
+    );
+    assert!(
+        has("\"ready\"", "string"),
+        "embedded <script> JS string: {tokens:?}"
+    );
 }

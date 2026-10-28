@@ -17,7 +17,7 @@ pub(crate) fn ensure_current(id: &str, socket: &Path) {
     let (Some(agent), Some(env)) = (TargetAgent::parse(id), Env::current()) else {
         return;
     };
-    if env.state != super::super::default_state_dir(&env.home) || !socket.starts_with(&env.state) {
+    if env.is_isolated_state() || !socket.starts_with(&env.state) {
         return;
     }
     if let Err(error) = install(agent, &env, None) {

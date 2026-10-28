@@ -18,17 +18,18 @@ use krill_proto::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod command_catalog;
 mod requests;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -94,7 +95,9 @@ pub(super) struct Backend {
     hello: ServerHello,
     host: Value,
     /// 카드 git 요약(branch·added·deleted) cwd별 캐시. 실패도 `Null`로 캐시한다.
-    git_cache: Mutex<HashMap<PathBuf, (Instant, Value)>>,
+    git_cache: Arc<Mutex<HashMap<PathBuf, (Instant, Value)>>>,
+    git_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+    git_revision: Arc<AtomicU64>,
     snapshot_cache: Mutex<Option<DashboardSnapshot>>,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
     settings_lock: Mutex<()>,
@@ -141,6 +144,7 @@ enum Action {
         #[serde(default)]
         since: Option<String>,
     },
+    #[serde(alias = "set_quick_commands")]
     SaveQuickCommands {
         commands: Vec<QuickCommandEntry>,
     },
@@ -236,6 +240,10 @@ enum Action {
         session: u64,
         path: Option<String>,
     },
+    /// Selected session CLI skills and custom command metadata.
+    CommandCatalog {
+        session: u64,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -287,7 +295,9 @@ impl Backend {
             dir: dir.map(Path::to_path_buf),
             hello,
             host: host_metadata(),
-            git_cache: Mutex::default(),
+            git_cache: Arc::default(),
+            git_inflight: Arc::default(),
+            git_revision: Arc::default(),
             snapshot_cache: Mutex::default(),
             catalog_cache: Mutex::default(),
             settings_lock: Mutex::default(),
@@ -421,7 +431,15 @@ impl Backend {
                             rows: 24,
                             account: None,
                         })) {
-                            Ok(Reply::Created { session, .. }) => Some(session.0),
+                            Ok(Reply::Created { session, .. }) => {
+                                if let Some(dir) = self.dir.as_deref()
+                                    && !krill_proto::git::is_default_branch_or_worktree_name(name)
+                                {
+                                    krill_proto::git::record_session_auto_title(dir, session, name)
+                                        .ok();
+                                }
+                                Some(session.0)
+                            }
                             other => {
                                 tree.warnings.push(format!(
                                     "Workspace created; terminal unavailable: {other:?}"
@@ -634,7 +652,78 @@ impl Backend {
                 serde_json::from_slice(&output).map_err(io::Error::other)
             }
             Action::Git { session, path } => self.git(session, path.as_deref()),
+            Action::CommandCatalog { session } => self.command_catalog(session),
         }
+    }
+    fn command_catalog(&self, session: u64) -> io::Result<Value> {
+        let cwd = self.cwd(session)?;
+        let stored =
+            crate::agent::control::Control::new(self.dir.as_deref()).stored(SessionId(session))?;
+        let status = match self.control(&Request::States)? {
+            Reply::States(states) => states.into_iter().find(|s| s.session.0 == session),
+            _ => None,
+        };
+        let observed = status.as_ref().map(|s| &s.status);
+        let agent = observed
+            .map(|s| s.agent.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| stored.as_ref().map(|s| s.profile.as_str()))
+            .or_else(|| observed.and_then(|s| s.foreground.as_deref()))
+            .unwrap_or_default();
+        let raw = self
+            .dir
+            .as_ref()
+            .and_then(|dir| fs::read_to_string(dir.join(krill_proto::agent::FILE_NAME)).ok());
+        let agents = krill_proto::agent::Agents::load(raw.as_deref()).map_err(io::Error::other)?;
+        let profile = agents.resolve(agent).map(|(_, profile)| profile);
+        let program = profile
+            .and_then(krill_proto::agent::Profile::program)
+            .unwrap_or(agent);
+        let program = Path::new(program)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(agent);
+        let canonical = krill_proto::agent::canonical_id(agent);
+        let provider = if matches!(
+            canonical,
+            "claude" | "codex" | "agy" | "cursor" | "opencode" | "pi"
+        ) {
+            canonical
+        } else {
+            krill_proto::agent::canonical_id(program)
+        };
+        let key = match provider {
+            "claude" => "CLAUDE_CONFIG_DIR",
+            "codex" => "CODEX_HOME",
+            "opencode" => "OPENCODE_CONFIG_DIR",
+            "pi" => "PI_CODING_AGENT_DIR",
+            _ => "",
+        };
+        let config = stored
+            .as_ref()
+            .and_then(|s| s.account.as_ref())
+            .filter(|a| a.env_key == key && !a.dir.is_empty())
+            .map(|a| PathBuf::from(&a.dir))
+            .or_else(|| {
+                profile
+                    .and_then(|p| p.env.get(key))
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| {
+                std::env::var_os(key)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            });
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(invalid)?;
+        Ok(command_catalog::load(
+            &home,
+            &cwd,
+            provider,
+            config.as_deref(),
+        ))
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
         self.registry
@@ -759,7 +848,7 @@ impl Backend {
             .sessions
             .into_iter()
             .find(|s| s.session.0 == session)
-            .ok_or_else(invalid)?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Session not found"))?;
         if directory.cwd.is_empty() {
             return Err(io::Error::other("session working directory unavailable"));
         }
@@ -772,7 +861,8 @@ impl Backend {
         let normalized: Vec<_> = commands.into_iter().map(normalize_quick_command).collect();
         for entry in &normalized {
             if entry.name.is_empty()
-                || entry.name.len() > 120
+                || entry.name.chars().count() > 120
+                || entry.name.len() > 480
                 || entry.name.chars().any(char::is_control)
                 || entry.text.trim().is_empty()
                 || entry.text.len() > 16 * 1024
@@ -818,11 +908,19 @@ impl Backend {
         Ok(json!({"quick_commands":normalized}))
     }
 
+    fn effective_revision(&self, registry: &Registry) -> u64 {
+        registry.dashboard_revision()
+            ^ self
+                .git_revision
+                .load(Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
     fn snapshot_since(&self, since: Option<&str>) -> io::Result<Value> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         // This mutex is a snapshot-only singleflight, independent of registry/session IO.
         let mut cached = crate::session::lock(&self.snapshot_cache);
-        let revision = registry.dashboard_revision();
+        let revision = self.effective_revision(&registry);
         if let Some(snapshot) = cached.as_ref()
             && snapshot.revision == revision
             && snapshot.at.elapsed() < GIT_TTL
@@ -851,7 +949,6 @@ impl Backend {
         // Validate the dependency identity actually used by this body. A newer
         // catalog or a fresh post-build stamp cannot authenticate an older body.
         if let Some((paths, stamps)) = self.snapshot_dependencies(&data, catalog_used.as_ref())
-            && registry.dashboard_revision() == revision
             && before == file_stamps(&base_paths)
         {
             *cached = Some(DashboardSnapshot {
@@ -984,6 +1081,7 @@ impl Backend {
             _ => control::SidebarData {
                 sessions: Vec::new(),
                 repositories: Vec::new(),
+                branches: Vec::new(),
             },
         };
         let catalog = self.catalog(&sidebar.repositories);
@@ -1002,7 +1100,7 @@ impl Backend {
                 (info, cwd, group)
             })
             .collect();
-        let git = self.git_summaries(
+        let git = self.git_summaries_swr(
             rows.iter()
                 .filter_map(|(_, cwd, group)| git_cwd(cwd, group)),
         );
@@ -1112,8 +1210,127 @@ impl Backend {
             .orchestration_snapshot()?;
         Ok(requests::snapshot(&store))
     }
+    /// 만료된 값도 즉시 반환하고, cwd별로 하나의 백그라운드 조회만 예약한다.
+    /// 최초 미캐시(cold) cwd는 총 80ms 시한 안에서만 즉시 수확하고 넘치면 백그라운드로 넘긴다.
+    fn git_summaries_swr(
+        &self,
+        cwds: impl IntoIterator<Item = PathBuf>,
+    ) -> HashMap<PathBuf, Value> {
+        let mut found = HashMap::new();
+        let mut cold = Vec::new();
+        let mut stale = Vec::new();
+        {
+            let cache = crate::session::lock(&self.git_cache);
+            for cwd in cwds {
+                if found.contains_key(&cwd) {
+                    continue;
+                }
+                let value = if let Some((at, value)) = cache.get(&cwd) {
+                    if at.elapsed() >= GIT_TTL {
+                        stale.push(cwd.clone());
+                    }
+                    value.clone()
+                } else {
+                    cold.push(cwd.clone());
+                    Value::Null
+                };
+                found.insert(cwd, value);
+            }
+        }
+        {
+            let mut inflight = crate::session::lock(&self.git_inflight);
+            cold.retain(|cwd| inflight.insert(cwd.clone()));
+            stale.retain(|cwd| inflight.insert(cwd.clone()));
+        }
+        let mut deferred = Vec::new();
+        if !cold.is_empty() {
+            let queue = crate::git::queue().ok();
+            let pending: Vec<_> = cold
+                .into_iter()
+                .map(|cwd| {
+                    let rx = queue.map(|q| {
+                        crate::git::changes::query_with_branch(
+                            q,
+                            cwd.clone(),
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                    });
+                    (cwd, rx)
+                })
+                .collect();
+            let deadline = Instant::now() + Duration::from_millis(80);
+            for (cwd, rx) in pending {
+                let Some(rx) = rx else {
+                    cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
+                    crate::session::lock(&self.git_inflight).remove(&cwd);
+                    continue;
+                };
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(res) => {
+                        let value = res.ok().map_or(Value::Null, |(changes, branch)| {
+                            let (added, deleted) = totals(&changes);
+                            json!({"branch":branch,"added":added,"deleted":deleted})
+                        });
+                        cache_git_summary(&self.git_cache, cwd.clone(), value.clone());
+                        crate::session::lock(&self.git_inflight).remove(&cwd);
+                        found.insert(cwd, value);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        deferred.push((cwd, Some(rx)));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
+                        crate::session::lock(&self.git_inflight).remove(&cwd);
+                    }
+                }
+            }
+        }
+        if !deferred.is_empty() || !stale.is_empty() {
+            let cache = Arc::clone(&self.git_cache);
+            let inflight = Arc::clone(&self.git_inflight);
+            let revision = Arc::clone(&self.git_revision);
+            let mut scheduled: Vec<PathBuf> = deferred.iter().map(|(cwd, _)| cwd.clone()).collect();
+            scheduled.extend(stale.iter().cloned());
+            let spawned = thread::Builder::new()
+                .name("mobile-git-swr".into())
+                .spawn(move || {
+                    let queue = crate::git::queue().ok();
+                    let mut pending = deferred;
+                    pending.extend(stale.into_iter().map(|cwd| {
+                        let rx = queue.map(|q| {
+                            crate::git::changes::query_with_branch(
+                                q,
+                                cwd.clone(),
+                                Arc::new(AtomicBool::new(false)),
+                            )
+                        });
+                        (cwd, rx)
+                    }));
+                    for (cwd, rx) in pending {
+                        let value = rx
+                            .and_then(|rx| rx.recv().ok())
+                            .and_then(Result::ok)
+                            .map_or(Value::Null, |(changes, branch)| {
+                                let (added, deleted) = totals(&changes);
+                                json!({"branch":branch,"added":added,"deleted":deleted})
+                            });
+                        cache_git_summary(&cache, cwd.clone(), value);
+                        crate::session::lock(&inflight).remove(&cwd);
+                        revision.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            if spawned.is_err() {
+                let mut inflight = crate::session::lock(&self.git_inflight);
+                for cwd in scheduled {
+                    inflight.remove(&cwd);
+                }
+            }
+        }
+        found
+    }
     /// 카드용 git 요약을 cwd별로 모은다. 캐시에 없는 cwd는 큐에 전부 먼저 넣고 나서 받는다
     /// (큐 워커 [`crate::git::MAX_CONCURRENT`]개가 서로 다른 cwd를 동시에 돈다. 같은 키만 직렬).
+    #[cfg(all(test, unix))]
     fn git_summaries(&self, cwds: impl IntoIterator<Item = PathBuf>) -> HashMap<PathBuf, Value> {
         let mut found = HashMap::new();
         let mut missing = Vec::new();
@@ -1150,14 +1367,14 @@ impl Backend {
                     let (added, deleted) = totals(&changes);
                     json!({"branch":branch,"added":added,"deleted":deleted})
                 });
-            crate::session::lock(&self.git_cache)
-                .insert(cwd.clone(), (Instant::now(), value.clone()));
+            cache_git_summary(&self.git_cache, cwd.clone(), value.clone());
             found.insert(cwd, value);
         }
         found
     }
     fn git(&self, session: u64, path: Option<&str>) -> io::Result<Value> {
         let cwd = self.cwd(session)?;
+        let root = git_root(&cwd)?;
         let queue = crate::git::queue().map_err(io::Error::other)?;
         let (changes, branch) = crate::git::changes::query_with_branch(
             queue,
@@ -1174,25 +1391,23 @@ impl Backend {
             .map(|file| String::from_utf8_lossy(&file.path).into_owned())
             .collect();
         let patch = if let Some(raw_path) = path {
-            let rel_path = Path::new(raw_path)
-                .strip_prefix(&cwd)
-                .ok()
-                .and_then(|p| p.to_str())
-                .unwrap_or(raw_path);
-            if Path::new(rel_path)
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return Ok(json!({"diff_status":"outside_scope","patch":"","files":files}));
+            let Some(rel_path) = git_relative_path(&root, &cwd, raw_path, &files) else {
+                return Ok(
+                    json!({"diff_status":"outside_scope","patch":"","files":files,"limited":changes.limited}),
+                );
+            };
+            if !changes.limited && !files.iter().any(|p| p == &rel_path) {
+                return Ok(
+                    json!({"diff_status":"no_current_diff","patch":"","files":files,"limited":changes.limited}),
+                );
             }
-            if !files.iter().any(|p| p == rel_path) {
-                return Ok(json!({"diff_status":"no_current_diff","patch":"","files":files}));
-            }
-            read_patch(&cwd, rel_path)?
+            read_patch(&root, &rel_path)?
         } else {
             String::new()
         };
-        Ok(json!({"branch":branch,"added":added,"deleted":deleted,"files":files,"patch":patch}))
+        Ok(
+            json!({"branch":branch,"added":added,"deleted":deleted,"files":files,"patch":patch,"limited":changes.limited}),
+        )
     }
 }
 /// 표시용 lossy UTF-8과 분리해 OS 경로 바이트를 그대로 식별한다.
@@ -1375,7 +1590,27 @@ fn decode_base64(data: &str) -> io::Result<Vec<u8>> {
     }
     Ok(out)
 }
-fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
+fn cache_git_summary(
+    cache: &Mutex<HashMap<PathBuf, (Instant, Value)>>,
+    cwd: PathBuf,
+    value: Value,
+) {
+    let mut cache = crate::session::lock(cache);
+    cache.insert(cwd, (Instant::now(), value));
+    while cache.len() > 64 {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(path, _)| path.clone());
+        if let Some(path) = oldest {
+            cache.remove(&path);
+        } else {
+            break;
+        }
+    }
+}
+
+fn mobile_git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
@@ -1390,24 +1625,172 @@ fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
     ] {
         command.env_remove(key);
     }
-    command.args([
-        "--literal-pathspecs",
-        "-c",
-        "diff.maxFiles=1",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "HEAD",
-        "--",
-        path,
-    ]);
-    Ok(String::from_utf8_lossy(&bounded_command(
-        &mut command,
+    command.arg("--literal-pathspecs");
+    command
+}
+
+fn git_root(cwd: &Path) -> io::Result<PathBuf> {
+    let bytes = bounded_command(
+        mobile_git_command(cwd).args(["rev-parse", "--show-toplevel"]),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .map_err(|_| io::Error::other("Not a Git repository"))?;
+    // Git terminates this path with a newline; spaces in a repository name are significant.
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    fs::canonicalize(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+fn canonical_missing(path: &Path) -> Option<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Some(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let name = path.file_name()?;
+            Some(canonical_missing(path.parent()?)?.join(name))
+        }
+        Err(_) => None,
+    }
+}
+
+fn git_relative_path(root: &Path, cwd: &Path, raw: &str, files: &[String]) -> Option<String> {
+    use std::path::Component;
+    let input = Path::new(raw);
+    let normalize = |path: &Path| {
+        let mut out = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => (),
+                Component::ParentDir => {
+                    if !out.pop() {
+                        return None;
+                    }
+                }
+                other => out.push(other.as_os_str()),
+            }
+        }
+        Some(out)
+    };
+    let normalized = normalize(input)?;
+    let candidate = if input.is_absolute() {
+        normalized
+    } else if files.iter().any(|p| Path::new(p) == normalized) {
+        root.join(normalized)
+    } else {
+        let local = normalize(&cwd.join(input))?;
+        if local.exists() || !root.join(&normalized).exists() {
+            local
+        } else {
+            root.join(normalized)
+        }
+    };
+    // Resolve parent aliases without following a final symlink: Git diffs the link
+    // itself, and untracked_patch must still be able to reject that link.
+    let canonical = canonical_missing(candidate.parent()?)?.join(candidate.file_name()?);
+    let relative = canonical.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    relative.to_str().map(str::to_owned)
+}
+
+fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
+    let has_head = bounded_command(
+        mobile_git_command(cwd).args(["rev-parse", "--verify", "HEAD"]),
+        Duration::from_secs(5),
+        1024,
+    )
+    .is_ok();
+    let base = if has_head {
+        "HEAD"
+    } else {
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    };
+    let patch = bounded_command(
+        mobile_git_command(cwd).args([
+            "-c",
+            "diff.maxFiles=1",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            base,
+            "--",
+            path,
+        ]),
         Duration::from_secs(5),
         128 * 1024,
-    )?)
-    .into_owned())
+    )?;
+    if !patch.is_empty() {
+        return Ok(String::from_utf8_lossy(&patch).into_owned());
+    }
+    if bounded_command(
+        mobile_git_command(cwd).args(["ls-files", "--error-unmatch", "--", path]),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .is_ok()
+    {
+        return Ok(String::new());
+    }
+    untracked_patch(cwd, path)
+}
+
+fn untracked_patch(root: &Path, path: &str) -> io::Result<String> {
+    const LIMIT: u64 = 128 * 1024;
+    let target = root.join(path);
+    let meta = match fs::symlink_metadata(&target) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Ok(String::new());
+    }
+    if meta.len() > LIMIT {
+        return Err(io::Error::other("File exceeds 128 KiB diff limit"));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    if !fs::canonicalize(&target)?.starts_with(&canonical_root) {
+        return Err(io::Error::other("File is outside the repository"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(&target)?;
+    if !file.metadata()?.is_file() {
+        return Ok(String::new());
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(io::Error::other("File exceeds 128 KiB diff limit"));
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(format!("Binary files /dev/null and b/{path} differ\n"));
+    };
+    if bytes.contains(&0) {
+        return Ok(format!("Binary files /dev/null and b/{path} differ\n"));
+    }
+    let lines = text.split_inclusive('\n').count();
+    let filename = format!("b/{path}");
+    let filename = if path.chars().any(char::is_control) {
+        serde_json::to_string(&filename).map_err(io::Error::other)?
+    } else {
+        filename
+    };
+    let mut patch = format!("--- /dev/null\n+++ {filename}\n@@ -0,0 +1,{lines} @@\n");
+    for line in text.split_inclusive('\n') {
+        patch.push('+');
+        patch.push_str(line);
+        if !line.ends_with('\n') {
+            patch.push_str("\n\\ No newline at end of file\n");
+        }
+    }
+    if u64::try_from(patch.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(io::Error::other("mobile command output exceeds limit"));
+    }
+    Ok(patch)
 }
 fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Vec<u8>> {
     let mut child = command
@@ -1738,7 +2121,7 @@ mod tests {
 
         let saved = rpc(
             &backend,
-            &json!({"action":"save_quick_commands","commands":[{"name":"mobile","text":"/mobile "}]}),
+            &json!({"action":"set_quick_commands","commands":[{"name":"mobile","text":"/mobile "}]}),
         );
         assert_eq!(saved["ok"], true);
         assert!(crate::session::lock(&backend.snapshot_cache).is_none());
@@ -1817,6 +2200,7 @@ mod tests {
             json!([{"name":"valid","text":"invalid\u{1b}text"}]),
             json!([{"name":"valid","text":"invalid\u{0}text"}]),
             json!([{"name":"x".repeat(121),"text":"valid"}]),
+            json!([{"name":"한".repeat(121),"text":"valid"}]),
             json!([{"name":"valid","text":"x".repeat(16 * 1024 + 1)}]),
             json!(vec![json!({"name":"valid","text":"valid"}); 129]),
             json!([{"name":"missing text"}]),
@@ -1833,6 +2217,13 @@ mod tests {
             rpc(
                 &backend,
                 &json!({"action":"save_quick_commands","commands":maximum})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            rpc(
+                &backend,
+                &json!({"action":"set_quick_commands","commands":[{"name":"한".repeat(120),"text":"cargo check"}]})
             )["ok"],
             true
         );
@@ -2146,6 +2537,140 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn mobile_git_paths_untracked_and_unborn_head_have_real_patches() {
+        let dir = std::env::temp_dir().join(format!("mk-mobile-git-audit-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let root = fs::canonicalize(&dir).unwrap();
+        let cwd = root.join("sub");
+        assert_eq!(
+            git_root(&cwd).unwrap_err().to_string(),
+            "Not a Git repository"
+        );
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(cwd.join("a.txt"), "one\ntwo").unwrap();
+        assert_eq!(git_root(&cwd).unwrap(), root);
+        let files = vec!["sub/a.txt".to_owned()];
+        for raw in [
+            "sub/a.txt".to_owned(),
+            "a.txt".into(),
+            "./a.txt".into(),
+            cwd.join("a.txt").to_string_lossy().into_owned(),
+            dir.join("sub/a.txt").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                git_relative_path(&root, &cwd, &raw, &files).as_deref(),
+                Some("sub/a.txt"),
+                "{raw}"
+            );
+        }
+        assert!(git_relative_path(&root, &cwd, "../../escape", &files).is_none());
+        // A truncated status list still permits a valid cwd-relative path.
+        assert_eq!(
+            git_relative_path(&root, &cwd, "./a.txt", &[]).as_deref(),
+            Some("sub/a.txt")
+        );
+        let patch = read_patch(&root, "sub/a.txt").unwrap();
+        assert!(
+            patch.starts_with("--- /dev/null\n+++ b/sub/a.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n"),
+            "{patch}"
+        );
+        assert!(patch.contains("\\ No newline at end of file"));
+        assert!(
+            Command::new("git")
+                .args(["add", "sub/a.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let staged = read_patch(&root, "sub/a.txt").unwrap();
+        assert!(staged.contains("+one"), "{staged}");
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "user.name=Fixture",
+                    "commit",
+                    "-qm",
+                    "fixture"
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+        assert!(read_patch(&root, "sub/a.txt").unwrap().contains("+changed"));
+        fs::remove_file(cwd.join("a.txt")).unwrap();
+        assert_eq!(
+            git_relative_path(&root, &cwd, "./a.txt", &files).as_deref(),
+            Some("sub/a.txt")
+        );
+        assert!(
+            read_patch(&root, "sub/a.txt")
+                .unwrap()
+                .contains("--- a/sub/a.txt")
+        );
+        fs::write(root.join("binary"), b"a\0b").unwrap();
+        assert!(
+            read_patch(&root, "binary")
+                .unwrap()
+                .contains("Binary files")
+        );
+        fs::write(root.join("large"), vec![b'x'; 128 * 1024 + 1]).unwrap();
+        assert!(read_patch(&root, "large").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("binary"), root.join("link")).unwrap();
+            assert_eq!(
+                git_relative_path(&root, &cwd, root.join("link").to_str().unwrap(), &[]).as_deref(),
+                Some("link")
+            );
+            assert!(read_patch(&root, "link").unwrap().is_empty());
+            std::os::unix::fs::symlink(&root, dir.with_extension("alias")).unwrap();
+            assert_eq!(
+                git_relative_path(
+                    &root,
+                    &cwd,
+                    dir.with_extension("alias")
+                        .join("sub/a.txt")
+                        .to_str()
+                        .unwrap(),
+                    &files
+                )
+                .as_deref(),
+                Some("sub/a.txt")
+            );
+            fs::remove_file(dir.with_extension("alias")).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn mobile_git_cache_stays_bounded_even_for_late_background_results() {
+        let backend = test_backend();
+        for i in 0..100 {
+            cache_git_summary(
+                &backend.git_cache,
+                PathBuf::from(format!("/fixture/{i}")),
+                json!(i),
+            );
+        }
+        let cache = crate::session::lock(&backend.git_cache);
+        assert_eq!(cache.len(), 64);
+        assert!(cache.contains_key(Path::new("/fixture/99")));
+        assert!(!cache.contains_key(Path::new("/fixture/0")));
+    }
     fn test_backend() -> Backend {
         Backend::new(
             Weak::new(),
@@ -2222,6 +2747,77 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // git CLI shell alias gates the shared queue for this cwd.
+    fn card_git_swr_returns_cold_and_expired_values_before_background_refresh() {
+        let dir = std::env::temp_dir().join(format!("mk-pwa-git-swr-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let output = Command::new("git")
+            .args(["init", "-q", "-b", "swr"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let backend = test_backend();
+        let expected = json!({"branch":"swr","added":0,"deleted":0});
+        let stale = json!({"branch":"old","added":7,"deleted":3});
+        for generation in 1..=2 {
+            if generation == 2 {
+                crate::session::lock(&backend.git_cache).insert(
+                    dir.clone(),
+                    (Instant::now().checked_sub(GIT_TTL).unwrap(), stale.clone()),
+                );
+            }
+            // Keep the real Git query queued until both immediate responses are checked.
+            let gate = crate::git::queue().unwrap().submit(dir.clone(), [
+                "-c", "alias.swr-gate=!touch .git/swr-started; while test ! -e .git/swr-release; do sleep 0.01; done",
+                "swr-gate",
+            ]);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !dir.join(".git/swr-started").exists() {
+                assert!(Instant::now() < deadline, "queue gate did not start");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let started = Instant::now();
+            let found = backend.git_summaries_swr([dir.clone(), dir.clone()]);
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert_eq!(found.len(), 1);
+            let immediate = if generation == 1 {
+                Value::Null
+            } else {
+                stale.clone()
+            };
+            assert_eq!(found[&dir], immediate);
+            assert_eq!(backend.git_summaries_swr([dir.clone()])[&dir], immediate);
+            assert_eq!(crate::session::lock(&backend.git_inflight).len(), 1);
+            assert_eq!(backend.git_revision.load(Ordering::Relaxed), generation - 1);
+            fs::remove_file(dir.join(".git/swr-started")).unwrap();
+            fs::write(dir.join(".git/swr-release"), "").unwrap();
+            assert!(
+                gate.recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            fs::remove_file(dir.join(".git/swr-release")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while backend.git_revision.load(Ordering::Relaxed) < generation {
+                assert!(
+                    Instant::now() < deadline,
+                    "background refresh did not complete"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(backend.git_revision.load(Ordering::Relaxed), generation);
+            assert!(crate::session::lock(&backend.git_inflight).is_empty());
+            assert_eq!(crate::session::lock(&backend.git_cache)[&dir].1, expected);
+            assert_eq!(backend.git_summaries_swr([dir.clone()])[&dir], expected);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn host_metadata_reports_only_actual_hostname_and_platform() {
         let host = host_metadata();
         let expected = Command::new(if cfg!(windows) {
@@ -2277,6 +2873,109 @@ mod tests {
             let reply: Value = serde_json::from_str(&backend.request(request)).unwrap();
             assert_eq!(reply["ok"], false, "{request}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_workspace_on_non_git_folder_project_spawns_session_and_records_title() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-folder-ws-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let state_dir = dir.join("state");
+        let folder = dir.join("구글드라이브").join("내 드라이브");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        let canonical_folder = fs::canonicalize(&folder).unwrap();
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"gdrive\"\nname = \"구글드라이브\"\npath = {:?}\nkind = \"folder\"\n",
+                canonical_folder.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, cwd, .. } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected Spawn");
+            };
+            let (master, _pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: std::process::id(),
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            cwd
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_folder.as_os_str().as_bytes());
+        let request = json!({
+            "action": "create_workspace",
+            "repository": repo_key,
+            "name": "보험",
+        })
+        .to_string();
+        let reply: Value = serde_json::from_str(&backend.request(&request)).unwrap();
+        let spawned_cwd = holder_worker.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["data"]["workspace"], repo_key);
+        assert_eq!(
+            reply["data"]["path"],
+            canonical_folder.to_string_lossy().as_ref()
+        );
+        assert_eq!(reply["data"]["branch"], "보험");
+        assert_eq!(spawned_cwd, canonical_folder.as_os_str().as_bytes());
+        let session_id = reply["data"]["session"].as_u64().expect("session spawned");
+        let titles = krill_proto::git::load_session_auto_titles(&state_dir);
+        assert_eq!(
+            titles.get(&SessionId(session_id)).map(String::as_str),
+            Some("보험")
+        );
+
+        drop(backend);
+        drop(registry);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2348,6 +3047,30 @@ mod tests {
 mod revision_tests {
     use super::*;
     #[test]
+    fn git_refresh_changes_the_effective_dashboard_revision() {
+        let registry = Registry::new(None, None);
+        let backend = Backend::new(
+            Weak::new(),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let before = backend.effective_revision(&registry);
+        assert_eq!(before, registry.dashboard_revision());
+        backend.git_revision.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(backend.effective_revision(&registry), before);
+        assert_eq!(
+            backend.effective_revision(&registry),
+            registry.dashboard_revision() ^ 0x9E37_79B9_7F4A_7C15
+        );
+    }
+
+    #[test]
     fn near_limit_workflow_snapshot_roundtrips_on_rpc_stack() {
         let worker = std::thread::Builder::new().stack_size(super::super::gateway::RPC_STACK).spawn(|| {
             let registry = Arc::new(Registry::new(None, None));
@@ -2357,7 +3080,7 @@ mod revision_tests {
             let sessions: Vec<_> = (1..=64).map(|id| json!({"id":id,"title":"fixture","state":"Working","lines":["one","two","three"]})).collect();
             let data = json!({"sessions":sessions,"padding":"x".repeat(ipc::MAX_FRAME - 20_000),"etag":"stack"});
             *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
-                revision: registry.dashboard_revision(), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
+                revision: backend.effective_revision(&registry), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
             });
             let reply = backend.request("{\"action\":\"snapshot\"}");
             assert!(reply.len() > ipc::MAX_FRAME - 20_000);
@@ -2391,8 +3114,9 @@ mod revision_tests {
                 instance_id: 1,
             },
         );
+        backend.git_revision.store(7, Ordering::Relaxed);
         *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
-            revision: registry.dashboard_revision(),
+            revision: backend.effective_revision(&registry),
             paths: Vec::new(),
             stamps: Vec::new(),
             at: Instant::now(),

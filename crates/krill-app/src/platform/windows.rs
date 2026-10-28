@@ -249,6 +249,8 @@ mod win {
 }
 
 #[cfg(windows)]
+pub use shell::instance;
+#[cfg(windows)]
 pub use shell::menu_bar;
 
 #[cfg(not(windows))]

@@ -696,7 +696,7 @@ fn gh(args: &[&str]) -> bool {
     crate::pull_request::execute(&mut cmd, GH_TIMEOUT).is_ok()
 }
 
-/// 메인 창 우하단 카드. 숨김 상태면 `None`.
+/// 메인 창 우상단 카드. 숨김 상태면 `None`.
 pub fn card(cx: &App) -> Option<AnyElement> {
     let nag = cx.try_global::<StarNag>()?;
     let card = nag.card;
@@ -716,8 +716,8 @@ pub fn card(cx: &App) -> Option<AnyElement> {
             }
         })
         .absolute()
-        .bottom(px(34.))
-        .right(px(12.))
+        .top(crate::ui::TITLEBAR_HEIGHT + crate::ui::SPACE_4)
+        .right(crate::ui::SPACE_3)
         .w(px(300.))
         .p_3()
         .rounded(crate::ui::RADIUS_MD)

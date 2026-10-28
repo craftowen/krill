@@ -43,8 +43,25 @@ impl Cache {
     pub(super) fn total(&self) -> usize {
         self.complete.unwrap_or(self.known)
     }
+    pub(super) fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub(super) fn complete_total(&self) -> Option<usize> {
+        self.complete
+    }
     pub(super) fn can_compose(&self, lines: usize) -> bool {
-        (self.shown.saturating_sub(lines)..self.shown).all(|i| self.rows.contains_key(&i))
+        self.shown == 0
+            || (lines > 0
+                && (self.shown.saturating_sub(lines)..self.shown)
+                    .all(|i| self.rows.contains_key(&i)))
+    }
+    pub(super) fn can_compose_at(&self, wanted: usize) -> bool {
+        let wanted = self.complete.map_or(wanted, |total| wanted.min(total));
+        self.lines > 0
+            && (wanted.saturating_sub(self.lines)..wanted).all(|i| self.rows.contains_key(&i))
     }
     pub(super) fn row(&self, index: usize) -> Option<&Vec<Cell>> {
         self.rows.get(&index)
@@ -67,8 +84,23 @@ impl Cache {
     pub(super) fn show(&mut self, wanted: usize, lines: usize) {
         self.wanted = self.complete.map_or(wanted, |total| wanted.min(total));
         self.lines = lines;
-        if (self.wanted.saturating_sub(lines)..self.wanted).all(|i| self.rows.contains_key(&i)) {
+        if self.wanted == 0
+            || (lines > 0
+                && (self.wanted.saturating_sub(lines)..self.wanted)
+                    .all(|i| self.rows.contains_key(&i)))
+        {
             self.shown = self.wanted;
+        } else if lines > 0
+            && self.wanted > self.shown
+            && self.wanted.saturating_sub(self.shown) <= 128usize.saturating_add(lines)
+            && self.can_compose(lines)
+        {
+            let contiguous = (self.shown..self.wanted)
+                .take_while(|i| self.rows.contains_key(i))
+                .count();
+            if contiguous > 0 {
+                self.shown = self.shown.saturating_add(contiguous);
+            }
         }
     }
     pub(super) fn next(
@@ -78,10 +110,18 @@ impl Cache {
         req: u32,
     ) -> Option<HistoryViewRequest> {
         self.show(wanted, lines);
-        if self.stopped || self.pending.is_some() || wanted == 0 {
+        if self.stopped || self.pending.is_some() || wanted == 0 || lines == 0 {
             return None;
         }
-        let start = self.wanted.saturating_sub(lines);
+        let target_start = self.wanted.saturating_sub(lines);
+        let start = if self.wanted > self.shown
+            && target_start.saturating_sub(self.shown) <= 128
+            && !self.rows.keys().any(|&k| k >= target_start)
+        {
+            target_start.min(self.shown)
+        } else {
+            target_start
+        };
         let missing = (start..self.wanted).find(|i| !self.rows.contains_key(i))?;
         // Keep adjacent scrolling in memory. A source/frame can end before
         // the target, so resume after the closest cached prefix on each reply.
@@ -184,11 +224,20 @@ impl Cache {
         if reply.complete {
             self.complete = Some(total);
         }
+        let incoming_end = incoming.end;
         for (n, row) in reply.rows.into_iter().enumerate() {
             self.rows.insert(skip.saturating_add(n), row);
         }
         let before = self.shown;
         self.show(self.wanted, self.lines);
+        if self.lines > 0 && self.shown < self.wanted && skip <= self.shown {
+            let partial = incoming_end.min(self.wanted);
+            if partial > self.shown
+                && (partial.saturating_sub(self.lines)..partial).all(|i| self.rows.contains_key(&i))
+            {
+                self.shown = partial;
+            }
+        }
         self.prune();
         self.can_compose(self.lines) && (self.shown != before || self.shown == self.wanted)
     }
@@ -403,5 +452,80 @@ mod tests {
         assert!(cache.stopped);
         assert!(cache.take_notice().unwrap().contains("limit"));
         assert_eq!(cache.visible(), 24);
+    }
+
+    #[test]
+    fn progressive_upward_scroll_across_short_sources_advances_on_each_reply() {
+        let mut cache = Cache::new(SessionId(1));
+        let first = cache.next(3, 35, 1).unwrap();
+        assert_eq!(first.skip, 0);
+        // Simulate rapid trackpad scroll events accumulating wanted > lines while first is in flight.
+        assert!(cache.next(60, 35, 2).is_none());
+        assert_eq!(cache.visible(), 0);
+
+        let mut short0 = reply(first);
+        short0.total = 9;
+        short0.rows.truncate(9);
+        assert!(cache.accept(short0));
+        assert_eq!(cache.visible(), 9);
+
+        let second = cache.next(60, 35, 2).unwrap();
+        assert_eq!(second.skip, 9);
+        let mut short1 = reply(second);
+        short1.total = 29;
+        short1.rows.truncate(20);
+        assert!(cache.accept(short1));
+        assert_eq!(cache.visible(), 29);
+
+        let third = cache.next(60, 35, 3).unwrap();
+        assert_eq!(third.skip, 29);
+        let mut short2 = reply(third);
+        short2.total = 68;
+        short2.rows.truncate(39);
+        assert!(cache.accept(short2));
+        assert_eq!(cache.visible(), 60);
+    }
+
+    #[test]
+    fn nearby_wide_miss_converges_when_unpinned_bridge_rows_are_evicted() {
+        let mut cache = Cache::new(SessionId(1));
+        let initial = cache.next(24, 24, 1).unwrap();
+        let mut first = reply(initial);
+        first.rows = vec![vec![Cell::default(); usize::from(krill_proto::screen::MAX_COLS)]; 24];
+        assert!(cache.accept(first));
+        assert_eq!(cache.visible(), 24);
+
+        // target_start = 100 - 24 = 76, so target_start - shown = 52 (<= 128).
+        // Even if MAX_BYTES evicts unpinned bridge rows in 24..76, requests must reach 100.
+        for req in 2..20 {
+            let Some(request) = cache.next(100, 24, req) else {
+                break;
+            };
+            let mut chunk = reply(request);
+            chunk.rows =
+                vec![vec![Cell::default(); usize::from(krill_proto::screen::MAX_COLS)]; 16];
+            cache.accept(chunk);
+            assert!(cache.rows.values().map(Cache::weight).sum::<usize>() <= MAX_BYTES);
+        }
+        assert_eq!(cache.visible(), 100);
+        assert!(!cache.stopped);
+    }
+
+    #[test]
+    fn zero_lines_before_initial_screen_does_not_corrupt_shown_or_issue_premature_request() {
+        let mut cache = Cache::new(SessionId(1));
+        assert!(cache.can_compose(0));
+        assert!(cache.next(5, 0, 1).is_none());
+        assert_eq!(cache.visible(), 0);
+        assert!(!cache.is_pending());
+        assert!(cache.can_compose(24));
+
+        let req = cache.next(5, 24, 1).unwrap();
+        assert_eq!(req.view, 0);
+        assert_eq!(req.skip, 0);
+        assert!(cache.accept(reply(req)));
+        assert_eq!(cache.visible(), 5);
+        assert!(!cache.can_compose(0));
+        assert!(cache.can_compose(24));
     }
 }

@@ -246,6 +246,12 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     assert!(
         visual
             .debug_bounds("status-provider-details-host")
+            .is_some(),
+        "시안 D는 팝오버를 열면 우측 인라인 상세 패널에 활성 계정을 바로 표시한다"
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-other")
             .is_none()
     );
     assert!(
@@ -283,6 +289,32 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .debug_bounds("status-provider-detail-host-model-pool")
             .is_some()
     );
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-host")
+            .is_some()
+    );
+    let saved_reset = visual
+        .debug_bounds("status-provider-detail-reset-saved")
+        .expect("inactive profile in details panel must also expose reset usage button");
+    visual.simulate_click(saved_reset.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-confirm-saved")
+            .is_some(),
+        "clicking detail reset button arms confirmation in-place without closing panel"
+    );
+    let cancel_reset = visual
+        .debug_bounds("status-provider-detail-reset-cancel-saved")
+        .unwrap();
+    visual.simulate_click(cancel_reset.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-confirm-saved")
+            .is_none()
+    );
     let saved = visual.debug_bounds("status-provider-use-saved").unwrap();
     visual.simulate_mouse_move(saved.center(), None, gpui::Modifiers::default());
     visual.run_until_parked();
@@ -292,6 +324,13 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .is_some(),
         "행에서 상세 패널로 이동해도 패널이 유지된다"
     );
+    let header_before = visual.debug_bounds("status-provider-table-header").unwrap();
+    let toggle_before = visual
+        .debug_bounds("status-provider-toggle-bar-codex")
+        .unwrap();
+    let open_accounts_before = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
     visual.simulate_click(other.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(
@@ -304,10 +343,20 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .debug_bounds("status-provider-details-other")
             .is_some()
     );
-    assert!(
-        visual
-            .debug_bounds("status-provider-table-header")
-            .is_some()
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header_before),
+        "계정 선택이 바뀌어도 상단 헤더 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-toggle-bar-codex"),
+        Some(toggle_before),
+        "상세 패널 길이가 다른 계정으로 바꿔도 하단 메뉴 항목 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(open_accounts_before),
+        "상세 패널 전환 시 팝오버 전체 높이가 변하지 않는다 (CONVENTIONS G7)"
     );
     shell.read_with(visual, |s, _| {
         assert!(
@@ -372,7 +421,6 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     });
 }
 
-#[cfg(unix)]
 #[gpui::test]
 fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff(
     cx: &mut gpui::TestAppContext,
@@ -409,12 +457,6 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
             instance_id: 7777,
         };
         while let Ok((mut stream, _)) = listener.accept() {
-            if stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                .is_err()
-            {
-                break; // The explicit shutdown connection may already be closed on accept.
-            }
             if stream.write_all(&server_hello.encode().unwrap()).is_err() {
                 break;
             }
@@ -497,6 +539,67 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
         visual.debug_bounds("status-provider-active-host").is_some(),
         "remote host badge must appear in provider popup header"
     );
+    assert!(
+        visual.debug_bounds("status-provider-tab-local").is_some(),
+        "local host tab in Variant D header"
+    );
+    let tab_remote = visual
+        .debug_bounds("status-provider-tab-remote")
+        .expect("remote hosts tab in Variant D header");
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-hosts-view")
+            .is_none()
+    );
+    let header_before_tab = visual.debug_bounds("status-provider-table-header").unwrap();
+    let toggle_before_tab = visual
+        .debug_bounds("status-provider-toggle-bar-codex")
+        .unwrap();
+    let open_accounts_before_tab = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
+    visual.simulate_click(tab_remote.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-hosts-view")
+            .is_some(),
+        "clicking remote tab switches popover body to remote hosts view"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header_before_tab),
+        "로컬↔원격 탭 전환 시 상단 헤더 높이와 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-toggle-bar-codex"),
+        Some(toggle_before_tab),
+        "로컬↔원격 탭 전환 시 하단 메뉴 항목 위치가 흔들리지 않는다 (CONVENTIONS G7)"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(open_accounts_before_tab),
+        "로컬↔원격 탭 전환 시 팝오버 전체 높이가 유지된다 (CONVENTIONS G7)"
+    );
+    let tab_local = visual
+        .debug_bounds("status-provider-tab-local")
+        .expect("local host tab after switching to remote tab");
+    visual.simulate_click(tab_local.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-hosts-view")
+            .is_none(),
+        "clicking local tab returns to master-detail account view"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header_before_tab)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(open_accounts_before_tab)
+    );
     let use_alt = visual
         .debug_bounds("status-provider-use-remote-alt")
         .expect("use button for inactive remote profile");
@@ -535,7 +638,125 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
         );
     });
 
-    drop(std::os::unix::net::UnixStream::connect(&sock_path).unwrap());
-    server.join().unwrap();
+    std::os::unix::net::UnixStream::connect(&sock_path).ok();
+    server.join().ok();
     std::fs::remove_file(&sock_path).ok();
+}
+
+#[test]
+fn exhaustion_forecasts_use_whole_hours() {
+    let now = krill_app::accounts::display::now();
+    let account = profile("forecast", None);
+    let mut snap = AccountsSnapshot::default();
+    snap.advanced.supported = true;
+    snap.advanced.forecasts = vec![krill_proto::usage::UsageForecast {
+        account_id: account.id.clone(),
+        window: "5h".into(),
+        percent_per_hour: 12,
+        exhausts_at: now + 7_199,
+        resets_at: now + 18_000,
+    }];
+    let notes = advanced_notes(&snap, &account);
+    assert_eq!(
+        notes,
+        vec![krill_app::i18n::catalog::shell::ACCOUNT_FORECAST.format(&[
+            ("window", "5h"),
+            ("hours", "2"),
+            ("rate", "12"),
+        ])]
+    );
+}
+
+#[gpui::test]
+fn remote_model_limits_and_resets_are_visible_without_moving_tab_controls(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+    use std::sync::Arc;
+    let (shell, handle) = super::super::tests::open(cx);
+    let mut local = profile("host", None);
+    local.provider = ProviderKind::Antigravity;
+    local.active = true;
+    let mut remote = local.clone();
+    remote.usage.five_hour = Some(UsageWindow {
+        percent: 5,
+        resets_at: None,
+    });
+    let mut snap = AccountsSnapshot {
+        accounts: vec![remote],
+        ..Default::default()
+    };
+    snap.details.supported = true;
+    snap.details.accounts.push(AccountMeters {
+        account_id: "host".into(),
+        plan: None,
+        meters: vec![UsageMeter {
+            key: "gemini_weekly".into(),
+            label: "Gemini · 7d".into(),
+            value: None,
+            window: Some(UsageWindow {
+                percent: 73,
+                resets_at: Some("4102444800".into()),
+            }),
+        }],
+    });
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Antigravity,
+        ])));
+        Arc::make_mut(&mut s.accounts_snapshot).accounts = vec![local];
+        s.host_statuses.push((
+            RemoteHostSpec {
+                id: "quota-box".into(),
+                label: "Quota Box".into(),
+                address: "quota-box".into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            },
+            HostStatus::Connected,
+        ));
+        s.remote_accounts
+            .insert(HostId::Remote("quota-box".into()), Arc::new(snap));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(850.)));
+    visual.run_until_parked();
+    let pill = visual.debug_bounds("status-provider-pill-agy").unwrap();
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let footer = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
+    let tab = visual.debug_bounds("status-provider-tab-remote").unwrap();
+    visual.simulate_click(tab.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-quota-box-host-gemini_weekly-percent")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-quota-box-host-gemini_weekly-reset")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-quota-box-host-status")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-remote-quota-box-host-5h-percent")
+            .is_none(),
+        "원격 모델 미터를 로컬/요약 창으로 대체하지 않는다"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(footer)
+    );
 }

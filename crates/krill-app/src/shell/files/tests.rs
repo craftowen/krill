@@ -475,20 +475,50 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
     let hover = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).path_hover(pane));
 
     cx.simulate_mouse_move(at(9.), None, Modifiers::default());
-    assert_eq!(hover(cx), None, "⌘ 없이는 밑줄이 없다");
-    cx.simulate_mouse_move(at(9.), None, cmd);
+    cx.run_until_parked();
     let underline = Some(Highlight {
         line: 1,
         column: 6,
         cols: 15,
     });
+    assert_eq!(
+        hover(cx),
+        underline,
+        "마우스 보고가 꺼져 있으면 ⌘ 없이 마우스만 올려도 밑줄과 포인터 커서가 표시된다"
+    );
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::Msg as _;
+        use krill_proto::term_modes::Modes;
+        let frame = Modes {
+            flags: Modes::MOUSE_CLICK,
+            ..Modes::default()
+        }
+        .encode()
+        .unwrap();
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.simulate_mouse_move(at(9.), None, Modifiers::default());
+    assert_eq!(
+        hover(cx),
+        None,
+        "마우스 보고가 켜진 TUI에서는 ⌘ 없이는 밑줄이 없다"
+    );
+    cx.simulate_mouse_move(at(9.), None, cmd);
     assert_eq!(hover(cx), underline);
     cx.simulate_modifiers_change(Modifiers::default());
-    assert_eq!(hover(cx), None, "⌘을 떼면 사라진다");
+    assert_eq!(hover(cx), None, "마우스 보고 중 ⌘을 떼면 사라진다");
     cx.simulate_modifiers_change(cmd);
     assert_eq!(hover(cx), underline, "움직이지 않고 ⌘만 눌러도 나타난다");
     cx.simulate_mouse_move(at(25.), None, cmd);
     assert_eq!(hover(cx), None, "없는 파일은 링크가 아니다");
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::Msg as _;
+        use krill_proto::term_modes::Modes;
+        let frame = Modes::default().encode().unwrap();
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
 
     cx.simulate_mouse_down(at(9.), MouseButton::Left, cmd);
     cx.simulate_mouse_up(at(9.), MouseButton::Left, cmd);
@@ -1999,4 +2029,190 @@ fn session_tab_keeps_focus_after_viewing_file_and_closing_or_reloading(cx: &mut 
         cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
         "백그라운드 파일 자동 리로드가 실행 중인 세션 탭의 포커스를 뺏으면 안 된다"
     );
+}
+
+#[gpui::test]
+fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, point};
+    use krill_app::hosts::{HostId, HostTarget};
+    use krill_proto::control::{FEAT_CONTROL, FEAT_REMOTE_FS, Reply, Request};
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::os::net::UnixListener;
+    use krill_proto::remote_fs::{
+        RemoteFsReply, RemoteFsRequest, WireReadChunk, WireStamp, WireStat,
+    };
+    use krill_proto::screen::{Cell, Msg as _, Op, Revision, Seq, encode_update};
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = TempDir::new("remote-image-open");
+    let sock_path = dir.0.join("remote-d.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let remote_img = PathBuf::from("/Users/remote/visual/threads/krill-threads-card.png");
+    let remote_img_wire = remote_img.as_os_str().as_bytes().to_vec();
+    let mut png_bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png_bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let probe_calls_bg = probe_calls.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = stop.clone();
+
+    let daemon = std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            if stop_bg.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut writer = stream.try_clone().unwrap();
+            let server = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: FEAT_CONTROL | FEAT_REMOTE_FS,
+                build: "test".to_owned(),
+                instance_id: 1,
+            };
+            if writer.write_all(&server.encode().unwrap()).is_err() {
+                continue;
+            }
+            let Some((kind, body)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                continue;
+            };
+            let _ = ClientHello::decode(kind, &body).unwrap();
+            let Some((kind, payload)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                continue;
+            };
+            let Ok(req) = Request::decode(kind, &payload) else {
+                continue;
+            };
+            let reply = match req {
+                Request::RemoteFs(RemoteFsRequest::ProbePaths { paths, .. }) => {
+                    probe_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    let resolved = paths
+                        .into_iter()
+                        .map(|p| (p == remote_img_wire).then(|| remote_img_wire.clone()))
+                        .collect();
+                    Reply::RemoteFs(RemoteFsReply::ProbedPaths(resolved))
+                }
+                Request::RemoteFs(RemoteFsRequest::ReadFile { .. }) => {
+                    Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                        stat: WireStat {
+                            exists: true,
+                            is_file: true,
+                            is_dir: false,
+                            is_symlink: false,
+                            stamp: Some(WireStamp {
+                                modified_unix_ns: Some(1_700_000_000_000_000_000),
+                                len: u64::try_from(png_bytes.len()).unwrap(),
+                            }),
+                        },
+                        bytes: png_bytes.clone(),
+                        eof: true,
+                    })))
+                }
+                Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
+                    Reply::RemoteFs(RemoteFsReply::Stat(Ok(WireStat {
+                        exists: true,
+                        is_file: true,
+                        is_dir: false,
+                        is_symlink: false,
+                        stamp: Some(WireStamp {
+                            modified_unix_ns: Some(1_700_000_000_000_000_000),
+                            len: u64::try_from(png_bytes.len()).unwrap(),
+                        }),
+                    })))
+                }
+                _ => continue,
+            };
+            stream.write_all(&reply.encode().unwrap()).ok();
+        }
+    });
+
+    let (view, cx) = open(cx, state_path("remote-image-open"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let host = HostId::Remote("macmini".into());
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let line_text = format!("  {}", remote_img.display());
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(
+            host.clone(),
+            HostTarget::remote("macmini", sock_path.clone()),
+        );
+        s.layout.set_host(pane, host.clone());
+        s.attach_test(pane, krill_proto::SessionId(860), ours, cx);
+        let cells: Vec<_> = line_text
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        let ops = vec![
+            Op::Reset { cols: 80, lines: 4 },
+            Op::Line { line: 1, cells },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.run_until_parked();
+
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let at = |col: f32| {
+        point(
+            bounds.origin.x + cell.width * (col + 0.5),
+            bounds.origin.y + cell.height * 1.5,
+        )
+    };
+    let cmd = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+
+    // 1. ⌘ 없이 마우스만 올려도 원격 ProbePaths를 거쳐 밑줄(및 포인터 커서)이 뜨고,
+    // 같은 경로의 옆 열로 움직여도 재조회 없이 밑줄이 유지된다.
+    cx.simulate_mouse_move(at(5.), None, Modifiers::default());
+    cx.run_until_parked();
+    let expected_hl = Some(Highlight {
+        line: 1,
+        column: 2,
+        cols: u16::try_from(remote_img.to_str().unwrap().len()).unwrap(),
+    });
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
+    );
+    let calls_after_hover = probe_calls.load(Ordering::SeqCst);
+    assert_eq!(calls_after_hover, 1);
+
+    cx.simulate_mouse_move(at(12.), None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
+    );
+    assert_eq!(
+        probe_calls.load(Ordering::SeqCst),
+        calls_after_hover,
+        "같은 링크 범위 안 열 이동은 원격 ProbePaths를 다시 호출하지 않는다"
+    );
+    cx.simulate_mouse_move(at(12.), None, cmd);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
+    );
+
+    // 2. 원격 터미널에서 이미지를 일반 클릭(⌘ 없이)해도 원격 호스트의 이미지 탭으로 열린다.
+    cx.simulate_click(at(12.), Modifiers::default());
+    cx.run_until_parked();
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(
+        layout_of(&view, cx).file(opened),
+        Some(remote_img.as_path())
+    );
+    assert_eq!(layout_of(&view, cx).host(opened), &host);
+    assert!(cx.update(|_, cx| matches!(view.read(cx).files.tabs[&opened].body, Body::Image(_))));
+
+    stop.store(true, Ordering::SeqCst);
+    drop(UnixStream::connect(&sock_path));
+    daemon.join().ok();
 }

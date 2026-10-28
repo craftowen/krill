@@ -352,7 +352,7 @@ fn dispatch_handoff(args: &[String]) -> io::Result<()> {
     };
 
     let packet = format!(
-        "[MK HANDOFF from session #{from_id} -> {to_agent}] Worktree: {wt_key} | Status: {} | Note: {}\nPrompt:\n{prompt}\nRecent terminal context:\n{}",
+        "[KRILL HANDOFF from session #{from_id} -> {to_agent}] Worktree: {wt_key} | Status: {} | Note: {}\nPrompt:\n{prompt}\nRecent terminal context:\n{}",
         checkpoint.workspace_status.as_deref().unwrap_or("none"),
         checkpoint.comment.as_deref().unwrap_or("-"),
         if context_tail.is_empty() {

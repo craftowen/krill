@@ -151,6 +151,8 @@ impl Waker {
 }
 #[derive(Debug)]
 pub(super) struct State {
+    /// Reoffering installation keeps an already delivered, unexpired fragment usable.
+    install_offer: Option<krill_proto::mobile::PairingTicket>,
     pub(super) devices: Devices,
     mode: ConnectMode,
     custom: Option<String>,
@@ -361,6 +363,7 @@ impl Gateway {
         let waker = Arc::new(Waker::new()?);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
+                install_offer: None,
                 devices: Devices::open(dir)?,
                 mode: intent.mode,
                 custom: intent.custom,
@@ -456,7 +459,16 @@ impl Gateway {
         let fragment = (|| -> io::Result<String> {
             let mut state = lock(&self.shared.state);
             let now = now_ms();
-            state.devices.mint(now, false)?;
+            let reusable = state
+                .devices
+                .ticket(now)
+                .zip(state.install_offer.as_ref())
+                .is_some_and(|(current, offered)| {
+                    current.token == offered.token
+                        && current.expires_at_ms.saturating_sub(now) >= 30_000
+                });
+            let ticket = state.devices.mint(now, !reusable)?;
+            state.install_offer = Some(ticket);
             let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now)? else {
                 return Err(invalid());
             };
@@ -1417,3 +1429,74 @@ fn bridge(
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod handoff_regression_tests {
+    use super::*;
+    #[test]
+    fn repeated_install_handoff_preserves_a_valid_offer_then_renews_near_expiry() {
+        let registry = Arc::new(Registry::new(None, None));
+        registry
+            .start_mobile(ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            })
+            .unwrap();
+        let gateway = registry.mobile_gateway().unwrap();
+        gateway.install_handoff();
+        let first = lock(&gateway.shared.state)
+            .devices
+            .ticket(now_ms())
+            .unwrap()
+            .clone();
+        gateway.install_handoff();
+        assert_eq!(
+            lock(&gateway.shared.state)
+                .devices
+                .ticket(now_ms())
+                .unwrap()
+                .token,
+            first.token
+        );
+        let nearly_expired = {
+            let mut state = lock(&gateway.shared.state);
+            let ticket = state.devices.mint(now_ms() - 299_000, true).unwrap();
+            state.install_offer = Some(ticket.clone());
+            ticket
+        };
+        gateway.install_handoff();
+        let state = lock(&gateway.shared.state);
+        let renewed = state.devices.ticket(now_ms()).unwrap();
+        assert_ne!(renewed.token, nearly_expired.token);
+        assert!(renewed.expires_at_ms > nearly_expired.expires_at_ms + 298_000);
+    }
+
+    #[test]
+    fn install_handoff_rotates_a_nearly_expired_ticket() {
+        let registry = Arc::new(Registry::new(None, None));
+        registry
+            .start_mobile(ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            })
+            .unwrap();
+        let gateway = registry.mobile_gateway().unwrap();
+        let old = lock(&gateway.shared.state)
+            .devices
+            .mint(now_ms() - 299_000, true)
+            .unwrap();
+        // Even when no route is configured and an offer cannot yet be delivered,
+        // the installation request must replace the nearly expired credential.
+        gateway.install_handoff();
+        let state = lock(&gateway.shared.state);
+        let ticket = state.devices.ticket(now_ms()).unwrap();
+        assert_ne!(ticket.token, old.token);
+        assert!(ticket.expires_at_ms > old.expires_at_ms + 298_000);
+    }
+}

@@ -448,7 +448,7 @@ pub fn extract_clipboard_invite(clipboard_text: &str) -> Option<String> {
     is_valid_invite_link(trimmed).then(|| trimmed.to_owned())
 }
 
-/// 이 Mac의 기본 표시 이름을 결정한다(UI 스레드 블로킹 없이 즉시 반환).
+/// 이 컴퓨터의 기본 표시 이름을 결정한다(UI 스레드 블로킹 없이 즉시 반환).
 #[must_use]
 pub fn default_device_name() -> String {
     for key in ["KRILL_DEVICE_NAME", "COMPUTERNAME", "HOSTNAME"] {
@@ -459,10 +459,12 @@ pub fn default_device_name() -> String {
             }
         }
     }
-    if let Ok(user) = std::env::var("USER") {
-        let cleaned = user.trim();
-        if !cleaned.is_empty() && !cleaned.chars().any(char::is_control) {
-            return text::USER_MAC_NAME.format(&[("user", cleaned)]);
+    for key in ["USER", "USERNAME"] {
+        if let Ok(user) = std::env::var(key) {
+            let cleaned = user.trim();
+            if !cleaned.is_empty() && !cleaned.chars().any(char::is_control) {
+                return text::USER_MAC_NAME.format(&[("user", cleaned)]);
+            }
         }
     }
     text::DEFAULT_DEVICE_NAME.get().to_owned()

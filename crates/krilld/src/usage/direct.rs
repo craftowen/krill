@@ -46,6 +46,7 @@ const MAX_BYTES: u64 = 512 * 1024;
 /// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다(직접 조회가 켜져 있을 때).
 pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     lock(&CACHE).remove(&(home.to_path_buf(), provider, dir.to_path_buf()));
+    super::meters::evict_profile(home, provider, dir);
 }
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
@@ -123,7 +124,8 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
             && (lock(&RETRY)
                 .get(&key)
                 .is_some_and(|(until, _)| Instant::now() < *until)
-                || live_fresh(provider, &key.2))
+                || (live_fresh(provider, &key.2)
+                    && super::meters::has_cached(&key.0, provider, &key.2)))
             || lock(&CACHE)
                 .get(&key)
                 .is_some_and(|(at, u)| u.error.is_none() && !u.stale && at.elapsed() < interval)
@@ -164,7 +166,7 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                     let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
                     retry.insert(job.clone(), (Instant::now() + wait, streak));
                     drop(retry);
-                    mark_rate_limited(&mut lock(&CACHE), &job);
+                    mark_rate_limited(&mut lock(&CACHE), &job, now);
                     None
                 }
                 Fetched::Failed => {
@@ -228,12 +230,28 @@ fn failure_wait(streak: u32) -> Duration {
 }
 
 /// 429 때: 마지막 정상 값은 받은 시각을 그대로 둔 채 오래됨으로 바꾼다. 정상 값이 없으면
-/// 오류 행을 지워 프로필 사용량 파일(statusline 캐시)로 넘어가게 한다.
-fn mark_rate_limited(cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>, key: &Key) {
+/// '모름(--)' 대신 요청 제한 오류로 둔다(값은 지어내지 않는다). 사용량이 빈 오류 행이라
+/// 프로필 사용량 파일(statusline 캐시)이 있으면 그 값이 이긴다.
+fn mark_rate_limited(
+    cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>,
+    key: &Key,
+    now: Option<u64>,
+) {
     match cache.get_mut(key) {
         Some((_, u)) if u.error.is_none() && !u.usage.is_empty() => u.stale = true,
         _ => {
-            cache.remove(key);
+            cache.insert(
+                key.clone(),
+                (
+                    Instant::now(),
+                    ProfileUsage {
+                        error: Some("요청 제한".into()),
+                        detail: Some("사용량 API 요청 제한(429)".into()),
+                        updated_at: now,
+                        ..ProfileUsage::default()
+                    },
+                ),
+            );
         }
     }
 }
@@ -269,7 +287,7 @@ fn fetch(
     // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
     // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
     if provider == ProviderKind::Claude
-        && let Some(count) = claude_reset_count(&token, get_text)
+        && let Some((count, expiries)) = claude_reset_credits(&token, get_text)
     {
         out.1.meters.push(krill_proto::usage::UsageMeter {
             key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
@@ -277,6 +295,7 @@ fn fetch(
             window: None,
             value: Some(count.to_string()),
         });
+        out.1.meters.extend(expiries);
     }
     Fetched::Usage(out.0, out.1)
 }
@@ -454,21 +473,68 @@ impl ClaudeResetProgram {
     }
 }
 
-/// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 하나라도 실패하면
+/// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 두 프로브가 모두 실패하면
 /// `None`(기존 미터를 유지하고 다음 주기에 다시 시도한다).
-#[cfg_attr(
-    test,
-    expect(dead_code, reason = "테스트 빌드는 네트워크 조회 경로를 쓰지 않는다")
-)]
-pub(super) fn claude_reset_count(
+#[cfg(test)]
+fn claude_reset_count(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
 ) -> Option<u64> {
-    let status = send(&claude_probe_config(token, ClaudeResetProbe::Juniper)?)?;
-    let juniper = u64::from(parse_juniper_status(std::str::from_utf8(&status).ok()?)?);
-    let cedar_body = send(&claude_probe_config(token, ClaudeResetProbe::Cedar)?)?;
-    let cedar = parse_cedar_status(std::str::from_utf8(&cedar_body).ok()?, now_secs())?;
-    Some(juniper.saturating_add(cedar))
+    claude_reset_credits(token, send).map(|(count, _)| count)
+}
+
+fn claude_reset_credits(
+    token: &str,
+    send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<(u64, Vec<krill_proto::usage::UsageMeter>)> {
+    let mut expiries = Vec::new();
+    let juniper = claude_probe_config(token, ClaudeResetProbe::Juniper)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| {
+            let text = std::str::from_utf8(&body).ok()?;
+            let offered = parse_juniper_status(text)?;
+            if offered {
+                let json: serde_json::Value = serde_json::from_str(text).ok()?;
+                let block = json.get("juniper_tide")?;
+                expiries.push(krill_proto::usage::reset_credit_expiry_meter(
+                    0,
+                    1,
+                    reset_expiry(block),
+                ));
+            }
+            Some(offered)
+        })
+        .map(u64::from);
+    let cedar = claude_probe_config(token, ClaudeResetProbe::Cedar)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_cedar_grants(std::str::from_utf8(&body).ok()?, now_secs()))
+        .map(|grants| {
+            let mut total = 0_u64;
+            for (count, expiry) in grants {
+                total = total.saturating_add(count);
+                expiries.push(krill_proto::usage::reset_credit_expiry_meter(
+                    expiries.len(),
+                    count,
+                    expiry,
+                ));
+            }
+            total
+        });
+    let count = match (juniper, cedar) {
+        (Some(j), Some(c)) => Some(j.saturating_add(c)),
+        (Some(j), None) => Some(j),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }?;
+    Some((count, expiries))
+}
+
+fn reset_expiry(raw: &serde_json::Value) -> Option<i64> {
+    ["ends_at", "expires_at"]
+        .iter()
+        .find_map(|key| raw.get(key).and_then(super::resets))
+        .and_then(|at| krill_proto::time::parse_reset_epoch(&at))
+        .filter(|at| *at > 0)
 }
 
 /// 소진 시점에 제공 중인 프로그램. 바깥은 `None`(프로브 실패)과 제공 없음(`Some(None)`)을
@@ -478,17 +544,20 @@ pub(super) fn claude_offered_program(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
 ) -> Option<Option<ClaudeResetProgram>> {
-    let status = send(&claude_probe_config(token, ClaudeResetProbe::Juniper)?)?;
-    if parse_juniper_status(std::str::from_utf8(&status).ok()?)? {
+    let juniper = claude_probe_config(token, ClaudeResetProbe::Juniper)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_juniper_status(std::str::from_utf8(&body).ok()?));
+    if juniper == Some(true) {
         return Some(Some(ClaudeResetProgram::Juniper));
     }
-    let cedar_body = send(&claude_probe_config(token, ClaudeResetProbe::Cedar)?)?;
-    let usable = parse_cedar_status(std::str::from_utf8(&cedar_body).ok()?, now_secs())?;
-    Some(if usable > 0 {
-        Some(ClaudeResetProgram::Cedar)
-    } else {
-        None
-    })
+    let cedar = claude_probe_config(token, ClaudeResetProbe::Cedar)
+        .and_then(|cfg| send(&cfg))
+        .and_then(|body| parse_cedar_status(std::str::from_utf8(&body).ok()?, now_secs()));
+    match (juniper, cedar) {
+        (_, Some(usable)) if usable > 0 => Some(Some(ClaudeResetProgram::Cedar)),
+        (Some(_), _) | (_, Some(_)) => Some(None),
+        (None, None) => None,
+    }
 }
 
 /// Claude 리셋 상태 조회 설정. 프로브마다 고정 쿼리를 쓴다.
@@ -520,15 +589,23 @@ fn parse_juniper_status(text: &str) -> Option<bool> {
 
 /// `cedar_ember` 블록의 사용 가능 grant 합. `None`은 읽을 수 없음이다.
 fn parse_cedar_status(text: &str, now: i64) -> Option<u64> {
+    Some(
+        parse_cedar_grants(text, now)?
+            .into_iter()
+            .fold(0_u64, |total, (left, _)| total.saturating_add(left)),
+    )
+}
+
+fn parse_cedar_grants(text: &str, now: i64) -> Option<Vec<(u64, Option<i64>)>> {
     let json: serde_json::Value = serde_json::from_str(text).ok()?;
     let block = json.get("cedar_ember")?;
     if block.is_null() {
-        return Some(0);
+        return Some(Vec::new());
     }
     if block.get("eligible").and_then(serde_json::Value::as_bool) == Some(false) {
-        return Some(0);
+        return Some(Vec::new());
     }
-    let mut total = 0_u64;
+    let mut grants = Vec::new();
     for grant in block.get("grants").and_then(serde_json::Value::as_array)? {
         if grant.get("usable_now").and_then(serde_json::Value::as_bool) != Some(true) {
             continue;
@@ -559,9 +636,13 @@ fn parse_cedar_status(text: &str, now: i64) -> Option<u64> {
                 continue;
             }
         }
-        total = total.saturating_add(left);
+        let expiry = reset_expiry(grant);
+        if expiry.is_some_and(|at| at <= now) {
+            continue;
+        }
+        grants.push((left, expiry));
     }
-    Some(total)
+    Some(grants)
 }
 
 /// 소진 경로용 Claude 토큰. 프로필·프로브·소진이 같은 자격증명을 쓴다.
@@ -826,25 +907,120 @@ fn credentials(
     let raw = if provider == ProviderKind::Claude {
         let user = claude_keychain_user();
         let mut dirs = vec![dir.to_path_buf()];
-        if let Ok(canonical) = dir.canonicalize()
-            && canonical != dir
+        for candidate in [
+            krill_proto::os::canonicalize(dir).ok(),
+            dir.canonicalize().ok(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            dirs.push(canonical);
+            if !dirs.contains(&candidate) {
+                dirs.push(candidate);
+            }
         }
+        let accounts: &[&str] = if user == "claude-code-user" {
+            &["claude-code-user"]
+        } else {
+            &[user.as_str(), "claude-code-user"]
+        };
         dirs.iter()
-            .find_map(|dir| keychain(&claude_service((!host).then_some(dir.as_path()))?, &user))
-            .or_else(|| read_file(&dir.join(".credentials.json")))?
+            .find_map(|dir| {
+                let service = claude_service((!host).then_some(dir.as_path()))?;
+                accounts
+                    .iter()
+                    .find_map(|account| keychain(&service, account))
+            })
+            .or_else(|| read_file(&dir.join(".credentials.json")))
+            .or_else(|| read_file(&dir.join("credentials.json")))?
     } else {
         read_file(&dir.join("auth.json"))?
     };
     parse_credentials(provider, &raw)
 }
 
+fn credential_utf8(raw: &[u8]) -> Option<Zeroizing<String>> {
+    let raw = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(raw);
+    if let Ok(text) = std::str::from_utf8(raw)
+        && !text.trim_end_matches('\0').contains('\0')
+    {
+        return Some(Zeroizing::new(text.trim_end_matches('\0').to_owned()));
+    }
+    let (raw, big_endian) = if let Some(body) = raw.strip_prefix(&[0xfe, 0xff]) {
+        (body, true)
+    } else {
+        (raw.strip_prefix(&[0xff, 0xfe]).unwrap_or(raw), false)
+    };
+    if raw.len() >= 2 && raw.len().is_multiple_of(2) {
+        let units = Zeroizing::new(
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|unit| {
+                    if big_endian {
+                        u16::from_be_bytes(unit)
+                    } else {
+                        u16::from_le_bytes(unit)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let text = Zeroizing::new(String::from_utf16(&units).ok()?);
+        let text = text.trim_end_matches('\0');
+        return (!text.contains('\0')).then(|| Zeroizing::new(text.to_owned()));
+    }
+    None
+}
+
+fn decode_base64(input: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let mut bits = 0_u32;
+    let mut count = 0_u32;
+    let mut pad = 0_u8;
+    let mut out = Zeroizing::new(Vec::with_capacity(input.len() * 3 / 4));
+    for byte in input.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            pad = pad.saturating_add(1);
+            if pad > 2 {
+                return None;
+            }
+            continue;
+        }
+        if pad > 0 {
+            return None;
+        }
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(val);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push(u8::try_from((bits >> count) & 0xff).ok()?);
+        }
+        if u64::try_from(out.len()).ok()? > MAX_BYTES {
+            return None;
+        }
+    }
+    if count >= 6 {
+        return None;
+    }
+    Some(out)
+}
+
 fn parse_credentials(
     provider: ProviderKind,
     raw: &[u8],
 ) -> Option<(Zeroizing<String>, Option<String>)> {
-    let mut json: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let text = credential_utf8(raw)?;
+    let mut json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let (token_path, account_path) = if provider == ProviderKind::Claude {
         ("/claudeAiOauth/accessToken", "")
     } else {
@@ -864,6 +1040,7 @@ fn parse_credentials(
 /// Claude Code가 키체인 항목 account로 쓰는 사용자 이름.
 pub(crate) fn claude_keychain_user() -> String {
     std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .filter(|s| {
             !s.is_empty()
@@ -879,7 +1056,8 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
         return Some("Claude Code-credentials".into());
     };
     let path = dir.to_str()?;
-    // macOS 파일명은 분해형일 수 있어 Claude의 NFC 해시 규약에 맞춘다.
+    // macOS 파일명은 분해형일 수 있어 Claude의 NFC 해시 규약에 맞춘다. Windows·Linux는 이미 NFC다.
+    #[cfg(target_os = "macos")]
     let normalized = if path.is_ascii() {
         path.as_bytes().to_vec()
     } else {
@@ -890,6 +1068,8 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
         )?
         .to_vec()
     };
+    #[cfg(not(target_os = "macos"))]
+    let normalized = path.as_bytes().to_vec();
     let digest = format!("{:x}", Sha256::digest(&normalized));
     Some(format!(
         "Claude Code-credentials-{}",
@@ -899,7 +1079,7 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
 
 // Claude Code·agy(go-keyring)는 `/usr/bin/security`로 항목을 만들어 ACL이 그 도구만 믿는다.
 // krilld가 SecItem으로 직접 읽으면 macOS가 매번 로그인 키체인 암호를 묻는다 — Orca처럼 같은 도구로 읽는다.
-#[cfg(not(test))]
+#[cfg(all(not(test), not(windows)))]
 fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
     let output = Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
@@ -909,6 +1089,18 @@ fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
         .ok()?;
     let stdout = Zeroizing::new(output.stdout);
     (output.status.success() && u64::try_from(stdout.len()).ok()? <= MAX_BYTES).then_some(stdout)
+}
+// Windows 자격 증명 관리자: go-keyring(`service:account`), keytar/Bun(`service/account`), keyring-rs(`account.service`) 순으로 찾는다.
+#[cfg(all(not(test), windows))]
+fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
+    [
+        format!("{service}:{account}"),
+        format!("{service}/{account}"),
+        format!("{account}.{service}"),
+        service.to_owned(),
+    ]
+    .into_iter()
+    .find_map(|target| crate::sys::generic_credential(&target))
 }
 #[cfg(test)]
 fn keychain(_: &str, _: &str) -> Option<Zeroizing<Vec<u8>>> {
@@ -995,9 +1187,10 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
 }
 
 fn parse_antigravity_auth(raw: &[u8]) -> Option<AuthStatus> {
-    let text = std::str::from_utf8(raw).ok()?.trim();
+    let raw_text = credential_utf8(raw)?;
+    let text = raw_text.trim();
     let decoded = if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
-        pipe_command("/usr/bin/base64", &["--decode"], encoded.as_bytes())?
+        decode_base64(encoded)?
     } else if let Some(encoded) = text.strip_prefix("go-keyring-encoded:") {
         let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
         if !remainder.is_empty() {
@@ -1378,17 +1571,22 @@ pub(crate) mod agy {
         if let Some(hit) = lock(&VERSION_TEXT_CACHE).get(&(exe.to_path_buf(), mtime, len)) {
             return hit.clone();
         }
-        let mut text = run_agy(
+        let text = run_agy(
             exe,
             &["--version".to_owned()],
             true,
             VERSION_TIMEOUT,
             64 * 1024,
         )
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
-        // 키 팽창 방지: 앞 64바이트만 쓴다(버전 표기는 앞에 있다).
-        text.truncate(64);
+        .and_then(|b| String::from_utf8(b).ok());
+        let Some(text) = text.filter(|s| parse_version(s).is_some()) else {
+            // A failed/partial cold-start probe says nothing about the installed
+            // version. Retry at the next usage poll instead of caching failure
+            // until the executable is replaced.
+            return String::new();
+        };
+        // 키 팽창 방지: 앞 64글자만 쓴다(버전 표기는 앞에 있다).
+        let text = text.chars().take(64).collect::<String>();
         let mut cache = lock(&VERSION_TEXT_CACHE);
         if cache.len() >= 64 {
             cache.pop_first();
@@ -1520,7 +1718,7 @@ pub(crate) mod agy {
         } else {
             cmd.env_remove("SSH_CONNECTION");
         }
-        let mut child = cmd.spawn().ok()?;
+        let mut child = crate::child::spawn(crate::child::own_group(&mut cmd)).ok()?;
         let stdout = child.stdout.take()?;
         let reader = std::thread::Builder::new()
             .name("agy-read".into())
@@ -1536,19 +1734,13 @@ pub(crate) mod agy {
         let ok = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if Instant::now() >= deadline => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    break false;
-                }
+                Ok(None) if Instant::now() >= deadline => break false,
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                _ => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    break false;
-                }
+                _ => break false,
             }
         };
+        // Drop the job/group before joining stdout so lingering grandchild helpers cannot block EOF.
+        drop(child);
         if !ok {
             return None;
         }
@@ -1600,6 +1792,31 @@ pub(crate) mod agy {
                  [ \"$1 $2 $3 $4 $5 $6\" = '-p /usage --output-format json --print-timeout 20s' ] || exit 5\n\
                  printf '%s' '{body}'\n",
             )
+        }
+
+        #[test]
+        fn failed_version_probe_is_retried_without_reinstalling_agy() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root =
+                std::env::temp_dir().join(format!("agy-version-retry-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let ready = root.join("ready");
+            let exe = write_fake_agy(
+                &root,
+                "agy",
+                &format!(
+                    "#!/bin/sh\n[ -f '{}' ] || exit 1\nprintf 'agy 1.1.11\\n'\n",
+                    ready.display()
+                ),
+            );
+            assert!(!probe_version_for_tests(&exe));
+            std::fs::write(&ready, b"ready").unwrap();
+            assert!(
+                probe_version_for_tests(&exe),
+                "a transient launch failure must not disable usage until the binary changes"
+            );
+            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1797,6 +2014,27 @@ fn agy_exe() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn credential_files_accept_windows_bom_encodings() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"fixture-bom-token"}}"#;
+        let mut utf8 = vec![0xef, 0xbb, 0xbf];
+        utf8.extend_from_slice(json.as_bytes());
+        let mut utf16le = vec![0xff, 0xfe];
+        let mut utf16be = vec![0xfe, 0xff];
+        for unit in json.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+            utf16be.extend_from_slice(&unit.to_be_bytes());
+        }
+        for (encoding, raw) in [("utf8", utf8), ("utf16le", utf16le), ("utf16be", utf16be)] {
+            let parsed = parse_credentials(ProviderKind::Claude, &raw);
+            assert_eq!(
+                parsed.map(|(token, _)| token.to_string()).as_deref(),
+                Some("fixture-bom-token"),
+                "{encoding}"
+            );
+        }
+    }
+
     /// 로그인 정보만 있는 기본 계정도 조회할 수 있다. HTTP 대신 로컬 fixture를 읽어
     /// 실제 OS curl 실행·stdin 설정 전달·응답 파싱을 네트워크 없이 검증한다.
     #[test]
@@ -1965,14 +2203,21 @@ mod tests {
         );
         assert!(parse_antigravity_auth(b"invalid").is_none());
         assert!(parse_antigravity_auth(b"go-keyring-encoded:7").is_none());
-        // go-keyring base64 풀기는 /usr/bin/base64에 맡긴다(Unix 전용 경로).
-        #[cfg(unix)]
-        {
-            let encoded = pipe_command("/usr/bin/base64", &[], raw).unwrap();
-            let mut wrapped = b"go-keyring-base64:".to_vec();
-            wrapped.extend_from_slice(&encoded);
-            assert!(parse_antigravity_auth(&wrapped).unwrap().logged_in);
-        }
+        let wrapped =
+            b"go-keyring-base64:eyJhdXRoX21ldGhvZCI6Im9hdXRoIiwidG9rZW4iOnsiYWNjZXNzX3Rva2VuIjoiZml4dHVyZS1vbmx5In19\n";
+        assert!(parse_antigravity_auth(wrapped).unwrap().logged_in);
+        let utf16_claude: Vec<u8> = br#"{"claudeAiOauth":{"accessToken":"utf16-token"}}"#
+            .iter()
+            .flat_map(|&b| [b, 0])
+            .collect();
+        assert_eq!(
+            parse_credentials(ProviderKind::Claude, &utf16_claude)
+                .unwrap()
+                .0
+                .as_str(),
+            "utf16-token"
+        );
+        #[cfg(target_os = "macos")]
         assert_eq!(
             claude_service(Some(Path::new("/tmp/é"))),
             claude_service(Some(Path::new("/tmp/e\u{301}")))
@@ -2144,10 +2389,52 @@ mod tests {
             offered(r#"{"juniper_tide":null}"#, r#"{"cedar_ember":null}"#),
             Some(None)
         );
+        assert_eq!(
+            offered(
+                "{}",
+                r#"{"cedar_ember":{"eligible":true,"grants":[{"id":"g","resets_left":1,"usable_now":true}]}}"#
+            ),
+            Some(Some(ClaudeResetProgram::Cedar))
+        );
+        assert_eq!(
+            claude_reset_count("fixture-only", |config| {
+                let body = if config.contains("at_wall") {
+                    "{}"
+                } else {
+                    r#"{"cedar_ember":{"eligible":true,"grants":[{"id":"g","resets_left":2,"usable_now":true}]}}"#
+                };
+                Some(Zeroizing::new(body.as_bytes().to_vec()))
+            }),
+            Some(2)
+        );
         assert!(
             claude_offered_program("fixture-only", |_| None).is_none(),
             "probe failure must not look like no offer"
         );
+    }
+
+    #[test]
+    fn reset_credit_probes_preserve_each_usable_grants_expiry() {
+        let (count, meters) = claude_reset_credits("fixture-only", |config| {
+            let body = if config.contains("at_wall") {
+                r#"{"juniper_tide":{"eligible":true,"arm":"reset","available":true}}"#
+            } else {
+                r#"{"cedar_ember":{"eligible":true,"grants":[
+                    {"resets_left":2,"usable_now":true,"ends_at":"2099-01-01T00:00:00Z"},
+                    {"resets_left":1,"usable_now":true,"expires_at":"2099-02-01T00:00:00Z"},
+                    {"resets_left":9,"usable_now":true,"ends_at":"2000-01-01T00:00:00Z"},
+                    {"resets_left":8,"usable_now":true,"paused":true}
+                ]}}"#
+            };
+            Some(Zeroizing::new(body.as_bytes().to_vec()))
+        })
+        .unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(meters.len(), 3);
+        assert_eq!(meters[0].value.as_deref(), Some("unknown"));
+        assert_eq!(meters[1].value.as_deref(), Some("4070908800"));
+        assert_eq!(meters[2].value.as_deref(), Some("4073587200"));
+        assert_ne!(meters[0].key, meters[1].key);
     }
 
     #[test]
@@ -2239,7 +2526,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// 429는 마지막 정상 값을 받은 시각 그대로 오래됨으로 남기고, 오류 행은 지워 파일 폴백으로 넘긴다.
+    /// 429는 마지막 정상 값은 오래됨으로 남기고, 정상 값이 없을 때는 제한 이유를 보존한다.
     #[test]
     fn rate_limit_keeps_last_good_usage_as_stale() {
         let key = (
@@ -2260,7 +2547,7 @@ mod tests {
         };
         let at = Instant::now();
         let mut cache = BTreeMap::from([(key.clone(), (at, good.clone()))]);
-        mark_rate_limited(&mut cache, &key);
+        mark_rate_limited(&mut cache, &key, Some(200));
         let (kept_at, kept) = &cache[&key];
         assert_eq!(*kept_at, at);
         assert!(kept.stale && kept.updated_at == Some(100) && kept.usage == good.usage);
@@ -2274,8 +2561,14 @@ mod tests {
                 },
             ),
         );
-        mark_rate_limited(&mut cache, &key);
-        assert!(cache.is_empty());
+        mark_rate_limited(&mut cache, &key, Some(200));
+        // 정상 값이 없으면 지어낸 값 없이 요청 제한 오류(조회 오류 표시)로 남는다.
+        let (_, limited) = &cache[&key];
+        assert!(limited.usage.is_empty() && limited.updated_at == Some(200));
+        assert_eq!(limited.error.as_deref(), Some("요청 제한"));
+        cache.clear();
+        mark_rate_limited(&mut cache, &key, None);
+        assert_eq!(cache[&key].1.error.as_deref(), Some("요청 제한"));
     }
 
     /// Orca 패리티: 방금 쓴 statusline 값이 있으면 자동 조회를 건너뛰고, 직접 조회 값보다 새롭거나

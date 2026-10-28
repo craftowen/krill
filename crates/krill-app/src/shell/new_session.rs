@@ -478,10 +478,13 @@ impl Shell {
                         sb_text::NAV_AUTOMATIONS.get(),
                     )
                     .debug_selector(|| "nav-automations".into())
-                    .when(self.automations_page_open(cx), |d| {
-                        d.bg(p.sidebar_accent)
-                            .text_color(p.sidebar_accent_foreground)
-                    })
+                    .when(
+                        self.automations.is_some() || self.automations_page_open(cx),
+                        |d| {
+                            d.bg(p.sidebar_accent)
+                                .text_color(p.sidebar_accent_foreground)
+                        },
+                    )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_automations_page(Some(window), cx);
                     }))
@@ -527,12 +530,12 @@ impl Shell {
                                             .items_center()
                                             .gap_1()
                                             .text_color(p.muted_foreground)
-                                            .child(
-                                                div()
-                                                    .size(krill_app::ui::STATE_DOT)
-                                                    .rounded_full()
-                                                    .bg(p.agent_question),
-                                            )
+                                            .child(krill_app::ui::status::status_glyph(
+                                                krill_proto::control::AgentState::Waiting,
+                                                false,
+                                                krill_app::ui::status::Size::Sm,
+                                                cx,
+                                            ))
                                             .child(
                                                 div()
                                                     .font_family(krill_app::ui::FONT_MONO)

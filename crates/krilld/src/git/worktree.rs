@@ -201,10 +201,14 @@ pub fn create_with_pool(
     }
     let given = Path::new(OsStr::from_bytes(&req.repo));
     // 넘겨받은 워크트리가 설정·include의 출처다. 경로는 비 UTF-8 바이트도 보존한다.
-    let top = output_path(
-        git(q, given, ["rev-parse", "--show-toplevel"])?,
-        "not a git repository",
-    )?;
+    let rev = git(q, given, ["rev-parse", "--show-toplevel"])?;
+    if !rev.status.success()
+        && given.is_dir()
+        && !given.ancestors().any(|a| a.join(".git").exists())
+    {
+        return create_folder_workspace(given, req, trust);
+    }
+    let top = output_path(rev, "not a git repository")?;
     let _transaction = transaction(q, &top)?;
     let config = compat::read_config_with_state(&top, trust.parent())?;
 
@@ -298,6 +302,52 @@ pub fn create_with_pool(
             base,
             copied,
             warnings,
+            setup: None,
+        },
+        setup,
+    })
+}
+
+/// 비-Git 폴더 프로젝트(`kind = "folder"`)에서 작업 공간·세션을 열 때 폴더 자체를 작업 경로로 반환한다.
+fn create_folder_workspace(
+    given: &Path,
+    req: &NewWorktree,
+    trust: &Path,
+) -> Result<Outcome, String> {
+    if let Some(b) = req.base.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Err(format!("base ref {b:?} requires a git repository"));
+    }
+    let top = fs::canonicalize(given).map_err(|e| format!("{}: {e}", given.display()))?;
+    let config = compat::read_config_with_state(&top, trust.parent())?;
+
+    if let (Some(archive), Setup::Approve(h)) = (config.worktree.archive.as_deref(), &req.setup)
+        && *h == digest(&top, archive)
+    {
+        remember(trust, h).map_err(|e| format!("cannot record setup trust: {e}"))?;
+    }
+
+    let setup = match (config.worktree.setup, &req.setup) {
+        (None, _) | (_, Setup::Skip) => None,
+        (Some(script), mode) => {
+            let hash = digest(&top, &script);
+            if matches!(mode, Setup::Approve(h) if *h == hash) {
+                remember(trust, &hash).map_err(|e| format!("cannot record setup trust: {e}"))?;
+            } else if !trusted(trust, &hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+                return Ok(Outcome::Untrusted { script, hash });
+            }
+            Some(script)
+        }
+    };
+
+    let branch = leaf(&req.name)?;
+    crate::agent::pre_trust_all_agents(&top);
+    Ok(Outcome::Created {
+        worktree: Worktree {
+            path: top.into_os_string().into_vec(),
+            branch,
+            base: String::new(),
+            copied: Vec::new(),
+            warnings: Vec::new(),
             setup: None,
         },
         setup,

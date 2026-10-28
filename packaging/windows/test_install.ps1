@@ -51,10 +51,23 @@ try {
     Assert (Test-Path (Join-Path $root 'offline/krill-app.exe')) 'Offline installation failed'
 
     $before = $state.Requests
-    try { Install (Join-Path $root 'downloaded'); throw 'Existing installation accepted' }
-    catch { Assert ($_.Exception.Message -match 'already exists') 'Wrong collision error' }
+    Set-Content -LiteralPath (Join-Path $root 'downloaded/user-data.txt') -Value 'preserve me'
+    Install (Join-Path $root 'downloaded')
+    Install (Join-Path $root 'downloaded') @{ Zip = (Join-Path $root 'does-not-exist.zip') }
+    Assert ((Get-Content (Join-Path $root 'downloaded/user-data.txt') -Raw).Trim() -eq 'preserve me') 'User files were modified'
     Assert ($state.Requests -eq $before) 'Existing install triggered network access'
     Assert ((Get-Content (Join-Path $root 'downloaded/krill.exe') -Raw).Trim() -eq 'fixture') 'Existing install was modified'
+
+    $partial = Join-Path $root 'partial'
+    New-Item -ItemType Directory $partial | Out-Null
+    Set-Content -LiteralPath (Join-Path $partial 'keep.txt') -Value 'preserve me'
+    $before = $state.Requests
+    $caught = $false
+    try { Install $partial }
+    catch { Assert ($_.Exception.Message -match 'not a complete Krill installation') 'Wrong partial-install error'; $caught = $true }
+    Assert $caught 'Partial install should require choosing another destination'
+    Assert ($state.Requests -eq $before) 'Partial install triggered network access'
+    Assert ((Get-Content (Join-Path $partial 'keep.txt') -Raw).Trim() -eq 'preserve me') 'Partial install was modified'
 
     $state.Checksum = ('0' * 64) + "  $name"
     Reject 'bad-hash' 'SHA-256 mismatch'

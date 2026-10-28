@@ -1,5 +1,7 @@
 //! MK-093: 워크트리 코멘트(`krill set --comment`) 조회와 외부 `.claude/worktrees` 감지·숨김 분류·표시.
 //! 선행 MK-046(`sidebar.rs`)에 대한 의존과 UI 표시 헬퍼는 이 모듈로 격리한다.
+//! UI/design adapted from Orca (src/main/repo-icon-file-detection.ts).
+//! Copyright (c) 2026 Lovecast Inc., MIT License; implemented here in Rust.
 
 use krill_proto::os::fs::DirBuilderExt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -462,14 +464,22 @@ const MAX_PROJECTS_BYTES: u64 = 512 * 1024;
 /// 보관(`archived`)된 동일 경로는 보관 해제하고 `Ok(true)`를 돌려준다.
 /// 파싱 실패·상한 초과 등에서는 폴더 열기를 막지 않도록 `Ok(false)`로 조용히 넘어간다.
 pub fn register_project(state_dir: &Path, path: &Path) -> io::Result<bool> {
+    let cleaned = path
+        .to_str()
+        .and_then(|s| {
+            krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !path.exists())
+        })
+        .map(PathBuf::from);
+    let path = cleaned.as_deref().unwrap_or(path);
     // linked 워크트리(⌘N으로 만든 탭 등)는 독립 프로젝트가 아니라 주 워크트리(저장소)로 등록한다.
     let main = main_worktree(path);
     let path = main.as_deref().unwrap_or(path);
     let normalized = normalize_project_path(path);
-    if normalized.is_empty() {
+    if normalized.is_empty() || !Path::new(&normalized).is_dir() {
         return Ok(false);
     }
     let file_path = state_dir.join(PROJECTS_FILE);
+    let _guard = krill_proto::config_document::lock_toml(&file_path)?;
     let mut raw = String::new();
     if let Ok(file) = fs::File::open(&file_path) {
         let mut bytes = Vec::new();
@@ -776,7 +786,178 @@ fn load_imported_projects(state_dir: &Path) -> Option<ImportedProjectsFile> {
         return None;
     }
     let text = std::str::from_utf8(&bytes).ok()?;
-    toml::from_str(text).ok()
+    let mut parsed: ImportedProjectsFile = toml::from_str(text).ok()?;
+    if sanitize_imported_projects(&mut parsed) {
+        repair_projects_file_on_disk(state_dir, text);
+    }
+    Some(parsed)
+}
+
+fn sanitize_imported_projects(file: &mut ImportedProjectsFile) -> bool {
+    let mut changed = false;
+    let mut cleaned_projects: Vec<ImportedProject> = Vec::with_capacity(file.projects.len());
+    for mut proj in std::mem::take(&mut file.projects) {
+        if proj.host_id.is_none() {
+            let clean_path = krill_proto::orchestration::clean_workspace_path_str(&proj.path);
+            if clean_path != proj.path.trim() {
+                changed = true;
+                if krill_proto::orchestration::strip_workspace_instance(&proj.display_name)
+                    .is_some()
+                {
+                    Path::new(&clean_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&clean_path)
+                        .clone_into(&mut proj.display_name);
+                }
+                proj.path = clean_path;
+            }
+            if cleaned_projects
+                .iter()
+                .any(|p| p.host_id.is_none() && same_project_path(&p.path, &proj.path))
+            {
+                changed = true;
+                continue;
+            }
+        }
+        cleaned_projects.push(proj);
+    }
+    file.projects = cleaned_projects;
+
+    let mut worktrees = BTreeMap::new();
+    for (k, v) in std::mem::take(&mut file.worktrees) {
+        let clean_k = krill_proto::orchestration::clean_workspace_path_str(&k);
+        if clean_k != k.trim() {
+            changed = true;
+        }
+        worktrees.entry(clean_k).or_insert(v);
+    }
+    file.worktrees = worktrees;
+
+    let mut lineage = BTreeMap::new();
+    for (k, mut v) in std::mem::take(&mut file.lineage) {
+        let clean_k = krill_proto::orchestration::clean_workspace_path_str(&k);
+        let clean_wt = krill_proto::orchestration::clean_workspace_path_str(&v.worktree_path);
+        if clean_k != k.trim() || clean_wt != v.worktree_path.trim() {
+            changed = true;
+        }
+        v.worktree_path = clean_wt;
+        lineage.entry(clean_k).or_insert(v);
+    }
+    file.lineage = lineage;
+    changed
+}
+
+fn repair_projects_file_on_disk(state_dir: &Path, raw: &str) {
+    let path = state_dir.join(PROJECTS_FILE);
+    let Ok(_guard) = krill_proto::config_document::lock_toml(&path) else {
+        return;
+    };
+    // The snapshot was read before taking the lock. A newer edit must win.
+    if !fs::read_to_string(&path).is_ok_and(|current| current == raw) {
+        return;
+    }
+    let Ok(mut doc) = toml::from_str::<toml::Value>(raw) else {
+        return;
+    };
+    let Some(root) = doc.as_table_mut() else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(toml::Value::Array(projects)) = root.get_mut("projects") {
+        let mut kept: Vec<toml::Value> = Vec::with_capacity(projects.len());
+        let mut canonical_id_by_path: Vec<(String, String)> = Vec::new();
+        for item in projects.iter() {
+            let Some(tbl) = item.as_table() else {
+                continue;
+            };
+            if tbl.get("host_id").is_some() {
+                continue;
+            }
+            let p = tbl.get("path").and_then(toml::Value::as_str).unwrap_or("");
+            let id = tbl.get("id").and_then(toml::Value::as_str).unwrap_or("");
+            if krill_proto::orchestration::strip_workspace_instance(p).is_none()
+                && !p.trim().is_empty()
+                && !id.trim().is_empty()
+            {
+                canonical_id_by_path.push((p.trim().to_owned(), id.trim().to_owned()));
+            }
+        }
+        for mut item in std::mem::take(projects) {
+            let Some(tbl) = item.as_table_mut() else {
+                kept.push(item);
+                continue;
+            };
+            if tbl.get("host_id").is_some() {
+                kept.push(item);
+                continue;
+            }
+            let p = tbl
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let clean_p = krill_proto::orchestration::clean_workspace_path_str(&p);
+            if clean_p != p.trim() {
+                changed = true;
+                if canonical_id_by_path
+                    .iter()
+                    .any(|(cp, _)| same_project_path(cp, &clean_p))
+                    || kept.iter().any(|existing| {
+                        existing
+                            .as_table()
+                            .and_then(|t| t.get("path"))
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(|ep| same_project_path(ep, &clean_p))
+                    })
+                {
+                    continue;
+                }
+                tbl.insert("path".to_owned(), toml::Value::String(clean_p.clone()));
+                if let Some(dn) = tbl.get("display_name").and_then(toml::Value::as_str)
+                    && krill_proto::orchestration::strip_workspace_instance(dn).is_some()
+                {
+                    let base = Path::new(&clean_p)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&clean_p)
+                        .to_owned();
+                    tbl.insert("display_name".to_owned(), toml::Value::String(base));
+                }
+            }
+            kept.push(item);
+        }
+        *projects = kept;
+    }
+    for table_name in ["worktrees", "lineage"] {
+        if let Some(toml::Value::Table(tbl)) = root.get_mut(table_name) {
+            let mut next = toml::map::Map::new();
+            for (k, mut v) in std::mem::take(tbl) {
+                let clean_k = krill_proto::orchestration::clean_workspace_path_str(&k);
+                if clean_k != k.trim() {
+                    changed = true;
+                }
+                if table_name == "lineage"
+                    && let Some(vt) = v.as_table_mut()
+                    && let Some(wp) = vt
+                        .get("worktree_path")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned)
+                {
+                    let clean_wp = krill_proto::orchestration::clean_workspace_path_str(&wp);
+                    if clean_wp != wp.trim() {
+                        changed = true;
+                        vt.insert("worktree_path".to_owned(), toml::Value::String(clean_wp));
+                    }
+                }
+                next.entry(clean_k).or_insert(v);
+            }
+            *tbl = next;
+        }
+    }
+    if changed {
+        write_projects_file(&state_dir.join(PROJECTS_FILE), &doc).ok();
+    }
 }
 
 fn resolve_repo_for_worktree(
@@ -812,6 +993,13 @@ fn resolve_repo_for_worktree(
 /// 사이드바에서 하나의 저장소로 합쳐지도록 읽는 쪽에서도 정규화한다.
 /// 별칭 후보가 아니면 시스템 콜 없이 그대로 둔다(스냅샷 폴링 부하 방지).
 fn normalize_imported_path(path: &Path) -> PathBuf {
+    let cleaned = path
+        .to_str()
+        .and_then(|s| {
+            krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !path.exists())
+        })
+        .map(PathBuf::from);
+    let path = cleaned.as_deref().unwrap_or(path);
     if !["/tmp", "/var", "/etc", "/private"]
         .iter()
         .any(|prefix| path.starts_with(prefix))
@@ -834,6 +1022,13 @@ fn normalize_imported_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// 로컬 원본 저장소(`repo`)가 실제로 존재할 때 삭제된 하위 워크트리(`wt_path != repo`)는 유령 행으로 넣지 않는다.
+fn is_missing_local_worktree(repo: &Path, wt_path: &Path) -> bool {
+    repo != wt_path
+        && repo.is_dir()
+        && fs::metadata(wt_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+}
+
 /// `<state_dir>/projects.toml`(Orca 이관 프로젝트·워크트리·계보)을 사이드바 스냅샷 트리와 브랜치 메타에 병합한다.
 pub fn include_imported_projects(
     state_dir: &Path,
@@ -851,6 +1046,9 @@ pub fn include_imported_projects(
         // v0.1.8이 linked 워크트리를 프로젝트로 등록했다. 주 저장소 그룹 안에 넣어 중복 그룹을 막는다.
         let key =
             main_worktree(&repo).map_or_else(|| repo.clone(), |m| normalize_imported_path(&m));
+        if is_missing_local_worktree(&key, &repo) {
+            continue;
+        }
         let list = trees.entry(key).or_default();
         if !list.contains(&repo) {
             list.push(repo);
@@ -862,6 +1060,9 @@ pub fn include_imported_projects(
         }
         let wt_path = normalize_imported_path(Path::new(wt_key.trim()));
         let repo = resolve_repo_for_worktree(&file.projects, wt.repo_id.as_deref(), &wt_path);
+        if is_missing_local_worktree(&repo, &wt_path) {
+            continue;
+        }
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
             list.push(wt_path);
@@ -878,6 +1079,9 @@ pub fn include_imported_projects(
         }
         let wt_path = normalize_imported_path(Path::new(wt_str));
         let repo = resolve_repo_for_worktree(&file.projects, lin.repo_id.as_deref(), &wt_path);
+        if is_missing_local_worktree(&repo, &wt_path) {
+            continue;
+        }
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
             list.push(wt_path.clone());
@@ -891,11 +1095,19 @@ pub fn include_imported_projects(
             }
         }
     }
+    for wt_path in trees.values().flatten() {
+        if let Some(live) = super::ipc::branch(wt_path) {
+            meta.entry(wt_path.clone()).or_default().branch = Some(live);
+        }
+    }
 }
 
 /// `<state_dir>/projects.toml`에서 지정한 저장소·폴더 프로젝트와 소속 워크트리·계보 항목을 제거한다(OWE-845).
 pub fn remove_imported_project(state_dir: &Path, project_path: &Path) {
     let path = state_dir.join(PROJECTS_FILE);
+    let Ok(_guard) = krill_proto::config_document::lock_toml(&path) else {
+        return;
+    };
     let mut bytes = Vec::new();
     let Ok(file) = fs::File::open(&path) else {
         return;
@@ -990,11 +1202,24 @@ pub fn remove_imported_project(state_dir: &Path, project_path: &Path) {
     fs::rename(&tmp, &path).ok();
 }
 
-/// `<state_dir>/projects.toml`의 표시 이름·고정 여부·코멘트·이슈·상태를
-/// 사이드바 인메모리 상태에 반영한다. 계보(부모 워크트리)는 이관기가 `WorktreeStore`(단일 원천)에 기록한다.
-///
-/// `pinned`와 `display_name`은 `prefs`에 해당 경로 엔트리가 아직 없을 때(`Entry::Vacant`)만
-/// 초기값으로 주입해, 이미 사용자가 수정한 `sidebar.bin` 설정(핀 해제·이름 초기화)을 덮어쓰지 않는다(`OWE-767`).
+/// Resolve occupied aliases before inserting imported defaults.
+pub(super) fn imported_entry<'a, T>(
+    map: &'a mut BTreeMap<PathBuf, T>,
+    path: &Path,
+) -> std::collections::btree_map::Entry<'a, PathBuf, T> {
+    let key = if map.contains_key(path) {
+        path.to_path_buf()
+    } else {
+        map.keys()
+            .find(|key| krill_proto::path::equivalent(key, path))
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    map.entry(key)
+}
+
+/// `<state_dir>/projects.toml` 표시 설정을 읽는다. 동등한 경로의 설정이 있으면
+/// 사용자가 해제한 핀·비운 이름도 그대로 보존한다(`OWE-767`).
 pub(super) fn apply_imported_project_prefs(
     state_dir: &Path,
     prefs: &mut super::Preferences,
@@ -1012,7 +1237,7 @@ pub(super) fn apply_imported_project_prefs(
         let repo = normalize_imported_path(Path::new(proj.path.trim()));
         let dn = proj.display_name.trim();
         if (!dn.is_empty() || proj.pinned)
-            && let std::collections::btree_map::Entry::Vacant(vacant) = prefs.entry(repo)
+            && let std::collections::btree_map::Entry::Vacant(vacant) = imported_entry(prefs, &repo)
         {
             vacant.insert(super::Preference {
                 pinned: proj.pinned,
@@ -1031,7 +1256,8 @@ pub(super) fn apply_imported_project_prefs(
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if (dn.is_some() || wt.pinned)
-            && let std::collections::btree_map::Entry::Vacant(vacant) = prefs.entry(wt_path.clone())
+            && let std::collections::btree_map::Entry::Vacant(vacant) =
+                imported_entry(prefs, &wt_path)
         {
             vacant.insert(super::Preference {
                 pinned: wt.pinned,
@@ -1041,20 +1267,18 @@ pub(super) fn apply_imported_project_prefs(
         if let Some(ref c) = wt.comment {
             let clean = sanitize(c);
             if !clean.is_empty() {
-                comments.entry(wt_path.clone()).or_insert(clean);
+                imported_entry(comments, &wt_path).or_insert(clean);
             }
         }
         if let Some(ref iss) = wt.issue
             && !iss.trim().is_empty()
         {
-            issues
-                .entry(wt_path.clone())
-                .or_insert_with(|| iss.trim().to_owned());
+            imported_entry(issues, &wt_path).or_insert_with(|| iss.trim().to_owned());
         }
         if let Some(ref st_str) = wt.workspace_status
             && let Ok(st) = krill_proto::orchestration::WorkspaceStatus::parse(st_str)
         {
-            statuses.entry(wt_path).or_insert(st);
+            imported_entry(statuses, &wt_path).or_insert(st);
         }
     }
 }
@@ -1071,21 +1295,47 @@ const REPO_ICON_DIR: &str = "repo-icons";
 const MAX_ICON_SOURCE_BYTES: u64 = 64 * 1024;
 const MAX_ICON_IMAGE_BYTES: usize = 256 * 1024;
 
-/// Orca `REPO_ICON_FILE_STEMS`(`.ref/orca/src/main/repo-icon-file-detection.ts`)와 같은 탐색 우선순위.
+/// Orca `REPO_ICON_FILE_STEMS`(`.ref/orca/src/main/repo-icon-file-detection.ts`) 및
+/// 모노레포(`apps/web`, `packages/web`)·표준 파비콘 하위 폴더를 포함한 탐색 우선순위.
+/// 앞 16개 스템(× 4 확장자 = 64개)은 원격 `ProbePaths` 첫 배치(`MAX_PROBE_PATHS`)에서 한 번에 조회된다.
 const REPO_ICON_FILE_STEMS: &[&str] = &[
     "favicon",
     "public/favicon",
+    "public/apple-touch-icon",
+    "public/favicon/favicon",
+    "public/favicon/apple-touch-icon",
+    "public/icons/icon-192x192",
     "app/favicon",
     "app/icon",
     "src/favicon",
     "src/app/icon",
-    "assets/favicon",
-    "assets/icon",
-    "static/favicon",
     "logo",
     "public/logo",
     "public/icon",
     "src-tauri/icons/icon",
+    "apps/web/public/favicon",
+    "apps/web/public/icon-192",
+    "apps/web/public/apple-touch-icon",
+    "apps/web/public/favicon-192",
+    "apps/web/public/icon",
+    "apps/web/public/logo",
+    "apps/web/app/favicon",
+    "apps/web/app/icon",
+    "apps/web/src/app/favicon",
+    "apps/web/src/app/icon",
+    "packages/web/public/favicon",
+    "packages/web/public/icon",
+    "packages/web/public/logo",
+    "public/icons/apple-touch-icon",
+    "app/apple-icon",
+    "src/app/favicon",
+    "src/app/apple-icon",
+    "assets/favicon",
+    "assets/icon",
+    "assets/logo",
+    "static/favicon",
+    "static/logo",
+    "public/icons",
     "app-icon",
     "icon",
     "packaging/macos/favicon",
@@ -1093,7 +1343,7 @@ const REPO_ICON_FILE_STEMS: &[&str] = &[
     "packaging/favicon",
 ];
 
-const REPO_ICON_RASTER_EXTS: &[&str] = &["png", "webp", "ico"];
+const REPO_ICON_RASTER_EXTS: &[&str] = &["png", "webp", "ico", "svg"];
 
 /// Orca `REPO_ICON_SOURCE_FILE_CANDIDATES`(`.ref/orca/src/main/repo-icon-file-detection.ts`).
 const REPO_ICON_SOURCE_FILES: &[&str] = &[
@@ -1104,6 +1354,10 @@ const REPO_ICON_SOURCE_FILES: &[&str] = &[
     "app/root.tsx",
     "src/root.tsx",
     "src/index.html",
+    "apps/web/index.html",
+    "apps/web/public/index.html",
+    "apps/web/app/root.tsx",
+    "apps/web/src/index.html",
 ];
 
 const RESERVED_GITHUB_PATHS: &[&str] = &[
@@ -1154,7 +1408,78 @@ const ICON_RETRY_AFTER_NETWORK_ERROR: std::time::Duration = std::time::Duration:
 #[cfg(not(test))]
 const ICON_RETRY_AFTER_INVALID_IMAGE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// PNG·JPEG·WebP·ICO 헤더인지 확인한다. 실제 이미지 디코딩은 gpui가 담당한다(내용으로 형식을 고르므로
+fn is_valid_svg_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 6 || bytes.contains(&0) {
+        return false;
+    }
+    let Some(prefix) = bytes.get(..bytes.len().min(4096)) else {
+        return false;
+    };
+    let s = match std::str::from_utf8(prefix) {
+        Ok(s) => s,
+        Err(e) if e.valid_up_to() > 0 => {
+            let Some(valid) = prefix.get(..e.valid_up_to()) else {
+                return false;
+            };
+            let Ok(s) = std::str::from_utf8(valid) else {
+                return false;
+            };
+            s
+        }
+        Err(_) => return false,
+    };
+    let mut rest = s.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        if let Some(after_xml) = rest.strip_prefix("<?") {
+            let Some(end) = after_xml.find("?>") else {
+                return false;
+            };
+            let Some(next) = after_xml.get(end + 2..) else {
+                return false;
+            };
+            rest = next.trim_start();
+        } else if let Some(after_comment) = rest.strip_prefix("<!--") {
+            let Some(end) = after_comment.find("-->") else {
+                return false;
+            };
+            let Some(next) = after_comment.get(end + 3..) else {
+                return false;
+            };
+            rest = next.trim_start();
+        } else if rest
+            .get(..9)
+            .is_some_and(|head| head.eq_ignore_ascii_case("<!doctype"))
+        {
+            let Some(after_dt_raw) = rest.get(9..) else {
+                return false;
+            };
+            let after_dt = after_dt_raw.trim_start();
+            if !after_dt
+                .get(..3)
+                .is_some_and(|dt| dt.eq_ignore_ascii_case("svg"))
+            {
+                return false;
+            }
+            let Some(end) = after_dt.find('>') else {
+                return false;
+            };
+            let Some(next) = after_dt.get(end + 1..) else {
+                return false;
+            };
+            rest = next.trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.get(..4)
+        .is_some_and(|tag| tag.eq_ignore_ascii_case("<svg"))
+        && rest
+            .as_bytes()
+            .get(4)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/')
+}
+
+/// PNG·JPEG·WebP·ICO·SVG 헤더인지 확인한다. 실제 이미지 디코딩은 gpui가 담당한다(내용으로 형식을 고르므로
 /// 캐시 파일 확장자가 `.png`여도 된다). GitHub 아바타(`github.com/<owner>.png`)는 실제로 JPEG를 돌려준다.
 #[must_use]
 pub fn has_valid_icon_bytes(bytes: &[u8]) -> bool {
@@ -1169,7 +1494,7 @@ pub fn has_valid_icon_bytes(bytes: &[u8]) -> bool {
             .get(4)
             .zip(bytes.get(5))
             .is_some_and(|(&lo, &hi)| u16::from_le_bytes([lo, hi]) > 0);
-    is_png || is_jpeg || is_webp || is_ico
+    is_png || is_jpeg || is_webp || is_ico || is_valid_svg_bytes(bytes)
 }
 
 fn has_valid_icon_magic(path: &Path) -> bool {
@@ -1179,10 +1504,10 @@ fn has_valid_icon_magic(path: &Path) -> bool {
     let Ok(meta) = file.metadata() else {
         return false;
     };
-    if !meta.is_file() || meta.len() < 8 || meta.len() > (MAX_ICON_IMAGE_BYTES as u64) * 8 {
+    if !meta.is_file() || meta.len() < 6 || meta.len() > (MAX_ICON_IMAGE_BYTES as u64) * 8 {
         return false;
     }
-    let mut header = [0u8; 12];
+    let mut header = [0u8; 4096];
     let Ok(n) = file.read(&mut header) else {
         return false;
     };
@@ -1277,11 +1602,13 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `data:image/(png|webp);base64,...` 데이터 URL을 `<cache_dir>`에 디코드·저장하고 경로를 돌려준다.
+/// `data:image/(png|webp|svg+xml);base64,...` 데이터 URL을 `<cache_dir>`에 디코드·저장하고 경로를 돌려준다.
 pub fn cache_data_url_icon(data_url: &str, cache_dir: &Path) -> Option<PathBuf> {
     let trimmed = data_url.trim();
     let (ext, b64) = if let Some(rest) = trimmed.strip_prefix("data:image/png;base64,") {
         ("png", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("data:image/svg+xml;base64,") {
+        ("svg", rest)
     } else {
         let rest = trimmed.strip_prefix("data:image/webp;base64,")?;
         ("webp", rest)
@@ -1419,11 +1746,16 @@ fn resolve_local_icon_href(
     let canon_repo = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
     let mut candidates = Vec::new();
     if let Some(stripped) = href.strip_prefix('/') {
+        if let Some(parent) = source_file.parent() {
+            candidates.push(parent.join("public").join(stripped));
+            candidates.push(parent.join(stripped));
+        }
         candidates.push(repo_path.join("public").join(stripped));
         candidates.push(repo_path.join(stripped));
     } else {
         if let Some(parent) = source_file.parent() {
             candidates.push(parent.join(href));
+            candidates.push(parent.join("public").join(href));
         }
         candidates.push(repo_path.join("public").join(href));
         candidates.push(repo_path.join(href));
@@ -1971,7 +2303,281 @@ pub(super) fn resolve_project_visuals(
     out
 }
 
-/// 원격 호스트의 저장소 목록에 대해 원격 `.git/config`의 GitHub 소유자 아바타를 조회해 로컬 캐시 아이콘으로 변환한다.
+fn cache_remote_repo_icon_file(
+    repo: &Path,
+    remote_file: &Path,
+    bytes: &[u8],
+    cache_dir: &Path,
+) -> Option<PathBuf> {
+    if !has_valid_icon_bytes(bytes) || bytes.len() > MAX_ICON_IMAGE_BYTES {
+        return None;
+    }
+    let ext = if is_valid_svg_bytes(bytes) {
+        "svg"
+    } else {
+        remote_file
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|e| {
+                REPO_ICON_RASTER_EXTS
+                    .iter()
+                    .copied()
+                    .find(|cand| *cand != "svg" && e.eq_ignore_ascii_case(cand))
+            })
+            .unwrap_or("png")
+    };
+    let hash_input = format!(
+        "{}::{}",
+        repo.to_string_lossy(),
+        remote_file.to_string_lossy()
+    );
+    let target = cache_dir.join(format!("remote-{}.{ext}", short_sha256_hex(&hash_input)));
+    write_cached_icon_bytes(&target, bytes).ok()?;
+    Some(target)
+}
+
+fn fetch_remote_icon_sync(url: &str, cache_dir: &Path) -> Option<crate::ui::icons::ProjectIcon> {
+    let target = cached_icon_path_for_url(cache_dir, url);
+    if has_valid_icon_magic(&target) {
+        return Some(crate::ui::icons::ProjectIcon::Image(target));
+    }
+    #[cfg(not(test))]
+    {
+        let clean_url = url.trim().to_owned();
+        let recently_failed = FAILED_ICON_URLS.lock().is_ok_and(|mut failed| {
+            let now = std::time::Instant::now();
+            failed.retain(|_, retry_at| *retry_at > now);
+            failed.contains_key(&clean_url)
+        });
+        if !recently_failed {
+            let out = std::process::Command::new("/usr/bin/curl")
+                .args([
+                    "-fsSL",
+                    "--max-time",
+                    "5",
+                    "--max-filesize",
+                    "262144",
+                    &clean_url,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    if write_cached_icon_bytes(&target, &out.stdout).is_ok() {
+                        return Some(crate::ui::icons::ProjectIcon::Image(target));
+                    }
+                    if let Ok(mut failed) = FAILED_ICON_URLS.lock() {
+                        failed.insert(
+                            clean_url,
+                            std::time::Instant::now() + ICON_RETRY_AFTER_INVALID_IMAGE,
+                        );
+                    }
+                }
+                _ => {
+                    if let Ok(mut failed) = FAILED_ICON_URLS.lock() {
+                        failed.insert(
+                            clean_url,
+                            std::time::Instant::now() + ICON_RETRY_AFTER_NETWORK_ERROR,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn remote_icon_href_candidates(rel_source: &str, raw_href: &str) -> Vec<String> {
+    let Some(href) = raw_href
+        .trim()
+        .split('#')
+        .next()
+        .and_then(|s| s.split('?').next())
+        .map(str::trim)
+    else {
+        return Vec::new();
+    };
+    if href.is_empty()
+        || href.starts_with("http://")
+        || href.starts_with("https://")
+        || href.starts_with("data:")
+        || href.starts_with("//")
+        || href.contains("..")
+    {
+        return Vec::new();
+    }
+    let ext_ok = Path::new(href)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            REPO_ICON_RASTER_EXTS
+                .iter()
+                .any(|ext| e.eq_ignore_ascii_case(ext))
+        });
+    if !ext_ok {
+        return Vec::new();
+    }
+    let parent_prefix = Path::new(rel_source)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    let mut push_unique = |cand: String| {
+        if !cand.is_empty() && !out.contains(&cand) {
+            out.push(cand);
+        }
+    };
+    if let Some(stripped) = href.strip_prefix('/') {
+        if let Some(prefix) = parent_prefix {
+            push_unique(format!("{prefix}/public/{stripped}"));
+            push_unique(format!("{prefix}/{stripped}"));
+        }
+        push_unique(format!("public/{stripped}"));
+        push_unique(stripped.to_owned());
+    } else {
+        if let Some(prefix) = parent_prefix {
+            push_unique(format!("{prefix}/{href}"));
+            push_unique(format!("{prefix}/public/{href}"));
+        }
+        push_unique(format!("public/{href}"));
+        push_unique(href.to_owned());
+    }
+    out
+}
+
+/// 원격 저장소 하나에 대해 로컬 탐지(`probe_project_icon_source`)와 같은 우선순위
+/// (파비콘·로고 파일 → HTML `<link rel="icon">` → `package.json`/`Cargo.toml` homepage → GitHub 아바타)로
+/// 아이콘을 조회해 로컬 캐시 아이콘으로 돌려준다.
+pub(super) fn probe_single_remote_repo_icon<S>(
+    repo: &Path,
+    cache_dir: &Path,
+    state: &mut S,
+    mut probe_paths: impl FnMut(&mut S, &Path, &[String]) -> Option<Vec<Option<PathBuf>>>,
+    mut read_file: impl FnMut(&mut S, &Path, usize) -> Option<Vec<u8>>,
+) -> Option<crate::ui::icons::ProjectIcon> {
+    let max_source_bytes = usize::try_from(MAX_ICON_SOURCE_BYTES).unwrap_or(usize::MAX);
+    let mut stem_candidates =
+        Vec::with_capacity(REPO_ICON_FILE_STEMS.len() * REPO_ICON_RASTER_EXTS.len());
+    for stem in REPO_ICON_FILE_STEMS {
+        for ext in REPO_ICON_RASTER_EXTS {
+            stem_candidates.push(format!("{stem}.{ext}"));
+        }
+    }
+    for chunk in stem_candidates.chunks(krill_proto::remote_fs::MAX_PROBE_PATHS) {
+        let probed = probe_paths(state, repo, chunk)?;
+        for found in probed.into_iter().flatten() {
+            if let Some(bytes) = read_file(state, &found, MAX_ICON_IMAGE_BYTES)
+                && let Some(target) = cache_remote_repo_icon_file(repo, &found, &bytes, cache_dir)
+            {
+                return Some(crate::ui::icons::ProjectIcon::Image(target));
+            }
+        }
+    }
+
+    let mut meta_candidates: Vec<String> = REPO_ICON_SOURCE_FILES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    meta_candidates.push("package.json".to_owned());
+    meta_candidates.push("Cargo.toml".to_owned());
+    meta_candidates.push(".git/config".to_owned());
+    let meta_probed = probe_paths(state, repo, &meta_candidates)?;
+
+    for (idx, rel_source) in REPO_ICON_SOURCE_FILES.iter().enumerate() {
+        let Some(Some(source_path)) = meta_probed.get(idx) else {
+            continue;
+        };
+        let Some(bytes) = read_file(state, source_path, max_source_bytes) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let mut href_cands = Vec::new();
+        for href in extract_icon_link_hrefs(text) {
+            for cand in remote_icon_href_candidates(rel_source, &href) {
+                if !href_cands.contains(&cand)
+                    && href_cands.len() < krill_proto::remote_fs::MAX_PROBE_PATHS
+                {
+                    href_cands.push(cand);
+                }
+            }
+        }
+        if href_cands.is_empty() {
+            continue;
+        }
+        if let Some(probed_hrefs) = probe_paths(state, repo, &href_cands) {
+            for found in probed_hrefs.into_iter().flatten() {
+                if let Some(icon_bytes) = read_file(state, &found, MAX_ICON_IMAGE_BYTES)
+                    && let Some(target) =
+                        cache_remote_repo_icon_file(repo, &found, &icon_bytes, cache_dir)
+                {
+                    return Some(crate::ui::icons::ProjectIcon::Image(target));
+                }
+            }
+        }
+    }
+
+    let pkg_idx = REPO_ICON_SOURCE_FILES.len();
+    if let Some(Some(pkg_path)) = meta_probed.get(pkg_idx)
+        && let Some(bytes) = read_file(state, pkg_path, max_source_bytes)
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(homepage) = val.get("homepage").and_then(serde_json::Value::as_str)
+        && let Some(url) = favicon_url_from_website(homepage)
+        && let Some(icon) = fetch_remote_icon_sync(&url, cache_dir)
+    {
+        return Some(icon);
+    }
+
+    if let Some(Some(cargo_path)) = meta_probed.get(pkg_idx + 1)
+        && let Some(bytes) = read_file(state, cargo_path, max_source_bytes)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && let Ok(manifest) = toml::from_str::<toml::Value>(text)
+    {
+        let homepage = manifest
+            .get("package")
+            .and_then(|p| p.get("homepage"))
+            .and_then(toml::Value::as_str)
+            .or_else(|| {
+                manifest
+                    .get("workspace")?
+                    .get("package")?
+                    .get("homepage")?
+                    .as_str()
+            });
+        if let Some(raw_url) = homepage
+            && let Some(url) = favicon_url_from_website(raw_url)
+            && let Some(icon) = fetch_remote_icon_sync(&url, cache_dir)
+        {
+            return Some(icon);
+        }
+    }
+
+    if let Some(Some(git_cfg_path)) = meta_probed.get(pkg_idx + 2)
+        && let Some(bytes) = read_file(state, git_cfg_path, max_source_bytes)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+    {
+        let (origin, upstream) = parse_git_config_remotes(text);
+        for remote_url in [upstream.as_deref(), origin.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(slug) = github_avatar_slug(remote_url) {
+                let avatar_url = format!("https://github.com/{slug}.png?size=64");
+                if let Some(icon) = fetch_remote_icon_sync(&avatar_url, cache_dir) {
+                    return Some(icon);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// 원격 호스트의 저장소 목록에 대해 파비콘·로고 파일을 최우선으로 조회하고, 없을 때만
+/// `package.json`/`Cargo.toml` homepage 파비콘 → `.git/config` GitHub 소유자 아바타 순으로 폴백한다.
 pub(super) fn probe_remote_project_visuals(
     target: &crate::hosts::HostTarget,
     state_dir: Option<&Path>,
@@ -1985,11 +2591,13 @@ pub(super) fn probe_remote_project_visuals(
     #[cfg(not(test))]
     {
         use krill_proto::control::{
-            CaptureFormat, Create, FEAT_CLI, FEAT_CONTROL, Program, Reply, Request,
+            CaptureFormat, Create, FEAT_CLI, FEAT_CONTROL, FEAT_REMOTE_FS, Program, Reply, Request,
         };
         use krill_proto::ipc::{self, ClientRole};
-        use krill_proto::os::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
+        use krill_proto::remote_fs::{RemoteFsReply, RemoteFsRequest};
         use krill_proto::screen::Msg as _;
+        use std::ffi::OsString;
         use std::io::Write as _;
         use std::time::Duration;
 
@@ -2002,17 +2610,72 @@ pub(super) fn probe_remote_project_visuals(
         else {
             return BTreeMap::new();
         };
-        let required = FEAT_CONTROL | FEAT_CLI;
         let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-remote-icons");
         let Ok(conn) = target.connect(&hello) else {
             return BTreeMap::new();
         };
-        if conn.negotiated.features & required != required {
-            return BTreeMap::new();
-        }
+        let features = conn.negotiated.features;
         let mut stream = conn.stream;
         stream.set_read_timeout(Some(Duration::from_secs(4))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
+
+        if features & (FEAT_CONTROL | FEAT_REMOTE_FS) == (FEAT_CONTROL | FEAT_REMOTE_FS) {
+            let mut out = BTreeMap::new();
+            for repo in repos.iter().take(64) {
+                let icon = probe_single_remote_repo_icon(
+                    repo,
+                    &cache_dir,
+                    &mut stream,
+                    |sock, cwd, candidates| {
+                        let req = Request::RemoteFs(RemoteFsRequest::ProbePaths {
+                            cwd: Some(cwd.as_os_str().as_bytes().to_vec()),
+                            paths: candidates.iter().map(|c| c.as_bytes().to_vec()).collect(),
+                        });
+                        sock.write_all(&req.encode().ok()?).ok()?;
+                        let (kind, body) = ipc::read_frame(sock).ok()??;
+                        match Reply::decode(kind, &body).ok()? {
+                            Reply::RemoteFs(RemoteFsReply::ProbedPaths(list)) => Some(
+                                list.into_iter()
+                                    .map(|opt| opt.map(|b| PathBuf::from(OsString::from_vec(b))))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        }
+                    },
+                    |sock, path, max_bytes| {
+                        let req = Request::RemoteFs(RemoteFsRequest::ReadFile {
+                            path: path.as_os_str().as_bytes().to_vec(),
+                            offset: 0,
+                            max_bytes: u32::try_from(max_bytes).unwrap_or(u32::MAX),
+                        });
+                        sock.write_all(&req.encode().ok()?).ok()?;
+                        let (kind, body) = ipc::read_frame(sock).ok()??;
+                        match Reply::decode(kind, &body).ok()? {
+                            Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(chunk))) => {
+                                Some(chunk.bytes)
+                            }
+                            _ => None,
+                        }
+                    },
+                );
+                if let Some(icon) = icon {
+                    out.insert(
+                        repo.clone(),
+                        ProjectVisualMeta {
+                            display_name: None,
+                            badge_color: None,
+                            icon: Some(icon),
+                        },
+                    );
+                }
+            }
+            return out;
+        }
+
+        let required = FEAT_CONTROL | FEAT_CLI;
+        if features & required != required {
+            return BTreeMap::new();
+        }
 
         let script = b"for r in \"$@\"; do \
             u=$(git -C \"$r\" config --get remote.upstream.url 2>/dev/null || git -C \"$r\" config --get remote.origin.url 2>/dev/null); \
@@ -2674,6 +3337,66 @@ parent_worktree_path = "/Users/test/repo"
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(test)]
+#[test]
+fn windows_imported_alias_does_not_revive_cleared_user_preferences() {
+    let dir = std::env::temp_dir().join(format!("krill-imported-alias-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(PROJECTS_FILE),
+        r#"
+[[projects]]
+id = "repo"
+path = '\\?\C:\Work'
+display_name = "Imported Repo"
+pinned = true
+
+[worktrees.'\\?\C:\Work\간단작업']
+repo_id = "repo"
+display_name = "Imported Worktree"
+pinned = true
+comment = "Imported comment"
+issue = "OLD-1"
+workspace_status = "completed"
+"#,
+    )
+    .unwrap();
+    let repo = PathBuf::from("c:/work");
+    let tree = PathBuf::from("c:/work/간단작업");
+    // After reconciliation the user clears the imported name and pin. A later
+    // disk refresh must recognize these occupied entries despite their spelling.
+    let mut prefs = BTreeMap::from([
+        (repo, super::Preference::default()),
+        (tree.clone(), super::Preference::default()),
+    ]);
+    let mut comments = BTreeMap::from([(tree.clone(), "My comment".into())]);
+    let mut issues = BTreeMap::from([(tree.clone(), "NEW-2".into())]);
+    let mut statuses = BTreeMap::from([(
+        tree,
+        krill_proto::orchestration::WorkspaceStatus::InProgress,
+    )]);
+    for _ in 0..2 {
+        apply_imported_project_prefs(&dir, &mut prefs, &mut comments, &mut issues, &mut statuses);
+        assert_eq!(prefs.len(), 2);
+        assert!(
+            prefs
+                .values()
+                .all(|pref| !pref.pinned && pref.name.is_empty())
+        );
+        assert_eq!(
+            comments.values().collect::<Vec<_>>(),
+            [&"My comment".to_owned()]
+        );
+        assert_eq!(issues.values().collect::<Vec<_>>(), [&"NEW-2".to_owned()]);
+        assert_eq!(
+            statuses.values().copied().collect::<Vec<_>>(),
+            [krill_proto::orchestration::WorkspaceStatus::InProgress]
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// OWE-803: 과거 이관분(`[[projects]]` 원본 경로 vs `[worktrees]` 정규 경로)이 섞여도
 /// 사이드바 트리는 하나의 저장소로 합쳐진다.
 #[cfg(unix)]
@@ -2904,4 +3627,93 @@ kind = "folder"
     assert_eq!(v_folder.icon, None);
 
     fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(test)]
+#[test]
+fn workspace_suffix_and_missing_worktrees_are_repaired_and_filtered() {
+    let base = std::env::temp_dir().join(format!("mk-workspace-repair-{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    let state_dir = base.join("state");
+    let drive = base.join("내 드라이브");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&drive).unwrap();
+    let drive_canon = fs::canonicalize(&drive).unwrap();
+    let polluted = format!(
+        "{}::workspace:2de7222e-4069-4b91-bb07-3e05a9808a9f",
+        drive_canon.display()
+    );
+    let deleted_wt = drive_canon.join("deleted-wt");
+
+    // 존재하지 않는 디렉터리는 projects.toml에 등록되지 않는다.
+    assert!(!register_project(&state_dir, &deleted_wt).unwrap());
+
+    fs::write(
+        state_dir.join(PROJECTS_FILE),
+        format!(
+            r#"[[projects]]
+id = "gdrive"
+path = "{drive}"
+display_name = "구글드라이브"
+kind = "folder"
+
+[[projects]]
+id = "workspace-2de7222e-4069-4b91-bb07-3e05a9808a9f"
+path = "{polluted}"
+display_name = "내 드라이브::workspace:2de7222e-4069-4b91-bb07-3e05a9808a9f"
+kind = "folder"
+
+[worktrees."{drive}"]
+repo_id = "gdrive"
+display_name = "내 드라이브"
+
+[worktrees."{polluted}"]
+repo_id = "gdrive"
+display_name = "가상 세션"
+
+[worktrees."{deleted}"]
+repo_id = "gdrive"
+display_name = "지워진 워크트리"
+"#,
+            drive = drive_canon.display(),
+            polluted = polluted,
+            deleted = deleted_wt.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut trees = BTreeMap::new();
+    let mut meta = super::Meta::default();
+    include_imported_projects(&state_dir, &mut trees, &mut meta);
+
+    assert_eq!(trees.len(), 1, "{trees:?}");
+    assert_eq!(
+        trees.get(&drive_canon),
+        Some(&vec![drive_canon.clone()]),
+        "오염된 ::workspace: 항목과 삭제된 하위 워크트리는 트리에 남지 않는다"
+    );
+
+    let repaired = fs::read_to_string(state_dir.join(PROJECTS_FILE)).unwrap();
+    assert!(
+        !repaired.contains("::workspace:"),
+        "디스크의 projects.toml도 자동 치유되어야 한다: {repaired}"
+    );
+
+    fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn projects_repair_preserves_edits_newer_than_its_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-projects-stale-repair-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(PROJECTS_FILE);
+    let stale = "[[projects]]\nid = 'stale'\npath = '/missing::workspace:2de7222e-4069-4b91-bb07-3e05a9808a9f'\n";
+    let newer = "[[projects]]\nid = 'new-project'\npath = '/new-project'\nfuture = 'keep'\n";
+    fs::write(&path, newer).unwrap();
+    repair_projects_file_on_disk(&dir, stale);
+    assert_eq!(fs::read_to_string(&path).unwrap(), newer);
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -33,6 +33,7 @@ pub(super) fn capture(s: &Sidebar) -> PersistedSidebarState {
             removed_projects: s.removed_projects.clone(),
         },
         s.project_order.clone(),
+        s.worktree_order.clone(),
     )
 }
 
@@ -140,6 +141,9 @@ impl Edits {
         if self.last.4 != now.4 {
             self.fields.insert("project_order");
         }
+        if self.last.5 != now.5 {
+            self.fields.insert("worktree_order");
+        }
         self.last = now;
     }
 
@@ -223,6 +227,9 @@ impl Edits {
         }
         if self.fields.contains("project_order") {
             saved.4 = now.4;
+        }
+        if self.fields.contains("worktree_order") {
+            saved.5 = now.5;
         }
         saved
     }

@@ -99,9 +99,23 @@ test('a photo prepared for a previous desktop cannot send to its replacement',as
  context.decodeImage=async()=>{await decoded;return {source:{},width:1,height:1,close(){}};};vm.runInContext(line+';globalThis.testPhoto=photo;',context);const pending=context.testPhoto(7,{type:'image/jpeg',size:1});assert.equal(holds,1);context.transport=B;context.hostGeneration=2;decode();await assert.rejects(pending,/target changed/);assert.equal(holds,0);assert.deepEqual(calls,[]);
 });
 test('closing a sheet discards hidden pairing inputs so secrets cannot keep safe updates busy',()=>{
- const line=read('app.js').split('\n').find(l=>l.includes('function closeSheet()'));let cleared=0,restored=0;
+ const lines=read('app.js').split('\n'),pick=m=>lines.find(l=>l.includes(m));let cleared=0,restored=0;
  const dialog={open:true,close(){this.open=false;}},sheetBody={replaceChildren(){assert.equal(dialog.open,false);cleared++;}},context=vm.createContext({dialog,sheetBody,restoreFocus(){restored++;}});
- vm.runInContext(line+';globalThis.close=closeSheet;',context);context.close();assert.equal(cleared,1);assert.equal(restored,1);context.close();assert.equal(cleared,2);
+ vm.runInContext(pick('function closeSheet()')+';globalThis.close=closeSheet;',context);context.close();assert.equal(cleared,1);assert.equal(restored,1);context.close();assert.equal(cleared,2);
+ // Nested sheets preserve original trigger focus and render error alerts inside the open modal dialog.
+ const E=class{constructor(tag,text,cls){this.tagName=tag;this.textContent=text||'';this.className=cls||'';this.children=[];this.attrs={};this.dataset={};this.hidden=false;this.isConnected=true;}append(...ns){for(const n of ns){n.parentElement=this;this.children.push(n);}}prepend(...ns){for(const n of ns){n.parentElement=this;this.children.unshift(n);}}insertBefore(n,b){n.parentElement=this;const i=b?this.children.indexOf(b):-1;if(i<0)this.children.push(n);else this.children.splice(i,0,n);}replaceChildren(...ns){for(const c of this.children)c.isConnected=false;this.children=[];this.append(...ns);}setAttribute(k,v){this.attrs[k]=v;}removeAttribute(k){delete this.attrs[k];}addEventListener(k,fn){this['on_'+k]=fn;}querySelector(){return null;}contains(n){return n===this||this.children.some(c=>c.contains?.(n));}focus(){doc.activeElement=this;}blur(){if(doc.activeElement===this)doc.activeElement=doc.body;}};
+ const doc={body:new E('body'),activeElement:null};doc.body.classList={add(){},remove(){}};
+ const trigger=new E('button'),dlg=new E('dialog'),body=new E('div'),notice=new E('div');notice.hidden=true;dlg.open=false;dlg.showModal=()=>{dlg.open=true;};dlg.close=()=>{dlg.open=false;};dlg.append(body);doc.body.append(trigger,dlg,notice);trigger.focus();
+ const sctx=vm.createContext({document:doc,dialog:dlg,sheetBody:body,notice,lastFocus:null,el:(t,tx,c)=>new E(t,tx,c),t:s=>s,button:(l,a,c)=>{const b=new E('button',l,c);b.action=a;return b;},setTimeout:()=>1,clearTimeout(){},M:{agentIcon:()=>new E('svg')}});
+ vm.runInContext([pick('let noticeTimer'),pick('function restoreFocus()'),pick('function closeSheet()'),pick('function sheet(')].join('\n')+'\nglobalThis.S={sheet,closeSheet,toast};',sctx);
+ sctx.S.sheet('First',[],undefined,b=>{const sub=new E('button','Sub');b.append(sub);sub.focus();});
+ sctx.S.sheet('Second',[],undefined);
+ sctx.S.toast('Sheet error');
+ const inSheet=body.children.find(c=>c.className==='sheet-notice');
+ assert(inSheet&&!inSheet.hidden&&inSheet.textContent==='Sheet error');
+ assert.equal(notice.textContent,'Sheet error');
+ sctx.S.closeSheet();
+ assert.equal(doc.activeElement,trigger);
 });
 test('update body reader limits individual and total decoded bytes, including chunked bodies',async()=>{
  for(const kind of ['header','chunked','total']){const f=fixture(),fetch=f.context.fetch;f.context.fetch=async(url,options)=>{const response=await fetch(url,options);if(url.endsWith('/'))return response;if(kind==='header')return new Response('x',{headers:{'content-length':String(3*1024*1024)}});if(kind==='chunked')return new Response(new ReadableStream({start(controller){controller.enqueue(new Uint8Array(3*1024*1024));controller.close();}}));return new Response(new Uint8Array(1024*1024));};await assert.rejects(f.context.KrillMobile.updates.prepare(f.hash,new AbortController().signal),/too large/);assert.equal(f.cache.size,0);}

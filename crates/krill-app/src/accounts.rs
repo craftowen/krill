@@ -278,13 +278,22 @@ pub fn request_target(
     target: &krill_hosts::HostTarget,
     req: &UsageRequest,
 ) -> Result<AccountsSnapshot, String> {
-    match exchange_target(target, req)? {
-        UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => Ok(snap),
+    request_target_with_features(target, req).map(|(snapshot, _)| snapshot)
+}
+
+pub fn request_target_with_features(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<(AccountsSnapshot, u64), String> {
+    let (reply, features) = exchange_target_with_features(target, req)?;
+    let snapshot = match reply {
+        UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => snap,
         UsageReply::Current(_) | UsageReply::Orphans(_) | UsageReply::Provisioning(_) => {
-            Ok(AccountsSnapshot::default())
+            AccountsSnapshot::default()
         }
-        UsageReply::Failed(e) => Err(failure_text(e)),
-    }
+        UsageReply::Failed(e) => return Err(failure_text(e)),
+    };
+    Ok((snapshot, features))
 }
 
 /// Codex banked reset 크레딧 소진. 데몬에만 묻는다(로컬 폴백 없음).
@@ -354,6 +363,13 @@ fn exchange_target(
     target: &krill_hosts::HostTarget,
     req: &UsageRequest,
 ) -> Result<UsageReply, String> {
+    exchange_target_with_features(target, req).map(|(reply, _)| reply)
+}
+
+fn exchange_target_with_features(
+    target: &krill_hosts::HostTarget,
+    req: &UsageRequest,
+) -> Result<(UsageReply, u64), String> {
     let mut hello = daemon::client_hello(ClientRole::App, "krill-app accounts");
     hello.features = FEAT_USAGE
         | krill_proto::usage::FEAT_PROVIDER_DETAILS
@@ -367,7 +383,8 @@ fn exchange_target(
         | krill_proto::usage::FEAT_ACCOUNT_POLICY
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
         | krill_proto::usage::FEAT_USAGE_RESET
-        | krill_proto::usage::FEAT_USAGE_REFRESH;
+        | krill_proto::usage::FEAT_USAGE_REFRESH
+        | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH;
     let mut conn = target.connect(&hello).map_err(|e| e.to_string())?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("FEAT_USAGE not negotiated".to_owned());
@@ -400,7 +417,7 @@ fn exchange_target(
     };
     let reply = UsageReply::decode(kind, &body).map_err(|e| e.to_string())?;
     target.record_outcome(true, None);
-    Ok(reply)
+    Ok((reply, conn.negotiated.features))
 }
 
 pub fn request_local(
@@ -412,6 +429,10 @@ pub fn request_local(
         UsageRequest::CancelAccountSwitch { .. } => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "account handoff cancellation requires the daemon",
+        )),
+        UsageRequest::SwitchSessionAccount { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "session account switching requires the daemon",
         )),
         UsageRequest::Get
         | UsageRequest::ListAccounts
@@ -648,6 +669,17 @@ pub fn start_login(
     account: &AccountInfo,
     newly_added: bool,
 ) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
+    start_login_with_mode(paths, account, newly_added, true)
+}
+
+/// 로그인 CLI를 백그라운드에서 실행한다. `open_browser`가 `false`이면 브라우저를 자동으로 열지 않고
+/// 인증 링크만 캡처해([`login_url`]) 클립보드 복사 로그인에 쓴다.
+pub fn start_login_with_mode(
+    paths: &Paths,
+    account: &AccountInfo,
+    newly_added: bool,
+    open_browser: bool,
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
     // agy needs a TTY for its account picker and the SSH OAuth code prompt.
     if account.provider == ProviderKind::Antigravity {
         return Err(crate::i18n::catalog::settings::AGY_LOGIN_GUIDE
@@ -673,7 +705,14 @@ pub fn start_login(
     std::thread::Builder::new()
         .name("account-login-browser".into())
         .spawn(move || {
-            run_browser_login(&paths, &account, newly_added, command, &cancel_for_thread);
+            run_browser_login_with_mode(
+                &paths,
+                &account,
+                newly_added,
+                command,
+                &cancel_for_thread,
+                open_browser,
+            );
         })
         .map_err(|e| e.to_string())?;
     Ok(cancel)
@@ -797,23 +836,79 @@ pub(crate) fn record_login_outcome_for_test(account_id: &str, outcome: LoginOutc
 /// 백그라운드 로그인 스레드가 남긴 종료 사유를 꺼낸다. 없으면 아직 진행 중이다(OWE-881).
 #[must_use]
 pub fn take_login_outcome(account_id: &str) -> Option<LoginOutcome> {
-    match login_outcomes().try_lock() {
+    let outcome = match login_outcomes().try_lock() {
         Ok(mut outcomes) => outcomes.remove(account_id),
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().remove(account_id),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    if outcome.is_some() {
+        clear_login_url(account_id);
+    }
+    outcome
+}
+
+fn login_urls() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static URLS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    URLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lock_login_urls() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    login_urls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn record_login_url(account_id: &str, url: &str) {
+    lock_login_urls().insert(account_id.to_owned(), url.to_owned());
+}
+
+fn clear_login_url(account_id: &str) {
+    lock_login_urls().remove(account_id);
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) fn record_login_url_for_test(account_id: &str, url: &str) {
+    record_login_url(account_id, url);
+}
+
+/// 백그라운드 로그인 스레드가 캡처한 인증 URL을 읽는다(진행 중에 여러 번 복사할 수 있게 유지).
+#[must_use]
+pub fn login_url(account_id: &str) -> Option<String> {
+    match login_urls().try_lock() {
+        Ok(urls) => urls.get(account_id).cloned(),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            error.into_inner().get(account_id).cloned()
+        }
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
+#[cfg(test)]
+#[cfg(unix)]
 fn run_browser_login(
+    paths: &Paths,
+    account: &AccountInfo,
+    newly_added: bool,
+    command: std::process::Command,
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    run_browser_login_with_mode(paths, account, newly_added, command, cancel, true);
+}
+
+fn run_browser_login_with_mode(
     paths: &Paths,
     account: &AccountInfo,
     newly_added: bool,
     mut command: std::process::Command,
     cancel: &std::sync::atomic::AtomicBool,
+    open_browser: bool,
 ) {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::Ordering;
+    clear_login_url(&account.id);
     // 실패 기록+정리를 한 번에 한다. 취소는 별도 경로(호출자가 구분해야 한다).
     let fail = |reason: LoginFailReason| {
         record_login_outcome(&account.id, LoginOutcome::Failed(reason));
@@ -870,13 +965,18 @@ fn run_browser_login(
             && let Some(raw) = browser_link.or(printed_link)
             && let Some(url) = authorize_url(account.provider, &raw)
         {
-            opened = if cfg!(target_os = "macos") {
-                crate::platform::background_command("open")
-                    .arg(url)
-                    .status()
-                    .is_ok_and(|status| status.success())
+            record_login_url(&account.id, url);
+            opened = if open_browser {
+                if cfg!(target_os = "macos") {
+                    crate::platform::background_command("open")
+                        .arg(url)
+                        .status()
+                        .is_ok_and(|status| status.success())
+                } else {
+                    crate::platform::permissions::open_url(url)
+                }
             } else {
-                crate::platform::permissions::open_url(url)
+                true
             };
         }
         match child.try_wait() {

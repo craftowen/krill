@@ -637,6 +637,115 @@ pub fn notebook(
         .into_any_element()
 }
 
+/// HTML 파일 미리보기 화면: 문서 `<title>`·파일 크기와 "브라우저로 열기"·"코드 편집"·"Finder에서 보기".
+pub fn html_preview(
+    path: &Path,
+    title: Option<&str>,
+    len: u64,
+    on_edit: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    html_preview_on(path, None, title, len, on_edit, cx)
+}
+
+/// HTML metadata preview with host-scoped external actions.
+pub fn html_preview_on(
+    path: &Path,
+    remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
+    title: Option<&str>,
+    len: u64,
+    on_edit: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let pal = crate::ui::palette(cx);
+    let open_label = crate::i18n::catalog::editor::OPEN_BROWSER.get();
+    let edit_label = crate::i18n::catalog::editor::EDIT_CODE.get();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let open_browser = {
+        let path = path.to_path_buf();
+        let remote = remote.clone();
+        crate::ui::primary("file-html-open-browser", open_label)
+            .debug_selector(|| "file-html-open-browser".into())
+            .on_click(move |_, _, cx| {
+                spawn_open_on(
+                    path.clone(),
+                    remote.clone(),
+                    super::open_default_command,
+                    cx,
+                );
+            })
+    };
+    let edit_code = crate::ui::secondary("file-html-edit", edit_label)
+        .debug_selector(|| "file-html-edit".into())
+        .on_click(move |_, window, cx| on_edit(window, cx));
+    let reveal_action = {
+        let path = path.to_path_buf();
+        crate::ui::secondary(
+            "file-reveal",
+            text::REVEAL
+                .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                .get(),
+        )
+        .debug_selector(|| "file-reveal".into())
+        .on_click(move |_, _, cx| {
+            spawn_open_on(path.clone(), remote.clone(), super::reveal_command, cx);
+        })
+    };
+    div()
+        .debug_selector(|| "file-html-preview".into())
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .font_family(crate::ui::FONT_UI)
+        .text_size(crate::ui::TEXT_SM)
+        .bg(pal.editor_surface)
+        .text_color(pal.foreground)
+        .when_some(title, |d, t| {
+            d.child(
+                div()
+                    .text_size(crate::ui::TEXT_MD)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(t.to_owned()),
+            )
+        })
+        .child(
+            div()
+                .font_family(crate::ui::FONT_MONO)
+                .text_size(crate::ui::TEXT_SM)
+                .child(name),
+        )
+        .child(
+            div()
+                .text_size(crate::ui::TEXT_SM)
+                .text_color(pal.muted_foreground)
+                .child(format!("{} · {}", text::KIND_HTML.get(), size_label(len))),
+        )
+        .child(
+            div()
+                .text_size(crate::ui::TEXT_SM)
+                .text_color(pal.muted_foreground)
+                .child(text::HTML_PREVIEW_DESC.get()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(open_browser)
+                .child(edit_code)
+                .child(reveal_action),
+        )
+        .into_any_element()
+}
+
 /// 미리보기할 수 없는 파일: 종류·크기와 "기본 앱으로 열기"·"Finder에서 보기".
 pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
     placeholder_on(path, None, kind, len, cx)

@@ -25,6 +25,23 @@ impl Default for CardList {
 }
 
 impl CardList {
+    /// A committed account handoff keeps the same measured row and scroll anchor.
+    pub(super) fn rebind_session(
+        &mut self,
+        host: &HostId,
+        from: krill_proto::SessionId,
+        to: krill_proto::SessionId,
+    ) {
+        for (row_host, row, _) in &mut self.rows {
+            if row_host == host
+                && let Row::Session(session, _) = row
+                && session.id == from
+            {
+                session.id = to;
+            }
+        }
+    }
+
     pub fn update(&mut self, rows: Vec<(HostId, Row, usize)>) {
         if rows == self.rows {
             return;
@@ -533,6 +550,27 @@ mod regression_tests {
     }
 
     #[test]
+    fn account_replacement_keeps_the_same_scroll_anchor_and_pixel_offset() {
+        let mut list = CardList::default();
+        let row = |id, index| {
+            (
+                HostId::Local,
+                Row::Session(session(id, "/tree"), true),
+                index,
+            )
+        };
+        list.update(vec![row(10, 0), row(20, 1), row(30, 2)]);
+        list.state.scroll_to(ListOffset {
+            item_ix: 1,
+            offset_in_item: px(11.),
+        });
+        list.rebind_session(&HostId::Local, SessionId(20), SessionId(90));
+        list.update(vec![row(10, 0), row(90, 1), row(30, 2)]);
+        assert_eq!(list.state.logical_scroll_top().item_ix, 1);
+        assert_eq!(list.state.logical_scroll_top().offset_in_item, px(11.));
+    }
+
+    #[test]
     fn removing_the_anchor_keeps_its_next_surviving_neighbour() {
         let mut list = CardList::default();
         let row = |path: &str, i| (HostId::Local, Row::Worktree(path.into()), i);
@@ -797,6 +835,7 @@ mod regression_tests {
         nested.cwd = Some("/repo/main/src".into());
         let mut exited = session(3, "/repo/main");
         exited.status.state = AgentState::Exited;
+        exited.status.source = Some(krill_proto::control::Source::Process);
         s.snapshot = Snapshot {
             sessions: vec![
                 session(1, "/repo/main"),

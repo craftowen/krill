@@ -3,6 +3,7 @@
 const assert=require('node:assert/strict'),{getEventListeners}=require('node:events'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 class Element extends EventTarget {
  constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollLeft=0;this.scrollTop=0;const classes=new Set((cls||'').split(/\s+/));this.classList={toggle:(name,on)=>{if(on)classes.add(name);else classes.delete(name);},remove:name=>classes.delete(name),contains:name=>classes.has(name)};}
+ focus(){if(this.ownerDocument)this.ownerDocument.activeElement=this;}
  append(...nodes){for(const n of nodes){n.parentElement=this;this.children.push(n);}}
  insertBefore(node,before){if(node===before)return;node.remove();const index=before?this.children.indexOf(before):-1;node.parentElement=this;if(index<0)this.children.push(node);else this.children.splice(index,0,node);}
  prepend(...nodes){for(const n of nodes)n.parentElement=this;this.children.unshift(...nodes);}
@@ -19,10 +20,10 @@ class Element extends EventTarget {
 const longPressCode=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes('function longPress('));
 function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot,tablet=false,preferences={}){
  const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],created=[],abort=new AbortController(),wide=new EventTarget(),viewport=new EventTarget(),windowEvents=new EventTarget();wide.matches=tablet;let clock=0,id=0;
- let resize;const sandbox={addEventListener:windowEvents.addEventListener.bind(windowEvents),removeEventListener:windowEvents.removeEventListener.bind(windowEvents),dispatchEvent:windowEvents.dispatchEvent.bind(windowEvents),visualViewport:viewport,ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const port=new Element('div',undefined,'terminal-port'),capture=new Element('textarea');capture.tagName='TEXTAREA';port.append(capture);root.append(port);const h={root,port,capture,options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;if(!active&&sandbox.document.activeElement===capture)sandbox.document.activeElement=null;},focus(){h.focused++;sandbox.document.activeElement=capture;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
+ let resize;const doc={activeElement:null,createElementNS:(_,tag)=>new Element(tag)};const sandbox={addEventListener:windowEvents.addEventListener.bind(windowEvents),removeEventListener:windowEvents.removeEventListener.bind(windowEvents),dispatchEvent:windowEvents.dispatchEvent.bind(windowEvents),visualViewport:viewport,ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:doc,setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const port=new Element('div',undefined,'terminal-port'),capture=new Element('textarea');capture.tagName='TEXTAREA';port.append(capture);root.append(port);const h={root,port,capture,options,focused:0,unmounted:false,fitRequests:[],fitToPhone(...args){h.fitRequests.push(args);return Promise.resolve();},setInputActive(active){h.inputActive=active;if(!active&&sandbox.document.activeElement===capture)sandbox.document.activeElement=null;},focus(){h.focused++;sandbox.document.activeElement=capture;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
  vm.createContext(sandbox);vm.runInContext(longPressCode,sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
  const group={key:'g',label:'Workspace',sessions},state={groups:new Map([['g',group]]),sessions:new Map(sessions.map(s=>[s.id,s])),connection:{phase:'ready'},preferences,drafts:new Map(),snapshot};
- const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{},createSession(group,agent,request){calls.push(request);created.push([group.key,agent||'']);}};
+ const el=(...args)=>{const n=new Element(...args);n.ownerDocument=doc;return n;},ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.setAttribute('aria-label',label);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:(g,id)=>`/host/local/group/${g.key}/s/${id??g.sessions[0]?.id}`,go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{},createSession(group,agent,request){calls.push(request);created.push([group.key,agent||'']);}};
  const root=el('main'),view=sandbox.KrillMobile.screens.session(root,ctx);
  function advance(ms){clock+=ms;for(const [key,t] of [...timers])if(t.at<=clock){timers.delete(key);t.fn();}}
  return {resize:width=>resize([{contentRect:{width}}]),view,state,ctx,abort,wide,root,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered,created};
@@ -125,6 +126,21 @@ function testSplitTabReplacement(){
 async function main(){
  await testQuickActions();testSplitContinuity();testSplitTabReplacement();
  testHostViewBudgets();testImeDefersSnapshotUpdates();testSessionBackSkipsSessionHistory();
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Done'},{id:9,state:'Exited'},{id:10,state:'Working',exited:true}]);
+  assert.deepEqual(f.root.descendants().filter(n=>n.className==='session-tab').map(n=>n.dataset.session),[7,8]);
+  f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,1);
+  f.state.sessions.get(7).exited=true;f.view.update();assert.equal(f.routes.at(-1),'/host/local/group/g/s/8');assert.equal(f.timers.size,0);f.advance(60000);assert.equal(f.mounts.length,1);f.view.cleanup();
+ }
+ {const f=fixture();f.state.sessions.delete(7);f.view.update();assert.equal(f.routes.at(-1),'/host/local','missing selected session leaves the terminal screen');f.view.cleanup();}
+ {const f=fixture();f.state.groups.clear();f.state.sessions.clear();f.view.update();assert.equal(f.routes.at(-1),'/host/local','removed workspace leaves without updating the old summary');f.view.cleanup();}
+ {const f=fixture();f.state.sessions.get(7).state='Exited';f.view.update();assert.equal(f.routes.at(-1),'/host/local');f.view.cleanup();}
+ {const f=fixture([{id:7,state:'Exited'},{id:8,state:'Working'}]);assert.equal(f.mounts.length,0);assert.equal(f.routes.length,0,'initial redirect waits until the screen has mounted');await Promise.resolve();assert.equal(f.routes.at(-1),'/host/local/group/g/s/8');}
+ {const f=fixture([{id:7,state:'Exited'}]);f.abort.abort();await Promise.resolve();assert.equal(f.routes.length,0,'abandoned initial redirects cannot change the route');}
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}]);f.mounts[0].options.onStatus({phase:'ended'});assert.equal(f.routes.length,0,'exit navigation waits until snapshot pruning finishes');await Promise.resolve();assert.equal(f.routes.at(-1),'/host/local/group/g/s/8');assert.equal(f.calls.length,0,'exit cleanup never terminates a PTY');f.view.cleanup();}
+ {const f=fixture();f.mounts[0].options.onStatus({phase:'ended'});f.view.cleanup();await Promise.resolve();assert.equal(f.routes.length,0,'stale exit callbacks cannot navigate after cleanup');}
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();const secondary=f.mounts[1];secondary.options.onStatus({phase:'ended'});await Promise.resolve();assert(secondary.unmounted);assert(!f.mounts[0].unmounted);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.calls.length,0);f.view.cleanup();}
+ console.log('PASS exited tabs disappear; selected/missing/stream-ended sessions leave for a live tab or workspaces; split exits preserve the other PTY');
+
  {const sessions=Array.from({length:64},(_,n)=>({id:n+7,agent:'codex',state:'Working'})),f=fixture(sessions);const initial=f.buttons.filter(b=>b.className==='session-tab'),marks=initial.map(b=>b.children[1]);for(let i=0;i<100;i++)f.view.update();assert.equal(f.buttons.filter(b=>b.className==='session-tab').length,64);assert(initial.every((tab,i)=>tab.children[1]===marks[i]));const removed=sessions[63],down=new Event('pointerdown');down.button=0;initial[63].dispatchEvent(down);assert.equal(f.timers.size,1);f.state.groups.get('g').sessions=sessions.slice(0,63);f.state.sessions.delete(removed.id);f.view.update();assert.equal(f.timers.size,0,'removed tab cancels pending long press');f.view.cleanup();console.log('PASS 64 keyed tabs x100 updates: new buttons/icons 0, removed-tab handlers cleaned');}
 
  {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),M=f.sandbox.KrillMobile;
@@ -166,6 +182,21 @@ async function main(){
   f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();f.buttons.find(b=>b.className==='ghost small mode-toggle').action();
   assert.equal(f.state.preferences.sessionViewModes[8],'chat');assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,1);assert.equal(f.calls.length,0);f.view.cleanup();
  }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),primary=f.mounts[0];
+  primary.options.onStatus({phase:'ready'});f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const requests=primary.fitRequests.length;assert.equal(requests,1,'entering a split fits the existing primary once');
+  primary.options.onPreferenceChange({fitToPhone:false});for(let i=0;i<5;i++)f.view.update();
+  assert.equal(primary.fitRequests.length,requests,'snapshot updates must not undo the PC mode selected in the dock');
+  const secondary=f.mounts.at(-1),mountCount=f.mounts.length;
+  f.wide.matches=false;f.wide.dispatchEvent(new Event('change'));f.wide.matches=true;f.wide.dispatchEvent(new Event('change'));
+  assert.equal(f.mounts.length,mountCount,'folding retains both connections');
+  secondary.options.onStatus({phase:'disconnected'});f.advance(1000);
+  assert.equal(f.mounts.at(-1).options.preferences.fitToPhone,false,'secondary reconnect keeps the saved PC mode');
+  assert.equal(primary.fitRequests.length,requests,'unfolding respects the explicit PC mode');
+  primary.options.onStatus({phase:'disconnected'});f.advance(1000);
+  assert.equal(f.mounts.at(-1).options.preferences.fitToPhone,false,'primary reconnect keeps the saved PC mode');f.view.cleanup();
+ }
+ console.log('PASS split snapshots, folding and reconnect preserve the PC mode selected in the dock');
  console.log('PASS symmetric pane headers, active labels and tab replacement, duplicate PTY disabled and primary close preserves PTY');
  console.log('PASS split direction selection, current choice, persisted state, automatic threshold and minimum pane width');
  console.log('PASS tablet split excludes duplicate PTY, preserves active pane on folding, reconnects after main transport and closes only the view');
@@ -202,11 +233,19 @@ async function main(){
  let stop;for(let i=0;i<100;i++){stop?.();stop=f.longPress(new Element('button'),()=>{});assert.equal(getEventListeners(f.abort.signal,'abort').length,1);}
  stop();assert.equal(getEventListeners(f.abort.signal,'abort').length,0);f.view.cleanup();
  console.log('PASS longPress abort listener cleanup across 100 redraws');
- f=fixture([{id:7,agent:'claude',state:'Waiting'},{id:8,agent:'claude',state:'Working'},{id:9,agent:null,state:'Unknown'},{id:10,agent:'antigravity',state:'Done'},{id:11,agent:'my-bot',state:'Working',exited:true}]);
+ f=fixture([{id:7,agent:'claude',state:'Waiting'},{id:8,agent:'claude',state:'Working'},{id:9,agent:null,state:'Unknown'},{id:10,agent:'antigravity',state:'Done'},{id:11,agent:'my-bot',state:'Working'},{id:12,state:'Working',exited:true},{id:13,state:'Exited'}]);
  const tabs=()=>f.buttons.filter(b=>b.className==='session-tab').slice(-5),summary=()=>tabs().map(t=>[t.children[0].className,t.children[1].attrs.class||t.children[1].className,t.children[2].textContent,t.attrs['aria-label']]);
- assert.deepEqual(summary(),[['status-dot waiting','agent-icon claude','Claude Code','Claude Code · Waiting · Terminal #7'],['status-dot working','agent-icon claude','Claude Code 2','Claude Code 2 · Working · Terminal #8'],['status-dot unknown','agent-icon','Shell','Shell · Unknown · Terminal #9'],['status-dot done','agent-icon agy','Antigravity','Antigravity · Done · Terminal #10'],['status-dot exited','agent-icon custom','my-bot','my-bot · Exited · Terminal #11']]);
+ assert.deepEqual(summary(),[['status-dot waiting','agent-icon claude','Claude Code','Claude Code · Waiting · Terminal #7'],['status-dot working','agent-icon claude','Claude Code 2','Claude Code 2 · Working · Terminal #8'],['status-dot unknown','agent-icon','Shell','Shell · Unknown · Terminal #9'],['status-dot done','agent-icon agy','Antigravity','Antigravity · Done · Terminal #10'],['status-dot working','agent-icon custom','my-bot','my-bot · Working · Terminal #11']]);
  assert.equal(tabs()[0].children[1].children.length,1);assert.equal(tabs()[3].children[1].children.at(-1).attrs.class,'layer');assert.equal(tabs()[4].children[1].textContent,'M');
- const strip=tabs()[0].parentElement;strip.scrollLeft=300;f.state.sessions.get(8).state='Waiting';f.view.update();assert.equal(tabs()[1].children[0].className,'status-dot waiting');assert.equal(tabs()[0].parentElement.scrollLeft,300);
+ assert.deepEqual(tabs().map(t=>t.tabIndex),[0,-1,-1,-1,-1]);
+ const strip=tabs()[0].parentElement;tabs()[0].focus();
+ const key=k=>{const e=new Event('keydown',{cancelable:true});e.key=k;strip.dispatchEvent(e);return e;};
+ assert(key('ArrowRight').defaultPrevented);assert.equal(f.sandbox.document.activeElement,tabs()[1]);assert.deepEqual(tabs().map(t=>t.tabIndex),[-1,0,-1,-1,-1]);
+ assert(key('End').defaultPrevented);assert.equal(f.sandbox.document.activeElement,tabs()[4]);assert.deepEqual(tabs().map(t=>t.tabIndex),[-1,-1,-1,-1,0]);
+ assert(key('ArrowRight').defaultPrevented);assert.equal(f.sandbox.document.activeElement,tabs()[0]);assert.deepEqual(tabs().map(t=>t.tabIndex),[0,-1,-1,-1,-1]);
+ assert(key('ArrowLeft').defaultPrevented);assert.equal(f.sandbox.document.activeElement,tabs()[4]);
+ assert(key('Home').defaultPrevented);assert.equal(f.sandbox.document.activeElement,tabs()[0]);
+ strip.scrollLeft=300;f.state.sessions.get(8).state='Waiting';f.view.update();assert.equal(tabs()[1].children[0].className,'status-dot waiting');assert.equal(tabs()[0].parentElement.scrollLeft,300);
  f.buttons.find(b=>b.textContent==='Terminal actions').action();assert(f.sheets.at(-1).some(e=>e.label==='Select text'));f.view.cleanup();
  f=fixture([{id:7,agent:null,state:'Unknown'},{id:8,agent:'codex',state:'Working'}]);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onTitle('✳ vim notes.md');assert.deepEqual(tabs().slice(-2).map(t=>t.children[2].textContent),['vim notes.md','Codex']);
  f.mounts[0].options.onStatus({phase:'disconnected',typing:true});f.advance(1000);assert.equal(f.mounts.length,2);assert.equal(f.mounts[1].focused,0);f.mounts[1].options.onStatus({phase:'ready'});assert.equal(f.mounts[1].focused,1);f.mounts[1].options.onStatus({phase:'ready'});assert.equal(f.mounts[1].focused,1);f.view.cleanup();
@@ -223,6 +262,7 @@ async function main(){
  await testPromptDraftAndInactiveMenu();
  await testHybridChatToggleAndQuestionCards();
  await testInstantCreate();
+ await require('./mobile_quick_commands.cjs').main(fixture);
  console.log('PASS Hybrid Chat visibility, chat_poll cards, historical answers remain notes until Terminal review, and current diff modal');
 }
 // 새 세션은 누르는 즉시 /s/new로 옮기고, 응답이 오면 그 자리를 새 세션으로 바꾼다. 스냅샷을 기다리지 않고, 아직 스냅샷에 없는 새 세션 때문에 다른 세션으로 튀지 않는다.
@@ -283,7 +323,7 @@ async function testHybridChatToggleAndQuestionCards(){
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
  const session={id:7,state:'Working',agent:'claude',branch:'main',lines:['● Editing src/lib.rs']},shellSession={id:8,state:'Idle',agent:'',branch:'main',lines:['$']},group={key:'g',label:'Workspace',sessions:[session,shellSession]},state={groups:new Map([['g',group]]),sessions:new Map([[7,session],[8,shellSession]]),connection:{phase:'ready'},preferences:{},drafts:new Map()};
  const el=(...args)=>new Element(...args);
- const ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(){},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},error(){},photo(){},transport:{},closeSheet(){},sheet:(title,entries,_,render)=>sheets.push({title,entries,render}),act:fn=>fn(),rpc:async req=>{calls.push(req);if(req.action==='chat_poll')return {agent:'claude',bound:true,next_offset:128,reset:false,items:[{kind:'user',text:'Fix bug'},{kind:'tool_call',tool_name:'Edit',title:'Update lib',file_path:'src/lib.rs',text:'src/lib.rs'},{kind:'question',title:'Mode',text:'Pick one',multi_select:false,options:[{label:'Fast',description:'Quick'},{label:'Safe',description:'Thorough'}]}]};if(req.action==='git')return {patch:'+added line'};return {sent:true};},refresh:async()=>{}};
+ const ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:(g,id)=>`/host/local/group/${g.key}/s/${id??g.sessions[0]?.id}`,go(){},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},error(){},photo(){},transport:{},closeSheet(){},sheet:(title,entries,_,render)=>sheets.push({title,entries,render}),act:fn=>fn(),rpc:async req=>{calls.push(req);if(req.action==='chat_poll')return {agent:'claude',bound:true,next_offset:128,reset:false,items:[{kind:'user',text:'Fix bug'},{kind:'tool_call',tool_name:'Edit',title:'Update lib',file_path:'src/lib.rs',text:'src/lib.rs'},{kind:'question',title:'Mode',text:'Pick one',multi_select:false,options:[{label:'Fast',description:'Quick'},{label:'Safe',description:'Thorough'}]}]};if(req.action==='git')return {patch:'+added line'};return {sent:true};},refresh:async()=>{}};
  const root=el('main');
  const view=sandbox.KrillMobile.screens.session(root,ctx);
  assert.equal(mounts.length,1);
@@ -330,9 +370,11 @@ async function testHybridChatToggleAndQuestionCards(){
  buttons.length=0;const savedView=sandbox.KrillMobile.screens.session(el('main'),ctx);assert.equal(buttons.find(b=>b.className?.includes('mode-toggle')).textContent,'Term');savedView.cleanup();
  // 일반 셸 세션(agent === '')은 기본값이 Term 뷰다.
  buttons.length=0;
- const shellView=sandbox.KrillMobile.screens.session(el('main'),{...ctx,route:{groupKey:'g',sessionId:8}});
+ const shellRoot=el('main'),shellView=sandbox.KrillMobile.screens.session(shellRoot,{...ctx,route:{groupKey:'g',sessionId:8}});
  const shellToggle=buttons.find(b=>b.className?.includes('mode-toggle'));
  assert.equal(shellToggle.textContent,'Chat');
+ const tabs=shellRoot.descendants().find(n=>n.className==='session-tabs');
+ assert(!tabs.descendants().some(n=>n.className==='tab-quick'||n.className==='tab-action-divider'));
  shellView.cleanup();
 }
 async function testTransportAuthRetries(){
@@ -408,13 +450,15 @@ async function testPipelinedHandshakeAndPolling(){
  // 폴링은 직전 etag를 since로 보내고, unchanged 응답이면 화면을 다시 그리지 않는다.
  assert.deepEqual(JSON.parse(new TextDecoder().decode(socket.sent[4].slice(7))),{action:'snapshot',since:'e1'});reply({unchanged:true,etag:'e1'});await flush();assert.equal(snapshots.length,1);
  const [[,slow]]=[...timers];assert.equal(slow.at-now,10000);
- // resume() 시 살아 있는 프리워밍 소켓은 그대로 두고, 정상 응답이 1.5초 안에 오면 재연결하지 않는다.
- t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);reply();await flush();assert.equal(snapshots.length,2);
- for(const [id,tm] of [...timers])if(tm.at<=now+1500){timers.delete(id);tm.fn();}await flush();assert.equal(sockets.length,4);
- // 1.5초 동안 응답이 없으면 좀비 소켓으로 판정해 즉시 reconnect()하며, 끊긴 refresh의 오류를 onError로 흘리지 않는다.
+ // A healthy snapshot slower than 1.5s retains the existing authenticated socket.
+ t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);
+ for(const [id,tm] of [...timers])if(tm.at<=now+2000){timers.delete(id);tm.fn();}await flush();assert.equal(socket.closed,undefined);
+ reply();await flush();assert.equal(snapshots.length,2);assert.equal(sockets.length,4);
+ // The normal RPC deadline still closes a genuinely stalled socket and retries.
  t.resume();await flush();assert.equal(socket.sent.length,7);
- const zombieTimer=[...timers.values()].find(tm=>tm.at===now+1500);assert(zombieTimer);
- zombieTimer.fn();await flush();
+ const rpcDeadline=[...timers.values()].find(tm=>tm.at===now+15000);assert(rpcDeadline);
+ rpcDeadline.fn();await flush();assert.equal(socket.closed,true);
+ for(const [id,tm] of [...timers])if(tm.at<=now){timers.delete(id);tm.fn();}await flush();
  assert.equal(socket.closed,true);assert.equal(sockets.length,5);assert.deepEqual(errors,[]);
  t.close();
 }

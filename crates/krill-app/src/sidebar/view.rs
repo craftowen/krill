@@ -471,6 +471,9 @@ fn row_menu(
 
 impl Sidebar {
     /// Connection context lives next to its project, never above the project tree.
+    /// Connected remote hosts already render their `[호스트]` badge on worktree cards and
+    /// session rows (Orca parity), so the project header only shows a status/reconnect
+    /// control when the host is connecting or disconnected.
     fn project_host_control(
         &self,
         index: usize,
@@ -480,6 +483,7 @@ impl Sidebar {
         let Some(remote) = host
             .remote_id()
             .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+            .filter(|r| r.status != HostStatus::Connected)
         else {
             return div().into_any_element();
         };
@@ -541,8 +545,12 @@ impl Sidebar {
     /// 합쳐진 프로젝트 머리줄에, 다시 연결이 필요한 다른 PC의 상태·다시 연결 버튼을 단다.
     /// 연결된 PC는 워크트리·세션 배지로 이미 보이므로 머리줄을 붐비게 하지 않는다.
     fn merged_host_controls(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let primary_host = self.row_host(index);
         let mut hosts: Vec<&HostId> = Vec::new();
         for (host, _) in self.merged_projects.get(&index).into_iter().flatten() {
+            if host == primary_host {
+                continue;
+            }
             let connected = host
                 .remote_id()
                 .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
@@ -582,9 +590,9 @@ impl Sidebar {
         }
         if let Some(focused) = self
             .focused
-            .and_then(|id| self.folder_on(&HostId::Local, id))
+            .and_then(|id| self.folder_on(&self.focused_host, id))
         {
-            return self.row_host(index).is_local() && focused == path;
+            return self.row_host(index) == &self.focused_host && focused == path;
         }
         self.selected_workspace()
             .is_some_and(|(host, folder)| self.row_host(index) == &host && folder == path)
@@ -1120,27 +1128,6 @@ impl Sidebar {
                         s.cursor = Some(index);
                         s.fold(&fold_row, None, cx);
                     }))
-                    // Orca처럼 프로젝트 머리줄을 끌어다 다른 프로젝트 위에 놓아 순서를 바꾼다(내 Mac 프로젝트만).
-                    .when(row_host.is_local(), |d| {
-                        let drop_to = path.clone();
-                        let ring = p.ring;
-                        d.on_drag(
-                            ProjectDrag {
-                                path: path.clone(),
-                                name: basename(path).into(),
-                            },
-                            |drag, _, _, cx| cx.new(|_| drag.clone()),
-                        )
-                        .drag_over::<ProjectDrag>(move |d, _, _, _| {
-                            d.border_t_2().border_color(ring)
-                        })
-                        .on_drop(cx.listener(
-                            move |s, drag: &ProjectDrag, _, cx| {
-                                cx.stop_propagation();
-                                s.move_project(&drag.path, &drop_to, cx);
-                            },
-                        ))
-                    })
             }
             Row::Folder(path) => {
                 let (fold_btn, fold_row, fresh, fresh_host) =
@@ -1250,6 +1237,13 @@ impl Sidebar {
                     .as_ref()
                     .map(|a| a.label.trim())
                     .filter(|l| !l.is_empty());
+                let account_choices = self.session_account_choices(&row_host, session);
+                let account_host = row_host.clone();
+                let account_pending = self.session_account_pending(&account_host, id);
+                let account_error = self
+                    .session_account_error(&account_host, id)
+                    .map(str::to_owned);
+                let current_account = session.account.as_ref().map(|a| a.account_id.clone());
                 let app_settings = crate::settings::current(cx);
                 let session_cache_secs = app_settings
                     .prompt_cache_timer_enabled
@@ -1274,8 +1268,39 @@ impl Sidebar {
                             .map(|r| r.label.clone())
                     })
                     .flatten();
+                let now_ns = self.now_unix_ns();
+                let prompt_history = self.session_prompt_history_on(&row_host, id);
+                let state_with_age = if session.status.since_unix_ns > 0 {
+                    format!(
+                        "{state} ({})",
+                        crate::jump::format_age_ns(session.status.since_unix_ns, now_ns)
+                    )
+                } else {
+                    state.to_owned()
+                };
+                let inferred_agent = status::infer_agent_from_status(&session.status, &name);
+                let hover_spec = ui::SessionHoverCardSpec {
+                    id: format!("sidebar-session-hover-{}", id.0).into(),
+                    title: name.clone().into(),
+                    agent: inferred_agent.to_owned().into(),
+                    state_line: state_with_age.into(),
+                    total_turns: prompt_history.map_or(0, |h| h.total_turns),
+                    last_prompt: prompt_history
+                        .and_then(krill_proto::git::SessionPromptHistory::display_last_prompt)
+                        .map(Into::into),
+                    last_prompt_age: prompt_history
+                        .and_then(krill_proto::git::SessionPromptHistory::latest_unix_ns)
+                        .filter(|&ts| ts > 0)
+                        .map(|ts| crate::jump::format_age_ns(ts, now_ns).into()),
+                    prev_turn: prompt_history
+                        .and_then(krill_proto::git::SessionPromptHistory::previous_turn)
+                        .map(|t| (t.turn, t.text.clone().into())),
+                };
                 single_line(base)
                     .debug_selector(move || format!("sidebar-session-{index}"))
+                    .tooltip(move |window, cx| {
+                        ui::session_hover_card_view(hover_spec.clone(), window, cx)
+                    })
                     .h(px(if *nested { 26. } else { ROW_HEIGHT }))
                     // Orca 에이전트 행(`text-[11px]`)처럼 카드 제목보다 한 단계 작게.
                     .text_size(ui::TEXT_XS)
@@ -1419,12 +1444,115 @@ impl Sidebar {
                                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                             })
                     }))
+                    .children(
+                        (account_label.is_some()
+                            || !account_choices.is_empty()
+                            || account_pending
+                            || account_error.is_some())
+                        .then(|| {
+                            let full = account_label
+                                .unwrap_or_else(|| text::SESSION_ACCOUNT_SWITCH.get())
+                                .to_owned();
+                            let pending = account_pending;
+                            let tip = self.session_account_tooltip(&account_host, id, &full);
+                            let button = ui::button_with_tooltip(
+                                Button::new(("account-badge", index))
+                                    .debug_selector(move || format!("account-badge-{index}"))
+                                    .when_some(account_label, |button, label| {
+                                        button
+                                            .label(status::abbreviate_account_label(label))
+                                            .icon(IconName::ChevronDown)
+                                    })
+                                    .when(account_label.is_none(), |button| {
+                                        button.icon(IconName::User)
+                                    })
+                                    .ghost()
+                                    .xsmall()
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(if account_error.is_some() && !pending {
+                                        p.destructive
+                                    } else {
+                                        p.muted_foreground
+                                    })
+                                    .loading(self.session_account_loading(&account_host, id)),
+                                format!("session-account-tooltip-{index}"),
+                                tip,
+                            );
+                            if account_choices.is_empty() {
+                                return button.disabled(true).into_any_element();
+                            }
+                            let sidebar = cx.weak_entity();
+                            button
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    menu = menu.label(text::SESSION_ACCOUNT_SWITCH.get());
+                                    for account in &account_choices {
+                                        let target = super::SwitchSessionAccount {
+                                            host: account_host.clone(),
+                                            session: id,
+                                            provider: account.provider,
+                                            account_id: account.id.clone(),
+                                        };
+                                        let sidebar = sidebar.clone();
+                                        let current = current_account.as_ref() == Some(&account.id);
+                                        menu = menu.item(
+                                            PopupMenuItem::new(super::profiles::account_label(
+                                                account,
+                                                &account_choices,
+                                            ))
+                                            .icon(ui::icons::provider_menu_icon(account.provider))
+                                            .checked(current)
+                                            .disabled(current)
+                                            .on_click(move |_, _, cx| {
+                                                sidebar
+                                                    .update(cx, |s, cx| {
+                                                        s.switch_session_account(
+                                                            target.clone(),
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                            }),
+                                        );
+                                    }
+                                    menu
+                                })
+                                .into_any_element()
+                        }),
+                    )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         cx.stop_propagation();
                         s.select_session(index, id, cx);
                     }))
             }
         };
+        let project =
+            super::project_key(row).filter(|_| self.options.group_by == super::GroupBy::Repo);
+        let element = element.when_some(project, |d, (_, path)| {
+            let drop_to = path.clone();
+            let ring = p.ring;
+            d.on_drag(
+                ProjectDrag {
+                    path: path.clone(),
+                    name: if row_host.is_local() {
+                        self.project_header_name(path)
+                    } else {
+                        basename(path)
+                    }
+                    .into(),
+                    index,
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
+            .drag_over::<ProjectDrag>(move |d, drag, _, _| match drag.index.cmp(&index) {
+                std::cmp::Ordering::Equal => d,
+                std::cmp::Ordering::Less => d.border_b_2().border_color(ring),
+                std::cmp::Ordering::Greater => d.border_t_2().border_color(ring),
+            })
+            .on_drop(cx.listener(move |s, drag: &ProjectDrag, _, cx| {
+                cx.stop_propagation();
+                s.move_project(&drag.path, &drop_to, cx);
+            }))
+        });
         self.card_segment(index, row, element, cx)
     }
 
@@ -1740,6 +1868,26 @@ impl Sidebar {
         use krill_proto::control::AgentState;
 
         let p = ui::palette(cx);
+        let base = base.when(
+            self.row_host(index).is_local() && self.editing.is_none(),
+            |d| {
+                let drop_to = path.to_path_buf();
+                let ring = p.ring;
+                d.on_drag(
+                    WorktreeDrag(ProjectDrag {
+                        path: path.to_path_buf(),
+                        name: self.name(path).into(),
+                        index,
+                    }),
+                    |drag, _, _, cx| cx.new(|_| drag.clone()),
+                )
+                .drag_over::<WorktreeDrag>(move |d, _, _, _| d.border_t_2().border_color(ring))
+                .on_drop(cx.listener(move |s, drag: &WorktreeDrag, _, cx| {
+                    cx.stop_propagation();
+                    s.move_worktree(&drag.0.path, &drop_to, cx);
+                }))
+            },
+        );
         let row_host = self.row_host(index).clone();
         let virtualized = self.rows.len() >= 100;
         let row_key = (row_host.clone(), path.to_path_buf());
@@ -1775,7 +1923,7 @@ impl Sidebar {
         let card_expanded = self.session_card_index(index + 1) == Some(index)
             && self.card_list.contains_row(index + 1);
         let pinned = row_host.is_local() && self.prefs.get(path).is_some_and(|p| p.pinned);
-        let name = self.name(path);
+        let name = self.name_on(&row_host, path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
         let branch = self
             .branch_on(&row_host, path)
@@ -1820,7 +1968,7 @@ impl Sidebar {
             .snapshot_for(&row_host)
             .sessions
             .iter()
-            .filter(|s| s.worktree.as_deref() == Some(path))
+            .filter(|s| !s.is_exited() && s.worktree.as_deref() == Some(path))
             .collect();
         let unread =
             row_host.is_local() && tree_sessions.iter().any(|s| self.unread.contains(&s.id));
@@ -3510,7 +3658,29 @@ pub(super) fn disconnect_reason(error: &str) -> &'static str {
 #[derive(Clone)]
 struct ProjectDrag {
     path: PathBuf,
+    index: usize,
     name: gpui::SharedString,
+}
+
+#[derive(Clone)]
+struct WorktreeDrag(ProjectDrag);
+
+impl Render for WorktreeDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
+        div()
+            .px(ui::SPACE_3)
+            .py(ui::SPACE_2)
+            .rounded(ui::RADIUS_SM)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .child(self.0.name.clone())
+    }
 }
 
 impl Render for ProjectDrag {

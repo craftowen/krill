@@ -1382,3 +1382,40 @@ fn provider_metric_rules_require_negotiation_and_stay_off_legacy_wire() {
         assert_eq!(UsageReply::decode(kind, &body).unwrap(), gated);
     }
 }
+
+#[test]
+fn session_account_switch_is_appended_scoped_feature_gated_and_not_read_only() {
+    let request = UsageRequest::SwitchSessionAccount {
+        session: crate::SessionId(7),
+        provider: ProviderKind::Codex,
+        account_id: "chosen".into(),
+    };
+    assert_eq!(
+        postcard::to_stdvec(&request).unwrap(),
+        b"\x14\x07\x01\x06chosen"
+    );
+    let frame = request.encode().unwrap();
+    assert_eq!(
+        UsageRequest::decode(kind::USAGE_REQ, &frame[5..]).unwrap(),
+        request
+    );
+    assert_eq!(
+        request.required_features(),
+        FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_SESSION_ACCOUNT_SWITCH
+    );
+    assert_ne!(crate::ipc::FEATURES & FEAT_SESSION_ACCOUNT_SWITCH, 0);
+    assert!(!request.is_read());
+    assert!(!request.contains_removed_provider());
+    let retired = UsageRequest::SwitchSessionAccount {
+        session: crate::SessionId(7),
+        provider: ProviderKind::Gemini,
+        account_id: "removed".into(),
+    };
+    assert!(retired.contains_removed_provider());
+    let agy = UsageRequest::SwitchSessionAccount {
+        session: crate::SessionId(7),
+        provider: ProviderKind::Antigravity,
+        account_id: "agy".into(),
+    };
+    assert_ne!(agy.required_features() & FEAT_USAGE_AGY, 0);
+}

@@ -19,7 +19,7 @@
 
 use std::process::Stdio;
 
-use krill_proto::os::ffi::OsStringExt;
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt};
 
 use crate::sys::{self, User};
 
@@ -214,8 +214,16 @@ impl Shell {
                 .map(<[u8]>::to_vec)
                 .or_else(|| from_env(key))
         };
+        let windows_path = if cfg!(windows) {
+            let base = from_env(b"PATH");
+            krill_proto::os::augment_windows_path(base.as_deref().map(std::ffi::OsStr::from_bytes))
+                .map(OsStringExt::into_vec)
+                .or(base)
+        } else {
+            None
+        };
         let login_shell = if cfg!(windows) {
-            fallback_shell(from_env(b"PATH").as_deref())
+            fallback_shell(windows_path.as_deref())
         } else {
             pick(user.map(|u| u.shell.as_slice()), b"SHELL").unwrap_or_else(|| fallback_shell(None))
         };
@@ -245,9 +253,9 @@ impl Shell {
             (b"SHELL".to_vec(), login_shell.clone()),
             (
                 b"PATH".to_vec(),
-                // Windows는 로그인 셸 탐침이 없어 물려받은 PATH가 기준이다.
-                from_env(b"PATH")
-                    .filter(|_| cfg!(windows))
+                // Windows는 로그인 셸 탐침이 없어 물려받은 PATH에 사용자 CLI 기본 폴더를 보강한 값이 기준이다.
+                windows_path
+                    .clone()
                     .unwrap_or_else(|| LAUNCHD_PATH.to_vec()),
             ),
             (b"TERM".to_vec(), b"xterm-256color".to_vec()),
@@ -259,7 +267,7 @@ impl Shell {
             Self::Login if cfg!(windows) => vec![login_shell],
             Self::Login => vec![login_shell, b"-l".to_vec()],
             Self::Custom { program, args } => {
-                std::iter::once(resolve(program, from_env(b"PATH").as_deref()))
+                std::iter::once(resolve(program, windows_path.as_deref()))
                     .chain(args.iter().cloned())
                     .collect()
             }

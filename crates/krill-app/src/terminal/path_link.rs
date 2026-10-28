@@ -503,6 +503,7 @@ fn resolve(path: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> 
 #[derive(Debug, Default)]
 pub struct Cache {
     last: Option<Cached>,
+    remote_probes: std::collections::HashMap<(Option<PathBuf>, String), Option<PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -622,6 +623,45 @@ impl Cache {
             .found
             .clone()
             .filter(|link| (link.column..link.column.saturating_add(link.cols)).contains(&column))
+    }
+
+    pub(super) fn probe_remote(
+        &mut self,
+        target: &krill_hosts::HostTarget,
+        cwd: Option<&Path>,
+        query_paths: &[PathBuf],
+    ) -> std::collections::HashMap<String, PathBuf> {
+        let cwd_key = cwd.map(Path::to_owned);
+        let mut missing = Vec::new();
+        for raw in query_paths {
+            if let Some(raw_str) = raw.to_str()
+                && !self
+                    .remote_probes
+                    .contains_key(&(cwd_key.clone(), raw_str.to_owned()))
+            {
+                missing.push(raw.clone());
+            }
+        }
+        if !missing.is_empty() {
+            let probed = crate::remote_fs::probe_paths(target, cwd, &missing);
+            for (raw, found) in missing.into_iter().zip(probed) {
+                if let Some(raw_str) = raw.to_str() {
+                    self.remote_probes
+                        .insert((cwd_key.clone(), raw_str.to_owned()), found);
+                }
+            }
+        }
+        let mut resolved = std::collections::HashMap::new();
+        for raw in query_paths {
+            if let Some(raw_str) = raw.to_str()
+                && let Some(Some(found_path)) = self
+                    .remote_probes
+                    .get(&(cwd_key.clone(), raw_str.to_owned()))
+            {
+                resolved.insert(raw_str.to_owned(), found_path.clone());
+            }
+        }
+        resolved
     }
 }
 

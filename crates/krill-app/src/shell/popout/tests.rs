@@ -164,7 +164,7 @@ fn linked_account_refresh_keeps_daemon_snapshot_on_ipc_failure(cx: &mut TestAppC
         shell.link = Link::Up;
         shell.accounts_snapshot = (snapshot.clone()).into();
         shell.notice = None;
-        shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+        shell.refresh_accounts(UsageRequest::RefreshUsage, cx);
     });
     cx.run_until_parked();
     cx.executor().advance_clock(Duration::from_secs(2));
@@ -611,11 +611,14 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
         "dashboard-session-1",
         "dashboard-session-2",
         "dashboard-session-3",
-        "dashboard-session-4",
         "dashboard-session-5",
     ] {
         assert!(visual.debug_bounds(selector).is_some());
     }
+    assert!(
+        visual.debug_bounds("dashboard-session-4").is_none(),
+        "ended sessions are not dashboard cards"
+    );
     assert_eq!(
         [
             lane(AgentState::Waiting),
@@ -1107,7 +1110,7 @@ fn unreleased_workers_includes_completed_runs_and_hides_released() {
 }
 
 /// OWE-702: 데몬 연결 중에만 `ACCOUNTS_POLL`마다 계정을 다시 묻고, 링크가 끊기면 멈춘다.
-/// 가짜 데몬 소켓은 연결 수만 센다(응답 없음 → 조용히 다음 바퀴).
+/// 가짜 데몬은 준비·감시 연결을 제외하고 계정 요청만 센다(응답 없음 → 조용히 다음 바퀴).
 #[gpui::test]
 fn accounts_poll_runs_only_while_linked(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1120,9 +1123,32 @@ fn accounts_poll_runs_only_while_linked(cx: &mut TestAppContext) {
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
     std::thread::spawn(move || {
+        use std::io::Write as _;
         for stream in listener.incoming() {
-            counter.fetch_add(1, Ordering::SeqCst);
-            drop(stream);
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            let server = ipc::ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: krill_proto::usage::FEAT_USAGE,
+                build: "fixture".into(),
+                instance_id: 1,
+            };
+            if stream.write_all(&server.encode().unwrap()).is_err() {
+                continue;
+            }
+            let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                continue;
+            };
+            let Ok(hello) = ipc::ClientHello::decode(kind, &body) else {
+                continue;
+            };
+            if hello.features & krill_proto::usage::FEAT_USAGE != 0
+                && matches!(ipc::read_frame(&mut stream), Ok(Some(_)))
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }
     });
     let paths = krill_proto::daemon::Paths {
@@ -1908,16 +1934,16 @@ fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
         expanded_account_usage(&windows, now + 60),
         "5h 0% 1h 30m · 7d 92% 1d 18h"
     );
-    // 좁은 창은 막대 쌍을 유지하고 리셋만 가장 큰 단위로 접는다.
+    // 5시간 사용량은 분까지, 주간 사용량은 남은 시간까지 표기한다.
     assert_eq!(
-        status_window_parts(usage.seven_day.as_ref(), now, true),
-        (Some(92), Some("1d".to_owned()))
+        status_window_parts(usage.seven_day.as_ref(), now),
+        (Some(92), Some("1d 19h".to_owned()))
     );
     assert_eq!(
-        status_window_parts(usage.five_hour.as_ref(), now, false),
+        status_window_parts(usage.five_hour.as_ref(), now),
         (Some(0), Some("1h 31m".to_owned()))
     );
-    assert_eq!(status_window_parts(None, now, true), (None, None));
+    assert_eq!(status_window_parts(None, now), (None, None));
     assert_eq!(status_window_label(None, now), "—");
     for (secs, expected) in [
         (0, "0m"),
@@ -2138,9 +2164,9 @@ fn dashboard_done_lane_orders_unread_top_and_clicked_cards_move_to_bottom(cx: &m
                 id: SessionId(3),
                 status: AgentStatus {
                     agent: "gemini".into(),
-                    state: AgentState::Exited,
+                    state: AgentState::Done,
                     since_unix_ns: 200,
-                    title: Some("exited-mid".into()),
+                    title: Some("done-mid".into()),
                     ..AgentStatus::UNKNOWN
                 },
                 worktree: Some("/repo/three".into()),
@@ -2259,4 +2285,93 @@ fn dashboard_done_lane_orders_unread_top_and_clicked_cards_move_to_bottom(cx: &m
             (SessionId(3), false, Some(2)),
         ]
     );
+}
+
+#[gpui::test]
+fn status_bar_provider_visibility_toggle_hides_and_restores_pill(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountInfo, Snapshot, Window};
+    let (shell, handle) = open(cx);
+    shell.update(cx, |s, cx| {
+        // Keep the seeded daemon snapshot when Config changes request a refresh.
+        s.link = Link::Up;
+        s.paths = Some(krill_proto::daemon::Paths {
+            socket: std::env::temp_dir()
+                .join(format!("provider-toggle-{}.sock", std::process::id())),
+            holder: "/unused/provider-toggle-holder".into(),
+            krilld: "/unused/provider-toggle-daemon".into(),
+        });
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Claude,
+            ProviderKind::OpenCode,
+        ])));
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
+            [ProviderKind::Claude, ProviderKind::OpenCode]
+                .into_iter()
+                .map(|provider| AccountInfo {
+                    id: provider.as_str().into(),
+                    provider,
+                    label: provider.display_name().into(),
+                    email: None,
+                    profile_dir: "/tmp/provider-toggle".into(),
+                    active: true,
+                    host_default: false,
+                    stale: false,
+                    usage: Snapshot {
+                        five_hour: Some(Window {
+                            percent: 12,
+                            resets_at: Some(
+                                (krill_app::accounts::display::now() + 5400).to_string(),
+                            ),
+                        }),
+                        seven_day: Some(Window {
+                            percent: 34,
+                            resets_at: Some(
+                                (krill_app::accounts::display::now() + 172_800).to_string(),
+                            ),
+                        }),
+                    },
+                })
+                .collect();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    assert!(vcx.debug_bounds("status-provider-pill-claude").is_some());
+    assert!(vcx.debug_bounds("status-provider-pill-opencode").is_some());
+
+    // OpenCode pill 메뉴에서 하단바 표시 끄기
+    let oc_pill = vcx.debug_bounds("status-provider-pill-opencode").unwrap();
+    vcx.simulate_click(oc_pill.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let toggle = vcx
+        .debug_bounds("status-provider-toggle-bar-opencode")
+        .unwrap();
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("status-provider-pill-claude").is_some());
+    assert!(vcx.debug_bounds("status-provider-pill-opencode").is_none());
+
+    // 상태바 우클릭 메뉴에서 다시 켜기
+    let bar = vcx.debug_bounds("status-bar").unwrap();
+    vcx.simulate_mouse_down(
+        bar.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    vcx.simulate_mouse_up(
+        bar.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    vcx.run_until_parked();
+    let restore = vcx
+        .debug_bounds("status-bar-menu-provider-opencode")
+        .unwrap();
+    vcx.simulate_click(restore.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.read(|cx| krill_app::settings::status_provider_visible(ProviderKind::OpenCode, cx))
+    );
+    assert!(vcx.debug_bounds("status-provider-pill-opencode").is_some());
 }

@@ -35,6 +35,8 @@ use crate::usage::accounts;
 
 pub mod detect;
 mod monitor;
+#[cfg(any(windows, test))]
+pub(crate) mod process_tree;
 mod subagents;
 pub(crate) use monitor::monitor;
 
@@ -123,7 +125,15 @@ impl Statuses {
         let mut next = lock(&self.map).clone();
         let mut n = 0;
         for &(session, e) in events {
-            let Some(state) = normalize(&e.payload) else {
+            let state = if let Some(state) = normalize(&e.payload) {
+                state
+            } else if next
+                .get(&session)
+                .is_some_and(|r| r.status.state == AgentState::Waiting)
+                && subagent_clears_waiting(&e.payload)
+            {
+                AgentState::Working
+            } else {
                 continue;
             };
             let r = next.entry(session).or_insert_with(|| Record {
@@ -173,8 +183,11 @@ impl Statuses {
             if let Some(r) = map.get(&session) {
                 if r.status.source == Some(Source::Process)
                     || (r.status.source == Some(Source::Hook)
-                        && !(r.status.state == AgentState::Waiting
-                            && evidence.dismissed_since == Some(r.status.since_unix_ns)))
+                        && !(matches!(r.status.state, AgentState::Waiting | AgentState::Blocked)
+                            && evidence.dismissed_since == Some(r.status.since_unix_ns))
+                        && !(!matches!(r.status.state, AgentState::Waiting | AgentState::Blocked)
+                            && evidence.source == Source::Screen
+                            && matches!(evidence.state, AgentState::Waiting | AgentState::Blocked)))
                 {
                     return;
                 }
@@ -281,13 +294,22 @@ pub(crate) fn now_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
+/// Antigravity 등 중첩 `toolCall` 객체에서 도구 이름을 읽는 보조 필드.
+#[derive(Deserialize)]
+struct ToolCallFields {
+    #[serde(alias = "toolName", alias = "tool_name")]
+    name: Option<String>,
+}
+
 /// hook payload(JSON)에서 읽는 필드. 나머지는 무시한다.
 #[derive(Deserialize)]
 struct Fields {
     #[serde(alias = "hookEventName", alias = "event")]
     hook_event_name: Option<String>,
-    #[serde(alias = "toolName")]
+    #[serde(alias = "toolName", alias = "name")]
     tool_name: Option<String>,
+    #[serde(alias = "toolCall")]
+    tool_call: Option<ToolCallFields>,
     #[serde(alias = "notificationType")]
     notification_type: Option<String>,
     #[serde(alias = "agentId", alias = "subagent_id", alias = "subagentId")]
@@ -298,6 +320,8 @@ struct Fields {
     teammate_id: Option<String>,
     #[serde(default, alias = "isSubagent")]
     is_subagent: bool,
+    #[serde(alias = "fullyIdle")]
+    fully_idle: Option<bool>,
 }
 
 /// Claude·Codex·Cursor·OpenCode·Antigravity hook payload 하나를 상태로. 상태를 바꾸지 않는 이벤트(서브에이전트·압축 등)와
@@ -308,28 +332,32 @@ struct Fields {
 /// | `SessionStart`, Cursor `sessionStart` | done(프롬프트에서 대기, 턴 완료 여부는 wait 기준점으로 구분) |
 /// | `Stop`, `StopFailure`, `Interrupt`, Antigravity `PostInvocation`, Cursor `stop` | done(프롬프트에서 대기) |
 /// | `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, Antigravity `PreInvocation`, Cursor `beforeSubmitPrompt`·`afterShellExecution`·`afterMCPExecution` | working |
-/// | `PermissionRequest`, 질문 도구(`AskUserQuestion`·`request_user_input`·`ask_question`·`ask_permission`)의 `PreToolUse`/`BeforeTool` | waiting |
+/// | `PermissionRequest`, 질문 도구(`AskUserQuestion`·`ExitPlanMode`·`request_user_input`·`ask_question`·`ask_permission`·`question`)의 `PreToolUse`/`BeforeTool` | waiting |
 /// | `Notification`의 `permission_prompt`·`elicitation_dialog` | waiting(`idle_prompt`는 Stop 약 60초 뒤라 무시) |
 /// | `SessionEnd`, Cursor `sessionEnd` | exited |
 pub fn normalize(payload: &[u8]) -> Option<AgentState> {
     let f: Fields = serde_json::from_slice(payload).ok()?;
-    if f.is_subagent
+    let is_subagent = f.is_subagent
         || f.agent_id.as_deref().is_some_and(|s| !s.is_empty())
         || f.parent_session_id
             .as_deref()
             .is_some_and(|s| !s.is_empty())
-        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty())
-    {
-        return None;
-    }
-    let asks = f.tool_name.as_deref().is_some_and(asks_user);
-    Some(match f.hook_event_name.as_deref()? {
+        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty());
+    let tool = f
+        .tool_name
+        .as_deref()
+        .or_else(|| f.tool_call.as_ref()?.name.as_deref());
+    let asks = tool.is_some_and(asks_user);
+    let state = match f.hook_event_name.as_deref()? {
+        "Stop" if f.fully_idle == Some(false) => return None,
         "SessionStart" | "sessionStart" | "Stop" | "StopFailure" | "Interrupt" | "AfterAgent"
         | "PostInvocation" | "stop" => AgentState::Done,
         "PreToolUse" | "BeforeTool" if asks => AgentState::Waiting,
         "UserPromptSubmit"
         | "PreToolUse"
         | "PostToolUse"
+        | "PostToolUseFailure"
+        | "ElicitationResult"
         | "BeforeAgent"
         | "BeforeTool"
         | "AfterTool"
@@ -337,7 +365,7 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
         | "beforeSubmitPrompt"
         | "afterShellExecution"
         | "afterMCPExecution" => AgentState::Working,
-        "PermissionRequest" => AgentState::Waiting,
+        "PermissionRequest" | "Elicitation" | "AskUserQuestion" => AgentState::Waiting,
         "Notification"
             if matches!(
                 f.notification_type.as_deref(),
@@ -348,10 +376,46 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
         }
         "SessionEnd" | "sessionEnd" => AgentState::Exited,
         _ => return None,
-    })
+    };
+    if is_subagent {
+        return (state == AgentState::Waiting).then_some(AgentState::Waiting);
+    }
+    Some(state)
 }
 
-/// 사람에게 묻는 도구(Claude `AskUserQuestion`, Codex `request_user_input`, Antigravity `ask_question`·`ask_permission`). 대소문자·구분자 무시.
+/// 서브에이전트가 띄운 권한·질문(`Waiting`)이 끝났음을 뜻하는 서브에이전트 후속 이벤트인가(Orca `claude-roster-state` 준용).
+fn subagent_clears_waiting(payload: &[u8]) -> bool {
+    let Ok(f) = serde_json::from_slice::<Fields>(payload) else {
+        return false;
+    };
+    let is_subagent = f.is_subagent
+        || f.agent_id.as_deref().is_some_and(|s| !s.is_empty())
+        || f.parent_session_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty());
+    let Some(event) = f.hook_event_name.as_deref() else {
+        return false;
+    };
+    if matches!(event, "SubagentStop" | "TeammateIdle") {
+        return true;
+    }
+    if !is_subagent {
+        return false;
+    }
+    let tool = f
+        .tool_name
+        .as_deref()
+        .or_else(|| f.tool_call.as_ref().and_then(|t| t.name.as_deref()));
+    let asks = tool.is_some_and(asks_user);
+    match event {
+        "PostToolUse" | "PostToolUseFailure" | "AfterTool" | "ElicitationResult" => true,
+        "PreToolUse" | "BeforeTool" => !asks,
+        _ => false,
+    }
+}
+
+/// 사람에게 묻는 도구(Claude `AskUserQuestion`·`ExitPlanMode`, Codex `request_user_input`, Antigravity `ask_question`·`ask_permission`, `OpenCode` `question`). 대소문자·구분자 무시.
 fn asks_user(tool: &str) -> bool {
     let n: String = tool
         .chars()
@@ -360,7 +424,12 @@ fn asks_user(tool: &str) -> bool {
         .collect();
     matches!(
         n.as_str(),
-        "askuserquestion" | "requestuserinput" | "askquestion" | "askpermission"
+        "askuserquestion"
+            | "exitplanmode"
+            | "requestuserinput"
+            | "askquestion"
+            | "askpermission"
+            | "question"
     )
 }
 
@@ -456,6 +525,17 @@ pub(crate) fn foreground_process(
     resolve(pid)
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty() && name.len() <= krill_proto::control::MAX_AGENT_TEXT)
+}
+
+/// Unix reports the terminal foreground group. Windows instead identifies an unambiguous
+/// native agent in this session's process tree, without treating generic runtimes as agents.
+pub(crate) fn session_foreground(root: u32, fg: Option<u32>, exited: bool) -> Option<String> {
+    if exited {
+        return None;
+    }
+    #[cfg(windows)]
+    let fg = fg.or_else(|| crate::sys::session_agent_process(root));
+    foreground_process(root, fg, false, |pid| crate::sys::process_name(pid).ok())
 }
 
 #[cfg(test)]

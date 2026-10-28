@@ -62,7 +62,8 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
         );
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("host-error-iroh:studio").is_some());
+    assert!(vcx.debug_bounds("host-header-iroh:studio").is_none());
+    assert!(vcx.debug_bounds("host-error-iroh:studio").is_none());
 }
 
 #[gpui::test]
@@ -1233,7 +1234,7 @@ fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAp
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.prs.insert(path.clone(), Status::Missing);
-            s.poll_error = Some("daemon slow".into());
+            s.poll_error = Some(("daemon slow".into(), false));
             s.notice = Some("sidebar notice".into());
             s.error = Some("save failed".into());
             cx.notify();
@@ -1752,9 +1753,9 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
                 .collect::<Vec<_>>()
         })
     };
-    // 세션이 남은 끊긴 호스트(kak)는 다시 연결하도록 보이고, 세션 없는 끊긴 호스트 둘과
-    // 프로젝트 없이 연결만 된 호스트(oci, 관리는 설정)는 프로젝트 목록에 띄우지 않는다.
-    assert_eq!(headers(cx), ["kak"]);
+    // 연결 안 된 호스트와 프로젝트 없이 연결만 된 호스트(oci, 관리는 설정)는 프로젝트 목록에 띄우지 않는다.
+    assert!(headers(cx).is_empty());
+    assert!(cx.update(|_, cx| view.read(cx).rows.is_empty()));
 
     assert_eq!(
         super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
@@ -1848,7 +1849,7 @@ fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) 
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rows, ["/local", "/tax", "/seol", "host:off", "loose"]);
+        assert_eq!(rows, ["/local", "/tax", "/seol", "loose"]);
         // The other PC's worktree sits inside the local project, before the next project.
         let merged = s
             .rows
@@ -1874,7 +1875,7 @@ fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) 
         let loose_hosts = (loose + 1..s.rows.len())
             .map(|i| s.row_host(i).as_key().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(loose_hosts, ["win", "off"]);
+        assert_eq!(loose_hosts, ["win"]);
     });
     // Folding the merged header folds the other PC's part too.
     view.update(cx, |s, cx| s.fold(Path::new("/local"), Some(false), cx));
@@ -1913,11 +1914,15 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         };
         s.focused = Some(SessionId(1));
         s.custom_titles.insert(SessionId(1), "Local title".into());
+        let mut remote_snap = s.snapshot.clone();
+        remote_snap
+            .trees
+            .insert("/remote-only".into(), vec!["/remote-only".into()]);
         s.remote_hosts = vec![RemoteHost {
             id: "studio".into(),
             label: "Studio".into(),
             status: HostStatus::Connected,
-            snapshot: s.snapshot.clone(),
+            snapshot: remote_snap,
             meta: Meta::new(),
             source: None,
             error: None,
@@ -1927,7 +1932,7 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         s.rebuild(cx);
     });
     cx.run_until_parked();
-    let (local_tree, remote_repo, remote_tree) = cx.update(|_, cx| {
+    let (local_tree, remote_repo, remote_only_repo, remote_tree) = cx.update(|_, cx| {
         let s = view.read(cx);
         assert!(!s.rows.iter().any(|r| matches!(r, Row::HostHeader { .. })));
         assert!(matches!(&s.rows[0], Row::Repository(p) if p == Path::new("/repo")));
@@ -1940,13 +1945,17 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
             s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
             Some("Studio".into())
         );
-        // The same project on another PC merges into the one project header.
+        assert_eq!(
+            s.host_badge_for(&remote, Path::new("/remote-only")),
+            Some("Studio".into())
+        );
+        // The same project on another PC merges into the one project header; remote-only stays its own project.
         assert_eq!(
             s.rows
                 .iter()
                 .filter(|r| matches!(r, Row::Repository(_)))
                 .count(),
-            1
+            2
         );
         assert_eq!(
             s.merged_projects.get(&0).map(Vec::as_slice),
@@ -1969,12 +1978,17 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         (
             find(&HostId::Local, false),
             find(&HostId::Local, true),
+            find(&remote, true),
             find(&remote, false),
         )
     });
     let sel = |prefix: &str, index| -> &'static str { format!("{prefix}-{index}").leak() };
-    // A connected PC shows on its cards, not as another badge on the merged header.
+    // A connected PC shows on its cards, not as another badge on either merged or remote-only headers.
     assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
+    assert!(
+        cx.debug_bounds(sel("project-host", remote_only_repo))
+            .is_none()
+    );
     let bounds = cx.debug_bounds(sel("card-session", remote_tree)).unwrap();
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
@@ -1989,28 +2003,31 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         let remote_session = &s.remote_hosts[0].snapshot.sessions[0];
         assert_ne!(s.session_label_on(&remote, remote_session).0, "Local title");
     });
-    let reconnected = Rc::new(RefCell::new(Vec::new()));
-    let out = reconnected.clone();
-    let _sub = cx.update(|_, cx| {
-        cx.subscribe(&view, move |_, event: &ReconnectHost, _| {
-            out.borrow_mut().push(event.0.clone());
-        })
-    });
     view.update(cx, |s, cx| {
         s.remote_hosts[0].status = HostStatus::Disconnected;
         s.rebuild(cx);
     });
     cx.run_until_parked();
-    assert!(view.read_with(cx, |s, _| s.is_row_dimmed(remote_tree)));
-    let reconnect = cx
-        .debug_bounds(sel("project-reconnect", remote_repo))
-        .unwrap();
-    cx.simulate_click(reconnect.center(), Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(reconnected.borrow().as_slice(), &[remote]);
+    view.read_with(cx, |s, _| {
+        assert!(s.row_hosts.iter().all(HostId::is_local));
+        assert!(s.merged_projects.is_empty());
+    });
+    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
+    assert!(
+        cx.debug_bounds(sel("project-reconnect", remote_repo))
+            .is_none()
+    );
+    assert!(
+        cx.debug_bounds(sel("project-host", remote_only_repo))
+            .is_none()
+    );
+    assert!(
+        cx.debug_bounds(sel("project-reconnect", remote_only_repo))
+            .is_none()
+    );
     assert!(
         selected.borrow().len() == 1,
-        "reconnect must not activate or fold the project"
+        "disconnect must not activate or fold the project"
     );
 }
 
@@ -2454,6 +2471,84 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("worktree-cache-timer-1").is_none());
     assert!(vcx.debug_bounds("session-cache-timer-2").is_none());
+
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 제안 B: 사이드바 세션 행 호버 시 구조화된 멀티라인 호버 카드(`Turn N`, 세션 제목,
+/// 단답형 응답 병합된 마지막 프롬프트 상자, 이전 턴 요약)가 표시된다.
+#[gpui::test]
+fn session_row_hover_card_shows_last_prompt_turn_badge_and_previous_turn(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-prompt-hover", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sid = SessionId(11);
+    let t1 = 10_000_000_000_000_u64;
+    krill_proto::git::record_session_prompt(&dir, sid, "로그인 세션 만료 버그 수정해줘", t1)
+        .unwrap();
+    krill_proto::git::record_session_prompt(
+        &dir,
+        sid,
+        "쿠키 만료 회귀 테스트 추가해줘",
+        t1 + 10_000_000_000,
+    )
+    .unwrap();
+    krill_proto::git::record_session_prompt(&dir, sid, "ㅇㅇ 진행해", t1 + 20_000_000_000).unwrap();
+    let sidebar_file = dir.join("sidebar.bin");
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_file)));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut claude = session(11, AgentState::Working, Some("/repo/wt-1"));
+            claude.status.agent = "claude".into();
+            claude.status.since_unix_ns = t1 + 20_000_000_000;
+            let wt = PathBuf::from("/repo/wt-1");
+            s.snapshot = Snapshot {
+                sessions: vec![claude],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec![wt.clone()])]),
+            };
+            s.expanded_cards.insert(wt);
+            s.set_now_unix_ns_for_test(Some(t1 + 80_000_000_000), cx);
+            s.rebuild(cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let row_bounds = vcx
+        .debug_bounds("session-title-2")
+        .expect("session row title bounds");
+    vcx.simulate_mouse_move(row_bounds.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds("tooltip:sidebar-session-hover-11")
+            .is_some(),
+        "hovering sidebar session row must render structured hover card"
+    );
+    assert!(
+        vcx.debug_bounds("tooltip-turn:sidebar-session-hover-11:3")
+            .is_some(),
+        "hover card must display Turn 3 badge"
+    );
+    assert!(
+        vcx.debug_bounds("tooltip-last-prompt:sidebar-session-hover-11")
+            .is_some(),
+        "hover card must render last prompt surface box"
+    );
+    assert!(
+        vcx.debug_bounds(
+            "tooltip-prompt-text:sidebar-session-hover-11:쿠키 만료 회귀 테스트 추가해줘 (→ ㅇㅇ 진행해)"
+        )
+        .is_some(),
+        "hover card must merge short ack with substantive prompt"
+    );
+    assert!(
+        vcx.debug_bounds("tooltip-prev-prompt:sidebar-session-hover-11")
+            .is_some(),
+        "hover card must render previous turn summary line"
+    );
 
     fs::remove_dir_all(dir).ok();
 }
@@ -5098,7 +5193,7 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    let (_, _, _, _, order) = load_state(&file).unwrap();
+    let (_, _, _, _, order, _) = load_state(&file).unwrap();
     assert_eq!(
         order,
         [
@@ -5283,6 +5378,49 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
             generic.status.title = Some("Claude Code".into());
             s.set_auto_title(generic.id, "fix-login-timeout", cx);
             assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
+            generic.status.title = Some("Windows PowerShell".into());
+            assert_eq!(
+                s.session_label(&generic).0,
+                "Windows PowerShell",
+                "a shell without an identified agent retains its title"
+            );
+            generic.status.agent = "claude".into();
+            assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
+            s.auto_titles.remove(&generic.id);
+            assert_eq!(
+                s.session_label(&generic).0,
+                "Windows PowerShell",
+                "an agent without a known prompt must not invent a title"
+            );
+            s.set_auto_title(generic.id, "fix-login-timeout", cx);
+
+            // The pane's cached generic OSC label must not hide a newer title
+            // reported by the remote daemon, or borrow a local title by ID.
+            let remote = HostId::Remote("windows".into());
+            let mut remote_session = generic.clone();
+            remote_session.status.title = Some("원격 대화 제목".into());
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("✳ Claude Code"))
+                    .0,
+                "원격 대화 제목"
+            );
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("⠂ 원격 터미널 제목"))
+                    .0,
+                "원격 터미널 제목"
+            );
+            remote_session.status.title = None;
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("✳ Claude Code"))
+                    .0,
+                "Claude Code"
+            );
+            assert_eq!(
+                s.session_label_on_with_title(&remote, &remote_session, Some("Windows PowerShell"))
+                    .0,
+                "Windows PowerShell",
+                "a remote ID never borrows the local prompt title"
+            );
         });
     });
 }
@@ -5667,6 +5805,27 @@ fn default_worktree_ignores_redundant_project_name_in_prefs(cx: &mut TestAppCont
             assert_eq!(s.name(&repo), "직접 정한 기본 워크트리");
         });
     });
+
+    // `projects.toml`로 등록된 프로젝트(세션 없음)도 `.git/HEAD`에서 브랜치를 읽어 폴더명 대신 브랜치를 표기한다.
+    let dir = std::env::temp_dir().join(format!("krill-imported-branch-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let imported_repo = dir.join("oh-my-vibecode");
+    fs::create_dir_all(imported_repo.join(".git")).unwrap();
+    fs::write(imported_repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let canon_repo = fs::canonicalize(&imported_repo).unwrap();
+    fs::write(
+        dir.join(external::PROJECTS_FILE),
+        format!(
+            "[[projects]]\nid = \"omv\"\npath = \"{}\"\ndisplay_name = \"oh-my-vibecode\"\nkind = \"git\"\n\n\
+             [worktrees.\"{}\"]\nrepo_id = \"omv\"\n",
+            canon_repo.display(),
+            canon_repo.display()
+        ),
+    )
+    .unwrap();
+    let loaded = Sidebar::new_loaded(Some(dir.join("sidebar.bin")));
+    assert_eq!(loaded.name(&canon_repo), "main");
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[gpui::test]
@@ -6244,4 +6403,619 @@ fn remote_host_worktree_creation_and_child_lineage(cx: &mut TestAppContext) {
     assert_eq!(del_sent.len(), 1);
     assert_eq!(del_sent[0].repo, b"/remote/repo".to_vec());
     assert_eq!(del_sent[0].path, b"/remote/repo/child-wt".to_vec());
+}
+
+#[gpui::test]
+fn exited_processes_leave_sidebar_dashboard_counts_and_unread(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(cx, |sidebar, cx| {
+        let mut ended = session(1, AgentState::Exited, Some("/repo/a"));
+        ended.status.agent = "codex".into();
+        ended.status.source = Some(krill_proto::control::Source::Process);
+        let mut hook_ended = session(2, AgentState::Exited, Some("/repo/a"));
+        hook_ended.status.agent = "claude".into();
+        hook_ended.status.source = Some(krill_proto::control::Source::Hook);
+        let mut loose = ended.clone();
+        loose.id = SessionId(3);
+        loose.worktree = None;
+        loose.cwd = None;
+        let mut folder = ended.clone();
+        folder.id = SessionId(4);
+        folder.worktree = None;
+        folder.cwd = Some("/folder".into());
+        let done = session(5, AgentState::Done, Some("/repo/a"));
+        sidebar.unread = BTreeSet::from([SessionId(1), SessionId(2)]);
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![ended, hook_ended, loose, folder, done],
+                    trees: BTreeMap::from([("/repo".into(), vec!["/repo/a".into()])]),
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        let mut row_ids: Vec<_> = sidebar
+            .rows
+            .iter()
+            .filter_map(|row| {
+                if let Row::Session(session, _) = row {
+                    Some(session.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        row_ids.sort();
+        assert_eq!(row_ids, vec![SessionId(2), SessionId(5)]);
+        assert_eq!(sidebar.agent_counts(), (0, 0, 1));
+        assert!(sidebar.unread.is_empty());
+        assert_eq!(
+            sidebar
+                .dashboard_sessions()
+                .iter()
+                .map(|(_, session)| session.id)
+                .collect::<Vec<_>>(),
+            vec![SessionId(5)]
+        );
+        // Matching IDs on other hosts must be treated independently.
+        let mut remote_done = session(1, AgentState::Done, None);
+        remote_done.status.agent = "codex".into();
+        let mut remote_waiting = session(2, AgentState::Waiting, None);
+        remote_waiting.status.agent = "claude".into();
+        sidebar.set_remote_snapshot_for_test(
+            "remote",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![remote_done, remote_waiting],
+                ..Snapshot::default()
+            },
+            cx,
+        );
+        assert_eq!(sidebar.dashboard_sessions().len(), 3);
+        assert_eq!(sidebar.agent_counts(), (1, 0, 2));
+    });
+}
+
+#[gpui::test]
+fn windows_identity_merges_imported_repositories_sessions_and_preferences(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |s, cx| {
+        let repo = PathBuf::from(r"C:\Users\Owen\프로젝트");
+        let tree = PathBuf::from(r"C:\Workspaces\간단작업");
+        s.snapshot = Snapshot {
+            trees: BTreeMap::from([
+                (repo.clone(), vec![repo.clone(), tree.clone()]),
+                (
+                    PathBuf::from(r"\\?\c:\users\owen\프로젝트"),
+                    vec![PathBuf::from("c:/workspaces/간단작업/")],
+                ),
+            ]),
+            sessions: vec![
+                Session {
+                    cwd: Some(PathBuf::from(r"\\?\C:\WORKSPACES\간단작업")),
+                    worktree: None,
+                    ..session(1, AgentState::Working, None)
+                },
+                Session {
+                    cwd: Some(PathBuf::from("c:/workspaces/간단작업/sub")),
+                    worktree: None,
+                    ..session(2, AgentState::Unknown, None)
+                },
+            ],
+        };
+        s.prefs.insert(
+            tree.clone(),
+            Preference {
+                pinned: true,
+                name: String::new(),
+            },
+        );
+        let alias = PathBuf::from(r"\\?\C:\WORKSPACES\간단작업");
+        s.comments.insert(tree.clone(), String::new());
+        s.comments.insert(alias.clone(), "Review me".into());
+        s.meta.insert(
+            tree.clone(),
+            Tree {
+                branch: None,
+                dirty: Some(0),
+            },
+        );
+        s.meta.insert(
+            alias.clone(),
+            Tree {
+                branch: Some("topic".into()),
+                dirty: Some(3),
+            },
+        );
+        s.worktree_updated_at.insert(tree.clone(), 10);
+        s.worktree_updated_at.insert(alias.clone(), 20);
+        s.prefs.insert(
+            PathBuf::from(r"\\?\C:\WORKSPACES\간단작업"),
+            Preference {
+                name: "간단작업".into(),
+                pinned: false,
+            },
+        );
+        s.selected_worktree = Some(PathBuf::from("c:/workspaces/간단작업"));
+        s.rebuild(cx);
+        assert_eq!(s.snapshot.trees.len(), 1);
+        assert_eq!(s.snapshot.trees[&repo], [repo.clone(), tree.clone()]);
+        assert!(
+            s.snapshot
+                .sessions
+                .iter()
+                .all(|session| session.worktree.as_ref() == Some(&tree))
+        );
+        assert!(!s.rows.iter().any(|row| matches!(row, Row::Folder(_))));
+        assert_eq!(s.selected_worktree, Some(tree.clone()));
+        assert_eq!(s.prefs[&tree].name, "간단작업");
+        assert!(s.prefs[&tree].pinned);
+        assert_eq!(s.comments[&tree], "Review me");
+        assert_eq!(s.meta[&tree].branch.as_deref(), Some("topic"));
+        assert_eq!(s.meta[&tree].dirty, Some(3));
+        assert_eq!(s.worktree_updated_at[&tree], 20);
+        assert_eq!(
+            s.worktree_for_path(Path::new(r"\\?\c:\workspaces\간단작업\sub")),
+            Some(tree.clone())
+        );
+        assert_eq!(
+            s.repo_for_worktree(Path::new("C:/WORKSPACES/간단작업")),
+            Some(repo)
+        );
+        assert_eq!(
+            s.session_for_workspace(&HostId::Local, Path::new("C:/WORKSPACES/간단작업")),
+            Some(SessionId(1))
+        );
+        let before = s.snapshot.clone();
+        s.rebuild(cx);
+        assert_eq!(before, s.snapshot);
+        s.prefs = BTreeMap::from([
+            (
+                tree.clone(),
+                Preference {
+                    pinned: false,
+                    name: "간단작업".into(),
+                },
+            ),
+            (
+                alias,
+                Preference {
+                    pinned: true,
+                    name: String::new(),
+                },
+            ),
+        ]);
+        s.rebuild(cx);
+        assert!(s.prefs[&tree].pinned);
+        assert_eq!(s.prefs[&tree].name, "간단작업");
+    });
+}
+
+#[gpui::test]
+fn windows_slash_unc_snapshot_merges_aliases_without_drive_paths(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new(None));
+    sidebar.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            trees: BTreeMap::from([
+                (
+                    "//SERVER/Share".into(),
+                    vec!["//SERVER/Share/간단작업".into()],
+                ),
+                (
+                    "//server/share".into(),
+                    vec!["//server/share/간단작업".into()],
+                ),
+            ]),
+            sessions: vec![Session {
+                cwd: Some("//server/share/간단작업/sub".into()),
+                worktree: None,
+                ..session(1, AgentState::Working, None)
+            }],
+        };
+        s.rebuild(cx);
+        assert_eq!(s.snapshot.trees.len(), 1);
+        assert_eq!(s.snapshot.trees.values().next().unwrap().len(), 1);
+        assert!(krill_proto::path::equivalent(
+            s.snapshot.sessions[0].worktree.as_deref().unwrap(),
+            Path::new("//server/share/간단작업"),
+        ));
+    });
+}
+
+#[gpui::test]
+fn dragging_worktree_cards_changes_manual_order_and_persists_without_reordering_projects(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-card-drag-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view({
+        let file = file.clone();
+        move |_, _| Sidebar::new_loaded(Some(file))
+    });
+    view.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![],
+            trees: BTreeMap::from([
+                (
+                    "/repo".into(),
+                    vec!["/repo".into(), "/a".into(), "/b".into()],
+                ),
+                ("/other".into(), vec!["/other".into()]),
+            ]),
+        };
+        s.options.sort_by = SortBy::Smart;
+        s.project_order = vec!["/repo".into(), "/other".into()];
+        s.rebuild(cx);
+    });
+    cx.run_until_parked();
+    let bounds = |path: &str, cx: &mut gpui::VisualTestContext| {
+        let index = view.read_with(cx, |s, _| {
+            s.rows
+                .iter()
+                .position(|r| matches!(r, Row::Worktree(p) if p == Path::new(path)))
+                .unwrap()
+        });
+        let selector: &'static str = Box::leak(format!("worktree-card-{index}").into_boxed_str());
+        cx.debug_bounds(selector).unwrap()
+    };
+    // Exercise actual detailed and compact card drag handlers.
+    for layout in [CardLayout::Detailed, CardLayout::Compact] {
+        view.update(cx, |s, cx| {
+            s.options.card_layout = layout;
+            s.worktree_order.clear();
+            s.set_sort_by(SortBy::Smart, cx);
+        });
+        cx.run_until_parked();
+        let from = bounds("/b", cx).center();
+        let to = bounds("/a", cx).center();
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            to,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |s, cx| {
+            let cards = |s: &Sidebar| {
+                s.rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        Row::Worktree(p) => Some(p.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(s.options.sort_by, SortBy::Created);
+            assert_eq!(cards(s), ["/b", "/a", "/repo", "/other"].map(PathBuf::from));
+            assert_eq!(s.project_order, ["/repo", "/other"].map(PathBuf::from));
+            s.move_worktree(Path::new("/b"), Path::new("/repo"), cx);
+            assert_eq!(cards(s), ["/a", "/repo", "/b", "/other"].map(PathBuf::from));
+            // A drop into a different repository must not move or regroup cards.
+            let order = s.worktree_order.clone();
+            s.move_worktree(Path::new("/b"), Path::new("/other"), cx);
+            assert_eq!(s.worktree_order, order);
+            s.set_sort_by(SortBy::Name, cx);
+            assert_eq!(cards(s), ["/a", "/b", "/repo", "/other"].map(PathBuf::from));
+        });
+    }
+    cx.run_until_parked();
+    let restored = Sidebar::new_loaded(Some(file.clone()));
+    assert_eq!(
+        restored.worktree_order,
+        ["/a", "/repo", "/b"].map(PathBuf::from)
+    );
+    assert_eq!(restored.options.sort_by, SortBy::Name);
+    // Existing five-segment files still load with an empty manual card order.
+    let mut legacy = vec![FORMAT_VERSION];
+    for segment in [
+        postcard::to_stdvec(&restored.prefs).unwrap(),
+        postcard::to_stdvec(&restored.options).unwrap(),
+        postcard::to_stdvec(&lineage::LineageState::default()).unwrap(),
+        postcard::to_stdvec(&UiExpansionState::default()).unwrap(),
+        postcard::to_stdvec(&restored.project_order).unwrap(),
+    ] {
+        legacy.extend(segment);
+    }
+    assert!(decode_state(&legacy).unwrap().5.is_empty());
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// 백그라운드 폴링 재시도는 조용히 복구하고 권한·프로토콜 오류는 조치를 요청한다.
+#[gpui::test]
+fn transient_poll_errors_keep_diagnostics_without_popup(cx: &mut TestAppContext) {
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+    sidebar.update(cx, |s, cx| {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            s.apply(Err(kind.into()), BTreeMap::new(), cx);
+            assert!(s.poll_error().is_some());
+            assert_eq!(s.poll_error_notice(), None);
+            assert_eq!(s.local_status, HostStatus::Disconnected);
+        }
+        s.apply(
+            Err(io::ErrorKind::PermissionDenied.into()),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(s.poll_error_notice().is_some());
+        s.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
+        assert_eq!(s.poll_error(), None);
+        assert_eq!(s.poll_error_notice(), None);
+        assert_eq!(s.local_status, HostStatus::Connected);
+    });
+}
+
+#[test]
+fn jump_connected_snapshots_keep_host_identity_labels_paths_and_local_preferences_separate() {
+    let mut sidebar = Sidebar::new_loaded(None);
+    let mut local = session(7, AgentState::Working, Some("/srv/repo/feature"));
+    local.cwd = Some("/srv/repo/feature/local-subdir".into());
+    sidebar.snapshot = Snapshot {
+        sessions: vec![local],
+        trees: [("/srv/repo".into(), vec!["/srv/repo/feature".into()])].into(),
+    };
+    sidebar
+        .custom_titles
+        .insert(SessionId(7), "Local alias".into());
+    sidebar.focused = Some(SessionId(7));
+    sidebar.unread.insert(SessionId(7));
+    let mut remote_session = session(7, AgentState::Waiting, Some("/srv/repo/feature"));
+    remote_session.cwd = Some("/srv/repo/feature/zzremotezz".into());
+    remote_session.status.title = Some("Remote task".into());
+    for (id, status) in [
+        ("studio", HostStatus::Connected),
+        ("offline", HostStatus::Disconnected),
+    ] {
+        sidebar.remote_hosts.push(RemoteHost {
+            id: id.into(),
+            label: format!("{id} PC"),
+            status,
+            snapshot: Snapshot {
+                sessions: vec![remote_session.clone()],
+                trees: [("/srv/repo".into(), vec!["/srv/repo/feature".into()])].into(),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        });
+    }
+    // 접힘·사이드바 필터로 보이지 않는 세션도 Jump의 수신 스냅샷에는 남아 있다.
+    sidebar
+        .collapsed_hosts
+        .insert(HostId::Remote("studio".into()));
+    let items = sidebar.jump_items();
+    assert_eq!(items.len(), 2);
+    let local = items.iter().find(|i| i.host.is_local()).unwrap();
+    let remote = items.iter().find(|i| i.host.is_remote()).unwrap();
+    assert_eq!(local.title, "Local alias");
+    assert!(local.is_current_tab && local.unread);
+    assert_eq!(remote.host, HostId::Remote("studio".into()));
+    assert_eq!(remote.host_label, "studio PC");
+    assert_eq!(remote.title, "Remote task");
+    assert!(!remote.is_current_tab && !remote.is_current_worktree && !remote.unread);
+    assert_eq!(remote.repo_name, "repo");
+    assert_eq!(remote.cwd, "/srv/repo/feature/zzremotezz");
+    assert_eq!(crate::jump::search(&items, "zzremotezz").len(), 1);
+    let trees = sidebar.jump_worktrees();
+    assert_eq!(trees.len(), 2, "same path on two hosts remains two rows");
+    let remote_tree = trees.iter().find(|t| t.host.is_remote()).unwrap();
+    assert_eq!(remote_tree.host, remote.host);
+    assert_eq!(remote_tree.session_id, Some(SessionId(7)));
+    assert!(!remote_tree.is_current && !remote_tree.unread);
+}
+
+/// A local snapshot refresh must not steal focus from a colliding remote ID.
+#[gpui::test]
+fn local_poll_keeps_remote_focus_and_local_unread(cx: &mut TestAppContext) {
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+    sidebar.update(cx, |s, cx| {
+        let local = session(7, AgentState::Done, Some("/srv/local"));
+        let remote = session(7, AgentState::Waiting, Some("/srv/remote"));
+        s.snapshot.sessions = vec![local];
+        s.snapshot
+            .trees
+            .insert("/srv/local".into(), vec!["/srv/local".into()]);
+        s.remote_hosts.push(RemoteHost {
+            id: "studio".into(),
+            label: "Studio".into(),
+            status: HostStatus::Connected,
+            snapshot: Snapshot {
+                sessions: vec![remote],
+                trees: [("/srv/remote".into(), vec!["/srv/remote".into()])].into(),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        });
+        s.unread.insert(SessionId(7));
+        s.set_focused_on(HostId::Remote("studio".into()), Some(SessionId(7)), cx);
+        let mut next = s.snapshot.clone();
+        next.sessions[0].status.title = Some("Local update".into());
+        s.apply(Ok((next, Meta::new())), BTreeMap::new(), cx);
+        assert_eq!(s.focused_host, HostId::Remote("studio".into()));
+        assert!(s.unread.contains(&SessionId(7)));
+        assert_eq!(s.focused_synced, None);
+        assert!(
+            s.cursor
+                .is_some_and(|i| s.row_host(i) == &HostId::Remote("studio".into()))
+        );
+    });
+}
+
+#[gpui::test]
+fn focusing_session_expands_collapsed_project_and_selects_session_row_across_hosts(
+    cx: &mut TestAppContext,
+) {
+    let view = cx.new(|cx| {
+        let mut s = Sidebar::new(None);
+        let mut local_a = session(7, AgentState::Working, Some("/repo-a/feat-a"));
+        local_a.cwd = Some("/repo-a/feat-a".into());
+        let mut local_b = session(8, AgentState::Waiting, Some("/repo-b/feat-b"));
+        local_b.cwd = Some("/repo-b/feat-b".into());
+        s.snapshot = Snapshot {
+            sessions: vec![local_a, local_b],
+            trees: [
+                (
+                    "/repo-a".into(),
+                    vec!["/repo-a".into(), "/repo-a/feat-a".into()],
+                ),
+                (
+                    "/repo-b".into(),
+                    vec!["/repo-b".into(), "/repo-b/feat-b".into()],
+                ),
+            ]
+            .into(),
+        };
+        let mut remote_s = session(7, AgentState::Working, Some("/srv/repo-r/feat-r"));
+        remote_s.cwd = Some("/srv/repo-r/feat-r".into());
+        s.remote_hosts.push(RemoteHost {
+            id: "studio".into(),
+            label: "studio PC".into(),
+            status: HostStatus::Connected,
+            snapshot: Snapshot {
+                sessions: vec![remote_s],
+                trees: [(
+                    "/srv/repo-r".into(),
+                    vec!["/srv/repo-r".into(), "/srv/repo-r/feat-r".into()],
+                )]
+                .into(),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        });
+        s.collapsed.insert("/repo-b".into());
+        s.collapsed.insert("/repo-b/feat-b".into());
+        s.collapsed.insert("/srv/repo-r".into());
+        s.collapsed.insert("/srv/repo-r/feat-r".into());
+        s.collapsed_hosts.insert(HostId::Remote("studio".into()));
+        s.rebuild(cx);
+        s
+    });
+
+    // 1. 접혀 있는 로컬 저장소·워크트리의 세션을 포커싱하면 펼치고 세션 행을 선택·노출한다.
+    view.update(cx, |s, cx| {
+        s.set_focused_on(HostId::Local, Some(SessionId(8)), cx);
+        assert!(!s.is_collapsed(Path::new("/repo-b")));
+        assert!(!s.is_collapsed(Path::new("/repo-b/feat-b")));
+        assert_eq!(s.selected_worktree(), Some(Path::new("/repo-b/feat-b")));
+        let idx = s.cursor.expect("local session row must be selected");
+        assert_eq!(s.row_host(idx), &HostId::Local);
+        assert!(matches!(
+            s.rows.get(idx),
+            Some(Row::Session(sess, true)) if sess.id == SessionId(8)
+        ));
+        assert!(
+            s.card_list.contains_row(idx),
+            "focused local session row must be visible in card_list viewport"
+        );
+        assert_eq!(s.card_list.pending_reveal.get(), Some(idx));
+    });
+
+    // 2. 동일한 SessionId(7)를 가진 원격 호스트 세션을 포커싱하면 원격 호스트·저장소·워크트리를 펼치고
+    //    로컬이 아닌 원격 호스트의 세션 행을 정확히 선택·노출한다.
+    let remote_host = HostId::Remote("studio".into());
+    view.update(cx, |s, cx| {
+        s.set_focused_on(remote_host.clone(), Some(SessionId(7)), cx);
+        assert!(!s.is_host_collapsed(&remote_host));
+        assert!(!s.is_collapsed(Path::new("/srv/repo-r")));
+        assert!(!s.is_collapsed(Path::new("/srv/repo-r/feat-r")));
+        assert_eq!(
+            s.selected_workspace(),
+            Some((remote_host.clone(), PathBuf::from("/srv/repo-r/feat-r")))
+        );
+        let idx = s.cursor.expect("remote session row must be selected");
+        assert_eq!(s.row_host(idx), &remote_host);
+        assert!(matches!(
+            s.rows.get(idx),
+            Some(Row::Session(sess, true)) if sess.id == SessionId(7)
+        ));
+        assert!(
+            s.card_list.contains_row(idx),
+            "focused remote session row must be visible in card_list viewport"
+        );
+        assert_eq!(s.card_list.pending_reveal.get(), Some(idx));
+    });
+}
+
+#[gpui::test]
+fn daemon_title_change_replaces_stale_screen_title(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(vcx, |sidebar, cx| {
+        let mut task = session(51, AgentState::Working, Some("/repo"));
+        task.status.title = Some("First task".into());
+        let snapshot = |task| Snapshot {
+            sessions: vec![task],
+            ..Snapshot::default()
+        };
+        sidebar.apply(
+            Ok((snapshot(task.clone()), Meta::new())),
+            BTreeMap::new(),
+            cx,
+        );
+        sidebar.set_title(task.id, "First screen title", cx);
+        assert_eq!(sidebar.session_label(&task).0, "First screen title");
+        task.status.title = Some("Second task".into());
+        sidebar.apply(
+            Ok((snapshot(task.clone()), Meta::new())),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(sidebar.session_label(&task).0, "Second task");
+        sidebar.set_custom_titles(BTreeMap::from([(task.id, "My tab".into())]), cx);
+        task.status.title = Some("Third task".into());
+        sidebar.apply(
+            Ok((snapshot(task.clone()), Meta::new())),
+            BTreeMap::new(),
+            cx,
+        );
+        assert_eq!(sidebar.session_label(&task).0, "My tab");
+    });
+}
+
+#[gpui::test]
+fn transient_poll_errors_keep_diagnostics_without_warning_card(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(vcx, |sidebar, cx| {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+        ] {
+            sidebar.apply(Err(kind.into()), BTreeMap::new(), cx);
+            assert!(
+                sidebar.poll_error.is_some(),
+                "retain diagnostic for {kind:?}"
+            );
+            assert!(
+                sidebar.poll_error_notice().is_none(),
+                "retry silently for {kind:?}"
+            );
+        }
+        sidebar.apply(
+            Err(io::ErrorKind::PermissionDenied.into()),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(sidebar.poll_error_notice().is_some());
+        sidebar.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
+        assert!(sidebar.poll_error.is_none());
+    });
 }

@@ -57,9 +57,7 @@ pub fn meters_summary(meters: &krill_proto::usage::AccountMeters, now: u64) -> S
         .meters
         .iter()
         .map(|meter| {
-            let value = meter
-                .value
-                .clone()
+            let value = meter_value(meter, u64::try_from(now).unwrap_or(0))
                 .unwrap_or_else(|| window(meter.window.as_ref(), now).text);
             format!("{} {value}", meter_label(meter))
         })
@@ -68,6 +66,16 @@ pub fn meters_summary(meters: &krill_proto::usage::AccountMeters, now: u64) -> S
 }
 
 pub fn meter_label(meter: &krill_proto::usage::UsageMeter) -> String {
+    if meter
+        .key
+        .starts_with(krill_proto::usage::RESET_CREDITS_EXPIRY_METER_PREFIX)
+    {
+        let count = meter
+            .label
+            .strip_prefix("Reset credit expiry · ")
+            .unwrap_or("—");
+        return text::METER_RESET_CREDIT_EXPIRY.format(&[("count", count)]);
+    }
     let label = match meter.label.as_str() {
         "5h" => text::WINDOW_5H.get(),
         "7d" => text::WINDOW_7D.get(),
@@ -85,6 +93,32 @@ pub fn meter_label(meter: &krill_proto::usage::UsageMeter) -> String {
     } else {
         label.to_owned()
     }
+}
+
+/// 만료 메타데이터는 원시 epoch 대신 시간대가 명시된 날짜로 표시한다.
+pub fn meter_value(meter: &krill_proto::usage::UsageMeter, now: u64) -> Option<String> {
+    let value = meter.value.as_ref()?;
+    if !meter
+        .key
+        .starts_with(krill_proto::usage::RESET_CREDITS_EXPIRY_METER_PREFIX)
+    {
+        return Some(value.clone());
+    }
+    let epoch = krill_proto::time::parse_reset_epoch(value)
+        .and_then(|at| u64::try_from(at).ok())
+        .filter(|at| *at > 0);
+    let Some(epoch) = epoch else {
+        return Some(text::METER_EXPIRY_UNKNOWN.get().into());
+    };
+    let time = crate::settings::schedules::format_run_minute(epoch / 60);
+    if time.is_empty() {
+        return Some(text::METER_EXPIRY_UNKNOWN.get().into());
+    }
+    Some(if epoch <= now {
+        text::METER_EXPIRED.format(&[("time", &time)])
+    } else {
+        time
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +254,39 @@ pub fn render_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_credit_expiry_shows_date_timezone_unknown_and_expired() {
+        let expiry = krill_proto::time::parse_reset_epoch("2030-01-01T09:00:00+09:00").unwrap();
+        let meter = krill_proto::usage::reset_credit_expiry_meter(0, 2, Some(expiry));
+        assert!(meter_label(&meter).contains('2'));
+        assert_eq!(
+            meter_value(&meter, 100),
+            Some("2030-01-01 00:00 (UTC)".into())
+        );
+        assert!(
+            meter_value(&meter, u64::try_from(expiry).unwrap())
+                .unwrap()
+                .contains("2030-01-01")
+        );
+        assert_ne!(
+            meter_value(&meter, u64::try_from(expiry).unwrap()),
+            meter_value(&meter, 100)
+        );
+        let unknown = krill_proto::usage::reset_credit_expiry_meter(1, 1, None);
+        assert_eq!(
+            meter_value(&unknown, 100).unwrap(),
+            text::METER_EXPIRY_UNKNOWN.get()
+        );
+        let summary = meters_summary(
+            &krill_proto::usage::AccountMeters {
+                meters: vec![meter],
+                ..Default::default()
+            },
+            100,
+        );
+        assert!(summary.contains("2030-01-01 00:00 (UTC)"));
+    }
 
     #[test]
     fn unknown_and_expired_windows_never_look_like_available_quota() {

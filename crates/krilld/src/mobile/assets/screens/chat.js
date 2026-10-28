@@ -19,54 +19,30 @@ function renderInline(el,parent,text,depth=0){
  if(end<text.length)parent.append(el('span',text.slice(end)));
 }
 function renderRichText(el,text){
- const wrap=el('div',undefined,'chat-md');
- const blocks=String(text||'').split(/```/);
- const splitCells=s=>s.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>c.trim());
+ const wrap=el('div',undefined,'chat-md'),blocks=String(text||'').split(/```/);
+ const rich=(tag,value,cls)=>{const node=el(tag,undefined,cls);renderInline(el,node,value);return node;};
+ const cells=line=>line.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(s=>s.trim());
+ const tableLine=line=>/^\s*\|.*\|\s*$/.test(line),separator=line=>cells(line).every(s=>/^:?-{3,}:?$/.test(s));
  for(let i=0;i<blocks.length;i++){
   const part=blocks[i];
   if(i%2===1){
-   const nl=part.indexOf('\n');
-   const codeText=nl>=0?part.slice(nl+1):part;
-   const pre=el('pre',undefined,'chat-code'),code=el('code',codeText.replace(/\n$/,''));
-   pre.append(code);wrap.append(pre);
-  }else{
-   const lines=part.split('\n');
-   for(let j=0;j<lines.length;j++){
-    const line=lines[j].trimEnd(),trimmed=line.trim();
-    if(!trimmed)continue;
-    if(trimmed.startsWith('|')&&trimmed.endsWith('|')&&/^\|?[\s:|-]+\|[\s:|-]*$/.test(lines[j+1]?.trim()||'')&&lines[j+1].includes('-')){
-     const table=el('table',undefined,'chat-table'),thead=el('thead'),trHead=el('tr'),tbody=el('tbody');
-     for(const c of splitCells(trimmed)){const th=el('th');renderInline(el,th,c);trHead.append(th);}
-     thead.append(trHead);table.append(thead,tbody);j+=2;
-     while(j<lines.length&&lines[j].trim().startsWith('|')&&lines[j].trim().endsWith('|')){
-      const tr=el('tr');
-      for(const c of splitCells(lines[j])){const td=el('td');renderInline(el,td,c);tr.append(td);}
-      tbody.append(tr);j++;
-     }
-     j--;wrap.append(table);continue;
-    }
-    if(/^>\s?/.test(trimmed)){
-     const quote=el('blockquote',undefined,'chat-quote'),qLines=[trimmed.replace(/^>\s?/,'')];
-     while(j+1<lines.length&&/^>\s?/.test(lines[j+1].trim()))qLines.push(lines[++j].trim().replace(/^>\s?/,''));
-     renderInline(el,quote,qLines.join('\n'));wrap.append(quote);continue;
-    }
-    if(/^\d+\.\s+/.test(trimmed)){
-     const ol=el('ol',undefined,'chat-ol');
-     for(;;){
-      const li=el('li');renderInline(el,li,lines[j].trim().replace(/^\d+\.\s+/,''));ol.append(li);
-      if(j+1>=lines.length||!/^\d+\.\s+/.test(lines[j+1].trim()))break;
-      j++;
-     }
-     wrap.append(ol);continue;
-    }
-    let node,content=line;
-    if(line.startsWith('### ')){node=el('h4',undefined,'chat-h');content=line.slice(4);}
-    else if(line.startsWith('## ')){node=el('h3',undefined,'chat-h');content=line.slice(3);}
-    else if(line.startsWith('# ')){node=el('h2',undefined,'chat-h');content=line.slice(2);}
-    else if(/^[-*]\s+/.test(trimmed)){node=el('p',undefined,'chat-li');content='• '+trimmed.slice(2);}
-    else node=el('p',undefined,'chat-p');
-    renderInline(el,node,content);wrap.append(node);
+   const nl=part.indexOf('\n'),codeText=nl>=0?part.slice(nl+1):part,pre=el('pre',undefined,'chat-code');
+   pre.append(el('code',codeText.replace(/\n$/,'')));wrap.append(pre);continue;
+  }
+  const lines=part.split('\n');let list=null,quote=null;
+  for(let n=0;n<lines.length;n++){
+   const line=lines[n].trimEnd(),trimmed=line.trim();
+   if(!trimmed){list=quote=null;continue;}
+   if(tableLine(line)){
+    list=quote=null;const table=el('table',undefined,'chat-table'),scroll=el('div',undefined,'chat-code'),header=tableLine(lines[n+1]||'')&&separator(lines[n+1]);
+    let first=true;
+    while(n<lines.length&&tableLine(lines[n])){const row=el('tr');if(!separator(lines[n])){for(const value of cells(lines[n]))row.append(rich(first&&header?'th':'td',value));table.append(row);first=false;}n++;}
+    n--;scroll.append(table);wrap.append(scroll);continue;
    }
+   const heading=trimmed.match(/^(#{1,3})\s+(.*)$/),bullet=trimmed.match(/^(?:([-*])|([0-9]+)[.)])\s+(.*)$/),quoted=trimmed.match(/^>\s?(.*)$/);
+   if(quoted){list=null;if(!quote){quote=el('blockquote',undefined,'chat-quote');wrap.append(quote);}quote.append(rich('p',quoted[1],'chat-p'));}
+   else if(bullet){quote=null;const tag=bullet[2]?'ol':'ul';if(!list||list.dataset.listKind!==tag){list=el(tag,undefined,tag==='ol'?'chat-ol':undefined);list.dataset.listKind=tag;if(bullet[2])list.setAttribute('start',bullet[2]);wrap.append(list);}list.append(rich('li',bullet[3],'chat-li'));}
+   else{list=quote=null;wrap.append(rich(heading?'h'+(heading[1].length+1):'p',heading?heading[2]:line,heading?'chat-h':'chat-p'));}
   }
  }
  return wrap;
@@ -88,7 +64,7 @@ function mountChat(root,opts){
  entry.pages||=[];entry.photoVersion||=0;
  entry.mounts=(entry.mounts||0)+1;cacheMap.delete(sessionId);cacheMap.set(sessionId,entry);pruneCache(state);
  const shell=el('div',undefined,'chat-view'),feed=el('div',undefined,'chat-feed'),strip=el('div',undefined,'chat-live-strip'),composer=el('form',undefined,'chat-composer');
- const stripBadge=el('span','IDLE','badge'),stripText=el('span',t('Waiting for transcript…'),'chat-live-text'),rawBtn=button(t('Term →'),()=>onSwitchTerm?.(),'ghost small chat-raw-btn');
+ const stripBadge=el('span','IDLE','badge'),stripText=el('span','','chat-live-text'),rawBtn=button(t('Term →'),()=>onSwitchTerm?.(),'ghost small chat-raw-btn');
  strip.append(stripBadge,stripText,rawBtn);
  const history=el('div',undefined,'chat-actions chat-history'),historyText=el('span',undefined,'muted');
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
@@ -115,7 +91,7 @@ function mountChat(root,opts){
  entry.loaded??=entry.initialized;
  let refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
  // Only the reader moving up stops following; pins and late layout growth never do.
- let lastTop=0;feed.addEventListener('scroll',()=>{if(!visible)return;const top=feed.scrollTop;if(feed.scrollHeight-top-feed.clientHeight<60)following=true;else if(top<lastTop-1)following=false;lastTop=top;});
+ let lastTop=0;feed.addEventListener('scroll',()=>{if(!visible)return;const top=feed.scrollTop,gap=feed.scrollHeight-top-feed.clientHeight;if(gap<=1)following=true;else if(top<lastTop-1)following=false;else if(gap<60)following=true;lastTop=top;});
  function pinLatest(){if(visible&&following&&!entry.live){feed.scrollTop=feed.scrollHeight||0;lastTop=feed.scrollTop;}}
  // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
  const resize=globalThis.ResizeObserver?new ResizeObserver(()=>pinLatest()):null;resize?.observe(feed);
@@ -141,10 +117,10 @@ function mountChat(root,opts){
  function chatAgent(){return M.sessionAgent?.({...state.sessions?.get(sessionId),...(entry.agent?{agent:entry.agent}:{})})||entry.agent||'';}
  function chooseModel(){
   const agent=chatAgent(),choices=modelChoices[agent];
-  if(choices){ctx.sheet(t('Model'),choices.map(([id,label])=>({label:t(label),action:()=>run(()=>ctx.rpc({action:'prompt',session:sessionId,text:`/model ${id}`}))})),t('Sends /model to {0}.',agentName(agent)));return;}
+  if(choices){ctx.sheet(t('Model'),choices.map(([id,label])=>({label:t(label),action:()=>run(async()=>{await ctx.rpc({action:'prompt',session:sessionId,text:`/model ${id}`});entry.model={agent,id,label};if(!disposed&&!ctx.signal?.aborted)syncAgent();})})),t('Sends /model to {0}.',agentName(agent)));return;}
   run(async()=>{await ctx.rpc({action:'prompt',session:sessionId,text:'/model'});onSwitchTerm?.();});
  }
- function syncAgent(){const agent=chatAgent();modelBtn.hidden=!modelChoices[agent]&&!modelPicker.has(agent);const text=agent?t('Message {0}',agentName(agent)):t('Message agent (Bracketed Paste)…');if(input.placeholder!==text)input.placeholder=text;}
+ function syncAgent(){const agent=chatAgent(),label=entry.model?.agent===agent?t(entry.model.label):t('Model');if(modelBtn.textContent!==label){modelBtn.textContent=label;modelBtn.setAttribute('aria-label',label);}modelBtn.hidden=!modelChoices[agent]&&!modelPicker.has(agent);const text=agent?t('Message {0}',agentName(agent)):t('Message agent (Bracketed Paste)…');if(input.placeholder!==text)input.placeholder=text;}
  function copyText(text,node){
   run(async()=>{
    // 클립보드 권한이 거부되면(일부 웹뷰) 선택 복사로 한 번 더 시도한다.
@@ -233,19 +209,29 @@ function mountChat(root,opts){
    let card=cards.get(key);
    if(!card){card=renderCard(item,key);card.dataset.chatId=key;cards.set(key,card);}else if(!sameItem(card._item,item)){const next=renderCard(item,key);card.replaceChildren(...Array.from(next.children));}card._item=item;
    if(item.kind==='tool_call'||item.kind==='tool_result'){
-    if(!run){let group=toolRuns.get(key);if(!group){const details=el('details',undefined,'chat-tool-run'),summary=el('summary',undefined,'chat-tool-summary'),body=el('div',undefined,'chat-tool-items');rememberDetails(details,'run:'+key);details.append(summary,body);group={details,summary,body};toolRuns.set(key,group);}run={...group,key,nodes:[],steps:new Map(),count:0,errors:0};wantedRuns.add(key);nodes.push(run.details);}
-    run.nodes.push(card);if(item.is_error)run.errors++;if(item.kind==='tool_call'){run.count++;const step=toolStep(item.tool_name);run.steps.set(step,(run.steps.get(step)||0)+1);}run.summary.textContent=[run.errors||!run.count?t(run.errors?'Tool error':'Tool activity'):'',...[...run.steps].map(([step,n])=>t(step,n))].filter(Boolean).join(' · ');
-    const at=run.body.children?.[run.nodes.length-1];if(at!==card)run.body.insertBefore(card,at||null);
+    if(!run){let group=toolRuns.get(key);if(!group){const details=el('details',undefined,'chat-tool-run'),summary=el('summary',undefined,'chat-tool-summary'),body=el('div',undefined,'chat-tool-items');rememberDetails(details,'run:'+key);details.append(summary,body);group={details,summary,body,pairs:new Map()};toolRuns.set(key,group);}run={...group,key,nodes:[],nodeSet:new Set(),steps:new Map(),calls:new Map(),pending:[],pairs:group.pairs,count:0,errors:0};wantedRuns.add(key);nodes.push(run.details);}
+    // Pair results by the wire tool ID, with ordered fallback for older transcripts.
+    const callId=item.call_id||item.tool_use_id||item.tool_id;let pair;
+    if(item.kind==='tool_call'){
+     pair=run.pairs.get(key)||{node:el('div',undefined,'chat-tool-pair'),call:item};run.pairs.set(key,pair);run.pending.push(pair);if(callId)run.calls.set(String(callId),pair);
+     run.count++;const step=toolStep(item.tool_name);run.steps.set(step,(run.steps.get(step)||0)+1);
+    }else{
+     pair=callId?run.calls.get(String(callId)):run.pending[0];
+     if(pair){const index=run.pending.indexOf(pair);if(index>=0)run.pending.splice(index,1);const summary=card.children?.[0]?.children?.[0];if(summary)summary.textContent=[t(item.is_error?'Tool error':'Tool output'),pair.call.tool_name,pair.call.title||pair.call.file_path].filter(Boolean).join(' · ');}
+    }
+    const node=pair?.node||card;if(pair){const at=pair.node.children?.[item.kind==='tool_call'?0:1];if(at!==card)pair.node.insertBefore(card,at||null);}
+    if(!run.nodeSet.has(node)){run.nodeSet.add(node);run.nodes.push(node);const at=run.body.children?.[run.nodes.length-1];if(at!==node)run.body.insertBefore(node,at||null);}
+    if(item.is_error)run.errors++;run.summary.textContent=[run.errors||!run.count?t(run.errors?'Tool error':'Tool activity'):'',...[...run.steps].map(([step,n])=>t(step,n))].filter(Boolean).join(' · ');
    }else{run=null;nodes.push(card);}
   }
   for(const [idx,node] of nodes.entries()){const at=incremental?null:feed.children?.[idx];if(at!==node){feed.insertBefore(node,at||null);resize?.observe(node);}}
-  for(const [key,group] of toolRuns)if(!incremental&&!wantedRuns.has(key)){group.details.remove();resize?.unobserve(group.details);toolRuns.delete(key);}
+  for(const [key,group] of toolRuns)if(!incremental){if(!wantedRuns.has(key)){group.details.remove();resize?.unobserve(group.details);toolRuns.delete(key);}else for(const [callKey,pair] of group.pairs)if(!wanted.has(callKey)){pair.node.remove();group.pairs.delete(callKey);}}
   for(const [key,card] of cards)if(!incremental&&!wanted.has(key)){card.remove();resize?.unobserve(card);cards.delete(key);}
   if(!incremental){for(const child of Array.from(feed.children||[]))if(child.className==='chat-empty')child.remove();for(const key of entry.disclosures?.keys()||[])if(!cards.has(key)&&!toolRuns.has(key.replace(/^run:/,'')))entry.disclosures.delete(key);}
   tailRun=run;renderedCount=entry.items.length;renderedItems=entry.items;
   if(!entry.items.length&&entry.loaded){
    const empty=el('div',undefined,'chat-empty');
-   empty.append(el('p',t(entry.bound?'No chat turns recorded yet.':'Waiting for agent hook or transcript binding…'),'muted'));
+   empty.append(el('p',t('Enter a new message'),'muted'));
    feed.append(empty);
   }
   const first=entry.items[0];
@@ -296,9 +282,11 @@ function mountChat(root,opts){
  }
  function openDiff(filePath){
   run(async()=>{
-   const sess=state.sessions?.get(sessionId),cwd=(sess?.cwd||'').replace(/\/+$/,'');
-   const relPath=cwd&&filePath.startsWith(cwd+'/')?filePath.slice(cwd.length+1):filePath;
+   const normalizePrefix=p=>String(p||'').replace(/^\/private(?=\/(?:tmp|var)(?:\/|$))/,'');
+   const sess=state.sessions?.get(sessionId),cwd=normalizePrefix(sess?.cwd).replace(/\/+$/,''),path=normalizePrefix(filePath);
+   const relPath=cwd&&path.startsWith(cwd+'/')?path.slice(cwd.length+1):filePath;
    const data=await ctx.rpc({action:'git',session:sessionId,path:relPath});
+   if(disposed||ctx.signal?.aborted)return;
    ctx.sheet?.(t('Current diff')+`: ${filePath}`,[],undefined,body=>{
     const message=data?.diff_status==='outside_scope'?t('This file is outside the current workspace diff.'):t('No current changes for this file. This is a historical tool record; its earlier diff is not stored here.');
     body.append(el('pre',data?.patch||message,data?.patch?'chat-code':'muted'));
@@ -408,7 +396,7 @@ M.chat={mount:mountChat,pruneCache,forgetSession};
 M.screens.chat=(root,ctx)=>{
  const session=ctx.state.sessions.get(ctx.route.sessionId);
  if(!session){root.append(ctx.el('p',(ctx.t||((s)=>s))('Session not found'),'empty'));return {};}
- const handle=mountChat(root,{ctx,sessionId:session.id,onSwitchTerm:()=>ctx.go(`/session/${session.id}`)});
+ const handle=mountChat(root,{ctx,sessionId:session.id,onSwitchTerm:()=>ctx.go(ctx.groupRoute?ctx.groupRoute(ctx.state?.groups?.get(session.groupKey),session.id):`/host/local/group/${encodeURIComponent(session.groupKey||'default')}/s/${session.id}`)});
  return {update:()=>handle.update(),cleanup:()=>handle.unmount()};
 };
 })();

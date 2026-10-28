@@ -193,7 +193,9 @@ use windows_sys::Win32::System::Console::{self as winconsole, COORD, HPCON};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
-    JobObjectAssociateCompletionPortInformation, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectAssociateCompletionPortInformation,
+    JobObjectBasicAccountingInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{
@@ -695,11 +697,24 @@ impl Job {
             } == 0
             {
                 let e = io::Error::last_os_error();
-                return if e.raw_os_error() == Some(258) {
-                    Ok(false)
-                } else {
-                    Err(e)
-                };
+                if e.raw_os_error() != Some(258) {
+                    return Err(e);
+                }
+                // SAFETY: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION is an output-only POD struct.
+                let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+                    unsafe { std::mem::zeroed() };
+                // SAFETY: live job handle and writable accounting struct.
+                cvt(unsafe {
+                    QueryInformationJobObject(
+                        self.handle.as_raw_handle(),
+                        JobObjectBasicAccountingInformation,
+                        (&raw mut info).cast(),
+                        u32::try_from(size_of_val(&info))
+                            .map_err(|_| io::ErrorKind::InvalidInput)?,
+                        null_mut(),
+                    )
+                })?;
+                return Ok(info.ActiveProcesses == 0);
             }
             if code == 4
             /* JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO (winnt.h) */
@@ -1008,6 +1023,15 @@ mod tests {
         let valid =
             unsafe { windows_sys::Win32::Foundation::GetHandleInformation(handle, &raw mut flags) };
         assert_eq!(valid, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_job_stays_empty_without_iocp_transition() -> io::Result<()> {
+        let job = Job::new()?;
+        assert!(job.empty()?);
+        job.terminate()?;
+        assert!(job.empty()?);
         Ok(())
     }
 }

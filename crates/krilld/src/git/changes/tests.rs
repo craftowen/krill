@@ -206,6 +206,49 @@ fn timeout_and_parse_failure_reap_children() {
 }
 
 #[test]
+fn final_stderr_producer_cannot_bypass_cancellation_or_deadline() {
+    struct Producer<'a> {
+        cancel: &'a AtomicBool,
+        reads: usize,
+    }
+    impl Read for Producer<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            buf.fill(b'x');
+            if self.reads == 3 {
+                self.cancel.store(true, Ordering::Release);
+            }
+            Ok(buf.len())
+        }
+    }
+    let cancel = AtomicBool::new(false);
+    let mut producer = Producer {
+        cancel: &cancel,
+        reads: 0,
+    };
+    let mut errors = Vec::new();
+    let mut buf = [0; 8192];
+    let result = drain_final_stderr(
+        &mut producer,
+        &mut errors,
+        &mut buf,
+        &cancel,
+        Instant::now() + Duration::from_secs(10),
+    );
+    assert!(result.unwrap_err().contains("cancelled"));
+    assert_eq!(producer.reads, 3);
+    assert!(errors.len() <= MAX_STDERR);
+    let result = drain_final_stderr(
+        &mut io::repeat(b'x'),
+        &mut errors,
+        &mut buf,
+        &AtomicBool::new(false),
+        Instant::now(),
+    );
+    assert!(result.unwrap_err().contains("timed out"));
+}
+
+#[test]
 fn parser_conflict_and_rename_with_tabs() {
     let mut raw = StatusParser::default();
     raw.record(b"? \xffx").unwrap();

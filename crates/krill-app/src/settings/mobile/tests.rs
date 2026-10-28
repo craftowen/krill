@@ -34,6 +34,28 @@ fn ago_scales_from_just_now_to_days() {
     );
 }
 
+/// Windows 100% 배율의 168px QR은 칸이 2·3px로 번갈았다. 모든 배율에서 칸은 정수 기기 픽셀이고 4px 이상이다.
+#[test]
+fn qr_side_keeps_whole_device_pixel_modules() {
+    assert_eq!(qr_side(px(168.), 1.), px(260.));
+    assert_eq!(qr_side(px(168.), 2.), px(162.5));
+    assert_eq!(qr_side(px(220.), 2.), px(227.5));
+    assert_eq!(qr_side(px(168.), 0.), px(260.));
+    assert_eq!(
+        px(QR_MODULES),
+        px(f32::from(u16::try_from(SIZE + 8).unwrap()))
+    );
+    for target in [168., 220.] {
+        for scale in [1., 1.25, 1.5, 1.75, 2., 3.] {
+            let module = f32::from(qr_side(px(target), scale)) * scale / 65.;
+            assert!(
+                (module - module.round()).abs() < 1e-3 && module.round() >= 4.,
+                "{target}px @ {scale}x -> {module} device px per module"
+            );
+        }
+    }
+}
+
 #[test]
 fn device_line_avoids_paired_duplication_and_handles_never_seen() {
     let now = 10_000_000_000;
@@ -293,5 +315,154 @@ fn mobile_poll_renews_missing_failed_or_expired_standalone_offer(cx: &mut gpui::
         );
         assert!(requests.iter().all(|r| !matches!(r, MobileRequest::MintPairingTicket { mode, custom_address, rotate }
             if *mode != ConnectMode::Tailscale || custom_address.as_deref() != Some("100.64.1.2:443") || *rotate)));
+    }
+}
+
+/// 실제 티켓과 같은 길이(203바이트)·모양의 가짜 페어링 URL. 실제 토큰이 아니다.
+const FIXTURE_TICKET: &str = concat!(
+    "https://krill-mobile.pages.dev/m/0000000000000000/#pair=",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "&key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "&r=fixture-relay-000000000000000000"
+);
+
+fn offer_view(
+    cx: &mut gpui::TestAppContext,
+    page: bool,
+) -> (gpui::Entity<SettingsView>, &mut gpui::VisualTestContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut view = SettingsView::new(cx);
+        view.tab = super::super::AdminTab::Mobile;
+        view.mobile_page = page;
+        view.mobile = Panel::new(Arc::new(|_| Err("fixture offline".into())));
+        view.mobile.accept(pairing_offer(
+            FIXTURE_TICKET,
+            krill_proto::mobile::client::now_ms() + 600_000,
+        ));
+        view
+    });
+    (view, vcx)
+}
+
+fn redraw(vcx: &mut gpui::VisualTestContext, width: f32, scale: f32) {
+    vcx.simulate_scale_factor_change(scale);
+    vcx.simulate_resize(gpui::size(px(width), px(2000.)));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+}
+
+fn span(b: gpui::Bounds<gpui::Pixels>) -> (f32, f32) {
+    (f32::from(b.left()), f32::from(b.right()))
+}
+
+/// 화면이 덮는 가로 범위 안에 `inner`가 다 들어가는지(세로는 스크롤된다).
+fn inside(inner: (f32, f32), outer: (f32, f32)) -> bool {
+    inner.0 >= outer.0 - 0.01 && inner.1 <= outer.1 + 0.01
+}
+
+/// 단독 페이지(메인 창 터미널 영역)와 설정 탭 QR이 지원 폭·배율에서 잘리지 않고,
+/// 그린 QR 칸이 정수 기기 픽셀인지 실제 gpui 레이아웃 경계로 확인한다.
+#[gpui::test]
+fn mobile_qr_cards_fit_without_clipping_at_supported_widths(cx: &mut gpui::TestAppContext) {
+    let mut failures = Vec::new();
+    {
+        let (_view, vcx) = offer_view(cx, true);
+        // 360 = 최소 창 폭(사이드바 접힘), 959 = 기본 1200px 창 − 사이드바 240 − 구분선.
+        for width in [360., 480., 720., 959., 1100.] {
+            for scale in [1., 1.25, 1.5, 2.] {
+                redraw(vcx, width, scale);
+                let qr = vcx.debug_bounds("mobile-page-qr").expect("page qr");
+                let card = vcx.debug_bounds("mobile-page-card").expect("page card");
+                let copy = vcx.debug_bounds("mobile-page-copy").expect("page copy");
+                let new_qr = vcx.debug_bounds("mobile-page-new-qr").expect("page new qr");
+                let phone = vcx.debug_bounds("mobile-page-phone").expect("phone");
+                // QR 상자는 p_2 흰 여백 안에 캔버스를 둔다.
+                let canvas = (f32::from(qr.left()) + 8., f32::from(qr.right()) - 8.);
+                let module = (canvas.1 - canvas.0) * scale / 65.;
+                eprintln!(
+                    "page w={width} @{scale}x card={:?} qr_box={:?} canvas={canvas:?} module={module} copy={:?} new_qr={:?} phone_top={} card_top={}",
+                    span(card),
+                    span(qr),
+                    span(copy),
+                    span(new_qr),
+                    f32::from(phone.top()),
+                    f32::from(card.top())
+                );
+                let view = (0., width);
+                if (module - module.round()).abs() > 1e-3 || module.round() < 4. {
+                    failures.push(format!("page w={width} @{scale}x module {module}"));
+                }
+                if width >= 959. && f32::from(phone.top()) >= f32::from(card.bottom()) {
+                    failures.push(format!("page w={width} @{scale}x phone wrapped below card"));
+                }
+                for (name, b) in [
+                    ("qr", canvas),
+                    ("copy", span(copy)),
+                    ("new_qr", span(new_qr)),
+                ] {
+                    if !inside(b, span(card)) || !inside(b, view) {
+                        failures.push(format!("page w={width} @{scale}x {name} clipped"));
+                    }
+                }
+            }
+        }
+    }
+    {
+        let (_view, vcx) = offer_view(cx, false);
+        // 설정은 왼쪽 탐색 248px가 고정이라 360px 창에서는 본문 열이 48px뿐이다(기존부터, 측정만 한다).
+        for width in [360., 560., 580., 598., 800., 1100.] {
+            for scale in [1., 1.25, 1.5, 2.] {
+                redraw(vcx, width, scale);
+                let card = vcx.debug_bounds("mobile-qr-card").expect("tab qr card");
+                let copy = vcx.debug_bounds("mobile-copy-link").expect("tab copy");
+                // QR 캔버스는 선택자가 없다. 카드(p_3 + 테두리 1)가 가운데 정렬하므로 실제 카드 경계와 렌더 크기로 위치를 구한다.
+                let side = f32::from(qr_side(px(220.), scale));
+                let center = f32::from(card.center().x);
+                let qr = (center - side / 2., center + side / 2.);
+                let content = (f32::from(card.left()) + 13., f32::from(card.right()) - 13.);
+                eprintln!(
+                    "tab w={width} @{scale}x card={:?} content={content:?} qr~{qr:?} side={side} fits_before_220={} copy={:?}",
+                    span(card),
+                    content.1 - content.0 >= 220.,
+                    span(copy)
+                );
+                if width < 598. {
+                    continue;
+                }
+                let view = (0., width);
+                for (name, b) in [("qr", qr), ("copy", span(copy))] {
+                    if !inside(b, content) || !inside(b, view) {
+                        failures.push(format!("tab w={width} @{scale}x {name} clipped"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// 두 화면의 복사 버튼은 QR에 담긴 것과 같은 티켓 URL을 복사한다.
+#[gpui::test]
+fn mobile_copy_buttons_copy_the_url_encoded_in_the_qr(cx: &mut gpui::TestAppContext) {
+    assert_eq!(FIXTURE_TICKET.len(), 203);
+    for (page, selector) in [(true, "mobile-page-copy"), (false, "mobile-copy-link")] {
+        let (view, vcx) = offer_view(cx, page);
+        redraw(vcx, 1100., 1.);
+        let button = vcx.debug_bounds(selector).expect("copy button");
+        vcx.simulate_click(button.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        let copied = vcx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard text");
+        assert_eq!(copied, FIXTURE_TICKET, "{selector}");
+        vcx.update(|_, cx| {
+            let mobile = &view.read(cx).mobile;
+            let (url, _, qr) = mobile.offer.as_ref().expect("offer");
+            assert_eq!(url, &copied);
+            assert_eq!(qr, &Qr::encode(&copied).unwrap(), "{selector}");
+            assert_eq!(mobile.copied_url.as_deref(), Some(FIXTURE_TICKET));
+        });
     }
 }

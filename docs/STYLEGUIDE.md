@@ -111,15 +111,15 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - 다크 모드 기본: `TERMINAL_DARK` = **`Krill Trench`** (`DEFAULT_TERMINAL_THEME_DARK`, 배경 `#061620`, 전경 `#dfedf2`, 커서 `#d3e5ee`, 해구 전용 ANSI 16색). 데몬이 앱 테마를 받기 전 색 질의(OSC 10/11/12/4)에 답하는 `krill_proto::theme::DEFAULT`와 같은 값이다 — 두 값이 어긋나면 에이전트가 실제와 다른 배경을 보고 색을 고른다. 배경이 어두워 OSC 11 응답은 계속 다크로 판정된다.
 - 기존 심해는 `TERMINAL_DEEP` / `Krill Deep`으로 계속 선택할 수 있다(배경 `#10131b`, 전경 `#ffffff`, 코랄 커서 `#ff5238`). 저장된 테마 이름과 색은 유지한다.
 - `TERMINAL_GHOSTTY_DARK`: Orca `Ghostty Default Style Dark`(배경 `#282c34`, 전경·커서 `#ffffff`). 내장 카탈로그에 선택지로 남긴다.
-- 라이트 모드 기본: `TERMINAL_LIGHT` (`DEFAULT_TERMINAL_THEME_LIGHT` = Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
-- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 15종(해구 기본값·기존 5종·새 테마 나머지 9종) + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
+- 라이트 모드 기본: `TERMINAL_LIGHT` = **`Krill Paper`** (`DEFAULT_TERMINAL_THEME_LIGHT`, 배경 `#fbf9f4`, 전경 `#24211d`, 커서 `#e5482f`). Orca `Builtin Tango Light`(`TERMINAL_TANGO_LIGHT`, 배경 `#ffffff`, 전경 `#000000`)는 `기본`(`LIGHT`) 앱 테마의 짝으로 내장 카탈로그에 유지한다.
+- 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 15종(해구·종이 기본값·기존 4종·새 테마 나머지 9종) + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
 - 설정 화면의 테마 스와치·미리보기처럼 터미널 `Rgb` 색을 UI 요소에 입힐 때는 생 색상 대신 `ui::terminal_rgb_hsla(rgb)`를 쓴다.
 - 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
 
 ### 3.5 앱 테마 (`DarkUiTheme` / `LightUiTheme`)
 
 - 앱 색 조합은 다크·라이트 모드마다 하나씩 고른다(설정 > 일반 > 모양 · 인터페이스의 `다크 테마`·`라이트 테마`, 설정 키 `ui_theme_dark`·`ui_theme_light`). 모드 선택(다크·라이트·시스템)은 그대로 `theme`이 맡는다.
-- 다크 기본은 **해구**(`TRENCH`)다. 다크 목록: 해구 · 흑연 · 해송 · 자수정 · 이탄 · 황혼 · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 기본(`LIGHT`, 기본값 유지) · 종이(`PAPER`) · 월광 · 석회 · 청자 · 빙하.
+- 다크 기본은 **해구**(`TRENCH`), 라이트 기본은 **종이**(`PAPER`)다. 다크 목록: 해구 · 흑연 · 해송 · 자수정 · 이탄 · 황혼 · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 종이(`PAPER`) · 기본(`LIGHT`, 기존 색 유지) · 월광 · 석회 · 청자 · 빙하.
 - 선택지가 4개를 넘는 테마 목록은 `DropdownMenu` / `PopupMenuItem`으로 표시하며 현재 항목에 체크하고 트리거에는 드롭다운 화살표를 둔다. 모드(다크·라이트·시스템)는 기존 세그먼트 컨트롤을 유지한다.
 - 새 팔레트는 [`ui/app_themes.rs`](../crates/krill-app/src/ui/app_themes.rs)에 둔다. 공통 `Palette`의 의미·치수는 그대로다.
 
@@ -137,7 +137,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | 황혼 | `DUSK` | `#211d27` | `#292330` | `Krill Dusk` |
 
 - 테마는 `Palette` 값만 바꾼다. 반경·간격·글자 크기 상수는 모든 테마가 같다. 새 테마도 `Palette` 상수 하나와 짝 터미널 테마 하나로 추가하고, `text_tokens_meet_wcag_aa_on_every_surface` 목록에 넣어 대비를 고정한다.
-- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`TRENCH`·`LIGHT`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
+- `ui::palette(cx)`는 `ui::apply`가 고른 팔레트를 전역으로 들고 있다가 돌려준다(렌더마다 설정을 복제하지 않는다). `ui::palette_for(mode)`는 모드 기본 팔레트(`TRENCH`·`PAPER`)만 돌려주므로 화면 코드는 `ui::palette(cx)`를 쓴다.
 - 앱 테마 키가 없으면 새 기본값을 쓰고, 명시적으로 저장된 기존 앱·터미널 선택은 유지한다. 터미널 테마 키가 없으면 선택된 앱 테마의 짝을 쓴다.
 - 앱 테마를 바꿀 때 그 모드의 터미널 테마가 이전 앱 테마의 짝이면 새 짝으로 함께 바꾸고, 사용자가 다른 터미널 테마를 골라 두었으면 그대로 둔다(`Settings::set_ui_theme_dark`·`set_ui_theme_light`).
 
@@ -184,7 +184,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **사이드바·패널·상태바**:
   - `SIDEBAR_DEFAULT_WIDTH = 240pt`, `SIDEBAR_HEADER_HEIGHT = 32px`, `SIDEBAR_EMPTY_PY = 24px`
   - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
-  - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 24px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
+  - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 20px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
+  - 하단 바 버튼은 `STATUS_BAR_BUTTON_HEIGHT = 18px`로 맞춰 터미널 영역을 넓힌다.
   - 상태바 사용량은 `STATUS_USAGE_CONTROLS_WIDTH = 480px`를 컨트롤에 예약하고, 프로바이더당 `STATUS_USAGE_PROVIDER_WIDTH = 280px` 여유가 있으면 두 사용량 창을 `0% 1h 31m · 92% 1d 19h`처럼 표시한다. 상태바의 창 이름·리셋 안내 문장 없이 `%`와 남은 시간(`m`·`h`·`d`)만 쓰며 앱 언어와 무관하다. UI 줌도 반영하며, 좁으면 최대 사용률 창의 `% + 남은 시간`으로 축약한다. 만료된 창은 이전 사용률을 재사용하지 않고 `— now`, 시각을 모르면 퍼센트만 표시한다.
   - 사이드바 상단(헤더 바로 아래)에 검색·아티팩트·에이전트 대시보드(작업 중·완료 개수)·Krill 모바일 진입 행을 라벨이 있는 전체 폭 행으로 둔다. 그 아래가 프로젝트 목록이다.
   - 프로젝트 기준 보기에서는 Orca처럼 프로젝트(저장소·폴더) 행을 끊지 않고 이어 배치한다. 원격 프로젝트의 호스트·연결 상태는 프로젝트 헤더 배지로 보이고, 프로젝트가 없는 연결 호스트와 작업 폴더 없는 세션 묶음은 모든 프로젝트 뒤에 둔다. 연결 안 됐고 프로젝트·세션도 없는 호스트는 목록에 띄우지 않는다(호스트 관리는 설정). 같은 저장소의 연결 워크트리는 형제 행이며 명시적으로 저장한 부모 관계만 중첩한다(모바일 목록도 같다).
@@ -193,6 +194,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
+  - 채팅 대화와 입력창은 `CHAT_CONTENT_MAX_WIDTH = 46rem`(줌 100%에서 736px)의 같은 중앙 열에 정렬한다. 좁은 칸에서는 가용 폭을 채우며 가로로 넘치지 않는다(Orca `--chat-content-max-width`).
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`
   - 세션 기록은 우측 패널의 탭으로 열며 `PANEL_DEFAULT_WIDTH`와 사용자가 조절한 패널 폭을 따른다. 목록은 남은 높이 전체를 스크롤 영역으로 사용하고, 바깥 클릭으로 닫지 않는다.
@@ -328,9 +330,10 @@ Krill은 Linear처럼 **어떤 동작이든 누르는 순간 끝난 것처럼 �
 | `1s ~ 3s` | 비활성화 + 스피너 또는 상태 문구 전환(예: "생성 중…"). 낙관적으로 먼저 바꾼 화면(§7.0)은 이 단계에서만 과정 문구를 덧붙인다. |
 | `3s 이상 / 다단계` | 현재 단계 라벨(예: 워크트리 백그라운드 준비 상태 + 취소 버튼)을 표시한다. |
 
-- **공간 사전 예약 (Pre-reserve footprint)**: 상태가 바뀔 때 컨트롤의 크기가 변해 주변 레이아웃이 흔들리면 안 된다. 특히 2단계 삭제 확인 버튼(`ui::danger_confirm`)은 기본 문구와 확인 문구를 같은 1×1 grid 칸에 겹쳐 그려 폭을 고정함으로써, 무장 상태에서 옆 버튼("이름 변경" 등) 자리를 침범해 오클릭을 유발하는 사고(OWE-704)를 원천 차단한다.
-
-- 진행 중 문구가 바뀌는 버튼은 `ui::button_with_reserved_label(id, 기본 문구, 진행 문구, 진행 여부)`에 크기·스타일·아이콘을 지정해 두 문구의 폭을 예약하고, 현재 문구만 화면과 접근성 트리에 노출한다.
+- **공간 사전 예약 (Pre-reserve footprint, 레이아웃 시프트 금지 — CONVENTIONS G7·G8)**: 상태·선택·호버가 바뀔 때 컨트롤이나 컨테이너의 크기가 변해 주변 레이아웃이나 팝오버 위치가 흔들리면 안 된다.
+  1. **버튼·배지 상태 전환**: 2단계 삭제 확인 버튼(`ui::danger_confirm`)과 진행 중 문구가 바뀌는 버튼(`ui::button_with_reserved_label(id, 기본 문구, 진행 문구, 진행 여부)`)은 후보 문구들을 같은 1×1 `grid()` 칸에 겹쳐 그리고 비활성 분기에 `Styled::invisible`을 걸어 가장 넓은 폭을 항상 예약한다. 무장·진행 상태에서 옆 버튼("이름 변경" 등) 자리를 침범해 오클릭을 유발하는 사고(OWE-704)를 원천 차단한다.
+  2. **마스터-디테일·인라인 탭·호버 상세 고정**: 마우스 호버(`on_mouse_move`), 행 선택, 인라인 세그먼트 탭 전환(예: 상태바 프로바이더 팝오버의 계정 상세·원격 기기 탭), 인라인 2단계 확인(`reset_armed`)으로 내용이 바뀌는 영역은 모든 후보 분기를 1×1 `grid()`(`row_start(1).col_start(1)`)에 겹쳐 비활성 분기를 `invisible()`로 두거나 고정 치수를 예약해, 호버·탭 전환·무장 전후 팝오버와 하단 메뉴 항목의 `bounds`가 1px도 흔들리지 않게 한다(비활성 분기는 레이아웃 측정에만 쓰고 접근성·히트테스트·`debug_selector` 트리에 노출하지 않는다).
+  3. **Flex 가로 행 텍스트 열 폭 보장 (1글자 세로 줄바꿈 금지)**: 가로 `flex` 행 안에 고정 폭(`w(..)` + `flex_none()`) 열들과 가변 텍스트 열(`flex_1().min_w_0()`)을 함께 둘 때, 고정 폭 열들의 합이 부모 폭을 다 차지하면 `min_w_0()` 텍스트 열이 `0px`로 붕괴해 글자가 세로(`계\n정`)로 줄바꿈된다. 반드시 가변 열의 잔여 폭(`min_w(..)`)과 `.truncate()`를 보장하거나, 컬럼이 이미 전체 폭을 쓰는 표에서는 불필요한 앞 열을 두지 않는다.
 
 ### 7.4 인접(Sibling) 컴포넌트 일관성
 

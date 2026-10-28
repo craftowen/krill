@@ -156,9 +156,14 @@ fn render_legacy(collected: &Collected, checks: &[Check]) {
     if let Some(state) = &collected.extra.state {
         // 정보 표시만 하며 종료 코드에 영향을 주지 않는다.
         match telemetry::consent(Some(state), &telemetry::Env::live()) {
-            Consent::Enabled => println!("telemetry  on (opt-in)"),
+            Consent::Enabled => {
+                println!("telemetry  on (default; stop with `krill telemetry disable`)");
+            }
             Consent::Disabled(Reason::NoConsentFile) => {
-                println!("telemetry  off (default; nothing is sent)");
+                println!("telemetry  off (no state directory; nothing is sent)");
+            }
+            Consent::Disabled(Reason::UserDisabled) => {
+                println!("telemetry  off (disabled; start with `krill telemetry enable`)");
             }
             Consent::Disabled(Reason::EnvVeto(var)) => {
                 println!("telemetry  off ({var} is set; nothing is sent)");

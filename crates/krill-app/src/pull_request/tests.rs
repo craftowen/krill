@@ -101,13 +101,58 @@ fn states_missing_cli_and_auth_failure_hide_badges_and_provide_guidance() {
     }
     for (kind, expected) in [
         (io::ErrorKind::NotFound, Status::Missing),
-        (io::ErrorKind::Other, Status::Failed),
+        (io::ErrorKind::Other, Status::Failed(Failure::Other)),
+        (io::ErrorKind::TimedOut, Status::Failed(Failure::TimedOut)),
+        // 권한 거부(spawn 실패 등)는 gh 인증 실패로 단정하지 않는다.
+        (
+            io::ErrorKind::PermissionDenied,
+            Status::Failed(Failure::Other),
+        ),
     ] {
         let status = status_error(&kind.into());
         assert_eq!(status, expected);
         assert!(status.badge().is_none());
         assert!(status.guidance().is_some());
     }
+}
+
+#[test]
+fn failures_distinguish_auth_timeout_and_general_errors_without_leaking_details() {
+    type Case = (io::Error, Failure, &'static str);
+    let cases: [Case; 3] = [
+        (
+            io::Error::new(io::ErrorKind::PermissionDenied, GhAuthRequired),
+            Failure::Auth,
+            FAILED.get(),
+        ),
+        (
+            io::Error::new(io::ErrorKind::TimedOut, "secret timeout"),
+            Failure::TimedOut,
+            text::TIMED_OUT.get(),
+        ),
+        (
+            io::Error::other("secret response"),
+            Failure::Other,
+            text::GH_FAILED.get(),
+        ),
+    ];
+    for (error, expected, message) in cases {
+        let status = status_error(&error);
+        assert_eq!(status, Status::Failed(expected));
+        assert_eq!(status.guidance(), Some(message));
+        assert_eq!(failure_text(&error), message);
+        assert!(!message.contains("secret"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn gh_exit_four_is_authentication_required_without_stderr_in_guidance() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "printf secret >&2; exit 4"]);
+    let error = execute(&mut cmd, Duration::from_secs(1)).unwrap_err();
+    assert_eq!(status_error(&error), Status::Failed(Failure::Auth));
+    assert!(!error.to_string().contains("secret"));
 }
 
 #[test]
@@ -134,7 +179,14 @@ fn bounded_output_timeout_nonzero_and_missing_executable_are_local_and_reaped() 
     );
     let mut failed = Command::new("/bin/sh");
     failed.args(["-c", "exit 1"]);
-    assert!(execute(&mut failed, Duration::from_secs(1)).is_err());
+    let error = execute(&mut failed, Duration::from_secs(1)).unwrap_err();
+    assert_eq!(status_error(&error), Status::Failed(Failure::Other));
+    // gh 문서의 종료 코드 4(인증 필요)만 로그인 안내로 분류한다. stderr는 읽지 않는다.
+    let mut unauthenticated = Command::new("/bin/sh");
+    unauthenticated.args(["-c", "echo secret-token >&2; exit 4"]);
+    let error = execute(&mut unauthenticated, Duration::from_secs(1)).unwrap_err();
+    assert_eq!(status_error(&error), Status::Failed(Failure::Auth));
+    assert!(!error.to_string().contains("secret-token"));
     let mut missing = Command::new("/no-such-mk090-gh");
     assert_eq!(
         execute(&mut missing, Duration::from_secs(1))
@@ -196,17 +248,38 @@ fn two_windows_keep_independent_branch_caches_with_one_global_budget() {
 
 #[test]
 fn missing_cli_and_unauthenticated_runner_are_guidance_only() {
-    struct Unavailable(io::ErrorKind);
+    type Case = (fn() -> io::Error, Status, &'static str);
+    struct Unavailable(fn() -> io::Error);
     impl Runner for Unavailable {
         fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
-            Err(self.0.into())
+            Err((self.0)())
         }
     }
-    for (kind, status, guidance) in [
-        (io::ErrorKind::NotFound, Status::Missing, MISSING.get()),
-        (io::ErrorKind::Other, Status::Failed, FAILED.get()),
-    ] {
-        let service = Service::new(Arc::new(Unavailable(kind)));
+    let cases: [Case; 4] = [
+        (
+            || io::ErrorKind::NotFound.into(),
+            Status::Missing,
+            MISSING.get(),
+        ),
+        (
+            || io::Error::new(io::ErrorKind::PermissionDenied, GhAuthRequired),
+            Status::Failed(Failure::Auth),
+            FAILED.get(),
+        ),
+        (
+            || io::ErrorKind::TimedOut.into(),
+            Status::Failed(Failure::TimedOut),
+            text::TIMED_OUT.get(),
+        ),
+        (
+            || io::Error::other("gh failed"),
+            Status::Failed(Failure::Other),
+            text::GH_FAILED.get(),
+        ),
+    ];
+    for (error, status, guidance) in cases {
+        assert_eq!(status.guidance(), Some(guidance));
+        let service = Service::new(Arc::new(Unavailable(error)));
         let path = PathBuf::from("/repo");
         let branches = BTreeMap::from([(path.clone(), "branch".into())]);
         let now = Instant::now();

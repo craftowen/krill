@@ -50,6 +50,7 @@ mod account_switch;
 pub mod admission;
 mod agent_history;
 mod hibernation;
+mod hook_identity;
 mod orch_cache;
 mod schedule;
 mod sidebar;
@@ -119,6 +120,10 @@ struct State {
     exited: HashMap<SessionId, i32>,
     /// 닫기를 요청받은 세션. `Exited`가 오면 바로 지운다.
     closing: HashSet<SessionId>,
+    /// 명시적 `Close`로 닫힌 세션. 재부팅 소실 세션과 구분해 `Cold`·`Resume` 부활을 막는다.
+    closed: HashSet<SessionId>,
+    /// 이미 `Resume`으로 새 세션에 인계된 옛 세션. 중복 `Resume`이 빈 로그인 셸을 또 띄우지 않게 한다.
+    resumed: HashSet<SessionId>,
     roots: Roots,
     /// 다음 세션 id 후보.
     next: u64,
@@ -150,6 +155,7 @@ pub struct Registry {
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
     account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
     account_recovered: std::sync::atomic::AtomicBool,
+    account_processing: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
     account_switch_opt_out: Mutex<std::collections::BTreeSet<SessionId>>,
     /// main에 프로세스 종료를 알린다(업그레이드 답을 보낸 뒤).
@@ -218,6 +224,7 @@ impl Registry {
             ),
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
+            account_processing: std::sync::atomic::AtomicBool::new(false),
             account_replacements: Mutex::default(),
             account_switch_opt_out: Mutex::default(),
             exit: OnceLock::new(),
@@ -341,9 +348,10 @@ impl Registry {
                     .collect()
             };
             for (id, cwd, tap, e) in found {
-                self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))?;
-                self.auto_switch_from_hook(id, e);
-                hooked.push((id, e.payload.clone()));
+                if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
+                    self.auto_switch_from_hook(id, e);
+                    hooked.push((id, e.payload.clone()));
+                }
             }
             Ok(())
         })
@@ -1264,6 +1272,9 @@ impl Registry {
         if !peer.authorize("cold", id, &lock(&self.state).roots, &self.audit) {
             return Err(Failure::Denied);
         }
+        if self.is_closed(id) {
+            return Err(Failure::NoSession);
+        }
         let store = self.store.as_ref().ok_or(Failure::NoSession)?;
         let restored = store
             .history(id)
@@ -1305,7 +1316,8 @@ impl Registry {
         )
     }
 
-    fn create(&self, peer: &Peer, c: Create) -> Result<Reply, Failure> {
+    fn create(&self, peer: &Peer, mut c: Create) -> Result<Reply, Failure> {
+        sanitize_spawn_cwd(&mut c.cwd);
         if c.account.is_some() && !matches!(c.program, Program::Agent { .. }) {
             return Err(Failure::BadRequest);
         }
@@ -1399,6 +1411,7 @@ impl Registry {
                 c.cwd = dir.as_os_str().as_bytes().to_vec();
             }
         }
+        sanitize_spawn_cwd(&mut c.cwd);
         let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
         let status_agent = self.status.get(old).agent;
         let profile_id = stored
@@ -1484,8 +1497,14 @@ impl Registry {
         if !peer.authorize("resume", old, &lock(&self.state).roots, &self.audit) {
             return Err(Failure::Denied);
         }
+        if self.is_closed(old) {
+            return Err(Failure::NoSession);
+        }
         {
             let st = lock(&self.state);
+            if st.resumed.contains(&old) {
+                return Err(Failure::NoSession);
+            }
             if st.sessions.contains_key(&old) && !st.exited.contains_key(&old) {
                 return Err(Failure::BadRequest);
             }
@@ -1493,6 +1512,10 @@ impl Registry {
         // 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다. 두 창이 동시에 눌러도
         // `claude --resume`이 두 번 뜨지 않는다(K-25).
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
+        // A competing resume may have completed between the first check and claim.
+        if self.is_closed(old) || lock(&self.state).resumed.contains(&old) {
+            return Err(Failure::NoSession);
+        }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let stored = self.agents.stored(old).map_err(|e| os(&e))?;
         let state = self.state_dir();
@@ -1505,6 +1528,7 @@ impl Registry {
         {
             c.cwd.clone_from(&s.cwd);
         }
+        sanitize_spawn_cwd(&mut c.cwd);
         let session = self.next_id();
         let Launch { argv, env } = match stored {
             Some(s) => {
@@ -1587,9 +1611,18 @@ impl Registry {
             store.inherit_history(session, old).map_err(|e| os(&e))?;
         }
         let (session, pid) =
-            self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows)?;
+            match self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows) {
+                Ok(spawned) => spawned,
+                Err(e) => {
+                    if let Some(store) = &self.store {
+                        store.discard_inherited_history(session);
+                    }
+                    return Err(e);
+                }
+            };
         let (has_old, exited_old) = {
-            let st = lock(&self.state);
+            let mut st = lock(&self.state);
+            st.resumed.insert(old);
             (st.sessions.contains_key(&old), st.exited.contains_key(&old))
         };
         if has_old && exited_old {
@@ -1631,26 +1664,19 @@ impl Registry {
         peer: &Peer,
         holder: &Holder,
         id: SessionId,
-        argv: Vec<Vec<u8>>,
+        mut argv: Vec<Vec<u8>>,
         mut env: Vec<(Vec<u8>, Vec<u8>)>,
-        cwd: Vec<u8>,
+        mut cwd: Vec<u8>,
         cols: u16,
         rows: u16,
     ) -> Result<(SessionId, u32), Failure> {
         use krill_proto::os::ffi::OsStrExt as _;
+        sanitize_spawn_cwd(&mut cwd);
         env.extend(crate::agent::pane_env_in(id, self.state_dir().as_deref()));
         // daemon `Create`의 거대 cols·rows도 여기서 자른다(K-01, CLI만 막는다).
         let size = crate::term::clamp_size(WinSize { cols, rows });
-        let initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
+        let mut initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
         env.extend(crate::git::worktree::environment(&initial_cwd));
-        let spawn = |req| ToHolder::Spawn {
-            req,
-            id,
-            argv,
-            env,
-            cwd,
-            size,
-        };
         // holder가 spawn한 직후 krilld가 죽어도 생성 계보가 남도록 먼저 저장한다.
         lock(&self.state)
             .roots
@@ -1659,8 +1685,36 @@ impl Registry {
         // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
-        let _commit = lock(&self.hook_commit);
-        match holder.request(spawn).map_err(|_| Failure::NoHolder)? {
+        let commit = lock(&self.hook_commit);
+        let mut reply = holder
+            .request(|req| ToHolder::Spawn {
+                req,
+                id,
+                argv: argv.clone(),
+                env: env.clone(),
+                cwd: cwd.clone(),
+                size,
+            })
+            .map_err(|_| Failure::NoHolder)?;
+        if matches!(
+            reply,
+            (FromHolder::Failed { errno, .. }, _)
+                if Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
+        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &env)
+        {
+            initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
+            reply = holder
+                .request(|req| ToHolder::Spawn {
+                    req,
+                    id,
+                    argv,
+                    env,
+                    cwd,
+                    size,
+                })
+                .map_err(|_| Failure::NoHolder)?;
+        }
+        match reply {
             (FromHolder::Spawned { pid, .. }, Some(master)) => {
                 let session = self.start(id, master, size).map_err(|e| {
                     // krilld가 master를 버렸으니 holder 것까지 놓으면 세션은 SIGHUP으로 끝난다.
@@ -1686,6 +1740,17 @@ impl Registry {
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
+                drop(commit);
+                if let Some(state) = self.dir.as_deref() {
+                    use krill_proto::error_reporting::{self, Code, Event, Process};
+                    if let Ok(event) = Event::new(
+                        Process::Daemon,
+                        Code::SessionStartFailed,
+                        error_reporting::source_location(file!(), line!()),
+                    ) {
+                        error_reporting::record_at(state, event).ok();
+                    }
+                }
                 Err(Failure::from_holder_errno(errno))
             }
             _ => {
@@ -1815,10 +1880,15 @@ impl Registry {
                 .into_iter()
                 .map(|(session, root, exited, tap)| {
                     let mut status = self.status.get(session);
-                    status.foreground =
-                        status::foreground_process(root, tap.foreground(), exited, |pid| {
-                            crate::sys::process_name(pid).ok()
-                        });
+                    // Pi has no hook identity. Its executable may be reported as `node`,
+                    // and its terminal title can be renamed. Keep the explicit launch identity.
+                    if status.agent.is_empty()
+                        && let Ok(Some(launch)) = self.agents.launch(session)
+                        && launch.profile == "pi"
+                    {
+                        status.agent = launch.profile;
+                    }
+                    status.foreground = status::session_foreground(root, tap.foreground(), exited);
                     status.title = tap.title();
                     let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
                         || status.agent.eq_ignore_ascii_case("antigravity")
@@ -1912,9 +1982,12 @@ impl Registry {
             })
         };
         if let Some((id, cwd, tap)) = target {
-            self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))?;
-            self.auto_switch_from_hook(id, e);
-            Ok(Some(id))
+            if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
+                self.auto_switch_from_hook(id, e);
+                Ok(Some(id))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
@@ -1922,18 +1995,22 @@ impl Registry {
 
     /// OWE-737: 첫 프롬프트 hook(`UserPromptSubmit` 등)이 오면 세션 자동 제목을 기록하고,
     /// 현재 디렉터리가 기본 이름(`worktree-1`, `claude-1` 등)의 git 브랜치이면 슬러그로 개명한다.
+    /// 또한 매 턴 프롬프트 히스토리를 `session-prompts.json`에 기록한다.
     pub(crate) fn maybe_rename_from_hook(&self, id: SessionId, payload: &[u8]) {
         use krill_proto::os::ffi::OsStrExt as _;
         if self.agents.is_subagent_or_foreign_hook(id, payload) {
             return;
         }
-        let state_dir = self.state_dir();
-        if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
-            return;
-        }
         let Some(prompt) = krill_proto::git::extract_prompt_from_hook_payload(payload) else {
             return;
         };
+        let state_dir = self.state_dir();
+        if let Some(dir) = state_dir.as_deref() {
+            krill_proto::git::record_session_prompt(dir, id, &prompt, status::now_ns()).ok();
+        }
+        if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
+            return;
+        }
         let Some(slug) = krill_proto::git::prompt_branch_slug(&prompt) else {
             return;
         };
@@ -1963,12 +2040,28 @@ impl Registry {
         e: &HookEvent,
         cwd: Option<&Path>,
         tap: Option<&Tap>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         use krill_proto::os::ffi::OsStrExt as _;
         let cwd_hint = cwd.map(|cwd| cwd.as_os_str().as_bytes());
-        let is_subagent_or_foreign =
-            self.agents
-                .record_hook_session_with_context(id, &e.payload, Some(&e.agent), cwd_hint);
+        let root = lock(&self.state).sessions.get(&id).map(|entry| entry.pid);
+        let origin = root.map_or(hook_identity::Origin::Unverified, |root| {
+            hook_identity::origin(root, tap.and_then(Tap::foreground), e)
+        });
+        let is_subagent_or_foreign = match origin {
+            hook_identity::Origin::Foreground => self
+                .agents
+                .record_foreground_hook_session(id, &e.payload, &e.agent, cwd_hint),
+            hook_identity::Origin::Auxiliary => {
+                self.agents.block_hibernation(id);
+                true
+            }
+            hook_identity::Origin::Unverified => self.agents.record_hook_session_with_context(
+                id,
+                &e.payload,
+                Some(&e.agent),
+                cwd_hint,
+            ),
+        };
         if !is_subagent_or_foreign
             && let Ok(Some(stored)) = self.agents.stored(id)
             && (stored.session_id.is_none() || stored.transcript_path.is_none())
@@ -2007,7 +2100,9 @@ impl Registry {
         }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         self.observe_webhook(id);
-        if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
+        let allow_status_hook = !is_subagent_or_foreign
+            || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
+        if allow_status_hook && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
             if status.state == control::AgentState::Working {
@@ -2040,7 +2135,7 @@ impl Registry {
                 crate::usage::accounts::record_rate_limited(provider, &account_id);
             }
         }
-        Ok(())
+        Ok(!is_subagent_or_foreign)
     }
 
     // Account evaluation wakes the session worker. Release `state` first: the worker's
@@ -2078,7 +2173,7 @@ impl Registry {
             }
             if !st.exited.contains_key(&id) {
                 // 끝나면 on_exited가 지운다. 잠금 안에서 표시해 그사이 온 Exited를 놓치지 않는다.
-                st.closing.insert(id);
+                let first = st.closing.insert(id);
                 drop(st);
                 let end = |req| {
                     if holder.version() >= TERMINATE_SINCE {
@@ -2091,27 +2186,52 @@ impl Registry {
                         }
                     }
                 };
-                return match holder.request(end) {
+                match holder.request(end) {
                     // ESRCH: 그사이 끝났다. Exited가 먼저 와서 on_exited가 지운다.
-                    Ok((FromHolder::Done { .. }, _)) => Ok(Reply::Closed),
+                    Ok((FromHolder::Done { .. }, _)) => {
+                        self.mark_closed(id);
+                        return Ok(Reply::Closed);
+                    }
                     Ok((FromHolder::Failed { errno, .. }, _)) if errno == libc::ESRCH => {
-                        Ok(Reply::Closed)
+                        self.mark_closed(id);
+                        return Ok(Reply::Closed);
                     }
                     r => {
-                        lock(&self.state).closing.remove(&id);
-                        Err(match r {
-                            Ok((FromHolder::Failed { errno, .. }, _)) => Failure::Os(errno),
-                            Ok(_) => Failure::Os(libc::EIO),
-                            Err(_) => Failure::NoHolder,
-                        })
+                        let mut st = lock(&self.state);
+                        if !st.sessions.contains_key(&id) {
+                            return Ok(Reply::Closed);
+                        }
+                        if !st.exited.contains_key(&id) {
+                            if first {
+                                st.closing.remove(&id);
+                            }
+                            return Err(match r {
+                                Ok((FromHolder::Failed { errno, .. }, _)) => Failure::Os(errno),
+                                Ok(_) => Failure::Os(libc::EIO),
+                                Err(_) => Failure::NoHolder,
+                            });
+                        }
                     }
-                };
+                }
             }
         }
         // 이미 끝난 세션: holder가 보관하던 master·상태를 놓게 한다. holder가 없거나 이미 놓았어도 지운다.
         holder.request(|req| ToHolder::Release { req, id }).ok();
+        self.mark_closed(id);
         self.remove(id);
         Ok(Reply::Closed)
+    }
+
+    fn mark_closed(&self, id: SessionId) {
+        lock(&self.state).closed.insert(id);
+        if let Some(store) = &self.store {
+            store.mark_closed(id);
+        }
+    }
+
+    fn is_closed(&self, id: SessionId) -> bool {
+        lock(&self.state).closed.contains(&id)
+            || self.store.as_ref().is_some_and(|s| s.is_closed(id))
     }
 
     /// holder `Exited` 송신 큐의 워커. 응답 리더와 분리해 `Release`가 exec 잠금을 기다려도 응답을 계속 읽는다.
@@ -2133,6 +2253,7 @@ impl Registry {
         if let Some(h) = &self.holder {
             h.notify(|req| ToHolder::Release { req, id }).ok();
         }
+        self.mark_closed(id);
         self.remove(id);
     }
 
@@ -2270,6 +2391,28 @@ impl Registry {
             UsageRequest::RefreshUsage => {
                 crate::usage::direct::refresh_manual(&home, state_ref);
                 UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+            }
+            UsageRequest::SwitchSessionAccount {
+                session,
+                provider,
+                account_id,
+            } => {
+                let required = krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
+                    | krill_proto::usage::FEAT_PROVIDER_DETAILS;
+                if features & required == required {
+                    let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                    match self.queue_session_account_switch(
+                        session,
+                        provider,
+                        &account_id,
+                        &snapshot,
+                    ) {
+                        Ok(()) => UsageReply::Accounts(snapshot),
+                        Err(error) => UsageReply::Failed(error),
+                    }
+                } else {
+                    UsageReply::Failed(Failure::BadRequest)
+                }
             }
             UsageRequest::SwitchAccount {
                 provider,
@@ -2448,6 +2591,14 @@ impl Registry {
                 (0, None, true)
             }
         };
+        // Windows has no PTY foreground group. Without this, an agent typed into a shell
+        // never gets a transcript unless its hook arrives (Codex has none outside Krill launches).
+        #[cfg(windows)]
+        let fg_pid = fg_pid.or_else(|| {
+            (!exited)
+                .then(|| crate::sys::session_agent_process(root_pid))
+                .flatten()
+        });
         let cwd = self
             .session_cwd(id)
             .map(|p| p.as_os_str().as_bytes().to_vec())
@@ -2545,6 +2696,13 @@ impl Registry {
         }
 
         let launched_at = self.agents.launched_at(id);
+        // A shell-launched agent has no launch record; its transcript cannot predate its process.
+        // Windows `start_us` counts from 1601, 11,644,473,600 s before the Unix epoch.
+        #[cfg(windows)]
+        let launched_at = launched_at.or_else(|| {
+            let start = crate::sys::start_us(fg_pid?).ok()?;
+            (start / 1_000_000).checked_sub(11_644_473_600)
+        });
         let claimed = self.agents.claimed_transcripts(id);
         let (snapshot, resolved) = crate::agent_history::chat::poll_session_bounded(
             self.state_dir().as_deref(),
@@ -2643,6 +2801,13 @@ impl Registry {
         let before_end = tap.pulse().end;
         let was_working = self.status.get(session).state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        if submit
+            && !self.status.get(session).agent.is_empty()
+            && let Ok(text) = std::str::from_utf8(bytes)
+            && let Some(dir) = self.state_dir()
+        {
+            krill_proto::git::record_session_prompt(&dir, session, text, status::now_ns()).ok();
+        }
         if submit && wait_submit {
             let deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < deadline {
@@ -3156,7 +3321,9 @@ impl Registry {
                 let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
                 loop {
                     let seen_gen = *lock(&self.orch_signal.0);
-                    let checked = OrchestrationStore::mutate(&dir, |s| {
+                    // 빈 폴링은 캐시 사본만 확인한다. ack=false도 명시적 ACK에 쓸
+                    // 영속 delivery가 필요하므로, 전달할 때는 잠금 안에서 다시 선택한다.
+                    let check = |s: &mut OrchestrationStore| {
                         s.check_delivery(
                             recipient.as_deref(),
                             &types,
@@ -3165,6 +3332,14 @@ impl Registry {
                             run_id.as_deref(),
                             delivery_id.as_deref(),
                         )
+                    };
+                    let checked = self.orchestration_snapshot().and_then(|mut snapshot| {
+                        let preview = check(&mut snapshot)?;
+                        if !preview.1.is_empty() || delivery_id.is_some() {
+                            OrchestrationStore::mutate(&dir, check)
+                        } else {
+                            Ok(preview)
+                        }
                     });
                     match checked {
                         Ok((delivery, messages))
@@ -3235,7 +3410,7 @@ impl Registry {
                 let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
                 loop {
                     let seen_gen = *lock(&self.orch_signal.0);
-                    let found = OrchestrationStore::load(&dir).ok().and_then(|s| {
+                    let found = self.orchestration_snapshot().ok().and_then(|s| {
                         s.messages
                             .iter()
                             .find(|m| m.reply_to.as_deref() == Some(question_id.as_str()))
@@ -3354,6 +3529,71 @@ fn os(e: &io::Error) -> Failure {
     Failure::Os(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
+fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
+    if let Ok(text) = std::str::from_utf8(cwd) {
+        let cleaned = krill_proto::orchestration::clean_workspace_path_str(text);
+        if cleaned != text {
+            *cwd = cleaned.into_bytes();
+        }
+    }
+}
+
+/// holder Spawn이 ENOENT로 실패했을 때:
+/// - `cwd` 디렉터리가 삭제·유실되어 존재하지 않는 경우 존재하는 상위 폴더·홈·빈 cwd로 폴백한다.
+/// - 로그인 셸(`-l`) 실행 파일이 삭제된 경우(`/opt/homebrew/bin/fish` 등) 시스템 기본 셸로 폴백한다.
+///
+/// 사용자 지정 실행 파일(`Program::Custom`) 자체가 없는 경우는 건드리지 않고 ENOENT를 그대로 돌려준다.
+fn fallback_spawn_on_enoent(
+    #[cfg_attr(
+        not(unix),
+        expect(unused_variables, reason = "로그인 셸(-l) 경로 폴백은 Unix 전용")
+    )]
+    argv: &mut [Vec<u8>],
+    cwd: &mut Vec<u8>,
+    env: &[(Vec<u8>, Vec<u8>)],
+) -> bool {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let mut changed = false;
+    if !cwd.is_empty() {
+        let cwd_path = Path::new(std::ffi::OsStr::from_bytes(cwd));
+        if !cwd_path.is_dir() {
+            let next_cwd = cwd_path
+                .ancestors()
+                .skip(1)
+                .find(|a| !a.as_os_str().is_empty() && a.is_dir())
+                .map(|a| a.as_os_str().as_bytes().to_vec())
+                .or_else(|| {
+                    env.iter()
+                        .find(|(k, _)| k.as_slice() == b"HOME")
+                        .map(|(_, v)| Path::new(std::ffi::OsStr::from_bytes(v)))
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.as_os_str().as_bytes().to_vec())
+                })
+                .unwrap_or_default();
+            *cwd = next_cwd;
+            changed = true;
+        }
+    }
+    #[cfg(unix)]
+    if argv.get(1).is_some_and(|a| a.as_slice() == b"-l")
+        && let Some(prog) = argv.first_mut()
+    {
+        let prog_path = Path::new(std::ffi::OsStr::from_bytes(prog));
+        if prog_path.is_absolute() && !prog_path.is_file() {
+            for candidate in [&b"/bin/zsh"[..], &b"/bin/sh"[..]] {
+                if Path::new(std::ffi::OsStr::from_bytes(candidate)).is_file()
+                    && prog.as_slice() != candidate
+                {
+                    *prog = candidate.to_vec();
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    changed
+}
+
 fn read_only(req: &Request) -> bool {
     matches!(
         req,
@@ -3401,6 +3641,244 @@ mod orchestration_delivery_tests {
     use super::*;
     use krill_proto::orchestration::{MessageType, OrchAction, OrchestrationStore, SendParams};
     use std::io::Read as _;
+
+    #[test]
+    fn empty_orchestration_waiters_preserve_file_and_response_shapes() -> io::Result<()> {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        let dir = std::env::temp_dir().join(format!("krill-empty-waits-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        OrchestrationStore::mutate(&dir, |s| s.create_run("empty wait", None))?;
+        let before = stamp(&dir.join(ORCH_FILE)).unwrap();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let start = Arc::new(std::sync::Barrier::new(5));
+        let waiters: Vec<_> = (0..4)
+            .map(|i| {
+                let reg = Arc::clone(&reg);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    reg.orchestration(
+                        &Peer {
+                            pid: None,
+                            scope: Scope::Full,
+                        },
+                        if i < 2 {
+                            OrchAction::CheckMessagesLegacy {
+                                recipient: Some("empty".into()),
+                                types: vec![],
+                                unread_only: true,
+                                ack: i == 1,
+                                wait_ms: 800,
+                            }
+                        } else {
+                            OrchAction::CheckMessages {
+                                recipient: Some("empty".into()),
+                                types: vec![],
+                                unread_only: true,
+                                ack: i == 3,
+                                wait_ms: 800,
+                                run_id: None,
+                                delivery_id: None,
+                            }
+                        },
+                    )
+                })
+            })
+            .collect();
+        start.wait();
+        // 250ms 재확인을 여러 번 거쳐도 inode/mtime이 바뀌지 않아야 한다.
+        for _ in 0..35 {
+            std::thread::sleep(Duration::from_millis(25));
+            assert_eq!(stamp(&dir.join(ORCH_FILE)).as_ref(), Some(&before));
+        }
+        for (i, waiter) in waiters.into_iter().enumerate() {
+            let response = waiter.join().unwrap().unwrap();
+            if i == 2 {
+                assert!(
+                    matches!(response, Reply::Orchestration(OrchResponse::Delivery { delivery: None, messages }) if messages.is_empty())
+                );
+            } else {
+                assert!(
+                    matches!(response, Reply::Orchestration(OrchResponse::Messages(messages)) if messages.is_empty())
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn cached_answer_wait_observes_external_reply_without_idle_writes() -> io::Result<()> {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        let dir = std::env::temp_dir().join(format!("krill-answer-wait-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let question = OrchestrationStore::mutate(&dir, |s| {
+            s.send_message(&SendParams {
+                from: "worker".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Question,
+                summary: "question".into(),
+                body: String::new(),
+                run_id: None,
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })
+            .map(|messages| messages[0].clone())
+        })?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let question_id = question.id.clone();
+            std::thread::spawn(move || {
+                reg.orchestration(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    OrchAction::WaitAnswer {
+                        question_id,
+                        wait_ms: 5000,
+                    },
+                )
+            })
+        };
+        let before = stamp(&dir.join(ORCH_FILE));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(stamp(&dir.join(ORCH_FILE)), before);
+        // 외부 프로세스의 저장처럼 notify 없이 파일 교체만으로 캐시를 무효화한다.
+        let reply = OrchestrationStore::mutate(&dir, |s| {
+            s.reply_message(&question.id, "coordinator", "answer")
+        })?;
+        assert_eq!(
+            waiter.join().unwrap().unwrap(),
+            Reply::Orchestration(OrchResponse::Answer(Some(reply.clone())))
+        );
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .messages
+                .iter()
+                .any(|m| m.id == reply.id && m.acked)
+        );
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn cached_wait_wakes_and_replays_durable_delivery_before_explicit_ack() -> io::Result<()> {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        let dir = std::env::temp_dir().join(format!("krill-delivery-wait-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("delivery wait", None))?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let action = OrchAction::CheckMessages {
+            recipient: Some("receiver".into()),
+            types: vec![MessageType::Status],
+            unread_only: true,
+            ack: false,
+            wait_ms: 5000,
+            run_id: Some(run.id.clone()),
+            delivery_id: None,
+        };
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let action = action.clone();
+            std::thread::spawn(move || {
+                reg.orchestration(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    action,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let send = |summary: &str| {
+            reg.orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "sender".into(),
+                    to: "receiver".into(),
+                    msg_type: MessageType::Status,
+                    summary: summary.into(),
+                    body: String::new(),
+                    run_id: Some(run.id.clone()),
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .unwrap()
+        };
+        let sent_at = Instant::now();
+        send("first");
+        let Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(batch),
+            messages,
+        }) = waiter.join().unwrap().unwrap()
+        else {
+            panic!("expected durable delivery")
+        };
+        assert!(sent_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].acked);
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.deliveries.as_slice(),
+            std::slice::from_ref(&batch)
+        );
+        let before = stamp(&dir.join(ORCH_FILE));
+        assert_eq!(
+            reg.orchestration(&peer, action.clone()).unwrap(),
+            Reply::Orchestration(OrchResponse::Delivery {
+                delivery: Some(batch.clone()),
+                messages: messages.clone()
+            })
+        );
+        assert_eq!(stamp(&dir.join(ORCH_FILE)), before);
+        send("later");
+        let OrchAction::CheckMessages {
+            recipient,
+            types,
+            unread_only,
+            wait_ms,
+            run_id,
+            ..
+        } = action
+        else {
+            unreachable!()
+        };
+        let ack = OrchAction::CheckMessages {
+            recipient,
+            types,
+            unread_only,
+            wait_ms,
+            run_id,
+            ack: true,
+            delivery_id: Some(batch.id.clone()),
+        };
+        let Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(acked),
+            messages,
+        }) = reg.orchestration(&peer, ack).unwrap()
+        else {
+            panic!("expected explicit ack delivery")
+        };
+        assert_eq!(acked.id, batch.id);
+        assert!(acked.acked);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].acked);
+        let store = OrchestrationStore::load(&dir)?;
+        assert_eq!(store.messages.iter().filter(|m| !m.acked).count(), 1);
+        std::fs::remove_dir_all(dir)
+    }
 
     #[test]
     fn idle_headless_mail_pointer_is_delivered_once_and_busy_mail_is_deferred() -> io::Result<()> {

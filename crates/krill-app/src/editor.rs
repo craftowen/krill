@@ -10,6 +10,7 @@
 //! - 지워지면 표시한다. 저장하면 다시 생긴다.
 
 pub mod quick_open;
+pub mod syntax;
 
 use krill_proto::os::fs::OpenOptionsExt as _;
 use std::fs::{self, OpenOptions};
@@ -103,13 +104,14 @@ pub enum Opened {
 }
 
 /// 텍스트 탭의 미리보기 화면. 있으면 탭 헤더에 편집/미리보기 토글이 생기고 미리보기로 시작한다
-/// (Orca `getDefaultMarkdownViewMode`: 편집 모드 기본값이 'rich' — markdown·csv·notebook 공통).
+/// (Orca `getDefaultMarkdownViewMode`: 편집 모드 기본값이 'rich' — markdown·csv·notebook·html 공통).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Preview {
     Markdown,
     Table(Delimiter),
     Notebook,
     Svg,
+    Html,
 }
 
 /// 분류 → 미리보기. 일반 텍스트는 코드 에디터만 쓴다.
@@ -119,6 +121,7 @@ pub fn preview(kind: Kind) -> Option<Preview> {
         Kind::Csv { delimiter } => Some(Preview::Table(delimiter)),
         Kind::Ipynb => Some(Preview::Notebook),
         Kind::Image(ImageFormat::Svg) => Some(Preview::Svg),
+        Kind::Text { language: "html" } => Some(Preview::Html),
         _ => None,
     }
 }

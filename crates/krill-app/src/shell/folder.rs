@@ -23,8 +23,9 @@ pub(super) fn default_folder() -> PathBuf {
 impl Shell {
     /// 폴더를 지정하지 않은 기존 칸은 로컬이면 사용자 홈 디렉터리, 원격이면 원격 기본 디렉터리를 사용한다.
     pub(super) fn launch_for(&self, pane: PaneId) -> Create {
-        self.layout.launch(pane).cloned().unwrap_or_else(|| {
-            let cwd = if self.layout.host(pane).is_remote() {
+        let is_remote = self.layout.host(pane).is_remote();
+        let mut create = self.layout.launch(pane).cloned().unwrap_or_else(|| {
+            let cwd = if is_remote {
                 Vec::new()
             } else {
                 default_folder().as_os_str().as_bytes().to_vec()
@@ -36,7 +37,14 @@ impl Shell {
                 cols: pane::SIZE.0,
                 rows: pane::SIZE.1,
             }
-        })
+        });
+        if !is_remote && let Ok(text) = std::str::from_utf8(&create.cwd) {
+            let cleaned = krill_proto::orchestration::clean_workspace_path_str(text);
+            if cleaned != text {
+                create.cwd = cleaned.into_bytes();
+            }
+        }
+        create
     }
 
     pub(super) fn folder(&self) -> PathBuf {
@@ -63,6 +71,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let is_remote = host.is_remote();
+        let cleaned = (!is_remote)
+            .then(|| folder.to_str())
+            .flatten()
+            .and_then(|s| {
+                krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !folder.exists())
+            })
+            .map(PathBuf::from);
+        let folder = cleaned.as_deref().unwrap_or(folder);
         if matches!(program, Program::Agent { .. }) {
             krill_app::star_nag::record_agent_start(cx);
         }

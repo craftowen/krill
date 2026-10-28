@@ -280,15 +280,14 @@ pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
     }
 }
 
-/// Hooks identify the agent first; foreground and original titles survive user aliases.
+/// A recognized live foreground agent supersedes hooks left by an earlier agent in the same shell.
+/// Generic runtimes (`node`, `bun`) and titles cannot override an explicit hook identity.
 #[must_use]
 pub fn infer_agent_from_status<'a>(
     status: &'a krill_proto::control::AgentStatus,
     title: &str,
 ) -> &'a str {
-    if is_shell_agent(&status.agent)
-        && let Some(agent) = status.foreground.as_deref().and_then(known_agent)
-    {
+    if let Some(agent) = status.foreground.as_deref().and_then(known_agent) {
         return agent;
     }
     if let Some(original_title) = status.title.as_deref() {
@@ -319,7 +318,10 @@ fn is_shell_agent(agent: &str) -> bool {
 
 fn known_agent(agent: &str) -> Option<&'static str> {
     let name = agent.rsplit(['/', '\\']).next().unwrap_or(agent);
-    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let name = name
+        .rsplit_once('.')
+        .filter(|(_, ext)| ext.eq_ignore_ascii_case("exe"))
+        .map_or(name, |(stem, _)| stem);
     [
         ("claude", "claude"),
         ("codex", "codex"),
@@ -671,7 +673,7 @@ mod tests {
             "codex"
         );
         status.agent = "claude".into();
-        assert_eq!(infer_agent_from_status(&status, "Codex task"), "claude");
+        assert_eq!(infer_agent_from_status(&status, "Codex task"), "codex");
         status.agent.clear();
         status.foreground = None;
         status.title = Some("Claude task".into());
@@ -710,6 +712,28 @@ mod tests {
         }
         status.agent = "custom".into();
         assert_eq!(infer_agent_from_status(&status, "Pi"), "custom");
+    }
+
+    #[test]
+    fn live_agent_replaces_stale_hooks_and_titles_in_a_reused_terminal() {
+        use krill_proto::control::AgentStatus;
+        let mut status = AgentStatus {
+            agent: "claude".into(),
+            title: Some("Claude Code".into()),
+            ..AgentStatus::UNKNOWN
+        };
+        for process in ["codex", "C:\\npm\\codex.exe", "C:\\npm\\CODEX.EXE"] {
+            status.foreground = Some(process.into());
+            assert_eq!(infer_agent_from_status(&status, "Claude Code"), "codex");
+        }
+        status.agent = "codex".into();
+        status.foreground = Some("claude".into());
+        assert_eq!(infer_agent_from_status(&status, "Codex"), "claude");
+        for process in [None, Some("node"), Some("bun"), Some("git")] {
+            status.agent = "claude".into();
+            status.foreground = process.map(str::to_owned);
+            assert_eq!(infer_agent_from_status(&status, "Codex"), "claude");
+        }
     }
 
     #[test]

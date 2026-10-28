@@ -135,6 +135,15 @@ async fn cmd_serve(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         i += 1;
     }
 
+    #[cfg(target_os = "macos")]
+    let agent = krill_link::launchd::lifecycle::ManagedAgent::from_env(state_dir);
+    #[cfg(target_os = "macos")]
+    if let Some(agent) = agent.as_ref()
+        && !agent.prepare_start().await.map_err(Error::Io)?
+    {
+        return Ok(());
+    }
+
     let mut opts = ServeOptions::new(state_dir.to_path_buf());
     opts.krilld_socket = socket_override;
     let mut handle = start_server(opts).await?;
@@ -146,12 +155,19 @@ async fn cmd_serve(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     .ok();
     io::stdout().flush().ok();
 
-    tokio::select! {
-        () = wait_for_shutdown_signal() => {},
-        () = handle.stopped() => {},
-    }
+    let result: Result<(), io::Error> = tokio::select! {
+        () = wait_for_shutdown_signal() => Ok(()),
+        () = handle.stopped() => Ok(()),
+        result = async {
+            #[cfg(target_os = "macos")]
+            if let Some(agent) = agent {
+                return agent.wait_for_removal().await;
+            }
+            std::future::pending::<Result<(), io::Error>>().await
+        } => result,
+    };
     handle.shutdown().await;
-    Ok(())
+    result.map_err(Error::Io)
 }
 
 fn cmd_enable(state_dir: &Path) -> Result<(), Error> {
@@ -219,7 +235,7 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "초대 링크 (10분간 1회 유효 — 다른 맥에서 붙여넣으세요 / Invite link, valid once for 10m):\n{}",
+            "초대 링크 (10분간 1회 유효 — 다른 컴퓨터에서 붙여넣으세요 / Invite link, valid once for 10m):\n{}",
             out.link
         )
         .ok();

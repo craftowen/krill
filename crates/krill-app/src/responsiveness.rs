@@ -186,6 +186,22 @@ fn start_with(
                             whole_process,
                             "UI heartbeat recovered"
                         );
+                        if let Some(state) = &state {
+                            use krill_proto::error_reporting::{self, Code, Event, Process};
+                            if let Ok(mut event) = Event::new(
+                                Process::App,
+                                Code::UiStall,
+                                error_reporting::source_location(file!(), line!()),
+                            ) {
+                                event.hang_bucket_ms = Some(match delay_ms {
+                                    0..=1_499 => 500,
+                                    1_500..=4_999 => 1_500,
+                                    5_000..=29_999 => 5_000,
+                                    _ => 30_000,
+                                });
+                                error_reporting::record_at(state, event).ok();
+                            }
+                        }
                     }
                     Some(Report::ObserverLate { observer_gap_ms }) => {
                         tracing::warn!(

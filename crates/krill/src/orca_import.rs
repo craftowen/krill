@@ -595,6 +595,7 @@ impl ProjectsStore {
     /// `original`(로드 전에 읽은 원본)이 그대로일 때만 원자 교체한다.
     pub fn save(&self, state_dir: &Path, original: Option<&str>) -> io::Result<()> {
         let path = state_dir.join(PROJECTS_FILE);
+        let _guard = config_document::lock_toml(&path)?;
         let body = config_document::save_toml(&path, self)?;
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_PROJECTS_BYTES {
             return Err(invalid_data("projects.toml exceeds size limit"));

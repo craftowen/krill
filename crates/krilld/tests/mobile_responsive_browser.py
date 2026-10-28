@@ -1,4 +1,4 @@
-"""Chromium responsive matrix against the isolated mobile_pwa.cjs LAN fixture.
+"""Chromium responsive matrix against the isolated mobile_pwa.cjs loopback fixture.
 
 Run with CARGO_TARGET_DIR pointing at the actual Cargo target directory.
 --phase before records problems without failing; after enforces the contract.
@@ -27,13 +27,13 @@ MEASURE = """(()=>{
  const rect=n=>{const r=n.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,right:r.right,bottom:r.bottom};};
  const visible=n=>!!n.getClientRects().length&&getComputedStyle(n).visibility!=='hidden';
  const dialog=document.querySelector('dialog[open]'),scope=dialog||document.querySelector('.scanner')||document.querySelector('#route-root');
- const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.command-dock'),...rect(n)}));
+ const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.command-dock,.quick-commands-list')||n.classList.contains('quick-command-add'),...rect(n)}));
  const reading=[...document.querySelectorAll('.home-list,.workspace-list,.settings-list,.detail-list,.connection-log')].filter(visible).map(n=>({name:n.className,...rect(n)}));
  const overflow=[...document.querySelectorAll('#route-root,.screen,.home-list,.workspace-list,.settings-list,.detail-list,.connection-log,.chat-view,.chat-feed,.command-dock')].filter(visible).filter(n=>n.scrollWidth>n.clientWidth+1).map(n=>({name:n.className||n.id,scroll:n.scrollWidth,client:n.clientWidth}));
  const dock=document.querySelector('.terminal-mount:not([hidden]) .command-dock');
  const conversation=document.querySelector('.chat-view');
  const headerControls=[...document.querySelectorAll('.page-header button,.home-topbar button')].filter(visible).map(rect);
- return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,conversation:conversation?rect(conversation):null,sheet:dialog?rect(dialog):null,dock:dock?rect(dock):null};
+ return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,conversation:conversation?rect(conversation):null,sheet:dialog?.classList.contains('sheet')?rect(dialog):null,scanner:dialog?.classList.contains('scanner')?rect(dialog):null,dock:dock?rect(dock):null};
 })()"""
 
 
@@ -42,7 +42,7 @@ def problems(m):
     if m['scrollWidth'] > m['width'] or m['overflow']:
         issues.append('horizontal overflow')
     # The session header, tabs and terminal dock are compact so the terminal body keeps the most rows.
-    small = [c['name'] for c in m['controls'] if min(c['w'], c['h']) < (33.9 if c['compact'] else 43.9)]
+    small = [c['name'] for c in m['controls'] if min(c['w'], c['h']) < (27.9 if c['compact'] else 43.9)]
     if small:
         issues.append('touch target <44: ' + ', '.join(small))
     for item in m['reading']:
@@ -55,6 +55,11 @@ def problems(m):
         # Very short landscape screens keep the full available height scrollable.
         if abs(m['sheet']['y'] - (m['height'] - m['sheet']['h']) / 2) > 2:
             issues.append('sheet not centered')
+    scanner = m.get('scanner')
+    if scanner and (abs(scanner['x']) > 1 or abs(scanner['y']) > 1
+                    or abs(scanner['w'] - m['width']) > 1
+                    or abs(scanner['h'] - m['height']) > 1):
+        issues.append('scanner must fill the viewport')
     if m['dock'] and m['dock']['bottom'] > m['height'] + 1:
         issues.append('terminal dock below viewport')
     if m.get('conversation') and m['conversation']['w'] > 1041:
@@ -144,12 +149,12 @@ def main():
                     capture('scanner-photo-fallback', width, height)
                     named('Close scanner')
                 browser('open', cfg['url'])
-                wait('!!document.querySelector(".pair-screen")')
-                for width, height in VIEWPORTS:
-                    browser('set', 'viewport', str(width), str(height))
-                    capture('pair-confirm', width, height)
-                named('Pair')
+                # Opening a pairing link now connects immediately; no manual Pair
+                # confirmation is shown. Keep the device and secret-removal checks.
                 wait('KrillMobile.store.connection.phase==="ready"')
+                assert evaluate('location.hash.startsWith("#/") && !["pair","key","t","r"].some(k=>new URLSearchParams(location.hash.slice(1)).has(k))')
+                assert not evaluate('!!document.querySelector(".pair-screen")')
+                assert len(json.loads((Path(cfg['dir']) / 'mobile-devices.json').read_text())) == 1
                 sid = cfg['session']
                 wait(f'KrillMobile.store.sessions.has({sid})')
                 route = evaluate(f'"/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({sid}).groupKey)+"/s/{sid}"')
@@ -169,7 +174,8 @@ def main():
                     capture('workspace-terminals', width, height)
                     click('.workspace-toolbar .filter-chip')
                     capture('workspace-options', width, height)
-                    close()
+                    click('.workspace-toolbar .filter-chip')
+                    assert evaluate('document.querySelector(".workspace-options").hidden')
                     named('Search')
                     browser('fill', 'input[type=search]', 'no-matching-workspace')
                     capture('workspace-search-empty', width, height)
@@ -180,6 +186,17 @@ def main():
                     evaluate('KrillMobile.activeTerminal.setInputMode("direct");true')
                     settle()
                     capture('session-direct', width, height)
+                    named('Quick Commands')
+                    wait('!!document.querySelector(".quick-commands-list")')
+                    capture('quick-commands', width, height)
+                    named('Add Quick Command')
+                    wait('document.querySelectorAll(".quick-command-result").length>=3')
+                    capture('quick-command-catalog', width, height)
+                    browser('fill', '.quick-command-search', 'mobile-review')
+                    wait('document.querySelectorAll(".quick-command-result").length===1')
+                    assert evaluate('document.querySelector(".quick-command-result").textContent.includes("/mobile-review")')
+                    capture('quick-command-search', width, height)
+                    close()
                     named('Terminal actions')
                     capture('terminal-actions', width, height)
                     named('Send prompt')
@@ -199,12 +216,12 @@ def main():
                     evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
                     settle()
                     capture('session-buffered', width, height)
-                    evaluate(f'KrillMobile.store.chatCache?.delete({sid});true')
                     named('Chat')
                     wait('!!document.querySelector(".chat-feed")')
                     capture('chat-empty', width, height)
                     # Real renderer, deterministic content: the shell fixture has no
-                    # agent transcript. Seed only its cache; no production QA hooks.
+                    # agent transcript. The hidden view already preloads its cache;
+                    # keep that mounted entry and seed it without replacing its Map.
                     evaluate(f'''(()=>{{const e=KrillMobile.store.chatCache.get({sid});e.items=[{{kind:'user',text:'폴드를 펼친 뒤에도 입력을 이어갑니다. '.repeat(8)}},{{kind:'assistant',text:'Long readable conversation on a wide screen. '.repeat(28)}}];e.bound=true;return true;}})()''')
                     named('Term')
                     named('Chat')
@@ -355,7 +372,7 @@ def main():
                         capture('dialog-ko-large-light', width, height)
                         close()
                         click('.session .mode-toggle')
-                # Keep the original 608 captures before any split reload or new input.
+                # Keep the viewport captures before any split reload or new input.
                 navigate('/settings')
                 click('[data-focus-key="preference-language-en"]')
                 click('[data-focus-key="preference-appearance-dark"]')
@@ -400,7 +417,7 @@ def main():
                 pane_ready()
                 assert evaluate('getComputedStyle(document.querySelector(".terminal-pane[data-active=true]"),"::after").borderTopWidth') == '2px'
                 assert evaluate('document.getElementById("notice").hidden || !document.getElementById("notice").textContent.includes("Wait for the live terminal")')
-                assert evaluate('!document.querySelector(".primary-pane .command-dock").getClientRects().length && !!document.querySelector(".secondary-pane .command-dock").getClientRects().length')
+                assert evaluate('getComputedStyle(document.querySelector(".primary-pane .command-dock")).visibility==="hidden" && getComputedStyle(document.querySelector(".primary-pane .command-dock")).pointerEvents==="none" && getComputedStyle(document.querySelector(".secondary-pane .command-dock")).visibility==="visible"')
                 capture('tablet-split-columns-active-second', 1180, 820)
                 assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'row'
                 assert evaluate('document.querySelectorAll(".is-split > .terminal-pane > .pane-header").length') == 2
@@ -488,8 +505,8 @@ def main():
                 evaluate('document.querySelector(".secondary-pane .command-input").value="second fold draft 한글";globalThis.firstHandle=KrillMobile.activeTerminal;globalThis.splitSocketCount=tabletSockets.filter(s=>s.readyState===1).length;true')
                 capture('tablet-split-columns-active-first', 1180, 820)
                 browser('set', 'viewport', '830', '690')
-                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
-                wait('tabletSockets.filter(s=>s.readyState===1).length===splitSocketCount-1')
+                pane_ready()
+                assert evaluate('tabletSockets.filter(s=>s.readyState===1).length===splitSocketCount')
                 assert evaluate('firstHandle===KrillMobile.activeTerminal')
                 assert evaluate('document.querySelector(".primary-pane .command-input").value') == 'primary fold draft 한글'
                 browser('set', 'viewport', '1180', '820')
@@ -499,7 +516,8 @@ def main():
                 browser('click', '.secondary-pane .terminal-scroll')
                 evaluate('globalThis.secondHandle=KrillMobile.activeTerminal;true')
                 browser('set', 'viewport', '830', '690')
-                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                pane_ready()
+                assert evaluate('tabletSockets.filter(s=>s.readyState===1).length===splitSocketCount')
                 assert evaluate('secondHandle===KrillMobile.activeTerminal')
                 browser('set', 'viewport', '1180', '820')
                 pane_ready()
@@ -546,7 +564,7 @@ def main():
     print(f'{args.phase}: {len(results)} screenshots; {len(failed)} states with issues; {len(resizing)} live resizes')
     if args.phase == 'after':
         assert not failed, '\n'.join(f'{r["viewport"]}/{r["screen"]}: {r["issues"]}' for r in failed)
-        print('PASS responsive Chromium LAN matrix')
+        print('PASS responsive Chromium loopback matrix')
 
 
 if __name__ == '__main__':

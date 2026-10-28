@@ -1,0 +1,6 @@
+.dev.vars
+.wrangler/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+worker-configuration.d.ts

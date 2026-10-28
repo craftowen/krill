@@ -19,6 +19,9 @@ use krill_proto::usage::{AccountsSnapshot, ConnectionStatus, ProviderKind, Sessi
 
 use super::{Peer, Registry, Scope, lock};
 use crate::usage::accounts;
+use accounts::switch_work::SwitchScope;
+
+const MAX_HANDOFF_WORKERS: usize = 4;
 
 const FILE: &str = "account-handoffs.json";
 const PREPARED_FILE: &str = "account-replacement.json";
@@ -70,6 +73,166 @@ fn foreground_vault_agent(
 }
 
 impl Registry {
+    fn live_agent_for_switch(
+        &self,
+        session: SessionId,
+    ) -> Option<crate::agent::control::StoredLaunch> {
+        self.live_agent_for_switch_in(session, &accounts::default_home())
+    }
+
+    fn switch_provider(
+        &self,
+        stored: &crate::agent::control::StoredLaunch,
+    ) -> Option<ProviderKind> {
+        let agents = self.agents.agents().ok()?;
+        let (_, profile) = agents.resolve(&stored.profile)?;
+        profile
+            .program()
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .and_then(ProviderKind::parse)
+    }
+
+    fn queue_session_account_switch_locked(
+        &self,
+        session: SessionId,
+        provider: ProviderKind,
+        account_id: &str,
+        snapshot: &AccountsSnapshot,
+        pending: &mut BTreeMap<SwitchScope, accounts::switch_work::SwitchTarget>,
+    ) -> Result<(), Failure> {
+        // A sidebar click can still name the original while retirement is being observed.
+        // Follow only durable aliases; an unconfirmed replacement is never a valid target.
+        let mut session = session;
+        // Retirement can be marked just before close sets state.closing. Persist a
+        // follow-up against the live confirmed replacement during that window too.
+        if self.agents.account_binding_retiring(session) {
+            let next = lock(&self.account_handoffs)
+                .get(&session)
+                .and_then(|h| h.to);
+            if let Some(next) = next.filter(|next| {
+                let state = lock(&self.state);
+                state.sessions.contains_key(next)
+                    && !state.exited.contains_key(next)
+                    && !state.closing.contains(next)
+            }) {
+                session = next;
+            }
+        }
+        for _ in 0..krill_proto::holder::MAX_SESSIONS {
+            let retired = {
+                let state = lock(&self.state);
+                !state.sessions.contains_key(&session)
+                    || state.exited.contains_key(&session)
+                    || state.closing.contains(&session)
+            };
+            if !retired {
+                break;
+            }
+            let next = lock(&self.account_handoffs)
+                .get(&session)
+                .and_then(|h| h.to);
+            let Some(next) = next.filter(|next| *next != session) else {
+                return Err(Failure::NoSession);
+            };
+            session = next;
+        }
+        {
+            let state = lock(&self.state);
+            if !state.sessions.contains_key(&session)
+                || state.exited.contains_key(&session)
+                || state.closing.contains(&session)
+            {
+                return Err(Failure::NoSession);
+            }
+        }
+        let committed_replacement = lock(&self.account_handoffs)
+            .values()
+            .any(|h| h.to == Some(session));
+        if lock(&self.account_replacements).contains(&session) && !committed_replacement {
+            return Err(Failure::BadRequest);
+        }
+        let stored = self
+            .live_agent_for_switch(session)
+            .ok_or(Failure::UnknownAgent)?;
+        if self.switch_provider(&stored) != Some(provider) {
+            return Err(Failure::BadRequest);
+        }
+        let target = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.provider == provider && a.id == account_id)
+            .ok_or(Failure::BadRequest)?;
+        if !target.host_default && !Path::new(&target.profile_dir).is_dir() {
+            return Err(Failure::BadRequest);
+        }
+        if self.agents.account_binding_retiring(session) {
+            // Retirement has committed its durable alias. Preserve it while a later
+            // selection waits to be applied to the confirmed replacement.
+            pending.insert(
+                SwitchScope::Session(session, provider),
+                accounts::switch_work::SwitchTarget {
+                    account_id: account_id.into(),
+                    prepared: true,
+                    not_before: None,
+                },
+            );
+            self.account_work.wake.notify_one();
+            return Ok(());
+        }
+        let mut handoffs = lock(&self.account_handoffs);
+        let previous = handoffs.get(&session).cloned();
+        if stored.account.as_ref().is_some_and(|a| a.id == account_id) {
+            handoffs.remove(&session);
+        } else {
+            handoffs.insert(
+                session,
+                SessionHandoff {
+                    from: session,
+                    to: None,
+                    account_id: account_id.into(),
+                    error: None,
+                },
+            );
+        }
+        if let Err(error) = self.write_account_handoffs(&handoffs) {
+            if let Some(previous) = previous {
+                handoffs.insert(session, previous);
+            } else {
+                handoffs.remove(&session);
+            }
+            return Err(super::os(&error));
+        }
+        pending.insert(
+            SwitchScope::Session(session, provider),
+            accounts::switch_work::SwitchTarget {
+                account_id: account_id.into(),
+                prepared: true,
+                not_before: None,
+            },
+        );
+        drop(handoffs);
+        self.account_work.wake.notify_one();
+        Ok(())
+    }
+
+    pub(super) fn queue_session_account_switch(
+        &self,
+        session: SessionId,
+        provider: ProviderKind,
+        account_id: &str,
+        snapshot: &AccountsSnapshot,
+    ) -> Result<(), Failure> {
+        let mut pending = lock(&self.account_work.pending);
+        self.queue_session_account_switch_locked(
+            session,
+            provider,
+            account_id,
+            snapshot,
+            &mut pending,
+        )
+    }
+
     fn provider_for_profile(&self, profile_id: &str) -> Option<ProviderKind> {
         let agents = self.agents.agents().ok()?;
         let (_, profile) = agents.resolve(profile_id)?;
@@ -240,9 +403,12 @@ impl Registry {
 
     pub(super) fn queue_account_switch(&self, provider: ProviderKind, account_id: &str) {
         let mut pending = lock(&self.account_work.pending);
+        pending.retain(
+            |scope, _| !matches!(scope, SwitchScope::Session(_, selected) if *selected == provider),
+        );
         self.prepare_account_switch_in(provider, account_id, &accounts::default_home(), false);
         pending.insert(
-            provider,
+            SwitchScope::Provider(provider),
             crate::usage::accounts::switch_work::SwitchTarget {
                 account_id: account_id.into(),
                 prepared: true,
@@ -258,6 +424,23 @@ impl Registry {
         account_id: &str,
         home: &Path,
         automatic: bool,
+    ) {
+        self.prepare_account_switch_excluding(
+            provider,
+            account_id,
+            home,
+            automatic,
+            &std::collections::BTreeSet::new(),
+        );
+    }
+
+    fn prepare_account_switch_excluding(
+        &self,
+        provider: ProviderKind,
+        account_id: &str,
+        home: &Path,
+        automatic: bool,
+        excluded: &std::collections::BTreeSet<SessionId>,
     ) {
         let sessions: Vec<_> = {
             let state = lock(&self.state);
@@ -275,8 +458,13 @@ impl Registry {
         let mut found = false;
         let mut cancelled = false;
         for (from, root_pid, fg_pid) in sessions {
+            if excluded.contains(&from) {
+                continue;
+            }
             // A later click must not enqueue a replacement that is still being prepared.
-            if lock(&self.account_replacements).contains(&from) {
+            if lock(&self.account_replacements).contains(&from)
+                || self.agents.account_binding_retiring(from)
+            {
                 continue;
             }
             let Some(stored) = self.live_agent_for_switch_in(from, home) else {
@@ -292,6 +480,14 @@ impl Registry {
                 .and_then(ProviderKind::parse)
                 != Some(provider)
             {
+                let mut handoffs = lock(&self.account_handoffs);
+                if handoffs
+                    .get(&from)
+                    .is_some_and(|handoff| handoff.to.is_none() && handoff.account_id == account_id)
+                {
+                    handoffs.remove(&from);
+                    cancelled = true;
+                }
                 continue;
             }
             let current =
@@ -508,108 +704,157 @@ impl Registry {
     }
 
     fn process_account_work_in(&self, home: &Path) {
-        if *lock(&self.upgrading) {
+        use std::sync::atomic::Ordering;
+        if *lock(&self.upgrading)
+            || self
+                .account_processing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             return;
         }
+        let _processing = Processing(&self.account_processing);
         self.recover_account_work(home);
         let pending = {
             let mut pending = lock(&self.account_work.pending);
             let ready: Vec<_> = pending
                 .iter()
                 .filter(|(_, target)| target.not_before.is_none_or(|at| Instant::now() >= at))
-                .map(|(provider, _)| *provider)
+                .map(|(scope, _)| *scope)
+                .collect();
+            let excluded = pending
+                .keys()
+                .filter_map(|scope| match scope {
+                    SwitchScope::Session(session, _) => Some(*session),
+                    SwitchScope::Provider(_) => None,
+                })
                 .collect();
             let mut work = BTreeMap::new();
-            for provider in ready {
-                if let Some(target) = pending.remove(&provider) {
-                    if !target.prepared {
-                        self.prepare_account_switch_in(provider, &target.account_id, home, true);
+            for scope in ready {
+                if let Some(target) = pending.remove(&scope) {
+                    if !target.prepared
+                        && let SwitchScope::Provider(provider) = scope
+                    {
+                        self.prepare_account_switch_excluding(
+                            provider,
+                            &target.account_id,
+                            home,
+                            true,
+                            &excluded,
+                        );
                     }
-                    work.insert(provider, target);
+                    work.insert(scope, target);
                 }
             }
             work
         };
+        let handoffs: Vec<_> = lock(&self.account_handoffs)
+            .values()
+            .filter(|h| h.to.is_none() && h.error.is_none())
+            .cloned()
+            .collect();
+        let jobs: Vec<_> = handoffs
+            .into_iter()
+            .filter_map(|h| {
+                let stored = self.live_agent_for_switch_in(h.from, home)?;
+                let provider = self.switch_provider(&stored)?;
+                // Recovery and explicit requests are always scoped to the saved original.
+                pending
+                    .keys()
+                    .any(|scope| match scope {
+                        SwitchScope::Provider(p) => *p == provider,
+                        SwitchScope::Session(id, p) => *id == h.from && *p == provider,
+                    })
+                    .then_some((h.from, provider, h.account_id))
+            })
+            .collect();
+        run_bounded(&jobs, |(old, provider, account_id)| {
+            self.process_account_handoff(*old, *provider, account_id, home);
+        });
+    }
+
+    fn process_account_handoff(
+        &self,
+        old: SessionId,
+        provider: ProviderKind,
+        account_id: &str,
+        home: &Path,
+    ) {
         let peer = Peer {
             pid: None,
             scope: Scope::Full,
         };
-        for (provider, target) in pending {
-            let account_id = target.account_id;
-            let from: Vec<_> = lock(&self.account_handoffs)
-                .values()
-                .filter(|h| h.account_id == account_id && h.to.is_none() && h.error.is_none())
-                .map(|h| h.from)
-                .collect();
-            for old in from {
-                if lock(&self.account_work.pending)
-                    .get(&provider)
-                    .is_some_and(|target| target.account_id != account_id)
-                {
-                    break;
-                }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.handoff_account(&peer, old, provider, &account_id, home)
-                }))
-                .unwrap_or(Err(Failure::BadRequest));
-                if result == Err(Failure::Os(libc::EBUSY)) {
-                    // SQLite is still writing the original conversation. Keep the handoff
-                    // pending and retry after it closes; a later selection always wins.
-                    lock(&self.account_work.pending)
-                        .entry(provider)
-                        .or_insert_with(|| crate::usage::accounts::switch_work::SwitchTarget {
-                            account_id: account_id.clone(),
-                            prepared: true,
-                            not_before: Some(Instant::now() + Duration::from_millis(500)),
-                        });
-                    continue;
-                }
-                let superseded = lock(&self.account_work.pending)
-                    .get(&provider)
-                    .is_some_and(|target| target.account_id != account_id);
-                let mut handoffs = lock(&self.account_handoffs);
-                if superseded && result.is_err() {
-                    if handoffs
-                        .get(&old)
-                        .is_some_and(|h| h.account_id == account_id && h.to.is_none())
-                    {
-                        handoffs.remove(&old);
-                    }
-                } else if let Some(handoff) = handoffs
-                    .get_mut(&old)
-                    .filter(|h| h.account_id == account_id)
-                {
-                    match result {
-                        Ok(new) => handoff.to = Some(new),
-                        Err(error) => {
-                            let reason = match error {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handoff_account(&peer, old, provider, account_id, home)
+        }))
+        .unwrap_or(Err(Failure::BadRequest));
+        if result == Err(Failure::Os(libc::EBUSY)) {
+            lock(&self.account_work.pending)
+                .entry(SwitchScope::Session(old, provider))
+                .or_insert_with(|| accounts::switch_work::SwitchTarget {
+                    account_id: account_id.to_owned(),
+                    prepared: true,
+                    not_before: Some(Instant::now() + Duration::from_millis(500)),
+                });
+            return;
+        }
+        // A repeated selection made during CLI IO is a new retry. Do not let this
+        // older attempt overwrite its durable pending record with a failure.
+        let selection = lock(&self.account_work.pending);
+        let retry_queued = selection
+            .get(&SwitchScope::Session(old, provider))
+            .or_else(|| selection.get(&SwitchScope::Provider(provider)))
+            .is_some_and(|target| target.account_id == account_id);
+        let mut handoffs = lock(&self.account_handoffs);
+        if let Some(handoff) = handoffs.get_mut(&old).filter(|h| {
+            h.account_id == account_id && h.to.is_none() && !(result.is_err() && retry_queued)
+        }) {
+            match result {
+                Ok(new) => handoff.to = Some(new),
+                Err(error) => {
+                    let reason = match error {
                                 Failure::Denied => "selected account login or credential scope could not be verified".into(),
-                                Failure::Os(libc::EAGAIN) => "the running conversation could not be identified from its hooks or open transcript".into(),
+                                Failure::Os(libc::EAGAIN) => "conversation identity is not bound; wait for the original agent's session-start hook before retrying".into(),
                                 Failure::Os(libc::ENOENT) => "conversation transcript is missing; original conversation was not replaced".into(),
                                 Failure::Os(libc::EILSEQ) => "conversation transcript identity is mismatched or ambiguous".into(),
                                 Failure::Os(libc::EEXIST) => "selected profile contains a separate or conflicting conversation copy; reconcile its history before retrying".into(),
                                 Failure::Os(libc::ETIMEDOUT) => "conversation preparation or resume confirmation timed out; check that provider hooks are enabled before retrying".into(),
                                 _ => error.to_string(),
                             };
-                            if handoff.error.is_none() {
-                                handoff.error = Some(format!(
-                                    "Session {}: could not resume with selected account ({reason}); original session preserved",
-                                    old.0
-                                ));
-                            }
-                        }
+                    if handoff.error.is_none() {
+                        handoff.error = Some(format!(
+                            "Session {}: could not resume with selected account ({reason}); original session preserved",
+                            old.0
+                        ));
                     }
                 }
-                if let Ok(new) = result {
-                    // Keep durable aliases short across repeated A -> B -> C switches.
-                    for alias in handoffs.values_mut().filter(|h| h.to == Some(old)) {
-                        alias.to = Some(new);
-                    }
-                }
-                drop(handoffs);
-                self.save_account_handoffs().ok();
             }
         }
+        if let Ok(new) = result {
+            // Keep durable aliases short across repeated A -> B -> C switches.
+            for alias in handoffs.values_mut().filter(|h| h.to == Some(old)) {
+                alias.to = Some(new);
+            }
+        }
+        drop(handoffs);
+        self.save_account_handoffs().ok();
+        drop(selection);
+    }
+
+    fn account_selection_current(
+        &self,
+        old: SessionId,
+        provider: ProviderKind,
+        account_id: &str,
+        pending: &BTreeMap<SwitchScope, accounts::switch_work::SwitchTarget>,
+    ) -> bool {
+        let desired = pending
+            .get(&SwitchScope::Session(old, provider))
+            .or_else(|| pending.get(&SwitchScope::Provider(provider)));
+        desired.is_none_or(|target| target.account_id == account_id)
+            && lock(&self.account_handoffs)
+                .get(&old)
+                .is_some_and(|h| h.account_id == account_id && h.to.is_none() && h.error.is_none())
     }
 
     fn recover_account_work(&self, home: &Path) {
@@ -685,7 +930,7 @@ impl Registry {
                 .find(|a| a.id == handoff.account_id)
             {
                 lock(&self.account_work.pending)
-                    .entry(account.provider)
+                    .entry(SwitchScope::Session(handoff.from, account.provider))
                     .or_insert_with(|| crate::usage::accounts::switch_work::SwitchTarget {
                         account_id: account.id.clone(),
                         prepared: true,
@@ -787,6 +1032,57 @@ impl Registry {
         !state.sessions.contains_key(&session) || state.exited.contains_key(&session)
     }
 
+    fn transfer_account_selection(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        provider: ProviderKind,
+        current_account: &str,
+        snapshot: impl FnOnce() -> AccountsSnapshot,
+    ) -> Result<(), Failure> {
+        let old_scope = SwitchScope::Session(old, provider);
+        let new_scope = SwitchScope::Session(new, provider);
+        let provider_scope = SwitchScope::Provider(provider);
+        {
+            let mut pending = lock(&self.account_work.pending);
+            if pending.contains_key(&new_scope) {
+                pending.remove(&old_scope);
+                return Ok(());
+            }
+            if !pending.contains_key(&old_scope) && !pending.contains_key(&provider_scope) {
+                return Ok(());
+            }
+        }
+        // Account discovery may perform CLI IO. Refresh before the atomic recheck and
+        // transfer; requests arriving during discovery take precedence below.
+        let snapshot = snapshot();
+        let mut pending = lock(&self.account_work.pending);
+        let old_target = pending.remove(&old_scope);
+        if pending.contains_key(&new_scope) {
+            return Ok(());
+        }
+        let target = old_target
+            .as_ref()
+            .or_else(|| pending.get(&provider_scope))
+            .map(|target| target.account_id.clone());
+        if let Some(target) = target.filter(|target| target != current_account) {
+            let result = self.queue_session_account_switch_locked(
+                new,
+                provider,
+                &target,
+                &snapshot,
+                &mut pending,
+            );
+            if result.is_err()
+                && let Some(old_target) = old_target
+            {
+                pending.insert(old_scope, old_target);
+            }
+            return result;
+        }
+        Ok(())
+    }
+
     fn handoff_account(
         &self,
         peer: &Peer,
@@ -796,10 +1092,26 @@ impl Registry {
         home: &Path,
     ) -> Result<SessionId, Failure> {
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
+        if !self.account_selection_current(
+            old,
+            provider,
+            account_id,
+            &lock(&self.account_work.pending),
+        ) {
+            return Err(Failure::BadRequest);
+        }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let mut stored = self
             .live_agent_for_switch_in(old, home)
             .ok_or(Failure::UnknownAgent)?;
+        if self.switch_provider(&stored) != Some(provider) {
+            tracing::warn!(
+                session = old.0,
+                stage = "provider_recheck",
+                "account handoff rejected a changed provider"
+            );
+            return Err(Failure::BadRequest);
+        }
         if stored.permission == krill_proto::agent::Permission::Manual
             && self.live_agent_has_yolo_args(old, &stored.profile)
         {
@@ -886,7 +1198,11 @@ impl Registry {
         let mut transcript_home = None;
         loop {
             if let Some(current) = self.agents.stored(old).map_err(|e| super::os(&e))? {
+                let permission = stored.permission;
                 stored = current;
+                if permission == krill_proto::agent::Permission::Yolo {
+                    stored.permission = permission;
+                }
             }
             let foreground = lock(&self.state)
                 .sessions
@@ -1028,7 +1344,7 @@ impl Registry {
                 account_id: account_id.into(),
             })
             .map_err(|_| Failure::BadRequest)?;
-            accounts::write_atomic_0600(&dir.join(PREPARED_FILE), &raw)
+            accounts::write_atomic_0600(&replacement_journal(dir, new), &raw)
                 .map_err(|e| super::os(&e))?;
         }
         let (new, _) = self.spawn_holder(
@@ -1109,12 +1425,11 @@ impl Registry {
         }
         // Serialize the final commit with a later user selection. A -> B -> C must never
         // strand this pane on B or erase the A -> B handoff.
+        // Hooks take these locks in the same order. Freeze the verified identity
+        // before releasing hook_commit, then let the holder's exit observer run.
+        let hook_commit = lock(&self.hook_commit);
         let pending = lock(&self.account_work.pending);
-        if pending
-            .get(&provider)
-            .is_some_and(|target| target.account_id != account_id)
-        {
-            self.close(peer, new).ok();
+        if !self.account_selection_current(old, provider, account_id, &pending) {
             return Err(Failure::BadRequest);
         }
         prepared_transcript
@@ -1126,6 +1441,14 @@ impl Registry {
                 .stored(session)
                 .map_err(|e| super::os(&e))?
                 .ok_or(Failure::Os(libc::EILSEQ))?;
+            if self.switch_provider(&current) != Some(provider) {
+                tracing::warn!(
+                    session = session.0,
+                    stage = "provider_recheck",
+                    "account handoff rejected a changed provider"
+                );
+                return Err(Failure::BadRequest);
+            }
             if transcript::session_id(provider, &current)
                 .map_err(|e| prepare_failure("conversation_recheck", &e))?
                 != session_id
@@ -1143,9 +1466,11 @@ impl Registry {
             },
             |handoffs| self.write_account_handoffs(handoffs),
         ) {
-            self.close(peer, new).ok();
             return Err(super::os(&error));
         }
+        let _retiring_binding = self.agents.retire_account_binding(old);
+        drop(pending);
+        drop(hook_commit);
         let should_continue = self.agents.take_rate_limited(old) || {
             let st = self.status.get(old);
             st.state == krill_proto::control::AgentState::Working
@@ -1168,9 +1493,7 @@ impl Registry {
             self.save_account_handoffs().ok();
             return Err(error);
         }
-        // Holder Done acknowledges the teardown request, not process exit. Do not hold
-        // the selection mutex while waiting for the holder's Exited observation.
-        drop(pending);
+        // Holder Done acknowledges the teardown request, not process exit.
         let deadline = Instant::now() + Duration::from_secs(7);
         while !self.account_original_ended(old) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1198,14 +1521,44 @@ impl Registry {
         }
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
-        let later = lock(&self.account_work.pending)
-            .get(&provider)
-            .map(|target| target.account_id.clone());
-        if let Some(target) = later.filter(|target| target != account_id) {
-            self.queue_account_switch(provider, &target);
-        }
+        self.transfer_account_selection(old, new, provider, account_id, || {
+            accounts::refresh_accounts_with(home, state_dir.as_deref(), false)
+        })
+        .ok();
         Ok(new)
     }
+}
+
+fn replacement_journal(dir: &Path, session: SessionId) -> std::path::PathBuf {
+    dir.join("account-replacements")
+        .join(format!("{}.json", session.0))
+}
+
+struct Processing<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Processing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+// Scoped workers borrow the registry and finish before the next batch; no registry lock
+// survives CLI IO. A claim_resume guard independently excludes other resume APIs per session.
+fn run_bounded<T: Sync>(jobs: &[T], work: impl Fn(&T) + Sync) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.len().min(MAX_HANDOFF_WORKERS) {
+            let work = &work;
+            let next = &next;
+            scope.spawn(move || {
+                while let Some(job) =
+                    jobs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    work(job);
+                }
+            });
+        }
+    });
 }
 
 struct Replacement<'a> {
@@ -1242,7 +1595,7 @@ impl Drop for Replacement<'_> {
                 .ok();
         }
         if let Some(dir) = self.registry.state_dir() {
-            std::fs::remove_file(dir.join(PREPARED_FILE)).ok();
+            std::fs::remove_file(replacement_journal(&dir, self.session)).ok();
         }
     }
 }

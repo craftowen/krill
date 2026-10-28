@@ -29,7 +29,7 @@ pub(crate) mod stable;
 pub use recorder::Recorder;
 
 use krill_proto::os::fs::DirBuilderExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -57,9 +57,13 @@ const LEVEL: i32 = 3;
 const WINDOW_LOG: u32 = 20;
 /// 재생 때 스크롤백을 거두는 간격. 이 안에서 [`HOT_LINES`](crate::HOT_LINES)행 넘게 밀려나면 넘친 행은 페이지에서 빠진다.
 // ponytail: 256B로 1,000행을 넘기려면 `CSI n S` 반복 같은 병적 입력뿐이다. 실제로 잘리면 간격을 줄이거나 재생 Term 상한을 키운다.
+pub(crate) type CheckpointFn<'a> = &'a mut dyn FnMut(usize, usize, &Engine);
+
 const REPLAY_STEP: usize = 256;
 /// 세션별 스크롤백 지우기 기준선(`u64` LE 8B)을 남기는 파일 이름(OWE-873b).
 const CLEARED_FILE: &str = "cleared";
+/// 명시적 `Request::Close`로 닫힌 세션을 표시하는 파일 이름. 재부팅 소실 세션과 구분해 부활을 막는다.
+const CLOSED_FILE: &str = "closed";
 
 /// 저장소 상한. 기본값이 ARCHITECTURE §4의 값이다(MB = 10⁶B).
 #[derive(Debug, Clone)]
@@ -142,6 +146,8 @@ pub struct Store {
     pause: RwLock<Pause>,
     /// 세션별 스크롤백 지우기 기준선 `(generation, cleared_seq)`(OWE-873b).
     cleared: Mutex<HashMap<SessionId, (u64, u64)>>,
+    /// 명시적 `Close`로 닫힌 세션 집합.
+    closed: Mutex<HashSet<SessionId>>,
 }
 
 #[derive(Debug, Default)]
@@ -207,11 +213,39 @@ impl Store {
             written: AtomicU64::new(0),
             pause: RwLock::default(),
             cleared: Mutex::default(),
+            closed: Mutex::default(),
         })
     }
 
     pub fn session_dir(&self, id: SessionId) -> PathBuf {
         self.sessions.join(format!("{}.noindex", id.0))
+    }
+
+    /// 명시적으로 닫힌 세션(`Request::Close`)임을 메모리와 디스크에 기록한다.
+    pub fn mark_closed(&self, id: SessionId) {
+        let _gate = lock(&self.gate);
+        lock(&self.closed).insert(id);
+        if self.recording {
+            let dir = self.session_dir(id);
+            if dir.is_dir() {
+                write_closed(&dir);
+            }
+        }
+    }
+
+    /// 명시적으로 닫힌 세션이면 `true`. 재부팅으로 소실된 콜드 세션과 구분한다.
+    pub fn is_closed(&self, id: SessionId) -> bool {
+        if lock(&self.closed).contains(&id) {
+            return true;
+        }
+        if !self.recording {
+            return false;
+        }
+        let closed = self.session_dir(id).join(CLOSED_FILE).is_file();
+        if closed {
+            lock(&self.closed).insert(id);
+        }
+        closed
     }
 
     pub(crate) fn recording(&self) -> bool {
@@ -610,6 +644,17 @@ fn read_cleared(dir: &Path) -> Option<u64> {
     Some(u64::from_le_bytes(arr))
 }
 
+fn write_closed(dir: &Path) {
+    use krill_proto::os::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(CLOSED_FILE))
+        .ok();
+}
+
 /// [`Store::raw`]가 넘기는 원본 구간 조각.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece {
@@ -680,7 +725,9 @@ impl Restored {
 
     /// 화면 위 스크롤백, 오래된 행부터(최대 [`HOT_LINES`](crate::HOT_LINES)행).
     pub fn history(&self) -> Vec<Vec<Cell>> {
-        self.engine.history_rows(0, self.engine.history_len()).1
+        let mut rows = self.engine.snapshot_hot_rows();
+        rows.reverse();
+        rows
     }
 }
 
@@ -835,21 +882,34 @@ impl History {
         &self,
         limit_seq: u64,
         cancelled: &dyn Fn() -> bool,
-        mut visitor: impl FnMut(usize, HistoryEvent),
+        visitor: impl FnMut(usize, HistoryEvent),
     ) {
+        self.visit_until_checkpoints(limit_seq, cancelled, None, visitor);
+    }
+
+    pub(crate) fn visit_until_checkpoints(
+        &self,
+        limit_seq: u64,
+        cancelled: &dyn Fn() -> bool,
+        mut checkpoint: Option<CheckpointFn<'_>>,
+        mut visitor: impl FnMut(usize, HistoryEvent),
+    ) -> Option<Engine> {
         if limit_seq <= self.cleared_seq || self.is_empty() {
-            return;
+            return None;
         }
         let look = no_theme();
         let mut canonical: Option<Engine> = None;
         let mut harvested: Option<Engine> = None;
         let mut previous_end = None;
         let mut parser_reset = false;
+        let mut view_diverged = false;
+        let mut raw_size: Option<WinSize> = None;
+        let mut run_id = 0usize;
         // Cleared pages still contain parser state needed by the first visible page.
         // Warm that prefix once in forward order too, instead of rereading it twice.
         for raw_i in 0..self.segs.len() {
             if cancelled() {
-                return;
+                return None;
             }
             let page = raw_i.checked_sub(self.first_page);
             let seg = match self.read_raw(raw_i) {
@@ -858,6 +918,8 @@ impl History {
                     canonical = None;
                     harvested = None;
                     previous_end = None;
+                    view_diverged = false;
+                    raw_size = None;
                     if let Some(page) = page {
                         visitor(page, HistoryEvent::End(Err(error)));
                     }
@@ -870,6 +932,7 @@ impl History {
             let new_run =
                 previous_end != Some(seg.header.start_seq) || seg.header.base == Base::Start;
             if new_run {
+                run_id = run_id.saturating_add(1);
                 let start = || {
                     if cancelled() {
                         return None;
@@ -882,20 +945,36 @@ impl History {
                 };
                 canonical = start();
                 harvested = start();
+                view_diverged = false;
+                raw_size = Some(crate::term::clamp_size(seg.header.size));
             } else if parser_reset {
                 // A parser panic can reset only one view. Rebuild that exceptional
                 // prefix once; ordinary resize/alt/sync histories never use this path.
                 harvested = self.warm_checked(raw_i, &seg, &look, cancelled).ok();
+                view_diverged = true;
             }
             let (Some(raw), Some(view)) = (canonical.as_mut(), harvested.as_mut()) else {
-                return;
+                return None;
             };
+            let next_size = crate::term::clamp_size(seg.header.size);
+            if raw_size != Some(next_size) {
+                view_diverged = true;
+                raw_size = Some(next_size);
+            }
             raw.resize(seg.header.size);
             if seg.header.start_seq <= self.cleared_seq {
                 raw.clear_history();
             }
+            if !parser_reset && let Some(record_cp) = checkpoint.as_deref_mut() {
+                record_cp(run_id, raw_i, raw);
+            }
             if page.is_some() {
-                view.rebase_replay(raw);
+                if view_diverged
+                    || (raw.input_modes().flags & krill_proto::term_modes::Modes::ALT_SCREEN != 0)
+                {
+                    view.rebase_replay(raw);
+                    view_diverged = false;
+                }
                 view.clear_history();
             } else {
                 view.resize(seg.header.size);
@@ -915,7 +994,7 @@ impl History {
                 cancelled,
             );
             if cancelled() {
-                return;
+                return None;
             }
             let (gaps, end_seq, view_reset) = match page {
                 Some(page) => replay_harvest_report(
@@ -938,9 +1017,21 @@ impl History {
                 ),
             };
             if cancelled() {
-                return;
+                return None;
             }
             parser_reset = raw_reset || view_reset;
+            for rec in &seg.records {
+                if let Record::Resize(s) = rec {
+                    let clamped = crate::term::clamp_size(*s);
+                    if raw_size != Some(clamped) {
+                        view_diverged = true;
+                        raw_size = Some(clamped);
+                    }
+                }
+            }
+            if parser_reset {
+                view_diverged = true;
+            }
             previous_end = Some(end_seq);
             if let Some(page) = page
                 && end_seq > self.cleared_seq
@@ -956,6 +1047,7 @@ impl History {
                 );
             }
         }
+        canonical
     }
 
     /// 마지막 세그먼트까지 재생해 화면과 핫 스크롤백을 되살린다.
@@ -1158,9 +1250,12 @@ fn replay_harvest_report(
     let mut size = seg.header.size;
     let mut reap = |engine: &mut Engine| {
         if let Some(h) = harvest.as_deref_mut()
-            && engine.history_len() > 0
+            && engine.has_history()
         {
-            h(engine.take_history());
+            let batch = engine.take_history();
+            if !batch.is_empty() {
+                h(batch);
+            }
         }
     };
     if seq <= cleared_seq {

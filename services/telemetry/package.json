@@ -1,0 +1,14 @@
+{
+  "name": "krill-telemetry",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "node --test",
+    "local": "node local.mjs",
+    "dev": "wrangler dev --local",
+    "test:http": "node http-e2e.mjs"
+  }
+}

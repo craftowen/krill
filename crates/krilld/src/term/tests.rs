@@ -637,3 +637,246 @@ fn replay_rebase_preserves_partial_vt_sync_and_inactive_history() {
     assert!(view.history_len() <= HOT_LINES);
     assert!(canonical.history_len() <= HOT_LINES);
 }
+
+#[test]
+fn snapshot_hot_rows_survives_demote_and_live_csi_3j_until_explicit_clear_or_resize() {
+    let look = Appearance::load(PathBuf::new());
+    let mut engine = Engine::new(WinSize { cols: 20, rows: 2 });
+    engine.feed(b"row-1\r\nrow-2\r\nrow-3\r\nrow-4", Feed::Live, &look);
+    let row_texts = |rows: Vec<Vec<Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["row-2", "row-1"]
+    );
+
+    // Parking drops live grid rows to 0 but keeps compressed hot snapshot for immediate scroll on reattach.
+    engine.demote(&look);
+    assert_eq!(engine.history_len(), 0);
+    engine.promote(&look);
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["row-2", "row-1"]
+    );
+
+    // Child TUI redraw with CSI 3 J wipes grid history, but snapshot_hot_rows keeps prior hot rows
+    // behind any newly scrolled rows in newest-first order.
+    engine.feed(
+        b"\x1b[2J\x1b[3J\x1b[Hafter-1\r\nafter-2\r\nafter-3",
+        Feed::Live,
+        &look,
+    );
+    assert_eq!(engine.history_len(), 1);
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["after-1", "row-2", "row-1"]
+    );
+
+    //Resize on attach (e.g. schedule_fit) keeps preserved hot rows available for immediate scroll.
+    engine.resize(WinSize { cols: 24, rows: 2 });
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["after-1", "row-2", "row-1"]
+    );
+
+    // Explicit user clear_history drops preserved hot rows too.
+    engine.clear_history();
+    assert!(engine.snapshot_hot_rows().is_empty());
+}
+
+#[test]
+fn parked_session_preserves_and_updates_hot_rows_across_background_output_and_resize() {
+    let look = Appearance::load(PathBuf::new());
+    let mut engine = Engine::new(WinSize { cols: 20, rows: 2 });
+    engine.feed(b"row-1\r\nrow-2\r\nrow-3\r\nrow-4", Feed::Live, &look);
+    let row_texts = |rows: Vec<Vec<Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    engine.demote(&look);
+    assert_eq!(engine.history_len(), 0);
+
+    // In-place statusbar redraw while parked must not wipe parked_hot.
+    engine.feed(
+        b"\x1b[?2026h\x1b[?7l\r\x1b[1Arow-3\r\nrow-4 (4h 4m)\x1b[?7h\x1b[?2026l",
+        Feed::Live,
+        &look,
+    );
+    assert_eq!(engine.history_len(), 0);
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["row-2", "row-1"]
+    );
+
+    // Background scrolling output while parked updates parked_hot while keeping grid truncated.
+    engine.feed(b"\r\nrow-5", Feed::Live, &look);
+    assert_eq!(engine.history_len(), 0);
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["row-3", "row-2", "row-1"]
+    );
+
+    // Reattaching promotes and fits the window size without losing hot scrollback.
+    engine.promote(&look);
+    engine.resize(WinSize { cols: 25, rows: 2 });
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["row-3", "row-2", "row-1"]
+    );
+}
+
+#[test]
+fn csi_3j_in_replay_and_live_preserves_hot_rows() {
+    let look = Appearance::load(PathBuf::new());
+    let row_texts = |rows: Vec<Vec<Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    for mode in [Feed::Live, Feed::Replay] {
+        let mut engine = Engine::new(WinSize { cols: 20, rows: 2 });
+        engine.feed(b"row-1\r\nrow-2\r\nrow-3\r\nrow-4", mode, &look);
+        engine.feed(
+            b"\x1b[2J\x1b[3J\x1b[Hafter-1\r\nafter-2\r\nafter-3",
+            mode,
+            &look,
+        );
+        assert_eq!(engine.history_len(), 1);
+        assert_eq!(
+            row_texts(engine.snapshot_hot_rows()),
+            vec!["after-1", "row-2", "row-1"]
+        );
+        let (total, rows) = engine.history_rows(0, 10);
+        assert_eq!(total, 3);
+        assert_eq!(row_texts(rows), vec!["row-1", "row-2", "after-1"]);
+    }
+}
+
+#[test]
+fn single_chunk_csi_3j_and_ris_preserve_hot_rows_and_unparked_history_rows() {
+    let look = Appearance::load(PathBuf::new());
+    let row_texts = |rows: Vec<Vec<Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    for mode in [Feed::Live, Feed::Replay] {
+        let mut engine = Engine::new(WinSize { cols: 20, rows: 2 });
+        engine.feed(
+            b"row-1\r\nrow-2\r\nrow-3\r\nrow-4\x1b[2J\x1b[3J\x1b[Hmid-1\r\nmid-2\r\nmid-3\x1bcafter-1\r\nafter-2\r\nafter-3",
+            mode,
+            &look,
+        );
+        assert_eq!(
+            row_texts(engine.snapshot_hot_rows()),
+            vec!["after-1", "mid-1", "row-2", "row-1"]
+        );
+        let (total, sliced) = engine.history_rows(1, 2);
+        assert_eq!(total, 4);
+        assert_eq!(row_texts(sliced), vec!["row-2", "mid-1"]);
+
+        // Parked sessions report 0 live history to history_rows while keeping snapshot_hot_rows.
+        engine.demote(&look);
+        assert_eq!(engine.history_rows(0, 10).0, 0);
+        engine.promote(&look);
+        assert_eq!(
+            row_texts(engine.history_rows(0, 10).1),
+            vec!["row-1", "row-2", "mid-1", "after-1"]
+        );
+        assert_eq!(
+            row_texts(engine.take_history()),
+            vec!["row-1", "row-2", "mid-1", "after-1"]
+        );
+        assert!(engine.snapshot_hot_rows().is_empty());
+    }
+}
+
+#[test]
+fn dec2026_sync_csi_2j_3j_preserves_hot_rows_across_single_and_split_feeds() {
+    let look = Appearance::load(PathBuf::new());
+    let row_texts = |rows: Vec<Vec<Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // Case 1: Single-chunk output + synced CSI 2 J + CSI 3 J + trailing synced block.
+    let mut engine = Engine::new(WinSize { cols: 20, rows: 2 });
+    engine.feed(
+        b"row-1\r\nrow-2\r\nrow-3\r\nrow-4\x1b[?2026h\x1b[2J\x1b[3J\x1b[Hmid-1\r\nmid-2\x1b[?2026l\x1b[?2026h\r\nafter-1\x1b[?2026l",
+        Feed::Live,
+        &look,
+    );
+    assert_eq!(
+        row_texts(engine.snapshot_hot_rows()),
+        vec!["mid-1", "row-2", "row-1"]
+    );
+    assert_eq!(
+        row_texts(engine.history_rows(0, 10).1),
+        vec!["row-1", "row-2", "mid-1"]
+    );
+
+    // Case 2: Split-chunk CSI 2 J -> synced CSI 3 J -> pure ASCII chunk -> ESU.
+    let mut split = Engine::new(WinSize { cols: 20, rows: 2 });
+    split.feed(
+        b"row-1\r\nrow-2\r\nrow-3\r\nrow-4\x1b[2J",
+        Feed::Live,
+        &look,
+    );
+    split.feed(b"\x1b[?2026h\x1b[3J\x1b[H", Feed::Live, &look);
+    split.feed(b"live-1\r\nlive-2", Feed::Live, &look);
+    split.feed(b"\x1b[?2026l", Feed::Live, &look);
+    assert_eq!(row_texts(split.snapshot_hot_rows()), vec!["row-2", "row-1"]);
+
+    // Case 3: Split-chunk CSI 2 J -> synced CSI 3 J -> pure ASCII chunk -> end_sync timeout.
+    let mut timeout = Engine::new(WinSize { cols: 20, rows: 2 });
+    timeout.feed(
+        b"row-1\r\nrow-2\r\nrow-3\r\nrow-4\x1b[2J",
+        Feed::Live,
+        &look,
+    );
+    timeout.feed(b"\x1b[?2026h\x1b[3J\x1b[H", Feed::Live, &look);
+    timeout.feed(b"live-1\r\nlive-2", Feed::Live, &look);
+    timeout.end_sync(Feed::Live, &look);
+    assert_eq!(
+        row_texts(timeout.snapshot_hot_rows()),
+        vec!["row-2", "row-1"]
+    );
+}

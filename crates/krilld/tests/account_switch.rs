@@ -277,8 +277,13 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
     );
     // Crash after the new process starts but before it becomes ready or commits its alias.
     wait_for(|| fs::read_to_string(target.join("observed-profile")).ok());
-    let prepared: serde_json::Value =
-        serde_json::from_slice(&fs::read(state.join("account-replacement.json")).unwrap()).unwrap();
+    let journal = fs::read_dir(state.join("account-replacements"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let prepared: serde_json::Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
     let abandoned = prepared
         .get("to")
         .and_then(serde_json::Value::as_u64)

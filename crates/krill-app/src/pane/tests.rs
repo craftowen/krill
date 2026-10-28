@@ -1680,3 +1680,430 @@ fn feature_loss_keeps_expired_stable_view_without_invisible_legacy_fetch() {
         "fresh explicit view still supports a legacy daemon"
     );
 }
+
+#[test]
+fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_cache() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+    let mut pane = Pane::default();
+    pane.link(
+        SessionId(1),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    update(&mut pane, 1, snapshot(["live-a", "live-b", "live-c"]));
+    sent(out(&mut pane));
+
+    // Rapid trackpad scroll ticks while the first remote HistoryViewRequest is in flight
+    // must accumulate offset instead of resetting to visible (0) + lines on every event.
+    pane.scroll(3);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let first_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(first_req.view, 0);
+    pane.scroll(5);
+    pane.scroll(-1);
+    assert_eq!(pane.history.offset, 7);
+
+    // If the first response fails (Missing) before any history row was shown (visible == 0),
+    // the pane resets back to live bottom and subsequent upward scroll opens a fresh view
+    // instead of wedging permanently at shown == 0, stopped == true.
+    let missing = HistoryViewRows {
+        req: first_req.req,
+        view: 1,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Missing,
+        identity: None,
+        skip: 0,
+        total: 0,
+        complete: false,
+        rows: Vec::new(),
+    };
+    let ev = feed(&mut pane, &missing.encode().unwrap());
+    assert!(ev.history_notice.is_some());
+    assert_eq!(pane.scroll_offset(), 0);
+    assert!(pane.history.stable.is_none());
+
+    // Scrolling up again must issue a brand new view == 0 request and render returned rows.
+    pane.scroll(2);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let retry_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(retry_req.view, 0);
+    let ready = HistoryViewRows {
+        req: retry_req.req,
+        view: 2,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 0,
+        total: 10,
+        complete: false,
+        rows: vec![row("hist-2"), row("hist-1")],
+    };
+    assert!(feed(&mut pane, &ready.encode().unwrap()).redraw);
+    assert_eq!(pane.scroll_offset(), 2);
+    assert_eq!(
+        pane.shown().rows,
+        vec![row("hist-1"), row("hist-2"), row("live-a")]
+    );
+
+    // Prefetch rows 3..6 along with 0..2, then jump wanted to 10 (wanted - lines = 7 > shown = 2):
+    // Cache::show must still advance shown across the contiguous cached prefix (up to 6).
+    pane.scroll(1);
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let req2 = HistoryViewRequest::decode(*kind, body).unwrap();
+    let prefetch = HistoryViewRows {
+        req: req2.req,
+        view: 2,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 2,
+        total: 20,
+        complete: false,
+        rows: vec![row("hist-3"), row("hist-4"), row("hist-5"), row("hist-6")],
+    };
+    assert!(feed(&mut pane, &prefetch.encode().unwrap()).redraw);
+    assert_eq!(pane.scroll_offset(), 3);
+    pane.scroll(7);
+    assert_eq!(pane.scroll_offset(), 6);
+}
+
+/// 가짜 krilld. 붙기마다 감시 연결(핸드셰이크 뒤 클라이언트가 닫음)과 제어 연결 한 쌍을 받고, 제어 연결은
+/// `handlers`를 차례로 쓴다. 처리기는 받은 요청을 `seen`에 적는다.
+type Handler = Box<dyn FnOnce(&mut UnixStream, &mut Vec<Request>) + Send>;
+
+fn control_fixture(
+    name: &str,
+    features: u64,
+    handlers: Vec<Handler>,
+) -> (Paths, thread::JoinHandle<Vec<Request>>) {
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("mk-pane-{name}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = Paths {
+        socket: dir.join("k.sock"),
+        holder: dir.join("holder"),
+        krilld: dir.join("daemon"),
+    };
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let server = thread::spawn(move || {
+        let hello = ipc::ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        let mut seen = Vec::new();
+        for handle in handlers {
+            let (mut watch, _) = listener.accept().unwrap();
+            watch.write_all(&hello.encode().unwrap()).unwrap();
+            ipc::read_frame(&mut watch).unwrap().unwrap();
+            drop(watch);
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(&hello.encode().unwrap()).unwrap();
+            ipc::read_frame(&mut s).unwrap().unwrap();
+            handle(&mut s, &mut seen);
+        }
+        seen
+    });
+    (paths, server)
+}
+
+fn next_request(s: &mut UnixStream, seen: &mut Vec<Request>) -> Option<Request> {
+    let (k, b) = ipc::read_frame(s).unwrap()?;
+    let request = Request::decode(k, &b).unwrap();
+    seen.push(request.clone());
+    Some(request)
+}
+
+fn login(cwd: &[u8]) -> Create {
+    Create {
+        account: None,
+        program: Program::Login,
+        cwd: cwd.to_vec(),
+        cols: 80,
+        rows: 24,
+    }
+}
+
+/// Actorjin(Windows): Create·Resume 프레임을 보낸 뒤 연결이 끊기면(데몬 교체 등) krilld가 세션을 만들었는지 알 수
+/// 없다. 그 실패만 [`is_unknown_outcome`]이고, 요청을 보내기 전 조회 실패는 다시 시도해도 되는 일반 오류다.
+#[test]
+fn only_failures_after_a_session_request_have_unknown_outcome() {
+    let (paths, server) = control_fixture(
+        "unknown-outcome",
+        FEAT_CONTROL | FEAT_RESUME,
+        vec![
+            // 1. 새 세션: Create를 받고 답 없이 끊는다.
+            Box::new(|s, seen| {
+                assert!(matches!(next_request(s, seen), Some(Request::Create(_))));
+            }),
+            // 2. 아는 세션 조회: List를 받고 답 없이 끊는다(아직 아무것도 바꾸지 않았다).
+            Box::new(|s, seen| {
+                assert_eq!(next_request(s, seen), Some(Request::List));
+            }),
+            // 3. 다시 시작(Resume): 받고 답 없이 끊는다.
+            Box::new(|s, seen| {
+                assert!(matches!(
+                    next_request(s, seen),
+                    Some(Request::Resume { .. })
+                ));
+            }),
+            // 4. 결과를 모르는 칸의 조회는 목록만 묻고 만들지 않는다.
+            Box::new(|s, seen| {
+                assert_eq!(next_request(s, seen), Some(Request::List));
+                s.write_all(&Reply::Sessions(Vec::new()).encode().unwrap())
+                    .unwrap();
+                assert_eq!(next_request(s, seen), None, "lookup must not mutate");
+            }),
+        ],
+    );
+    let create = login(b"/w");
+    let lost = ensure_session_in(&paths, None, &create).unwrap_err();
+    assert!(is_unknown_outcome(&lost), "{lost:?}");
+    assert_eq!(lost.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(lost.to_string(), "unexpected end of file");
+
+    let before = ensure_session_in(&paths, Some(SessionId(7)), &create).unwrap_err();
+    assert!(!is_unknown_outcome(&before), "{before:?}");
+    assert_eq!(before.kind(), io::ErrorKind::UnexpectedEof);
+
+    let resume = resume_session_in(&paths, Some(SessionId(7)), &create).unwrap_err();
+    assert!(is_unknown_outcome(&resume), "{resume:?}");
+
+    assert!(find_session_in(&paths, SessionId(7)).unwrap().is_none());
+    let seen = server.join().unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|r| matches!(r, Request::Create(_) | Request::Resume { .. }))
+            .count(),
+        2
+    );
+}
+
+/// 쓰다 끊긴 생성 요청도 krilld가 프레임을 다 받았는지 알 수 없다. 조회 요청의 같은 실패는 다시 시도해도 된다.
+#[test]
+fn write_failure_of_a_session_request_has_unknown_outcome() {
+    let (mut ours, theirs) = UnixStream::pair().unwrap();
+    drop(theirs);
+    let create = call(&mut ours, &Request::Create(login(b"/w"))).unwrap_err();
+    assert!(is_unknown_outcome(&create), "{create:?}");
+    let list = call(&mut ours, &Request::List).unwrap_err();
+    assert!(!is_unknown_outcome(&list), "{list:?}");
+    assert_eq!(create.kind(), list.kind());
+}
+
+#[test]
+fn scroll_before_link_or_initial_update_fetches_once_screen_arrives() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+
+    // Case 1: User scrolls while connecting (before link) and again after link before first Update.
+    let mut pane = Pane::default();
+    pane.scroll(2);
+    pane.link(
+        SessionId(1),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    pane.scroll(1);
+    assert_eq!(pane.history.offset, 3);
+    assert_eq!(pane.scroll_offset(), 0);
+    assert!(sent(out(&mut pane)).is_empty());
+
+    // Initial Update arrives with 3 lines: must render live screen and immediately send HistoryViewRequest.
+    assert!(update(&mut pane, 1, snapshot(["live-a", "live-b", "live-c"])).redraw);
+    assert_eq!(
+        pane.shown().rows,
+        vec![row("live-a"), row("live-b"), row("live-c")]
+    );
+    let frames = sent(out(&mut pane));
+    let (kind, body) = frames.last().unwrap();
+    let req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(req.view, 0);
+    assert_eq!(req.skip, 0);
+
+    let ready = HistoryViewRows {
+        req: req.req,
+        view: 3,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [0; 32],
+        }),
+        skip: 0,
+        total: 10,
+        complete: false,
+        rows: vec![row("hist-3"), row("hist-2"), row("hist-1")],
+    };
+    assert!(feed(&mut pane, &ready.encode().unwrap()).redraw);
+    assert_eq!(pane.scroll_offset(), 3);
+    assert_eq!(
+        pane.shown().rows,
+        vec![row("hist-1"), row("hist-2"), row("hist-3")]
+    );
+
+    // Case 2: scroll_top() after an initial empty history response resets the stopped cache
+    // and fetches newly arrived scrollback rows.
+    let mut pane2 = Pane::default();
+    pane2.scroll_top();
+    pane2.link(
+        SessionId(2),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    assert!(update(&mut pane2, 1, snapshot(["live-a", "live-b", "live-c"])).redraw);
+    let frames = sent(out(&mut pane2));
+    let (kind, body) = frames.last().unwrap();
+    let top_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(top_req.view, 0);
+    let empty = HistoryViewRows {
+        req: top_req.req,
+        view: 4,
+        session: SessionId(2),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: None,
+        skip: 0,
+        total: 0,
+        complete: true,
+        rows: Vec::new(),
+    };
+    feed(&mut pane2, &empty.encode().unwrap());
+    assert_eq!(pane2.scroll_offset(), 0);
+
+    pane2.scroll_top();
+    let frames = sent(out(&mut pane2));
+    let (kind, body) = frames.last().unwrap();
+    let retry_req = HistoryViewRequest::decode(*kind, body).unwrap();
+    assert_eq!(retry_req.view, 0);
+    assert_ne!(retry_req.req, top_req.req);
+}
+
+/// A login shell may start an agent or switch providers without replacing its PTY.
+/// Reattachment must refresh launch metadata before opening the screen stream.
+#[test]
+fn reattach_refreshes_agent_launch_after_shell_hook_and_rebind() {
+    use krill_proto::screen::Attached;
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("pane-launch-refresh-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("screen.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected = vec![
+        None,
+        Some(AgentLaunch {
+            profile: "claude".into(),
+            permission: Permission::Manual,
+        }),
+        Some(AgentLaunch {
+            profile: "codex".into(),
+            permission: Permission::Yolo,
+        }),
+    ];
+    let launches = expected.clone();
+    let (release, keep_open) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let handshake = || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(
+                    &ipc::ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_SCREEN | FEAT_CONTROL | FEAT_AGENTS,
+                        build: "test".into(),
+                        instance_id: 7,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = read(&mut stream).unwrap();
+            ipc::ClientHello::decode(kind, &body).unwrap();
+            stream
+        };
+        for launch in launches {
+            // Hooks may introduce or replace AgentLaunch without changing the PTY ID.
+            let mut control = handshake();
+            let (kind, body) = read(&mut control).unwrap();
+            assert_eq!(
+                Request::decode(kind, &body).unwrap(),
+                Request::AgentLaunch {
+                    session: SessionId(42)
+                }
+            );
+            control
+                .write_all(&Reply::AgentLaunch(launch).encode().unwrap())
+                .unwrap();
+            drop(control);
+            let mut screen = handshake();
+            let (kind, body) = read(&mut screen).unwrap();
+            assert_eq!(
+                Attach::decode(kind, &body).unwrap(),
+                Attach {
+                    session: SessionId(42),
+                    stream: Stream::Screen { known: None }
+                }
+            );
+            screen
+                .write_all(
+                    &Attached {
+                        seq: Seq(0),
+                        revision: Revision(0),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            // Keep the subscription alive through client socket setup (macOS setsockopt).
+            keep_open.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    });
+    let target = HostTarget::remote("fixture", socket);
+    for launch in expected {
+        let linked = attach(&target, SessionId(42), None).unwrap();
+        assert_eq!(linked.instance, 7);
+        assert_eq!(linked.launch, launch);
+        drop(linked);
+        release.send(()).unwrap();
+    }
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

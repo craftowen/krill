@@ -265,7 +265,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         (
             "FEAT_WINDOWS_UPGRADE",
             crate::control::FEAT_WINDOWS_UPGRADE,
-            28,
+            29,
         ),
         ("FEAT_COLD", crate::control::FEAT_COLD, 18),
         ("FEAT_HOLDER_WATCH", crate::daemon::FEAT_HOLDER_WATCH, 7),
@@ -317,6 +317,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_USAGE_MANAGE", crate::usage::FEAT_USAGE_MANAGE, 59),
         ("FEAT_ACCOUNT_POLICY", crate::usage::FEAT_ACCOUNT_POLICY, 61),
         ("FEAT_ACCOUNT_CANCEL", crate::usage::FEAT_ACCOUNT_CANCEL, 22),
+        (
+            "FEAT_SESSION_ACCOUNT_SWITCH",
+            crate::usage::FEAT_SESSION_ACCOUNT_SWITCH,
+            28,
+        ),
         (
             "FEAT_ACCOUNT_CONNECTION",
             crate::usage::FEAT_ACCOUNT_CONNECTION,

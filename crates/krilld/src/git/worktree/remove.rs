@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use krill_proto::control::{RemoveWorktree, RemovedWorktree, Reply};
 
-use crate::child::{kill_and_reap, nonblocking};
+use crate::child::PipeReader;
 
 use super::{GitQueue, git, output_path, queue, text, transaction};
 
@@ -190,6 +190,9 @@ pub fn remove_with_state(
     {
         result.warnings.push(format!("worktree prune failed: {e}"));
     }
+    if let Some(dir) = state_dir {
+        prune_removed_worktree_from_projects(dir, &path);
+    }
     Ok(result)
 }
 
@@ -307,6 +310,74 @@ fn remove_orphan(q: &GitQueue, repo: &Path, path: &Path) -> Result<(), String> {
     }
     verify_git_link(q, repo, path)?;
     fs::remove_dir_all(path).map_err(|e| format!("cannot remove orphan worktree directory: {e}"))
+}
+
+fn prune_removed_worktree_from_projects(state_dir: &Path, removed: &Path) {
+    fn alias(path: &str) -> &str {
+        path.strip_prefix("/private")
+            .filter(|_| path.starts_with("/private/"))
+            .unwrap_or(path)
+    }
+    use krill_proto::os::fs::OpenOptionsExt as _;
+    use std::io::{Read as _, Write as _};
+    let file_path = state_dir.join("projects.toml");
+    let Ok(_guard) = krill_proto::config_document::lock_toml(&file_path) else {
+        return;
+    };
+    let Ok(file) = fs::File::open(&file_path) else {
+        return;
+    };
+    let mut raw = String::new();
+    if file.take(512 * 1024 + 1).read_to_string(&mut raw).is_err() || raw.len() > 512 * 1024 {
+        return;
+    }
+    let Ok(mut doc) = toml::from_str::<toml::Value>(&raw) else {
+        return;
+    };
+    let Some(root) = doc.as_table_mut() else {
+        return;
+    };
+    let removed_str = removed.to_string_lossy();
+    let removed_trimmed = removed_str.trim();
+    let removed_norm = alias(removed_trimmed);
+    let matches_removed = |candidate: &str| {
+        krill_proto::path::equivalent(Path::new(alias(candidate.trim())), Path::new(removed_norm))
+    };
+    let mut changed = false;
+    if let Some(toml::Value::Table(worktrees)) = root.get_mut("worktrees") {
+        let before = worktrees.len();
+        worktrees.retain(|k, _| !matches_removed(k));
+        changed |= worktrees.len() != before;
+    }
+    if let Some(toml::Value::Table(lineage)) = root.get_mut("lineage") {
+        let before = lineage.len();
+        lineage.retain(|k, v| {
+            let wp = v
+                .as_table()
+                .and_then(|t| t.get("worktree_path"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or(k);
+            !(matches_removed(k) || matches_removed(wp))
+        });
+        changed |= lineage.len() != before;
+    }
+    if changed && let Ok(body) = toml::to_string_pretty(&doc) {
+        let tmp = state_dir.join(format!(".projects.toml.rm.tmp.{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &file_path)
+        };
+        if write().is_err() {
+            fs::remove_file(&tmp).ok();
+        }
+    }
 }
 
 fn is_valid_worktree_symlink(wt_real: &Path, raw: &str) -> bool {
@@ -431,7 +502,14 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
 
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
     let envs = super::compat::environment_in(q, wt)?;
-    let mut cmd = std::process::Command::new("/bin/sh");
+    #[cfg(windows)]
+    let shell = output_path(
+        git(q, wt, ["var", "GIT_SHELL_PATH"])?,
+        "cannot find Git shell",
+    )?;
+    #[cfg(unix)]
+    let shell = Path::new("/bin/sh");
+    let mut cmd = std::process::Command::new(shell);
     crate::child::own_group(&mut cmd)
         .arg("-c")
         .arg(script)
@@ -460,35 +538,22 @@ fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String>
     Err(format!("archive hook failed: {detail}"))
 }
 
-struct Reap(Child);
-
-impl Drop for Reap {
-    fn drop(&mut self) {
-        kill_and_reap(&mut self.0);
-    }
-}
-
 fn run_bounded_command(
     cmd: &mut std::process::Command,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("archive hook failed to start: {e}"))?;
-    let mut child = Reap(child);
-    let mut stdout = child
-        .0
+    let mut child =
+        crate::child::spawn(cmd).map_err(|e| format!("archive hook failed to start: {e}"))?;
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "archive hook failed: missing stdout".to_owned())?;
-    let mut stderr = child
-        .0
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| "archive hook failed: missing stderr".to_owned())?;
-    nonblocking(&stdout)
-        .and_then(|()| nonblocking(&stderr))
-        .map_err(|e| format!("archive hook failed: {e}"))?;
+    let mut stdout = PipeReader::new(stdout).map_err(|e| format!("archive hook failed: {e}"))?;
+    let mut stderr = PipeReader::new(stderr).map_err(|e| format!("archive hook failed: {e}"))?;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut buf = [0u8; 8192];
@@ -499,7 +564,7 @@ fn run_bounded_command(
         if let Err(e) = a.and(b) {
             return Err(format!("archive hook failed: {e}"));
         }
-        match child.0.try_wait() {
+        match child.try_wait() {
             Ok(Some(status)) => {
                 drain_capped(&mut stdout, &mut out, &mut buf).ok();
                 drain_capped(&mut stderr, &mut err, &mut buf).ok();
@@ -513,7 +578,7 @@ fn run_bounded_command(
             Err(e) => return Err(format!("archive hook failed: {e}")),
         }
         if Instant::now() >= deadline {
-            terminate_gracefully(&mut child.0);
+            terminate_gracefully(&mut child);
             return Err("archive hook failed: timed out".to_owned());
         }
         thread::sleep(Duration::from_millis(5));
@@ -521,10 +586,12 @@ fn run_bounded_command(
 }
 
 fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<()> {
-    loop {
+    let mut read = 0;
+    while read < super::super::DRAIN_BYTES {
         match pipe.read(buf) {
             Ok(0) => return Ok(()),
             Ok(n) => {
+                read += n;
                 let remaining = MAX_ARCHIVE_OUTPUT_BYTES.saturating_sub(dst.len());
                 if remaining > 0 {
                     dst.extend(buf.iter().take(n.min(remaining)).copied());
@@ -541,6 +608,7 @@ fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> 
             Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 
 fn terminate_gracefully(child: &mut Child) {
@@ -605,7 +673,10 @@ fn parse_entries(bytes: &[u8]) -> Result<Vec<Entry>, String> {
     for field in bytes.split(|b| *b == 0) {
         if let Some(path) = field.strip_prefix(b"worktree ") {
             entries.push(Entry {
-                path: PathBuf::from(OsString::from_vec(path.to_vec())),
+                path: {
+                    let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+                    fs::canonicalize(&path).unwrap_or(path)
+                },
                 branch: None,
                 locked: false,
             });
@@ -629,6 +700,38 @@ mod tests {
     use krill_proto::control::Request;
     use krill_proto::screen::Msg;
     use proptest::prelude::*;
+
+    #[test]
+    fn projects_prune_removes_only_deleted_worktree_and_preserves_future_metadata() {
+        let dir = std::env::temp_dir().join(format!("krill-projects-prune-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("projects.toml");
+        fs::write(
+            &path,
+            r#"
+future = "keep"
+[worktrees."/tmp/deleted"]
+name = "deleted"
+[worktrees."/privateer/tmp/deleted"]
+name = "unrelated"
+[lineage.child]
+worktree_path = "/tmp/deleted"
+[lineage.other]
+worktree_path = "/tmp/other"
+"#,
+        )
+        .unwrap();
+        prune_removed_worktree_from_projects(&dir, Path::new("/private/tmp/deleted"));
+        let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["future"].as_str(), Some("keep"));
+        let worktrees = doc["worktrees"].as_table().unwrap();
+        assert!(!worktrees.contains_key("/tmp/deleted"));
+        assert!(worktrees.contains_key("/privateer/tmp/deleted"));
+        let lineage = doc["lineage"].as_table().unwrap();
+        assert!(!lineage.contains_key("child"));
+        assert!(lineage.contains_key("other"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(unix)]
     fn fixture_worktree(tag: &str) -> (super::super::tests::Fixture, PathBuf, RemoveWorktree) {

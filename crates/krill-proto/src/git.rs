@@ -152,6 +152,15 @@ pub const WORKSPACE_TRUST_PRESET_ENABLED_FLAG: &str = "workspace-trust-preset.en
 /// 첫 프롬프트에서 파생된 세션별 자동 제목 저장 파일 이름(OWE-737).
 pub const SESSION_TITLES_FILE: &str = "session-titles.json";
 
+/// 세션별 최근 프롬프트 턴 히스토리 저장 파일 이름.
+pub const SESSION_PROMPTS_FILE: &str = "session-prompts.json";
+
+/// 세션 프롬프트 요약 표시 최대 글자 수.
+pub const MAX_PROMPT_DISPLAY_CHARS: usize = 240;
+
+/// 세션당 보존할 최근 프롬프트 턴 최대 개수.
+pub const MAX_PROMPT_HISTORY_TURNS: usize = 5;
+
 /// 브랜치 슬러그 최대 글자 수(OWE-737).
 pub const MAX_BRANCH_SLUG_CHARS: usize = 50;
 
@@ -291,7 +300,7 @@ pub fn sanitize_branch_slug(raw: &str) -> Option<String> {
     Some(final_slug)
 }
 
-/// 프롬프트 원문에서 `<USER_REQUEST>` 래퍼, `[Image #N]`·`[Pasted ...]` 마커, 선행 붙여넣기 파일 경로를 걷어낸다.
+/// 프롬프트 원문에서 `<USER_REQUEST>` 래퍼, 오케스트레이션·핸드오프 프리앰블, `[Image #N]`·`[Pasted ...]` 마커, 선행 붙여넣기 파일 경로를 걷어낸다.
 #[must_use]
 pub fn clean_user_prompt(raw: &str) -> String {
     let mut s = raw.trim();
@@ -304,6 +313,9 @@ pub fn clean_user_prompt(raw: &str) -> String {
                 tail.trim()
             };
         }
+    }
+    if let Some(stripped) = strip_orchestration_or_handoff_wrapper(s) {
+        s = stripped;
     }
     loop {
         s = s.trim_start();
@@ -318,6 +330,60 @@ pub fn clean_user_prompt(raw: &str) -> String {
         break;
     }
     s.trim().to_owned()
+}
+
+fn strip_orchestration_or_handoff_wrapper(s: &str) -> Option<&str> {
+    if let Some(rest) = s
+        .strip_prefix("[KRILL ORCHESTRATION PREAMBLE]")
+        .or_else(|| s.strip_prefix("[MK ORCHESTRATION PREAMBLE]"))
+    {
+        if let Some((_, after_label)) = rest.split_once("Task Prompt:") {
+            let body = after_label
+                .split_once("\nFirst read the Krill worker contract:")
+                .map_or(after_label, |(prompt, _)| prompt);
+            return Some(body.trim());
+        }
+        let rest = rest.trim_start();
+        if let Some(after_run) = rest.strip_prefix("Run:") {
+            return Some(
+                after_run
+                    .split_once('\n')
+                    .map_or("", |(_, tail)| tail.trim()),
+            );
+        }
+        return Some(rest);
+    }
+    if let Some(rest) = s.strip_prefix("[Krill Worker]") {
+        let body = rest
+            .split_once("\nRead `krill skills get orchestration")
+            .map_or(rest, |(head, _)| head);
+        let first_line_end = body.find('\n').unwrap_or(body.len());
+        let first_line = body.get(..first_line_end).unwrap_or(body);
+        if let Some((_, after_colon)) = first_line.split_once(": ") {
+            let offset = first_line.len().checked_sub(after_colon.len())?;
+            return body.get(offset..).map(str::trim);
+        }
+        return Some(body.trim());
+    }
+    if let Some(rest) = s
+        .strip_prefix("[KRILL SESSION HANDOFF]")
+        .or_else(|| s.strip_prefix("[MK SESSION HANDOFF]"))
+        && let Some((_, after_inst)) = rest.split_once("Instructions:")
+    {
+        let body = after_inst
+            .split_once("\n--- Recent terminal context ---")
+            .map_or(after_inst, |(inst, _)| inst);
+        return Some(body.trim());
+    }
+    if (s.starts_with("[KRILL HANDOFF from session") || s.starts_with("[MK HANDOFF from session"))
+        && let Some((_, after_prompt)) = s.split_once("\nPrompt:\n")
+    {
+        let body = after_prompt
+            .split_once("\nRecent terminal context:\n")
+            .map_or(after_prompt, |(prompt, _)| prompt);
+        return Some(body.trim());
+    }
+    None
 }
 
 fn strip_leading_bracket_marker(s: &str) -> Option<&str> {
@@ -568,6 +634,304 @@ pub fn load_session_auto_titles(
         .collect()
 }
 
+/// 세션에서 사용자가 제출한 개별 프롬프트 턴 기록.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPromptTurn {
+    /// 정제된 프롬프트 원문 요약(최대 [`MAX_PROMPT_DISPLAY_CHARS`]자).
+    pub text: String,
+    /// 제출 시각(Unix epoch nanoseconds).
+    #[serde(default)]
+    pub unix_ns: u64,
+    /// 1부터 시작하는 세션 누적 턴 번호.
+    #[serde(default)]
+    pub turn: u32,
+}
+
+/// 세션별 최근 프롬프트 히스토리(최신 턴이 `turns`의 0번 원소).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPromptHistory {
+    /// 이 세션에서 기록된 누적 프롬프트 턴 수.
+    #[serde(default)]
+    pub total_turns: u32,
+    /// 최신순 프롬프트 턴 링버퍼(최대 [`MAX_PROMPT_HISTORY_TURNS`]개).
+    #[serde(default)]
+    pub turns: Vec<SessionPromptTurn>,
+}
+
+/// 프롬프트 원문을 UI 표시에 적합하게 정제하고 최대 `max_chars` 글자로 자른다.
+#[must_use]
+pub fn clean_prompt_display(raw: &str, max_chars: usize) -> Option<String> {
+    let cleaned = clean_user_prompt(raw);
+    let mut normalized = String::new();
+    let mut prev_newline = false;
+    for ch in cleaned.chars() {
+        if ch == '\n' {
+            if !normalized.is_empty() && !prev_newline {
+                normalized.push('\n');
+                prev_newline = true;
+            }
+        } else if !ch.is_control() {
+            normalized.push(ch);
+            prev_newline = false;
+        }
+    }
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let char_count = trimmed.chars().count();
+    if char_count <= max_chars {
+        return Some(trimmed.to_owned());
+    }
+    let capped: String = trimmed.chars().take(max_chars).collect();
+    Some(format!("{}…", capped.trim_end()))
+}
+
+/// 단답형 승인·진행 지시(`"ㅇㅇ"`, `"진행해"`, `"yes"`, `"ok"` 등)인지 판정한다.
+///
+/// 마지막 프롬프트가 단답형이면 직전 실질 작업 지시 프롬프트를 함께 보존해
+/// `"기존 지시문 (→ ㅇㅇ 진행해)"` 형태로 합성할 때 사용한다.
+#[must_use]
+pub fn is_ack_or_trivial_prompt(text: &str) -> bool {
+    let trimmed: String = text
+        .trim()
+        .chars()
+        .filter(|c| !c.is_ascii_punctuation() && !matches!(c, '!' | '?' | '.' | ',' | '~' | '…'))
+        .collect();
+    let norm = trimmed.trim().to_lowercase();
+    if norm.is_empty() || norm.chars().count() <= 4 {
+        return true;
+    }
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    if words.is_empty() || words.len() > 3 {
+        return false;
+    }
+    words.iter().all(|w| {
+        matches!(
+            *w,
+            "ㅇㅇ"
+                | "네"
+                | "응"
+                | "예"
+                | "좋아"
+                | "좋아요"
+                | "진행"
+                | "진행해"
+                | "진행해줘"
+                | "진행해주세요"
+                | "진행해요"
+                | "계속"
+                | "계속해"
+                | "계속해줘"
+                | "계속해주세요"
+                | "고"
+                | "고고"
+                | "확인"
+                | "승인"
+                | "그래"
+                | "그렇게"
+                | "그대로"
+                | "해"
+                | "해줘"
+                | "해주세요"
+                | "맞아"
+                | "맞아요"
+                | "오케이"
+                | "오키"
+                | "ㄱㄱ"
+                | "가자"
+                | "yes"
+                | "y"
+                | "yep"
+                | "yeah"
+                | "ok"
+                | "okay"
+                | "sure"
+                | "continue"
+                | "proceed"
+                | "go"
+                | "ahead"
+                | "lgtm"
+                | "ship"
+                | "it"
+                | "do"
+                | "please"
+        )
+    })
+}
+
+impl SessionPromptHistory {
+    /// 새 프롬프트 턴을 기록한다.
+    /// 직전 턴과 동일한 텍스트가 3초 이내에 중복 도착하면(훅 + `SendInput` 동시 호출 등) 무시하고 `false`를 돌려준다.
+    pub fn record_turn(&mut self, raw: &str, unix_ns: u64) -> bool {
+        let Some(clean) = clean_prompt_display(raw, MAX_PROMPT_DISPLAY_CHARS) else {
+            return false;
+        };
+        if let Some(latest) = self.turns.first()
+            && latest.text == clean
+            && unix_ns.abs_diff(latest.unix_ns) < 3_000_000_000
+        {
+            return false;
+        }
+        let next_turn = self.total_turns.saturating_add(1);
+        self.total_turns = next_turn;
+        self.turns.insert(
+            0,
+            SessionPromptTurn {
+                text: clean,
+                unix_ns,
+                turn: next_turn,
+            },
+        );
+        self.turns.truncate(MAX_PROMPT_HISTORY_TURNS);
+        true
+    }
+
+    /// 최신 턴의 타임스탬프를 돌려준다.
+    #[must_use]
+    pub fn latest_unix_ns(&self) -> Option<u64> {
+        self.turns.first().map(|t| t.unix_ns)
+    }
+
+    /// 단답형 후속 응답(`"ㅇㅇ 진행해"` 등)일 때 직전 실질 프롬프트와 병합한 표시 문자열을 돌려준다.
+    #[must_use]
+    pub fn display_last_prompt(&self) -> Option<String> {
+        let latest = self.turns.first()?;
+        if is_ack_or_trivial_prompt(&latest.text)
+            && let Some(substantive) = self
+                .turns
+                .iter()
+                .skip(1)
+                .find(|t| !is_ack_or_trivial_prompt(&t.text))
+        {
+            return Some(format!("{} (→ {})", substantive.text, latest.text));
+        }
+        Some(latest.text.clone())
+    }
+
+    /// 상단 고정 바(Sticky Prompt Bar) 등 한 줄 요약 표시에 쓸 공백 정규화 문자열을 돌려준다.
+    #[must_use]
+    pub fn single_line_summary(&self) -> Option<String> {
+        let display = self.display_last_prompt()?;
+        let collapsed: Vec<&str> = display.split_whitespace().collect();
+        if collapsed.is_empty() {
+            None
+        } else {
+            Some(collapsed.join(" "))
+        }
+    }
+
+    /// 호버 카드 하단에 `"이전(Turn N-1)"` 맥락으로 보여줄 직전 턴을 돌려준다.
+    #[must_use]
+    pub fn previous_turn(&self) -> Option<&SessionPromptTurn> {
+        let latest = self.turns.first()?;
+        if is_ack_or_trivial_prompt(&latest.text)
+            && let Some(idx) = self
+                .turns
+                .iter()
+                .skip(1)
+                .position(|t| !is_ack_or_trivial_prompt(&t.text))
+        {
+            return self.turns.get(idx.saturating_add(2));
+        }
+        self.turns.get(1)
+    }
+}
+
+static SESSION_PROMPTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SESSION_PROMPTS_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const SESSION_PROMPTS_LOCK_FILE: &str = ".session-prompts.lock";
+
+/// 세션의 프롬프트 턴을 상태 디렉터리(`session-prompts.json`)에 원자적으로 추가 기록한다.
+pub fn record_session_prompt(
+    state_dir: &std::path::Path,
+    session: crate::SessionId,
+    prompt: &str,
+    unix_ns: u64,
+) -> std::io::Result<bool> {
+    use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::collections::BTreeMap;
+    use std::fs::{DirBuilder, OpenOptions};
+    use std::io::Write as _;
+
+    if clean_prompt_display(prompt, MAX_PROMPT_DISPLAY_CHARS).is_none() {
+        return Ok(false);
+    }
+    let _guard = SESSION_PROMPTS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state_dir)?;
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(state_dir.join(SESSION_PROMPTS_LOCK_FILE))?;
+    lock_file.lock()?;
+
+    let path = state_dir.join(SESSION_PROMPTS_FILE);
+    let mut map: BTreeMap<u64, SessionPromptHistory> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if !map.contains_key(&session.0) {
+        while map.len() >= 256 {
+            let Some(&first) = map.keys().next() else {
+                break;
+            };
+            map.remove(&first);
+        }
+    }
+    let entry = map.entry(session.0).or_default();
+    if !entry.record_turn(prompt, unix_ns) {
+        return Ok(false);
+    }
+    let mut bytes = serde_json::to_vec(&map).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    let seq = SESSION_PROMPTS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    })();
+    if write_res.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    write_res?;
+    Ok(true)
+}
+
+/// 상태 디렉터리에 기록된 세션별 프롬프트 히스토리 목록을 읽는다.
+#[must_use]
+pub fn load_session_prompt_histories(
+    state_dir: &std::path::Path,
+) -> std::collections::BTreeMap<crate::SessionId, SessionPromptHistory> {
+    let path = state_dir.join(SESSION_PROMPTS_FILE);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return std::collections::BTreeMap::new();
+    };
+    let Ok(map) =
+        serde_json::from_str::<std::collections::BTreeMap<u64, SessionPromptHistory>>(&text)
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    map.into_iter()
+        .filter(|(_, v)| !v.turns.is_empty())
+        .map(|(k, v)| (crate::SessionId(k), v))
+        .collect()
+}
+
 #[cfg(test)]
 mod slug_tests {
     use super::*;
@@ -634,6 +998,19 @@ mod slug_tests {
             prompt_branch_slug("'/var/folders/nm/foo/T/krill-paste/img.png'"),
             None
         );
+        let orch_prompt = "[KRILL ORCHESTRATION PREAMBLE]\nRun: run-1 | Dispatch: disp-1 | Worker: w1 | Task: task-1\nTask Prompt: 상단 탭 클릭 시 사이드바 포커싱 동기화\nFirst read the Krill worker contract: krill skills get orchestration";
+        assert_eq!(
+            clean_user_prompt(orch_prompt),
+            "상단 탭 클릭 시 사이드바 포커싱 동기화"
+        );
+        assert_eq!(
+            prompt_branch_slug(orch_prompt).as_deref(),
+            Some("상단-탭-클릭-시-사이드바")
+        );
+        let min_prompt = "[Krill Worker] run=run-1 task=task-1 dispatch=disp-1 worker=w1: 모바일 채팅 레이아웃 수정\nRead `krill skills get orchestration --reference references/worker-contract.md`";
+        assert_eq!(clean_user_prompt(min_prompt), "모바일 채팅 레이아웃 수정");
+        let handoff_prompt = "[KRILL SESSION HANDOFF]\nSource session: s42\nTarget agent: codex\nInstructions: 남은 단위 테스트 마무리\n--- Recent terminal context ---\nfoo\n--- End context ---\n";
+        assert_eq!(clean_user_prompt(handoff_prompt), "남은 단위 테스트 마무리");
 
         let dir = std::env::temp_dir().join(format!("owe737-titles-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
@@ -714,6 +1091,69 @@ mod slug_tests {
             let name = name.to_string_lossy();
             assert!(!name.contains(".tmp."), "leftover tmp file: {name}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_prompt_history_tracks_turns_merges_short_acks_and_deduplicates() {
+        let dir = std::env::temp_dir().join(format!("session-prompts-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let sid = crate::SessionId(42);
+
+        let t1 = 10_000_000_000_u64;
+        assert!(record_session_prompt(&dir, sid, "로그인 세션 만료 버그 수정해줘", t1).unwrap());
+        // 3초 이내 동일 프롬프트 중복 호출(훅 + SendInput)은 무시된다.
+        assert!(
+            !record_session_prompt(
+                &dir,
+                sid,
+                "로그인 세션 만료 버그 수정해줘",
+                t1.saturating_add(500_000_000)
+            )
+            .unwrap()
+        );
+
+        let t2 = t1.saturating_add(10_000_000_000);
+        assert!(
+            record_session_prompt(
+                &dir,
+                sid,
+                "쿠키 만료 테스트 케이스 3개 추가하고 PR 올려줘",
+                t2
+            )
+            .unwrap()
+        );
+
+        let t3 = t2.saturating_add(10_000_000_000);
+        assert!(record_session_prompt(&dir, sid, "ㅇㅇ 진행해", t3).unwrap());
+
+        let histories = load_session_prompt_histories(&dir);
+        let hist = histories.get(&sid).unwrap();
+        assert_eq!(hist.total_turns, 3);
+        assert_eq!(hist.turns.len(), 3);
+        assert_eq!(
+            hist.display_last_prompt().as_deref(),
+            Some("쿠키 만료 테스트 케이스 3개 추가하고 PR 올려줘 (→ ㅇㅇ 진행해)")
+        );
+        assert_eq!(
+            hist.previous_turn().map(|t| (t.turn, t.text.as_str())),
+            Some((1, "로그인 세션 만료 버그 수정해줘"))
+        );
+
+        // 5개 초과 시 최근 5개만 유지하고 total_turns는 누적 증가한다.
+        for step in 4_u64..=7_u64 {
+            let ts = t3.saturating_add(step.saturating_mul(10_000_000_000));
+            assert!(
+                record_session_prompt(&dir, sid, &format!(" 후속 작업 지시 {step} 단계 진행 "), ts)
+                    .unwrap()
+            );
+        }
+        let hist = load_session_prompt_histories(&dir).remove(&sid).unwrap();
+        assert_eq!(hist.total_turns, 7);
+        assert_eq!(hist.turns.len(), MAX_PROMPT_HISTORY_TURNS);
+        assert_eq!(hist.turns.first().map(|t| t.turn), Some(7));
+        assert_eq!(hist.turns.last().map(|t| t.turn), Some(3));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

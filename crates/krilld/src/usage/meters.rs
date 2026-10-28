@@ -15,28 +15,52 @@ mod claude;
 
 type Key = (PathBuf, ProviderKind, PathBuf);
 static CACHE: Mutex<BTreeMap<Key, (Instant, AccountMeters)>> = Mutex::new(BTreeMap::new());
+const CACHE_TTL: Duration = Duration::from_mins(30);
 
 pub(super) fn remember(home: &Path, provider: ProviderKind, dir: &Path, reading: AccountMeters) {
     let mut cache = lock(&CACHE);
-    cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
+    cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
     cache.insert(
         (home.into(), provider, dir.into()),
         (Instant::now(), reading),
     );
 }
 
+pub(super) fn has_cached(home: &Path, provider: ProviderKind, dir: &Path) -> bool {
+    lock(&CACHE)
+        .get(&(home.into(), provider, dir.into()))
+        .is_some_and(|(at, _)| at.elapsed() < CACHE_TTL)
+}
+
 pub(super) fn evict(home: &Path) {
     lock(&CACHE).retain(|(h, _, _), _| h != home);
+}
+
+pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
+    lock(&CACHE).remove(&(home.into(), provider, dir.into()));
 }
 
 pub(super) fn read(home: &Path, account: &AccountInfo) -> AccountMeters {
     let dir = Path::new(&account.profile_dir);
     let cached = lock(&CACHE)
         .get(&(home.into(), account.provider, dir.into()))
-        .filter(|(at, _)| at.elapsed() < Duration::from_secs(600))
+        .filter(|(at, _)| at.elapsed() < CACHE_TTL)
         .map(|(_, reading)| reading.clone());
+    let from_cache = cached.is_some();
     let mut reading = cached.unwrap_or_else(|| read_local(home, account));
     reading.account_id.clone_from(&account.id);
+    if from_cache && account.provider == ProviderKind::Claude {
+        for (key, window) in [
+            ("five_hour", &account.usage.five_hour),
+            ("seven_day", &account.usage.seven_day),
+        ] {
+            if let Some(window) = window
+                && let Some(meter) = reading.meters.iter_mut().find(|m| m.key == key)
+            {
+                meter.window = Some(window.clone());
+            }
+        }
+    }
     if reading.meters.is_empty() {
         for (key, label, window) in [
             ("five_hour", "5h", &account.usage.five_hour),
@@ -192,6 +216,20 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                     krill_proto::usage::RESET_CREDITS_METER_LABEL,
                     count.to_string(),
                 );
+                if count > 0 {
+                    let expiry = json
+                        .get("rate_limit_reset_credits")
+                        .and_then(|credits| {
+                            credits.get("expires_at").or_else(|| credits.get("ends_at"))
+                        })
+                        .and_then(super::resets)
+                        .and_then(|at| krill_proto::time::parse_reset_epoch(&at))
+                        .filter(|at| *at > 0);
+                    out.meters
+                        .push(krill_proto::usage::reset_credit_expiry_meter(
+                            0, count, expiry,
+                        ));
+                }
             }
             if let Some(review) = json.get("code_review_rate_limit") {
                 for key in ["primary_window", "secondary_window"] {
@@ -373,6 +411,20 @@ fn value_meter(out: &mut AccountMeters, key: &str, label: &str, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_reset_credit_expiry_is_metadata_not_a_usage_pool() {
+        for (raw, expected) in [
+            (r#","expires_at":"2099-01-01T00:00:00Z""#, "4070908800"),
+            ("", "unknown"),
+        ] {
+            let meters = parse(
+                ProviderKind::Codex,
+                &format!(r#"{{"rate_limit_reset_credits":{{"available_count":2{raw}}}}}"#),
+            );
+            assert_eq!(meters.meters[1].value.as_deref(), Some(expected));
+            assert_eq!(meters.effective_max(1), None);
+        }
+    }
     #[test]
     fn provider_meters_preserve_pools_credits_and_monthly_limits() {
         let agy = parse(

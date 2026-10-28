@@ -213,3 +213,35 @@ fn osc8_and_hidden_cells_are_hard_boundaries_even_inside_quotes() {
         }
     }
 }
+
+#[test]
+fn claude_code_styled_prefix_and_slash_boundary_hard_wrap_resolve_full_image_path() {
+    use krill_proto::screen::Color;
+
+    let dir = TempDir::new("claude-wrap-image");
+    let subdir = dir.0.join("visual/threads");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let img = subdir.join("krill-threads-card.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+
+    // Row 0 has a plain label ("  첨부 이미지: ") followed by a blue-colored path token wrapped at `/`.
+    let head_str = format!("  첨부 이미지: {}", subdir.display());
+    let tail_str = "  /krill-threads-card.png";
+    let mut r0 = row(&head_str);
+    let label_cells = row("  첨부 이미지: ").len();
+    for cell in &mut r0[label_cells..] {
+        cell.fg = Color::Indexed(12);
+    }
+    let mut r1 = row(tail_str);
+    for cell in &mut r1[2..] {
+        cell.fg = Color::Indexed(12);
+    }
+    let cols = u16::try_from(r0.len() + 2).unwrap();
+    let mut s = Screen::blank(cols, 2);
+    s.rows[0] = r0;
+    s.rows[1] = r1;
+
+    let col0 = u16::try_from(label_cells + 2).unwrap();
+    assert_eq!(resolve(&s, 0, col0, &dir).unwrap().path, img);
+    assert_eq!(resolve(&s, 1, 5, &dir).unwrap().path, img);
+}

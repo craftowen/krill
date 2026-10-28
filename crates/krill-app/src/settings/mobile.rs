@@ -382,7 +382,7 @@ impl SettingsView {
     }
     pub(super) fn render_mobile_tab(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let p = crate::ui::palette(cx);
@@ -577,7 +577,7 @@ impl SettingsView {
 
         if let Some((url, expires, qr)) = &self.mobile.offer {
             let seconds = expires.saturating_sub(krill_proto::mobile::client::now_ms()) / 1000;
-            let visual = qr_canvas(qr.clone()).size(px(220.));
+            let visual = qr_canvas(qr.clone()).size(qr_side(px(220.), window.scale_factor()));
             let copied = self.mobile.copied_url.as_deref() == Some(url.as_str());
             let copy_label = if copied {
                 text::COPIED.get()
@@ -803,13 +803,32 @@ impl SettingsView {
         div().child(root)
     }
 }
-/// QR 행렬을 흰 바탕(조용한 영역 4칸 포함)에 그린다.
+/// QR 칸 하나의 최소 기기 픽셀. 1배율 화면에서 칸이 2~3px로 번갈아 그려지면 카메라가 잘 읽지 못한다.
+const QR_MIN_MODULE: f32 = 4.;
+/// 조용한 영역 4칸씩을 포함한 한 변 칸 수(`SIZE + 8`, 테스트가 확인한다).
+const QR_MODULES: f32 = 65.;
+/// `target`에 가장 가까운 QR 한 변. 칸을 정수 기기 픽셀(최소 [`QR_MIN_MODULE`])로 맞춘다.
+fn qr_side(target: gpui::Pixels, scale: f32) -> gpui::Pixels {
+    let scale = if scale > 0. { scale } else { 1. };
+    let module = (f32::from(target) * scale / QR_MODULES)
+        .round()
+        .max(QR_MIN_MODULE);
+    px(module * QR_MODULES / scale)
+}
+/// QR 행렬을 흰 바탕(조용한 영역 4칸 포함)에 그린다. 칸은 정수 기기 픽셀로 그려 폭이 번갈아 바뀌지 않게 한다.
 fn qr_canvas(matrix: Qr) -> gpui::Canvas<()> {
     gpui::canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
             window.paint_quad(gpui::fill(bounds, crate::ui::theme::QR_LIGHT));
-            let cell = bounds.size.width / 65.;
+            let scale = window.scale_factor();
+            let scale = if scale > 0. { scale } else { 1. };
+            let module = (f32::from(bounds.size.width) * scale / QR_MODULES)
+                .floor()
+                .max(1.);
+            let left = (f32::from(bounds.origin.x) * scale).round();
+            let top = (f32::from(bounds.origin.y) * scale).round();
+            let cell = px(module / scale);
             for y in 0..SIZE {
                 for x in 0..SIZE {
                     if matrix.dark(x, y) {
@@ -817,7 +836,10 @@ fn qr_canvas(matrix: Qr) -> gpui::Canvas<()> {
                         let y = f32::from(u16::try_from(y).unwrap_or(0)) + 4.;
                         window.paint_quad(gpui::fill(
                             gpui::Bounds::new(
-                                bounds.origin + gpui::point(cell * x, cell * y),
+                                gpui::point(
+                                    px((left + module * x) / scale),
+                                    px((top + module * y) / scale),
+                                ),
                                 gpui::size(cell, cell),
                             ),
                             crate::ui::theme::QR_DARK,
@@ -834,6 +856,7 @@ impl SettingsView {
     /// 오른쪽은 실제 페어링된 휴대폰 목록을 휴대폰 틀 안에 보여 준다. 기기 해제 등 관리는 설정 탭으로 넘긴다.
     pub(super) fn render_mobile_page(
         &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         use gpui_component::{
@@ -869,7 +892,7 @@ impl SettingsView {
             text::TUNNEL_DESC.get()
         };
 
-        let qr_size = px(168.);
+        let qr_size = qr_side(px(168.), window.scale_factor());
         let qr_box = if let Some((_, _, qr)) = &self.mobile.offer {
             div()
                 .id("mobile-page-qr")
@@ -952,10 +975,17 @@ impl SettingsView {
                 })),
         );
 
+        // 1배율에서 커진 QR만큼 카드를 넓혀 설명 칸 폭을 지킨다.
+        let card_width = px(460.)
+            + if qr_size > px(168.) {
+                qr_size - px(168.)
+            } else {
+                px(0.)
+            };
         let card = layout::card(p)
             .id("mobile-page-card")
             .debug_selector(|| "mobile-page-card".into())
-            .w(px(460.))
+            .w(card_width)
             .max_w_full()
             .p_5()
             .flex()
@@ -964,11 +994,12 @@ impl SettingsView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_5()
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(px(200.))
                             .flex()
                             .flex_col()
                             .gap_3()
@@ -1168,7 +1199,7 @@ impl SettingsView {
                     .flex_wrap()
                     .items_center()
                     .justify_center()
-                    .gap_x(px(72.))
+                    .gap_x(px(40.))
                     .gap_y_8()
                     .child(card)
                     .child(phone),

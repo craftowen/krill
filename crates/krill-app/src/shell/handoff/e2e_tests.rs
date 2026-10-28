@@ -20,7 +20,7 @@ use super::*;
 use crate::shell::tests::{open, state_path};
 
 const SESSION: SessionId = SessionId(661);
-const BRIEF: &[u8] = "[MK SESSION HANDOFF]\n한글 브리프\n두 번째 줄".as_bytes();
+const BRIEF: &[u8] = "[KRILL SESSION HANDOFF]\n한글 브리프\n두 번째 줄".as_bytes();
 const WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Default)]
@@ -255,13 +255,14 @@ fn bracketed() -> Modes {
 fn handoff_tui_e2e_waits_before_delivering_one_multiline_brief(cx: &mut TestAppContext) {
     let (mut tui, sock) = FakeTui::new("ready");
     let (view, cx) = open(cx, state_path("handoff-tui-ready"));
+    view.update(cx, |shell, _| {
+        shell.notice = Some(text::HANDOFF_WAITING.format(&[("agent", "codex")]));
+    });
     tui.after_boot(Stage::Ready);
     tui.attach(&view, cx, sock, bracketed(), WAIT);
-    wait_notice(
-        &view,
-        cx,
-        &text::HANDOFF_SPAWNED.format(&[("agent", "codex")]),
-    );
+    pump_until(cx, |cx| {
+        view.read_with(cx, |shell, _| shell.notice.is_none())
+    });
     pump_until(cx, |_| !tui.state.lock().unwrap().received.is_empty());
     tui.finish_input(&view, cx);
     let state = tui.state.lock().unwrap();

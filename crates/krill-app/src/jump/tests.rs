@@ -84,8 +84,10 @@ fn open(
     let events = Rc::new(RefCell::new(Vec::new()));
     let got = events.clone();
     cx.update(|_, cx| {
-        cx.subscribe(&view, move |_, e: &Event, _| got.borrow_mut().push(*e))
-            .detach();
+        cx.subscribe(&view, move |_, e: &Event, _| {
+            got.borrow_mut().push(e.clone());
+        })
+        .detach();
     });
     cx.run_until_parked();
     (view, events, cx)
@@ -704,4 +706,136 @@ fn async_item_publication_does_not_override_new_keyboard_selection(cx: &mut Test
         assert_eq!(p.selected, 0);
         assert!(p.pending_item_selection.is_none());
     });
+}
+
+#[test]
+fn remote_session_search_indexes_host_and_full_paths_before_project_filtering() {
+    let mut remote = item(7, "Remote task", true);
+    remote.host = HostId::Remote("studio-id".into());
+    remote.host_label = "빌드 서버".into();
+    remote.cwd = "/srv/unique-parent/repo/feature/subdir".into();
+    remote.worktree_path = "/srv/worktree-root/feature".into();
+    remote.repo_name = "repo".into();
+    remote.rebuild_search_chars();
+    let mut other = item(7, "Local task", false);
+    other.repo_name = "other".into();
+    other.rebuild_search_chars();
+    let items = vec![other, remote];
+    for query in [
+        "STUDIO-ID",
+        "ㅂㄷㅅㅂ",
+        "unique-parent",
+        "worktree-root",
+        "subdir",
+    ] {
+        assert_eq!(search(&items, query), [1], "{query}");
+    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for query in ["", "task"] {
+        let chars = query_chars(query, false);
+        assert_eq!(
+            search_items(&items, &chars, false, Some("repo"), &cancel),
+            [1]
+        );
+        assert_eq!(
+            search_items(&items, &chars, false, Some("other"), &cancel),
+            [0]
+        );
+        assert!(search_items(&items, &chars, false, Some("missing"), &cancel).is_empty());
+    }
+}
+
+#[gpui::test]
+fn remote_session_selection_survives_reorder_and_async_snapshot_with_colliding_ids(
+    cx: &mut TestAppContext,
+) {
+    let local = item(7, "needle-local", false);
+    let mut remote = item(7, "needle-remote", false);
+    remote.host = HostId::Remote("studio".into());
+    remote.rebuild_search_chars();
+    let (view, events, cx) = open(cx, vec![local.clone(), remote.clone()]);
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.selected = 1;
+            p.set_items(vec![remote.clone(), local.clone()], cx);
+            assert_eq!(
+                p.selected, 0,
+                "identity includes host, even for the same id"
+            );
+            p.query = "needle".into();
+            p.recompute_all_matches(cx);
+            p.selected = p
+                .matches
+                .iter()
+                .position(|&i| p.items[i].host == remote.host)
+                .unwrap();
+            let mut items = vec![local, remote];
+            items.extend((100..2300).map(|id| item(id, "needle-extra", false)));
+            p.set_snapshot(items, Vec::new(), cx);
+            assert!(p.pending_item_selection.is_some());
+            p.confirm(cx);
+        });
+    });
+    assert!(events.borrow().is_empty());
+    cx.run_until_parked();
+    cx.update(|_, cx| view.update(cx, Palette::confirm));
+    assert_eq!(
+        *events.borrow(),
+        [Event::ConfirmOn(
+            HostId::Remote("studio".into()),
+            SessionId(7)
+        )]
+    );
+}
+
+#[gpui::test]
+fn remote_worktree_confirmation_carries_host_and_label_is_searchable(cx: &mut TestAppContext) {
+    let (view, events, cx) = open(cx, Vec::new());
+    let mut tree = WorktreeItem::new(
+        "/remote/repo/wt".into(),
+        Some(SessionId(7)),
+        "wt".into(),
+        String::new(),
+        "repo".into(),
+        "Studio".into(),
+        String::new(),
+        None,
+        false,
+        false,
+        false,
+    );
+    tree.host = HostId::Remote("studio".into());
+    cx.update(|_, cx| view.update(cx, |p, cx| p.set_worktrees(vec![tree], cx)));
+    cx.simulate_input("studio");
+    assert_eq!(cx.update(|_, cx| view.read(cx).worktree_matches.len()), 1);
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        *events.borrow(),
+        [Event::ConfirmOn(
+            HostId::Remote("studio".into()),
+            SessionId(7)
+        )]
+    );
+}
+
+#[test]
+fn thousand_remote_items_search_under_50_ms() {
+    let mut items = thousand();
+    for item in &mut items {
+        item.host = HostId::Remote(format!("host-{}", item.id.0 % 5));
+        item.host_label = "Remote Studio".into();
+        item.cwd = format!("/srv/projects/repo-{}/worktree/subdir", item.id.0);
+        item.worktree_path = format!("/srv/worktrees/repo-{}", item.id.0);
+        item.rebuild_search_chars();
+    }
+    for query in ["", "remote", "host-3", "subdir", "0999", "ㅅㅌㄷㅇ"] {
+        let start = Instant::now();
+        let hits = search(&items, query);
+        let took = start.elapsed();
+        eprintln!(
+            "remote search 1000 {query:?}: {} hits in {took:?}",
+            hits.len()
+        );
+        assert!(took < Duration::from_millis(50), "{query}: {took:?}");
+    }
 }

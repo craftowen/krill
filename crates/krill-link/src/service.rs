@@ -63,6 +63,14 @@ fn lock(state_dir: &Path) -> Result<File, Error> {
 
 /// 앱 시작 시 기본으로 수신 서버를 시작한다. 명시적으로 끈 설정은 유지한다.
 pub fn ensure_default_server(executable: &Path, state_dir: &Path) -> Result<(), Error> {
+    #[cfg(target_os = "macos")]
+    {
+        // 임시 HOME을 실제 사용자 launchd 도메인에 자동 등록하지 않는다.
+        if !crate::launchd::lifecycle::default_autostart_allowed() {
+            return Ok(());
+        }
+        crate::launchd::lifecycle::cleanup_orphans_in_background();
+    }
     let _lock = lock(state_dir)?;
     if incoming_enabled(state_dir)? {
         start(executable, state_dir)?;
@@ -157,7 +165,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kl-pref-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         assert!(incoming_enabled(&dir).unwrap());
-        disable_server(&dir).unwrap();
+        save_preference(&dir, false).unwrap();
         assert!(!incoming_enabled(&dir).unwrap());
         // 꺼져 있으면 존재하지 않는 실행 파일로도 자동 시작하지 않는다.
         ensure_default_server(Path::new("missing-krill-link"), &dir).unwrap();

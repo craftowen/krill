@@ -176,7 +176,7 @@ fn fake(name: &str) -> Fake {
     let root = std::env::temp_dir().join(format!("mk-onboard-{}-{name}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     let (bin, home) = (root.join("bin"), root.join("home"));
-    let state = default_state_dir(&home);
+    let state = krill_proto::daemon::state_dir_in(&home);
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(home.join(".local/bin")).unwrap();
     script(&bin.join("git"), "echo 'git version 2.50.1'\n");
@@ -212,6 +212,7 @@ fn fake(name: &str) -> Fake {
         env: Env {
             shell: root.join("shell").into(),
             krill,
+            default_state: Some(state.clone()),
             state,
             home,
             state_overridden: false,
@@ -733,7 +734,7 @@ fn broken_symlink_summary_offers_replacement_instead_of_conflict() {
 fn isolated_state_dir_skips_cli_symlink_step(cx: &mut TestAppContext) {
     let mut f = fake("explicit-state-override");
     f.env.state_overridden = true;
-    assert_eq!(f.env.state, default_state_dir(&f.env.home));
+    assert_eq!(Some(&f.env.state), f.env.default_state.as_ref());
     let cx = open(cx, &f.env);
     assert!(wizard_window(cx).is_none());
     // 격리 상태에서는 CLI 링크·스테이징을 만들지 않는다.
@@ -1523,6 +1524,7 @@ fn quick_checks_find_helpers_in_app_bundle() {
         shell: "/bin/sh".into(),
         krill: contents.join("MacOS/krill"),
         state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
         home: root.join("home"),
         state_overridden: true,
     };

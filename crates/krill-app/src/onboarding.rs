@@ -60,6 +60,8 @@ pub struct Env {
     pub krill: PathBuf,
     /// 상태 디렉터리([`krill_proto::daemon::state_dir`]).
     pub state: PathBuf,
+    /// Native default resolved independently from the override and user profile directory.
+    pub default_state: Option<PathBuf>,
     pub home: PathBuf,
     /// 상태 디렉터리 재정의(`KRILL_STATE_DIR`) 여부. 프로세스 환경은 `current`에서만 읽고 테스트는 직접 주입한다.
     pub state_overridden: bool,
@@ -85,13 +87,14 @@ impl Env {
                 .unwrap_or_else(|| "/bin/zsh".into()),
             krill: krill_proto::daemon::sibling_exe("krill").ok()?,
             state: krill_proto::daemon::state_dir()?,
+            default_state: krill_proto::daemon::default_state_dir(),
             home: krill_proto::os::home_dir()?,
             state_overridden: krill_proto::daemon::state_dir_override().is_some(),
         })
     }
 
     pub(crate) fn is_isolated_state(&self) -> bool {
-        self.state_overridden || self.state != default_state_dir(&self.home)
+        self.state_overridden || self.default_state.as_deref() != Some(self.state.as_path())
     }
 }
 
@@ -209,10 +212,10 @@ pub fn login_path(shell: &OsStr) -> Option<OsString> {
         .map(OsString::from)
 }
 
-/// Windows has no POSIX login shell. Use the PATH inherited from Explorer.
+/// Windows has no POSIX login shell. Use the PATH inherited from Explorer plus standard per-user CLI folders.
 #[cfg(windows)]
 pub fn login_path(_shell: &OsStr) -> Option<OsString> {
-    std::env::var_os("PATH").filter(|path| !path.is_empty())
+    krill_proto::os::augment_windows_path(std::env::var_os("PATH").as_deref())
 }
 
 /// git·에이전트·`krill` CLI를 감지한다. 셸과 `--version`을 띄우므로 백그라운드에서 부른다.
@@ -251,10 +254,6 @@ pub fn survey(env: &Env) -> Survey {
     }
 }
 
-fn default_state_dir(home: &Path) -> PathBuf {
-    krill_proto::daemon::state_dir_in(home)
-}
-
 fn in_app_bundle(krill: &Path) -> bool {
     krill
         .ancestors()
@@ -267,7 +266,9 @@ pub(super) fn stable_mk_path(krill: &Path, home: &Path) -> PathBuf {
     if in_app_bundle(krill) {
         krill.to_path_buf()
     } else {
-        krill_proto::user_dirs::share_dir(home).join("bin/krill")
+        krill_proto::user_dirs::share_dir(home)
+            .join("bin")
+            .join(format!("krill{}", std::env::consts::EXE_SUFFIX))
     }
 }
 
@@ -285,7 +286,7 @@ fn is_replaceable_broken_symlink(path: &Path) -> bool {
 fn cli(krill: &Path, path: &OsStr, home: &Path) -> Cli {
     let stable = stable_mk_path(krill, home);
     for dir in std::env::split_paths(path) {
-        let candidate = dir.join("krill");
+        let candidate = dir.join(format!("krill{}", std::env::consts::EXE_SUFFIX));
         if access(&candidate, Access::EXEC_OK).is_ok() && candidate.is_file() {
             let found_canon = std::fs::canonicalize(&candidate).ok();
             let same = found_canon.is_some()
@@ -1098,10 +1099,13 @@ pub(crate) fn stage_binaries(krill: &Path, home: &Path) -> Result<PathBuf, Strin
         stage_executable(krill, &target).map_err(|e| format!("krill: {e}"))?;
         if let (Some(src_dir), Some(dst_dir)) = (krill.parent(), target.parent()) {
             for helper in ["krill-holder", "krilld"] {
-                let src = src_dir.join(helper);
+                let src = krill_proto::daemon::exe_near(src_dir, helper);
                 if src.is_file() {
-                    stage_executable(&src, &dst_dir.join(helper))
-                        .map_err(|e| format!("{helper}: {e}"))?;
+                    stage_executable(
+                        &src,
+                        &dst_dir.join(format!("{helper}{}", std::env::consts::EXE_SUFFIX)),
+                    )
+                    .map_err(|e| format!("{helper}: {e}"))?;
                 }
             }
         }
@@ -1178,3 +1182,75 @@ pub mod welcome;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn native_cli_is_detected_with_its_platform_extension() {
+        let root = std::env::temp_dir().join(format!("krill-native-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.fixture");
+        let executable = root.join(format!("krill{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&source, b"fixture-only").unwrap();
+        stage_executable(&source, &executable).unwrap();
+        let path = std::env::join_paths([&root]).unwrap();
+        assert!(matches!(cli(&executable, &path, &root), Cli::Installed));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_storage_root_can_differ_from_profile_home() {
+        // Windows USERPROFILE and LOCALAPPDATA can also be on different drives.
+        // Inject both paths instead of changing process-wide environment variables.
+        let home = PathBuf::from("C:/Users/actorjin");
+        let state = krill_proto::daemon::state_dir_in(Path::new("D:/LocalAppData/actorjin"));
+        let mut env = Env {
+            shell: OsString::new(),
+            krill: home.join("krill.exe"),
+            default_state: Some(state.clone()),
+            state,
+            home,
+            state_overridden: false,
+        };
+        assert!(!env.is_isolated_state());
+        // Explicit overrides remain isolated even when they equal the native default.
+        env.state_overridden = true;
+        assert!(env.is_isolated_state());
+        env.state_overridden = false;
+        env.state = env.home.join("isolated");
+        assert!(env.is_isolated_state());
+        env.state = env.default_state.clone().unwrap();
+        env.default_state = None;
+        assert!(env.is_isolated_state());
+    }
+
+    #[test]
+    fn staging_preserves_native_executable_names_and_helpers() {
+        let root = std::env::temp_dir().join(format!("krill-native-stage-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let source = root.join("source");
+        let home = root.join("home");
+        std::fs::create_dir_all(&source).unwrap();
+        let suffix = std::env::consts::EXE_SUFFIX;
+        for name in ["krill", "krill-holder", "krilld"] {
+            std::fs::write(source.join(format!("{name}{suffix}")), name.as_bytes()).unwrap();
+        }
+        let staged = stage_binaries(&source.join(format!("krill{suffix}")), &home).unwrap();
+        let bin = krill_proto::user_dirs::share_dir(&home).join("bin");
+        assert_eq!(staged, bin.join(format!("krill{suffix}")));
+        for name in ["krill", "krill-holder", "krilld"] {
+            assert_eq!(
+                std::fs::read(bin.join(format!("{name}{suffix}"))).unwrap(),
+                name.as_bytes()
+            );
+        }
+        #[cfg(windows)]
+        assert!(
+            !bin.join("krill").exists(),
+            "hooks need the .exe destination"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

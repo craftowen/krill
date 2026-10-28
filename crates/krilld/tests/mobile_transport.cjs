@@ -4,6 +4,18 @@ const test=require('node:test'),assert=require('node:assert/strict'),vm=require(
 const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/client.js'),'utf8');
 const enc=new TextEncoder(),flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 const deferred=()=>{let resolve;const promise=new Promise(done=>resolve=done);return {promise,resolve};};
+
+test('foreground resume keeps a healthy slow snapshot on its existing connection',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);
+ h.response(socket,{sessions:[]});await pending;
+ h.transport.resume(false);await flush();
+ await h.tick(2000);
+ assert.equal(h.transport.ready,true,'a snapshot within the RPC deadline is still in flight');
+ assert.equal(socket.closed,undefined);
+ h.response(socket,{sessions:[],etag:'fresh'});await flush();
+ assert.equal(h.transport.ready,true);
+ h.transport.close();
+});
 function harness(saved=null,href='https://phone.test/m/0123456789abcdef/',useEndpoint=false){
  let now=100000,nextTimer=0;const timers=new Map(),sockets=[],events=[],redirects=[],store=new Map(saved?[['krill-mobile-v2',JSON.stringify(saved)]]:[]),url=new URL(href);
  url.replace=href=>redirects.push(href);
@@ -206,4 +218,34 @@ test('selected terminal preauthentication overlaps the first snapshot instead of
  socket.emit('message',{data:Uint8Array.from([0,0,0,0,1])});await flush();assert.equal(h.sockets.length,2);assert.equal(h.transport.state.phase,'connecting','snapshot deadline still applies');
  const warm=h.sockets.at(-1);warm.emit('open');warm.emit('message',{data:JSON.stringify({version:2,challenge:'aa'})});await flush();assert.equal(warm.sent.length,3);
  h.response(socket,{sessions:[]});await pending;assert.equal(h.transport.state.phase,'ready');const taken=h.transport.terminalConnect();assert.equal(taken.socket,warm);h.transport.close();taken.socket.close();
+});
+test('reconnect sends the previous live etag and becomes ready at ServerHello while serializing RPCs behind snapshot',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{etag:'same',sessions:[{id:7}]});await pending;h.transport.setActive(false);
+ h.transport.reconnect();await flush();const next=h.sockets.at(-1);await h.advance(next,3);assert.equal(h.transport.state.phase,'connecting');
+ const request=next.sent[3];let at=6,n=0,shift=0,b;do{b=request[at++];n|=(b&127)<<shift;shift+=7;}while(b&128);assert.deepEqual(JSON.parse(new TextDecoder().decode(request.slice(at,at+n))),{action:'snapshot',since:'same'});
+ next.emit('message',{data:Uint8Array.from([0,0,0,0,1])});await flush();assert.equal(h.transport.state.phase,'ready');assert.equal(h.transport.ready,true);assert.equal(h.transport.updateBusy,true);
+ const before=next.sent.length,rpc=h.transport.rpc({action:'git'});await flush();assert.equal(next.sent.length,before,'the first snapshot owns the next response');
+ h.response(next,{unchanged:true,etag:'same'});await flush();assert.equal(next.sent.length,before+1);h.response(next,{files:[]});await rpc;assert.equal(h.transport.updateBusy,false);assert.equal(h.events.filter(e=>e.phase==='ready').length,2);h.transport.close();
+});
+test('a reconnect snapshot timeout still disconnects an immediately ready transport',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{etag:'same',sessions:[]});await pending;h.transport.setActive(false);h.transport.reconnect();await flush();await h.advance(h.sockets.at(-1));assert.equal(h.transport.state.phase,'ready');await h.tick(20000);assert.equal(h.transport.ready,false);assert.match(h.transport.state.message,/timed out/);h.transport.close();
+});
+test('new pairing discards the prior live snapshot before authentication',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{etag:'old-host',sessions:[]});await pending;h.transport.setActive(false);h.transport.setPair({ticket:'new',secret:'secret'});await flush();const next=h.sockets.at(-1);await h.advance(next);assert.equal(h.transport.state.phase,'connecting');assert(!new TextDecoder().decode(next.sent[3]).includes('old-host'));h.response(next,{etag:'new-host',sessions:[]});await flush();assert.equal(h.transport.state.phase,'ready');h.transport.close();
+});
+test('update start probes immediately once and completed probes suppress repeated lifecycle events',async()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true),doc=new EventTarget(),events=new EventTarget();doc.hidden=false;h.context.document=doc;h.context.addEventListener=events.addEventListener.bind(events);h.context.removeEventListener=events.removeEventListener.bind(events);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/updates.js'),'utf8'),h.context);let probes=0;h.endpoint.probeUpdate=async()=>{probes++;return null;};const api=h.context.KrillMobile.updates.create({endpoint:h.endpoint});api.start();await flush();assert.equal(probes,1);api.start();events.dispatchEvent(new Event('pageshow'));events.dispatchEvent(new Event('online'));doc.dispatchEvent(new Event('visibilitychange'));await flush();assert.equal(probes,1);await h.tick(1000);events.dispatchEvent(new Event('online'));await flush();assert.equal(probes,2);await api.check();assert.equal(probes,3,'explicit discovery is never throttled');api.stop();h.transport.close();
+});
+
+test('resume keeps a healthy slow connection while the existing RPC deadline bounds refresh',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;h.transport.setActive(false);
+ const sent=socket.sent.length;h.transport.resume();await flush();assert.equal(socket.sent.length,sent+1);
+ await h.tick(2000);assert.equal(h.transport.ready,true);assert.equal(socket.closed,undefined);
+ h.transport.resume();await flush();assert.equal(socket.sent.length,sent+1,'lifecycle events share the pending snapshot');
+ h.response(socket,{sessions:[]});await flush();assert.equal(h.transport.ready,true);assert.equal(socket.closed,undefined);h.transport.close();
+});
+test('resume refresh still disconnects a truly stalled transport at the RPC deadline',async()=>{
+ const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;h.transport.setActive(false);
+ h.transport.resume();await flush();await h.tick(15000);assert.equal(h.transport.ready,false);assert.equal(socket.closed,true);h.transport.close();
 });

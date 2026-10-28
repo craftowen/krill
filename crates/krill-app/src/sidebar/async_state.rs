@@ -23,7 +23,7 @@ pub(super) struct State {
     writes_pending: usize,
     pub store: WorktreeStore,
     pub orchestration: OrchestrationStore,
-    imported: Snapshot,
+    pub imported: Snapshot,
     imported_meta: Meta,
     pub folder_updated_at: BTreeMap<PathBuf, u64>,
     /// 워크트리 폴더 생성 시각(ms). `SortBy::Created` 정렬 키.
@@ -154,8 +154,10 @@ impl Startup {
 
     fn apply(self, sidebar: &mut Sidebar) {
         let edits = std::mem::take(&mut sidebar.disk.startup);
-        let (prefs, options, lin, ui, order) = edits.merge(self.state, startup::capture(sidebar));
+        let (prefs, options, lin, ui, order, worktree_order) =
+            edits.merge(self.state, startup::capture(sidebar));
         sidebar.project_order = order;
+        sidebar.worktree_order = worktree_order;
         sidebar.prefs = prefs;
         sidebar.options = options;
         sidebar.collapsed = ui.collapsed;
@@ -214,6 +216,7 @@ pub(super) struct DiskSnapshot {
     store: WorktreeStore,
     orchestration: OrchestrationStore,
     auto_titles: BTreeMap<SessionId, String>,
+    prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
     visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
     folder_updated_at: BTreeMap<PathBuf, u64>,
     worktree_created_at: BTreeMap<PathBuf, u64>,
@@ -315,6 +318,7 @@ impl DiskSnapshot {
             store,
             orchestration,
             auto_titles: load_auto_titles_from_sidebar_path(path),
+            prompt_histories: load_prompt_histories_from_sidebar_path(path),
             visuals,
             folder_updated_at,
             worktree_created_at,
@@ -461,20 +465,40 @@ impl Sidebar {
             || self.disk.folder_updated_at != data.folder_updated_at
             || self.disk.worktree_created_at != data.worktree_created_at
             || (self.path.is_some()
-                && (self.comments != data.comments || self.auto_titles != data.auto_titles))
-            || data.prefs.keys().any(|key| !self.prefs.contains_key(key))
+                && (self.comments != data.comments
+                    || self.auto_titles != data.auto_titles
+                    || self.prompt_histories != data.prompt_histories))
+            || data.prefs.keys().any(|key| {
+                !self
+                    .prefs
+                    .keys()
+                    .any(|known| path_identity::same(key, known))
+            })
+            || data.imported_meta.iter().any(|(key, value)| {
+                value.branch.is_some()
+                    && self
+                        .meta
+                        .get(key)
+                        .and_then(|existing| existing.branch.as_ref())
+                        .is_none()
+            })
     }
 
     pub(super) fn apply_disk_snapshot(&mut self, data: DiskSnapshot) -> bool {
         self.snapshot.trees = data.snapshot.trees;
         for (key, value) in &data.imported_meta {
-            self.meta
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            let entry = self.meta.entry(key.clone()).or_default();
+            if entry.branch.is_none() {
+                entry.branch.clone_from(&value.branch);
+            }
+            if entry.dirty.is_none() {
+                entry.dirty = value.dirty;
+            }
         }
         if self.path.is_some() {
             self.comments = data.comments;
             self.auto_titles = data.auto_titles;
+            self.prompt_histories = data.prompt_histories;
         }
         self.project_visuals = data.visuals;
         self.disk.folder_updated_at = data.folder_updated_at;
@@ -495,7 +519,7 @@ impl Sidebar {
             false
         };
         for (key, value) in data.prefs {
-            self.prefs.entry(key).or_insert(value);
+            external::imported_entry(&mut self.prefs, &key).or_insert(value);
         }
         self.prune_stale_worktree_state();
         auto
@@ -511,9 +535,13 @@ impl Sidebar {
             }
         }
         for (key, value) in &self.disk.imported_meta {
-            self.meta
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            let entry = self.meta.entry(key.clone()).or_default();
+            if entry.branch.is_none() {
+                entry.branch.clone_from(&value.branch);
+            }
+            if entry.dirty.is_none() {
+                entry.dirty = value.dirty;
+            }
         }
         false
     }
@@ -591,6 +619,53 @@ impl Sidebar {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn windows_disk_aliases_preserve_status_and_cleared_preferences(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = std::env::temp_dir().join(format!("krill-disk-alias-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sidebar.bin");
+        let tree = PathBuf::from(r"C:\Work\간단작업");
+        let alias = r"\\?\c:\WORK\간단작업";
+        WorktreeStore::mutate(&dir, |store| {
+            store.statuses.insert(alias.into(), "in-review".into());
+            store.issues.insert(alias.into(), "WIN-1".into());
+            store.updated_at.insert(alias.into(), 42);
+            Ok(())
+        })
+        .unwrap();
+        let snapshot = Snapshot {
+            sessions: vec![],
+            trees: BTreeMap::from([(r"C:\Work".into(), vec![tree.clone()])]),
+        };
+        let sidebar = cx.new(|_| Sidebar::new(Some(file.clone())));
+        sidebar.update(cx, |s, cx| {
+            s.prefs.insert(tree.clone(), Preference::default());
+            for _ in 0..2 {
+                let mut data = DiskSnapshot::load(Some(&file), snapshot.clone(), Meta::new());
+                // Imported defaults arrive in the disk payload under an alias.
+                data.prefs.insert(
+                    alias.into(),
+                    Preference {
+                        pinned: true,
+                        name: "Imported".into(),
+                    },
+                );
+                s.apply_disk_snapshot(data);
+                s.rebuild(cx);
+                assert_eq!(
+                    s.worktree_statuses[&tree],
+                    krill_proto::orchestration::WorkspaceStatus::InReview
+                );
+                assert_eq!(s.worktree_updated_at[&tree], 42);
+                assert_eq!(s.issues[&tree], "WIN-1");
+                assert_eq!(s.prefs[&tree], Preference::default());
+            }
+        });
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn linked_worktrees_are_project_siblings_unless_parent_is_explicit() {
@@ -739,6 +814,7 @@ mod tests {
             &lin,
             &ui,
             &[repo.clone(), card.clone()],
+            &[],
         )
         .unwrap();
         let sidebar = cx.new(|_| Sidebar::new(Some(path.clone())));
@@ -777,11 +853,12 @@ mod tests {
             &lin,
             &ui,
             &[repo.clone(), card.clone()],
+            &[],
         )
         .unwrap();
         release.send(()).unwrap();
         cx.run_until_parked();
-        let (saved_prefs, saved_options, saved_lin, saved_ui, saved_order) =
+        let (saved_prefs, saved_options, saved_lin, saved_ui, saved_order, _) =
             load_state(&path).unwrap();
         assert_eq!(saved_order, [card.clone(), repo.clone()]);
         assert_eq!(saved_options.group_by, options::GroupBy::Repo);

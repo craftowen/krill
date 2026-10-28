@@ -136,6 +136,7 @@ impl MenuState {
                 ),
             ] {
                 let shell = shell.clone();
+                let pane = self.pane;
                 let link = link.clone();
                 menu = menu.item(
                     PopupMenuItem::element(move |_, _| {
@@ -144,6 +145,9 @@ impl MenuState {
                     .on_click(move |_, _, cx| {
                         shell
                             .update(cx, |shell, cx| {
+                                if shell.layout.focused() != Some(pane) {
+                                    shell.change(true, cx, |l| l.focus(pane));
+                                }
                                 shell.activate_terminal_file(link.clone(), action, cx);
                             })
                             .ok();

@@ -85,6 +85,52 @@ fn read(s: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
     ipc::read_frame(s)?.ok_or_else(|| io::ErrorKind::UnexpectedEof.into())
 }
 
+/// 세션을 만드는 요청(Create·Resume·Hibernation)을 쓰기 시작한 뒤 답을 받지 못했다(쓰기 중 끊김·끊김·응답 시간
+/// 초과·깨진 답). krilld가 이미 세션을 만들었을 수 있으니 자동으로 다시 보내지 않는다. 문구와 종류는 원래 오류 그대로다.
+#[derive(Debug)]
+struct UnknownOutcome(io::Error);
+
+impl std::fmt::Display for UnknownOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for UnknownOutcome {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn unknown_outcome(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), UnknownOutcome(e))
+}
+
+/// 세션을 만드는 요청이 krilld에 닿았는지 알 수 없는 실패다. 같은 요청을 자동으로 다시 보내면 PTY가 둘이 될 수 있다.
+#[must_use]
+pub fn is_unknown_outcome(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(inner) if inner.is::<UnknownOutcome>())
+}
+
+/// 제어 요청 하나를 보내고 답을 읽는다. 세션을 만드는 요청이면 쓰기 시작한 뒤의 모든 실패를 [`UnknownOutcome`]으로
+/// 표시한다(쓰다 끊겨도 krilld가 프레임을 다 받았는지 앱은 알 수 없다).
+fn call(s: &mut UnixStream, req: &Request) -> io::Result<Reply> {
+    let frame = req.encode()?;
+    let reply = s
+        .write_all(&frame)
+        .and_then(|()| read(s))
+        .and_then(|(k, b)| Ok(Reply::decode(k, &b)?));
+    let mutates = matches!(
+        req,
+        Request::Create(_) | Request::Resume { .. } | Request::Hibernation { .. }
+    );
+    if mutates {
+        reply.map_err(unknown_outcome)
+    } else {
+        reply
+    }
+}
+
 /// [`ensure_session`]의 결과.
 #[derive(Debug)]
 pub enum Found {
@@ -133,8 +179,9 @@ pub fn clear_scrollback(target: impl Into<HostTarget>, session: SessionId) -> io
     if features & FEAT_CLEAR_SCROLLBACK == 0 {
         return Ok(false);
     }
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // macOS는 피어가 이미 닫은 소켓의 setsockopt를 EINVAL로 거부한다(OWE-487). 닫힘은 다음 읽기·쓰기에서 드러난다.
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     s.write_all(&Request::ClearScrollback { session }.encode()?)?;
     let (k, b) = read(&mut s)?;
     match Reply::decode(k, &b)? {
@@ -185,33 +232,84 @@ pub fn ensure_session_in(
     want: Option<SessionId>,
     create: &Create,
 ) -> io::Result<Found> {
+    ensure_session_inner(&target.into(), want, create, true)
+}
+
+/// 이미 아는 세션만 찾는다: 라이브면 [`Found::Live`], 디스크 기록만 있으면 [`Found::Cold`], 없으면 `None`.
+/// 세션을 만들거나 깨우지 않는다 — 앞서 만든 요청의 결과를 모르는 칸([`is_unknown_outcome`])이 쓴다.
+///
+/// # Errors
+/// krilld에 붙지 못했거나 답을 읽지 못했다.
+pub fn find_session_in(
+    target: impl Into<HostTarget>,
+    session: SessionId,
+) -> io::Result<Option<Found>> {
     let target = target.into();
-    prepare_status_hook(&target, &create.program);
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    let mut call = |req: &Request| -> io::Result<Reply> {
-        s.write_all(&req.encode()?)?;
-        let (k, b) = read(&mut s)?;
-        Ok(Reply::decode(k, &b)?)
-    };
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    known_session(&target, &mut s, features, session, true)
+}
+
+/// 목록·계정 이어받기·콜드 기록에서 `id`를 찾는다(읽기만).
+fn known_session(
+    target: &HostTarget,
+    s: &mut UnixStream,
+    features: u64,
+    id: SessionId,
+    allow_cold: bool,
+) -> io::Result<Option<Found>> {
+    if let Reply::Sessions(list) = call(s, &Request::List)?
+        && list.iter().any(|i| i.session == id)
+    {
+        return Ok(Some(Found::Live(id, false)));
+    }
+    if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
+        && let Some(replacement) = account_handoff(target, id)?
+    {
+        return Ok(Some(Found::Live(replacement, false)));
+    }
+    if allow_cold
+        && features & FEAT_COLD != 0
+        && let Reply::Cold(cold) = call(s, &Request::Cold { session: id })?
+    {
+        return Ok(Some(Found::Cold(id, cold)));
+    }
+    Ok(None)
+}
+
+/// [`ensure_session_in`]과 같으나 숨은 칸 복원 등에서 콜드 화면 재생(`Request::Cold`)을 거치지 않고
+/// 곧바로 라이브 재개(`Request::Resume`)로 이어진다.
+///
+/// # Errors
+/// krilld에 붙지 못했거나 세션을 만들지 못했다(`Failure` 문구).
+pub fn ensure_live_session_in(
+    target: impl Into<HostTarget>,
+    want: Option<SessionId>,
+    create: &Create,
+) -> io::Result<(SessionId, bool)> {
+    match ensure_session_inner(&target.into(), want, create, false)? {
+        Found::Live(id, created) => Ok((id, created)),
+        Found::Cold(id, _) => Ok((id, false)),
+    }
+}
+
+fn ensure_session_inner(
+    target: &HostTarget,
+    want: Option<SessionId>,
+    create: &Create,
+    allow_cold: bool,
+) -> io::Result<Found> {
+    prepare_status_hook(target, &create.program);
+    let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if let Some(id) = want {
-        if let Some(session) = hibernation::wake(&mut call, features, id, create)? {
+        if let Some(session) =
+            hibernation::wake(&mut |req| call(&mut s, req), features, id, create)?
+        {
             return Ok(Found::Live(session, true));
         }
-        if let Reply::Sessions(list) = call(&Request::List)?
-            && list.iter().any(|i| i.session == id)
-        {
-            return Ok(Found::Live(id, false));
-        }
-        if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
-            && let Some(replacement) = account_handoff(&target, id)?
-        {
-            return Ok(Found::Live(replacement, false));
-        }
-        if features & FEAT_COLD != 0
-            && let Reply::Cold(cold) = call(&Request::Cold { session: id })?
-        {
-            return Ok(Found::Cold(id, cold));
+        if let Some(found) = known_session(target, &mut s, features, id, allow_cold)? {
+            return Ok(found);
         }
     }
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
@@ -236,12 +334,20 @@ pub fn ensure_session_in(
         },
         None => Request::Create(create.clone()),
     };
-    match call(&create)? {
+    match call(&mut s, &create)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
             Ok(Found::Live(session, true))
         }
-        Reply::Failed(f) => Err(io::Error::other(f.to_string())),
+        Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
+fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
+    match failure {
+        krill_proto::control::Failure::NoHolder => io::Error::other(failure.to_string()),
+        krill_proto::control::Failure::Os(errno) => io::Error::from_raw_os_error(errno),
+        other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
     }
 }
 
@@ -249,8 +355,11 @@ pub fn ensure_session_in(
 fn account_handoff(target: &HostTarget, old: SessionId) -> io::Result<Option<SessionId>> {
     use krill_proto::usage::{UsageReply, UsageRequest};
     let mut connection = target.connect(&hello()).map_err(connect_error)?;
-    connection.stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    connection.stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    connection.stream.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    connection
+        .stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .ok();
     connection
         .stream
         .write_all(&UsageRequest::ListAccounts.encode()?)?;
@@ -316,7 +425,7 @@ pub fn resume_session_in(
     let target = target.into();
     prepare_status_hook(&target, &create.program);
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -330,17 +439,9 @@ pub fn resume_session_in(
         },
         None => Request::Create(create.clone()),
     };
-    s.write_all(&req.encode()?)?;
-    let (k, b) = read(&mut s)?;
-    match Reply::decode(k, &b)? {
+    match call(&mut s, &req)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => Ok(session),
-        Reply::Failed(krill_proto::control::Failure::NoHolder) => Err(io::Error::other(
-            krill_proto::control::Failure::NoHolder.to_string(),
-        )),
-        Reply::Failed(krill_proto::control::Failure::Os(errno)) => {
-            Err(io::Error::from_raw_os_error(errno))
-        }
-        Reply::Failed(f) => Err(io::Error::new(io::ErrorKind::InvalidInput, f.to_string())),
+        Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }
@@ -399,8 +500,8 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
         return Ok(None); // 이전 데몬에는 새 variant를 보내지 않는다.
     }
     let mut stream = conn.stream;
-    stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    stream.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     stream.write_all(&request.encode()?)?;
     let (kind, body) = read(&mut stream)?;
     match Reply::decode(kind, &body)? {
@@ -442,7 +543,7 @@ impl Writer {
     }
 
     fn spawn_for(mut s: UnixStream, target: Option<HostTarget>) -> io::Result<Self> {
-        s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
         let (tx, rx) = mpsc::sync_channel::<PendingWrite>(WRITE_QUEUE_FRAMES);
         let bytes = Arc::new(AtomicUsize::new(0));
         thread::Builder::new()
@@ -527,7 +628,7 @@ pub fn attach(
         }
         .encode()?,
     )?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     let (k, b) = read(&mut s)?;
     if k == kind::REFUSED {
         return Err(io::Error::new(
@@ -536,7 +637,7 @@ pub fn attach(
         ));
     }
     krill_proto::screen::Attached::decode(k, &b)?;
-    s.set_read_timeout(None)?;
+    s.set_read_timeout(None).ok();
     let writer = Writer::spawn_for(s.try_clone()?, Some(target))?;
     Ok(Linked {
         reader: s,
@@ -938,6 +1039,13 @@ impl<W: Write> Pane<W> {
         if let Some((cols, rows)) = self.grid {
             notices.extend(self.fit(cols, rows));
         }
+        if self.out.is_some()
+            && self.view.screen.lines > 0
+            && self.history.stable.is_none()
+            && self.history.offset > 0
+        {
+            self.fetch();
+        }
         notices
     }
 
@@ -1076,8 +1184,16 @@ impl<W: Write> Pane<W> {
         if self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
             && self.history.prior.is_empty()
         {
-            self.history.offset = usize::MAX;
-            self.fetch();
+            self.scroll(isize::MAX);
+            if self
+                .history
+                .stable
+                .as_ref()
+                .is_none_or(|c| !c.is_stopped() && c.complete_total().is_none())
+            {
+                self.history.offset = usize::MAX;
+                self.fetch();
+            }
         } else {
             self.history.reset();
             self.request_top(Source::Cold { page: 0 }, None);
@@ -1207,7 +1323,7 @@ impl<W: Write> Pane<W> {
                     self.resync = false;
                     ev.bell = self.view.screen.bells != bells;
                     ev.redraw = true;
-                    if self.history.stable.is_some() {
+                    if self.history.stable.is_some() || self.history.offset > 0 {
                         self.fetch();
                     }
                     self.refresh();
@@ -1218,6 +1334,14 @@ impl<W: Write> Pane<W> {
                 if let Some(cache) = self.history.stable.as_mut() {
                     ev.redraw = cache.accept(reply);
                     ev.history_notice = cache.take_notice().or(ev.history_notice);
+                    if cache.is_stopped() {
+                        self.history.offset = cache.visible();
+                    } else if let Some(total) = cache.complete_total() {
+                        self.history.offset = self.history.offset.min(total);
+                    }
+                    if self.history.offset == 0 && !cache.is_pending() {
+                        self.history.reset();
+                    }
                     if ev.redraw {
                         self.refresh();
                     }
@@ -1328,16 +1452,19 @@ impl<W: Write> Pane<W> {
             && (self.history.stable.is_some() || self.history.rows.is_empty())
             && self.features & krill_proto::screen::FEAT_HISTORY_VIEW != 0
         {
-            if let Some(session) = self.session {
+            if lines > 0
+                && let Some(session) = self.session
+            {
                 let cache = self
                     .history
                     .stable
                     .get_or_insert_with(|| stable_history::Cache::new(session));
-                self.history.req = self.history.req.wrapping_add(1);
-                if let Some(req) = cache.next(self.history.offset, lines, self.history.req)
-                    && self.send(&req).is_err()
-                {
-                    self.unlink();
+                let next_req = self.history.req.wrapping_add(1);
+                if let Some(req) = cache.next(self.history.offset, lines, next_req) {
+                    self.history.req = next_req;
+                    if self.send(&req).is_err() {
+                        self.unlink();
+                    }
                 }
             }
             return;
@@ -1781,19 +1908,46 @@ impl History {
 
     fn scroll(&mut self, lines: isize) {
         if let Some(cache) = &self.stable {
-            self.offset = cache.visible().saturating_add_signed(lines);
-            if self.offset == 0 {
+            if (cache.is_stopped() || cache.complete_total() == Some(0)) && cache.visible() == 0 {
                 self.reset();
+                if lines <= 0 {
+                    return;
+                }
+            } else {
+                let base = if cache.is_stopped() {
+                    self.offset.min(cache.visible())
+                } else if let Some(total) = cache.complete_total() {
+                    self.offset.min(total)
+                } else {
+                    self.offset
+                };
+                let next = base.saturating_add_signed(lines);
+                self.offset = if cache.is_stopped() && lines > 0 && !cache.can_compose_at(next) {
+                    cache.visible()
+                } else if let Some(total) = cache.complete_total() {
+                    next.min(total)
+                } else if cache.is_pending() && lines > 0 && lines < isize::MAX {
+                    next.min(cache.visible().saturating_add(128).max(self.offset))
+                } else {
+                    next
+                };
+                if self.offset == 0 {
+                    self.reset();
+                }
+                return;
             }
-            return;
         }
-        // 비동기 요청량이 받은 히스토리보다 커도 이동 기준은 실제 보이는 위치다.
-        let next = self.visible().saturating_add_signed(lines);
-        // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 두고, 행이 오면 그만큼 보인다.
+        let base = if self.phase == Phase::Done {
+            self.offset.min(self.total_len())
+        } else {
+            self.offset
+        };
+        let next = base.saturating_add_signed(lines);
+        // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 누적하고, 행이 오면 그만큼 보인다.
         let cap = if self.phase == Phase::Done {
             self.total_len()
         } else {
-            self.visible().saturating_add(lines.unsigned_abs())
+            next
         };
         self.offset = next.min(cap);
         if self.offset == 0 {

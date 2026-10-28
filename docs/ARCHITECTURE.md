@@ -53,7 +53,7 @@
 | 데몬 업그레이드 | T4 세대 공존 + 세션 0 구 데몬 은퇴 / T2 holder 유지, krilld만 교체 | **T2 방식.** krilld는 holder가 새 바이너리로 재기동, holder는 exec 핸드오프. 세대 공존 없음. 앱·CLI는 Hello에서 N-1 호환 | 세대가 하나뿐이면 "고아 데몬 0"이 구조적으로 보장된다 |
 | 메모리 목표 | T1 ≤150MB / T3 ≤180MB(상한 200) / T4 게이트 ≤200 | **목표 180MB(앱 120 + 데몬 60), 출시 차단선 200MB**, 터미널 10개, phys_footprint, 에이전트 프로세스 제외, 창 1600×1000pt @2x(MK-009). 창 drawable은 창 픽셀 수에 비례하므로 더 큰 창은 이 예산으로 판정하지 않는다(2026-10-22 실측: 2560×1319pt @2x에서 drawable 1장 52.6MB, 3장 약 158MB) | T3가 창 drawable(IOSurface)을 실측해 150MB가 비현실적임을 보였다 |
 | diff 뷰 범위 | T1 v1.x / T3 M2 | **읽기 전용 diff + 변경 파일 목록은 M3(P1)**, 커밋 UI·줄 주석은 M5 | 에이전트 결과를 검토하는 핵심 동선이지만 편집 기능은 범위 밖 |
-| 텔레메트리 | T1 v1 없음 / T4 opt-in | **v1 없음**, M5에서 opt-in(기본 꺼짐) | 두 의견이 양립 |
+| 텔레메트리 | 초기 opt-in / 기본 활성 사용 통계 | **별도 동의창 없이 기본 활성**(2026-10-27 사용자 지시). 설치별 무작위 ID·최초 실행·앱 실행·일별 입력 활동만 백그라운드 전송. 오류 보고 opt-in은 독립 유지 | 환경 거부·명시적 비활성화 지원. [수집·집계 규약](../services/telemetry/CLIENT.md) |
 
 ## 4. 세션 데몬 (T2)
 
@@ -121,6 +121,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_SIDEBAR | `1 << 14` | `krill_proto::control` (세션 cwd·워크트리 조회, Request 10 / Reply 14, OWE-411 지휘자 배정) |
 | FEAT_PROVIDER_DETAILS | `1 << 15` | `krill_proto::usage` (제공자별 상세 사용량·계정 전환 상태, 기존 사용량 응답 뒤 확장) |
 | FEAT_ACCOUNT_CANCEL | `1 << 22` | `krill_proto::usage` (실패한 계정 전환 취소·원본 세션 입력 재개, 명시적 동의 후에만 보류 입력 전달) |
+| FEAT_SESSION_ACCOUNT_SWITCH | `1 << 28` | `krill_proto::usage` (클릭한 호스트의 단일 세션 계정 전환 `UsageRequest::SwitchSessionAccount`; 기본 계정·다른 세션 유지, 지휘자 배정 2026-10-27) |
 | FEAT_HISTORY | `1 << 16` | `krill_proto::history` (기록 삭제, 전용 요청·응답, OWE-440) |
 | FEAT_USAGE | `1 << 17` | `krill_proto::usage` (사용량·프로바이더 다계정 조회·전환·자동전환, 전용 요청·응답, MK-084·MK-107·MK-108) |
 | FEAT_ORCH_RETAIN | `1 << 19` | `krill_proto::orchestration` (retain 요청·상태, v0.1.23 지휘자 배정; 구 피어 응답은 Stopped로 변환) |
@@ -130,7 +131,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_CLIPBOARD | `1 << 33` | `krill_proto::clipboard` (OSC 52 쓰기 통지, OWE-398 지휘자 배정) |
 | FEAT_SESSION_FORK | `1 << 34` | `krill_proto::control` (에이전트 세션 포크 `Program::Agent { id: "fork:<spec>" }`, MK-182·OWE-736 지휘자 배정; 미협상 피어에 요청 금지) |
 | FEAT_UPGRADE | `1 << 36` | `krill_proto::control` (krilld 업그레이드 요청 `Request::Upgrade`/`Reply::Upgrade` 한 쌍, MK-062 지휘자 배정) |
-| FEAT_WINDOWS_UPGRADE | `1 << 28` | `krill_proto::control` (Windows 활성 세션의 holder를 유지하는 데몬 업그레이드. 미협상 구 데몬에는 Upgrade 요청 보류(런타임 자연 종료 뒤 새 바이너리 기동). window-error 지휘자 배정) |
+| FEAT_WINDOWS_UPGRADE | `1 << 29` | `krill_proto::control` (Windows 활성 세션의 holder를 유지하는 데몬 업그레이드. 미협상 구 데몬에는 Upgrade 요청 보류(런타임 자연 종료 뒤 새 바이너리 기동). window-error 지휘자 배정) |
 | FEAT_RESOURCES | `1 << 38` | `krill_proto::resources` (Resource Manager `Request::Resources`/`Reply::Resources` 한 쌍, OWE-436 지휘자 배정) |
 | FEAT_GIT_SYNC | `1 << 41` | `krill_proto::ipc` (Git 원격 동기화 `Edit::Push`·`Pull`·`Sync`·`CommitAndPush`, MK-184·OWE-738 지휘자 배정; 구 피어에는 전송 금지) |
 | FEAT_RESUME_HISTORY | `1 << 30` | `krill_proto::control` (재개 전 세그먼트·마지막 화면의 지연 HISTORY 페이지, 지휘자 배정 2026-10-23; 미협상 피어는 기존 임시 prior 유지, 새 kind·DTO 없음) |
@@ -253,7 +254,8 @@ PWA는 `/`, `/manifest.json`, `/app.js`, `/app.css`, `/icon.svg`를 gzip 사전 
 - Developer ID + hardened runtime + notarytool + staple(macOS 러너). 엔타이틀먼트는 기본 비움, `device.audio-input`·`device.camera`·`automation.apple-events` 필요 여부는 MK-007에서 에이전트 시나리오로 실측. 서명은 안쪽부터 개별(`--deep` 금지). 인증서는 MK-104(사람).
 - 자체 최소 업데이터: `latest.json` + ed25519 + `codesign --verify` + `ditto` + 교체 + 롤백. `rename(2)`는 비어 있지 않은 `.app`을 덮어쓰지 못하므로 APFS `renamex_np(RENAME_SWAP)` 또는 2단계 이동(현재→`.prev`, staging→현재)과 단계별 저널로 중간 크래시 복구. 검증·교체·재실행·health 확인·롤백은 별도 relauncher가 맡는다. Velopack과 S-updater에서 비교.
 - 크래시: panic hook → 로컬 파일 → 다음 실행 때 "진단 보내기"(리댁션). 업로드는 opt-in.
-  (MK-067 구현: `krill_proto::diag`. 앱·krilld panic hook → `<상태 디렉터리>/crash/crash-<unix초>-<pid>-<프로세스>.txt`(0600, MK-069 로그와 별도, 미확인 32개 상한). 앱이 다음 실행에 대화상자 → "진단 번들 만들기"는 `<상태 디렉터리>/diagnostics/`에 리댁션한 텍스트(≤4MiB, 터미널 본문 없음)를 쓰고 Finder로 보인다. 같은 번들은 `krill doctor --bundle`. `krill doctor`는 데몬 바이너리 누락·상태 디렉터리 쓰기 불가·git 없음·데몬 연결 실패를 FAIL, 미확인 크래시 로그를 WARN으로 보인다. opt-in 업로드는 아직 없다.)
+  (MK-067 구현: `krill_proto::diag`. 앱·krilld panic hook → `<상태 디렉터리>/crash/crash-<unix초>-<pid>-<프로세스>.txt`(0600, MK-069 로그와 별도, 미확인 32개 상한). 앱이 다음 실행에 대화상자 → "진단 번들 만들기"는 `<상태 디렉터리>/diagnostics/`에 리댁션한 텍스트(≤4MiB, 터미널 본문 없음)를 쓰고 Finder로 보인다. 같은 번들은 `krill doctor --bundle`. `krill doctor`는 데몬 바이너리 누락·상태 디렉터리 쓰기 불가·git 없음·데몬 연결 실패를 FAIL, 미확인 크래시 로그를 WARN으로 보인다. 원본 로그와 진단 번들은 자동 업로드하지 않는다.)
+- 오류 메타데이터 보고: `krill_proto::error_reporting`의 별도 opt-in·환경 veto·상한 로컬 큐 → 앱 백그라운드의 `krill errors flush` → HTTPS 수집 API. 사용 통계 동의를 확대하지 않으며 원문·사용자 경로·호스트명은 스키마에 없다. 앱·krilld는 코드/공개 소스 위치만 기록하고 holder에는 수집 코드를 넣지 않는다. macOS `.ips`는 다음 정상 실행에서 동의 시각·유형을 확인하고 예외/신호 enum만 추출한다. panic·native crash·원인 불명 종료를 구분하며, 세션 소실이나 fatal 여부를 추정하지 않는다. 수신 서버 배포는 별도이고 실패는 세션 처리에 영향을 주지 않는다. [동의·데이터·전달 규약](agents/error-reporting.md).
 - 배포: DMG(GitHub Releases) + 자체 Homebrew tap(`auto_updates true`).
 - Windows 배포(M11, 후보만 — 미결정): 설치 형식은 zip·Inno Setup·MSIX·winget 중 MK-218(OWE-837)에서 고른다. 실행 중인 exe는 덮어쓸 수 없어 rename 방식 교체 + 롤백, holder exe는 버전별 경로, Velopack을 검토한다. 서명은 Authenticode(유료 인증서, 사람 결정 — MK-219/OWE-838). release 워크플로 Windows 잡과 Windows 메모리 게이트는 MK-220(OWE-839), 메모리 지표 정의는 S-W3(MK-209/OWE-828).
 - 품질 게이트(macOS nightly + 릴리스 차단): 메모리 ≤ 200MB, 앱 kill -9·업데이트·krilld 크래시 생존 e2e.

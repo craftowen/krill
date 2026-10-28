@@ -861,9 +861,13 @@ impl OrchestrationStore {
         fs::create_dir_all(state_dir)?;
         let _guard = LockGuard::acquire(&state_dir.join(ORCH_LOCK))?;
         let mut store = Self::load(state_dir)?;
+        // 구조 비교로 직렬화·해시 충돌 없이 실제 변경만 저장한다. 정리로 바뀐 값도 포함한다.
+        let before = store.clone();
         let out = f(&mut store)?;
         store.prune_if_needed()?;
-        store.save(state_dir)?;
+        if store != before {
+            store.save(state_dir)?;
+        }
         Ok(out)
     }
 
@@ -2542,7 +2546,7 @@ pub fn worker_preamble(dispatch: &Dispatch) -> String {
         .map(|t| format!(" --task {t}"))
         .unwrap_or_default();
     format!(
-        "[MK ORCHESTRATION PREAMBLE]\n\
+        "[KRILL ORCHESTRATION PREAMBLE]\n\
          Run: {run} | Dispatch: {disp} | Worker: {worker}{task_line}\n\
          Task Prompt: {prompt}\n\
          First read the Krill worker contract: krill skills get orchestration --reference references/worker-contract.md. If KRILL_CLI is set, use that absolute executable instead of bare krill; quote it for your shell. This is the krill-orchestration skill, not Orca orchestration.\n\
@@ -2687,11 +2691,67 @@ pub fn validate_symlink_path(raw: &str) -> io::Result<String> {
     Ok(parts.join("/"))
 }
 
+fn is_uuid_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, c) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *c != b'-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Orca의 가상 작업 공간 접미사(`::workspace:<uuid>`)는 파일 시스템 경로가 아니다.
+/// 일반 파일명의 `::`나 `::workspace:literal`은 보존한다.
+#[must_use]
+pub fn strip_workspace_instance(raw: &str) -> Option<&str> {
+    let (path, id) = raw.trim().rsplit_once("::workspace:")?;
+    is_uuid_shape(id).then_some(path.trim())
+}
+
+/// `::workspace:<uuid>` 가상 접미사가 붙은 경로가 실제로 존재하지 않으면 기본 폴더 경로로 되돌린다.
+#[must_use]
+pub fn clean_workspace_path_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(base) = strip_workspace_instance(trimmed)
+        && !Path::new(trimmed).exists()
+    {
+        return base.to_owned();
+    }
+    trimmed.to_owned()
+}
+
+fn sanitize_workspace_map<V>(map: &mut BTreeMap<String, V>) -> bool {
+    let mut changed = false;
+    let mut next = BTreeMap::new();
+    for (k, v) in std::mem::take(map) {
+        let cleaned = clean_workspace_path_str(&k);
+        if cleaned != k {
+            changed = true;
+        }
+        next.entry(cleaned).or_insert(v);
+    }
+    *map = next;
+    changed
+}
+
 /// Normalizes `cwd` to its canonical git worktree/repository root if `cwd` is inside a git
 /// repository (walking `ancestors()` for a `.git` directory or file) so subdirectory calls
 /// share the same `WorktreeStore` key as the repo root.
 #[must_use]
 pub fn worktree_key(cwd: &Path) -> String {
+    let cleaned = cwd
+        .to_str()
+        .and_then(|s| strip_workspace_instance(s).filter(|_| !cwd.exists()))
+        .map(PathBuf::from);
+    let cwd = cleaned.as_deref().unwrap_or(cwd);
     let path = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let root = path
         .ancestors()
@@ -2701,7 +2761,7 @@ pub fn worktree_key(cwd: &Path) -> String {
 }
 
 fn normalize_store_key(key: &str) -> String {
-    worktree_key(Path::new(key))
+    worktree_key(Path::new(&clean_workspace_path_str(key)))
 }
 
 type WorktreeStoreCacheEntry = (
@@ -2759,7 +2819,41 @@ impl WorktreeStore {
         let Ok(raw) = std::str::from_utf8(&bytes) else {
             return corrupt_comments_store(&path, "worktree-comments.toml is not UTF-8");
         };
-        toml::from_str(raw).or_else(|e| corrupt_comments_store(&path, &e.to_string()))
+        let mut store: Self =
+            toml::from_str(raw).or_else(|e| corrupt_comments_store(&path, &e.to_string()))?;
+        store.sanitize_workspace_keys();
+        Ok(store)
+    }
+
+    pub fn sanitize_workspace_keys(&mut self) -> bool {
+        let mut changed = false;
+        changed |= sanitize_workspace_map(&mut self.comments);
+        changed |= sanitize_workspace_map(&mut self.updated_at);
+        changed |= sanitize_workspace_map(&mut self.statuses);
+        changed |= sanitize_workspace_map(&mut self.unread);
+        changed |= sanitize_workspace_map(&mut self.prs);
+        changed |= sanitize_workspace_map(&mut self.issues);
+        changed |= sanitize_workspace_map(&mut self.references);
+        changed |= sanitize_workspace_map(&mut self.symlinks);
+        changed |= sanitize_workspace_map(&mut self.setup_scripts);
+        changed |= sanitize_workspace_map(&mut self.archive_scripts);
+        changed |= sanitize_workspace_map(&mut self.setup_prompt_dismissed);
+        changed |= sanitize_workspace_map(&mut self.pr_states);
+        let mut parents = BTreeMap::new();
+        for (child, parent) in std::mem::take(&mut self.parents) {
+            let c = clean_workspace_path_str(&child);
+            let p = clean_workspace_path_str(&parent);
+            if c != child || p != parent {
+                changed = true;
+            }
+            if !c.is_empty() && !p.is_empty() && c != p {
+                parents.entry(c).or_insert(p);
+            } else {
+                changed = true;
+            }
+        }
+        self.parents = parents;
+        changed
     }
 
     pub fn save(&self, state_dir: &Path) -> io::Result<()> {
@@ -3422,6 +3516,45 @@ fn not_found(msg: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutate_skips_unchanged_save_but_persists_pruning() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-orch-noop-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        OrchestrationStore::mutate(&dir, |_| Ok(()))?;
+        assert!(!dir.join(ORCH_FILE).exists());
+        OrchestrationStore::mutate(&dir, |s| s.create_run("keep", None))?;
+        let path = dir.join(ORCH_FILE);
+        let before = fs::metadata(&path)?;
+        // 클로저가 변경을 되돌렸다면 최종 값이 같으므로 저장하지 않는다.
+        OrchestrationStore::mutate(&dir, |s| {
+            let title = s.runs.first_mut().unwrap();
+            title.title.push('x');
+            title.title.pop();
+            Ok(())
+        })?;
+        let after = fs::metadata(&path)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(before.ino(), after.ino());
+        }
+        let mut store = OrchestrationStore::load(&dir)?;
+        store
+            .idle_mail_notified
+            .insert(42, ["missing".into()].into_iter().collect());
+        store.save(&dir)?;
+        // 클로저가 아무것도 하지 않아도 prune의 변경은 저장한다.
+        OrchestrationStore::mutate(&dir, |_| Ok(()))?;
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .idle_mail_notified
+                .is_empty()
+        );
+        assert_eq!(OrchestrationStore::load(&dir)?.runs, store.runs);
+        fs::remove_dir_all(dir)
+    }
 
     #[test]
     fn check_messages_filters_unread_and_acks_only_matching_messages() -> io::Result<()> {
@@ -4584,6 +4717,10 @@ mod tests {
             "Check preamble",
         )?;
         let preamble = worker_preamble(&disp);
+        assert!(
+            preamble.starts_with("[KRILL ORCHESTRATION PREAMBLE]\n"),
+            "{preamble}"
+        );
         assert!(preamble.contains("--wait"), "{preamble}");
         assert!(preamble.contains("--outcome succeeded"), "{preamble}");
 

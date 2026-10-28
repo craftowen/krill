@@ -206,11 +206,34 @@ struct LinkKey {
     column: u16,
     cwd: Option<PathBuf>,
 }
+
+impl LinkKey {
+    fn same_context(&self, other: &Self) -> bool {
+        self.pane == other.pane
+            && self.host == other.host
+            && self.session == other.session
+            && self.line == other.line
+            && self.cwd == other.cwd
+            && self.input.same_context(&other.input)
+    }
+}
+
 struct LinkLookup {
     key: LinkKey,
     ready: bool,
     checked_at: Option<std::time::Instant>,
     found: Option<PathLink>,
+}
+
+impl LinkLookup {
+    fn covers(&self, key: &LinkKey) -> bool {
+        self.key == *key
+            || (self.ready
+                && self.key.same_context(key)
+                && self.found.as_ref().is_some_and(|link| {
+                    (link.column..link.column.saturating_add(link.cols)).contains(&key.column)
+                }))
+    }
 }
 
 impl Default for Files {
@@ -311,6 +334,10 @@ enum Shown {
     Table(gpui::Entity<CsvView>),
     Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
     Image(gpui::Entity<ImageView>),
+    Html {
+        title: Option<String>,
+        len: u64,
+    },
 }
 
 /// Parse bounded preview data on the executor; entity creation remains on the UI.
@@ -319,6 +346,7 @@ enum PreparedPreview {
     Table(csv::Table),
     Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
     Svg(Arc<gpui::Image>),
+    Html { title: Option<String>, len: u64 },
 }
 
 fn prepare_preview(preview: Preview, text: &str) -> PreparedPreview {
@@ -340,6 +368,10 @@ fn prepare_preview(preview: Preview, text: &str) -> PreparedPreview {
             gpui::ImageFormat::Svg,
             text.as_bytes().to_vec(),
         ))),
+        Preview::Html => PreparedPreview::Html {
+            title: editor::syntax::html_title(text),
+            len: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        },
     }
 }
 
@@ -353,6 +385,7 @@ fn build_preview(prepared: PreparedPreview, cx: &mut App) -> Shown {
         PreparedPreview::Table(table) => Shown::Table(cx.new(|_| CsvView::new(table))),
         PreparedPreview::Notebook(result) => Shown::Notebook(result),
         PreparedPreview::Svg(image) => Shown::Image(cx.new(|_| ImageView::new_svg_image(image))),
+        PreparedPreview::Html { title, len } => Shown::Html { title, len },
     }
 }
 
@@ -405,6 +438,7 @@ fn toggle_labels(preview: Preview) -> (&'static str, &'static str) {
         Preview::Table(_) => (etext::TABLE.get(), etext::EDIT_TEXT.get()),
         Preview::Notebook => (etext::CELLS.get(), etext::EDIT_TEXT.get()),
         Preview::Svg => (etext::IMAGE.get(), etext::EDIT_TEXT.get()),
+        Preview::Html => (etext::PREVIEW.get(), etext::EDIT_CODE.get()),
     }
 }
 
@@ -572,7 +606,14 @@ impl Shell {
 
     /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
     pub(super) fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let host = self.active_workspace(cx).host;
+        let host = self
+            .layout
+            .focused()
+            .filter(|_| !self.page_open() && self.dashboard.is_none())
+            .map_or_else(
+                || self.active_workspace(cx).host,
+                |p| self.layout.host(p).clone(),
+            );
         self.open_file_on(host, path, cx);
     }
 
@@ -661,6 +702,7 @@ impl Shell {
         let live = self
             .layout
             .session(pane)
+            .or_else(|| self.live.get(&pane).and_then(|l| l.pane.session()))
             .and_then(|id| self.sidebar.read(cx).session_on(host, id))
             .and_then(|s| s.cwd.clone());
         live.or_else(|| {
@@ -702,7 +744,7 @@ impl Shell {
         };
         if let Some(action) = action {
             if let Some(lookup) = &self.files.link_lookup
-                && lookup.key == key
+                && lookup.covers(&key)
                 && lookup.ready
                 && lookup
                     .checked_at
@@ -714,6 +756,7 @@ impl Shell {
             let generation = self.files.link_open_generation;
             let session = l.pane.session();
             let remote = remote_target.clone();
+            let cache = self.files.link_cache.clone();
             let checked = key.clone();
             #[cfg(test)]
             let next_io = self.files.link_next_io.take();
@@ -725,13 +768,19 @@ impl Shell {
                 let found = cx
                     .background_executor()
                     .spawn(async move {
+                        let Ok(mut cache) = cache.lock() else {
+                            return None;
+                        };
+                        if cache.0.elapsed() >= Duration::from_millis(500) {
+                            *cache = (std::time::Instant::now(), path_link::Cache::default());
+                        }
                         match remote {
-                            Some(target) => checked
-                                .input
-                                .resolve_remote(&target, checked.cwd.as_deref()),
-                            None => checked
-                                .input
-                                .resolve(&mut path_link::Cache::default(), checked.cwd.as_deref()),
+                            Some(target) => checked.input.resolve_remote_cached(
+                                &mut cache.1,
+                                &target,
+                                checked.cwd.as_deref(),
+                            ),
+                            None => checked.input.resolve(&mut cache.1, checked.cwd.as_deref()),
                         }
                     })
                     .await;
@@ -754,7 +803,7 @@ impl Shell {
             return None;
         }
         if let Some(lookup) = &mut self.files.link_lookup
-            && lookup.key == key
+            && lookup.covers(&key)
             && (!lookup.ready
                 || lookup
                     .checked_at
@@ -796,16 +845,18 @@ impl Shell {
                 let found = cx
                     .background_executor()
                     .spawn(async move {
-                        if let Some(target) = remote {
-                            return checked
-                                .input
-                                .resolve_remote(&target, checked.cwd.as_deref());
-                        }
                         let Ok(mut cache) = cache.lock() else {
                             return None;
                         };
                         if cache.0.elapsed() >= Duration::from_millis(500) {
                             *cache = (std::time::Instant::now(), path_link::Cache::default());
+                        }
+                        if let Some(target) = remote {
+                            return checked.input.resolve_remote_cached(
+                                &mut cache.1,
+                                &target,
+                                checked.cwd.as_deref(),
+                            );
                         }
                         checked.input.resolve(&mut cache.1, checked.cwd.as_deref())
                     })
@@ -840,7 +891,12 @@ impl Shell {
                         let Some(lookup) = &mut this.files.link_lookup else {
                             return false;
                         };
-                        if lookup.key != key {
+                        let same_found_span = lookup.key.same_context(&key)
+                            && found.as_ref().is_some_and(|link| {
+                                (link.column..link.column.saturating_add(link.cols))
+                                    .contains(&lookup.key.column)
+                            });
+                        if lookup.key != key && !same_found_span {
                             return false;
                         }
                         lookup.ready = true;
@@ -848,11 +904,19 @@ impl Shell {
                         lookup.found.clone_from(&found);
                         if let Some(link) = found {
                             let under_pointer = pointer.is_some_and(|(position, command)| {
-                                command
-                                    && this.live.get(&key.pane).is_some_and(|live| {
-                                        cell_at(&live.painted, &live.pane.shown(), position)
-                                            == Some((key.column, key.line))
-                                    })
+                                this.live.get(&key.pane).is_some_and(|live| {
+                                    (command || !live.pane.modes().mouse())
+                                        && cell_at(&live.painted, &live.pane.shown(), position)
+                                            .is_some_and(|(col, line)| {
+                                                line == key.line
+                                                    && (col == key.column
+                                                        || (link.column
+                                                            ..link
+                                                                .column
+                                                                .saturating_add(link.cols))
+                                                            .contains(&col))
+                                            })
+                                })
                             });
                             if under_pointer {
                                 this.files.hover = Some((
@@ -979,8 +1043,8 @@ impl Shell {
         krill_app::terminal::url_link_target(&screen, &l.painted, position)
     }
 
-    /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
-    /// ⌘ 없이도 맨 클릭으로 팝오버가 뜨는 링크에는 밑줄을 긋는다.
+    /// 마우스를 움직이면 클릭 가능한 링크(OSC 8·평문 URL·파일 및 이미지 경로)에 밑줄과 포인터 커서를 표시한다(OWE-867).
+    /// 마우스 보고가 켜진 TUI에서는 ⌘를 누른 동안에만 링크로 동작한다.
     pub(super) fn update_path_hover(
         &mut self,
         pane: PaneId,
@@ -988,11 +1052,16 @@ impl Shell {
         cmd: bool,
         cx: &mut Context<Self>,
     ) {
-        if !cmd {
+        let clickable = cmd
+            || self
+                .live
+                .get(&pane)
+                .is_some_and(|l| !l.pane.modes().mouse());
+        if !clickable {
             self.files.link_generation = self.files.link_generation.wrapping_add(1);
             self.files.link_lookup = None;
         }
-        let next = if cmd {
+        let next = if clickable {
             let osc_or_url = self.live.get(&pane).and_then(|l| {
                 let screen = l.pane.shown();
                 krill_app::terminal::osc_link_highlight(&screen, &l.painted, position).or_else(
@@ -1017,7 +1086,7 @@ impl Shell {
                 })
                 .map(|h| (pane, h))
         } else {
-            self.click_link_at(pane, position).map(|(h, _)| (pane, h))
+            None
         };
         if self.files.hover != next {
             self.files.hover = next;
@@ -1113,6 +1182,11 @@ impl Shell {
                 )
             })
             .children(self.preview_toggle(id, cx))
+            .children(Self::open_browser_button(
+                id,
+                &path,
+                self.remote_target_for_pane(id),
+            ))
             .children(self.share_button(id, &path, cx))
             .when(is_split, |d| {
                 d.child(
@@ -1219,6 +1293,20 @@ impl Shell {
                     }
                     Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
                     Shown::Image(view) => view.clone().into_any_element(),
+                    Shown::Html { title, len } => {
+                        let weak = cx.weak_entity();
+                        fview::html_preview_on(
+                            &path,
+                            self.remote_target_for_pane(id),
+                            title.as_deref(),
+                            *len,
+                            move |window, cx| {
+                                weak.update(cx, |this, cx| this.set_preview(id, false, window, cx))
+                                    .ok();
+                            },
+                            cx,
+                        )
+                    }
                 },
                 Some(Body::Text { state, .. }) => div()
                     .size_full()
@@ -1269,6 +1357,39 @@ impl Shell {
             return None;
         };
         Some(preview.is_some() && shown.is_some())
+    }
+
+    /// 열린 HTML 파일을 기본 웹 브라우저에서 여는 머리 버튼.
+    fn open_browser_button(
+        id: PaneId,
+        path: &Path,
+        remote: Option<(krill_app::hosts::HostId, krill_app::hosts::HostTarget)>,
+    ) -> Option<Button> {
+        if !krill_app::file_format::is_html_path(path) {
+            return None;
+        }
+        let path = path.to_path_buf();
+        Some(
+            Button::new(("file-open-browser", id.get()))
+                .debug_selector(|| "file-open-browser".into())
+                .icon(IconName::ExternalLink)
+                .label(etext::OPEN_BROWSER.get())
+                .ghost()
+                .xsmall()
+                .max_w(gpui::relative(1.))
+                .overflow_hidden()
+                .accessibility_label(etext::OPEN_BROWSER_TOOLTIP.get())
+                .tooltip(etext::OPEN_BROWSER_TOOLTIP.get())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    fview::spawn_open_on(
+                        path.clone(),
+                        remote.clone(),
+                        krill_app::file_format::open_default_command,
+                        cx,
+                    );
+                }),
+        )
     }
 
     /// 열린 HTML·Markdown 파일을 아티팩트(공개 링크)로 공유하는 머리 버튼.
@@ -1951,12 +2072,14 @@ impl Shell {
                 let preview = editor::preview(kind);
                 let shown = prepared.map(|prepared| build_preview(prepared, cx));
                 let state = cx.new(|cx| {
-                    EditorState::new(window, cx)
+                    let mut ed = EditorState::new(window, cx)
                         .language(language)
                         .line_number(true)
                         // OWE-874: 긴 줄은 자동 줄 바꿈(기본값 true를 고정 — 잘려서 못 보는 일이 없게).
                         .soft_wrap(true)
-                        .default_value(text)
+                        .default_value(text);
+                    editor::syntax::install(&mut ed, language, cx);
+                    ed
                 });
                 // EditorMode preserves source bytes, including CRLF. The IO worker
                 // already prepared the baseline, avoiding a full UI rope conversion.

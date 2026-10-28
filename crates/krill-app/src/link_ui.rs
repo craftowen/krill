@@ -4,10 +4,10 @@
 //! - [`backend`]: [`LinkBackend`] 트레이트와 테스트·미리보기용 [`MockLinkBackend`]. 모든 호출은
 //!   `cx.background_executor()`에서 실행해 UI 스레드를 블로킹하지 않는다(CONVENTIONS T7).
 //! - [`qr`]: [`QrMatrixSource`] 트레이트(`Vec<Vec<bool>>`)와 gpui 모듈 격자 렌더러.
-//! - [`ServerPanel`]: "이 Mac에 다른 기기 접속 허용" 서버 패널(켜기/끄기 토글, 1회용 초대 링크·QR·복사·유효시간,
+//! - [`ServerPanel`]: "이 컴퓨터에 다른 기기 접속 허용" 서버 패널(켜기/끄기 토글, 1회용 초대 링크·QR·복사·유효시간,
 //!   페어링된 기기 목록 및 행内 2단계 연결 끊기 확인 버튼).
-//! - [`ClientDialog`]: "다른 Mac 추가" 클라이언트 대화상자(초대 링크 붙여넣기·클립보드 자동 채움 제안,
-//!   이 기기 이름 자동 채움, 연결 진행 상태 및 비개발자 한국어 실패 사유, 같은 Wi-Fi 근처 Mac 목록).
+//! - [`ClientDialog`]: "다른 컴퓨터 추가" 클라이언트 대화상자(초대 링크 붙여넣기·클립보드 자동 채움 제안,
+//!   이 기기 이름 자동 채움, 연결 진행 상태 및 비개발자 한국어 실패 사유, 같은 Wi-Fi 근처 컴퓨터 목록).
 //! - [`PairingView`]: 서버 패널과 클라이언트 대화상자를 한 화면에서 함께 볼 수 있는 통합 뷰.
 
 pub mod backend;
@@ -1650,6 +1650,9 @@ impl Render for ClientDialog {
             self.language = crate::i18n::language();
             self.link_input.update(cx, |input, cx| {
                 input.set_placeholder(text::LINK_PLACEHOLDER.get(), window, cx);
+            });
+            self.host_name_input.update(cx, |input, cx| {
+                input.set_placeholder(text::HOST_NAME_PLACEHOLDER.get(), window, cx);
             });
             self.device_name_input.update(cx, |input, cx| {
                 input.set_placeholder(text::DEVICE_NAME_PLACEHOLDER.get(), window, cx);

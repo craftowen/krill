@@ -109,7 +109,7 @@ fn session_settings_are_private_unique_and_do_not_touch_user_settings() {
     assert_eq!(settings.as_object().unwrap().len(), 2);
     let status_line = settings["statusLine"]["command"].as_str().unwrap();
     // `create`가 정식화한 경로로 기록하므로 판정도 정식 경로로 한다.
-    let canonical = krill.canonicalize().unwrap();
+    let canonical = krill_proto::os::canonicalize(&krill).unwrap();
     assert_eq!(
         krill_proto::statusline::classify_command(status_line, canonical.to_str().unwrap()),
         krill_proto::statusline::OwnCommand::Bare

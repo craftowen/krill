@@ -11,6 +11,20 @@ use crate::SessionId;
 pub const RESET_CREDITS_METER_KEY: &str = "reset_credits";
 /// 리셋 크레딧 미터 라벨. [`crate::accounts::display::meter_label`]이 현지화한다.
 pub const RESET_CREDITS_METER_LABEL: &str = "Reset credits";
+/// 사용권 묶음별 만료 미터 접두사. value는 epoch 초 또는 미제공 시 `unknown`이다.
+/// 기존 value 미터를 써 구 피어와도 와이어 형식을 유지한다.
+pub const RESET_CREDITS_EXPIRY_METER_PREFIX: &str = "reset_credits_expiry_";
+
+/// 제공자가 보고한 사용권 묶음의 남은 횟수·만료 시각만 전달한다.
+#[must_use]
+pub fn reset_credit_expiry_meter(index: usize, count: u64, expires_at: Option<i64>) -> UsageMeter {
+    UsageMeter {
+        key: format!("{RESET_CREDITS_EXPIRY_METER_PREFIX}{index}"),
+        label: format!("Reset credit expiry · {count}"),
+        window: None,
+        value: Some(expires_at.map_or_else(|| "unknown".into(), |at| at.to_string())),
+    }
+}
 
 /// A meter actually reported by a provider. Missing meters are never invented as 0%.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

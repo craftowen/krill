@@ -678,3 +678,210 @@ fn cached_signed_rules_fail_closed_after_public_key_removal() {
     assert_eq!(control.screen_rules(), ScreenRules::default());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn another_providers_resume_hook_cannot_replace_a_bound_conversation() {
+    let dir = std::env::temp_dir().join(format!("account-provider-hook-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(39374);
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+            Some("codex-parent".into()),
+            b"/parent".to_vec(),
+            Some(LaunchAccount {
+                id: "codex-original".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: String::new(),
+            }),
+        )
+        .unwrap();
+    let before = control.stored(session).unwrap().unwrap();
+    control.watch_account_resume(session);
+    for id in ["claude-child", "codex-parent"] {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "SessionStart", "source": "resume",
+            "session_id": id, "transcript_path": "/foreign/projects/demo/claude-child.jsonl"
+        }))
+        .unwrap();
+        assert!(control.record_hook_session_with_context(
+            session,
+            &payload,
+            Some("claude-code"),
+            None
+        ));
+        assert_eq!(control.stored(session).unwrap().unwrap(), before);
+        assert!(!control.account_resume_observed(session, id));
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn retiring_binding_rejects_hooks_until_retirement_finishes_or_is_cancelled() {
+    let dir = std::env::temp_dir().join(format!("account-retiring-hook-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(1);
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("original".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    let before = control.stored(session).unwrap().unwrap();
+    let retiring = control.retire_account_binding(session);
+    let payload = br#"{"hook_event_name":"SessionStart","source":"resume","session_id":"other"}"#;
+    assert!(control.record_foreground_hook_session(session, payload, "codex", None));
+    assert_eq!(control.stored(session).unwrap().unwrap(), before);
+    drop(retiring);
+    assert!(!control.record_foreground_hook_session(session, payload, "codex", None));
+    assert_eq!(control.stored(session).unwrap().unwrap().profile, "codex");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn first_foreground_hook_keeps_the_selected_launch_account_and_permission() {
+    let dir = std::env::temp_dir().join(format!("account-first-hook-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(1);
+    let account = LaunchAccount {
+        id: "codex-selected".into(),
+        env_key: "CODEX_HOME".into(),
+        dir: String::new(),
+    };
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Yolo,
+            },
+            None,
+            b"/launch".to_vec(),
+            Some(account.clone()),
+        )
+        .unwrap();
+    assert!(!control.record_foreground_hook_session(
+        session,
+        br#"{"hook_event_name":"SessionStart","source":"startup","session_id":"first"}"#,
+        "codex",
+        None
+    ));
+    let stored = control.stored(session).unwrap().unwrap();
+    assert_eq!(stored.session_id.as_deref(), Some("first"));
+    assert_eq!(stored.account.as_ref(), Some(&account));
+    assert_eq!(stored.permission, Permission::Yolo);
+    assert_eq!(stored.cwd, b"/launch");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn verified_foreground_session_replaces_stale_identity_as_one_binding() {
+    let dir = std::env::temp_dir().join(format!("account-foreground-hook-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    for (number, provider, source) in [(1, "claude", "startup"), (2, "codex", "resume")] {
+        let session = SessionId(number);
+        control
+            .remember_session(
+                session,
+                &AgentLaunch {
+                    profile: "claude".into(),
+                    permission: Permission::Yolo,
+                },
+                Some("previous-conversation".into()),
+                b"/old".to_vec(),
+                Some(LaunchAccount {
+                    id: "claude-original".into(),
+                    env_key: "CLAUDE_CONFIG_DIR".into(),
+                    dir: String::new(),
+                }),
+            )
+            .unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "SessionStart", "source": source, "session_id": "current-conversation",
+            "transcript_path": "/current/transcript.jsonl", "cwd": "/current"
+        })).unwrap();
+        assert!(!control.record_foreground_hook_session(session, &payload, provider, None));
+        let stored = control.stored(session).unwrap().unwrap();
+        assert_eq!(stored.profile, provider);
+        assert_eq!(stored.session_id.as_deref(), Some("current-conversation"));
+        assert_eq!(
+            stored.transcript_path.as_deref(),
+            Some("/current/transcript.jsonl")
+        );
+        assert_eq!(stored.cwd, b"/current");
+        assert_eq!(stored.account, None);
+        assert_eq!(stored.permission, Permission::Manual);
+        assert!(stored.hibernation_blocked);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn foreground_rotation_preserves_account_and_unexpected_resume_cannot_confirm_handoff() {
+    let dir = std::env::temp_dir().join(format!(
+        "account-foreground-rotation-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(1);
+    let account = LaunchAccount {
+        id: "claude-original".into(),
+        env_key: "CLAUDE_CONFIG_DIR".into(),
+        dir: String::new(),
+    };
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Yolo,
+            },
+            Some("original".into()),
+            b"/original".to_vec(),
+            Some(account.clone()),
+        )
+        .unwrap();
+    let rotated = br#"{"hook_event_name":"SessionStart","source":"clear","session_id":"rotated"}"#;
+    assert!(!control.record_foreground_hook_session(session, rotated, "claude", None));
+    let expected = control.stored(session).unwrap().unwrap();
+    assert_eq!(expected.account.as_ref(), Some(&account));
+    assert_eq!(expected.permission, Permission::Yolo);
+    control.watch_account_resume(session);
+    for (source, provider) in [
+        ("startup", "claude"),
+        ("resume", "claude"),
+        ("resume", "codex"),
+    ] {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "SessionStart", "source": source, "session_id": "unexpected",
+            "transcript_path": "/other/transcript.jsonl"
+        }))
+        .unwrap();
+        assert!(control.record_foreground_hook_session(session, &payload, provider, None));
+        assert_eq!(control.stored(session).unwrap().unwrap(), expected);
+        assert!(!control.account_resume_observed(session, "unexpected"));
+    }
+    assert!(!control.record_foreground_hook_session(
+        session,
+        br#"{"hook_event_name":"SessionStart","source":"resume","session_id":"rotated"}"#,
+        "claude",
+        None
+    ));
+    assert!(control.account_resume_observed(session, "rotated"));
+    fs::remove_dir_all(dir).unwrap();
+}
