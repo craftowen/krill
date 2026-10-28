@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-const HELP: &str = "usage: krill mobile pair [--tunnel|--tailscale] [--address <ip:port>] [--json]\n       krill mobile devices [--json]\n       krill mobile revoke <device_id|--all> [--json]\n       krill mobile serve [--tunnel]";
+const HELP: &str = "usage: krill mobile pair [--tunnel|--tailscale] [--address <ip:port>] [--json]\n       krill mobile devices [--json]\n       krill mobile revoke <device_id|--all> [--json]\n       krill mobile serve [--tunnel]\n       krill mobile login|logout|status [--json]";
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Pair {
@@ -24,6 +24,10 @@ enum Command {
     },
     Serve {
         tunnel: bool,
+    },
+    Account {
+        action: String,
+        json: bool,
     },
     Help,
 }
@@ -91,6 +95,14 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
         }
     }
     match command {
+        "login" | "logout" | "status"
+            if !tailscale && !tunnel && !all && id.is_none() && address.is_none() =>
+        {
+            Ok(Command::Account {
+                action: command.to_owned(),
+                json,
+            })
+        }
         "--help" | "-h"
             if !tailscale && !tunnel && !json && !all && id.is_none() && address.is_none() =>
         {
@@ -171,6 +183,7 @@ fn call(request: &MobileRequest) -> io::Result<MobileReply> {
 fn execute(command: Command) -> io::Result<()> {
     match command {
         Command::Help => println!("{HELP}"),
+        Command::Account { action, json } => account(&action, json)?,
         Command::Pair {
             mode,
             address,
@@ -309,6 +322,106 @@ fn execute(command: Command) -> io::Result<()> {
     }
     Ok(())
 }
+
+fn account_request(action: &str) -> io::Result<serde_json::Value> {
+    let MobileReply::Workflow(reply) = call(&MobileRequest::Workflow(
+        serde_json::json!({"action":action}).to_string(),
+    ))?
+    else {
+        return Err(io::Error::other("unexpected relay account response"));
+    };
+    let reply: serde_json::Value = serde_json::from_str(&reply).map_err(io::Error::other)?;
+    if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(io::Error::other(
+            reply
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("relay account request failed")
+                .to_owned(),
+        ));
+    }
+    Ok(reply.get("data").cloned().unwrap_or_default())
+}
+fn account(action: &str, json: bool) -> io::Result<()> {
+    let data = account_request(match action {
+        "login" => "relay_auth_start",
+        "logout" => "relay_auth_logout",
+        _ => "relay_auth_status",
+    })?;
+    if action == "login" {
+        let url = data
+            .get("verification_uri_complete")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::other("missing approval URL"))?;
+        if json {
+            println!("{data}");
+        } else {
+            println!("Approve this device in your browser:\n{url}");
+        }
+        let mut browser = std::process::Command::new(if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(windows) {
+            "rundll32.exe"
+        } else {
+            "xdg-open"
+        });
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            browser
+                .creation_flags(0x0800_0000)
+                .arg("url.dll,FileProtocolHandler");
+        }
+        browser
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_secs(5));
+            let data = account_request("relay_auth_poll")?;
+            if data.get("signed_in").and_then(serde_json::Value::as_bool) == Some(true) {
+                if json {
+                    println!("{data}");
+                } else {
+                    println!(
+                        "Signed in: {}",
+                        data.get("email")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                    );
+                }
+                return Ok(());
+            }
+            if data.get("pending").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err(io::Error::other("sign-in was cancelled"));
+            }
+        }
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "sign-in expired"));
+    }
+    if json {
+        println!("{data}");
+    } else if action == "logout" {
+        println!("Signed out on this device");
+        if data.get("revoked").and_then(serde_json::Value::as_bool) == Some(false) {
+            eprintln!("Server session revocation could not be confirmed");
+        }
+    } else if data.get("signed_in").and_then(serde_json::Value::as_bool) == Some(true) {
+        println!(
+            "Signed in: {}",
+            data.get("email")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        );
+    } else {
+        println!("Sign in with Google using `krill mobile login` to use the relay");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +454,16 @@ mod tests {
 
     #[test]
     fn command_validation() {
+        for action in ["login", "logout", "status"] {
+            assert_eq!(
+                parse(&args(&[action, "--json"])).unwrap(),
+                Command::Account {
+                    action: action.to_owned(),
+                    json: true
+                }
+            );
+            assert!(parse(&args(&[action, "--tunnel"])).is_err());
+        }
         assert_eq!(
             parse(&args(&["devices", "--json"])).unwrap(),
             Command::Devices { json: true }

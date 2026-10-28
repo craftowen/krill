@@ -29,6 +29,7 @@ pub(super) struct Publication {
     pub origin: String,
     pub rid: String,
     pub key: String,
+    pub session: Option<super::relay_auth::Session>,
 }
 impl std::fmt::Debug for Publication {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -687,6 +688,13 @@ fn http_status(url: &str) -> Option<u16> {
     std::str::from_utf8(&out.stdout).ok()?.parse().ok()
 }
 fn publish(p: &Publication, url: &str) -> bool {
+    let Some(session) = p
+        .session
+        .as_ref()
+        .filter(|session| session.valid(&p.origin, super::gateway::now_ms()))
+    else {
+        return false;
+    };
     // 헤더 파일을 stdin으로 전달해 ps에 랑데부 키가 남지 않게 한다.
     let body = serde_json::json!({"url":url, "hash":super::pwa::asset_hash()}).to_string();
     let mut command = Command::new("curl");
@@ -718,10 +726,14 @@ fn publish(p: &Publication, url: &str) -> bool {
     else {
         return false;
     };
-    let sent = child
-        .stdin
-        .take()
-        .is_some_and(|mut stdin| writeln!(stdin, "Authorization: Bearer {}", p.key).is_ok());
+    let sent = child.stdin.take().is_some_and(|mut stdin| {
+        writeln!(
+            stdin,
+            "Authorization: Bearer {}\nx-krill-session: {}",
+            p.key, session.token
+        )
+        .is_ok()
+    });
     if !sent {
         child.kill().ok();
     }
@@ -792,6 +804,12 @@ mod tests {
             origin: "https://stage.test".into(),
             rid: "a".repeat(32),
             key: "b".repeat(64),
+            session: Some(super::super::relay_auth::Session {
+                token: "test-session".into(),
+                expires_at_ms: u64::MAX,
+                email: String::new(),
+                origin: "https://stage.test".into(),
+            }),
         }
     }
     #[test]
@@ -945,6 +963,7 @@ mod tests {
                 let headers = String::from_utf8(request).unwrap();
                 assert!(headers.starts_with(&format!("PUT /r/{} HTTP/1.1", "a".repeat(32))));
                 assert!(headers.contains(&format!("Authorization: Bearer {}", "b".repeat(64))));
+                assert!(headers.contains("x-krill-session: test-session"));
                 let length: usize = headers
                     .lines()
                     .find_map(|l| l.strip_prefix("Content-Length: "))
@@ -966,6 +985,7 @@ mod tests {
         });
         let mut p = publication();
         p.origin = origin;
+        p.session.as_mut().unwrap().origin = p.origin.clone();
         assert!(!publish(&p, "https://fixture.trycloudflare.com"));
         assert!(publish(&p, "https://fixture.trycloudflare.com"));
         server.join().unwrap();

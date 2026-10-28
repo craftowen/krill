@@ -468,7 +468,39 @@ fn run_once(
         publication.rid,
         super::pwa::asset_hash()
     );
-    ws::connect_client(&mut transport, &host_header, &path, &publication.key)?;
+    let session = lock(&shared.state)
+        .account
+        .session
+        .clone()
+        .filter(|session| session.valid(&publication.origin, now_ms()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Sign in with Google to use the relay",
+            )
+        })?;
+    if let Err(error) = ws::connect_client(
+        &mut transport,
+        &host_header,
+        &path,
+        &publication.key,
+        &session.token,
+    ) {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            let mut state = lock(&shared.state);
+            if state
+                .account
+                .session
+                .as_ref()
+                .is_some_and(|current| current.token == session.token)
+            {
+                state.account.session = None;
+                state.publication.session = None;
+                super::relay_auth::Session::remove(state.account.dir.as_deref()).ok();
+            }
+        }
+        return Err(error);
+    }
     connected.store(true, Ordering::Release);
     settled.store(true, Ordering::Release);
     shared.wake();
@@ -509,6 +541,9 @@ fn run_once(
                     8 => return Ok(()),
                     _ => return Err(invalid()),
                 }
+            }
+            if !session.valid(&publication.origin, now_ms()) {
+                return Err(io::ErrorKind::PermissionDenied.into());
             }
             if last_rx.elapsed() >= PING.saturating_mul(3) {
                 return Err(io::ErrorKind::TimedOut.into());

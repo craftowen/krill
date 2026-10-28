@@ -64,11 +64,11 @@ async function fixedOriginTests(){
  const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
  const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
  let f=fixture(fixed+`?session=7&pair=query&key=query&t=evil&r=evil#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}`);
- assert.equal(f.endpoint.credentials,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.endpoint.pair.secret,'secret');assert.equal(f.location.href,fixed+'?session=7');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://paired.trycloudflare.com/ws?v=${hash}`);
+ assert.equal(f.endpoint.credentials,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.endpoint.pair.secret,'secret');assert.equal(f.location.href,fixed+'?session=7');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
  for(const fragment of ['#t=evil.trycloudflare.com&r=forged','#pair=only&t=evil.trycloudflare.com&r=forged','#key=only&t=evil.trycloudflare.com&r=forged']){
-  f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
+  f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
  }
- f=fixture(fixed+'?pair=query&key=query&t=evil.trycloudflare.com&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.equal(f.location.search,'');
+ f=fixture(fixed+'?pair=query&key=query&t=evil.trycloudflare.com&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);assert.equal(f.location.search,'');
  // Browsers expose service workers on HTTP loopback, but not ordinary insecure LAN origins.
  f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,['/sw.js']);
  f=fixture('http://192.0.2.1:1234/#pair=ticket&key=secret',null,undefined,{serviceWorker:false});assert.equal(f.endpoint.socketUrl(),'ws://192.0.2.1:1234/ws');assert.deepEqual(f.registrations,[]);
@@ -77,7 +77,7 @@ async function fixedOriginTests(){
  f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`);assert.equal(f.endpoint.pair,null);assert.deepEqual({...f.endpoint.credentials},saved);assert.equal(f.location.href,fixed);
  f=fixture(fixed+'#pair=ticket&key=secret&t=evil.test&r=bad');assert.throws(()=>f.endpoint.socketUrl(),/fresh QR/);
  for(const found of [{url:'https://evil.test',hash},{url:'https://ok.trycloudflare.com.evil.test',hash},{url:'https://ok.trycloudflare.com',hash:'../evil'},{url:'https://ok.trycloudflare.com',hash:'ABCDEF0123456789'},{url:'https://ok.trycloudflare.com',hash:1234567890123456}]){
-  f=fixture(fixed,saved,found);assert.equal(await f.endpoint.locate(),false);assert.deepEqual(f.stored(),saved);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.deepEqual(f.redirects,[]);
+  f=fixture(fixed,saved,found);assert.equal(await f.endpoint.locate(),false);assert.deepEqual(f.stored(),saved);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);assert.deepEqual(f.redirects,[]);
  }
  // A pre-open failure locates and tries a changed endpoint immediately; unchanged endpoints back off.
  f=fixture(fixed);let t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
@@ -100,20 +100,20 @@ async function fixedOriginTests(){
  // A hung connection handshake gives up after 20 s, so locate/fallback and retry run instead of waiting out the TCP timeout.
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===0));}t.close();
  // In-app QR scan (endpoint.adopt): t/r or an https tunnel origin pairs in place; another app version or LAN origin opens the link; a LAN code in the fixed app says what to do.
- {const key=Buffer.alloc(32).toString('base64url'),other='b'.repeat(32);f=fixture(fixed);const next=f.endpoint.adopt(`https://elsewhere.example/m/${hash}/#pair=ab12&key=${key}&t=scan.trycloudflare.com&r=${other}`);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);next.use();assert.equal(next.ticket,'ab12');assert.equal(next.secret,key);assert.equal(f.endpoint.socketUrl(),`wss://scan.trycloudflare.com/ws?v=${hash}`);
+ {const key=Buffer.alloc(32).toString('base64url'),other='b'.repeat(32);f=fixture(fixed);const next=f.endpoint.adopt(`https://elsewhere.example/m/${hash}/#pair=ab12&key=${key}&t=scan.trycloudflare.com&r=${other}`);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);next.use();assert.equal(next.ticket,'ab12');assert.equal(next.secret,key);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
   f=fixture(fixed);f.endpoint.adopt(`https://quick.trycloudflare.com/#pair=ab12&key=${key}`).use();assert.equal(f.endpoint.socketUrl(),`wss://quick.trycloudflare.com/ws?v=${hash}`);
   f=fixture(fixed,null);f.endpoint.adopt(`${fixed}#pair=ab12&key=${key}&r=${other}`).use();assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
   assert.equal(f.endpoint.adopt(`https://krill-mobile.pages.dev/m/fedcba9876543210/#pair=ab12&key=${key}&r=${rid}`),null);assert.throws(()=>f.endpoint.adopt(`http://192.168.0.5:52931/#pair=ab12&key=${key}`),/Choose Relay server.*New QR code/);
   for(const bad of ['hello','https://example.com/','https://example.com/#pair=zz&key=k',`javascript:x#pair=ab&key=${key}`])assert.throws(()=>f.endpoint.adopt(bad),/Not a Krill pairing code/);
   f=fixture('http://127.0.0.1:1234/');assert.equal(f.endpoint.adopt(`http://127.0.0.1:1234/#pair=ab12&key=${key}`).secret,key);assert.equal(f.endpoint.adopt(`http://10.0.0.2:1234/#pair=ab12&key=${key}`),null);}
- // Pure DO WebSocket relay mode (no t=) and automatic fallback when tunnel remains unreachable (e.g. 530).
+ // Relay wins over a saved tunnel; discovery retains that tunnel as the alternate.
  f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&r=${rid}`,null);
  assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
  f=fixture(fixed,saved,{url:'https://saved.trycloudflare.com',hash});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
- t.connect();await flush();assert.equal(f.sockets[0].url,`wss://saved.trycloudflare.com/ws?v=${hash}`);
+ t.connect();await flush();assert.equal(f.sockets[0].url,`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
  f.sockets[0].emit('error');await flush();
  const relayRetry=[...f.timers.values()][0];relayRetry.fn();await flush();
- assert.equal(f.sockets[1].url,`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);t.close();
+ assert.equal(f.sockets[1].url,`wss://saved.trycloudflare.com/ws?v=${hash}`);t.close();
  console.log('PASS fixed-origin fragment cleanup, saved destination protection, rid/url/hash persistence, DO WS relay & fallback, shared socket URLs, strict rendezvous validation, hash redirect and pre-open retry');
 }
 // Cross-language fixed screen fixtures: wide Hangul, combining ZWJ, colors and scroll ops.
