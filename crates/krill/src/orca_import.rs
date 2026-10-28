@@ -291,9 +291,8 @@ impl ImportOptions {
         domains: Vec<ImportDomain>,
         dry_run: bool,
     ) -> io::Result<Self> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        let home = krill_proto::os::home_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user home is not set"))?;
         let state_dir = daemon::state_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "state directory not found"))?;
         let orca_dir = orca_dir_override
@@ -315,9 +314,37 @@ impl ImportOptions {
 
 #[must_use]
 pub fn default_orca_dir(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join("orca")
+    #[cfg(windows)]
+    let roots = [
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        Some(home.join("AppData/Roaming")),
+    ];
+    #[cfg(target_os = "macos")]
+    let roots = [Some(home.join("Library/Application Support"))];
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let roots = [
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        Some(home.join(".config")),
+    ];
+    discover_orca_dir(roots.into_iter().flatten())
+}
+
+fn discover_orca_dir(roots: impl IntoIterator<Item = PathBuf>) -> PathBuf {
+    let candidates: Vec<_> = roots
+        .into_iter()
+        .flat_map(|root| [root.join("orca"), root.join("Orca")])
+        .collect();
+    candidates
+        .iter()
+        .find(|p| p.join("orca-profile-index.json").is_file() || p.join("profiles").is_dir())
+        .or_else(|| candidates.iter().find(|p| p.is_dir()))
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// 이관 결과 요약 리포트(`--json` 출력 및 `OWE-727` UI 미리보기 겸용).
@@ -6031,5 +6058,31 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod source_discovery_tests {
+    use super::*;
+    #[test]
+    fn windows_roaming_candidates_prefer_profile_index_and_keep_override() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-discovery-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let custom = root.join("custom-roaming");
+        let fallback = root.join("home/AppData/Roaming");
+        fs::create_dir_all(custom.join("orca")).unwrap();
+        fs::create_dir_all(fallback.join("Orca/profiles/default")).unwrap();
+        assert_eq!(
+            discover_orca_dir([custom.clone(), fallback.clone()]),
+            fallback.join("Orca")
+        );
+        fs::write(custom.join("orca/orca-profile-index.json"), "{}").unwrap();
+        assert_eq!(
+            discover_orca_dir([custom.clone(), fallback]),
+            custom.join("orca")
+        );
+        // from_env preserves explicit --orca-dir and KRILL_ORCA_DIR before discovery.
+        fs::remove_dir_all(root).unwrap();
     }
 }
