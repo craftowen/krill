@@ -41,7 +41,8 @@ globalThis.MkTerminalCodec=(()=>{
   byte(){if(at>=bytes.length)throw Error('Truncated screen');return bytes[at++];},
   bool(){const n=this.byte();if(n>1)throw Error('Invalid boolean');return !!n;},
   text(max=4096){const n=this.n(max);if(at+n>bytes.length)throw Error('Truncated screen text');const s=n===0?'':n===1&&bytes[at]<128?String.fromCharCode(bytes[at]):decoder.decode(bytes.subarray(at,at+n));at+=n;return s;},
-  end(){if(at!==bytes.length)throw Error('Trailing screen data');}
+  end(){if(at!==bytes.length)throw Error('Trailing screen data');},
+  more(){return at<bytes.length;}
  };}
  function color(r){switch(r.n(2)){case 0:return null;case 1:return {index:r.byte()};case 2:return `rgb(${r.byte()},${r.byte()},${r.byte()})`;}}
 
@@ -55,7 +56,7 @@ globalThis.MkTerminalCodec=(()=>{
   case 5:break;
   case 6:model.cursorStyle={shape:r.n(2),blink:r.bool()};break;
   case 7:r.n(1023);for(let n=r.n(2048);n--;){r.n(2047);r.n(2048);r.text(2048);}break;
- }}r.end();return {done,dirty};}
+ }}if(r.more())model.cursorExplicit=r.bool();return {done,dirty};}
  function history(bytes){const r=reader(bytes),reply={req:r.n(0xffffffff),total:r.n(0xffffffff),pages:r.n(0xffffffff),skip:r.n(0xffffffff)};reply.rows=Array.from({length:r.n(1000)},()=>cells(r));r.end();return reply;}
  return {v,text,frame,reader,update,history};
 })();

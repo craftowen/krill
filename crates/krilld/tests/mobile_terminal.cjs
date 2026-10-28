@@ -183,6 +183,8 @@ async function main(){
  update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(1,'def'),line(2,'ghi'),cursor(1,2));calls.texts=[];let rectBefore=calls.fillRect;assert.deepEqual(await drawn(),{text:3,font:0,draws:1});assert.deepEqual(calls.texts,['abc','def','ghi']);assert.equal(calls.fillRect-rectBefore,25,'24 dirty row clears + cursor only; default #1a1b26 cell backgrounds skip fillRect');calls.texts=null;
  update(line(1,'xy'));assert.deepEqual(await drawn(),{text:1,font:0,draws:1});
  update(cursor(2,0));assert.equal((await drawn()).text,2);
+ // 후행 cursor_explicit 바이트(0x01)와 미래 확장 바이트가 붙은 Update도 해독해야 한다(v0.2.25부터 모바일 터미널이 'Trailing screen data'로 안 뜬 회귀).
+ socket.frame(0x21,T.v(2),T.v(2),T.v(1),T.v(1),line(1,'zz'),Uint8Array.of(1,9));assert.deepEqual(await drawn(),{text:1,font:0,draws:1},'update with optional postfix still draws');
  update(line(0,'a'));update(line(2,'g'));assert.deepEqual(await drawn(),{text:2,font:0,draws:1});
  update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(3,'jk'));assert.equal((await drawn()).text,2);
  handle.setFontScale(1.25);assert.deepEqual(await drawn(),{text:2,font:1,draws:1});assert.equal(canvas.width,Math.round(80*8*16/13));
