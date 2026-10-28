@@ -69,9 +69,10 @@ function mountChat(root,opts){
  const history=el('div',undefined,'chat-actions chat-history'),historyText=el('span',undefined,'muted');
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
  const latestBtn=button(t('Back to latest'),()=>{
-  if(failedEarlier){refreshLatest=true;resetHistory=true;}
+  if(!active())return;
+  if(failedEarlier)requestLatest();
   earlierEpoch++;earlierQueued=false;failedEarlier=false;autoBlocked=null;pollStatus.hidden=true;
-  if(entry.live){entry.items=entry.live.items;entry.offset=entry.live.offset;entry.live=null;}
+  if(entry.live&&!resetHistory){entry.items=entry.live.items;entry.offset=entry.live.offset;entry.live=null;}
   following=true;renderItems();pollNow();
  },'ghost small');
  history.append(historyText,earlierBtn,latestBtn);
@@ -93,7 +94,7 @@ function mountChat(root,opts){
  entry.initialized??=entry.offset>0;
  entry.loaded??=entry.initialized;
  let earlierEpoch=0,earlierQueued=false,autoBlocked=null,failedEarlier=false;
- let resetHistory=false,refreshLatest=!!entry.initialized&&Date.now()-lastSuccess>3000;
+ let resetHistory=!!entry.latestRecovery,refreshLatest=resetHistory||!!entry.initialized&&Date.now()-lastSuccess>3000;
  // Only the reader moving up stops following; pins and late layout growth never do.
  let lastTop=0,lastHeight=0,lastViewport=feed.clientHeight;
  function syncScroll(){lastTop=feed.scrollTop;lastHeight=feed.scrollHeight;lastViewport=feed.clientHeight;}
@@ -131,7 +132,18 @@ function mountChat(root,opts){
  // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
  function chatAgent(){return M.sessionAgent?.({...state.sessions?.get(sessionId),...(entry.agent?{agent:entry.agent}:{})})||entry.agent||'';}
  function ownsEntry(){return state.chatCache===cacheMap&&state.drafts===drafts&&cacheMap.get(sessionId)===entry&&state.sessions?.has(sessionId);}
- function active(){return !disposed&&!ctx.signal?.aborted&&ownsEntry();}
+ function active(){if(disposed||ctx.signal?.aborted||!ownsEntry())return false;syncReadScope();return true;}
+ // Snapshot identity changes clear private paint immediately; transient read failures do not.
+ function syncReadScope(){
+  const sess=state.sessions.get(sessionId),key=JSON.stringify([ctx.sessionKey?.(sessionId)??sessionId,sess.agent,sess.cwd,sess.groupKey,sess.provider,sess.account_id,sess.profile_id,sess.command_context]);
+  if(entry.readScope===key)return;
+  const changed=entry.readScope!==undefined;entry.readScope=key;
+  if(!changed)return;
+  earlierEpoch++;earlierQueued=false;failedEarlier=false;autoBlocked=null;resetHistory=false;refreshLatest=true;entry.latestRecovery=false;
+  clearTranscript();entry.offset=0;entry.generation='';entry.initialized=false;entry.loaded=false;entry.progress=null;
+  lastSuccess=entry.lastSuccess=0;failures=0;pollStatus.hidden=true;following=true;renderItems();
+ }
+ function requestLatest(){refreshLatest=true;resetHistory=true;entry.latestRecovery=true;latestBtn.hidden=false;history.hidden=false;}
  function scope(){
   const sess=state.sessions?.get(sessionId),key=JSON.stringify([chatAgent(),sess?.agent||'',sess?.foreground||'',sess?.cwd||'',sess?.groupKey||'',sess?.provider||'',sess?.account_id||'',sess?.profile_id||'',sess?.command_context??'']);
   // A scope epoch also fences A → B → A account/profile switches while a read/change is pending.
@@ -353,7 +365,7 @@ function mountChat(root,opts){
   const start=first?._pageStart||0;
   earlierBtn.hidden=!(entry.pages.findIndex(page=>page.start===start)>0)&&!first?._clipped&&!(first&&start>0);
   earlierBtn.disabled=earlierPending;
-  latestBtn.hidden=!entry.live&&!earlierPending&&!failedEarlier;
+  latestBtn.hidden=!entry.live&&!earlierPending&&!failedEarlier&&!entry.latestRecovery;
   historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
   historyText.hidden=!entry.live;history.hidden=earlierBtn.hidden&&latestBtn.hidden;
   pinLatest();restoreReader(anchor);
@@ -480,28 +492,34 @@ function mountChat(root,opts){
  }
  async function pollNow(initial=false){
   // 숨은 Chat도 첫 내용을 받을 때까지는 받아 둔다(실패 2회까지). 연결 전에 마운트돼 첫 프리페치를 놓쳐도 ready 뒤 update()가 다시 받아, Chat을 누른 첫 프레임에 내용이 있다.
-  if(!active()||state.cached||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live||state.connection?.phase!=='ready')return;
-  const epoch=earlierEpoch,prefetch=!visible;
-  const current=()=>epoch===earlierEpoch&&active()&&!state.cached&&(visible||prefetch)&&!globalThis.document?.hidden&&globalThis.document?.visibilityState!=='hidden'&&state.connection?.phase==='ready';
+  if(!active()||state.cached||(!visible&&!initial&&(entry.loaded||failures>=2))||globalThis.document?.hidden||globalThis.document?.visibilityState==='hidden'||inFlight||earlierPending||entry.live&&!resetHistory||state.connection?.phase!=='ready')return;
+  const epoch=earlierEpoch,prefetch=!visible,owner=ctx.transport,linkEpoch=state.connection?.generation;
+  const current=()=>active()&&epoch===earlierEpoch&&owner===ctx.transport&&linkEpoch===state.connection?.generation&&!state.cached&&(visible||prefetch)&&!globalThis.document?.hidden&&globalThis.document?.visibilityState!=='hidden'&&state.connection?.phase==='ready';
   inFlight=true;
   try{
    // v0.1.37 이하 데몬은 latest를 모르는 필드로 거부한다. chat_tail이 없는 데몬이 그렇게 거부하면 처음부터 이어 읽는다(빈 화면으로 남기지 않는다).
    if(entry.noTail&&state.snapshot?.capabilities?.chat_tail===true)entry.noTail=false;
-   const start=entry.offset;let latest=(!entry.initialized||refreshLatest)&&!entry.noTail,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest?{latest:true}:{}});
-   if(!current()||earlierPending||entry.live||!res)return;
+   const start=entry.offset;let latest=!entry.initialized||refreshLatest,res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:latest?0:start,...latest&&!entry.noTail?{latest:true}:{}});
+   if(!current()||earlierPending||entry.live&&!resetHistory)return;
+   if(!res)throw new Error(t('Transcript changed. Return to latest and retry.'));
    let changed=entry.generation&&res.generation&&entry.generation!==res.generation;
    // Rebinding also opens at the tail. Keep the current paint until that window is ready.
-   if(!latest&&!entry.noTail&&(res.reset||changed)){
+   if(!latest&&!entry.noTail&&(res.reset||changed||!res.bound)){
+    requestLatest();
     res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:0,latest:true});
-    if(!current()||earlierPending||entry.live||!res)return;
+    if(!current()||earlierPending||entry.live&&!resetHistory)return;
+    if(!res)throw new Error(t('Transcript changed. Return to latest and retry.'));
     latest=true;changed=true;
+   }
+   if(!res.bound&&(entry.items.length||entry.latestRecovery)){
+    requestLatest();renderItems();throw new Error(t('Transcript changed. Return to latest and retry.'));
    }
    const rItems=res.items||[],sameTail=latest&&!resetHistory&&!changed&&!res.reset&&entry.generation===res.generation&&entry.items.length===rItems.length&&rItems.every((item,index)=>sameItem(entry.items[index],item));
    const reset=Boolean(res.reset||changed||latest&&resetHistory),metaChanged=entry.agent!==(res.agent||'')||entry.bound!==!!res.bound;
    const hadItems=entry.items.length,wasLoaded=entry.loaded,anchor=!sameTail&&(rItems.length||metaChanged)||!pollStatus.hidden?readerAnchor():null;
    if(reset){clearTranscript();following=true;}
    entry.generation=res.generation||entry.generation;entry.agent=res.agent||'';entry.bound=!!res.bound;
-   entry.initialized=entry.bound;entry.loaded=true;refreshLatest=false;resetHistory=false;
+   entry.initialized=entry.bound;entry.loaded=true;refreshLatest=false;resetHistory=false;entry.latestRecovery=false;
    const effectiveStart=res.page_start??(res.reset?0:start);
    const incoming=normalizeItems(res,effectiveStart),before=entry.items.length;
    let reconciled=false;
@@ -510,7 +528,7 @@ function mountChat(root,opts){
    if(typeof res.next_offset==='number')entry.offset=res.next_offset;
    lastSuccess=entry.lastSuccess=Date.now();failures=0;pollStatus.hidden=true;
    if(reconciled||entry.items.length!==before||trimmed||metaChanged||!wasLoaded||reset&&(hadItems||!renderedItems))renderItems(!reset&&!trimmed&&!reconciled?before:undefined);updateStrip();restoreReader(anchor);pruneCache(state);
-  }catch(error){if(!current())return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}showPollError(error);}finally{inFlight=false;if(earlierQueued)drainEarlier();if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
+  }catch(error){if(!current())return;if(!entry.noTail&&state.snapshot&&!state.cached&&state.snapshot.capabilities?.chat_tail!==true&&/invalid mobile authentication or frame/i.test(String(error?.message||error))){entry.noTail=true;retryWithoutTail=true;return;}if(refreshLatest&&entry.items.length)requestLatest();showPollError(error);}finally{inFlight=false;if(earlierQueued)drainEarlier();if(retryWithoutTail){retryWithoutTail=false;pollNow(initial);}}
  }
  function canReadEarlier(){return active()&&isVisible()&&!state.cached&&state.connection?.phase==='ready';}
  function earlierPage(){
@@ -528,14 +546,14 @@ function mountChat(root,opts){
   if(!canReadEarlier()||earlierPending||inFlight)return;
   const page=earlierPage();if(!page||automatic&&autoBlocked===page.key)return;
   const {first,end}=page;let {start}=page;
-  const epoch=++earlierEpoch,generation=entry.generation;
-  const current=()=>epoch===earlierEpoch&&canReadEarlier();
+  const epoch=++earlierEpoch,generation=entry.generation,owner=ctx.transport,linkEpoch=state.connection?.generation;
+  const current=()=>canReadEarlier()&&epoch===earlierEpoch&&owner===ctx.transport&&linkEpoch===state.connection?.generation;
   earlierQueued=false;earlierPending=true;failedEarlier=false;following=false;renderItems();
   try{
    const res=await ctx.rpc({action:'chat_poll',session:sessionId,offset:start??0,end_offset:end,...start===undefined?{latest:true}:{}});
    if(!current())return;
    const responseStart=res?.page_start??start;
-   if(!res||res.next_offset!==end||res.reset||res.generation!==generation||entry.generation!==generation||!Number.isSafeInteger(responseStart)||responseStart<0||responseStart===end||start!==undefined&&responseStart!==start)throw new Error(t('Transcript changed. Return to latest and retry.'));
+   if(!res||!res.bound||res.next_offset!==end||res.reset||res.generation!==generation||entry.generation!==generation||!Number.isSafeInteger(responseStart)||responseStart<0||responseStart===end||start!==undefined&&responseStart!==start)throw new Error(t('Transcript changed. Return to latest and retry.'));
    // Capture the viewport after any scrolling during the RPC, before changing chrome/items.
    following=false;const anchor=readerAnchor();
    start=responseStart;rememberPage(start,res.next_offset);
@@ -557,7 +575,7 @@ function mountChat(root,opts){
  function visibilityChanged(){if(!isVisible()){earlierEpoch++;earlierQueued=false;}schedule();if(isVisible()){if(Date.now()-lastSuccess>3000)refreshLatest=true;pinLatest();pollNow();}}
  globalThis.document?.addEventListener?.('visibilitychange',visibilityChanged);
  entry.notifyComposer=updateComposer;
- renderItems();updateStrip();updateComposer();pollNow(true);schedule();
+ active();renderItems();updateStrip();updateComposer();pollNow(true);schedule();
  return {insertText,pollNow,setVisible(next){const changed=visible!==!!next;visible=!!next;if(changed)visibilityChanged();},update(){if(!canReadEarlier()){earlierEpoch++;earlierQueued=false;}if(picker&&picker.scope!==scope())closeSuggestions();updateStrip();updateComposer();pollNow();},unmount(){if(disposed)return;earlierEpoch++;earlierQueued=false;closeSuggestions();discovery.clear();discovering.clear();disposed=true;entry.mounts=Math.max(0,(entry.mounts||1)-1);globalThis.document?.removeEventListener?.('visibilitychange',visibilityChanged);resize?.disconnect();pruneCache(state);clearTimeout(pollTimer);pollTimer=null;if(entry.notifyComposer===updateComposer)entry.notifyComposer=null;}};
 }
 M.chat={mount:mountChat,pruneCache,forgetSession};

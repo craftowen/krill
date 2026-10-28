@@ -280,7 +280,90 @@ async function opaqueCursorReplay(){
  stale.button('Back to latest').action();await flush();assert.equal(stale.entry.items[0].id,'100:0');assert.deepEqual(Array.from(stale.entry.pages,p=>[p.start,p.next]),[[100,end+1]]);stale.dispose();
  console.log('PASS opaque SQLite tokens: decreasing end-to-partial remembered, clipped replay, immutable old end, live resource reset and expired-history latest recovery');
 }
+async function recoveryPaint(){
+ const E=5160216417328039,P=2908416603642792;
+ const row=n=>({id:'stable'+n,kind:'assistant',text:'Row '+n});
+ const page=(start,end,items,extra={})=>({generation:'g1',agent:'opencode',bound:true,page_start:start,next_offset:end,items,...extra});
+ const metadata=f=>JSON.stringify(['pages','offset','generation','agent','bound','loaded','initialized','retainedBytes','lastSuccess'].map(k=>f.entry[k]));
+ const unchanged=(f,old,cards,meta)=>{assert.deepEqual(f.entry.items,old);assert.deepEqual(f.find('chat-feed').children,cards);assert.equal(metadata(f),meta);assert.equal(f.button('Retry').parentElement.hidden,false);};
+ // Exact independent regressions: unbound latest after live reset, and after expired history.
+ for(const origin of ['live','history','nested-history','stale-mount','legacy']){
+  for(const failure of ['unbound','throw','null']){
+   const f=fixture({capabilities:{chat_tail:true},handler:async()=>page(P,E,[row(5),row(6)])});await flush();
+   if(origin==='nested-history'){
+    f.handler=async()=>page(P-1,P,[row(4)]);f.button('Load earlier messages').action();await flush();assert(f.entry.live);
+   }
+   if(origin==='history'||origin==='nested-history'){
+    f.handler=async()=>page(0,0,[],{bound:false,reset:true});f.button('Load earlier messages').action();await flush();
+   }
+   if(origin==='legacy'){f.entry.noTail=true;f.state.snapshot.capabilities={};}
+   const old=f.entry.items.slice(),cards=f.find('chat-feed').children.slice(),meta=metadata(f),live=f.entry.live;
+   let n=0;f.handler=async req=>{
+    n++;
+    if((origin==='live'||origin==='legacy')&&!req.latest&&req.offset!==0)return page(0,0,[],{bound:false,reset:true});
+    assert.equal(req.offset,0);if(origin!=='legacy')assert(req.latest);
+    if(failure==='throw')throw Error('still overloaded');
+    return failure==='null'?null:page(0,0,[],{bound:false,reset:false});
+   };
+   if(origin==='stale-mount'){f.entry.lastSuccess=1;f.remount();}
+   else if(origin==='history'||origin==='nested-history')f.button('Back to latest').action();
+   else f.update();
+   await flush();
+   if(origin==='legacy'){assert.equal(n,1);f.button('Retry').action();await flush();}
+   else assert.equal(n,origin==='live'?2:1);
+   // Remount creates new DOM nodes, but must retain the same transcript and page metadata.
+   if(origin==='stale-mount'){assert.deepEqual(f.entry.items,old);assert.equal(f.entry.offset,E);}
+   else unchanged(f,old,cards,meta);
+   assert.equal(f.entry.live,live);assert.equal(f.button('Back to latest').hidden,false,origin+'/'+failure+' retains latest control');
+   // Recovery intent survives remount and every Retry goes straight to a fresh tail.
+   if(origin==='history'&&failure==='unbound'){f.remount();await flush();assert.deepEqual(f.entry.items,old);}
+   f.handler=async req=>{assert.equal(req.offset,0);assert.equal(req.latest,origin==='legacy'?undefined:true);return page(100,E+1,[row(100)]);};
+   f.button('Retry').action();await flush();assert.deepEqual(Array.from(f.entry.items,x=>x.id),['stable100']);
+   assert.deepEqual(Array.from(f.entry.pages,p=>[p.start,p.next]),[[100,E+1]]);assert.equal(f.entry.offset,E+1);assert.equal(f.entry.live,null);assert.equal(f.button('Retry').parentElement.hidden,true);f.dispose();
+  }
+ }
+ // A bound empty replacement is authoritative, and new generation data cannot merge old text.
+ const empty=fixture({handler:async()=>page(P,E,[row(5)])});await flush();
+ empty.handler=async req=>req.latest?page(0,0,[],{generation:'g2'}):page(0,0,[],{bound:false,reset:true});empty.update();await flush();
+ assert.equal(empty.entry.items.length,0);assert.equal(empty.entry.generation,'g2');assert.equal(empty.find('chat-empty').children[0].textContent,'Enter a new message');empty.dispose();
+ console.log('PASS recovery paint: exact live-reset and expired-history unbound regressions; thrown/null failures, nested history, stale remount and legacy retry preserve paint/pages until successful fresh tail; bound empty clears');
+}
+async function recoveryOwnership(){
+ const oldPage=historyPage(200,230),fresh={...historyPage(0,1),generation:'fresh'};
+ // An observed A -> B -> A identity cycle cannot revive A's pending response.
+ for(const field of ['account_id','profile_id','provider','agent','cwd','groupKey','command_context']){
+  for(const earlier of [false,true]){
+   const f=fixture({handler:async()=>oldPage});await flush();const pending=deferred(),sess=f.state.sessions.get(7),original=sess[field];f.handler=()=>pending.promise;
+   if(earlier)f.button('Load earlier messages').action();else f.update();await flush();
+   sess[field]='other';f.update();assert.equal(f.entry.items.length,0,field+' identity clears old private paint');assert.equal(f.find('chat-feed').children.length,0);
+   sess[field]=original;f.update();f.handler=async()=>fresh;pending.resolve(earlier?historyPage(190,200):historyPage(230,231));await flush();f.update();await flush();
+   assert.deepEqual(Array.from(f.entry.items,x=>x.id),['message0']);assert.equal(f.entry.generation,'fresh');f.dispose();
+  }
+ }
+ // Check a changed identity even when the snapshot update callback has not run yet.
+ const silent=fixture({handler:async()=>oldPage});await flush();const stale=deferred();silent.handler=()=>stale.promise;silent.update();silent.state.sessions.get(7).account_id='new';stale.resolve(historyPage(230,231));await flush();assert.equal(silent.entry.items.length,0);assert.equal(silent.find('chat-feed').children.length,0);silent.dispose();
+ // Reconnect epoch/transport changes fence both the initial and second (fresh-tail) await.
+ for(const stage of ['live','tail','earlier'])for(const change of ['link','transport','host','session','abort','unmount','navigation']){
+  const f=fixture({handler:async()=>oldPage});await flush();const old=f.entry,items=old.items.slice(),pages=JSON.stringify(old.pages),pending=deferred();
+  f.handler=req=>stage==='tail'&&!req.latest?Promise.resolve({...oldPage,reset:true,items:[]}):pending.promise;
+  if(stage==='earlier')f.button('Load earlier messages').action();else f.update();await flush();
+  if(change==='link')f.state.connection.generation=1;
+  if(change==='transport')f.ctx.transport={};
+  if(change==='host'){f.state.chatCache=new Map();f.state.drafts=new Map();}
+  if(change==='session')f.state.sessions.delete(7);
+  if(change==='abort')f.ctx.signal={aborted:true};
+  if(change==='unmount')f.dispose();
+  if(change==='navigation')f.button('Back to latest').action();
+  // Do not allow a deliberately resumed poll to obscure whether this response was rejected.
+  f.handler=async()=>{throw Error('later retry');};
+  pending.resolve(stage==='earlier'?historyPage(190,200):fresh);await flush();
+  assert.deepEqual(old.items,items,stage+'/'+change+' discards stale response');assert.equal(JSON.stringify(old.pages),pages);assert.equal(old.offset,230);f.dispose();
+ }
+ console.log('PASS recovery ownership: identity changes clear private paint and fence A-B-A/no-update replies; link epoch, transport, host, session, abort, unmount and page navigation fence live/fresh-tail/earlier responses');
+}
 async function main(){
+ await recoveryPaint();
+ await recoveryOwnership();
  await opaqueCursorReplay();
  await composerDiscovery();
  await composerRaces();
@@ -349,8 +432,8 @@ async function main(){
  await f.poll({generation:'g1',items:[{id:'a',kind:'assistant',text:'delta'}],next_offset:20,bound:true});
  assert.equal(f.find('chat-card chat-question'),card);assert.equal(custom.value,'keep notes');assert.equal(details.open,true);assert.equal(f.button('Safe').attrs['aria-pressed'],'true');
  f.button('Confirm in Term').action();assert.equal(f.term,1);assert(!f.calls.some(c=>['approve','answer_question'].includes(c.action)));
- await f.poll({generation:'g1',items:[],next_offset:3,reset:true,bound:false});assert.equal(f.root.descendants().filter(n=>n.tag==='article').length,0);assert.equal(f.entry.items.length,0);assert.equal(f.entry.bound,false);assert.equal(f.entry.agent,'');assert.equal(f.find('chat-empty').children[0].textContent,'Enter a new message');f.dispose();
- console.log('PASS TR-A01/06/07 historical cards direct to Term, Copy answer copies draft, DOM notes/selection/expansion survive, empty reset clears immediately');
+ await f.poll({generation:'g2',items:[],next_offset:0,reset:true,bound:true});assert.equal(f.root.descendants().filter(n=>n.tag==='article').length,0);assert.equal(f.entry.items.length,0);assert.equal(f.entry.bound,true);assert.equal(f.entry.agent,'');assert.equal(f.find('chat-empty').children[0].textContent,'Enter a new message');f.dispose();
+ console.log('PASS TR-A01/06/07 historical cards direct to Term, Copy answer copies draft, DOM notes/selection/expansion survive, successful empty replacement clears');
  f=fixture();await flush();f.handler=async()=>{throw new Error('history unavailable');};f.update();await flush();const status=f.root.descendants().find(n=>n.attrs.role==='status'&&n.children.some(c=>c.textContent==='Retry'));assert.equal(status.hidden,false);assert.match(status.children[0].textContent,/history unavailable/);assert.match(status.children[0].textContent,/\d\d:\d\d:\d\d/);
  f.handler=async req=>({generation:'g1',items:[],next_offset:req.offset,bound:true});f.button('Retry').action();await flush();assert.equal(status.hidden,true);f.dispose();
  console.log('PASS TR-A08 poll failure includes 24h HH:MM:SS last update, explicit retry recovers');
