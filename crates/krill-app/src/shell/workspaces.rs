@@ -307,8 +307,10 @@ impl Shell {
         let Some(target) = self.local_target() else {
             return;
         };
+        // 원격 호스트의 SessionId는 로컬과 독립이라, 보이는 로컬 칸만 견준다.
         let visible_sessions: Vec<_> = visible
             .iter()
+            .filter(|p| self.layout.host(**p).is_local())
             .filter_map(|p| self.layout.session(*p))
             .collect();
         let candidates: Vec<_> = (0..self.layout.tabs().len())
@@ -361,6 +363,22 @@ impl Shell {
                     this.restoring_sessions.remove(&old);
                     // 재개 요청이 닿았는지 모르면, 보이게 된 칸도 다시 재개하지 않고 아는 세션만 찾는다.
                     let unknown = got.as_ref().is_err_and(pane::is_unknown_outcome);
+                    // 재개 요청 전에 끊겼거나(조회 EOF·연결 실패) 구 데몬이었으면 다음 sync·재접속에서 다시 시도한다.
+                    // 결과를 모르는 재개, 데몬의 확정 거부(closed 등), 복원 중 닫힌 칸은 다시 시도하지 않는다.
+                    let retry = match &got {
+                        Ok(found) => found.is_none(),
+                        Err(e) => {
+                            !unknown
+                                && !matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::InvalidInput
+                                        | std::io::ErrorKind::Interrupted
+                                )
+                        }
+                    };
+                    if retry {
+                        this.restore_attempted.remove(&old);
+                    }
                     if let Err(e) = &got
                         && unknown
                     {
