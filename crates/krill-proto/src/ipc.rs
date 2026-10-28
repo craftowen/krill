@@ -63,6 +63,7 @@ pub const FEATURES: u64 = crate::screen::FEAT_HISTORY_VIEW
     | crate::control::FEAT_SIDEBAR
     | crate::control::FEAT_AGENTS
     | crate::control::FEAT_UPGRADE
+    | crate::control::FEAT_WINDOWS_UPGRADE
     | crate::control::FEAT_COLD
     | crate::resources::FEAT_RESOURCES
     | crate::clipboard::FEAT_CLIPBOARD

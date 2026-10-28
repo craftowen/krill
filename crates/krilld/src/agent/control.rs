@@ -311,6 +311,9 @@ impl Control {
         if stored.account.is_none() {
             stored.account.clone_from(&discovered.account);
         }
+        if stored.permission == Permission::Manual && discovered.permission == Permission::Yolo {
+            stored.permission = Permission::Yolo;
+        }
         if self.read_stored(session)?.as_ref() != Some(&stored) {
             let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
             save(&self.launch_path(session)?, &bytes)?;
