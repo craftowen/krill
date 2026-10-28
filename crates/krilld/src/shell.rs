@@ -32,8 +32,8 @@ pub fn run_windows_shell(
     let Some(program) = args.next() else {
         return std::process::ExitCode::from(2);
     };
-    let result = sys::console_utf8()
-        .and_then(|()| sys::protect_agent_launcher())
+    sys::console_utf8();
+    let result = sys::protect_agent_launcher()
         .and_then(|()| std::process::Command::new(program).args(args).status());
     match result {
         Ok(status) => {

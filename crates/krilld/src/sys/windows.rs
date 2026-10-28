@@ -84,21 +84,27 @@ pub(crate) fn protect_agent_launcher() -> io::Result<()> {
 
 /// The trampoline is already attached to its session's `ConPTY`. Codepages are
 /// console state, so initialization here affects the child without another console.
-pub(crate) fn console_utf8() -> io::Result<()> {
+/// Best effort: a failure is shown in the session and the child still starts.
+pub(crate) fn console_utf8() {
+    use std::io::Write as _;
     use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP, SetConsoleOutputCP};
     // SAFETY: a zero codepage means this invocation has no attached console.
     if unsafe { GetConsoleCP() } == 0 {
-        return Ok(());
+        return;
     }
-    // SAFETY: UTF-8 is a supported codepage for the current attached console.
-    if unsafe { SetConsoleCP(65001) } == 0 {
-        return Err(io::Error::last_os_error());
+    // Output first: it decides the bytes children such as `powershell -NoProfile` write to pipes.
+    // SAFETY: UTF-8 is a supported codepage for the current attached session console.
+    let switched = unsafe { SetConsoleOutputCP(65001) } != 0
+        // SAFETY: same current session console; no shared daemon console is modified.
+        && unsafe { SetConsoleCP(65001) } != 0;
+    if !switched {
+        let error = io::Error::last_os_error();
+        writeln!(
+            io::stderr().lock(),
+            "krill: UTF-8 console setup failed: {error}"
+        )
+        .ok();
     }
-    // SAFETY: same current session console; no shared daemon console is modified.
-    if unsafe { SetConsoleOutputCP(65001) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 extern "system" fn agent_launcher_control(event: u32) -> i32 {
