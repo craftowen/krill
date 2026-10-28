@@ -2099,6 +2099,7 @@ impl History {
             title: screen.title.clone(),
             bells: screen.bells,
             cursor_style: screen.cursor_style,
+            cursor_explicit: screen.cursor_explicit,
         }
     }
 }

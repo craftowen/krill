@@ -45,6 +45,7 @@ fn styled() -> Cell {
 
 fn update() -> Update {
     Update {
+        cursor_explicit: None,
         revision: Revision(300),
         seq: Seq(70_000),
         done: true,
@@ -121,6 +122,7 @@ const UPDATE_META_V1: &str = "2b0000002102030104040eebb98ceb939c20e28093207a7368
 
 fn update_meta() -> Update {
     Update {
+        cursor_explicit: None,
         revision: Revision(2),
         seq: Seq(3),
         done: true,
@@ -603,4 +605,44 @@ fn frozen_history_has_new_kinds_and_old_history_stays_frozen() {
     reply.rows = vec![Vec::new(); usize::from(MAX_HISTORY_ROWS) + 1];
     let (kind, body) = frame(&reply.encode().unwrap());
     assert!(HistoryViewRows::decode(kind, &body).is_err());
+}
+
+#[test]
+fn cursor_explicit_postfix_is_compatible_bounded_and_applied_after_reset() {
+    let mut current = update();
+    let old = current.encode().unwrap();
+    let (kind, body) = frame(&old);
+    assert_eq!(Update::decode(kind, &body).unwrap().cursor_explicit, None);
+    current.cursor_explicit = Some(true);
+    let (kind, body) = frame(&current.encode().unwrap());
+    assert_eq!(Update::decode(kind, &body).unwrap(), current);
+    let old_decoder = postcard::from_bytes::<Update>(&body).unwrap();
+    assert_eq!(old_decoder.cursor_explicit, None);
+    assert_eq!(old_decoder.ops, current.ops);
+    let mut malformed = postcard::to_stdvec(&current).unwrap();
+    malformed.push(2); // postcard bool is only zero or one.
+    assert!(Update::decode(kind, &malformed).is_err());
+    let mut view = View::default();
+    view.apply(current).unwrap();
+    assert!(view.screen.cursor_explicit);
+    let mut reset = update();
+    reset.cursor_explicit = Some(false);
+    view.apply(reset).unwrap();
+    assert!(!view.screen.cursor_explicit);
+}
+
+#[test]
+fn cursor_explicit_is_carried_only_by_final_split_update() {
+    let ops = vec![Op::Title("a".repeat(MAX_TITLE)); 1100];
+    let frames = encode_update_with_cursor(Revision(1), Seq(1), ops, Some(true)).unwrap();
+    assert!(frames.len() > 1);
+    let mut view = View::default();
+    for bytes in frames {
+        let (kind, body) = frame(&bytes);
+        let update = Update::decode(kind, &body).unwrap();
+        assert_eq!(update.cursor_explicit, update.done.then_some(true));
+        view.apply(update).unwrap();
+    }
+    assert_eq!(view.revision, Some(Revision(1)));
+    assert!(view.screen.cursor_explicit);
 }
