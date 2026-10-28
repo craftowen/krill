@@ -1650,6 +1650,19 @@ fn stale_provider_handoff_is_cancelled_and_rejected_before_reading_transcripts()
     assert!(!load(Some(&state)).contains_key(&session));
     assert!(!lock(&reg.state).closing.contains(&session));
     original.write_all(b"original still running\r\n").unwrap();
+    // Wait for the capture so the store does not write a segment while the fixture is removed.
+    let tap = lock(&reg.state)
+        .sessions
+        .get(&session)
+        .unwrap()
+        .session
+        .tap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tap.pulse().end < 24 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!tap.pulse().closed);
+    assert!(tap.pulse().end >= 24, "original PTY keeps capturing output");
     assert!(
         fs::read_dir(&to)
             .unwrap()
