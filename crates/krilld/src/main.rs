@@ -232,6 +232,9 @@ fn main() -> ExitCode {
             .stack_size(256 * 1024)
             .spawn(move || {
                 krilld::alloc::mobile_thread().ok();
+                // 연속 실패는 보고를 한 번만 하고 재시도 간격을 늘린다. 상태 디렉터리가 사라진 고아 데몬이 초당
+                // 오류 보고를 13시간 쏟아낸 적이 있다(2026-10-26 pid 51545, 47,263줄).
+                let mut failures = 0u32;
                 loop {
                     // 한 번의 panic으로 스케줄러가 영구 정지하지 않게 격리한다(K-06).
                     // `poll_schedules`의 오류는 이미 안에서 처리하고 `io::Result`로만 나온다.
@@ -240,17 +243,21 @@ fn main() -> ExitCode {
                     })) {
                         Err(_) => tracing::warn!("schedule poll panicked; continuing"),
                         Ok(Err(error)) => {
-                            tracing::warn!(kind = ?error.kind(), "schedule poll failed");
-                            krill_proto::error_reporting::capture(
-                                krill_proto::error_reporting::Process::Daemon,
-                                krill_proto::error_reporting::Code::SchedulerFailed,
-                                file!(),
-                                line!(),
-                            );
+                            if failures == 0 {
+                                tracing::warn!(kind = ?error.kind(), "schedule poll failed");
+                                krill_proto::error_reporting::capture(
+                                    krill_proto::error_reporting::Process::Daemon,
+                                    krill_proto::error_reporting::Code::SchedulerFailed,
+                                    file!(),
+                                    line!(),
+                                );
+                            }
+                            failures = failures.saturating_add(1);
                         }
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => failures = 0,
                     }
-                    thread::sleep(std::time::Duration::from_secs(1));
+                    let backoff = 1u64 << failures.min(6);
+                    thread::sleep(std::time::Duration::from_secs(backoff));
                 }
             })
             .ok();
