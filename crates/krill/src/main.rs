@@ -300,6 +300,8 @@ fn agent_list() -> ExitCode {
         }
     );
     let path = std::env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    let path = krill_proto::os::augment_windows_path(Some(&path)).unwrap_or(path);
     let all_profiles = agents.all_profiles_with_presets();
     let mut rows: Vec<_> = all_profiles.iter().collect();
     rows.sort_by(|(a, _), (b, _)| {

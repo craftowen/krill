@@ -645,7 +645,7 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn login_path() -> Option<OsString> {
-    std::env::var_os("PATH")
+    krill_proto::os::augment_windows_path(std::env::var_os("PATH").as_deref())
 }
 
 /// 상태 디렉터리·`run/`에 실제로 써 본다. Unix 소유자(uid) 검사는 Windows ACL에 대응하는 것이 없어 건너뛴다
