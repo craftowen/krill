@@ -329,6 +329,12 @@ pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
     unsupported()
 }
 
+/// 프로세스 argv. Toolhelp 스냅샷에는 명령줄이 없어 지원하지 않는다.
+// ponytail: 계정 전환이 Windows 셸 직접 실행 에이전트를 Manual로 이어 띄운다. 필요해지면 PEB 명령줄을 읽는다.
+pub(crate) fn process_args(_pid: u32) -> io::Result<Vec<String>> {
+    unsupported()
+}
+
 /// 실행 파일 이름에서 `.exe`를 뺀 것(`node.exe` → `node`). macOS·Linux의 짧은 실행 이름과 같은 꼴이다.
 pub(crate) fn process_name(pid: u32) -> io::Result<String> {
     let exe = process(pid)?.exe;
