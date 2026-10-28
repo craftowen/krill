@@ -1,7 +1,3 @@
-#![expect(
-    unsafe_code,
-    reason = "Handle-relative Windows filesystem operations (CONVENTIONS U1)"
-)]
 use super::{Component, File, OsStr, OsString, Path, PathBuf, denied, io, normal};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
