@@ -260,7 +260,8 @@ impl Shell {
                     this.restoring_sessions.remove(&old);
                     // 재개 요청이 닿았는지 모르면, 보이게 된 칸도 다시 재개하지 않고 아는 세션만 찾는다.
                     let unknown = got.as_ref().is_err_and(pane::is_unknown_outcome);
-                    // 재개 요청 전에 끊겼거나(조회 EOF·연결 실패) 구 데몬이었으면 다음 sync·재접속에서 다시 시도한다.
+                    // 재개 요청 전에 끊겼거나(조회 EOF·연결 실패) 구 데몬이었으면 다음 재접속에서 한 번 다시 시도한다.
+                    // 같은 Up 상태의 sync마다 다시 시도하면 끊김이 이어질 때 I/O가 쉼 없이 반복된다.
                     // 결과를 모르는 재개, 데몬의 확정 거부(closed 등), 복원 중 닫힌 칸은 다시 시도하지 않는다.
                     let retry = match &got {
                         Ok(found) => found.is_none(),
@@ -274,7 +275,7 @@ impl Shell {
                         }
                     };
                     if retry {
-                        this.restore_attempted.remove(&old);
+                        this.restore_on_reconnect.insert(old);
                     }
                     if let Err(e) = &got
                         && unknown
@@ -302,12 +303,9 @@ impl Shell {
                         // 실패·구 데몬이면 옛 ID를 유지한다. 선택돼 있었다면 콜드 폴백을 보여준다.
                         _ => old,
                     };
-                    if this
-                        .layout
-                        .visible()
-                        .iter()
-                        .any(|p| this.layout.session(*p) == Some(session))
-                    {
+                    if this.layout.visible().iter().any(|p| {
+                        this.layout.host(*p).is_local() && this.layout.session(*p) == Some(session)
+                    }) {
                         this.sync(cx);
                     }
                     cx.notify();

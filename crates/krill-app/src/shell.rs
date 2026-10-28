@@ -575,6 +575,8 @@ pub struct Shell {
     creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
     restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
     restore_attempted: std::collections::HashSet<krill_proto::SessionId>,
+    /// 재개 요청 전에 실패한 숨은 칸. sync마다가 아니라 다음 재접속(`set_link`가 Up으로 바뀔 때) 한 번만 다시 시도한다.
+    restore_on_reconnect: std::collections::HashSet<krill_proto::SessionId>,
     restarting_panes: std::collections::HashSet<PaneId>,
     /// 세션을 만드는 요청(Create·Resume)을 보냈지만 답을 잃은 칸과 그 안내 문구. 이미 아는 세션에만 다시 붙고
     /// 새로 만들지 않는다(PTY 중복 방지). 만들어졌다면 사이드바에 보인다.
@@ -1127,6 +1129,7 @@ impl Shell {
             creations: HashMap::new(),
             restoring_sessions: std::collections::HashSet::new(),
             restore_attempted: std::collections::HashSet::new(),
+            restore_on_reconnect: std::collections::HashSet::new(),
             restarting_panes: std::collections::HashSet::new(),
             outcome_unknown: HashMap::new(),
             observed_sessions: std::collections::HashSet::new(),
@@ -2880,6 +2883,11 @@ impl Shell {
         let reconnecting = link == Link::Down;
         self.sidebar
             .update(cx, |s, cx| s.set_local_reconnecting(reconnecting, cx));
+        if self.link != Link::Up && link == Link::Up {
+            for old in self.restore_on_reconnect.drain() {
+                self.restore_attempted.remove(&old);
+            }
+        }
         self.link = link;
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
