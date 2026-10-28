@@ -534,15 +534,77 @@ fn poll_opencode_session(
     page
 }
 
-// Database cursors address message rows, so bounded pages can traverse conversations
-// larger than an export budget. End fingerprints notice rewrites; no wire fields change.
-const DB_ROW_MASK: u64 = (1 << 32) - 1;
+// Live database cursors reference bounded, process-local SHA-256 prefix proofs.
+// Historical boundaries remain raw row indexes. Eviction/restart fails closed with a
+// reset; no open connection or transcript content is retained. Each proof is checked
+// against content AND ordering in the same SQLite read transaction as the next page.
+const DB_PARTIAL: u64 = 1 << 51;
+const DB_TOKEN_MASK: u64 = DB_PARTIAL - 1;
 
-fn database_end(path: &Path, total: u64) -> u64 {
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    crate::agent::control::cache::stamp(path).hash(&mut hash);
-    crate::agent::control::cache::stamp(&path.with_extension("db-wal")).hash(&mut hash);
-    OPENCODE_END | ((hash.finish() & ((1 << 20) - 1)) << 32) | (total & DB_ROW_MASK)
+struct DatabaseProof {
+    token: u64,
+    path: PathBuf,
+    sid: String,
+    rows: u64,
+    digest: [u8; 32],
+}
+
+#[derive(Default)]
+struct DatabaseProofs {
+    next: u64,
+    entries: std::collections::VecDeque<DatabaseProof>,
+}
+
+fn database_proofs() -> &'static Mutex<DatabaseProofs> {
+    static CACHE: OnceLock<Mutex<DatabaseProofs>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn database_proof(path: &Path, sid: &str, token: u64) -> Option<(u64, [u8; 32])> {
+    let cache = database_proofs().lock().ok()?;
+    cache
+        .entries
+        .iter()
+        .find(|entry| entry.token == token && entry.path == path && entry.sid == sid)
+        .map(|entry| (entry.rows, entry.digest))
+}
+
+fn database_cursor(path: &Path, sid: &str, rows: u64, digest: [u8; 32], end: bool) -> Option<u64> {
+    let mut cache = database_proofs().lock().ok()?;
+    let tag = if end { OPENCODE_END } else { DB_PARTIAL };
+    if let Some(entry) = cache.entries.iter().find(|entry| {
+        entry.path == path
+            && entry.sid == sid
+            && entry.rows == rows
+            && entry.digest == digest
+            && entry.token & OPENCODE_END == tag & OPENCODE_END
+    }) {
+        return Some(entry.token);
+    }
+    if cache.next == 0 {
+        // Process restarts invalidate old proofs. A random starting nonce also prevents
+        // old client cursors from aliasing freshly issued entries after a daemon restart.
+        use ring::rand::SecureRandom as _;
+        let mut seed = [0; 8];
+        ring::rand::SystemRandom::new().fill(&mut seed).ok()?;
+        cache.next = u64::from_le_bytes(seed) & (DB_TOKEN_MASK >> 1);
+    }
+    cache.next = cache.next.checked_add(1)?;
+    if cache.next > DB_TOKEN_MASK {
+        return None;
+    }
+    let token = tag | cache.next;
+    if cache.entries.len() >= 512 {
+        cache.entries.pop_front();
+    }
+    cache.entries.push_back(DatabaseProof {
+        token,
+        path: path.into(),
+        sid: sid.into(),
+        rows,
+        digest,
+    });
+    Some(token)
 }
 
 fn poll_opencode_database(
@@ -559,13 +621,25 @@ fn poll_opencode_database(
         transcript_path: path_str.into(),
         ..Default::default()
     };
-    let was_end = offset >= OPENCODE_END;
-    let mut start = if was_end {
-        offset & DB_ROW_MASK
-    } else {
-        offset
-    };
-    let Ok(mut batch) = super::opencode_sqlite::read_page(path, sid, start) else {
+    let proof = database_proof(path, sid, offset);
+    let mut start = proof.map_or(offset, |(rows, _)| rows);
+    let mut reset = offset > 0 && limit.is_none() && proof.is_none();
+    if reset {
+        start = 0;
+    }
+    let end_proof = limit
+        .filter(|end| *end >= DB_PARTIAL)
+        .and_then(|end| database_proof(path, sid, end));
+    if limit.is_some_and(|end| end >= DB_PARTIAL) && end_proof.is_none() {
+        page.reset = true;
+        return page;
+    }
+    let Ok(mut batch) = super::opencode_sqlite::read_page_verified(
+        path,
+        sid,
+        start,
+        end_proof.map(|(rows, _)| rows),
+    ) else {
         page.reset = offset > 0;
         return page;
     };
@@ -578,16 +652,16 @@ fn poll_opencode_database(
         return page;
     };
     let total = session.message_count;
-    if total > DB_ROW_MASK {
-        page.reset = offset > 0;
+    reset |= start > total || proof.is_some_and(|(_, digest)| digest != session.prefix_digest);
+    if end_proof.is_some_and(|(_, digest)| session.verified_end != Some(digest)) {
+        page.reset = true;
         return page;
     }
-    let end_cursor = database_end(path, total);
-    // Appends continue after the last message row. Same-count edits and truncation reset.
-    let reset = start > total
-        || (was_end && offset != end_cursor && start == total)
-        || limit.is_some_and(|end| end >= OPENCODE_END && end != end_cursor);
     if reset {
+        if limit.is_some() {
+            page.reset = true;
+            return page;
+        }
         start = 0;
         let Ok(fresh) = super::opencode_sqlite::read_page(path, sid, 0) else {
             page.reset = true;
@@ -605,21 +679,28 @@ fn poll_opencode_database(
     };
     let mut consumed = start;
     let end = limit
-        .filter(|n| *n < OPENCODE_END)
+        .filter(|n| *n < DB_PARTIAL)
+        .or_else(|| end_proof.map(|(rows, _)| rows))
         .unwrap_or(total)
         .min(total);
     let mut remaining = MAX_SKIP_BYTES;
-    for record in session.messages {
+    let mut digest = session.prefix_digest;
+    for (record, proof) in session.messages.into_iter().zip(session.message_digests) {
         if consumed >= end || page.items.len() >= MAX_CHAT_ITEMS {
             break;
         }
         parse_opencode_message_record(&record, None, &mut page.items, &mut remaining);
         consumed = consumed.saturating_add(1);
+        digest = proof;
     }
-    page.next_offset = if consumed >= total && limit.is_none_or(|n| n >= OPENCODE_END) {
-        database_end(path, total)
-    } else {
+    page.next_offset = if limit.is_some_and(|n| n < DB_PARTIAL) {
         consumed
+    } else {
+        let Some(cursor) = database_cursor(path, sid, consumed, digest, consumed >= total) else {
+            page.reset = offset > 0;
+            return page;
+        };
+        cursor
     };
     page.bound = true;
     page.reset = reset;
@@ -653,6 +734,11 @@ fn latest_opencode_database(
         .into_iter()
         .next()
         .ok_or_else(|| std::io::Error::other("missing OpenCode session"))?;
+    if session.message_count != total {
+        return Err(std::io::Error::other(
+            "OpenCode database changed during history read; retry",
+        ));
+    }
     let take = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
     let mut records = Vec::new();
     let mut count = 0usize;
@@ -679,7 +765,13 @@ fn latest_opencode_database(
     page.next_offset = if before.is_some() {
         end
     } else {
-        database_end(path, total)
+        let digest = session
+            .message_digests
+            .last()
+            .copied()
+            .unwrap_or(session.prefix_digest);
+        database_cursor(path, &snapshot.session_id, total, digest, true)
+            .ok_or_else(|| std::io::Error::other("OpenCode cursor cache unavailable"))?
     };
     page.reset = false;
     page.bound = true;
