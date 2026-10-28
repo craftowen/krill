@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn status_only_advertises_a_bound_tailnet_backup() {
+    let mut panel = Panel::new(Arc::new(|_| Err("unused".into())));
+    let status = |bind_addrs| MobileReply::GatewayStatus {
+        listening: true,
+        bind_addrs,
+        mode: ConnectMode::Tunnel,
+        tunnel_url: None,
+        active_offer: false,
+        devices: Vec::new(),
+    };
+    panel.accept(status(vec![
+        "127.0.0.1:1234".into(),
+        "100.64.1.2:1234".into(),
+    ]));
+    assert_eq!(panel.backup_address.as_deref(), Some("100.64.1.2:1234"));
+    panel.accept(status(vec![
+        "127.0.0.1:1234".into(),
+        "192.168.1.2:1234".into(),
+    ]));
+    assert!(panel.backup_address.is_none());
+}
+
 fn device(created_at_ms: u64, last_seen_ms: u64) -> PairedMobileDevice {
     PairedMobileDevice {
         device_id: "dev-1".into(),
@@ -195,6 +218,7 @@ fn mobile_enter_mints_first_device_or_standalone_page_without_rotation(
                         pairing_offer("https://example.test/#pair=fixture", u64::MAX)
                     }
                     MobileRequest::ConnectedDevices => MobileReply::ConnectedDevices(Vec::new()),
+                    MobileRequest::Workflow(_) => MobileReply::Workflow("{\"ok\":true,\"data\":{\"requires_sign_in\":false,\"signed_in\":false,\"pending\":false}}".into()),
                     other => panic!("unexpected request: {other:?}"),
                 })
             }));
@@ -274,6 +298,7 @@ fn mobile_poll_renews_missing_failed_or_expired_standalone_offer(cx: &mut gpui::
                     MobileRequest::ConnectedDevices => {
                         Ok(MobileReply::ConnectedDevices(Vec::new()))
                     }
+                    MobileRequest::Workflow(_) => Ok(MobileReply::Workflow("{\"ok\":true,\"data\":{\"requires_sign_in\":false,\"signed_in\":false,\"pending\":false}}".into())),
                     MobileRequest::Status => Ok(MobileReply::GatewayStatus {
                         listening: true,
                         bind_addrs: Vec::new(),
@@ -465,4 +490,42 @@ fn mobile_copy_buttons_copy_the_url_encoded_in_the_qr(cx: &mut gpui::TestAppCont
             assert_eq!(mobile.copied_url.as_deref(), Some(FIXTURE_TICKET));
         });
     }
+}
+
+#[gpui::test]
+fn transient_google_approval_poll_failure_keeps_polling_after_page_is_hidden(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    cx.update(gpui_component::init);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut view = SettingsView::new(cx);
+        view.visible = false;
+        view.mobile = Panel::new(Arc::new(move |request| {
+            assert!(matches!(request, MobileRequest::Workflow(_)));
+            if count.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err("temporary IPC failure".into())
+            } else {
+                Ok(MobileReply::Workflow("{\"ok\":true,\"data\":{\"signed_in\":true,\"email\":\"fixture@example.test\",\"pending\":false}}".into()))
+            }
+        }));
+        view.mobile.account.pending = true;
+        view.mobile_account_poll(cx);
+        view
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(view.read(cx).mobile.account.pending));
+    vcx.executor().advance_clock(Duration::from_secs(5));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(!view.read(cx).mobile.account.pending);
+        assert_eq!(
+            view.read(cx).mobile.account.email.as_deref(),
+            Some("fixture@example.test")
+        );
+        assert!(view.read(cx).mobile.error.is_none());
+    });
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
 }

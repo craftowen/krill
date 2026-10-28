@@ -2,6 +2,12 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "This desktop uses a different Google account. Open Settings, sign out of Google, then sign in with the account used on this desktop.": "이 데스크톱과 Google 계정이 다릅니다. 설정에서 Google 계정을 로그아웃한 뒤 데스크톱에서 사용한 계정으로 로그인하세요.",
+ "Sign in with Google": "Google로 로그인",
+ "Sign in with Google to use the relay.": "릴레이를 사용하려면 Google로 로그인하세요.",
+ "Sign out of Google": "Google 계정 로그아웃",
+ "Could not preserve pairing. Allow session storage and try again.": "페어링 정보를 보관하지 못했습니다. 세션 저장소를 허용하고 다시 시도하세요.",
+ "Could not sign out. Try again.": "로그아웃하지 못했습니다. 다시 시도하세요.",
  "Close": "닫기",
  "Add": "추가",
  "Saved on this phone. Could not sync quick actions to desktop. Reconnect and save again.": "이 휴대폰에 저장했습니다. 데스크톱과 퀵액션을 동기화하지 못했습니다. 다시 연결한 뒤 저장하세요.",

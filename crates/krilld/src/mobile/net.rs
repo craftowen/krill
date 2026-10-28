@@ -43,7 +43,7 @@ pub fn detect() -> io::Result<Vec<NetworkInterface>> {
 pub fn detect() -> io::Result<Vec<NetworkInterface>> {
     Ok(crate::sys::ipv4_interfaces()?
         .into_iter()
-        .filter(|(name, ip, _)| !excluded(name) && (tailscale(*ip) || ip.is_private()))
+        .filter(|(name, ip, _)| !excluded(name) && tailscale(*ip))
         .map(|(name, address, default_route)| NetworkInterface {
             name,
             address: address.to_string(),
@@ -64,7 +64,9 @@ pub fn select(
     }
     let custom = custom.map(parse).transpose()?;
     if let Some(address) = custom {
-        if !address.ip().is_loopback() && (mode == ConnectMode::Lan || !tailscale(*address.ip())) {
+        if (mode == ConnectMode::Tailscale && !tailscale(*address.ip()))
+            || (mode == ConnectMode::Lan && !address.ip().is_loopback())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "select a Tailscale address",
@@ -143,6 +145,7 @@ mod tests {
         assert!(select(&all, ConnectMode::Lan, None).is_err());
         assert!(select(&all, ConnectMode::Lan, Some("192.168.1.2:8765")).is_err());
         assert!(select(&all, ConnectMode::Tailscale, Some("192.168.1.2:8765")).is_err());
+        assert!(select(&all, ConnectMode::Tailscale, Some("127.0.0.1:8765")).is_err());
         assert_eq!(
             select(&all, ConnectMode::Lan, Some("127.0.0.1:8765"))
                 .unwrap()

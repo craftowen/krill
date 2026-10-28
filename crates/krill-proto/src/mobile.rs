@@ -12,7 +12,9 @@ pub const MOBILE_REPLY: u8 = 0x65;
 pub enum ConnectMode {
     /// Retired LAN discriminant (0). Decode for existing saved configurations only.
     Lan,
+    /// Selects the direct backup QR; an authenticated relay remains active.
     Tailscale,
+    /// Prefer the relay QR while keeping an available tailnet listener open.
     #[default]
     Tunnel,
 }
@@ -46,6 +48,7 @@ pub enum MobileRequest {
 pub enum MobileReply {
     PairingOffer {
         url: String,
+        /// Reachable direct IPv4 address, or empty when only relay is available.
         host: String,
         port: u16,
         expires_at_ms: u64,
