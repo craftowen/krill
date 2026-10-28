@@ -88,7 +88,7 @@ async function workspaceTree(){
 async function emptyWorkspace(){
  const f=fixture('workspaces',{rpc:()=>({session:99})}),g={key:'empty',label:'PC 이름',path:'/repo/empty',repoKey:'repo',pinned:true,sessions:[]};groups(f);f.state.groups.set(g.key,g);f.state.snapshot.capabilities={workspace_create:true};f.state.snapshot.agents=[{id:'codex',name:'Codex'}];f.view.update();const row=f.all().find(n=>n.dataset.group===g.key);assert(row);assert.equal(row.querySelector('.terminal-count').textContent,'0');await row.action();assert.equal(f.routes.length,0);assert.equal(f.sheets.at(-1)[0],'New session');await f.sheets.at(-1)[1][0].action();assert.deepEqual(JSON.parse(JSON.stringify(f.calls)),[{action:'create_terminal',workspace:g.key,agent:'codex'}]);assert(f.routes.at(-1).endsWith('/s/new'));f.abort.abort();
  // Execute the app's actual grouping function: empty catalog entries survive and attach sessions by key.
- const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),line=source.split('\n').find(l=>l.includes('function group(data)')),sandbox={state:{},M:{}};vm.createContext(sandbox);vm.runInContext(line+'globalThis.groupSnapshot=group;',sandbox);sandbox.groupSnapshot({workspaces:[{key:'a',label:'PC 이름',path:'/repo/a',repo_key:'r',pinned:true,primary:true,depth:2,icon:{kind:'emoji',value:'🚀'}},{key:'empty',label:'빈 작업 공간',path:'/repo/empty',repo_key:'r'}],sessions:[{id:1,worktree_key:'a',group_label:'폴더명',cwd:'/repo/a'}]});assert.equal(sandbox.state.groups.size,2);assert.equal(sandbox.state.groups.get('empty').sessions.length,0);assert.equal(sandbox.state.groups.get('a').label,'PC 이름');assert.equal(sandbox.state.groups.get('a').depth,2);assert.equal(sandbox.state.groups.get('a').primary,true);assert.equal(sandbox.state.groups.get('a').icon.value,'🚀');assert.equal(sandbox.state.groups.get('a').sessions[0].id,1);sandbox.hostRoute=()=>'/host/desktop';vm.runInContext(source.split('\n').find(l=>l.includes('const groupRoute='))+'globalThis.routeFor=groupRoute;',sandbox);assert.equal(sandbox.routeFor(sandbox.state.groups.get('empty')),'/host/desktop');assert(sandbox.routeFor(sandbox.state.groups.get('empty'),99).endsWith('/s/99'));sandbox.groupSnapshot({sessions:[{id:2,worktree_key:'old',group_label:'구버전'}]});assert.equal(sandbox.state.groups.size,1);assert.equal(sandbox.state.groups.get('old').label,'구버전');
+ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),line=source.split('\n').find(l=>l.includes('function group(data)')),sandbox={state:{},M:f.M};vm.createContext(sandbox);vm.runInContext(line+'globalThis.groupSnapshot=group;',sandbox);sandbox.groupSnapshot({workspaces:[{key:'a',label:'PC 이름',path:'/repo/a',repo_key:'r',pinned:true,primary:true,depth:2,icon:{kind:'emoji',value:'🚀'}},{key:'empty',label:'빈 작업 공간',path:'/repo/empty',repo_key:'r'}],sessions:[{id:1,worktree_key:'a',group_label:'폴더명',cwd:'/repo/a'}]});assert.equal(sandbox.state.groups.size,2);assert.equal(sandbox.state.groups.get('empty').sessions.length,0);assert.equal(sandbox.state.groups.get('a').label,'PC 이름');assert.equal(sandbox.state.groups.get('a').depth,2);assert.equal(sandbox.state.groups.get('a').primary,true);assert.equal(sandbox.state.groups.get('a').icon.value,'🚀');assert.equal(sandbox.state.groups.get('a').sessions[0].id,1);sandbox.hostRoute=()=>'/host/desktop';vm.runInContext(source.split('\n').find(l=>l.includes('const groupRoute='))+'globalThis.routeFor=groupRoute;',sandbox);assert.equal(sandbox.routeFor(sandbox.state.groups.get('empty')),'/host/desktop');assert(sandbox.routeFor(sandbox.state.groups.get('empty'),99).endsWith('/s/99'));sandbox.groupSnapshot({sessions:[{id:2,worktree_key:'old',group_label:'구버전'}]});assert.equal(sandbox.state.groups.size,1);assert.equal(sandbox.state.groups.get('old').label,'구버전');
  console.log('PASS workspace catalog: sessionless rows, PC names, session grouping, legacy snapshot and scoped session creation');
 }
 // Orca 작업 공간 옵션: PC와 같은 기능으로 프로젝트·작업 공간을 숨기고 묶고 정렬한다. 바꾸면 바로 다시 그리고 이 폰에만 저장한다. 숨은 항목도 검색하면 보인다.
@@ -363,5 +363,38 @@ async function tabletRoutePreservation(){
  console.log('PASS CLS tablet: session routes reuse sidebar DOM/scroll and independent RPC lifetime');
 }
 
-async function main(){await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+function pathLabelSnapshots(){
+ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8');
+ const cases=[
+  ["C:\\Users\\owen\\project", "windows", "project"],
+  ["D:\\work\\project\\", null, "project"],
+  ["C:/work/project/", null, "project"],
+  ["\\\\server\\share\\project\\", null, "project"],
+  ["\\\\server\\share\\", "windows", "share"],
+  ["/home/owen/project/", null, "project"],
+  ["/home/owen/literal\\name", "linux", "literal\\name"],
+  ["/home/owen/literal\\name", null, "literal\\name"],
+  ["relative\\project", "windows", "project"],
+  ["relative\\project", null, "relative\\project"],
+  ["C:\\", "windows", "C:"],
+  ["/", "linux", ""],
+  ["", null, ""]
+ ];
+ for(const [cwd,platform,basename] of cases){
+  const f=fixture('home'),session={id:1,state:'Working',cwd},data={host:{platform},sessions:[session]},sandbox={state:f.state,M:f.M};
+  vm.createContext(sandbox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',sandbox);
+  for(const provided of [undefined,'Provided workspace label']){
+   session.group_label=provided;sandbox.groupSnapshot(data);const label=provided||basename;
+   assert.equal([...f.state.groups.values()][0].label,label||'Workspace',JSON.stringify({cwd,platform,provided}));
+   f.ctx.connections=[{id:'pc',name:'PC',connection:{phase:'ready'},snapshot:data}];f.view.update();
+   assert.equal(f.find('.recent-session-row').querySelector('strong').textContent,label||'Terminal #1',JSON.stringify({cwd,platform,provided}));
+  }
+  delete data.host;f.ctx.connections[0].platform=platform;session.group_label=undefined;f.view.update();assert.equal(f.find('.recent-session-row').querySelector('strong').textContent,basename||'Terminal #1','saved host platform is used for legacy snapshots');
+  session.title='Provided session title';f.view.update();assert.equal(f.find('.recent-session-row').querySelector('strong').textContent,session.title);
+  f.abort.abort();
+ }
+ console.log('PASS path label snapshots and actual Home module: drive, UNC, platform metadata, POSIX literal backslash, trailing/root/empty, provided workspace/session labels');
+}
+
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};
