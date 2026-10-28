@@ -16,9 +16,7 @@ use super::{Shell, text};
 
 /// Finder에서 실행해도 새 칸은 사용자 홈에서 시작한다.
 pub(super) fn default_folder() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+    krill_proto::os::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 impl Shell {
@@ -486,6 +484,32 @@ pub(super) fn completed_project(launch: &Create, live_cwd: &std::path::Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_policy_default_folder_uses_native_home() {
+        const CHILD: &str = "KRILL_TEST_NATIVE_FOLDER";
+        if let Some(expected) = std::env::var_os(CHILD) {
+            assert_eq!(default_folder(), PathBuf::from(expected));
+            return;
+        }
+        let expected =
+            std::env::temp_dir().join(format!("krill-native-folder-{}", std::process::id()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "shell::folder::tests::input_policy_default_folder_uses_native_home",
+                "--nocapture",
+            ])
+            .env(CHILD, &expected);
+        if cfg!(windows) {
+            child.env_remove("HOME").env("USERPROFILE", &expected);
+        } else {
+            child.env("HOME", &expected).env_remove("USERPROFILE");
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
 
     #[test]
     fn unix_targets_keep_the_login_shell_script_with_positional_args() {
