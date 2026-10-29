@@ -296,7 +296,7 @@ fn help_flag_returns_zero() {
 fn chain_that_never_exits_is_killed_at_the_deadline() {
     let started = std::time::Instant::now();
     let out = run_chain_within(
-        OsStr::new("printf partial; sleep 30"),
+        OsStr::new("printf partial; exec sleep 30"),
         b"{}",
         Duration::from_millis(300),
     );
