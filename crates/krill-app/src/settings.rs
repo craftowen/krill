@@ -1356,7 +1356,31 @@ pub fn terminal_font_family(cx: &App) -> SharedString {
     let Some(raw) = raw else {
         return SharedString::new_static(crate::ui::FONT_MONO);
     };
-    crate::terminal_font::effective_terminal_font(cx.text_system(), raw).family
+    let effective = crate::terminal_font::effective_terminal_font(cx.text_system(), raw);
+    if effective.replaced {
+        warn_terminal_font_fallback_once(raw, &effective.family);
+    }
+    effective.family
+}
+
+/// 지정 터미널 글꼴을 못 써 대체할 때 운영 로그에 지정값마다 한 번 남긴다. gpui의 'm' 글리프 건너뜀 경고는
+/// 글꼴 목록 탐색 소음이라 krill-log가 거르므로, 사용자 글꼴 실패는 여기서 보인다. 매 프레임 불려서 중복을 막는다.
+fn warn_terminal_font_fallback_once(requested: &str, family: &str) -> bool {
+    thread_local! {
+        static WARNED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    WARNED.with_borrow_mut(|warned| {
+        if warned == requested {
+            return false;
+        }
+        tracing::warn!(
+            requested,
+            family,
+            "configured terminal font is not usable; drawing with fallback"
+        );
+        requested.clone_into(warned);
+        true
+    })
 }
 
 /// 지정 글꼴이 고정폭으로 해석되지 않아 Menlo로 대신 그릴 때 (지정값, 실제값).

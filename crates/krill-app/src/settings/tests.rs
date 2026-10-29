@@ -24,6 +24,13 @@ fn agent_status_hooks_default_on_and_fail_closed_on_unreadable_settings() {
 }
 
 #[test]
+fn unusable_configured_terminal_font_is_logged_once_per_value() {
+    assert!(warn_terminal_font_fallback_once("NoMGlyph", "Menlo"));
+    assert!(!warn_terminal_font_fallback_once("NoMGlyph", "Menlo"));
+    assert!(warn_terminal_font_fallback_once("Other", "Menlo"));
+}
+
+#[test]
 fn first_launch_locale_matches_korean_primary_subtag_else_english() {
     for locale in ["ko", "ko-KR", "ko_KR.UTF-8", "KO-kr", " ko@modifier "] {
         assert_eq!(
