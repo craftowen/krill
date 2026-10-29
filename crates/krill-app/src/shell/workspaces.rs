@@ -148,6 +148,7 @@ impl Shell {
         } else {
             self.layout.deactivate();
         }
+        self.sync_sidebar_tab_state(cx);
         self.save();
         self.refresh_detached(cx);
         cx.notify();
@@ -407,6 +408,7 @@ impl Shell {
                                 {
                                     this.drop_stale_pastes_for_pane(rebound, Some(new), cx);
                                 }
+                                this.sync_sidebar_tab_state(cx);
                                 this.save();
                             }
                             new

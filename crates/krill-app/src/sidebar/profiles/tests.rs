@@ -235,6 +235,55 @@ fn replacement_preserves_sidebar_slot_cursor_and_host_across_poll_gap_and_chain(
 }
 
 #[gpui::test]
+fn session_order_keeps_tab_position_during_replacement_and_chain(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|_| Sidebar::new_loaded(None));
+    view.update(cx, |s, cx| {
+        s.apply(Ok((snapshot(), Meta::new())), BTreeMap::new(), cx);
+        s.set_session_order(
+            [30, 20, 10]
+                .into_iter()
+                .map(|id| (HostId::Local, SessionId(id)))
+                .collect(),
+            cx,
+        );
+        let mut accounts = accounts();
+        accounts.details.handoffs.push(SessionHandoff {
+            from: SessionId(20),
+            to: Some(SessionId(90)),
+            account_id: "other".into(),
+            error: None,
+        });
+        s.sync_session_accounts(&HostId::Local, accounts.clone().into(), cx);
+        assert_eq!(
+            row_sessions(s, &HostId::Local),
+            vec![SessionId(30), SessionId(90), SessionId(10)]
+        );
+        s.set_session_order(
+            [30, 90, 10]
+                .into_iter()
+                .map(|id| (HostId::Local, SessionId(id)))
+                .collect(),
+            cx,
+        );
+        let mut gap = snapshot();
+        gap.sessions.retain(|s| s.id != SessionId(20));
+        s.apply(Ok((gap, Meta::new())), BTreeMap::new(), cx);
+        accounts.details.handoffs.push(SessionHandoff {
+            from: SessionId(90),
+            to: Some(SessionId(100)),
+            account_id: "main".into(),
+            error: None,
+        });
+        s.sync_session_accounts(&HostId::Local, accounts.into(), cx);
+        assert_eq!(
+            row_sessions(s, &HostId::Local),
+            vec![SessionId(30), SessionId(100), SessionId(10)]
+        );
+    });
+}
+
+#[gpui::test]
 fn account_badge_opens_inline_menu_without_selecting_session(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));

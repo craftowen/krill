@@ -78,6 +78,29 @@ impl HostProfiles {
 }
 
 impl State {
+    pub(super) fn session_rank(
+        &self,
+        host: &HostId,
+        mut session: SessionId,
+        order: &BTreeMap<SessionId, usize>,
+    ) -> Option<usize> {
+        if let Some(rank) = order.get(&session) {
+            return Some(*rank);
+        }
+        let state = self.hosts.get(host)?;
+        for _ in 0..state.replacements.len() {
+            let (&previous, _) = state
+                .replacements
+                .iter()
+                .find(|(_, next)| **next == session)?;
+            session = previous;
+            if let Some(rank) = order.get(&session) {
+                return Some(*rank);
+            }
+        }
+        None
+    }
+
     /// Only fresh status polls consume the one-poll grace, never unrelated redraws.
     pub(super) fn observe(&mut self, host: &HostId, snapshot: &Snapshot) -> bool {
         let Some(state) = self.hosts.get_mut(host) else {

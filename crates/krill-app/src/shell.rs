@@ -1299,7 +1299,7 @@ impl Shell {
             shell.flush_layout_snapshot();
         })
         .detach();
-        shell.sync_sidebar_custom_titles(cx);
+        shell.sync_sidebar_tab_state(cx);
         shell.record_workspace_nav(cx);
         Self::register_overlay_hosts(cx);
         shell.refresh_local_state(cx);
@@ -1454,7 +1454,7 @@ impl Shell {
                             d.set_tab(panel_tab, cx);
                         });
                         this.sync_focused_session(cx);
-                        this.sync_sidebar_custom_titles(cx);
+                        this.sync_sidebar_tab_state(cx);
                         this.record_workspace_nav(cx);
                     }
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1595,10 +1595,16 @@ impl Shell {
         })
     }
 
-    /// OWE-854: 탭의 사용자 지정 제목을 사이드바 세션 행 라벨에 동기화한다.
-    pub(super) fn sync_sidebar_custom_titles(&self, cx: &mut Context<Self>) {
+    /// Project tab titles and structural session order from the persisted Layout.
+    pub(super) fn sync_sidebar_tab_state(&self, cx: &mut Context<Self>) {
         let mut custom = std::collections::BTreeMap::new();
+        let mut order = Vec::new();
         for (i, tab) in self.layout.tabs().iter().enumerate() {
+            for pane in self.layout.tab_panes(i) {
+                if let Some(session) = self.layout.session(pane) {
+                    order.push((self.layout.host(pane).clone(), session));
+                }
+            }
             let Some(title) = self.layout.tab_title(i) else {
                 continue;
             };
@@ -1611,8 +1617,10 @@ impl Shell {
                 }
             }
         }
-        self.sidebar
-            .update(cx, |s, cx| s.set_custom_titles(custom, cx));
+        self.sidebar.update(cx, |s, cx| {
+            s.set_custom_titles(custom, cx);
+            s.set_session_order(order, cx);
+        });
     }
 
     /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
@@ -3684,7 +3692,7 @@ impl Shell {
             }
             self.sync(cx);
             self.sync_focused_session(cx);
-            self.sync_sidebar_custom_titles(cx);
+            self.sync_sidebar_tab_state(cx);
             self.save();
             self.refresh_detached(cx);
         }
@@ -4239,6 +4247,7 @@ impl Shell {
             }
         }
         if recovered {
+            self.sync_sidebar_tab_state(cx);
             self.save();
         }
         if !any_terminal && let Some(state) = self.update_ready.take() {
@@ -4543,7 +4552,7 @@ impl Shell {
                     self.layout.clear_session(pane);
                 }
                 self.layout.set_session(pane, session);
-                self.sync_sidebar_custom_titles(cx);
+                self.sync_sidebar_tab_state(cx);
                 self.sync_focused_session(cx);
                 if self.layout.host(pane).is_local()
                     && self
@@ -4643,7 +4652,7 @@ impl Shell {
         if self.layout.session(pane) != Some(session) {
             self.layout.clear_session(pane);
             self.layout.set_session(pane, session);
-            self.sync_sidebar_custom_titles(cx);
+            self.sync_sidebar_tab_state(cx);
             self.sync_focused_session(cx);
             self.record_workspace_nav(cx);
             self.save();
@@ -5552,7 +5561,7 @@ impl Shell {
         if save || now_focused != focused {
             self.sync_focused_session(cx);
         }
-        self.sync_sidebar_custom_titles(cx);
+        self.sync_sidebar_tab_state(cx);
         // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
         if now_focused.is_some() {
             self.sync_diff_workspace(cx);

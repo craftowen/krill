@@ -40,6 +40,7 @@ pub mod options;
 mod path_identity;
 mod pr;
 mod profiles;
+mod session_order;
 mod startup;
 mod view;
 mod viewport;
@@ -880,6 +881,8 @@ pub struct Sidebar {
     /// 사용자가 끌어다 놓아 정한 프로젝트(저장소·폴더) 순서(`sidebar.bin` 5번째 구간).
     project_order: Vec<PathBuf>,
     worktree_order: Vec<PathBuf>,
+    /// Runtime projection of Layout order; Layout remains the persisted source.
+    session_order: BTreeMap<HostId, BTreeMap<SessionId, usize>>,
     row_hosts: Vec<HostId>,
     action_host: Option<HostId>,
     prs: BTreeMap<PathBuf, crate::pull_request::Status>,
@@ -1270,6 +1273,7 @@ impl Sidebar {
             collapsed_hosts: ui.collapsed_hosts,
             project_order: Vec::new(),
             worktree_order: Vec::new(),
+            session_order: BTreeMap::new(),
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -2851,7 +2855,7 @@ impl Sidebar {
         if !self.host_connected(host) {
             return Vec::new();
         }
-        self.snapshot_for(host)
+        self.ordered_snapshot(host, self.snapshot_for(host))
             .sessions
             .iter()
             .filter(|s| {
