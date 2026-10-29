@@ -364,7 +364,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
             crate::orchestration::FEAT_ORCH_SNAPSHOT_PAGE,
             35,
         ),
-        ("FEAT_WORKTREE_REFS", crate::control::FEAT_WORKTREE_REFS, 29),
+        ("FEAT_WORKTREE_REFS", crate::control::FEAT_WORKTREE_REFS, 37),
     ];
     // 새 상수를 표·fixture 양쪽에서 빠뜨리는 것도 잡는다.
     let declared: std::collections::BTreeSet<_> =

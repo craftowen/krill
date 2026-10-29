@@ -395,8 +395,11 @@ impl Session {
                     #[cfg(unix)]
                     let source = halt;
                     #[cfg(windows)]
-                    let source = pipe;
+                    let mut source = pipe;
+                    #[cfg(unix)]
                     let r = read_loop(&shared, source, rec);
+                    #[cfg(windows)]
+                    let r = read_loop(&shared, &mut source, rec);
                     #[cfg(test)]
                     pause_tests::before_close(shared.id);
                     // Handoff parks inside read_loop instead of returning. Reaching
@@ -455,7 +458,7 @@ impl Session {
         lock(&self.shared.gaps).clone()
     }
 
-    /// 리더가 끝났는지: PTY가 닫혔거나(EOF) [`halt`]로 멈췄다.
+    /// 리더가 EOF 또는 오류로 끝났는지. 인계 중 주차된 리더는 닫힌 것이 아니다.
     pub fn is_closed(&self) -> bool {
         lock(&self.shared.reader)
             .as_ref()
@@ -470,12 +473,9 @@ impl Session {
     pub fn wait(self) -> io::Result<()> {
         let reader = lock(&self.shared.reader).take();
         reader.map_or(Ok(()), |reader| {
-            reader
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(io::Error::other("pty reader panicked outside catch_unwind"))
-                })
-                .map(|_| ())
+            reader.join().unwrap_or_else(|_| {
+                Err(io::Error::other("pty reader panicked outside catch_unwind"))
+            })
         })
     }
 }
@@ -978,11 +978,9 @@ fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
 type Source<'a> = BorrowedFd<'a>;
 /// 리더 스레드가 소유하고 되돌리기 경합 때 새 워커로 바꾼다(`read_loop`가 끝나면 취소·join).
 #[cfg(windows)]
-type Source<'a> = windows::Reader;
+type Source<'a> = &'a mut windows::Reader;
 
 fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
-    #[cfg(windows)]
-    let mut source = source;
     let look = &*shared.look;
     let mut buf = vec![0u8; BATCH];
     let mut seq = shared.live().seq;
@@ -1032,7 +1030,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
                 // this canceled worker is not terminal EOF and must be replaced.
                 handoff::wait(shared, &mut rec);
                 match windows::Reader::start(&shared.master) {
-                    Ok(reader) => source = reader,
+                    Ok(reader) => *source = reader,
                     Err(error) => {
                         errors = errors.saturating_add(1);
                         tracing::warn!(kind = ?error.kind(), "pty reader resume failed; retrying");

@@ -807,7 +807,7 @@ function testHostViewBudgets() {
     "question",
   ])
     assert(hostViews.has(key(id)), id + " pinned");
-  assert.equal(hostViews.size, 8);
+  assert.equal(hostViews.size, 9);
   hostViews.clear();
   for (let n = 0; n < 6; n++)
     put("heavy-" + n, { bytes: 7 * 1024 * 1024, entry: { mounts: 1 } });

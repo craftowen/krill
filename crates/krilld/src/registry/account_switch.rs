@@ -1327,7 +1327,7 @@ impl Registry {
             Some(&session_id),
             account.as_ref(),
         )
-        .map_err(|e| prepare_failure("resume_launch", &e))?;
+        .map_err(|e| prepare_failure(old, "resume_launch", &e))?;
         if applied.as_ref().is_none_or(|a| a.id != account_id) {
             self.discard_settings(new);
             return Err(Failure::Denied);
@@ -1344,7 +1344,7 @@ impl Registry {
                 cwd.clone(),
                 applied,
             )
-            .map_err(|e| prepare_failure("replacement_identity", &e))?;
+            .map_err(|e| prepare_failure(old, "replacement_identity", &e))?;
         if let Some(dir) = state_dir.as_deref() {
             let raw = serde_json::to_vec(&Prepared {
                 from: old,
@@ -1353,7 +1353,7 @@ impl Registry {
             })
             .map_err(|_| Failure::BadRequest)?;
             accounts::write_atomic_0600(&replacement_journal(dir, new), &raw)
-                .map_err(|e| prepare_failure("replacement_journal", &e))?;
+                .map_err(|e| prepare_failure(old, "replacement_journal", &e))?;
         }
         let (new, _) = self.spawn_holder(
             holder,
@@ -1364,8 +1364,7 @@ impl Registry {
             size.cols,
             size.rows,
         )?;
-        // Swap as soon as the replacement runs, like Orca: resume confirmation only gates
-        // the continuation prompt below, never the switch itself.
+        // Keep the original conversation until the replacement identity is confirmed.
         let (tap, new_pid) = {
             let state = lock(&self.state);
             let entry = state.sessions.get(&new).ok_or(Failure::NoSession)?;
@@ -1385,13 +1384,16 @@ impl Registry {
             {
                 next_identity_probe = Instant::now() + Duration::from_millis(200);
                 let observed = resume_identity(|| {
-                    let mut observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    let observed = identity::discover(provider, new_pid, tap.foreground())?;
                     #[cfg(windows)]
-                    if observed.is_none()
-                        && let Some(watch) = &codex_resume
-                    {
-                        observed = watch.observe(new_pid, tap.foreground())?;
-                    }
+                    let observed = if observed.is_none() {
+                        match &codex_resume {
+                            Some(watch) => watch.observe(new_pid, tap.foreground())?,
+                            None => observed,
+                        }
+                    } else {
+                        observed
+                    };
                     if observed.is_none() && provider == ProviderKind::Claude {
                         identity::discover_claude(&claude_homes, new_pid, tap.foreground())
                     } else {

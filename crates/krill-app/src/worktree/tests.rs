@@ -371,35 +371,84 @@ fn branch_picker_separates_selection_search_and_keyboard(cx: &mut TestAppContext
         cx.update(|_, cx| dialog.read(cx).base_value(cx)),
         "feat/parent"
     );
-    // 입력済み면 덮지 않는다.
-    cx.update(|window, cx| {
-        dialog.update(cx, |d, cx| {
-            d.base.update(cx, |input, cx| {
-                input.set_value("custom", window, cx);
-            });
-            d.set_base_default(Some("other".to_owned()), window, cx);
-        });
-    });
-    assert_eq!(cx.update(|_, cx| dialog.read(cx).base_value(cx)), "custom");
-    cx.update(|window, cx| {
-        dialog.update(cx, |d, cx| {
-            d.base.update(cx, |input, cx| {
-                input.set_value("feat", window, cx);
-            });
-        });
-    });
+    assert!(cx.debug_bounds("worktree-base-options").is_none());
+    assert!(cx.debug_bounds("worktree-initial-prompt").is_none());
+    assert!(cx.debug_bounds("worktree-fanout-agents").is_some());
+    let create_before = cx.debug_bounds("worktree-create").unwrap();
+    let trigger = cx.debug_bounds("worktree-base-picker").unwrap();
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    // 기준 ref 칸에 포커스가 없으면 후보 목록을 펼치지 않는다.
-    assert!(
-        cx.debug_bounds("worktree-base-option-feat/parent")
-            .is_none()
+    assert!(cx.debug_bounds("worktree-base-option-main").is_some());
+    assert!(cx.debug_bounds("worktree-base-option-origin/dev").is_some());
+    assert_eq!(cx.debug_bounds("worktree-create").unwrap(), create_before);
+    let click_point = cx
+        .debug_bounds("worktree-base-option-main")
+        .unwrap()
+        .center();
+    cx.simulate_click(click_point, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).base_value(cx)), "main");
+    assert_eq!(
+        closed.get(),
+        0,
+        "a branch-row click cannot dismiss its parent modal"
     );
-    // 포커스가 오면 검색어로 필터된 후보가 펼쳐진다.
-    cx.update(|window, cx| {
-        dialog.update(cx, |d, cx| {
-            d.base.update(cx, |input, cx| input.focus(window, cx));
-        });
-    });
+    let click_point = cx.debug_bounds("worktree-base-picker").unwrap().center();
+    cx.simulate_click(click_point, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // A selected base never becomes the query; typing only filters, and doesn't change the request.
+    cx.simulate_input("DEV");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("worktree-base-option-main").is_none());
+    assert!(cx.debug_bounds("worktree-base-option-origin/dev").is_some());
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).base_value(cx)), "main");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| dialog.read(cx).base_value(cx)),
+        "origin/dev"
+    );
+    assert!(
+        fake.requests.lock().unwrap().is_empty(),
+        "Enter picks rather than creates"
+    );
+    assert!(cx.debug_bounds("worktree-base-options").is_none());
+    let click_point = cx.debug_bounds("worktree-base-picker").unwrap().center();
+    cx.simulate_click(click_point, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| dialog.read(cx).base_value(cx)),
+        "feat/parent"
+    );
+    let click_point = cx.debug_bounds("worktree-base-picker").unwrap().center();
+    cx.simulate_click(click_point, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("worktree-dialog").is_some());
+    assert!(cx.debug_bounds("worktree-base-options").is_none());
+    assert!(cx.update(|window, cx| {
+        dialog
+            .read(cx)
+            .name
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }));
+    cx.simulate_resize(gpui::size(px(320.), px(480.)));
+    let click_point = cx.debug_bounds("worktree-base-picker").unwrap().center();
+    cx.simulate_click(click_point, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let popup = cx.debug_bounds("worktree-base-options").unwrap();
+    assert!(
+        popup.left() >= px(0.) && popup.right() <= px(320.),
+        "{popup:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert!(
         fake.requests.lock().unwrap().is_empty(),

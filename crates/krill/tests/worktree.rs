@@ -228,12 +228,17 @@ fn cli_new_worktree_starts_session_in_the_created_path() {
             1,
             "stdout must contain only the session ID"
         );
-        let waited = run(cwd, &["wait", id.trim(), "--timeout", "5"]);
+        let name = if index == 0 { "feat-x" } else { "feat-x-2" };
+        let path = fs::canonicalize(f.dir.join("worktrees/레포").join(name)).unwrap();
+        let condition = format!("pattern:{}", path.display());
+        // Agent programs retain a login shell after printing; wait for their output.
+        let waited = run(
+            cwd,
+            &["wait", id.trim(), "--for", &condition, "--timeout", "5"],
+        );
         assert!(waited.status.success(), "{waited:?}");
         let output = run(cwd, &["read", id.trim()]);
         assert!(output.status.success(), "{output:?}");
-        let name = if index == 0 { "feat-x" } else { "feat-x-2" };
-        let path = fs::canonicalize(f.dir.join("worktrees/레포").join(name)).unwrap();
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(path.to_str().unwrap()),
             "{output:?}"

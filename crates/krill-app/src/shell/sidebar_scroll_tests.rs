@@ -6,7 +6,7 @@ use krill_proto::{SessionId, control::AgentStatus};
 use std::path::Path;
 
 #[gpui::test]
-fn sidebar_clicks_keep_scroll_when_restoring_a_session_below_the_viewport(cx: &mut TestAppContext) {
+fn sidebar_clicks_keep_scroll_with_persisted_tab_order(cx: &mut TestAppContext) {
     struct Memory;
     impl sidebar::Source for Memory {
         fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
@@ -64,7 +64,7 @@ fn sidebar_clicks_keep_scroll_when_restoring_a_session_below_the_viewport(cx: &m
         let before = cx.debug_bounds(card_selector).expect("visible worktree");
         let last_session: &'static str = format!("sidebar-session-{}", index + 80).leak();
         assert!(cx.debug_bounds(last_session).is_none());
-        // Restore the worktree's MRU session, which is far below the visible header.
+        // Restore the worktree MRU without moving the card; persisted tab order pins it first.
         cx.simulate_click(
             before.origin + point(px(45.), px(12.)),
             Modifiers::default(),
@@ -81,7 +81,7 @@ fn sidebar_clicks_keep_scroll_when_restoring_a_session_below_the_viewport(cx: &m
         );
         assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
 
-        let session_selector: &'static str = format!("sidebar-session-{}", index + 1).leak();
+        let session_selector: &'static str = format!("sidebar-session-{}", index + 2).leak();
         let session_before = cx.debug_bounds(session_selector).expect("visible session");
         cx.simulate_click(session_before.center(), Modifiers::default());
         cx.run_until_parked();
@@ -96,11 +96,33 @@ fn sidebar_clicks_keep_scroll_when_restoring_a_session_below_the_viewport(cx: &m
         );
 
         // An explicit reveal after selection must still work: the scroll guard is scoped.
-        view.update(cx, |s, cx| s.open_session(SessionId(80), cx));
+        view.update(cx, |s, cx| s.open_session(SessionId(79), cx));
         cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |s, _| s.focused_local_session()),
+            Some(SessionId(79))
+        );
+        let selected_row = sidebar.read_with(cx, |s, _| {
+            let index = s
+                .visible_workspaces()
+                .into_iter()
+                .find(|(_, _, path)| path == Path::new("/repo/tree"))
+                .unwrap()
+                .0;
+            let position = s
+                .live_sessions_in_workspace(
+                    &krill_app::hosts::HostId::Local,
+                    Path::new("/repo/tree"),
+                )
+                .iter()
+                .position(|id| *id == SessionId(79))
+                .unwrap();
+            index + position + 1
+        });
+        let revealed: &'static str = format!("sidebar-session-{selected_row}").leak();
         assert!(
-            cx.debug_bounds(card_selector).is_none(),
-            "explicit navigation reveals the off-screen session"
+            cx.debug_bounds(revealed).is_some(),
+            "explicit navigation reveals the selected session"
         );
     }
 }

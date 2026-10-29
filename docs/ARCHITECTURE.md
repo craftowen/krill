@@ -158,7 +158,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_USAGE_MANAGE | `1 << 59` | `krill_proto::usage` (계정 라벨 변경·데이터 삭제·고아 프로필 정리 요청과 `UsageReply::Orphans`, MK-144·145·OWE-704·705 지휘자 배정; enum 끝에 추가) |
 | FEAT_ACCOUNT_POLICY | `1 << 61` | `krill_proto::usage::policy` (`Create.account` 선택 꼬리·고급 자동전환 정책·전환 이력·모델별 주간 창, MK-152·OWE-712 지휘자 배정; 구 피어에는 꼬리 생략) |
 | FEAT_ACCOUNT_CONNECTION | `1 << 62` | `krill_proto::usage::connections` (연결 상태 꼬리, OWE-719; 구 피어에는 꼬리 생략. `direct_usage`는 항상 true, `SetDirectUsage`는 구버전 호환용 무동작 요청이며 사용량은 항상 자동 수집) |
-| FEAT_WORKTREE_REFS | `1 << 29` | `krill_proto::control` (호스트별 Git 브랜치·태그 조회) |
+| FEAT_WORKTREE_REFS | `1 << 37` | `krill_proto::control` (호스트별 Git 브랜치·태그 조회) |
 | FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가) |
 | FEAT_ORCH_SNAPSHOT_PAGE | `1 << 35` | `krill_proto::orchestration` (1MiB 프레임을 넘는 유효 저장소의 무손실 페이지 스냅샷 `OrchAction::SnapshotPage`(opcode 25)/`OrchResponse::SnapshotPage`(wire 14), foundation-02 지휘자 배정 2026-10-27; enum 끝에 추가, 미협상 피어에는 요청 금지) |
 

@@ -710,11 +710,6 @@ pub(crate) fn cancel_sync_io(thread: BorrowedHandle<'_>) {
     }
 }
 
-pub(crate) fn thread_finished(thread: BorrowedHandle<'_>) -> bool {
-    // SAFETY: live borrowed thread handle, zero timeout cannot block.
-    unsafe { WaitForSingleObject(thread.as_raw_handle(), 0) == WAIT_OBJECT_0 }
-}
-
 /// Peer-disconnect probe for a blocked PTY input write (daemon-02): polled from the thread that holds
 /// the input turn, never read, never blocking. `WSAPoll` rejects `POLLHUP` in `events` (`WSAEINVAL`),
 /// so readability is requested and the hang-up, error and invalid-socket bits are taken from `revents`.

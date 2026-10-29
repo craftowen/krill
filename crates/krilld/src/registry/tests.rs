@@ -2756,16 +2756,29 @@ fn worktree_refs_are_read_only_but_enforce_scope_and_negotiation() {
     };
     assert!(read_only(&request));
     let registry = Registry::new(None, None);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(999))] {
-        assert_eq!(
-            registry.handle(
-                &Peer { pid: None, scope },
-                request.clone(),
-                &mut HashMap::new()
-            ),
-            Reply::Failed(Failure::Denied)
-        );
-    }
+    assert_eq!(
+        registry.handle(
+            &Peer {
+                pid: None,
+                scope: Scope::Restricted
+            },
+            request.clone(),
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::Denied)
+    );
+    // Verified session peers share the same owner permissions as external shells.
+    assert!(matches!(
+        registry.handle(
+            &Peer {
+                pid: None,
+                scope: Scope::Session(SessionId(999))
+            },
+            request.clone(),
+            &mut HashMap::new()
+        ),
+        Reply::WorktreeFailed(_)
+    ));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(3)))

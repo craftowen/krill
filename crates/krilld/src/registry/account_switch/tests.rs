@@ -174,8 +174,14 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             else {
                 panic!("expected old process retirement after new output");
             };
-            // An unconfirmed resume still swaps immediately, like Orca.
-            assert_eq!(old, if cancel { id } else { SessionId(7) });
+            assert_eq!(
+                old,
+                if cancel || unconfirmed {
+                    id
+                } else {
+                    SessionId(7)
+                }
+            );
             let mut snapshot = AccountsSnapshot::default();
             hook_reg.account_switch_snapshot(&mut snapshot);
             assert!(
@@ -191,7 +197,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 FromHolder::Done { req }
             };
             holder_link.send(&reply.encode().unwrap(), &[]).unwrap();
-            if !close_fail && !cancel {
+            if !close_fail && !cancel && !unconfirmed {
                 // Done only accepts teardown. Completion must remain hidden until Exited.
                 std::thread::sleep(Duration::from_millis(50));
                 let mut snapshot = AccountsSnapshot::default();
@@ -244,7 +250,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 "in-flight cancellation must not rebind the original"
             );
             assert!(!lock(&reg.state).closing.contains(&SessionId(7)));
-        } else if fail || close_fail {
+        } else if fail || unconfirmed || close_fail {
             let result = saved.get(&SessionId(7)).unwrap();
             assert!(result.to.is_none());
             assert!(result.error.is_some());
@@ -819,8 +825,7 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
             else {
                 panic!("expected old process retirement after agy output settles");
             };
-            // Unconfirmed agy resumes swap immediately too; only continuation waits.
-            assert_eq!(old, SessionId(11));
+            assert_eq!(old, if confirmed { SessionId(11) } else { id });
             holder_link
                 .send(&FromHolder::Done { req }.encode().unwrap(), &[])
                 .unwrap();
@@ -855,16 +860,23 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
         reg.process_account_work_in(&home);
         let saved = load(Some(&state));
         let result = saved.get(&SessionId(11)).unwrap();
-        assert!(
-            result.error.is_none(),
-            "unexpected error: {:?}",
-            result.error
-        );
-        let new = result.to.expect("durable replacement for agy");
-        assert_eq!(
-            reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
-            target
-        );
+        if confirmed {
+            assert!(
+                result.error.is_none(),
+                "unexpected error: {:?}",
+                result.error
+            );
+            let new = result.to.expect("durable replacement for agy");
+            assert_eq!(
+                reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
+                target
+            );
+        } else {
+            assert!(result.to.is_none());
+            assert!(result.error.as_deref().unwrap().contains("timed out"));
+            assert!(!lock(&reg.state).closing.contains(&SessionId(11)));
+            assert!(!lock(&reg.state).exited.contains_key(&SessionId(11)));
+        }
         assert!(
             to_agy
                 .join("brain")
@@ -1070,7 +1082,7 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
 }
 
 #[test]
-fn unconfirmed_replacement_swaps_now_withholds_continue_and_can_switch_again() {
+fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
     use std::io::Read as _;
 
     let root = Path::new("/tmp").join(format!("kas-unconfirmed-{}", std::process::id()));
@@ -1160,7 +1172,8 @@ fn unconfirmed_replacement_swaps_now_withholds_continue_and_can_switch_again() {
     let hook_reg = Arc::clone(&reg);
     let mock = std::thread::spawn(move || {
         let mut replacements = Vec::new();
-        for (round, retired) in [(0, None), (1, Some(0))] {
+        let mut processes = Vec::new();
+        for round in [0, 1] {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
             else {
@@ -1192,10 +1205,11 @@ fn unconfirmed_replacement_swaps_now_withholds_continue_and_can_switch_again() {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
             else {
-                panic!("expected immediate retirement of the previous session");
+                panic!(
+                    "expected rollback of an unconfirmed replacement or retirement after confirmation"
+                );
             };
-            let expected: SessionId =
-                retired.map_or(SessionId(31), |index: usize| replacements[index]);
+            let expected = if round == 0 { id } else { SessionId(31) };
             assert_eq!(old, expected);
             holder_link
                 .send(&FromHolder::Done { req }.encode().unwrap(), &[])
@@ -1208,28 +1222,39 @@ fn unconfirmed_replacement_swaps_now_withholds_continue_and_can_switch_again() {
                     .unwrap();
                 let mut byte = [0_u8; 1];
                 assert!(
-                    process.read(&mut byte).is_err(),
+                    !matches!(process.read(&mut byte), Ok(1..)),
                     "an unconfirmed replacement must not receive the continuation prompt"
                 );
             }
+            processes.push(process);
         }
-        replacements
+        (replacements, processes)
     });
 
     reg.queue_account_switch(ProviderKind::Codex, &target_ids[0]);
     reg.process_account_work_in(&home);
-    let first = load(Some(&state))
+    let failed = load(Some(&state))
         .get(&SessionId(31))
-        .and_then(|h| h.to)
-        .expect("unconfirmed replacement is committed immediately");
+        .cloned()
+        .expect("failure must preserve the original's recovery record");
+    assert!(failed.to.is_none() && failed.error.is_some());
+    assert!(
+        reg.agents.stored(SessionId(31)).unwrap().is_some(),
+        "original conversation remains switchable"
+    );
     let snapshot = accounts::refresh_accounts_with(&home, Some(&state), false);
-    reg.queue_session_account_switch(first, ProviderKind::Codex, &target_ids[1], &snapshot)
-        .expect("the unconfirmed replacement keeps a switchable conversation");
+    reg.queue_session_account_switch(
+        SessionId(31),
+        ProviderKind::Codex,
+        &target_ids[1],
+        &snapshot,
+    )
+    .unwrap();
     reg.process_account_work_in(&home);
-    let replacements = mock.join().unwrap();
-    assert_eq!(replacements[0], first);
+    let (replacements, _processes) = mock.join().unwrap();
+    assert_ne!(replacements[0], replacements[1]);
     assert_eq!(
-        load(Some(&state)).get(&first).and_then(|h| h.to),
+        load(Some(&state)).get(&SessionId(31)).and_then(|h| h.to),
         Some(replacements[1])
     );
     reader_worker.join().unwrap();

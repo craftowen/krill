@@ -1,7 +1,6 @@
 //! Composer layout adapted from Orca `NewWorkspaceComposerCard`/`NameSection` and `CreateFromPicker`.
 //! Copyright (c) 2026 Lovecast Inc. (MIT License; see docs/licensing/spdx/MIT.txt).
 use super::*;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::popover::Popover;
 
 impl Render for Dialog {
@@ -21,7 +20,8 @@ impl Render for Dialog {
                 input.set_placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get(), window, cx);
             });
         }
-        if self.pickers_dirty {
+
+        if self.picker_sync == PickerSync::Dirty {
             self.sync_pickers(window, cx);
         }
         let p = crate::ui::palette(cx);
@@ -70,6 +70,8 @@ impl Render for Dialog {
             }
             _ => repo_name,
         };
+        let has_repo_choice = !host_options.is_empty();
+        let has_host_choice = host_options.len() > 1;
         let body = match &self.phase {
             Phase::Edit(error) => body
                 .when(!host_options.is_empty(), |d| {
@@ -560,9 +562,6 @@ impl Dialog {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        if self.pickers_dirty {
-            self.sync_pickers(window, cx);
-        }
         let p = crate::ui::palette(cx);
         let count = self.filtered_bases(cx).len();
         let rows = u16::try_from(count.clamp(1, 7)).unwrap_or(7);
@@ -648,9 +647,6 @@ impl Dialog {
                     "worktree-branch-rows",
                     count,
                     cx.processor(|dialog, range: std::ops::Range<usize>, _, cx| {
-                        if self.pickers_dirty {
-                            self.sync_pickers(window, cx);
-                        }
                         let p = crate::ui::palette(cx);
                         let candidates = dialog.filtered_bases(cx);
                         let selected = dialog.base.read(cx).value().to_string();

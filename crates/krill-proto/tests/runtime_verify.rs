@@ -66,9 +66,9 @@ fn independent_status_multirow_root_tail_boundaries_and_truncation() {
 }
 
 #[test]
-fn repro_producer_root_name_filter_accepts_a_name_that_poisons_all_status_rows() {
+fn invalid_observed_root_name_cannot_poison_other_status_rows() {
     let observed = "sh\ncmd".to_owned();
-    // Exact producer predicate, registry.rs:1918. A legal Unix executable name.
+    // A legacy producer can observe a legal Unix filename containing control characters.
     let root = Some(observed).filter(|name| !name.is_empty() && name.len() <= 256);
     assert!(root.is_some());
     let mut status = AgentStatus::UNKNOWN;
@@ -90,8 +90,11 @@ fn repro_producer_root_name_filter_accepts_a_name_that_poisons_all_status_rows()
     ]);
     let frame = reply.encode().unwrap();
     let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
-    assert!(
-        Reply::decode(kind, &body).is_err(),
-        "current producer sends a root name forbidden by decoder"
-    );
+    let Reply::States(rows) = Reply::decode(kind, &body)
+        .expect("invalid observed names must not poison valid status rows")
+    else {
+        panic!("expected states")
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status.root_shell.is_none()));
 }

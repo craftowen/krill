@@ -69,9 +69,8 @@ pub(crate) fn prepare(reg: &Registry, holder: &Holder, u: Upgrade) -> Result<Upg
     // (새 holder를 띄울 주체가 없다). 실패로 보고하고 구 krilld가 계속 쥔다.
     // 판정과 종료 사이의 수 μs 경합은 핸드오프 재설계(needs-owen a) 없이 막지 못한다.
     if !holder.is_connected() {
-        let stalled = crate::session::end_halt();
+        drop(pause);
         tracing::warn!(
-            stalled,
             "upgrade: holder lost before handover completed; readers resumed, keeping old krilld"
         );
         return Err(Failure::NoHolder);

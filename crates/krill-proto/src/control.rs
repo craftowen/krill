@@ -106,7 +106,7 @@ pub const FEAT_CLEAR_SCROLLBACK: u64 = 1 << 47;
 /// 원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩. [`Request::RemoteFs`]·[`Reply::RemoteFs`] 한 쌍.
 pub const FEAT_REMOTE_FS: u64 = 1 << 27;
 /// 실제 브랜치·태그 조회. `FEAT_CONTROL`과 함께 협상한다.
-pub const FEAT_WORKTREE_REFS: u64 = 1 << 29;
+pub const FEAT_WORKTREE_REFS: u64 = 1 << 37;
 /// 조회 한 번의 ref 수 상한.
 pub const MAX_WORKTREE_REFS: usize = 2048;
 /// UI에서 선택할 ref 이름의 UTF-8 바이트 상한.

@@ -1099,7 +1099,6 @@
           sessionId: session.id,
           agentIcon,
           visible: inChat,
-          onQuickActions: () => quickActions(),
           getQuestion: () => handle?.getQuestion?.(),
           onAnswerQuestion: (token, selected) =>
             handle.replyQuestion(token, selected),

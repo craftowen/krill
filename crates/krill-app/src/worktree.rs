@@ -141,6 +141,12 @@ impl<V: Clone + PartialEq> SearchableListItem for PickItem<V> {
 type ProjectPicker = SelectState<SearchableVec<PickItem<String>>>;
 type HostPicker = SelectState<SearchableVec<PickItem<HostId>>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerSync {
+    Dirty,
+    Current,
+}
+
 pub struct Dialog {
     language: crate::i18n::Language,
     focus: gpui::FocusHandle,
@@ -170,7 +176,7 @@ pub struct Dialog {
     project_picker: Entity<ProjectPicker>,
     host_picker: Entity<HostPicker>,
     /// 호스트·프로젝트가 바뀌어 콤보박스 항목을 다음 렌더에서 다시 채워야 한다.
-    pickers_dirty: bool,
+    picker_sync: PickerSync,
     preparation: Option<Preparation>,
     preparation_task: Option<Task<()>>,
     preparation_ready: bool,
@@ -358,7 +364,7 @@ impl Dialog {
             _enter: subscriptions,
             project_picker,
             host_picker,
-            pickers_dirty: true,
+            picker_sync: PickerSync::Dirty,
             preparation: None,
             preparation_task: None,
             preparation_ready: false,
@@ -411,7 +417,7 @@ impl Dialog {
             self.refresh_repo_hooks(cx);
             self.prepare(cx);
         }
-        self.pickers_dirty = true;
+        self.picker_sync = PickerSync::Dirty;
         cx.notify();
     }
 
@@ -441,7 +447,7 @@ impl Dialog {
         }
         self.refresh_repo_hooks(cx);
         self.prepare(cx);
-        self.pickers_dirty = true;
+        self.picker_sync = PickerSync::Dirty;
         cx.notify();
     }
 
@@ -487,7 +493,7 @@ impl Dialog {
     /// 프로젝트 목록은 모든 호스트의 프로젝트를 이름으로 묶고(보조 설명에 호스트), 실행 위치는 고른 프로젝트가 있는 호스트만 보인다.
     // ponytail: 호스트 간 같은 프로젝트를 이름으로 묶는다. 한 호스트에 같은 이름이 둘이면 첫 항목만 고를 수 있다.
     fn sync_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.pickers_dirty = false;
+        self.picker_sync = PickerSync::Current;
         let multi_host = self.host_options.len() > 1;
         let mut projects: Vec<PickItem<String>> = Vec::new();
         for opt in &self.host_options {
@@ -551,7 +557,7 @@ impl Dialog {
         self.apply_repo_branch_options(repo_branch.as_deref(), window, cx);
         self.refresh_repo_hooks(cx);
         self.prepare(cx);
-        self.pickers_dirty = true;
+        self.picker_sync = PickerSync::Dirty;
         cx.notify();
     }
 

@@ -463,8 +463,11 @@ launch = ["/bin/sh", "-c", "printf 'folder-agent-ready\\n'; /bin/pwd -P; IFS= re
     };
     assert!(text.contains(expected.to_str().unwrap()), "{text}");
     d.ok(&["send", id, "--enter", "folder-input"]);
-    d.ok(&["wait", id, "--timeout", "5"]);
     d.wait_text(id, "agent-received:folder-input");
+    assert!(
+        ls_has_session(&d.ok(&["ls"]), id),
+        "agent exit must retain its login shell"
+    );
     assert!(!folder.join(".git").exists());
 }
 
@@ -1243,7 +1246,8 @@ launch = ["/bin/sh", "-c", "exit 3"]
     .unwrap();
     assert_eq!(recorded, receipt);
     assert!(
-        String::from_utf8_lossy(&broken.stderr).contains("exited during startup"),
+        String::from_utf8_lossy(&broken.stderr)
+            .contains("did not become ready; prompt was not sent"),
         "{}",
         String::from_utf8_lossy(&broken.stderr)
     );

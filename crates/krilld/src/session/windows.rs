@@ -12,7 +12,9 @@ use std::os::windows::io::{AsHandle as _, OwnedHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use super::{BATCH, HALTED, Shared, lock};
 use crate::holder::Master;
@@ -35,10 +37,6 @@ impl Stop {
     /// Abort the worker's in-flight `ReadFile`/`WriteFile` without stopping the worker.
     fn cancel_io(&self) {
         crate::sys::cancel_sync_io(self.thread.as_handle());
-    }
-
-    fn finished(&self) -> bool {
-        crate::sys::thread_finished(self.thread.as_handle())
     }
 }
 

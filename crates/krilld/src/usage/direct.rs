@@ -89,13 +89,6 @@ pub fn refresh_manual(home: &Path, state: Option<&Path>) {
 
 fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bool) {
     let file = accounts::load_file(home, state);
-    if !file.direct_usage {
-        lock(&CACHE).retain(|(h, _, _), _| h != home);
-        lock(&RETRY).retain(|(h, _, _), _| h != home);
-        agy::evict(home);
-        super::meters::evict(home);
-        return;
-    }
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
@@ -153,10 +146,7 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
-            // Discard in-flight results if the user disabled direct usage meanwhile.
-            if accounts::load_file(&job.0, state.as_deref()).direct_usage
-                && let Some(usage) = apply_result(&job, result, now)
-            {
+            if let Some(usage) = apply_result(&job, result, now) {
                 let mut cache = lock(&CACHE);
                 cache.retain(|_, (at, u)| alive(*at, u));
                 cache.insert(job.clone(), (Instant::now(), usage));
@@ -367,7 +357,7 @@ fn mark_failed(
 }
 
 /// 테스트용: 직접 조회가 401로 실패한 상태를 만든다(이전 정상값 없음).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn fail_for_tests(home: &Path, provider: ProviderKind, dir: &Path) {
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
     mark_failed(&mut lock(&CACHE), &key, None, Failure::Http(401));
@@ -2445,31 +2435,26 @@ mod tests {
     }
 
     #[test]
-    fn completion_after_direct_usage_disabled_does_not_reinsert_failure() {
+    fn legacy_direct_usage_opt_out_does_not_hide_refresh_failures() {
         let root =
             std::env::temp_dir().join(format!("usage-disabled-completion-{}", std::process::id()));
         let home = root.join("home");
         let state = root.join("state");
         let key = (home.clone(), ProviderKind::Claude, home.join(".claude"));
-        accounts::save_file(
-            &home,
-            Some(&state),
-            &accounts::AccountsFile {
-                direct_usage: false,
-                ..accounts::AccountsFile::default()
-            },
-        )
-        .unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("accounts.toml"), "direct_usage = false\n").unwrap();
         lock(&PENDING).insert(key.clone());
-        // 테스트 fetch는 실제 자격증명을 읽지 않고 실패한다. 완료 처리 시 설정이 꺼져 있다.
+        // 사용량은 항상 자동 수집한다. 구버전 opt-out은 완료 오류를 숨기지 않는다.
         spawn(&key, true, Some(state));
         let deadline = Instant::now() + Duration::from_secs(5);
         while lock(&PENDING).contains(&key) {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!lock(&CACHE).contains_key(&key));
-        assert!(!lock(&RETRY).contains_key(&key));
+        assert_eq!(lock(&CACHE)[&key].1.error.as_deref(), Some("갱신 실패"));
+        assert!(lock(&RETRY).contains_key(&key));
+        lock(&CACHE).remove(&key);
+        lock(&RETRY).remove(&key);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -680,15 +680,11 @@ fn render_detail_panel_ghost(
         snap.status_for(&account.id),
         krill_app::accounts::display::now(),
     );
-    profile = profile.child(
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_size(ui::TEXT_2XS)
-            .child(ui::badge(p, ui::BadgeTone::Muted, status.label))
-            .child(div().child(status.updated)),
-    );
+    profile = profile.child(krill_app::accounts::display::render_status(
+        format!("ghost-detail-status-{}", account.id),
+        &status,
+        p,
+    ));
     if let Some(meters) = snap.meters_for(&account.id) {
         profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
         for meter in &meters.meters {

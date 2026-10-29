@@ -1083,7 +1083,7 @@ impl Registry {
                 })
             }
             Request::WorktreeRefs { repo } => {
-                if self.authorize_cwd(peer, "worktree-refs", &repo) {
+                if peer.authorize("worktree-refs", SessionId(0), &self.audit) {
                     Ok(crate::git::worktree_refs::serve(&repo))
                 } else {
                     Err(Failure::Denied)

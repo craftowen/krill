@@ -114,7 +114,8 @@ fn reports_each_profile_and_reason_streak_once_and_recovers_once() {
     lock(&RETRY).remove(&first);
     lock(&RETRY).remove(&second);
     lock(&CACHE).remove(&first);
-    super::super::meters::evict(&home);
+    super::super::meters::evict_profile(&home, first.1, &first.2);
+    super::super::meters::evict_profile(&home, second.1, &second.2);
 }
 
 #[test]

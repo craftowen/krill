@@ -2189,6 +2189,12 @@ fn change_feed_pushes_through_the_relay_mux_and_ends_with_mux_close() {
     {
         let mut s = lock(&g.shared.state);
         s.publication.origin = format!("http://127.0.0.1:{relay_port}");
+        s.account.session = Some(super::super::relay_auth::Session {
+            token: "test-session".into(),
+            expires_at_ms: u64::MAX,
+            email: "test@example.test".into(),
+            origin: s.publication.origin.clone(),
+        });
         s.relay_enabled = true;
         s.tunnel_start = Some(must_not_start_tunnel);
     }

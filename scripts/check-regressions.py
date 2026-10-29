@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCOPES = ("harness", "packaging", "mobile", "telemetry")
 # Explicit inventory: mobile_pwa.cjs needs compiled helpers; *_browser.* needs Chrome.
 # Those remain integration/visual checks, not standalone Node test programs.
-MOBILE = ("transport", "storage", "terminal", "updates", "quick_commands", "session", "chat", "screens")
+MOBILE = ("transport", "storage", "terminal", "updates", "quick_commands", "session", "chat", "screens", "diagnostics", "feed")
 MOBILE_INTEGRATION = {
     "mobile_pwa.cjs": "compiled holder/daemon; invoked by Rust mobile_pwa integration tests",
     "mobile_install.cjs": "Chrome/real daemon fixture invoked by mobile_pwa.cjs",

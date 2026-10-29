@@ -274,7 +274,6 @@ fn main() -> ExitCode {
             .stack_size(256 * 1024)
             .spawn(move || {
                 krilld::alloc::mobile_thread().ok();
-                let mut seen = None;
                 let mut quota_tick = std::time::Instant::now();
                 loop {
                     r.wait_account_work(
