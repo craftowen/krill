@@ -394,3 +394,21 @@ fn output_budget_abort_allows_git_to_remove_its_lock() {
         "output-limit cleanup left an owned Git lock behind"
     );
 }
+
+#[test]
+fn panicking_job_does_not_wedge_its_repo() {
+    let dir = Dir::new("panic");
+    let git = dir.script("echo ok");
+    let queue = GitQueue::with_program(git, 1).unwrap();
+    queue.enqueue(
+        dir.0.clone(),
+        0,
+        Box::new(|_, _| std::panic::panic_any("job panicked")),
+    );
+    let reply = queue.submit(&dir.0, ["a"]);
+    let out = reply
+        .recv_timeout(Duration::from_secs(5))
+        .expect("later job on the same repo must still run")
+        .unwrap();
+    assert_eq!(out.stdout, b"ok\n");
+}
