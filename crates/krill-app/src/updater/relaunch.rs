@@ -204,7 +204,8 @@ pub(super) fn swap_with(
             Mode::InPlace => sync_bundle_in_place(&staging, app_bundle)?,
             Mode::Rename => rename::move_tree(&staging, app_bundle, &trash)?,
         }
-        fs::remove_dir_all(&staging)?;
+        // 교체는 끝났다. 남은 스테이징을 못 지웠다고 완료된 업데이트를 되돌리지 않는다(다음 스테이징이 치운다).
+        fs::remove_dir_all(&staging).ok();
         journal.stage = Stage::VerifyingLaunch;
         journal.save(state_dir)
     })();
