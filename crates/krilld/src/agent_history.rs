@@ -10,6 +10,7 @@ use krill_proto::agent_history::{Agent, Entry, MAX_ENTRIES, MAX_TEXT, Snapshot};
 use serde_json::Value;
 
 pub(crate) mod chat;
+mod opencode_sqlite;
 pub(crate) mod vault;
 
 /// 탐색/IO 예산. 실제 성능 측정값이 아닌 구현 상한이다.

@@ -8,7 +8,7 @@ Usage: scripts/check-windows.sh [--bootstrap] [-p crate]... [--clippy] [--target
   --bootstrap       Install isolated Rust 1.98.1 and MinGW headers, then exit.
   -p crate          Check selected packages (default: --workspace).
   --clippy          Run official Clippy with -D warnings instead of cargo check.
-  --target-dir DIR  Override CARGO_TARGET_DIR (default: target/windows-gnu).
+  --target-dir DIR  Override CARGO_TARGET_DIR (default: /Volumes/krill-build/targets/windows-gnu).
 
 Requires Apple Silicon macOS, Homebrew cargo and LLVM (llvm@22 or llvm).
 Installations and downloads live in ~/.cache/krill-win; rustup is not used.
@@ -20,7 +20,7 @@ die() { printf 'check-windows: %s\n' "$*" >&2; exit 1; }
 bootstrap=false
 clippy=false
 packages=()
-target_args=()
+build_target="${CARGO_TARGET_DIR:-/Volumes/krill-build/targets/windows-gnu}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bootstrap) bootstrap=true; shift ;;
@@ -30,12 +30,17 @@ while [[ $# -gt 0 ]]; do
             packages+=( -p "$2" ); shift 2 ;;
         --target-dir)
             [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "$1 needs a directory"
-            target_args=( --target-dir "$2" ); shift 2 ;;
+            build_target=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown argument: $1" ;;
     esac
 done
 [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || die 'requires Apple Silicon macOS'
+cd "$(dirname "$0")/.."
+# Bootstrap only installs the isolated toolchain; it does not produce Cargo output.
+if ! $bootstrap; then
+    python3 scripts/check-build-target.py --target-dir "$build_target" || exit 1
+fi
 
 cache="$HOME/.cache/krill-win"
 version=1.98.1
@@ -121,13 +126,11 @@ export CFLAGS_x86_64_pc_windows_gnu="--target=x86_64-w64-windows-gnu -isystem \"
 export CXXFLAGS_x86_64_pc_windows_gnu="$CFLAGS_x86_64_pc_windows_gnu"
 # boost 하네스와 같은 BLAKE3 pure 경로. MSVC 크로스 검사에서 어셈블러를 우회하며 GNU에도 유지한다.
 export CARGO_FEATURE_PURE=1
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/windows-gnu}"
+export CARGO_TARGET_DIR="$build_target"
 if [[ ${#packages[@]} -eq 0 ]]; then packages=( --workspace ); fi
 subcommand=check
 if $clippy; then subcommand=clippy; fi
-cd "$(dirname "$0")/.."
 # Bash 3.2 + nounset에서도 빈 배열을 안전하게 처리한다.
 args=( "$subcommand" --locked --target x86_64-pc-windows-gnu --all-targets "${packages[@]}" )
-if [[ ${#target_args[@]} -gt 0 ]]; then args+=( "${target_args[@]}" ); fi
 if $clippy; then args+=( -- -D warnings ); fi
 exec cargo "${args[@]}"

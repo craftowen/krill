@@ -328,7 +328,12 @@ fn quick_open_finds_and_opens(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("files-quick"));
     let root = dir.0.clone();
     view.update(cx, |s, cx| {
-        s.new_folder_tab(&root, krill_proto::control::Program::Login, cx);
+        s.new_folder_tab_on(
+            s.launch_host.clone(),
+            &root,
+            krill_proto::control::Program::Login,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -1563,12 +1568,28 @@ fn reload_comparison_read_races_preserve_new_edits_and_replaced_tabs(cx: &mut Te
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
             let loaded = read_file(&file, false);
-            let fresh = Shell::load_file_tab(pane, file.clone(), None, window, cx, loaded);
+            let fresh = Shell::load_file_tab(
+                pane,
+                file.clone(),
+                None,
+                krill_app::hosts::HostId::Local,
+                window,
+                cx,
+                loaded,
+            );
             shell.files.tabs.insert(pane, fresh);
             shell.files.next_io = Some(gate);
             shell.reload_file(pane, window, cx);
             let loaded = read_file(&file, false);
-            let fresh = Shell::load_file_tab(pane, file.clone(), None, window, cx, loaded);
+            let fresh = Shell::load_file_tab(
+                pane,
+                file.clone(),
+                None,
+                krill_app::hosts::HostId::Local,
+                window,
+                cx,
+                loaded,
+            );
             shell.files.tabs.insert(pane, fresh);
         });
     });
@@ -2215,4 +2236,604 @@ fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppC
     stop.store(true, Ordering::SeqCst);
     drop(UnixStream::connect(&sock_path));
     daemon.join().ok();
+}
+
+/// APP-RUNTIME-004: `layout_loading` 중에 파일을 열어 에디터를 띄우고 저장하지 않은 내용을 입력한 뒤
+/// `restore_layout`이 끝나도, 미저장 버퍼·더티 상태·`EditorState` 이벤트 구독 콜백과 이후 `Cmd+S` 저장까지
+/// 모두 같은 파일 탭을 가리키며 복원된 저장본 탭과 `PaneId`가 충돌하지 않는다.
+#[gpui::test]
+fn early_file_editor_unsaved_buffer_and_subscription_survive_startup_restore(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("startup-early-editor");
+    let saved_file = dir.0.join("saved.rs");
+    let early_file = dir.0.join("early.rs");
+    fs::write(&saved_file, "const SAVED: usize = 1;\n").unwrap();
+    fs::write(&early_file, "fn main() {}\n").unwrap();
+
+    let path = state_path("startup-early-editor-layout");
+    let mut saved = krill_app::layout::Layout::default();
+    let saved_term = saved.focused().unwrap();
+    saved.set_session(saved_term, krill_proto::SessionId(7));
+    let saved_editor_pane = saved.open_file(saved_file.clone());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::shell::bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut shell = crate::shell::Shell::new_with_restore_gate(Some(path.clone()), gate, cx);
+        assert!(shell.layout_loading);
+        shell.open_file(early_file.clone(), cx);
+        shell
+    });
+    cx.run_until_parked();
+
+    let (early_pane, editor_entity_before) = view.read_with(cx, |shell, _| {
+        assert!(shell.layout_loading);
+        let pane = shell.layout.active_tab().focused;
+        let entity_id = shell.files.tabs[&pane].editor().unwrap().entity_id();
+        (pane, entity_id)
+    });
+    assert_eq!(
+        early_pane, saved_editor_pane,
+        "early file tab originally collides with saved editor PaneId before saved-layout rekey"
+    );
+    assert_eq!(editor_text(&view, early_pane, cx), "fn main() {}\n");
+
+    cx.simulate_input("// unsaved\n");
+    assert_eq!(
+        editor_text(&view, early_pane, cx),
+        "// unsaved\nfn main() {}\n"
+    );
+    assert!(dirty(&view, early_pane, cx));
+
+    // 이제 백그라운드 레이아웃 복원이 끝난다.
+    release.send(()).unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.layout_loading);
+        assert_eq!(shell.layout.tabs().len(), 3);
+        assert_eq!(shell.layout.active(), 2);
+        assert_eq!(shell.layout.tab_panes(2), vec![early_pane]);
+        assert_ne!(shell.layout.tab_panes(1)[0], early_pane);
+        assert_eq!(
+            shell.layout.file(shell.layout.tab_panes(1)[0]),
+            Some(saved_file.as_path())
+        );
+        assert_eq!(
+            shell.files.tabs[&early_pane].editor().unwrap().entity_id(),
+            editor_entity_before,
+            "same EditorState entity must survive startup restore without reload"
+        );
+    });
+    assert_eq!(
+        editor_text(&view, early_pane, cx),
+        "// unsaved\nfn main() {}\n"
+    );
+    assert!(dirty(&view, early_pane, cx));
+
+    // 복원 뒤에 저장한 뒤 다시 입력해 EditorState 구독 콜백(file_edited)이 여전히 early_pane을 더티로 바꾸는지 검증한다.
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert!(!dirty(&view, early_pane, cx));
+    assert_eq!(
+        fs::read_to_string(&early_file).unwrap(),
+        "// unsaved\nfn main() {}\n"
+    );
+
+    cx.simulate_input("// post-restore\n");
+    assert!(
+        dirty(&view, early_pane, cx),
+        "EditorState subscription captured during layout_loading must still mark early_pane dirty"
+    );
+    assert_eq!(
+        editor_text(&view, early_pane, cx),
+        "// unsaved\n// post-restore\nfn main() {}\n"
+    );
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert!(!dirty(&view, early_pane, cx));
+    assert_eq!(
+        fs::read_to_string(&early_file).unwrap(),
+        "// unsaved\n// post-restore\nfn main() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved_file).unwrap(),
+        "const SAVED: usize = 1;\n"
+    );
+}
+
+/// APP-F01 후속 회귀용 가짜 원격 파일 데몬: 연결마다 요청 하나를 처리한다(`Stat`·`ReadFile`·`WriteAtomic`).
+/// 읽기·쓰기 횟수와 써진 바이트를 기록해, 원격 칸이 로컬 디스크 대신 이 데몬만 쓰는지 확인한다.
+struct FakeRemoteFs {
+    sock_path: PathBuf,
+    text: Arc<std::sync::Mutex<Vec<u8>>>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeRemoteFs {
+    fn serve(initial: &[u8]) -> Self {
+        use krill_proto::control::{FEAT_CONTROL, FEAT_REMOTE_FS, Reply, Request};
+        use krill_proto::ipc::{ClientHello, ServerHello};
+        use krill_proto::os::net::UnixListener;
+        use krill_proto::remote_fs::{
+            RemoteFsReply, RemoteFsRequest, WireReadChunk, WireStamp, WireStat, WireWriteOutcome,
+        };
+        use krill_proto::screen::Msg as _;
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // macOS 유닉스 소켓 경로 상한(SUN_LEN)이 짧아 임시 폴더 바로 아래의 짧은 이름을 쓴다.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let sock_path = std::env::temp_dir().join(format!(
+            "mk-rfs-{}-{}.sock",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::remove_file(&sock_path).ok();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let text = Arc::new(std::sync::Mutex::new(initial.to_vec()));
+        let generation = Arc::new(AtomicUsize::new(1));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (text_bg, reads_bg, writes_bg, stop_bg) =
+            (text.clone(), reads.clone(), writes.clone(), stop.clone());
+        let stat = move |text: &[u8], generation: usize| WireStat {
+            exists: true,
+            is_file: true,
+            is_dir: false,
+            is_symlink: false,
+            stamp: Some(WireStamp {
+                modified_unix_ns: Some(
+                    1_700_000_000_000_000_000 + u64::try_from(generation).unwrap(),
+                ),
+                len: u64::try_from(text.len()).unwrap(),
+            }),
+        };
+        let thread = std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                if stop_bg.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut writer = stream.try_clone().unwrap();
+                let server = ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: FEAT_CONTROL | FEAT_REMOTE_FS,
+                    build: "test".to_owned(),
+                    instance_id: 1,
+                };
+                if writer.write_all(&server.encode().unwrap()).is_err() {
+                    continue;
+                }
+                let Some((kind, body)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                    continue;
+                };
+                let _ = ClientHello::decode(kind, &body).unwrap();
+                let Some((kind, payload)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                    continue;
+                };
+                let Ok(req) = Request::decode(kind, &payload) else {
+                    continue;
+                };
+                let reply = match req {
+                    Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
+                        let text = text_bg.lock().unwrap();
+                        Reply::RemoteFs(RemoteFsReply::Stat(Ok(stat(
+                            &text,
+                            generation.load(Ordering::SeqCst),
+                        ))))
+                    }
+                    Request::RemoteFs(RemoteFsRequest::ReadFile { .. }) => {
+                        reads_bg.fetch_add(1, Ordering::SeqCst);
+                        let text = text_bg.lock().unwrap().clone();
+                        Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                            stat: stat(&text, generation.load(Ordering::SeqCst)),
+                            bytes: text,
+                            eof: true,
+                        })))
+                    }
+                    Request::RemoteFs(RemoteFsRequest::WriteAtomic { bytes, commit, .. }) => {
+                        assert!(commit, "test files fit one chunk");
+                        *text_bg.lock().unwrap() = bytes.clone();
+                        let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                        writes_bg.lock().unwrap().push(bytes.clone());
+                        Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(
+                            stat(&bytes, generation).stamp.unwrap(),
+                        )))
+                    }
+                    _ => continue,
+                };
+                stream.write_all(&reply.encode().unwrap()).ok();
+            }
+        });
+        Self {
+            sock_path,
+            text,
+            reads,
+            writes,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn target(&self) -> krill_app::hosts::HostTarget {
+        krill_app::hosts::HostTarget::remote("studio", self.sock_path.clone())
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn writes(&self) -> Vec<Vec<u8>> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl Drop for FakeRemoteFs {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(UnixStream::connect(&self.sock_path));
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+        fs::remove_file(&self.sock_path).ok();
+    }
+}
+
+/// APP-F01 후속: 원격 텍스트 칸은 어떤 경로에서도 같은 경로의 로컬 파일을 읽거나 쓰지 않는다.
+/// 전송이 없으면 읽지 않고(오프라인 안내), 편집 중 전송이 끊기면 ⌘S·닫기/종료 저장·내 편집 유지·
+/// 다시 읽기·비교가 버퍼를 지킨 채 거부되며, 전송이 돌아오면 원격 데몬으로만 저장된다.
+#[gpui::test]
+fn remote_text_pane_never_reads_or_writes_colliding_local_file(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-local-guard");
+    // 원격 경로와 같은 로컬 경로에 다른 내용의 파일을 둔다(충돌 경로).
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "local secret\n").unwrap();
+    let daemon = FakeRemoteFs::serve(b"remote content\n");
+    let host = HostId::Remote("studio".into());
+    let (view, cx) = open(cx, state_path("remote-editor-local-guard"));
+
+    // 1. 전송이 없는 원격 칸: 같은 경로의 로컬 파일을 읽지 않는다.
+    view.update(cx, |s, cx| {
+        assert!(s.target_for_host(&host).is_none());
+        s.open_file_on(host.clone(), file.clone(), cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).host(pane), &host);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-offline").is_some());
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert!(matches!(tab.body, Body::Offline));
+        assert!(
+            tab.doc.is_none() && tab.editor().is_none(),
+            "a remote pane without a transport must not load the colliding local file"
+        );
+        assert!(!s.files.loading.contains_key(&pane));
+    });
+    assert_eq!(daemon.reads(), 0);
+
+    // 2. 전송이 생기면 원격 데몬에서 읽는다(로컬 내용은 보이지 않는다).
+    view.update(cx, |s, _| {
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "remote content\n");
+    assert_eq!(daemon.reads(), 1);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-offline").is_none());
+
+    // 3. 편집 중 전송이 끊기면 ⌘S는 로컬 파일에 쓰지 않고 버퍼·dirty를 지킨 채 오류 띠만 띄운다.
+    cx.simulate_input("x");
+    assert_eq!(editor_text(&view, pane, cx), "xremote content\n");
+    assert!(dirty(&view, pane, cx));
+    view.update(cx, |s, _| {
+        s.host_targets.remove(&host);
+    });
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "local secret\n");
+    assert!(daemon.writes().is_empty());
+    assert!(dirty(&view, pane, cx));
+    assert_eq!(editor_text(&view, pane, cx), "xremote content\n");
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert!(!tab.saving);
+        assert_eq!(
+            tab.error.as_deref(),
+            Some(etext::REMOTE_DISCONNECTED_KEPT.get())
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-error").is_some());
+
+    // 닫기·종료의 "저장"도 같은 경로를 타므로 로컬에 쓰지 않고 멈춘다(탭·편집 유지).
+    let closed = cx.update(|_, cx| {
+        view.update(cx, |_, cx| {
+            Shell::resolve_unsaved(async { Some(0) }, &[pane], cx)
+        })
+    });
+    assert!(
+        !cx.foreground_executor().block_test(closed),
+        "save-on-close must fail closed without a transport"
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "local secret\n");
+    assert!(daemon.writes().is_empty());
+    assert!(cx.update(|_, cx| view.read(cx).files.tabs.contains_key(&pane)));
+    assert!(dirty(&view, pane, cx));
+
+    // 4. 내 편집 유지·다시 읽기·비교도 로컬 파일을 읽지 않고 버퍼를 지킨다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.keep_file(pane, cx);
+            s.reload_file(pane, window, cx);
+            s.compare_file(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "xremote content\n");
+    assert!(dirty(&view, pane, cx));
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert!(tab.comparison.is_none());
+        assert!(tab.recovery.is_none());
+        assert!(!s.files.loading.contains_key(&pane));
+    });
+    assert_eq!(
+        daemon.reads(),
+        1,
+        "no disk read happened while disconnected"
+    );
+
+    // 5. 전송이 돌아오면 원격 데몬으로 저장되고 로컬 파일은 그대로다.
+    view.update(cx, |s, _| {
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert_eq!(daemon.writes(), vec![b"xremote content\n".to_vec()]);
+    assert!(!dirty(&view, pane, cx));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "local secret\n");
+    view.read_with(cx, |s, _| assert!(s.files.tabs[&pane].error.is_none()));
+    assert_eq!(*daemon.text.lock().unwrap(), b"xremote content\n".to_vec());
+}
+
+/// APP-F01 후속: 원격 HTML 칸은 로컬 전용 공유(아티팩트)를 버튼·호출 모두에서 거부하고, 전송이 없으면
+/// 브라우저 열기·Finder 보기처럼 로컬 경로로 떨어지는 동작을 숨긴다. 로컬 칸의 공유 버튼은 그대로다.
+#[gpui::test]
+fn remote_html_pane_hides_local_only_share_and_browser_actions(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-share-guard");
+    let file = dir.0.join("page.html");
+    fs::write(&file, "<title>local</title>\n").unwrap();
+    let daemon = FakeRemoteFs::serve(b"<title>remote</title>\n");
+    let host = HostId::Remote("studio".into());
+    let (view, cx) = open(cx, state_path("remote-editor-share-guard"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), file.clone(), cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).host(pane), &host);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // 연결된 원격: HTML 미리보기·브라우저 열기는 원격 전송으로 가므로 보이고, 로컬 전용 공유 버튼은 없다.
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(pane)),
+        Some(true)
+    );
+    assert!(cx.debug_bounds("file-html-preview").is_some());
+    assert!(cx.debug_bounds("file-open-browser").is_some());
+    assert!(cx.debug_bounds("file-share-artifact").is_none());
+    assert_eq!(daemon.reads(), 1);
+
+    // 버튼 없이 직접 불러도 원격 칸의 공유는 거부된다(같은 경로의 로컬 파일이 올라가지 않는다).
+    cx.update(|window, cx| view.update(cx, |s, cx| s.share_file_artifact(pane, window, cx)));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(!s.files.sharing.contains(&pane));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(atext::SHARE_REMOTE_UNSUPPORTED.get())
+        );
+    });
+
+    // 전송이 끊기면 로컬 경로로 떨어지는 동작을 모두 숨기고 연결 안내만 보인다.
+    view.update(cx, |s, _| {
+        s.host_targets.remove(&host);
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-offline").is_some());
+    assert!(cx.debug_bounds("file-html-preview").is_none());
+    assert!(cx.debug_bounds("file-open-browser").is_none());
+    assert!(cx.debug_bounds("file-html-open-browser").is_none());
+    assert!(cx.debug_bounds("file-reveal").is_none());
+    assert!(cx.debug_bounds("file-share-artifact").is_none());
+
+    // 전송이 돌아오면 다시 읽지 않고도 원격 미리보기로 돌아간다.
+    view.update(cx, |s, _| {
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-html-preview").is_some());
+    assert!(cx.debug_bounds("file-open-browser").is_some());
+    assert_eq!(daemon.reads(), 1);
+
+    // 로컬 칸에는 공유 버튼이 그대로 있다.
+    let local = dir.0.join("doc.md");
+    fs::write(&local, "# doc\n").unwrap();
+    view.update(cx, |s, cx| s.open_file_on(HostId::Local, local.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-share-artifact").is_some());
+}
+
+/// APP-F01 후속: 탭이 없는 원격 작업공간에서 단일 클릭 미리보기는 `open_file`처럼 작업공간 호스트에 열린다.
+/// 전송이 없으므로 같은 경로의 로컬 파일이 있어도 읽지 않는다.
+#[gpui::test]
+fn preview_in_empty_remote_workspace_keeps_workspace_host(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+    use std::collections::BTreeMap;
+
+    let (view, cx) = open(cx, state_path("remote-editor-empty-ws-preview"));
+    let host = HostId::Remote("studio".into());
+    let wt = PathBuf::from("/remote/repo/wt-1");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_manager.sync_specs(&[RemoteHostSpec {
+                id: "studio".into(),
+                label: "Studio".into(),
+                address: "owen@studio.local".into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            }]);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "studio",
+                    HostStatus::Connected,
+                    krill_app::sidebar::Snapshot {
+                        sessions: Vec::new(),
+                        trees: BTreeMap::from([(PathBuf::from("/remote/repo"), vec![wt.clone()])]),
+                    },
+                    cx,
+                );
+                sb.select_worktree(Some(wt.clone()), cx);
+            });
+            while !s.layout.tabs().is_empty() {
+                s.layout.close_tab(0);
+            }
+        });
+    });
+    cx.run_until_parked();
+    let readme = wt.join("README.md");
+    view.update(cx, |s, cx| {
+        assert!(s.layout.focused().is_none());
+        assert_eq!(s.active_workspace(cx).host, host);
+        assert!(s.target_for_host(&host).is_none());
+        s.open_file_preview(readme.clone(), cx);
+    });
+    cx.run_until_parked();
+    let l = layout_of(&view, cx);
+    let pane = l.active_tab().focused;
+    assert_eq!(l.file(pane), Some(readme.as_path()));
+    assert_eq!(
+        l.host(pane),
+        &host,
+        "preview in an empty remote workspace must open on the workspace host, not Local"
+    );
+    assert_eq!(
+        l.launch(pane).map(|c| c.cwd.clone()),
+        Some(wt.as_os_str().as_bytes().to_vec())
+    );
+    view.read_with(cx, |s, _| {
+        assert!(matches!(
+            s.files.tabs.get(&pane).map(|t| &t.body),
+            Some(Body::Offline)
+        ));
+    });
+}
+
+/// APP-F01 후속: 전송이 없는 원격 터미널 칸의 경로 링크 동작(기본 앱으로 열기·Finder에서 보기)은 같은 경로의
+/// 로컬 파일로 떨어지지 않고 연결 안내만 띄운다. 경로 복사와 에디터로 열기(오프라인 칸)는 그대로 된다.
+#[gpui::test]
+fn terminal_link_actions_on_disconnected_remote_pane_never_touch_local_path(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-link-guard");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "local secret\n").unwrap();
+    let (view, cx) = open(cx, state_path("remote-editor-link-guard"));
+    let host = HostId::Remote("studio".into());
+    let link = || PathLink {
+        column: 0,
+        cols: 1,
+        path: file.clone(),
+        line: None,
+        col: None,
+    };
+    view.update(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_host(pane, host.clone());
+        assert!(s.target_for_host(&host).is_none());
+        for action in [
+            terminal_menu::FileAction::OpenDefault,
+            terminal_menu::FileAction::Reveal,
+        ] {
+            s.notice = None;
+            s.activate_terminal_file(link(), action, cx);
+            assert_eq!(
+                s.notice.as_deref(),
+                Some(etext::REMOTE_DISCONNECTED.get()),
+                "{action:?} must fail closed without a transport"
+            );
+        }
+        s.notice = None;
+        s.activate_terminal_file(link(), terminal_menu::FileAction::CopyPath, cx);
+        assert!(s.notice.is_none());
+        s.activate_terminal_file(link(), terminal_menu::FileAction::Open, cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(pane), Some(file.as_path()));
+    assert_eq!(layout_of(&view, cx).host(pane), &host);
+    view.read_with(cx, |s, _| {
+        assert!(matches!(
+            s.files.tabs.get(&pane).map(|t| &t.body),
+            Some(Body::Offline)
+        ));
+    });
+}
+
+/// APP-F01 후속: 읽어 온 본문은 읽어 온 호스트에만 속한다. 칸의 호스트가 바뀌면 로컬에서 읽은 에디터를
+/// 원격 칸으로 재사용하지 않고 버린 뒤 새 호스트 기준으로 다시 읽는다(전송이 없으면 오프라인 칸).
+#[gpui::test]
+fn loaded_file_body_is_dropped_when_pane_host_changes(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-host-identity");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "local\n").unwrap();
+    let (view, cx) = open(cx, state_path("remote-editor-host-identity"));
+    let pane = open_file(&view, &file, cx);
+    assert_eq!(editor_text(&view, pane, cx), "local\n");
+    let host = HostId::Remote("studio".into());
+    view.update(cx, |s, _| s.layout.set_host(pane, host.clone()));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert_eq!(tab.host, host);
+        assert!(
+            matches!(tab.body, Body::Offline),
+            "a body loaded from Local must not be reused under a remote host"
+        );
+    });
+    view.update(cx, |s, _| s.layout.set_host(pane, HostId::Local));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "local\n");
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.files.tabs[&pane].host, HostId::Local);
+    });
 }

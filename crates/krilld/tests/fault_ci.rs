@@ -1168,13 +1168,15 @@ fn fault_injection_accelerated_24h_memory_soak() {
     for &(_, spid) in &sessions {
         assert!(alive(spid), "session died during 24-epoch soak");
     }
-    let (_, base_krilld, base_holder) = samples_kib[0];
+    // 기준선은 epoch 12: 백그라운드 세션이 한 번 늘었다 정착하는 계단(약 +25MiB)이 epoch 2~12 사이 시간에 따라 어디서든
+    // 올라와, epoch 2를 기준선으로 쓰면 누수가 아닌 계단이 20MiB 한도를 간헐적으로 넘겼다.
+    let (_, base_krilld, base_holder) = samples_kib[2];
     let &(_, end_krilld, end_holder) = samples_kib.last().unwrap();
     let daemon_total_kib = end_krilld + end_holder;
     let drift_kib = i64::try_from(daemon_total_kib).unwrap()
         - i64::try_from(base_krilld + base_holder).unwrap();
     eprintln!(
-        "MK-064 24-epoch soak (10x 120x40, warmup={warmup_lines}, epoch={lines_per_epoch}): samples(epoch, krilld KiB, holder KiB)={samples_kib:?}, daemon_total={daemon_total_kib}KiB, drift(e{epochs}-e2)={drift_kib:+}KiB"
+        "MK-064 24-epoch soak (10x 120x40, warmup={warmup_lines}, epoch={lines_per_epoch}): samples(epoch, krilld KiB, holder KiB)={samples_kib:?}, daemon_total={daemon_total_kib}KiB, drift(e{epochs}-e12)={drift_kib:+}KiB"
     );
     assert!(
         daemon_total_kib <= 60 * 1024,

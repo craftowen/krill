@@ -6,6 +6,53 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 #[test]
+fn startup_sweep_prunes_only_expired_orphan_launches() {
+    use std::time::{Duration, SystemTime};
+
+    let dir = std::env::temp_dir().join(format!("launch-sweep-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let control = Control::new(Some(&dir));
+    control.sweep(&[], SystemTime::now()).unwrap();
+    assert!(!dir.exists());
+    let launch = AgentLaunch {
+        profile: "codex".into(),
+        permission: Permission::Manual,
+    };
+    for id in 1..=6 {
+        control.remember(SessionId(id), &launch).unwrap();
+    }
+    fs::create_dir_all(dir.join("sessions/2.noindex")).unwrap();
+    fs::create_dir_all(dir.join("hibernated")).unwrap();
+    fs::write(dir.join("hibernated/3"), b"resume").unwrap();
+    fs::write(dir.join("agent-launches/notes.json"), b"unrelated").unwrap();
+    let later = SystemTime::now() + Duration::from_hours(8 * 24);
+    let recent = later - Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(control.launch_path(SessionId(4)).unwrap())
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(recent))
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(control.launch_path(SessionId(6)).unwrap())
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(later + Duration::from_secs(60)))
+        .unwrap();
+    control.sweep(&[SessionId(1)], later).unwrap();
+    for id in [1, 2, 3, 4, 6] {
+        assert!(control.has(SessionId(id)), "lost recoverable launch {id}");
+    }
+    assert!(!control.has(SessionId(5)), "expired orphan was retained");
+    assert!(dir.join("agent-launches/notes.json").is_file());
+    // Once the cold history is collected, its launch is an orphan too.
+    fs::remove_dir_all(dir.join("sessions/2.noindex")).unwrap();
+    control.sweep(&[SessionId(1)], later).unwrap();
+    assert!(!control.has(SessionId(2)));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn switch_identity_merge_keeps_late_hook_and_source_account_across_restart() {
     let dir = std::env::temp_dir().join(format!("switch-identity-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();

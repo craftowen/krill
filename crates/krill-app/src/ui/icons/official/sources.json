@@ -1,0 +1,83 @@
+[
+  {
+    "file": "claude.svg",
+    "source_page": "https://www.anthropic.com/news",
+    "source_url": "https://www-cdn.anthropic.com/ae59ca4ca194dac9c9dc3bc78c5829468cb0e8af.zip",
+    "archive_member_or_payload": "Anthropic media resources/Anthropic logos/Claude logos/3 Claude Spark/SVG/Claude Spark - Clay.svg",
+    "sha256": "6d53db4be375e899c937c26cf16684a80d6e869b1928d72b37748bef2560e219",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "openai-light.svg",
+    "source_page": "https://openai.com/brand/",
+    "source_url": "https://cdn.openai.com/brand/openai-logos.zip",
+    "archive_member_or_payload": "OpenAI-logos/SVGs/OAI_OpenAI-Blossom_Black.svg",
+    "sha256": "75c1e9fffa5e8c437bec1d67197a73992bca45d166c6ff23215185dea8fae92a",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "openai-dark.svg",
+    "source_page": "https://openai.com/brand/",
+    "source_url": "https://cdn.openai.com/brand/openai-logos.zip",
+    "archive_member_or_payload": "OpenAI-logos/SVGs/OAI_OpenAI-Blossom_White.svg",
+    "sha256": "01d158767c4eec0e47bd617e67759c33da0accd1438be1a8d29dfdb99ce87285",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "antigravity.svg",
+    "source_page": "https://antigravity.google/press",
+    "source_url": "https://antigravity.google/assets/image/brand/antigravity-icon__full-color.svg",
+    "archive_member_or_payload": null,
+    "sha256": "d775965ea1f8060538c15f758a3e22487317211fcb6051333b5e023f35aa726f",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "opencode-light.svg",
+    "source_page": "https://opencode.ai/brand",
+    "source_url": "https://opencode.ai/_build/assets/index-6aeJ_iFM.js",
+    "archive_member_or_payload": "data:image/svg+xml download payload: logoLightSquareSvg",
+    "sha256": "4510b522890d06fc757e545094db2e519211f1fd2bfe5728e72543e46ff6285e",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "opencode-dark.svg",
+    "source_page": "https://opencode.ai/brand",
+    "source_url": "https://opencode.ai/_build/assets/index-6aeJ_iFM.js",
+    "archive_member_or_payload": "data:image/svg+xml download payload: logoDarkSquareSvg",
+    "sha256": "c3ba0e84ed064d5ae444ef11b4fcf21096125ec72dde76ba58b93bcd6bc52404",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "cursor-light.svg",
+    "source_page": "https://cursor.com/brand",
+    "source_url": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+    "archive_member_or_payload": "General Logos/Cube/SVG/CUBE_2D_LIGHT.svg",
+    "sha256": "c483c02f78eb2619778fdd959e72a9adfac4844854472cd2653d4cbfd60e4d71",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "cursor-dark.svg",
+    "source_page": "https://cursor.com/brand",
+    "source_url": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+    "archive_member_or_payload": "General Logos/Cube/SVG/CUBE_2D_DARK.svg",
+    "sha256": "cd0e3e5d8991a4cdd4577f8896cd063105207665165c73e25a1ff918dd367eb7",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  },
+  {
+    "file": "pi.svg",
+    "source_page": "https://pi.dev/press-kit",
+    "source_url": "https://pi.dev/logo.svg",
+    "archive_member_or_payload": null,
+    "sha256": "abd66e7868b2d24f0f0895f9237ee8a6dcb22337583b0dc54aeb595acecb4d6b",
+    "retrieved": "2026-10-29",
+    "modifications": "none"
+  }
+]

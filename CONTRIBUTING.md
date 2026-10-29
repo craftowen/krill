@@ -2,7 +2,7 @@
 
 [한국어](CONTRIBUTING.ko.md)
 
-Start with the [README](README.md) and [Getting started](docs/GETTING_STARTED.md), then read [AGENTS.md](AGENTS.md), [Architecture](docs/ARCHITECTURE.md), [Roadmap](docs/ROADMAP.md), [Code conventions](docs/CONVENTIONS.md), and [UI style guide](docs/STYLEGUIDE.md). These design and repository rules currently remain in Korean. Architecture, Roadmap, Conventions, and Style Guide define the public repository rules. Internal investigation records stay local.
+Start with the [README](README.md) and [Getting started](GETTING_STARTED.md), then read [AGENTS.md](AGENTS.md), [Architecture](docs/ARCHITECTURE.md), [Roadmap](docs/ROADMAP.md), [Code conventions](docs/CONVENTIONS.md), and [UI style guide](docs/STYLEGUIDE.md). These design and repository rules currently remain in Korean. Architecture, Roadmap, Conventions, and Style Guide define the public repository rules. Internal investigation records stay local.
 
 ## Workflow
 
@@ -32,7 +32,7 @@ The full `scripts/check.sh` is required for a **final release candidate**, rathe
 
 ## Source-build environment
 
-Use the [source walkthrough](docs/GETTING_STARTED.md#build-from-source-on-macos). Rust's MSRV is 1.98; do not rely on features first introduced in 1.99. Homebrew Rust is the repository's local reference toolchain; rustup is not required. Keep Cargo build output under `/Volumes/krill-build/targets/<name>` in the shared maintainer workspace, including when overriding `CARGO_TARGET_DIR`. Do not create a target directory on the internal SSD.
+Use the [source walkthrough](GETTING_STARTED.md#build-from-source-on-macos). Rust's MSRV is 1.98; do not rely on features first introduced in 1.99. Homebrew Rust is the repository's local reference toolchain; rustup is not required. Keep Cargo build output under `/Volumes/krill-build/targets/<name>` in the shared maintainer workspace, including when overriding `CARGO_TARGET_DIR`. Do not create a target directory on the internal SSD.
 
 ## Code and review rules
 

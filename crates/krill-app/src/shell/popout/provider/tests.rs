@@ -182,6 +182,14 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
             vec![host, saved, profile("other", Some("other@example.com"))];
         std::sync::Arc::make_mut(&mut s.accounts_snapshot)
+            .statuses
+            .push(krill_proto::usage::AccountStatusInfo {
+                account_id: "other".into(),
+                status: AccountStatus::Error,
+                updated_at: None,
+                detail: Some("usage API returned HTTP 403".into()),
+            });
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot)
             .details
             .accounts
             .push(AccountMeters {
@@ -240,6 +248,19 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         .debug_bounds("status-provider-account-codex-other")
         .unwrap();
     assert!(
+        visual
+            .debug_bounds("status-provider-account-codex-other-status")
+            .is_some(),
+        "사용량이 없는 계정은 모름·갱신 기록 상태를 보여 준다"
+    );
+    let diagnostic = visual
+        .debug_bounds("status-provider-account-codex-other-status-detail")
+        .expect("failed usage must expose its diagnostic in the account card");
+    assert!(diagnostic.size.width > gpui::px(0.));
+    assert!(diagnostic.origin.x >= other.origin.x);
+    assert!(diagnostic.right() <= other.right());
+    assert!(diagnostic.bottom() <= other.bottom());
+    assert!(
         row.bottom() < other.origin.y,
         "계정 영역 사이에 간격이 있다"
     );
@@ -281,8 +302,9 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     );
     assert!(
         visual
-            .debug_bounds("status-provider-profile-saved")
-            .is_some()
+            .debug_bounds("status-provider-detail-status-saved")
+            .is_none(),
+        "같은 계정의 저장 프로필을 상세에 중복 표시하지 않는다"
     );
     assert!(
         visual
@@ -294,29 +316,38 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
             .debug_bounds("status-provider-detail-reset-host")
             .is_some()
     );
-    let saved_reset = visual
-        .debug_bounds("status-provider-detail-reset-saved")
-        .expect("inactive profile in details panel must also expose reset usage button");
-    visual.simulate_click(saved_reset.center(), gpui::Modifiers::default());
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-saved")
+            .is_none(),
+        "같은 계정의 초기화 버튼도 한 번만 표시한다"
+    );
+    assert!(visual.debug_bounds("status-provider-use-saved").is_none());
+    let host_reset = visual
+        .debug_bounds("status-provider-detail-reset-host")
+        .unwrap();
+    visual.simulate_click(host_reset.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(
         visual
-            .debug_bounds("status-provider-detail-reset-confirm-saved")
+            .debug_bounds("status-provider-detail-reset-confirm-host")
             .is_some(),
         "clicking detail reset button arms confirmation in-place without closing panel"
     );
     let cancel_reset = visual
-        .debug_bounds("status-provider-detail-reset-cancel-saved")
+        .debug_bounds("status-provider-detail-reset-cancel-host")
         .unwrap();
     visual.simulate_click(cancel_reset.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(
         visual
-            .debug_bounds("status-provider-detail-reset-confirm-saved")
+            .debug_bounds("status-provider-detail-reset-confirm-host")
             .is_none()
     );
-    let saved = visual.debug_bounds("status-provider-use-saved").unwrap();
-    visual.simulate_mouse_move(saved.center(), None, gpui::Modifiers::default());
+    let reset = visual
+        .debug_bounds("status-provider-detail-reset-host")
+        .unwrap();
+    visual.simulate_mouse_move(reset.center(), None, gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(
         visual
@@ -395,7 +426,7 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         .unwrap();
     visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
     visual.run_until_parked();
-    let saved = visual.debug_bounds("status-provider-use-saved").unwrap();
+    let other_use = visual.debug_bounds("status-provider-use-other").unwrap();
     shell.update(visual, |s, _| {
         let root = std::env::temp_dir().join("krill-provider-details-missing-socket");
         s.paths = Some(krill_proto::daemon::Paths {
@@ -405,7 +436,7 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
         });
         s.link = super::super::super::Link::Up;
     });
-    visual.simulate_click(saved.center(), gpui::Modifiers::default());
+    visual.simulate_click(other_use.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     visual
         .executor()
@@ -418,6 +449,73 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     );
     shell.read_with(visual, |s, _| {
         assert!(s.notice.is_some(), "사용 버튼은 전환 IPC를 요청한다");
+    });
+}
+
+#[gpui::test]
+fn active_saved_account_has_one_detail_even_with_system_and_saved_duplicates(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Codex,
+        ])));
+        let mut system = profile("system", Some("same@example.com"));
+        system.host_default = true;
+        let mut saved = profile("saved", Some(" SAME@example.com "));
+        saved.active = true;
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts = vec![
+            system,
+            profile("duplicate", Some("same@example.com")),
+            saved,
+        ];
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(gpui::px(890.), gpui::px(700.)));
+    visual.run_until_parked();
+    let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-account-codex-saved")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-status-saved")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-saved")
+            .is_some()
+    );
+    for selector in [
+        "status-provider-account-codex-system",
+        "status-provider-account-codex-duplicate",
+        "status-provider-detail-status-system",
+        "status-provider-detail-status-duplicate",
+        "status-provider-detail-reset-system",
+        "status-provider-detail-reset-duplicate",
+        "status-provider-use-system",
+        "status-provider-use-duplicate",
+    ] {
+        assert!(
+            visual.debug_bounds(selector).is_none(),
+            "duplicate: {selector}"
+        );
+    }
+    shell.read_with(visual, |s, _| {
+        assert_eq!(
+            s.accounts_snapshot.accounts.len(),
+            3,
+            "표시 통합은 저장된 프로필을 삭제하지 않는다"
+        );
     });
 }
 
@@ -683,8 +781,13 @@ fn remote_model_limits_and_resets_are_visible_without_moving_tab_controls(
         percent: 5,
         resets_at: None,
     });
+    remote.email = Some("same@example.com".into());
+    let mut system = remote.clone();
+    system.id = "system".into();
+    system.active = false;
+    system.host_default = true;
     let mut snap = AccountsSnapshot {
-        accounts: vec![remote],
+        accounts: vec![system, remote],
         ..Default::default()
     };
     snap.details.supported = true;
@@ -751,6 +854,12 @@ fn remote_model_limits_and_resets_are_visible_without_moving_tab_controls(
     );
     assert!(
         visual
+            .debug_bounds("status-provider-remote-quota-box-system-status")
+            .is_none(),
+        "원격 기기도 같은 계정의 시스템 기본 프로필은 중복 표시하지 않는다"
+    );
+    assert!(
+        visual
             .debug_bounds("status-provider-remote-quota-box-host-5h-percent")
             .is_none(),
         "원격 모델 미터를 로컬/요약 창으로 대체하지 않는다"
@@ -759,4 +868,615 @@ fn remote_model_limits_and_resets_are_visible_without_moving_tab_controls(
         visual.debug_bounds("status-provider-open-accounts"),
         Some(footer)
     );
+}
+
+/// Sparse local accounts must not reserve the full height of every hidden remote host.
+#[gpui::test]
+fn many_remote_hosts_keep_provider_popup_compact_and_scroll_to_last_host(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+    use std::sync::Arc;
+    let (shell, handle) = super::super::tests::open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::OpenCode,
+        ])));
+        let mut account = profile("host", None);
+        account.provider = ProviderKind::OpenCode;
+        account.active = true;
+        account.host_default = true;
+        account.usage.five_hour = Some(UsageWindow {
+            percent: 0,
+            resets_at: None,
+        });
+        account.usage.seven_day = Some(UsageWindow {
+            percent: 0,
+            resets_at: None,
+        });
+        Arc::make_mut(&mut s.accounts_snapshot).accounts = vec![account.clone()];
+        for i in 0..5 {
+            let id = format!("compact-{i}");
+            s.host_statuses.push((
+                RemoteHostSpec {
+                    id: id.clone(),
+                    label: format!("Remote {i}"),
+                    address: id.clone(),
+                    port: None,
+                    identity_file: None,
+                    remote_socket: None,
+                },
+                HostStatus::Connected,
+            ));
+            s.remote_accounts.insert(
+                HostId::Remote(id),
+                Arc::new(AccountsSnapshot {
+                    accounts: vec![account.clone()],
+                    ..Default::default()
+                }),
+            );
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    for (width, height, rem) in [
+        (1280., 1600., 16.),
+        (1000., 850., 16.),
+        (800., 500., 16.),
+        (1000., 850., 32.),
+    ] {
+        shell.update(visual, |s, cx| s.set_launch_host(HostId::Local, cx));
+        visual.simulate_resize(gpui::size(px(width), px(height)));
+        visual.update(|window, _| window.set_rem_size(px(rem)));
+        visual.run_until_parked();
+        let pill = visual
+            .debug_bounds("status-provider-pill-opencode")
+            .unwrap();
+        visual.simulate_click(pill.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        let header = visual.debug_bounds("status-provider-table-header").unwrap();
+        let footer = visual
+            .debug_bounds("status-provider-open-accounts")
+            .unwrap();
+        assert!(
+            footer.bottom() - header.top() <= px(320.) + px(rem) * 16.,
+            "one local account / five remote hosts must stay compact: header={header:?}, footer={footer:?}"
+        );
+        assert!(
+            header.top() >= px(0.) && footer.bottom() <= px(height) - ui::STATUS_BAR_HEIGHT,
+            "popup must fit above the status bar: header={header:?}, footer={footer:?}, height={height}, rem={rem}"
+        );
+        let tab = visual.debug_bounds("status-provider-tab-remote").unwrap();
+        visual.simulate_click(tab.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        assert_eq!(
+            visual.debug_bounds("status-provider-table-header"),
+            Some(header)
+        );
+        assert_eq!(
+            visual.debug_bounds("status-provider-open-accounts"),
+            Some(footer)
+        );
+        let viewport = visual
+            .debug_bounds("status-provider-remote-scroll")
+            .unwrap();
+        let last_selector = "status-provider-select-host-compact-4";
+        let last = visual.debug_bounds(last_selector).unwrap();
+        assert!(last.bottom() > viewport.bottom(), "fixture must overflow");
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        visual.run_until_parked();
+        let last = visual.debug_bounds(last_selector).unwrap();
+        if last.top() < viewport.top() {
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(
+                    px(0.),
+                    viewport.top() + ui::SPACE_2 - last.top(),
+                )),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            visual.run_until_parked();
+        }
+        let last = visual.debug_bounds(last_selector).unwrap();
+        assert!(
+            last.top() >= viewport.top() && last.bottom() <= viewport.bottom(),
+            "last host must scroll into view: last={last:?}, viewport={viewport:?}"
+        );
+        assert_eq!(
+            visual.debug_bounds("status-provider-table-header"),
+            Some(header)
+        );
+        assert_eq!(
+            visual.debug_bounds("status-provider-open-accounts"),
+            Some(footer)
+        );
+        let tab = visual.debug_bounds("status-provider-tab-local").unwrap();
+        visual.simulate_click(tab.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        let row = visual
+            .debug_bounds("status-provider-account-opencode-host")
+            .unwrap();
+        let viewport = visual.debug_bounds("status-provider-local-scroll").unwrap();
+        assert!(
+            row.top() >= viewport.top() && row.bottom() <= viewport.bottom(),
+            "remote scroll must not leave local accounts offscreen"
+        );
+        assert_eq!(
+            visual.debug_bounds("status-provider-table-header"),
+            Some(header)
+        );
+        assert_eq!(
+            visual.debug_bounds("status-provider-open-accounts"),
+            Some(footer)
+        );
+        // Verify the last host is actionable through the scroll mask, too.
+        let tab = visual.debug_bounds("status-provider-tab-remote").unwrap();
+        visual.simulate_click(tab.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        let viewport = visual
+            .debug_bounds("status-provider-remote-scroll")
+            .unwrap();
+        let last = visual.debug_bounds(last_selector).unwrap();
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(
+                px(0.),
+                viewport.top() + ui::SPACE_2 - last.top(),
+            )),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        visual.run_until_parked();
+        let last = visual.debug_bounds(last_selector).unwrap();
+        visual.simulate_click(last.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        shell.read_with(visual, |s, _| {
+            assert_eq!(s.launch_host, HostId::Remote("compact-4".into()));
+        });
+        assert!(
+            visual
+                .debug_bounds("status-provider-table-header")
+                .is_none()
+        );
+        eprintln!(
+            "compact popup viewport={width}x{height} rem={rem}: header_to_footer={:?}",
+            footer.bottom() - header.top()
+        );
+    }
+}
+
+#[gpui::test]
+fn local_account_list_fits_small_snapshots_and_scrolls_large_ones(cx: &mut gpui::TestAppContext) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(px(1000.), px(850.)));
+    for count in [1, 12] {
+        shell.update(visual, |s, cx| {
+            cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+                ProviderKind::OpenCode,
+            ])));
+            std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts = (0..count)
+                .map(|i| {
+                    let mut account = profile(&format!("local-{i}"), None);
+                    account.provider = ProviderKind::OpenCode;
+                    account.active = i == 0;
+                    account
+                })
+                .collect();
+            cx.notify();
+        });
+        visual.run_until_parked();
+        let pill = visual
+            .debug_bounds("status-provider-pill-opencode")
+            .unwrap();
+        visual.simulate_click(pill.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        let viewport = visual.debug_bounds("status-provider-local-scroll").unwrap();
+        let header = visual.debug_bounds("status-provider-table-header").unwrap();
+        let footer = visual
+            .debug_bounds("status-provider-open-accounts")
+            .unwrap();
+        if count == 1 {
+            assert!(
+                viewport.size.height < px(320.),
+                "small snapshots must use natural height"
+            );
+        } else {
+            assert!(viewport.size.height <= px(320.));
+            let selector = "status-provider-account-opencode-local-11";
+            assert!(visual.debug_bounds(selector).unwrap().bottom() > viewport.bottom());
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            visual.run_until_parked();
+            let last = visual.debug_bounds(selector).unwrap();
+            assert!(last.top() >= viewport.top() && last.bottom() <= viewport.bottom());
+            visual.simulate_click(last.center(), gpui::Modifiers::default());
+            visual.run_until_parked();
+            let detail = visual
+                .debug_bounds("status-provider-details-local-11")
+                .unwrap();
+            assert!(
+                detail.top() >= viewport.top() && detail.bottom() <= viewport.bottom(),
+                "scrolling the account list must leave the selected detail visible: {detail:?}, viewport={viewport:?}"
+            );
+            assert_eq!(
+                visual.debug_bounds("status-provider-table-header"),
+                Some(header)
+            );
+            assert_eq!(
+                visual.debug_bounds("status-provider-open-accounts"),
+                Some(footer)
+            );
+        }
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn long_details_scroll_independently_and_new_selection_starts_at_top(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::OpenCode,
+        ])));
+        let snap = std::sync::Arc::make_mut(&mut s.accounts_snapshot);
+        snap.accounts.clear();
+        snap.details.accounts.clear();
+        for id in ["first", "second", "short"] {
+            let mut account = profile(id, None);
+            account.provider = ProviderKind::OpenCode;
+            account.active = id == "first";
+            snap.accounts.push(account);
+            snap.details.accounts.push(AccountMeters {
+                account_id: id.into(),
+                plan: None,
+                meters: (0..if id == "short" { 2 } else { 20 })
+                    .map(|i| UsageMeter {
+                        key: format!("pool-{i}"),
+                        label: format!("Pool {i}"),
+                        value: None,
+                        window: Some(UsageWindow {
+                            percent: 25,
+                            resets_at: None,
+                        }),
+                    })
+                    .collect(),
+            });
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(px(1000.), px(850.)));
+    visual.run_until_parked();
+    let pill = visual
+        .debug_bounds("status-provider-pill-opencode")
+        .unwrap();
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let viewport = visual
+        .debug_bounds("status-provider-detail-scroll")
+        .unwrap();
+    let header = visual.debug_bounds("status-provider-table-header").unwrap();
+    let footer = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
+    let first = visual
+        .debug_bounds("status-provider-account-opencode-first")
+        .unwrap();
+    let second = visual
+        .debug_bounds("status-provider-account-opencode-second")
+        .unwrap();
+    let last_selector = "status-provider-detail-first-pool-19-percent";
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-first")
+            .is_some()
+    );
+    assert!(visual.debug_bounds(last_selector).unwrap().bottom() > viewport.bottom());
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: viewport.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let last = visual.debug_bounds(last_selector).unwrap();
+    assert!(last.top() >= viewport.top() && last.bottom() <= viewport.bottom());
+    assert_eq!(
+        visual.debug_bounds("status-provider-account-opencode-first"),
+        Some(first)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-account-opencode-second"),
+        Some(second)
+    );
+    visual.simulate_click(second.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let detail = visual
+        .debug_bounds("status-provider-details-second")
+        .unwrap();
+    let first_meter = visual
+        .debug_bounds("status-provider-detail-second-pool-0-percent")
+        .unwrap();
+    assert_eq!(
+        detail.top(),
+        viewport.top(),
+        "new selection must reset detail scroll"
+    );
+    assert!(first_meter.top() >= viewport.top() && first_meter.bottom() <= viewport.bottom());
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(footer)
+    );
+    visual.simulate_click(first.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let detail = visual
+        .debug_bounds("status-provider-details-first")
+        .unwrap();
+    assert_eq!(
+        detail.top(),
+        viewport.top(),
+        "returning to an account must start at the top"
+    );
+    let short_row = visual
+        .debug_bounds("status-provider-account-opencode-short")
+        .unwrap();
+    visual.simulate_click(short_row.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let short_viewport = visual
+        .debug_bounds("status-provider-detail-scroll")
+        .unwrap();
+    let short_detail = visual
+        .debug_bounds("status-provider-details-short")
+        .unwrap();
+    assert!(
+        short_detail.size.height < short_viewport.size.height
+            || short_detail.size.height < px(312.)
+    );
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: short_viewport.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    assert_eq!(
+        visual.debug_bounds("status-provider-details-short"),
+        Some(short_detail),
+        "hidden long details must not create blank scroll space for a short account"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(footer)
+    );
+    visual.simulate_click(second.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: viewport.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let switch = visual
+        .debug_bounds("status-provider-detail-use-second")
+        .unwrap();
+    assert!(switch.top() >= viewport.top() && switch.bottom() <= viewport.bottom());
+    shell.update(visual, |s, _| {
+        let root = std::env::temp_dir().join(format!("krill-detail-scroll-{}", std::process::id()));
+        s.paths = Some(krill_proto::daemon::Paths {
+            socket: root.join("missing.sock"),
+            holder: root.join("holder"),
+            krilld: root.join("krilld"),
+        });
+        s.link = super::super::super::Link::Up;
+    });
+    visual.simulate_click(switch.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    visual
+        .executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-table-header")
+            .is_none()
+    );
+    shell.read_with(visual, |s, _| {
+        assert!(
+            s.notice.is_some(),
+            "the visible switch button must submit its request"
+        );
+    });
+}
+
+#[gpui::test]
+fn short_window_detail_reset_confirmation_stays_reachable(cx: &mut gpui::TestAppContext) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Codex,
+        ])));
+        let mut account = profile("reset-scroll", None);
+        account.active = true;
+        let snap = std::sync::Arc::make_mut(&mut s.accounts_snapshot);
+        snap.accounts = vec![account];
+        snap.details.accounts = vec![AccountMeters {
+            account_id: "reset-scroll".into(),
+            plan: None,
+            meters: (0..12)
+                .map(|i| UsageMeter {
+                    key: format!("pool-{i}"),
+                    label: format!("Pool {i}"),
+                    value: None,
+                    window: Some(UsageWindow {
+                        percent: 25,
+                        resets_at: None,
+                    }),
+                })
+                .collect(),
+        }];
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(px(800.), px(500.)));
+    visual.run_until_parked();
+    let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let viewport = visual
+        .debug_bounds("status-provider-detail-scroll")
+        .unwrap();
+    let header = visual.debug_bounds("status-provider-table-header").unwrap();
+    let footer = visual
+        .debug_bounds("status-provider-open-accounts")
+        .unwrap();
+    let row = visual
+        .debug_bounds("status-provider-account-codex-reset-scroll")
+        .unwrap();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: viewport.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20000.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let reset = visual
+        .debug_bounds("status-provider-detail-reset-reset-scroll")
+        .unwrap();
+    assert!(reset.top() >= viewport.top() && reset.bottom() <= viewport.bottom());
+    visual.simulate_click(reset.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let confirm = visual
+        .debug_bounds("status-provider-detail-reset-confirm-reset-scroll")
+        .unwrap();
+    let cancel = visual
+        .debug_bounds("status-provider-detail-reset-cancel-reset-scroll")
+        .unwrap();
+    assert!(
+        confirm.top() >= viewport.top() && confirm.bottom() <= viewport.bottom(),
+        "confirm={confirm:?}, viewport={viewport:?}"
+    );
+    assert!(
+        cancel.top() >= viewport.top() && cancel.bottom() <= viewport.bottom(),
+        "cancel={cancel:?}, viewport={viewport:?}"
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(footer)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-detail-scroll"),
+        Some(viewport)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-account-codex-reset-scroll"),
+        Some(row)
+    );
+    visual.simulate_click(cancel.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("status-provider-detail-reset-reset-scroll")
+            .is_some()
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-table-header"),
+        Some(header)
+    );
+    assert_eq!(
+        visual.debug_bounds("status-provider-open-accounts"),
+        Some(footer)
+    );
+}
+
+#[gpui::test]
+fn every_provider_popup_fits_short_windows_at_supported_zoom(cx: &mut gpui::TestAppContext) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(px(800.), px(500.)));
+    for provider in ProviderKind::ALL {
+        let selector: &'static str = format!("status-provider-pill-{}", provider.as_str()).leak();
+        shell.update(visual, |s, cx| {
+            cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+                provider,
+            ])));
+            let mut account = profile("chrome-budget", None);
+            account.provider = provider;
+            account.active = true;
+            let snap = std::sync::Arc::make_mut(&mut s.accounts_snapshot);
+            snap.accounts = vec![account];
+            snap.details.accounts = vec![AccountMeters {
+                account_id: "chrome-budget".into(),
+                plan: None,
+                meters: (0..12)
+                    .map(|i| UsageMeter {
+                        key: format!("pool-{i}"),
+                        label: format!("Pool {i}"),
+                        value: None,
+                        window: Some(UsageWindow {
+                            percent: 25,
+                            resets_at: None,
+                        }),
+                    })
+                    .collect(),
+            }];
+            s.reset_armed = None;
+            cx.notify();
+        });
+        for rem in [12., 16., 32.] {
+            visual.update(|window, _| window.set_rem_size(px(rem)));
+            visual.run_until_parked();
+            let pill = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(pill.center(), gpui::Modifiers::default());
+            visual.run_until_parked();
+            let header = visual.debug_bounds("status-provider-table-header").unwrap();
+            let footer = visual
+                .debug_bounds("status-provider-open-accounts")
+                .unwrap();
+            assert!(
+                header.top() >= px(0.),
+                "provider={provider:?}, rem={rem}, header={header:?}"
+            );
+            assert!(
+                footer.bottom() <= px(500.) - ui::STATUS_BAR_HEIGHT,
+                "provider={provider:?}, rem={rem}, footer={footer:?}"
+            );
+            visual.simulate_keystrokes("escape");
+            visual.run_until_parked();
+        }
+    }
 }

@@ -787,6 +787,36 @@ impl SessionPromptHistory {
         true
     }
 
+    /// 실행 단계마다 반복되는 마지막 사용자 입력은 새 제출이 아니다.
+    fn record_context(&mut self, raw: &str, unix_ns: u64) -> bool {
+        let Some(clean) = clean_prompt_display(raw, MAX_PROMPT_DISPLAY_CHARS) else {
+            return false;
+        };
+        if self.turns.first().is_some_and(|turn| turn.text == clean) {
+            return false;
+        }
+        self.record_turn(raw, unix_ns)
+    }
+
+    /// 출처 정보가 없는 이전 버전 기록에만 적용한다. 명시적 재제출은 합치지 않는다.
+    fn repair_context_duplicates(&mut self, raw: &str) -> bool {
+        let Some(clean) = clean_prompt_display(raw, MAX_PROMPT_DISPLAY_CHARS) else {
+            return false;
+        };
+        let repeated = self
+            .turns
+            .iter()
+            .take_while(|turn| turn.text == clean)
+            .count();
+        if repeated <= 1 {
+            return false;
+        }
+        self.turns.drain(..repeated.saturating_sub(1));
+        let removed = u32::try_from(repeated.saturating_sub(1)).unwrap_or(u32::MAX);
+        self.total_turns = self.total_turns.saturating_sub(removed);
+        true
+    }
+
     /// 최신 턴의 타임스탬프를 돌려준다.
     #[must_use]
     pub fn latest_unix_ns(&self) -> Option<u64> {
@@ -849,6 +879,75 @@ pub fn record_session_prompt(
     prompt: &str,
     unix_ns: u64,
 ) -> std::io::Result<bool> {
+    record_prompt(
+        state_dir,
+        session,
+        prompt,
+        unix_ns,
+        PromptRecord::Submission,
+        None,
+    )
+}
+
+/// `PreInvocation`의 `lastUserInput`은 턴 식별자가 아닌 반복 문맥이다.
+/// 직접 제출 훅은 같은 문장을 다시 제출해도 기존 시간 기반 병합 규칙만 적용한다.
+pub fn record_session_prompt_from_hook(
+    state_dir: &std::path::Path,
+    session: crate::SessionId,
+    payload: &[u8],
+    event_id: crate::hook::EventId,
+) -> std::io::Result<bool> {
+    let Some(prompt) = extract_prompt_from_hook_payload(payload) else {
+        return Ok(false);
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(std::io::Error::other)?;
+    let event = value
+        .get("hook_event_name")
+        .or_else(|| value.get("hookEventName"))
+        .or_else(|| value.get("event"))
+        .and_then(serde_json::Value::as_str);
+    let source = if event == Some("PreInvocation") {
+        PromptRecord::Context
+    } else {
+        PromptRecord::Submission
+    };
+    record_prompt(
+        state_dir,
+        session,
+        &prompt,
+        event_id.unix_ns,
+        source,
+        Some(event_id),
+    )
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptRecord {
+    Submission,
+    Context,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StoredPromptHistory {
+    #[serde(flatten)]
+    history: SessionPromptHistory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<PromptRecord>,
+    /// 소켓 ACK 유실 뒤 spool로 재전송돼도 동일 제출로 취급한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hook_ids: Vec<crate::hook::EventId>,
+}
+
+fn record_prompt(
+    state_dir: &std::path::Path,
+    session: crate::SessionId,
+    prompt: &str,
+    unix_ns: u64,
+    source: PromptRecord,
+    event_id: Option<crate::hook::EventId>,
+) -> std::io::Result<bool> {
     use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     use std::collections::BTreeMap;
     use std::fs::{DirBuilder, OpenOptions};
@@ -874,7 +973,7 @@ pub fn record_session_prompt(
     lock_file.lock()?;
 
     let path = state_dir.join(SESSION_PROMPTS_FILE);
-    let mut map: BTreeMap<u64, SessionPromptHistory> = std::fs::read_to_string(&path)
+    let mut map: BTreeMap<u64, StoredPromptHistory> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -887,9 +986,25 @@ pub fn record_session_prompt(
         }
     }
     let entry = map.entry(session.0).or_default();
-    if !entry.record_turn(prompt, unix_ns) {
+    if event_id.is_some_and(|id| entry.hook_ids.contains(&id)) {
         return Ok(false);
     }
+    let changed = match source {
+        PromptRecord::Submission => entry.history.record_turn(prompt, unix_ns),
+        PromptRecord::Context => {
+            let repaired =
+                entry.source.is_none() && entry.history.repair_context_duplicates(prompt);
+            entry.history.record_context(prompt, unix_ns) || repaired
+        }
+    };
+    if !changed && event_id.is_none() {
+        return Ok(false);
+    }
+    if let Some(id) = event_id {
+        entry.hook_ids.insert(0, id);
+        entry.hook_ids.truncate(32);
+    }
+    entry.source = Some(source);
     let mut bytes = serde_json::to_vec(&map).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     let seq = SESSION_PROMPTS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -909,7 +1024,7 @@ pub fn record_session_prompt(
         std::fs::remove_file(&tmp).ok();
     }
     write_res?;
-    Ok(true)
+    Ok(changed)
 }
 
 /// 상태 디렉터리에 기록된 세션별 프롬프트 히스토리 목록을 읽는다.
@@ -1092,6 +1207,112 @@ mod slug_tests {
             assert!(!name.contains(".tmp."), "leftover tmp file: {name}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn prompt_event_id(unix_ns: u64) -> crate::hook::EventId {
+        crate::hook::EventId { pid: 1, unix_ns }
+    }
+
+    #[test]
+    fn invocation_context_deduplicates_delayed_hooks_but_preserves_real_resubmissions() {
+        let dir = std::env::temp_dir().join(format!("prompt-context-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let sid = crate::SessionId(77);
+        let context =
+            br#"{"hook_event_name":"PreInvocation","lastUserInput":"Continue the original task"}"#;
+        assert!(record_session_prompt_from_hook(&dir, sid, context, prompt_event_id(1)).unwrap());
+        for timestamp in [4_000_000_001, 40_000_000_001, 400_000_000_001] {
+            assert!(
+                !record_session_prompt_from_hook(&dir, sid, context, prompt_event_id(timestamp))
+                    .unwrap()
+            );
+        }
+        let history = load_session_prompt_histories(&dir).remove(&sid).unwrap();
+        assert_eq!(history.total_turns, 1);
+        assert_eq!(history.turns[0].unix_ns, 1);
+        // A genuine repeated submission is still a new turn after the receipt merge window.
+        let submitted =
+            br#"{"hook_event_name":"UserPromptSubmit","prompt":"Continue the original task"}"#;
+        assert!(
+            record_session_prompt_from_hook(&dir, sid, submitted, prompt_event_id(500_000_000_001))
+                .unwrap()
+        );
+        assert_eq!(load_session_prompt_histories(&dir)[&sid].total_turns, 2);
+        assert!(
+            !record_session_prompt_from_hook(&dir, sid, context, prompt_event_id(600_000_000_001))
+                .unwrap()
+        );
+        assert_eq!(load_session_prompt_histories(&dir)[&sid].total_turns, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replayed_prompt_hook_is_ignored_even_after_a_newer_prompt() {
+        let dir = std::env::temp_dir().join(format!("prompt-replay-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let sid = crate::SessionId(77);
+        let first = br#"{"hook_event_name":"UserPromptSubmit","prompt":"First user request"}"#;
+        let second = br#"{"hook_event_name":"UserPromptSubmit","prompt":"A newer user request"}"#;
+        assert!(record_session_prompt_from_hook(&dir, sid, first, prompt_event_id(1)).unwrap());
+        assert!(
+            record_session_prompt_from_hook(&dir, sid, second, prompt_event_id(10_000_000_000))
+                .unwrap()
+        );
+        assert!(!record_session_prompt_from_hook(&dir, sid, first, prompt_event_id(1)).unwrap());
+        let history = load_session_prompt_histories(&dir).remove(&sid).unwrap();
+        assert_eq!(history.total_turns, 2);
+        assert_eq!(history.turns[0].text, "A newer user request");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invocation_context_repairs_legacy_disk_history_once() {
+        let dir =
+            std::env::temp_dir().join(format!("legacy-prompt-context-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = crate::SessionId(77);
+        let mut history = SessionPromptHistory::default();
+        history.record_turn("Previous user task", 1);
+        history.record_turn("Current user task", 10_000_000_000);
+        history.record_turn("Current user task", 20_000_000_000);
+        let original = std::collections::BTreeMap::from([(sid.0, history)]);
+        std::fs::write(
+            dir.join(SESSION_PROMPTS_FILE),
+            serde_json::to_vec(&original).unwrap(),
+        )
+        .unwrap();
+        let context = br#"{"event":"PreInvocation","lastUserInput":"Current user task"}"#;
+        assert!(
+            record_session_prompt_from_hook(&dir, sid, context, prompt_event_id(40_000_000_000))
+                .unwrap()
+        );
+        let history = load_session_prompt_histories(&dir).remove(&sid).unwrap();
+        assert_eq!(history.total_turns, 2);
+        assert_eq!(history.turns.len(), 2);
+        assert!(
+            !record_session_prompt_from_hook(&dir, sid, context, prompt_event_id(80_000_000_000))
+                .unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invocation_context_repairs_retained_duplicates_and_keeps_previous_task() {
+        let mut history = SessionPromptHistory::default();
+        history.record_turn("Previous user task", 1);
+        history.record_turn("Current user task", 10_000_000_000);
+        history.record_turn("Current user task", 20_000_000_000);
+        history.record_turn("Current user task", 30_000_000_000);
+        assert!(history.repair_context_duplicates("Current user task"));
+        assert_eq!(history.total_turns, 2);
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(history.turns[0].turn, 2);
+        assert_eq!(history.turns[0].unix_ns, 10_000_000_000);
+        assert_eq!(history.turns[1].text, "Previous user task");
+        assert!(!history.record_context("Current user task", 90_000_000_000));
+        assert!(history.record_context("A different user task", 100_000_000_000));
+        assert_eq!(history.total_turns, 3);
     }
 
     #[test]

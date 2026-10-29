@@ -1,5 +1,5 @@
 use super::{
-    LoginFailReason, LoginOutcome, authorize_url, login_url, run_browser_login,
+    LoginFailReason, LoginOutcome, authorize_url, login_link, login_url, run_browser_login,
     run_browser_login_with_mode, take_login_outcome,
 };
 use krill_proto::usage::ProviderKind;
@@ -260,6 +260,24 @@ fn agy_terminal_login_preserves_literal_profile_and_never_uses_login_subcommand(
     account.host_default = true;
     assert_eq!(super::terminal_login_command(&account), "agy");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn only_links_handed_to_browser_are_opened_by_krill() {
+    let url = "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback";
+    // Codex ignores BROWSER on macOS and opens its own tab before printing the link.
+    assert_eq!(
+        login_link(ProviderKind::Codex, None, Some(url)),
+        Some((url, false))
+    );
+    assert_eq!(
+        login_link(ProviderKind::Codex, Some(url), Some(url)),
+        Some((url, true))
+    );
+    assert_eq!(
+        login_link(ProviderKind::Codex, None, Some("https://evil.example/a")),
+        None
+    );
 }
 
 #[test]

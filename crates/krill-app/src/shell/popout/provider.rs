@@ -1,5 +1,5 @@
 //! 상태바 계정 비교표(시안 D: 로컬/원격 상단 탭 분리 + 좌우 마스터-디테일 인라인 상세 뷰).
-//! 이메일 묶음은 표시만 합치며 프로필·전환 대상은 보존한다.
+//! 같은 이메일은 활성 프로필을 대표로 한 번만 표시하며 원본 프로필·전환 대상은 보존한다.
 
 use super::*;
 use krill_app::i18n::catalog::settings as account_text;
@@ -90,7 +90,7 @@ impl AccountGroup {
     }
 }
 
-/// 이메일이 없는 프로필은 합치지 않는다. 같은 이메일도 상세에서 개별 선택 가능하다.
+/// 이메일이 없는 프로필은 합치지 않는다. 대표는 활성 → 시스템 기본 → 첫 프로필 순이다.
 fn account_groups(snap: &AccountsSnapshot, provider: ProviderKind) -> Vec<AccountGroup> {
     let mut groups: Vec<AccountGroup> = Vec::new();
     for account in snap
@@ -665,148 +665,111 @@ fn render_detail_panel_ghost(
         .gap_2()
         .text_size(ui::TEXT_XS)
         .text_color(p.muted_foreground);
-    if group.profiles.len() > 1 {
-        detail = detail.child(provider_text::PROVIDER_GROUP_PROFILES.get());
-    }
-    for account in &group.profiles {
-        let mut profile = div()
-            .w_full()
-            .min_w_0()
-            .pt_2()
-            .border_t_1()
-            .border_color(p.border)
-            .flex()
-            .flex_col()
-            .gap_2();
-        if group.profiles.len() > 1 {
-            let label = if account.host_default {
-                account_text::SYSTEM_DEFAULT.get().to_owned()
-            } else if account.label.trim().is_empty() {
-                account.id.clone()
-            } else {
-                account.label.clone()
-            };
+    let account = panel_account;
+    let mut profile = div()
+        .w_full()
+        .min_w_0()
+        .pt_2()
+        .border_t_1()
+        .border_color(p.border)
+        .flex()
+        .flex_col()
+        .gap_2();
+    let status = krill_app::accounts::display::account(
+        account,
+        snap.status_for(&account.id),
+        krill_app::accounts::display::now(),
+    );
+    profile = profile.child(krill_app::accounts::display::render_status(
+        format!("ghost-detail-status-{}", account.id),
+        &status,
+        p,
+    ));
+    if let Some(meters) = snap.meters_for(&account.id) {
+        profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
+        for meter in &meters.meters {
+            let label = krill_app::accounts::display::meter_label(meter);
             profile = profile.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(if account.active {
-                        ui::badge(
-                            p,
-                            ui::BadgeTone::Success,
-                            account_text::ACCOUNT_IN_USE.get(),
-                        )
+                if let Some(value) = krill_app::accounts::display::meter_value(
+                    meter,
+                    krill_app::accounts::display::now(),
+                ) {
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_between()
+                        .gap_2()
+                        .child(label)
+                        .child(div().font_family(ui::FONT_MONO).child(value.clone()))
                         .into_any_element()
-                    } else {
-                        Button::new("ghost-profile-use")
-                            .small()
-                            .primary()
-                            .label(provider_text::PROVIDER_USE.get())
-                            .into_any_element()
-                    }),
+                } else {
+                    render_popover_usage_ghost_row(&label, meter.window.as_ref(), p)
+                        .into_any_element()
+                },
             );
         }
-        let status = krill_app::accounts::display::account(
-            account,
-            snap.status_for(&account.id),
-            krill_app::accounts::display::now(),
-        );
-        profile = profile.child(
+    } else {
+        for (label, window) in [
+            (
+                provider_text::PROVIDER_USED_5H.get(),
+                account.usage.five_hour.as_ref(),
+            ),
+            (
+                provider_text::PROVIDER_USED_7D.get(),
+                account.usage.seven_day.as_ref(),
+            ),
+        ] {
+            profile = profile.child(render_popover_usage_ghost_row(label, window, p));
+        }
+    }
+    if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
+        profile = profile.child(format!(
+            "{} · {}",
+            provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
+            krill_app::settings::rule_summary(rule, &snap.accounts)
+        ));
+    }
+    profile = profile.children(
+        advanced_notes(snap, account)
+            .into_iter()
+            .map(|note| div().child(note)),
+    );
+    if let Some(reset_box) = render_detail_reset_controls_ghost(snap, account, false, p) {
+        profile = profile.child(reset_box);
+    }
+
+    profile =
+        profile.child(
             div()
+                .pt_1p5()
+                .border_t_1()
+                .border_color(p.border)
                 .flex()
                 .items_center()
+                .justify_between()
                 .gap_2()
-                .text_size(ui::TEXT_2XS)
-                .child(ui::badge(p, ui::BadgeTone::Muted, status.label))
-                .child(div().child(status.updated)),
-        );
-        if let Some(meters) = snap.meters_for(&account.id) {
-            profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
-            for meter in &meters.meters {
-                let label = krill_app::accounts::display::meter_label(meter);
-                profile = profile.child(
-                    if let Some(value) = krill_app::accounts::display::meter_value(
-                        meter,
-                        krill_app::accounts::display::now(),
-                    ) {
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .justify_between()
-                            .gap_2()
-                            .child(label)
-                            .child(div().font_family(ui::FONT_MONO).child(value.clone()))
-                            .into_any_element()
-                    } else {
-                        render_popover_usage_ghost_row(&label, meter.window.as_ref(), p)
-                            .into_any_element()
-                    },
-                );
-            }
-        } else {
-            for (label, window) in [
-                (
-                    provider_text::PROVIDER_USED_5H.get(),
-                    account.usage.five_hour.as_ref(),
-                ),
-                (
-                    provider_text::PROVIDER_USED_7D.get(),
-                    account.usage.seven_day.as_ref(),
-                ),
-            ] {
-                profile = profile.child(render_popover_usage_ghost_row(label, window, p));
-            }
-        }
-        if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
-            profile = profile.child(format!(
-                "{} · {}",
-                provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
-                krill_app::settings::rule_summary(rule, &snap.accounts)
-            ));
-        }
-        profile = profile.children(
-            advanced_notes(snap, account)
-                .into_iter()
-                .map(|note| div().child(note)),
-        );
-        if let Some(reset_box) = render_detail_reset_controls_ghost(snap, account, false, p) {
-            profile = profile.child(reset_box);
-        }
-        if group.profiles.len() == 1 {
-            profile = profile.child(
-                div()
-                    .pt_1p5()
-                    .border_t_1()
-                    .border_color(p.border)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .grid()
-                            .child(div().row_start(1).col_start(1).flex().items_center().child(
-                                ui::badge(
-                                    p,
-                                    ui::BadgeTone::Success,
-                                    provider_text::PROVIDER_ACTIVE_NOW.get(),
-                                ),
-                            ))
-                            .child(
-                                div().row_start(1).col_start(1).child(
-                                    Button::new("ghost-detail-use")
-                                        .small()
-                                        .primary()
-                                        .label(provider_text::PROVIDER_SWITCH_NOW.get()),
-                                ),
+                .child(
+                    div()
+                        .grid()
+                        .child(div().row_start(1).col_start(1).flex().items_center().child(
+                            ui::badge(
+                                p,
+                                ui::BadgeTone::Success,
+                                provider_text::PROVIDER_ACTIVE_NOW.get(),
                             ),
-                    ),
-            );
-        }
-        detail = detail.child(profile);
-    }
+                        ))
+                        .child(
+                            div().row_start(1).col_start(1).child(
+                                Button::new("ghost-detail-use")
+                                    .small()
+                                    .primary()
+                                    .label(provider_text::PROVIDER_SWITCH_NOW.get()),
+                            ),
+                        ),
+                ),
+        );
+
+    detail = detail.child(profile);
     div()
         .w(detail_panel_width)
         .flex_none()
@@ -894,7 +857,9 @@ fn render_remote_account_usage(
                 ));
             }
         }
-    } else {
+    } else if account.usage.five_hour.is_some() || account.usage.seven_day.is_some() {
+        // No usage at all (host not installed / never refreshed): the status
+        // line already says so, so skip two empty "—" bars.
         for (label, window) in [
             ("5h", account.usage.five_hour.as_ref()),
             ("7d", account.usage.seven_day.as_ref()),
@@ -938,17 +903,14 @@ fn render_remote_hosts_tab_ghost(
                 .child(provider_text::PROVIDER_REMOTE_HINT.get()),
         );
     for (other_host, other_label, other_snap) in other_hosts {
-        let profiles: Vec<AccountInfo> = other_snap
-            .accounts
-            .iter()
-            .filter(|a| a.provider == provider && !krill_app::accounts::orca_managed(a))
-            .cloned()
-            .collect();
+        let groups = account_groups(other_snap, provider);
+        let profiles: Vec<&AccountInfo> =
+            groups.iter().filter_map(AccountGroup::selected).collect();
         let active_profile = profiles
             .iter()
             .find(|a| a.active)
             .or_else(|| profiles.first())
-            .cloned();
+            .copied();
         let peak_pct = active_profile
             .as_ref()
             .and_then(|acc| account_peak_percent(other_snap, acc));
@@ -1076,186 +1038,135 @@ fn render_details(
         .gap_2()
         .text_size(ui::TEXT_XS)
         .text_color(p.muted_foreground);
-    if group.profiles.len() > 1 {
-        detail = detail.child(provider_text::PROVIDER_GROUP_PROFILES.get());
-    }
-    for account in &group.profiles {
-        let mut profile = div()
-            .w_full()
-            .min_w_0()
-            .pt_2()
-            .border_t_1()
-            .border_color(p.border)
-            .flex()
-            .flex_col()
-            .gap_2();
-        if group.profiles.len() > 1 {
-            let label = if account.host_default {
-                account_text::SYSTEM_DEFAULT.get().to_owned()
-            } else if account.label.trim().is_empty() {
-                account.id.clone()
-            } else {
-                account.label.clone()
-            };
-            let selector = format!("status-provider-profile-{}", account.id);
-            let debug_id = selector.clone();
-            let path = account.profile_dir.clone();
+    let Some(account) = group.selected() else {
+        return detail;
+    };
+    let mut profile = div()
+        .w_full()
+        .min_w_0()
+        .pt_2()
+        .border_t_1()
+        .border_color(p.border)
+        .flex()
+        .flex_col()
+        .gap_2();
+    let status = krill_app::accounts::display::account(
+        account,
+        snap.status_for(&account.id),
+        krill_app::accounts::display::now(),
+    );
+    profile = profile.child(krill_app::accounts::display::render_status(
+        format!("status-provider-detail-status-{}", account.id),
+        &status,
+        p,
+    ));
+    if let Some(meters) = snap.meters_for(&account.id) {
+        profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
+        for meter in &meters.meters {
+            let label = krill_app::accounts::display::meter_label(meter);
             profile = profile.child(
-                div()
-                    .id(gpui::SharedString::from(selector))
-                    .debug_selector(move || debug_id.clone())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(if account.active {
-                                p.foreground
-                            } else {
-                                p.muted_foreground
-                            })
-                            .font_weight(if account.active {
-                                gpui::FontWeight::SEMIBOLD
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .child(label),
-                    )
-                    .child(if account.active {
-                        ui::badge(
-                            p,
-                            ui::BadgeTone::Success,
-                            account_text::ACCOUNT_IN_USE.get(),
+                if let Some(value) = krill_app::accounts::display::meter_value(
+                    meter,
+                    krill_app::accounts::display::now(),
+                ) {
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_between()
+                        .gap_2()
+                        .child(label)
+                        .child(
+                            div()
+                                .font_family(ui::FONT_MONO)
+                                .text_color(p.foreground)
+                                .child(value.clone()),
                         )
                         .into_any_element()
-                    } else {
-                        use_button(account, weak.clone(), menu.clone()).into_any_element()
-                    })
-                    .tooltip(move |window, cx| {
-                        ui::tooltip_view("status-profile-path", path.clone(), window, cx)
-                    }),
+                } else {
+                    render_popover_usage_row(
+                        &label,
+                        format!("status-provider-detail-{}-{}", account.id, meter.key),
+                        meter.window.as_ref(),
+                        window_bar_color(meter.window.as_ref(), p),
+                        p,
+                    )
+                    .into_any_element()
+                },
             );
         }
-        let status = krill_app::accounts::display::account(
-            account,
-            snap.status_for(&account.id),
-            krill_app::accounts::display::now(),
-        );
-        profile = profile.child(krill_app::accounts::display::render_status(
-            format!("status-provider-detail-status-{}", account.id),
-            &status,
-            p,
-        ));
-        if let Some(meters) = snap.meters_for(&account.id) {
-            profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
-            for meter in &meters.meters {
-                let label = krill_app::accounts::display::meter_label(meter);
-                profile = profile.child(
-                    if let Some(value) = krill_app::accounts::display::meter_value(
-                        meter,
-                        krill_app::accounts::display::now(),
-                    ) {
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .justify_between()
-                            .gap_2()
-                            .child(label)
-                            .child(
-                                div()
-                                    .font_family(ui::FONT_MONO)
-                                    .text_color(p.foreground)
-                                    .child(value.clone()),
-                            )
-                            .into_any_element()
-                    } else {
-                        render_popover_usage_row(
-                            &label,
-                            format!("status-provider-detail-{}-{}", account.id, meter.key),
-                            meter.window.as_ref(),
-                            window_bar_color(meter.window.as_ref(), p),
-                            p,
-                        )
-                        .into_any_element()
-                    },
-                );
-            }
-        } else {
-            for (label, window) in [
-                (
-                    provider_text::PROVIDER_USED_5H.get(),
-                    account.usage.five_hour.as_ref(),
-                ),
-                (
-                    provider_text::PROVIDER_USED_7D.get(),
-                    account.usage.seven_day.as_ref(),
-                ),
-            ] {
-                profile = profile.child(render_popover_usage_row(
-                    label,
-                    format!("status-provider-detail-{}-{label}", account.id),
-                    window,
-                    window_bar_color(window, p),
-                    p,
-                ));
-            }
-        }
-        if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
-            profile = profile.child(format!(
-                "{} · {}",
-                provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
-                krill_app::settings::rule_summary(rule, &snap.accounts)
+    } else {
+        for (label, window) in [
+            (
+                provider_text::PROVIDER_USED_5H.get(),
+                account.usage.five_hour.as_ref(),
+            ),
+            (
+                provider_text::PROVIDER_USED_7D.get(),
+                account.usage.seven_day.as_ref(),
+            ),
+        ] {
+            profile = profile.child(render_popover_usage_row(
+                label,
+                format!("status-provider-detail-{}-{label}", account.id),
+                window,
+                window_bar_color(window, p),
+                p,
             ));
         }
-        profile = profile.children(
-            advanced_notes(snap, account)
-                .into_iter()
-                .map(|note| div().child(note)),
-        );
-        if let Some(reset_box) =
-            render_detail_reset_controls(snap, account, reset_armed, weak, menu, detail_menu, p)
-        {
-            profile = profile.child(reset_box);
-        }
-        if group.profiles.len() == 1 {
-            profile = profile.child(
-                div()
-                    .pt_1p5()
-                    .border_t_1()
-                    .border_color(p.border)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(if account.active {
-                        div()
-                            .grid()
-                            .child(
-                                div().row_start(1).col_start(1).invisible().child(
-                                    Button::new("ghost-active-detail-use")
-                                        .small()
-                                        .primary()
-                                        .label(provider_text::PROVIDER_SWITCH_NOW.get()),
-                                ),
-                            )
-                            .child(div().row_start(1).col_start(1).flex().items_center().child(
-                                ui::badge(
-                                    p,
-                                    ui::BadgeTone::Success,
-                                    provider_text::PROVIDER_ACTIVE_NOW.get(),
-                                ),
-                            ))
-                            .into_any_element()
-                    } else {
-                        detail_use_button(account, weak.clone(), menu.clone()).into_any_element()
-                    }),
-            );
-        }
-        detail = detail.child(profile);
     }
+    if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
+        profile = profile.child(format!(
+            "{} · {}",
+            provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
+            krill_app::settings::rule_summary(rule, &snap.accounts)
+        ));
+    }
+    profile = profile.children(
+        advanced_notes(snap, account)
+            .into_iter()
+            .map(|note| div().child(note)),
+    );
+    if let Some(reset_box) =
+        render_detail_reset_controls(snap, account, reset_armed, weak, menu, detail_menu, p)
+    {
+        profile = profile.child(reset_box);
+    }
+
+    profile =
+        profile.child(
+            div()
+                .pt_1p5()
+                .border_t_1()
+                .border_color(p.border)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(if account.active {
+                    div()
+                        .grid()
+                        .child(
+                            div().row_start(1).col_start(1).invisible().child(
+                                Button::new("ghost-active-detail-use")
+                                    .small()
+                                    .primary()
+                                    .label(provider_text::PROVIDER_SWITCH_NOW.get()),
+                            ),
+                        )
+                        .child(div().row_start(1).col_start(1).flex().items_center().child(
+                            ui::badge(
+                                p,
+                                ui::BadgeTone::Success,
+                                provider_text::PROVIDER_ACTIVE_NOW.get(),
+                            ),
+                        ))
+                        .into_any_element()
+                } else {
+                    detail_use_button(account, weak.clone(), menu.clone()).into_any_element()
+                }),
+        );
+
+    detail = detail.child(profile);
     detail
 }
 
@@ -1297,17 +1208,14 @@ fn render_remote_hosts_tab(
         );
 
     for (other_host, other_label, other_snap) in other_hosts {
-        let profiles: Vec<AccountInfo> = other_snap
-            .accounts
-            .iter()
-            .filter(|a| a.provider == provider && !krill_app::accounts::orca_managed(a))
-            .cloned()
-            .collect();
+        let groups = account_groups(other_snap, provider);
+        let profiles: Vec<&AccountInfo> =
+            groups.iter().filter_map(AccountGroup::selected).collect();
         let active_profile = profiles
             .iter()
             .find(|a| a.active)
             .or_else(|| profiles.first())
-            .cloned();
+            .copied();
         let peak_pct = active_profile
             .as_ref()
             .and_then(|acc| account_peak_percent(other_snap, acc));
@@ -1495,6 +1403,25 @@ fn render_remote_hosts_tab(
     container
 }
 
+/// Bound each tab *before* reserving their shared grid footprint. A scroll region
+/// around the grid would still expose the hidden tab's full height as blank space.
+fn provider_body_viewport(
+    id: &'static str,
+    content: impl IntoElement,
+    width: gpui::Pixels,
+    max_height: gpui::Pixels,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .w(width)
+        .flex_none()
+        .min_h_0()
+        .max_h(max_height)
+        .overflow_y_scroll()
+        .child(content)
+}
+
 pub(super) fn provider_usage_menu(
     mut menu: PopupMenu,
     scope: &ProviderHostScope<'_>,
@@ -1564,6 +1491,8 @@ pub(super) fn provider_usage_menu(
     menu = menu
         .min_w(width)
         .max_w(width)
+        // Only the tab body scrolls; the menu's padding must not scroll its chrome.
+        .scrollable(false)
         .check_side(gpui_component::Side::Right);
     menu = menu.item(
         PopupMenuItem::element(move |_, cx| {
@@ -1692,8 +1621,14 @@ pub(super) fn provider_usage_menu(
     let body_menu = menu_weak;
     let body_other_hosts = other_hosts;
     menu = menu.separator().item(
-        PopupMenuItem::element(move |_, cx| {
+        PopupMenuItem::element(move |window, cx| {
             let p = ui::palette(cx);
+            // Leave room for the header and actions, even in a short window.
+            // This is a cap, not a fixed height: small snapshots still fit naturally.
+            let room = window.viewport_size().height - ui::STATUS_BAR_HEIGHT - ui::SPACE_4 * 2.;
+            let body_max_height = (room
+                - ui::STATUS_PROVIDER_CHROME_RESERVE.to_pixels(window.rem_size()))
+            .clamp(ui::SPACE_4, ui::STATUS_PROVIDER_BODY_MAX_HEIGHT);
             let remote_tab = is_remote_tab_for(cx, provider, has_remote_hosts);
             let selected_group = selected_account_for(cx, provider, &body_groups);
             let selected_id = selected_group
@@ -1724,8 +1659,8 @@ pub(super) fn provider_usage_menu(
                     body_snap.status_for(&account.id),
                     krill_app::accounts::display::now(),
                 );
-                let status_visible =
-                    !matches!(status.status, AccountStatus::Ok | AccountStatus::Unknown);
+                // 값이 없을 때도 모름·갱신 시각을 보여 원인 없는 대시만 남기지 않는다.
+                let status_visible = status.status != AccountStatus::Ok;
 
                 let hover_id = account.id.clone();
                 let hover_menu = body_menu.clone();
@@ -1831,46 +1766,18 @@ pub(super) fn provider_usage_menu(
                                             account_text::ACCOUNT_IN_USE.get(),
                                         )
                                         .into_any_element()
-                                    } else if group.profiles.len() > 1 {
-                                        ui::badge(
-                                            p,
-                                            ui::BadgeTone::Muted,
-                                            account_text::PROFILES_COUNT.format(&[(
-                                                "count",
-                                                &group.profiles.len().to_string(),
-                                            )]),
-                                        )
-                                        .into_any_element()
                                     } else {
                                         use_button(account, body_weak.clone(), body_menu.clone())
                                             .into_any_element()
                                     },
                                 )),
                         )
-                        .when(account.host_default || group.profiles.len() > 1, |d| {
-                            d.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .when(account.host_default, |d| {
-                                        d.child(ui::badge(
-                                            p,
-                                            ui::BadgeTone::Muted,
-                                            provider_text::PROVIDER_DEFAULT_LOGIN.get(),
-                                        ))
-                                    })
-                                    .when(group.profiles.len() > 1, |d| {
-                                        d.child(ui::badge(
-                                            p,
-                                            ui::BadgeTone::Muted,
-                                            account_text::PROFILES_COUNT.format(&[(
-                                                "count",
-                                                &group.profiles.len().to_string(),
-                                            )]),
-                                        ))
-                                    }),
-                            )
+                        .when(account.host_default, |d| {
+                            d.child(ui::badge(
+                                p,
+                                ui::BadgeTone::Muted,
+                                provider_text::PROVIDER_DEFAULT_LOGIN.get(),
+                            ))
                         })
                         .child(div().w_full().flex().items_start().gap_2().children(
                             body_columns.iter().map(|label| {
@@ -1893,6 +1800,8 @@ pub(super) fn provider_usage_menu(
                 );
             }
 
+            // Account for the local row's .py_1() at the current zoom.
+            let column_max_height = (body_max_height - window.rem_size() * 0.5).max(ui::SPACE_1);
             let detail_col = if let Some(panel_group) = selected_group
                 && let Some(panel_account) = panel_group.selected().cloned()
             {
@@ -1950,14 +1859,41 @@ pub(super) fn provider_usage_menu(
                         p,
                     ));
 
+                let active_detail = div()
+                    // Keep detail scroll independent and reset it on selection.
+                    .id(gpui::SharedString::from(format!(
+                        "status-provider-detail-scroll-{}",
+                        panel_account.id
+                    )))
+                    .debug_selector(|| "status-provider-detail-scroll".into())
+                    .w(detail_panel_width)
+                    .flex_none()
+                    .min_h_0()
+                    .max_h(column_max_height)
+                    .overflow_y_scroll()
+                    .child(active_detail);
                 let mut stack = div().w(detail_panel_width).flex_none().grid();
                 for group in &body_groups {
                     if group.selected().is_some_and(|a| a.id == panel_account.id) {
                         continue;
                     }
-                    stack = stack.child(div().row_start(1).col_start(1).invisible().child(
-                        render_detail_panel_ghost(&body_snap, group, detail_panel_width, p),
-                    ));
+                    // Bound each reservation before the grid; a long hidden
+                    // detail must never become blank scroll space in a short one.
+                    stack = stack.child(
+                        div()
+                            .row_start(1)
+                            .col_start(1)
+                            .invisible()
+                            .min_h_0()
+                            .max_h(column_max_height)
+                            .overflow_hidden()
+                            .child(render_detail_panel_ghost(
+                                &body_snap,
+                                group,
+                                detail_panel_width,
+                                p,
+                            )),
+                    );
                 }
                 stack
                     .child(div().row_start(1).col_start(1).child(active_detail))
@@ -1966,6 +1902,14 @@ pub(super) fn provider_usage_menu(
                 div().w(detail_panel_width).flex_none().into_any_element()
             };
 
+            // Scrolling to a lower account must leave its detail at the top of
+            // the adjacent column. Both columns share the same height budget.
+            let master_col = provider_body_viewport(
+                "status-provider-local-scroll",
+                master_col,
+                master_width,
+                column_max_height,
+            );
             let local_view = div()
                 .w(content_width)
                 .py_1()
@@ -1974,7 +1918,6 @@ pub(super) fn provider_usage_menu(
                 .gap_3()
                 .child(master_col)
                 .child(detail_col);
-
             if !has_remote_hosts {
                 return local_view.into_any_element();
             }
@@ -1998,7 +1941,17 @@ pub(super) fn provider_usage_menu(
                             .invisible()
                             .child(local_view),
                     )
-                    .child(div().row_start(1).col_start(1).child(remote_view))
+                    .child(
+                        div()
+                            .row_start(1)
+                            .col_start(1)
+                            .child(provider_body_viewport(
+                                "status-provider-remote-scroll",
+                                remote_view,
+                                content_width,
+                                body_max_height,
+                            )),
+                    )
                     .into_any_element()
             } else {
                 let remote_ghost =
@@ -2006,13 +1959,14 @@ pub(super) fn provider_usage_menu(
                 div()
                     .w(content_width)
                     .grid()
-                    .child(
-                        div()
-                            .row_start(1)
-                            .col_start(1)
-                            .invisible()
-                            .child(remote_ghost),
-                    )
+                    .child(div().row_start(1).col_start(1).invisible().child(
+                        provider_body_viewport(
+                            "status-provider-remote-scroll",
+                            remote_ghost,
+                            content_width,
+                            body_max_height,
+                        ),
+                    ))
                     .child(div().row_start(1).col_start(1).child(local_view))
                     .into_any_element()
             }

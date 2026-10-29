@@ -1942,3 +1942,399 @@ fn target_named_configuration_controls_google_gate_before_any_mutation() {
         );
     }
 }
+
+/// 변경 피드 고정 장치: 상태 디렉터리가 있는 게이트웨이(설정 파일로 스냅샷 본문을 바꿀 수 있다).
+fn start_in(dir: &Path) -> (Arc<Registry>, Arc<Gateway>) {
+    let r = Arc::new(Registry::new(None, Some(dir)));
+    r.start_mobile(hello()).unwrap();
+    lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
+        Some(super::super::tunnel::Tunnel::fixture);
+    let gateway = Arc::clone(r.mobile_gateway().unwrap());
+    (r, gateway)
+}
+fn feed_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("mk-feed-{}", hex(&random().unwrap())));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+fn set_quick_command(dir: &Path, name: &str) {
+    std::fs::write(
+        dir.join("settings.toml"),
+        format!("[[quick_commands]]\nname = '{name}'\ntext = '/{name} '\n"),
+    )
+    .unwrap();
+}
+fn workflow_json(kind: u8, body: &[u8]) -> serde_json::Value {
+    let MobileReply::Workflow(text) = MobileReply::decode(kind, body).unwrap() else {
+        panic!("not a workflow frame");
+    };
+    serde_json::from_str(&text).unwrap()
+}
+fn quick_names(snapshot: &serde_json::Value) -> Vec<String> {
+    snapshot["quick_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// 한 연결 위의 워크플로 송수신. 직접 연결과 릴레이가 같은 시나리오를 돈다.
+trait FeedWire {
+    fn send_json(&mut self, request: serde_json::Value);
+    /// 다음 IPC 프레임. `None`은 `timeout` 동안 아무것도 오지 않음.
+    fn next(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)>;
+}
+impl FeedWire for Client {
+    fn send_json(&mut self, request: serde_json::Value) {
+        self.write(
+            &MobileRequest::Workflow(request.to_string())
+                .encode()
+                .unwrap(),
+        );
+    }
+    fn next(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)> {
+        self.socket.set_read_timeout(Some(timeout)).unwrap();
+        let mut probe = [0];
+        match self.socket.peek(&mut probe) {
+            Ok(0) => panic!("connection closed"),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return None;
+            }
+            Err(e) => panic!("{e}"),
+        }
+        self.socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        Some(self.read().unwrap())
+    }
+}
+/// 다음 응답(푸시가 아닌 프레임)을 받는다. 그 사이 도착한 푸시는 함께 돌려준다.
+fn reply(wire: &mut impl FeedWire) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let mut pushes = Vec::new();
+    loop {
+        let (kind, body) = wire
+            .next(Duration::from_secs(10))
+            .expect("reply within deadline");
+        let value = workflow_json(kind, &body);
+        if value.get("push").is_some() {
+            pushes.push(value);
+        } else {
+            return (value, pushes);
+        }
+    }
+}
+fn feed_scenario(wire: &mut impl FeedWire, dir: &Path) {
+    // 옛 클라이언트 요청(feed 없음): 응답 모양은 그대로이고 아무것도 켜지지 않는다.
+    wire.send_json(serde_json::json!({"action":"snapshot"}));
+    let (first, pushes) = reply(wire);
+    assert!(pushes.is_empty());
+    assert_eq!(first["ok"], true);
+    let data = &first["data"];
+    assert_eq!(data["capabilities"]["change_feed"], true);
+    assert!(data.get("feed").is_none() && data.get("rev").is_none());
+    assert_eq!(quick_names(data), ["one"]);
+    let etag = data["etag"].as_str().unwrap().to_owned();
+    set_quick_command(dir, "legacy");
+    assert!(
+        wire.next(Duration::from_millis(2500)).is_none(),
+        "no push to a client that never asked for the feed"
+    );
+
+    // 가장 긴 간격으로 켜도 변경 요청 응답은 그 간격을 기다리지 않는다(HOL 없음).
+    wire.send_json(serde_json::json!({"action":"snapshot","since":etag,"feed":600_000}));
+    let (armed, _) = reply(wire);
+    assert_eq!(armed["data"]["feed"], 60_000, "interval is clamped");
+    let etag = armed["data"]["etag"].as_str().unwrap().to_owned();
+    let started = Instant::now();
+    wire.send_json(serde_json::json!({"action":"save_quick_commands","commands":[{"name":"mobile","text":"/mobile "}]}));
+    let (saved, _) = reply(wire);
+    assert_eq!(saved["ok"], true);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // 1초 간격: 데스크톱 쪽 파일 변경이 요청 없이 같은 E2EE 채널로 푸시된다.
+    wire.send_json(serde_json::json!({"action":"snapshot","since":etag,"feed":1000}));
+    let (rearmed, _) = reply(wire);
+    assert_eq!(rearmed["data"]["feed"], 1000);
+    assert_eq!(quick_names(&rearmed["data"]), ["mobile"]);
+    let mut rev = rearmed["data"]["rev"].as_u64().unwrap();
+    // 재무장 직후 같은 상태는 푸시하지 않는다.
+    assert!(wire.next(Duration::from_millis(1500)).is_none());
+    let changed = Instant::now();
+    set_quick_command(dir, "desktop");
+    let (kind, body) = wire
+        .next(Duration::from_secs(5))
+        .expect("push after desktop change");
+    let latency = changed.elapsed();
+    let push = workflow_json(kind, &body);
+    assert_eq!(push["push"], "snapshot");
+    assert_eq!(quick_names(&push["data"]), ["desktop"]);
+    assert!(push["data"]["rev"].as_u64().unwrap() > rev);
+    rev = push["data"]["rev"].as_u64().unwrap();
+    // 간격(1초) + 스냅샷 계산 시간 안에 도착한다.
+    assert!(latency < Duration::from_secs(3), "push latency {latency:?}");
+    eprintln!("feed push latency after desktop edit: {latency:?}");
+    assert!(
+        wire.next(Duration::from_millis(2500)).is_none(),
+        "unchanged state is not pushed again"
+    );
+
+    // 숨김(feed 0): 변경이 있어도 보내지 않고, 다시 켜면 최신 본문으로 재동기화한다.
+    let since = push["data"]["etag"].as_str().unwrap().to_owned();
+    wire.send_json(serde_json::json!({"action":"snapshot","since":since,"feed":0}));
+    let (paused, _) = reply(wire);
+    assert_eq!(paused["data"]["feed"], 0);
+    assert_eq!(paused["data"]["unchanged"], true);
+    set_quick_command(dir, "hidden");
+    assert!(wire.next(Duration::from_millis(2500)).is_none());
+    wire.send_json(serde_json::json!({"action":"snapshot","since":since,"feed":1000}));
+    let (resumed, _) = reply(wire);
+    assert_eq!(quick_names(&resumed["data"]), ["hidden"]);
+    assert!(resumed["data"]["rev"].as_u64().unwrap() > rev);
+}
+
+#[test]
+fn change_feed_pushes_on_the_direct_e2ee_channel_and_stops_with_the_connection() {
+    let dir = feed_dir();
+    set_quick_command(&dir, "one");
+    let (_r, g) = start_in(&dir);
+    let (port, t) = offer(&g);
+    let mut c = Client::pair(port, &t);
+    c.ipc();
+    feed_scenario(&mut c, &dir);
+    // 끊기면 브리지가 피드 스레드를 멈추고 회수한 뒤에야 연결 슬롯을 돌려준다.
+    drop(c);
+    until(|| lock(&g.shared.state).connections.is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn change_feed_pushes_through_the_relay_mux_and_ends_with_mux_close() {
+    use super::super::relay::{MUX_BINARY, MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
+    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        panic!("a healthy relay must not start cloudflared")
+    }
+    struct Relay {
+        host: TcpStream,
+        channel: Channel,
+        conn: u32,
+    }
+    impl Relay {
+        fn frame(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)> {
+            self.host.set_read_timeout(Some(timeout)).unwrap();
+            loop {
+                let mut probe = [0];
+                match self.host.peek(&mut probe) {
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return None;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+                self.host
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (op, body) = ws::read(&mut self.host).unwrap();
+                if op != ws::BINARY {
+                    continue;
+                }
+                let (kind, cid, payload) = decode_mux(&body).unwrap();
+                if cid == self.conn {
+                    return Some((kind, payload.to_vec()));
+                }
+            }
+        }
+    }
+    impl FeedWire for Relay {
+        fn send_json(&mut self, request: serde_json::Value) {
+            let sealed = self
+                .channel
+                .seal(
+                    &MobileRequest::Workflow(request.to_string())
+                        .encode()
+                        .unwrap(),
+                )
+                .unwrap();
+            ws::write(
+                &mut self.host,
+                ws::BINARY,
+                &encode_mux(MUX_BINARY, self.conn, &sealed),
+            )
+            .unwrap();
+        }
+        fn next(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)> {
+            let (kind, payload) = self.frame(timeout)?;
+            assert_eq!(kind, MUX_BINARY);
+            let plain = self.channel.open(&payload).unwrap();
+            ipc::read_frame(&mut plain.as_slice()).unwrap()
+        }
+    }
+
+    let dir = feed_dir();
+    set_quick_command(&dir, "one");
+    let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let relay_port = relay_listener.local_addr().unwrap().port();
+    let (_r, g) = start_in(&dir);
+    {
+        let mut s = lock(&g.shared.state);
+        s.publication.origin = format!("http://127.0.0.1:{relay_port}");
+        s.account.session = Some(super::super::relay_auth::Session {
+            token: "test-session".into(),
+            expires_at_ms: u64::MAX,
+            email: "test@example.test".into(),
+            origin: s.publication.origin.clone(),
+        });
+        s.relay_enabled = true;
+        s.tunnel_start = Some(must_not_start_tunnel);
+    }
+    let server = thread::spawn(move || {
+        let (mut manifest, _) = relay_listener.accept().unwrap();
+        manifest
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            manifest.read_exact(&mut byte).unwrap();
+            header.extend(byte);
+        }
+        manifest
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+        drop(manifest);
+        let (mut host, _) = relay_listener.accept().unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        host.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut req = Vec::new();
+        while !req.ends_with(b"\r\n\r\n") {
+            let mut b = [0_u8; 1];
+            host.read_exact(&mut b).unwrap();
+            req.extend_from_slice(&b);
+        }
+        let headers = String::from_utf8(req).unwrap();
+        let key = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+            .unwrap()
+            .trim();
+        let mut accept_in = Vec::from(key.as_bytes());
+        accept_in.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = ws::base64(
+            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &accept_in).as_ref(),
+            false,
+        );
+        write!(
+            host,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .unwrap();
+        host
+    });
+    let MobileReply::PairingOffer { .. } = g.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    }) else {
+        panic!("expected relay offer");
+    };
+    let mut host = server.join().unwrap();
+    let ticket = lock(&g.shared.state)
+        .devices
+        .ticket(now_ms())
+        .unwrap()
+        .clone();
+    ws::write(&mut host, ws::BINARY, &encode_mux(MUX_OPEN, 1, &[])).unwrap();
+    let challenge = loop {
+        let (_, body) = ws::read(&mut host).unwrap();
+        let (kind, cid, text) = decode_mux(&body).unwrap();
+        if cid == 1 && kind == MUX_TEXT {
+            let hello: serde_json::Value = serde_json::from_slice(text).unwrap();
+            break decode_hex::<32>(hello["challenge"].as_str().unwrap()).unwrap();
+        }
+    };
+    let nonce = [0x33_u8; 32];
+    let mut salt = [0_u8; 64];
+    salt[..32].copy_from_slice(&challenge);
+    salt[32..].copy_from_slice(&nonce);
+    let channel = Channel::new(&ticket.secret, &salt, Endpoint::Client).unwrap();
+    let mut relay = Relay {
+        host,
+        channel,
+        conn: 1,
+    };
+    let auth = serde_json::to_vec(&AuthHello {
+        token: Some(hex(&ticket.token)),
+        device_id: None,
+        client_nonce: hex(&nonce),
+    })
+    .unwrap();
+    ws::write(&mut relay.host, ws::BINARY, &encode_mux(MUX_TEXT, 1, &auth)).unwrap();
+    let proof = relay
+        .channel
+        .seal(
+            &serde_json::to_vec(&AuthProof {
+                label: "relay-feed".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    ws::write(
+        &mut relay.host,
+        ws::BINARY,
+        &encode_mux(MUX_BINARY, 1, &proof),
+    )
+    .unwrap();
+    let (kind, sealed) = relay.frame(Duration::from_secs(5)).unwrap();
+    assert_eq!(kind, MUX_BINARY);
+    let _: Authenticated = serde_json::from_slice(&relay.channel.open(&sealed).unwrap()).unwrap();
+    let (k, b) = relay.next(Duration::from_secs(5)).unwrap();
+    ServerHello::decode(k, &b).unwrap();
+    let hello = relay
+        .channel
+        .seal(
+            &client_hello(ClientRole::App, "relay-feed")
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+    ws::write(
+        &mut relay.host,
+        ws::BINARY,
+        &encode_mux(MUX_BINARY, 1, &hello),
+    )
+    .unwrap();
+
+    feed_scenario(&mut relay, &dir);
+
+    // 중계 서버가 휴대폰 소켓 종료를 알리면 피드가 멈추고 연결 슬롯이 회수된다. 호스트 WS는 산다.
+    ws::write(
+        &mut relay.host,
+        ws::BINARY,
+        &encode_mux(MUX_CLOSE, 1, &1000_u16.to_be_bytes()),
+    )
+    .unwrap();
+    until(|| {
+        lock(&g.shared.state)
+            .connections
+            .values()
+            .all(|c| c.device.is_none())
+    });
+    assert!(
+        relay
+            .frame(Duration::from_millis(2500))
+            .is_none_or(|(kind, _)| kind == MUX_CLOSE)
+    );
+    std::fs::remove_dir_all(dir).ok();
+}

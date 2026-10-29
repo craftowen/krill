@@ -6,6 +6,9 @@ paths. Use a fresh worker context for substantive independent verification; do n
 ask the implementation worker to certify its own result as independent evidence.
 For a trivial change, proportional coordinator review can suffice when consistent
 with repository rules. Avoid repeating whole-workspace tests at every small edit.
+Keep the verifier's product-code scope read-only unless fixes were explicitly
+assigned. If it changes the result, verification of that new state needs a
+separate context; a fix and its author's approval are not independent evidence.
 
 For code, inspect the diff and exercise the behavior with appropriate focused
 checks. For UI behavior, capture the real surface when layout/interaction matters.

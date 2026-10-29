@@ -256,6 +256,95 @@ impl Selection {
     }
 }
 
+/// 스크롤해도 같은 글자를 가리키는 선택(Orca/xterm.js처럼 버퍼 기준 줄). 끝점은 `(줄, 열)`이다.
+/// 줄은 라이브 화면 맨 위가 0이고 그 위 스크롤백은 -1, -2, …다. 바닥에서 `offset`행 올린 화면의
+/// 보이는 줄 `l`은 `l - offset`이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchored {
+    pub anchor: (i64, u16),
+    pub head: (i64, u16),
+    pub block: bool,
+}
+
+impl Anchored {
+    /// 보이는 화면 칸을 버퍼 기준 끝점으로.
+    pub fn point(at: Point, offset: usize) -> (i64, u16) {
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        (i64::from(at.line).saturating_sub(offset), at.column)
+    }
+
+    /// `offset`행 올린 화면에서 잡은 선택.
+    pub fn from_view(sel: Selection, offset: usize) -> Self {
+        Self {
+            anchor: Self::point(sel.anchor, offset),
+            head: Self::point(sel.head, offset),
+            block: sel.block,
+        }
+    }
+
+    fn ordered(self) -> ((i64, u16), (i64, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// `offset`행 올린 `lines`×`cols` 화면에 보이는 부분(그리기용). 화면 밖으로 나간 끝은 화면 끝에
+    /// 붙인다. 하나도 안 보이면 `None`.
+    pub fn view(self, offset: usize, lines: u16, cols: u16) -> Option<Selection> {
+        let (start, end) = self.ordered();
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let (first, last) = (start.0.saturating_add(offset), end.0.saturating_add(offset));
+        let bottom = i64::from(lines) - 1;
+        if lines == 0 || last < 0 || first > bottom {
+            return None;
+        }
+        let line = |l: i64| u16::try_from(l.clamp(0, bottom)).unwrap_or(0);
+        let start_column = if first < 0 && !self.block { 0 } else { start.1 };
+        let end_column = if last > bottom && !self.block {
+            cols.saturating_sub(1)
+        } else {
+            end.1
+        };
+        Some(Selection {
+            anchor: Point {
+                line: line(first),
+                column: start_column,
+            },
+            head: Point {
+                line: line(last),
+                column: end_column,
+            },
+            block: self.block,
+        })
+    }
+
+    /// 선택한 칸의 텍스트([`Selection::text`] 규칙). `row`는 버퍼 기준 줄의 행이고, 한 행이라도
+    /// 없으면(받지 않았거나 버린 스크롤백) `None`.
+    pub fn text(self, cols: u16, row: impl Fn(i64) -> Option<Vec<Cell>>) -> Option<String> {
+        let (start, end) = self.ordered();
+        let lines = u16::try_from(end.0.checked_sub(start.0)?.checked_add(1)?).ok()?;
+        let rows = (start.0..=end.0).map(row).collect::<Option<Vec<_>>>()?;
+        let screen = Screen {
+            cols,
+            lines,
+            rows,
+            ..Screen::default()
+        };
+        let rebase = |(line, column): (i64, u16)| Point {
+            line: u16::try_from(line - start.0).unwrap_or(0),
+            column,
+        };
+        let sel = Selection {
+            anchor: rebase(self.anchor),
+            head: rebase(self.head),
+            block: self.block,
+        };
+        Some(sel.text(&screen))
+    }
+}
+
 fn str_display_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
@@ -669,6 +758,54 @@ mod tests {
             block: true,
             ..sel(a, b)
         }
+    }
+
+    /// 스크롤해도 선택이 같은 글자를 가리키고, 화면 밖 행까지 복사한다(Orca/xterm.js와 같음).
+    #[test]
+    fn anchored_selection_survives_scroll_and_copies_offscreen_rows() {
+        // 버퍼: 스크롤백 -2 "old", -1 "mid", 화면 0 "top", 1 "end". 화면은 2행.
+        let buffer = |line: i64| {
+            let text = match line {
+                -2 => "old",
+                -1 => "mid",
+                0 => "top",
+                1 => "end",
+                _ => return None,
+            };
+            Some(screen(&[text], 4).rows.remove(0))
+        };
+        // 바닥에서 2행 올린 화면(old, mid)의 0행 1열부터, 바닥 화면(top, end)의 1행 1열까지.
+        let anchor = Anchored::point(Point { line: 0, column: 1 }, 2);
+        let head = Anchored::point(Point { line: 1, column: 1 }, 0);
+        assert_eq!((anchor, head), ((-2, 1), (1, 1)));
+        let anchored = Anchored {
+            anchor,
+            head,
+            block: false,
+        };
+        assert_eq!(
+            anchored.text(4, buffer).as_deref(),
+            Some("ld\nmid\ntop\nen")
+        );
+        // 버린 스크롤백이 끼면 모른다.
+        assert_eq!(
+            anchored.text(4, |l| (l >= -1).then(|| buffer(l)).flatten()),
+            None
+        );
+        // 바닥 화면에는 화면 위로 잘린 앞쪽이 0행 0열부터 보인다.
+        assert_eq!(anchored.view(0, 2, 4), Some(sel((0, 0), (1, 1))));
+        // 1행 올리면 mid~end가 보인다. 3행 올리면(-3..-2) 앞 끝만 걸친다.
+        assert_eq!(anchored.view(1, 2, 4), Some(sel((0, 0), (1, 3))));
+        assert_eq!(anchored.view(3, 2, 4), Some(sel((1, 1), (1, 3))));
+        assert_eq!(anchored.view(4, 2, 4), None);
+        // 거꾸로 끌어도 같다.
+        let reversed = Anchored {
+            anchor: head,
+            head: anchor,
+            block: false,
+        };
+        assert_eq!(reversed.view(0, 2, 4), anchored.view(0, 2, 4));
+        assert_eq!(reversed.text(4, buffer), anchored.text(4, buffer));
     }
 
     #[test]

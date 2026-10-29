@@ -216,7 +216,6 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
     let file = krilld::usage::accounts::AccountsFile {
         active: std::collections::BTreeMap::from([(name.into(), a.id.clone())]),
         accounts: vec![a.clone(), b.clone()],
-        direct_usage: false,
         ..Default::default()
     };
     fs::write(state.join("accounts.toml"), toml::to_string(&file).unwrap()).unwrap();

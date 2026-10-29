@@ -60,9 +60,28 @@ pub(crate) fn from_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Ide
     })
 }
 
-/// agy 1.4.7+ stores display identity beside OAuth tokens. Never use these fields
-/// to rescue a present but invalid JWT, or mix an email with another object's ID.
+/// agy 1.4.8 stores `id_token_email` in the native OAuth envelope without a JWT
+/// or subject. Read that exact field only with its credentials, never from settings
+/// or another profile. A present but invalid JWT still cannot use this fallback.
 fn agy_identity_fields(data: &Value) -> Option<Identity> {
+    if data.get("id_token_email").is_some()
+        && data
+            .get("auth_method")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+        && data
+            .pointer("/token/access_token")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        if data
+            .get("email_verified")
+            .is_some_and(|v| v != &Value::Bool(true))
+        {
+            return None;
+        }
+        return agy_email(data.get("id_token_email")?);
+    }
     [
         Some(data),
         data.get("token"),
@@ -88,22 +107,28 @@ fn agy_identity_fields(data: &Value) -> Option<Identity> {
         }
         ["id_token_email", "email", "account_email"]
             .iter()
-            .find_map(|key| {
-                let email = object.get(key).filter(|v| valid_text(v))?.as_str()?.trim();
-                let (local, domain) = email.split_once('@')?;
-                if local.is_empty()
-                    || domain.is_empty()
-                    || domain.contains('@')
-                    || email.chars().any(char::is_whitespace)
-                {
-                    return None;
-                }
-                Some(Identity {
-                    email: email.to_owned(),
-                    org_id: None,
-                    org_name: None,
-                })
-            })
+            .find_map(|key| agy_email(object.get(key)?))
+    })
+}
+
+fn agy_email(value: &Value) -> Option<Identity> {
+    let raw = value.as_str()?;
+    if raw.len() > 320 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let email = raw.trim();
+    let (local, domain) = email.split_once('@')?;
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || email.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(Identity {
+        email: email.to_owned(),
+        org_id: None,
+        org_name: None,
     })
 }
 
@@ -259,6 +284,63 @@ mod tests {
                 &serde_json::to_vec(&raw).unwrap()
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn agy_native_envelope_email_does_not_require_a_subject_or_jwt() {
+        let native = serde_json::json!({
+            "auth_method":"consumer",
+            "id_token_email":" native@example.test ",
+            "token":{
+                "access_token":"synthetic-access",
+                "refresh_token":"synthetic-refresh",
+                "token_type":"Bearer",
+                "expiry":"2030-01-01T00:00:00Z",
+                "expires_in":3600
+            }
+        });
+        let parse = |data: &Value| {
+            from_credentials(
+                ProviderKind::Antigravity,
+                &serde_json::to_vec(data).unwrap(),
+            )
+        };
+        assert_eq!(parse(&native).unwrap().email, "native@example.test");
+        for bad in [
+            serde_json::json!({"auth_method":"consumer", "id_token_email":"a@b"}),
+            serde_json::json!({"id_token_email":"a@b", "token":{"access_token":"access"}}),
+            serde_json::json!({"auth_method":"consumer", "id_token_email":"a@b", "token":{"access_token":" "}}),
+            serde_json::json!({"auth_method":"consumer", "email":"a@b", "token":{"access_token":"access"}}),
+            serde_json::json!({"auth_method":"consumer", "token":{"access_token":"access", "id_token_email":"a@b"}}),
+            serde_json::json!({"auth_method":"consumer", "token":{"access_token":"access"}, "account":{"id_token_email":"a@b"}}),
+        ] {
+            assert!(parse(&bad).is_none());
+        }
+        for (key, value) in [
+            ("auth_method", serde_json::json!(" ")),
+            ("id_token_email", serde_json::json!("invalid")),
+            ("id_token_email", serde_json::json!("a@@b")),
+            ("id_token_email", serde_json::json!("a b@c")),
+            ("id_token_email", serde_json::json!("a\n@b")),
+            ("id_token_email", serde_json::json!("\na@b\n")),
+            (
+                "id_token_email",
+                serde_json::json!(format!("{}@b", "a".repeat(321))),
+            ),
+            ("email_verified", serde_json::json!(false)),
+            ("id_token", serde_json::json!("invalid")),
+            (
+                "token",
+                serde_json::json!({"access_token":"access", "id_token":"invalid"}),
+            ),
+        ] {
+            let mut bad = native.clone();
+            bad[key] = value;
+            assert!(parse(&bad).is_none());
+        }
+        assert!(
+            from_credentials(ProviderKind::Codex, &serde_json::to_vec(&native).unwrap()).is_none()
         );
     }
 

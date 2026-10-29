@@ -5,6 +5,35 @@ use gpui::TestAppContext;
 use super::*;
 
 #[test]
+fn remote_project_paths_keep_the_target_platform_syntax() {
+    for raw in [
+        "/srv/repo",
+        r"C:\remote\repo",
+        "c:/remote/repo",
+        r"\\server\share\repo",
+    ] {
+        assert_eq!(host_path(raw), Some(PathBuf::from(raw)), "{raw}");
+    }
+    assert_eq!(
+        host_path(r"  C:\remote\repo  "),
+        Some(PathBuf::from(r"C:\remote\repo"))
+    );
+    for raw in [
+        "",
+        "repo",
+        "C:repo",
+        r"\repo",
+        r"C:\",
+        r"\\server\share",
+        "/",
+        "/..",
+        "/repo\0bad",
+    ] {
+        assert!(host_path(raw).is_none(), "{raw:?}");
+    }
+}
+
+#[test]
 fn clone_dir_follows_git_default_name() {
     assert_eq!(
         clone_dir("https://github.com/o/repo.git").as_deref(),

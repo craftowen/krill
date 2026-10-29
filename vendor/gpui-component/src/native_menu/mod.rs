@@ -11,6 +11,9 @@
 //! [`gpui::MenuItem`]s (see [`NativeMenu::from_menu_items`] /
 //! [`From<gpui::Menu>`]).
 //!
+//! Krill modification: keep original image colors and select theme variants before native rendering.
+//! Based on gpui-component (https://github.com/longbridge/gpui-kit), Apache-2.0.
+//!
 //! ```ignore
 //! use gpui_kit::component::native_menu::NativeMenu;
 //!
@@ -22,7 +25,7 @@
 //!     .show(position, window, cx);
 //! ```
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::ActiveTheme as _;
 use crate::Icon;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
@@ -203,14 +206,19 @@ impl NativeMenu {
             return;
         }
 
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let mut this = self;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        select_image_variants(&mut this.items, cx.theme().is_dark());
+
         #[cfg(target_os = "macos")]
         {
-            macos::show(self.items, cx.asset_source().clone(), position, window, cx);
+            macos::show(this.items, cx.asset_source().clone(), position, window, cx);
         }
         #[cfg(target_os = "windows")]
         {
             windows::show(
-                self.items,
+                this.items,
                 cx.asset_source().clone(),
                 position,
                 cx.theme().is_dark(),
@@ -220,6 +228,19 @@ impl NativeMenu {
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         fallback::show(self.items, position, window, cx);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn select_image_variants(items: &mut [NativeMenuItem], is_dark: bool) {
+    for item in items {
+        match item {
+            NativeMenuItem::Item {
+                icon: Some(icon), ..
+            } => icon.select_image_variant(is_dark),
+            NativeMenuItem::Submenu { items, .. } => select_image_variants(items, is_dark),
+            _ => {}
+        }
     }
 }
 
@@ -236,6 +257,8 @@ pub(super) fn resolve_icon_image(
                 bytes.to_vec(),
             )));
         }
+        // NativeMenu::show has already selected the current theme variant.
+        IconSource::Image { light, .. } => return Some(light.clone()),
     };
     if path.is_empty() {
         return None;

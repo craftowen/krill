@@ -220,6 +220,13 @@ impl Panel {
         if self.checks.merging {
             return;
         }
+        if self.remote_host() {
+            // 원격 저장소의 브랜치·PR은 로컬 git·gh로 조회할 수 없다(같은 경로의 로컬 저장소는 다른
+            // 저장소다). 진행 중이던 로컬 조회 결과도 세대 번호로 버리고 빈 미지원 상태만 보여 준다(APP-F01).
+            self.checks.reset();
+            cx.notify();
+            return;
+        }
         self.checks.pending_merge = None;
         self.checks.loading = true;
         self.checks.error = None;
@@ -270,7 +277,7 @@ impl Panel {
     }
 
     pub fn toggle_pr_draft(&mut self, cx: &mut Context<Self>) {
-        if self.checks.loading || self.checks.merging {
+        if self.checks.loading || self.checks.merging || self.remote_host() {
             return;
         }
         let Some(pr) = &self.checks.inspection else {
@@ -792,6 +799,17 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = crate::ui::palette(cx);
+
+        if self.remote_host() {
+            return Self::render_empty_state(
+                "pr-checks-remote-unsupported",
+                IconName::CircleCheck,
+                text::CHECKS_REMOTE_UNSUPPORTED.get(),
+                "",
+                cx,
+            )
+            .into_any_element();
+        }
 
         if self.checks.loading && self.checks.inspection.is_none() {
             return div()

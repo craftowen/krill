@@ -297,6 +297,77 @@ fn statusline_install_chains_user_command_through_git_bash_and_records_usage() {
 }
 
 #[test]
+fn codex_command_hook_preserves_windows_executable_metacharacters() {
+    use std::os::windows::process::CommandExt as _;
+    let home = temp_home("codex-hook-command");
+    let dir = home.join("한글 O'wen %PATH% $cash & safe");
+    fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("krill.exe");
+    fs::copy(KRILL, &exe).unwrap();
+    let command =
+        krill_proto::agent::hooks::command(&exe, krill_proto::agent::hooks::Agent::Codex).unwrap();
+    let out = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c"])
+        .raw_arg(format!("\"{command}\""))
+        .env_remove("MK_PANE_ID")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn agent_list_and_doctor_find_npm_cli_before_path_refresh() {
+    let home = temp_home("npm-path-refresh");
+    let roaming = home.join("AppData/Roaming");
+    let npm = roaming.join("npm");
+    fs::create_dir_all(&npm).unwrap();
+    fs::write(
+        npm.join("claude.cmd"),
+        b"@echo off\r\necho cli-path-fixture\r\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["agent", "list"],
+        vec!["doctor", "--json", "--no-start"],
+    ] {
+        let out = Command::new(KRILL)
+            .args(&args)
+            .env("USERPROFILE", &home)
+            .env("APPDATA", &roaming)
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .env("KRILL_STATE_DIR", home.join("state"))
+            .env("PATH", "")
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        if args[0] == "agent" {
+            assert!(out.status.success());
+            let text = String::from_utf8_lossy(&out.stdout);
+            let row = text
+                .lines()
+                .find(|line| line.starts_with("claude "))
+                .unwrap();
+            assert!(row.contains("cli-path-fixture"), "{row}");
+            assert!(row.contains("claude.cmd"), "{row}");
+        } else {
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            let found = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == "agent.any")
+                .unwrap();
+            assert_eq!(found["status"], "ok", "{found}");
+        }
+    }
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn doctor_json_no_start_reports_missing_daemon_without_launching() {
     let home = temp_home("doctor");
     fs::create_dir_all(home.join("state").join("run")).unwrap();

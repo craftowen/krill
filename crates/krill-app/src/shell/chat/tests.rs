@@ -68,7 +68,7 @@ fn long_chat_renders_viewport_rows_and_shares_message_text(cx: &mut TestAppConte
     let pane = shell.update(cx, |shell, cx| {
         let pane = shell.layout.focused().unwrap();
         shell.layout.set_session(pane, SessionId(444));
-        shell.chat.active_sessions.insert(SessionId(444));
+        shell.layout.set_chat_view(pane, true);
         shell.apply_chat_poll(
             SessionId(444),
             ChatPollSnapshot {
@@ -164,7 +164,7 @@ fn slow_chat_poll_is_coalesced_and_rejects_changed_host(cx: &mut gpui::TestAppCo
             holder: "/unused".into(),
             krilld: "/unused".into(),
         });
-        shell.chat.active_sessions.insert(SessionId(321));
+        shell.layout.set_chat_view(pane, true);
         let recorded = calls.clone();
         shell.chat.poll_call = Some(Arc::new(move |_| {
             recorded.fetch_add(1, Ordering::SeqCst);
@@ -245,4 +245,90 @@ fn chat_card_copy_and_code_block_copy_write_clean_clipboard(cx: &mut TestAppCont
         cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
         Some("실행하세요:\n```sh\npython3 -c 'print(123)'\n```")
     );
+}
+
+#[gpui::test]
+fn desktop_chat_choice_survives_update_restart(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+    cx.run_until_parked();
+    let path = std::env::temp_dir().join(format!("krill-chat-restart-{}.bin", std::process::id()));
+    shell.update(cx, |this, cx| {
+        let pane = this.layout.focused().unwrap();
+        this.layout.set_session(pane, SessionId(9241));
+        this.toggle_chat_view(cx);
+        assert!(this.is_session_chat_view(SessionId(9241), cx));
+        this.layout.save(&path).unwrap();
+        // A new app process retains only the persisted layout and the same daemon session.
+        this.chat = ChatState::default();
+        this.layout = krill_app::layout::Layout::load(&path).unwrap();
+        assert_eq!(this.layout.session(pane), Some(SessionId(9241)));
+        assert!(
+            this.is_session_chat_view(SessionId(9241), cx),
+            "update restart replaced the saved Chat view with Terminal"
+        );
+        this.apply_chat_poll(
+            SessionId(9241),
+            ChatPollSnapshot {
+                agent: "claude".into(),
+                session_id: "existing-conversation".into(),
+                transcript_path: "fixture.jsonl".into(),
+                bound: true,
+                items: vec![ChatItem {
+                    kind: ChatItemKind::Assistant,
+                    text: "existing conversation".into(),
+                    ..ChatItem::default()
+                }],
+                ..ChatPollSnapshot::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_some());
+    assert!(
+        cx.debug_bounds("desktop-chat-send").is_some(),
+        "restart lost the Chat composer"
+    );
+    shell.update(cx, |this, cx| {
+        assert_eq!(
+            this.chat.logs[&SessionId(9241)].items[0].text,
+            "existing conversation"
+        );
+        this.toggle_chat_view(cx);
+        assert!(!this.is_session_chat_view(SessionId(9241), cx));
+        this.layout.save(&path).unwrap();
+        this.chat = ChatState::default();
+        this.layout = krill_app::layout::Layout::load(&path).unwrap();
+        assert!(!this.is_session_chat_view(SessionId(9241), cx));
+    });
+    std::fs::remove_file(path).unwrap();
+}
+
+#[gpui::test]
+fn chat_view_choice_does_not_leak_to_same_session_number_on_another_host(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+    cx.run_until_parked();
+    shell.update(cx, |this, cx| {
+        let local = this.layout.focused().unwrap();
+        this.layout.set_session(local, SessionId(9242));
+        this.layout.new_tab();
+        let remote = this.layout.focused().unwrap();
+        this.layout.set_host(
+            remote,
+            krill_app::hosts::HostId::Remote("windows-pc".into()),
+        );
+        this.layout.set_session(remote, SessionId(9242));
+        this.toggle_chat_view(cx);
+        assert!(this.is_pane_chat_view(remote, cx));
+        assert!(
+            !this.is_pane_chat_view(local, cx),
+            "remote Chat choice changed local Terminal"
+        );
+        this.layout.activate(0);
+        assert!(!this.is_session_chat_view(SessionId(9242), cx));
+        this.layout.activate(1);
+        assert!(this.is_session_chat_view(SessionId(9242), cx));
+    });
 }

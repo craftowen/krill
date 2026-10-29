@@ -332,3 +332,34 @@ fn url_at_parses_plaintext_http_https_and_trims_punctuation() {
         None
     );
 }
+
+#[test]
+fn input_policy_native_home_lookup_uses_userprofile_on_windows() {
+    const CHILD: &str = "KRILL_TEST_NATIVE_LINK_HOME";
+    if let Some(home) = std::env::var_os(CHILD) {
+        let home = PathBuf::from(home);
+        let cells = row("~/src/main.rs");
+        assert_eq!(
+            Cache::default().link_at(&cells, 2, None).unwrap().path,
+            home.join("src/main.rs")
+        );
+        assert_eq!(
+            Cache::default()
+                .bounded(&cells, 2, None, 32, &mut 256, None)
+                .unwrap()
+                .path,
+            home.join("src/main.rs")
+        );
+        return;
+    }
+    let home = TempDir::new("native-home");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", "terminal::path_link::tests::input_policy_native_home_lookup_uses_userprofile_on_windows", "--nocapture"]).env(CHILD, &home.0);
+    if cfg!(windows) {
+        child.env_remove("HOME").env("USERPROFILE", &home.0);
+    } else {
+        child.env("HOME", &home.0).env_remove("USERPROFILE");
+    }
+    let output = child.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}

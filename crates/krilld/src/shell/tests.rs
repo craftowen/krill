@@ -326,3 +326,32 @@ fn launch_debug_redacts_env_values() {
         }
     );
 }
+
+#[test]
+fn filtered_socket_environment_reaches_a_real_child() {
+    let inherited = vec![
+        kv("KRILL_SOCKET_DIR", "/private/socket-root"),
+        kv("UNRELATED_SECRET", "hidden"),
+    ];
+    let launch = Shell::Login.launch_with_lang(Some(&owen()), inherited, None);
+    let mut command = Command::new("/bin/sh");
+    command.env_clear();
+    for (key, value) in launch.env {
+        command.env(
+            std::ffi::OsStr::from_bytes(&key),
+            std::ffi::OsStr::from_bytes(&value),
+        );
+    }
+    let output = command
+        .args([
+            "-c",
+            "printf '%s\\n%s' \"$KRILL_SOCKET_DIR\" \"${UNRELATED_SECRET-unset}\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "/private/socket-root\nunset"
+    );
+}

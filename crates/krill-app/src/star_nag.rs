@@ -361,9 +361,8 @@ fn show_card(cx: &mut App) {
         nag.card = Card::Checking;
         match nag.repo_star {
             RepoStar::Starred => Some(Some(true)),
-            RepoStar::NotStarred => Some(Some(false)),
-            RepoStar::WebFallback => Some(None),
-            RepoStar::Loading => None,
+            // 브라우저에서 별을 줬거나 gh 인증이 바뀌었을 수 있어 요청마다 다시 확인한다.
+            RepoStar::NotStarred | RepoStar::WebFallback | RepoStar::Loading => None,
         }
     };
     if let Some(starred) = resolved {

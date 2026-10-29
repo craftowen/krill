@@ -26,6 +26,7 @@ pub mod changes;
 pub mod edit;
 pub mod watch;
 pub mod worktree;
+pub mod worktree_refs;
 
 /// git 동시 실행 상한(T4 G8: Orca 일반 작업 2~4).
 pub const MAX_CONCURRENT: usize = 4;
@@ -75,6 +76,8 @@ struct State {
     pending: VecDeque<Job>,
     pending_bytes: usize,
     busy: HashSet<PathBuf>,
+    active_workers: usize,
+    workers: Vec<JoinHandle<()>>,
     closed: bool,
 }
 
@@ -82,18 +85,18 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     program: PathBuf,
+    max_workers: usize,
 }
 
 /// git 작업 큐. 버리면(drop) 실행 중인 작업은 끝까지 돌리고, 시작 전 작업은 버린다(받는 쪽은 `RecvError`).
 pub struct GitQueue {
     shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for GitQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitQueue")
-            .field("workers", &self.workers.len())
+            .field("workers", &self.shared.max_workers)
             .finish_non_exhaustive()
     }
 }
@@ -104,25 +107,15 @@ impl GitQueue {
         Self::with_program(PathBuf::from("git"), MAX_CONCURRENT)
     }
 
+    #[expect(clippy::unnecessary_wraps, reason = "공개 생성자 시그니처 유지")]
     pub fn with_program(program: PathBuf, workers: usize) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             program,
+            max_workers: workers,
         });
-        let mut queue = Self {
-            shared,
-            workers: Vec::with_capacity(workers),
-        };
-        for i in 0..workers {
-            // 실패하면 `queue`의 Drop이 이미 띄운 워커를 정리한다.
-            let handle = thread::Builder::new().name(format!("git-{i}")).spawn({
-                let shared = Arc::clone(&queue.shared);
-                move || work(&shared)
-            })?;
-            queue.workers.push(handle);
-        }
-        Ok(queue)
+        Ok(Self { shared })
     }
 
     /// `repo`에서 `git <고정 옵션> <args>`를 실행하도록 넣는다. 결과(종료 코드·stdout·stderr)는 돌려준 채널로 온다.
@@ -243,15 +236,44 @@ impl GitQueue {
             execute,
             retained,
         });
+        state.workers.retain(|w| !w.is_finished());
+        let runnable_repos = state
+            .pending
+            .iter()
+            .filter(|j| !state.busy.contains(&j.key))
+            .map(|j| &j.key)
+            .collect::<HashSet<_>>()
+            .len();
+        if state.active_workers < self.shared.max_workers
+            && state.active_workers < state.busy.len().saturating_add(runnable_repos)
+        {
+            let index = state.active_workers;
+            let shared = Arc::clone(&self.shared);
+            if let Ok(handle) = thread::Builder::new()
+                .name(format!("git-{index}"))
+                .stack_size(128 * 1024)
+                .spawn(move || {
+                    crate::alloc::mobile_thread().ok();
+                    work(&shared);
+                })
+            {
+                state.active_workers += 1;
+                state.workers.push(handle);
+            }
+        }
         self.shared.changed.notify_one();
     }
 }
 
 impl Drop for GitQueue {
     fn drop(&mut self) {
-        lock(&self.shared.state).closed = true;
+        let workers = {
+            let mut state = lock(&self.shared.state);
+            state.closed = true;
+            std::mem::take(&mut state.workers)
+        };
         self.shared.changed.notify_all();
-        for worker in self.workers.drain(..) {
+        for worker in workers {
             // 워커 본문은 panic하지 않는다(Command 실행·채널 전송뿐).
             worker.join().ok();
         }
@@ -261,17 +283,21 @@ impl Drop for GitQueue {
 fn work(shared: &Shared) {
     while let Some(job) = next(shared) {
         (job.execute)(&shared.program, &job.repo);
+        crate::alloc::purge();
         lock(&shared.state).busy.remove(&job.key);
         // 이 레포를 기다리던 작업이 다른 워커 몫일 수 있다.
         shared.changed.notify_all();
     }
+    crate::alloc::purge();
+    crate::session::purge_soon();
 }
 
-/// 다른 워커가 잡지 않은 레포의 가장 오래된 작업을 꺼내고 그 레포를 잡는다. 닫혔으면 `None`.
+/// 다른 워커가 잡지 않은 레포의 가장 오래된 작업을 꺼내고 그 레포를 잡는다. 닫혔거나 일이 없으면 `None`.
 fn next(shared: &Shared) -> Option<Job> {
     let mut st = lock(&shared.state);
     loop {
-        if st.closed {
+        if st.closed || st.pending.is_empty() {
+            st.active_workers = st.active_workers.saturating_sub(1);
             return None;
         }
         let State { pending, busy, .. } = &mut *st;
@@ -299,13 +325,27 @@ fn argument_bytes(args: &[OsString]) -> usize {
     })
 }
 
+/// 맨이름 프로그램을 `PATH` 디렉터리에서 절대 경로로 풀어 준다. std는 `PATH`를 바꾼 맨이름 실행을 `posix_spawn`으로
+/// 못 하고 `fork`+`exec`로 돌리는데, 다중 스레드 데몬의 fork 자식이 exec 전에 죽어(2026-10-27 12:04 `krilld` SIGABRT,
+/// "crashed on child side of fork pre-exec") 데몬째 사라진 적이 있다. 못 찾으면 원래 이름을 그대로 쓴다.
+fn resolve_program(program: &Path, path: &OsStr) -> PathBuf {
+    if program.components().count() != 1 {
+        return program.to_path_buf();
+    }
+    std::env::split_paths(path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| program.to_path_buf())
+}
+
 fn command(program: &Path, repo: &Path, args: &[OsString]) -> Command {
-    let mut cmd = Command::new(program);
+    let path = OsStr::from_bytes(crate::shell::login_path());
+    let mut cmd = Command::new(resolve_program(program, path));
     crate::child::own_group(&mut cmd)
         .args(FIXED_ARGS)
         .args(args)
         .current_dir(repo)
-        .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
+        .env("PATH", path)
         .envs(FIXED_ENV)
         .stdin(Stdio::null());
     for var in CLEARED_ENV {
@@ -467,3 +507,22 @@ mod tests;
 
 #[cfg(test)]
 mod platform_tests;
+
+#[cfg(all(test, unix))]
+mod resolve_tests {
+    use super::*;
+
+    #[test]
+    fn bare_names_resolve_against_the_given_path_and_paths_are_kept() {
+        let found = resolve_program(Path::new("sh"), OsStr::new("/nonexistent:/bin"));
+        assert_eq!(found, Path::new("/bin/sh"));
+        assert_eq!(
+            resolve_program(Path::new("nope-krill"), OsStr::new("/bin")),
+            Path::new("nope-krill")
+        );
+        assert_eq!(
+            resolve_program(Path::new("/usr/bin/git"), OsStr::new("/bin")),
+            Path::new("/usr/bin/git")
+        );
+    }
+}

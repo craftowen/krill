@@ -139,6 +139,17 @@ fn installed_agent_is_execed_with_args() {
     );
 }
 
+/// 에이전트가 실패 코드로 끝나도 세션은 로그인 셸로 이어진다. 여기선 stdin이 비어 셸이 바로 0으로 끝난다.
+#[test]
+fn agent_exit_falls_back_to_login_shell() {
+    let out = run(&profile(&["/bin/sh", "-c", "echo mk-agent-done; exit 3"]));
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("mk-agent-done"),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn selected_credentials_win_over_login_rc_and_custom_profile_environment() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1869,4 +1880,152 @@ fn sync_claude_profile_hooks_preserve_existing_config() {
     assert!(synced_claude["hooks"]["PreToolUse"].is_array());
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// daemon-01: the zsh host check must name the same directory `host_default_dir` writes for the `OpenCode`
+/// host account, or a host selection is treated as an isolated profile.
+#[test]
+fn zsh_opencode_host_check_matches_host_default_dir() {
+    let home = Path::new("/fixture/home");
+    assert_eq!(
+        accounts::host_default_dir(home, ProviderKind::OpenCode),
+        home.join(".config").join("opencode")
+    );
+    assert!(
+        super::ZSH_ACCOUNT_SYNC_ENV
+            .contains(r#""$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode""#)
+    );
+    assert!(
+        super::ZSH_ACCOUNT_SYNC_ENV
+            .contains(r#""$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode""#)
+    );
+}
+
+/// daemon-01: switching `OpenCode` custom → host → removed in one managed zsh restores the shell's original
+/// `XDG_DATA_HOME`/`XDG_STATE_HOME` (set or unset) and keeps a value the user changed meanwhile.
+#[test]
+fn zsh_opencode_host_and_removal_restore_original_xdg_dirs() {
+    if !Path::new("/bin/zsh").exists() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("krill-zsh-xdg-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let sync = root.join("sync.zsh");
+    std::fs::write(&sync, super::ZSH_ACCOUNT_SYNC_ENV).unwrap();
+    let a = root.join("profile-a").display().to_string();
+    let b = root.join("profile-b").display().to_string();
+    let env_file = state.join("active-accounts.env");
+    let driver = r#"
+source "$1"
+p() { printf 'data=%s state=%s db=%s\n' "${XDG_DATA_HOME-UNSET}" "${XDG_STATE_HOME-UNSET}" "${OPENCODE_DB-UNSET}"; }
+set_env() { printf "export OPENCODE_CONFIG_DIR='%s'\n" "$1" > "$KRILL_STATE_DIR/active-accounts.env"; __krill_sync_accounts; }
+p
+set_env "$CUSTOM_B"; p
+set_env "$HOME/.config/opencode"; p
+set_env "$CUSTOM_A"; p
+set_env "$HOME/.local/share/opencode"; p
+set_env "$CUSTOM_A"; p
+: > "$KRILL_STATE_DIR/active-accounts.env"; __krill_sync_accounts; p
+set_env "$CUSTOM_A"; export XDG_DATA_HOME=/user/changed; : > "$KRILL_STATE_DIR/active-accounts.env"; __krill_sync_accounts; p
+"#;
+    let run = |baseline: Option<(&str, &str)>| {
+        std::fs::write(&env_file, format!("export OPENCODE_CONFIG_DIR='{a}'\n")).unwrap();
+        let mut cmd = Command::new("/bin/zsh");
+        cmd.args(["-f", "-c", driver, "daemon-01"])
+            .arg(&sync)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("ZDOTDIR", &home)
+            .env("KRILL_STATE_DIR", &state)
+            .env("CUSTOM_A", &a)
+            .env("CUSTOM_B", &b)
+            .stdin(Stdio::null());
+        if let Some((data, state)) = baseline {
+            cmd.env("XDG_DATA_HOME", data).env("XDG_STATE_HOME", state);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let custom = |dir: &str| format!("data={dir}/data state={dir}/state db=opencode.db\n");
+
+    // 1. Shell without XDG overrides: host and removal unset the profile-only exports.
+    let unset = "data=UNSET state=UNSET db=UNSET\n";
+    let expected = format!(
+        "{}{}{unset}{}{unset}{}{unset}data=/user/changed state=UNSET db=UNSET\n",
+        custom(&a),
+        custom(&b),
+        custom(&a),
+        custom(&a)
+    );
+    assert_eq!(run(None), expected);
+
+    // 2. Shell with its own XDG dirs: host and removal restore them; the user's later change survives.
+    let orig = "data=/orig/data state=/orig/state db=UNSET\n";
+    let expected = format!(
+        "{}{}{orig}{}{orig}{}{orig}data=/user/changed state=/orig/state db=UNSET\n",
+        custom(&a),
+        custom(&b),
+        custom(&a),
+        custom(&a)
+    );
+    assert_eq!(run(Some(("/orig/data", "/orig/state"))), expected);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn pane_env_propagates_only_explicit_socket_override() {
+    let env = pane_env_with_socket(
+        krill_proto::SessionId(7),
+        Some(Path::new("/state")),
+        Some(OsStr::new("/private/socket-root")),
+    );
+    assert!(env.contains(&kv("KRILL_SOCKET_DIR", "/private/socket-root")));
+    assert!(env.contains(&kv("KRILL_STATE_DIR", "/state")));
+    assert_eq!(env.len(), 4); // Pane ID, CLI, state, socket root; no arbitrary parent env.
+    // Preserve invalid overrides too: consumers must report them, never use the old endpoint.
+    let env = pane_env_with_socket(
+        krill_proto::SessionId(7),
+        None,
+        Some(OsStr::new("relative")),
+    );
+    assert!(env.contains(&kv("KRILL_SOCKET_DIR", "relative")));
+}
+
+#[test]
+fn pane_env_inherits_socket_override_from_process() {
+    const CHILD: &str = "KRILL_PANE_ENV_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let env = pane_env_in(krill_proto::SessionId(11), Some(Path::new("/state")));
+        assert!(env.contains(&kv("KRILL_SOCKET_DIR", "private-socket-root")));
+        assert!(!env.iter().any(|(key, _)| key == b"UNRELATED_SECRET"));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agent::tests::pane_env_inherits_socket_override_from_process",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("KRILL_SOCKET_DIR", "private-socket-root")
+        .env("UNRELATED_SECRET", "must-not-propagate")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("1 passed")
+    );
 }

@@ -53,15 +53,32 @@ mod tests {
 /// Share arena 0 and bypass per-thread caches so reconnects/history do not retain arenas
 /// proportional to the number of worker threads. This changes this calling thread only.
 #[cfg(not(windows))]
-pub(crate) fn mobile_thread() -> Result<(), Error> {
+pub fn mobile_thread() -> Result<(), Error> {
     b"thread.arena\0".name().write(0_u32)?;
     b"thread.tcache.enabled\0".name().write(false)
 }
 
 #[cfg(windows)]
 #[expect(clippy::unnecessary_wraps, reason = "jemalloc 판과 같은 시그니처")]
-pub(crate) fn mobile_thread() -> Result<(), Error> {
+pub fn mobile_thread() -> Result<(), Error> {
     Ok(())
+}
+
+/// 일시적 대형 작업(콜드 세그먼트 zstd 재생·세션 강등) 뒤 jemalloc arena 0과 시스템 malloc 캐시를 비운다.
+#[cfg(not(windows))]
+pub(crate) fn purge() {
+    for key in [
+        b"arena.0.dirty_decay_ms\0".as_slice(),
+        b"arena.0.muzzy_decay_ms\0",
+    ] {
+        key.name().write(0_isize).ok();
+    }
+    crate::sys::release_malloc_cache();
+}
+
+#[cfg(windows)]
+pub(crate) fn purge() {
+    crate::sys::release_malloc_cache();
 }
 
 #[cfg(all(test, not(windows)))]

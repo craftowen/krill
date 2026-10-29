@@ -433,8 +433,8 @@ impl SettingsView {
         };
         let mut element = cell("", 110.).flex().items_center().gap_2();
         if !agent.is_empty() {
-            element = element.child(ui::icons::svg_icon(
-                ui::icons::agent_svg_bytes(agent),
+            element = element.child(ui::icons::agent_brand_icon(
+                agent,
                 ui::ICON_SM,
                 p.muted_foreground,
             ));

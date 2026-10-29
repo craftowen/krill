@@ -744,3 +744,182 @@ fn duplicate_holder_exits_without_restarting_healthy_daemon() {
     drop(first);
     fs::remove_dir_all(dir).ok();
 }
+
+/// daemon-04: holder가 두 `Done` 뒤(리더 정지 중)에 사라지면 업그레이드는 `NoHolder`로 실패하고, 구 krilld는
+/// 멈춘 리더를 같은 엔진·master로 다시 띄워 출력을 계속 읽는다(처음부터 재생한 tick이 빠짐·중복·Gap 없이 이어진다).
+/// holder 없이도 자식 종료(kqueue)를 감지한다. 가짜 holder가 실제 PTY·tick 자식을 넘기고 `UpgradeHolder`·
+/// `UpgradeKrilld`에 `Done`을 답한 뒤 링크를 닫는다(PTY master·자식은 진짜 holder처럼 계속 쥔다).
+#[test]
+fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
+    use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder, VERSION};
+    use krilld::holder::link::Link;
+    use std::os::fd::AsFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    /// 테스트가 어떻게 끝나든 자식(tick 셸·krilld)을 죽이고 거둔다.
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.kill().ok();
+            self.0.wait().ok();
+        }
+    }
+    fn send(link: &Link, m: &FromHolder, fds: &[std::os::fd::BorrowedFd<'_>]) {
+        link.send(&m.encode().unwrap(), fds).unwrap();
+    }
+
+    let dir = env::temp_dir().join(format!("daemon04-resume-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("run/krilld.sock");
+
+    // 실제 PTY + tick 자식. 가짜 holder가 master를 들고 krilld에 사본을 넘긴다.
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    rustix::termios::tcsetwinsize(
+        &pty.controller,
+        rustix::termios::Winsize {
+            ws_col: 80,
+            ws_row: 24,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    let child = Guard(
+        Command::new("/bin/sh")
+            .args([
+                "-c",
+                "i=0; while :; do i=$((i+1)); echo \"tick $i\"; sleep 0.02; done",
+            ])
+            .stdin(Stdio::from(pty.user.try_clone().unwrap()))
+            .stdout(Stdio::from(pty.user.try_clone().unwrap()))
+            .stderr(Stdio::from(pty.user))
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let child_pid = child.0.id();
+
+    // krilld를 holder처럼 띄운다: stdin = socketpair 한쪽.
+    let (ours, theirs) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::empty(),
+        None,
+    )
+    .unwrap();
+    // krilld가 holder 쪽 끝(`ours`)의 사본을 물려받으면 링크를 닫아도 EOF가 나지 않는다(진짜 holder와 같은 CLOEXEC).
+    rustix::io::fcntl_setfd(&ours, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&theirs, rustix::io::FdFlags::CLOEXEC).unwrap();
+    let krilld = Guard(
+        Command::new(KRILLD)
+            .arg(&sock)
+            .env("KRILL_STATE_DIR", &dir)
+            .stdin(Stdio::from(theirs))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    let session = SessionId(7);
+    let controller = pty.controller;
+    let holder = thread::spawn(move || {
+        let mut link = Link::new(ours);
+        send(
+            &link,
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: std::process::id(),
+                inbox: false,
+            },
+            &[],
+        );
+        send(
+            &link,
+            &FromHolder::Session {
+                id: session,
+                pid: child_pid,
+                status: None,
+            },
+            &[controller.as_fd()],
+        );
+        send(&link, &FromHolder::Ready, &[]);
+        // 요청마다 `Done`. `UpgradeKrilld`의 `Done` 뒤 링크를 닫는다: 리더 정지 중 holder 상실.
+        while let Ok(Some(p)) = link.recv() {
+            let m = ToHolder::decode(p.frame()).unwrap();
+            send(&link, &FromHolder::Done { req: m.req() }, &[]);
+            if matches!(m, ToHolder::UpgradeKrilld { .. }) {
+                break;
+            }
+        }
+        drop(link);
+        controller
+    });
+
+    let (mut c, hello) = wait_daemon(&sock, 0);
+    assert_eq!(
+        request(&mut c, &Request::List),
+        Reply::Sessions(vec![Info {
+            session,
+            pid: child_pid,
+            status: None
+        }])
+    );
+    let before = ticks_until(&sock, session, 5);
+    let last = *before.last().unwrap();
+
+    // 두 `Done` 뒤 holder 상실: 실패로 보고하고 구 krilld가 계속 서빙한다.
+    assert_eq!(
+        request(
+            &mut c,
+            &upgrade_req(NEWER, Path::new("/usr/bin/true"), Path::new(KRILLD))
+        ),
+        Reply::Failed(Failure::NoHolder)
+    );
+    assert_eq!(connect(&sock).unwrap().1.instance_id, hello.instance_id);
+    assert!(alive(child_pid), "session died with holder");
+
+    // 멈췄던 리더가 같은 엔진으로 이어 읽는다: 처음부터 재생한 tick이 연속이고(Gap 없음) 계속 늘어난다.
+    let after = ticks_until(&sock, session, last + 30);
+    assert_eq!(
+        after,
+        (1..=after.len() as u64).collect::<Vec<_>>(),
+        "ticks must stay contiguous across halt and resume"
+    );
+    assert!(after.len() as u64 > last + 30);
+    assert_eq!(
+        request(&mut c, &Request::List),
+        Reply::Sessions(vec![Info {
+            session,
+            pid: child_pid,
+            status: None
+        }])
+    );
+
+    // holder 없이 자식 종료를 감지하고(kqueue NOTE_EXIT) 리더는 EOF로 끝난다.
+    let controller = holder.join().unwrap();
+    kill_process(pid(child_pid), Signal::KILL).unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if request(&mut c, &Request::List)
+            == Reply::Sessions(vec![Info {
+                session,
+                pid: child_pid,
+                status: Some(STATUS_UNKNOWN),
+            }])
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exit not observed without holder"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(controller);
+    drop(c);
+    drop(child);
+    drop(krilld);
+    fs::remove_dir_all(&dir).ok();
+}

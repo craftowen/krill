@@ -127,7 +127,7 @@ pub(super) fn fixture<'a>(
         });
 
         shell.layout.set_session(pane, SESSION);
-        shell.chat.active_sessions.insert(SESSION);
+        shell.layout.set_chat_view(pane, true);
         shell.chat.send_input = Some(Box::new(move |bytes| {
             captured.lock().unwrap().push(bytes);
             true
@@ -138,6 +138,34 @@ pub(super) fn fixture<'a>(
     });
     cx.run_until_parked();
     (view, cx, request, sent)
+}
+
+#[gpui::test]
+fn chat_action_uses_its_own_pane_view_when_another_pane_shares_session(cx: &mut TestAppContext) {
+    let (view, cx, request, _) = fixture(
+        cx,
+        "chat-pane-view-binding",
+        &permission(),
+        "deploy production (y/n)",
+    );
+    view.update(cx, |shell, cx| {
+        let origin = shell.layout.focused().unwrap();
+        shell.layout.split(krill_app::layout::Axis::Horizontal);
+        let other = shell.layout.focused().unwrap();
+        shell.layout.set_session(other, SESSION);
+        shell.layout.set_chat_view(other, true);
+        shell.layout.set_chat_view(origin, false);
+        assert!(
+            !shell.chat_request_is_current(&request, cx),
+            "a focused Chat pane enabled an action on a Terminal pane"
+        );
+        shell.layout.set_chat_view(other, false);
+        shell.layout.set_chat_view(origin, true);
+        assert!(
+            shell.chat_request_is_current(&request, cx),
+            "a focused Terminal pane disabled another pane's Chat action"
+        );
+    });
 }
 
 #[gpui::test]
@@ -356,6 +384,7 @@ fn chat_stale_binding_host_session_and_live_screen_never_inject_keys(cx: &mut Te
         shell.layout.set_session(pane, SessionId(992));
         shell.approve_chat_permission(request.clone(), true, cx);
         shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
         screen(shell, pane, "shell$", cx);
         shell.approve_chat_permission(request.clone(), true, cx);
         screen(shell, pane, "deploy production (y/n)", cx);
@@ -492,6 +521,7 @@ fn chat_host_session_changes_and_binding_reset_cancel_remaining_question_keys(
     view.update(cx, |shell, cx| {
         let pane = shell.layout.focused().unwrap();
         shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
         shell.answer_chat_question(request.clone(), vec![1], false, cx);
         assert!(matches!(
             shell.chat.logs[&SESSION].submissions[&request.key],

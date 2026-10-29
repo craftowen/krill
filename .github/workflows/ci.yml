@@ -57,16 +57,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gitleaks-bin"
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
           echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
-      - name: Release pipeline regressions
-        run: |
-          python3 packaging/test_ci_evidence.py
-          python3 packaging/test_cgu_compare.py
-          python3 packaging/test_vendor_cache.py
-          python3 packaging/test_release_check.py
-          python3 packaging/test_release_verify.py
-          python3 packaging/test_nightly.py
-          python3 packaging/test_publish.py
-          python3 scripts/test_hooks.py
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '>=22.13.0 <23'
+      - name: Non-Cargo regressions
+        run: python3 scripts/check-regressions.py
 
       - name: Public surface and reachable history
         run: |

@@ -699,11 +699,11 @@ impl Registry {
     }
 
     /// Called by the account worker. No registry or account-file lock is held across CLI IO.
-    pub fn process_account_work(&self) {
+    pub fn process_account_work(self: &std::sync::Arc<Self>) {
         self.process_account_work_in(&accounts::default_home());
     }
 
-    fn process_account_work_in(&self, home: &Path) {
+    fn process_account_work_in(self: &std::sync::Arc<Self>, home: &Path) {
         use std::sync::atomic::Ordering;
         if *lock(&self.upgrading)
             || self
@@ -774,7 +774,7 @@ impl Registry {
     }
 
     fn process_account_handoff(
-        &self,
+        self: &std::sync::Arc<Self>,
         old: SessionId,
         provider: ProviderKind,
         account_id: &str,
@@ -1084,7 +1084,7 @@ impl Registry {
     }
 
     fn handoff_account(
-        &self,
+        self: &std::sync::Arc<Self>,
         peer: &Peer,
         old: SessionId,
         provider: ProviderKind,
@@ -1210,10 +1210,10 @@ impl Registry {
                 .and_then(|e| e.session.tap().foreground())
                 .or(old_fg);
             let mut observed = identity::discover(provider, old_pid, foreground)
-                .map_err(|e| prepare_failure("process_identity", &e))?;
+                .map_err(|e| prepare_failure(old, "process_identity", &e))?;
             if observed.is_none() && provider == ProviderKind::Claude {
                 observed = identity::discover_claude(&claude_homes, old_pid, foreground)
-                    .map_err(|e| prepare_failure("process_identity", &e))?;
+                    .map_err(|e| prepare_failure(old, "process_identity", &e))?;
             }
             if observed.is_none()
                 && provider == ProviderKind::Antigravity
@@ -1237,7 +1237,7 @@ impl Registry {
                 // observation must agree even when a record already contains an ID.
                 if (stored.session_id.is_some() || stored.transcript_path.is_some())
                     && transcript::session_id(provider, &stored)
-                        .map_err(|e| prepare_failure("process_identity", &e))?
+                        .map_err(|e| prepare_failure(old, "process_identity", &e))?
                         != found.id
                 {
                     return Err(Failure::Os(libc::EILSEQ));
@@ -1261,13 +1261,13 @@ impl Registry {
         // A project path never identifies a conversation. Only launch/resume/hooks or
         // files held by this process can supply the identity used for retirement.
         let session_id = transcript::session_id(provider, &stored)
-            .map_err(|error| prepare_failure("transcript_preparation", &error))?;
+            .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
         stored.session_id = Some(session_id.clone());
         let bound_path = stored.transcript_path.clone();
         stored = self
             .agents
             .bind_switch_identity(old, &stored)
-            .map_err(|e| prepare_failure("identity_binding", &e))?;
+            .map_err(|e| prepare_failure(old, "identity_binding", &e))?;
         let source = transcript_home
             .map(|home| crate::agent::control::LaunchAccount {
                 id: String::new(),
@@ -1301,7 +1301,7 @@ impl Registry {
             &cwd,
             bound_path.as_deref(),
         )
-        .map_err(|error| prepare_failure("transcript_preparation", &error))?;
+        .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
         let new = self.next_id();
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
@@ -1311,6 +1311,14 @@ impl Registry {
             committed: false,
         };
         self.agents.watch_account_resume(new);
+        #[cfg(windows)]
+        let codex_resume = (provider == ProviderKind::Codex)
+            .then(|| {
+                prepared_transcript
+                    .path()
+                    .and_then(|p| identity::CodexResume::new(p).ok())
+            })
+            .flatten();
         let (launch, sid, applied) = crate::agent::resume_in(
             profile,
             stored.permission,
@@ -1319,7 +1327,7 @@ impl Registry {
             Some(&session_id),
             account.as_ref(),
         )
-        .map_err(|e| super::os(&e))?;
+        .map_err(|e| prepare_failure(old, "resume_launch", &e))?;
         if applied.as_ref().is_none_or(|a| a.id != account_id) {
             self.discard_settings(new);
             return Err(Failure::Denied);
@@ -1336,7 +1344,7 @@ impl Registry {
                 cwd.clone(),
                 applied,
             )
-            .map_err(|e| super::os(&e))?;
+            .map_err(|e| prepare_failure(old, "replacement_identity", &e))?;
         if let Some(dir) = state_dir.as_deref() {
             let raw = serde_json::to_vec(&Prepared {
                 from: old,
@@ -1345,7 +1353,7 @@ impl Registry {
             })
             .map_err(|_| Failure::BadRequest)?;
             accounts::write_atomic_0600(&replacement_journal(dir, new), &raw)
-                .map_err(|e| super::os(&e))?;
+                .map_err(|e| prepare_failure(old, "replacement_journal", &e))?;
         }
         let (new, _) = self.spawn_holder(
             holder,
@@ -1356,7 +1364,7 @@ impl Registry {
             size.cols,
             size.rows,
         )?;
-        // Give the local CLI preflight a chance to report an immediate spawn/auth failure.
+        // Keep the original conversation until the replacement identity is confirmed.
         let (tap, new_pid) = {
             let state = lock(&self.state);
             let entry = state.sessions.get(&new).ok_or(Failure::NoSession)?;
@@ -1364,6 +1372,7 @@ impl Registry {
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut ready = false;
+        let mut confirmed_at = None;
         let mut next_identity_probe = Instant::now();
         while Instant::now() < deadline {
             if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
@@ -1374,12 +1383,24 @@ impl Registry {
                 && Instant::now() >= next_identity_probe
             {
                 next_identity_probe = Instant::now() + Duration::from_millis(200);
-                let mut observed = identity::discover(provider, new_pid, tap.foreground())
-                    .map_err(|e| prepare_failure("resume_identity", &e))?;
-                if observed.is_none() && provider == ProviderKind::Claude {
-                    observed = identity::discover_claude(&claude_homes, new_pid, tap.foreground())
-                        .map_err(|e| prepare_failure("resume_identity", &e))?;
-                }
+                let observed = resume_identity(|| {
+                    let observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    #[cfg(windows)]
+                    let observed = if observed.is_none() {
+                        match &codex_resume {
+                            Some(watch) => watch.observe(new_pid, tap.foreground())?,
+                            None => observed,
+                        }
+                    } else {
+                        observed
+                    };
+                    if observed.is_none() && provider == ProviderKind::Claude {
+                        identity::discover_claude(&claude_homes, new_pid, tap.foreground())
+                    } else {
+                        Ok(observed)
+                    }
+                })
+                .map_err(|e| prepare_failure(old, "resume_identity", &e))?;
                 let observed = observed
                     .filter(|found| {
                         if provider != ProviderKind::Antigravity {
@@ -1406,17 +1427,27 @@ impl Registry {
                     self.agents.observe_account_resume(new, &session_id);
                 }
             }
-            if self.agents.account_resume_observed(new, &session_id)
-                && tap.pulse().end > 0
-                && tap.quiet_ms() >= 150
-            {
-                ready = true;
-                break;
+            // Preserve a short preflight interval to observe immediate exits, but do not
+            // restart it on every output byte: a verified resume may already be working.
+            if self.agents.account_resume_observed(new, &session_id) && tap.pulse().end > 0 {
+                if confirmed_at.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_millis(150)
+                {
+                    ready = true;
+                    break;
+                }
+            } else {
+                confirmed_at = None;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         if !ready {
             tracing::warn!(
+                original = old.0,
+                replacement = new.0,
+                provider = provider.as_str(),
+                identity_confirmed = self.agents.account_resume_observed(new, &session_id),
+                output_observed = tap.pulse().end > 0,
                 stage = "resume_confirmation",
                 "account handoff timed out without a confirmed conversation"
             );
@@ -1433,7 +1464,7 @@ impl Registry {
         }
         prepared_transcript
             .verify()
-            .map_err(|error| prepare_failure("transcript_preparation", &error))?;
+            .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
         for session in [old, new] {
             let current = self
                 .agents
@@ -1449,7 +1480,7 @@ impl Registry {
                 return Err(Failure::BadRequest);
             }
             if transcript::session_id(provider, &current)
-                .map_err(|e| prepare_failure("conversation_recheck", &e))?
+                .map_err(|e| prepare_failure(old, "conversation_recheck", &e))?
                 != session_id
             {
                 return Err(Failure::Os(libc::EILSEQ));
@@ -1504,19 +1535,37 @@ impl Registry {
                 error: Some(format!("Original process termination could not be confirmed; replacement {} was retained for explicit selection. Held input was not sent", new.0)),
             });
             self.save_account_handoffs().ok();
+            self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
+        // Publish the swap first. The continuation waits on its own thread so the account
+        // worker is free for the next switch; only a confirmed resume may receive input,
+        // so a login or directory prompt never gets an unintended Enter.
         drop(replacement);
-        if should_continue
-            && let Err(error) =
-                Self::deliver_input_to_tap(&tap, b"Continue from where you left off.", true)
-        {
-            tracing::warn!(
-                session = new.0,
-                from = old.0,
-                error = %error,
-                "failed to send continuation prompt after account switch"
-            );
+        if should_continue {
+            let this = std::sync::Arc::clone(self);
+            let (session_id, target) = (session_id.clone(), target.clone());
+            let watcher = tap.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("account-continue".to_owned())
+                .spawn(move || {
+                    this.continue_after_account_switch(
+                        old,
+                        new,
+                        provider,
+                        new_pid,
+                        &watcher,
+                        &session_id,
+                        &claude_homes,
+                        &target,
+                    );
+                })
+            {
+                tracing::warn!(session = new.0, error = %error, "continuation watcher did not start");
+                self.agents.finish_account_resume(new);
+            }
+        } else {
+            self.agents.finish_account_resume(new);
         }
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
@@ -1525,6 +1574,133 @@ impl Registry {
         })
         .ok();
         Ok(new)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the probe needs the replacement process, terminal, and target home together"
+    )]
+    fn continue_after_account_switch(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        provider: ProviderKind,
+        new_pid: u32,
+        tap: &crate::session::Tap,
+        session_id: &str,
+        claude_homes: &[std::path::PathBuf],
+        target: &krill_proto::usage::AccountInfo,
+    ) {
+        let resumed = self.account_resume_confirmed(
+            provider,
+            new,
+            new_pid,
+            tap,
+            session_id,
+            claude_homes,
+            target,
+        );
+        self.agents.finish_account_resume(new);
+        // A later switch away from the replacement owns it now; never type into it.
+        // ponytail: typing in the new pane during the ~2s resume is not detected; add a
+        // last-input check on Tap if prompts ever collide with user input.
+        let superseded = self.agents.account_binding_retiring(new)
+            || lock(&self.account_handoffs).contains_key(&new)
+            || lock(&self.account_work.pending)
+                .keys()
+                .any(|scope| matches!(scope, SwitchScope::Session(id, _) if *id == new));
+        if !resumed || superseded {
+            tracing::warn!(
+                session = new.0,
+                from = old.0,
+                resumed,
+                "continuation prompt withheld after account switch"
+            );
+            return;
+        }
+        if let Err(error) =
+            Self::deliver_input_to_tap(tap, b"Continue from where you left off.", true)
+        {
+            tracing::warn!(
+                session = new.0,
+                from = old.0,
+                error = %error,
+                "failed to send continuation prompt after account switch"
+            );
+        }
+    }
+
+    /// Wait for the replacement to reopen the exact conversation and settle its output.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the probe needs the replacement process, terminal, and target home together"
+    )]
+    fn account_resume_confirmed(
+        &self,
+        provider: ProviderKind,
+        new: SessionId,
+        new_pid: u32,
+        tap: &crate::session::Tap,
+        session_id: &str,
+        claude_homes: &[std::path::PathBuf],
+        target: &krill_proto::usage::AccountInfo,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut next_identity_probe = Instant::now();
+        while Instant::now() < deadline {
+            if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
+                return false;
+            }
+            if !self.agents.account_resume_observed(new, session_id)
+                && Instant::now() >= next_identity_probe
+            {
+                next_identity_probe = Instant::now() + Duration::from_millis(200);
+                let mut observed = identity::discover(provider, new_pid, tap.foreground());
+                if matches!(observed, Ok(None)) && provider == ProviderKind::Claude {
+                    observed = identity::discover_claude(claude_homes, new_pid, tap.foreground());
+                }
+                let observed = match observed {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        tracing::warn!(stage = "resume_identity", kind = ?error.kind(), "account handoff identity probe failed");
+                        return false;
+                    }
+                };
+                if let Some(found) = observed.filter(|found| {
+                    if provider != ProviderKind::Antigravity {
+                        return true;
+                    }
+                    let expected = if target.host_default {
+                        std::path::PathBuf::from(&target.profile_dir)
+                    } else {
+                        Path::new(&target.profile_dir).join(".gemini/antigravity-cli")
+                    };
+                    found
+                        .home
+                        .canonicalize()
+                        .ok()
+                        .zip(expected.canonicalize().ok())
+                        .is_some_and(|(actual, expected)| actual == expected)
+                }) && found.id == session_id
+                {
+                    self.agents
+                        .bind_discovered_session(new, &found.id, Some(&found.path));
+                    self.agents.observe_account_resume(new, session_id);
+                }
+            }
+            if self.agents.account_resume_observed(new, session_id)
+                && tap.pulse().end > 0
+                && tap.quiet_ms() >= 150
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tracing::warn!(
+            stage = "resume_confirmation",
+            "account handoff could not confirm the resumed conversation"
+        );
+        false
     }
 }
 
@@ -1569,7 +1745,10 @@ struct Replacement<'a> {
 
 impl Drop for Replacement<'_> {
     fn drop(&mut self) {
-        self.registry.agents.finish_account_resume(self.session);
+        // A committed replacement keeps its resume watch for the continuation gate.
+        if !self.committed {
+            self.registry.agents.finish_account_resume(self.session);
+        }
         lock(&self.registry.account_replacements).remove(&self.session);
         let only_remaining = !self.committed
             && self.registry.account_original_ended(self.original)
@@ -1599,10 +1778,28 @@ impl Drop for Replacement<'_> {
     }
 }
 
+// Process/file discovery races with the resumed CLI creating or rotating its transcript.
+// Keep polling within the existing deadline; ambiguous/invalid identities remain fatal.
+fn resume_identity(
+    discover: impl FnOnce() -> std::io::Result<Option<identity::Identity>>,
+) -> std::io::Result<Option<identity::Identity>> {
+    match discover() {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
 // Validation errors constructed without an OS errno must retain their meaning on the wire.
-fn prepare_failure(stage: &'static str, error: &std::io::Error) -> Failure {
+fn prepare_failure(original: SessionId, stage: &'static str, error: &std::io::Error) -> Failure {
     use std::io::ErrorKind;
-    tracing::warn!(stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    tracing::warn!(original = original.0, stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
     Failure::Os(error.raw_os_error().unwrap_or_else(|| match error.kind() {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
         ErrorKind::NotFound => libc::ENOENT,

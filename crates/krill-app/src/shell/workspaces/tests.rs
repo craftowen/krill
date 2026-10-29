@@ -4,6 +4,7 @@ use gpui::{Modifiers, TestAppContext};
 use krill_proto::SessionId;
 
 mod reconciliation;
+mod session_order;
 
 /// A, B, A, B 순으로 섞인 저장 레이아웃. 화면 인덱스와 전체 인덱스가 다르다.
 fn fixture(s: &mut Shell, cx: &mut Context<Shell>) -> Vec<PaneId> {

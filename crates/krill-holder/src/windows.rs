@@ -1,10 +1,12 @@
 //! Windows holder: `ConPTY`와 세션 Job을 보관하고 자식 krilld를 재기동한다.
+pub use crate::sys::{Process as DetachedProcess, spawn_detached};
 use crate::{
     link::{Link, Packet},
     sys::{self, Api, Console, Job, Process},
 };
 use krill_proto::{
     SessionId,
+    daemon::KRILLD_DUPLICATE,
     holder::{
         FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION,
         request_id,
@@ -210,8 +212,9 @@ impl Holder {
             .map(Link::drain_nowait);
         match packets {
             Some(Ok((packets, alive))) => {
-                for p in packets {
-                    if self.request(p) {
+                let last = packets.len().saturating_sub(1);
+                for (index, p) in packets.into_iter().enumerate() {
+                    if self.request(p, index == last) {
                         return true;
                     }
                 }
@@ -253,7 +256,8 @@ impl Holder {
         false
     }
     fn daemon_exited(&mut self, status: i32, uptime: Duration) -> bool {
-        if status == i32::from(krill_proto::daemon::KRILLD_DUPLICATE) && self.sessions.is_empty() {
+        if status == i32::from(KRILLD_DUPLICATE) && self.sessions.is_empty() {
+            self.daemon = None;
             return true;
         }
         let upgrading = std::mem::take(&mut self.upgrading);
@@ -292,11 +296,17 @@ impl Holder {
                     .min(30_000)
             });
     }
-    fn request(&mut self, packet: Packet) -> bool {
+    fn request(&mut self, packet: Packet, handoff_allowed: bool) -> bool {
         let req = request_id(&packet.body).unwrap_or(0);
         let decoded = ToHolder::decode(packet.frame());
         if let Ok(ToHolder::UpgradeHolder { req, ref path }) = decoded {
-            let result = text(path.clone()).and_then(|path| self.upgrade(&path, req));
+            // Extracted packets are no longer visible to Link::has_pending(). A successful
+            // handoff here would discard them, so let the caller retry after they are served.
+            let result = if handoff_allowed {
+                text(path.clone()).and_then(|path| self.upgrade(&path, req))
+            } else {
+                Err(io::Error::from_raw_os_error(16))
+            };
             match result {
                 Ok(()) => return true,
                 Err(e) => {
@@ -352,6 +362,20 @@ impl Holder {
                     return Err(io::Error::from_raw_os_error(17));
                 }
                 let argv = argv.into_iter().map(text).collect::<io::Result<Vec<_>>>()?;
+                // Rust's Command implements cmd batch escaping. The helper inherits
+                // this session's Job and ConPTY, as the agent launcher already does.
+                let argv = if argv.first().is_some_and(|path| {
+                    std::path::Path::new(path).extension().is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                    })
+                }) {
+                    std::iter::once(self.path.clone())
+                        .chain(std::iter::once(OsString::from("--shell-exec")))
+                        .chain(argv)
+                        .collect()
+                } else {
+                    argv
+                };
                 let (path, args) = argv.split_first().ok_or(io::ErrorKind::InvalidInput)?;
                 let env = env
                     .into_iter()
@@ -586,6 +610,7 @@ fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     fn holder() -> Holder {
         Holder {
@@ -595,11 +620,79 @@ mod tests {
             api: Api::load(),
             daemon: None,
             streak: 0,
-            restart: Instant::now(),
+            restart: Instant::now() + Duration::from_secs(60),
             previous: None,
             upgrading: false,
             listener: None,
         }
+    }
+
+    /// `cmd /d /c exit <code>`를 자식 krilld 자리에 둔다(bootstrap 링크는 읽지 않고 바로 끝난다).
+    /// `sys::child_link`는 인수마다 CRT 따옴표를 붙여 `"/c" "exit" "3"`이 되는데, cmd.exe는 CRT 규칙으로
+    /// 파싱하지 않아 `exit 3`이 실행되지 않았다(CI job 40502947206). `std::process::Command`는 공백 없는
+    /// 인수를 감싸지 않는다. 종료 상태가 요청한 값인지 holder `poll` 전에 확인한다.
+    fn exited_daemon(code: i32) -> io::Result<Daemon> {
+        let cmd =
+            std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+        let mut child = Command::new(cmd)
+            .args(["/d", "/c", "exit"])
+            .arg(code.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => {
+                    // 시간 초과나 대기 오류: 자식을 거둔 뒤 알린다.
+                    child.kill().ok();
+                    child.wait().ok();
+                    outcome?;
+                    panic!("mock krilld did not exit within 10s");
+                }
+            }
+        };
+        assert_eq!(status.code(), Some(code), "mock krilld exit status");
+        let pid = child.id();
+        let process = Process {
+            handle: OwnedHandle::from(child),
+            pid,
+        };
+        assert_eq!(process.status()?, Some(code), "holder-side exit status");
+        let target = sys::duplicate_target(pid)?;
+        let (link, _peer) = Link::pair()?;
+        Ok(Daemon {
+            process,
+            target,
+            link: Some(link),
+            started: Instant::now(),
+        })
+    }
+
+    /// foundation-01: 세션 없는 중복 holder는 `KRILLD_DUPLICATE`(3)에서 재기동 없이 끝난다(Unix `reap`과 같은 계약).
+    #[test]
+    fn empty_duplicate_holder_exits_instead_of_restarting() -> io::Result<()> {
+        let mut h = holder();
+        h.daemon = Some(exited_daemon(3)?);
+        assert!(h.poll());
+        assert!(h.daemon.is_none());
+        assert_eq!(h.streak, 0, "duplicate exit must not count as a crash");
+        Ok(())
+    }
+
+    #[test]
+    fn crash_exit_still_schedules_restart() -> io::Result<()> {
+        let mut h = holder();
+        h.daemon = Some(exited_daemon(1)?);
+        assert!(!h.poll());
+        assert!(h.daemon.is_none());
+        assert_eq!(h.streak, 1);
+        Ok(())
     }
 
     #[test]
@@ -644,8 +737,8 @@ mod tests {
     fn same_path_update_rolls_back_to_the_previous_install_image() {
         let root =
             std::env::temp_dir().join(format!("krill-holder-rollback-{}", std::process::id()));
-        let current = root.join("Krill/krilld.exe");
-        let previous = root.join("Krill.prev/krilld.exe");
+        let current = root.join("Krill").join("krilld.exe");
+        let previous = root.join("Krill.prev").join("krilld.exe");
         for path in [&current, &previous] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"fixture").unwrap();
@@ -737,5 +830,59 @@ mod tests {
         );
         assert!(h.daemon.is_none());
         drop((h, listener));
+    }
+
+    #[test]
+    fn nonlast_upgrade_is_rejected_before_starting_a_replacement_and_keeps_following_request() {
+        let (link, mut peer) = Link::pair().unwrap();
+        let target = sys::duplicate_target(std::process::id()).unwrap();
+        let mut holder = Holder {
+            path: "unused-daemon.exe".into(),
+            args: Vec::new(),
+            sessions: Vec::new(),
+            api: Api::load(),
+            daemon: Some(Daemon {
+                // The same-process handle is used only as a frame duplication target.
+                process: Process {
+                    handle: target.try_clone().unwrap(),
+                    pid: std::process::id(),
+                },
+                target,
+                link: Some(link),
+                started: Instant::now(),
+            }),
+            streak: 0,
+            restart: Instant::now(),
+            previous: None,
+            upgrading: false,
+            listener: None,
+        };
+        let mut frames = ToHolder::UpgradeHolder {
+            req: 1,
+            path: b"missing-replacement.exe".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        frames.extend(
+            ToHolder::Resize {
+                req: 2,
+                id: SessionId(999),
+                size: krill_proto::holder::WinSize { cols: 80, rows: 24 },
+            }
+            .encode()
+            .unwrap(),
+        );
+        peer.send(&frames, &[]).unwrap();
+        assert!(!holder.poll());
+        let packet = peer.recv().unwrap().unwrap();
+        assert_eq!(
+            FromHolder::decode(packet.frame()).unwrap(),
+            FromHolder::Failed { req: 1, errno: 16 }
+        );
+        let packet = peer.recv().unwrap().unwrap();
+        assert_eq!(
+            FromHolder::decode(packet.frame()).unwrap(),
+            FromHolder::Failed { req: 2, errno: 3 }
+        );
     }
 }

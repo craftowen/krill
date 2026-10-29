@@ -34,7 +34,8 @@ pub fn start(registry: Arc<Registry>, done: Sender<()>) -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_LIMIT);
-    thread::Builder::new().name("resources".to_owned()).spawn(move || {
+    thread::Builder::new().name("resources".to_owned()).stack_size(256 * 1024).spawn(move || {
+        crate::alloc::mobile_thread().ok();
         let mut monitor = Monitor::new(dir, limit);
         let mut previous = sys::resources().ok().map(|(_, writes)| (Instant::now(), writes));
         loop {

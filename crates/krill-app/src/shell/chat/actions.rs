@@ -108,7 +108,7 @@ impl Shell {
     }
 
     fn chat_request_binding_matches(&self, request: &RequestIdentity, cx: &gpui::App) -> bool {
-        if !self.is_session_chat_view(request.session, cx)
+        if !self.is_pane_chat_view(request.pane, cx)
             || self.layout.session(request.pane) != Some(request.session)
             || self.layout.host(request.pane) != &request.host
             || self.layout.file(request.pane).is_some()

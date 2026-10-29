@@ -41,6 +41,16 @@ impl Clock {
     }
 }
 
+/// `(pid, 부모)` 목록에서 `root` 아래가 비었거나, 자식 하나(에이전트)뿐이고 그 밑이 비었는지 본다.
+fn idle_roster(root: u32, links: &[(u32, u32)]) -> bool {
+    let mut children = links.iter().filter(|(_, parent)| *parent == root);
+    match (children.next(), children.next()) {
+        (None, _) => true,
+        (Some(&(agent, _)), None) => !links.iter().any(|(_, parent)| *parent == agent),
+        _ => false,
+    }
+}
+
 impl Registry {
     fn sleep_path(&self, id: SessionId) -> Option<PathBuf> {
         Some(self.dir.as_ref()?.join("hibernated").join(id.0.to_string()))
@@ -169,16 +179,17 @@ impl Registry {
             if !group.iter().all(|(id, _, _)| self.resumable(*id)) {
                 continue;
             }
-            // 보수적 roster 조건: 프로세스 자식 하나라도 있거나 전체 조회가 실패하면 종료하지 않는다.
+            // 보수적 roster 조건: 에이전트 밑에 자식 프로세스가 하나라도 있거나 전체 조회가 실패하면 종료하지 않는다.
+            // 루트는 셸 복귀 래퍼(로그인 셸)이고 에이전트는 그 자식 하나다(`agent::PREFLIGHT`).
             let Ok(pids) = crate::sys::all_pids() else {
                 continue;
             };
-            let parents: Vec<_> = pids
+            let links: Vec<_> = pids
                 .into_iter()
                 .filter(|&pid| pid > 1)
-                .filter_map(|pid| crate::sys::parent_pid(pid).ok())
+                .filter_map(|pid| crate::sys::parent_pid(pid).ok().map(|parent| (pid, parent)))
                 .collect();
-            if group.iter().any(|(_, _, root)| parents.contains(root)) {
+            if group.iter().any(|(_, _, root)| !idle_roster(*root, &links)) {
                 continue;
             }
             let guards: Option<Vec<_>> = group

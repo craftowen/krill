@@ -105,6 +105,12 @@ pub const FEAT_SESSION_ACCOUNT: u64 = 1 << 58;
 pub const FEAT_CLEAR_SCROLLBACK: u64 = 1 << 47;
 /// 원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩. [`Request::RemoteFs`]·[`Reply::RemoteFs`] 한 쌍.
 pub const FEAT_REMOTE_FS: u64 = 1 << 27;
+/// 실제 브랜치·태그 조회. `FEAT_CONTROL`과 함께 협상한다.
+pub const FEAT_WORKTREE_REFS: u64 = 1 << 37;
+/// 조회 한 번의 ref 수 상한.
+pub const MAX_WORKTREE_REFS: usize = 2048;
+/// UI에서 선택할 ref 이름의 UTF-8 바이트 상한.
+pub const MAX_WORKTREE_REF_BYTES: usize = 256;
 /// 캡처 한 번의 최대 바이트. 넘으면 잘라내지 않고 `BadRequest`로 거부한다.
 pub const MAX_CAPTURE: usize = 512 * 1024;
 
@@ -246,6 +252,11 @@ pub enum Request {
     },
     /// `FEAT_REMOTE_FS` 필요. 원격 파일 탐색·읽기·원자적 저장·Quick Open·루프백 포트 포워딩.
     RemoteFs(crate::remote_fs::RemoteFsRequest),
+    /// `FEAT_WORKTREE_REFS` 필요. 명령·옵션은 받지 않는 읽기 전용 Git 조회.
+    WorktreeRefs {
+        #[serde(deserialize_with = "sidebar_path")]
+        repo: Vec<u8>,
+    },
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -471,6 +482,51 @@ pub struct AgentStatus {
     /// `title` 꼬리 뒤 세 번째 꼬리로만 오가 구버전과 상호 호환한다.
     #[serde(default, skip)]
     pub subagents: Vec<Subagent>,
+    /// Observed root shell and host OS; fourth States extension, never inferred by the client.
+    #[serde(default, skip)]
+    pub root_shell: Option<Box<RootShell>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootShell {
+    pub os: ShellOs,
+    #[serde(deserialize_with = "root_program")]
+    pub program: String,
+}
+
+impl RootShell {
+    /// Observed process names are optional metadata. Unsupported names must not
+    /// make a complete States reply undecodable.
+    pub fn new(os: ShellOs, program: String) -> Option<Self> {
+        valid_root_program(&program).then_some(Self { os, program })
+    }
+}
+
+fn valid_root_program(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellOs {
+    Unix,
+    Windows,
+}
+
+fn root_program<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Text;
+    impl serde::de::Visitor<'_> for Text {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("root program under 257 bytes")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+            if !valid_root_program(value) {
+                return Err(E::custom("invalid root program"));
+            }
+            Ok(value.to_owned())
+        }
+    }
+    d.deserialize_str(Text)
 }
 
 /// 세션 안에서 돌고 있는 서브에이전트 하나. 필드는 끝에만 붙인다.
@@ -520,6 +576,7 @@ impl AgentStatus {
         foreground: None,
         title: None,
         subagents: Vec::new(),
+        root_shell: None,
     };
 }
 
@@ -540,6 +597,9 @@ pub struct SidebarData {
     /// 워크트리 경로별 현재 브랜치(`refs/heads/` 제거). 와이어 호환을 위해 [`Reply::Sidebar`] 꼬리 바이트로만 인코딩한다.
     #[serde(default, skip)]
     pub branches: Vec<(Vec<u8>, String)>,
+    /// 세션 프롬프트 기록. 기존 브랜치 확장 뒤 선택 꼬리로 전달한다.
+    #[serde(default, skip)]
+    pub prompt_histories: Vec<(SessionId, crate::git::SessionPromptHistory)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -566,6 +626,40 @@ struct Branch(
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct Branches(#[serde(deserialize_with = "bounded::<_, Branch, 512>")] Vec<Branch>);
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct PromptHistories(
+    #[serde(deserialize_with = "bounded::<_, PromptHistory, MAX_SESSIONS>")] Vec<PromptHistory>,
+);
+
+#[derive(Deserialize)]
+struct PromptHistory(SessionId, PromptHistoryBody);
+
+#[derive(Deserialize)]
+struct PromptHistoryBody {
+    total_turns: u32,
+    #[serde(
+        deserialize_with = "bounded::<_, PromptTurn, { crate::git::MAX_PROMPT_HISTORY_TURNS }>"
+    )]
+    turns: Vec<PromptTurn>,
+}
+
+#[derive(Deserialize)]
+struct PromptTurn {
+    #[serde(deserialize_with = "prompt_text")]
+    text: String,
+    unix_ns: u64,
+    turn: u32,
+}
+
+fn prompt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let text = <&str>::deserialize(d)?;
+    if text.is_empty() || text.chars().count() > crate::git::MAX_PROMPT_DISPLAY_CHARS + 1 {
+        return Err(serde::de::Error::custom("prompt text exceeds limit"));
+    }
+    Ok(text.to_owned())
+}
+
 fn branch_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let text = <&str>::deserialize(d)?;
     if text.is_empty() || text.len() > MAX_TITLE_TEXT {
@@ -918,6 +1012,20 @@ pub enum Reply {
     },
     /// `FEAT_REMOTE_FS` 필요. [`Request::RemoteFs`]의 응답.
     RemoteFs(crate::remote_fs::RemoteFsReply),
+    /// `FEAT_WORKTREE_REFS` 필요. 실패는 기존 `WorktreeFailed`로 답한다.
+    WorktreeRefs(#[serde(deserialize_with = "worktree_refs")] Vec<String>),
+}
+
+fn worktree_refs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let refs = bounded::<D, String, MAX_WORKTREE_REFS>(d)?;
+    if refs.iter().any(|name| {
+        name.is_empty()
+            || name.len() > MAX_WORKTREE_REF_BYTES
+            || name.chars().any(|c| c.is_control() || c.is_whitespace())
+    }) {
+        return Err(serde::de::Error::custom("invalid worktree ref name"));
+    }
+    Ok(refs)
 }
 
 /// Only meaningful in one negotiated daemon incarnation; includes session to prevent cross-scope reuse.
@@ -1056,7 +1164,8 @@ impl Msg for Reply {
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::States(rows) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            let has_subagents = rows.iter().any(|r| !r.status.subagents.is_empty());
+            let has_root = rows.iter().any(|r| r.status.root_shell.is_some());
+            let has_subagents = has_root || rows.iter().any(|r| !r.status.subagents.is_empty());
             let has_title = has_subagents || rows.iter().any(|r| r.status.title.is_some());
             if has_title || rows.iter().any(|r| r.status.foreground.is_some()) {
                 for row in rows {
@@ -1081,12 +1190,31 @@ impl Msg for Reply {
                     );
                 }
             }
+            if has_root {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(
+                            &row.status
+                                .root_shell
+                                .as_deref()
+                                .filter(|root| valid_root_program(&root.program)),
+                        )
+                        .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
             return crate::ipc::encode_frame(Self::KIND, &body);
         }
         if let Self::Sidebar(data) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            if !data.branches.is_empty() {
+            if !data.branches.is_empty() || !data.prompt_histories.is_empty() {
                 body.extend(postcard::to_stdvec(&data.branches).map_err(crate::ipc::Error::Codec)?);
+            }
+            if !data.prompt_histories.is_empty() {
+                body.extend(
+                    postcard::to_stdvec(&data.prompt_histories)
+                        .map_err(crate::ipc::Error::Codec)?,
+                );
             }
             return crate::ipc::encode_frame(Self::KIND, &body);
         }
@@ -1149,6 +1277,24 @@ impl Msg for Reply {
                         tail = next;
                     }
                 }
+                if !tail.is_empty() {
+                    for row in rows.iter_mut() {
+                        let (root, next) =
+                            postcard::take_from_bytes::<Option<Box<RootShell>>>(tail)
+                                .map_err(crate::ipc::Error::Codec)?;
+                        if root.as_ref().is_some_and(|r| {
+                            r.program.is_empty()
+                                || r.program.len() > 256
+                                || r.program.chars().any(char::is_control)
+                        }) {
+                            return Err(crate::ipc::Error::Codec(
+                                postcard::Error::DeserializeBadEncoding,
+                            ));
+                        }
+                        row.status.root_shell = root;
+                        tail = next;
+                    }
+                }
             }
             return Ok(reply);
         }
@@ -1158,7 +1304,7 @@ impl Msg for Reply {
             if !rest.is_empty()
                 && let Self::Sidebar(data) = &mut reply
             {
-                let (Branches(branches), _) = postcard::take_from_bytes::<Branches>(rest)
+                let (Branches(branches), tail) = postcard::take_from_bytes::<Branches>(rest)
                     .map_err(crate::ipc::Error::Codec)?;
                 let branches: Vec<_> = branches
                     .into_iter()
@@ -1177,6 +1323,31 @@ impl Msg for Reply {
                     ));
                 }
                 data.branches = branches;
+                if !tail.is_empty() {
+                    let (histories, _) = postcard::take_from_bytes::<PromptHistories>(tail)
+                        .map_err(crate::ipc::Error::Codec)?;
+                    data.prompt_histories = histories
+                        .0
+                        .into_iter()
+                        .map(|PromptHistory(id, history)| {
+                            (
+                                id,
+                                crate::git::SessionPromptHistory {
+                                    total_turns: history.total_turns,
+                                    turns: history
+                                        .turns
+                                        .into_iter()
+                                        .map(|turn| crate::git::SessionPromptTurn {
+                                            text: turn.text,
+                                            unix_ns: turn.unix_ns,
+                                            turn: turn.turn,
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        })
+                        .collect();
+                }
             }
             return Ok(reply);
         }

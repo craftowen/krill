@@ -3,6 +3,7 @@
 //! PTY 읽기 스레드는 건드리지 않고, 데몬 전체 감시 스레드 하나가 그룹과 조용해진 화면을 확인한다.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -14,17 +15,57 @@ use crate::registry::Registry;
 use crate::sys::ExitWatch;
 
 const POLL: Duration = Duration::from_millis(100);
+const PROCESS_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct Tracked {
     detector: Detector,
     /// pid 재사용을 구분하는 시작 시각. 이전 그룹의 늦은 종료는 새 그룹을 종료시키지 않는다.
     process: Option<(u32, u64)>,
+    process_checked: Option<Instant>,
     /// Name lookups may be reused only after start identity is revalidated each tick.
     name: Option<(u32, u64, Instant, String)>,
     /// 마지막으로 문자열화한 화면(revision·제목·평문). revision이 그대로면 다시 문자열화하지 않고
     /// 이 캐시로 감지한다(OWE-586: 유휴 20세션 문자열화 비용 제거).
     evidence: Option<(u64, String, String)>,
+    /// [`Registry::wrapped`] 결과. 세션 수명 동안 바뀌지 않아 한 번만 읽는다.
+    launched: Option<bool>,
+}
+
+impl Tracked {
+    /// Kernel notifications are an optimization. Keep checking the original identity,
+    /// including when the agent moved to the background or the watch could not be installed.
+    fn ended(
+        &mut self,
+        exits: &[u32],
+        now: Instant,
+        start_us: impl FnOnce(u32) -> io::Result<u64>,
+    ) -> bool {
+        let Some((pid, start)) = self.process else {
+            return false;
+        };
+        let notified = exits.contains(&pid);
+        if !notified
+            && self
+                .process_checked
+                .is_some_and(|at| now.saturating_duration_since(at) < PROCESS_POLL)
+        {
+            return false;
+        }
+        self.process_checked = Some(now);
+        let ended = match start_us(pid) {
+            Ok(current) => current != start || notified,
+            Err(e) => {
+                notified
+                    || e.kind() == io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH)
+            }
+        };
+        if ended {
+            self.process = None;
+        }
+        ended
+    }
 }
 
 pub(crate) fn monitor(reg: &Registry) {
@@ -54,13 +95,8 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
     reg.gc_due(Instant::now(), SystemTime::now());
     let exits = watch.and_then(|w| w.drain().ok()).unwrap_or_default();
     for (&id, t) in &mut *tracked {
-        if let Some((pid, start)) = t.process
-            && exits.contains(&pid)
-        {
-            if !crate::sys::start_us(pid).is_ok_and(|current| current != start) {
-                reg.with_status(id, |s| s.exited(id));
-            }
-            t.process = None;
+        if t.ended(&exits, Instant::now(), crate::sys::start_us) {
+            reg.with_status(id, |s| s.exited(id));
         }
     }
     let mut sessions = Vec::new();
@@ -89,7 +125,15 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
         let evidence = t
             .detector
             .observe(title, screen, *rev, &status, Instant::now());
-        if let Some(pid) = tap.foreground() {
+        let raw = tap.foreground();
+        let foreground = super::effective_foreground(root, raw);
+        #[cfg(windows)]
+        let foreground = foreground.or_else(|| crate::sys::session_agent_process(root));
+        if let Some(pid) = foreground {
+            // 셸 복귀 래퍼 아래 자식은 이름과 상관없이 실행한 에이전트다.
+            let wrapped = raw == Some(root)
+                && pid != root
+                && *t.launched.get_or_insert_with(|| reg.wrapped(id));
             let mut identity = crate::sys::start_us(pid).ok();
             let name = if let Some((cached_pid, cached_start, at, name)) = &t.name
                 && *cached_pid == pid
@@ -105,31 +149,52 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                 t.name = identity.map(|start| (pid, start, Instant::now(), name.clone()));
                 name
             };
+            let name = name.to_ascii_lowercase();
             let agent = matches!(
                 name.as_str(),
-                "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity"
-            ) || (pid != root
-                && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
-                    || evidence.is_some_and(|e| e.source == krill_proto::control::Source::Title)
-                        && status.source != Some(krill_proto::control::Source::Process)));
+                "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity" | "pi"
+            ) || wrapped
+                || (pid != root
+                    && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
+                        || evidence
+                            .is_some_and(|e| e.source == krill_proto::control::Source::Title)
+                            && status.source != Some(krill_proto::control::Source::Process)));
             if agent
                 && let Some(start) = identity
                 && t.process != Some((pid, start))
             {
+                // Retain identity even if kernel watching is unavailable; polling still
+                // detects exit. A foreground-group change alone does not end an agent.
+                t.process = Some((pid, start));
+                t.process_checked = None;
+                reg.with_status(id, |s| s.started(id));
                 // 먼저 등록해 직후 종료도 놓치지 않는다.
                 if let Some(w) = watch {
                     match w.add(pid) {
-                        Ok(()) => {
-                            t.process = Some((pid, start));
-                            reg.with_status(id, |s| s.started(id));
-                        }
-                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                        Err(e)
+                            if e.raw_os_error() == Some(libc::ESRCH)
+                                || cfg!(windows) && e.raw_os_error() == Some(87) =>
+                        {
+                            t.process = None;
                             reg.with_status(id, |s| s.exited(id));
                         }
-                        Err(_) => {}
+                        Ok(()) | Err(_) => {}
                     }
                 }
             }
+        }
+        // 셸 복귀 래퍼가 로그인 셸로 바뀌었으면(인자에서 `mk-agent`가 사라짐) 에이전트가 끝났다.
+        // 폴링 사이에 끝나 감시에 붙지 못한 에이전트(시작 직후 실패 등)도 여기서 잡는다.
+        #[cfg(unix)]
+        if raw == Some(root)
+            && foreground == raw
+            && !(status.state == krill_proto::control::AgentState::Exited
+                && status.source == Some(krill_proto::control::Source::Process))
+            && *t.launched.get_or_insert_with(|| reg.wrapped(id))
+            && crate::sys::process_args(root)
+                .is_ok_and(|args| !args.iter().any(|a| a == crate::agent::WRAPPER_ARG0))
+        {
+            reg.with_status(id, |s| s.exited(id));
         }
         if let Some(e) = evidence {
             reg.with_status(id, |s| s.inferred(id, e, super::now_ns()));
@@ -143,3 +208,6 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
     reg.retain_webhooks(&ids);
     reg.hibernate_idle();
 }
+
+#[cfg(test)]
+mod tests;

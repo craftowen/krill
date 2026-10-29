@@ -206,3 +206,92 @@ fn windows_remote_failures_name_the_cause() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("too old"), "{err}");
 }
+
+/// foundation-02: 페이지 스냅샷을 모르는 원격(N-1) 데몬이 단일 프레임 상한 오류를 내면 `--host` CLI는
+/// 로컬 상태로 대체하지 않고(원격→로컬 fallback 금지) 원격 데몬 갱신을 요구하는 명시 오류로 끝난다.
+mod orchestration_frame_bound {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc::{ClientHello, FEATURES, PROTO_MAX, PROTO_MIN, ServerHello, read_frame};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore, frame_limit_error,
+    };
+    use krill_proto::screen::Msg as _;
+
+    #[test]
+    fn prior_remote_daemon_snapshot_overflow_never_falls_back_to_local_state() {
+        let r = WindowsRemote::new("orch-old", false, &format!("exec '{MK}' \"$@\""));
+        // 로컬에는 원격과 다른 상태가 있다 — 출력에 나타나면 안 된다.
+        let mut local = OrchestrationStore::default();
+        let run = local.create_run("local-only", None).unwrap();
+        local
+            .create_task(&run.id, "local-only-task", "", vec![])
+            .unwrap();
+        local.save(&r.local_dir).unwrap();
+        fs::create_dir_all(r.remote_dir.join("run")).unwrap();
+        let listener = Arc::new(UnixListener::bind(r.remote_dir.join("run/krilld.sock")).unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let listener = Arc::clone(&listener);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            thread::spawn(move || serve_prior(socket));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        let out = r.run(&["--host", HOST, "orchestration", "task-list", "--json"]);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("update the remote krilld"), "{err}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("local-only-task"),
+            "remote overflow must never read local state"
+        );
+    }
+
+    /// `FEAT_ORCH_SNAPSHOT_PAGE`를 모르는 원격 데몬 흉내: Hello 뒤 모든 요청에 프레임 상한 명시 오류.
+    /// `krill __bridge --probe`는 연결만 하고 읽지 않으므로 Hello 뒤 EOF까지 기다리다 끝난다.
+    fn serve_prior(mut socket: UnixStream) {
+        socket.set_nonblocking(false).ok();
+        socket.set_read_timeout(Some(WAIT)).ok();
+        let hello = ServerHello {
+            proto_min: PROTO_MIN,
+            proto_max: PROTO_MAX,
+            features: FEATURES & !FEAT_ORCH_SNAPSHOT_PAGE,
+            build: "prior-remote-fixture".into(),
+            instance_id: 7,
+        };
+        if socket.write_all(&hello.encode().unwrap()).is_err() {
+            return;
+        }
+        let Ok(Some((kind, body))) = read_frame(&mut socket) else {
+            return;
+        };
+        ClientHello::decode(kind, &body).unwrap();
+        while let Ok(Some((kind, body))) = read_frame(&mut socket) {
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Orchestration(OrchAction::SnapshotV2)
+            ));
+            let reply = Reply::Orchestration(OrchResponse::Error(frame_limit_error(1_204_357)));
+            socket.write_all(&reply.encode().unwrap()).unwrap();
+        }
+    }
+}

@@ -58,6 +58,11 @@ pub(super) struct PreparedTranscript {
 }
 
 impl PreparedTranscript {
+    #[cfg(windows)]
+    pub(super) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub(super) fn verify(&self) -> io::Result<()> {
         if self.provider == ProviderKind::Antigravity {
             // Only the conversation database makes an Antigravity conversation resumable.
@@ -212,8 +217,23 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
         return Err(io::ErrorKind::InvalidData.into());
     }
     let mut head = Vec::new();
-    File::open(path)?.take(128 * 1024).read_to_end(&mut head)?;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    file.take(128 * 1024).read_to_end(&mut head)?;
+    // A newly opened rollout may be visible before its metadata write completes.
+    // Only an empty file or an incomplete last line is retryable; complete invalid
+    // metadata stays fatal. A read cut at the size cap is not a pending write.
+    let last_line = head
+        .rsplit(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let pending_header = head.is_empty()
+        || (len <= head.len() as u64
+            && !last_line.is_empty()
+            && serde_json::from_slice::<serde_json::Value>(last_line).is_err_and(|e| e.is_eof()));
     let mut identity: Option<String> = None;
+    // A forked Codex rollout replays the parent's `session_meta` after its own.
+    let mut parent: Option<String> = None;
     for record in String::from_utf8_lossy(&head)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -244,15 +264,31 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
         }
         .and_then(serde_json::Value::as_str);
         if let Some(id) = id {
+            if provider == ProviderKind::Codex
+                && identity.is_some()
+                && parent.as_deref() == Some(id)
+            {
+                continue;
+            }
             if !valid_session_id(id) || identity.as_deref().is_some_and(|previous| previous != id) {
                 return Err(io::ErrorKind::InvalidData.into());
+            }
+            if identity.is_none() {
+                parent = record
+                    .pointer("/payload/forked_from_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
             }
             identity = Some(id.to_owned());
         }
     }
     identity.ok_or_else(|| {
         io::Error::new(
-            io::ErrorKind::InvalidData,
+            if pending_header {
+                io::ErrorKind::WouldBlock
+            } else {
+                io::ErrorKind::InvalidData
+            },
             "conversation transcript has no verified identity",
         )
     })
@@ -761,6 +797,8 @@ esac
             session_id(ProviderKind::Codex, &stored).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"forked_from_id\":\"two\"}}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"two\"}}\n").unwrap();
+        assert_eq!(session_id(ProviderKind::Codex, &stored).unwrap(), "one");
         fs::write(&path, "{\"sessionId\":\"claude-one\"}\n").unwrap();
         assert_eq!(
             session_id(ProviderKind::Claude, &stored).unwrap(),

@@ -122,7 +122,7 @@ globalThis.handle=null;mountCase();
             wait('document.querySelector(".terminal-mount").dataset.phase==="ready"')
             expected = ['escape', 'tab', 'enter', 'shiftTab', 'space', 'backspace',
                         'delete', 'arrowUp', 'arrowDown', 'arrowLeft', 'arrowRight']
-            assert evaluate('[...document.querySelector(".keybar").children].slice(2,13).map(n=>n.dataset.keyId)') == expected
+            assert evaluate('[...document.querySelector(".keybar").children].slice(3,14).map(n=>n.dataset.keyId)') == expected
             assert evaluate('document.querySelector(".direct-toggle svg path").getAttribute("d")') == 'm6 17 5-5-5-5'
             browser('click', '.live-focus-target')
             browser('keyboard', 'type', 'hello')
@@ -140,11 +140,12 @@ globalThis.handle=null;mountCase();
             evaluate('globalThis.beforeIME=sentInputs().length;fire("compositionstart");edit("ㅎ",{isComposing:true});true')
             assert evaluate('document.querySelector(".live-input-copy small").textContent') == 'ㅎ'
             assert evaluate('sentInputs().length===beforeIME')
+            assert evaluate('!document.querySelector(".terminal-preedit").hidden && document.querySelector(".terminal-preedit").getBoundingClientRect().width>0')
             evaluate('edit("한",{isComposing:true});fire("compositionend",{data:"한"});fire("input",{inputType:"insertFromComposition"});true')
             wait('sentInputs().at(-1)==="한"')
             assert evaluate('sentInputs().length===beforeIME+1')
             evaluate('edit("한국",{inputType:"insertText"});edit("한",{inputType:"deleteContentBackward"});true')
-            assert evaluate('sentInputs().at(-1)') == '\x7f'
+            assert evaluate('sentInputs().at(-1)') == '한'
 
             # A slow ACK used to reveal a new row under the terminal. Neither
             # ACK nor output/viewport updates may change its footprint or preview.
@@ -164,41 +165,21 @@ globalThis.handle=null;mountCase();
                 assert evaluate('getComputedStyle(document.querySelector(".terminal-status")).display') == 'none'
                 assert evaluate('document.querySelector(".live-input-copy small").textContent') == '한 live preview'
                 tail_check = evaluate('''(()=>{
-                  const small=document.querySelector(".live-input-copy small"),row=document.querySelector(".input-row"),live=document.querySelector(".live-focus-target"),frame=document.querySelector(".terminal-frame");
-                  const snap=()=>({frameH:frame.getBoundingClientRect().height,rowH:row.getBoundingClientRect().height,rowTop:row.getBoundingClientRect().top,liveH:live.getBoundingClientRect().height,smallH:small.getBoundingClientRect().height});
-                  const base=snap(),steps=[
-                    "cargo nextest run -p krilld --locked",
-                    "cargo nextest run -p krilld --locked -- 한글 긴 입력 미리보기에서도 방금 친 끝부분이",
-                    "cargo nextest run -p krilld --locked --target-dir /Volumes/krill-build/targets/shared -- 한글 긴 입력 미리보기에서도 가로 모드를 포함해 방금 친 끝부분이 잘리지 않고 항상 보입니다 TAIL_OK"
-                  ];
-                  for(const text of steps){
-                    edit(text,{inputType:"insertText"});
-                    const now=snap();
-                    if(now.frameH!==base.frameH||now.rowH!==base.rowH||now.rowTop!==base.rowTop||now.liveH!==base.liveH||now.smallH!==base.smallH)return {ok:false,reason:"flicker",base,now};
-                  }
-                  fire("compositionstart");
-                  edit(steps[2]+" ㅎ",{isComposing:true});
-                  edit(steps[2]+" 한",{isComposing:true});
-                  const afterIme=snap();
-                  if(afterIme.frameH!==base.frameH||afterIme.rowH!==base.rowH||afterIme.rowTop!==base.rowTop||afterIme.liveH!==base.liveH||afterIme.smallH!==base.smallH)return {ok:false,reason:"ime-flicker",base,afterIme};
-                  const textNode=small.firstChild,box=small.getBoundingClientRect();
-                  const tailRange=document.createRange();
-                  tailRange.setStart(textNode,textNode.data.length-8);
-                  tailRange.setEnd(textNode,textNode.data.length);
-                  const tailRect=tailRange.getBoundingClientRect();
-                  const headRange=document.createRange();
-                  headRange.setStart(textNode,0);
-                  headRange.setEnd(textNode,5);
-                  const headRect=headRange.getBoundingClientRect();
-                  fire("compositionend",{data:"한"});
-                  fire("input",{inputType:"insertFromComposition"});
-                  return {
-                    ok:small.scrollWidth>small.clientWidth&&small.scrollLeft>0&&Math.abs(small.scrollLeft+small.clientWidth-small.scrollWidth)<=2&&tailRect.width>0&&tailRect.left>=box.left&&tailRect.right<=box.right+1.5&&headRect.left<box.left,
-                    scrollWidth:small.scrollWidth,clientWidth:small.clientWidth,scrollLeft:small.scrollLeft,
-                    box:{left:box.left,right:box.right},tail:{left:tailRect.left,right:tailRect.right,width:tailRect.width},head:{left:headRect.left,right:headRect.right}
-                  };
+                  const frame=document.querySelector('.terminal-frame'),preedit=document.querySelector('.terminal-preedit');
+                  const base=frame.getBoundingClientRect().height;
+                  fire('compositionstart');
+                  const text='한글 조합 중 받침과 자모 삭제를 브라우저가 처리하고 긴 미리보기의 끝부분까지 보입니다';
+                  edit(capture.value+text,{isComposing:true,inputType:'insertCompositionText'});
+                  const box=preedit.getBoundingClientRect(),parent=frame.getBoundingClientRect();
+                  const result={ok:!preedit.hidden&&getComputedStyle(preedit).display!=='none'&&box.width>0&&box.left>=parent.left&&box.right<=parent.right&&box.bottom<=parent.bottom&&frame.getBoundingClientRect().height===base&&preedit.textContent===text,box:{left:box.left,right:box.right,bottom:box.bottom},parent:{left:parent.left,right:parent.right,bottom:parent.bottom}};
+                  fire('compositionend',{data:text});fire('input',{inputType:'insertFromComposition'});
+                  return result;
                 })()''')
                 assert tail_check.get('ok'), (width, tail_check)
+                # Capture the visible native preedit as evidence, before commit.
+                evaluate('fire("compositionstart");edit(capture.value+" 한글 조합 중",{isComposing:true});true')
+                shot(f'{width}-preedit')
+                evaluate('fire("compositionend",{data:"조합 중"});fire("input",{inputType:"insertFromComposition"});true')
                 evaluate('edit("한 live preview",{inputType:"deleteContentBackward"});true')
                 shot(f'{width}-pending')
                 evaluate('for(const a of socket.sent.filter(a=>a instanceof Uint8Array&&a[4]===0x13)){const r=MkTerminalCodec.reader(a.slice(5));socket.frame(0x27,MkTerminalCodec.v(r.n()),MkTerminalCodec.v(0));}socket.autoAck=true;true')
@@ -207,10 +188,10 @@ globalThis.handle=null;mountCase();
                 evaluate('visualViewport.height=innerHeight-260;visualViewport.dispatchEvent(new Event("resize"));true')
                 wait('document.querySelector(".terminal-mount").dataset.keyboardOpen==="true"')
                 assert evaluate('document.querySelector(".live-input-copy small").textContent') == '한 live preview'
-                assert evaluate('!document.querySelector(".dismiss-keyboard").hidden')
-                assert evaluate('(()=>{const a=capture.getBoundingClientRect(),b=document.querySelector(".input-row").getBoundingClientRect();return a.top>=b.top&&a.bottom<=b.bottom;})()')
+                assert evaluate('document.querySelector(".live-focus-target").getAttribute("aria-pressed")==="true"')
+                assert evaluate('(()=>{const a=capture.getBoundingClientRect(),b=document.querySelector(".accessory-row").getBoundingClientRect();return a.top>=b.top&&a.bottom<=b.bottom;})()')
                 shot(f'{width}-keyboard')
-                browser('click', '.dismiss-keyboard')
+                browser('click', '.live-focus-target')
                 assert evaluate('document.activeElement!==capture')
                 evaluate('visualViewport.height=innerHeight;visualViewport.dispatchEvent(new Event("resize"));true')
                 browser('click', '.live-focus-target')

@@ -18,11 +18,14 @@ use zeroize::Zeroizing;
 use super::{ProfileUsage, Usage, Window, accounts};
 use crate::session::lock;
 
+mod codex_reset;
+
 type Key = (PathBuf, ProviderKind, PathBuf);
+type Credentials = (Zeroizing<String>, Option<String>);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 /// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
-static RETRY: Mutex<BTreeMap<Key, (Instant, u32)>> = Mutex::new(BTreeMap::new());
+static RETRY: Mutex<BTreeMap<Key, Retry>> = Mutex::new(BTreeMap::new());
 // 아래 값은 Orca(MIT) rate-limits/service/service-types.ts·usage-retry-after.ts를 따른다.
 // 사용량 엔드포인트는 예산이 빡빡하고 사용량은 참고용이라, 촘촘히 조회하기보다 최근 값을 쓴다.
 /// 주기 틱의 조회 간격.
@@ -43,7 +46,7 @@ const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_hours(24);
 const MAX_BYTES: u64 = 512 * 1024;
 
 /// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
-/// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다(직접 조회가 켜져 있을 때).
+/// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다.
 pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     lock(&CACHE).remove(&(home.to_path_buf(), provider, dir.to_path_buf()));
     super::meters::evict_profile(home, provider, dir);
@@ -62,7 +65,7 @@ pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<
 /// 정상 값은 `CACHE_TTL`, 429로 오래됨 처리된 값은 마지막 성공 시각부터 하루까지 쓴다.
 fn alive(at: Instant, usage: &ProfileUsage) -> bool {
     at.elapsed()
-        < if usage.stale {
+        < if usage.stale && usage.error.is_none() {
             MAX_RATE_LIMIT_WAIT
         } else {
             CACHE_TTL
@@ -86,12 +89,6 @@ pub fn refresh_manual(home: &Path, state: Option<&Path>) {
 
 fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bool) {
     let file = accounts::load_file(home, state);
-    if !file.direct_usage {
-        lock(&CACHE).retain(|(h, _, _), _| h != home);
-        agy::evict(home);
-        super::meters::evict(home);
-        return;
-    }
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
@@ -123,7 +120,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
         if !force
             && (lock(&RETRY)
                 .get(&key)
-                .is_some_and(|(until, _)| Instant::now() < *until)
+                .is_some_and(|retry| Instant::now() < retry.until)
                 || (live_fresh(provider, &key.2)
                     && super::meters::has_cached(&key.0, provider, &key.2)))
             || lock(&CACHE)
@@ -144,47 +141,12 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
         .spawn(move || {
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
-                    .unwrap_or(Fetched::Failed);
+                    .unwrap_or(Fetched::Failed(Failure::Internal));
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
-            let usage = match result {
-                Fetched::Usage(usage, meters) => {
-                    lock(&RETRY).remove(&job);
-                    super::meters::remember(&job.0, job.1, &job.2, meters);
-                    Some(ProfileUsage {
-                        usage,
-                        updated_at: now,
-                        ..ProfileUsage::default()
-                    })
-                }
-                // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
-                Fetched::RateLimited(wait) => {
-                    let mut retry = lock(&RETRY);
-                    let streak = retry.get(&job).map_or(0, |r| r.1);
-                    let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
-                    retry.insert(job.clone(), (Instant::now() + wait, streak));
-                    drop(retry);
-                    mark_rate_limited(&mut lock(&CACHE), &job, now);
-                    None
-                }
-                Fetched::Failed => {
-                    let mut retry = lock(&RETRY);
-                    let streak = retry.get(&job).map_or(0, |r| r.1).saturating_add(1);
-                    retry.insert(job.clone(), (Instant::now() + failure_wait(streak), streak));
-                    Some(ProfileUsage {
-                        error: Some("갱신 실패".into()),
-                        detail: Some("사용량 갱신 실패".into()),
-                        updated_at: now,
-                        ..ProfileUsage::default()
-                    })
-                }
-            };
-            // 조회 중 사용자가 끈 경우에는 결과도 버린다.
-            if let Some(usage) = usage
-                && accounts::load_file(&job.0, state.as_deref()).direct_usage
-            {
+            if let Some(usage) = apply_result(&job, result, now) {
                 let mut cache = lock(&CACHE);
                 cache.retain(|_, (at, u)| alive(*at, u));
                 cache.insert(job.clone(), (Instant::now(), usage));
@@ -196,18 +158,120 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     }
 }
 
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "테스트 빌드의 fetch는 네트워크 없이 Failed만 돌려준다"
-    )
-)]
+fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileUsage> {
+    match result {
+        Fetched::Usage(usage, meters) => {
+            if lock(&RETRY)
+                .remove(job)
+                .is_some_and(|retry| retry.reason.is_some())
+            {
+                tracing::info!(provider = job.1.as_str(), profile = %profile_id(&job.2), "direct usage refresh recovered");
+            }
+            super::meters::remember(&job.0, job.1, &job.2, meters);
+            Some(ProfileUsage {
+                usage,
+                updated_at: now,
+                ..ProfileUsage::default()
+            })
+        }
+        // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
+        Fetched::RateLimited(wait) => {
+            let mut retry = lock(&RETRY);
+            let entry = retry.entry(job.clone()).or_insert_with(Retry::new);
+            entry.until =
+                Instant::now() + wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
+            drop(retry);
+            mark_rate_limited(&mut lock(&CACHE), job, now);
+            None
+        }
+        Fetched::Failed(reason) => {
+            let mut retry = lock(&RETRY);
+            if retry
+                .entry(job.clone())
+                .or_insert_with(Retry::new)
+                .fail(reason, Instant::now())
+            {
+                tracing::warn!(provider = job.1.as_str(), profile = %profile_id(&job.2), reason = %reason.detail(), "direct usage refresh failed");
+            }
+            drop(retry);
+            mark_failed(&mut lock(&CACHE), job, now, reason);
+            None
+        }
+    }
+}
+
 enum Fetched {
     Usage(Usage, krill_proto::usage::AccountMeters),
     /// HTTP 429와 Retry-After. 같은 토큰을 다른 도구(Claude Code·Orca)와 함께 쓰면 자주 걸린다.
     RateLimited(Option<Duration>),
-    Failed,
+    Failed(Failure),
+}
+
+/// Only fixed diagnostics are retained; credentials and server response text never enter logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Failure {
+    Credentials,
+    Expired,
+    Request,
+    Transport,
+    Http(u16),
+    Response,
+    Internal,
+}
+
+impl Failure {
+    fn detail(self) -> String {
+        match self {
+            Self::Credentials => "사용량 자격증명 읽기 실패".into(),
+            Self::Expired => {
+                "사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요".into()
+            }
+            Self::Request => "사용량 요청 구성 실패".into(),
+            Self::Transport => "사용량 API 연결·전송 실패".into(),
+            Self::Http(401) => "사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요".into(),
+            Self::Http(403) => "사용량 API 접근 거절(HTTP 403)".into(),
+            Self::Http(code) => format!("사용량 API 응답 오류(HTTP {code})"),
+            Self::Response => "사용량 API 응답 해석 실패".into(),
+            Self::Internal => "사용량 조회 작업 실패".into(),
+        }
+    }
+}
+
+struct Retry {
+    until: Instant,
+    failures: u32,
+    reason: Option<Failure>,
+}
+
+impl Retry {
+    fn new() -> Self {
+        Self {
+            until: Instant::now(),
+            failures: 0,
+            reason: None,
+        }
+    }
+
+    /// Like the scheduler failure streak: warn once, double the wait, reset on success.
+    /// A changed reason starts a new streak; 429 only changes the deadline.
+    fn fail(&mut self, reason: Failure, now: Instant) -> bool {
+        let report = self.reason != Some(reason);
+        if report {
+            self.failures = 0;
+        }
+        self.reason = Some(reason);
+        self.failures = self.failures.saturating_add(1);
+        self.until = now + failure_wait(self.failures);
+        report
+    }
+}
+
+/// Stable diagnostic identifier without paths, account emails or credential material.
+fn profile_id(dir: &Path) -> String {
+    format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()))
+        .chars()
+        .take(12)
+        .collect()
 }
 
 /// 실행 중인 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
@@ -238,7 +302,11 @@ fn mark_rate_limited(
     now: Option<u64>,
 ) {
     match cache.get_mut(key) {
-        Some((_, u)) if u.error.is_none() && !u.usage.is_empty() => u.stale = true,
+        Some((at, u)) if alive(*at, u) && !u.usage.is_empty() => {
+            u.stale = true;
+            u.error = None;
+            u.detail = Some("사용량 API 요청 제한(429) — 마지막 성공 값".into());
+        }
         _ => {
             cache.insert(
                 key.clone(),
@@ -256,10 +324,49 @@ fn mark_rate_limited(
     }
 }
 
+/// 일시적인 조회 실패가 마지막 수치를 지우지 않게 하되, 성공 시각과 오류를 보존한다.
+/// 오래된 실패 값에는 일반 캐시 TTL을 적용한다(429의 하루 유예와 다름).
+fn mark_failed(
+    cache: &mut BTreeMap<Key, (Instant, ProfileUsage)>,
+    key: &Key,
+    now: Option<u64>,
+    reason: Failure,
+) {
+    cache.retain(|_, (at, usage)| alive(*at, usage));
+    if let Some((at, usage)) = cache.get_mut(key)
+        && alive(*at, usage)
+        && !usage.usage.is_empty()
+    {
+        usage.stale = true;
+        usage.error = Some("갱신 실패".into());
+        usage.detail = Some(format!("{} — 마지막 성공 값", reason.detail()));
+        return;
+    }
+    cache.insert(
+        key.clone(),
+        (
+            Instant::now(),
+            ProfileUsage {
+                error: Some("갱신 실패".into()),
+                detail: Some(reason.detail()),
+                updated_at: now,
+                ..ProfileUsage::default()
+            },
+        ),
+    );
+}
+
+/// 테스트용: 직접 조회가 401로 실패한 상태를 만든다(이전 정상값 없음).
+#[cfg(all(test, unix))]
+pub(super) fn fail_for_tests(home: &Path, provider: ProviderKind, dir: &Path) {
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    mark_failed(&mut lock(&CACHE), &key, None, Failure::Http(401));
+}
+
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
 #[cfg(test)]
 fn fetch(_: ProviderKind, _: &Path, _: bool, _: &Path, _: Option<&Path>) -> Fetched {
-    Fetched::Failed
+    Fetched::Failed(Failure::Internal)
 }
 
 #[cfg(not(test))]
@@ -270,34 +377,61 @@ fn fetch(
     home: &Path,
     state: Option<&Path>,
 ) -> Fetched {
-    let Some((token, account)) = credentials(provider, dir, host, home, state) else {
-        return Fetched::Failed;
+    let (token, account) = match usage_credentials(provider, dir, host, home, state) {
+        Ok(credentials) => credentials,
+        Err(reason) => return Fetched::Failed(reason),
     };
-    let mut limited = None;
-    let out = query(provider, &token, account.as_deref(), |config| {
-        let (code, retry_after, body) = curl_response(config)?;
-        if code == 429 {
-            limited = Some(retry_after);
-        }
-        (200..300).contains(&code).then_some(body)
-    });
-    let Some(mut out) = out else {
-        return limited.map_or(Fetched::Failed, Fetched::RateLimited);
+    let (usage, mut meters) = match fetch_usage(provider, &token, account.as_deref(), curl_response)
+    {
+        Fetched::Usage(usage, meters) => (usage, meters),
+        failure => return failure,
     };
+    if provider == ProviderKind::Codex {
+        codex_reset::supplement(&mut meters, &token, account.as_deref(), get_text);
+    }
     // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
     // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
     if provider == ProviderKind::Claude
         && let Some((count, expiries)) = claude_reset_credits(&token, get_text)
     {
-        out.1.meters.push(krill_proto::usage::UsageMeter {
+        meters.meters.push(krill_proto::usage::UsageMeter {
             key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
             label: krill_proto::usage::RESET_CREDITS_METER_LABEL.into(),
             window: None,
             value: Some(count.to_string()),
         });
-        out.1.meters.extend(expiries);
+        meters.meters.extend(expiries);
     }
-    Fetched::Usage(out.0, out.1)
+    Fetched::Usage(usage, meters)
+}
+
+type HttpResponse = (u16, Option<Duration>, Zeroizing<Vec<u8>>);
+
+fn fetch_usage(
+    provider: ProviderKind,
+    token: &str,
+    account: Option<&str>,
+    send: impl FnOnce(&str) -> Option<HttpResponse>,
+) -> Fetched {
+    let mut failure = Failure::Request;
+    let mut limited = None;
+    let out = query(provider, token, account, |config| {
+        failure = Failure::Transport;
+        let (code, retry_after, body) = send(config)?;
+        if code == 429 {
+            limited = Some(retry_after);
+        }
+        if !(200..300).contains(&code) {
+            failure = Failure::Http(code);
+            return None;
+        }
+        failure = Failure::Response;
+        Some(body)
+    });
+    match out {
+        Some((usage, meters)) => Fetched::Usage(usage, meters),
+        None => limited.map_or(Fetched::Failed(failure), Fetched::RateLimited),
+    }
 }
 
 /// curl GET 전송. 설정·본문에 비밀(토큰)은 로그에 남기지 않는다.
@@ -863,13 +997,13 @@ fn opencode_go_override(home: &Path, state: Option<&Path>) -> Option<Zeroizing<S
     None
 }
 
-fn credentials(
+fn other_credentials(
     provider: ProviderKind,
     dir: &Path,
     host: bool,
     home: &Path,
     state: Option<&Path>,
-) -> Option<(Zeroizing<String>, Option<String>)> {
+) -> Option<Credentials> {
     if provider == ProviderKind::OpenCode {
         if let Some(key) = opencode_go_override(home, state) {
             return Some((key, None));
@@ -904,38 +1038,87 @@ fn credentials(
             .filter(|s| !s.is_empty())?;
         return Some((Zeroizing::new(env_key), None));
     }
-    let raw = if provider == ProviderKind::Claude {
-        let user = claude_keychain_user();
-        let mut dirs = vec![dir.to_path_buf()];
-        for candidate in [
-            krill_proto::os::canonicalize(dir).ok(),
-            dir.canonicalize().ok(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !dirs.contains(&candidate) {
-                dirs.push(candidate);
-            }
+    parse_credentials(provider, &read_file(&dir.join("auth.json"))?)
+}
+
+fn credentials(
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+    home: &Path,
+    state: Option<&Path>,
+) -> Option<Credentials> {
+    usage_credentials(provider, dir, host, home, state).ok()
+}
+
+fn usage_credentials(
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+    home: &Path,
+    state: Option<&Path>,
+) -> Result<Credentials, Failure> {
+    if provider == ProviderKind::Claude {
+        return claude_credentials_at(dir, host, keychain, now_secs().saturating_mul(1000));
+    }
+    other_credentials(provider, dir, host, home, state).ok_or(Failure::Credentials)
+}
+
+/// Re-read the CLI-owned store on every attempt. Never rotate its refresh token or
+/// fall through to a different account just because the selected token expired.
+fn claude_credentials_at(
+    dir: &Path,
+    host: bool,
+    read_secret: impl Fn(&str, &str) -> Option<Zeroizing<Vec<u8>>>,
+    now_ms: i64,
+) -> Result<Credentials, Failure> {
+    let user = claude_keychain_user();
+    let mut dirs = vec![dir.to_path_buf()];
+    for candidate in [
+        krill_proto::os::canonicalize(dir).ok(),
+        dir.canonicalize().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !dirs.contains(&candidate) {
+            dirs.push(candidate);
         }
-        let accounts: &[&str] = if user == "claude-code-user" {
-            &["claude-code-user"]
-        } else {
-            &[user.as_str(), "claude-code-user"]
-        };
-        dirs.iter()
-            .find_map(|dir| {
-                let service = claude_service((!host).then_some(dir.as_path()))?;
-                accounts
-                    .iter()
-                    .find_map(|account| keychain(&service, account))
-            })
-            .or_else(|| read_file(&dir.join(".credentials.json")))
-            .or_else(|| read_file(&dir.join("credentials.json")))?
+    }
+    let accounts: &[&str] = if user == "claude-code-user" {
+        &["claude-code-user"]
     } else {
-        read_file(&dir.join("auth.json"))?
+        &[user.as_str(), "claude-code-user"]
     };
-    parse_credentials(provider, &raw)
+    let selected = dirs
+        .iter()
+        .find_map(|dir| {
+            let service = claude_service((!host).then_some(dir.as_path()))?;
+            accounts.iter().find_map(|account| {
+                let raw = read_secret(&service, account)?;
+                claude_credential(&raw, now_ms)
+            })
+        })
+        .or_else(|| {
+            [".credentials.json", "credentials.json"]
+                .iter()
+                .find_map(|name| claude_credential(&read_file(&dir.join(name))?, now_ms))
+        });
+    selected.unwrap_or(Err(Failure::Credentials))
+}
+
+fn claude_credential(raw: &[u8], now_ms: i64) -> Option<Result<Credentials, Failure>> {
+    let credentials = parse_credentials(ProviderKind::Claude, raw)?;
+    let text = credential_utf8(raw)?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if json
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|expires| expires <= now_ms)
+    {
+        return Some(Err(Failure::Expired));
+    }
+    Some(Ok(credentials))
 }
 
 fn credential_utf8(raw: &[u8]) -> Option<Zeroizing<String>> {
@@ -1015,10 +1198,7 @@ fn decode_base64(input: &str) -> Option<Zeroizing<Vec<u8>>> {
     Some(out)
 }
 
-fn parse_credentials(
-    provider: ProviderKind,
-    raw: &[u8],
-) -> Option<(Zeroizing<String>, Option<String>)> {
+fn parse_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Credentials> {
     let text = credential_utf8(raw)?;
     let mut json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let (token_path, account_path) = if provider == ProviderKind::Claude {
@@ -1315,12 +1495,6 @@ pub(crate) mod agy {
             .map(|(_, usage)| usage.clone())
     }
 
-    pub(super) fn evict(home: &Path) {
-        lock(&CACHE).retain(|(h, _), _| h != home);
-        lock(&FAILED).retain(|(h, _), _| h != home);
-        lock(&PENDING).retain(|(h, _)| h != home);
-    }
-
     /// `direct::refresh`가 `SAVE_LOCK` 없이 호출한다. 실제 실행은 스레드에서만.
     pub(super) fn refresh(
         home: &Path,
@@ -1408,52 +1582,48 @@ pub(crate) mod agy {
                 })
                 .ok()
                 .flatten();
-                // 조회 중 사용자가 직접 조회를 끄면 결과도 버린다.
-                let enabled = accounts::load_file(&job.0, state.as_deref()).direct_usage;
-                if enabled {
-                    if let Some((usage, meters)) = usage {
-                        lock(&FAILED).remove(&job);
-                        super::super::meters::remember(
-                            &job.0,
-                            ProviderKind::Antigravity,
-                            &job.1,
-                            meters,
-                        );
-                        // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
-                        // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
-                        if usage_max(&usage) < 100
-                            && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
-                        {
-                            accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
-                        }
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs());
-                        let mut cache = lock(&CACHE);
-                        cache.retain(|_, (at, _)| at.elapsed() < TTL);
-                        if cache.len() >= 256 {
-                            cache.pop_first();
-                        }
-                        cache.insert(
-                            job.clone(),
-                            (
-                                Instant::now(),
-                                ProfileUsage {
-                                    usage,
-                                    updated_at: now,
-                                    ..ProfileUsage::default()
-                                },
-                            ),
-                        );
-                    } else {
-                        let mut failed = lock(&FAILED);
-                        failed.retain(|_, at| at.elapsed() < TTL);
-                        if failed.len() >= 256 {
-                            failed.pop_first();
-                        }
-                        failed.insert(job.clone(), Instant::now());
+                if let Some((usage, meters)) = usage {
+                    lock(&FAILED).remove(&job);
+                    super::super::meters::remember(
+                        &job.0,
+                        ProviderKind::Antigravity,
+                        &job.1,
+                        meters,
+                    );
+                    // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
+                    // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
+                    if usage_max(&usage) < 100
+                        && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
+                    {
+                        accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
                     }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs());
+                    let mut cache = lock(&CACHE);
+                    cache.retain(|_, (at, _)| at.elapsed() < TTL);
+                    if cache.len() >= 256 {
+                        cache.pop_first();
+                    }
+                    cache.insert(
+                        job.clone(),
+                        (
+                            Instant::now(),
+                            ProfileUsage {
+                                usage,
+                                updated_at: now,
+                                ..ProfileUsage::default()
+                            },
+                        ),
+                    );
+                } else {
+                    let mut failed = lock(&FAILED);
+                    failed.retain(|_, at| at.elapsed() < TTL);
+                    if failed.len() >= 256 {
+                        failed.pop_first();
+                    }
+                    failed.insert(job.clone(), Instant::now());
                 }
                 lock(&PENDING).remove(&job);
             });
@@ -2095,8 +2265,198 @@ fn agy_exe() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+mod failure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_usage_failure_diagnostics_distinguish_stages_without_body_or_tokens() {
+        let reason = |result: Fetched| match result {
+            Fetched::Failed(reason) => reason,
+            _ => panic!("expected failed usage"),
+        };
+        let token = "fixture-token-never-in-diagnostic";
+        let body = b"fixture-response-never-in-diagnostic";
+        for code in [401, 403, 500] {
+            let failure = reason(fetch_usage(ProviderKind::Claude, token, None, |_| {
+                Some((code, None, body.to_vec().into()))
+            }));
+            assert_eq!(failure, Failure::Http(code));
+            assert!(failure.detail().contains(&code.to_string()));
+            assert!(!failure.detail().contains(token));
+            assert!(!failure.detail().contains("fixture-response"));
+        }
+        assert_eq!(
+            reason(fetch_usage(ProviderKind::Claude, token, None, |_| None)),
+            Failure::Transport
+        );
+        assert_eq!(
+            reason(fetch_usage(ProviderKind::Claude, token, None, |_| Some((
+                200,
+                None,
+                body.to_vec().into()
+            )))),
+            Failure::Response
+        );
+        assert_eq!(
+            reason(fetch_usage(
+                ProviderKind::Claude,
+                "bad\ntoken",
+                None,
+                |_| panic!("invalid credentials must not reach transport")
+            )),
+            Failure::Request
+        );
+        assert!(
+            matches!(fetch_usage(ProviderKind::Claude, token, None, |_| Some((429, Some(Duration::from_secs(123)), body.to_vec().into()))), Fetched::RateLimited(Some(wait)) if wait == Duration::from_secs(123))
+        );
+        assert!(
+            matches!(fetch_usage(ProviderKind::Claude, token, None, |_| Some((200, None, br#"{"five_hour":{"utilization":42}}"#.to_vec().into()))), Fetched::Usage(usage, _) if usage.five_hour.as_ref().unwrap().percent == 42)
+        );
+    }
+
+    #[test]
+    fn direct_usage_failure_detail_reaches_host_account_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("usage-diagnostic-snapshot-{}", std::process::id()));
+        let home = root.join("home");
+        let state = root.join("state");
+        let dir = accounts::host_default_dir(&home, ProviderKind::Claude);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = (home.clone(), ProviderKind::Claude, dir);
+        for reason in [
+            Failure::Expired,
+            Failure::Credentials,
+            Failure::Request,
+            Failure::Transport,
+            Failure::Http(401),
+            Failure::Http(403),
+            Failure::Response,
+            Failure::Internal,
+        ] {
+            mark_failed(&mut lock(&CACHE), &key, Some(123), reason);
+            let snap = accounts::refresh_accounts_with(&home, Some(&state), false);
+            let status = snap.status_for("claude-host").unwrap();
+            assert_eq!(status.status, krill_proto::usage::AccountStatus::Error);
+            assert_eq!(status.detail.as_deref(), Some(reason.detail().as_str()));
+            assert_eq!(status.updated_at, Some(123));
+            assert!(
+                snap.accounts
+                    .iter()
+                    .find(|a| a.id == "claude-host")
+                    .unwrap()
+                    .usage
+                    .is_empty()
+            );
+        }
+        lock(&CACHE).remove(&key);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_claude_sources_do_not_mask_current_file_credentials() {
+        let root =
+            std::env::temp_dir().join(format!("claude-source-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let primary = root.join(".credentials.json");
+        let fallback = root.join("credentials.json");
+        let valid = br#"{"claudeAiOauth":{"accessToken":"current-fixture-only"}}"#;
+        std::fs::write(&fallback, valid).unwrap();
+        for broken in [
+            b"not json".as_slice(),
+            b"{}",
+            br#"{"claudeAiOauth":{}}"#,
+            br#"{"claudeAiOauth":{"accessToken":""}}"#,
+        ] {
+            std::fs::write(&primary, broken).unwrap();
+            let found =
+                claude_credentials_at(&root, true, |_, _| Some(broken.to_vec().into()), 0).unwrap();
+            assert_eq!(&*found.0, "current-fixture-only");
+            assert_eq!(std::fs::read(&primary).unwrap(), broken);
+            assert_eq!(std::fs::read(&fallback).unwrap(), valid);
+        }
+        // 정상 키체인은 기존 우선순위를 유지한다.
+        let from_keychain = claude_credentials_at(
+            &root,
+            true,
+            |_, _| {
+                Some(
+                    br#"{"claudeAiOauth":{"accessToken":"keychain-fixture-only"}}"#
+                        .to_vec()
+                        .into(),
+                )
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(&*from_keychain.0, "keychain-fixture-only");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_refresh_retains_last_good_value_and_success_time_until_normal_ttl() {
+        let key = (
+            PathBuf::from("/failed-home"),
+            ProviderKind::Claude,
+            PathBuf::from("/failed-home/.claude"),
+        );
+        let at = Instant::now();
+        let good = ProfileUsage {
+            usage: Usage {
+                five_hour: Some(Window {
+                    percent: 42,
+                    resets_at: None,
+                }),
+                seven_day: None,
+            },
+            updated_at: Some(100),
+            ..ProfileUsage::default()
+        };
+        let mut cache = BTreeMap::from([(key.clone(), (at, good.clone()))]);
+        for now in [200, 300] {
+            mark_failed(&mut cache, &key, Some(now), Failure::Internal);
+            let (kept_at, kept) = &cache[&key];
+            assert_eq!(*kept_at, at);
+            assert_eq!(kept.usage, good.usage);
+            assert_eq!(kept.updated_at, Some(100));
+            assert!(kept.stale);
+            assert_eq!(kept.error.as_deref(), Some("갱신 실패"));
+        }
+        // 반복 실패는 마지막 성공 시각을 갱신하거나 정상 TTL을 하루로 늘리지 않는다.
+        let expired_at = at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
+        cache.get_mut(&key).unwrap().0 = expired_at;
+        assert!(!alive(expired_at, &cache[&key].1));
+        mark_failed(&mut cache, &key, Some(400), Failure::Internal);
+        assert!(cache[&key].1.usage.is_empty());
+        assert_eq!(cache[&key].1.updated_at, Some(400));
+        assert_eq!(cache[&key].1.error.as_deref(), Some("갱신 실패"));
+    }
+
+    #[test]
+    fn legacy_direct_usage_opt_out_does_not_hide_refresh_failures() {
+        let root =
+            std::env::temp_dir().join(format!("usage-disabled-completion-{}", std::process::id()));
+        let home = root.join("home");
+        let state = root.join("state");
+        let key = (home.clone(), ProviderKind::Claude, home.join(".claude"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("accounts.toml"), "direct_usage = false\n").unwrap();
+        lock(&PENDING).insert(key.clone());
+        // 사용량은 항상 자동 수집한다. 구버전 opt-out은 완료 오류를 숨기지 않는다.
+        spawn(&key, true, Some(state));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&PENDING).contains(&key) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lock(&CACHE)[&key].1.error.as_deref(), Some("갱신 실패"));
+        assert!(lock(&RETRY).contains_key(&key));
+        lock(&CACHE).remove(&key);
+        lock(&RETRY).remove(&key);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn credential_files_accept_windows_bom_encodings() {
@@ -2278,6 +2638,8 @@ mod tests {
     }
     #[test]
     fn antigravity_native_metadata_is_validated_without_a_model_turn() {
+        use std::fmt::Write as _;
+
         let raw = br#"{"auth_method":"oauth","token":{"access_token":"fixture-only"}}"#;
         assert!(parse_antigravity_auth(raw).unwrap().logged_in);
         assert!(
@@ -2290,6 +2652,16 @@ mod tests {
         let wrapped =
             b"go-keyring-base64:eyJhdXRoX21ldGhvZCI6Im9hdXRoIiwidG9rZW4iOnsiYWNjZXNzX3Rva2VuIjoiZml4dHVyZS1vbmx5In19\n";
         assert!(parse_antigravity_auth(wrapped).unwrap().logged_in);
+        let native = br#"{"auth_method":"consumer","token":{"access_token":"synthetic-access"},"id_token_email":"native@example.test"}"#;
+        let mut encoded = String::from("go-keyring-encoded:");
+        for byte in native {
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        for raw in [native.as_slice(), encoded.as_bytes()] {
+            let status = parse_antigravity_auth(raw).unwrap();
+            assert!(status.logged_in);
+            assert_eq!(status.identity.unwrap().email, "native@example.test");
+        }
         let utf16_claude: Vec<u8> = br#"{"claudeAiOauth":{"accessToken":"utf16-token"}}"#
             .iter()
             .flat_map(|&b| [b, 0])
@@ -2593,21 +2965,52 @@ mod tests {
         assert!(parse_codex_backend("bad").is_empty());
         assert!(parse_codex_backend(r#"{"rate_limit":{"primary_window":{"limit_window_seconds":60,"used_percent":100}}}"#).is_empty());
     }
+    /// 이전 버전에서 꺼 둔 설정이 남아 있어도 자동 수집 결과를 버리지 않는다.
     #[test]
-    fn disabled_setting_drops_cached_usage_without_reading_credentials() {
-        let root = std::env::temp_dir().join(format!("owe719-direct-{}", std::process::id()));
+    fn legacy_disabled_setting_keeps_automatic_usage() {
+        let root = std::env::temp_dir().join(format!("auto-usage-{}", std::process::id()));
         let home = root.join("home");
         let state = root.join("state");
-        let key = (home.clone(), ProviderKind::Claude, home.join(".claude"));
-        lock(&CACHE).insert(key.clone(), (Instant::now(), ProfileUsage::default()));
-        let file = accounts::AccountsFile {
-            direct_usage: false,
-            ..accounts::AccountsFile::default()
+        let dir = home.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let config = accounts::config_path(&home, Some(&state));
+        let raw = "direct_usage = false\n[auto_switch]\nenabled = false\n";
+        std::fs::write(&config, raw).unwrap();
+        let key = (home.clone(), ProviderKind::Claude, dir.clone());
+        let usage = Usage {
+            five_hour: Some(Window {
+                percent: 42,
+                resets_at: None,
+            }),
+            seven_day: None,
         };
-        accounts::save_file(&home, Some(&state), &file).unwrap();
+        lock(&CACHE).insert(
+            key.clone(),
+            (
+                Instant::now(),
+                ProfileUsage {
+                    usage: usage.clone(),
+                    ..ProfileUsage::default()
+                },
+            ),
+        );
         refresh(&home, Some(&state));
-        assert!(!lock(&CACHE).contains_key(&key));
-        std::fs::remove_dir_all(root).ok();
+        let snap = accounts::refresh_accounts(&home, Some(&state));
+        assert!(snap.connections.direct_usage);
+        let host = snap
+            .accounts
+            .iter()
+            .find(|a| a.id == "claude-host")
+            .unwrap();
+        assert_eq!(host.usage, usage.to_proto());
+        assert_eq!(
+            cached(&home, ProviderKind::Claude, &dir).unwrap().usage,
+            usage
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), raw);
+        lock(&CACHE).remove(&key);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 429는 마지막 정상 값은 오래됨으로 남기고, 정상 값이 없을 때는 제한 이유를 보존한다.
@@ -2635,20 +3038,24 @@ mod tests {
         let (kept_at, kept) = &cache[&key];
         assert_eq!(*kept_at, at);
         assert!(kept.stale && kept.updated_at == Some(100) && kept.usage == good.usage);
-        cache.insert(
-            key.clone(),
-            (
-                at,
-                ProfileUsage {
-                    error: Some("갱신 실패".into()),
-                    ..good
-                },
-            ),
-        );
-        mark_rate_limited(&mut cache, &key, Some(200));
+        // 성공 → 일시 실패 → 429에서도 성공 수치·시각은 그대로 남는다.
+        mark_failed(&mut cache, &key, Some(200), Failure::Internal);
+        assert!(cache[&key].1.error.is_some());
+        mark_rate_limited(&mut cache, &key, Some(201));
+        let (kept_at, kept) = &cache[&key];
+        assert_eq!(*kept_at, at);
+        assert_eq!(kept.usage, good.usage);
+        assert_eq!(kept.updated_at, Some(100));
+        assert!(kept.stale && kept.error.is_none());
+        assert!(kept.detail.as_deref().is_some_and(|s| s.contains("429")));
+        // 실패 수치의 정상 TTL이 지난 뒤에는 429가 값을 되살리면 안 된다.
+        mark_failed(&mut cache, &key, Some(202), Failure::Internal);
+        cache.get_mut(&key).unwrap().0 =
+            at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
+        mark_rate_limited(&mut cache, &key, Some(203));
         // 정상 값이 없으면 지어낸 값 없이 요청 제한 오류(조회 오류 표시)로 남는다.
         let (_, limited) = &cache[&key];
-        assert!(limited.usage.is_empty() && limited.updated_at == Some(200));
+        assert!(limited.usage.is_empty() && limited.updated_at == Some(203));
         assert_eq!(limited.error.as_deref(), Some("요청 제한"));
         cache.clear();
         mark_rate_limited(&mut cache, &key, None);

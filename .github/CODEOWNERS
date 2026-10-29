@@ -9,5 +9,6 @@
 /rustfmt.toml            @craftowen
 /deny.toml               @craftowen
 /.config/nextest.toml    @craftowen
+/.cargo/                @craftowen
 /.github/                @craftowen
 /.claude/                @craftowen

@@ -595,11 +595,16 @@ fn collect_ports_with(
                 ));
             }
         }
-    } else if let Ok(sessions) = list() {
+    } else {
+        let sessions =
+            list().map_err(|e| io::Error::other(format!("cannot list sessions: {e}")))?;
         for sid in sessions {
-            if let Ok(text) = capture(sid) {
-                entries.extend(extract_local_urls(sid, &text, probe));
-            }
+            let text = capture(sid).map_err(|e| {
+                io::Error::other(format!(
+                    "cannot scan ports: session {sid} capture failed: {e}"
+                ))
+            })?;
+            entries.extend(extract_local_urls(sid, &text, probe));
         }
     }
 
@@ -865,9 +870,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(err.to_string().contains("999"), "{err}");
-        // 전체 스캔 경로는 개별 실패를 건너뛴다(기존 동작 유지).
+        // A partial scan must not appear to be a complete successful inventory.
         let scan = args(&["--no-probe"]);
-        let entries = collect_ports_with(
+        let error = collect_ports_with(
             &scan,
             |sid| {
                 if sid == 1 {
@@ -878,9 +883,11 @@ mod tests {
             },
             || Ok(vec![1, 2]),
         )
-        .expect("scan keeps working sessions");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id, 1);
+        .unwrap_err();
+        assert!(error.to_string().contains("session 2"));
+        let error = collect_ports_with(&scan, |_| unreachable!(), || Err("daemon offline".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("daemon offline"));
     }
 
     #[test]

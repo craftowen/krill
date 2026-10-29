@@ -22,10 +22,26 @@ impl Shell {
         action: FileAction,
         cx: &mut Context<Self>,
     ) {
-        let remote = self
+        let remote = match self
             .layout
             .focused()
-            .and_then(|pane| self.remote_target_for_pane(pane));
+            .map(|pane| self.file_host_for_pane(pane))
+        {
+            Some(super::files::FileHost::Remote(host, target)) => Some((host, *target)),
+            // 전송이 없는 원격(끊김·시작 중): 같은 경로의 로컬 파일을 열거나 Finder에 보이지 않는다(APP-F01 후속).
+            Some(super::files::FileHost::Unavailable(_))
+                if matches!(action, FileAction::OpenDefault | FileAction::Reveal) =>
+            {
+                self.notice = Some(
+                    krill_app::i18n::catalog::editor::REMOTE_DISCONNECTED
+                        .get()
+                        .to_owned(),
+                );
+                cx.notify();
+                return;
+            }
+            _ => None,
+        };
         match action {
             FileAction::Open => self.open_path_link(link, cx),
             FileAction::OpenDefault => krill_app::file_format::view::spawn_open_on(

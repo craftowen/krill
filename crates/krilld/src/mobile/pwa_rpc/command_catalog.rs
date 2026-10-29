@@ -49,6 +49,32 @@ pub(super) fn load(
         remaining: MAX_VISITS,
         truncated: false,
     };
+    // Codex 0.164's native empty-session welcome screen lists these local commands.
+    // /model is consumed by the mobile composer chooser, which verifies the running CLI.
+    if agent == "codex" {
+        for (name, description) in [
+            (
+                "init",
+                "Create an AGENTS.md file with instructions for Codex",
+            ),
+            ("status", "Show current session configuration"),
+            ("permissions", "Choose what Codex is allowed to do"),
+            ("model", "Choose the model for this chat session"),
+            ("review", "Review changes and find issues"),
+        ] {
+            let text = format!("/{name}");
+            scan.items.insert(
+                text.clone(),
+                Item {
+                    name: name.into(),
+                    text,
+                    description: description.into(),
+                    kind: "Command",
+                    scope: "Built-in",
+                },
+            );
+        }
+    }
     // CLI가 부모 프로젝트의 지시도 읽으므로 가까운 작업 폴더부터 위로 찾는다.
     for parent in cwd.ancestors().take(32) {
         if parent == home {

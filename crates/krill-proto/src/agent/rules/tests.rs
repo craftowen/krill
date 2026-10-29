@@ -202,3 +202,29 @@ fn builtin_screen_rules_match_previous_behavior() {
     assert!(!rules.is_prompt("❯ 1. Yes"));
     assert!(!rules.is_prompt("> Yes, I trust this folder"));
 }
+
+#[test]
+fn codex_pending_questions_require_the_queue_footer() {
+    for screen in [
+        "• Working (14m 03s • esc to interrupt)\n• Queued follow-up inputs\n  ? 1 question\n  ⇧← to answer\n\n› Ask Codex to do anything",
+        "• Queued follow-up inputs\n  ? 12 questions\n  shift+left to answer\n›",
+    ] {
+        assert!(has_pending_question(screen), "{screen}");
+    }
+    for screen in [
+        "• Queued follow-up inputs\n  run tests\n  ↑ to edit\n›",
+        "• Queued follow-up inputs\n  ? 0 questions\n  ⇧← to answer\n›",
+        "• Queued follow-up inputs\n  ? 1 question\n›",
+        "? 1 question\n⇧← to answer\n›",
+        "Explaining Queued follow-up inputs and 1 question to answer",
+        "• Queued follow-up inputs\n  ? 1 question\n\nSome other output\n⇧← to answer",
+    ] {
+        assert!(!has_pending_question(screen), "{screen}");
+    }
+    // 출력 본문에 남은 예시를 현재 footer로 오인하지 않는다.
+    let old = format!(
+        "• Queued follow-up inputs\n  ? 1 question\n  ⇧← to answer\n{}",
+        "output\n".repeat(20)
+    );
+    assert!(!has_pending_question(&old));
+}

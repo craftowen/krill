@@ -124,12 +124,6 @@ pub(crate) fn nonblocking(pipe: &impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
-/// 익명 파이프 비차단 읽기는 Windows에 없다(Phase 3에서 리더 스레드로 바꾼다).
-#[cfg(windows)]
-pub(crate) fn nonblocking(_pipe: &impl AsFd) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
 /// 열린 파이프 중 하나가 읽을 거리·EOF를 가질 때까지 최대 `timeout` 기다린다(sleep 폴링 대신 poll(2)).
 /// 열린 파이프가 없으면(둘 다 EOF, 자식 종료 대기) 1ms만 쉬어 바쁜 루프를 막는다. poll 오류·EINTR은 바로
 /// 돌아가 호출자가 다시 읽고 판단한다.

@@ -33,7 +33,8 @@ try {
     $env:PROCESSOR_ARCHITECTURE = 'AMD64'
     $env:PROCESSOR_ARCHITEW6432 = ''
     $env:LOCALAPPDATA = $root
-    foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe')) {
+    New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/x64') -Force | Out-Null
+    foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64/OpenConsole.exe')) {
         Set-Content -LiteralPath (Join-Path $root "source/Krill/$name") -Value 'fixture'
     }
     $state.Fixture = Join-Path $root 'fixture.zip'
@@ -92,6 +93,16 @@ try {
     $env:OS = 'Other'
     Reject 'wrong-os' 'requires Windows'
     $env:OS = 'Windows_NT'
+
+    foreach ($backend in @('conpty.dll', 'x64\OpenConsole.exe')) {
+        $source = Join-Path $root "source/Krill/$backend"
+        $bytes = [IO.File]::ReadAllBytes($source)
+        Remove-Item -LiteralPath $source
+        $invalid = Join-Path $root ('missing-backend-' + [guid]::NewGuid().ToString('N') + '.zip')
+        Compress-Archive -Path (Join-Path $root 'source/Krill') -DestinationPath $invalid
+        Reject ('missing-backend-' + [guid]::NewGuid().ToString('N')) ('missing ' + [regex]::Escape($backend)) @{ Zip = $invalid }
+        [IO.File]::WriteAllBytes($source, $bytes)
+    }
 
     Remove-Item -LiteralPath (Join-Path $root 'source/Krill/krilld.exe')
     $incomplete = Join-Path $root 'incomplete.zip'

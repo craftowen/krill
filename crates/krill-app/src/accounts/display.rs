@@ -127,6 +127,7 @@ pub struct AccountDisplay {
     pub label: &'static str,
     pub updated: String,
     pub faded: bool,
+    pub detail: Option<String>,
 }
 
 pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64) -> AccountDisplay {
@@ -160,6 +161,11 @@ pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64)
         faded: info.stale
             || kind == AccountStatus::Stale
             || krill_proto::usage::is_updated_stale(updated, now),
+        detail: status
+            .and_then(|s| s.detail.as_deref())
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+            .map(str::to_owned),
     }
 }
 
@@ -231,23 +237,64 @@ pub fn render_status(
         _ => crate::ui::BadgeTone::Muted,
     };
     let debug_id = id.clone();
+    let detail_id = format!("{id}-detail");
+    let label = match &info.detail {
+        Some(detail) => format!("{} · {} · {detail}", info.label, info.updated),
+        None => format!("{} · {}", info.label, info.updated),
+    };
     div()
         .id(gpui::SharedString::from(id))
         .debug_selector(move || debug_id.clone())
         .role(gpui::Role::Status)
-        .aria_label(format!("{} · {}", info.label, info.updated))
+        .aria_label(label)
+        .w_full()
+        .min_w_0()
         .flex()
-        .items_center()
-        .gap_2()
+        .flex_col()
+        .gap_1()
         .text_size(crate::ui::TEXT_2XS)
-        .child(crate::ui::badge(p, tone, info.label))
         .child(
             div()
-                .text_color(
-                    p.muted_foreground
-                        .opacity(if info.faded { 0.55 } else { 1.0 }),
-                )
-                .child(info.updated.clone()),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(crate::ui::badge(p, tone, info.label))
+                .child(
+                    div()
+                        .text_color(
+                            p.muted_foreground
+                                .opacity(if info.faded { 0.55 } else { 1.0 }),
+                        )
+                        .child(info.updated.clone()),
+                ),
+        )
+        // Reserve one line even without a diagnostic so polling does not move
+        // the account details or their actions when a failure arrives.
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .h_4()
+                .children(info.detail.as_ref().map(|detail| {
+                    let tooltip = detail.clone();
+                    let selector = detail_id.clone();
+                    div()
+                        .id(gpui::SharedString::from(detail_id.clone()))
+                        .debug_selector(move || selector.clone())
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(p.muted_foreground)
+                        .child(detail.clone())
+                        .tooltip(move |window, cx| {
+                            crate::ui::tooltip_view(
+                                "account-usage-diagnostic",
+                                tooltip.clone(),
+                                window,
+                                cx,
+                            )
+                        })
+                })),
         )
 }
 
@@ -344,6 +391,7 @@ mod tests {
             label: "",
             updated: String::new(),
             faded: false,
+            detail: None,
         };
         let mut snap = AccountsSnapshot::default();
         for (usage, want) in [
@@ -429,6 +477,15 @@ mod tests {
         assert!(account(&info, Some(&status), 6801).faded);
         status.updated_at = None;
         assert!(account(&info, Some(&status), 5000).faded);
+        status.status = AccountStatus::Error;
+        status.detail = Some("  usage API returned HTTP 403  ".into());
+        assert_eq!(
+            account(&info, Some(&status), 5000).detail.as_deref(),
+            Some("usage API returned HTTP 403")
+        );
+        status.detail = Some(" \n ".into());
+        assert!(account(&info, Some(&status), 5000).detail.is_none());
+        assert!(account(&info, None, 5000).detail.is_none());
         assert_eq!(
             updated_text(None, 5000),
             text::ACCOUNT_UPDATED_UNKNOWN.get()

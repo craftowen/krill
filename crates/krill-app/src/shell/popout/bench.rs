@@ -1,6 +1,7 @@
 //! 실제 Metal 창의 MK-098 재현 측정. 데몬/실제 에이전트 없이 고정된 10세션 화면을 쓴다.
 //! `KRILL_STATE_DIR` 격리 + onboarding.done 생성 후 krill-app --popout-bench=terminal|dashboard|both.
 //! `--popout-bench=accounts`는 같은 합성 계정으로 실제 상태바 팝업을 수동 확인한다.
+//! `KRILL_BENCH_REMOTE_HOSTS=5`로 합성 원격 기기가 많은 팝업도 재현한다.
 //! `--popout-bench=chat`은 데몬 없이 실제 채팅 화면의 레이아웃과 상호작용을 확인한다.
 
 mod chat;
@@ -241,6 +242,18 @@ pub(crate) fn run(mode: String) -> ExitCode {
                     shell._config_observer = cx.observe_global::<krill_app::settings::Config>(|_, cx| cx.notify());
                 }
                 shell.accounts_snapshot = account_popup_snapshot().into();
+                if let Ok(count) = std::env::var("KRILL_BENCH_REMOTE_HOSTS")
+                    && let Ok(count) = count.parse::<usize>()
+                {
+                    for i in 0..count.min(32) {
+                        let id = format!("popup-preview-{i}");
+                        shell.host_statuses.push((krill_app::hosts::RemoteHostSpec {
+                            id: id.clone(), label: format!("Synthetic remote {i}"), address: id.clone(),
+                            port: None, identity_file: None, remote_socket: None,
+                        }, krill_app::hosts::HostStatus::Connected));
+                        shell.remote_accounts.insert(krill_app::hosts::HostId::Remote(id), shell.accounts_snapshot.clone());
+                    }
+                }
                 shell.notice = Some("Synthetic account popup preview".into());
                 let accounts = shell.accounts_snapshot.clone();
                 shell.sidebar.update(cx, |s, cx| {

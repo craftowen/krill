@@ -1164,3 +1164,131 @@ fn file_tabs_and_previews_keep_identical_paths_on_different_hosts_separate() {
     assert_eq!(layout.host(remote_preview), &remote);
     assert!(layout.is_valid());
 }
+
+/// APP-RUNTIME-004: 시작 복원이 끝나기 전 임시 기본 레이아웃에서 연 탭은 원래 `PaneId`를 그대로 유지한 채 복원한
+/// 레이아웃 뒤에 붙고, 저장된 탭·분할·세션·호스트·파일 매핑은 충돌 없는 새 `PaneId`로 옮겨 의미 그대로 보존된다.
+/// 아무 의도 없는 placeholder 탭은 버리고, 런타임/입력 의도가 걸린 탭·확대·미리보기·열 너비는 유지한다.
+#[test]
+fn startup_edits_are_appended_to_the_restored_layout() {
+    let mut saved = Layout::default();
+    saved.set_session(PaneId(0), SessionId(7));
+    saved.new_tab();
+    saved.split(Axis::Horizontal);
+    saved.set_zoomed_pane(Some(PaneId(2)));
+    saved.set_host(PaneId(2), HostId::Remote("box".into()));
+    saved.set_tab_title(1, Some("work"));
+    let _saved_file = saved.open_file(PathBuf::from("/tmp/notes.txt"));
+    let expected_tab_count = saved.tabs().len();
+
+    let baseline = Layout::default();
+    let mut edited = baseline.clone();
+    // 로딩 중 Cmd+T + 분할 + 확대 + 단일 클릭 미리보기 + 열 너비 조절.
+    edited.new_tab();
+    let early_first = edited.focused().unwrap();
+    assert_eq!(early_first, PaneId(1));
+    edited.split(Axis::Vertical);
+    let early_second = edited.focused().unwrap();
+    edited.set_zoomed_pane(Some(early_second));
+    edited.set_launch(
+        early_first,
+        Create {
+            account: None,
+            program: Program::Login,
+            cwd: b"/work".to_vec(),
+            cols: 80,
+            rows: 24,
+        },
+    );
+    edited.set_host(early_first, HostId::Remote("box".into()));
+    let preview_pane = edited.open_file_preview(PathBuf::from("/tmp/preview-a.rs"));
+    edited.sidebar_collapsed = true;
+    edited.sidebar_width = 312.0;
+    edited.panel_width = 428.0;
+
+    let empty_panes = BTreeSet::new();
+    let empty_tabs = BTreeSet::new();
+    let mut merged = saved.clone();
+    let tab_map = merged.absorb_startup_edits(&baseline, &edited, &empty_panes, &empty_tabs);
+    assert!(merged.is_valid());
+    assert_eq!(merged.tabs().len(), expected_tab_count + 2);
+    assert_eq!(tab_map.get(&1).copied(), Some(expected_tab_count));
+    assert_eq!(tab_map.get(&2).copied(), Some(expected_tab_count + 1));
+    assert!(
+        !tab_map.contains_key(&0),
+        "untouched placeholder is dropped"
+    );
+
+    // 저장된 탭들의 구조·세션·호스트·확대·사용자 제목·파일 경로가 그대로 살아남는다.
+    let restored_tab0 = merged.tab_panes(0);
+    assert_eq!(restored_tab0.len(), 1);
+    assert_eq!(merged.session(restored_tab0[0]), Some(SessionId(7)));
+
+    let restored_tab1 = merged.tab_panes(1);
+    assert_eq!(restored_tab1.len(), 2);
+    assert_eq!(merged.tabs()[1].focused, restored_tab1[1]);
+    assert_eq!(merged.host(restored_tab1[1]), &HostId::Remote("box".into()));
+    assert_eq!(merged.tab_title(1), Some("work"));
+
+    let restored_tab2 = merged.tab_panes(2);
+    assert_eq!(restored_tab2.len(), 1);
+    assert_eq!(
+        merged.file(restored_tab2[0]),
+        Some(Path::new("/tmp/notes.txt"))
+    );
+
+    // 초기 편집 탭의 PaneId는 바뀌지 않고 저장본과도 겹치지 않는다.
+    let restored_all: BTreeSet<PaneId> = (0..expected_tab_count)
+        .flat_map(|idx| merged.tab_panes(idx))
+        .collect();
+    assert!(!restored_all.contains(&early_first));
+    assert!(!restored_all.contains(&early_second));
+    assert!(!restored_all.contains(&preview_pane));
+    assert_eq!(
+        merged.tab_panes(expected_tab_count),
+        vec![early_first, early_second]
+    );
+    assert_eq!(
+        merged.launch(early_first).map(|c| c.cwd.as_slice()),
+        Some(&b"/work"[..])
+    );
+    assert_eq!(merged.host(early_first), &HostId::Remote("box".into()));
+    assert_eq!(merged.active(), expected_tab_count + 1);
+    assert_eq!(
+        merged.file(preview_pane),
+        Some(Path::new("/tmp/preview-a.rs"))
+    );
+    // 단일 클릭 미리보기 슬롯도 유지되어 다음 미리보기가 같은 칸을 재사용한다.
+    let reused = merged.open_file_preview(PathBuf::from("/tmp/preview-b.rs"));
+    assert_eq!(reused, preview_pane);
+    assert!(merged.sidebar_collapsed);
+    assert!((merged.sidebar_width - 312.0).abs() < f32::EPSILON);
+    assert!((merged.panel_width - 428.0).abs() < f32::EPSILON);
+
+    merged.activate(1);
+    assert_eq!(merged.zoomed_pane(), Some(restored_tab1[1]));
+    merged.activate(expected_tab_count);
+    assert_eq!(merged.zoomed_pane(), Some(early_second));
+
+    // 아무것도 하지 않았으면(placeholder 탭만) 저장본이 그대로다.
+    let mut untouched = saved.clone();
+    let map = untouched.absorb_startup_edits(&baseline, &baseline, &empty_panes, &empty_tabs);
+    assert!(map.is_empty());
+    assert_eq!(untouched, saved);
+
+    // placeholder 탭에 초기 입력/런타임 의도가 걸려 있으면 버리지 않고 원래 PaneId(0) 그대로 뒤에 남긴다.
+    let retained_panes = BTreeSet::from([PaneId(0)]);
+    let mut with_input = saved.clone();
+    let map = with_input.absorb_startup_edits(&baseline, &baseline, &retained_panes, &empty_tabs);
+    assert!(with_input.is_valid());
+    assert_eq!(map.get(&0).copied(), Some(expected_tab_count));
+    assert_eq!(with_input.tab_panes(expected_tab_count), vec![PaneId(0)]);
+    assert_eq!(with_input.active(), expected_tab_count);
+
+    // placeholder 탭을 닫기만 한 경우(보이는 탭 없음)도 저장본의 활성 탭을 유지한다.
+    let mut closed = baseline.clone();
+    closed.close_tab(0);
+    let mut kept = saved.clone();
+    kept.absorb_startup_edits(&baseline, &closed, &empty_panes, &empty_tabs);
+    assert_eq!(kept.tabs(), saved.tabs());
+    assert_eq!(kept.active(), saved.active());
+}

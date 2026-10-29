@@ -104,9 +104,18 @@ fn manual_reimport_repairs_old_paths_and_current_lineage_without_duplicates() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let child = format!("{repo}/child");
-    let legacy = format!("{repo}/legacy");
-    let removed = format!("{repo}/removed-child");
+    let child = Path::new(&repo)
+        .join("child")
+        .to_string_lossy()
+        .into_owned();
+    let legacy = Path::new(&repo)
+        .join("legacy")
+        .to_string_lossy()
+        .into_owned();
+    let removed = Path::new(&repo)
+        .join("removed-child")
+        .to_string_lossy()
+        .into_owned();
     let bad = format!("{repo}::workspace:{INSTANCE}");
     let opts = ImportOptions {
         home: root.join("home"),

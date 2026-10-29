@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.32"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/craftowen/krill"
 homepage = "https://krill.page"
 
 [workspace.dependencies]
+base64 = "0.22.1"
 same-file = "1.0.6"
 krill-proto = { path = "crates/krill-proto" }
 krill-term = { path = "crates/krill-term" }
@@ -44,6 +45,8 @@ alacritty_terminal = { version = "=0.26.0", default-features = false }
 # krilld 세그먼트 저장소(MK-024): zstd 하나(ARCHITECTURE §3), 청크 체크섬.
 zstd = { version = "0.14.2", default-features = false }
 crc32fast = "1.5.2"
+# Read-only, bounded OpenCode SQLite transcript compatibility.
+rusqlite = { version = "=0.41.0", default-features = false, features = ["bundled", "hooks", "limits"] }
 # krilld 전역 할당기: macOS 기본 malloc은 해제한 핫 스크롤백(200열 행 4,800B)을 footprint로 돌려주지 않는다.
 # decay 설정은 ctl의 안전 API로 한다.
 tikv-jemallocator = "0.7.0"

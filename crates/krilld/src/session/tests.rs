@@ -289,7 +289,9 @@ fn guarded_rebuilds_engine_after_panic() {
             generation: 0,
         }),
         changed: Condvar::new(),
+        paused: AtomicBool::new(false),
         store: None,
+        reader: Mutex::new(None),
     };
     // panic한 묶음은 `false`를 돌리고, 원본 끝은 먹은 바이트만큼 민다.
     // 복구 엔진은 시작 크기가 아니라 현재 크기(리사이즈 반영)로 만든다(K-19).

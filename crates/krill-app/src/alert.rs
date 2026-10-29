@@ -27,7 +27,7 @@ const SLEEP_REASON: &str = "Krill agent working";
 
 enum AwakeCommand {
     Set(bool),
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     Barrier(mpsc::Sender<()>),
 }
 
@@ -51,7 +51,7 @@ impl AwakeWorker {
                         }
                         AwakeCommand::Set(false) => assertion = None,
                         AwakeCommand::Set(true) => {}
-                        #[cfg(test)]
+                        #[cfg(all(test, target_os = "macos"))]
                         AwakeCommand::Barrier(done) => {
                             done.send(()).ok();
                         }

@@ -47,6 +47,29 @@ pub fn run(raw_args: &[OsString]) -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    if host.is_some()
+        && let Some(command) = args.first().and_then(|arg| arg.to_str())
+        && matches!(
+            command,
+            "cleanup"
+                | "clean"
+                | "space"
+                | "list"
+                | "ls"
+                | "show"
+                | "current"
+                | "set"
+                | "symlink"
+                | "symlinks"
+                | "hooks"
+                | "hook"
+        )
+    {
+        eprintln!(
+            "worktree {command}: --host is unsupported; refusing to operate on local worktrees"
+        );
+        return ExitCode::from(2);
+    }
     let target = match Target::establish(host) {
         Ok(target) => target,
         Err(e) => {
@@ -222,7 +245,7 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
         let repo_path = repo.or(parent).ok_or_else(|| {
             "remote worktree new requires --repo <absolute path on the remote host>".to_owned()
         })?;
-        if !repo_path.as_os_str().as_bytes().starts_with(b"/") {
+        if !crate::remote::is_remote_absolute_path(repo_path.as_os_str().as_bytes()) {
             return Err("remote --repo must be an absolute path on the remote host".to_owned());
         }
         return Ok(ParsedNew {
@@ -904,6 +927,18 @@ fn run_hooks(args: &[OsString]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_new_accepts_windows_repository_roots_without_local_resolution() {
+        for repo in [r"C:\remote\repo", "C:/remote/repo", r"\\server\share\repo"] {
+            let args: Vec<_> = ["new", "child", "--repo", repo, "--setup", "skip"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect();
+            let parsed = super::parse_with_remote(&args, true).unwrap();
+            assert_eq!(parsed.req.repo, repo.as_bytes());
+        }
+    }
+
     use super::*;
 
     #[test]

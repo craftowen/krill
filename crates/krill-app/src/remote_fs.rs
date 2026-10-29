@@ -353,8 +353,17 @@ pub fn save_atomic(
     text: &str,
     expected: Option<Stamp>,
 ) -> Result<Stamp, SaveError> {
+    save_atomic_bytes(target, path, text.as_bytes(), expected)
+}
+
+/// [`save_atomic`]의 바이트판(클립보드 이미지 등 원격 첨부 업로드).
+pub fn save_atomic_bytes(
+    target: &HostTarget,
+    path: &Path,
+    data: &[u8],
+    expected: Option<Stamp>,
+) -> Result<Stamp, SaveError> {
     static STAGE_SEQ: AtomicU64 = AtomicU64::new(1);
-    let data = text.as_bytes();
     let chunk_limit = MAX_REMOTE_CHUNK;
     let expected_wire = expected.map(Stamp::to_wire);
 

@@ -32,7 +32,19 @@ create the remote worktree separately and pass its exact remote path. Resolve ex
 facts on the execution host, not by interpreting remote paths locally.
 Do not silently fall back to local execution if the remote command fails.
 
+This targets the remote Krill state and execution host; it is not Orca's `--on`
+placement with a locally authoritative Run. Krill does not accept `--on`, remote
+`new-child`, or `--worktree new-top-level` in worker-start. Use the documented
+worktree commands separately when those placements are needed.
+
 When a remote run is active, keep that host target on follow-up calls and in the
 worker assignment. Network loss is not proof a worker exited. Preserve the
 session and reports until the host can confirm its state. Do not copy Orca remote
 placement flags into Krill or claim runtime capabilities that this CLI lacks.
+
+For mixed versions, obtain the guide and command help from the execution host.
+If an orchestration action is rejected as unsupported or lacks a required
+capability, inspect the compatibility limit and use a compatible binary/daemon.
+Do not manually replay that rejected mutation against client-local state.
+Never translate an old worker's IDs into a newly created attempt or invent a
+legacy-takeover command; preserve its process and report the compatibility limit.

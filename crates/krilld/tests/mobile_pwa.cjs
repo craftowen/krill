@@ -126,7 +126,7 @@ for(let n=0;n<128;n++){const bytes=crypto.randomBytes(n);try{T.update(bytes,{col
 assert.equal(sandbox.KrillMobile.terminal.keys.length,24);
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
-const env={...process.env,KRILL_STATE_DIR:dir,HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'.claude'),CODEX_HOME:path.join(home,'.codex'),TMPDIR:path.join(dir,'paste')};
+const env={...process.env,KRILL_TEST_OFFLINE:'1',KRILL_STATE_DIR:dir,HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'.claude'),CODEX_HOME:path.join(home,'.codex'),TMPDIR:path.join(dir,'paste')};
 const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,webhookServer,files=[];
 const deadline=setTimeout(()=>{console.error('PWA E2E deadline exceeded');cleanup();process.exit(1);},150_000);
 function cli(args){return execFileSync(mk,args,{env,encoding:'utf8',timeout:20000,stdio:['ignore','pipe','pipe']}).trim();}
@@ -200,6 +200,28 @@ async function connect(url,credential){
   const same=await phone.rpc({action:'snapshot',since:data.etag});assert.deepEqual(same,{unchanged:true,etag:data.etag});const card=data.sessions.find(s=>s.id===session);assert(card);assert.equal(card.state,'Waiting');assert.equal(card.branch,'mobile-test');assert.equal(card.added,1);assert(card.lines.some(l=>l.includes('READY')));assert(data.orchestration.gates.some(g=>g.id===gateId));assert(data.orchestration.tasks.length>=1);assert(data.orchestration.questions.some(q=>q.id===question.id));assert(!data.orchestration.questions.some(q=>q.id===internalQuestion.id));
   const commandCatalog=await phone.rpc({action:'command_catalog',session});assert.equal(commandCatalog.agent,'claude');assert(commandCatalog.items.some(c=>c.text==='/mobile-check'&&c.scope==='Project'));assert(commandCatalog.items.some(c=>c.text==='/mobile-review'&&c.kind==='Command'));assert(commandCatalog.items.some(c=>c.text==='/mobile-global'&&c.scope==='Global'));assert(!commandCatalog.items.some(c=>c.text==='/codex-only'));assert(!JSON.stringify(commandCatalog).includes('Private instructions'));
   await assert.rejects(phone.rpc({action:'command_catalog',session:999999999}));await assert.rejects(phone.rpc({action:'command_catalog',session,cwd:'/tmp/forged'}));
+  assert.equal(data.capabilities.command_catalog,true);
+  assert.equal(data.capabilities.mention_files,true);
+  const mentionDir=path.join(repo,'src');fs.mkdirSync(mentionDir,{recursive:true});
+  fs.writeFileSync(path.join(mentionDir,'한글 file.rs'),'PRIVATE FILE CONTENT');
+  fs.writeFileSync(path.join(repo,'.env'),'PRIVATE ENV CONTENT');
+  const outsideMention=path.join(dir,'outside-mention');fs.mkdirSync(outsideMention);fs.writeFileSync(path.join(outsideMention,'outside-only.txt'),'OUTSIDE CONTENT');
+  fs.symlinkSync(outsideMention,path.join(mentionDir,'outside-link'));
+  const mentions=await phone.rpc({action:'mention_files',session,query:'한글'});
+  assert(mentions.items.some(item=>item.path==='src/한글 file.rs'));
+  assert(!JSON.stringify(mentions).includes('PRIVATE FILE CONTENT'));
+  const outsideFiles=await phone.rpc({action:'mention_files',session,query:'outside-only'});assert.equal(outsideFiles.items.length,0);
+  const envFiles=await phone.rpc({action:'mention_files',session,query:'.env'});assert(!envFiles.items.some(item=>item.path==='.env'));
+  await assert.rejects(phone.rpc({action:'mention_files',session:999999999,query:'example'}));
+  await assert.rejects(phone.rpc({action:'mention_files',session,query:'example',cwd:outsideMention}));
+  console.log('PASS real daemon file mentions: selected workspace, Korean/spaced relative paths, metadata only, hidden secret/symlink exclusion and forged target rejection');
+  assert.equal(data.capabilities.composer_models,true);
+  const modelScreen=cli(['read',String(session)]),modelCatalog=await phone.rpc({action:'composer_models',session});
+  assert.equal(modelCatalog.agent,'claude');assert.equal(modelCatalog.supported,false,'a hook name alone cannot authorize model control for a mock shell');
+  assert.equal(modelCatalog.current,null);assert.equal(cli(['read',String(session)]),modelScreen,'model discovery must not type into the session');
+  for(const request of [{session:999999999,model:'opus'},{session,model:'bad\ncommand'},{session,model:'../../forged'},{session,model:'opus',cwd:outsideMention}])await assert.rejects(phone.rpc({action:'set_model',...request}));
+  assert.equal(cli(['read',String(session)]),modelScreen,'invalid model requests must not alter native input');
+  console.log('PASS real daemon model control: read-only discovery, native-layout authority, unknown current, forged session/path/model rejection and unchanged PTY');
   const quickSaved=await phone.rpc({action:'set_quick_commands',commands:[{name:'mobile-check',text:'/mobile-check'}]});assert.equal(quickSaved.quick_commands[0].text,'/mobile-check');assert.equal((await phone.rpc({action:'snapshot'})).quick_commands[0].text,'/mobile-check');await phone.rpc({action:'set_quick_commands',commands:[]});
   console.log('PASS real daemon CLI command catalog: scoped project/global metadata, safe invocation, forbidden session/path rejection and quick-command persistence');
   const latestChat=await phone.rpc({action:'chat_poll',session,latest:true});

@@ -138,6 +138,7 @@ fn session_row_shows_name_and_click_emits_open(cx: &mut TestAppContext) {
             Ok(self.0.clone())
         }
     }
+    cx.update(gpui_component::init);
     let sidebar = cx.update(|cx| cx.new(|_| crate::sidebar::Sidebar::new(None)));
     sidebar.update(cx, |s, cx| {
         s.connect_source(

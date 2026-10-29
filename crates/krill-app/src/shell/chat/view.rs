@@ -542,7 +542,7 @@ impl Shell {
             window.focus(&self.focus, cx);
             self.chat.focus_pending = None;
         }
-        if !self.is_session_chat_view(session, cx) {
+        if !self.is_pane_chat_view(pane, cx) {
             return None;
         }
         self.ensure_chat_poll_timer(cx);
@@ -753,7 +753,7 @@ impl Shell {
                         .xsmall()
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.chat.set_session_chat_view(session, false);
+                                this.set_pane_chat_view(pane, false, cx);
                                 this.chat.focus_pending = None;
                                 window.focus(&this.focus, cx);
                                 cx.notify();

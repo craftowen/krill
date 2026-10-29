@@ -24,6 +24,13 @@ fn agent_status_hooks_default_on_and_fail_closed_on_unreadable_settings() {
 }
 
 #[test]
+fn unusable_configured_terminal_font_is_logged_once_per_value() {
+    assert!(warn_terminal_font_fallback_once("NoMGlyph", "Menlo"));
+    assert!(!warn_terminal_font_fallback_once("NoMGlyph", "Menlo"));
+    assert!(warn_terminal_font_fallback_once("Other", "Menlo"));
+}
+
+#[test]
 fn first_launch_locale_matches_korean_primary_subtag_else_english() {
     for locale in ["ko", "ko-KR", "ko_KR.UTF-8", "KO-kr", " ko@modifier "] {
         assert_eq!(
@@ -1210,13 +1217,15 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
         ProviderKind::OpenCode,
     ] {
         assert!(
-            crate::ui::icons::provider_svg_bytes(provider).starts_with(b"<svg"),
+            std::str::from_utf8(crate::ui::icons::provider_svg_bytes(provider))
+                .is_ok_and(|svg| svg.contains("<svg")),
             "missing svg for {provider:?}"
         );
     }
     for agent_id in ["claude", "codex", "agy", "cursor", "opencode"] {
         assert!(
-            crate::ui::icons::agent_svg_bytes(agent_id).starts_with(b"<svg"),
+            std::str::from_utf8(crate::ui::icons::agent_svg_bytes(agent_id))
+                .is_ok_and(|svg| svg.contains("<svg")),
             "missing svg for {agent_id}"
         );
     }
@@ -1910,7 +1919,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     fs::remove_dir_all(&root).ok();
     fs::create_dir_all(&root).unwrap();
 
-    // Claude: 사용자 테마·기존 훅을 살리고 4개 이벤트에 matcher 없는 항목을 추가한다.
+    // Claude: 사용자 테마·기존 훅을 살리고 5개 이벤트에 matcher 없는 항목을 추가한다.
     let claude_path = root.join("settings.json");
     let claude_before = r#"{"theme": "dark", "hooks": {"PreToolUse": [{"command": "user-hook"}]}}"#;
     fs::write(&claude_path, claude_before).unwrap();
@@ -1926,6 +1935,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
             "PostToolUse": [ours],
             "Stop": [ours],
             "SessionStart": [ours],
+            "UserPromptSubmit": [ours],
         },
     });
     assert_eq!(
@@ -4934,9 +4944,9 @@ fn owe719_single_in_use_marker_moves_with_switch(cx: &mut TestAppContext) {
 }
 
 /// OWE-719 (1): 데몬 연결 꼬리가 "연결됨"이면 사용량 상태가 로그인 필요여도 "다시 로그인"을 주 동작으로 띄우지
-/// 않는다. 꼬리가 로그인 필요면 띄운다. 꼬리를 지원하는 데몬일 때만 "사용량 직접 조회" 토글이 보인다.
+/// 않는다. 꼬리가 로그인 필요면 띄운다. 사용량 수집 설정은 데몬 지원 여부와 관계없이 노출하지 않는다.
 #[gpui::test]
-fn owe719_connection_tail_drives_login_action_and_direct_usage_toggle(cx: &mut TestAppContext) {
+fn connection_tail_drives_login_action_without_usage_setting(cx: &mut TestAppContext) {
     use krill_proto::usage::{
         AccountConnection, AccountInfo, AccountStatus, AccountStatusInfo, ConnectionStatus,
         ConnectionsSnapshot, ProviderKind, Snapshot,
@@ -4992,7 +5002,7 @@ fn owe719_connection_tail_drives_login_action_and_direct_usage_toggle(cx: &mut T
         vcx.debug_bounds("admin-account-status-claude-work")
             .is_some()
     );
-    assert!(vcx.debug_bounds("admin-direct-usage-toggle").is_some());
+    assert!(vcx.debug_bounds("admin-direct-usage-toggle").is_none());
     set(vcx, Some(ConnectionStatus::NeedsLogin));
     assert!(
         vcx.debug_bounds("admin-login-account-claude-work")
@@ -5106,10 +5116,10 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-719 QA D4 + OWE-793: "사용량 직접 조회"·"자동 계정 전환"이 다른 불리언 설정과 같은
+/// OWE-719 QA D4 + OWE-793: "자동 계정 전환"이 다른 불리언 설정과 같은
 /// `ui::switch` 트랙·썸 스위치로 렌더링되며 클릭할 때마다 상태와 썸 위치가 전환된다.
 #[gpui::test]
-fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
+fn account_auto_switch_uses_switch_primitive(cx: &mut TestAppContext) {
     use krill_proto::usage::ConnectionsSnapshot;
 
     let d = dir("owe719-segments");
@@ -5128,12 +5138,7 @@ fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
         });
     });
     vcx.run_until_parked();
-    for id in [
-        "admin-direct-usage-toggle",
-        "admin-direct-usage-toggle-thumb",
-        "admin-auto-switch-toggle",
-        "admin-auto-switch-toggle-thumb",
-    ] {
+    for id in ["admin-auto-switch-toggle", "admin-auto-switch-toggle-thumb"] {
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
     let enabled = |vcx: &mut gpui::VisualTestContext| {
@@ -7672,8 +7677,8 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
         );
     }
     assert!(
-        bounds(vcx, "mobile-tunnel").top() < bounds(vcx, "mobile-tailscale").top(),
-        "Tunnel must be prioritized above Tailscale in mobile mode card"
+        bounds(vcx, "mobile-tailscale").top() < bounds(vcx, "mobile-tunnel").top(),
+        "Tailscale must be prioritized above Relay in mobile mode card"
     );
     for sel in [
         "admin-mobile-pair-section",
@@ -8045,7 +8050,6 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
     for switch_sel in [
         "admin-auto-switch-toggle",
         "admin-rate-limit-toggle",
-        "admin-direct-usage-toggle",
         "admin-predict-exhaustion-toggle",
         "admin-prefer-soonest-reset-toggle",
     ] {
@@ -10296,4 +10300,33 @@ fn hidden_status_providers_parse_roundtrip_and_toggle() {
     s.set_status_provider_visible(ProviderKind::Antigravity, true);
     assert!(s.hidden_status_providers.is_empty());
     assert!(!s.to_toml().contains("hidden_status_providers"));
+}
+
+#[gpui::test]
+fn settings_search_enter_scrolls_and_focuses_matching_row(cx: &mut TestAppContext) {
+    let d = dir("search-anchor");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(500.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| view.update(cx, |view, cx| view.focus_search(window, cx)));
+    vcx.simulate_input("font");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.tab, AdminTab::Terminal);
+        assert_eq!(view.search_focus.title, Some(text::TERMINAL_FONT));
+        assert!(view.search_focus.rendered.get());
+        assert!(view.search_focus.focus.is_focused(window));
+        assert!(
+            view.search_focus.scroll.offset().y < px(0.),
+            "matching font row must scroll past theme previews"
+        );
+    });
+    fs::remove_dir_all(d).ok();
 }

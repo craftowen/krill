@@ -5,10 +5,10 @@ use std::sync::TryLockError;
 
 use super::{BorrowedFd, Duration, MutexGuard, Tap, io, thread};
 use crate::os::AsFd as _;
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::io::Errno;
 #[cfg(unix)]
-use rustix::io::write;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+#[cfg(unix)]
+use rustix::io::{Errno, write};
 
 const START: &[u8] = b"\x1b[200~";
 const END: &[u8] = b"\x1b[201~";
@@ -59,6 +59,7 @@ impl State {
     }
 }
 
+#[cfg(unix)]
 fn disconnected(peer: BorrowedFd<'_>) -> io::Result<bool> {
     let mut fds = [PollFd::from_borrowed_fd(peer, PollFlags::HUP)];
     match poll(
@@ -72,6 +73,13 @@ fn disconnected(peer: BorrowedFd<'_>) -> io::Result<bool> {
         Err(Errno::INTR) => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Windows: `WSAPoll`은 요청 마스크의 `HUP`를 거부하고(WSAEINVAL) 정상 종료(FIN)는 `HUP` 없이 "읽을 수 있음"으로만
+/// 보일 수 있어, 소켓 전용 판정([`crate::sys::socket_disconnected`])을 쓴다. Unix의 `HUP` 폴링은 그대로다.
+#[cfg(windows)]
+fn disconnected(peer: BorrowedFd<'_>) -> io::Result<bool> {
+    crate::sys::socket_disconnected(peer)
 }
 
 fn alive(tap: &Tap, peer: Option<BorrowedFd<'_>>) -> io::Result<()> {
@@ -105,6 +113,7 @@ fn turn<'a>(tap: &'a Tap, peer: Option<BorrowedFd<'_>>) -> io::Result<MutexGuard
     }
 }
 
+#[cfg(unix)]
 fn write_all(
     tap: &Tap,
     mut bytes: &[u8],
@@ -114,17 +123,8 @@ fn write_all(
     while !bytes.is_empty() {
         alive(tap, None)?;
         let result = {
-            #[cfg(unix)]
             let _live = tap.0.live();
-            #[cfg(unix)]
-            let result = write(&tap.0.master, bytes).map_err(io::Error::from);
-            #[cfg(windows)]
-            let result = {
-                use std::io::Write as _;
-                let handle = tap.0.master.input.try_clone()?;
-                std::fs::File::from(handle).write(bytes)
-            };
-            result
+            write_once(tap, bytes)
         };
         match result {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -137,25 +137,138 @@ fn write_all(
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                #[cfg(unix)]
-                {
-                    let mut fds = [PollFd::new(&tap.0.master, PollFlags::OUT)]
-                        .into_iter()
-                        .chain(peer.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::HUP)))
-                        .collect::<Vec<_>>();
-                    match poll(&mut fds, Some(&WAIT)) {
-                        Ok(_) | Err(Errno::INTR) => {}
-                        Err(err) => return Err(err.into()),
-                    }
+                let mut fds = [PollFd::new(&tap.0.master, PollFlags::OUT)]
+                    .into_iter()
+                    .chain(peer.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::HUP)))
+                    .collect::<Vec<_>>();
+                match poll(&mut fds, Some(&WAIT)) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(err) => return Err(err.into()),
                 }
-                #[cfg(windows)]
-                thread::sleep(Duration::from_millis(20));
                 alive(tap, peer)?;
             }
             Err(err) => return Err(err),
         }
     }
     Ok(())
+}
+
+/// Windows(daemon-02): 막히는 `WriteFile`은 세션 writer 스레드가 하고, 이 스레드는 20ms마다 세션 종료·연결 HUP만
+/// 본다. 취소되면 writer가 실제로 쓴 접두사만 장부에 적는다(큐에 넣은 바이트가 곧 쓴 바이트가 아니다).
+#[cfg(windows)]
+fn write_all(
+    tap: &Tap,
+    bytes: &[u8],
+    peer: Option<BorrowedFd<'_>>,
+    state: &mut State,
+) -> io::Result<()> {
+    alive(tap, None)?;
+    let (written, result) = tap.0.writer.write(bytes, || alive(tap, peer));
+    state.record(bytes.get(..written).unwrap_or_default());
+    if state.peer.is_none() && (state.paste || state.matched > 0) {
+        state.peer = peer.map(|fd| fd.try_clone_to_owned()).transpose()?;
+    }
+    result
+}
+
+#[cfg(unix)]
+fn write_once(tap: &Tap, bytes: &[u8]) -> io::Result<usize> {
+    write(&tap.0.master, bytes).map_err(io::Error::from)
+}
+
+/// A short local CLI command, serialized with every other writer. The caller must recognize
+/// both the empty composer and its exact echoed command before Enter is permitted.
+#[cfg(unix)]
+pub(super) fn guarded_command(
+    tap: &Tap,
+    revision: u64,
+    command: &[u8],
+    accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
+) -> io::Result<()> {
+    if command.is_empty() || command.len() > 256 || command.iter().any(u8::is_ascii_control) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut state = tap
+        .0
+        .input
+        .try_lock()
+        .map_err(|_| io::Error::other("Terminal input is busy"))?;
+    let clients = tap
+        .0
+        .clients
+        .lock()
+        .map_err(|_| io::Error::other("Terminal client state unavailable"))?;
+    let mut live = tap.0.live();
+    if clients.sleeping
+        || state.paste
+        || state.matched != 0
+        || live.revision != revision
+        || crate::status::now_ns().saturating_sub(live.last_input_ns) < 250_000_000
+        || live.last_output.elapsed() < Duration::from_millis(100)
+        || !accepts(&live.engine.screen(), false)
+    {
+        return Err(io::Error::other(
+            "Wait for an idle terminal with an empty native composer",
+        ));
+    }
+    let bytes = if live
+        .engine
+        .input_modes()
+        .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+    {
+        [START, command, END].concat()
+    } else {
+        command.to_vec()
+    };
+    // The screen authority and the first write share the live lock; a resize/output cannot
+    // invalidate the inspected empty composer before these bytes enter the PTY.
+    let written = write_once(tap, &bytes)?;
+    state.record(bytes.get(..written).unwrap_or_default());
+    state.owner = Some(thread::current().id());
+    live.input_since_done = true;
+    live.last_input_ns = crate::status::now_ns();
+    drop(live);
+    drop(clients);
+    if written != bytes.len() {
+        state.finish(tap).ok();
+        return Err(io::Error::other(
+            "Command delivery was partial; no Enter was sent",
+        ));
+    }
+    // Codex coalesces fast text+Enter as paste. Wait for its actual echo, without allowing
+    // another user's input to be interleaved between text and submission.
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_millis(1500) {
+        thread::sleep(Duration::from_millis(25));
+        let mut live = tap.0.live();
+        if started.elapsed() < Duration::from_millis(250) || live.revision <= revision {
+            continue;
+        }
+        if accepts(&live.engine.screen(), true) {
+            let written = write_once(tap, b"\r")?;
+            if written != 1 {
+                return Err(io::Error::other("Command submission was not confirmed"));
+            }
+            live.last_input_ns = crate::status::now_ns();
+            return Ok(());
+        }
+    }
+    Err(io::Error::other(
+        "Native command echo was not recognized; no Enter was sent",
+    ))
+}
+
+#[cfg(windows)]
+pub(super) fn guarded_command(
+    _tap: &Tap,
+    _revision: u64,
+    _command: &[u8],
+    _accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Verified atomic model input is unavailable on Windows",
+    ))
 }
 
 pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {
@@ -206,3 +319,6 @@ pub(super) fn finish_input(tap: &Tap) {
         state.peer = None;
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;

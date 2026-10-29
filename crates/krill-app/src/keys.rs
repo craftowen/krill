@@ -55,6 +55,35 @@ pub fn windows_keys(mac: &str) -> String {
     )
 }
 
+/// Workspace indices use Cmd on macOS and Ctrl elsewhere; tab indices stay distinct.
+pub fn tab_index_key(index: u8) -> String {
+    format!(
+        "{}-{index}",
+        if cfg!(target_os = "macos") {
+            "ctrl"
+        } else {
+            "alt"
+        }
+    )
+}
+
+/// Effective binding in a Shell context. Disabled bindings have no hint.
+pub fn shortcut_label(window: &gpui::Window, action: &dyn gpui::Action) -> Option<String> {
+    window
+        .highest_precedence_binding_for_action_in_context(
+            action,
+            gpui::KeyContext::parse("Shell").ok()?,
+        )
+        .map(|binding| {
+            binding
+                .keystrokes()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+}
+
 /// Modifier used to open terminal links, matching the platform's click hint.
 pub fn link_modifier(modifiers: gpui::Modifiers) -> bool {
     if cfg!(target_os = "macos") {

@@ -23,11 +23,15 @@ Krill의 공식 소개·문서 사이트(`https://krill.page`)와 HTML·Markdown
 
 ```sh
 # 1. HTML 또는 Markdown 파일 공개 공유 (이미 공유된 파일이면 동일 링크를 자동 덮어씀)
-krill artifacts share ./report.html [--title "성능 리포트"] [--api-url <url>] [--json]
+krill artifacts share ./report.html [--title "성능 리포트"] [--expires-in <days|never>] [--api-url <url>] [--json]
 krill artifacts share ./notes.md --json
 
 # 2. 이전에 공유한 로컬 파일의 아티팩트 강제 갱신
-krill artifacts update ./report.html [--title "새 제목"] [--api-url <url>] [--json]
+krill artifacts update ./report.html [--title "새 제목"] [--expires-in <days|never>] [--api-url <url>] [--json]
+
+# 2-1. 파일을 재업로드하지 않고 기존 링크의 기한 변경
+krill artifacts retention <slug> --expires-in 90 --json
+krill artifacts retention <slug> --expires-in never --json
 
 # 3. 로컬 파일과 연결된 공개 링크 회수(삭제)
 krill artifacts unshare ./report.html [--api-url <url>] [--json]
@@ -66,8 +70,9 @@ krill artifacts rm <slug> [--json]
 
 ### 동작 및 로컬 상태 파일
 
-- **지원 확장자·용량**: `.html`, `.htm`, `.md`, `.markdown` 단일 파일(최대 2 MiB, 빈 파일 거부). 상대 경로 로컬 에셋은 업로드하지 않으므로 단일 완결형 HTML이거나 절대 URL 에셋을 사용한다.
-- **자동 만료**: 마지막 발행·갱신부터 **30일** 뒤 만료한다. 단순 열람은 기간을 늘리지 않는다. 만료 즉시 목록·뷰어·원문·갱신에서 제외하고, 매시간 정리 작업이 R2 본문과 D1 메타데이터를 함께 삭제한다. 한 실행은 최대 500건을 처리하며 남은 자료는 다음 실행에서 이어서 정리한다. 저장소 삭제 실패 시 메타데이터를 남겨 재시도한다. 로컬 원본 파일은 삭제하지 않는다.
+- **공유 기한 설정**: `share`·`update`의 `--expires-in <days|never>`로 1~3650일 또는 무기한을 지정한다. 새 링크에서 생략하면 기기 기본값(최초 30일)을 쓰며, 갱신에서 생략하면 기존 링크의 보존 기간을 유지하고 그 기간만큼 연장한다. 앱 아티팩트 페이지에서 새 링크 기본값(7일·30일·90일·1년·무기한)을 고르고, 상세 화면에서 기존 링크의 기한도 바꾼다. 기본값은 `<state_dir>/artifact-retention-days`에 저장하며 기존 링크에는 소급하지 않는다. `retention`은 본문·URL·내용 수정 시각을 바꾸지 않고 선택 시점부터 기한만 다시 계산한다. 공개 공유 게이트가 꺼져 있으면 `retention`도 거부한다.
+- **지원 확장자·용량**: `.html`, `.htm`, `.md`, `.markdown` 단일 파일(최대 10 MiB, 빈 파일 거부). 상대 경로 로컬 에셋은 업로드하지 않으므로 단일 완결형 HTML이거나 절대 URL 에셋을 사용한다.
+- **자동 만료**: 마지막 발행·갱신 또는 기한 변경부터 **선택한 일수** 뒤 만료한다(기본 30일). 무기한 링크는 자동 만료·정리하지 않으며 명시적으로 삭제할 수 있다. 단순 열람은 기간을 늘리지 않는다. 만료 즉시 목록·뷰어·원문·갱신에서 제외하고, 매시간 정리 작업이 R2 본문과 D1 메타데이터를 함께 삭제한다. 한 실행은 최대 500건을 처리하며 남은 자료는 다음 실행에서 이어서 정리한다. 저장소 삭제 실패 시 메타데이터를 남겨 재시도한다. 로컬 원본 파일은 삭제하지 않는다.
 - **기본 서버 주소**: `https://share.krill.page` (`--api-url <url>` 플래그 또는 `KRILL_ARTIFACTS_API_URL` 환경변수로 재정의 가능; HTTPS origin만, 로컬 개발 시에만 `http://127.0.0.1`·`http://localhost` 허용. 경로·자격증명(`user@`)·쿼리는 거부).
 - **계정 없는 로컬 인증 (0600 권한)**:
   - `<state_dir>/artifact-token`: 최초 실행 시 256-bit 무작위 소유자 토큰을 자동 생성해 보관한다(`KRILL_ARTIFACTS_AUTH_TOKEN`으로 재정의 가능).
@@ -86,10 +91,13 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 
 | 메서드 및 경로 | 인증 헤더 | 설명 |
 |---|---|---|
-| `POST /v1/artifacts` | `Authorization: Bearer <token>` (생략 시 임시 토큰 발급), 선택 `Idempotency-Key` | `{ content, contentType, fileName, title? }` 업로드. 30일 만료 설정 후 `{ change: "created", artifact, editToken, shareUrl }` 반환 |
-| `PUT /v1/artifacts/:slug` | `x-krill-edit-token` 또는 `x-orca-edit-token` (또는 소유자 Bearer 토큰) | 본문·제목·만료 시각(+30일) 갱신 후 `{ artifact, shareUrl }` 반환 |
+| `POST /v1/artifacts` | `Authorization: Bearer <token>` (생략 시 임시 토큰 발급), 선택 `Idempotency-Key` | `{ content, contentType, fileName, title?, retentionDays? }` 업로드. 보존 기간(생략 시 30일) 설정 후 `{ change: "created", artifact, editToken, shareUrl }` 반환 |
+| `PUT /v1/artifacts/:slug` | `x-krill-edit-token` 또는 `x-orca-edit-token` (또는 소유자 Bearer 토큰) | 본문·제목·보존 기간에 따른 만료 시각 갱신 후 `{ artifact, shareUrl }` 반환 |
+| `PATCH /v1/artifacts/:slug` | 수정 토큰 또는 소유자 Bearer 토큰 | `{ retentionDays }`로 기한만 변경. 0은 무기한, 1~3650은 일수 |
 | `DELETE /v1/artifacts/:slug` | 수정 토큰 또는 소유자 Bearer 토큰 | R2 객체 삭제 및 D1 `deleted_at` 마킹 후 `204 No Content` 반환 |
 | `GET /v1/artifacts?cursor=...` | `Authorization: Bearer <token>` | 해당 소유자 토큰 해시의 활성 아티팩트 페이지 조회 (`{ artifacts, nextCursor? }`) |
+
+응답 `artifact.retentionDays`는 보존 일수(0은 무기한)이며, 무기한이면 `expiresAt`은 `null`이다. DB는 기존 인덱스·정리 규약을 유지하기 위해 무기한의 `expires_at`을 `9999-12-31T23:59:59.999Z`로 저장한다. UTF-8 원문은 최대 10 MiB, JSON 봉투는 이스케이프를 고려해 최대 20 MiB + 64 KiB이며, Content-Length와 무관하게 스트림의 실제 바이트를 제한한다.
 
 ### 3.2 열람 라우트 및 샌드박스 격리
 
@@ -133,9 +141,11 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 # 1. 소개 사이트 배포 (krill.page, www.krill.page)
 (cd cloud/site && npx wrangler deploy)
 
-# 2. 아티팩트 서버 D1 스키마 적용 및 배포 (share.krill.page)
+# 2. 아티팩트 서버 스키마 적용 및 배포 (share.krill.page)
+# 새 DB에만 schema.sql 적용. 기존 DB에는 적용하지 않는다.
 (cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=schema.sql)
-(cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=migrations/0001_retention_30_days.sql)
+# 기존 30일 정책 DB는 위 schema.sql 대신 다음 마이그레이션을 한 번만 적용한다.
+(cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=migrations/0002_configurable_retention.sql)
 (cd cloud/share && npx wrangler deploy)
 
 # 3. 아티팩트 서버 라이브 E2E 검증
@@ -148,4 +158,4 @@ cargo nextest run -p krill artifacts
 (cd cloud/share && bun test tests)
 ```
 
-30일 정책으로 전환할 때는 마이그레이션도 적용한다. 기존 링크의 만료를 마지막 갱신부터 30일로 줄이며, 이미 더 짧은 만료일은 늘리지 않는다. 정리 스케줄(`0 * * * *`, UTC 매시)은 Worker 배포 시 등록된다. 소스 변경만으로 운영 서버의 보존 기간이나 스케줄이 바뀌지는 않는다.
+이전 30일 정책 전환용 `0001_retention_30_days.sql`은 기한 설정 도입 이후 다시 적용하지 않는다. 해당 구 마이그레이션은 기존 링크의 만료를 마지막 갱신부터 30일로 줄이며, 이미 더 짧은 만료일은 늘리지 않는다. 정리 스케줄(`0 * * * *`, UTC 매시)은 Worker 배포 시 등록된다. 기한 설정 도입 시 기존 링크의 만료일은 바꾸지 않고 갱신 기간만 기본 30일로 초기화한다. DB 마이그레이션을 먼저 적용하고 Worker를 배포한 뒤 새 CLI·앱을 배포한다. 소스 변경만으로 운영 서버의 동작이 바뀌지는 않는다.

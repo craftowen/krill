@@ -169,6 +169,7 @@ fn literal_head_and_web_creation_never_request_push_or_fork() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_output_timeout_nonzero_and_missing_executable_are_local_and_reaped() {
     let mut ok = Command::new("/bin/sh");
@@ -944,5 +945,63 @@ fn owe924_merge_and_draft_toggle_commands_and_service_updates_cache() {
     assert_eq!(
         service.merge(&repo, "feat/owe-924", PrMergeMethod::Squash),
         Ok(())
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_command_output_status_and_timeout_are_bounded() {
+    use std::os::windows::process::CommandExt as _;
+
+    let command = |script: &str| {
+        let mut command = Command::new("cmd.exe");
+        // These fixed test scripts use cmd syntax, not CRT argument quoting.
+        command.args(["/D", "/C"]).raw_arg(script);
+        command
+    };
+    assert_eq!(
+        parse(
+            &execute(
+                &mut command(r#"echo [{"state":"OPEN","isDraft":false}]"#),
+                Duration::from_secs(2)
+            )
+            .unwrap()
+        )
+        .unwrap(),
+        Status::Open
+    );
+    for (script, expected) in [
+        ("exit /b 1", Failure::Other),
+        ("echo secret-token 1>&2 & exit /b 4", Failure::Auth),
+    ] {
+        let error = execute(&mut command(script), Duration::from_secs(2)).unwrap_err();
+        assert_eq!(status_error(&error), Status::Failed(expected));
+        assert!(!error.to_string().contains("secret-token"));
+    }
+    let mut missing = Command::new(r"C:\krill-qa-nonexistent\gh.exe");
+    assert_eq!(
+        execute(&mut missing, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    let output_file =
+        std::env::temp_dir().join(format!("krill-pr-output-{}.txt", std::process::id()));
+    std::fs::write(
+        &output_file,
+        vec![b'x'; usize::try_from(MAX_OUTPUT + 1).unwrap()],
+    )
+    .unwrap();
+    let mut flood = command("type \"%KRILL_PR_TEST_OUTPUT%\"");
+    flood.env("KRILL_PR_TEST_OUTPUT", &output_file);
+    let overflow = execute(&mut flood, Duration::from_secs(2)).unwrap_err();
+    std::fs::remove_file(output_file).unwrap();
+    assert_eq!(overflow.kind(), io::ErrorKind::Other);
+    let mut hung = command("for /L %i in (0,0,1) do @rem waiting");
+    assert_eq!(
+        execute(&mut hung, Duration::from_millis(30))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
     );
 }

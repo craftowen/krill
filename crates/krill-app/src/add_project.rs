@@ -91,14 +91,24 @@ pub fn clone_dir(url: &str) -> Option<String> {
     (!name.is_empty() && name != "." && name != "..").then(|| name.to_owned())
 }
 
-/// 호스트의 입력 경로(앞뒤 공백 제거, 절대 경로만 받는다).
+/// 원격 호스트의 입력 경로. 이 컴퓨터의 OS와 관계없이 Unix·Windows 절대 경로를 그대로 보낸다.
 fn host_path(raw: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(raw.trim());
-    (path.is_absolute()
-        && path
-            .components()
-            .any(|c| matches!(c, std::path::Component::Normal(_))))
-    .then_some(path)
+    let raw = raw.trim();
+    if raw.contains('\0') {
+        return None;
+    }
+    let normal = |part: &str| !part.is_empty() && !matches!(part, "." | "..");
+    let unix = raw.starts_with('/') && raw.split('/').any(normal);
+    let drive = matches!(raw.as_bytes(), [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic())
+        && raw
+            .get(3..)
+            .is_some_and(|rest| rest.split(['/', '\\']).any(normal));
+    let unc = raw.strip_prefix("\\\\").is_some_and(|rest| {
+        // 서버·공유 이름 뒤에 실제 프로젝트 폴더가 있어야 한다(루트만 고르는 기존 거부 규칙).
+        let mut parts = rest.split(['/', '\\']).filter(|part| !part.is_empty());
+        parts.next().is_some_and(normal) && parts.next().is_some_and(normal) && parts.any(normal)
+    });
+    (unix || drive || unc).then(|| PathBuf::from(raw))
 }
 
 impl Dialog {

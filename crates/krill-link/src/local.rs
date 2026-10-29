@@ -23,8 +23,8 @@ mod windows {
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use krill_proto::os::net;
@@ -46,6 +46,49 @@ mod windows {
     struct Shared {
         sock: net::UnixStream,
         closed: AtomicBool,
+        written: AtomicU64,
+        write_done: AtomicBool,
+        write_failed: AtomicBool,
+        write_waiter: std::sync::Mutex<Option<Waker>>,
+    }
+
+    impl Shared {
+        fn wake_writer(&self) {
+            let wake = self
+                .write_waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+        }
+
+        fn poll_written(
+            &self,
+            cx: &Context<'_>,
+            queued: u64,
+            shutdown: bool,
+        ) -> Poll<io::Result<()>> {
+            let mut wake = self
+                .write_waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.write_failed.load(Ordering::Acquire) {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let ready = if shutdown {
+                self.write_done.load(Ordering::Acquire)
+            } else {
+                self.written.load(Ordering::Acquire) >= queued
+            };
+            if ready {
+                Poll::Ready(Ok(()))
+            } else {
+                *wake = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 
     /// tokio 쪽 끝. 드롭하면 소켓을 닫는다.
@@ -53,6 +96,7 @@ mod windows {
     pub struct Stream {
         io: DuplexStream,
         shared: Arc<Shared>,
+        queued: u64,
     }
 
     impl Stream {
@@ -70,6 +114,10 @@ mod windows {
             let shared = Arc::new(Shared {
                 sock,
                 closed: AtomicBool::new(false),
+                written: AtomicU64::new(0),
+                write_done: AtomicBool::new(false),
+                write_failed: AtomicBool::new(false),
+                write_waiter: std::sync::Mutex::new(None),
             });
             let (io, bridge) = tokio::io::duplex(BRIDGE_BUFFER);
             let (mut from_tokio, mut to_tokio) = tokio::io::split(bridge);
@@ -113,12 +161,23 @@ mod windows {
                     // EOF = tokio 쪽 shutdown(반쪽 닫기) 또는 드롭.
                     while let Ok(n @ 1..) = rt.block_on(from_tokio.read(&mut buf)) {
                         if (&writer.sock).write_all(&buf[..n]).is_err() {
+                            writer.write_failed.store(true, Ordering::Release);
                             break;
                         }
+                        writer.written.fetch_add(n as u64, Ordering::Release);
+                        writer.wake_writer();
                     }
-                    writer.sock.shutdown(Shutdown::Write).ok();
+                    if writer.sock.shutdown(Shutdown::Write).is_err() {
+                        writer.write_failed.store(true, Ordering::Release);
+                    }
+                    writer.write_done.store(true, Ordering::Release);
+                    writer.wake_writer();
                 })?;
-            Ok(Self { io, shared })
+            Ok(Self {
+                io,
+                shared,
+                queued: 0,
+            })
         }
     }
 
@@ -146,15 +205,29 @@ mod windows {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+            let this = self.get_mut();
+            match Pin::new(&mut this.io).poll_write(cx, buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.queued = this.queued.saturating_add(n as u64);
+                    Poll::Ready(Ok(n))
+                }
+                other => other,
+            }
         }
 
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().io).poll_flush(cx)
+            let this = self.get_mut();
+            std::task::ready!(Pin::new(&mut this.io).poll_flush(cx))?;
+            // A DuplexStream flush only reaches the bridge buffer. Wait for the
+            // socket writer too, so a server can exit after sending its reply.
+            this.shared.poll_written(cx, this.queued, false)
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+            let this = self.get_mut();
+            std::task::ready!(this.shared.poll_written(cx, this.queued, false))?;
+            std::task::ready!(Pin::new(&mut this.io).poll_shutdown(cx))?;
+            this.shared.poll_written(cx, this.queued, true)
         }
     }
 

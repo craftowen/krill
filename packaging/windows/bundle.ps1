@@ -8,7 +8,7 @@ zip 안 레이아웃(업데이터 updater.rs·rename.rs와 holder sys/windows.rs
 
   Krill\Krill.json               CFBundleShortVersionString·KrillUpdatePublicKey·KrillUpdateURL (Info.plist와 같은 키)
   Krill\krill-app.exe, krill.exe, krilld.exe, krill-holder.exe, [krill-link.exe]
-  Krill\conpty.dll               (B안, -ConptyDir를 줄 때) holder가 자기 exe 옆에서 로드한다
+  Krill\conpty.dll               필수: holder가 자기 exe 옆에서 로드한다
   Krill\x64\OpenConsole.exe      (B안) conpty.dll이 <dll 폴더>\x64\OpenConsole.exe를 띄운다
   Krill\THIRD_PARTY_NOTICES.txt  ConPTY MIT 고지
 
@@ -36,6 +36,15 @@ $ConptyPins = [ordered]@{
     'build\native\runtimes\x64\OpenConsole.exe' = @('x64\OpenConsole.exe', '3d66b23d0a71bb8eed2b77edc8b9df9bf54ce6c8fb74c863a30e760997f80586')
 }
 
+# New sessions require the pinned backend; never produce a valid-looking ZIP
+# which can only fail at its first terminal launch. Validate before creating output.
+if ([string]::IsNullOrWhiteSpace($ConptyDir)) { throw 'ConptyDir is required for Windows terminal sessions' }
+foreach ($src in $ConptyPins.Keys) {
+    $from = Join-Path $ConptyDir $src
+    $got = (Get-FileHash -LiteralPath $from -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($got -ne $ConptyPins[$src][1]) { throw "sha256 mismatch for ${from}: $got" }
+}
+
 $root = Join-Path $OutDir 'Krill'
 $zip = Join-Path $OutDir "Krill-$Version-windows-x64.zip"
 # 기존 산출물을 덮어쓰지 않는다(macOS release.sh와 같다).
@@ -48,16 +57,12 @@ foreach ($name in 'krill-app', 'krill', 'krilld', 'krill-holder') {
 $link = Join-Path $TargetDir 'krill-link.exe'
 if (Test-Path $link) { Copy-Item $link $root }
 
-if ($ConptyDir) {
-    foreach ($src in $ConptyPins.Keys) {
-        $dst, $want = $ConptyPins[$src]
-        $from = Join-Path $ConptyDir $src
-        $got = (Get-FileHash -Algorithm SHA256 $from).Hash.ToLowerInvariant()
-        if ($got -ne $want) { throw "sha256 mismatch for ${from}: $got" }
-        $to = Join-Path $root $dst
-        New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
-        Copy-Item $from $to
-    }
+foreach ($src in $ConptyPins.Keys) {
+    $dst = $ConptyPins[$src][0]
+    $from = Join-Path $ConptyDir $src
+    $to = Join-Path $root $dst
+    New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
+    Copy-Item -LiteralPath $from -Destination $to
 }
 Copy-Item (Join-Path $PSScriptRoot 'THIRD_PARTY_NOTICES.txt') $root
 

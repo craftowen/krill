@@ -106,6 +106,25 @@ fn unknown_outcome(e: io::Error) -> io::Error {
     io::Error::new(e.kind(), UnknownOutcome(e))
 }
 
+/// krilld가 세션을 닫힘·이미 재개됨으로 확정해 거절한 응답([`krill_proto::control::Failure::NoSession`]).
+/// 문구는 그대로 두고 타입만 남긴다.
+#[derive(Debug)]
+struct SessionGone;
+
+impl std::fmt::Display for SessionGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&krill_proto::control::Failure::NoSession, f)
+    }
+}
+
+impl std::error::Error for SessionGone {}
+
+/// 데몬이 "이 세션은 끝났다"고 확정 응답한 실패인가. attach 거절·일반 `InvalidInput`·전송 오류는 아니다.
+#[must_use]
+pub fn is_session_gone(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(inner) if inner.is::<SessionGone>())
+}
+
 /// 세션을 만드는 요청이 krilld에 닿았는지 알 수 없는 실패다. 같은 요청을 자동으로 다시 보내면 PTY가 둘이 될 수 있다.
 #[must_use]
 pub fn is_unknown_outcome(e: &io::Error) -> bool {
@@ -293,7 +312,35 @@ pub fn ensure_live_session_in(
     }
 }
 
+/// 세션 생성·재개 실패를 운영 로그에 남긴다. 2026-10-29 "새 AI 세션이 되다가 안 된다가"를 신고받았으나 앱 로그에
+/// 실패 흔적이 전혀 없어 원인을 추적할 수 없었다. 종류·에이전트 여부·재개 여부만 남기고 경로·오류 문구는 남기지 않는다.
 fn ensure_session_inner(
+    target: &HostTarget,
+    want: Option<SessionId>,
+    create: &Create,
+    allow_cold: bool,
+) -> io::Result<Found> {
+    let started = std::time::Instant::now();
+    let result = ensure_session_attempt(target, want, create, allow_cold);
+    match &result {
+        Err(error) => tracing::warn!(
+            kind = ?error.kind(),
+            agent = matches!(create.program, Program::Agent { .. }),
+            resume = want.is_some(),
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "session create failed"
+        ),
+        Ok(_) if started.elapsed() >= Duration::from_secs(2) => tracing::info!(
+            agent = matches!(create.program, Program::Agent { .. }),
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "session create slow"
+        ),
+        Ok(_) => {}
+    }
+    result
+}
+
+fn ensure_session_attempt(
     target: &HostTarget,
     want: Option<SessionId>,
     create: &Create,
@@ -348,10 +395,13 @@ fn unexpected_reply() -> io::Error {
     unknown_outcome(io::ErrorKind::InvalidData.into())
 }
 
-fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
+pub fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
     match failure {
         krill_proto::control::Failure::NoHolder => io::Error::other(failure.to_string()),
         krill_proto::control::Failure::Os(errno) => io::Error::from_raw_os_error(errno),
+        krill_proto::control::Failure::NoSession => {
+            io::Error::new(io::ErrorKind::InvalidInput, SessionGone)
+        }
         other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
     }
 }
@@ -1085,6 +1135,19 @@ impl<W: Write> Pane<W> {
             || self.account_input == AccountInput::Delivering && self.journal.has_pending_input()
     }
 
+    /// 아직 데몬이 확인하지 않은 보류·미확정 입력이 저널에 남아 있으면 `true`.
+    pub fn has_pending_input(&self) -> bool {
+        self.journal.has_pending_input()
+    }
+
+    pub fn input_receipt(&self) -> input::Receipt {
+        self.journal.receipt()
+    }
+
+    pub fn input_delivery(&self, receipt: input::Receipt) -> input::Delivery {
+        self.journal.delivery(receipt)
+    }
+
     /// A cancelled switch may continue on the original account. A failed switch drops the held
     /// bytes with a notice, so prompts intended for the new account never reach the original
     /// one, and the pane goes back to the preserved original session. The daemon keeps failed
@@ -1265,6 +1328,17 @@ impl<W: Write> Pane<W> {
     /// 화면 바닥 위로 올린 행 수(0 = 라이브). 셸이 스크롤바·바닥 복귀 배지를 그릴 때 쓴다(OWE-873).
     pub fn scroll_offset(&self) -> usize {
         self.history.visible()
+    }
+
+    /// 버퍼 기준 줄의 행([`krill_term::select::Anchored`]: 라이브 화면 맨 위가 0, 스크롤백은 음수).
+    /// 받지 않았거나 버린 스크롤백이면 `None`.
+    pub fn row(&self, line: i64) -> Option<Vec<Cell>> {
+        if let Ok(v) = usize::try_from(line) {
+            return (v < usize::from(self.view.screen.lines))
+                .then(|| self.view.screen.rows.get(v).cloned().unwrap_or_default());
+        }
+        let idx = usize::try_from(line.checked_neg()?.checked_sub(1)?).ok()?;
+        self.history.row(idx).cloned()
     }
 
     /// 받아 둔 스크롤백 행 수(화면 바로 위부터). 아직 도착하지 않은 요청분은 세지 않는다(OWE-873).
@@ -2060,6 +2134,15 @@ impl History {
         }
     }
 
+    /// 받아 둔 히스토리 행(화면 바로 위가 0번).
+    fn row(&self, idx: usize) -> Option<&Vec<Cell>> {
+        self.stable
+            .as_ref()
+            .and_then(|cache| cache.row(idx))
+            .or_else(|| self.rows.get(idx))
+            .or_else(|| self.prior.get(idx.saturating_sub(self.rows.len())))
+    }
+
     /// 화면 위에 보이는 히스토리 행을 붙인 화면. 스크롤하지 않았으면 그대로.
     fn compose(&self, screen: &Screen) -> Screen {
         let off = self.visible();
@@ -2074,16 +2157,10 @@ impl History {
                     screen.links.get(v).cloned().unwrap_or_default(),
                 )
             } else {
-                let idx = off - l - 1;
-                let row = self
-                    .stable
-                    .as_ref()
-                    .and_then(|cache| cache.row(idx))
-                    .or_else(|| self.rows.get(idx))
-                    .or_else(|| self.prior.get(idx.saturating_sub(self.rows.len())))
-                    .cloned()
-                    .unwrap_or_default();
-                (row, Vec::new())
+                (
+                    self.row(off - l - 1).cloned().unwrap_or_default(),
+                    Vec::new(),
+                )
             }
         };
         // Build only displayed rows, rather than cloning the live grid then replacing it.
@@ -2099,6 +2176,7 @@ impl History {
             title: screen.title.clone(),
             bells: screen.bells,
             cursor_style: screen.cursor_style,
+            cursor_explicit: screen.cursor_explicit,
         }
     }
 }

@@ -34,6 +34,8 @@ pub struct Artifact {
     #[serde(default)]
     pub expires_at: Option<String>,
     #[serde(default)]
+    pub retention_days: Option<u16>,
+    #[serde(default)]
     pub byte_size: Option<u64>,
 }
 
@@ -241,6 +243,10 @@ pub struct View {
     selected_slug: Option<String>,
     copied_slug: Option<String>,
     deleting_slug: Option<String>,
+    retention_slug: Option<String>,
+    default_retention_days: u16,
+    retention_call: retention::RetentionCall,
+    retention_task: Option<Task<()>>,
     error: Option<String>,
     loading: bool,
     slow_load: bool,
@@ -290,6 +296,13 @@ impl View {
             .is_none_or(krill_proto::artifacts::sharing_enabled);
         let mut view = Self {
             focus: cx.focus_handle(),
+            default_retention_days: state_dir
+                .as_deref()
+                .and_then(|dir| krill_proto::artifacts::default_retention_days(dir).ok())
+                .unwrap_or(krill_proto::artifacts::DEFAULT_RETENTION_DAYS),
+            retention_call: retention::cli_retention_call(state_dir.clone()),
+            retention_slug: None,
+            retention_task: None,
             state_dir,
             sharing_enabled,
             input: None,
@@ -378,7 +391,7 @@ impl View {
     }
 
     pub fn delete_artifact(&mut self, slug: String, cx: &mut Context<Self>) {
-        if self.deleting_slug.is_some() {
+        if self.deleting_slug.is_some() || self.retention_slug.is_some() {
             return;
         }
         let call = self.delete_call.clone();
@@ -411,7 +424,7 @@ impl View {
     }
 
     fn load(&mut self, more: bool, cx: &mut Context<Self>) {
-        if self.loading || (more && self.next.is_none()) {
+        if self.loading || self.retention_slug.is_some() || (more && self.next.is_none()) {
             return;
         }
         if let Some(dir) = &self.state_dir {
@@ -525,7 +538,7 @@ impl View {
                     .child(
                         ui::secondary("artifacts-retry", text::RETRY.get())
                             .debug_selector(|| "artifacts-retry".into())
-                            .disabled(self.loading)
+                            .disabled(self.loading || self.retention_slug.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.load(false, cx))),
                     ),
             ),
@@ -738,7 +751,7 @@ impl View {
         let is_deleting = self.deleting_slug.as_deref() == Some(slug.as_str());
         let updated = format_timestamp_short(item.artifact.updated_at.as_deref());
         let size = format_byte_size(item.artifact.byte_size);
-        let expires = format_timestamp_short(item.artifact.expires_at.as_deref());
+        let expires = retention::expiration_label(&item.artifact);
         let meta_line = format!(
             "{} {updated} · {size} · {} {expires}",
             text::COL_UPDATED.get(),
@@ -869,13 +882,14 @@ impl View {
                                     .danger()
                                     .label(text::DELETE.get())
                                     .debug_selector(|| "artifact-detail-delete".into())
-                                    .disabled(is_deleting)
+                                    .disabled(is_deleting || self.retention_slug.is_some())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.delete_artifact(slug_for_delete.clone(), cx);
                                     })),
                             ),
                     ),
             )
+            .child(self.render_retention_control(Some(item), p, cx))
             .child(
                 // ArtifactPreview surface
                 div()
@@ -1105,7 +1119,8 @@ impl Render for View {
                     .debug_selector(|| "artifacts-sharing-toggle".into())
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_sharing(!enabled, cx))),
                 )
-            });
+            })
+            .child(self.render_retention_control(None, p, cx));
 
         let main_body = if self.slow_load && self.items.is_empty() {
             Self::render_skeleton(p).into_any_element()
@@ -1154,7 +1169,7 @@ impl Render for View {
                 let type_label = item.type_label();
                 let size_label = format_byte_size(item.artifact.byte_size);
                 let updated_label = format_timestamp_short(item.artifact.updated_at.as_deref());
-                let expires_label = format_timestamp_short(item.artifact.expires_at.as_deref());
+                let expires_label = retention::expiration_label(&item.artifact);
 
                 rows = rows.child(
                     div()
@@ -1424,5 +1439,6 @@ impl Render for View {
 #[cfg(test)]
 mod tests;
 
+mod retention;
 mod sharing;
 pub use sharing::{runner, share_path};

@@ -1,48 +1,19 @@
-//! 공식 AI 프로바이더·에이전트 브랜드 아이콘 자산.
+//! 공식 배포 원본을 사용하는 AI 프로바이더·에이전트 브랜드 아이콘.
 //!
-//! SVG 경로 일부는 Orca(`.ref/orca`, Copyright (c) 2026 Lovecast Inc., MIT License)에서 차용했다.
-//! 네트워크 요청이나 외부 이미지 디코더 없이 `gpui` 인라인 벡터(`IconSource::Data`)로 즉시 그린다.
+//! 원본·출처·SHA-256은 `icons/official/`에 보존한다. 브랜드는 RGB 이미지로 표시하고,
+//! 유틸리티 아이콘만 단색 SVG 마스크를 사용한다. 프로젝트 아이콘 매핑은 Orca에서 차용했다
+//! (Copyright (c) 2026 Lovecast Inc., MIT License).
 
 use gpui::{Hsla, ParentElement as _, Styled as _, div, px, rgb};
 use gpui_component::{Icon, Sizable as _};
 use krill_proto::usage::ProviderKind;
 
-/// Anthropic Claude 공식 스파크 아이콘 SVG (`viewBox="0 0 24 24"`).
-/// Source: `.ref/orca/src/renderer/src/components/status-bar/icons.tsx` (MIT License).
-pub const CLAUDE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z" fill="currentColor" fill-rule="nonzero"/></svg>"#;
+mod brands;
 
-/// `OpenAI` / Codex 공식 블로섬 아이콘 SVG (`viewBox="0 0 24 24"`).
-/// Source: `.ref/orca/src/renderer/src/components/status-bar/icons.tsx` (MIT License).
-pub const OPENAI_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" fill-rule="evenodd" d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"/></svg>"#;
-
-/// Google Antigravity (`agy`) 공식 아치 마크 SVG (`viewBox="0 0 24 24"`).
-/// Source geometry adapted from `.ref/orca/src/shared/agent-icons/antigravity.png` (MIT License).
-pub const ANTIGRAVITY_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12 2.2C9.1 2.2 6.8 5.4 4.9 10.5C3.1 15.1 1.9 18.7 1.4 20.3C1.1 21.3 2.1 22.1 3.0 21.4C4.5 20.3 6.5 17.9 8.3 15.9C9.5 14.6 10.7 13.9 12 13.9C13.3 13.9 14.5 14.6 15.7 15.9C17.5 17.9 19.5 20.3 21.0 21.4C21.9 22.1 22.9 21.3 22.6 20.3C22.1 18.7 20.9 15.1 19.1 10.5C17.2 5.4 14.9 2.2 12 2.2Z"/></svg>"#;
-
-/// Google Antigravity (`agy`) 상단 코랄/앰버 크레스트 레이어 SVG (`viewBox="0 0 24 24"`).
-pub const ANTIGRAVITY_CREST_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12 2.2C9.7 2.2 7.8 4.4 6.1 8.0C7.8 6.7 9.8 6.0 12 6.0C14.2 6.0 16.2 6.7 17.9 8.0C16.2 4.4 14.3 2.2 12 2.2Z"/></svg>"#;
-
-/// `OpenCode` 공식 마크 SVG (`viewBox="0 0 512 512"`).
-/// Source: `.ref/orca/src/renderer/src/lib/agent-icon-glyphs.tsx` (MIT License).
-pub const OPENCODE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M320 224V352H192V224H320Z" fill="currentColor" fill-opacity="0.28"/><path fill-rule="evenodd" clip-rule="evenodd" d="M384 416H128V96H384V416ZM320 160H192V352H320V160Z" fill="currentColor"/></svg>"#;
-
-/// `OpenCode` 내부 코어 블록 레이어 SVG (`viewBox="0 0 512 512"`).
-pub const OPENCODE_CORE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M320 224V352H192V224H320Z" fill="currentColor"/></svg>"#;
+pub use brands::{ANTIGRAVITY_SVG, CLAUDE_SVG, CURSOR_SVG, OPENAI_SVG, OPENCODE_SVG, PI_SVG};
 
 /// 커스텀 에이전트 메뉴용 중립 봇 마크. 특정 프로바이더 로고로 오인하지 않게 한다.
 pub const CUSTOM_AGENT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5M23 12v5M9 17h6"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>"#;
-
-/// Pi 공식 π 마크. Orca `src/renderer/src/lib/agent-icon-glyphs.tsx`의 `PiIcon`
-/// (Copyright (c) 2026 Lovecast Inc., MIT License, 원본 `pi.dev/favicon.svg`).
-/// 공식 단색 마크이므로 호출자의 테마 전경색으로 그린다.
-pub const PI_SVG: &[u8] = br#"<svg viewBox="0 0 800 800" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" fill-rule="evenodd" d="M165.29 165.29 H517.36 V400 H400 V517.36 H282.65 V634.72 H165.29 Z M282.65 282.65 V400 H400 V282.65 Z"/><path fill="currentColor" d="M517.36 400 H634.72 V634.72 H517.36 Z"/></svg>"#;
-
-/// Cursor 공식 아이소메트릭 큐브·커서 마크 SVG (`viewBox="0 0 24 24"`).
-/// Source geometry adapted from `.ref/orca/src/shared/agent-icons/cursor.png` (MIT License).
-pub const CURSOR_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" fill-rule="evenodd" d="M12 1.75L20.88 6.88V17.12L12 22.25L3.12 17.12V6.88L12 1.75ZM5.4 8.2L12 12.0V19.6L18.6 8.2H5.4Z"/></svg>"#;
-
-/// Cursor 큐브 상단 패싯 하이라이트 레이어 SVG (`viewBox="0 0 24 24"`).
-pub const CURSOR_TOP_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12 1.75L20.88 6.88L12 12.0L3.12 6.88L12 1.75Z"/></svg>"#;
 
 /// Lucide `trash-2` 아이콘 SVG(ISC License). gpui-component 기본 아이콘 번들에 휴지통이 없어 인라인으로 둔다.
 pub const TRASH_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"#;
@@ -166,20 +137,8 @@ pub const KRILL_CORAL_LIGHT: u32 = 0x00d6_3a24;
 pub const BRAND_TILE_BG: u32 = 0x0008_090e;
 /// Claude 공식 브랜드 컬러(`#D97757`, Terracotta).
 pub const CLAUDE_COLOR: u32 = 0x00d9_7757;
-/// `OpenAI` / Codex 공식 브랜드 컬러(`#10A37F`, Emerald).
-pub const CODEX_COLOR: u32 = 0x0010_a37f;
-/// Google Antigravity 공식 브랜드 블루(`#4285F4`).
-pub const ANTIGRAVITY_BLUE: u32 = 0x0042_85f4;
-/// Google Antigravity 상단 크레스트 코랄(`#EA4335`).
-pub const ANTIGRAVITY_CORAL: u32 = 0x00ea_4335;
-/// `OpenCode` 공식 브랜드 시안(`#06B6D4`).
-pub const OPENCODE_COLOR: u32 = 0x0006_b6d4;
-/// `OpenCode` 내부 코어 스카이(`#67E8F9`).
-pub const OPENCODE_CORE_COLOR: u32 = 0x0067_e8f9;
-/// Cursor 공식 브랜드 인디고(`#6366F1`).
-pub const CURSOR_COLOR: u32 = 0x0063_66f1;
-/// Cursor 큐브 상단 패싯 하이라이트(`#A5B4FC`).
-pub const CURSOR_HIGHLIGHT_COLOR: u32 = 0x00a5_b4fc;
+/// Antigravity 원본 SVG에 포함된 파랑. 계정 아바타의 보조 색상이며 마크에는 tint하지 않는다.
+pub const ANTIGRAVITY_BLUE: u32 = 0x0031_86ff;
 /// 사용자 정의 커스텀 에이전트 기본 브랜드 앰버(`#F59E0B`).
 pub const CUSTOM_AGENT_COLOR: u32 = 0x00f5_9e0b;
 
@@ -210,95 +169,88 @@ pub const fn provider_svg_bytes(provider: ProviderKind) -> &'static [u8] {
     }
 }
 
-/// 프로바이더 대표 브랜드 색을 돌려준다.
+/// 계정 아바타 보조 색. 공식 마크 렌더링에는 사용하지 않는다.
 #[must_use]
 pub fn provider_brand_color(provider: ProviderKind, fg: Hsla) -> Hsla {
     match provider {
         ProviderKind::Claude => rgb(CLAUDE_COLOR).into(),
-        ProviderKind::Codex => rgb(CODEX_COLOR).into(),
-        // `Gemini`는 제거된 wire tombstone이라 호출자 전경색으로 폴백한다.
-        ProviderKind::Gemini => fg,
+        // 단색 브랜드와 제거된 wire tombstone은 호출자 전경색을 보조 UI에 쓴다.
+        ProviderKind::Codex | ProviderKind::Gemini | ProviderKind::OpenCode => fg,
         ProviderKind::Antigravity => rgb(ANTIGRAVITY_BLUE).into(),
-        ProviderKind::OpenCode => rgb(OPENCODE_COLOR).into(),
     }
 }
 
-/// 에이전트 ID 대표 브랜드 색을 돌려준다.
+/// 에이전트의 보조 UI 색. 공식 마크 렌더링에는 사용하지 않는다.
 #[must_use]
 pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => rgb(CLAUDE_COLOR).into(),
-        "codex" => rgb(CODEX_COLOR).into(),
         "agy" => rgb(ANTIGRAVITY_BLUE).into(),
-        "opencode" => rgb(OPENCODE_COLOR).into(),
-        "cursor" | "cursor-agent" => rgb(CURSOR_COLOR).into(),
-        "pi" => fg,
+        "codex" | "opencode" | "cursor" | "cursor-agent" | "pi" => fg,
         _ => rgb(CUSTOM_AGENT_COLOR).into(),
     }
 }
 
-/// 버튼·팝업 메뉴 항목(`Button::icon`, `PopupMenuItem::icon`)에 넣는 브랜드 색상 적용 프로바이더 [`Icon`].
+/// 버튼·팝업 메뉴에도 원본 RGB와 공식 테마 변형을 보존한다.
 #[must_use]
 pub fn provider_menu_icon(provider: ProviderKind) -> Icon {
-    let color = provider_brand_color(provider, rgb(CLAUDE_COLOR).into());
-    Icon::default()
-        .data(provider_svg_bytes(provider))
-        .text_color(color)
+    brands::provider_icon(provider).unwrap_or_default()
 }
 
-/// 버튼·팝업 메뉴 항목(`Button::icon`, `PopupMenuItem::icon`, `PopupMenu::submenu_with_icon`)에 넣는 브랜드 색상 적용 에이전트 [`Icon`].
+/// 버튼·팝업 메뉴 항목용 공식 원본. 사용자 정의 에이전트만 중립 봇으로 표시한다.
 #[must_use]
 pub fn agent_menu_icon(agent_id: &str) -> Icon {
-    let icon = Icon::default().data(agent_svg_bytes(agent_id));
-    if agent_id == "pi" {
-        icon
-    } else {
-        icon.text_color(agent_brand_color(agent_id, rgb(CLAUDE_COLOR).into()))
-    }
+    brands::agent_icon(agent_id).unwrap_or_else(|| {
+        Icon::default()
+            .data(CUSTOM_AGENT_SVG)
+            .text_color(rgb(CUSTOM_AGENT_COLOR))
+    })
 }
 
-/// 프로바이더 공식 로고 아이콘 요소를 만든다(관리자 페이지·상태바 공용).
+/// 상태바·계정 화면·메뉴 모두 같은 공식 원본과 이미지 렌더 경로를 쓴다.
 pub fn provider_icon(provider: ProviderKind, size_px: f32, _fg: Hsla) -> gpui::Div {
-    match provider {
-        ProviderKind::Claude => svg_box(CLAUDE_SVG, size_px, rgb(CLAUDE_COLOR).into()),
-        ProviderKind::Codex => svg_box(OPENAI_SVG, size_px, rgb(CODEX_COLOR).into()),
-        // `Gemini`는 제거된 wire tombstone이라 빈 박스를 유지한다.
-        ProviderKind::Gemini => div().size(px(size_px)),
-        ProviderKind::Antigravity => antigravity_box(size_px),
-        ProviderKind::OpenCode => opencode_box(size_px),
+    let boxed = div()
+        .size(px(size_px))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center();
+    match brands::provider_icon(provider) {
+        Some(icon) => boxed.child(icon.with_size(px(size_px))),
+        None => boxed,
     }
 }
 
 /// 에이전트 ID에 맞는 공식 브랜드 아이콘 요소를 만든다(관리자 페이지·탭 바·사이드바 공용).
-pub fn agent_brand_icon(agent_id: &str, size_px: f32, fg: Hsla) -> gpui::Div {
-    match krill_proto::agent::canonical_id(agent_id) {
-        "claude" => svg_box(CLAUDE_SVG, size_px, rgb(CLAUDE_COLOR).into()),
-        "codex" => svg_box(OPENAI_SVG, size_px, rgb(CODEX_COLOR).into()),
-        "agy" => antigravity_box(size_px),
-        "opencode" => opencode_box(size_px),
-        "cursor" | "cursor-agent" => cursor_box(size_px),
-        "pi" => svg_box(PI_SVG, size_px, fg),
-        other => {
-            let brand: Hsla = rgb(CUSTOM_AGENT_COLOR).into();
-            let letter = other
-                .chars()
-                .next()
-                .map_or_else(|| "?".to_owned(), |c| c.to_ascii_uppercase().to_string());
-            div()
-                .size(px(size_px))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(super::theme::RADIUS_XS)
-                .bg(brand.opacity(0.14))
-                .border_1()
-                .border_color(brand.opacity(0.45))
-                .text_size(super::theme::TEXT_2XS)
-                .text_color(brand)
-                .child(letter)
-        }
+pub fn agent_brand_icon(agent_id: &str, size_px: f32, _fg: Hsla) -> gpui::Div {
+    if let Some(icon) = brands::agent_icon(agent_id) {
+        return div()
+            .size(px(size_px))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon.with_size(px(size_px)));
     }
+    let other = krill_proto::agent::canonical_id(agent_id);
+    let brand: Hsla = rgb(CUSTOM_AGENT_COLOR).into();
+    let letter = other
+        .chars()
+        .next()
+        .map_or_else(|| "?".to_owned(), |c| c.to_ascii_uppercase().to_string());
+    div()
+        .size(px(size_px))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(super::theme::RADIUS_XS)
+        .bg(brand.opacity(0.14))
+        .border_1()
+        .border_color(brand.opacity(0.45))
+        .text_size(super::theme::TEXT_2XS)
+        .text_color(brand)
+        .child(letter)
 }
 
 /// 인라인 SVG 바이트로 지정 크기·색상의 [`Icon`]을 만든다.
@@ -352,74 +304,6 @@ pub fn brand_mark_tile(size_px: f32) -> gpui::Div {
             size_px * 2. / 3.,
             rgb(KRILL_CORAL).into(),
         ))
-}
-
-fn layered_svg_box(
-    base_svg: &'static [u8],
-    base_color: Hsla,
-    overlay_svg: &'static [u8],
-    overlay_color: Hsla,
-    size_px: f32,
-) -> gpui::Div {
-    div()
-        .relative()
-        .size(px(size_px))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            Icon::default()
-                .data(base_svg)
-                .with_size(px(size_px))
-                .text_color(base_color),
-        )
-        .child(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::default()
-                        .data(overlay_svg)
-                        .with_size(px(size_px))
-                        .text_color(overlay_color),
-                ),
-        )
-}
-
-fn antigravity_box(size_px: f32) -> gpui::Div {
-    layered_svg_box(
-        ANTIGRAVITY_SVG,
-        rgb(ANTIGRAVITY_BLUE).into(),
-        ANTIGRAVITY_CREST_SVG,
-        rgb(ANTIGRAVITY_CORAL).into(),
-        size_px,
-    )
-}
-
-fn opencode_box(size_px: f32) -> gpui::Div {
-    let core: Hsla = rgb(OPENCODE_CORE_COLOR).into();
-    layered_svg_box(
-        OPENCODE_SVG,
-        rgb(OPENCODE_COLOR).into(),
-        OPENCODE_CORE_SVG,
-        core.opacity(0.45),
-        size_px,
-    )
-}
-
-fn cursor_box(size_px: f32) -> gpui::Div {
-    let top: Hsla = rgb(CURSOR_HIGHLIGHT_COLOR).into();
-    layered_svg_box(
-        CURSOR_SVG,
-        rgb(CURSOR_COLOR).into(),
-        CURSOR_TOP_SVG,
-        top.opacity(0.55),
-        size_px,
-    )
 }
 
 /// 사이드바 프로젝트(저장소·폴더) 헤더 아이콘(Orca `RepoIcon`).
@@ -539,15 +423,13 @@ mod tests {
     }
 
     #[test]
-    fn pi_mark_is_shared_by_agent_and_menu_paths_and_keeps_the_theme_foreground() {
+    fn pi_mark_is_shared_by_agent_and_menu_paths() {
         assert_eq!(agent_svg_bytes("pi"), PI_SVG);
         assert_ne!(agent_svg_bytes("pi"), OPENCODE_SVG);
-        for p in [&crate::ui::LIGHT, &crate::ui::DARK] {
-            assert_eq!(agent_brand_color("pi", p.foreground), p.foreground);
-        }
         let svg = std::str::from_utf8(PI_SVG).expect("Pi SVG");
-        assert!(svg.contains("fill-rule=\"evenodd\""));
-        assert!(svg.contains("M517.36 400 H634.72 V634.72 H517.36 Z"));
+        for color in ["#F09082", "#4D9ABF", "#F1BE58"] {
+            assert!(svg.contains(color));
+        }
     }
 
     #[test]
@@ -559,55 +441,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_providers_and_agents_have_chromatic_brand_colors_and_valid_svgs() {
-        let fallback = gpui::hsla(0.0, 0.0, 0.5, 1.0);
-        for provider in ProviderKind::ALL {
-            let bytes = provider_svg_bytes(provider);
-            let svg = std::str::from_utf8(bytes).expect("provider SVG must be valid UTF-8");
-            assert!(
-                svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"),
-                "invalid SVG for {provider:?}"
-            );
-            let color = provider_brand_color(provider, fallback);
-            assert!(
-                color.s > 0.35,
-                "provider {provider:?} brand color must be chromatic: {color:?}"
-            );
-            assert!(
-                color.l > 0.25 && color.l < 0.80,
-                "provider {provider:?} brand color must remain legible on light and dark surfaces: {color:?}"
-            );
-        }
-
-        for agent in [
-            "claude",
-            "codex",
-            "agy",
-            "antigravity",
-            "gemini",
-            "opencode",
-            "cursor",
-            "cursor-agent",
-            "custom-agent",
-            "",
-        ] {
-            let bytes = agent_svg_bytes(agent);
-            let svg = std::str::from_utf8(bytes).expect("agent SVG must be valid UTF-8");
-            assert!(
-                svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"),
-                "invalid SVG for {agent}"
-            );
-            let color = agent_brand_color(agent, fallback);
-            assert!(
-                color.s > 0.35,
-                "agent {agent} brand color must be chromatic: {color:?}"
-            );
-            assert!(
-                color.l > 0.25 && color.l < 0.80,
-                "agent {agent} brand color must remain legible on light and dark surfaces: {color:?}"
-            );
-        }
+    #[gpui::test]
+    fn official_brand_sources_parse_and_keep_their_original_colors(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            for provider in ProviderKind::ALL {
+                let bytes = provider_svg_bytes(provider);
+                cx.svg_renderer()
+                    .parse_svg(bytes)
+                    .expect("valid official provider SVG");
+            }
+            for agent in [
+                "claude",
+                "codex",
+                "agy",
+                "pi",
+                "cursor",
+                "opencode",
+                "custom-agent",
+            ] {
+                cx.svg_renderer()
+                    .parse_svg(agent_svg_bytes(agent))
+                    .expect("valid agent SVG");
+            }
+        });
+        // 다색 원본과 흑백 원본을 임의의 유채색으로 강제하는 회귀를 막는다.
+        assert!(
+            std::str::from_utf8(ANTIGRAVITY_SVG)
+                .unwrap()
+                .contains("feGaussianBlur")
+        );
+        assert!(
+            std::str::from_utf8(OPENCODE_SVG)
+                .unwrap()
+                .contains("#CFCECD")
+        );
+        assert!(
+            std::str::from_utf8(OPENAI_SVG)
+                .unwrap()
+                .contains("fill=\"black\"")
+        );
     }
 
     struct IconGallery;
@@ -699,32 +571,37 @@ mod tests {
     }
 
     #[gpui::test]
-    fn gpui_renders_all_colored_provider_and_agent_icons_across_themes(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let window = cx.add_window(|_, _| IconGallery);
-        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
-        vcx.run_until_parked();
+    fn gpui_renders_official_provider_and_agent_icons_across_themes(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        for mode in [
+            gpui_component::ThemeMode::Light,
+            gpui_component::ThemeMode::Dark,
+        ] {
+            cx.update(|cx| gpui_component::Theme::change(mode, None, cx));
+            let window = cx.add_window(|_, _| IconGallery);
+            let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+            vcx.run_until_parked();
 
-        for (provider, sel) in GALLERY_PROVIDERS {
-            assert!(
-                vcx.debug_bounds(sel).is_some(),
-                "missing provider icon bounds for {provider:?}"
-            );
+            for (provider, sel) in GALLERY_PROVIDERS {
+                assert!(
+                    vcx.debug_bounds(sel).is_some(),
+                    "missing provider icon bounds for {provider:?}"
+                );
+            }
+            for (_, _, sel, menu_sel) in GALLERY_AGENTS {
+                assert!(
+                    vcx.debug_bounds(sel).is_some(),
+                    "missing agent icon bounds for {sel}"
+                );
+                assert!(
+                    vcx.debug_bounds(menu_sel).is_some(),
+                    "missing menu icon bounds for {menu_sel}"
+                );
+            }
+            assert!(vcx.debug_bounds("gallery-krill-mark").is_some());
+            let tile = vcx.debug_bounds("gallery-krill-tile");
+            assert_eq!(tile.map(|b| b.size.width), Some(px(72.)));
         }
-        for (_, _, sel, menu_sel) in GALLERY_AGENTS {
-            assert!(
-                vcx.debug_bounds(sel).is_some(),
-                "missing agent icon bounds for {sel}"
-            );
-            assert!(
-                vcx.debug_bounds(menu_sel).is_some(),
-                "missing menu icon bounds for {menu_sel}"
-            );
-        }
-        assert!(vcx.debug_bounds("gallery-krill-mark").is_some());
-        let tile = vcx.debug_bounds("gallery-krill-tile");
-        assert_eq!(tile.map(|b| b.size.width), Some(px(72.)));
     }
 
     /// 코랄은 라이트 바탕에서 `#D63A24`, 다크 바탕에서 `#FF5238`. 히어로 타일은 늘 남색 위 `#FF5238`.

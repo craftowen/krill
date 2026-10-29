@@ -2,6 +2,7 @@
 
 mod clipboard;
 // Krill modification (Apache-2.0 §4(b)): asynchronous native clipboard IO.
+mod character_input;
 mod clipboard_worker;
 mod destination_list;
 mod dialog;

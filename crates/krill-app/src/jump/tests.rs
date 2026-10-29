@@ -221,7 +221,8 @@ fn jump_palette_filters_vault_hits_and_emits_resume_vault(cx: &mut TestAppContex
         .expect("jump vault resume button");
     cx.simulate_click(btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(events.borrow().last(), Some(&Event::ResumeVault(1)));
+    let expected = cx.update(|_, cx| view.read(cx).vault_event(1).unwrap());
+    assert_eq!(events.borrow().last(), Some(&expected));
 }
 
 /// OWE-768: 열린 세션이 있을 때와 0개일 때 모두 방향키(↑/↓)·Enter로
@@ -304,7 +305,8 @@ fn jump_palette_keyboard_navigates_vault_items_and_syncs_history_search(cx: &mut
     // down 두 번으로 2번째 볼트 항목(index 2)까지 이동 후 Enter로 선택.
     cx.simulate_keystrokes("down down enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 2);
-    assert_eq!(events.borrow().as_slice(), &[Event::ResumeVault(1)]);
+    let expected = cx.update(|_, cx| view.read(cx).vault_event(1).unwrap());
+    assert_eq!(events.borrow().as_slice(), &[expected]);
 
     // 열린 세션과 일치하지 않는 검색어("snippet") 입력:
     // 백엔드 `Action::Search`가 연동되고, 열린 세션 매치가 0개여도
@@ -318,7 +320,16 @@ fn jump_palette_keyboard_navigates_vault_items_and_syncs_history_search(cx: &mut
     // OWE-862: ↑↓는 순환한다. 2행에서 down 3번은 0→1→0→1.
     cx.simulate_keystrokes("down down down enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 1);
-    assert_eq!(events.borrow().as_slice(), &[Event::ResumeVault(1)]);
+    let expected = cx.update(|_, cx| view.read(cx).vault_event(1).unwrap());
+    assert_eq!(events.borrow().as_slice(), &[expected]);
+
+    // A host switch invalidates the shared history before the new daemon replies.
+    // The palette must remove the old host's resumable rows even with no new data.
+    history.update(cx, |h, cx| {
+        h.set_host(HostId::Remote("disconnected".into()), None, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 0);
 }
 
 fn worktree(id: &str, label: &str, session: Option<u64>) -> WorktreeEntry {

@@ -147,7 +147,9 @@ fn subprocess_writer() -> io::Result<()> {
         let dir =
             std::env::var_os("KRILL_LOG_DIR").ok_or_else(|| io::Error::other("missing log dir"))?;
         let log = RollingLog::open(PathBuf::from(dir), component)?;
-        let record = "load".repeat(64);
+        // Exercise maximum record pressure even when the nonblocking family
+        // lock drops most competing attempts on a slower filesystem.
+        let record = "load".repeat(RECORD_BYTES / 4);
         for _ in 0..21_600 {
             log.append(&record)?;
         }
