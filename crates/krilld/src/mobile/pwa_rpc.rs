@@ -1043,6 +1043,7 @@ impl Backend {
                 sessions: Vec::new(),
                 repositories: Vec::new(),
                 branches: Vec::new(),
+                prompt_histories: Vec::new(),
             },
         };
         let catalog = self.catalog(&sidebar.repositories);

@@ -46,7 +46,7 @@ const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_hours(24);
 const MAX_BYTES: u64 = 512 * 1024;
 
 /// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
-/// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다(직접 조회가 켜져 있을 때).
+/// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다.
 pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     lock(&CACHE).remove(&(home.to_path_buf(), provider, dir.to_path_buf()));
     super::meters::evict_profile(home, provider, dir);
@@ -1498,12 +1498,6 @@ pub(crate) mod agy {
             .map(|(_, usage)| usage.clone())
     }
 
-    pub(super) fn evict(home: &Path) {
-        lock(&CACHE).retain(|(h, _), _| h != home);
-        lock(&FAILED).retain(|(h, _), _| h != home);
-        lock(&PENDING).retain(|(h, _)| h != home);
-    }
-
     /// `direct::refresh`가 `SAVE_LOCK` 없이 호출한다. 실제 실행은 스레드에서만.
     pub(super) fn refresh(
         home: &Path,
@@ -1514,6 +1508,16 @@ pub(crate) mod agy {
         if cfg!(test) || latched() {
             return;
         }
+        refresh_with(home, state, file, interval, spawn);
+    }
+
+    fn refresh_with(
+        home: &Path,
+        state: Option<&Path>,
+        file: &accounts::AccountsFile,
+        interval: Duration,
+        mut schedule: impl FnMut(&Key, bool, Option<PathBuf>),
+    ) {
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -1540,12 +1544,12 @@ pub(crate) mod agy {
             {
                 continue;
             }
-            // 로그인 안 된 agy에 `-p /usage`를 보내면 매번 대화형 OAuth를 시작한다(설 실기, v0.1.9:
-            // 격리 HOME에서 2~3분마다 OAuth 시도 46회). 로그인된 프로필만 조회한다.
-            if !should_probe(&key.1, host) || !lock(&PENDING).insert(key.clone()) {
+            // Deduplicate before authentication: host login checks may wait on
+            // the macOS keychain and must run on the worker, never on Create/hook.
+            if !lock(&PENDING).insert(key.clone()) {
                 continue;
             }
-            spawn(&key, host, state.map(Path::to_path_buf));
+            schedule(&key, host, state.map(Path::to_path_buf));
         }
     }
 
@@ -1558,58 +1562,71 @@ pub(crate) mod agy {
         let launched = std::thread::Builder::new()
             .name("agy-usage".into())
             .spawn(move || {
+                // An unauthenticated profile must never run `/usage` (it can
+                // start interactive OAuth). Keep this check off request threads.
+                let started = Instant::now();
+                let authenticated =
+                    std::panic::catch_unwind(|| should_probe(&job.1, host)).unwrap_or(false);
+                if started.elapsed() >= Duration::from_secs(2) {
+                    tracing::info!(
+                        host,
+                        elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "agy authentication check slow"
+                    );
+                }
+                if !authenticated {
+                    lock(&PENDING).remove(&job);
+                    return;
+                }
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
                 })
                 .ok()
                 .flatten();
-                // 조회 중 사용자가 직접 조회를 끄면 결과도 버린다.
-                let enabled = accounts::load_file(&job.0, state.as_deref()).direct_usage;
-                if enabled {
-                    if let Some((usage, meters)) = usage {
-                        lock(&FAILED).remove(&job);
-                        super::super::meters::remember(
-                            &job.0,
-                            ProviderKind::Antigravity,
-                            &job.1,
-                            meters,
-                        );
-                        // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
-                        // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
-                        if usage_max(&usage) < 100
-                            && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
-                        {
-                            accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
-                        }
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs());
-                        let mut cache = lock(&CACHE);
-                        cache.retain(|_, (at, _)| at.elapsed() < TTL);
-                        if cache.len() >= 256 {
-                            cache.pop_first();
-                        }
-                        cache.insert(
-                            job.clone(),
-                            (
-                                Instant::now(),
-                                ProfileUsage {
-                                    usage,
-                                    updated_at: now,
-                                    ..ProfileUsage::default()
-                                },
-                            ),
-                        );
-                    } else {
-                        let mut failed = lock(&FAILED);
-                        failed.retain(|_, at| at.elapsed() < TTL);
-                        if failed.len() >= 256 {
-                            failed.pop_first();
-                        }
-                        failed.insert(job.clone(), Instant::now());
+                if let Some((usage, meters)) = usage {
+                    lock(&FAILED).remove(&job);
+                    super::super::meters::remember(
+                        &job.0,
+                        ProviderKind::Antigravity,
+                        &job.1,
+                        meters,
+                    );
+                    // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
+                    // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
+                    if usage_max(&usage) < 100
+                        && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
+                    {
+                        accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
                     }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs());
+                    let mut cache = lock(&CACHE);
+                    cache.retain(|_, (at, _)| at.elapsed() < TTL);
+                    if cache.len() >= 256 {
+                        cache.pop_first();
+                    }
+                    cache.insert(
+                        job.clone(),
+                        (
+                            Instant::now(),
+                            ProfileUsage {
+                                usage,
+                                updated_at: now,
+                                ..ProfileUsage::default()
+                            },
+                        ),
+                    );
+                } else {
+                    let mut failed = lock(&FAILED);
+                    failed.retain(|_, at| at.elapsed() < TTL);
+                    if failed.len() >= 256 {
+                        failed.pop_first();
+                    }
+                    failed.insert(job.clone(), Instant::now());
                 }
                 lock(&PENDING).remove(&job);
             });
@@ -1951,6 +1968,63 @@ pub(crate) mod agy {
             std::fs::write(&exe, script).unwrap();
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
             exe
+        }
+
+        #[test]
+        fn refresh_queues_authentication_without_waiting_or_launching_duplicates() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let home =
+                std::env::temp_dir().join(format!("agy-auth-schedule-{}", std::process::id()));
+            let file = accounts::AccountsFile::default();
+            let mut scheduled = Vec::new();
+            // No credentials: refresh must still queue the auth check, rather than
+            // synchronously querying the keychain before it can schedule the job.
+            for _ in 0..2 {
+                refresh_with(
+                    &home,
+                    None,
+                    &file,
+                    Duration::from_secs(300),
+                    |key, host, _| {
+                        scheduled.push((key.clone(), host));
+                    },
+                );
+            }
+            let key = (
+                home.clone(),
+                accounts::host_default_dir(&home, ProviderKind::Antigravity),
+            );
+            let pending = lock(&PENDING).contains(&key);
+            reset_latch_for_tests();
+            assert_eq!(scheduled, vec![(key, true)]);
+            assert!(
+                pending,
+                "authentication must be deduplicated while it is queued"
+            );
+        }
+
+        #[test]
+        fn signed_out_auth_worker_releases_pending_without_caching_failure() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let home =
+                std::env::temp_dir().join(format!("agy-auth-signed-out-{}", std::process::id()));
+            let key = (home.clone(), home.join("missing-profile"));
+            assert!(lock(&PENDING).insert(key.clone()));
+            spawn(&key, false, None);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while lock(&PENDING).contains(&key) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let pending = lock(&PENDING).contains(&key);
+            let failed = lock(&FAILED).contains_key(&key);
+            reset_latch_for_tests();
+            assert!(!pending, "signed-out authentication must release its job");
+            assert!(
+                !failed,
+                "a subsequent login must not wait for the usage failure cooldown"
+            );
         }
 
         const USAGE_ENVELOPE: &str = r#"{
@@ -2572,6 +2646,8 @@ mod tests {
     }
     #[test]
     fn antigravity_native_metadata_is_validated_without_a_model_turn() {
+        use std::fmt::Write as _;
+
         let raw = br#"{"auth_method":"oauth","token":{"access_token":"fixture-only"}}"#;
         assert!(parse_antigravity_auth(raw).unwrap().logged_in);
         assert!(
@@ -2584,6 +2660,16 @@ mod tests {
         let wrapped =
             b"go-keyring-base64:eyJhdXRoX21ldGhvZCI6Im9hdXRoIiwidG9rZW4iOnsiYWNjZXNzX3Rva2VuIjoiZml4dHVyZS1vbmx5In19\n";
         assert!(parse_antigravity_auth(wrapped).unwrap().logged_in);
+        let native = br#"{"auth_method":"consumer","token":{"access_token":"synthetic-access"},"id_token_email":"native@example.test"}"#;
+        let mut encoded = String::from("go-keyring-encoded:");
+        for byte in native {
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        for raw in [native.as_slice(), encoded.as_bytes()] {
+            let status = parse_antigravity_auth(raw).unwrap();
+            assert!(status.logged_in);
+            assert_eq!(status.identity.unwrap().email, "native@example.test");
+        }
         let utf16_claude: Vec<u8> = br#"{"claudeAiOauth":{"accessToken":"utf16-token"}}"#
             .iter()
             .flat_map(|&b| [b, 0])
@@ -2887,21 +2973,52 @@ mod tests {
         assert!(parse_codex_backend("bad").is_empty());
         assert!(parse_codex_backend(r#"{"rate_limit":{"primary_window":{"limit_window_seconds":60,"used_percent":100}}}"#).is_empty());
     }
+    /// 이전 버전에서 꺼 둔 설정이 남아 있어도 자동 수집 결과를 버리지 않는다.
     #[test]
-    fn disabled_setting_drops_cached_usage_without_reading_credentials() {
-        let root = std::env::temp_dir().join(format!("owe719-direct-{}", std::process::id()));
+    fn legacy_disabled_setting_keeps_automatic_usage() {
+        let root = std::env::temp_dir().join(format!("auto-usage-{}", std::process::id()));
         let home = root.join("home");
         let state = root.join("state");
-        let key = (home.clone(), ProviderKind::Claude, home.join(".claude"));
-        lock(&CACHE).insert(key.clone(), (Instant::now(), ProfileUsage::default()));
-        let file = accounts::AccountsFile {
-            direct_usage: false,
-            ..accounts::AccountsFile::default()
+        let dir = home.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let config = accounts::config_path(&home, Some(&state));
+        let raw = "direct_usage = false\n[auto_switch]\nenabled = false\n";
+        std::fs::write(&config, raw).unwrap();
+        let key = (home.clone(), ProviderKind::Claude, dir.clone());
+        let usage = Usage {
+            five_hour: Some(Window {
+                percent: 42,
+                resets_at: None,
+            }),
+            seven_day: None,
         };
-        accounts::save_file(&home, Some(&state), &file).unwrap();
+        lock(&CACHE).insert(
+            key.clone(),
+            (
+                Instant::now(),
+                ProfileUsage {
+                    usage: usage.clone(),
+                    ..ProfileUsage::default()
+                },
+            ),
+        );
         refresh(&home, Some(&state));
-        assert!(!lock(&CACHE).contains_key(&key));
-        std::fs::remove_dir_all(root).ok();
+        let snap = accounts::refresh_accounts(&home, Some(&state));
+        assert!(snap.connections.direct_usage);
+        let host = snap
+            .accounts
+            .iter()
+            .find(|a| a.id == "claude-host")
+            .unwrap();
+        assert_eq!(host.usage, usage.to_proto());
+        assert_eq!(
+            cached(&home, ProviderKind::Claude, &dir).unwrap().usage,
+            usage
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), raw);
+        lock(&CACHE).remove(&key);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 429는 마지막 정상 값은 오래됨으로 남기고, 정상 값이 없을 때는 제한 이유를 보존한다.

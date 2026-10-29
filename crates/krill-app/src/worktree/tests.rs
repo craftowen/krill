@@ -360,12 +360,23 @@ fn owe853_base_default_and_searchable_dropdown(cx: &mut TestAppContext) {
         });
     });
     assert_eq!(cx.update(|_, cx| dialog.read(cx).base_value(cx)), "custom");
-    // 검색어로 필터된다.
     cx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
             d.base.update(cx, |input, cx| {
                 input.set_value("feat", window, cx);
             });
+        });
+    });
+    cx.run_until_parked();
+    // 기준 ref 칸에 포커스가 없으면 후보 목록을 펼치지 않는다.
+    assert!(
+        cx.debug_bounds("worktree-base-option-feat/parent")
+            .is_none()
+    );
+    // 포커스가 오면 검색어로 필터된 후보가 펼쳐진다.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.base.update(cx, |input, cx| input.focus(window, cx));
         });
     });
     cx.run_until_parked();
@@ -812,9 +823,10 @@ fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut Tes
     });
     cx.run_until_parked();
 
+    // 칩 나열 대신 프로젝트·실행 위치 콤보박스 두 개만 보인다.
+    assert!(cx.debug_bounds("worktree-repo-selector").is_some());
     assert!(cx.debug_bounds("worktree-host-selector").is_some());
-    assert!(cx.debug_bounds("worktree-host-local").is_some());
-    assert!(cx.debug_bounds("worktree-host-mini").is_some());
+    assert!(cx.debug_bounds("worktree-repo-0").is_none());
 
     let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
     assert_eq!(
@@ -824,8 +836,8 @@ fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut Tes
 
     cx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
-            d.select_host(HostId::Remote("mini".into()), window, cx);
-            d.select_repo(PathBuf::from("/remote/repo-b"), window, cx);
+            // 원격에만 있는 프로젝트를 고르면 그 호스트로 옮겨 간다.
+            d.select_project("repo-b", window, cx);
             d.name.update(cx, |input, cx| {
                 input.set_value("wt-remote", window, cx);
             });

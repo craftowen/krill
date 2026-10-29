@@ -5400,6 +5400,68 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
     }
 }
 
+#[test]
+fn orchestration_session_labels_preserve_provenance_across_title_changes() {
+    use krill_proto::orchestration::{DispatchSessionOrigin, DispatchStatus, OrchestrationStore};
+
+    let mut sidebar = Sidebar::new_loaded(None);
+    let mut worker = session(21, AgentState::Working, Some("/repo"));
+    worker.status.agent = "codex".into();
+    worker.status.title = Some("조사 신고리스트".into());
+    assert_eq!(sidebar.session_label(&worker).0, "조사 신고리스트");
+
+    let store = &mut sidebar.disk.orchestration;
+    let run = store.create_run("Title provenance", None).unwrap();
+    store
+        .start_worker(&run.id, None, "worker", "codex", Some(21), "/repo", "p")
+        .unwrap();
+    // Persisted dispatches also identify workers created before an app restart.
+    sidebar.disk.orchestration =
+        serde_json::from_slice(&serde_json::to_vec(&sidebar.disk.orchestration).unwrap()).unwrap();
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 조사 신고리스트"
+    );
+    assert_eq!(
+        sidebar
+            .session_label_on_with_title(&HostId::Local, &worker, Some("⠂ 새 터미널 제목"))
+            .0,
+        "[orchestration] 새 터미널 제목"
+    );
+    sidebar
+        .custom_titles
+        .insert(worker.id, "직접 정한 제목".into());
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 직접 정한 제목"
+    );
+    sidebar
+        .custom_titles
+        .insert(worker.id, "[orchestration] 기존 접두사".into());
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 기존 접두사"
+    );
+
+    sidebar.disk.orchestration.dispatches[0].status = DispatchStatus::Succeeded;
+    sidebar.custom_titles.clear();
+    worker.status.title = None;
+    sidebar.auto_titles.insert(worker.id, "첫 프롬프트".into());
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 첫 프롬프트"
+    );
+    sidebar.auto_titles.clear();
+    assert_eq!(sidebar.session_label(&worker).0, "[orchestration] codex");
+
+    let remote = HostId::Remote("other-host".into());
+    assert_eq!(sidebar.session_label_on(&remote, &worker).0, "codex");
+    sidebar.disk.orchestration.dispatches[0].session_origin = DispatchSessionOrigin::Borrowed;
+    assert_eq!(sidebar.session_label(&worker).0, "codex");
+    sidebar.disk.orchestration = OrchestrationStore::default();
+    assert_eq!(sidebar.session_label(&worker).0, "codex");
+}
+
 /// 칸이 열리지 않은 세션도 krilld가 보낸 터미널 제목으로 이름을 보이고, 칸 제목의 상태 글리프는 떼며,
 /// 에이전트 기본 제목(`Claude Code`)은 첫 프롬프트 자동 제목에 양보한다.
 #[gpui::test]

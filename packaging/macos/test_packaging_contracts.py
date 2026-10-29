@@ -34,7 +34,12 @@ class SourceInstallTests(unittest.TestCase):
         self.prefix = self.root / "installation"
         self.fake = self.root / "tools"
         self.fake.mkdir()
-        executable(self.fake / "uname", '#!/bin/sh\nif [ "$1" = -m ]; then echo arm64; else echo Darwin; fi\n')
+        executable(self.fake / "uname", '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; else echo arm64; fi\n')
+        for name in ("curl", "gh"):
+            executable(self.fake / name, "#!" + sys.executable + "\n"
+                       "import os,pathlib,sys\n"
+                       "pathlib.Path(os.environ['FAKE_NETWORK_CALL']).write_text(sys.argv[0])\n"
+                       "sys.exit(85)\n")
         self.artifacts = []
         for name in NAMES:
             artifact = self.target / name
@@ -53,6 +58,7 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
 """)
         self.env = dict(os.environ, PATH=str(self.fake) + os.pathsep + os.environ['PATH'],
                         FAKE_SOURCE=str(self.source), FAKE_CALL=str(self.root / "cargo-call"),
+                        FAKE_NETWORK_CALL=str(self.root / "network-call"),
                         CARGO_TARGET_DIR=str(self.target.parent))
 
     def install(self, **env):
@@ -82,6 +88,7 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
     def test_failed_build_never_installs_artifacts(self):
         result = self.install(FAKE_STATUS="17")
         self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.root / "cargo-call").exists(), "must reach the failing compiler fixture")
         self.assertFalse(self.prefix.exists())
 
     def test_missing_reported_artifact_never_partially_installs(self):
@@ -155,6 +162,8 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Krill supports Apple Silicon Macs only", result.stderr)
+        self.assertFalse((self.root / "cargo-call").exists())
+        self.assertFalse((self.root / "network-call").exists())
         self.assertFalse(self.prefix.exists())
         self.assertFalse((self.root / "apps").exists())
 

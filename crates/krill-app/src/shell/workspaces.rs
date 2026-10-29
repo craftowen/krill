@@ -45,6 +45,11 @@ impl Shell {
                     && (sidebar
                         .session_on(host, session)
                         .is_some_and(sidebar::Session::is_exited)
+                        // krilld가 닫힘·이미 재개됨(`NoSession`)으로 확정한 세션: 목록 부재와 달리 증거가 있다.
+                        || self.gone_sessions.contains(&(host.clone(), session))
+                            && sidebar
+                                .session_on(host, session)
+                                .is_none_or(sidebar::Session::is_exited)
                         // A local daemon restarting for an update may briefly
                         // publish an incomplete list. Absence is not proof of
                         // PTY exit; keep saved tabs until an explicit exit.
@@ -66,6 +71,7 @@ impl Shell {
                 if let Some(session) = self.layout.session(pane) {
                     let host = self.layout.host(pane).clone();
                     self.workspace_closing.insert((host.clone(), session));
+                    self.gone_sessions.remove(&(host.clone(), session));
                     self.observed_sessions.remove(&(host, session));
                 }
             }

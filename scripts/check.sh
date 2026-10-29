@@ -1,14 +1,15 @@
 #!/bin/zsh
-# 완료 게이트. 하나라도 실패하면 0이 아닌 코드로 끝난다. 작업 완료 주장 전 반드시 통과.
+# 릴리스 후보의 전체 검사. 개발 중에는 AGENTS.md의 영향 범위별 검증을 따른다.
 set -euo pipefail
 cd "${0:A:h}/.."
 if [[ ${1-} == -h || ${1-} == --help ]]; then
   print "사용: scripts/check.sh [--memory]
-  fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency) · doctest
+  비Cargo 회귀 · fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency) · doctest
   --memory          끝에 scripts/memory-gate.sh(MK-066)까지 돈다
   KRILL_TEST_SLOTS  머신 전체 동시 테스트 실행 수(기본: CPU 코어 수 / 4, 최소 1)"
   exit 0
 fi
+python3 scripts/check-build-target.py
 # 종료·타임아웃(perl alarm → SIGALRM)·Ctrl-C 때 이 스크립트가 띄운 cargo·테스트 프로세스 트리를 정리한다(고아 cargo가
 # 공유 빌드 락을 쥔 채 남는 문제). `kill 0`은 호출자 셸까지 죽일 수 있어 자기 자식 트리만 찾아 끈다.
 # zsh는 포그라운드 자식이 끝날 때까지 신호 trap을 미루므로 각 단계는 run(백그라운드 + wait)으로 돌린다.
@@ -20,6 +21,7 @@ trap 'cleanup; exit 142' ALRM
 trap 'cleanup; exit 143' TERM HUP
 run(){ "$@" & wait $!; }
 step(){ print -P "%B== $1%b"; }
+step "non-Cargo regressions"; run python3 scripts/check-regressions.py
 # 병렬 1단계: 읽기 전용 검사 4종을 묶고, 하나라도 실패하면 전체 검사를 중단한다.
 # clippy·nextest·doctest는 target/ 락을 공유하므로 순서를 유지한다.
 step "fmt+deny+notices+public-surface (parallel)";

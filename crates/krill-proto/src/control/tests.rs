@@ -370,6 +370,7 @@ fn sidebar_fixtures_and_shared_badge() {
             sessions: vec![],
             repositories: vec![],
             branches: vec![],
+            prompt_histories: Vec::new(),
         })),
         "04000000310e0000"
     );
@@ -384,6 +385,7 @@ fn sidebar_fixtures_and_shared_badge() {
                 worktrees: vec![b"/a".to_vec()]
             }],
             branches: vec![],
+            prompt_histories: Vec::new(),
         })),
         "0f000000310e0101022f6101022f6101022f61"
     );
@@ -394,6 +396,7 @@ fn sidebar_fixtures_and_shared_badge() {
             worktrees: vec![b"/a".to_vec()],
         }],
         branches: vec![(b"/a".to_vec(), "main".into())],
+        prompt_histories: Vec::new(),
     });
     let _ = roundtrip(&with_branches);
     let mut status = AgentStatus::UNKNOWN;
@@ -415,16 +418,19 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(vec![b'x'; 4097], "main".into())],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(b"/a".to_vec(), "x".repeat(MAX_TITLE_TEXT + 1))],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(b"/a".to_vec(), "main".into()); 513],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![SessionDirectory {
@@ -433,6 +439,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             }],
             repositories: vec![],
             branches: vec![],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![
@@ -444,6 +451,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             ],
             repositories: vec![],
             branches: vec![],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![],
@@ -452,6 +460,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
                 worktrees: vec![vec![]; 513],
             }],
             branches: vec![],
+            prompt_histories: Vec::new(),
         },
     ];
     for data in cases {
@@ -1341,5 +1350,75 @@ fn invalid_observed_root_metadata_does_not_poison_other_rows_or_status() {
         assert_eq!(old_rows.len(), 2);
         assert_eq!(old_rows[1].status.agent, "claude");
         assert!(old_rows.iter().all(|row| row.status.root_shell.is_none()));
+    }
+}
+
+#[test]
+fn sidebar_prompt_tail_roundtrip_and_legacy_compatibility() {
+    use crate::git::{SessionPromptHistory, SessionPromptTurn};
+    let history = SessionPromptHistory {
+        total_turns: 1,
+        turns: vec![SessionPromptTurn {
+            text: "hi".into(),
+            unix_ns: 1,
+            turn: 1,
+        }],
+    };
+    let reply = Reply::Sidebar(SidebarData {
+        prompt_histories: vec![(SessionId(7), history)],
+        ..SidebarData::default()
+    });
+    assert_eq!(roundtrip(&reply), "0e000000310e000000010701010268690101");
+    let bytes = reply.encode().unwrap();
+    let (_, body) = read_frame(&mut &bytes[..]).unwrap().unwrap();
+    // N-1 decoder consumes the original sidebar and optional branches, ignoring newer tails.
+    let (Reply::Sidebar(legacy), rest) = postcard::take_from_bytes::<Reply>(&body).unwrap() else {
+        panic!("expected sidebar");
+    };
+    assert!(legacy.prompt_histories.is_empty());
+    let (Branches(branches), _) = postcard::take_from_bytes::<Branches>(rest).unwrap();
+    assert!(branches.is_empty());
+    let Reply::Sidebar(old) = Reply::decode(kind::REPLY, &[14, 0, 0]).unwrap() else {
+        panic!("expected legacy sidebar");
+    };
+    assert!(old.prompt_histories.is_empty());
+}
+
+#[test]
+fn sidebar_prompt_tail_rejects_unbounded_peer_data() {
+    use crate::git::{SessionPromptHistory, SessionPromptTurn};
+    let turn = SessionPromptTurn {
+        text: "hello".into(),
+        unix_ns: 1,
+        turn: 1,
+    };
+    for histories in [
+        vec![(SessionId(1), SessionPromptHistory::default()); MAX_SESSIONS + 1],
+        vec![(
+            SessionId(1),
+            SessionPromptHistory {
+                total_turns: 6,
+                turns: vec![turn.clone(); crate::git::MAX_PROMPT_HISTORY_TURNS + 1],
+            },
+        )],
+        vec![(
+            SessionId(1),
+            SessionPromptHistory {
+                total_turns: 1,
+                turns: vec![SessionPromptTurn {
+                    text: "x".repeat(crate::git::MAX_PROMPT_DISPLAY_CHARS + 2),
+                    ..turn.clone()
+                }],
+            },
+        )],
+    ] {
+        let bytes = Reply::Sidebar(SidebarData {
+            prompt_histories: histories,
+            ..SidebarData::default()
+        })
+        .encode()
+        .unwrap();
+        let (kind, body) = read_frame(&mut &bytes[..]).unwrap().unwrap();
+        assert!(Reply::decode(kind, &body).is_err());
     }
 }

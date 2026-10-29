@@ -413,6 +413,35 @@ fn menu_names_distinguish_profiles_without_exposing_directories() {
 }
 
 #[gpui::test]
+fn session_tooltip_refreshes_email_from_the_owning_host(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|_| Sidebar::new_loaded(None));
+    view.update(cx, |s, cx| {
+        s.apply(Ok((snapshot(), Meta::new())), BTreeMap::new(), cx);
+        let tooltip =
+            |s: &Sidebar| s.session_account_tooltip(&HostId::Local, SessionId(10), "Main");
+        let expected =
+            |label| crate::i18n::catalog::sidebar::SESSION_ACCOUNT.format(&[("label", label)]);
+        assert_eq!(tooltip(s), expected("Main"));
+        let mut local = accounts();
+        local.accounts[0].provider = ProviderKind::Antigravity;
+        local.accounts[0].email = Some("local@example.test".into());
+        s.sync_session_accounts(&HostId::Local, local.clone().into(), cx);
+        assert_eq!(tooltip(s), expected("main · local@example.test"));
+        let mut remote = local.clone();
+        remote.accounts[0].email = Some("remote@example.test".into());
+        s.sync_session_accounts(&HostId::Remote("studio".into()), remote.into(), cx);
+        assert_eq!(tooltip(s), expected("main · local@example.test"));
+        local.accounts[0].email = Some("updated@example.test".into());
+        s.sync_session_accounts(&HostId::Local, local.clone().into(), cx);
+        assert_eq!(tooltip(s), expected("main · updated@example.test"));
+        local.accounts[0].email = None;
+        s.sync_session_accounts(&HostId::Local, local.into(), cx);
+        assert_eq!(tooltip(s), expected("Main"));
+    });
+}
+
+#[gpui::test]
 fn menu_covers_every_live_provider_with_its_negotiated_requirements(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let view = cx.new(|_| Sidebar::new_loaded(None));

@@ -445,3 +445,103 @@ fn orca_title_waiting_working_and_done_glyphs() {
             .is_none()
     );
 }
+
+#[test]
+fn codex_queued_question_survives_continuous_redraw_and_hook_working() {
+    let st = Statuses::open(None);
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let work = crate::status::tests::event(
+        1,
+        10,
+        "codex",
+        r#"{"hook_event_name":"PreToolUse","tool_name":"exec_command"}"#,
+    );
+    st.hook(&[(ID, &work)]).unwrap();
+    let screen = "• Working (14m 03s • esc to interrupt)\n• Queued follow-up inputs\n  ? 1 question\n  ⇧← to answer\n\n› Ask Codex to do anything";
+    // 스피너·경과 시간으로 revision이 매번 바뀌어도 질문이 계속 있으면 Waiting이다.
+    for tick in 0..=6 {
+        let e = detector
+            .observe(
+                "⠋ | Codex task",
+                screen,
+                tick + 1,
+                &st.get(ID),
+                now + Duration::from_millis(tick * 100),
+            )
+            .unwrap();
+        st.inferred(ID, e, 20 + tick);
+        assert_eq!(
+            st.get(ID).state,
+            if tick < 3 {
+                AgentState::Working
+            } else {
+                AgentState::Waiting
+            }
+        );
+    }
+    assert_eq!(st.get(ID).source, Some(Source::Screen));
+    // 병렬 도구 hook이 Working을 알려도 미응답 질문은 다음 관찰에서 다시 잡는다.
+    let work = crate::status::tests::event(
+        2,
+        40,
+        "codex",
+        r#"{"hook_event_name":"PostToolUse","tool_name":"exec_command"}"#,
+    );
+    st.hook(&[(ID, &work)]).unwrap();
+    let e = detector
+        .observe("⠙ | Codex task", screen, 8, &st.get(ID), now + QUIET * 3)
+        .unwrap();
+    st.inferred(ID, e, 50);
+    assert_eq!(st.get(ID).state, AgentState::Waiting);
+    // 응답 뒤에는 작업 중으로 돌아간다. 일반 입력창만 있다고 Done으로 바꾸지 않는다.
+    let e = detector
+        .observe(
+            "⠹ | Codex task",
+            "• Working\n› Ask Codex to do anything",
+            9,
+            &st.get(ID),
+            now + QUIET * 4,
+        )
+        .unwrap();
+    st.inferred(ID, e, 60);
+    assert_eq!(st.get(ID).state, AgentState::Working);
+}
+
+#[test]
+fn codex_queued_question_must_remain_visible_without_a_title() {
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let question = "• Queued follow-up inputs\n? 1 question\n⇧← to answer\n›";
+    for (rev, ms, screen) in [
+        (1, 0, question),
+        (2, 200, "Working..."),
+        (3, 400, question),
+        (4, 500, question),
+    ] {
+        assert!(
+            detector
+                .observe(
+                    "",
+                    screen,
+                    rev,
+                    &AgentStatus::UNKNOWN,
+                    now + Duration::from_millis(ms),
+                )
+                .is_none()
+        );
+    }
+    let e = detector
+        .observe(
+            "",
+            question,
+            5,
+            &AgentStatus::UNKNOWN,
+            now + Duration::from_millis(700),
+        )
+        .unwrap();
+    assert_eq!(
+        (e.state, e.source, e.confidence),
+        (AgentState::Waiting, Source::Screen, Confidence::Low)
+    );
+}

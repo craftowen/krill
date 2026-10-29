@@ -33,10 +33,6 @@ pub(super) fn has_cached(home: &Path, provider: ProviderKind, dir: &Path) -> boo
         .is_some_and(|(at, _)| at.elapsed() < CACHE_TTL)
 }
 
-pub(super) fn evict(home: &Path) {
-    lock(&CACHE).retain(|(h, _, _), _| h != home);
-}
-
 pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     lock(&CACHE).remove(&(home.into(), provider, dir.into()));
 }

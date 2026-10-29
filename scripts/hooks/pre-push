@@ -20,8 +20,12 @@ while read -r lref lsha rref _rsha; do
       fi ;;
   esac
   [[ $lsha == "$zero" ]] && continue # ref 삭제는 내용 점검 없음
-  # 주석 태그도 끝 커밋을 검사한다. 트리·blob 태그에는 커밋 공개 표면이 없다.
-  commit=$(git rev-parse --verify -q "${lsha}^{commit}" 2>/dev/null) || continue
+  # 주석 태그도 끝 커밋을 검사한다. 검사할 수 없는 트리·blob 태그를 통과시키지 않는다.
+  if ! commit=$(git rev-parse --verify -q "${lsha}^{commit}" 2>/dev/null); then
+    echo "pre-push: $lref($lsha) 커밋으로 해석할 수 없는 ref — 공개 표면을 검사할 수 없어 차단" >&2
+    fail=1
+    continue
+  fi
   if [[ ! -f $root/scripts/public-surface.sh ]]; then
     echo "pre-push: scripts/public-surface.sh가 없어 공개 표면을 점검할 수 없다 — 차단" >&2
     fail=1

@@ -9,6 +9,7 @@ use super::{HostId, Row};
 pub(super) struct CardList {
     pub state: ListState,
     pub pending_reveal: Rc<Cell<Option<usize>>>,
+    preserve_scroll: Rc<Cell<bool>>,
     rows: Vec<(HostId, Row, usize)>,
     editor: Option<usize>,
 }
@@ -18,6 +19,7 @@ impl Default for CardList {
         Self {
             state: ListState::new(0, ListAlignment::Top, px(super::ROW_HEIGHT * 2.)),
             pending_reveal: Rc::new(Cell::new(None)),
+            preserve_scroll: Rc::new(Cell::new(false)),
             rows: Vec::new(),
             editor: None,
         }
@@ -25,6 +27,19 @@ impl Default for CardList {
 }
 
 impl CardList {
+    /// Selection already identifies an on-screen target; opening it must not move the list.
+    pub fn preserve_scroll(&self) -> impl Drop + use<> {
+        struct Restore(Rc<Cell<bool>>, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let previous = self.preserve_scroll.replace(true);
+        self.pending_reveal.set(None);
+        Restore(self.preserve_scroll.clone(), previous)
+    }
+
     /// A committed account handoff keeps the same measured row and scroll anchor.
     pub(super) fn rebind_session(
         &mut self,
@@ -153,7 +168,7 @@ impl CardList {
     }
 
     pub fn reveal(&self, row: usize, strategy: ScrollStrategy) {
-        if self.rows.is_empty() {
+        if self.preserve_scroll.get() || self.rows.is_empty() {
             return;
         }
         let index = self

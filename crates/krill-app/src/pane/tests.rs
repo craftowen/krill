@@ -1904,6 +1904,51 @@ fn only_failures_after_a_session_request_have_unknown_outcome() {
     );
 }
 
+/// 데몬이 닫힘·이미 재개됨(`NoSession`)으로 확정한 Resume만 "끝난 세션"이다. 살아있는 세션의 `BadRequest`,
+/// attach 거절(`NotFound`), 전송 오류는 아니다 — 이것을 잘못 거두면 살아있는 탭을 닫는다. 문구는 그대로다.
+#[test]
+fn only_daemon_no_session_reply_is_session_gone() {
+    use krill_proto::control::Failure;
+    let (paths, server) = control_fixture(
+        "session-gone",
+        FEAT_CONTROL | FEAT_RESUME,
+        vec![
+            Box::new(|s, seen| {
+                assert!(matches!(
+                    next_request(s, seen),
+                    Some(Request::Resume { .. })
+                ));
+                s.write_all(&Reply::Failed(Failure::NoSession).encode().unwrap())
+                    .unwrap();
+            }),
+            Box::new(|s, seen| {
+                assert!(matches!(
+                    next_request(s, seen),
+                    Some(Request::Resume { .. })
+                ));
+                s.write_all(&Reply::Failed(Failure::BadRequest).encode().unwrap())
+                    .unwrap();
+            }),
+        ],
+    );
+    let create = login(b"/w");
+    let gone = resume_session_in(&paths, Some(SessionId(7)), &create).unwrap_err();
+    assert!(is_session_gone(&gone), "{gone:?}");
+    assert_eq!(gone.to_string(), "no such session");
+    assert_eq!(gone.kind(), io::ErrorKind::InvalidInput);
+
+    let live = resume_session_in(&paths, Some(SessionId(8)), &create).unwrap_err();
+    assert!(!is_session_gone(&live), "{live:?}");
+    assert!(!is_session_gone(&io::Error::new(
+        io::ErrorKind::NotFound,
+        "NoSession"
+    )));
+    assert!(!is_session_gone(&io::Error::from(
+        io::ErrorKind::InvalidInput
+    )));
+    server.join().unwrap();
+}
+
 /// 쓰다 끊긴 생성 요청도 krilld가 프레임을 다 받았는지 알 수 없다. 조회 요청의 같은 실패는 다시 시도해도 된다.
 #[test]
 fn write_failure_of_a_session_request_has_unknown_outcome() {

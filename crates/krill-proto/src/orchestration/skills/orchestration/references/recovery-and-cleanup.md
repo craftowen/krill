@@ -13,6 +13,12 @@ terminal idle, contact loss, and heartbeat absence do not prove process death.
 
 Use these actual Krill lifecycle semantics:
 
+`worker_done` records the result and settles ownership; it does not close the
+terminal. The coordinator owns cleanup. Once the report/output has been read and
+no follow-up needs the terminal, release the settled worker as part of the same
+workflow. No separate cleanup approval is needed for sessions created by that
+dispatch. Keep active, borrowed, reassigned, and uncertain sessions intact.
+
 - `worker-retain <dispatch-id>` keeps the terminal. **For an active dispatch it
   ends ownership and returns its task to ready**; it is not a pause/continue verb.
   Use it on settled work when preserving output or handing ownership back is intended.
@@ -25,6 +31,14 @@ Use these actual Krill lifecycle semantics:
   while preserving its terminal session. Use only after identifying the exact owned
   attempt and deciding to end its ownership.
   A late `worker_done` from that attempt is rejected.
+
+Before reporting completion, run `worker-list --run <run-id> --json`. For each
+owned settled worker with `terminal_state: "reclaimable"` and a created session,
+run `worker-release <dispatch-id>` after preserving the needed evidence. Re-read
+the list to verify release; a command attempt alone is not proof of closure.
+Retain a settled terminal only for a specific continuing need, and include the
+dispatch ID and reason in the final response. Report any failed cleanup instead
+of claiming that all worker sessions were closed.
 
 For a known failed/stopped attempt, preserve its report, end any still-active
 ownership deliberately, verify the task is startable, then `worker-start --run

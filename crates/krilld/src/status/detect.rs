@@ -6,10 +6,10 @@
 
 use std::time::{Duration, Instant};
 
-use krill_proto::agent::rules::{MenuHit, ScreenRules};
+use krill_proto::agent::rules::{MenuHit, ScreenRules, has_pending_question};
 use krill_proto::control::{AgentState, AgentStatus, Confidence, Source};
 
-/// 화면 규칙은 출력이 잠깐 멎은 뒤에만 적용한다(부분 재그리기를 대화상자 소실로 오인하지 않는다).
+/// 일반 메뉴는 화면 갱신이, 비동기 질문은 질문 표시가 이 시간 동안 안정된 뒤 판정한다.
 pub const QUIET: Duration = Duration::from_millis(300);
 
 /// 대화상자를 한 번도 못 본 Claude hook waiting을 떠도는 hook으로 보는 유예. 실제 대화상자는 이 안에 그려진다.
@@ -35,6 +35,8 @@ pub fn badge(status: &AgentStatus) -> Option<&'static str> {
 pub struct Detector {
     revision: Option<u64>,
     changed: Option<Instant>,
+    /// 비동기 질문은 스피너·작업 출력과 함께 갱신되므로 화면 전체의 quiet와 따로 잰다.
+    pending_question_since: Option<Instant>,
     /// Codex의 일반 제목은 idle 때 글리프가 없다. 스피너를 실제 본 세션에서만 Done으로 해석한다.
     spinning_title: Option<String>,
     dialog_waiting_since: Option<u64>,
@@ -55,6 +57,7 @@ impl Detector {
         Self {
             revision: None,
             changed: None,
+            pending_question_since: None,
             spinning_title: None,
             dialog_waiting_since: None,
             stray_waiting: None,
@@ -89,10 +92,21 @@ impl Detector {
         let quiet = self
             .changed
             .is_some_and(|at| now.saturating_duration_since(at) >= QUIET);
-        let menu = self.rules.menu_hit(screen).map(|hit| match hit {
-            MenuHit::Blocked => AgentState::Blocked,
-            MenuHit::Waiting => AgentState::Waiting,
-        });
+        let pending_question = has_pending_question(screen);
+        let question_quiet = if pending_question {
+            now.saturating_duration_since(*self.pending_question_since.get_or_insert(now)) >= QUIET
+        } else {
+            self.pending_question_since = None;
+            false
+        };
+        let menu = self
+            .rules
+            .menu_hit(screen)
+            .map(|hit| match hit {
+                MenuHit::Blocked => AgentState::Blocked,
+                MenuHit::Waiting => AgentState::Waiting,
+            })
+            .or(pending_question.then_some(AgentState::Waiting));
         let title_state = self.title_state(title);
         if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
             && matches!(status.source, Some(Source::Hook | Source::Screen))
@@ -158,7 +172,9 @@ impl Detector {
         {
             return None;
         }
-        let (state, source, confidence) = if quiet && let Some(state) = menu {
+        let (state, source, confidence) = if (quiet || question_quiet)
+            && let Some(state) = menu
+        {
             (state, Source::Screen, Confidence::Low)
         } else if let Some(state) = title_state {
             (state, Source::Title, Confidence::Medium)

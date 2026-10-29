@@ -54,6 +54,8 @@ mod hook_identity;
 mod orch_cache;
 mod schedule;
 mod sidebar;
+#[cfg(all(test, unix))]
+mod stale_sessions_tests;
 pub mod usage_tick;
 
 /// `Terminate`가 없는 holder(v2 이하)에 닫기를 보내는 방법.
@@ -355,15 +357,15 @@ impl Registry {
             for (id, cwd, tap, e) in found {
                 if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
                     self.auto_switch_from_hook(id, e);
-                    hooked.push((id, e.payload.clone()));
+                    hooked.push((id, e.payload.clone(), e.id));
                 }
             }
             Ok(())
         })
         .ok();
         drop(commit);
-        for (id, payload) in &hooked {
-            self.maybe_rename_from_hook(*id, payload);
+        for (id, payload, event_id) in &hooked {
+            self.maybe_rename_from_hook(*id, payload, *event_id);
         }
     }
 
@@ -432,6 +434,11 @@ impl Registry {
             .filter(|(id, _)| !st.exited.contains_key(id))
             .map(|(&id, e)| (id, e.pid))
             .collect()
+    }
+
+    /// Wait for in-flight reader creation to finish registration before a handoff snapshots it.
+    pub(crate) fn session_start_barrier(&self) -> std::sync::MutexGuard<'_, ()> {
+        lock(&self.hook_commit)
     }
 
     /// 세션마다 `f(id, pid, 끝났으면 상태, 세션)`. 상태 잠금 안에서 부른다.
@@ -646,7 +653,7 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
-                self.maybe_rename_from_hook(id, &e.payload);
+                self.maybe_rename_from_hook(id, &e.payload, e.id);
             }
             return ack;
         }
@@ -1059,6 +1066,13 @@ impl Registry {
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
                     if peer.scope.full() {
                         sidebar::include_projects(&mut data);
+                    }
+                    if let Some(dir) = self.state_dir() {
+                        data.prompt_histories =
+                            krill_proto::git::load_session_prompt_histories(&dir)
+                                .into_iter()
+                                .filter(|(id, _)| data.sessions.iter().any(|s| s.session == *id))
+                                .collect();
                     }
                     Reply::Sidebar(data)
                 })
@@ -1861,8 +1875,11 @@ impl Registry {
                 .iter()
                 .filter(|_| peer.scope.full())
                 .map(|(&session, e)| {
-                    let exited = st.exited.contains_key(&session) || e.session.is_closed();
-                    (session, e.pid, exited, e.session.tap())
+                    let tap = e.session.tap();
+                    // Reader completion also occurs during daemon handoff. Only the
+                    // published EOF flag (or holder exit) proves the terminal ended.
+                    let exited = st.exited.contains_key(&session) || tap.pulse().closed;
+                    (session, e.pid, exited, tap)
                 })
                 .collect()
         };
@@ -1871,6 +1888,14 @@ impl Registry {
                 .into_iter()
                 .map(|(session, root, exited, tap)| {
                     let mut status = self.status.get(session);
+                    // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
+                    // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
+                    if exited {
+                        status.state = control::AgentState::Exited;
+                        status.source = Some(control::Source::Process);
+                        status.confidence = control::Confidence::High;
+                        status.subagents.clear();
+                    }
                     // Pi has no hook identity. Its executable may be reported as `node`,
                     // and its terminal title can be renamed. Keep the explicit launch identity.
                     if status.agent.is_empty()
@@ -2001,7 +2026,12 @@ impl Registry {
     /// OWE-737: 첫 프롬프트 hook(`UserPromptSubmit` 등)이 오면 세션 자동 제목을 기록하고,
     /// 현재 디렉터리가 기본 이름(`worktree-1`, `claude-1` 등)의 git 브랜치이면 슬러그로 개명한다.
     /// 또한 매 턴 프롬프트 히스토리를 `session-prompts.json`에 기록한다.
-    pub(crate) fn maybe_rename_from_hook(&self, id: SessionId, payload: &[u8]) {
+    pub(crate) fn maybe_rename_from_hook(
+        &self,
+        id: SessionId,
+        payload: &[u8],
+        event_id: hook::EventId,
+    ) {
         use krill_proto::os::ffi::OsStrExt as _;
         if self.agents.is_subagent_or_foreign_hook(id, payload) {
             return;
@@ -2011,7 +2041,7 @@ impl Registry {
         };
         let state_dir = self.state_dir();
         if let Some(dir) = state_dir.as_deref() {
-            krill_proto::git::record_session_prompt(dir, id, &prompt, status::now_ns()).ok();
+            krill_proto::git::record_session_prompt_from_hook(dir, id, payload, event_id).ok();
         }
         if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
             return;
@@ -2362,11 +2392,9 @@ impl Registry {
                 Ok(enabled) => UsageReply::Provisioning(enabled),
                 Err(e) => UsageReply::Failed(os(&e)),
             },
-            UsageRequest::SetDirectUsage(enabled) => {
-                match accounts::set_direct_usage(&home, state_ref, enabled) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
+            // 구버전 요청의 opcode는 유지한다. 사용량 자동 수집은 끌 수 없다.
+            UsageRequest::SetDirectUsage(_) => {
+                UsageReply::Accounts(accounts::refresh_accounts_with(&home, state_ref, false))
             }
             UsageRequest::SetAdvancedPolicy(policy) => {
                 match accounts::set_advanced_policy(&home, state_ref, &policy) {

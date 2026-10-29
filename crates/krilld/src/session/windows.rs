@@ -105,8 +105,7 @@ impl Reader {
         })
     }
 
-    /// The worker was cancelled ([`halt`]) rather than reaching EOF.
-    pub(super) fn halted(&self) -> bool {
+    pub(super) fn cancelled(&self) -> bool {
         self.stop.stopped.load(Ordering::SeqCst)
     }
 
@@ -181,20 +180,12 @@ impl Drop for Reader {
 /// Cancel every read worker and wait for all of them to exit. Cancellation may precede `ReadFile`, so it
 /// repeats until each worker has exited. A worker whose engine loop stalled keeps its last read queued
 /// (never dropped) and `TimedOut` returns at `deadline`; the caller proceeds as crash scope (daemon-02).
-pub(super) fn halt(deadline: Instant) -> io::Result<()> {
+pub(super) fn halt() {
     let readers: Vec<_> = lock(&READERS).iter().filter_map(Weak::upgrade).collect();
-    loop {
-        for reader in &readers {
-            reader.cancel();
-        }
-        if readers.iter().all(|r| r.finished()) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        thread::sleep(Duration::from_millis(1));
+    for reader in &readers {
+        reader.cancel();
     }
+    // The caller repeats cancellation while waiting under its overall deadline.
 }
 
 /// One `WriteFile` never exceeds this. Win32 does not report the bytes of an aborted write
@@ -399,7 +390,7 @@ pub(super) fn resize(shared: &Shared, size: WinSize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{end_halt, halt};
+    use super::super::Handoff;
     use super::*;
     use std::os::windows::io::AsSocket as _;
 
@@ -626,10 +617,7 @@ mod tests {
         drop(tap);
     }
 
-    /// daemon-02 + daemon-04: `halt` returns `TimedOut` at its deadline while the engine loop is stalled and
-    /// the read worker is blocked on the bounded queue (its reads are never dropped); once the engine
-    /// drains, halt completes, the reader ends without reporting the session closed, and `end_halt`
-    /// starts one replacement reader on the same engine that keeps reading until EOF.
+    /// A bounded pause preserves queued output and resumes the same engine on rollback.
     #[test]
     #[ignore = "global halt(): run through halt_deadline_and_resume_run_in_an_isolated_process"]
     fn isolated_halt_deadline_and_resume() {
@@ -646,10 +634,22 @@ mod tests {
             output
         });
         thread::sleep(Duration::from_millis(500));
+        let pause_until = |deadline: Instant| -> io::Result<Handoff> {
+            let pause = Handoff::begin()?;
+            while !session.is_paused() {
+                if Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                super::super::wake_halt();
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(pause)
+        };
         let started = Instant::now();
         assert_eq!(
-            halt(Instant::now() + Duration::from_millis(300))
-                .unwrap_err()
+            pause_until(Instant::now() + Duration::from_millis(300))
+                .err()
+                .unwrap()
                 .kind(),
             io::ErrorKind::TimedOut
         );
@@ -659,9 +659,9 @@ mod tests {
         );
         assert!(!session.is_closed(), "stalled reader must not be abandoned");
         drop(stall);
-        halt(Instant::now() + Duration::from_secs(10)).unwrap();
+        let pause = pause_until(Instant::now() + Duration::from_secs(10)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !session.is_closed() {
+        while !session.is_paused() {
             assert!(Instant::now() < deadline, "reader did not halt after drain");
             thread::sleep(Duration::from_millis(5));
         }
@@ -675,7 +675,7 @@ mod tests {
             !pulse.closed,
             "a halted reader must not report the session closed"
         );
-        assert_eq!(end_halt(), 0);
+        drop(pause);
         let deadline = Instant::now() + Duration::from_secs(10);
         while tap.pulse().end < len + 12 {
             assert!(

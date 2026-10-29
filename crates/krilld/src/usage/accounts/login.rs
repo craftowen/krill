@@ -263,6 +263,110 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agy_profiles_refresh_native_emails_after_login_without_cross_profile_fallback() {
+        use super::super::{
+            AccountsFile, RefreshTrigger, StoredAccount, refresh_accounts_authenticated, save_file,
+        };
+        let root = std::env::temp_dir().join(format!("agy-native-identity-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let one = home.join("profile-one");
+        let two = home.join("profile-two");
+        for dir in [&one, &two] {
+            std::fs::create_dir_all(dir.join(".gemini/antigravity-cli")).unwrap();
+        }
+        let file = AccountsFile {
+            accounts: [(&one, "agy-one"), (&two, "agy-two")]
+                .into_iter()
+                .map(|(dir, id)| StoredAccount {
+                    id: id.into(),
+                    provider: "agy".into(),
+                    label: id.into(),
+                    email: Some("previous@example.test".into()),
+                    profile_dir: dir.display().to_string(),
+                })
+                .collect(),
+            provisioning: false,
+            ..AccountsFile::default()
+        };
+        save_file(&home, Some(&state), &file).unwrap();
+        // agy identity reads no CLI. Other providers may fail their isolated fake probes.
+        FAKE_EXE.with(|e| *e.borrow_mut() = Some(root.join("unused-cli")));
+        let emails = || {
+            let auth = statuses(&home, Some(&state));
+            let snapshot = refresh_accounts_authenticated(
+                &home,
+                Some(&state),
+                RefreshTrigger::ReadOnly,
+                &auth,
+            );
+            snapshot
+                .accounts
+                .into_iter()
+                .filter(|a| !a.host_default && a.provider == ProviderKind::Antigravity)
+                .map(|a| (a.id, a.email))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let token_path = |dir: &Path| dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        let write_token = |dir: &Path, email: &str| {
+            std::fs::write(
+                token_path(dir),
+                serde_json::to_vec(&serde_json::json!({
+                    "auth_method":"consumer", "id_token_email":email,
+                    "token":{"access_token":"synthetic-access"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        // Host credentials must never fill an unauthenticated isolated profile.
+        let host = host_default_dir(&home, ProviderKind::Antigravity);
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(
+            host.join("antigravity-oauth-token"),
+            br#"{"auth_method":"consumer","token":{"access_token":"host"},"id_token_email":"host@example.test"}"#,
+        )
+        .unwrap();
+        assert!(emails().values().all(Option::is_none));
+        write_token(&one, "one@example.test");
+        write_token(&two, "two@example.test");
+        assert_eq!(
+            emails(),
+            BTreeMap::from([
+                ("agy-one".into(), Some("one@example.test".into())),
+                ("agy-two".into(), Some("two@example.test".into()))
+            ])
+        );
+        // A completed login invalidates the cache even if token mtime is preserved.
+        let modified = std::fs::metadata(token_path(&one))
+            .unwrap()
+            .modified()
+            .unwrap();
+        write_token(&one, "new@example.test");
+        std::fs::File::options()
+            .write(true)
+            .open(token_path(&one))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::write(one.join(".krill-login-completed"), "new login").unwrap();
+        std::fs::remove_file(token_path(&two)).unwrap();
+        assert_eq!(
+            emails(),
+            BTreeMap::from([
+                ("agy-one".into(), Some("new@example.test".into())),
+                ("agy-two".into(), None)
+            ])
+        );
+        // A token file alone still indicates login, but cannot revive saved identity.
+        std::fs::write(token_path(&one), b"unreadable-identity").unwrap();
+        assert!(emails().values().all(Option::is_none));
+        FAKE_EXE.with(|e| *e.borrow_mut() = None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_probe_is_check_failed_and_login_marker_invalidates_cache() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = std::env::temp_dir().join(format!("owe719-cache-{}", std::process::id()));

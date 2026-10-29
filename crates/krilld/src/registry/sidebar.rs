@@ -120,6 +120,7 @@ pub(super) fn snapshot(
         sessions,
         repositories: repositories.into_values().collect(),
         branches: Vec::new(),
+        prompt_histories: Vec::new(),
     };
     populate_branches(&mut data);
     Ok(data)
@@ -506,6 +507,7 @@ mod tests {
                 worktrees: vec![b"/repo".to_vec(), b"/repo-wt".to_vec()],
             }],
             branches: Vec::new(),
+            prompt_histories: Vec::new(),
         };
         merge_projects(&mut data, &dir);
         let git_repo_bytes = git_repo.as_os_str().as_bytes().to_vec();

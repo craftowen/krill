@@ -67,6 +67,15 @@ impl std::fmt::Debug for ExternalHost {
 }
 
 impl ExternalHost {
+    /// 이 등록으로 데몬에 붙는 호스트 타깃(연결 세대 추적 포함).
+    pub fn target(&self) -> HostTarget {
+        HostTarget::remote_with_connector(
+            self.spec.id.clone(),
+            self.socket.clone(),
+            (self.factory)(),
+        )
+    }
+
     pub fn new(
         spec: RemoteHostSpec,
         socket: PathBuf,

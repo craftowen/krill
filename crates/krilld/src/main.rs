@@ -282,14 +282,13 @@ fn main() -> ExitCode {
                     );
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if quota_tick.elapsed() >= krilld::registry::usage_tick::TICK {
-                            r.tick_accounts(&mut seen);
+                            r.tick_accounts();
                             quota_tick = std::time::Instant::now();
                         }
                         r.process_account_work();
                     }))
                     .is_err()
                     {
-                        seen = None;
                         tracing::warn!("usage tick panicked; continuing");
                     }
                 }

@@ -819,7 +819,7 @@ pub enum UsageRequest {
     PurgeOrphanProfiles,
     /// OWE-712: 고급 정책만 변경한다. 기존 정책·규칙은 그대로 둔다.
     SetAdvancedPolicy(AdvancedPolicy),
-    /// 읽기 전용 OAuth 사용량 조회 on/off.
+    /// 구버전 호환용 opcode. 새 데몬은 값을 무시하고 항상 사용량을 자동 수집한다.
     SetDirectUsage(bool),
     /// OWE-722: 프로필 공유 opt-in 설정. 미출시 관리 기능에 포함해 새 비트를 쓰지 않는다.
     /// [`FEAT_USAGE_MANAGE`]를 협상한 피어에만 보낸다.

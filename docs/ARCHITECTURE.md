@@ -157,7 +157,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_USAGE_RATELIMIT | `1 << 60` | `krill_proto::usage` (상태 꼬리 한도 도달 구분 수신, 없으면 `Error`로 폴백, OWE-703·OWE-710) |
 | FEAT_USAGE_MANAGE | `1 << 59` | `krill_proto::usage` (계정 라벨 변경·데이터 삭제·고아 프로필 정리 요청과 `UsageReply::Orphans`, MK-144·145·OWE-704·705 지휘자 배정; enum 끝에 추가) |
 | FEAT_ACCOUNT_POLICY | `1 << 61` | `krill_proto::usage::policy` (`Create.account` 선택 꼬리·고급 자동전환 정책·전환 이력·모델별 주간 창, MK-152·OWE-712 지휘자 배정; 구 피어에는 꼬리 생략) |
-| FEAT_ACCOUNT_CONNECTION | `1 << 62` | `krill_proto::usage::connections` (연결 상태·직접 사용량 설정 꼬리와 `SetDirectUsage`, OWE-719; 구 피어에는 꼬리 생략) |
+| FEAT_ACCOUNT_CONNECTION | `1 << 62` | `krill_proto::usage::connections` (연결 상태 꼬리, OWE-719; 구 피어에는 꼬리 생략. `direct_usage`는 항상 true, `SetDirectUsage`는 구버전 호환용 무동작 요청이며 사용량은 항상 자동 수집) |
 | FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가) |
 | FEAT_ORCH_SNAPSHOT_PAGE | `1 << 35` | `krill_proto::orchestration` (1MiB 프레임을 넘는 유효 저장소의 무손실 페이지 스냅샷 `OrchAction::SnapshotPage`(opcode 25)/`OrchResponse::SnapshotPage`(wire 14), foundation-02 지휘자 배정 2026-10-27; enum 끝에 추가, 미협상 피어에는 요청 금지) |
 
@@ -209,6 +209,8 @@ OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisionin
 `term_modes::Modes.flags`는 bit 0 APP_CURSOR, 1 MOUSE_CLICK, 2 MOUSE_DRAG, 3 MOUSE_MOTION, 4 SGR_MOUSE, 5 BRACKETED_PASTE, 6 ALT_SCREEN, 7 ALTERNATE_SCROLL(DEC 1007)을 사용한다. 알 수 없는 비트는 무시한다. 대체 화면에서 마우스 보고가 꺼져 있고 DEC 1007이 켜져 있으면 클라이언트는 휠을 커서 모드에 맞는 위/아래 키로 보낸다.
 
 `krill_proto::control`의 Request/Reply enum은 postcard 변형 순서가 곧 와이어 번호라 **끝에 추가만** 하고, 병렬 작업 중에는 지휘자가 변형 번호를 배정한다(2026-10-15 MK-045: Request 7·8, Reply 11·12).
+
+`Reply::Sidebar`는 기존 세션·저장소 본문 뒤에 브랜치 목록, 세션별 최근 프롬프트 목록 순서로 선택 꼬리를 붙인다. 프롬프트 꼬리만 있으면 빈 브랜치 목록을 먼저 쓴다. 구 클라이언트는 모르는 뒤쪽 꼬리를 무시하고, 새 클라이언트는 꼬리 없는 구 응답을 빈 기록으로 읽는다. 프롬프트는 요청 범위에 포함된 세션만 전달하며 세션 수·턴 수·문자 수 상한을 디코딩 때 적용한다. 앱의 기록 키는 호스트와 세션 ID를 함께 사용한다.
 
 Resource Manager(MK-071)는 control에 `Request::Resources(Action)`·`Reply::Resources` 한 쌍만 더한다(페이로드 `krill_proto::resources`, `FEAT_RESOURCES`를 협상했을 때만 보낸다 — 앱은 미지원 데몬이면 '데몬 업데이트 필요'를 보이고 요청하지 않는다). 메모리는 krilld가 `proc_pid_rusage`로 읽은 `phys_footprint`(요청자·krilld·holder·세션 루트와 ppid 후손 합), 디스크는 상태 디렉터리의 할당 블록 합이다. `RestartDaemon`은 전체 범위 interactive만, 확인 대화상자는 앱이 띄우고, krilld는 holder `UpgradeKrilld`(MK-068과 같은 경로) 승인 뒤 답을 보내고 끝난다. 세션 kill은 기존 `Close`.
 

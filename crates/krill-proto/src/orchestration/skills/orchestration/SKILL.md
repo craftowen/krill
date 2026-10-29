@@ -79,14 +79,21 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    Use [verification-and-evidence](references/verification-and-evidence.md) for independent
    verification and invalidating stale results. Correct drift through follow-ups or a
    new scoped assignment; do not silently expand the requested result.
-7. Resolve every owned dispatch, recording failed/blocked work honestly. Use
-   `worker-retain <dispatch-id>` for a needed settled terminal, otherwise
-   `worker-release <dispatch-id>`. Release requires settled work and a session
-   created by that dispatch. `worker-abandon <dispatch-id>` fences an old attempt
-   while preserving its session; it still changes task ownership.
+7. Resolve every owned dispatch, recording failed/blocked work honestly.
+   `worker_done` settles work but does **not** close its session. After reading
+   the evidence and deciding no follow-up needs that terminal, call
+   `worker-release <dispatch-id>` without asking for a separate cleanup approval.
+   Do this throughout the run, rather than leaving completed workers open until
+   the end. Release archives bounded output and requires settled work and a
+   session created by that dispatch. Use `worker-retain <dispatch-id>` only for
+   a concrete continuing need and report that reason. `worker-abandon <dispatch-id>`
+   fences an old attempt while preserving its session; it still changes task ownership.
    Read [recovery-and-cleanup](references/recovery-and-cleanup.md) before abandoning,
-   retrying, or handling an uncertain start. End with each task's outcome, evidence,
-   remaining blockers, and retained sessions. Completion means the user's acceptance
+   retrying, or handling an uncertain start. Before the final response, re-read
+   `worker-list --run <run-id> --json`: release any remaining owned, settled,
+   reclaimable sessions, and verify the resulting terminal states. Report cleanup
+   failures and retained sessions with reasons. End with each task's outcome,
+   evidence, remaining blockers, and retained sessions. Completion means the user's acceptance
    conditions passed, not that the last worker printed “done”.
 
 Commands above with only a subcommand shown still start with `KRILL orchestration`.

@@ -1191,6 +1191,15 @@ impl Shell {
         if !e.modifiers.control && self.layout.mru_switching() {
             self.commit_mru_switcher(cx);
         }
+        // 마우스 모드 패인의 우클릭 메뉴는 ⇧·⌥ 상태로 붙인다(render_pane). 바뀌면 다시 그린다.
+        if self
+            .layout
+            .visible()
+            .into_iter()
+            .any(|p| !self.selects(p, gpui::Modifiers::default()))
+        {
+            cx.notify();
+        }
         let position = window.mouse_position();
         let pane = self.layout.visible().into_iter().find(|p| {
             self.live

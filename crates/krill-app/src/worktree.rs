@@ -12,11 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, Focusable as _, Subscription, Task, Window, div,
-    prelude::*, px,
+    App, Context, Entity, EventEmitter, Focusable as _, SharedString, Subscription, Task, Window,
+    div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
 use krill_proto::control::{
     NewWorktree, PrepareWorktree, Reply, Setup, Worktree, WorktreePreparation,
@@ -89,6 +91,54 @@ pub const FAN_OUT_AGENTS: &[(&str, &str)] = &[
     ("aider", "Aider"),
 ];
 
+/// 프로젝트·실행 위치 콤보박스 행: 이름 + 오른쪽 흐린 보조 설명(Orca `ProjectOptionRow`).
+#[derive(Clone)]
+struct PickItem<V> {
+    value: V,
+    title: SharedString,
+    detail: SharedString,
+}
+
+impl<V: Clone + PartialEq> SearchableListItem for PickItem<V> {
+    type Value = V;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &V {
+        &self.value
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = crate::ui::palette(cx);
+        div()
+            .flex()
+            .w_full()
+            .min_w_0()
+            .items_baseline()
+            .justify_between()
+            .gap_2()
+            .child(div().min_w_0().truncate().child(self.title.clone()))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(self.detail.clone()),
+            )
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.title.to_lowercase().contains(&query) || self.detail.to_lowercase().contains(&query)
+    }
+}
+
+type ProjectPicker = SelectState<SearchableVec<PickItem<String>>>;
+type HostPicker = SelectState<SearchableVec<PickItem<HostId>>>;
+
 pub struct Dialog {
     language: crate::i18n::Language,
     focus: gpui::FocusHandle,
@@ -106,7 +156,12 @@ pub struct Dialog {
     phase: Phase,
     source: Arc<dyn Source>,
     task: Option<Task<()>>,
-    _enter: [Subscription; 1],
+    _enter: [Subscription; 3],
+    /// Orca처럼 프로젝트를 먼저 고르고(검색 콤보박스), 그 프로젝트가 있는 호스트 중 실행 위치를 고른다.
+    project_picker: Entity<ProjectPicker>,
+    host_picker: Entity<HostPicker>,
+    /// 호스트·프로젝트가 바뀌어 콤보박스 항목을 다음 렌더에서 다시 채워야 한다.
+    pickers_dirty: bool,
     preparation: Option<Preparation>,
     preparation_task: Option<Task<()>>,
     preparation_ready: bool,
@@ -305,11 +360,39 @@ impl Dialog {
             InputState::new(window, cx).placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get())
         });
         name.update(cx, |input, cx| input.focus(window, cx));
-        let subscriptions = [cx.subscribe(&base, |d, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                d.prepare(cx);
-            }
-        })];
+        let project_picker = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
+        });
+        let host_picker = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
+        });
+        let subscriptions = [
+            cx.subscribe(&base, |d, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    d.prepare(cx);
+                }
+            }),
+            cx.subscribe_in(
+                &project_picker,
+                window,
+                |d, _, event: &SelectEvent<SearchableVec<PickItem<String>>>, window, cx| {
+                    let SelectEvent::Confirm(Some(label)) = event else {
+                        return;
+                    };
+                    d.select_project(label, window, cx);
+                },
+            ),
+            cx.subscribe_in(
+                &host_picker,
+                window,
+                |d, _, event: &SelectEvent<SearchableVec<PickItem<HostId>>>, window, cx| {
+                    let SelectEvent::Confirm(Some(host)) = event else {
+                        return;
+                    };
+                    d.select_host(host.clone(), window, cx);
+                },
+            ),
+        ];
         let mut dialog = Self {
             language: crate::i18n::language(),
             host: HostId::Local,
@@ -328,6 +411,9 @@ impl Dialog {
             source,
             task: None,
             _enter: subscriptions,
+            project_picker,
+            host_picker,
+            pickers_dirty: true,
             preparation: None,
             preparation_task: None,
             preparation_ready: false,
@@ -380,6 +466,7 @@ impl Dialog {
             self.refresh_repo_hooks(cx);
             self.prepare(cx);
         }
+        self.pickers_dirty = true;
         cx.notify();
     }
 
@@ -390,6 +477,7 @@ impl Dialog {
         let Some(opt) = self.host_options.iter().find(|o| o.host == host).cloned() else {
             return;
         };
+        let label = self.repo_label();
         self.host = host;
         self.source = opt.source;
         self.parent = None;
@@ -397,6 +485,7 @@ impl Dialog {
             .repos
             .iter()
             .find(|r| r.path == self.repo)
+            .or_else(|| opt.repos.iter().find(|r| r.label == label))
             .or_else(|| opt.repos.first())
             .cloned();
         if let Some(repo_opt) = next_repo {
@@ -407,7 +496,99 @@ impl Dialog {
         }
         self.refresh_repo_hooks(cx);
         self.prepare(cx);
+        self.pickers_dirty = true;
         cx.notify();
+    }
+
+    /// 프로젝트 콤보박스 선택: 현재 호스트에 같은 이름의 프로젝트가 있으면 그대로, 없으면 그 프로젝트가 있는 첫 호스트로 옮긴다.
+    pub fn select_project(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let on_host = |opt: &WorktreeHostOption| {
+            opt.repos
+                .iter()
+                .find(|r| r.label == label)
+                .map(|r| (opt.host.clone(), r.path.clone()))
+        };
+        let target = self
+            .host_options
+            .iter()
+            .find(|o| o.host == self.host)
+            .and_then(on_host)
+            .or_else(|| self.host_options.iter().find_map(on_host));
+        let Some((host, path)) = target else {
+            return;
+        };
+        self.select_host(host, window, cx);
+        self.select_repo(path, window, cx);
+    }
+
+    /// 현재 프로젝트 이름(호스트 옵션의 라벨, 없으면 폴더 이름).
+    fn repo_label(&self) -> String {
+        self.host_options
+            .iter()
+            .find(|o| o.host == self.host)
+            .and_then(|o| o.repos.iter().find(|r| r.path == self.repo))
+            .map_or_else(
+                || {
+                    self.repo
+                        .file_name()
+                        .unwrap_or(self.repo.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                },
+                |r| r.label.clone(),
+            )
+    }
+
+    /// 프로젝트 목록은 모든 호스트의 프로젝트를 이름으로 묶고(보조 설명에 호스트), 실행 위치는 고른 프로젝트가 있는 호스트만 보인다.
+    // ponytail: 호스트 간 같은 프로젝트를 이름으로 묶는다. 한 호스트에 같은 이름이 둘이면 첫 항목만 고를 수 있다.
+    fn sync_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pickers_dirty = false;
+        let multi_host = self.host_options.len() > 1;
+        let mut projects: Vec<PickItem<String>> = Vec::new();
+        for opt in &self.host_options {
+            for repo in &opt.repos {
+                if let Some(existing) = projects.iter_mut().find(|p| p.value == repo.label) {
+                    if multi_host && !existing.detail.split(", ").any(|h| h == opt.label) {
+                        existing.detail = format!("{}, {}", existing.detail, opt.label).into();
+                    }
+                    continue;
+                }
+                projects.push(PickItem {
+                    value: repo.label.clone(),
+                    title: repo.label.clone().into(),
+                    detail: if multi_host {
+                        opt.label.clone().into()
+                    } else {
+                        repo.path.display().to_string().into()
+                    },
+                });
+            }
+        }
+        let label = self.repo_label();
+        let hosts: Vec<PickItem<HostId>> = self
+            .host_options
+            .iter()
+            .filter(|o| o.repos.iter().any(|r| r.label == label))
+            .map(|o| PickItem {
+                value: o.host.clone(),
+                title: o.label.clone().into(),
+                detail: o
+                    .repos
+                    .iter()
+                    .find(|r| r.label == label)
+                    .map(|r| r.path.display().to_string().into())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let host = self.host.clone();
+        self.project_picker.update(cx, |picker, cx| {
+            picker.set_items(SearchableVec::new(projects), window, cx);
+            picker.set_selected_value(&label, window, cx);
+        });
+        self.host_picker.update(cx, |picker, cx| {
+            picker.set_items(SearchableVec::new(hosts), window, cx);
+            picker.set_selected_value(&host, window, cx);
+        });
     }
 
     pub fn select_repo(&mut self, repo: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -425,6 +606,7 @@ impl Dialog {
         self.apply_repo_branch_options(repo_branch.as_deref(), window, cx);
         self.refresh_repo_hooks(cx);
         self.prepare(cx);
+        self.pickers_dirty = true;
         cx.notify();
     }
 
@@ -969,6 +1151,9 @@ impl Render for Dialog {
                 input.set_placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get(), window, cx);
             });
         }
+        if self.pickers_dirty {
+            self.sync_pickers(window, cx);
+        }
         let p = crate::ui::palette(cx);
         let (warning, muted) = (p.warning, p.muted_foreground);
         let close = Button::new("worktree-close")
@@ -986,8 +1171,9 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4();
+        // Orca `CreateFromPicker`처럼 후보는 기준 ref 칸을 쓰는 동안만 펼친다.
         let filtered = match &self.phase {
-            Phase::Edit(_) => self.filtered_bases(cx),
+            Phase::Edit(_) if self.base_is_focused(window, cx) => self.filtered_bases(cx),
             _ => Vec::new(),
         };
         let highlight = self.highlight;
@@ -996,11 +1182,6 @@ impl Render for Dialog {
         let current_host = self.host.clone();
         let current_repo = self.repo.clone();
         let host_options = self.host_options.clone();
-        let current_host_repos = host_options
-            .iter()
-            .find(|o| o.host == current_host)
-            .map(|o| o.repos.clone())
-            .unwrap_or_default();
         let host_label = host_options
             .iter()
             .find(|o| o.host == current_host)
@@ -1018,37 +1199,7 @@ impl Render for Dialog {
         };
         let body = match &self.phase {
             Phase::Edit(error) => body
-                .when(host_options.len() > 1, |d| {
-                    let current = current_host.clone();
-                    d.child(
-                        div()
-                            .id("worktree-host-selector")
-                            .debug_selector(|| "worktree-host-selector".into())
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(crate::ui::field_label(text::HOST_LABEL.get(), None, p))
-                            .child(div().flex().flex_wrap().gap_1().children(
-                                host_options.iter().enumerate().map(|(idx, opt)| {
-                                    let selected = opt.host == current;
-                                    let next = opt.host.clone();
-                                    let key = opt.host.as_key().to_owned();
-                                    Button::new(("worktree-host", idx))
-                                        .debug_selector(move || format!("worktree-host-{key}"))
-                                        .xsmall()
-                                        .label(opt.label.clone())
-                                        .selected(selected)
-                                        .toggled(selected)
-                                        .ghost()
-                                        .on_click(cx.listener(move |d, _, window, cx| {
-                                            d.select_host(next.clone(), window, cx);
-                                        }))
-                                }),
-                            )),
-                    )
-                })
-                .when(current_host_repos.len() > 1, |d| {
-                    let current = current_repo.clone();
+                .when(!host_options.is_empty(), |d| {
                     d.child(
                         div()
                             .id("worktree-repo-selector")
@@ -1058,27 +1209,32 @@ impl Render for Dialog {
                             .gap_1()
                             .child(crate::ui::field_label(text::REPO_LABEL.get(), None, p))
                             .child(
-                                div().flex().flex_wrap().gap_1().children(
-                                    current_host_repos
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(idx, repo_opt)| {
-                                            let selected = repo_opt.path == current;
-                                            let next = repo_opt.path.clone();
-                                            Button::new(("worktree-repo", idx))
-                                                .debug_selector(move || {
-                                                    format!("worktree-repo-{idx}")
-                                                })
-                                                .xsmall()
-                                                .label(repo_opt.label.clone())
-                                                .selected(selected)
-                                                .toggled(selected)
-                                                .ghost()
-                                                .on_click(cx.listener(move |d, _, window, cx| {
-                                                    d.select_repo(next.clone(), window, cx);
-                                                }))
-                                        }),
-                                ),
+                                Select::new(&self.project_picker)
+                                    .id("worktree-project-picker")
+                                    .w_full()
+                                    .menu_width(px(420.))
+                                    .placeholder(text::PROJECT_PLACEHOLDER.get())
+                                    .search_placeholder(text::PROJECT_SEARCH.get())
+                                    .accessibility_label(text::REPO_LABEL.get()),
+                            ),
+                    )
+                })
+                .when(host_options.len() > 1, |d| {
+                    d.child(
+                        div()
+                            .id("worktree-host-selector")
+                            .debug_selector(|| "worktree-host-selector".into())
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(crate::ui::field_label(text::HOST_LABEL.get(), None, p))
+                            .child(
+                                Select::new(&self.host_picker)
+                                    .id("worktree-host-picker")
+                                    .w_full()
+                                    .menu_width(px(420.))
+                                    .search_placeholder(text::HOST_SEARCH.get())
+                                    .accessibility_label(text::HOST_LABEL.get()),
                             ),
                     )
                 })
@@ -1139,14 +1295,19 @@ impl Render for Dialog {
                                                 .when(is_active, |row| row.bg(p.accent))
                                                 .cursor_pointer()
                                                 .child(picked.clone())
-                                                .on_click(cx.listener(move |d, _, window, cx| {
-                                                    d.base.update(cx, |input, cx| {
-                                                        input.set_value(&picked, window, cx);
-                                                    });
-                                                    d.highlight = None;
-                                                    d.prepare(cx);
-                                                    cx.notify();
-                                                }))
+                                                // 마우스 누름에서 고르고 기본 동작을 막아 입력칸 포커스(=목록)가 유지되게 한다.
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    cx.listener(move |d, _, window, cx| {
+                                                        window.prevent_default();
+                                                        d.base.update(cx, |input, cx| {
+                                                            input.set_value(&picked, window, cx);
+                                                        });
+                                                        d.highlight = None;
+                                                        d.prepare(cx);
+                                                        cx.notify();
+                                                    }),
+                                                )
                                         },
                                     )),
                             )

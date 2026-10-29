@@ -60,17 +60,13 @@ pub(crate) fn prepare(reg: &Registry, holder: &Holder, u: Upgrade) -> Result<Upg
         req,
         path: u.krilld,
     }))?;
-    // Done 뒤에 holder를 이미 잃었으면 리더를 멈추지 않는다(daemon-04: 창을 좁힌다).
-    if !holder.is_connected() {
-        tracing::warn!("upgrade: holder lost after handoff; keeping old krilld");
-        return Err(Failure::NoHolder);
-    }
-    // 멈추지 못한 리더가 있어도 끝낸다: 그 세션은 krilld 크래시 범위(Gap 가능)로 이어진다.
-    if let Err(e) = crate::rejoin::halt_all(reg) {
-        tracing::warn!(kind = ?e.kind(), "upgrade: readers did not halt");
-    }
-    // 정지 중에 holder가 죽었으면 `Started`를 보내고 끝나면 세션이 유실된다(새 holder를 띄울 주체가 없다).
-    // 실패로 보고하고 구 krilld가 계속 쥔다: 멈춘 리더는 같은 엔진으로 다시 띄워 출력을 계속 읽는다(daemon-04).
+    // Failure or holder loss must leave the same engine/recorder and live IO usable.
+    let pause = crate::rejoin::halt_all(reg).map_err(|e| {
+        tracing::warn!(kind = ?e.kind(), "upgrade: readers did not pause");
+        Failure::Os(e.raw_os_error().unwrap_or(libc::EIO))
+    })?;
+    // Done 뒤·정지 중에 holder가 죽었으면 `Started`를 보내고 끝나면 세션이 유실된다
+    // (새 holder를 띄울 주체가 없다). 실패로 보고하고 구 krilld가 계속 쥔다.
     // 판정과 종료 사이의 수 μs 경합은 핸드오프 재설계(needs-owen a) 없이 막지 못한다.
     if !holder.is_connected() {
         let stalled = crate::session::end_halt();
@@ -80,6 +76,7 @@ pub(crate) fn prepare(reg: &Registry, holder: &Holder, u: Upgrade) -> Result<Upg
         );
         return Err(Failure::NoHolder);
     }
+    pause.commit();
     tracing::info!(build = %u.build, "upgrade: handing over to holder");
     Ok(Upgraded::Started)
 }

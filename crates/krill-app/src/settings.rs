@@ -4905,15 +4905,6 @@ impl SettingsView {
         // 테스트용 임시 상태 디렉터리에서는 데몬 없이 로컬 파일로 동기 처리한다.
         if !is_daemon_state_dir(dir.as_deref()) {
             match &req {
-                krill_proto::usage::UsageRequest::SetDirectUsage(on)
-                    if self.accounts_snapshot.connections.supported =>
-                {
-                    self.accounts_snapshot.connections.direct_usage = *on;
-                    self.account_error = None;
-                    cx.defer(notify_external_change);
-                    cx.notify();
-                    return;
-                }
                 krill_proto::usage::UsageRequest::SetAdvancedPolicy(policy)
                     if self.accounts_snapshot.advanced.supported =>
                 {
@@ -9539,42 +9530,6 @@ impl SettingsView {
                 Some(text::AUTO_SWITCH_THRESHOLD_DESC.get()),
             ))
             .child(layout::controls().child(layout::segmented_control(p, preset_btns)));
-
-        // OWE-719 1부: 데몬이 연결 꼬리를 지원할 때만 "사용량 직접 조회" 토글을 보인다.
-        let connections = &self.accounts_snapshot.connections;
-        if connections.supported {
-            let direct_usage = connections.direct_usage;
-            let view = cx.entity();
-            root = root.child(
-                layout::row(p)
-                    .child(layout::label(
-                        p,
-                        text::ACCOUNTS_DIRECT_USAGE.get(),
-                        Some(text::ACCOUNTS_DIRECT_USAGE_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "admin-direct-usage-toggle",
-                                direct_usage,
-                                false,
-                                move |on, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        if this.accounts_snapshot.connections.direct_usage != on {
-                                            this.apply_account_request(
-                                                UsageRequest::SetDirectUsage(on),
-                                                cx,
-                                            );
-                                        }
-                                    });
-                                },
-                            )
-                            .aria_label(text::ACCOUNTS_DIRECT_USAGE.get()),
-                        ),
-                    ),
-            );
-        }
 
         let mut auto_switch_card = layout::card(p)
             .flex()

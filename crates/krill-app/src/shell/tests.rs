@@ -832,11 +832,18 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     cx.simulate_mouse_down(at, MouseButton::Left, cmd);
     cx.simulate_mouse_up(at, MouseButton::Left, cmd);
     assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/문서"));
+    // 우클릭은 프로그램으로, ⇧+우클릭은 Krill 메뉴 몫이라 보내지 않는다.
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    assert_eq!(input(), b"\x1b[<2;1;1M");
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    assert_eq!(input(), b"\x1b[<2;1;1m");
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::shift());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::shift());
     theirs.set_nonblocking(true).unwrap();
     let mut extra = [0; 1];
     assert!(
         std::io::Read::read(&mut theirs, &mut extra).is_err(),
-        "Cmd+click and preedit send no input"
+        "Cmd+click, Shift+right-click and preedit send no input"
     );
 }
 
@@ -3034,6 +3041,41 @@ fn restart_keeps_session_until_resumed_and_stops_on_permanent_failure(cx: &mut T
     assert!(cx.debug_bounds("pane-error").is_some());
 }
 
+/// 데몬이 닫힘·이미 재개됨(`NoSession`)으로 확정한 세션의 칸은 "no such session" 빈 화면으로 남지 않고
+/// 그 칸만 거둔다. 같은 오류라도 다른 영구 실패(예: 에이전트 프로필 없음)·형제 칸은 그대로 둔다.
+#[gpui::test]
+fn no_such_session_pane_is_removed_but_other_failures_and_siblings_stay(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("no-such-session-removed"));
+    let keep = layout_of(&view, cx).active_tab().focused;
+    cx.simulate_keystrokes("cmd-t");
+    let stale = layout_of(&view, cx).active_tab().focused;
+    let (keep_id, stale_id) = (krill_proto::SessionId(801), krill_proto::SessionId(802));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(keep, keep_id);
+            s.layout.set_session(stale, stale_id);
+            s.live.insert(keep, Live::new(Task::ready(())));
+            s.live.insert(stale, Live::new(Task::ready(())));
+            // 다른 영구 실패는 칸을 남긴다(기존 동작).
+            let other = std::io::Error::new(std::io::ErrorKind::NotFound, "unknown agent profile");
+            assert!(matches!(s.settled(stale, Err(other), cx), Next::Gone));
+            assert!(
+                s.layout.pane_exists(stale),
+                "non-NoSession failure keeps the pane"
+            );
+            // 데몬이 NoSession으로 확정하면 그 칸만 거둔다.
+            let gone = pane::failure_to_io_error(krill_proto::control::Failure::NoSession);
+            assert!(matches!(s.settled(stale, Err(gone), cx), Next::Gone));
+            assert!(
+                !s.layout.pane_exists(stale),
+                "dead session pane must be removed"
+            );
+            assert!(s.layout.pane_exists(keep), "sibling pane must stay");
+            assert_eq!(s.layout.session(keep), Some(keep_id));
+        });
+    });
+}
+
 /// OWE-615 원인 1: 연속 음절 입력에서 `insertText` 직후 프레임이 와도 이전 확정 글자가 사라지지 않고
 /// 새 preedit가 그 다음 칸에 그려진다. 에코(커서 전진)가 오면 낙관적 글자가 지워진다.
 #[gpui::test]
@@ -3442,9 +3484,9 @@ fn stale_selection_clears_on_new_output(cx: &mut TestAppContext) {
     let frame = |ops: Vec<Op>| encode_update(Revision(1), Seq(0), ops).unwrap()[0].clone();
     let select_all_first_line = |s: &mut Shell, cx: &mut gpui::Context<Shell>| {
         let l = s.live.get_mut(&pane).unwrap();
-        l.selection = Some(Selection {
-            anchor: select::Point { line: 0, column: 0 },
-            head: select::Point { line: 0, column: 4 },
+        l.selection = Some(Anchored {
+            anchor: (0, 0),
+            head: (0, 4),
             block: false,
         });
         l.selecting = true;
@@ -7466,8 +7508,8 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
             );
             assert!(s.select_end(pane, cx));
             let sel = s.live[&pane].selection.expect("shift selection");
-            assert_eq!(sel.anchor, select::Point { line: 1, column: 0 });
-            assert_eq!(sel.head, select::Point { line: 1, column: 5 });
+            assert_eq!(sel.anchor, (1, 0));
+            assert_eq!(sel.head, (1, 5));
         });
     });
     assert_eq!(text_of(&view, cx).as_deref(), Some("second"));
@@ -8375,6 +8417,106 @@ fn scrolled_terminal_shows_scrollbar_and_bottom_badge(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("scrollbar").is_none());
     let offset = cx.update(|_, cx| view.read(cx).live.get(&pane).unwrap().pane.scroll_offset());
     assert_eq!(offset, 0);
+}
+
+/// 액터진 제보: 끌어 선택하다 휠로 위로 올려도 선택이 풀리지 않고, 화면 밖 스크롤백까지
+/// 이어 복사한다(Orca/xterm.js처럼 버퍼 기준 줄).
+#[gpui::test]
+fn wheel_scroll_keeps_drag_selection_across_scrollback(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use krill_proto::control::Cold;
+    use krill_proto::screen::{Cell, Op};
+    use std::os::unix::net::UnixStream;
+
+    fn row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    let (view, cx) = open(cx, state_path("selection-wheel"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(3), ours, cx);
+            s.live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .show_cold(
+                    krill_proto::SessionId(3),
+                    Cold {
+                        screen: vec![
+                            Op::Reset { cols: 10, lines: 2 },
+                            Op::Line {
+                                line: 0,
+                                cells: row("top"),
+                            },
+                            Op::Line {
+                                line: 1,
+                                cells: row("end"),
+                            },
+                        ],
+                        history: vec![row("old"), row("mid")],
+                    },
+                )
+                .unwrap();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let at = |col: f32, line: f32| {
+        point(
+            bounds.origin.x + cell.width * (col + 0.5),
+            bounds.origin.y + cell.height * (line + 0.5),
+        )
+    };
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at(2., 1.), MouseButton::Left, none);
+    cx.simulate_mouse_move(at(0., 0.), MouseButton::Left, none);
+    // 끄는 중에 휠로 2행 올린다.
+    cx.simulate_event(ScrollWheelEvent {
+        position: at(0., 0.),
+        delta: ScrollDelta::Lines(point(0., 2.)),
+        modifiers: none,
+        touch_phase: TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let live = &view.read(cx).live[&pane];
+        assert_eq!(live.pane.scroll_offset(), 2);
+        assert!(live.selection.is_some(), "휠 스크롤은 선택을 지우지 않는다");
+    });
+    // 올라간 화면 맨 위 "old"의 1열까지 끌고 놓는다.
+    cx.simulate_mouse_move(at(1., 0.), MouseButton::Left, none);
+    cx.simulate_mouse_up(at(1., 0.), MouseButton::Left, none);
+    cx.simulate_keystrokes("cmd-c");
+    let clip = |cx: &mut VisualTestContext| cx.read_from_clipboard().and_then(|c| c.text());
+    assert_eq!(clip(cx).as_deref(), Some("ld\nmid\ntop\nend"));
+
+    // 바닥으로 내려와도 선택은 남고, 보이는 부분만 칠한다.
+    cx.simulate_event(ScrollWheelEvent {
+        position: at(0., 0.),
+        delta: ScrollDelta::Lines(point(0., -2.)),
+        modifiers: none,
+        touch_phase: TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let live = &view.read(cx).live[&pane];
+        assert_eq!(live.pane.scroll_offset(), 0);
+        let shown = live.shown_selection().expect("visible part");
+        assert_eq!(shown.anchor, select::Point { line: 0, column: 0 });
+        assert_eq!(shown.head, select::Point { line: 1, column: 2 });
+    });
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new()));
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(clip(cx).as_deref(), Some("ld\nmid\ntop\nend"));
 }
 
 /// OWE-874-5: 파일 탭 우클릭 메뉴에 절대·상대 경로 복사, Finder 보기가 있고 세션 탭에는 없다.
@@ -11205,4 +11347,83 @@ fn tab_menu_home_end_arrows_space_escape_skip_disabled(cx: &mut TestAppContext) 
     cx.run_until_parked();
     assert!(cx.debug_bounds("tab-context-menu").is_none());
     cx.update(|w, cx| assert!(!view.read(cx).tab_menu_focus.is_focused(w)));
+}
+
+#[gpui::test]
+fn sticky_prompt_bar_uses_polled_remote_history_with_colliding_session_id(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_app::sidebar::{PromptHistories, Source};
+    struct RemotePrompts;
+    impl Source for RemotePrompts {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: SessionId(501),
+                    status: krill_proto::control::AgentStatus::UNKNOWN,
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                }],
+                trees: std::collections::BTreeMap::new(),
+            })
+        }
+        fn prompt_histories(&self) -> PromptHistories {
+            let mut history = krill_proto::git::SessionPromptHistory::default();
+            history.record_turn("Remote host user request", 10_000_000_000);
+            [(SessionId(501), history)].into()
+        }
+    }
+    let (view, cx) = open(cx, state_path("remote-sticky-prompts"));
+    let pane = cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            s.layout.set_host(pane, HostId::Remote("studio".into()));
+            s.layout.set_session(pane, SessionId(501));
+            s.sidebar.update(cx, |sb, cx| {
+                sb.record_local_prompt(SessionId(501), "Unrelated local user request", cx);
+                sb.set_remote_host_source(
+                    "studio",
+                    "Studio",
+                    HostStatus::Connected,
+                    std::sync::Arc::new(RemotePrompts),
+                    cx,
+                );
+            });
+            cx.notify();
+            pane
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| {
+        let sb = view.read(cx).sidebar.read(cx);
+        assert_eq!(
+            sb.session_prompt_history_on(&HostId::Remote("studio".into()), SessionId(501))
+                .unwrap()
+                .single_line_summary()
+                .as_deref(),
+            Some("Remote host user request")
+        );
+        assert_eq!(
+            sb.session_prompt_history_on(&HostId::Local, SessionId(501))
+                .unwrap()
+                .single_line_summary()
+                .as_deref(),
+            Some("Unrelated local user request")
+        );
+    });
+    let bar: &'static str = format!("sticky-prompt-bar-{}", pane.get()).leak();
+    let copy: &'static str = format!("sticky-prompt-copy-{}", pane.get()).leak();
+    let item: &'static str = format!("sticky-prompt-turn-item-{}-0", pane.get()).leak();
+    let copy_bounds = cx.debug_bounds(copy).expect("remote prompt copy button");
+    cx.simulate_click(copy_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("Remote host user request".into())
+    );
+    let bar_bounds = cx.debug_bounds(bar).expect("remote prompt bar");
+    cx.simulate_click(bar_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(item).is_some(), "remote timeline must open");
 }

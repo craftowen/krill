@@ -3,6 +3,7 @@
 //! PTY 읽기 스레드는 건드리지 않고, 데몬 전체 감시 스레드 하나가 그룹과 조용해진 화면을 확인한다.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -14,17 +15,55 @@ use crate::registry::Registry;
 use crate::sys::ExitWatch;
 
 const POLL: Duration = Duration::from_millis(100);
+const PROCESS_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct Tracked {
     detector: Detector,
     /// pid 재사용을 구분하는 시작 시각. 이전 그룹의 늦은 종료는 새 그룹을 종료시키지 않는다.
     process: Option<(u32, u64)>,
+    process_checked: Option<Instant>,
     /// Name lookups may be reused only after start identity is revalidated each tick.
     name: Option<(u32, u64, Instant, String)>,
     /// 마지막으로 문자열화한 화면(revision·제목·평문). revision이 그대로면 다시 문자열화하지 않고
     /// 이 캐시로 감지한다(OWE-586: 유휴 20세션 문자열화 비용 제거).
     evidence: Option<(u64, String, String)>,
+}
+
+impl Tracked {
+    /// Kernel notifications are an optimization. Keep checking the original identity,
+    /// including when the agent moved to the background or the watch could not be installed.
+    fn ended(
+        &mut self,
+        exits: &[u32],
+        now: Instant,
+        start_us: impl FnOnce(u32) -> io::Result<u64>,
+    ) -> bool {
+        let Some((pid, start)) = self.process else {
+            return false;
+        };
+        let notified = exits.contains(&pid);
+        if !notified
+            && self
+                .process_checked
+                .is_some_and(|at| now.saturating_duration_since(at) < PROCESS_POLL)
+        {
+            return false;
+        }
+        self.process_checked = Some(now);
+        let ended = match start_us(pid) {
+            Ok(current) => current != start || notified,
+            Err(e) => {
+                notified
+                    || e.kind() == io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH)
+            }
+        };
+        if ended {
+            self.process = None;
+        }
+        ended
+    }
 }
 
 pub(crate) fn monitor(reg: &Registry) {
@@ -54,13 +93,8 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
     reg.gc_due(Instant::now(), SystemTime::now());
     let exits = watch.and_then(|w| w.drain().ok()).unwrap_or_default();
     for (&id, t) in &mut *tracked {
-        if let Some((pid, start)) = t.process
-            && exits.contains(&pid)
-        {
-            if !crate::sys::start_us(pid).is_ok_and(|current| current != start) {
-                reg.with_status(id, |s| s.exited(id));
-            }
-            t.process = None;
+        if t.ended(&exits, Instant::now(), crate::sys::start_us) {
+            reg.with_status(id, |s| s.exited(id));
         }
     }
     let mut sessions = Vec::new();
@@ -120,20 +154,22 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                 && let Some(start) = identity
                 && t.process != Some((pid, start))
             {
+                // Retain identity even if kernel watching is unavailable; polling still
+                // detects exit. A foreground-group change alone does not end an agent.
+                t.process = Some((pid, start));
+                t.process_checked = None;
+                reg.with_status(id, |s| s.started(id));
                 // 먼저 등록해 직후 종료도 놓치지 않는다.
                 if let Some(w) = watch {
                     match w.add(pid) {
-                        Ok(()) => {
-                            t.process = Some((pid, start));
-                            reg.with_status(id, |s| s.started(id));
-                        }
                         Err(e)
                             if e.raw_os_error() == Some(libc::ESRCH)
                                 || cfg!(windows) && e.raw_os_error() == Some(87) =>
                         {
+                            t.process = None;
                             reg.with_status(id, |s| s.exited(id));
                         }
-                        Err(_) => {}
+                        Ok(()) | Err(_) => {}
                     }
                 }
             }
@@ -150,3 +186,6 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
     reg.retain_webhooks(&ids);
     reg.hibernate_idle();
 }
+
+#[cfg(test)]
+mod tests;

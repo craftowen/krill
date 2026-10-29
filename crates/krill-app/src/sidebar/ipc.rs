@@ -136,7 +136,7 @@ type Job = Box<dyn FnOnce() + Send>;
 /// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
 const SLOW_POLL: Duration = Duration::from_secs(1);
 
-type SharedSnapshot = Mutex<Option<(Instant, Arc<Snapshot>)>>;
+type SharedSnapshot = Mutex<Option<(Instant, Arc<Snapshot>, super::PromptHistories)>>;
 type SnapshotRegistry = Mutex<Vec<(SnapshotSource, Weak<SharedSnapshot>)>>;
 
 // A registry key must not retain RemoteConnector or its transport resources.
@@ -368,7 +368,7 @@ impl Shared {
             .snapshot
             .lock()
             .map_err(|_| io::Error::other("sidebar snapshot mutex poisoned"))?;
-        if let Some((at, snapshot)) = cached.as_ref()
+        if let Some((at, snapshot, _)) = cached.as_ref()
             && at.elapsed() < Duration::from_millis(450)
         {
             return Ok(snapshot.clone());
@@ -389,12 +389,12 @@ impl Shared {
             |stream| fetch_from(stream, &external, is_local),
         );
         match result {
-            Ok((snapshot, branches)) => {
+            Ok((snapshot, branches, histories)) => {
                 if let Ok(mut guard) = self.branches.lock() {
                     *guard = branches;
                 }
                 let snapshot = Arc::new(snapshot);
-                *cached = Some((Instant::now(), snapshot.clone()));
+                *cached = Some((Instant::now(), snapshot.clone(), histories));
                 Ok(snapshot)
             }
             Err(error) => {
@@ -461,6 +461,15 @@ impl Source for Socket {
 
     fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
         self.shared.fetch_shared()
+    }
+
+    fn prompt_histories(&self) -> super::PromptHistories {
+        self.shared
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|cached| cached.as_ref().map(|(_, _, histories)| histories.clone()))
+            .unwrap_or_default()
     }
 
     fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
@@ -766,7 +775,7 @@ fn fetch_from(
     stream: &mut UnixStream,
     external: &BTreeMap<PathBuf, super::external::ExternalHit>,
     is_local: bool,
-) -> io::Result<(Snapshot, BTreeMap<PathBuf, String>)> {
+) -> io::Result<(Snapshot, BTreeMap<PathBuf, String>, super::PromptHistories)> {
     use krill_proto::ipc;
     let mut call = |request: Request| -> io::Result<Reply> {
         stream.write_all(&request.encode()?)?;
@@ -866,7 +875,12 @@ fn fetch_from(
         })
         .collect();
     sessions.sort_by_key(|s| s.id);
-    Ok((Snapshot { sessions, trees }, branches))
+    let histories = data
+        .prompt_histories
+        .into_iter()
+        .filter(|(id, _)| sessions.iter().any(|s| s.id == *id))
+        .collect();
+    Ok((Snapshot { sessions, trees }, branches, histories))
 }
 
 #[cfg(test)]
@@ -885,7 +899,8 @@ mod tests {
         let second = Socket::new(&paths);
         assert!(Arc::ptr_eq(&first.shared.snapshot, &second.shared.snapshot));
         let snapshot = Arc::new(Snapshot::default());
-        *first.shared.snapshot.lock().unwrap() = Some((Instant::now(), snapshot.clone()));
+        *first.shared.snapshot.lock().unwrap() =
+            Some((Instant::now(), snapshot.clone(), BTreeMap::new()));
         assert!(Arc::ptr_eq(&first.fetch_shared().unwrap(), &snapshot));
         assert!(Arc::ptr_eq(&second.fetch_shared().unwrap(), &snapshot));
         first
@@ -901,6 +916,57 @@ mod tests {
             ..paths
         });
         assert!(!Arc::ptr_eq(&first.shared.snapshot, &other.shared.snapshot));
+    }
+
+    #[test]
+    fn remote_snapshot_receives_prompt_tail_and_old_daemons_remain_supported() {
+        for include_prompts in [false, true] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut history = krill_proto::git::SessionPromptHistory::default();
+                history.record_turn("Request entered on remote host", 1);
+                for expected in [
+                    Request::List,
+                    Request::States,
+                    Request::Sidebar,
+                    Request::SessionAccounts,
+                ] {
+                    let (kind, bytes) = krill_proto::ipc::read_frame(&mut server).unwrap().unwrap();
+                    let request = Request::decode(kind, &bytes).unwrap();
+                    assert_eq!(request, expected);
+                    let reply = match request {
+                        Request::List => Reply::Sessions(vec![krill_proto::control::Info {
+                            session: krill_proto::SessionId(7),
+                            pid: 0,
+                            status: None,
+                        }]),
+                        Request::States => Reply::States(vec![]),
+                        Request::Sidebar => Reply::Sidebar(krill_proto::control::SidebarData {
+                            prompt_histories: if include_prompts {
+                                vec![
+                                    (krill_proto::SessionId(7), history.clone()),
+                                    (krill_proto::SessionId(99), history.clone()),
+                                ]
+                            } else {
+                                vec![]
+                            },
+                            ..Default::default()
+                        }),
+                        Request::SessionAccounts => Reply::SessionAccounts(vec![]),
+                        _ => unreachable!(),
+                    };
+                    server.write_all(&reply.encode().unwrap()).unwrap();
+                }
+            });
+            let (snapshot, _, histories) =
+                fetch_from(&mut client, &BTreeMap::new(), false).unwrap();
+            worker.join().unwrap();
+            assert_eq!(snapshot.sessions.len(), 1);
+            assert_eq!(histories.len(), usize::from(include_prompts));
+            if include_prompts {
+                assert_eq!(histories[&krill_proto::SessionId(7)].total_turns, 1);
+            }
+        }
     }
 
     const FIXTURE: &str = r#"[

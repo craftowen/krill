@@ -16,7 +16,12 @@ pub struct RealLinkBackend {
     state_dir: PathBuf,
     executable: PathBuf,
     hosts: std::sync::OnceLock<std::sync::Arc<crate::hosts::link::LinkHosts>>,
+    /// 연결된 원격 호스트별 데몬 빌드. 연결이 끊기면 비워 다시 읽는다.
+    versions: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
 }
+
+/// 원격 Mac에서 설치된 Krill.app의 헤드리스 업데이터(`krill-app --update-cli`)를 실행한다.
+const REMOTE_UPDATE_SCRIPT: &str = r#"for d in /Applications/Krill.app "$HOME/Applications/Krill.app"; do [ -x "$d/Contents/MacOS/krill-app" ] && exec "$d/Contents/MacOS/krill-app" --update-cli; done; echo 'Krill.app not found'; exit 1"#;
 
 impl RealLinkBackend {
     pub fn new(state_dir: PathBuf, executable: PathBuf) -> Self {
@@ -24,7 +29,53 @@ impl RealLinkBackend {
             state_dir,
             executable,
             hosts: std::sync::OnceLock::new(),
+            versions: std::sync::Arc::default(),
         }
+    }
+
+    fn link_hosts(&self) -> &std::sync::Arc<crate::hosts::link::LinkHosts> {
+        self.hosts.get_or_init(|| {
+            crate::hosts::link::LinkHosts::shared(self.state_dir.clone(), self.executable.clone())
+        })
+    }
+
+    fn remote_target(&self, id: &str) -> Result<krill_hosts::HostTarget, String> {
+        let want = crate::hosts::link::host_id(id);
+        self.link_hosts()
+            .registrations()
+            .ok()
+            .and_then(|hosts| hosts.into_iter().find(|h| h.spec.id == want))
+            .map(|h| h.target())
+            .ok_or_else(|| text::ERR_UNAVAILABLE.get().to_owned())
+    }
+
+    /// 연결된 호스트면 데몬 빌드를 돌려준다(처음 한 번만 핸드셰이크).
+    fn host_version(&self, id: &str, connected: bool) -> Option<String> {
+        let mut cache = self.versions.lock().ok()?;
+        if !connected {
+            cache.remove(id);
+            return None;
+        }
+        if let Some(v) = cache.get(id) {
+            return Some(v.clone());
+        }
+        drop(cache);
+        let hello = krill_proto::daemon::client_hello(
+            krill_proto::ipc::ClientRole::App,
+            "krill-app-remote-version",
+        );
+        let build = self
+            .remote_target(id)
+            .ok()?
+            .connect(&hello)
+            .ok()?
+            .server
+            .build;
+        self.versions
+            .lock()
+            .ok()?
+            .insert(id.to_owned(), build.clone());
+        Some(build)
     }
 
     pub fn state_dir(&self) -> &std::path::Path {
@@ -142,23 +193,63 @@ impl LinkBackend for RealLinkBackend {
             .map(|host| {
                 let info = crate::hosts::link::connection_info(&self.state_dir, &host.id)
                     .map_err(|_| text::ERR_UNAVAILABLE.get().to_owned())?;
+                let version =
+                    self.host_version(&host.id, info.status == krill_hosts::HostStatus::Connected);
                 Ok(PairedHost {
                     id: host.id,
                     name: host.name,
                     status: info.status,
+                    version,
                 })
             })
             .collect()
     }
 
+    fn update_host(&self, id: &str) -> Result<(), String> {
+        use krill_proto::control::{Create, FEAT_CLI, FEAT_CONTROL, Program, Reply, Request};
+        use krill_proto::screen::Msg as _;
+        use std::io::Write as _;
+
+        let err = || text::ERR_UPDATE.get().to_owned();
+        let hello = krill_proto::daemon::client_hello(
+            krill_proto::ipc::ClientRole::App,
+            "krill-app-remote-update",
+        );
+        let mut conn = self.remote_target(id)?.connect(&hello).map_err(|_| err())?;
+        let need = FEAT_CONTROL | FEAT_CLI;
+        if conn.negotiated.features & need != need {
+            return Err(text::ERR_UPDATE_UNSUPPORTED.get().to_owned());
+        }
+        let create = Request::Create(Create {
+            account: None,
+            program: Program::Custom {
+                program: b"/bin/sh".to_vec(),
+                args: vec![b"-c".to_vec(), REMOTE_UPDATE_SCRIPT.as_bytes().to_vec()],
+            },
+            cwd: b"/tmp".to_vec(),
+            cols: 120,
+            rows: 24,
+        });
+        conn.stream
+            .write_all(&create.encode().map_err(|_| err())?)
+            .map_err(|_| err())?;
+        let (kind, body) = krill_proto::ipc::read_frame(&mut conn.stream)
+            .ok()
+            .flatten()
+            .ok_or_else(err)?;
+        match Reply::decode(kind, &body) {
+            Ok(Reply::Created { .. }) => {
+                if let Ok(mut cache) = self.versions.lock() {
+                    cache.remove(id);
+                }
+                Ok(())
+            }
+            _ => Err(err()),
+        }
+    }
+
     fn disconnect_host(&self, id: &str) -> Result<Vec<PairedHost>, String> {
-        self.hosts
-            .get_or_init(|| {
-                crate::hosts::link::LinkHosts::shared(
-                    self.state_dir.clone(),
-                    self.executable.clone(),
-                )
-            })
+        self.link_hosts()
             .disconnect_host(id)
             .map_err(|_| text::ERR_DISCONNECT.get().to_owned())?;
         self.remote_hosts()

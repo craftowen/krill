@@ -289,8 +289,8 @@ fn guarded_rebuilds_engine_after_panic() {
             generation: 0,
         }),
         changed: Condvar::new(),
+        paused: AtomicBool::new(false),
         store: None,
-        halted: AtomicBool::new(false),
         reader: Mutex::new(None),
     };
     // panic한 묶음은 `false`를 돌리고, 원본 끝은 먹은 바이트만큼 민다.

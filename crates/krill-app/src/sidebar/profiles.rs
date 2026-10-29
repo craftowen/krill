@@ -318,7 +318,23 @@ impl Sidebar {
                 .get()
                 .to_owned();
         }
-        let account = super::text::SESSION_ACCOUNT.format(&[("label", label)]);
+        let identity = self
+            .snapshot_for(host)
+            .sessions
+            .iter()
+            .find(|row| row.id == session)
+            .and_then(|row| row.account.as_ref())
+            .and_then(|running| {
+                let accounts = &self.profiles.hosts.get(host)?.accounts.accounts;
+                let account = accounts.iter().find(|a| a.id == running.account_id)?;
+                account
+                    .email
+                    .as_deref()
+                    .filter(|email| !email.trim().is_empty())
+                    .map(|_| account_label(account, accounts))
+            });
+        let account =
+            super::text::SESSION_ACCOUNT.format(&[("label", identity.as_deref().unwrap_or(label))]);
         if !self.session_account_pending(host, session)
             && let Some(error) = self.session_account_error(host, session)
         {

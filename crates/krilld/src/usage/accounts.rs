@@ -49,10 +49,6 @@ pub fn record_rate_limited(provider: ProviderKind, account_id: &str) {
     lock(&RATE_LIMITED).insert((provider.as_str().to_owned(), account_id.to_owned()), now);
 }
 
-pub(crate) fn has_rate_limits() -> bool {
-    !lock(&RATE_LIMITED).is_empty()
-}
-
 /// 한도 기록을 지운다(복구·테스트 정리용). 있었으면 참이다.
 pub fn clear_rate_limited(provider: ProviderKind, account_id: &str) -> bool {
     lock(&RATE_LIMITED)
@@ -173,16 +169,9 @@ pub struct AccountsFile {
     /// 오웬 지시 2026-10-22). 명시한 `provisioning = false`는 그대로 존중한다.
     #[serde(default = "provisioning_default")]
     pub provisioning: bool,
-    /// OWE-719: 기존 자격증명을 읽기만 하는 직접 사용량 조회(오웬 지시로 기본 켜짐).
-    #[serde(default = "direct_usage_default")]
-    pub direct_usage: bool,
     /// Krill 목록에서 지운 Orca 감지 계정 id. Orca 캐시 파일은 Orca 소유라 건드리지 않고 여기서 숨긴다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_accounts: Vec<String>,
-}
-
-fn direct_usage_default() -> bool {
-    true
 }
 
 fn provisioning_default() -> bool {
@@ -197,7 +186,6 @@ impl Default for AccountsFile {
             accounts: Vec::new(),
             advanced_policy: krill_proto::usage::AdvancedPolicy::default(),
             provisioning: provisioning_default(),
-            direct_usage: true,
             hidden_accounts: Vec::new(),
         }
     }
@@ -1184,8 +1172,14 @@ fn refresh_accounts_authenticated(
 
     // 로그인 프로브의 현재 신원은 등록 이름이나 오래된 사용량 캐시보다 우선한다.
     for account in &mut all {
-        if let Some(identity) = auth
-            .get(&(account.provider, PathBuf::from(&account.profile_dir)))
+        let status = auth.get(&(account.provider, PathBuf::from(&account.profile_dir)));
+        if account.provider == ProviderKind::Antigravity && status.is_some() {
+            // 재로그인·로그아웃 뒤 이전 등록 이메일을 현재 로그인 신원으로 남기지 않는다.
+            account.email = status
+                .filter(|status| status.logged_in)
+                .and_then(|status| status.identity.as_ref())
+                .map(|identity| identity.email.clone());
+        } else if let Some(identity) = status
             .filter(|status| status.logged_in)
             .and_then(|status| status.identity.as_ref())
         {
@@ -1472,7 +1466,7 @@ fn refresh_accounts_authenticated(
 
     let connections = krill_proto::usage::ConnectionsSnapshot {
         supported: true,
-        direct_usage: file.direct_usage,
+        direct_usage: true, // 구버전 클라이언트용 필드. 사용량은 항상 자동 수집한다.
         accounts: all
             .iter()
             .map(|a| krill_proto::usage::AccountConnection {
@@ -2296,21 +2290,6 @@ pub fn set_advanced_policy(
         save_inner(home, state_dir, &file)?;
     }
     Ok(refresh_accounts_with(home, state_dir, false))
-}
-
-/// 직접 사용량 조회만 켜거나 끈다. 프로바이더 인증 파일에는 쓰지 않는다.
-pub fn set_direct_usage(
-    home: &Path,
-    state: Option<&Path>,
-    enabled: bool,
-) -> io::Result<AccountsSnapshot> {
-    {
-        let _guard = lock(&SAVE_LOCK);
-        let mut file = load_writable(home, state)?;
-        file.direct_usage = enabled;
-        save_inner(home, state, &file)?;
-    }
-    Ok(refresh_accounts_with(home, state, false))
 }
 
 #[cfg(test)]

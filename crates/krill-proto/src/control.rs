@@ -586,6 +586,9 @@ pub struct SidebarData {
     /// 워크트리 경로별 현재 브랜치(`refs/heads/` 제거). 와이어 호환을 위해 [`Reply::Sidebar`] 꼬리 바이트로만 인코딩한다.
     #[serde(default, skip)]
     pub branches: Vec<(Vec<u8>, String)>,
+    /// 세션 프롬프트 기록. 기존 브랜치 확장 뒤 선택 꼬리로 전달한다.
+    #[serde(default, skip)]
+    pub prompt_histories: Vec<(SessionId, crate::git::SessionPromptHistory)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +615,40 @@ struct Branch(
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct Branches(#[serde(deserialize_with = "bounded::<_, Branch, 512>")] Vec<Branch>);
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct PromptHistories(
+    #[serde(deserialize_with = "bounded::<_, PromptHistory, MAX_SESSIONS>")] Vec<PromptHistory>,
+);
+
+#[derive(Deserialize)]
+struct PromptHistory(SessionId, PromptHistoryBody);
+
+#[derive(Deserialize)]
+struct PromptHistoryBody {
+    total_turns: u32,
+    #[serde(
+        deserialize_with = "bounded::<_, PromptTurn, { crate::git::MAX_PROMPT_HISTORY_TURNS }>"
+    )]
+    turns: Vec<PromptTurn>,
+}
+
+#[derive(Deserialize)]
+struct PromptTurn {
+    #[serde(deserialize_with = "prompt_text")]
+    text: String,
+    unix_ns: u64,
+    turn: u32,
+}
+
+fn prompt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let text = <&str>::deserialize(d)?;
+    if text.is_empty() || text.chars().count() > crate::git::MAX_PROMPT_DISPLAY_CHARS + 1 {
+        return Err(serde::de::Error::custom("prompt text exceeds limit"));
+    }
+    Ok(text.to_owned())
+}
+
 fn branch_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let text = <&str>::deserialize(d)?;
     if text.is_empty() || text.len() > MAX_TITLE_TEXT {
@@ -1145,8 +1182,14 @@ impl Msg for Reply {
         }
         if let Self::Sidebar(data) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            if !data.branches.is_empty() {
+            if !data.branches.is_empty() || !data.prompt_histories.is_empty() {
                 body.extend(postcard::to_stdvec(&data.branches).map_err(crate::ipc::Error::Codec)?);
+            }
+            if !data.prompt_histories.is_empty() {
+                body.extend(
+                    postcard::to_stdvec(&data.prompt_histories)
+                        .map_err(crate::ipc::Error::Codec)?,
+                );
             }
             return crate::ipc::encode_frame(Self::KIND, &body);
         }
@@ -1236,7 +1279,7 @@ impl Msg for Reply {
             if !rest.is_empty()
                 && let Self::Sidebar(data) = &mut reply
             {
-                let (Branches(branches), _) = postcard::take_from_bytes::<Branches>(rest)
+                let (Branches(branches), tail) = postcard::take_from_bytes::<Branches>(rest)
                     .map_err(crate::ipc::Error::Codec)?;
                 let branches: Vec<_> = branches
                     .into_iter()
@@ -1255,6 +1298,31 @@ impl Msg for Reply {
                     ));
                 }
                 data.branches = branches;
+                if !tail.is_empty() {
+                    let (histories, _) = postcard::take_from_bytes::<PromptHistories>(tail)
+                        .map_err(crate::ipc::Error::Codec)?;
+                    data.prompt_histories = histories
+                        .0
+                        .into_iter()
+                        .map(|PromptHistory(id, history)| {
+                            (
+                                id,
+                                crate::git::SessionPromptHistory {
+                                    total_turns: history.total_turns,
+                                    turns: history
+                                        .turns
+                                        .into_iter()
+                                        .map(|turn| crate::git::SessionPromptTurn {
+                                            text: turn.text,
+                                            unix_ns: turn.unix_ns,
+                                            turn: turn.turn,
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        })
+                        .collect();
+                }
             }
             return Ok(reply);
         }

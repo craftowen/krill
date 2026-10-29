@@ -13,7 +13,7 @@ use krill_proto::usage::{
     ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
-const USAGE: &str = "usage: krill account [list [--json] | history [--json] | direct-usage <on|off> | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json] | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
+const USAGE: &str = "usage: krill account [list [--json] | history [--json] | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json] | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
@@ -78,9 +78,6 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     let (req, json) = match strs.as_slice() {
         [] | ["list" | "ls"] => (UsageRequest::ListAccounts, false),
         ["list" | "ls", "--json"] => (UsageRequest::ListAccounts, true),
-        ["direct-usage", value @ ("on" | "off")] => {
-            (UsageRequest::SetDirectUsage(*value == "on"), false)
-        }
         ["policy", key, value] => {
             let parsed = request(&UsageRequest::ListAccounts)
                 .and_then(|snap| parse_advanced_policy(key, value, snap.advanced.policy));
@@ -643,14 +640,18 @@ fn print_snapshot(snap: &AccountsSnapshot) {
             .as_ref()
             .map_or_else(|| "-".to_owned(), format_window);
         println!(
-            "{mark} {:<8} {:<22} {:<18} 5h:{:<5} 7d:{:<5} {} [{}]",
+            "{mark} {:<8} {:<22} {:<18} 5h:{:<5} 7d:{:<5} {} [{}] email:{}",
             a.provider.as_str(),
             a.id,
             a.label,
             h5,
             d7,
             a.profile_dir,
-            snap.connection_for(&a.id).label_ko()
+            snap.connection_for(&a.id).label_ko(),
+            a.email
+                .as_deref()
+                .filter(|email| !email.trim().is_empty())
+                .unwrap_or("—")
         );
     }
 }

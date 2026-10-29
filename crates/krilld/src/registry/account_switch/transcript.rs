@@ -227,6 +227,8 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
             && !last_line.is_empty()
             && serde_json::from_slice::<serde_json::Value>(last_line).is_err_and(|e| e.is_eof()));
     let mut identity: Option<String> = None;
+    // A forked Codex rollout replays the parent's `session_meta` after its own.
+    let mut parent: Option<String> = None;
     for record in String::from_utf8_lossy(&head)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -257,8 +259,20 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
         }
         .and_then(serde_json::Value::as_str);
         if let Some(id) = id {
+            if provider == ProviderKind::Codex
+                && identity.is_some()
+                && parent.as_deref() == Some(id)
+            {
+                continue;
+            }
             if !valid_session_id(id) || identity.as_deref().is_some_and(|previous| previous != id) {
                 return Err(io::ErrorKind::InvalidData.into());
+            }
+            if identity.is_none() {
+                parent = record
+                    .pointer("/payload/forked_from_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
             }
             identity = Some(id.to_owned());
         }
@@ -778,6 +792,8 @@ esac
             session_id(ProviderKind::Codex, &stored).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"forked_from_id\":\"two\"}}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"two\"}}\n").unwrap();
+        assert_eq!(session_id(ProviderKind::Codex, &stored).unwrap(), "one");
         fs::write(&path, "{\"sessionId\":\"claude-one\"}\n").unwrap();
         assert_eq!(
             session_id(ProviderKind::Claude, &stored).unwrap(),

@@ -212,8 +212,9 @@ impl Holder {
             .map(Link::drain_nowait);
         match packets {
             Some(Ok((packets, alive))) => {
-                for p in packets {
-                    if self.request(p) {
+                let last = packets.len().saturating_sub(1);
+                for (index, p) in packets.into_iter().enumerate() {
+                    if self.request(p, index == last) {
                         return true;
                     }
                 }
@@ -295,11 +296,17 @@ impl Holder {
                     .min(30_000)
             });
     }
-    fn request(&mut self, packet: Packet) -> bool {
+    fn request(&mut self, packet: Packet, handoff_allowed: bool) -> bool {
         let req = request_id(&packet.body).unwrap_or(0);
         let decoded = ToHolder::decode(packet.frame());
         if let Ok(ToHolder::UpgradeHolder { req, ref path }) = decoded {
-            let result = text(path.clone()).and_then(|path| self.upgrade(&path, req));
+            // Extracted packets are no longer visible to Link::has_pending(). A successful
+            // handoff here would discard them, so let the caller retry after they are served.
+            let result = if handoff_allowed {
+                text(path.clone()).and_then(|path| self.upgrade(&path, req))
+            } else {
+                Err(io::Error::from_raw_os_error(16))
+            };
             match result {
                 Ok(()) => return true,
                 Err(e) => {
@@ -823,5 +830,59 @@ mod tests {
         );
         assert!(h.daemon.is_none());
         drop((h, listener));
+    }
+
+    #[test]
+    fn nonlast_upgrade_is_rejected_before_starting_a_replacement_and_keeps_following_request() {
+        let (link, mut peer) = Link::pair().unwrap();
+        let target = sys::duplicate_target(std::process::id()).unwrap();
+        let mut holder = Holder {
+            path: "unused-daemon.exe".into(),
+            args: Vec::new(),
+            sessions: Vec::new(),
+            api: Api::load(),
+            daemon: Some(Daemon {
+                // The same-process handle is used only as a frame duplication target.
+                process: Process {
+                    handle: target.try_clone().unwrap(),
+                    pid: std::process::id(),
+                },
+                target,
+                link: Some(link),
+                started: Instant::now(),
+            }),
+            streak: 0,
+            restart: Instant::now(),
+            previous: None,
+            upgrading: false,
+            listener: None,
+        };
+        let mut frames = ToHolder::UpgradeHolder {
+            req: 1,
+            path: b"missing-replacement.exe".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        frames.extend(
+            ToHolder::Resize {
+                req: 2,
+                id: SessionId(999),
+                size: krill_proto::holder::WinSize { cols: 80, rows: 24 },
+            }
+            .encode()
+            .unwrap(),
+        );
+        peer.send(&frames, &[]).unwrap();
+        assert!(!holder.poll());
+        let packet = peer.recv().unwrap().unwrap();
+        assert_eq!(
+            FromHolder::decode(packet.frame()).unwrap(),
+            FromHolder::Failed { req: 1, errno: 16 }
+        );
+        let packet = peer.recv().unwrap().unwrap();
+        assert_eq!(
+            FromHolder::decode(packet.frame()).unwrap(),
+            FromHolder::Failed { req: 2, errno: 3 }
+        );
     }
 }

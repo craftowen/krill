@@ -45,6 +45,10 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
                 cwd,
             },
         );
+        let dir = reg.state_dir().unwrap();
+        krill_proto::git::record_session_prompt(&dir, id, "Visible scoped prompt", 1).unwrap();
+        krill_proto::git::record_session_prompt(&dir, SessionId(9999), "Private other session", 1)
+            .unwrap();
         writer
     };
     let check = |reg: &Registry, expected: &[u8]| {
@@ -52,6 +56,9 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
             panic!("expected sidebar reply");
         };
         assert_eq!(data.sessions.len(), 1);
+        assert_eq!(data.prompt_histories.len(), 1);
+        assert_eq!(data.prompt_histories[0].0, id);
+        assert_eq!(data.prompt_histories[0].1.total_turns, 1);
         assert_eq!(data.sessions[0].session, id);
         assert_eq!(data.sessions[0].cwd, expected);
         // 세션 피어는 전체 권한이라 등록된 프로젝트도 함께 받는다. 이 세션의 저장소만 확인한다.
@@ -1044,6 +1051,37 @@ fn session_accounts_returns_launch_account_with_label() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// 구버전 앱이 끄기 요청을 보내도 자동 수집을 멈추거나 설정 파일을 덮어쓰지 않는다.
+#[test]
+fn legacy_direct_usage_request_cannot_disable_collection() {
+    use krill_proto::usage::{UsageReply, UsageRequest};
+
+    let root = std::env::temp_dir().join(format!("auto-usage-dispatch-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("accounts.toml");
+    let raw = "direct_usage = false\n[auto_switch]\nenabled = false\n";
+    fs::write(&path, raw).unwrap();
+    let reg = Registry::new(None, Some(&root));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    for enabled in [false, true] {
+        let reply = reg.on_usage(
+            &peer,
+            Role::Interactive,
+            UsageRequest::SetDirectUsage(enabled),
+        );
+        let UsageReply::Accounts(snapshot) = reply else {
+            panic!("expected accounts snapshot, got {reply:?}");
+        };
+        assert!(snapshot.connections.direct_usage);
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+    }
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// OWE-722: 실제 usage 분기에서 저장·조회·권한·협상 거부를 확인한다.
 #[test]
 fn provisioning_usage_dispatch_and_access_control() {
@@ -1407,11 +1445,25 @@ fn owe755_concurrent_hook_auto_rename_preserves_all_session_titles() {
                     r#"{{"hook_event_name":"UserPromptSubmit","prompt":"Fix hook bug {i}"}}"#
                 );
                 b.wait();
-                r.maybe_rename_from_hook(SessionId(i), payload.as_bytes());
+                r.maybe_rename_from_hook(
+                    SessionId(i),
+                    payload.as_bytes(),
+                    hook::EventId {
+                        pid: 1,
+                        unix_ns: status::now_ns(),
+                    },
+                );
                 // 같은 세션에 두 번째 프롬프트 훅이 와도 첫 제목이 유지되어야 한다.
                 let second =
                     r#"{"hook_event_name":"UserPromptSubmit","prompt":"Second prompt ignored"}"#;
-                r.maybe_rename_from_hook(SessionId(i), second.as_bytes());
+                r.maybe_rename_from_hook(
+                    SessionId(i),
+                    second.as_bytes(),
+                    hook::EventId {
+                        pid: 1,
+                        unix_ns: status::now_ns(),
+                    },
+                );
             })
         })
         .collect();
@@ -2521,14 +2573,23 @@ fn maybe_rename_from_hook_records_every_prompt_turn_while_preserving_first_title
     reg.maybe_rename_from_hook(
         id,
         br#"{"hook_event_name":"UserPromptSubmit","prompt":"Fix auth token expiry bug"}"#,
+        hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
     );
     reg.maybe_rename_from_hook(
         id,
         br#"{"hook_event_name":"UserPromptSubmit","prompt":"Add regression test for expired cookie"}"#,
+        hook::EventId { pid: 1, unix_ns: status::now_ns() },
     );
     reg.maybe_rename_from_hook(
         id,
         br#"{"hook_event_name":"UserPromptSubmit","prompt":"ok proceed"}"#,
+        hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
     );
 
     let titles = krill_proto::git::load_session_auto_titles(&dir);

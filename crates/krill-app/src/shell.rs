@@ -81,7 +81,7 @@ use krill_proto::input::{Notice, Now};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::theme::{CellSize, Push, Theme};
 use krill_term::ime::{CellPoint, Ime, Output};
-use krill_term::select::{self, Selection};
+use krill_term::select::{self, Anchored, Selection};
 
 use krill_app::layout::{self, Axis, Branch, Layout, PaneId, PaneTree};
 
@@ -190,10 +190,11 @@ struct Live {
     /// 붙지 못한 이유(연결 전까지 칸에 보인다).
     error: Option<String>,
     launch: Option<AgentLaunch>,
-    /// 마우스 선택(MK-033, 보이는 화면 좌표). 입력·스크롤하면 지운다.
-    selection: Option<Selection>,
+    /// 마우스 선택(MK-033, 버퍼 기준 줄). 휠로 스크롤해도 같은 글자를 가리키고, 입력하면 지운다.
+    selection: Option<Anchored>,
     /// 선택을 마쳤을 때 그 자리 글자(AS-17: 출력 스크롤·리사이즈·재접속으로 내용이
-    /// 바뀌면 선택 좌표가 다른 글자를 가리키므로 선택을 지운다).
+    /// 바뀌면 선택 좌표가 다른 글자를 가리키므로 선택을 지운다). 바닥으로 돌아와 버린
+    /// 스크롤백 행을 다시 읽을 수 없을 때 복사할 글자이기도 하다.
     selection_text: Option<String>,
     /// 왼쪽 버튼으로 선택을 끄는 중.
     selecting: bool,
@@ -240,16 +241,40 @@ impl Live {
         }
     }
 
-    /// 선택을 지운다(입력·휠 스크롤·출력으로 내용이 바뀔 때).
+    /// 선택을 지운다(입력·출력으로 내용이 바뀔 때).
     fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_text = None;
         self.selecting_kind = SelectKind::Char;
     }
 
+    /// 보이는 화면 칸을 버퍼 기준 끝점으로.
+    fn anchor_point(&self, at: select::Point) -> (i64, u16) {
+        Anchored::point(at, self.pane.scroll_offset())
+    }
+
+    /// 지금 화면에 보이는 선택 부분(그리기·클릭 판정용).
+    fn shown_selection(&self) -> Option<Selection> {
+        let shown = self.pane.shown();
+        self.selection?
+            .view(self.pane.scroll_offset(), shown.lines, shown.cols)
+    }
+
+    /// 선택한 칸을 지금 버퍼에서 읽는다. 버린 스크롤백 행이 끼면 `None`.
+    fn read_selection(&self) -> Option<String> {
+        self.selection?
+            .text(self.pane.shown().cols, |line| self.pane.row(line))
+    }
+
+    /// 복사할 글자: 지금 읽을 수 있으면 그 글자, 아니면 선택을 마칠 때 기록한 글자.
+    fn selected_text(&self) -> Option<String> {
+        self.read_selection()
+            .or_else(|| self.selection_text.clone())
+    }
+
     /// 확정된 선택의 그 자리 글자를 기록한다(AS-17: 출력으로 내용이 바뀌면 지우기 위해).
     fn snapshot_selection(&mut self) {
-        self.selection_text = self.selection.map(|s| s.text(&self.pane.shown()));
+        self.selection_text = self.read_selection();
     }
 }
 
@@ -620,6 +645,8 @@ pub struct Shell {
     outcome_unknown: HashMap<PaneId, String>,
     observed_sessions:
         std::collections::HashSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
+    /// krilld가 `NoSession`으로 끝났다고 확정한 세션. 이 세션을 가진 칸은 reconcile이 거둔다.
+    gone_sessions: std::collections::HashSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
     titles: HashMap<PaneId, String>,
     agents: Option<AgentSettings>,
@@ -852,6 +879,7 @@ impl Shell {
         cx.subscribe(
             &sidebar,
             |this, _, event: &sidebar::WorkspaceSelected, cx| {
+                let _scroll = this.sidebar.read(cx).preserve_scroll();
                 this.open_workspace_on(event.host.clone(), event.path.clone(), cx);
                 this.files.refocus = event.focus_terminal;
                 if let Some(handle) = this.window {
@@ -871,6 +899,7 @@ impl Shell {
         )
         .detach();
         let selection = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::Selected, cx| {
+            let _scroll = sidebar.read(cx).preserve_scroll();
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
                 .unwrap_or(krill_app::hosts::HostId::Local);
@@ -1203,6 +1232,7 @@ impl Shell {
             restarting_panes: std::collections::HashSet::new(),
             outcome_unknown: HashMap::new(),
             observed_sessions: std::collections::HashSet::new(),
+            gone_sessions: std::collections::HashSet::new(),
             titles: HashMap::new(),
             agents: None,
             agents_busy: false,
@@ -4023,7 +4053,6 @@ impl Shell {
             return;
         }
         if let Some(live) = self.focused_live() {
-            live.clear_selection();
             live.pane.scroll(lines);
             cx.notify();
         }
@@ -4366,10 +4395,16 @@ impl Shell {
                                 },
                                 None => return Ok(Got::Stopped),
                             },
-                            Some(old) => (
-                                pane::resume_session_in(&p, Some(old), &launch)?,
-                                pane::load_cold(&p, old).map(|c| (old, c)),
-                            ),
+                            Some(old) => match pane::resume_session_in(&p, Some(old), &launch) {
+                                Ok(session) => {
+                                    (session, pane::load_cold(&p, old).map(|c| (old, c)))
+                                }
+                                // 사용자가 직접 누른 "다시 시작"인데 옛 세션이 이미 닫혔다: 새 세션으로 잇는다.
+                                Err(e) if pane::is_session_gone(&e) => {
+                                    (pane::resume_session_in(&p, None, &launch)?, None)
+                                }
+                                Err(e) => return Err(e),
+                            },
                             None => match pane::ensure_session_in(&p, want, &launch)? {
                                 pane::Found::Live(session, _) => (session, None),
                                 // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
@@ -4387,6 +4422,8 @@ impl Shell {
                                         Err(e) if pane::is_unknown_outcome(&e) => {
                                             return Ok(Got::ColdUnknown(cold_session, cold, e));
                                         }
+                                        // 데몬이 이미 이어졌다고 확정한 옛 세션: 콜드 칸으로 남기지 않는다.
+                                        Err(e) if pane::is_session_gone(&e) => return Err(e),
                                         Err(_) => return Ok(Got::Cold(cold_session, cold)),
                                     }
                                 }
@@ -4584,6 +4621,14 @@ impl Shell {
                     .detach();
                 }
                 let old = self.layout.session(pane);
+                // 데몬이 끝났다고 확정한 세션의 칸은 오류 문구로 남기지 않고 reconcile이 거둔다.
+                if pane::is_session_gone(&e)
+                    && let Some(session) = old
+                {
+                    let host = self.layout.host(pane).clone();
+                    self.gone_sessions.insert((host, session));
+                    self.reconcile_workspace_sessions(cx);
+                }
                 match self.live.get_mut(&pane) {
                     Some(l) => {
                         if permanent
@@ -4821,11 +4866,12 @@ impl Shell {
             }
             // AS-17: 출력 스크롤·리사이즈·재접속으로 선택 자리 글자가 바뀌면 선택을 지운다.
             // 끌기 중이거나 글자가 그대로면(커서만 움직임 등) 유지한다.
-            if !l.selecting && l.selection.is_some() {
-                let current = l.selection.map(|s| s.text(&l.pane.shown()));
-                if current != l.selection_text {
-                    l.clear_selection();
-                }
+            // 휠 스크롤은 버퍼 기준 줄이라 그대로 두고, 버린 스크롤백처럼 읽을 수 없는 행이면 판정하지 않는다.
+            if !l.selecting
+                && let (Some(current), Some(before)) = (l.read_selection(), &l.selection_text)
+                && &current != before
+            {
+                l.clear_selection();
             }
             if self.layout.focused() == Some(pane) {
                 self.maybe_poll_active_chat(cx);
@@ -5259,17 +5305,21 @@ impl Shell {
                 self.show(notice.as_ref(), cx);
                 cx.stop_propagation();
             } else if l.pane.scroll(lines as isize) {
-                l.clear_selection();
                 cx.notify();
             }
         }
     }
 
-    /// 마우스 선택을 쓸지: 프로그램이 마우스 보고를 켜지 않았거나 Shift를 눌렀다(MK-033).
+    /// 앱이 보고할 수 있는 SGR 마우스 모드에서만 프로그램에 넘긴다.
+    /// 지원하지 않는 보고 형식은 선택까지 막지 않으며 Shift·Alt는 로컬 선택을 우선한다.
     fn selects(&self, pane: PaneId, modifiers: Modifiers) -> bool {
-        self.live
-            .get(&pane)
-            .is_some_and(|l| modifiers.shift || modifiers.alt || !l.pane.modes().mouse())
+        self.live.get(&pane).is_some_and(|l| {
+            let modes = l.pane.modes();
+            modifiers.shift
+                || modifiers.alt
+                || !modes.mouse()
+                || !modes.contains(krill_proto::term_modes::Modes::SGR_MOUSE)
+        })
     }
 
     /// 왼쪽 버튼 누름(OWE-866): Shift+클릭은 기존 anchor를 유지한 채 head만 옮기고,
@@ -5290,12 +5340,13 @@ impl Shell {
             return;
         };
         let at = select::Point { line, column };
-        if modifiers.shift && l.selection.is_some() {
-            let anchor = l.selection.map_or(at, |sel| sel.anchor);
-            l.selection = Some(Selection {
-                anchor,
-                head: at,
-                block: modifiers.alt || l.selection.is_some_and(|sel| sel.block),
+        if modifiers.shift
+            && let Some(sel) = l.selection
+        {
+            l.selection = Some(Anchored {
+                anchor: sel.anchor,
+                head: l.anchor_point(at),
+                block: modifiers.alt || sel.block,
             });
             l.selection_text = None;
             l.selecting = true;
@@ -5312,7 +5363,7 @@ impl Shell {
         } else {
             (Selection::new(at), SelectKind::Char)
         };
-        l.selection = Some(selection);
+        l.selection = Some(Anchored::from_view(selection, l.pane.scroll_offset()));
         l.selection_text = None;
         l.selecting = true;
         l.selecting_kind = kind;
@@ -5335,31 +5386,26 @@ impl Shell {
         if !selecting {
             return;
         }
-        match kind {
-            SelectKind::Char => sel.head = at,
+        let point = l.anchor_point(at);
+        sel.head = match kind {
+            SelectKind::Char => point,
             SelectKind::Word => {
                 let word = Selection::word_at(&screen, at);
-                sel.head = if at >= sel.anchor {
+                l.anchor_point(if point >= sel.anchor {
                     word.head
                 } else {
                     word.anchor
-                };
+                })
             }
             SelectKind::Line => {
-                let cols = screen.cols;
-                sel.head = if at.line >= sel.anchor.line {
-                    select::Point {
-                        line: at.line,
-                        column: cols.saturating_sub(1),
-                    }
+                let column = if point.0 >= sel.anchor.0 {
+                    screen.cols.saturating_sub(1)
                 } else {
-                    select::Point {
-                        line: at.line,
-                        column: 0,
-                    }
+                    0
                 };
+                (point.0, column)
             }
-        }
+        };
         l.selection = Some(sel);
         cx.notify();
     }
@@ -5432,8 +5478,9 @@ impl Shell {
             return;
         }
         let Some(l) = self.focused_live() else { return };
-        let Some(sel) = l.selection else { return };
-        let text = sel.text(&l.pane.shown());
+        let Some(text) = l.selected_text() else {
+            return;
+        };
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -5444,8 +5491,9 @@ impl Shell {
             return;
         }
         let Some(l) = self.focused_live() else { return };
-        let Some(sel) = l.selection else { return };
-        let text = sel.clean_text(&l.pane.shown());
+        let Some(text) = l.selected_text().map(|t| select::clean_text(&t)) else {
+            return;
+        };
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -6292,7 +6340,6 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(l) = this.live.get_mut(&id) {
-                    l.clear_selection();
                     l.pane.scroll(isize::MIN);
                     cx.notify();
                 }
@@ -6462,7 +6509,7 @@ impl Shell {
                 // OWE-871: 비포커스 칸의 블록 커서는 빈 테두리로 그려 포커스 칸과 구별한다.
                 el.cursor_hollow = !focused;
                 el.painted = Some(Rc::clone(&l.painted));
-                el.selection = l.selection;
+                el.selection = l.shown_selection();
                 el.highlight = l.pane.highlight();
                 el.highlights = l.pane.highlights().to_vec();
                 el.link = self.path_hover(id);
@@ -6713,7 +6760,15 @@ impl Shell {
                     if !this.focus.is_focused(window) {
                         window.focus(&this.focus, cx);
                     }
-                    this.mouse_input(id, keys::tui::Mouse::Press(2), e.position, e.modifiers, cx);
+                    if !this.selects(id, e.modifiers) {
+                        this.mouse_input(
+                            id,
+                            keys::tui::Mouse::Press(2),
+                            e.position,
+                            e.modifiers,
+                            cx,
+                        );
+                    }
                 }),
             )
             .on_mouse_up(
@@ -6777,6 +6832,15 @@ impl Shell {
                     );
                 }),
             )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
+                    // 패인 밖의 release도 시작한 선택을 확정한다. 다른 패인에는 입력을 보내지 않는다.
+                    if this.select_end(id, cx) && krill_app::settings::copy_on_select(cx) {
+                        this.copy(cx);
+                    }
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
@@ -6792,6 +6856,9 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                    if this.selects(id, e.modifiers) {
+                        return;
+                    }
                     this.mouse_input(
                         id,
                         keys::tui::Mouse::Release(2),
@@ -6824,11 +6891,12 @@ impl Shell {
                 this.change(true, cx, |l| l.focus(id));
                 this.paste_dropped_paths(paths, window, cx);
             }));
-        // 우클릭 메뉴는 프로그램이 마우스 보고를 켜지 않았을 때만(켰으면 우클릭은 프로그램 것이다).
+        // 로컬 선택을 쓰는 패인에서는 지원하지 않는 마우스 모드여도 복사 메뉴를 연다.
+        // 프로그램이 마우스를 받는 패인도 ⇧·⌥를 누르고 있으면 메뉴를 연다(선택과 같은 규칙).
         let menu = self
             .live
             .get(&id)
-            .filter(|l| !l.pane.modes().mouse())
+            .filter(|_| self.selects(id, window.modifiers()))
             .map(|_| cx.weak_entity());
         match menu {
             Some(weak) => pane
@@ -7589,12 +7657,16 @@ impl Render for Shell {
                     let rows = u16::try_from(shown.rows.len()).unwrap_or(u16::MAX);
                     let cols = shown.cols;
                     if rows > 0 && cols > 0 {
-                        l.selection = Some(Selection {
-                            anchor: select::Point { line: 0, column: 0 },
-                            head: select::Point {
-                                line: rows.saturating_sub(1),
-                                column: cols.saturating_sub(1),
-                            },
+                        let offset = l.pane.scroll_offset();
+                        l.selection = Some(Anchored {
+                            anchor: Anchored::point(select::Point { line: 0, column: 0 }, offset),
+                            head: Anchored::point(
+                                select::Point {
+                                    line: rows.saturating_sub(1),
+                                    column: cols.saturating_sub(1),
+                                },
+                                offset,
+                            ),
                             block: false,
                         });
                         l.snapshot_selection();
@@ -8516,3 +8588,9 @@ mod tests;
 
 #[cfg(all(test, unix))]
 mod update_tests;
+
+#[cfg(all(test, unix))]
+mod selection_tests;
+
+#[cfg(all(test, unix))]
+mod sidebar_scroll_tests;
