@@ -502,7 +502,7 @@ fn file_created_by_archive_hook_is_not_force_deleted() {
     )
     .unwrap();
     let err = f.remove(&w, false).unwrap_err();
-    assert!(err.contains("dirty"), "{err}");
+    assert!(err.contains("untracked"), "{err}");
     assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
     assert!(
         fs::symlink_metadata(wt.join("link"))
