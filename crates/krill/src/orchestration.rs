@@ -54,7 +54,7 @@ usage: krill [--host <user@host>] orchestration <subcommand> [options]
   worker-retain <worker-or-dispatch> [--json]
   worker-release <worker-or-dispatch> [--json]
   worker-abandon <worker-or-dispatch> [--json]
-  reset [--run <run-id>] [--json]";
+  reset (--run <run-id> | --yes) [--json]   (--yes는 모든 run 초기화)";
 
 enum TargetRef<'a> {
     Borrowed(&'a Target),
@@ -888,9 +888,9 @@ fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartAr
                     auto_create_task = true;
                 }
             }
-            "--run" => spec.run_id = it.next().cloned(),
-            "--task" => spec.task_id = it.next().cloned(),
-            "--worker" => spec.worker = it.next().cloned(),
+            "--run" => spec.run_id = Some(take_opt(&mut it, "--run")?.clone()),
+            "--task" => spec.task_id = Some(take_opt(&mut it, "--task")?.clone()),
+            "--worker" => spec.worker = Some(take_opt(&mut it, "--worker")?.clone()),
             "--name" => {
                 let name = take_opt(&mut it, "--name")?.clone();
                 spec.worker = Some(name.clone());
@@ -924,7 +924,14 @@ fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartAr
             "--retry-request" => {
                 spec.retry_request = Some(take_opt(&mut it, "--retry-request")?.clone());
             }
-            "--prompt" => spec.prompt = it.next().cloned(),
+            "--prompt" => {
+                // 프롬프트는 `--`로 시작할 수 있지만, 공백 없는 `--json` 같은 토큰은 다음 플래그다.
+                let v = it.next().ok_or_else(|| bad_arg("missing --prompt"))?;
+                if v.starts_with("--") && !v.contains(char::is_whitespace) {
+                    return Err(bad_arg("missing --prompt"));
+                }
+                spec.prompt = Some(v.clone());
+            }
             "--depth" => {
                 let v = it.next().ok_or_else(|| bad_arg("missing --depth"))?;
                 explicit_depth = Some(v.parse::<u32>().map_err(|_| bad_arg("invalid --depth"))?);
@@ -2898,13 +2905,20 @@ fn cmd_reset(state_dir: &Path, args: &[String]) -> io::Result<()> {
 fn cmd_reset_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut run_id = None;
     let mut json = false;
+    let mut yes = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--run" => run_id = it.next().cloned(),
+            "--run" => run_id = Some(take_opt(&mut it, "--run")?.clone()),
             "--json" => json = true,
+            "--yes" | "-y" => yes = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
+    }
+    if run_id.is_none() && !yes {
+        return Err(bad_arg(
+            "reset without --run clears every run; pass --run <run-id> or --yes",
+        ));
     }
     if ctx
         .try_ipc(
@@ -3205,13 +3219,28 @@ mod tests {
             OrchestrationStore::default()
         );
         let next_seq = store.next_seq;
-        cmd_reset(&dir, &args(&["--json"]))?;
+        assert!(
+            cmd_reset(&dir, &args(&["--json"])).is_err(),
+            "bare reset must be refused"
+        );
+        assert_eq!(OrchestrationStore::load(&dir)?.next_seq, next_seq);
+        cmd_reset(&dir, &args(&["--yes", "--json"]))?;
         let reset = OrchestrationStore::load(&dir)?;
         assert!(reset.messages.is_empty());
         assert!(reset.gates.is_empty());
         assert_eq!(reset.next_seq, next_seq);
         std::fs::remove_dir_all(dir)
     }
+    #[test]
+    fn value_flags_do_not_swallow_the_next_flag() {
+        for flag in ["--prompt", "--run", "--task", "--worker"] {
+            let err = parse_worker_start(&args(&[flag, "--json"]), false).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{flag}");
+        }
+        let ok = parse_worker_start(&args(&["--prompt", "-- keep going"]), false).unwrap();
+        assert_eq!(ok.spec.prompt.as_deref(), Some("-- keep going"));
+    }
+
     #[test]
     fn launch_preferences_parse_and_reject_invalid_effort() -> io::Result<()> {
         let parsed = parse_worker_start(
