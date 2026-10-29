@@ -348,10 +348,15 @@ impl Sizable for Icon {
 impl RenderOnce for Icon {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let text_size = window.text_style().font_size.to_pixels(window.rem_size());
+        // Standalone SVG icons also render before component theme initialization.
+        // Match the surrounding text contrast when no theme is installed yet.
+        let is_dark = cx
+            .try_global::<crate::Theme>()
+            .map_or(window.text_style().color.l > 0.5, |theme| theme.is_dark());
         self.into_icon_element(
             text_size,
             window.text_style().color,
-            cx.theme().is_dark(),
+            is_dark,
             window.rem_size(),
             window.scale_factor(),
         )
