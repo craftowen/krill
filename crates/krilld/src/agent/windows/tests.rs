@@ -66,11 +66,11 @@ fn windows_wrapper_keeps_argv_literal_and_accepts_later_session_flags() {
         argv: vec![b"powershell.exe".to_vec()],
         env: env(),
     };
-    let mut launch = wrap(login.clone(), "install hint", args.clone());
+    let mut launch = wrap(login.clone(), "install hint", args.clone(), true);
     launch
         .argv
         .extend([b"resume".to_vec(), b"conversation-id".to_vec()]);
-    assert_eq!(launch.argv[1], b"--agent-exec");
+    assert_eq!(launch.argv[1], AGENT_THEN_SHELL);
     assert_eq!(launch.argv[2], b"install hint");
     assert_eq!(
         launch.argv[3..7],

@@ -32,9 +32,9 @@ mod skills;
 #[cfg(any(windows, test))]
 mod windows;
 #[cfg(windows)]
-pub use windows::run as run_windows_agent;
-#[cfg(windows)]
 pub(crate) use windows::wrap_shell as wrap_windows_shell;
+#[cfg(windows)]
+pub use windows::{AGENT_THEN_SHELL, run as run_windows_agent};
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
 /// 에이전트가 끝나면 같은 PTY에서 로그인 셸로 돌아간다(Orca처럼 종료 화면·세션 id가 남고 다른 CLI를 바로 띄운다).
@@ -2222,7 +2222,7 @@ fn wrap_account(
     }
     #[cfg(windows)]
     {
-        windows::wrap(login, &hint, agent_argv)
+        windows::wrap(login, &hint, agent_argv, true)
     }
     #[cfg(unix)]
     {

@@ -132,7 +132,7 @@ fn agent_launch_uses_native_helper_instead_of_powershell() {
         krill_proto::SessionId(42),
     )
     .unwrap();
-    assert_eq!(launch.argv[1], b"--agent-exec");
+    assert_eq!(launch.argv[1], krilld::agent::AGENT_THEN_SHELL);
     assert_eq!(
         launch.argv[3..],
         [b"fake-agent".as_slice(), b"--fixture-yolo"]

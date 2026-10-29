@@ -52,7 +52,11 @@ fn main() -> ExitCode {
     // 세션 Job/ConPTY 안에서 에이전트만 실행한다. 데몬 소켓·상태·스레드는 만들지 않는다.
     #[cfg(windows)]
     if argument == "--agent-exec" {
-        return krilld::agent::run_windows_agent(std::env::args_os().skip(2));
+        return krilld::agent::run_windows_agent(std::env::args_os().skip(2), false);
+    }
+    #[cfg(windows)]
+    if argument.as_encoded_bytes() == krilld::agent::AGENT_THEN_SHELL {
+        return krilld::agent::run_windows_agent(std::env::args_os().skip(2), true);
     }
     #[cfg(windows)]
     if argument == "--shell-exec" {
