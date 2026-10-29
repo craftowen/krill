@@ -622,6 +622,18 @@
                   },
                 }
               : null;
+          // HTTPS pages cannot dial ws://. Open a validated tailnet QR at its
+          // own origin and keep this origin's saved relay credentials untouched.
+          if (
+            u.protocol === "http:" &&
+            u.pathname === "/" &&
+            !u.username &&
+            !u.password &&
+            !f.has("t") &&
+            !f.has("r") &&
+            /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$/.test(u.hostname)
+          )
+            return null;
           if (
             (u.protocol === "https:" &&
               !version &&

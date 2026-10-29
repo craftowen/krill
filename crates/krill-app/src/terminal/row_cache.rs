@@ -7,7 +7,7 @@ use krill_proto::theme::Theme;
 use krill_term::grid::{RowPlan, Screen, plan_row};
 
 /// 보이는 터미널의 수명에 묶인 캐시. 폰트·배율·선택·커서는 행 계획에 들어가지 않는다.
-/// 직전 화면 하나만 참조하며 새 화면에서는 내용이 같은 행의 계획만 재사용한다.
+/// 직전 화면 하나만 참조한다. 같은 위치를 먼저 보고, 한 줄 이동한 내용도 재사용한다.
 #[derive(Debug, Clone, Default)]
 pub struct RowPlanCache(Rc<RefCell<Rows>>);
 
@@ -30,6 +30,9 @@ impl RowPlanCache {
         {
             return Rc::clone(&cached.plans);
         }
+        // 위/아래 한 줄 스크롤은 첫 두 miss 안에서 이웃을 찾는다(새로 들어온 첫 행 포함).
+        // 전체 갱신이면 실패한 탐색을 두 번까지만 시도하고 이후 행은 바로 다시 만든다.
+        let mut neighbor_misses = 0_usize;
         let plans = screen
             .rows
             .iter()
@@ -44,7 +47,25 @@ impl RowPlanCache {
                     && let Some(plan) = cached.plans.get(index)
                 {
                     Rc::clone(plan)
+                } else if same_theme
+                    && neighbor_misses < 2
+                    && let Some(previous) = cached.screen.as_ref()
+                    // 한 줄 스크롤의 이웃만 확인한다. 같은 위치의 빠른 경로에는
+                    // 후보 배열·탐색을 더하지 않고, miss당 추가 비교도 두 번으로 제한한다.
+                    && let Some(plan) = [index.checked_add(1), index.checked_sub(1)]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|candidate| {
+                            if previous.rows.get(candidate) == Some(row) {
+                                cached.plans.get(candidate)
+                            } else {
+                                None
+                            }
+                        })
+                {
+                    Rc::clone(plan)
                 } else {
+                    neighbor_misses = neighbor_misses.saturating_add(1);
                     Rc::new(plan_row(row, theme))
                 }
             })
