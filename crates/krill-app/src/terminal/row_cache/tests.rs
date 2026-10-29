@@ -2,6 +2,9 @@ use super::*;
 use krill_proto::theme::{DEFAULT, Rgb};
 use krill_term::grid::{Cell, Color, Flags};
 
+mod benchmark;
+mod scroll;
+
 #[test]
 fn reuses_unchanged_rows_and_rebuilds_changed_content_and_theme() {
     let cache = RowPlanCache::default();
