@@ -2,7 +2,7 @@
 //!
 //! - [`crate::control::Request::Resources`]`(`[`Action::Query`]`)`: krilld가 재는 메모리·디스크를
 //!   [`crate::control::Reply::Resources`]로 답한다. 메모리는 모두 커널 `phys_footprint`(`proc_pid_rusage`,
-//!   `footprint(1)`과 같은 값)다. 세션 목록은 요청자의 세션 범위(MK-036)를 따른다.
+//!   `footprint(1)`과 같은 값)다. 세션 목록은 계보를 확인한 요청자에게 전부 보인다(MK-036).
 //! - [`Action::RestartDaemon`]: 전체 범위의 interactive 클라이언트만. krilld가 holder에 자기 교체(`UpgradeKrilld`)를
 //!   맡기고 답을 보낸 뒤 끝난다. holder가 같은 실행 파일로 바로 다시 띄우고 세션을 넘긴다(MK-068과 같은 경로).
 //!   확인 대화상자는 클라이언트 몫이다.

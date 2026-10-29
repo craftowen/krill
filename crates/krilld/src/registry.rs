@@ -5,8 +5,8 @@
 //!   셸·지정 실행 파일(MK-034) 또는 에이전트 프로필(MK-037).
 //! - 닫기: 돌고 있으면 holder v3 `Terminate`(v2 이하는 프로세스 그룹에 SIGHUP `Kill`), `Exited`가 오면 `Release`하고
 //!   지운다. 이미 끝났으면 바로 `Release`.
-//! - 권한: 연결마다 [`Peer`]로 세션 범위를 판정한다(MK-036). 목록은 다룰 수 있는 세션만, 닫기·붙기는 범위 밖이면 거부하고
-//!   감사 로그에 남긴다. 생성은 기존 세션을 다루지 않으므로 막지 않는다.
+//! - 권한: 연결마다 [`Peer`]로 계보를 판정한다(MK-036). 세션 안 피어도 외부 셸처럼 모든 세션을 다루고(Orca 소유자
+//!   모델), 계보를 확인하지 못한 피어만 거부하고 감사 로그에 남긴다.
 //! - krilld 재기동: holder가 다시 넘긴 세션([`Kept`])을 같은 id로 다시 띄운다. seq는 디스크 세그먼트 끝에서 이어진다.
 //!   holder를 잃은 이전 krilld가 넘긴 세션도 같은 길로 들어온다([`crate::rejoin`]).
 //! - 에이전트 상태([`crate::status`], MK-039): hook 연결(첫 프레임이 hook 이벤트)과 spool을 세션에 붙여 반영한다.
@@ -248,7 +248,6 @@ impl Registry {
             spool: dir.map(|d| d.join(hook::SPOOL_FILE)),
             state: Mutex::new(State {
                 next: 1,
-                roots: Roots::open(dir.map(|d| d.join("session-creators"))),
                 ..State::default()
             }),
         };
@@ -290,7 +289,6 @@ impl Registry {
             );
         }
         let live: Vec<_> = st.sessions.keys().copied().collect();
-        st.roots.prune_dead(&live);
         if let Some(store) = &reg.store {
             store.gc(&live, SystemTime::now()).ok();
         }
@@ -505,7 +503,7 @@ impl Registry {
         };
         // 서명 정책이 강제되면 전체 피어의 코드서명을 핸드셰이크 전에 검증한다(MK-096). 닫힌 피어의 토큰
         // 조회도 실패하므로 먼저 읽은 토큰으로 검증하고, 못 넘기면 접속 자체를 거부한다.
-        if !mobile && peer.scope == Scope::Full {
+        if !mobile && peer.scope.full() {
             let policy = scope::SigningPolicy::load(self.dir.as_deref());
             if policy.enforced() {
                 let sign = crate::sys::peer_token(s.as_fd())
@@ -517,7 +515,7 @@ impl Registry {
             }
         }
         let (client, n) = crate::ipc::handshake(&mut s, hello)?;
-        if peer.scope == Scope::Full
+        if peer.scope.full()
             && client.role == ipc::ClientRole::App
             && self.app_opened.set(()).is_ok()
         {
@@ -565,7 +563,7 @@ impl Registry {
             let mut frame = Some((k, body));
             while let Some((kind, body)) = frame {
                 let request = MobileRequest::decode(kind, &body)?;
-                let allowed = peer.scope == Scope::Full
+                let allowed = peer.scope.full()
                     && (role != Role::Observer
                         || matches!(
                             request,
@@ -590,10 +588,7 @@ impl Registry {
             return Ok(());
         }
         if k == krill_proto::theme::THEME && n.features & krill_proto::theme::FEAT_THEME != 0 {
-            if peer.scope != Scope::Full
-                || role == Role::Observer
-                || client.role != ipc::ClientRole::App
-            {
+            if !peer.scope.full() || role == Role::Observer || client.role != ipc::ClientRole::App {
                 peer.deny("theme", &self.audit);
                 return Ok(());
             }
@@ -652,7 +647,7 @@ impl Registry {
         {
             use krill_proto::history::{HistoryReply, HistoryRequest};
             let request = HistoryRequest::decode(k, &body)?;
-            let reply = if peer.scope == Scope::Full && role != Role::Observer {
+            let reply = if peer.scope.full() && role != Role::Observer {
                 match &self.store {
                     Some(store) => match request {
                         HistoryRequest::Clear => match store.clear() {
@@ -834,7 +829,7 @@ impl Registry {
                 Ok(Request::RemoteFs(krill_proto::remote_fs::RemoteFsRequest::PortForward {
                     port,
                 })) => {
-                    if role == Role::Observer || peer.scope != Scope::Full {
+                    if role == Role::Observer || !peer.scope.full() {
                         peer.deny("port-forward", &self.audit);
                         s.write_all(&Reply::Failed(Failure::Denied).encode()?)?;
                         return Ok(());
@@ -929,7 +924,7 @@ impl Registry {
     ) -> Reply {
         let r = match req {
             Request::AgentSettings { permission } => {
-                if peer.scope == Scope::Full {
+                if peer.scope.full() {
                     self.agents
                         .settings(permission)
                         .map(Reply::AgentSettings)
@@ -942,7 +937,7 @@ impl Registry {
             Request::AgentLaunch { session } => {
                 let check = {
                     let st = lock(&self.state);
-                    if !peer.authorize("agent-launch", session, &st.roots, &self.audit) {
+                    if !peer.authorize("agent-launch", session, &self.audit) {
                         Err(Failure::Denied)
                     } else if !st.sessions.contains_key(&session) {
                         Err(Failure::NoSession)
@@ -1025,7 +1020,7 @@ impl Registry {
                 let entries: Vec<_> = st
                     .sessions
                     .keys()
-                    .filter(|id| peer.scope.allows(**id, &st.roots))
+                    .filter(|_| peer.scope.full())
                     .copied()
                     .collect();
                 drop(st);
@@ -1036,21 +1031,21 @@ impl Registry {
                     .map(|id| (id, self.session_cwd(id)))
                     .collect();
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
-                    if peer.scope == Scope::Full {
+                    if peer.scope.full() {
                         sidebar::include_projects(&mut data);
                     }
                     Reply::Sidebar(data)
                 })
             }
             Request::PrepareWorktree(w) => {
-                if self.authorize_cwd(peer, "worktree-prepare", &w.repo) {
+                if peer.authorize("worktree-prepare", SessionId(0), &self.audit) {
                     Ok(crate::git::worktree::prepare::serve(&w))
                 } else {
                     Err(Failure::Denied)
                 }
             }
             Request::NewWorktree(w) => {
-                if self.authorize_cwd(peer, "worktree-new", &w.repo) {
+                if peer.authorize("worktree-new", SessionId(0), &self.audit) {
                     let size = self.request_size(peer);
                     let reply = crate::git::worktree::serve(&w, size, |c| self.create(peer, c));
                     if matches!(reply, Reply::WorktreeCreated(_)) {
@@ -1062,7 +1057,7 @@ impl Registry {
                 }
             }
             Request::RemoveWorktree(w) => {
-                if self.authorize_cwd(peer, "worktree-rm", &w.path) {
+                if peer.authorize("worktree-rm", SessionId(0), &self.audit) {
                     let reply = crate::git::worktree::serve_remove(&w);
                     if matches!(reply, Reply::WorktreeRemoved(_)) {
                         lock(&self.sidebar).invalidate();
@@ -1072,8 +1067,8 @@ impl Registry {
                     Err(Failure::Denied)
                 }
             }
-            Request::Upgrade(u) => match (&self.holder, peer.scope) {
-                (Some(holder), Scope::Full) => {
+            Request::Upgrade(u) => match (&self.holder, peer.scope.full()) {
+                (Some(holder), true) => {
                     let mut started = lock(&self.upgrading);
                     if *started {
                         Ok(Reply::Upgrade(control::Upgraded::Started))
@@ -1083,7 +1078,7 @@ impl Registry {
                         r.map(Reply::Upgrade)
                     }
                 }
-                (None, Scope::Full) => Err(Failure::NoHolder),
+                (None, true) => Err(Failure::NoHolder),
                 _ => {
                     peer.deny("upgrade", &self.audit);
                     Err(Failure::Denied)
@@ -1092,7 +1087,7 @@ impl Registry {
             Request::AgentHistory(action) => self.agent_history(peer, action),
             Request::Resources(action) => self.resources(peer, action),
             Request::GitChanges { repo } => {
-                if peer.scope == Scope::Full {
+                if peer.scope.full() {
                     Ok(crate::git::changes::serve(&repo))
                 } else {
                     peer.deny("git-changes", &self.audit);
@@ -1100,7 +1095,7 @@ impl Registry {
                 }
             }
             Request::GitWatch(req) => {
-                if peer.scope == Scope::Full {
+                if peer.scope.full() {
                     Ok(Reply::GitWatch(
                         lock(&self.git_watch).handle_for(client_name, &req),
                     ))
@@ -1110,7 +1105,7 @@ impl Registry {
                 }
             }
             Request::GitEdit { repo, edit } => {
-                if peer.scope == Scope::Full {
+                if peer.scope.full() {
                     Ok(crate::git::edit::serve(&repo, edit))
                 } else {
                     peer.deny("git-edit", &self.audit);
@@ -1125,7 +1120,7 @@ impl Registry {
             } => self.send_input(peer, session, &bytes, submit, wait_submit),
             Request::Orchestration(action) => self.orchestration(peer, action),
             Request::RemoteFs(req) => {
-                if peer.scope == Scope::Full {
+                if peer.scope.full() {
                     Ok(Reply::RemoteFs(crate::remote_fs::serve(req)))
                 } else {
                     peer.deny("remote-fs", &self.audit);
@@ -1138,7 +1133,7 @@ impl Registry {
 
     fn resources(&self, peer: &Peer, action: Action) -> Result<Reply, Failure> {
         if action == Action::RestartDaemon {
-            if peer.scope != Scope::Full {
+            if !peer.scope.full() {
                 peer.deny("restart-daemon", &self.audit);
                 return Err(Failure::Denied);
             }
@@ -1150,7 +1145,7 @@ impl Registry {
         let sessions: Vec<_> = st
             .sessions
             .iter()
-            .filter(|(id, _)| peer.scope.allows(**id, &st.roots))
+            .filter(|_| peer.scope.full())
             .map(|(&id, e)| (id, (!st.exited.contains_key(&id)).then_some(e.pid)))
             .collect();
         drop(st);
@@ -1167,34 +1162,7 @@ impl Registry {
         Ok(Reply::Resources(r))
     }
 
-    /// `Full`이거나 세션 피어의 현재 디렉터리가 `target`과 같을 때만 허용한다. 거부는 감사 로그에 남긴다.
-    fn authorize_cwd(&self, peer: &Peer, op: &'static str, target: &[u8]) -> bool {
-        let allowed = match peer.scope {
-            Scope::Full => true,
-            Scope::Session(id) => self.same_cwd(id, target),
-            Scope::Restricted => false,
-        };
-        if !allowed {
-            peer.deny(op, &self.audit);
-        }
-        allowed
-    }
-
-    fn same_cwd(&self, id: SessionId, target: &[u8]) -> bool {
-        use krill_proto::os::ffi::OsStrExt as _;
-        if target.is_empty() {
-            return false;
-        }
-        let Some(cwd) = self.session_cwd(id) else {
-            return false;
-        };
-        let given = Path::new(std::ffi::OsStr::from_bytes(target));
-        // `session_cwd`와 같은 규칙(Windows `\\?\` 접두 제거)으로 맞춰야 같은 폴더가 같다고 나온다.
-        let given = krill_proto::os::canonicalize(given).unwrap_or_else(|_| given.to_path_buf());
-        cwd == given
-    }
-
-    /// setup 세션에 쓸 요청 세션의 현재 크기. 세션 범위가 아니거나 크기를 읽지 못하면 `None`(80x24 기본값).
+    /// setup 세션에 쓸 요청 세션의 현재 크기. 세션 안에서 온 요청이 아니거나 크기를 읽지 못하면 `None`(80x24 기본값).
     fn request_size(&self, peer: &Peer) -> Option<WinSize> {
         let Scope::Session(id) = peer.scope else {
             return None;
@@ -1239,7 +1207,7 @@ impl Registry {
     /// 화면 스트림이 붙을 세션. 범위 밖이면 감사 로그에 남기고 없는 세션처럼 답한다.
     fn tap(&self, peer: &Peer, id: SessionId) -> Option<Tap> {
         let st = lock(&self.state);
-        if !peer.authorize("attach", id, &st.roots, &self.audit) {
+        if !peer.authorize("attach", id, &self.audit) {
             return None;
         }
         st.sessions.get(&id).map(|e| e.session.tap())
@@ -1249,7 +1217,7 @@ impl Registry {
     fn clear_scrollback(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
         let tap = {
             let st = lock(&self.state);
-            if !peer.authorize("clear-scrollback", id, &st.roots, &self.audit) {
+            if !peer.authorize("clear-scrollback", id, &self.audit) {
                 return Err(Failure::Denied);
             }
             st.sessions.get(&id).map(|e| e.session.tap())
@@ -1273,7 +1241,7 @@ impl Registry {
     /// 잠정 결정 의존: MK-024 세그먼트 저장소(`Store::history`·`History::restore`). 거부되면 이 함수와
     /// `Request::Cold` 분기를 걷어 낸다.
     fn cold(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
-        if !peer.authorize("cold", id, &lock(&self.state).roots, &self.audit) {
+        if !peer.authorize("cold", id, &self.audit) {
             return Err(Failure::Denied);
         }
         if self.is_closed(id) {
@@ -1373,7 +1341,7 @@ impl Registry {
             }
         };
         let (session, pid) =
-            self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows)?;
+            self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows)?;
         Ok(Reply::Created { session, pid })
     }
 
@@ -1392,7 +1360,7 @@ impl Registry {
             .filter(|&n| n > 0)
             .map(SessionId)
             .ok_or(Failure::BadRequest)?;
-        if !peer.authorize("fork", old, &lock(&self.state).roots, &self.audit) {
+        if !peer.authorize("fork", old, &self.audit) {
             return Err(Failure::Denied);
         }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
@@ -1463,7 +1431,6 @@ impl Registry {
                 os(&e)
             })?;
         let (session, pid) = self.spawn_holder(
-            peer,
             holder,
             session,
             launch.argv,
@@ -1498,7 +1465,7 @@ impl Registry {
     ///
     /// 같은 세션의 동시 `Resume`는 [`Self::claim_resume`]으로 먼저 잡은 쪽만 진행한다(K-25).
     fn resume(&self, peer: &Peer, old: SessionId, mut c: Create) -> Result<Reply, Failure> {
-        if !peer.authorize("resume", old, &lock(&self.state).roots, &self.audit) {
+        if !peer.authorize("resume", old, &self.audit) {
             return Err(Failure::Denied);
         }
         if self.is_closed(old) {
@@ -1615,7 +1582,7 @@ impl Registry {
             store.inherit_history(session, old).map_err(|e| os(&e))?;
         }
         let (session, pid) =
-            match self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows) {
+            match self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows) {
                 Ok(spawned) => spawned,
                 Err(e) => {
                     if let Some(store) = &self.store {
@@ -1665,7 +1632,6 @@ impl Registry {
     )]
     fn spawn_holder(
         &self,
-        peer: &Peer,
         holder: &Holder,
         id: SessionId,
         mut argv: Vec<Vec<u8>>,
@@ -1681,11 +1647,6 @@ impl Registry {
         let size = crate::term::clamp_size(WinSize { cols, rows });
         let mut initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
         env.extend(crate::git::worktree::environment(&initial_cwd));
-        // holder가 spawn한 직후 krilld가 죽어도 생성 계보가 남도록 먼저 저장한다.
-        lock(&self.state)
-            .roots
-            .record_creator(id, peer.scope)
-            .map_err(|e| os(&e))?;
         // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
@@ -1812,7 +1773,7 @@ impl Registry {
         Reply::Sessions(
             st.sessions
                 .iter()
-                .filter(|(id, _)| peer.scope.allows(**id, &st.roots))
+                .filter(|_| peer.scope.full())
                 .map(|(&session, e)| Info {
                     session,
                     pid: e.pid,
@@ -1835,7 +1796,7 @@ impl Registry {
             st.sessions
                 .keys()
                 .copied()
-                .filter(|&id| peer.scope.allows(id, &st.roots))
+                .filter(|_| peer.scope.full())
                 .collect()
         };
         let mut out = Vec::new();
@@ -1872,7 +1833,7 @@ impl Registry {
             let st = lock(&self.state);
             st.sessions
                 .iter()
-                .filter(|(id, _)| peer.scope.allows(**id, &st.roots))
+                .filter(|_| peer.scope.full())
                 .map(|(&session, e)| {
                     let exited = st.exited.contains_key(&session) || e.session.is_closed();
                     (session, e.pid, exited, e.session.tap())
@@ -2166,7 +2127,7 @@ impl Registry {
     }
 
     fn close(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
-        if !peer.authorize("close", id, &lock(&self.state).roots, &self.audit) {
+        if !peer.authorize("close", id, &self.audit) {
             return Err(Failure::Denied);
         }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
@@ -2309,7 +2270,7 @@ impl Registry {
         use crate::usage::accounts;
         use krill_proto::usage::{UsageReply, UsageRequest};
 
-        if peer.scope != Scope::Full {
+        if !peer.scope.full() {
             peer.deny("usage", &self.audit);
             return UsageReply::Failed(Failure::Denied);
         }
@@ -2974,7 +2935,6 @@ impl Registry {
     /// clone, so configured accounts, trust, hooks and launch metadata remain intact.
     fn launch_orchestration_worker(
         &self,
-        peer: &Peer,
         dispatch_id: &str,
         account: Option<&str>,
     ) -> io::Result<krill_proto::orchestration::Dispatch> {
@@ -3046,7 +3006,7 @@ impl Registry {
                     .push((key.as_bytes().to_vec(), value.to_string().into_bytes()));
             }
             let (session, _) = self
-                .spawn_holder(peer, holder, session, launch.argv, launch.env, cwd, 120, 36)
+                .spawn_holder(holder, session, launch.argv, launch.env, cwd, 120, 36)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let stored = store
                 .dispatches
@@ -3258,7 +3218,7 @@ impl Registry {
                 dispatch_id,
                 account,
             } => self
-                .launch_orchestration_worker(peer, &dispatch_id, account.as_deref())
+                .launch_orchestration_worker(&dispatch_id, account.as_deref())
                 .map(|dispatch| {
                     self.notify_orch();
                     OrchResponse::DispatchV2(Box::new(dispatch))

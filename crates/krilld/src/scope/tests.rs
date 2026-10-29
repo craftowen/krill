@@ -10,7 +10,6 @@ use super::*;
 
 const A: SessionId = SessionId(1);
 const B: SessionId = SessionId(2);
-const C: SessionId = SessionId(3);
 
 /// 가짜 프로세스 트리: pid → (ppid, 시작 시각).
 struct Tree(HashMap<u32, (u32, u64)>);
@@ -45,7 +44,6 @@ fn roots(list: &[(SessionId, u32, u64)]) -> Roots {
             .iter()
             .map(|&(id, pid, start)| (pid, (id, start)))
             .collect(),
-        ..Roots::default()
     }
 }
 
@@ -81,23 +79,11 @@ fn walk_gives_up_on_cycles() {
 }
 
 #[test]
-fn allows_matrix() {
-    let mut r = Roots::default();
-    assert!(Scope::Full.allows(A, &r) && Scope::Full.allows(B, &r));
-    assert!(Scope::Session(A).allows(A, &r));
-    assert!(!Scope::Session(A).allows(B, &r));
-    assert!(!Scope::Restricted.allows(A, &r));
-
-    // A가 만든 B(그리고 B가 만든 C)는 A 범위 안에 들어가지만, 역방향·무관한 세션은 거부한다.
-    r.record_creator(B, Scope::Session(A)).unwrap();
-    r.record_creator(C, Scope::Session(B)).unwrap();
-    assert!(Scope::Session(A).allows(B, &r));
-    assert!(Scope::Session(A).allows(C, &r));
-    assert!(Scope::Session(B).allows(C, &r));
-    assert!(!Scope::Session(B).allows(A, &r));
-    assert!(!Scope::Session(C).allows(A, &r));
-    r.remove(B);
-    assert!(Scope::Session(A).allows(C, &r), "reparented grandchild");
+fn every_verified_peer_is_full() {
+    // Orca와 같은 소유자 모델: 세션 안 피어도 외부 셸과 같은 권한, 계보를 못 확인한 피어만 막는다.
+    assert!(Scope::Full.full());
+    assert!(Scope::Session(A).full());
+    assert!(!Scope::Restricted.full());
 }
 
 #[test]
@@ -132,27 +118,26 @@ fn audit_line_mode_and_rotation() {
     let dir = Dir::new("audit");
     let path = dir.0.join("audit.log");
     let audit = Audit::new(path.clone());
-    let r = Roots::default();
     let peer = Peer {
         pid: Some(42),
         scope: Scope::Session(A),
     };
-    assert!(!peer.authorize("send", B, &r, &audit));
     assert!(
-        peer.authorize("send", A, &r, &audit),
-        "allowed is not logged"
+        peer.authorize("send", B, &audit),
+        "session peers reach other sessions and allowed is not logged"
     );
+    peer.deny("theme", &audit);
     let gone = Peer {
         pid: None,
         scope: Scope::Restricted,
     };
-    assert!(!gone.authorize("read", A, &r, &audit));
+    assert!(!gone.authorize("read", A, &audit));
     let text = fs::read_to_string(&path).unwrap();
     let lines: Vec<_> = text.lines().map(|l| l.split_once(' ').unwrap().1).collect();
     assert_eq!(
         lines,
         [
-            "deny op=send target=2 peer_pid=42 scope=session:1",
+            "deny op=theme target=0 peer_pid=42 scope=session:1",
             "deny op=read target=1 peer_pid=? scope=restricted",
         ]
     );
@@ -162,7 +147,7 @@ fn audit_line_mode_and_rotation() {
     );
 
     fs::write(&path, vec![b'x'; usize::try_from(AUDIT_MAX).unwrap()]).unwrap();
-    assert!(!peer.authorize("send", B, &r, &audit));
+    assert!(!gone.authorize("send", B, &audit));
     assert_eq!(
         fs::metadata(dir.0.join("audit.log.1")).unwrap().len(),
         AUDIT_MAX
@@ -191,7 +176,7 @@ fn nested_nc_as(sock: &Path, nc: &Path) -> Child {
         .unwrap()
 }
 
-/// S13(MK-036 완료 조건): 세션 A 안에서 B로 보내는 요청은 거부되고 감사 로그에 남는다. 외부 셸은 B를 다룬다.
+/// S13(MK-036): 세션 A 안에서 온 요청은 A 출신으로 판정되지만 외부 셸처럼 B도 다룬다(Orca 소유자 모델).
 /// 실제 프로세스 계보와 실제 `LOCAL_PEERPID`·`proc_pidinfo`를 쓴다.
 #[test]
 fn real_processes_inside_vs_outside_session() {
@@ -212,18 +197,15 @@ fn real_processes_inside_vs_outside_session() {
         Some(inside.id()),
         "peer is a descendant, not the root"
     );
-    assert!(
-        !peer.authorize("send", B, &r, &audit),
-        "krill send B from A"
-    );
-    assert!(peer.authorize("send", A, &r, &audit), "own session");
+    assert!(peer.authorize("send", B, &audit), "krill send B from A");
+    assert!(peer.authorize("send", A, &audit), "own session");
 
     // 외부 셸: 같은 모양이지만 루트로 등록하지 않았다.
     let mut outside = nested_nc(&sock);
     let (conn2, _) = lis.accept().unwrap();
     let ext = Peer::of(&conn2, &r);
     assert_eq!(ext.scope, Scope::Full);
-    assert!(ext.authorize("send", B, &r, &audit));
+    assert!(ext.authorize("send", B, &audit));
 
     // 이 테스트 프로세스 자신(외부)도 전체 권한.
     let _me = UnixStream::connect(&sock).unwrap();
@@ -231,12 +213,7 @@ fn real_processes_inside_vs_outside_session() {
     let me = Peer::of(&conn3, &r);
     assert_eq!((me.pid, me.scope), (Some(std::process::id()), Scope::Full));
 
-    let log = fs::read_to_string(dir.0.join("audit.log")).unwrap();
-    assert_eq!(log.lines().count(), 1, "{log}");
-    assert!(log.contains(&format!(
-        "deny op=send target=2 peer_pid={} scope=session:1",
-        peer.pid.unwrap()
-    )));
+    assert!(!dir.0.join("audit.log").exists(), "nothing was denied");
 
     drop((conn, conn2, conn3));
     for c in [&mut inside, &mut outside] {
@@ -244,71 +221,6 @@ fn real_processes_inside_vs_outside_session() {
         kill_process_group(pgid, Signal::KILL).ok();
         c.wait().unwrap();
     }
-}
-
-#[test]
-fn prune_dead_drops_gone_children_and_reparents_grandchildren() {
-    const D: SessionId = SessionId(4);
-    const E: SessionId = SessionId(5);
-    let dir = std::env::temp_dir().join(format!("mk612-prune-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("session-creators");
-    let mut r = Roots::open(Some(path.clone()));
-    r.record_creator(B, Scope::Session(A)).unwrap();
-    r.record_creator(C, Scope::Session(B)).unwrap();
-    r.record_creator(D, Scope::Session(A)).unwrap();
-    // B는 죽었고 A·C·D·E만 살아 있다: B 항목은 버리고 C는 A 밑으로 이어 준다.
-    r.record_creator(E, Scope::Session(D)).unwrap();
-    r.prune_dead(&[A, C, D, E]);
-    assert!(!Scope::Session(A).allows(B, &r), "dead child must be gone");
-    assert!(
-        Scope::Session(A).allows(C, &r),
-        "grandchild reparented to A"
-    );
-    assert!(Scope::Session(A).allows(D, &r));
-    assert!(Scope::Session(D).allows(E, &r));
-    let back = Roots::open(Some(path));
-    assert!(!Scope::Session(A).allows(B, &back), "prune must persist");
-    assert!(Scope::Session(A).allows(C, &back));
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn creator_ancestry_and_reparenting_survive_restart_with_private_file() {
-    let dir = std::env::temp_dir().join(format!("mk595-creators-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("session-creators");
-    let mut r = Roots::open(Some(path.clone()));
-    r.record_creator(B, Scope::Session(A)).unwrap();
-    r.record_creator(C, Scope::Session(B)).unwrap();
-    let mut r = Roots::open(Some(path.clone()));
-    assert!(Scope::Session(A).allows(C, &r));
-    assert!(!Scope::Session(C).allows(A, &r));
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    r.remove(B);
-    let mut r = Roots::open(Some(path.clone()));
-    assert!(Scope::Session(A).allows(C, &r));
-    r.record_creator(C, Scope::Full).unwrap();
-    assert!(!Scope::Session(A).allows(C, &Roots::open(Some(path))));
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn failed_creator_save_does_not_grant_unpersisted_scope() {
-    let dir = std::env::temp_dir().join(format!("mk595-creators-fail-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("session-creators");
-    let mut r = Roots::open(Some(path.clone()));
-    fs::create_dir(path.with_extension("tmp")).unwrap();
-    assert!(r.record_creator(B, Scope::Session(A)).is_err());
-    assert!(!Scope::Session(A).allows(B, &r));
-    fs::remove_dir(path.with_extension("tmp")).unwrap();
-    r.record_creator(B, Scope::Session(A)).unwrap();
-    assert!(Scope::Session(A).allows(B, &Roots::open(Some(path))));
-    fs::remove_dir_all(dir).unwrap();
 }
 
 // ---- MK-096 피어 코드서명 검증 ----
@@ -419,7 +331,7 @@ fn signing_policy_load_defaults_and_file() {
 }
 
 #[test]
-fn gate_signing_downgrades_only_unverified_full() {
+fn gate_signing_downgrades_unverified_full_and_session_peers() {
     let dir = Dir::new("signing-gate");
     let audit = Audit::new(dir.0.join("audit.log"));
     let required = SigningPolicy {
@@ -432,7 +344,7 @@ fn gate_signing_downgrades_only_unverified_full() {
     };
     assert!(denied.gate_signing(&required, None, &audit));
     assert_eq!(denied.scope, Scope::Restricted);
-    assert!(!denied.authorize("send", B, &Roots::default(), &audit));
+    assert!(!denied.authorize("send", B, &audit));
 
     let mut allowed = Peer {
         pid: Some(7),
@@ -446,10 +358,10 @@ fn gate_signing_downgrades_only_unverified_full() {
         scope: Scope::Session(A),
     };
     assert!(
-        !session.gate_signing(&required, None, &audit),
-        "session peers keep their scope"
+        session.gate_signing(&required, None, &audit),
+        "session peers hold full rights, so the policy applies to them too"
     );
-    assert_eq!(session.scope, Scope::Session(A));
+    assert_eq!(session.scope, Scope::Restricted);
 
     let mut off = Peer {
         pid: Some(7),
@@ -461,7 +373,11 @@ fn gate_signing_downgrades_only_unverified_full() {
     );
 
     let log = fs::read_to_string(dir.0.join("audit.log")).unwrap();
-    assert_eq!(log.lines().count(), 2, "{log}");
+    assert_eq!(log.lines().count(), 3, "{log}");
+    assert!(
+        log.contains("deny op=peer-sign target=0 peer_pid=7 scope=session:1"),
+        "{log}"
+    );
     assert!(
         log.contains("deny op=peer-sign target=0 peer_pid=7 scope=full"),
         "{log}"
@@ -566,7 +482,7 @@ fn real_adhoc_peer_passes_when_signing_required() {
     };
     assert!(!peer.gate_signing(&policy, Some(&sign), &audit));
     assert_eq!(peer.scope, Scope::Full);
-    assert!(peer.authorize("send", B, &Roots::default(), &audit));
+    assert!(peer.authorize("send", B, &audit));
     drop(conn);
     kill_group(&mut child);
 }
@@ -592,7 +508,7 @@ fn real_identifier_mismatch_is_denied() {
     };
     assert!(peer.gate_signing(&policy, Some(&sign), &audit));
     assert_eq!(peer.scope, Scope::Restricted);
-    assert!(!peer.authorize("send", B, &Roots::default(), &audit));
+    assert!(!peer.authorize("send", B, &audit));
     let log = fs::read_to_string(dir.0.join("audit.log")).unwrap();
     assert!(log.contains("deny op=peer-sign target=0"), "{log}");
     drop(conn);
@@ -615,7 +531,7 @@ fn real_policy_off_keeps_full() {
         !peer.gate_signing(&SigningPolicy::default(), None, &audit),
         "policy off keeps existing behavior"
     );
-    assert!(peer.authorize("send", B, &Roots::default(), &audit));
+    assert!(peer.authorize("send", B, &audit));
     drop(conn);
     kill_group(&mut child);
 }

@@ -910,3 +910,376 @@ fn new_agent_session_opens_beside_tabs_of_the_same_windows_workspace(cx: &mut Te
         assert_eq!(tabs.last(), Some(&s.layout.active()));
     });
 }
+
+/// 숨은 칸 재개를 받는 가짜 krilld의 동작.
+#[derive(Clone, Copy)]
+enum FakeDaemon {
+    /// `List`를 이 횟수만큼 답 없이 끊고 이후엔 빈 목록을 준다. `Resume`은 닫힌 세션처럼 `NoSession`으로 거부한다.
+    ListEofs(usize),
+    /// 첫 `Resume`에 디코딩은 되지만 예상 밖인 답(`Closed`)을 주고, 이후엔 `NoSession`.
+    OddResumeReply,
+    /// `Hibernation`을 광고하고 `NoSession`으로 거부한다.
+    RefuseHibernation,
+}
+
+/// 가짜 krilld를 띄우고 소켓 경로와 (List, Resume, Hibernation) 요청 수를 돌려준다.
+fn fake_restore_daemon(
+    tag: &str,
+    mode: FakeDaemon,
+) -> std::io::Result<(PathBuf, Arc<[std::sync::atomic::AtomicUsize; 3]>)> {
+    use krill_proto::control::{
+        FEAT_CONTROL, FEAT_HIBERNATION, FEAT_RESUME, FEAT_RESUME_HISTORY, Failure, Reply, Request,
+    };
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering::SeqCst;
+    let socket = PathBuf::from(format!("/tmp/kr-hidden-{tag}-{}.sock", std::process::id()));
+    std::fs::remove_file(&socket).ok();
+    let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    let counts = Arc::new([0, 0, 0].map(std::sync::atomic::AtomicUsize::new));
+    let seen = Arc::clone(&counts);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                let hibernation = match mode {
+                    FakeDaemon::RefuseHibernation => FEAT_HIBERNATION,
+                    _ => 0,
+                };
+                let hello = krill_proto::ipc::ServerHello {
+                    proto_min: krill_proto::ipc::PROTO_MIN,
+                    proto_max: krill_proto::ipc::PROTO_MAX,
+                    features: FEAT_CONTROL | FEAT_RESUME | FEAT_RESUME_HISTORY | hibernation,
+                    build: "test".into(),
+                    instance_id: 1,
+                };
+                let Ok(hello) = hello.encode() else { return };
+                if stream.write_all(&hello).is_err() {
+                    return;
+                }
+                let Ok(Some(_)) = krill_proto::ipc::read_frame(&mut stream) else {
+                    return;
+                };
+                while let Ok(Some((kind, body))) = krill_proto::ipc::read_frame(&mut stream) {
+                    let reply = match Request::decode(kind, &body) {
+                        Ok(Request::List) => {
+                            let n = seen[0].fetch_add(1, SeqCst);
+                            if matches!(mode, FakeDaemon::ListEofs(eofs) if n < eofs) {
+                                return;
+                            }
+                            Reply::Sessions(Vec::new())
+                        }
+                        Ok(Request::Resume { .. }) => {
+                            let n = seen[1].fetch_add(1, SeqCst);
+                            if matches!(mode, FakeDaemon::OddResumeReply) && n == 0 {
+                                Reply::Closed
+                            } else {
+                                Reply::Failed(Failure::NoSession)
+                            }
+                        }
+                        Ok(Request::Hibernation { .. }) => {
+                            seen[2].fetch_add(1, SeqCst);
+                            Reply::Failed(Failure::NoSession)
+                        }
+                        _ => Reply::Failed(Failure::BadRequest),
+                    };
+                    let Ok(frame) = reply.encode() else { return };
+                    stream.write_all(&frame).ok();
+                }
+            });
+        }
+    });
+    Ok((socket, counts))
+}
+
+/// 숨은 로컬 칸 하나를 두고 가짜 데몬에 재개를 한 번 끝까지 돌린다.
+fn restore_once<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+    socket: &std::path::Path,
+    old: SessionId,
+) -> (gpui::Entity<Shell>, &'a mut gpui::VisualTestContext) {
+    let (view, cx) = open(cx, state_path(name));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, old);
+        s.layout.deactivate();
+        s.paths = Some(Paths {
+            socket: socket.to_path_buf(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.restore_hidden_sessions(&[], cx);
+        assert!(s.restoring_sessions.contains(&old));
+    });
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// 같은 Up 상태에서 sync를 네 번 돌린다(재접속·시간 진행 없음).
+fn sync_four_times(view: &gpui::Entity<Shell>, cx: &mut gpui::VisualTestContext) {
+    for _ in 0..4 {
+        view.update(cx, Shell::sync);
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn hidden_restore_retries_after_presend_failure_on_reconnect(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // 재부팅 직후 데몬이 바뀌며 읽기 전용 List가 끊기면 Resume은 나가지 않았다. 재접속(Up) 뒤 다시 시도해야 한다.
+    let (socket, counts) = fake_restore_daemon("eof", FakeDaemon::ListEofs(usize::MAX)).unwrap();
+    let old = SessionId(900);
+    let (view, cx) = restore_once(cx, "reboot-restore-presend", &socket, old);
+    view.update(cx, |s, _| {
+        assert_eq!(counts[0].load(SeqCst), 1, "List까지 가서 끊겨야 한다");
+        assert_eq!(counts[1].load(SeqCst), 0);
+        assert!(!s.restoring_sessions.contains(&old));
+        assert!(s.outcome_unknown.is_empty(), "재개 요청은 나가지 않았다");
+    });
+    // 끊김이 이어질 때 sync마다 다시 I/O하지 않는다.
+    sync_four_times(&view, cx);
+    assert_eq!(
+        counts[0].load(SeqCst),
+        1,
+        "같은 Up 상태의 sync는 재시도하지 않는다"
+    );
+    view.update(cx, |s, cx| {
+        s.set_link(Link::Down, cx);
+        s.set_link(Link::Up, cx);
+        assert!(
+            s.restoring_sessions.contains(&old),
+            "요청 전 실패는 재접속 뒤 다시 시도한다"
+        );
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+}
+
+#[gpui::test]
+fn hidden_restore_does_not_retry_daemon_refusal(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // 정상 종료(closed)된 세션은 데몬이 Resume을 거부한다. 재접속해도 다시 되살리려 하지 않는다.
+    let (socket, counts) = fake_restore_daemon("closed", FakeDaemon::ListEofs(0)).unwrap();
+    let old = SessionId(901);
+    let (view, cx) = restore_once(cx, "reboot-restore-refused", &socket, old);
+    view.update(cx, |s, cx| {
+        assert_eq!(counts[1].load(SeqCst), 1, "Resume이 거부돼야 한다");
+        assert!(!s.restoring_sessions.contains(&old));
+        s.set_link(Link::Down, cx);
+        s.set_link(Link::Up, cx);
+        assert!(
+            !s.restoring_sessions.contains(&old),
+            "확정 거부는 다시 시도하지 않는다"
+        );
+    });
+    std::fs::remove_file(socket).ok();
+}
+
+#[gpui::test]
+fn hidden_restore_does_not_retry_hibernation_refusal(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // Hibernation의 NoSession도 확정 거부다. sync·재접속 어느 쪽으로도 다시 보내지 않는다.
+    let (socket, counts) =
+        fake_restore_daemon("hibernation", FakeDaemon::RefuseHibernation).unwrap();
+    let old = SessionId(935);
+    let (view, cx) = restore_once(cx, "reboot-restore-hibernation", &socket, old);
+    assert_eq!(counts[2].load(SeqCst), 1);
+    sync_four_times(&view, cx);
+    view.update(cx, |s, cx| {
+        s.set_link(Link::Down, cx);
+        s.set_link(Link::Up, cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    assert_eq!(
+        counts[2].load(SeqCst),
+        1,
+        "확정 거부는 다시 시도하지 않는다"
+    );
+}
+
+#[gpui::test]
+fn hidden_restore_treats_unexpected_resume_reply_as_unknown(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // Resume을 보낸 뒤 해석할 수 없는 답이 오면 세션이 만들어졌는지 모른다. 다시 보내면 PTY가 둘이 될 수 있다.
+    let (socket, counts) = fake_restore_daemon("unexpected", FakeDaemon::OddResumeReply).unwrap();
+    let old = SessionId(934);
+    let (view, cx) = restore_once(cx, "reboot-restore-unexpected", &socket, old);
+    view.update(cx, |s, _| {
+        assert_eq!(counts[1].load(SeqCst), 1);
+        assert_eq!(s.outcome_unknown.len(), 1, "결과 불명으로 남아야 한다");
+    });
+    sync_four_times(&view, cx);
+    view.update(cx, |s, cx| {
+        s.set_link(Link::Down, cx);
+        s.set_link(Link::Up, cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    assert_eq!(
+        counts[1].load(SeqCst),
+        1,
+        "결과 불명인 Resume은 다시 보내지 않는다"
+    );
+}
+
+#[gpui::test]
+fn hidden_restore_remote_id_collision_does_not_self_retry(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // 보이는 원격 칸과 숨은 로컬 칸의 ID가 같다. 완료 콜백이 원격 칸을 같은 세션으로 보고 sync하면,
+    // 요청 전 실패가 외부 이벤트 없이 스스로 반복된다.
+    let (socket, counts) = fake_restore_daemon("remote-loop", FakeDaemon::ListEofs(4)).unwrap();
+    let (view, cx) = open(cx, state_path("reboot-restore-remote-loop"));
+    view.update(cx, |s, cx| {
+        let remote = s.layout.active_tab().focused;
+        let old = SessionId(932);
+        s.layout.set_host(remote, HostId::Remote("server".into()));
+        s.layout.set_session(remote, old);
+        s.layout.new_tab();
+        let local = s.layout.active_tab().focused;
+        s.layout.set_session(local, old);
+        s.layout.activate(0);
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.restore_hidden_sessions(&s.layout.visible(), cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    assert_eq!(
+        counts[0].load(SeqCst),
+        1,
+        "재접속 없이 스스로 다시 시도하면 안 된다"
+    );
+}
+
+#[gpui::test]
+fn hidden_restore_ignores_visible_remote_id_collision(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("reboot-restore-remote-collision"));
+    view.update(cx, |s, cx| {
+        // 원격 호스트의 SessionId는 로컬과 독립이라 숫자가 같을 수 있다.
+        let remote = s.layout.active_tab().focused;
+        let old = SessionId(910);
+        s.layout.set_host(remote, HostId::Remote("server".into()));
+        s.layout.set_session(remote, old);
+        s.layout.new_tab();
+        let local = s.layout.active_tab().focused;
+        s.layout.set_session(local, old);
+        s.layout.activate(0);
+        s.paths = Some(Paths {
+            socket: PathBuf::new(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        let visible = s.layout.visible();
+        assert!(visible.contains(&remote));
+        assert!(!visible.contains(&local));
+        s.restore_hidden_sessions(&visible, cx);
+        assert!(
+            s.restore_attempted.contains(&old),
+            "보이는 원격 칸의 같은 ID가 숨은 로컬 칸 복원을 막으면 안 된다"
+        );
+    });
+}
+
+#[gpui::test]
+fn hidden_restore_retries_when_reconnect_passes_during_attempt(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // 옛 연결의 List가 끊긴 뒤, 그 실패를 반영하는 UI 콜백보다 Down→Up이 먼저 지나갔다.
+    // 그 재접속은 아직 진행 중인 칸을 못 봤으므로, 늦게 온 실패는 다음 재접속을 기다리지 않고 지금 다시 시도한다.
+    let (socket, counts) = fake_restore_daemon("flap", FakeDaemon::ListEofs(1)).unwrap();
+    let old = SessionId(941);
+    let (view, cx) = open(cx, state_path("reboot-restore-inflight-reconnect"));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, old);
+        s.layout.deactivate();
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.restore_hidden_sessions(&[], cx);
+    });
+    // List EOF까지만 진행하고 완료 콜백 앞에서 멈춘다.
+    for _ in 0..1000 {
+        if counts[0].load(SeqCst) == 1 {
+            break;
+        }
+        assert!(cx.executor().tick(), "List EOF에 닿아야 한다");
+    }
+    assert_eq!(counts[0].load(SeqCst), 1);
+    view.update(cx, |s, cx| {
+        assert!(s.restoring_sessions.contains(&old), "완료 콜백은 아직이다");
+        s.set_link(Link::Down, cx);
+        s.set_link(Link::Up, cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    assert_eq!(
+        counts[1].load(SeqCst),
+        1,
+        "추가 재접속 없이 지금 세대에서 Resume까지 가야 한다"
+    );
+    // 세대당 한 번: 같은 Up 상태의 sync로는 더 시도하지 않는다.
+    let lists = counts[0].load(SeqCst);
+    sync_four_times(&view, cx);
+    assert_eq!(counts[0].load(SeqCst), lists);
+    assert_eq!(counts[1].load(SeqCst), 1);
+}
+
+#[gpui::test]
+fn visible_remote_pane_attaches_while_same_id_local_restores(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    // 복원 중 집합은 로컬 ID다. 숫자가 같은 보이는 원격 칸의 연결 시작을 막으면 안 된다.
+    let (socket, _) = fake_restore_daemon("remote-attach", FakeDaemon::ListEofs(0)).unwrap();
+    let connects = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&connects);
+    let host = HostId::Remote("server".into());
+    let target = krill_hosts::HostTarget::remote_with_connector(
+        "server",
+        PathBuf::from("/unused"),
+        krill_hosts::RemoteConnector::new(
+            move || {
+                count.fetch_add(1, SeqCst);
+                Err(std::io::ErrorKind::NotConnected.into())
+            },
+            |_, _| {},
+        ),
+    );
+    let (view, cx) = open(cx, state_path("reboot-restore-remote-attach"));
+    let remote = view.update(cx, |s, cx| {
+        let remote = s.layout.active_tab().focused;
+        let old = SessionId(944);
+        s.layout.set_host(remote, host.clone());
+        s.layout.set_session(remote, old);
+        s.host_targets.insert(host, target);
+        s.layout.new_tab();
+        let local = s.layout.active_tab().focused;
+        s.layout.set_session(local, old);
+        s.layout.activate(0);
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.sync(cx);
+        assert!(s.restoring_sessions.contains(&old));
+        remote
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+    view.read_with(cx, |s, _| {
+        assert!(s.live.contains_key(&remote), "원격 칸이 붙기 시작해야 한다");
+    });
+    assert_eq!(connects.load(SeqCst), 1);
+}
