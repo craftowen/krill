@@ -25,6 +25,8 @@ pub const ORCH_LOCK: &str = "orchestration.lock";
 pub const COMMENTS_FILE: &str = "worktree-comments.toml";
 pub const COMMENTS_LOCK: &str = "worktree-comments.lock";
 pub const MAX_ORCH_BYTES: u64 = 2 * 1024 * 1024;
+/// 바이트 압박 때 방치된 `Active` Run을 정리 대상으로 보는 무갱신 기간(24시간).
+const STALE_RUN_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_COMMENTS_BYTES: u64 = 256 * 1024;
 /// [`OrchestrationStore::prune_messages`]가 남기는 확인済み 일시 메시지(하트비트·상태) 상한.
 /// 근거: 본문 300B 하트비트 3,395건 ≈ 2MiB 실측(PH-02). 500건이면 본문만 ~150KiB라 상한에 여유가 있고,
@@ -963,7 +965,11 @@ impl OrchestrationStore {
         fs::create_dir_all(state_dir)?;
         let body = crate::config_document::save_json(&state_dir.join(ORCH_FILE), self)?;
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_ORCH_BYTES {
-            return Err(invalid("orchestration.json exceeds size limit"));
+            return Err(invalid(
+                "orchestration.json exceeds size limit and nothing safe to prune is left (current Run, \
+                 active dispatches, pending questions/gates are kept); free space with \
+                 `krill orchestration reset --run <run-id>` for a finished Run",
+            ));
         }
         atomic_write(&state_dir.join(ORCH_FILE), body.as_bytes())
     }
@@ -1929,8 +1935,14 @@ impl OrchestrationStore {
         Ok((Some(delivery), messages))
     }
 
-    /// Compact before the atomic size gate, preserving every outstanding delivery and
-    /// the selected Run. Completed older Runs can be discarded under byte pressure.
+    /// Compact before the atomic size gate. Under byte pressure the store MUST get back under the
+    /// threshold, otherwise every later mutate→save fails (T6: 2MiB wedge). Order, oldest first:
+    /// 1. acked deliveries/messages; 2. finished (Completed/Archived) Runs, even with unconfirmed
+    ///    deliveries — nobody is coming back for a finished Run's mail; 3. abandoned Runs (still
+    ///    `Active` but untouched for [`STALE_RUN_MS`]).
+    ///
+    /// Never dropped: the current Run, a Run with an active dispatch, an unanswered `question`
+    /// or a pending decision gate.
     pub fn prune_if_needed(&mut self) -> io::Result<()> {
         self.prune_messages();
         let unread: BTreeSet<_> = self
@@ -1959,30 +1971,70 @@ impl OrchestrationStore {
             .flat_map(|d| d.message_ids.iter().cloned())
             .collect();
         self.messages.retain(|m| !m.acked || pinned.contains(&m.id));
-        let mut completed: Vec<_> = self
-            .runs
-            .iter()
-            .filter(|r| {
-                r.status == RunStatus::Completed
-                    && self.current_run_id.as_deref() != Some(r.id.as_str())
-                    && !self
-                        .dispatches
-                        .iter()
-                        .any(|d| d.run_id == r.id && d.status == DispatchStatus::Active)
-                    && !self.messages.iter().any(|m| {
-                        m.run_id.as_deref() == Some(r.id.as_str()) && pinned.contains(&m.id)
-                    })
-            })
-            .map(|r| (r.updated_at_ms, r.id.clone()))
-            .collect();
-        completed.sort();
-        for (_, id) in completed {
-            if bytes(self)? < threshold {
-                break;
+        let now = now_ms();
+        for stale_only in [false, true] {
+            let mut victims: Vec<_> = self
+                .runs
+                .iter()
+                .filter(|r| self.run_is_discardable(r, now, stale_only))
+                .map(|r| (self.run_last_activity_ms(r), r.id.clone()))
+                .collect();
+            victims.sort();
+            for (_, id) in victims {
+                if bytes(self)? < threshold {
+                    return Ok(());
+                }
+                self.reset(Some(&id));
             }
-            self.reset(Some(&id));
         }
         Ok(())
+    }
+
+    fn run_last_activity_ms(&self, run: &Run) -> u64 {
+        let id = Some(run.id.as_str());
+        let tasks = self
+            .tasks
+            .iter()
+            .filter(|t| t.run_id == run.id)
+            .map(|t| t.updated_at_ms);
+        let dispatches = self
+            .dispatches
+            .iter()
+            .filter(|d| d.run_id == run.id)
+            .map(|d| d.ended_at_ms.unwrap_or(d.started_at_ms));
+        let messages = self
+            .messages
+            .iter()
+            .filter(|m| m.run_id.as_deref() == id)
+            .map(|m| m.created_at_ms);
+        tasks
+            .chain(dispatches)
+            .chain(messages)
+            .fold(run.updated_at_ms, u64::max)
+    }
+
+    /// `stale_only=false`: finished Runs. `true`: abandoned `Active` Runs idle for [`STALE_RUN_MS`].
+    fn run_is_discardable(&self, run: &Run, now: u64, stale_only: bool) -> bool {
+        let id = Some(run.id.as_str());
+        let eligible = if stale_only {
+            run.status == RunStatus::Active
+                && now.saturating_sub(self.run_last_activity_ms(run)) >= STALE_RUN_MS
+        } else {
+            run.status != RunStatus::Active
+        };
+        eligible
+            && self.current_run_id.as_deref() != id
+            && !self
+                .dispatches
+                .iter()
+                .any(|d| d.run_id == run.id && d.status == DispatchStatus::Active)
+            && !self
+                .gates
+                .iter()
+                .any(|g| g.run_id.as_deref() == id && g.status == GateStatus::Pending)
+            && !self.messages.iter().any(|m| {
+                m.run_id.as_deref() == id && !m.acked && m.msg_type == MessageType::Question
+            })
     }
 
     pub fn resolve_recipients(&self, to: &str, run_id: Option<&str>) -> Vec<String> {
@@ -5614,24 +5666,128 @@ mod mailbox_and_worker_safety_tests {
         fs::remove_dir_all(dir)
     }
 
-    #[test]
-    fn pruning_preserves_outstanding_delivery_even_for_completed_runs() -> io::Result<()> {
-        let mut store = OrchestrationStore::default();
-        let old = store.create_run("old", None)?;
-        store.runs.first_mut().unwrap().status = RunStatus::Completed;
-        // 메시지 하나는 MAX_MESSAGE_BYTES 이하라, 여러 건으로 정리 임계(1.75MiB)를 넘긴다.
-        for _ in 0..8 {
-            store.send_message(&mail(Some(&old.id), "coordinator", &"x".repeat(250_000)))?;
+    /// Run에 `bytes`짜리 미확인 메시지를 `n`건 쌓는다.
+    fn fill_run(store: &mut OrchestrationStore, run: &str, n: usize, bytes: usize) {
+        for _ in 0..n {
+            store
+                .send_message(&mail(Some(run), "coordinator", &"x".repeat(bytes)))
+                .unwrap();
         }
+    }
+
+    /// Run과 그 메시지의 마지막 활동 시각을 `ms`로 되돌린다.
+    fn age_run(store: &mut OrchestrationStore, run: &str, ms: u64) {
+        for r in store.runs.iter_mut().filter(|r| r.id == run) {
+            r.updated_at_ms = ms;
+        }
+        for m in store
+            .messages
+            .iter_mut()
+            .filter(|m| m.run_id.as_deref() == Some(run))
+        {
+            m.created_at_ms = ms;
+        }
+    }
+
+    fn store_len(store: &OrchestrationStore) -> u64 {
+        u64::try_from(serde_json::to_vec_pretty(store).unwrap().len()).unwrap()
+    }
+
+    #[test]
+    fn pruning_preserves_outstanding_delivery_of_current_run() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let cur = store.create_run("current", None)?;
+        // 메시지 하나는 MAX_MESSAGE_BYTES 이하라, 여러 건으로 정리 임계(1.75MiB)를 넘긴다.
+        fill_run(&mut store, &cur.id, 8, 250_000);
         let batch =
-            store.check_delivery(Some("coordinator"), &[], true, false, Some(&old.id), None)?;
-        store.create_run("current", None)?;
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&cur.id), None)?;
         store.prune_if_needed()?;
-        assert!(store.runs.iter().any(|r| r.id == old.id));
+        assert!(store.runs.iter().any(|r| r.id == cur.id));
         assert_eq!(
-            store.check_delivery(Some("coordinator"), &[], true, false, Some(&old.id), None)?,
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&cur.id), None)?,
             batch
         );
+        Ok(())
+    }
+
+    /// T6 재현: 완료 Run마다 미확인 delivery가 남고 나머지는 방치된 Active Run — 예전엔 아무것도
+    /// 못 지워 저장소가 한도에 고정됐다.
+    #[test]
+    fn byte_pressure_discards_completed_runs_with_unconfirmed_delivery_and_stale_active_runs()
+    -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let day = 24 * 60 * 60 * 1000;
+        let now = now_ms();
+        for i in 0..12u64 {
+            let run = store.create_run("done", None)?;
+            fill_run(&mut store, &run.id, 1, 110_000);
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+            store
+                .runs
+                .iter_mut()
+                .find(|r| r.id == run.id)
+                .unwrap()
+                .status = RunStatus::Completed;
+            age_run(&mut store, &run.id, now - i * 1000);
+        }
+        for i in 0..26u64 {
+            let run = store.create_run("abandoned", None)?;
+            fill_run(&mut store, &run.id, 1, 25_000);
+            age_run(&mut store, &run.id, now - 2 * day - i * 1000);
+        }
+        let live = store.create_run("live", None)?;
+        fill_run(&mut store, &live.id, 1, 25_000);
+        assert!(store_len(&store) >= MAX_STORE_BYTES - 256 * 1024);
+
+        store.prune_if_needed()?;
+
+        assert!(store_len(&store) + 256 * 1024 <= MAX_STORE_BYTES);
+        assert_eq!(store.current_run_id.as_deref(), Some(live.id.as_str()));
+        assert!(store.runs.iter().any(|r| r.id == live.id));
+        assert!(
+            store
+                .messages
+                .iter()
+                .any(|m| m.run_id.as_deref() == Some(live.id.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn byte_pressure_keeps_active_dispatch_pending_question_and_fresh_runs() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let day = 24 * 60 * 60 * 1000;
+        let old = now_ms() - 3 * day;
+        let mk = |store: &mut OrchestrationStore, title: &str| -> io::Result<String> {
+            let run = store.create_run(title, None)?;
+            fill_run(store, &run.id, 2, 250_000);
+            age_run(store, &run.id, old);
+            Ok(run.id)
+        };
+        let with_dispatch = mk(&mut store, "dispatch")?;
+        let with_question = mk(&mut store, "question")?;
+        let with_gate = mk(&mut store, "gate")?;
+        let fresh = mk(&mut store, "fresh")?;
+        let victim = mk(&mut store, "victim")?;
+        store.create_run("current", None)?;
+        store.start_worker(&with_dispatch, None, "w", "claude", None, "/tmp", "p")?;
+        store.send_message(&SendParams {
+            msg_type: MessageType::Question,
+            ..mail(Some(&with_question), "coordinator", "q?")
+        })?;
+        store.create_gate("w", "pick", vec![], Some(with_gate.clone()), None)?;
+        age_run(&mut store, &with_question, old);
+        age_run(&mut store, &with_gate, old);
+        age_run(&mut store, &with_dispatch, old);
+        age_run(&mut store, &fresh, now_ms());
+        // 압박이 풀리는 즉시 멈추므로, 보호 대상 + 최신 Run이 임계 안에 들어올 때까지 victim이 먼저 지워진다.
+        store.prune_if_needed()?;
+        let ids: Vec<_> = store.runs.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&with_dispatch.as_str()));
+        assert!(ids.contains(&with_question.as_str()));
+        assert!(ids.contains(&with_gate.as_str()));
+        assert!(ids.contains(&fresh.as_str()));
+        assert!(!ids.contains(&victim.as_str()));
         Ok(())
     }
 }
