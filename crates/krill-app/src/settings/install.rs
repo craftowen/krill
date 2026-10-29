@@ -497,21 +497,24 @@ pub fn upsert_alias_block(existing: &str, entries: &[AliasEntry], is_powershell:
 #[must_use]
 pub fn remove_alias_block(existing: &str) -> String {
     let mut out = Vec::new();
-    let mut inside = false;
+    // 시작 표지 뒤 줄은 끝 표지를 만나야 버린다. 끝 표지가 없으면 파일 끝까지 지우지 않고 되살린다.
+    let mut block: Option<Vec<&str>> = None;
     for line in existing.lines() {
         let trimmed = line.trim();
         if trimmed == ALIAS_BLOCK_START {
-            inside = true;
+            out.extend(block.replace(Vec::new()).unwrap_or_default());
             continue;
         }
         if trimmed == ALIAS_BLOCK_END {
-            inside = false;
+            block = None;
             continue;
         }
-        if !inside {
-            out.push(line);
+        match &mut block {
+            Some(lines) => lines.push(line),
+            None => out.push(line),
         }
     }
+    out.extend(block.unwrap_or_default());
     let joined = out.join("\n");
     let trimmed = joined.trim_end();
     if trimmed.is_empty() {
@@ -846,7 +849,16 @@ impl SettingsView {
         let home = Self::install_home_dir(cx);
         let rc_path = shell_rc_path(&home);
         let is_ps = cfg!(windows);
-        let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+        // 읽지 못한 프로필(UTF-8 아님·권한)을 빈 파일로 보면 사용자 설정 전체를 블록만으로 덮어쓴다.
+        let existing = match std::fs::read_to_string(&rc_path) {
+            Ok(existing) => existing,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                self.install.alias_status = Some((e.to_string().into(), true));
+                cx.notify();
+                return;
+            }
+        };
         let updated = upsert_alias_block(&existing, &entries, is_ps);
 
         if let Some(parent) = rc_path.parent()
