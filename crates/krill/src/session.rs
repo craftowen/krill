@@ -510,6 +510,7 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
             .as_bytes()
             .to_vec();
     }
+    let created_worktree = worktree.is_some();
     if let Some(name) = worktree {
         // --cwd selects the repository; the daemon returns the actual path after name collision handling.
         c.cwd = crate::worktree::create_on_target(
@@ -526,23 +527,26 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
     }
     let cwd_str = String::from_utf8_lossy(&c.cwd).into_owned();
     let is_agent = matches!(c.program, Program::Agent { .. });
-    let mut conn = connect(target, FEAT_CONTROL)?;
+    let mut conn = connect(target, FEAT_CONTROL)
+        .map_err(|e| keep_worktree_note(e, &cwd_str, created_worktree))?;
     // 데몬 spawn 실패(ENOENT 등)가 프로그램명 없이 그대로 나오면 무엇이 없는지 알 수 없다(C3).
     let program_label = match &c.program {
         Program::Custom { program, .. } => Some(String::from_utf8_lossy(program).into_owned()),
         _ => None,
     };
     let reply = request(&mut conn.stream, &Request::Create(c))
-        .map_err(|e| prefix_create_error(program_label.as_deref(), e))?;
+        .map_err(|e| prefix_create_error(program_label.as_deref(), e))
+        .map_err(|e| keep_worktree_note(e, &cwd_str, created_worktree))?;
     drop(conn);
     match reply {
         Reply::Created { session, pid } => {
             if let Some(prompt_text) = prompt.filter(|s| !s.is_empty()) {
                 if is_agent {
-                    send_initial_agent_prompt(target, session.0, &prompt_text).map_err(fail)?;
+                    send_initial_agent_prompt(target, session.0, &prompt_text)
                 } else {
-                    send_session_line(target, session.0, &prompt_text).map_err(fail)?;
+                    send_session_line(target, session.0, &prompt_text)
                 }
+                .map_err(|e| prompt_failed(session.0, &e))?;
             }
             if json {
                 let out = serde_json::to_string_pretty(&serde_json::json!({
@@ -681,7 +685,8 @@ fn fork(target: &Target, args: &[OsString]) -> Result<()> {
     let (session, pid) = fork_on_stream(conn.negotiated.features, &mut conn.stream, &parsed)?;
     drop(conn);
     if let Some(prompt) = parsed.prompt.filter(|s| !s.is_empty()) {
-        send_initial_agent_prompt(target, session.0, &prompt).map_err(fail)?;
+        send_initial_agent_prompt(target, session.0, &prompt)
+            .map_err(|e| prompt_failed(session.0, &e))?;
     }
     if parsed.json {
         let out = serde_json::to_string_pretty(&serde_json::json!({
@@ -695,6 +700,21 @@ fn fork(target: &Target, args: &[OsString]) -> Result<()> {
         println!("{}", session.0);
     }
     Ok(())
+}
+
+/// `--worktree`로 만든 워크트리는 세션 생성이 실패해도 남는다. 사용자가 경로를 알 수 있게 알린다.
+fn keep_worktree_note(mut e: Error, path: &str, created: bool) -> Error {
+    if created {
+        e.text = format!("{}\nworktree {path} was created and left in place", e.text);
+    }
+    e
+}
+
+/// 세션은 이미 떠 있다. 호출자가 ID를 잃어 고아 세션이 되지 않게 오류에 ID를 싣는다.
+fn prompt_failed(session: u64, cause: &str) -> Error {
+    fail(format!(
+        "session {session} was created but the prompt was not delivered: {cause}\nuse `krill read {session}` to inspect it or `krill kill {session}` to close it"
+    ))
 }
 
 fn number(value: Option<&OsString>) -> Result<u16> {
@@ -1535,6 +1555,20 @@ mod tests {
         );
         assert!(
             uncertain_prompt_delivery(7, "disconnected").contains("do not automatically resend")
+        );
+    }
+
+    #[test]
+    fn prompt_failure_reports_the_created_session_id() {
+        let e = prompt_failed(42, "disconnected");
+        assert_eq!(e.code, 1);
+        assert!(e.text.contains("session 42 was created"), "{}", e.text);
+        assert!(e.text.contains("krill kill 42"), "{}", e.text);
+        let kept = keep_worktree_note(fail("boom"), "/tmp/wt", true);
+        assert!(kept.text.contains("/tmp/wt was created"), "{}", kept.text);
+        assert_eq!(
+            keep_worktree_note(fail("boom"), "/tmp/wt", false).text,
+            "boom"
         );
     }
 
