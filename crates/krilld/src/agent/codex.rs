@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use krill_proto::os::ffi::OsStrExt as _;
@@ -32,6 +32,7 @@ const RETRY: Duration = if cfg!(test) {
 };
 
 static CHECKED: Mutex<BTreeMap<PathBuf, Checked>> = Mutex::new(BTreeMap::new());
+static CHECKED_DONE: Condvar = Condvar::new();
 
 /// Codex가 시작 시 trust를 읽으므로 갱신 완료 전에 실행하지 않는다. 실패하면 원래 세션을 보존한다.
 pub(super) fn ensure_trust(
@@ -117,20 +118,33 @@ pub(super) fn ensure_trust_in(
         return Ok(false);
     }
     let config = home.join("config.toml");
-    let current = stamp(&config);
     {
+        // 같은 홈을 다른 실행이 확인 중이면 EBUSY로 실패시키지 않고 그 결과를 기다린다.
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut checked = crate::session::lock(&CHECKED);
-        match checked.get(&home) {
-            Some(Checked::Trusted(command_at, stamp_at))
-                if command_at == command && *stamp_at == current =>
-            {
-                return Ok(false);
+        loop {
+            let current = stamp(&config);
+            match checked.get(&home) {
+                Some(Checked::Trusted(command_at, stamp_at))
+                    if command_at == command && *stamp_at == current =>
+                {
+                    return Ok(false);
+                }
+                Some(Checked::Failed(at, failed)) if *failed == current && at.elapsed() < RETRY => {
+                    return Err(io::Error::from_raw_os_error(libc::EBUSY));
+                }
+                Some(Checked::Checking) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::Error::from_raw_os_error(libc::EBUSY));
+                    }
+                    checked = CHECKED_DONE
+                        .wait_timeout(checked, left)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0;
+                }
+                _ => break,
             }
-            Some(Checked::Failed(at, failed)) if *failed == current && at.elapsed() < RETRY => {
-                return Err(io::Error::from_raw_os_error(libc::EBUSY));
-            }
-            Some(Checked::Checking) => return Err(io::Error::from_raw_os_error(libc::EBUSY)),
-            _ => {}
         }
         checked.insert(home.clone(), Checked::Checking);
     }
@@ -140,6 +154,7 @@ pub(super) fn ensure_trust_in(
         Err(_) => Checked::Failed(Instant::now(), stamp(&config)),
     };
     crate::session::lock(&CHECKED).insert(home, checked);
+    CHECKED_DONE.notify_all();
     result
 }
 
@@ -233,4 +248,16 @@ pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
         return false;
     };
     String::from_utf8_lossy(&raw).contains("--no-daemon")
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn set_checking_for_test(home: &Path, done_command: Option<&str>) {
+    let mut checked = crate::session::lock(&CHECKED);
+    let state = match done_command {
+        None => Checked::Checking,
+        Some(command) => Checked::Trusted(command.to_owned(), stamp(&home.join("config.toml"))),
+    };
+    checked.insert(home.to_path_buf(), state);
+    drop(checked);
+    CHECKED_DONE.notify_all();
 }
