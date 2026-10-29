@@ -1331,6 +1331,16 @@ pub(crate) mod agy {
         if cfg!(test) || latched() {
             return;
         }
+        refresh_with(home, state, file, interval, spawn);
+    }
+
+    fn refresh_with(
+        home: &Path,
+        state: Option<&Path>,
+        file: &accounts::AccountsFile,
+        interval: Duration,
+        mut schedule: impl FnMut(&Key, bool, Option<PathBuf>),
+    ) {
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -1357,12 +1367,12 @@ pub(crate) mod agy {
             {
                 continue;
             }
-            // 로그인 안 된 agy에 `-p /usage`를 보내면 매번 대화형 OAuth를 시작한다(설 실기, v0.1.9:
-            // 격리 HOME에서 2~3분마다 OAuth 시도 46회). 로그인된 프로필만 조회한다.
-            if !should_probe(&key.1, host) || !lock(&PENDING).insert(key.clone()) {
+            // Deduplicate before authentication: host login checks may wait on
+            // the macOS keychain and must run on the worker, never on Create/hook.
+            if !lock(&PENDING).insert(key.clone()) {
                 continue;
             }
-            spawn(&key, host, state.map(Path::to_path_buf));
+            schedule(&key, host, state.map(Path::to_path_buf));
         }
     }
 
@@ -1375,6 +1385,23 @@ pub(crate) mod agy {
         let launched = std::thread::Builder::new()
             .name("agy-usage".into())
             .spawn(move || {
+                // An unauthenticated profile must never run `/usage` (it can
+                // start interactive OAuth). Keep this check off request threads.
+                let started = Instant::now();
+                let authenticated =
+                    std::panic::catch_unwind(|| should_probe(&job.1, host)).unwrap_or(false);
+                if started.elapsed() >= Duration::from_secs(2) {
+                    tracing::info!(
+                        host,
+                        elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "agy authentication check slow"
+                    );
+                }
+                if !authenticated {
+                    lock(&PENDING).remove(&job);
+                    return;
+                }
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
@@ -1768,6 +1795,63 @@ pub(crate) mod agy {
             std::fs::write(&exe, script).unwrap();
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
             exe
+        }
+
+        #[test]
+        fn refresh_queues_authentication_without_waiting_or_launching_duplicates() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let home =
+                std::env::temp_dir().join(format!("agy-auth-schedule-{}", std::process::id()));
+            let file = accounts::AccountsFile::default();
+            let mut scheduled = Vec::new();
+            // No credentials: refresh must still queue the auth check, rather than
+            // synchronously querying the keychain before it can schedule the job.
+            for _ in 0..2 {
+                refresh_with(
+                    &home,
+                    None,
+                    &file,
+                    Duration::from_secs(300),
+                    |key, host, _| {
+                        scheduled.push((key.clone(), host));
+                    },
+                );
+            }
+            let key = (
+                home.clone(),
+                accounts::host_default_dir(&home, ProviderKind::Antigravity),
+            );
+            let pending = lock(&PENDING).contains(&key);
+            reset_latch_for_tests();
+            assert_eq!(scheduled, vec![(key, true)]);
+            assert!(
+                pending,
+                "authentication must be deduplicated while it is queued"
+            );
+        }
+
+        #[test]
+        fn signed_out_auth_worker_releases_pending_without_caching_failure() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let home =
+                std::env::temp_dir().join(format!("agy-auth-signed-out-{}", std::process::id()));
+            let key = (home.clone(), home.join("missing-profile"));
+            assert!(lock(&PENDING).insert(key.clone()));
+            spawn(&key, false, None);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while lock(&PENDING).contains(&key) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let pending = lock(&PENDING).contains(&key);
+            let failed = lock(&FAILED).contains_key(&key);
+            reset_latch_for_tests();
+            assert!(!pending, "signed-out authentication must release its job");
+            assert!(
+                !failed,
+                "a subsequent login must not wait for the usage failure cooldown"
+            );
         }
 
         const USAGE_ENVELOPE: &str = r#"{
