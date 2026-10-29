@@ -15,10 +15,12 @@ import tempfile
 
 from macos import ed25519_manifest as ed
 
+ROOT = Path(__file__).resolve().parents[1]
 VOLUME = Path("/Volumes/krill-build")
 TARGETS = VOLUME / "targets"
 BINARIES = ("krill-app", "krill", "krill-holder", "krilld", "krill-link")
-SCOPE = ("scripts/check.sh", "windows-clippy", "memory-10-terminals", "release-gui-kill9-replay", "release-holder-survival")
+SCOPE = ("scripts/check.sh", "windows-clippy", "memory-10-terminals", "release-gui-kill9-replay", "release-holder-survival",
+         "mobile-real-browser")
 SCHEMA = 1
 
 
@@ -149,6 +151,24 @@ def test_executable(package, target):
     return executables[0]
 
 
+MOBILE_BROWSER_TESTS = (("mobile_live_browser.py", "--browser-only"), ("mobile_responsive_browser.py",), ("mobile_hosts_browser.py",),
+                        ("mobile_terminal_input_browser.py",))
+
+
+def mobile_browser_gate(release):
+    """출고 바이너리를 실제 Chromium 모바일 PWA에 붙여 본다. v0.2.25·v0.2.26은 화면 업데이트 후행 바이트를 모바일
+    디코더가 거부해 'Trailing screen data'로 터미널이 안 뜬 채 출고됐다(이 테스트들이 어떤 게이트에도 없었다)."""
+    env = {"KRILLD_BIN": release / "krilld", "KRILL_BIN": release / "krill", "KRILL_MOBILE_TEST_BIN": release}
+    previous = {key: os.environ.get(key) for key in env}
+    os.environ.update({key: str(value) for key, value in env.items()})
+    try:
+        for script, *arguments in MOBILE_BROWSER_TESTS:
+            run(["python3", ROOT / "crates/krilld/tests" / script, *arguments], timeout=1800)
+    finally:
+        for key, value in previous.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+
+
 def validate(head, directory, key_file):
     directory = Path(directory)
     if VOLUME not in directory.resolve().parents or directory.exists():
@@ -196,6 +216,9 @@ def validate(head, directory, key_file):
         run(gate, timeout=900)
         if before != {name: sha256(target / "release" / name) for name in BINARIES}:
             raise ValueError("release binaries changed while validation was running")
+    mobile_browser_gate(target / "release")
+    if before != {name: sha256(target / "release" / name) for name in BINARIES}:
+        raise ValueError("release binaries changed while validation was running")
     run(["git", "diff", "--exit-code", "HEAD"])
     binary_dir = directory / "bin"
     binary_dir.mkdir(parents=True, mode=0o700)
