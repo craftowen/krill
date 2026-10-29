@@ -1073,14 +1073,14 @@ impl Panel {
         self.submit_patch_apply(patch_text, true, true, cx);
     }
 
-    pub fn discard_hunk(&mut self, hunk_index: usize, cx: &mut Context<Self>) {
+    pub fn discard_hunk(&mut self, hunk_index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.busy || self.comparison != Comparison::Worktree {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
             return;
         };
-        self.submit_patch_apply(patch_text, false, true, cx);
+        self.confirm_discard_patch(text::CONFIRM_DISCARD_HUNK.get(), patch_text, window, cx);
     }
 
     pub fn stage_selected_lines(&mut self, cx: &mut Context<Self>) {
@@ -1115,7 +1115,7 @@ impl Panel {
         self.submit_patch_apply(patch_text, true, true, cx);
     }
 
-    pub fn discard_selected_lines(&mut self, cx: &mut Context<Self>) {
+    pub fn discard_selected_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.busy || self.comparison != Comparison::Worktree {
             return;
         }
@@ -1128,7 +1128,38 @@ impl Panel {
         else {
             return;
         };
-        self.submit_patch_apply(patch_text, false, true, cx);
+        self.confirm_discard_patch(text::CONFIRM_DISCARD_LINES.get(), patch_text, window, cx);
+    }
+
+    fn confirm_discard_patch(
+        &mut self,
+        title: &str,
+        patch_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing.busy = true;
+        let detail = self.repo.display().to_string();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            title,
+            Some(&detail),
+            &[text::DISCARD.get(), text::CANCEL.get()],
+            cx,
+        );
+        self.editing.task = Some(cx.spawn(async move |this, cx| {
+            let confirmed = answer.await == Ok(0);
+            this.update(cx, |this, cx| {
+                if confirmed {
+                    this.submit_patch_apply(patch_text, false, true, cx);
+                } else {
+                    this.editing.busy = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn submit_patch_apply(
