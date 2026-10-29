@@ -2273,3 +2273,35 @@ mod executable_account_regressions {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod independent_state_verifier {
+    use super::*;
+    #[test]
+    fn independent_codex_executable_resume_uses_requested_state_not_other_active_account() {
+        let root=std::env::temp_dir().join(format!("independent-codex-state-{}",std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home=root.join("home");
+        let sid="12345678-1234-4234-8234-123456789abc";
+        let mut profile=krill_proto::agent::Agents::load(None).unwrap().profiles.get("codex").unwrap().clone();
+        profile.launch=vec![r"C:\Tools\Codex.EXE".into()];
+        for name in ["state-a","state-b"] {
+            let state=root.join(name); let data=state.join("profiles/codex/private");
+            std::fs::create_dir_all(data.join("sessions/2026/10/28")).unwrap();
+            std::fs::write(data.join("sessions/2026/10/28/rollout-only.jsonl"),format!(r#"{{"type":"session_meta","payload":{{"id":"{sid}","cwd":"/independent"}}}}"#)).unwrap();
+            let file=accounts::AccountsFile {accounts:vec![accounts::StoredAccount{id:format!("codex-{name}"),provider:"codex".into(),label:name.into(),email:None,profile_dir:data.display().to_string()}],..Default::default()};
+            let path=accounts::config_path(&home,Some(&state));
+            std::fs::write(&path,toml::to_string(&file).unwrap()).unwrap();
+        }
+        for name in ["state-a","state-b"] {
+            let state=root.join(name);let data=state.join("profiles/codex/private");
+            let path=accounts::config_path(&home,Some(&state));let before=std::fs::read(&path).unwrap();
+            let actual=resume_account_in(&home,&profile,Some(&state),None,Some(sid)).unwrap();
+            assert_eq!(actual.dir,data.display().to_string());
+            assert_eq!(actual.id,format!("codex-{name}"));
+            assert_eq!(actual.env_key,"CODEX_HOME");
+            assert_eq!(std::fs::read(&path).unwrap(),before);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
