@@ -733,3 +733,19 @@ fn worktree_local_only_subcommands_reject_host() {
     }
     fs::remove_dir_all(&state).ok();
 }
+
+#[test]
+fn account_daemon_failure_is_not_a_usage_error() {
+    for args in [
+        ["account", "policy", "a", "b"],
+        ["account", "rule", "x", "y"],
+        ["account", "auto-switch", "on", "z"],
+    ] {
+        let out = Command::new(MK)
+            .env("KRILL_STATE_DIR", "/dev/null/no-such-state")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+    }
+}

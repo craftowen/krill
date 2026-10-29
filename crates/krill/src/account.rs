@@ -79,9 +79,14 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         [] | ["list" | "ls"] => (UsageRequest::ListAccounts, false),
         ["list" | "ls", "--json"] => (UsageRequest::ListAccounts, true),
         ["policy", key, value] => {
-            let parsed = request(&UsageRequest::ListAccounts)
-                .and_then(|snap| parse_advanced_policy(key, value, snap.advanced.policy));
-            match parsed {
+            let snap = match request(&UsageRequest::ListAccounts) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    eprintln!("account: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match parse_advanced_policy(key, value, snap.advanced.policy) {
                 Ok(req) => (req, false),
                 Err(e) => {
                     eprintln!("account: {e}");
@@ -90,9 +95,14 @@ pub fn run(raw: &[OsString]) -> ExitCode {
             }
         }
         ["rule" | "rule-rm", ..] => {
-            let parsed = request(&UsageRequest::ListAccounts)
-                .and_then(|snap| parse_rule_command(&strs, &snap));
-            match parsed {
+            let snap = match request(&UsageRequest::ListAccounts) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    eprintln!("account: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match parse_rule_command(&strs, &snap) {
                 Ok(req) => (req, false),
                 Err(e) => {
                     eprintln!("account: {e}");
@@ -169,7 +179,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 Ok(snap) => snap,
                 Err(e) => {
                     eprintln!("account: {e}");
-                    return ExitCode::from(2);
+                    return ExitCode::FAILURE;
                 }
             };
             match parse_auto_switch_command(&strs, &snap) {
