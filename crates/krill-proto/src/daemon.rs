@@ -62,6 +62,8 @@ pub const PING: u8 = 0x43;
 pub const PONG: u8 = 0x63;
 /// 정상 응답 뒤 다음 ping까지의 간격. 세션 수와 무관하게 앱당 감시 연결 하나다.
 pub const INTERVAL: Duration = Duration::from_secs(2);
+/// PONG를 이만큼 연속으로 놓치면 데몬이 멈춘 것으로 본다(멈춘 데몬 감지는 `MISSES × PROBE` 안에 끝난다).
+const MISSES: u32 = 2;
 
 /// 감시 연결용 Hello에 ping/pong 지원을 더한다. 구 Hello fixture는 유지한다.
 pub fn heartbeat_hello(role: ClientRole, name: &str) -> ClientHello {
@@ -111,6 +113,7 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
     let mut nonce = 0u64;
     stream.write_all(&ping(nonce)?)?;
     let mut pending = true;
+    let mut missed = 0u32;
     let mut deadline = Instant::now()
         .checked_add(probe)
         .ok_or(io::ErrorKind::TimedOut)?;
@@ -134,8 +137,21 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
                     return Err(io::ErrorKind::InvalidData.into());
                 }
                 pending = false;
+                missed = 0;
                 deadline = Instant::now()
                     .checked_add(interval)
+                    .ok_or(io::ErrorKind::TimedOut)?;
+            }
+            // 부하가 큰 PC에서는 멀쩡한 데몬의 PONG도 한 번쯤 늦는다. 한 번 놓친 것으로 연결을 끊으면 사이드바가
+            // 재연결로 깜빡이고 알림·계정 폴링이 끊기므로, 연속 `MISSES`번 놓칠 때만 멈춘 것으로 본다.
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    && pending
+                    && missed.saturating_add(1) < MISSES =>
+            {
+                missed = missed.saturating_add(1);
+                deadline = Instant::now()
+                    .checked_add(probe)
                     .ok_or(io::ErrorKind::TimedOut)?;
             }
             Err(e) if e.kind() == io::ErrorKind::TimedOut && !pending && consumed == 0 => {
