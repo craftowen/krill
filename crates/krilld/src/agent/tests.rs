@@ -406,6 +406,29 @@ fn codex_trust_refreshes_selected_home_only_and_rechecks_after_config_changes() 
 }
 
 #[test]
+fn second_codex_trust_check_waits_for_the_one_in_progress() {
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("kd-codex-wait-{}", std::process::id()));
+    let (host, account) = (root.join("host"), root.join("account"));
+    for dir in [&host, &account] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    codex::set_checking_for_test(&account, None);
+    let finisher = {
+        let account = account.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            codex::set_checking_for_test(&account, Some("cmd"));
+        })
+    };
+    let waited = codex::ensure_trust_in(&account, &host, None, "cmd", None);
+    finisher.join().unwrap();
+    std::fs::remove_dir_all(root).ok();
+    assert!(!waited.unwrap(), "waiter reuses the finished trust");
+}
+
+#[test]
 fn pane_env_has_pane_id() {
     let env = pane_env(krill_proto::SessionId(42));
     assert_eq!(env[0], kv("MK_PANE_ID", "42"));
