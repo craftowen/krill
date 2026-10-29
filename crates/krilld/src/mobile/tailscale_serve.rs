@@ -220,6 +220,12 @@ fn choose_port(config: &Value, preferred: Option<u16>) -> io::Result<u16> {
         })
 }
 fn trusted_websocket(origin: &str, mobile_origin: &str) -> bool {
+    let Ok(nonce) = super::e2ee::random() else {
+        return false;
+    };
+    let Some(nonce) = nonce.get(..16) else {
+        return false;
+    };
     let Ok(output) = command_output(Command::new("curl").args([
         "--silent",
         "--show-error",
@@ -239,7 +245,7 @@ fn trusted_websocket(origin: &str, mobile_origin: &str) -> bool {
         "-H",
         "Sec-WebSocket-Version: 13",
         "-H",
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        &format!("Sec-WebSocket-Key: {}", super::ws::base64(nonce, false)),
         "-H",
         &format!("Origin: {mobile_origin}"),
         &format!("{origin}/ws"),
