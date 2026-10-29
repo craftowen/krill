@@ -253,6 +253,7 @@ fn exited_root_does_not_release_a_still_open_pty() {
                 session,
                 pid: 0,
                 cwd: dir.0.clone(),
+                wrapped: false,
             },
         );
         state.exited.insert(id, 0);
@@ -673,6 +674,7 @@ fn reuse_live_session_delivers_prompt_and_reaps_all_runs_after_exit() {
             session,
             pid: 0,
             cwd: dir.0.clone(),
+            wrapped: false,
         },
     );
     registry

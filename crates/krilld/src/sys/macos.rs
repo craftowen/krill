@@ -65,6 +65,22 @@ pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
     }
 }
 
+/// `pid`의 직계 자식 PID(`proc_listchildpids`).
+pub(crate) fn child_pids(pid: u32) -> io::Result<Vec<u32>> {
+    let ppid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    let mut pids: Vec<libc::pid_t> = vec![0; 64];
+    let bytes = c_int::try_from(pids.len().saturating_mul(size_of::<libc::pid_t>()))
+        .map_err(io::Error::other)?;
+    // SAFETY: pids는 bytes 바이트의 쓰기 가능한 버퍼다.
+    let n = unsafe { libc::proc_listchildpids(ppid, pids.as_mut_ptr().cast(), bytes) };
+    let n = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
+    pids.truncate(n);
+    Ok(pids
+        .into_iter()
+        .filter_map(|p| u32::try_from(p).ok())
+        .collect())
+}
+
 /// UDS 피어의 유효 UID(`getpeereid`).
 pub fn peer_uid(sock: BorrowedFd<'_>) -> io::Result<u32> {
     let mut uid: libc::uid_t = 0;

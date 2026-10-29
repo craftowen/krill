@@ -36,6 +36,10 @@ pub(crate) use windows::wrap_shell as wrap_windows_shell;
 #[cfg(windows)]
 pub use windows::{AGENT_THEN_SHELL, run as run_windows_agent};
 
+/// 래퍼 셸의 `$0`. 상태 모니터는 루트 인자에서 이 값이 사라지면 에이전트가 끝나 로그인 셸로 넘어간 것으로 본다.
+#[cfg(unix)]
+pub(crate) const WRAPPER_ARG0: &str = "mk-agent";
+
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
 /// 에이전트가 끝나면 같은 PTY에서 로그인 셸로 돌아간다(Orca처럼 종료 화면·세션 id가 남고 다른 CLI를 바로 띄운다).
 /// 설치 안 됨(127)과 종료 신호(HUP·TERM — 탭 닫기·동면)는 셸 없이 끝난다. 계정 env는 서브셸 안에서만 에이전트에 준다.
@@ -2231,7 +2235,7 @@ fn wrap_account(
         let Launch { mut argv, env } = login;
         argv.truncate(1);
         argv.extend(
-            ["-l", "-i", "-c", PREFLIGHT, "mk-agent", &hint]
+            ["-l", "-i", "-c", PREFLIGHT, WRAPPER_ARG0, &hint]
                 .into_iter()
                 .map(|s| s.as_bytes().to_vec()),
         );

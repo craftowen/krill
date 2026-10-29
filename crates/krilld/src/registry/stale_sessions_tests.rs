@@ -26,6 +26,7 @@ fn terminal_exit_overrides_stale_hook_status_without_hiding_live_done_sessions()
                 session,
                 pid: std::process::id(),
                 cwd: PathBuf::new(),
+                wrapped: false,
             },
         );
         outputs.push(output);

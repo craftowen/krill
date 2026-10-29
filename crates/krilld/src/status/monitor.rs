@@ -28,6 +28,8 @@ struct Tracked {
     /// 마지막으로 문자열화한 화면(revision·제목·평문). revision이 그대로면 다시 문자열화하지 않고
     /// 이 캐시로 감지한다(OWE-586: 유휴 20세션 문자열화 비용 제거).
     evidence: Option<(u64, String, String)>,
+    /// [`Registry::wrapped`] 결과. 세션 수명 동안 바뀌지 않아 한 번만 읽는다.
+    launched: Option<bool>,
 }
 
 impl Tracked {
@@ -123,10 +125,15 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
         let evidence = t
             .detector
             .observe(title, screen, *rev, &status, Instant::now());
-        let foreground = tap.foreground();
+        let raw = tap.foreground();
+        let foreground = super::effective_foreground(root, raw);
         #[cfg(windows)]
         let foreground = foreground.or_else(|| crate::sys::session_agent_process(root));
         if let Some(pid) = foreground {
+            // 셸 복귀 래퍼 아래 자식은 이름과 상관없이 실행한 에이전트다.
+            let wrapped = raw == Some(root)
+                && pid != root
+                && *t.launched.get_or_insert_with(|| reg.wrapped(id));
             let mut identity = crate::sys::start_us(pid).ok();
             let name = if let Some((cached_pid, cached_start, at, name)) = &t.name
                 && *cached_pid == pid
@@ -146,10 +153,12 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             let agent = matches!(
                 name.as_str(),
                 "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity" | "pi"
-            ) || (pid != root
-                && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
-                    || evidence.is_some_and(|e| e.source == krill_proto::control::Source::Title)
-                        && status.source != Some(krill_proto::control::Source::Process)));
+            ) || wrapped
+                || (pid != root
+                    && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
+                        || evidence
+                            .is_some_and(|e| e.source == krill_proto::control::Source::Title)
+                            && status.source != Some(krill_proto::control::Source::Process)));
             if agent
                 && let Some(start) = identity
                 && t.process != Some((pid, start))
@@ -173,6 +182,19 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                     }
                 }
             }
+        }
+        // 셸 복귀 래퍼가 로그인 셸로 바뀌었으면(인자에서 `mk-agent`가 사라짐) 에이전트가 끝났다.
+        // 폴링 사이에 끝나 감시에 붙지 못한 에이전트(시작 직후 실패 등)도 여기서 잡는다.
+        #[cfg(unix)]
+        if raw == Some(root)
+            && foreground == raw
+            && !(status.state == krill_proto::control::AgentState::Exited
+                && status.source == Some(krill_proto::control::Source::Process))
+            && *t.launched.get_or_insert_with(|| reg.wrapped(id))
+            && crate::sys::process_args(root)
+                .is_ok_and(|args| !args.iter().any(|a| a == crate::agent::WRAPPER_ARG0))
+        {
+            reg.with_status(id, |s| s.exited(id));
         }
         if let Some(e) = evidence {
             reg.with_status(id, |s| s.inferred(id, e, super::now_ns()));

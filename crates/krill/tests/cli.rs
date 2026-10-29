@@ -464,6 +464,8 @@ launch = ["/bin/sh", "-c", "printf 'folder-agent-ready\\n'; /bin/pwd -P; IFS= re
     assert!(text.contains(expected.to_str().unwrap()), "{text}");
     d.ok(&["send", id, "--enter", "folder-input"]);
     d.wait_text(id, "agent-received:folder-input");
+    // 에이전트 종료는 Exited로 잡히고, 세션은 로그인 셸로 남는다.
+    d.ok(&["wait", id, "--for", "exited", "--timeout", "5"]);
     assert!(
         ls_has_session(&d.ok(&["ls"]), id),
         "agent exit must retain its login shell"
@@ -1246,8 +1248,7 @@ launch = ["/bin/sh", "-c", "exit 3"]
     .unwrap();
     assert_eq!(recorded, receipt);
     assert!(
-        String::from_utf8_lossy(&broken.stderr)
-            .contains("did not become ready; prompt was not sent"),
+        String::from_utf8_lossy(&broken.stderr).contains("exited during startup"),
         "{}",
         String::from_utf8_lossy(&broken.stderr)
     );

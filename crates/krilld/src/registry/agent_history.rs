@@ -452,6 +452,7 @@ mod chat_process_tests {
                         session,
                         pid: child.0.id(),
                         cwd: "/same/project".into(),
+                        wrapped: false,
                     },
                 );
                 let snap = reg.chat_poll(id, 0);

@@ -43,6 +43,7 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
                 session,
                 pid: 0,
                 cwd,
+                wrapped: false,
             },
         );
         let dir = reg.state_dir().unwrap();
@@ -515,6 +516,7 @@ fn theme_ipc_updates_queries_and_survives_reconnect_and_restart() {
             session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     let mut light = DEFAULT;
@@ -1634,6 +1636,7 @@ fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
             session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     reg.agents
@@ -1703,6 +1706,7 @@ fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
             session: agy_session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     reg.agents
@@ -1895,6 +1899,7 @@ fn late_hook_cannot_resurrect_a_deleted_session_or_launch_metadata() {
             session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     reg.agents
@@ -2147,6 +2152,7 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
                 session,
                 pid: 1234,
                 cwd: dir.clone(),
+                wrapped: false,
             },
         );
         st.exited.insert(id, 0);
@@ -2870,4 +2876,17 @@ fn negotiated_worktree_refs_allow_observers_and_preserve_sessions() {
     drop(client);
     thread.join().unwrap();
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_argv_is_recognized_only_for_agent_launches() {
+    let agent = [
+        "/bin/zsh", "-l", "-i", "-c", "script", "mk-agent", "hint", "claude",
+    ];
+    assert!(is_wrapper_argv(&agent));
+    assert!(!is_wrapper_argv(&["/bin/zsh", "-l"]));
+    assert!(!is_wrapper_argv(&[
+        "/bin/sh", "-c", "x", "y", "z", "mk-agent"
+    ]));
 }

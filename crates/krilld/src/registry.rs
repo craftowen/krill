@@ -113,6 +113,22 @@ struct Entry {
     session: Session,
     pid: u32,
     cwd: PathBuf,
+    /// 루트가 에이전트 셸 복귀 래퍼(`agent::PREFLIGHT`)다. 에이전트 종료를 루트 종료 대신 래퍼로 판정한다.
+    wrapped: bool,
+}
+
+/// argv가 에이전트 셸 복귀 래퍼(`<shell> -l -i -c PREFLIGHT mk-agent ...`)인가.
+fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
+    #[cfg(unix)]
+    return argv
+        .get(5)
+        .is_some_and(|a| a.as_ref() == crate::agent::WRAPPER_ARG0.as_bytes())
+        && argv.get(3).is_some_and(|a| a.as_ref() == b"-c");
+    #[cfg(not(unix))]
+    {
+        let _ = argv;
+        false
+    }
 }
 
 #[derive(Default)]
@@ -288,6 +304,7 @@ impl Registry {
                     session,
                     pid: k.pid,
                     cwd: PathBuf::new(),
+                    wrapped: crate::sys::process_args(k.pid).is_ok_and(|a| is_wrapper_argv(&a)),
                 },
             );
         }
@@ -410,6 +427,14 @@ impl Registry {
     /// 현재 화면 규칙. 서명 규칙이 유효하면 그것, 아니면 내장(MK-091).
     pub(crate) fn screen_rules(&self) -> krill_proto::agent::rules::ScreenRules {
         self.agents.screen_rules()
+    }
+
+    /// 루트가 에이전트 셸 복귀 래퍼인 세션인가([`Entry::wrapped`]).
+    pub(crate) fn wrapped(&self, id: SessionId) -> bool {
+        lock(&self.state)
+            .sessions
+            .get(&id)
+            .is_some_and(|e| e.wrapped)
     }
 
     pub fn holder(&self) -> Option<&Holder> {
@@ -1694,6 +1719,7 @@ impl Registry {
     ) -> Result<(SessionId, u32), Failure> {
         use krill_proto::os::ffi::OsStrExt as _;
         sanitize_spawn_cwd(&mut cwd);
+        let wrapped = is_wrapper_argv(&argv);
         env.extend(crate::agent::pane_env_in(id, self.state_dir().as_deref()));
         // daemon `Create`의 거대 cols·rows도 여기서 자른다(K-01, CLI만 막는다).
         let size = crate::term::clamp_size(WinSize { cols, rows });
@@ -1748,6 +1774,7 @@ impl Registry {
                         session,
                         pid,
                         cwd: initial_cwd,
+                        wrapped,
                     },
                 );
                 Ok((id, pid))
@@ -4109,6 +4136,7 @@ mod orchestration_delivery_tests {
                 session,
                 pid: 0,
                 cwd: PathBuf::from("/tmp"),
+                wrapped: false,
             },
         );
         let run = OrchestrationStore::mutate(&dir, |s| {

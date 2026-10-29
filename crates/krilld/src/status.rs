@@ -527,12 +527,24 @@ pub(crate) fn foreground_process(
         .filter(|name| !name.is_empty() && name.len() <= krill_proto::control::MAX_AGENT_TEXT)
 }
 
+/// 전경 그룹이 루트(셸 복귀 래퍼)이면 그 그룹의 유일한 자식(에이전트)을 전경으로 본다([`crate::sys::wrapped_child`]).
+pub(crate) fn effective_foreground(root: u32, fg: Option<u32>) -> Option<u32> {
+    #[cfg(unix)]
+    if fg == Some(root) {
+        return crate::sys::wrapped_child(root).or(fg);
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    fg
+}
+
 /// Unix reports the terminal foreground group. Windows instead identifies an unambiguous
 /// native agent in this session's process tree, without treating generic runtimes as agents.
 pub(crate) fn session_foreground(root: u32, fg: Option<u32>, exited: bool) -> Option<String> {
     if exited {
         return None;
     }
+    let fg = effective_foreground(root, fg);
     #[cfg(windows)]
     let fg = fg.or_else(|| crate::sys::session_agent_process(root));
     foreground_process(root, fg, false, |pid| crate::sys::process_name(pid).ok())
