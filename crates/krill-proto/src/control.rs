@@ -10,7 +10,7 @@
 //! # 의미
 //!
 //! - [`Request::Create`]: krilld가 holder에 `Spawn`을 보내 새 PTY 세션을 만든다. 성공하면 [`Reply::Created`].
-//! - [`Request::List`]: 이 클라이언트가 다룰 수 있는 세션(세션 범위 권한, MK-036). 끝났지만 아직 닫지 않은 세션도 나온다.
+//! - [`Request::List`]: 이 클라이언트가 다룰 수 있는 세션(계보를 확인한 피어는 전부, MK-036). 끝났지만 아직 닫지 않은 세션도 나온다.
 //! - [`Request::Close`]: 돌고 있으면 holder가 종료 단계(SIGHUP → SIGTERM → SIGKILL, 탈출한 후손 포함)를 시작하고,
 //!   끝나면 krilld가 세션을 지운다. 이미 끝났으면 바로 지운다. 종료를 기다리지 않고 [`Reply::Closed`]로 답한다.
 //! - [`Request::NewWorktree`](MK-042): krilld의 git 작업 큐에서 워크트리를 만든다(수 초 걸릴 수 있다, 답은 끝난 뒤).
@@ -34,7 +34,7 @@
 //! - [`Request::AgentSettings`](OWE-488): [`FEAT_AGENTS`]를 협상한 뒤 전역 권한·프로필을 조회한다.
 //!   권한 변경은 전체 범위의 interactive 클라이언트만 가능하고 `agents.toml`에 저장한다. 이후 생성하는
 //!   세션부터 적용하며, 잘못된 설정 파일을 기본값으로 덮어쓰지 않는다.
-//! - [`Request::AgentLaunch`]: 같은 feature로 세션 생성 당시 프로필·권한을 조회한다. 세션 범위를 따르며,
+//! - [`Request::AgentLaunch`]: 같은 feature로 세션 생성 당시 프로필·권한을 조회한다. 피어 권한 검사를 따르며,
 //!   krilld가 Spawn 전에 저장하므로 재시작·전역 토글 변경 후에도 YOLO 배지를 복원할 수 있다.
 //!
 //! - [`Request::Upgrade`](MK-062): [`FEAT_UPGRADE`]를 협상한 전체 범위 클라이언트만. 요청한 빌드가 krilld보다 새것일
@@ -77,6 +77,8 @@ pub const FEAT_AGENTS: u64 = 1 << 31;
 pub const FEAT_SESSION_FORK: u64 = 1 << 34;
 /// krilld 업그레이드 요청(MK-062, 지휘자 배정). [`Request::Upgrade`]·[`Reply::Upgrade`] 한 쌍.
 pub const FEAT_UPGRADE: u64 = 1 << 36;
+/// Windows 업그레이드 시 활성 세션의 holder를 교체하지 않는다. 기존 Upgrade DTO는 그대로 쓴다.
+pub const FEAT_WINDOWS_UPGRADE: u64 = 1 << 29;
 /// 설정 응답의 프로필 수 상한.
 pub const MAX_AGENT_PROFILES: usize = 256;
 /// 프로필 id·표시 이름의 UTF-8 바이트 상한.
@@ -718,7 +720,7 @@ pub enum Failure {
     /// holder가 보관하는 세션이 [`MAX_SESSIONS`]개다(holder `Spawn`의 `EPROCLIM`).
     SessionLimit,
     NoSession,
-    /// 세션 범위 권한 밖(MK-036). 감사 로그에 남는다.
+    /// 권한 없음(계보 미확인 피어, observer 등). 감사 로그에 남는다.
     Denied,
     /// 없는 에이전트 프로필이거나 `agents.toml`을 읽지 못했다.
     UnknownAgent,
@@ -830,7 +832,7 @@ impl fmt::Display for Failure {
                 "session limit reached ({MAX_SESSIONS} sessions); close a session first"
             ),
             Self::NoSession => f.write_str("no such session"),
-            Self::Denied => f.write_str("not allowed from inside another session"),
+            Self::Denied => f.write_str("permission denied"),
             Self::UnknownAgent => f.write_str("unknown agent profile"),
             Self::BadRequest => f.write_str("bad request"),
             Self::Os(e) => write!(f, "{}", std::io::Error::from_raw_os_error(*e)),

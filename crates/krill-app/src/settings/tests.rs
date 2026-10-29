@@ -5467,6 +5467,108 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
     fs::remove_dir_all(d).ok();
 }
 
+#[gpui::test]
+fn project_worktree_location_saves_switches_and_resets(cx: &mut TestAppContext) {
+    let d = dir("worktree-location-form");
+    let repo_a = d.join("repo-a");
+    let repo_b = d.join("repo-b");
+    for repo in [&repo_a, &repo_b] {
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        crate::sidebar::external::register_project(&d, repo).unwrap();
+    }
+    let repo_a = fs::canonicalize(repo_a)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let repo_b = fs::canonicalize(repo_b)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Workflows, cx);
+            v.load_repo_hooks_for(&repo_a, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let input = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .worktree_location
+            .clone();
+        input.update(cx, |input, cx| input.set_value(".worktrees", window, cx));
+    });
+    click(vcx, "admin-worktree-location-save");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::sidebar::external::project_worktree_locations(&d, None)[&repo_a],
+        ".worktrees"
+    );
+
+    // An unsaved draft must not carry into another project's destination.
+    vcx.update(|window, cx| {
+        let input = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .worktree_location
+            .clone();
+        input.update(cx, |input, cx| input.set_value("unsaved", window, cx));
+        view.update(cx, |v, cx| v.load_repo_hooks_for(&repo_b, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .workflow_form
+                .as_ref()
+                .unwrap()
+                .worktree_location
+                .read(cx)
+                .value()
+                .is_empty()
+        );
+    });
+    vcx.update(|window, cx| view.update(cx, |v, cx| v.load_repo_hooks_for(&repo_a, window, cx)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx)
+                .workflow_form
+                .as_ref()
+                .unwrap()
+                .worktree_location
+                .read(cx)
+                .value()
+                .as_str(),
+            ".worktrees"
+        );
+    });
+    click(vcx, "admin-worktree-location-default");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::sidebar::external::project_worktree_locations(&d, None)[&repo_a],
+        ""
+    );
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-737: 에이전트 탭의 '첫 프롬프트로 브랜치·세션 이름 자동 변경'·'프롬프트 캐시 카운트다운'·'캐시 유지 시간(5분/1시간)'·
 /// '워크스페이스 신뢰 프리셋 자동 등록(기본 꺼짐·동의 확인 후 켜기)' 컨트롤이 `settings.toml` 및 플래그 파일에 동기화된다.
 #[gpui::test]

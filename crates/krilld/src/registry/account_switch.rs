@@ -276,6 +276,29 @@ impl Registry {
         Ok(observed)
     }
 
+    /// 셸에서 직접 띄운 에이전트는 Krill이 권한을 모르므로 Manual로 기록된다.
+    /// 살아 있는 프로세스 argv에 프로필의 `yolo_args`가 모두 있으면 YOLO로 본다.
+    fn live_agent_has_yolo_args(&self, session: SessionId, profile_id: &str) -> bool {
+        let Some(yolo) = self
+            .agents
+            .agents()
+            .ok()
+            .and_then(|a| a.resolve(profile_id).map(|(_, p)| p.yolo_args.clone()))
+            .filter(|y| !y.is_empty())
+        else {
+            return false;
+        };
+        let Some((root_pid, fg_pid)) = lock(&self.state)
+            .sessions
+            .get(&session)
+            .map(|e| (e.pid, e.session.tap().foreground()))
+        else {
+            return false;
+        };
+        let pid = foreground_vault_agent(root_pid, fg_pid).map_or(root_pid, |(pid, _)| pid);
+        crate::sys::process_args(pid).is_ok_and(|args| yolo.iter().all(|y| args.contains(y)))
+    }
+
     fn live_agent_for_switch_in(
         &self,
         session: SessionId,
@@ -1089,6 +1112,11 @@ impl Registry {
             );
             return Err(Failure::BadRequest);
         }
+        if stored.permission == krill_proto::agent::Permission::Manual
+            && self.live_agent_has_yolo_args(old, &stored.profile)
+        {
+            stored.permission = krill_proto::agent::Permission::Yolo;
+        }
         let state_dir = self.state_dir();
         let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
         let target = snapshot
@@ -1170,7 +1198,11 @@ impl Registry {
         let mut transcript_home = None;
         loop {
             if let Some(current) = self.agents.stored(old).map_err(|e| super::os(&e))? {
+                let permission = stored.permission;
                 stored = current;
+                if permission == krill_proto::agent::Permission::Yolo {
+                    stored.permission = permission;
+                }
             }
             let foreground = lock(&self.state)
                 .sessions
@@ -1316,7 +1348,6 @@ impl Registry {
                 .map_err(|e| super::os(&e))?;
         }
         let (new, _) = self.spawn_holder(
-            peer,
             holder,
             new,
             launch.argv,

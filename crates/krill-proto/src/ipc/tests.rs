@@ -262,6 +262,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_AGENTS", crate::control::FEAT_AGENTS, 31),
         ("FEAT_SESSION_FORK", crate::control::FEAT_SESSION_FORK, 34),
         ("FEAT_UPGRADE", crate::control::FEAT_UPGRADE, 36),
+        (
+            "FEAT_WINDOWS_UPGRADE",
+            crate::control::FEAT_WINDOWS_UPGRADE,
+            29,
+        ),
         ("FEAT_COLD", crate::control::FEAT_COLD, 18),
         ("FEAT_HOLDER_WATCH", crate::daemon::FEAT_HOLDER_WATCH, 7),
         ("FEAT_HISTORY", crate::history::FEAT_HISTORY, 16),

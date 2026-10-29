@@ -25,6 +25,7 @@ use crate::ui::{DarkUiTheme, LightUiTheme};
 pub use crate::i18n::Language;
 
 mod locale;
+mod location;
 
 const SETTINGS_FILE: &str = "settings.toml";
 const KEYS_FILE: &str = "keys.toml";
@@ -2850,6 +2851,7 @@ pub struct SettingsView {
 
 #[derive(Clone, Default)]
 struct ServiceCache {
+    worktree_locations: std::collections::BTreeMap<String, String>,
     worktrees: std::sync::Arc<krill_proto::orchestration::WorktreeStore>,
     orchestration: std::sync::Arc<krill_proto::orchestration::OrchestrationStore>,
     aliases: std::collections::BTreeMap<String, String>,
@@ -2923,6 +2925,7 @@ fn service_stamps(dir: &Path) -> Vec<Option<AdminFileStamp>> {
         krill_proto::schedule::FILE,
         krill_proto::schedule::RUNS,
         krill_proto::schedule::PREVIOUS_RUNS,
+        crate::sidebar::external::PROJECTS_FILE,
     ]
     .iter()
     .map(|name| admin_stamp(&dir.join(name)))
@@ -3071,6 +3074,9 @@ struct WorkflowRepoForm {
     loaded_repo: Option<String>,
     loaded_setup: String,
     loaded_archive: String,
+    worktree_location: gpui::Entity<gpui_component::input::InputState>,
+    loaded_location: String,
+    location_status: Option<(SharedString, bool)>,
     refresh_hooks: bool,
     status: Option<(SharedString, bool)>,
     _subs: Vec<Subscription>,
@@ -3379,7 +3385,11 @@ impl SettingsView {
                 this.file_jobs.remove(key);
                 if matches!(
                     key,
-                    "worktree-edit" | "schedule-edit" | "schedule-run" | "orchestration-reset"
+                    "worktree-edit"
+                        | "worktree-location-edit"
+                        | "schedule-edit"
+                        | "schedule-run"
+                        | "orchestration-reset"
                 ) {
                     this.services_checked = None;
                 }
@@ -3427,6 +3437,11 @@ impl SettingsView {
                     (
                         Some(stamp),
                         Some(ServiceCache {
+                            worktree_locations:
+                                crate::sidebar::external::project_worktree_locations(
+                                    &dir,
+                                    repo.as_deref(),
+                                ),
                             worktrees: std::sync::Arc::new(
                                 krill_proto::orchestration::WorktreeStore::load(&dir)
                                     .unwrap_or_default(),
@@ -3457,7 +3472,9 @@ impl SettingsView {
                 }
                 this.services_checked = Some(std::time::Instant::now());
                 let worktrees_changed = this.service_stamp.as_ref().and_then(|s| s.first())
-                    != stamp.as_ref().and_then(|s| s.first());
+                    != stamp.as_ref().and_then(|s| s.first())
+                    || this.service_stamp.as_ref().and_then(|s| s.last())
+                        != stamp.as_ref().and_then(|s| s.last());
                 this.service_stamp = stamp;
                 if let Some(cache) = cache {
                     let aliases_changed = this.services.aliases != cache.aliases;
@@ -11415,6 +11432,16 @@ impl SettingsView {
             .unwrap_or_default();
         let loaded_setup = default_setup.clone();
         let loaded_archive = default_archive.clone();
+        let loaded_location = self
+            .services
+            .script_for(&self.services.worktree_locations, &default_repo)
+            .unwrap_or_default();
+        let worktree_location = cx.new(|cx| {
+            let mut input = gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::WORKTREE_LOCATION_PLACEHOLDER.get());
+            input.set_value(loaded_location.clone(), window, cx);
+            input
+        });
         let repo_path = cx.new(|cx| {
             let mut input = gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::HOOKS_REPO_PLACEHOLDER.get());
@@ -11468,6 +11495,7 @@ impl SettingsView {
         // Input observers notify only; saved disk baselines must never advance with an unsent edit.
         let setup_obs = cx.observe(&setup_script, |_, _, cx| cx.notify());
         let archive_obs = cx.observe(&archive_script, |_, _, cx| cx.notify());
+        let location_obs = cx.observe(&worktree_location, |_, _, cx| cx.notify());
         self.workflow_form = Some(WorkflowRepoForm {
             repo_path,
             symlink_path,
@@ -11482,9 +11510,12 @@ impl SettingsView {
             loaded_repo,
             loaded_setup,
             loaded_archive,
+            worktree_location,
+            loaded_location,
+            location_status: None,
             refresh_hooks: false,
             status: None,
-            _subs: vec![repo_obs, repo_sub, setup_obs, archive_obs],
+            _subs: vec![repo_obs, repo_sub, setup_obs, archive_obs, location_obs],
         });
     }
 
@@ -11508,6 +11539,9 @@ impl SettingsView {
         }
         let prev_setup = form.loaded_setup.clone();
         let prev_archive = form.loaded_archive.clone();
+        let cur_location = form.worktree_location.read(cx).value().to_string();
+        let location_input = form.worktree_location.clone();
+        let refresh_location = navigating || cur_location == form.loaded_location;
         let cur_setup = form.setup_script.read(cx).value().to_string();
         let cur_archive = form.archive_script.read(cx).value().to_string();
         let setup_inp = form.setup_script.clone();
@@ -11523,6 +11557,19 @@ impl SettingsView {
             .as_deref()
             .and_then(|key| self.services.archive_script_for(key))
             .unwrap_or_default();
+
+        let repo_location = next_repo
+            .as_deref()
+            .and_then(|key| {
+                self.services
+                    .script_for(&self.services.worktree_locations, key)
+            })
+            .unwrap_or_default();
+        let target_location = if refresh_location {
+            repo_location.clone()
+        } else {
+            cur_location.clone()
+        };
 
         let target_setup = if cur_setup == prev_setup {
             repo_setup.clone()
@@ -11543,7 +11590,14 @@ impl SettingsView {
             form.loaded_repo = next_repo;
             form.loaded_setup = repo_setup;
             form.loaded_archive = repo_archive;
+            form.loaded_location = repo_location;
+            if navigating {
+                form.location_status = None;
+            }
             form.refresh_hooks = false;
+        }
+        if cur_location != target_location {
+            location_input.update(cx, |inp, cx| inp.set_value(target_location, window, cx));
         }
         if cur_setup != target_setup {
             setup_inp.update(cx, |inp, cx| inp.set_value(target_setup, window, cx));
@@ -11572,6 +11626,7 @@ impl SettingsView {
         let setup_inp = form.setup_script.clone();
         let archive_inp = form.archive_script.clone();
         let symlink_inp = form.symlink_path.clone();
+        let location_input = form.worktree_location.clone();
         let next_repo = Self::normalize_repo_key(repo_raw);
         self.refresh_service_cache(cx);
         let repo_setup = next_repo
@@ -11581,6 +11636,13 @@ impl SettingsView {
         let repo_archive = next_repo
             .as_deref()
             .and_then(|key| self.services.archive_script_for(key))
+            .unwrap_or_default();
+        let repo_location = next_repo
+            .as_deref()
+            .and_then(|key| {
+                self.services
+                    .script_for(&self.services.worktree_locations, key)
+            })
             .unwrap_or_default();
         let resolved = next_repo
             .as_ref()
@@ -11592,10 +11654,13 @@ impl SettingsView {
             form.loaded_archive.clone_from(&repo_archive);
             form.refresh_hooks = !resolved;
             form.status = None;
+            form.loaded_location.clone_from(&repo_location);
+            form.location_status = None;
         }
         if repo_inp.read(cx).value().as_str() != repo_raw {
             repo_inp.update(cx, |inp, cx| inp.set_value(repo_raw.to_owned(), window, cx));
         }
+        location_input.update(cx, |inp, cx| inp.set_value(repo_location, window, cx));
         setup_inp.update(cx, |inp, cx| inp.set_value(repo_setup, window, cx));
         archive_inp.update(cx, |inp, cx| inp.set_value(repo_archive, window, cx));
         if !symlink_inp.read(cx).value().is_empty() {
@@ -12305,6 +12370,7 @@ impl SettingsView {
             .to_owned();
 
         let mut known_repos = Self::workflow_repo_candidates(&wt_store);
+        known_repos.extend(self.services.worktree_locations.keys().cloned());
         if let Some(cur) = active_repo.as_ref().filter(|r| Path::new(r).is_absolute()) {
             known_repos.insert(cur.clone());
         }
@@ -12459,6 +12525,8 @@ impl SettingsView {
                         .text_color(p.muted_foreground)
                         .child(text::WORKFLOW_REPO_DESC.get()),
                 );
+
+            repo_context_card = repo_context_card.child(self.render_worktree_location(cx));
 
             symlinks_card = symlinks_card
                 .child(

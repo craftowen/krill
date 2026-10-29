@@ -575,6 +575,10 @@ pub struct Shell {
     creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
     restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
     restore_attempted: std::collections::HashSet<krill_proto::SessionId>,
+    /// 재개 요청 전에 실패한 숨은 칸. sync마다가 아니라 다음 재접속(`set_link`가 Up으로 바뀔 때) 한 번만 다시 시도한다.
+    restore_on_reconnect: std::collections::HashSet<krill_proto::SessionId>,
+    /// 재접속 세대. `set_link`가 Up으로 바뀔 때마다 는다. 시도 중에 재접속이 지나갔는지 가린다.
+    restore_generation: u64,
     restarting_panes: std::collections::HashSet<PaneId>,
     /// 세션을 만드는 요청(Create·Resume)을 보냈지만 답을 잃은 칸과 그 안내 문구. 이미 아는 세션에만 다시 붙고
     /// 새로 만들지 않는다(PTY 중복 방지). 만들어졌다면 사이드바에 보인다.
@@ -1127,6 +1131,8 @@ impl Shell {
             creations: HashMap::new(),
             restoring_sessions: std::collections::HashSet::new(),
             restore_attempted: std::collections::HashSet::new(),
+            restore_on_reconnect: std::collections::HashSet::new(),
+            restore_generation: 0,
             restarting_panes: std::collections::HashSet::new(),
             outcome_unknown: HashMap::new(),
             observed_sessions: std::collections::HashSet::new(),
@@ -2880,6 +2886,12 @@ impl Shell {
         let reconnecting = link == Link::Down;
         self.sidebar
             .update(cx, |s, cx| s.set_local_reconnecting(reconnecting, cx));
+        if self.link != Link::Up && link == Link::Up {
+            self.restore_generation = self.restore_generation.wrapping_add(1);
+            for old in self.restore_on_reconnect.drain() {
+                self.restore_attempted.remove(&old);
+            }
+        }
         self.link = link;
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
@@ -3941,10 +3953,12 @@ impl Shell {
         }
         let mut any_terminal = false;
         for p in visible {
-            if self
-                .layout
-                .session(p)
-                .is_some_and(|id| self.restoring_sessions.contains(&id))
+            // 복원 중 집합은 로컬 ID다. 원격 칸은 숫자가 같아도 그대로 붙인다.
+            if self.layout.host(p).is_local()
+                && self
+                    .layout
+                    .session(p)
+                    .is_some_and(|id| self.restoring_sessions.contains(&id))
             {
                 continue;
             }

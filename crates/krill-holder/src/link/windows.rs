@@ -139,11 +139,25 @@ impl Link {
             }
         }
     }
-    pub fn fill_nowait(&mut self) -> io::Result<bool> {
-        if sys::available(self.input.as_handle())? == 0 {
-            return Ok(true);
+    /// Drain every queued frame, retaining complete notifications before EOF.
+    pub fn drain_nowait(&mut self) -> io::Result<(Vec<Packet>, bool)> {
+        let mut packets = Vec::new();
+        loop {
+            while let Some(packet) = self.try_next()? {
+                packets.push(packet);
+            }
+            match sys::available(self.input.as_handle()) {
+                Ok(0) => return Ok((packets, true)),
+                Ok(_) => {}
+                Err(e) if matches!(e.raw_os_error(), Some(109 | 232)) => {
+                    return Ok((packets, false));
+                }
+                Err(e) => return Err(e),
+            }
+            if !self.fill()? {
+                return Ok((packets, false));
+            }
         }
-        self.fill()
     }
     pub fn try_next(&mut self) -> io::Result<Option<Packet>> {
         let Some((f, total)) = parse_frame(&self.buf).map_err(invalid)? else {
@@ -171,6 +185,34 @@ fn invalid(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn drain_keeps_buffered_frames_and_final_pipe_notification_before_eof() -> io::Result<()> {
+        let (a, mut b) = Link::pair()?;
+        // A large decoded batch plus a final notification still in the pipe.
+        for req in 0..2048 {
+            b.buf.extend(
+                FromHolder::Done { req }
+                    .encode_handles(&[])
+                    .map_err(invalid)?,
+            );
+        }
+        assert!(b.buf.len() > 8192);
+        a.send(
+            &FromHolder::Ready.encode_handles(&[]).map_err(invalid)?,
+            &[],
+        )?;
+        drop(a);
+        let (packets, alive) = b.drain_nowait()?;
+        assert_eq!(packets.len(), 2049);
+        assert!(!alive);
+        let last = packets.last().ok_or(io::ErrorKind::UnexpectedEof)?;
+        assert_eq!(
+            FromHolder::decode(last.frame()).map_err(invalid)?,
+            FromHolder::Ready
+        );
+        assert!(b.buf.is_empty());
+        Ok(())
+    }
     #[test]
     fn adopt_round_trip_preserves_all_recovery_handles() -> io::Result<()> {
         let (a, mut b) = Link::pair()?;

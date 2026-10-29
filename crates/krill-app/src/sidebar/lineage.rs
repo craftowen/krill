@@ -1022,6 +1022,14 @@ impl Sidebar {
         }
     }
 
+    /// 재부팅 뒤 자동 재개한 칸의 워크트리를 새로 만든 워크트리처럼 수면 숨김 필터에서도 보이게 한다.
+    /// 재개 직후엔 에이전트 상태가 아직 없어 라이브 세션만으로는 깨어 있다고 보지 않는다. 사용자가 재운 워크트리는 그대로 둔다.
+    pub fn reveal_restored_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.recently_created_worktrees.insert(path) {
+            self.rebuild(cx);
+        }
+    }
+
     /// 워크트리와 모든 자손 워크트리를 함께 수면 상태로 전환한다.
     pub fn sleep_with_descendants(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let descendants = self.lineage_descendants(&path);

@@ -196,14 +196,18 @@ impl Shell {
 
     /// 숨은 로컬 칸도 재부팅 복원 대상이다. 화면 스트림은 열지 않아 MK-035 예산을 유지한다.
     pub(super) fn restore_hidden_sessions(&mut self, visible: &[PaneId], cx: &mut Context<Self>) {
-        if self.role != WindowRole::Main {
+        // 재부팅 직후엔 앱이 krilld보다 먼저 떠서 이른 재개가 연결 실패로 끝나고 다시 시도되지 않았다
+        // (2026-10-28: 앱 기동 뒤 데몬 수신까지 약 8초). 감시 연결이 붙으면(`set_link`) 다시 불린다.
+        if self.role != WindowRole::Main || self.link != Link::Up {
             return;
         }
         let Some(target) = self.local_target() else {
             return;
         };
+        // 원격 호스트의 SessionId는 로컬과 독립이라, 보이는 로컬 칸만 견준다.
         let visible_sessions: Vec<_> = visible
             .iter()
+            .filter(|p| self.layout.host(**p).is_local())
             .filter_map(|p| self.layout.session(*p))
             .collect();
         let candidates: Vec<_> = (0..self.layout.tabs().len())
@@ -222,6 +226,7 @@ impl Shell {
                         .is_none()
             })
             .collect();
+        let generation = self.restore_generation;
         for (pane_id, old) in candidates {
             if !self.restoring_sessions.insert(old) {
                 continue;
@@ -255,11 +260,41 @@ impl Shell {
                 this.update(cx, |this, cx| {
                     this.restoring_sessions.remove(&old);
                     // 재개 요청이 닿았는지 모르면, 보이게 된 칸도 다시 재개하지 않고 아는 세션만 찾는다.
+                    let unknown = got.as_ref().is_err_and(pane::is_unknown_outcome);
+                    // 재개 요청 전에 끊겼거나(조회 EOF·연결 실패) 구 데몬이었으면 다음 재접속에서 한 번 다시 시도한다.
+                    // 같은 Up 상태의 sync마다 다시 시도하면 끊김이 이어질 때 I/O가 쉼 없이 반복된다.
+                    // 결과를 모르는 재개, 데몬의 확정 거부(closed 등), 복원 중 닫힌 칸은 다시 시도하지 않는다.
+                    let retry = match &got {
+                        Ok(found) => found.is_none(),
+                        Err(e) => {
+                            !unknown
+                                && !matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::InvalidInput
+                                        | std::io::ErrorKind::Interrupted
+                                )
+                        }
+                    };
+                    // 시도 중에 재접속이 지나갔으면 그 재접속은 이 칸을 못 봤다. 지금 세대에서 한 번 다시 시도한다.
+                    let reconnected = retry && this.restore_generation != generation;
+                    if reconnected {
+                        this.restore_attempted.remove(&old);
+                    } else if retry {
+                        this.restore_on_reconnect.insert(old);
+                    }
                     if let Err(e) = &got
-                        && pane::is_unknown_outcome(e)
+                        && unknown
                     {
                         this.outcome_unknown
                             .insert(pane_id, super::start_error_text(e));
+                    }
+                    // 정상 종료(closed)된 세션은 데몬이 재개를 거부하므로 그 워크트리는 계속 숨는다.
+                    if (unknown || matches!(got, Ok(Some(_))))
+                        && let Some(workspace) = this.pane_workspace(pane_id, cx)
+                    {
+                        this.sidebar.update(cx, |s, cx| {
+                            s.reveal_restored_worktree(workspace.folder, cx);
+                        });
                     }
                     let session = match got {
                         Ok(Some(new)) => {
@@ -273,13 +308,14 @@ impl Shell {
                         // 실패·구 데몬이면 옛 ID를 유지한다. 선택돼 있었다면 콜드 폴백을 보여준다.
                         _ => old,
                     };
-                    if this
-                        .layout
-                        .visible()
-                        .iter()
-                        .any(|p| this.layout.session(*p) == Some(session))
-                    {
+                    if this.layout.visible().iter().any(|p| {
+                        this.layout.host(*p).is_local() && this.layout.session(*p) == Some(session)
+                    }) {
                         this.sync(cx);
+                    }
+                    if reconnected {
+                        let visible = this.layout.visible();
+                        this.restore_hidden_sessions(&visible, cx);
                     }
                     cx.notify();
                 })
