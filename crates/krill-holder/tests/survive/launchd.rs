@@ -73,6 +73,7 @@ fn launchd_exec_handoff() {
 <key>MKH_GENS</key><string>10</string><key>MKH_RATE</key><string>1000000</string>
 <key>MKH_VERIFY</key><string>1</string><key>MKH_UPGRADES_RUN</key><string>10</string>
 <key>MKH_EVERY_MS</key><string>100</string><key>MKH_STEP</key><string>1</string>
+<key>KRILL_LOG_DIR</key><string>{dir}/logs</string>
 </dict><key>StandardOutPath</key><string>{dir}/stdout</string>
 <key>StandardErrorPath</key><string>{dir}/stderr</string>
 </dict></plist>"#,
