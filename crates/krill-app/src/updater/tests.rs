@@ -768,6 +768,82 @@ fn regression_relauncher_restarts_original_after_rename_failure() {
     assert_eq!(bundle_version(&app), "0.1.0");
 }
 
+/// 교체 뒤 새 앱 실행 자체가 실패하면 새 번들·`VerifyingLaunch` 저널을 남긴 채 아무 앱도 없이 끝났다.
+#[test]
+fn relaunch_rolls_back_when_the_new_app_cannot_start() {
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let d = TempGuard(temp_dir("spawn-failure"));
+    let app = d.0.join("Krill.app");
+    let state = d.0.join("state");
+    build_test_app_bundle(&app, "0.1.0", "exit 0", false);
+    let staging = staging_path(&app);
+    build_test_app_bundle(&staging, "0.2.0", "exit 0", false);
+    fs::set_permissions(
+        staging.join("Contents/MacOS/krill-app"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+
+    let outcome = relaunch_and_verify(
+        &app,
+        &state,
+        "0.1.0",
+        "0.2.0",
+        None,
+        Duration::from_secs(1),
+        &Accept,
+    )
+    .unwrap();
+    let RelaunchOutcome::RolledBack { mut restored, .. } = outcome else {
+        panic!("a new app that cannot start must roll back");
+    };
+    assert!(restored.wait().unwrap().success());
+    assert_eq!(bundle_version(&app), "0.1.0");
+    assert!(matches!(
+        Journal::load(&state).unwrap().unwrap().stage,
+        Stage::RolledBack { .. }
+    ));
+}
+
+/// 교체를 마친 뒤 남은 스테이징을 지우지 못했다는 이유만으로 완료된 업데이트를 되돌리지 않는다.
+#[test]
+fn staging_cleanup_failure_keeps_the_completed_swap() {
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let d = TempGuard(temp_dir("staging-cleanup"));
+    let app = d.0.join("Krill.app");
+    let state = d.0.join("state");
+    build_test_app_bundle(&app, "0.1.0", "exit 0", false);
+    let staging = staging_path(&app);
+    build_test_app_bundle(&staging, "0.2.0", "exit 0", false);
+    let undeletable = staging.join("Contents/Resources");
+    fs::set_permissions(&undeletable, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let swapped = swap_bundles(
+        &app,
+        &state,
+        "0.1.0",
+        "0.2.0",
+        Duration::from_secs(1),
+        &Accept,
+    );
+    fs::set_permissions(&undeletable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(swapped.unwrap().stage, Stage::VerifyingLaunch);
+    assert_eq!(bundle_version(&app), "0.2.0");
+}
+
 #[gpui::test]
 fn regression_startup_does_not_report_ready_before_attached(cx: &mut TestAppContext) {
     let d = TempGuard(temp_dir("not-attached"));
