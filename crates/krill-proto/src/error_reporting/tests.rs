@@ -1767,3 +1767,27 @@ proptest::proptest! {
         proptest::prop_assert_eq!((report.dropped, report.pending), (1, 0));
     }
 }
+
+/// 2026-10-28: krill-app updater 단위 테스트의 `single_flight(Err)`가 `capture`로 실제 상태 폴더 대기열에 썼다.
+#[test]
+fn test_processes_never_capture_into_the_default_state_dir() {
+    let none = |_: &str| None;
+    let deps = Path::new("/w/target/release/deps/pane_e2e-0123abcd");
+    assert!(is_test_process(none, Some(deps)));
+    assert!(is_test_process(
+        |k: &str| (k == "NEXTEST").then(|| "1".into()),
+        None
+    ));
+    assert!(is_test_process(
+        |k: &str| (k == "CARGO_MANIFEST_DIR").then(|| "/w/crates/krill-app".into()),
+        None
+    ));
+    let installed = Path::new("/Applications/Krill.app/Contents/MacOS/krill-app");
+    assert!(!is_test_process(none, Some(installed)));
+    assert!(!is_test_process(none, None));
+    // 이 테스트 프로세스 자신(nextest든 `cargo test`든 deps 바이너리다). Krill 세션에서 돌면 `KRILL_STATE_DIR`이
+    // 기본 경로와 같게 물려 들어온다 — 그래도 기본 폴더는 고르지 않는다.
+    if crate::daemon::state_dir() == crate::daemon::default_state_dir() {
+        assert_eq!(capture_state_dir(), None);
+    }
+}

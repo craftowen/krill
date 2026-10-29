@@ -100,7 +100,7 @@ pub fn status_with(state: &Path, env: &Env) -> std::io::Result<Status> {
 /// `UiStall`은 가장 짧은 구간(500ms 이상), `NativeCrash`는 예외·신호 미상으로 채운다 — 값을 알면
 /// [`capture_ui_stall`]이나 [`Event::new`] + [`record_at`]을 쓴다.
 pub fn capture(process: Process, code: Code, file: &str, line: u32) {
-    if let Some(state) = crate::daemon::state_dir() {
+    if let Some(state) = capture_state_dir() {
         capture_at(&state, process, code, file, line);
     }
 }
@@ -115,7 +115,7 @@ pub fn capture_ui_stall(process: Process, elapsed: Duration, file: &str, line: u
     let Some(bucket) = hang_bucket_ms(elapsed) else {
         return;
     };
-    if let Some(state) = crate::daemon::state_dir() {
+    if let Some(state) = capture_state_dir() {
         let env = Env::live();
         capture_with(
             &state,
@@ -127,6 +127,31 @@ pub fn capture_ui_stall(process: Process, elapsed: Duration, file: &str, line: u
             line,
         );
     }
+}
+
+/// [`capture`]가 쓸 상태 디렉터리. 테스트 프로세스는 기본(실제 사용자) 상태 폴더에 쓰지 않는다 — 동의가 있으면
+/// 테스트가 일부러 낸 실패가 실제 대기열로 올라간다(2026-10-28 `update_failed`). Krill 세션 안 셸은
+/// `KRILL_STATE_DIR`에 기본 경로를 그대로 물려받으므로 오버라이드 여부가 아니라 경로로 가른다.
+fn capture_state_dir() -> Option<PathBuf> {
+    let state = crate::daemon::state_dir()?;
+    let get = |key: &str| std::env::var_os(key);
+    if is_test_process(get, std::env::current_exe().ok().as_deref())
+        && crate::daemon::default_state_dir().is_some_and(|default| default == state)
+    {
+        return None;
+    }
+    Some(state)
+}
+
+/// nextest(`NEXTEST`)·`cargo test`·`cargo run --example`(`CARGO_MANIFEST_DIR`)이 띄웠거나, 직접 실행한 cargo
+/// 테스트 바이너리(`target/<프로필>/deps/<이름>-<해시>`)다. 설치본은 어느 것에도 해당하지 않는다.
+fn is_test_process(get: impl Fn(&str) -> Option<std::ffi::OsString>, exe: Option<&Path>) -> bool {
+    get("NEXTEST").is_some()
+        || get("CARGO_MANIFEST_DIR").is_some()
+        || exe
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir == "deps")
 }
 
 /// 동의·거부를 먼저 보고(꺼져 있으면 이벤트를 만들지 않는다) 종류별 필수 필드를 채워 기록한다.
