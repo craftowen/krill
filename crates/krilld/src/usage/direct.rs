@@ -21,10 +21,11 @@ use crate::session::lock;
 mod codex_reset;
 
 type Key = (PathBuf, ProviderKind, PathBuf);
+type Credentials = (Zeroizing<String>, Option<String>);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 /// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
-static RETRY: Mutex<BTreeMap<Key, (Instant, u32)>> = Mutex::new(BTreeMap::new());
+static RETRY: Mutex<BTreeMap<Key, Retry>> = Mutex::new(BTreeMap::new());
 // 아래 값은 Orca(MIT) rate-limits/service/service-types.ts·usage-retry-after.ts를 따른다.
 // 사용량 엔드포인트는 예산이 빡빡하고 사용량은 참고용이라, 촘촘히 조회하기보다 최근 값을 쓴다.
 /// 주기 틱의 조회 간격.
@@ -90,6 +91,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
     let file = accounts::load_file(home, state);
     if !file.direct_usage {
         lock(&CACHE).retain(|(h, _, _), _| h != home);
+        lock(&RETRY).retain(|(h, _, _), _| h != home);
         agy::evict(home);
         super::meters::evict(home);
         return;
@@ -125,7 +127,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
         if !force
             && (lock(&RETRY)
                 .get(&key)
-                .is_some_and(|(until, _)| Instant::now() < *until)
+                .is_some_and(|retry| Instant::now() < retry.until)
                 || (live_fresh(provider, &key.2)
                     && super::meters::has_cached(&key.0, provider, &key.2)))
             || lock(&CACHE)
@@ -151,47 +153,60 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
-            // 조회 중 사용자가 끈 경우에는 오류·429를 포함해 캐시를 갱신하지 않는다.
-            if accounts::load_file(&job.0, state.as_deref()).direct_usage {
-                let usage = match result {
-                    Fetched::Usage(usage, meters) => {
-                        lock(&RETRY).remove(&job);
-                        super::meters::remember(&job.0, job.1, &job.2, meters);
-                        Some(ProfileUsage {
-                            usage,
-                            updated_at: now,
-                            ..ProfileUsage::default()
-                        })
-                    }
-                    // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
-                    Fetched::RateLimited(wait) => {
-                        let mut retry = lock(&RETRY);
-                        let streak = retry.get(&job).map_or(0, |r| r.1);
-                        let wait = wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
-                        retry.insert(job.clone(), (Instant::now() + wait, streak));
-                        drop(retry);
-                        mark_rate_limited(&mut lock(&CACHE), &job, now);
-                        None
-                    }
-                    Fetched::Failed(reason) => {
-                        tracing::warn!(provider = job.1.as_str(), reason = %reason.detail(), "direct usage refresh failed");
-                        let mut retry = lock(&RETRY);
-                        let streak = retry.get(&job).map_or(0, |r| r.1).saturating_add(1);
-                        retry.insert(job.clone(), (Instant::now() + failure_wait(streak), streak));
-                        mark_failed(&mut lock(&CACHE), &job, now, reason);
-                        None
-                    }
-                };
-                if let Some(usage) = usage {
-                    let mut cache = lock(&CACHE);
-                    cache.retain(|_, (at, u)| alive(*at, u));
-                    cache.insert(job.clone(), (Instant::now(), usage));
-                }
+            // Discard in-flight results if the user disabled direct usage meanwhile.
+            if accounts::load_file(&job.0, state.as_deref()).direct_usage
+                && let Some(usage) = apply_result(&job, result, now)
+            {
+                let mut cache = lock(&CACHE);
+                cache.retain(|_, (at, u)| alive(*at, u));
+                cache.insert(job.clone(), (Instant::now(), usage));
             }
             lock(&PENDING).remove(&job);
         });
     if launched.is_err() {
         lock(&PENDING).remove(key);
+    }
+}
+
+fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileUsage> {
+    match result {
+        Fetched::Usage(usage, meters) => {
+            if lock(&RETRY)
+                .remove(job)
+                .is_some_and(|retry| retry.reason.is_some())
+            {
+                tracing::info!(provider = job.1.as_str(), profile = %profile_id(&job.2), "direct usage refresh recovered");
+            }
+            super::meters::remember(&job.0, job.1, &job.2, meters);
+            Some(ProfileUsage {
+                usage,
+                updated_at: now,
+                ..ProfileUsage::default()
+            })
+        }
+        // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
+        Fetched::RateLimited(wait) => {
+            let mut retry = lock(&RETRY);
+            let entry = retry.entry(job.clone()).or_insert_with(Retry::new);
+            entry.until =
+                Instant::now() + wait.unwrap_or(RATE_LIMIT_RETRY).min(MAX_RATE_LIMIT_WAIT);
+            drop(retry);
+            mark_rate_limited(&mut lock(&CACHE), job, now);
+            None
+        }
+        Fetched::Failed(reason) => {
+            let mut retry = lock(&RETRY);
+            if retry
+                .entry(job.clone())
+                .or_insert_with(Retry::new)
+                .fail(reason, Instant::now())
+            {
+                tracing::warn!(provider = job.1.as_str(), profile = %profile_id(&job.2), reason = %reason.detail(), "direct usage refresh failed");
+            }
+            drop(retry);
+            mark_failed(&mut lock(&CACHE), job, now, reason);
+            None
+        }
     }
 }
 
@@ -202,10 +217,11 @@ enum Fetched {
     Failed(Failure),
 }
 
-/// Closed diagnostic vocabulary: never retain credentials, response text or paths.
+/// Only fixed diagnostics are retained; credentials and server response text never enter logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
     Credentials,
+    Expired,
     Request,
     Transport,
     Http(u16),
@@ -217,6 +233,9 @@ impl Failure {
     fn detail(self) -> String {
         match self {
             Self::Credentials => "사용량 자격증명 읽기 실패".into(),
+            Self::Expired => {
+                "사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요".into()
+            }
             Self::Request => "사용량 요청 구성 실패".into(),
             Self::Transport => "사용량 API 연결·전송 실패".into(),
             Self::Http(401) => "사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요".into(),
@@ -226,6 +245,43 @@ impl Failure {
             Self::Internal => "사용량 조회 작업 실패".into(),
         }
     }
+}
+
+struct Retry {
+    until: Instant,
+    failures: u32,
+    reason: Option<Failure>,
+}
+
+impl Retry {
+    fn new() -> Self {
+        Self {
+            until: Instant::now(),
+            failures: 0,
+            reason: None,
+        }
+    }
+
+    /// Like the scheduler failure streak: warn once, double the wait, reset on success.
+    /// A changed reason starts a new streak; 429 only changes the deadline.
+    fn fail(&mut self, reason: Failure, now: Instant) -> bool {
+        let report = self.reason != Some(reason);
+        if report {
+            self.failures = 0;
+        }
+        self.reason = Some(reason);
+        self.failures = self.failures.saturating_add(1);
+        self.until = now + failure_wait(self.failures);
+        report
+    }
+}
+
+/// Stable diagnostic identifier without paths, account emails or credential material.
+fn profile_id(dir: &Path) -> String {
+    format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()))
+        .chars()
+        .take(12)
+        .collect()
 }
 
 /// 실행 중인 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
@@ -324,8 +380,9 @@ fn fetch(
     home: &Path,
     state: Option<&Path>,
 ) -> Fetched {
-    let Some((token, account)) = credentials(provider, dir, host, home, state) else {
-        return Fetched::Failed(Failure::Credentials);
+    let (token, account) = match usage_credentials(provider, dir, host, home, state) {
+        Ok(credentials) => credentials,
+        Err(reason) => return Fetched::Failed(reason),
     };
     let (usage, mut meters) = match fetch_usage(provider, &token, account.as_deref(), curl_response)
     {
@@ -943,13 +1000,13 @@ fn opencode_go_override(home: &Path, state: Option<&Path>) -> Option<Zeroizing<S
     None
 }
 
-fn credentials(
+fn other_credentials(
     provider: ProviderKind,
     dir: &Path,
     host: bool,
     home: &Path,
     state: Option<&Path>,
-) -> Option<(Zeroizing<String>, Option<String>)> {
+) -> Option<Credentials> {
     if provider == ProviderKind::OpenCode {
         if let Some(key) = opencode_go_override(home, state) {
             return Some((key, None));
@@ -984,19 +1041,40 @@ fn credentials(
             .filter(|s| !s.is_empty())?;
         return Some((Zeroizing::new(env_key), None));
     }
-    if provider == ProviderKind::Claude {
-        return claude_credentials(dir, host, keychain);
-    }
     parse_credentials(provider, &read_file(&dir.join("auth.json"))?)
 }
 
-/// 읽혔다는 이유만으로 자격증명 소스를 확정하지 않는다. 오래되거나 깨진 키체인 항목·
-/// 파일이 현재 CLI가 저장한 정상 파일을 가리지 않게 소스별로 파싱한다.
-fn claude_credentials(
+fn credentials(
+    provider: ProviderKind,
     dir: &Path,
     host: bool,
-    read_keychain: impl Fn(&str, &str) -> Option<Zeroizing<Vec<u8>>>,
-) -> Option<(Zeroizing<String>, Option<String>)> {
+    home: &Path,
+    state: Option<&Path>,
+) -> Option<Credentials> {
+    usage_credentials(provider, dir, host, home, state).ok()
+}
+
+fn usage_credentials(
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+    home: &Path,
+    state: Option<&Path>,
+) -> Result<Credentials, Failure> {
+    if provider == ProviderKind::Claude {
+        return claude_credentials_at(dir, host, keychain, now_secs().saturating_mul(1000));
+    }
+    other_credentials(provider, dir, host, home, state).ok_or(Failure::Credentials)
+}
+
+/// Re-read the CLI-owned store on every attempt. Never rotate its refresh token or
+/// fall through to a different account just because the selected token expired.
+fn claude_credentials_at(
+    dir: &Path,
+    host: bool,
+    read_secret: impl Fn(&str, &str) -> Option<Zeroizing<Vec<u8>>>,
+    now_ms: i64,
+) -> Result<Credentials, Failure> {
     let user = claude_keychain_user();
     let mut dirs = vec![dir.to_path_buf()];
     for candidate in [
@@ -1015,22 +1093,35 @@ fn claude_credentials(
     } else {
         &[user.as_str(), "claude-code-user"]
     };
-    dirs.iter()
+    let selected = dirs
+        .iter()
         .find_map(|dir| {
             let service = claude_service((!host).then_some(dir.as_path()))?;
             accounts.iter().find_map(|account| {
-                let raw = read_keychain(&service, account)?;
-                parse_credentials(ProviderKind::Claude, &raw)
+                let raw = read_secret(&service, account)?;
+                claude_credential(&raw, now_ms)
             })
         })
         .or_else(|| {
             [".credentials.json", "credentials.json"]
                 .iter()
-                .find_map(|name| {
-                    let raw = read_file(&dir.join(name))?;
-                    parse_credentials(ProviderKind::Claude, &raw)
-                })
-        })
+                .find_map(|name| claude_credential(&read_file(&dir.join(name))?, now_ms))
+        });
+    selected.unwrap_or(Err(Failure::Credentials))
+}
+
+fn claude_credential(raw: &[u8], now_ms: i64) -> Option<Result<Credentials, Failure>> {
+    let credentials = parse_credentials(ProviderKind::Claude, raw)?;
+    let text = credential_utf8(raw)?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if json
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|expires| expires <= now_ms)
+    {
+        return Some(Err(Failure::Expired));
+    }
+    Some(Ok(credentials))
 }
 
 fn credential_utf8(raw: &[u8]) -> Option<Zeroizing<String>> {
@@ -1110,10 +1201,7 @@ fn decode_base64(input: &str) -> Option<Zeroizing<Vec<u8>>> {
     Some(out)
 }
 
-fn parse_credentials(
-    provider: ProviderKind,
-    raw: &[u8],
-) -> Option<(Zeroizing<String>, Option<String>)> {
+fn parse_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Credentials> {
     let text = credential_utf8(raw)?;
     let mut json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let (token_path, account_path) = if provider == ProviderKind::Claude {
@@ -2106,6 +2194,9 @@ fn agy_exe() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+mod failure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2165,6 +2256,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let key = (home.clone(), ProviderKind::Claude, dir);
         for reason in [
+            Failure::Expired,
             Failure::Credentials,
             Failure::Request,
             Failure::Transport,
@@ -2209,19 +2301,24 @@ mod tests {
         ] {
             std::fs::write(&primary, broken).unwrap();
             let found =
-                claude_credentials(&root, true, |_, _| Some(broken.to_vec().into())).unwrap();
+                claude_credentials_at(&root, true, |_, _| Some(broken.to_vec().into()), 0).unwrap();
             assert_eq!(&*found.0, "current-fixture-only");
             assert_eq!(std::fs::read(&primary).unwrap(), broken);
             assert_eq!(std::fs::read(&fallback).unwrap(), valid);
         }
         // 정상 키체인은 기존 우선순위를 유지한다.
-        let from_keychain = claude_credentials(&root, true, |_, _| {
-            Some(
-                br#"{"claudeAiOauth":{"accessToken":"keychain-fixture-only"}}"#
-                    .to_vec()
-                    .into(),
-            )
-        })
+        let from_keychain = claude_credentials_at(
+            &root,
+            true,
+            |_, _| {
+                Some(
+                    br#"{"claudeAiOauth":{"accessToken":"keychain-fixture-only"}}"#
+                        .to_vec()
+                        .into(),
+                )
+            },
+            0,
+        )
         .unwrap();
         assert_eq!(&*from_keychain.0, "keychain-fixture-only");
         std::fs::remove_dir_all(root).unwrap();
