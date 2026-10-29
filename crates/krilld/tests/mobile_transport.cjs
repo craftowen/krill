@@ -1614,3 +1614,28 @@ test("1013 shows one generic temporary-limit message for auth cooldown and relay
   );
   h.transport.close();
 });
+
+test('Pair Desktop opens Tailscale QR links at their own origin and preserves saved relay credentials',()=>{
+ const saved={device_id:'saved',credential:'11'.repeat(32),rid:'c'.repeat(32),hash:'0123456789abcdef'};
+ for(const ip of ['100.64.0.0','100.64.1.2','100.127.255.255']){
+  const h=harness(saved,undefined,true),link=`http://${ip}:52931/#pair=ab12&key=secret`,stored=h.store.get('krill-mobile-v2'),book=h.store.get('krill-mobile-hosts-v1'),route=h.endpoint.socketUrl();
+  const next=h.endpoint.adopt(link);assert.equal(next,null,'direct HTTP pairing needs navigation out of the HTTPS app');
+  const line=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(line=>line.includes('function pairWith('));
+  h.context.location.assign=href=>h.redirects.push(href);h.context.startPairing=()=>assert.fail('HTTPS must not dial a direct HTTP endpoint');vm.runInContext(line+';globalThis.pairWith=pairWith;',h.context);h.context.pairWith(link,next);
+  assert.deepEqual(h.redirects,[link]);assert.equal(h.sockets.length,0);assert.equal(h.endpoint.socketUrl(),route);assert.equal(h.store.get('krill-mobile-v2'),stored);assert.equal(h.store.get('krill-mobile-hosts-v1'),book);h.transport.close();
+  const direct=harness(null,link,true);assert.equal(direct.endpoint.pair.ticket,'ab12');assert.equal(direct.endpoint.pair.secret,'secret');assert.equal(direct.endpoint.socketUrl(),`ws://${ip}:52931/ws`);direct.transport.close();
+ }
+});
+test('Tailscale pairing navigation rejects LAN, loopback, out-of-range and credential-bearing URLs',()=>{
+ const h=harness(null,undefined,true);
+ for(const origin of ['http://100.63.255.255:52931','http://100.128.0.0:52931','http://192.168.0.5:52931','http://127.0.0.1:52931','http://localhost:52931','http://100.64.1.2.evil.test:52931','http://user:pass@100.64.1.2:52931'])assert.throws(()=>h.endpoint.adopt(origin+'/#pair=ab12&key=secret'));
+ assert.throws(()=>h.endpoint.adopt('http://100.64.1.2:52931/other/#pair=ab12&key=secret'));
+ for(const hash of ['#pair=ab12','#key=secret','#pair=zz&key=secret'])assert.throws(()=>h.endpoint.adopt('http://100.64.1.2:52931/'+hash));
+ assert.equal(h.redirects.length,0);assert.equal(h.sockets.length,0);h.transport.close();
+});
+
+test('Tailscale pairing rejects malformed URLs and empty pairing fields without changing saved relay state',()=>{
+ const saved={device_id:'saved',credential:'11'.repeat(32),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,undefined,true),stored=h.store.get('krill-mobile-v2'),book=h.store.get('krill-mobile-hosts-v1'),route=h.endpoint.socketUrl();
+ for(const link of ['not a URL','http://100.64.1.256:52931/#pair=ab12&key=secret','http://100.64.1.2:99999/#pair=ab12&key=secret','http://user@100.64.1.2:52931/#pair=ab12&key=secret','http://:pass@100.64.1.2:52931/#pair=ab12&key=secret','http://[::1]:52931/#pair=ab12&key=secret','http://100.64.1.2:52931//#pair=ab12&key=secret','http://100.64.1.2:52931/#pair=&key=secret','http://100.64.1.2:52931/#pair=ab12&key='])assert.throws(()=>h.endpoint.adopt(link));
+ assert.deepEqual(h.redirects,[]);assert.equal(h.sockets.length,0);assert.equal(h.endpoint.socketUrl(),route);assert.equal(h.store.get('krill-mobile-v2'),stored);assert.equal(h.store.get('krill-mobile-hosts-v1'),book);h.transport.close();
+});
