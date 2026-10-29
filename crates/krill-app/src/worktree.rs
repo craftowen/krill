@@ -116,6 +116,8 @@ pub struct Dialog {
     highlight: Option<usize>,
     hooks: krill_proto::orchestration::RepoHookSummary,
     hooks_task: Option<Task<()>>,
+    /// git이 아닌 폴더인지(레포 경로별 캐시). 폴더면 기준 ref 대신 안내를 보인다.
+    folder: Option<(PathBuf, bool)>,
 }
 
 struct Preparation {
@@ -335,6 +337,7 @@ impl Dialog {
             highlight: None,
             hooks: krill_proto::orchestration::RepoHookSummary::default(),
             hooks_task: None,
+            folder: None,
         };
         if !candidates.is_empty() {
             dialog.set_branch_candidates(candidates, cx);
@@ -615,8 +618,34 @@ impl Dialog {
         }
     }
 
+    /// 로컬 레포가 git 저장소가 아닌지 판정해 캐시한다. 데몬의 폴더 작업공간 판정(`.git` 조상 없음)과 같다.
+    fn is_folder(&mut self) -> bool {
+        if self.host.is_local()
+            && self
+                .folder
+                .as_ref()
+                .is_none_or(|(path, _)| *path != self.repo)
+        {
+            let folder =
+                self.repo.is_dir() && !self.repo.ancestors().any(|a| a.join(".git").exists());
+            self.folder = Some((self.repo.clone(), folder));
+        }
+        self.cached_folder()
+    }
+
+    fn cached_folder(&self) -> bool {
+        self.host.is_local()
+            && self
+                .folder
+                .as_ref()
+                .is_some_and(|(path, folder)| *folder && *path == self.repo)
+    }
+
     /// OWE-853: 현재 입력값으로 필터한 후보(최대 8개). 빈 입력이면 상위 후보를 그대로 보인다.
     fn filtered_bases(&self, cx: &App) -> Vec<String> {
+        if self.cached_folder() {
+            return Vec::new();
+        }
         let query = self.base.read(cx).value().trim().to_lowercase();
         let mut out = Vec::new();
         for candidate in &self.candidates {
@@ -819,7 +848,8 @@ impl Dialog {
         Ok(NewWorktree {
             repo: self.repo.as_os_str().as_bytes().to_vec(),
             name,
-            base: (!base.is_empty()).then_some(base),
+            // 폴더 작업공간은 기준 ref가 없다(데몬이 거부한다).
+            base: (!base.is_empty() && !self.cached_folder()).then_some(base),
             setup,
         })
     }
@@ -969,6 +999,7 @@ impl Render for Dialog {
                 input.set_placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get(), window, cx);
             });
         }
+        let folder = self.is_folder();
         let p = crate::ui::palette(cx);
         let (warning, muted) = (p.warning, p.muted_foreground);
         let close = Button::new("worktree-close")
@@ -991,7 +1022,12 @@ impl Render for Dialog {
             _ => Vec::new(),
         };
         let highlight = self.highlight;
-        let base_candidates = filtered.clone();
+        // 기준 ref 후보는 그 입력에 포커스가 있을 때만 펼친다(콤보박스).
+        let base_candidates = if self.base_is_focused(window, cx) {
+            filtered.clone()
+        } else {
+            Vec::new()
+        };
         let selected_agents = self.selected_agents.clone();
         let current_host = self.host.clone();
         let current_repo = self.repo.clone();
@@ -1018,70 +1054,90 @@ impl Render for Dialog {
         };
         let body = match &self.phase {
             Phase::Edit(error) => body
-                .when(host_options.len() > 1, |d| {
-                    let current = current_host.clone();
-                    d.child(
-                        div()
-                            .id("worktree-host-selector")
+                .when(
+                    host_options.len() > 1 || current_host_repos.len() > 1,
+                    |d| {
+                        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+                        let this = cx.entity().downgrade();
+                        let host_menu = {
+                            let this = this.clone();
+                            let options = host_options.clone();
+                            let current = current_host.clone();
+                            crate::ui::secondary(
+                                "worktree-host-selector",
+                                host_label.clone().unwrap_or_default(),
+                            )
                             .debug_selector(|| "worktree-host-selector".into())
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(crate::ui::field_label(text::HOST_LABEL.get(), None, p))
-                            .child(div().flex().flex_wrap().gap_1().children(
-                                host_options.iter().enumerate().map(|(idx, opt)| {
-                                    let selected = opt.host == current;
+                            .dropdown_caret(true)
+                            .dropdown_menu(move |mut menu, _, _| {
+                                menu = menu.scrollable(true).max_h(px(360.));
+                                for opt in &options {
                                     let next = opt.host.clone();
-                                    let key = opt.host.as_key().to_owned();
-                                    Button::new(("worktree-host", idx))
-                                        .debug_selector(move || format!("worktree-host-{key}"))
-                                        .xsmall()
-                                        .label(opt.label.clone())
-                                        .selected(selected)
-                                        .toggled(selected)
-                                        .ghost()
-                                        .on_click(cx.listener(move |d, _, window, cx| {
-                                            d.select_host(next.clone(), window, cx);
-                                        }))
-                                }),
-                            )),
-                    )
-                })
-                .when(current_host_repos.len() > 1, |d| {
-                    let current = current_repo.clone();
-                    d.child(
-                        div()
-                            .id("worktree-repo-selector")
-                            .debug_selector(|| "worktree-repo-selector".into())
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(crate::ui::field_label(text::REPO_LABEL.get(), None, p))
-                            .child(
-                                div().flex().flex_wrap().gap_1().children(
-                                    current_host_repos
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(idx, repo_opt)| {
-                                            let selected = repo_opt.path == current;
-                                            let next = repo_opt.path.clone();
-                                            Button::new(("worktree-repo", idx))
-                                                .debug_selector(move || {
-                                                    format!("worktree-repo-{idx}")
+                                    let this = this.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(opt.label.clone())
+                                            .checked(opt.host == current)
+                                            .on_click(move |_, window, cx| {
+                                                this.update(cx, |d, cx| {
+                                                    d.select_host(next.clone(), window, cx);
                                                 })
-                                                .xsmall()
-                                                .label(repo_opt.label.clone())
-                                                .selected(selected)
-                                                .toggled(selected)
-                                                .ghost()
-                                                .on_click(cx.listener(move |d, _, window, cx| {
-                                                    d.select_repo(next.clone(), window, cx);
-                                                }))
-                                        }),
-                                ),
-                            ),
-                    )
-                })
+                                                .ok();
+                                            }),
+                                    );
+                                }
+                                menu
+                            })
+                        };
+                        let repo_menu = {
+                            let repos = current_host_repos.clone();
+                            let current = current_repo.clone();
+                            let label = repos.iter().find(|r| r.path == current).map_or_else(
+                                || current.to_string_lossy().into_owned(),
+                                |r| r.label.clone(),
+                            );
+                            crate::ui::secondary("worktree-repo-selector", label)
+                                .debug_selector(|| "worktree-repo-selector".into())
+                                .dropdown_caret(true)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    menu = menu.scrollable(true).max_h(px(360.));
+                                    for repo_opt in &repos {
+                                        let next = repo_opt.path.clone();
+                                        let this = this.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(repo_opt.label.clone())
+                                                .checked(repo_opt.path == current)
+                                                .on_click(move |_, window, cx| {
+                                                    this.update(cx, |d, cx| {
+                                                        d.select_repo(next.clone(), window, cx);
+                                                    })
+                                                    .ok();
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                })
+                        };
+                        let field = |label: &'static str, button| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(crate::ui::field_label(label, None, p))
+                                .child(button)
+                        };
+                        d.child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .when(host_options.len() > 1, |d| {
+                                    d.child(field(text::HOST_LABEL.get(), host_menu))
+                                })
+                                .when(current_host_repos.len() > 1, |d| {
+                                    d.child(field(text::REPO_LABEL.get(), repo_menu))
+                                }),
+                        )
+                    },
+                )
                 .child(
                     div()
                         .flex()
@@ -1090,92 +1146,110 @@ impl Render for Dialog {
                         .child(crate::ui::field_label(text::NAME_LABEL.get(), None, p))
                         .child(Input::new(&self.name)),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(crate::ui::field_label(
-                            text::BASE_LABEL.get(),
-                            Some(text::OPTIONAL.get()),
-                            p,
-                        ))
-                        .child(Input::new(&self.base))
-                        .when(!base_candidates.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .id("worktree-base-options")
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .mt_1()
-                                    .rounded(crate::ui::RADIUS_SM)
-                                    .border_1()
-                                    .border_color(p.border)
-                                    .bg(p.background)
-                                    .p_1()
-                                    .children(base_candidates.iter().enumerate().map(
-                                        |(index, candidate)| {
-                                            let label = candidate.clone();
-                                            let picked = candidate.clone();
-                                            let is_active = highlight == Some(index);
-                                            div()
-                                                .id(("worktree-base-option", index))
-                                                .debug_selector(move || {
-                                                    format!("worktree-base-option-{label}")
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(crate::ui::RADIUS_XS)
-                                                .font_family(crate::ui::FONT_MONO)
-                                                .text_size(crate::ui::TEXT_SM)
-                                                .text_color(if is_active {
-                                                    p.accent_foreground
-                                                } else {
-                                                    p.muted_foreground
-                                                })
-                                                .when(is_active, |row| row.bg(p.accent))
-                                                .cursor_pointer()
-                                                .child(picked.clone())
-                                                .on_click(cx.listener(move |d, _, window, cx| {
-                                                    d.base.update(cx, |input, cx| {
-                                                        input.set_value(&picked, window, cx);
-                                                    });
-                                                    d.highlight = None;
-                                                    d.prepare(cx);
-                                                    cx.notify();
-                                                }))
-                                        },
-                                    )),
-                            )
-                        })
-                        .when(self.preparation.is_some(), |d| {
-                            d.child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .text_color(muted)
-                                    .child(if self.preparation_ready {
-                                        text::PREPARED.get()
-                                    } else {
-                                        text::PREPARING.get()
-                                    })
-                                    .child(
-                                        Button::new("cancel-preparation")
-                                            .ghost()
-                                            .xsmall()
-                                            .label(text::CANCEL_PREPARATION.get())
-                                            .on_click(
-                                                cx.listener(|d, _, _, cx| d.cancel_preparation(cx)),
-                                            ),
-                                    ),
-                            )
-                        }),
-                )
+                .when(folder, |d| {
+                    d.child(
+                        div()
+                            .id("worktree-folder-notice")
+                            .debug_selector(|| "worktree-folder-notice".into())
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(muted)
+                            .child(text::FOLDER_NOTICE.get()),
+                    )
+                })
+                .when(!folder, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(crate::ui::field_label(
+                                text::BASE_LABEL.get(),
+                                Some(text::OPTIONAL.get()),
+                                p,
+                            ))
+                            .child(Input::new(&self.base))
+                            .when(!base_candidates.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .id("worktree-base-options")
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .mt_1()
+                                        .rounded(crate::ui::RADIUS_SM)
+                                        .border_1()
+                                        .border_color(p.border)
+                                        .bg(p.background)
+                                        .p_1()
+                                        .children(base_candidates.iter().enumerate().map(
+                                            |(index, candidate)| {
+                                                let label = candidate.clone();
+                                                let picked = candidate.clone();
+                                                let is_active = highlight == Some(index);
+                                                div()
+                                                    .id(("worktree-base-option", index))
+                                                    .debug_selector(move || {
+                                                        format!("worktree-base-option-{label}")
+                                                    })
+                                                    .flex()
+                                                    .items_center()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded(crate::ui::RADIUS_XS)
+                                                    .font_family(crate::ui::FONT_MONO)
+                                                    .text_size(crate::ui::TEXT_SM)
+                                                    .text_color(if is_active {
+                                                        p.accent_foreground
+                                                    } else {
+                                                        p.muted_foreground
+                                                    })
+                                                    .when(is_active, |row| row.bg(p.accent))
+                                                    .cursor_pointer()
+                                                    .child(picked.clone())
+                                                    // 눌림 시점에 처리하고 기본 동작을 막아 입력 포커스(=목록)를 유지한다.
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        cx.listener(move |d, _, window, cx| {
+                                                            window.prevent_default();
+                                                            d.base.update(cx, |input, cx| {
+                                                                input
+                                                                    .set_value(&picked, window, cx);
+                                                            });
+                                                            d.highlight = None;
+                                                            d.prepare(cx);
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                            },
+                                        )),
+                                )
+                            })
+                            .when(self.preparation.is_some(), |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .text_size(crate::ui::TEXT_2XS)
+                                        .text_color(muted)
+                                        .child(if self.preparation_ready {
+                                            text::PREPARED.get()
+                                        } else {
+                                            text::PREPARING.get()
+                                        })
+                                        .child(
+                                            Button::new("cancel-preparation")
+                                                .ghost()
+                                                .xsmall()
+                                                .label(text::CANCEL_PREPARATION.get())
+                                                .on_click(cx.listener(|d, _, _, cx| {
+                                                    d.cancel_preparation(cx);
+                                                })),
+                                        ),
+                                )
+                            }),
+                    )
+                })
                 .child(
                     div()
                         .id("worktree-fanout-agents")

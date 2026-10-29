@@ -957,6 +957,7 @@ catalog! {
         OPTIONAL => ("[선택]", "[Optional]"),
         NAME => ("한글 가능", "Korean supported"),
         BASE => ("비우면 기본 브랜치", "Blank for default branch"),
+        FOLDER_NOTICE => ("git 저장소가 아닌 폴더라 별도 워크트리(복사본·브랜치)를 만들 수 없습니다. 만들기를 누르면 이 폴더를 그대로 열고, 고른 에이전트도 이 폴더에서 시작합니다.", "This folder is not a git repository, so no separate worktree (copy or branch) can be created. Create opens this folder as-is and starts any selected agents here."),
         CREATE => ("만들기", "Create"),
         CLOSE => ("닫기", "Close"),
         CREATING => ("생성 중… 큰 레포는 수 초 걸릴 수 있습니다", "Creating… Large repositories may take a few seconds"),
