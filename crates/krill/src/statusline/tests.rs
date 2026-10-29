@@ -291,3 +291,19 @@ fn help_flag_returns_zero() {
     assert_eq!(super::run(&[OsString::from("--help")]), ExitCode::SUCCESS);
     assert_eq!(super::run(&[OsString::from("-h")]), ExitCode::SUCCESS);
 }
+
+#[test]
+fn chain_that_never_exits_is_killed_at_the_deadline() {
+    let started = std::time::Instant::now();
+    let out = run_chain_within(
+        OsStr::new("printf partial; sleep 30"),
+        b"{}",
+        Duration::from_millis(300),
+    );
+    assert!(out.is_empty(), "timeout means empty output");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}

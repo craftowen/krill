@@ -199,6 +199,11 @@ fn chain_shell() -> PathBuf {
 /// 사용자 명령을 [`chain_shell`]`-c`로 실행하고 stdout을 그대로 돌려준다.
 /// 실패·타임아웃은 빈 출력이다(표시 우선).
 fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
+    run_chain_within(command, input, CHAIN_WAIT)
+}
+
+fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + wait;
     let mut child = match std::process::Command::new(chain_shell())
         .arg("-c")
         .arg(command)
@@ -222,13 +227,20 @@ fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
                 stdin.write_all(&input).ok();
             }
         });
-    let mut output = Vec::new();
+    // stdout을 별도 스레드에서 읽어야 출력을 닫지 않는 명령도 마감 시각에 kill에 닿는다.
+    let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_end(&mut output).ok();
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).ok();
+            tx.send(output).ok();
+        });
     }
-    let steps = CHAIN_WAIT.as_millis().div_ceil(10);
+    let output = rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok();
     let mut waited = false;
-    for _ in 0..steps {
+    while output.is_some() && std::time::Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => {
                 waited = true;
@@ -247,7 +259,7 @@ fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
         writer.join().ok();
     }
     child.wait().ok();
-    output
+    output.unwrap_or_default()
 }
 
 fn usage_error(message: impl std::fmt::Display) -> io::Error {
