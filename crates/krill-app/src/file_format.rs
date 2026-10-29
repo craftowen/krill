@@ -234,7 +234,8 @@ impl Zoom {
 /// "기본 앱으로 열기" — Launch Services(`open`)·Windows 탐색기가 확장자에 맞는 앱을 고른다.
 /// 실행 파일은 그 앱이 **실행**하므로 Finder에서 보기로 바꾼다(저장소 속 바이너리 한 번 클릭 실행 방지).
 pub fn open_default_command(path: &Path) -> Command {
-    let executable = std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(path, &m));
+    let executable = runs_when_opened(path)
+        || std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(path, &m));
     if executable {
         return reveal_command(path);
     }
@@ -246,6 +247,18 @@ pub fn open_default_command(path: &Path) -> Command {
     }
     #[cfg(not(windows))]
     open_command(&[], path)
+}
+
+/// macOS는 실행 비트와 무관하게 `open`이 실행·설치하는 확장자(앱 번들·`.command`·설치 패키지 등).
+fn runs_when_opened(path: &Path) -> bool {
+    const MACOS_RUNNABLE: &[&str] = &[
+        "app", "command", "tool", "terminal", "pkg", "mpkg", "workflow", "scpt", "scptd", "action",
+    ];
+    cfg!(target_os = "macos")
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| MACOS_RUNNABLE.iter().any(|r| e.eq_ignore_ascii_case(r)))
 }
 
 /// 기본 앱으로 열면 실행되는 파일인가. Windows는 실행 비트가 없어 셸이 실행하는 확장자로 본다.

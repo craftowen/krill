@@ -384,6 +384,19 @@ fn open_default_does_not_execute_executables() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `.command`·`.app`은 실행 비트가 없어도 `open`이 실행한다.
+#[cfg(target_os = "macos")]
+#[test]
+fn open_default_reveals_runnable_bundles_without_exec_bit() {
+    let dir = std::env::temp_dir().join(format!("mk-open-bundle-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("X.app")).unwrap();
+    std::fs::write(dir.join("go.command"), b"echo hi").unwrap();
+    let revealed = |p: &Path| open_default_command(p).get_args().any(|a| a == "-R");
+    assert!(revealed(&dir.join("X.app")));
+    assert!(revealed(&dir.join("go.command")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 proptest::proptest! {
     #[test]
     fn parsers_never_panic(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048), cut in 0u64..4096) {
