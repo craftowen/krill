@@ -708,16 +708,46 @@ fn link_only_remote_never_receives_a_local_media_path() {
 
 #[test]
 fn remote_host_target_uploads_clipboard_bytes_without_ssh_cli() {
+    target_upload_roundtrip(true, false, false);
+}
+
+#[test]
+fn remote_host_target_legacy_upload_stays_below_linux_argument_limit() {
+    target_upload_roundtrip(false, false, false);
+}
+
+#[test]
+fn remote_host_target_rejected_chunk_never_returns_a_partial_file_path() {
+    target_upload_roundtrip(true, true, false);
+}
+
+#[test]
+fn remote_clipboard_large_upload_finishes_with_delayed_control_replies() {
+    target_upload_roundtrip(true, false, true);
+}
+
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "isolated upload protocol fixture"
+)]
+fn target_upload_roundtrip(binary: bool, reject_chunk: bool, delayed: bool) {
     use krill_proto::control::{Program, Reply, Request};
     use krill_proto::ipc::{self, ServerHello};
     use std::io::Write as _;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::net::UnixListener;
 
-    let root = state_path("upload-via-target")
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let root = state_path(&format!(
+        "u-{}{}{}",
+        u8::from(binary),
+        u8::from(reject_chunk),
+        u8::from(delayed)
+    ))
+    .parent()
+    .unwrap()
+    .to_path_buf();
     std::fs::remove_dir_all(&root).ok();
     std::fs::create_dir_all(&root).unwrap();
     let sock_path = root.join("remote.sock");
@@ -729,23 +759,40 @@ fn remote_host_target_uploads_clipboard_bytes_without_ssh_cli() {
         let hello = ServerHello {
             proto_min: ipc::PROTO_MIN,
             proto_max: ipc::PROTO_MAX,
-            features: ipc::FEATURES,
+            features: if binary {
+                ipc::FEATURES
+            } else {
+                ipc::FEATURES & !krill_proto::control::FEAT_REMOTE_FS
+            },
             build: "test".into(),
             instance_id: 99,
         };
         stream.write_all(&hello.encode().unwrap()).unwrap();
         drop(ipc::read_frame(&mut stream).unwrap().unwrap());
         let mut captured_stdout = Vec::new();
+        let mut creates = 0;
+        let mut writes = 0;
         while let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) {
+            if delayed {
+                std::thread::sleep(Duration::from_millis(120));
+            }
             match Request::decode(kind, &body).unwrap() {
                 Request::Create(create) => {
+                    creates += 1;
                     if let Program::Custom { program, args } = create.program {
                         let mut cmd =
                             std::process::Command::new(std::ffi::OsStr::from_bytes(&program));
                         cmd.env("TMPDIR", &server_root);
                         for a in &args {
-                            // `sleep 2` at the end is only for keeping a real PTY alive until Capture
-                            let s = String::from_utf8_lossy(a).replace("sleep 2", "true");
+                            // This fixture tests the wire and actual file handler; the separate
+                            // real-daemon test exercises PTY capture and helper cleanup.
+                            if !binary {
+                                assert!(
+                                    a.len() < 128 * 1024,
+                                    "Linux exec argument limit includes NUL"
+                                );
+                            }
+                            let s = String::from_utf8_lossy(a).replace("sleep 3", "true");
                             cmd.arg(s);
                         }
                         let out = cmd.output().unwrap();
@@ -767,26 +814,184 @@ fn remote_host_target_uploads_clipboard_bytes_without_ssh_cli() {
                 Request::Close { .. } => {
                     let reply = Reply::Closed {};
                     stream.write_all(&reply.encode().unwrap()).unwrap();
-                    break;
                 }
-                _ => {}
+                Request::RemoteFs(request) => {
+                    writes += 1;
+                    let response = if reject_chunk {
+                        krill_proto::remote_fs::RemoteFsReply::Written(
+                            krill_proto::remote_fs::WireWriteOutcome::Failed(
+                                "disk full fixture".into(),
+                            ),
+                        )
+                    } else {
+                        krilld::remote_fs::serve(request)
+                    };
+                    stream
+                        .write_all(&Reply::RemoteFs(response).encode().unwrap())
+                        .unwrap();
+                }
+                _ => panic!("unexpected upload request"),
             }
         }
+        (creates, writes)
     });
 
     let target = krill_app::hosts::HostTarget::remote("iroh:test-mac", sock_path);
-    let payload = b"\x89PNG\r\n\x1a\nremote-paste-image-bytes";
-    let uploaded_path = super::upload_bytes_via_target(
-        &target,
-        "clipboard-image.png",
-        payload,
-        Duration::from_secs(5),
-    )
-    .expect("upload via HostTarget must succeed");
-    server.join().unwrap();
-
-    assert_eq!(std::fs::read(&uploaded_path).unwrap(), payload);
+    let payload: Vec<u8> = (0_u8..251).cycle().take(1024 * 1024 + 7).collect();
+    let uploaded_path = if delayed {
+        super::upload_bytes_via_target(
+            &target,
+            "clipboard-image.png",
+            &payload,
+            Duration::from_secs(2),
+        )
+    } else if binary {
+        // A session reached through an existing tunnel needs no separate SSH credentials.
+        let upload = super::RemoteUploadTarget {
+            ssh_host: Some(upload_test_host()),
+            host_target: Some(target),
+            windows: false,
+        };
+        super::upload_bytes_to_remote_target(&upload, "clipboard-image.png", &payload)
+    } else {
+        super::upload_bytes_via_target(
+            &target,
+            "clipboard-image.png",
+            &payload,
+            Duration::from_secs(5),
+        )
+    };
+    let (creates, writes) = server.join().unwrap();
+    if binary {
+        assert_eq!(
+            creates, 1,
+            "one destination allocation regardless of image size"
+        );
+    } else {
+        assert!(creates > 1);
+        assert_eq!(writes, 0);
+    }
+    if reject_chunk {
+        assert!(
+            uploaded_path.is_none(),
+            "partial uploads must never reach the terminal"
+        );
+        assert_eq!(writes, 1, "failed writes must not be retried");
+    } else {
+        let uploaded_path = uploaded_path.expect("upload via HostTarget must succeed");
+        assert_eq!(std::fs::read(&uploaded_path).unwrap(), payload);
+        if binary {
+            assert_eq!(
+                writes, 3,
+                "binary chunks use the existing 512 KiB wire budget"
+            );
+        }
+    }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Exercise the holder, PTY engine and capture path, rather than substituting shell stdout.
+#[test]
+fn remote_image_upload_real_daemon_preserves_large_payload() {
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    struct Fixture {
+        holder: std::process::Child,
+        daemon: Option<rustix::process::Pid>,
+        root: std::path::PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.holder.kill().ok();
+            self.holder.wait().ok();
+            if let Some(pid) = self.daemon {
+                rustix::process::kill_process(pid, rustix::process::Signal::KILL).ok();
+            }
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+    let bin = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let root = state_path("real-image-upload")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(&root).unwrap();
+    let socket = root.join("run/k.sock");
+    let holder = Command::new(bin.join("krill-holder"))
+        .arg(bin.join("krilld"))
+        .arg(&socket)
+        .env("KRILL_STATE_DIR", &root)
+        .env("TMPDIR", &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("build krill-holder and krilld before the real-daemon paste test");
+    let mut fixture = Fixture {
+        holder,
+        daemon: None,
+        root,
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(mut c) = UnixStream::connect(&socket) {
+            c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            if let Ok(Some((kind, body))) = ipc::read_frame(&mut c) {
+                let hello = ipc::ServerHello::decode(kind, &body).unwrap();
+                fixture.daemon =
+                    rustix::process::Pid::from_raw(i32::try_from(hello.instance_id).unwrap());
+                break;
+            }
+        }
+        assert!(Instant::now() < until, "isolated daemon failed to start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let target = krill_app::hosts::HostTarget::remote("iroh:paste-test", socket);
+    for size in [37, 2 * 1024 * 1024 + 7] {
+        let payload = (0_u8..251).cycle().take(size).collect::<Vec<_>>();
+        let started = Instant::now();
+        let path =
+            super::upload_bytes_via_target(&target, "image.png", &payload, Duration::from_secs(15));
+        eprintln!(
+            "real daemon paste {size} bytes: {:?}, success={}",
+            started.elapsed(),
+            path.is_some()
+        );
+        let path = path.expect("real daemon upload must finish without terminal-capture loss");
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(std::path::Path::new(&path).parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    // Uploaded helper sessions must not remain in the sidebar.
+    let hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "paste-test");
+    let mut c = target.connect(&hello).unwrap().stream;
+    c.write_all(&Request::List.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut c).unwrap().unwrap();
+    let Reply::Sessions(sessions) = Reply::decode(kind, &body).unwrap() else {
+        panic!("session list");
+    };
+    assert!(sessions.is_empty(), "upload must not leave helper sessions");
 }
 
 #[expect(clippy::unwrap_used, reason = "테스트 헬퍼")]
@@ -1526,5 +1731,122 @@ fn refused_shell_path_has_user_feedback(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("notice").is_some(),
         "Refused paths must show a visible notice"
+    );
+}
+
+#[test]
+fn remote_clipboard_marker_read_obeys_the_shared_deadline() {
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc;
+    use std::io::Write as _;
+    use std::time::Instant;
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let worker = std::thread::spawn(move || {
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        assert!(matches!(
+            Request::decode(kind, &body).unwrap(),
+            Request::Create(_)
+        ));
+        server
+            .write_all(
+                &Reply::Created {
+                    session: krill_proto::SessionId(1),
+                    pid: 1,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        assert!(matches!(
+            Request::decode(kind, &body).unwrap(),
+            Request::Capture { .. }
+        ));
+        // Simulate a remote that stops answering after allocating the helper.
+        std::thread::sleep(Duration::from_millis(400));
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        assert!(
+            matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Close {
+                    session: krill_proto::SessionId(1)
+                }
+            ),
+            "expired preparation must still close its helper"
+        );
+    });
+    let started = Instant::now();
+    let result = super::run_custom_and_wait_marker(
+        &mut client,
+        b"/bin/sh",
+        b"/tmp",
+        vec![],
+        "KRILL_PASTE",
+        started + Duration::from_millis(50),
+    );
+    let elapsed = started.elapsed();
+    drop(client);
+    worker.join().unwrap();
+    assert!(result.is_none());
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "stalled capture exceeded paste deadline: {elapsed:?}"
+    );
+}
+
+#[test]
+fn remote_clipboard_partial_frame_cannot_extend_the_deadline() {
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc;
+    use std::io::Write as _;
+    use std::time::Instant;
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let worker = std::thread::spawn(move || {
+        ipc::read_frame(&mut server).unwrap().unwrap();
+        let reply = Reply::Sessions(vec![]).encode().unwrap();
+        for byte in reply {
+            std::thread::sleep(Duration::from_millis(40));
+            if server.write_all(&[byte]).is_err() {
+                break;
+            }
+        }
+    });
+    let started = Instant::now();
+    let result = super::clipboard_request_until(
+        &mut client,
+        &Request::List,
+        started + Duration::from_millis(70),
+    );
+    let elapsed = started.elapsed();
+    drop(client);
+    worker.join().unwrap();
+    assert!(result.is_none(), "a late frame must not count as success");
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "partial frame extended the deadline: {elapsed:?}"
+    );
+}
+
+#[test]
+fn remote_clipboard_rejects_a_local_upload_target() {
+    let root = state_path("wrong-paste-host");
+    let target = super::RemoteUploadTarget {
+        ssh_host: Some(upload_test_host()),
+        host_target: Some(krill_app::hosts::HostTarget::local(
+            krill_proto::daemon::Paths {
+                socket: root.join("must-not-connect.sock"),
+                holder: root.join("must-not-launch-holder"),
+                krilld: root.join("must-not-launch-daemon"),
+            },
+        )),
+        windows: false,
+    };
+    assert!(super::upload_bytes_to_remote_target(&target, "image.png", b"bytes").is_none());
+    assert!(
+        !root.exists(),
+        "a remote paste must never create local daemon state"
     );
 }

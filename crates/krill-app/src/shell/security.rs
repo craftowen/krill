@@ -33,7 +33,6 @@ const REMOTE_PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duratio
 pub(crate) struct RemoteUploadTarget {
     pub ssh_host: Option<krill_app::ssh_hosts::SshHost>,
     pub host_target: Option<krill_app::hosts::HostTarget>,
-    pub prefer_target_ipc: bool,
     /// Remote daemon runs on Windows: no `/bin/sh`, so stage via PowerShell + `RemoteFs`.
     pub windows: bool,
 }
@@ -453,7 +452,6 @@ impl Shell {
                 Some(RemoteUploadTarget {
                     ssh_host,
                     host_target,
-                    prefer_target_ipc: id.starts_with("iroh:"),
                     windows,
                 })
             }
@@ -1530,7 +1528,6 @@ pub(crate) fn clipboard_paste_payload_for_host(
     let target = remote.cloned().map(|h| RemoteUploadTarget {
         ssh_host: Some(h),
         host_target: None,
-        prefer_target_ipc: false,
         windows: false,
     });
     clipboard_paste_payload_for_target(item, target.as_ref())
@@ -1555,7 +1552,10 @@ fn clipboard_paste_payload_for_target_with_policy(
     let has_valid_image = item.entries().iter().any(|entry| {
         matches!(entry, gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
     });
-    let _permit = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS)?;
+    let Some(_permit) = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS) else {
+        tracing::warn!("remote clipboard preparation busy");
+        return None;
+    };
     remote_payload_inner(item, target, has_valid_image, policy)
 }
 
@@ -1641,32 +1641,36 @@ fn upload_bytes_to_remote_target(
     filename: &str,
     bytes: &[u8],
 ) -> Option<String> {
+    if target
+        .host_target
+        .as_ref()
+        .is_some_and(|host| host.host().is_local())
+    {
+        tracing::warn!("refused local destination for remote clipboard upload");
+        return None;
+    }
     if target.windows {
         // SSH upload relies on a POSIX shell (`mktemp`/`cat`); only the daemon RPC works here.
         return upload_bytes_via_windows_target(target.host_target.as_ref()?, filename, bytes);
     }
-    if target.prefer_target_ipc {
-        if let Some(ht) = &target.host_target
-            && let Some(path) =
-                upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15))
-        {
-            return Some(path);
+    // The connected daemon identifies the actual session host. Reuse its SSH/iroh tunnel
+    // before opening a separate SSH connection (which may not share the tunnel's auth).
+    if let Some(ht) = &target.host_target {
+        let started = std::time::Instant::now();
+        let path = upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15));
+        if path.is_none() {
+            tracing::warn!(
+                bytes = bytes.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "remote clipboard upload failed on connected host"
+            );
         }
-        if let Some(host) = &target.ssh_host {
-            return upload_bytes_to_remote(host, filename, bytes);
-        }
-        None
-    } else {
-        if let Some(host) = &target.ssh_host
-            && let Some(path) = upload_bytes_to_remote(host, filename, bytes)
-        {
-            return Some(path);
-        }
-        if let Some(ht) = &target.host_target {
-            return upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15));
-        }
-        None
+        return path;
     }
+    target
+        .ssh_host
+        .as_ref()
+        .and_then(|host| upload_bytes_to_remote(host, filename, bytes))
 }
 
 fn upload_bytes_to_remote(
@@ -1721,9 +1725,6 @@ fn run_custom_and_wait_marker(
     deadline: std::time::Instant,
 ) -> Option<String> {
     use krill_proto::control::{CaptureFormat, Create, Program, Reply, Request};
-    use krill_proto::ipc;
-    use krill_proto::screen::Msg as _;
-    use std::io::Write as _;
 
     let create = Request::Create(Create {
         account: None,
@@ -1735,9 +1736,8 @@ fn run_custom_and_wait_marker(
         cols: 1024,
         rows: 24,
     });
-    stream.write_all(&create.encode().ok()?).ok()?;
-    let (kind, body) = ipc::read_frame(stream).ok()??;
-    let Reply::Created { session, .. } = Reply::decode(kind, &body).ok()? else {
+    let Reply::Created { session, .. } = clipboard_request_until(stream, &create, deadline)? else {
+        tracing::warn!("remote clipboard destination helper could not start");
         return None;
     };
 
@@ -1747,17 +1747,8 @@ fn run_custom_and_wait_marker(
             session,
             format: CaptureFormat::Plain,
         };
-        if stream
-            .write_all(&cap_req.encode().unwrap_or_default())
-            .is_err()
-        {
-            break;
-        }
-        let Ok(Some((k, b))) = ipc::read_frame(stream) else {
-            break;
-        };
-        match Reply::decode(k, &b) {
-            Ok(Reply::Captured { bytes: cap, .. }) => {
+        match clipboard_request_until(stream, &cap_req, deadline) {
+            Some(Reply::Captured { bytes: cap, .. }) => {
                 let text = String::from_utf8_lossy(&cap);
                 let flat: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
                 if flat.contains(&format!("{marker}_ERR")) {
@@ -1770,17 +1761,17 @@ fn run_custom_and_wait_marker(
                     break;
                 }
             }
-            Ok(Reply::Failed(_)) | Err(_) => break,
-            Ok(_) => {}
+            Some(Reply::Failed(_)) | None => break,
+            Some(_) => {}
         }
         std::thread::sleep(Duration::from_millis(15));
     }
 
-    if let Ok(close_bytes) = (Request::Close { session }).encode()
-        && stream.write_all(&close_bytes).is_ok()
-    {
-        ipc::read_frame(stream).ok();
-    }
+    // Cleanup still needs to be sent when preparation has exhausted its budget.
+    // Its short, separate grace period never makes a late paste eligible for delivery.
+    let cleanup_deadline = deadline.max(std::time::Instant::now() + Duration::from_millis(100));
+    clipboard_request_until(stream, &(Request::Close { session }), cleanup_deadline);
+
     result
 }
 
@@ -1794,17 +1785,17 @@ pub(crate) fn upload_bytes_via_target(
     use krill_proto::ipc::{self, ClientRole};
     use std::io::Write as _;
 
-    // 96 KiB is a multiple of 3 (so each Base64 chunk is 128 KiB with no mid-stream '=' padding)
-    // and stays well below ARG_MAX (1 MiB) and ipc::MAX_FRAME (1 MiB).
-    const RAW_CHUNK_BYTES: usize = 96 * 1024;
+    // Keep encoded argv below Linux's 128 KiB MAX_ARG_STRLEN, including its NUL.
+    const RAW_CHUNK_BYTES: usize = 48 * 1024;
 
     if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         return None;
     }
+    let deadline = std::time::Instant::now() + timeout;
     let filename = sanitize_remote_filename(filename);
     let required = FEAT_CONTROL | FEAT_CLI;
     let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-clipboard");
-    let mut stream = if target.allow_local_launch() {
+    let (mut stream, features) = if target.allow_local_launch() {
         let mut s = krill_proto::os::net::UnixStream::connect(target.socket()).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -1815,7 +1806,7 @@ pub(crate) fn upload_bytes_via_target(
             return None;
         }
         s.write_all(&hello.encode().ok()?).ok()?;
-        s
+        (s, negotiated.features)
     } else {
         let c = target.connect(&hello).ok()?;
         if c.negotiated.features & required != required {
@@ -1827,10 +1818,12 @@ pub(crate) fn upload_bytes_via_target(
         c.stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .ok()?;
-        c.stream
+        (c.stream, c.negotiated.features)
     };
 
-    let deadline = std::time::Instant::now() + timeout;
+    if features & krill_proto::control::FEAT_REMOTE_FS != 0 {
+        return upload_bytes_via_remote_fs(&mut stream, &filename, bytes, deadline);
+    }
     let mut chunks = bytes.chunks(RAW_CHUNK_BYTES);
     let first_chunk = chunks.next()?;
     let first_b64 = base64_encode(first_chunk);
@@ -1890,6 +1883,115 @@ pub(crate) fn upload_bytes_via_target(
     }
 
     Some(remote_path)
+}
+
+/// Reuse the existing bounded binary file protocol. Only the private destination allocation
+/// needs a helper PTY; image bytes never pass through argv, Base64, or terminal capture.
+fn upload_bytes_via_remote_fs(
+    stream: &mut krill_proto::os::net::UnixStream,
+    filename: &str,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Option<String> {
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::remote_fs::{
+        MAX_REMOTE_CHUNK, RemoteFsReply, RemoteFsRequest, WireWriteOutcome,
+    };
+
+    let script = format!(
+        "umask 077; \
+         d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\" 2>/dev/null || mktemp -d /tmp/krill-paste.XXXXXXXX) || exit 1; \
+         f=\"$d/{filename}\"; \
+         if : > \"$f\"; then printf 'KRILL_PASTE_OK:%s:END\\n' \"$f\"; \
+         else rm -rf \"$d\"; printf 'KRILL_PASTE_ERR\\n'; fi; sleep 3"
+    );
+    let path = run_custom_and_wait_marker(
+        stream,
+        b"/bin/sh",
+        b"/tmp",
+        vec![b"-c".to_vec(), script.into_bytes()],
+        "KRILL_PASTE",
+        deadline,
+    )?;
+    if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let mut offset = 0_u64;
+    for chunk in bytes.chunks(MAX_REMOTE_CHUNK) {
+        let commit = offset + chunk.len() as u64 == bytes.len() as u64;
+        let request = Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+            path: path.as_bytes().to_vec(),
+            bytes: chunk.to_vec(),
+            expected: None,
+            stage_id: 1, // The destination has its own unique private directory.
+            offset,
+            commit,
+        });
+        let reply = clipboard_request_until(stream, &request, deadline);
+        let accepted = match reply {
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::StageAck))) => !commit,
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(stamp)))) => {
+                commit && stamp.len == bytes.len() as u64
+            }
+            _ => false,
+        };
+        if !accepted {
+            tracing::warn!(
+                offset,
+                total = bytes.len(),
+                "remote clipboard file write failed"
+            );
+            // No path is delivered unless the final atomic commit is acknowledged. Dropping
+            // a failed stream avoids replaying an ambiguous write on another connection.
+            return None;
+        }
+        offset += chunk.len() as u64;
+    }
+    Some(path)
+}
+
+/// Refresh the remaining timeout on every syscall, including partial frame reads.
+struct ClipboardIo<'a> {
+    stream: &'a mut krill_proto::os::net::UnixStream,
+    deadline: std::time::Instant,
+}
+impl ClipboardIo<'_> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
+    }
+}
+impl std::io::Read for ClipboardIo<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        std::io::Read::read(self.stream, bytes)
+    }
+}
+impl std::io::Write for ClipboardIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        std::io::Write::write(self.stream, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.stream)
+    }
+}
+
+fn clipboard_request_until(
+    stream: &mut krill_proto::os::net::UnixStream,
+    request: &krill_proto::control::Request,
+    deadline: std::time::Instant,
+) -> Option<krill_proto::control::Reply> {
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+    let mut io = ClipboardIo { stream, deadline };
+    io.write_all(&request.encode().ok()?).ok()?;
+    let (kind, body) = krill_proto::ipc::read_frame(&mut io).ok()??;
+    io.remaining().ok()?;
+    krill_proto::control::Reply::decode(kind, &body).ok()
 }
 
 /// Windows daemon: PowerShell creates a private temp folder, then the bytes go through the
