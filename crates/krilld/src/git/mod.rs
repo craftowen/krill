@@ -282,9 +282,16 @@ impl Drop for GitQueue {
 
 fn work(shared: &Shared) {
     while let Some(job) = next(shared) {
-        (job.execute)(&shared.program, &job.repo);
+        // CONVENTIONS P4: a panicking job must not kill the worker or leave its repo busy.
+        let Job {
+            execute, repo, key, ..
+        } = job;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(&shared.program, &repo);
+        }))
+        .ok();
         crate::alloc::purge();
-        lock(&shared.state).busy.remove(&job.key);
+        lock(&shared.state).busy.remove(&key);
         // 이 레포를 기다리던 작업이 다른 워커 몫일 수 있다.
         shared.changed.notify_all();
     }
