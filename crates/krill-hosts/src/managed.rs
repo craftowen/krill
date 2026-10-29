@@ -420,7 +420,7 @@ impl InstallSpec {
         let plist = shell_quote(&self.plist_path());
         let version = shell_quote(&self.version);
         format!(
-            r#"set -u
+            r#"set -eu
 if [ "$(uname -s)" != "Darwin" ]; then echo "krill-install: unsupported OS: $(uname -s)" >&2; exit {EXIT_UNSUPPORTED_OS}; fi
 BIN={bin}
 if [ ! -d "$BIN" ]; then echo "krill-install: missing bin dir $BIN" >&2; exit {EXIT_MISSING_BLOB}; fi
@@ -433,7 +433,7 @@ chmod 644 "$BIN/{REMOTE_VERSION_FILE}"
 PLIST={plist}
 if [ ! -f "$PLIST" ]; then echo "krill-install: missing plist $PLIST" >&2; exit {EXIT_MISSING_PLIST}; fi
 UID_NUM="$(id -u)"
-launchctl bootout "gui/$UID_NUM/{HOLDER_LABEL}" >/dev/null 2>&1
+launchctl bootout "gui/$UID_NUM/{HOLDER_LABEL}" >/dev/null 2>&1 || true
 if ! BOOT_ERR="$(launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>&1)"; then echo "krill-install: launchctl bootstrap failed: $BOOT_ERR" >&2; exit {EXIT_BOOTSTRAP_FAILED}; fi
 echo "krill-install: ok {version}"
 "#
@@ -768,9 +768,14 @@ fn mkdir_remote_command(spec: &InstallSpec) -> String {
     )
 }
 
-/// 표준 입력을 원격 파일 하나로 기록하는 명령.
-fn upload_remote_command(remote_path: &str) -> String {
-    format!("/bin/sh -c 'cat > \"$1\"' sh {}", shell_quote(remote_path))
+/// stdin을 같은 디렉터리 임시 파일에 받아 크기를 확인한 뒤 rename한다.
+/// 실행 중인 파일을 제자리에서 덮어쓰면 그 프로세스가 바뀐 페이지를 읽고, Apple Silicon은 서명 캐시
+/// 불일치로 새 실행을 SIGKILL한다(packaging/install.sh 참고). 끊긴 전송은 cat이 0으로 끝나므로 크기로 잡는다.
+fn upload_remote_command(remote_path: &str, len: usize, mode: &str) -> String {
+    format!(
+        "/bin/sh -c 't=\"$1.krill-upload.$$\"; if cat > \"$t\" && [ $(wc -c < \"$t\") -eq {len} ] && chmod {mode} \"$t\" && mv -f \"$t\" \"$1\"; then exit 0; fi; rm -f \"$t\"; echo \"krill-install: incomplete upload $t\" >&2; exit 1' sh {}",
+        shell_quote(remote_path)
+    )
 }
 
 /// 관리형 설치 전체 수행(디렉터리 준비 → 바이너리·plist 전송 → 설정 스크립트).
@@ -879,7 +884,7 @@ fn install_remote_with_program(
     for blob in payload.blobs {
         let remote_path = format!("{}/{}", spec.bin_dir(), blob.name);
         let out = run(
-            &upload_remote_command(&remote_path),
+            &upload_remote_command(&remote_path, blob.bytes.len(), "755"),
             Some(blob.bytes),
             "upload",
         )?;
@@ -888,7 +893,7 @@ fn install_remote_with_program(
         }
     }
     let plist_out = run(
-        &upload_remote_command(&spec.plist_path()),
+        &upload_remote_command(&spec.plist_path(), payload.plist_xml.len(), "644"),
         Some(payload.plist_xml.as_bytes()),
         "upload-plist",
     )?;

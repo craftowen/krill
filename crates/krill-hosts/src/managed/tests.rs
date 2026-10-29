@@ -636,11 +636,15 @@ fn mkdir_and_upload_commands_preserve_space_containing_home() {
     assert!(!base.join("o").exists());
 
     let remote_bin = format!("{}/krill", spec.bin_dir());
-    let upload_args = vec!["-c".into(), upload_remote_command(&remote_bin)];
+    let payload = b"space-safe-payload";
+    let upload_args = vec![
+        "-c".into(),
+        upload_remote_command(&remote_bin, payload.len(), "755"),
+    ];
     let upload_out = run_piped_ssh_with_timeout(
         OsStr::new("/bin/sh"),
         &upload_args,
-        Some(b"space-safe-payload"),
+        Some(payload),
         std::time::Duration::from_secs(2),
     )
     .unwrap();
