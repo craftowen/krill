@@ -969,7 +969,7 @@ impl OrchestrationStore {
                 .messages
                 .iter()
                 .filter(|m| !m.acked)
-                .map(|m| m.summary.len() + m.body.len())
+                .map(|m| m.summary.len().saturating_add(m.body.len()))
                 .sum();
             let outputs: usize = self
                 .dispatches
@@ -5896,7 +5896,7 @@ mod mailbox_and_worker_safety_tests {
         }
         let dir = std::env::temp_dir().join(format!("mk-sizeerr-{}", std::process::id()));
         let err = store.save(&dir).unwrap_err().to_string();
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         assert!(
             err.contains("unread mail") && err.contains("orchestration check"),
             "{err}"
