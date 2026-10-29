@@ -1016,6 +1016,7 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         "missing-preflight-agent",
         "--prompt",
         "Work",
+        "--json",
     ]);
     assert_eq!(spawn.status.code(), Some(2));
     assert!(
@@ -1028,6 +1029,14 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         serde_json::from_str(&d.ok(&["orchestration", "worker-show", "spawn-failure", "--json"]))
             .unwrap();
     assert_eq!(failed["status"], "failed");
+    let receipt: serde_json::Value = serde_json::from_slice(&spawn.stdout).unwrap();
+    assert_eq!(receipt["id"], failed["id"]);
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["summary"], failed["summary"]);
+    let request = receipt["request_id"].as_str().unwrap();
+    let lookup: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "request-show", request, "--json"])).unwrap();
+    assert_eq!(lookup, receipt);
     assert!(
         failed["summary"]
             .as_str()
@@ -1066,6 +1075,104 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         fs::read(d.dir.join("orchestration.json")).unwrap(),
         after_failed_start
     );
+}
+
+/// 시작 실패 영수증은 저장 상태와 일치하고 재시도 상한 직전에도 조회 가능해야 한다.
+#[test]
+fn orchestration_failed_start_receipts_preserve_retry_limit() {
+    let d = Daemon::new("orch-failed-receipt");
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "failed receipts",
+        "--json",
+    ]))
+    .unwrap();
+    let run_id = run["id"].as_str().unwrap();
+    let task: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "task-create",
+        "--run",
+        run_id,
+        "--title",
+        "work",
+        "--json",
+    ]))
+    .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+    let mut previous = None::<String>;
+    for attempt in 1..=3 {
+        let worker = format!("failed-{attempt}");
+        let mut args = vec![
+            "orchestration",
+            "worker-start",
+            "--run",
+            run_id,
+            "--task",
+            task_id,
+            "--worker",
+            &worker,
+            "--agent",
+            "missing-fixture-profile",
+            "--prompt",
+            "work",
+            "--json",
+        ];
+        if let Some(id) = previous.as_deref() {
+            args.extend(["--retry-of", id]);
+        }
+        let out = d.run(&args);
+        assert!(!out.status.success());
+        assert_eq!(out.status.code(), Some(if attempt == 3 { 1 } else { 2 }));
+        let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["retry_of"].as_str(), previous.as_deref());
+        let lookup: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "request-show",
+            receipt["request_id"].as_str().unwrap(),
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(lookup, receipt);
+        if attempt == 3 {
+            assert!(
+                receipt["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("circuit breaker")
+            );
+        }
+        previous = Some(receipt["id"].as_str().unwrap().to_owned());
+    }
+    let before = fs::read(d.dir.join("orchestration.json")).unwrap();
+    let blocked = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--retry-of",
+        previous.as_deref().unwrap(),
+        "--json",
+    ]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("circuit breaker"));
+    assert!(blocked.stdout.is_empty());
+    assert_eq!(fs::read(d.dir.join("orchestration.json")).unwrap(), before);
+    let plain = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run_id,
+        "--worker",
+        "plain-failure",
+        "--agent",
+        "missing-fixture-profile",
+        "--prompt",
+        "work",
+    ]);
+    assert!(!plain.status.success());
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("\tfailed\t"));
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("dispatch disp-"));
 }
 
 /// `worker-start`는 TUI가 프롬프트를 띄운 뒤에 지시문을 넣고, 부팅 중 죽은 에이전트는 실패로 알린다.
@@ -1121,8 +1228,20 @@ launch = ["/bin/sh", "-c", "exit 3"]
         cwd,
         "--prompt",
         "do it",
+        "--json",
     ]);
     assert!(!broken.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&broken.stdout).unwrap();
+    assert_eq!(receipt["status"], "failed");
+    assert!(receipt["session_id"].is_number());
+    let recorded: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "request-show",
+        receipt["request_id"].as_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(recorded, receipt);
     assert!(
         String::from_utf8_lossy(&broken.stderr).contains("exited during startup"),
         "{}",
@@ -1233,6 +1352,63 @@ fn orchestration_borrowed_session_survives_stop_rejection_and_abandon() {
     assert!(ls_has_session(&d.ok(&["ls"]), sid));
     d.ok(&["orchestration", "worker-abandon", "borrowed"]);
     assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    for outcome in ["succeeded", "failed"] {
+        let worker = format!("borrowed-{outcome}");
+        let dispatch: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run["id"].as_str().unwrap(),
+            "--worker",
+            &worker,
+            "--session",
+            sid,
+            "--no-preamble",
+            "--prompt",
+            "inspect",
+            "--json",
+        ]))
+        .unwrap();
+        let id = dispatch["id"].as_str().unwrap();
+        d.ok(&[
+            "orchestration",
+            "send",
+            "--from",
+            &worker,
+            "--to",
+            "coordinator",
+            "--type",
+            "worker_done",
+            "--run",
+            run["id"].as_str().unwrap(),
+            "--dispatch",
+            id,
+            "--outcome",
+            outcome,
+            "--summary",
+            "inspection result",
+        ]);
+        let rejected = d.run(&["orchestration", "worker-stop", id]);
+        assert!(!rejected.status.success());
+        let advice = String::from_utf8_lossy(&rejected.stderr);
+        assert!(advice.contains("worker-retain"), "{advice}");
+        assert!(!advice.contains("worker-abandon"), "{advice}");
+        let report: serde_json::Value =
+            serde_json::from_str(&d.ok(&["orchestration", "worker-show", id, "--json"])).unwrap();
+        assert_eq!(report["next_action"]["action"], "retain");
+        let command = report["next_action"]["command"].as_str().unwrap();
+        let retained: serde_json::Value = serde_json::from_str(
+            &d.ok(&command
+                .split_whitespace()
+                .skip(1)
+                .chain(["--json"])
+                .collect::<Vec<_>>()),
+        )
+        .unwrap();
+        assert_eq!(retained["status"], outcome);
+        assert_eq!(retained["release_state"], "retained");
+        assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    }
     d.ok(&["kill", sid]);
 }
 

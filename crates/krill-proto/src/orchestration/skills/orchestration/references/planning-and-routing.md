@@ -9,6 +9,9 @@ Choose a shape proportional to the work:
 - Research: independent source collection followed by synthesis/verification.
   Require file:line or URL provenance, distinguish observed facts and hypotheses,
   and do not invent implementation changes as a research deliverable.
+  When competing approaches matter, give independent workers the same scoped
+  evidence before sharing candidate answers. Resolve the strongest counterexample
+  with a discriminating check; model agreement is not validation.
 - Delivery: implementation units containing their related tests, followed by an
   independent verification task and integration after verification passes.
 - Review: read-only findings; dispatch fixes only within the user's authorization.
@@ -25,7 +28,8 @@ not a model ID. Respect user model/account choices. Krill has no provider-rankin
 model-price, or cross-provider fallback oracle. `worker-start --agent <profile>`
 uses that profile's argv/env, with optional `--model <id>` and `--effort <level>`
 overrides when supported by the provider. `--retry-of <dispatch-id>` and
-`--retry-request <request-id>` preserve retry lineage and the configured retry bound. Propose
+`--retry-request <request-id>` preserve retry lineage; the fixed start-failure
+breaker is described in [recovery-and-cleanup](recovery-and-cleanup.md). Propose
 profile changes if needed, without altering unrelated credentials or silently
 switching paid providers.
 

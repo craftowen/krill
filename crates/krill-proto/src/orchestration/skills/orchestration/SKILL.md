@@ -13,6 +13,11 @@ Run, Task, Dispatch, messages, and sessions. Use the Krill CLI for this workflow
 including from agy/Antigravity and pi. Native subagents and Orca commands do not register
 Krill workers and cannot replace these operations.
 
+Done means the requested acceptance checks passed, each Task has an honest outcome,
+and every owned session has a reuse, retention, or cleanup decision. A settled
+Dispatch alone is not acceptance. If execution cannot be verified, preserve the
+session and report the uncertainty instead of creating another editor.
+
 ## Select the role and executable
 
 - `[KRILL ORCHESTRATION PREAMBLE]` or `[Krill Worker] run=... task=... dispatch=...`
@@ -43,8 +48,9 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    independent scopes. Read [planning-and-routing](references/planning-and-routing.md)
    for decomposition, role profiles, and workload limits.
 2. Create/select a Run: `KRILL orchestration run-create --title "<objective>" --json`,
-   `run-use <run-id>`, `run-current --json`. Pass `--run <run-id>` on subsequent commands
-   that support it; the current Run is shared state, not private coordinator memory.
+   `run-use <run-id>`, `run-current --json`. After interruption, inspect the existing
+   Run before creating another. Pass `--run <run-id>` on subsequent commands that
+   support it; the current Run is shared state, not private coordinator memory.
 3. Define tasks before dispatch with `task-create --run <run-id> --title "<unit>"
    --desc "<self-contained assignment>" [--deps <task-id,...>] --json`.
    For delivery work needing independent verification, create implementation,
@@ -56,17 +62,20 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    --agent <configured-profile> --cwd "<absolute-directory>" --prompt "<assignment>" --json`.
    Use distinct worker names across active Runs. `--account <id>` is optional;
    `--preamble full|minimal|none` controls instructions. Keep `full` for new workers.
-   A new worker is a new session; it does not create a new worktree by default.
+   By default a worker starts a new session, without creating a worktree.
+   For immediate follow-up on a settled agent, `--session <numeric-id>` reuses
+   its existing context; read [coordinator-loop](references/coordinator-loop.md)
+   first. Independent verification still needs a fresh context.
    Create a child worktree only when the user requests one or parallel code edits
    would conflict in the same checkout/files. Use `--worktree new-child --name <name>`;
-   the enclosing worktree of `--cwd` (default: current directory) becomes its parent.
-   Example: `KRILL orchestration worker-start --run <run-id> --task <task-id> --worktree new-child --name <name> --agent <configured-profile> --prompt "<assignment>" --json`.
-   The base defaults to the parent branch. See [placement-and-remote](references/placement-and-remote.md)
-   for setup approval, explicit base selection, and remote limits.
+   the enclosing worktree of `--cwd` becomes its parent. See
+   [placement-and-remote](references/placement-and-remote.md) for examples, base
+   selection, setup approval, and remote limits.
    Optional `--model <id>` and `--effort <level>` override the profile's launch flags
    when supported by the provider. `--retry-of <dispatch-id>` or
-   `--retry-request <request-id>` links a bounded retry to its earlier attempt;
-   inspect that attempt before retrying an uncertain start.
+   `--retry-request <request-id>` links a bounded **new attempt** to its predecessor;
+   neither is an idempotent replay. On uncertain start, inspect `request-show
+   <request-id> --json` or `worker-show <dispatch-id> --json` before retrying.
 5. Inspect `task-list --run <run-id> --json`, `worker-list --run <run-id> --json`
    (which includes live `session_state`, `terminal_state`, and `next_action` hints),
    and bounded `worker-read <dispatch-id> --lines 60 --json`. Wait with
@@ -75,6 +84,10 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    See [messaging-and-gates](references/messaging-and-gates.md) before acknowledging mail
    with `--ack <delivery-id>` or `--ack-ids <id1,id2,...>`.
    Reply to questions using `reply <message-id> --body "<answer>" --json`.
+   Repeated empty waits call for inspection, not a duplicate launch. `session_state`
+   describes the observed session; quiet output and `agent_state` idle do not prove
+   the assignment finished. Keep the chosen executable and host when using a
+   `next_action.command`; a hint is not fresh authority to close a session.
 6. Read the returned evidence and run the acceptance checks appropriate to the task.
    Use [verification-and-evidence](references/verification-and-evidence.md) for independent
    verification and invalidating stale results. Correct drift through follow-ups or a
@@ -137,7 +150,7 @@ do not infer lifecycle success from a truncated receipt.
 | Situation | Read |
 | --- | --- |
 | Decomposition, role profiles, parallel write ownership, budgets | [planning-and-routing](references/planning-and-routing.md) |
-| Expanded task commands and dependencies | [coordinator-loop](references/coordinator-loop.md) |
+| Expanded tasks, dependencies, or settled-session reuse | [coordinator-loop](references/coordinator-loop.md) |
 | Assigned worker, evidence report, questions and settlement | [worker-contract](references/worker-contract.md) |
 | Implementation review, research proof, changed code or missing artifacts | [verification-and-evidence](references/verification-and-evidence.md) |
 | Inbox acknowledgment, follow-ups, approvals | [messaging-and-gates](references/messaging-and-gates.md) |

@@ -1029,8 +1029,20 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         if spec.task_id.is_none() {
             spec.task_id.clone_from(&previous.task_id);
         }
-        spec.worker
-            .get_or_insert_with(|| previous.worker_name.clone());
+        spec.worker.get_or_insert_with(|| {
+            let mut suffix = initial_store.dispatches.len().saturating_add(1);
+            loop {
+                let candidate = format!("{}-retry-{suffix}", previous.worker_name);
+                if !initial_store
+                    .dispatches
+                    .iter()
+                    .any(|d| d.worker_name == candidate)
+                {
+                    break candidate;
+                }
+                suffix = suffix.saturating_add(1);
+            }
+        });
         spec.agent.get_or_insert_with(|| previous.agent.clone());
         spec.cwd.get_or_insert_with(|| previous.cwd.clone());
         spec.prompt.get_or_insert_with(|| previous.prompt.clone());
@@ -1207,8 +1219,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                         error.kind(),
                         format!("spawn {agent} worker session: {error}"),
                     );
-                    mark_worker_start_failed(ctx, &dispatch.id, &error.to_string())?;
-                    return Err(error);
+                    return report_worker_start_failure(ctx, &dispatch, &error, json);
                 }
             }
         }
@@ -1227,6 +1238,15 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             Ok(())
         });
 
+        // Report the persisted failure, not the active snapshot from before delivery.
+        if let Err(error) = delivered {
+            return report_worker_start_failure(
+                ctx,
+                &dispatch,
+                &io::Error::other(format!("worker {}: {error}", dispatch.worker_name)),
+                json,
+            );
+        }
         if json {
             print_json(&dispatch)?;
         } else {
@@ -1241,14 +1261,6 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                     .map_or_else(|| "-".to_owned(), |n| n.to_string())
             );
         }
-        // 디스패치는 기록됐으니 출력은 남기고, 프롬프트를 못 넣었으면 실패로 끝낸다(`krill send`로 다시 넣을 수 있다).
-        if let Err(error) = delivered {
-            mark_worker_start_failed(ctx, &dispatch.id, &error)?;
-            return Err(io::Error::other(format!(
-                "worker {}: {error}",
-                dispatch.worker_name
-            )));
-        }
         Ok(())
     })
 }
@@ -1257,7 +1269,11 @@ fn caller_session_id() -> Option<u32> {
     std::env::var("MK_PANE_ID").ok()?.parse().ok()
 }
 
-fn mark_worker_start_failed(ctx: &OrchCtx<'_>, dispatch_id: &str, reason: &str) -> io::Result<()> {
+fn mark_worker_start_failed(
+    ctx: &OrchCtx<'_>,
+    dispatch_id: &str,
+    reason: &str,
+) -> io::Result<Dispatch> {
     let dispatch = match ctx.try_ipc(
         &OrchAction::WorkerStartFailed {
             dispatch_id: dispatch_id.to_owned(),
@@ -1272,10 +1288,60 @@ fn mark_worker_start_failed(ctx: &OrchCtx<'_>, dispatch_id: &str, reason: &str) 
         })?,
         Some(_) => return Err(io::Error::other("unexpected worker start failure reply")),
     };
-    if let Some(summary) = dispatch.summary.filter(|s| s.contains("circuit breaker")) {
-        return Err(io::Error::other(summary));
+    Ok(dispatch)
+}
+
+fn report_worker_start_failure(
+    ctx: &OrchCtx<'_>,
+    dispatch: &Dispatch,
+    error: &io::Error,
+    json: bool,
+) -> io::Result<()> {
+    let identity = format!(
+        "dispatch {}, request {}, session {}",
+        dispatch.id,
+        dispatch.request_id.as_deref().unwrap_or("unrecorded"),
+        dispatch
+            .session_id
+            .map_or_else(|| "unbound".to_owned(), |id| id.to_string()),
+    );
+    let failed = mark_worker_start_failed(ctx, &dispatch.id, &error.to_string()).map_err(|e| {
+        io::Error::new(
+            error.kind(),
+            format!("{error} ({identity}); failure state not confirmed: {e}; inspect worker-show before retrying"),
+        )
+    })?;
+    if json {
+        print_json(&failed)?;
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\tsession={}",
+            failed.id,
+            failed.worker_name,
+            failed.agent,
+            failed.status.as_str(),
+            failed
+                .session_id
+                .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+        );
     }
-    Ok(())
+    let breaker = failed
+        .summary
+        .as_deref()
+        .filter(|summary| summary.contains("circuit breaker"));
+    let detail = failed
+        .summary
+        .as_deref()
+        .filter(|summary| summary.contains("circuit breaker"))
+        .map_or_else(|| error.to_string(), str::to_owned);
+    Err(io::Error::new(
+        if breaker.is_some() {
+            io::ErrorKind::Other
+        } else {
+            error.kind()
+        },
+        format!("{detail} ({identity})"),
+    ))
 }
 
 fn cmd_request_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
@@ -2128,10 +2194,7 @@ fn dispatch_owns_session(all_dispatches: &[Dispatch], disp: &Dispatch) -> bool {
     let owner = all_dispatches
         .iter()
         .rev()
-        .find(|d| {
-            d.session_id == Some(sid)
-                && matches!(d.status, DispatchStatus::Active | DispatchStatus::Retained)
-        })
+        .find(|d| d.session_id == Some(sid) && d.status == DispatchStatus::Active)
         .or_else(|| {
             all_dispatches
                 .iter()
@@ -2189,14 +2252,17 @@ fn build_worker_report(
                     "retained"
                 }
             }
-            DispatchStatus::Released | DispatchStatus::Abandoned => {
+            DispatchStatus::Released => {
                 if disp.session_id.is_some() && !owns_session {
                     "reassigned"
                 } else {
                     "released"
                 }
             }
-            DispatchStatus::Succeeded | DispatchStatus::Failed | DispatchStatus::Stopped => {
+            DispatchStatus::Succeeded
+            | DispatchStatus::Failed
+            | DispatchStatus::Stopped
+            | DispatchStatus::Abandoned => {
                 if disp.session_id.is_none() || session_live == Some(false) {
                     "released"
                 } else if !owns_session {
@@ -2217,9 +2283,9 @@ fn build_worker_report(
         && disp.session_origin == DispatchSessionOrigin::Borrowed
     {
         Some(WorkerNextAction {
-            action: "abandon",
-            reason: "the dispatch borrowed an existing session; fence it without closing the session",
-            command: format!("krill orchestration worker-abandon {}", disp.id),
+            action: "retain",
+            reason: "preserve the settled outcome and borrowed session without closing it",
+            command: format!("krill orchestration worker-retain {}", disp.id),
         })
     } else if terminal_state == "reclaimable" {
         Some(WorkerNextAction {
@@ -2577,9 +2643,14 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
         selected.validate_release()?;
     }
     if selected.session_origin == DispatchSessionOrigin::Borrowed {
-        return Err(bad_arg(
-            "cannot close a borrowed session; use worker-abandon for non-destructive fencing",
-        ));
+        let action = if selected.status == DispatchStatus::Active {
+            "worker-abandon for non-destructive fencing"
+        } else {
+            "worker-retain to preserve its settled outcome"
+        };
+        return Err(bad_arg(format!(
+            "cannot close a borrowed session; use {action}; neither stops the existing process"
+        )));
     }
     let owns_session = dispatch_owns_session(&store.dispatches, selected);
     let target = ctx.effective_target()?;
@@ -4000,6 +4071,83 @@ mod tests {
     }
 
     #[test]
+    fn retained_predecessor_cannot_reclaim_a_completed_reused_session() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("reuse ownership", None)?;
+        let predecessor =
+            store.start_worker(&run.id, None, "old", "codex", Some(10), "/tmp", "old work")?;
+        store.retain_worker(&predecessor.id)?;
+        let replacement = store.start_worker_configured(&WorkerStartSpec {
+            run_id: Some(run.id.clone()),
+            worker: Some("new".into()),
+            session_id: Some(10),
+            ..WorkerStartSpec::default()
+        })?;
+        store.send_message(&SendParams {
+            from: "new".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "done".into(),
+            body: String::new(),
+            run_id: Some(run.id),
+            task_id: None,
+            dispatch_id: Some(replacement.id.clone()),
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        })?;
+        let old = store
+            .dispatches
+            .iter()
+            .find(|d| d.id == predecessor.id)
+            .unwrap();
+        let new = store
+            .dispatches
+            .iter()
+            .find(|d| d.id == replacement.id)
+            .unwrap();
+        assert!(!dispatch_owns_session(&store.dispatches, old));
+        assert!(dispatch_owns_session(&store.dispatches, new));
+        let report = build_worker_report(new, &store.dispatches, None);
+        assert_eq!(report.next_action.unwrap().action, "retain");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_live_sessions_remain_visible_for_cleanup() -> io::Result<()> {
+        use krill_proto::control::AgentState;
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("residual sessions", None)?;
+        let owned = store.start_worker(&run.id, None, "owned", "codex", Some(10), "/tmp", "p")?;
+        let borrowed = store.start_worker_configured(&WorkerStartSpec {
+            run_id: Some(run.id),
+            worker: Some("borrowed".into()),
+            session_id: Some(20),
+            ..WorkerStartSpec::default()
+        })?;
+        let observed: Vec<_> = [10, 20]
+            .into_iter()
+            .map(|id| crate::session::ObservedSession {
+                id,
+                exit_code: None,
+                agent_state: Some(AgentState::Working),
+            })
+            .collect();
+        for (dispatch, action) in [(owned, "release_or_retain"), (borrowed, "retain")] {
+            let abandoned = store.abandon_worker(&dispatch.id)?;
+            let report = build_worker_report(&abandoned, &store.dispatches, Some(&observed));
+            assert_eq!(report.session_state, "live");
+            assert_eq!(report.terminal_state, "reclaimable");
+            assert_eq!(report.next_action.unwrap().action, action);
+            let retained = store.retain_worker(&dispatch.id)?;
+            assert_eq!(retained.status, DispatchStatus::Abandoned);
+            let kept = build_worker_report(&retained, &store.dispatches, Some(&observed));
+            assert_eq!(kept.terminal_state, "retained");
+            assert!(kept.next_action.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn worker_report_projects_liveness_reuse_and_next_actions() -> io::Result<()> {
         use krill_proto::control::AgentState;
         let mut store = OrchestrationStore::default();
@@ -4105,7 +4253,7 @@ mod tests {
         retained.release_state = krill_proto::orchestration::DispatchReleaseState::Active;
         retained.session_origin = DispatchSessionOrigin::Borrowed;
         let report = build_worker_report(&retained, &store.dispatches, Some(&observed));
-        assert_eq!(report.next_action.unwrap().action, "abandon");
+        assert_eq!(report.next_action.unwrap().action, "retain");
 
         let dead_disp = store.dispatches.iter().find(|d| d.id == d_dead.id).unwrap();
         let r_dead = build_worker_report(dead_disp, &store.dispatches, Some(&observed));
@@ -4283,6 +4431,52 @@ mod delivery_and_launch_cli_tests {
     }
 
     #[test]
+    fn late_start_failure_preserves_accepted_completion_and_reports_identity() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-start-settled-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let dispatch = OrchestrationStore::mutate(&dir, |store| {
+            let run = store.create_run("accepted before start reply", None)?;
+            let task = store.create_task(&run.id, "work", "", Vec::new())?;
+            let dispatch = store.start_worker_configured(&WorkerStartSpec {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                worker: Some("worker".into()),
+                ..WorkerStartSpec::default()
+            })?;
+            store.send_message(&SendParams {
+                from: "worker".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                summary: "accepted".into(),
+                body: String::new(),
+                run_id: Some(run.id),
+                task_id: Some(task.id),
+                dispatch_id: Some(dispatch.id.clone()),
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            })?;
+            Ok(dispatch)
+        })?;
+        let before = OrchestrationStore::load(&dir)?;
+        let error = report_worker_start_failure(
+            &OrchCtx::local(&dir),
+            &dispatch,
+            &io::Error::other("submit response lost"),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failure state not confirmed"));
+        assert!(error.to_string().contains(&dispatch.id));
+        assert!(
+            error
+                .to_string()
+                .contains(dispatch.request_id.as_deref().unwrap())
+        );
+        assert_eq!(OrchestrationStore::load(&dir)?, before);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
     fn request_show_and_retry_inherit_launch_preferences() -> io::Result<()> {
         let dir =
             std::env::temp_dir().join(format!("krill-retry-request-cli-{}", std::process::id()));
@@ -4332,6 +4526,7 @@ mod delivery_and_launch_cli_tests {
         let store = OrchestrationStore::load(&dir)?;
         let retry = store.dispatches.last().unwrap();
         assert_eq!(retry.retry_of.as_deref(), Some(first.id.as_str()));
+        assert_ne!(retry.worker_name, first.worker_name);
         assert_eq!(retry.model, first.model);
         assert_eq!(retry.effort, first.effort);
         assert_ne!(retry.request_id, first.request_id);

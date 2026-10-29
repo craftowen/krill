@@ -2168,6 +2168,20 @@ impl OrchestrationStore {
                     )));
                 }
                 if let Some(active_disp) = matching.first() {
+                    // An older process with this name may still report after fencing.
+                    // Name-only inference cannot distinguish that report from its retry.
+                    if self.dispatches.iter().any(|d| {
+                        d.id != active_disp.id
+                            && d.worker_name == from
+                            && resolved_run_id.as_ref().is_none_or(|rid| &d.run_id == rid)
+                            && resolved_task_id
+                                .as_ref()
+                                .is_none_or(|tid| d.task_id.as_ref() == Some(tid))
+                    }) {
+                        return Err(invalid(format!(
+                            "worker '{from}' has prior dispatches in this scope; specify --dispatch explicitly"
+                        )));
+                    }
                     resolved_dispatch_id = Some(active_disp.id.clone());
                     if resolved_task_id.is_none() {
                         resolved_task_id.clone_from(&active_disp.task_id);
@@ -2921,12 +2935,17 @@ pub fn worker_preamble(dispatch: &Dispatch) -> String {
         "[KRILL ORCHESTRATION PREAMBLE]\n\
          Run: {run} | Dispatch: {disp} | Worker: {worker}{task_line}\n\
          Task Prompt: {prompt}\n\
-         First read the Krill worker contract: krill skills get orchestration --reference references/worker-contract.md. If KRILL_CLI is set, use that absolute executable instead of bare krill; quote it for your shell. This is the krill-orchestration skill, not Orca orchestration.\n\
-         IMPORTANT: Always use the `krill orchestration` CLI via your shell/command tool to report status or ask questions; do NOT use built-in subagent tools (like `send_message`, `Task`, or `spawn_agent`).\n\
-         When finished, report completion with:\n  \
+         Use KRILL_CLI if set (quote for your shell), else krill; never native subagent tools. Read:\n\
+         krill skills get orchestration --reference references/worker-contract.md\n\
+         At checkpoints/before completion:\n\
+         krill orchestration check --to {worker} --run {run} --unread --json\n\
+         Process, then ACK delivery.id with --ack <id>; read again (ACK returns the old batch).\n\
+         Finish once:\n\
          krill orchestration send --from {worker} --to coordinator --type worker_done --run {run}{task_flag} --dispatch {disp} --outcome succeeded --summary \"<result>\"\n\
-         If blocked or need clarification (blocks until answered):\n  \
-         krill orchestration ask --from {worker} --to coordinator --run {run} --wait --summary \"<question>\"",
+         Use --outcome failed if incomplete. Then idle; stop edits if ownership ends.\n\
+         Blocked:\n\
+         krill orchestration ask --from {worker} --to coordinator --run {run} --wait --timeout-ms 10000 --summary \"<question>\" --json\n\
+         Timeout stays pending; resume: krill orchestration ask --question-id <id> --wait --timeout-ms 10000 --json",
         run = dispatch.run_id,
         disp = dispatch.id,
         worker = dispatch.worker_name,
@@ -4463,6 +4482,112 @@ mod tests {
         let seq_before = store.next_seq;
         store.reset(None);
         assert_eq!(store.next_seq, seq_before);
+        Ok(())
+    }
+
+    #[test]
+    fn reused_worker_name_cannot_settle_replacement_without_dispatch_id() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("retry fencing", None)?;
+        let task = store.create_task(&run.id, "work", "", Vec::new())?;
+        let first = store.start_worker(
+            &run.id,
+            Some(&task.id),
+            "reused",
+            "codex",
+            None,
+            "/tmp",
+            "first",
+        )?;
+        store.abandon_worker(&first.id)?;
+        let replacement = store.start_worker(
+            &run.id,
+            Some(&task.id),
+            "reused",
+            "codex",
+            None,
+            "/tmp",
+            "replacement",
+        )?;
+        let snapshot = store.clone();
+        let mut late = SendParams {
+            from: "reused".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "late completion without attempt identity".into(),
+            body: String::new(),
+            run_id: Some(run.id),
+            task_id: Some(task.id),
+            dispatch_id: None,
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        };
+        for (omit_run, omit_task) in [(false, false), (true, false), (false, true), (true, true)] {
+            let scoped = SendParams {
+                run_id: if omit_run { None } else { late.run_id.clone() },
+                task_id: if omit_task {
+                    None
+                } else {
+                    late.task_id.clone()
+                },
+                ..late.clone()
+            };
+            assert!(store.send_message(&scoped).is_err());
+            assert_eq!(store, snapshot);
+        }
+        late.dispatch_id = Some(first.id);
+        assert!(store.send_message(&late).is_err());
+        assert_eq!(store, snapshot);
+        late.dispatch_id = Some(replacement.id.clone());
+        store.send_message(&late)?;
+        assert_eq!(
+            store
+                .dispatches
+                .iter()
+                .find(|d| d.id == replacement.id)
+                .unwrap()
+                .status,
+            DispatchStatus::Succeeded,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_completion_preserves_distinct_run_and_task_scopes() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let first_run = store.create_run("first", None)?;
+        let second_run = store.create_run("second", None)?;
+        let first_task = store.create_task(&first_run.id, "first", "", Vec::new())?;
+        let second_task = store.create_task(&first_run.id, "second", "", Vec::new())?;
+        for (run, task) in [
+            (&first_run.id, Some(first_task.id)),
+            (&first_run.id, Some(second_task.id)),
+            (&second_run.id, None),
+        ] {
+            let dispatch =
+                store.start_worker(run, task.as_deref(), "shared", "codex", None, "/tmp", "p")?;
+            store.send_message(&SendParams {
+                from: "shared".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                summary: "done".into(),
+                body: String::new(),
+                run_id: Some(run.clone()),
+                task_id: task,
+                dispatch_id: None,
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            })?;
+            assert_eq!(
+                store
+                    .dispatches
+                    .iter()
+                    .find(|d| d.id == dispatch.id)
+                    .unwrap()
+                    .status,
+                DispatchStatus::Succeeded
+            );
+        }
         Ok(())
     }
 

@@ -16,6 +16,12 @@ For a blocker, use `ask --from <worker> --to coordinator --run <run-id> --summar
 and re-wait with `ask --question-id <id> --wait --timeout-ms 10000 --json` after
 a timeout. In agy/pi collect the command tool's final output before sending another ask.
 
+For actual follow-up handling, use `check --to <worker> --run <run-id> --unread
+--json`, process the returned messages, then `check --to <worker> --run <run-id>
+--ack <delivery-id> --json`. The ACK returns the handled batch; read again until
+no unread messages remain. Preserve pending questions and do not acknowledge
+unhandled mail. See [messaging-and-gates](messaging-and-gates.md) for receipts.
+
 On long work send a useful status/heartbeat at meaningful checkpoints with the
 same Run/Task/Dispatch IDs. It indicates progress, not successful completion.
 Before settlement, write a concise result report as specified by
@@ -28,3 +34,8 @@ values when applicable. For blocked work, either keep waiting for a pending
 question or settle failed with the blocker; never send `blocked` or `cancelled`
 as an outcome. Then end the assignment and idle. New user work requires a new
 ownership decision; do not send lifecycle events under the settled dispatch.
+
+Retain and abandon can end your Dispatch while leaving your process alive.
+If the coordinator explicitly ends or reassigns your ownership, stop edits and
+external actions and preserve the work; do not send a late completion or try to
+resume the old identity. An empty inbox alone does not mean ownership was lost.
