@@ -2445,6 +2445,10 @@ pub fn install_all_skills_at(home: &Path) -> Vec<String> {
     for error in &report.failures {
         tracing::warn!(%error, "built-in skill synchronization skipped a target");
     }
+    for dir in &report.busy {
+        // 앱 시작과 krilld 세션 복원이 같은 폴더를 동시에 맞추는 예상된 경합이다. 잠금을 쥔 쪽이 같은 묶음을 쓴다.
+        tracing::debug!(dir = %dir.display(), "built-in skill synchronization deferred to the running installer");
+    }
     report
         .installed
         .iter()

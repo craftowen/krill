@@ -73,6 +73,10 @@ fn synchronize(
     account: Option<&LaunchAccount>,
 ) {
     let report = sync_builtin_skills(&directories(home, profile, launch, account));
+    for dir in report.busy {
+        // 앱·CLI·다른 세션 시작이 같은 폴더를 동기화하는 중이다. 같은 묶음을 쓰고 다음 세션 시작에 다시 맞춘다.
+        tracing::debug!(dir = %dir.display(), "built-in skill synchronization deferred to the running installer");
+    }
     for error in report.failures {
         // 프로필 skills가 사용자 스킬 폴더로 가는 심볼릭 링크면 그 폴더가 따로 동기화된다. 의도된 구성이라 경고하지 않는다
         // (2026-10-26부터 codex 프로필에서 매 동기화마다 800여 줄).
