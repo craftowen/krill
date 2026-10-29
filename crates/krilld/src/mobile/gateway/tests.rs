@@ -176,6 +176,7 @@ impl Client {
         );
         let (_, body) = receive(&mut s).unwrap();
         let a: Authenticated = serde_json::from_slice(&channel.open(&body).unwrap()).unwrap();
+        assert_eq!(a.desktop.as_ref().unwrap().host_id.len(), 32);
         let credential = a
             .credential
             .as_deref()
@@ -1311,6 +1312,10 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
     assert_eq!(kind, MUX_BINARY);
     let auth_1: Authenticated =
         serde_json::from_slice(&chan_1.open(&auth_sealed).unwrap()).unwrap();
+    assert_eq!(
+        auth_1.desktop.as_ref().unwrap().host_id,
+        lock(&g.shared.state).host_id
+    );
     let cred_1 = decode_hex::<32>(auth_1.credential.as_deref().unwrap()).unwrap();
 
     // ServerHello 수신 후 ClientHello + List 전송
@@ -2337,4 +2342,89 @@ fn change_feed_pushes_through_the_relay_mux_and_ends_with_mux_close() {
             .is_none_or(|(kind, _)| kind == MUX_CLOSE)
     );
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn desktop_identity_is_seeded_once_and_survives_relay_rotation() {
+    let dir = std::env::temp_dir().join(format!("mobile-desktop-id-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut intent = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(intent.host_id, intent.rid);
+    let identity = intent.host_id.clone();
+    intent.rid = "aa".repeat(16);
+    intent.save(&dir).unwrap();
+    let restored = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(restored.host_id, identity);
+    assert_eq!(restored.rid, "aa".repeat(16));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn secure_tailscale_qr_fits_fixed_encoder_at_long_machine_name() {
+    let (_registry, gateway) = start();
+    let (port, ticket) = offer(&gateway);
+    let mut state = lock(&gateway.shared.state);
+    state.mode = ConnectMode::Tailscale;
+    state.tailscale_serve = Some(super::super::tailscale_serve::Serve::fixture(
+        port,
+        format!("https://{}.tail187d9d.ts.net:18449", "a".repeat(63)),
+    ));
+    let url = pairing_url(&state, &ticket, &fixed_base(&state)).unwrap();
+    assert_eq!(url.len(), 269);
+    assert!(url.starts_with("https://krill-mobile.pages.dev/m/"));
+    assert!(url.contains("/#p="));
+    assert!(!url.contains("&h="));
+    let token = url.split("#p=").nth(1).unwrap().split('&').next().unwrap();
+    assert_eq!(token, ws::base64(&ticket.token, true));
+    state.tailscale_serve = Some(super::super::tailscale_serve::Serve::fixture(
+        port,
+        format!("https://{}.tail187d9d.ts.net:18449", "a".repeat(100)),
+    ));
+    assert!(pairing_url(&state, &ticket, &fixed_base(&state)).is_err());
+}
+#[test]
+fn changing_loopback_target_invalidates_only_the_owned_https_route() {
+    let (_registry, gateway) = start();
+    let (port, _) = offer(&gateway);
+    let mut state = lock(&gateway.shared.state);
+    state.tailscale_enabled = true;
+    state.tailscale_serve = Some(super::super::tailscale_serve::Serve::fixture(
+        port,
+        "https://desktop.tail123.ts.net:18449".into(),
+    ));
+    let next = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    next.set_nonblocking(true).unwrap();
+    let next_port = next.local_addr().unwrap().port();
+    state.listeners = vec![next];
+    request_tailscale(&mut state, false).unwrap();
+    assert!(
+        state
+            .tailscale_serve
+            .as_ref()
+            .unwrap()
+            .matches_port(next_port)
+    );
+    assert!(state.tailscale_serve.as_ref().unwrap().ready().is_none());
+    assert!(!state.devices.list().is_empty() || state.devices.ticket(now_ms()).is_some());
+}
+
+#[test]
+fn secure_tailscale_notification_uses_the_same_hosted_storage_origin() {
+    let (_registry, gateway) = start();
+    let (port, _) = offer(&gateway);
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.mode = ConnectMode::Tailscale;
+        state.tailscale_serve = Some(super::super::tailscale_serve::Serve::fixture(
+            port,
+            "https://desktop.tail123.ts.net:18449".into(),
+        ));
+    }
+    assert_eq!(
+        gateway.deep_link(krill_proto::SessionId(8)).unwrap(),
+        format!(
+            "https://krill-mobile.pages.dev/m/{}/?session=8",
+            super::super::pwa::asset_hash()
+        )
+    );
 }

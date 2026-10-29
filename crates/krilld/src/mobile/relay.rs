@@ -4,8 +4,8 @@
 use super::devices::{decode_hex, hex};
 use super::e2ee::{Channel, Endpoint, MAX_PLAINTEXT, invalid, random};
 use super::gateway::{
-    AuthHello, AuthProof, Authenticated, Connection, MAX_CONNECTIONS, MAX_PENDING, RPC_STACK,
-    Shared, ShutdownHandle, TIMEOUT, now_ms,
+    AuthHello, AuthProof, Connection, MAX_CONNECTIONS, MAX_PENDING, RPC_STACK, Shared,
+    ShutdownHandle, TIMEOUT, authenticated_reply, now_ms,
 };
 use super::tunnel::Publication;
 use super::ws;
@@ -860,10 +860,7 @@ fn serve_mux_client(
             };
             let conn = s.connections.get_mut(&id).ok_or_else(invalid)?;
             conn.device = Some(device_id.clone());
-            Authenticated {
-                device_id,
-                credential,
-            }
+            authenticated_reply(&s, device_id, credential)
         };
         let payload =
             channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;

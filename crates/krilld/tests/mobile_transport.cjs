@@ -656,7 +656,7 @@ test("re-pairing the same relay desktop rotates its credential without adding a 
   e.adopt(
     "https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r=" +
       "a".repeat(32),
-  ).use();
+  ).use({replace:true});
   e.authenticated({ device_id: "new", credential: "33".repeat(32) });
   assert.equal(e.profiles().length, 1);
   assert.equal(e.profiles()[0].name, "Same PC");
@@ -685,7 +685,7 @@ test("desktop aliases survive snapshots, reconnects, reloads and re-pairing with
       "https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r=" +
         "a".repeat(32),
     )
-    .use();
+    .use({replace:true});
   reloaded.authenticated({ device_id: "rotated", credential: "22".repeat(32) });
   reloaded.describeHost({ display_name: "System hostname" });
   assert.equal(reloaded.profiles().length, 1);
@@ -1109,10 +1109,10 @@ test("identical background host descriptions skip localStorage writes and creden
     peer.describeHost({ display_name: "Same PC", platform: "macos" });
   peer.authenticated({});
   assert.equal(writes, once);
-  peer.authenticated({ credential: "22".repeat(32) });
+  assert.throws(() => peer.authenticated({ credential: "22".repeat(32) }), /credential changed/);
   assert.equal(
     JSON.parse(h.store.get("krill-mobile-v2")).credential,
-    "22".repeat(32),
+    "11".repeat(32),
   );
   peer.describeHost({ display_name: "Renamed PC" });
   assert.equal(e.profiles()[0].name, "Renamed PC");
@@ -1627,14 +1627,12 @@ test('HTTPS relay pages explain the Tailscale HTTP backup instead of dialing mix
  const direct=harness(saved,'http://100.64.1.2:1234/',true);assert.equal(direct.endpoint.socketUrl(),'ws://100.64.1.2:1234/ws');direct.transport.close();
 });
 
-test('Pair Desktop opens Tailscale QR links at their own origin and preserves saved relay credentials',()=>{
+test('legacy HTTP Tailscale codes preserve a working HTTPS page and still pair standalone',()=>{
  const saved={device_id:'saved',credential:'11'.repeat(32),rid:'c'.repeat(32),hash:'0123456789abcdef'};
  for(const ip of ['100.64.0.0','100.64.1.2','100.127.255.255']){
   const h=harness(saved,undefined,true),link=`http://${ip}:52931/#pair=ab12&key=secret`,stored=h.store.get('krill-mobile-v2'),book=h.store.get('krill-mobile-hosts-v1'),route=h.endpoint.socketUrl();
-  const next=h.endpoint.adopt(link);assert.equal(next,null,'direct HTTP pairing needs navigation out of the HTTPS app');
-  const line=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(line=>line.includes('function pairWith('));
-  h.context.location.assign=href=>h.redirects.push(href);h.context.startPairing=()=>assert.fail('HTTPS must not dial a direct HTTP endpoint');vm.runInContext(line+';globalThis.pairWith=pairWith;',h.context);h.context.pairWith(link,next);
-  assert.deepEqual(h.redirects,[link]);assert.equal(h.sockets.length,0);assert.equal(h.endpoint.socketUrl(),route);assert.equal(h.store.get('krill-mobile-v2'),stored);assert.equal(h.store.get('krill-mobile-hosts-v1'),book);h.transport.close();
+  assert.throws(()=>h.endpoint.adopt(link),/older Tailscale address/);
+  assert.deepEqual(h.redirects,[]);assert.equal(h.sockets.length,0);assert.equal(h.endpoint.socketUrl(),route);assert.equal(h.store.get('krill-mobile-v2'),stored);assert.equal(h.store.get('krill-mobile-hosts-v1'),book);h.transport.close();
   const direct=harness(null,link,true);assert.equal(direct.endpoint.pair.ticket,'ab12');assert.equal(direct.endpoint.pair.secret,'secret');assert.equal(direct.endpoint.socketUrl(),`ws://${ip}:52931/ws`);direct.transport.close();
  }
 });
@@ -1650,4 +1648,145 @@ test('Tailscale pairing rejects malformed URLs and empty pairing fields without 
  const saved={device_id:'saved',credential:'11'.repeat(32),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,undefined,true),stored=h.store.get('krill-mobile-v2'),book=h.store.get('krill-mobile-hosts-v1'),route=h.endpoint.socketUrl();
  for(const link of ['not a URL','http://100.64.1.256:52931/#pair=ab12&key=secret','http://100.64.1.2:99999/#pair=ab12&key=secret','http://user@100.64.1.2:52931/#pair=ab12&key=secret','http://:pass@100.64.1.2:52931/#pair=ab12&key=secret','http://[::1]:52931/#pair=ab12&key=secret','http://100.64.1.2:52931//#pair=ab12&key=secret','http://100.64.1.2:52931/#pair=&key=secret','http://100.64.1.2:52931/#pair=ab12&key='])assert.throws(()=>h.endpoint.adopt(link));
  assert.deepEqual(h.redirects,[]);assert.equal(h.sockets.length,0);assert.equal(h.endpoint.socketUrl(),route);assert.equal(h.store.get('krill-mobile-v2'),stored);assert.equal(h.store.get('krill-mobile-hosts-v1'),book);h.transport.close();
+});
+
+const desktopManifest = (id = "a".repeat(32)) => ({ host_id: id,
+  relay: { origin: "https://phone.test", rid: id },
+  tailscale: { origin: "https://desktop.tail123.ts.net:18449" },
+});
+const secureQr = (rid = "a".repeat(32)) => "https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r=" + rid + "&d=desktop.tail123.ts.net:18449";
+async function candidateReply(h, reply) {
+  const socket = h.sockets.at(-1);
+  socket.emit("open");
+  socket.emit("message", { data: JSON.stringify({ version: 2, challenge: "aa" }) });
+  socket.emit("message", { data: enc.encode(JSON.stringify(reply)) });
+  await flush();
+  return socket;
+}
+test("adding authenticated Tailscale to a live relay keeps its owner, profile, credential and unused ticket", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) },
+    h = harness(saved, undefined, true), e = h.endpoint, id = e.profiles()[0].id;
+  e.renameHost(id, "My alias");
+  const { pending, socket } = await h.start(4);
+  h.response(socket, { sessions: [] }); await pending;
+  const next = e.adopt(secureQr()), attached = next.attach();
+  const probe = await candidateReply(h, { device_id: "phone", credential: null, desktop: desktopManifest() });
+  await attached;
+  assert.equal(JSON.parse(probe.sent[0]).token, null);
+  assert.equal(JSON.parse(probe.sent[0]).device_id, "phone");
+  assert.equal(probe.sent.length, 2, "auth-only candidate sends no IPC or workflow RPC");
+  assert.equal(probe.closed, true);
+  assert.equal(socket.closed, undefined);
+  assert.equal(h.transport.ready, true);
+  assert.equal(e.profiles().length, 1); assert.equal(e.profiles()[0].id, id);
+  assert.equal(e.profiles()[0].name, "My alias");
+  assert.equal(e.credentials.credential, saved.credential);
+  const peer = e.forHost(id);
+  assert.match(peer.socketUrl(), /\/r\//);
+  assert.equal(peer.fallback(peer.socketUrl()), true);
+  assert.equal(peer.socketUrl(), "wss://desktop.tail123.ts.net:18449/ws");
+  assert.equal(h.redirects.length, 0); h.transport.close();
+});
+test("matching QR hints cannot merge a mismatched desktop or replace its saved credential", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) }, h = harness(saved, undefined, true), e = h.endpoint;
+  const before = h.store.get("krill-mobile-hosts-v1"), next = e.adopt(secureQr());
+  assert.throws(() => next.use(), /saved pairing/);
+  const result = assert.rejects(next.attach(), /identity changed/);
+  await candidateReply(h, { device_id: "phone", credential: null, desktop: desktopManifest("b".repeat(32)) });
+  await result;
+  assert.equal(h.store.get("krill-mobile-hosts-v1"), before);
+  assert.equal(e.credentials.credential, saved.credential); h.transport.close();
+});
+test("opening a secure QR for a saved desktop keeps its saved pairing and attaches without ticket auth", () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) }, h = harness(saved, secureQr(), true);
+  assert.equal(h.endpoint.pair, null); assert.equal(h.endpoint.credentials.device_id, "phone");
+  assert.equal(new URLSearchParams(new URL(h.endpoint.initialRouteLink).hash.slice(1)).get("d"), "desktop.tail123.ts.net:18449"); h.transport.close();
+});
+test("active route loss uses the retained backup without replaying a submitted mutation", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) }, h = harness(saved, undefined, true);
+  h.endpoint.authenticated({ desktop: desktopManifest() });
+  const { pending, socket } = await h.start(4); h.response(socket, { sessions: [] }); await pending;
+  const action = assert.rejects(h.transport.rpc({ action: "input", text: "once" }), /not resent/);
+  await flush(); const writes = socket.sent.length;
+  socket.emit("close", { code: 1006 }); await action; await h.tick(0);
+  const backup = h.sockets.at(-1);
+  assert.equal(backup.url, "wss://desktop.tail123.ts.net:18449/ws");
+  assert.equal(socket.sent.length, writes); assert.equal(backup.sent.length, 0);
+  assert.equal(h.transport.updateBusy, true, "unknown mutation delivery remains visible"); h.transport.close();
+});
+test("fresh compact Tailscale QR uses hosted storage and secure direct route first", () => {
+  const h = harness(null, "https://phone.test/m/0123456789abcdef/#p=" + "A".repeat(43) + "&key=secret&r=" + "a".repeat(32) + "&d=desktop.tail123.ts.net:18449", true);
+  assert.equal(h.endpoint.pair.ticket, "00".repeat(32));
+  assert.equal(h.endpoint.socketUrl(), "wss://desktop.tail123.ts.net:18449/ws"); h.transport.close();
+});
+
+test("mid-auth route transport failure must try retained backup", async () => {
+ const saved={device_id:"phone",credential:"11".repeat(32),rid:"a".repeat(32)};
+ const h=harness(saved,undefined,true);h.endpoint.authenticated({desktop:desktopManifest()});
+ const {pending,socket}=await h.start(2); socket.emit("close",{code:1006});await pending;await h.tick(1000);
+ assert.equal(h.sockets.at(-1).url,"wss://desktop.tail123.ts.net:18449/ws");
+ h.transport.close();
+});
+
+test("malformed compact pairing fragments are stripped without throwing or replacing saved credentials", () => {
+  const h = harness({device_id:"phone",credential:"11".repeat(32),rid:"a".repeat(32)}), paths=[];
+  h.context.history.replaceState = (_state,_title,url) => paths.push(url);
+  for (const fragment of ["p=!", "p="+"A".repeat(44), "p="+"A".repeat(42)+"B", "pair=ab&p="+"A".repeat(43), "p="+"A".repeat(43)+"&d=http://bad.test"]) {
+    h.context.location.hash="#"+fragment+"&key=secret";
+    const endpoint = h.context.KrillMobile.transport.bootstrap();
+    assert.equal(endpoint.pair,null); assert(endpoint.pairingError);
+    assert.equal(endpoint.credentials.device_id,"phone"); assert(!paths.at(-1).includes("secret"));
+    assert.throws(()=>endpoint.adopt("https://phone.test/m/0123456789abcdef/#"+fragment+"&key=secret"), /Not a Krill pairing code/);
+  }
+  h.transport.close();
+});
+test("pasted pairing links return route authentication failures to the existing action handler", async () => {
+  const h=harness(), line=fs.readFileSync(path.join(__dirname,"../src/mobile/assets/app.js"),"utf8").split("\n").find(line=>line.includes("function pasteLink()"));
+  let submit;
+  Object.assign(h.context,{t:text=>text,endpoint:{adopt:()=>({})},closeSheet:()=>{},pairWith:()=>Promise.reject(Error("TLS unavailable")),el:()=>({value:secureQr(),addEventListener(){},setAttribute(){}}),button:(_text,action)=>{submit=action;return {};},sheet:(_title,_items,_copy,extra)=>extra({append(){}})});
+  vm.runInContext(line+";globalThis.paste= pasteLink;",h.context);
+  h.context.paste(); await assert.rejects(submit(),/TLS unavailable/); h.transport.close();
+});
+
+test("direct QR host hint never creates an unauthenticated relay route after relay ID rotation", () => {
+  const hostId="a".repeat(32), h=harness(null,"https://phone.test/m/0123456789abcdef/#p="+"A".repeat(43)+"&key=secret&r="+hostId+"&d=desktop.tail123.ts.net:18449",true);
+  h.endpoint.authenticated({device_id:"phone",credential:"11".repeat(32),desktop:{host_id:hostId}});
+  assert.equal(h.endpoint.credentials.rid,null);
+  assert.equal(h.endpoint.credentials.routes.relay,undefined);
+  assert.equal(h.endpoint.forHost(h.endpoint.profiles()[0].id).socketUrl(),"wss://desktop.tail123.ts.net:18449/ws");
+  h.transport.close();
+});
+test("authenticated existing relay is retained explicitly when a ready-only manifest omits it", () => {
+  const hostId="a".repeat(32), h=harness({device_id:"phone",credential:"11".repeat(32),rid:hostId},undefined,true), peer=h.endpoint.forHost(h.endpoint.profiles()[0].id);
+  assert.match(peer.socketUrl(), /\/r\//);
+  peer.authenticated({device_id:"phone",credential:null,desktop:{host_id:hostId}});
+  assert.equal(peer.credentials.routes.relay.rid,hostId);
+  assert.equal(peer.credentials.routes.relay.origin,"https://phone.test"); h.transport.close();
+});
+
+test("a retained direct-first endpoint discovers the relay attached later without rebuilding its owner", async () => {
+  const hostId="a".repeat(32), relayId="b".repeat(32), h=harness(null,"https://phone.test/m/0123456789abcdef/#p="+"A".repeat(43)+"&key=secret&r="+hostId+"&d=desktop.tail123.ts.net:18449",true);
+  const auth=h.endpoint.authenticated({device_id:"phone",credential:"11".repeat(32),desktop:{host_id:hostId}}), peer=h.endpoint.forHost(auth.id);
+  const attach=h.endpoint.adopt("https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r="+relayId+"&h="+hostId).attach();
+  await candidateReply(h,{device_id:"phone",credential:null,desktop:{host_id:hostId}}); await attach;
+  const requests=[];h.context.fetch=async url=>{requests.push(url);return {ok:true,json:async()=>({hash:"0123456789abcdef",url:"",relay:true})};};
+  await peer.locate(); assert.equal(requests[0],"https://phone.test/r/"+relayId);
+  assert.equal(h.endpoint.credentials.rid,relayId);
+  assert(h.endpoint.updateIdentity().includes(relayId)); h.transport.close();
+});
+
+test("active peer authenticated relay rotation updates the retained bootstrap update identity", () => {
+  const id="a".repeat(32), rotated="b".repeat(32), h=harness({device_id:"phone",credential:"11".repeat(32),rid:id},undefined,true), peer=h.endpoint.forHost(h.endpoint.profiles()[0].id);
+  peer.socketUrl(); peer.authenticated({device_id:"phone",credential:null,desktop:{host_id:id,relay:{origin:"https://phone.test",rid:rotated}}});
+  assert.equal(h.endpoint.credentials.rid,rotated);
+  assert(h.endpoint.updateIdentity().includes(rotated)); h.transport.close();
+});
+
+test("route attachment resolves the current saved desktop after storage reload while authenticating", async () => {
+ const hostId="a".repeat(32), h=harness({device_id:"phone",credential:"11".repeat(32),rid:hostId},undefined,true), e=h.endpoint;
+ const attached=e.adopt(secureQr()).attach(), book=JSON.parse(h.store.get("krill-mobile-hosts-v1"));
+ book.hosts[0].alias="Changed in another tab";h.store.set("krill-mobile-hosts-v1",JSON.stringify(book));e.reloadHosts();
+ await candidateReply(h,{device_id:"phone",credential:null,desktop:desktopManifest()});await attached;
+ const saved=JSON.parse(h.store.get("krill-mobile-hosts-v1")).hosts[0];
+ assert.equal(saved.routes.tailscale.origin,"https://desktop.tail123.ts.net:18449");assert.equal(saved.alias,"Changed in another tab");h.transport.close();
 });

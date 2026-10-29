@@ -41,6 +41,9 @@ fn main() -> ExitCode {
     let Some(argument) = std::env::args_os().nth(1) else {
         return ExitCode::from(2);
     };
+    if argument == "--mobile-tailscale-serve-guard" {
+        return krilld::mobile::tailscale_serve::run_guard(std::env::args_os().skip(2));
+    }
     // 앱 시작 점검은 소켓을 열지 않고 버전만 읽는다.
     if argument == "--version" {
         use std::io::Write as _;

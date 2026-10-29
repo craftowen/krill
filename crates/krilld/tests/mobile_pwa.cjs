@@ -40,7 +40,7 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  vm.runInContext(lines.find(l=>l.includes('let noticeTimer'))+lines.find(l=>l.includes('const pairingLink='))+'globalThis.T={toast,error,pairingLink};',context);const T=context.T;
  T.error(Error('RPC failed'));assert.equal(notice.hidden,false);assert.equal(notice.textContent,'RPC failed');T.error(Error('RPC failed'));timers[0].fn();assert.equal(notice.hidden,false);timers.at(-1).fn();assert.equal(notice.hidden,true);
  T.toast('Photo attached',3000);notice.dispatchEvent(new Event('click'));assert.equal(notice.hidden,true);
- assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#t=x.trycloudflare.com&r=rid'),true);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
+ assert.equal(T.pairingLink('#p=abc&key=def'),true);assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#t=x.trycloudflare.com&r=rid'),true);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
 console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
 for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','storage.js','client.js','terminal.js','qr.js','sw.js','screens/chat.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
 const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','storage.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
@@ -64,7 +64,13 @@ async function fixedOriginTests(){
  const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
  const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
  let f=fixture(fixed+`?session=7&pair=query&key=query&t=evil&r=evil#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}`);
- assert.equal(f.endpoint.credentials,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.endpoint.pair.secret,'secret');assert.equal(f.location.href,fixed+'?session=7');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
+ assert.equal(f.endpoint.credentials.device_id,'saved');assert.equal(f.endpoint.pair,null);assert(f.endpoint.initialRouteLink);assert.equal(f.location.href,fixed+'?session=7');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
+ for(const compact of ['!', 'a'.repeat(42), 'a'.repeat(44), 'A'.repeat(42)+'B', 'A'.repeat(40000)]) {
+  f=fixture(fixed+'#p='+compact+'&key=secret');assert.equal(f.endpoint.pair,null);assert(f.endpoint.pairingError);assert.equal(f.location.hash,'');assert.equal(f.endpoint.credentials.device_id,'saved');
+  assert.throws(()=>f.endpoint.adopt(fixed+'#p='+compact+'&key=secret&r='+rid),/Not a Krill pairing code/);
+ }
+ f=fixture(fixed+'#pair=ab&p='+'A'.repeat(43)+'&key=secret');assert.equal(f.endpoint.pair,null);assert.equal(f.location.hash,'');assert(f.endpoint.pairingError);
+ f=fixture(fixed+'#p='+Buffer.alloc(32,7).toString('base64url')+'&key=secret&d=desktop.tail123.ts.net:18449',null);assert.equal(f.endpoint.pair.ticket,'07'.repeat(32));assert.equal(f.location.hash,'');assert.equal(f.endpoint.socketUrl(),'wss://desktop.tail123.ts.net:18449/ws');
  for(const fragment of ['#t=evil.trycloudflare.com&r=forged','#pair=only&t=evil.trycloudflare.com&r=forged','#key=only&t=evil.trycloudflare.com&r=forged']){
   f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
  }
@@ -103,7 +109,7 @@ async function fixedOriginTests(){
  {const key=Buffer.alloc(32).toString('base64url'),other='b'.repeat(32);f=fixture(fixed);const next=f.endpoint.adopt(`https://elsewhere.example/m/${hash}/#pair=ab12&key=${key}&t=scan.trycloudflare.com&r=${other}`);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);next.use();assert.equal(next.ticket,'ab12');assert.equal(next.secret,key);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
   f=fixture(fixed);f.endpoint.adopt(`https://quick.trycloudflare.com/#pair=ab12&key=${key}`).use();assert.equal(f.endpoint.socketUrl(),`wss://quick.trycloudflare.com/ws?v=${hash}`);
   f=fixture(fixed,null);f.endpoint.adopt(`${fixed}#pair=ab12&key=${key}&r=${other}`).use();assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
-  assert.equal(f.endpoint.adopt(`https://krill-mobile.pages.dev/m/fedcba9876543210/#pair=ab12&key=${key}&r=${rid}`),null);assert.throws(()=>f.endpoint.adopt(`http://192.168.0.5:52931/#pair=ab12&key=${key}`),/Choose Relay server.*New QR code/);
+  assert.equal(f.endpoint.adopt(`https://krill-mobile.pages.dev/m/fedcba9876543210/#pair=ab12&key=${key}&r=${rid}`),null);assert.throws(()=>f.endpoint.adopt(`http://192.168.0.5:52931/#pair=ab12&key=${key}`),/older Tailscale address/);
   for(const bad of ['hello','https://example.com/','https://example.com/#pair=zz&key=k',`javascript:x#pair=ab&key=${key}`])assert.throws(()=>f.endpoint.adopt(bad),/Not a Krill pairing code/);
   f=fixture('http://127.0.0.1:1234/');assert.equal(f.endpoint.adopt(`http://127.0.0.1:1234/#pair=ab12&key=${key}`).secret,key);assert.equal(f.endpoint.adopt(`http://10.0.0.2:1234/#pair=ab12&key=${key}`),null);}
  // Relay wins over a saved tunnel; discovery retains that tunnel as the alternate.
