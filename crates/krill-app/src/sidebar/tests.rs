@@ -2258,33 +2258,45 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
         });
     });
     cx.run_until_parked();
-    // 기본 상태에서는 카드 요약 바만 보이고 하위 세션 행은 접혀 있다(렌더 행 2개: 저장소 + 워크트리 카드).
+    // 이미지 디코드가 재렌더를 일으킬 수 있으므로 누적 렌더 호출 수 대신
+    // 현재 목록의 항목 수와 실제 세션 행의 표시 여부를 검사한다.
+    // 기본 상태는 저장소 + 워크트리 카드 2개다.
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).rendered_rows),
+        cx.update(|_, cx| view.read(cx).card_list.state.item_count()),
         2,
         "collapsed card should hide nested session rows by default"
     );
+    for selector in ["sidebar-session-2", "sidebar-session-3"] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "{selector}: collapsed card should hide nested session rows by default"
+        );
+    }
 
     // 카드 요약 바 토글 시 하위 세션 행 2개가 펼쳐진다(렌더 행 4개).
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.rendered_rows = 0;
             s.toggle_card_sessions(Path::new("/repo/a"), cx);
             assert!(s.expanded_cards.contains(Path::new("/repo/a")));
         });
     });
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).rendered_rows),
+        cx.update(|_, cx| view.read(cx).card_list.state.item_count()),
         4,
         "expanded card should render nested session rows"
     );
+    for selector in ["sidebar-session-2", "sidebar-session-3"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector}: expanded card should render nested session rows"
+        );
+    }
 
     // 하위 세션에 커서가 있을 때 다시 토글하면 커서를 워크트리 행으로 되돌리고 하위 세션 행을 실제로 접는다.
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.cursor = Some(2);
-            s.rendered_rows = 0;
             s.toggle_card_sessions(Path::new("/repo/a"), cx);
             assert!(!s.expanded_cards.contains(Path::new("/repo/a")));
             assert_eq!(s.cursor, Some(1));
@@ -2292,10 +2304,16 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).rendered_rows),
+        cx.update(|_, cx| view.read(cx).card_list.state.item_count()),
         2,
         "re-collapsing card while cursor was on nested session must hide session rows"
     );
+    for selector in ["sidebar-session-2", "sidebar-session-3"] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "{selector}: re-collapsing card while cursor was on nested session must hide session rows"
+        );
+    }
 
     // 숨겨진 `.claude/worktrees` 안의 세션에 포커스가 있을 때 reveal_focused가 숨김을 풀고 워크트리를 가리킨다.
     cx.update(|_, cx| {
