@@ -274,8 +274,25 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
             account_id: b.id.clone(),
         },
     );
-    // Like Orca, the swap commits while the selected account is still starting.
+    // Crash after the new process starts but before it becomes ready or commits its alias.
     wait_for(|| fs::read_to_string(target.join("observed-profile")).ok());
+    let journal = fs::read_dir(state.join("account-replacements"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let prepared: serde_json::Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
+    let abandoned = prepared
+        .get("to")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap();
+    let daemon_pid = Pid::from_raw(i32::try_from(first_generation).unwrap()).unwrap();
+    kill_process(daemon_pid, Signal::KILL).unwrap();
+    let (mut stream, resumed_generation) =
+        wait_for(|| connect(&socket).filter(|(_, pid)| *pid != first_generation));
+    daemon.generations.push(resumed_generation);
+    fs::remove_file(wait_ready).unwrap();
     let new = wait_for(|| {
         let snapshot = usage(&socket, &UsageRequest::ListAccounts);
         let handoff = snapshot.details.handoffs.iter().find(|h| h.from == old)?;
@@ -283,17 +300,10 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
         handoff.to
     });
     assert_ne!(new, old);
-    assert!(
-        wait_ready.is_file(),
-        "the switch must not wait for the replacement to become ready"
+    assert_ne!(
+        new.0, abandoned,
+        "retry must retire the uncommitted process"
     );
-    // Crash after the commit but before the replacement is ready; it must survive.
-    let daemon_pid = Pid::from_raw(i32::try_from(first_generation).unwrap()).unwrap();
-    kill_process(daemon_pid, Signal::KILL).unwrap();
-    let (mut stream, resumed_generation) =
-        wait_for(|| connect(&socket).filter(|(_, pid)| *pid != first_generation));
-    daemon.generations.push(resumed_generation);
-    fs::remove_file(wait_ready).unwrap();
     assert_eq!(
         fs::read_to_string(target.join("observed-profile")).unwrap(),
         target.to_str().unwrap()
