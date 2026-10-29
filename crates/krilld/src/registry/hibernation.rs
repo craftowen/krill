@@ -65,7 +65,7 @@ impl Registry {
         use krill_proto::control::{Failure, Reply};
         // 타이머와 자동 재개를 직렬화한다. 동시에 두 창이 열려도 한 번만 재개한다.
         let mut clock = lock(&self.hibernation);
-        if !peer.authorize("hibernation", old, &lock(&self.state).roots, &self.audit) {
+        if !peer.authorize("hibernation", old, &self.audit) {
             return Err(Failure::Denied);
         }
         if let Some(&session) = clock.woken.get(&old) {

@@ -54,9 +54,13 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
         assert_eq!(data.sessions.len(), 1);
         assert_eq!(data.sessions[0].session, id);
         assert_eq!(data.sessions[0].cwd, expected);
+        // 세션 피어는 전체 권한이라 등록된 프로젝트도 함께 받는다. 이 세션의 저장소만 확인한다.
         if !expected.is_empty() {
-            assert_eq!(data.repositories.len(), 1);
-            assert_eq!(data.repositories[0].worktrees, [expected]);
+            assert!(
+                data.repositories
+                    .iter()
+                    .any(|repo| repo.worktrees == [expected])
+            );
         }
     };
     let reg = Registry::new(None, Some(&dir));
@@ -107,7 +111,9 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
 fn agent_settings_and_metadata_obey_peer_scope() {
     let reg = Registry::new(None, None);
     let mut clients = HashMap::new();
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         for permission in [None, Some(Permission::Yolo)] {
             assert_eq!(
@@ -128,7 +134,7 @@ fn agent_settings_and_metadata_obey_peer_scope() {
     }
     let full = Peer {
         pid: None,
-        scope: Scope::Full,
+        scope: Scope::Session(SessionId(7)),
     };
     assert!(matches!(
         reg.handle(
@@ -374,7 +380,9 @@ fn restart_daemon_needs_full_scope_and_holder() {
     let reg = Registry::new(None, None);
     let mut clients = HashMap::new();
     let restart = Request::Resources(Action::RestartDaemon);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         assert_eq!(
             reg.handle(&peer, restart.clone(), &mut clients),
@@ -383,7 +391,7 @@ fn restart_daemon_needs_full_scope_and_holder() {
     }
     let full = Peer {
         pid: None,
-        scope: Scope::Full,
+        scope: Scope::Session(SessionId(7)),
     };
     assert_eq!(
         reg.handle(&full, restart.clone(), &mut clients),
@@ -411,7 +419,9 @@ fn worktree_requests_obey_peer_scope_and_write_audit() {
     std::fs::create_dir_all(&dir).unwrap();
     let reg = Registry::new(None, Some(&dir));
     let mut clients = HashMap::new();
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer {
             pid: Some(42),
             scope,
@@ -457,30 +467,10 @@ fn worktree_requests_obey_peer_scope_and_write_audit() {
     }
     let audit = std::fs::read_to_string(dir.join("audit.log")).unwrap();
     assert!(audit.contains("deny op=worktree-new target=0 peer_pid=42 scope=restricted\n"));
-    assert!(audit.contains("deny op=worktree-new target=0 peer_pid=42 scope=session:7\n"));
     assert!(audit.contains("deny op=worktree-rm target=0 peer_pid=42 scope=restricted\n"));
-    assert!(audit.contains("deny op=worktree-rm target=0 peer_pid=42 scope=session:7\n"));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// OWE-612: 기동 시 `live`에 없는 자식 ID는 `session-creators`에서 정리된다.
-#[test]
-fn new_prunes_creators_of_dead_sessions() {
-    let dir = std::env::temp_dir().join(format!("mk612-reg-prune-{}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).unwrap();
-    let stale = vec![(SessionId(2), SessionId(1)), (SessionId(3), SessionId(2))];
-    std::fs::write(
-        dir.join("session-creators"),
-        serde_json::to_vec(&stale).unwrap(),
-    )
-    .unwrap();
-    let _reg = Registry::new(None, Some(&dir));
-    let rows: Vec<(SessionId, SessionId)> =
-        serde_json::from_slice(&std::fs::read(dir.join("session-creators")).unwrap()).unwrap();
     assert!(
-        rows.is_empty(),
-        "dead creator entries must be pruned: {rows:?}"
+        !audit.contains("scope=session:"),
+        "session peers are not denied: {audit}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -875,7 +865,9 @@ fn monitor_tick_collects_history_on_interval_without_restart() {
 #[test]
 fn git_mutations_reject_scoped_peers_and_are_never_read_only() {
     let reg = Registry::new(None, None);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         for edit in [
             krill_proto::git::Edit::Stage {
@@ -1044,9 +1036,10 @@ fn session_accounts_returns_launch_account_with_label() {
         pid: None,
         scope: Scope::Session(SessionId(8)),
     };
+    // 세션 피어도 전체 권한이라 다른 세션의 계정 배지를 본다.
     assert_eq!(
         reg.handle(&peer8, Request::SessionAccounts, &mut HashMap::new()),
-        Reply::SessionAccounts(vec![])
+        reg.handle(&peer7, Request::SessionAccounts, &mut HashMap::new())
     );
     fs::remove_dir_all(&dir).ok();
 }
@@ -1085,7 +1078,9 @@ fn provisioning_usage_dispatch_and_access_control() {
         reg.on_usage(&full, Role::Observer, UsageRequest::SetProvisioning(true)),
         UsageReply::Failed(Failure::Denied)
     );
-    for scope in [Scope::Restricted, Scope::Session(SessionId(1))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         for request in [
             UsageRequest::GetProvisioning,
@@ -1718,10 +1713,6 @@ fn first_hook_waits_for_spawn_registration_on_socket_and_spool() {
         let spawning = std::thread::spawn(move || {
             spawn_reg
                 .spawn_holder(
-                    &Peer {
-                        pid: None,
-                        scope: Scope::Full,
-                    },
                     spawn_reg.holder.as_ref().unwrap(),
                     id,
                     vec![b"/bin/sh".to_vec()],
@@ -1958,7 +1949,9 @@ fn negotiated_remote_fs_enforces_scope_and_observer_permissions() {
         commit: true,
     };
     let reg = Registry::new(None, None);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         for request in [stat.clone(), write.clone()] {
             assert_eq!(
                 reg.handle(

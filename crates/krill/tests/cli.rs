@@ -194,7 +194,7 @@ impl Drop for Daemon {
 }
 
 #[test]
-fn commands_work_without_app_and_enforce_session_scope() {
+fn commands_work_without_app_and_reach_other_sessions() {
     let d = Daemon::new("commands");
     assert!(d.ok(&["doctor"]).contains("daemon     ok"));
     let id = d.ok(&[
@@ -220,11 +220,21 @@ fn commands_work_without_app_and_enforce_session_scope() {
             .contains("unknown")
     );
 
-    let rejected = d.dir.join("rejected");
+    // 다른 세션 안에서 실행한 `krill`도 무관한 세션에 입력을 보낼 수 있다(Orca 소유자 모델).
+    let unrelated = d.ok(&[
+        "new",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty -echo; printf 'unrelated-ready\\n'; IFS= read -r line; printf 'unrelated-got:%s\\n' \"$line\"; sleep 30",
+    ]);
+    let unrelated = unrelated.trim();
+    d.wait_text(unrelated, "unrelated-ready");
+    let sent = d.dir.join("sent");
     let child_out = d.dir.join("child-out");
     let attack = format!(
-        "KRILL_STATE_DIR='{dir}' '{krill}' send {id} --enter hijack >'{rej}' 2>&1; \
-         printf '%s' $? >'{rej}.status'; \
+        "KRILL_STATE_DIR='{dir}' '{krill}' send {unrelated} --enter from-other >'{sent}' 2>&1; \
+         printf '%s' $? >'{sent}.status'; \
          cid=$(KRILL_STATE_DIR='{dir}' '{krill}' new -- /bin/sh -c 'stty -echo; printf child-ready\\\\n; IFS= read -r l; printf child-got:%s\\\\n \"$l\"') && \
          KRILL_STATE_DIR='{dir}' '{krill}' wait \"$cid\" --for pattern:child-ready --timeout 5 && \
          KRILL_STATE_DIR='{dir}' '{krill}' send \"$cid\" --enter -- from-creator && \
@@ -233,22 +243,18 @@ fn commands_work_without_app_and_enforce_session_scope() {
          printf '%s' $? >'{cout}.status'",
         dir = d.dir.display(),
         krill = MK,
-        id = id,
-        rej = rejected.display(),
+        sent = sent.display(),
         cout = child_out.display(),
     );
     let attacker = d.ok(&["new", "--", "/bin/sh", "-c", &attack]);
     d.ok(&["wait", attacker.trim(), "--timeout", "10"]);
     assert_eq!(
-        fs::read_to_string(rejected.with_extension("status")).unwrap(),
-        "1"
+        fs::read_to_string(sent.with_extension("status")).unwrap(),
+        "0",
+        "{}",
+        fs::read_to_string(&sent).unwrap_or_default()
     );
-    assert!(
-        fs::read_to_string(&rejected)
-            .unwrap()
-            .contains("no such session")
-    );
-    assert!(!d.ok(&["read", id]).contains("hijack"));
+    d.wait_text(unrelated, "unrelated-got:from-other");
     assert_eq!(
         fs::read_to_string(child_out.with_extension("status")).unwrap(),
         "0",
@@ -399,18 +405,17 @@ fn history_clear_preserves_live_session_and_restarts_recording() {
     d.ok(&["send", id, "--enter", "go"]);
     d.wait_text(id, "new-output");
     assert!(ls_has_session(&d.ok(&["ls"]), id));
-    // A session descendant cannot erase all sessions' history.
-    let report = d.dir.join("denied.status");
+    // A session descendant holds full rights like an external shell (Orca owner model).
+    let report = d.dir.join("inside.status");
     let script = format!(
         "KRILL_STATE_DIR='{}' '{}' history clear; printf '%s' $? > '{}'",
         d.dir.display(),
         MK,
         report.display()
     );
-    let attacker = d.ok(&["new", "--", "/bin/sh", "-c", &script]);
-    d.ok(&["wait", attacker.trim(), "--timeout", "5"]);
-    assert_eq!(fs::read_to_string(report).unwrap(), "1");
-    assert!(session.exists());
+    let inside = d.ok(&["new", "--", "/bin/sh", "-c", &script]);
+    d.ok(&["wait", inside.trim(), "--timeout", "5"]);
+    assert_eq!(fs::read_to_string(report).unwrap(), "0");
     assert_eq!(d.run(&["history"]).status.code(), Some(2));
     d.ok(&["history", "clear"]);
     assert!(!d.dir.join("sessions").exists());

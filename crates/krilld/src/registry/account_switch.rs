@@ -1348,7 +1348,6 @@ impl Registry {
                 .map_err(|e| super::os(&e))?;
         }
         let (new, _) = self.spawn_holder(
-            peer,
             holder,
             new,
             launch.argv,
