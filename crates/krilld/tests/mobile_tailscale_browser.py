@@ -44,7 +44,7 @@ def main():
     parser.add_argument('--screenshots', default='/tmp/krill-tailscale-browser')
     parser.add_argument('--baseline', help='serve client.js from this Git revision to reproduce the bug')
     args = parser.parse_args()
-    binaries = Path(os.environ['CARGO_TARGET_DIR']) / 'debug'
+    binaries = Path(os.environ.get('KRILL_MOBILE_TEST_BIN', str(Path(os.environ['CARGO_TARGET_DIR']) / 'debug')))
     tests = Path(__file__).resolve().parent
     assets = tests.parent / 'src/mobile/assets'
     shots = Path(args.screenshots).resolve()
