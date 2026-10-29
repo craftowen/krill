@@ -418,6 +418,41 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_without_yes_only_previews() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        let root = std::env::temp_dir().join(format!("mk-cli-cleanup-noyes-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("README.md"), "r").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let wt = root.join("wt-merged");
+        git(&repo, &["worktree", "add", "-b", "feat", wt.to_str().unwrap()]);
+
+        let args = ["--repo", repo.to_str().unwrap(), "--json"].map(OsString::from);
+        let (_, out) = execute_cleanup_with_state(&args, Some(&state), false).unwrap();
+        assert_eq!(out.candidates.len(), 1);
+        assert!(out.dry_run, "without --yes the run must be a preview");
+        assert!(wt.exists(), "cleanup without --yes must not delete");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn cli_worktree_space_and_cleanup_end_to_end() {
         let git = |cwd: &Path, args: &[&str]| {
             let out = Command::new("git")
