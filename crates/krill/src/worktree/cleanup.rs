@@ -472,7 +472,8 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "git {args:?} failed");
         };
-        let root = std::env::temp_dir().join(format!("mk-cli-cleanup-noyes-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("mk-cli-cleanup-noyes-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();
         let state = root.join("state");
         let repo = root.join("repo");
@@ -482,7 +483,10 @@ mod tests {
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-m", "initial"]);
         let wt = root.join("wt-merged");
-        git(&repo, &["worktree", "add", "-b", "feat", wt.to_str().unwrap()]);
+        git(
+            &repo,
+            &["worktree", "add", "-b", "feat", wt.to_str().unwrap()],
+        );
 
         let args = ["--repo", repo.to_str().unwrap(), "--json"].map(OsString::from);
         let (_, out) = execute_cleanup_with_state(&args, Some(&state), false).unwrap();

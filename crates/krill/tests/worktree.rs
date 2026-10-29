@@ -712,3 +712,24 @@ fn worktree_symlink_and_hooks_cli_end_to_end() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn worktree_local_only_subcommands_reject_host() {
+    let state = PathBuf::from(format!("/tmp/mkwt-host-{}", std::process::id()));
+    fs::create_dir_all(&state).unwrap();
+    for sub in [
+        "list", "show", "current", "cleanup", "space", "set", "symlink", "hooks",
+    ] {
+        let out = Command::new(MK)
+            .env("KRILL_STATE_DIR", &state)
+            .args(["worktree", sub, "--host", "nobody@invalid.invalid"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{sub}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--host"),
+            "{sub}: {out:?}"
+        );
+    }
+    fs::remove_dir_all(&state).ok();
+}
