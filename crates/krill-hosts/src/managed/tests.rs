@@ -32,7 +32,7 @@ impl FakeSsh {
         // 원격 명령이 쓰는 도구만 가짜 bin에 심볼링크로 고정해 PATH를 격리한다.
         // 시스템에 설치된 실제 `krill`이 프로브(`command -v krill`)에 새지 않게 한다.
         for tool in [
-            "sh", "dirname", "cat", "mkdir", "chmod", "id", "printf", "sleep",
+            "sh", "dirname", "cat", "mkdir", "chmod", "id", "printf", "sleep", "wc", "mv", "rm",
         ] {
             let target = ["/bin", "/usr/bin"]
                 .into_iter()
@@ -54,6 +54,7 @@ for a in "$@"; do last="$a"; done
 printf '%s\n' "$*" >> "$base/argv"
 if [ -f "$base/cfg_home" ]; then HOME=$(cat "$base/cfg_home"); export HOME; fi
 if [ -f "$base/cfg_path" ]; then PATH=$(cat "$base/cfg_path"); export PATH; fi
+if [ -f "$base/cfg_cut_holder" ]; then case "$last" in *krill-holder*) /usr/bin/head -c 4 | sh -c "$last"; exit $?;; esac; fi
 exec sh -c "$last"
 "#,
         )
@@ -475,6 +476,95 @@ fn install_reports_bootstrap_failure_with_guidance_kind() {
             .unwrap_err();
     assert_eq!(err.kind, InstallFailureKind::Bootstrap);
     assert_eq!(err.step, "setup");
+}
+
+fn install_with_holder(
+    fake: &FakeSsh,
+    home: &str,
+    holder: &[u8],
+) -> Result<InstallReport, InstallError> {
+    let opts = test_opts();
+    let spec = InstallSpec::new(home, "0.1.5").unwrap();
+    let remote = query_remote_info_with_program(&opts, &fake.ssh_bin()).unwrap();
+    let blobs = [
+        InstallBlob {
+            name: "krill",
+            bytes: b"krill",
+        },
+        InstallBlob {
+            name: "krilld",
+            bytes: b"krilld",
+        },
+        InstallBlob {
+            name: "krill-holder",
+            bytes: holder,
+        },
+    ];
+    let payload = InstallPayload {
+        blobs: &blobs,
+        plist_xml: &spec.render_plist(),
+    };
+    install_remote_with_program(&opts, &fake.ssh_bin(), &spec, "aarch64", &payload, &remote)
+}
+
+#[test]
+fn reinstall_leaves_the_running_binary_file_untouched() {
+    use std::io::Read as _;
+    let fake = FakeSsh::new("reinstall");
+    fake.set_uname("Darwin", "arm64");
+    fake.set_launchctl(0);
+    let home = fake.home.display().to_string();
+    install_with_holder(&fake, &home, b"old-holder").unwrap();
+    let path = fake.home.join(".krill/bin/krill-holder");
+    // A running holder keeps its executable file open.
+    let mut running = std::fs::File::open(&path).unwrap();
+
+    install_with_holder(&fake, &home, b"new-holder").unwrap();
+
+    let mut seen = Vec::new();
+    running.read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, b"old-holder");
+    assert_eq!(std::fs::read(&path).unwrap(), b"new-holder");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
+#[test]
+fn truncated_upload_fails_and_keeps_the_installed_binary() {
+    let fake = FakeSsh::new("truncated");
+    fake.set_uname("Darwin", "arm64");
+    fake.set_launchctl(0);
+    let home = fake.home.display().to_string();
+    install_with_holder(&fake, &home, b"old-holder").unwrap();
+    std::fs::write(fake.base.join("cfg_cut_holder"), "").unwrap();
+
+    let err = install_with_holder(&fake, &home, b"new-holder").unwrap_err();
+
+    assert_eq!(err.step, "upload");
+    let bin = fake.home.join(".krill/bin");
+    assert_eq!(
+        std::fs::read(bin.join("krill-holder")).unwrap(),
+        b"old-holder"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&bin)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["VERSION", "krill", "krill-holder", "krilld"]);
+}
+
+#[test]
+fn install_fails_when_the_version_file_cannot_be_written() {
+    let fake = FakeSsh::new("versionfail");
+    fake.set_uname("Darwin", "arm64");
+    fake.set_launchctl(0);
+    std::fs::create_dir_all(fake.home.join(".krill/bin/VERSION")).unwrap();
+
+    let err = install_with_holder(&fake, &fake.home.display().to_string(), b"holder").unwrap_err();
+
+    assert_eq!(err.step, "setup");
+    assert_eq!(fake.launchctl_argv(), "");
 }
 
 #[test]
