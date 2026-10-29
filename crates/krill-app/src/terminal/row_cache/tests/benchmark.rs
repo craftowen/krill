@@ -144,7 +144,7 @@ fn replay(frames: &[(Rc<Screen>, Theme)]) -> Duration {
 
 /// native paint・GPU·앱 전체가 아니라 행 계획 준비 비용만 비교한다.
 #[test]
-#[ignore = "수동: 같은 테스트 실행 파일을 baseline/candidate 순서를 바꿔 실행"]
+#[ignore = "manual: run the same test executable in alternating baseline/candidate order"]
 fn row_plan_workload_benchmark() {
     let variant = std::env::var("KRILL_ROW_CACHE_BENCH_VARIANT").unwrap_or_else(|_| "unset".into());
     for workload in [

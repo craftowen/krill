@@ -60,7 +60,7 @@ fn reuses_shifted_cjk_and_styled_rows_in_both_directions() {
             };
             assert!(
                 Rc::ptr_eq(&plans[new_index], &previous[old_index]),
-                "내용이 유지된 행은 이동 뒤에도 같은 계획을 쓴다: upward={upward}, row={new_index}"
+                "unchanged rows reuse their plans after shifting: upward={upward}, row={new_index}"
             );
         }
     }
