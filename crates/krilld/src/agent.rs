@@ -37,9 +37,15 @@ pub use windows::run as run_windows_agent;
 pub(crate) use windows::wrap_shell as wrap_windows_shell;
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
+/// 에이전트가 끝나면 같은 PTY에서 로그인 셸로 돌아간다(Orca처럼 종료 화면·세션 id가 남고 다른 CLI를 바로 띄운다).
+/// 설치 안 됨(127)과 종료 신호(HUP·TERM — 탭 닫기·동면)는 셸 없이 끝난다. 계정 env는 서브셸 안에서만 에이전트에 준다.
+/// `set +m`: 에이전트를 루트와 같은 프로세스 그룹에 둬 holder의 `killpg`(종료·신호)가 에이전트까지 닿게 한다.
 // ponytail: POSIX 문법이라 fish·nu 같은 로그인 셸에서는 깨진다. 지원하려면 그때 `/bin/zsh -l -i -c`로 감싼다.
 #[cfg(unix)]
 const PREFLIGHT: &str = r#"
+hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }
+set +m; trap : INT QUIT; trap 'exit 129' HUP; trap 'exit 143' TERM
+(
 case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
@@ -47,7 +53,10 @@ case "${KRILL_ACCOUNT_PROVIDER-}" in
   agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill; fi;;
 esac
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
-hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }; if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
+if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
+)
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
+exec "${SHELL:-/bin/zsh}" -l
 "#;
 
 /// 이 프로세스의 환경과 passwd로 에이전트 실행 argv·env를 만든다.

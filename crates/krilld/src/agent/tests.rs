@@ -139,6 +139,17 @@ fn installed_agent_is_execed_with_args() {
     );
 }
 
+/// 에이전트가 실패 코드로 끝나도 세션은 로그인 셸로 이어진다. 여기선 stdin이 비어 셸이 바로 0으로 끝난다.
+#[test]
+fn agent_exit_falls_back_to_login_shell() {
+    let out = run(&profile(&["/bin/sh", "-c", "echo mk-agent-done; exit 3"]));
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("mk-agent-done"),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn selected_credentials_win_over_login_rc_and_custom_profile_environment() {
     use std::os::unix::fs::PermissionsExt as _;
