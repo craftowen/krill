@@ -1812,6 +1812,18 @@ fn same_dir_sees_through_aliases() {
         Path::new("/nonexistent/a"),
         Path::new("/nonexistent/a")
     ));
+    // 아직 만들어지지 않은 기본 폴더도 `..`·심볼릭 링크 별칭으로 우회되지 않는다(첫 실행 전 상태).
+    let missing = state.path().join("fresh").join("dev.krill.app");
+    assert!(same_dir(&missing.join("../dev.krill.app"), &missing));
+    assert!(same_dir(&missing.join("./x/.."), &missing));
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(state.path().join("fresh")).unwrap();
+        let link = state.path().join("fresh-link");
+        std::os::unix::fs::symlink(state.path().join("fresh"), &link).unwrap();
+        assert!(same_dir(&link.join("dev.krill.app"), &missing));
+    }
+    assert!(!same_dir(&missing.join("../other"), &missing));
 }
 
 /// 이 테스트 프로세스 자신은 기본 상태 폴더(Krill 세션이 `KRILL_STATE_DIR`로 물려줘도, `..` 별칭으로 줘도)의

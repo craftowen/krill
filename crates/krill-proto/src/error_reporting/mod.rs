@@ -137,12 +137,39 @@ pub(crate) fn shielded(state: &Path) -> bool {
     is_test_process() && crate::daemon::default_state_dir().is_some_and(|d| same_dir(state, &d))
 }
 
-/// 같은 디렉터리인가(`..`·심볼릭 링크 별칭 포함). 한쪽이 없으면 글자 그대로 비교한다 — 없는 폴더에는 동의도 없다.
+/// 같은 디렉터리인가(`..`·심볼릭 링크 별칭 포함). 아직 없는 폴더도 별칭으로 동의를 만들 수 있으니 글자 비교로
+/// 물러서지 않고 [`resolve`]로 비교한다.
 fn same_dir(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+    resolve(a) == resolve(b)
+}
+
+/// 존재하는 가장 깊은 조상을 `canonicalize`하고, 없는 나머지 구성 요소는 글자 그대로 붙이며 `.`·`..`만 접는다.
+fn resolve(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut rest = Vec::new();
+    let mut base = path;
+    let mut out = loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            break real;
+        }
+        match (base.parent(), base.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last);
+                base = parent;
+            }
+            _ => break PathBuf::new(),
+        }
+    };
+    for part in rest.into_iter().rev() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
     }
+    out
 }
 
 /// 테스트 하네스가 띄운 프로세스(와 그 자식)인가 — `krill_log::is_test_process`와 같은 판정이다(이 크레이트는
