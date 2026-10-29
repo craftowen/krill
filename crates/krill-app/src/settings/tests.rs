@@ -1210,13 +1210,15 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
         ProviderKind::OpenCode,
     ] {
         assert!(
-            crate::ui::icons::provider_svg_bytes(provider).starts_with(b"<svg"),
+            std::str::from_utf8(crate::ui::icons::provider_svg_bytes(provider))
+                .is_ok_and(|svg| svg.contains("<svg")),
             "missing svg for {provider:?}"
         );
     }
     for agent_id in ["claude", "codex", "agy", "cursor", "opencode"] {
         assert!(
-            crate::ui::icons::agent_svg_bytes(agent_id).starts_with(b"<svg"),
+            std::str::from_utf8(crate::ui::icons::agent_svg_bytes(agent_id))
+                .is_ok_and(|svg| svg.contains("<svg")),
             "missing svg for {agent_id}"
         );
     }
