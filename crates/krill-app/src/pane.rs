@@ -293,7 +293,35 @@ pub fn ensure_live_session_in(
     }
 }
 
+/// 세션 생성·재개 실패를 운영 로그에 남긴다. 2026-10-29 "새 AI 세션이 되다가 안 된다가"를 신고받았으나 앱 로그에
+/// 실패 흔적이 전혀 없어 원인을 추적할 수 없었다. 종류·에이전트 여부·재개 여부만 남기고 경로·오류 문구는 남기지 않는다.
 fn ensure_session_inner(
+    target: &HostTarget,
+    want: Option<SessionId>,
+    create: &Create,
+    allow_cold: bool,
+) -> io::Result<Found> {
+    let started = std::time::Instant::now();
+    let result = ensure_session_attempt(target, want, create, allow_cold);
+    match &result {
+        Err(error) => tracing::warn!(
+            kind = ?error.kind(),
+            agent = matches!(create.program, Program::Agent { .. }),
+            resume = want.is_some(),
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "session create failed"
+        ),
+        Ok(_) if started.elapsed() >= Duration::from_secs(2) => tracing::info!(
+            agent = matches!(create.program, Program::Agent { .. }),
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "session create slow"
+        ),
+        Ok(_) => {}
+    }
+    result
+}
+
+fn ensure_session_attempt(
     target: &HostTarget,
     want: Option<SessionId>,
     create: &Create,
