@@ -244,7 +244,7 @@ def main():
                     click('Pair Desktop')
                     wait('!!document.querySelector("dialog.scanner")')
                     browser('upload', 'dialog.scanner input[type=file]', str(photo))
-                    wait('document.getElementById("notice").textContent.includes("Desktop backup added")')
+                    wait('dualProbe.notices.some(text=>text.includes("Desktop backup added"))')
                     stop(qr)
                     qr_log.close()
                 else:
@@ -253,7 +253,7 @@ def main():
                     click('Paste link instead')
                     browser('fill', 'input[type=url]', link)
                     click('Continue')
-                    wait('document.getElementById("notice").textContent.includes("Desktop backup added")')
+                    wait('dualProbe.notices.some(text=>text.includes("Desktop backup added"))')
                 if order == 'blocked-relay-first':
                     assert not evaluate('KrillMobile.app.transport.blocked'), 'an authenticated backup left the retained owner blocked'
                     wait('KrillMobile.app.transport.ready')
@@ -307,6 +307,11 @@ def main():
                 subprocess.run(['agent-browser', '--session', session, 'screenshot', str(shots / (session + '-failure.png'))], capture_output=True, timeout=20)
                 result = subprocess.run(['agent-browser', '--session', session, 'snapshot', '-i'], capture_output=True, text=True, timeout=20)
                 (shots / (session + '-failure.txt')).write_text(result.stdout + result.stderr)
+                for diagnostic in ('errors', 'console'):
+                    captured = subprocess.run(['agent-browser', '--session', session, diagnostic, '--json'], capture_output=True, text=True, timeout=20)
+                    (shots / (session + '-' + diagnostic + '.json')).write_text(captured.stdout + captured.stderr)
+                captured = subprocess.run(['agent-browser', '--session', session, 'eval', '--json', 'JSON.stringify({notices:globalThis.dualProbe?.notices,phase:globalThis.KrillMobile?.store?.connection?.phase,sessions:globalThis.KrillMobile?.store?.sessions?.size,blocked:globalThis.KrillMobile?.app?.transport?.blocked,ready:globalThis.KrillMobile?.app?.transport?.ready})'], capture_output=True, text=True, timeout=20)
+                (shots / (session + '-state.json')).write_text(captured.stdout + captured.stderr)
             raise
         finally:
             for session in sessions:

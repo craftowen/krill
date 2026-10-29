@@ -1938,3 +1938,23 @@ test("explicit retry after authentication rejection restores the cleared desktop
   assert.equal(pool.get(id).transport, owner);
   pool.close(); h.transport.close();
 });
+
+
+test("relay attachment saves the authenticated connection origin instead of its QR wrapper", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) },
+    h = harness(saved, undefined, true), e = h.endpoint, id = e.profiles()[0].id,
+    next = e.adopt("https://elsewhere.trycloudflare.com/m/0123456789abcdef/#pair=ab&key=secret&r=" + saved.rid);
+  const attaching = next.attach(),
+    probe = await candidateReply(h, { device_id: "phone", credential: null, desktop: desktopManifest() });
+  await attaching;
+  assert.equal(new URL(probe.url).origin, "wss://phone.test");
+  const stored = JSON.parse(h.store.get("krill-mobile-hosts-v1")).hosts[0];
+  assert.equal(stored.routes.relay.origin, "https://phone.test");
+  assert.equal(stored.relay_origin, "https://phone.test");
+  assert.equal(e.credentials.relay_origin, "https://phone.test");
+  const peer = e.forHost(id);
+  assert.equal(peer.selectRoute(next.routeUrl), true);
+  assert.equal(peer.socketUrl(), probe.url);
+  assert.equal(stored.credential, saved.credential);
+  h.transport.close();
+});

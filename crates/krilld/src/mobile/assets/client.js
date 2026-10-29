@@ -775,8 +775,9 @@
               const patch = manifestPatch(current, auth, route);
               if (d) patch.routes = { ...patch.routes, tailscale: { origin: d } };
               else if (validRid(r)) {
-                patch.routes = { ...patch.routes, relay: { origin: u.origin, rid: r } };
-                patch.rid = r; patch.relay_origin = u.origin;
+                const origin = new URL(route).origin.replace(/^ws/, "http");
+                patch.routes = { ...patch.routes, relay: { origin, rid: r } };
+                patch.rid = r; patch.relay_origin = origin;
               }
               Object.assign(current, patch);
               persist();
