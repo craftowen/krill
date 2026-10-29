@@ -6,7 +6,7 @@ use krill_proto::usage::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 const MAX_ACCOUNTS: usize = 256;
@@ -35,10 +35,63 @@ fn path(home: &Path, state: Option<&Path>) -> PathBuf {
     super::config_path(home, state).with_file_name("account-policy-state.json")
 }
 
+/// Older daemons used a PID-only name; the shared atomic writer adds a sequence.
+fn temp_owner(name: &str) -> Option<u32> {
+    let pid = if let Some(rest) = name.strip_prefix("account-policy-state.") {
+        rest.strip_suffix(".tmp")?
+    } else {
+        let rest = name.strip_prefix(".account-policy-state.json.tmp.")?;
+        let (pid, sequence) = rest.split_once('.')?;
+        if sequence.is_empty() || !sequence.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        pid
+    };
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok().filter(|pid| *pid > 1)
+}
+
+fn cleanup_orphan_temps(path: &Path, live_pids: &[u32]) {
+    // An empty/incomplete snapshot that cannot see this process is not proof of death.
+    if !live_pids.contains(&std::process::id()) {
+        return;
+    }
+    let Some(parent) = path.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(temp_owner) else {
+            continue;
+        };
+        if live_pids.contains(&pid) {
+            continue;
+        }
+        // Do not touch symlinks, directories, recent writes, or uncertain metadata.
+        let old_file = entry.file_type().is_ok_and(|kind| kind.is_file())
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age >= std::time::Duration::from_secs(3600));
+        if old_file {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
 impl Runtime {
     pub fn load(home: &Path, state: Option<&Path>) -> Self {
+        let path = path(home, state);
+        // If process enumeration fails, preserve every temp rather than guessing ownership.
+        if let Ok(pids) = crate::sys::all_pids() {
+            cleanup_orphan_temps(&path, &pids);
+        }
         let mut bytes = Vec::new();
-        let Ok(file) = std::fs::File::open(path(home, state)) else {
+        let Ok(file) = std::fs::File::open(path) else {
             return Self::default();
         };
         if file
@@ -68,22 +121,10 @@ impl Runtime {
     }
 
     pub fn save(&self, home: &Path, state: Option<&Path>) -> io::Result<()> {
-        use krill_proto::os::fs::OpenOptionsExt as _;
-        let path = path(home, state);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(tmp, path)
+        // Unique names avoid concurrent saves truncating each other's pending file;
+        // the shared writer removes its temp on write, sync, and rename errors.
+        super::write_atomic_0600(&path(home, state), &bytes)
     }
 
     pub fn observe(&mut self, accounts: &[AccountInfo], stamps: &BTreeMap<String, u64>) {
@@ -344,6 +385,81 @@ pub(super) fn model_windows(home: &Path, accounts: &[AccountInfo]) -> Vec<ModelW
 mod tests {
     use super::*;
     use krill_proto::usage::{ProviderKind, Window};
+
+    #[test]
+    fn failed_publish_removes_temp_and_keeps_previous_destination() {
+        let root =
+            std::env::temp_dir().join(format!("policy-publish-error-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let destination = path(&root, Some(&root));
+        std::fs::create_dir_all(&destination).unwrap(); // force rename failure
+        assert!(runtime().save(&root, Some(&root)).is_err());
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reload_cleans_only_old_dead_owner_temps_in_both_formats() {
+        let root = std::env::temp_dir().join(format!("policy-orphans-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let live = std::process::id();
+        let dead = (2..u32::MAX)
+            .find(|pid| !crate::sys::all_pids().unwrap().contains(pid))
+            .unwrap();
+        let names = [
+            format!("account-policy-state.{dead}.tmp"),
+            format!(".account-policy-state.json.tmp.{dead}.42"),
+            format!("account-policy-state.{live}.tmp"),
+            format!(".account-policy-state.json.tmp.{live}.43"),
+            format!("account-policy-state.{dead}.tmp.extra"),
+            "account-policy-state.invalid.tmp".into(),
+            "account-policy-state.0.tmp".into(),
+        ];
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for name in &names {
+            let file = std::fs::File::create(root.join(name)).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let recent = root.join(format!(".account-policy-state.json.tmp.{dead}.44"));
+        std::fs::write(&recent, b"pending").unwrap();
+        let directory = root.join(format!(".account-policy-state.json.tmp.{dead}.45"));
+        std::fs::create_dir(&directory).unwrap();
+        cleanup_orphan_temps(&path(&root, Some(&root)), &[]);
+        assert!(root.join(&names[0]).is_file());
+        assert!(root.join(&names[1]).is_file());
+        let expected = runtime();
+        expected.save(&root, Some(&root)).unwrap();
+        assert_eq!(Runtime::load(&root, Some(&root)), expected);
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(root.join(name).exists(), i >= 2, "{name}");
+        }
+        assert!(recent.is_file());
+        assert!(directory.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_saves_publish_complete_snapshots_without_temp_collisions() {
+        let root = std::env::temp_dir().join(format!("policy-concurrent-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..16 {
+                        runtime().save(&root, Some(&root)).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(Runtime::load(&root, Some(&root)), runtime());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn usage(percent: u8, reset: u64) -> Snapshot {
         Snapshot {
