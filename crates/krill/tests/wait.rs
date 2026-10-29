@@ -342,7 +342,7 @@ fn quiet_counts_invisible_output_and_reports_timeout_two() {
 }
 
 #[test]
-fn wait_query_enforces_feature_and_session_scope() {
+fn wait_query_enforces_feature_and_reaches_other_sessions() {
     let d = Daemon::new("scope");
     let target = d.session("printf 'target-ready\\n'");
     d.wait_text(&target, "target-ready");
@@ -384,13 +384,14 @@ fn wait_query_enforces_feature_and_session_scope() {
         }
     ));
 
-    let attacker = d.session(&format!(r#"KRILL_STATE_DIR="$D" "$MK" wait {target} --for quiet:0 --timeout 0 >"$D/rejected" 2>&1; printf '%s' $? >"$D/status"; printf 'attacker-ready\n'"#));
-    d.wait_text(&attacker, "attacker-ready");
-    assert_eq!(fs::read_to_string(d.dir.join("status")).unwrap(), "1");
-    assert!(
-        fs::read_to_string(d.dir.join("rejected"))
-            .unwrap()
-            .contains("no such session")
+    // 다른 세션 안에서도 대상 세션을 기다릴 수 있다(Orca 소유자 모델).
+    let other = d.session(&format!(r#"KRILL_STATE_DIR="$D" "$MK" wait {target} --for quiet:0 --timeout 5 >"$D/other" 2>&1; printf '%s' $? >"$D/status"; printf 'other-ready\n'"#));
+    d.wait_text(&other, "other-ready");
+    let out = fs::read_to_string(d.dir.join("other")).unwrap();
+    assert_eq!(
+        fs::read_to_string(d.dir.join("status")).unwrap(),
+        "0",
+        "{out}"
     );
     assert_eq!(d.probe("999999", "idle").status.code(), Some(1));
 }

@@ -1,11 +1,11 @@
 //! MK-082의 외부 transcript → MK-052 재개 경계.
 //! 잠정 결정 의존: OWE-417의 `agent::resume_in`. 거부 시 이 모듈의 재개 분기만 제거한다.
-use super::{Failure, Launch, Path, Peer, Registry, Reply, Scope, control, os};
+use super::{Failure, Launch, Path, Peer, Registry, Reply, control, os};
 use krill_proto::agent_history::{Action, Response, VaultAgent, VaultTarget};
 
 impl Registry {
     pub(super) fn agent_history(&self, peer: &Peer, action: Action) -> Result<Reply, Failure> {
-        if peer.scope != Scope::Full {
+        if !peer.scope.full() {
             peer.deny("agent-history", &self.audit);
             return Err(Failure::Denied);
         }
@@ -112,8 +112,7 @@ impl Registry {
                 self.discard_settings(session);
                 os(&e)
             })?;
-        let (session, _) =
-            self.spawn_holder(peer, holder, session, argv, env, cwd_bytes, 80, 24)?;
+        let (session, _) = self.spawn_holder(holder, session, argv, env, cwd_bytes, 80, 24)?;
         Ok(Reply::AgentHistory(Response::Resumed { session }))
     }
 }
@@ -122,6 +121,7 @@ impl Registry {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use crate::scope::Scope;
     use krill_proto::agent_history::{Agent, Entry, SearchQuery};
     use krill_proto::control::{FEAT_CONTROL, Request};
     use krill_proto::os::net::UnixStream;
@@ -143,10 +143,13 @@ mod tests {
     }
 
     #[test]
-    fn history_is_global_only_and_scan_is_the_only_read_only_action() {
+    fn history_denies_unverified_peers_and_scan_is_the_only_read_only_action() {
         let reg = Registry::new(None, None);
-        for scope in [Scope::Restricted, Scope::Session(SessionId(1))] {
-            let peer = Peer { pid: None, scope };
+        {
+            let peer = Peer {
+                pid: None,
+                scope: Scope::Restricted,
+            };
             for action in [
                 Action::Scan,
                 Action::Search(SearchQuery::default()),

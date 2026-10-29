@@ -227,4 +227,4 @@ krill changes --repo /private/tmp/.../hello
 | `doctor` 첫 기동·재사용 | 빈 `KRILL_STATE_DIR`에서 `doctor` 두 번 | `(launched)` → 재사용, 둘 다 0 |
 | `agent list` 미설치 | `krill agent list` | cursor·gemini·opencode 설치 안내, 0 |
 | `hook` fail-open | `printf ... \| krill hook claude` (에이전트 내부용) | `{}` 출력, 0 |
-| 세션 범위 거부 | 세션 안에서 `krill send <다른 id>` (통합 테스트) | `no such session`(1), 원래 세션에 `hijack` 없음 |
+| 다른 세션 제어 | 세션 안에서 `krill send <다른 id>` (통합 테스트) | 종료 코드 0, 대상 세션이 입력을 받음 |
