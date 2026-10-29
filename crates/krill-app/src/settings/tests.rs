@@ -9528,6 +9528,37 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
     fs::remove_dir_all(d).ok();
 }
 
+/// 읽지 못한 셸 프로필(UTF-8 아님)을 빈 파일로 보고 에일리어스 블록만 남겨 덮어쓰면 사용자 설정이 사라진다.
+#[gpui::test]
+fn saving_shell_aliases_never_overwrites_an_unreadable_rc(cx: &mut TestAppContext) {
+    let d = dir("install-alias-unreadable-rc");
+    init(cx, &d);
+    let rc_path = install::shell_rc_path(&d.join("test-home"));
+    fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
+    let original = b"export PS1='\xff\xfe> '\nexport PATH=\"$HOME/bin:$PATH\"\n".to_vec();
+    fs::write(&rc_path, &original).unwrap();
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Install, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| view.update(cx, SettingsView::save_shell_aliases));
+
+    assert_eq!(fs::read(&rc_path).unwrap(), original);
+    vcx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .install
+                .alias_status
+                .as_ref()
+                .is_some_and(|(_, error)| *error)
+        );
+    });
+    fs::remove_dir_all(d).ok();
+}
+
 /// Settings audit: short viewports must retain the schedule actions and restore editing focus.
 #[gpui::test]
 fn ui_audit_settings_modal_bounds_focus_and_escape(cx: &mut TestAppContext) {

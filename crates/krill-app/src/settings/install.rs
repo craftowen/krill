@@ -1695,6 +1695,23 @@ mod tests {
     }
 
     #[test]
+    fn alias_block_without_end_marker_keeps_following_rc_lines() {
+        let entries = vec![AliasEntry {
+            agent_id: "claude",
+            alias_name: "cc".into(),
+            use_yolo: false,
+        }];
+        let rc = format!("export A=1\n{ALIAS_BLOCK_START}\nalias cc='claude'\nexport B=2\n");
+        for out in [
+            remove_alias_block(&rc),
+            upsert_alias_block(&rc, &entries, false),
+        ] {
+            assert!(out.contains("export A=1"), "{out}");
+            assert!(out.contains("export B=2"), "{out}");
+        }
+    }
+
+    #[test]
     fn powershell_alias_block_rendering_and_parsing() {
         let entries = vec![AliasEntry {
             agent_id: "claude",
