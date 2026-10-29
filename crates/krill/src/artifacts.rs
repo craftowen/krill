@@ -829,7 +829,12 @@ fn request_with_idempotency(
             .stderr(Stdio::piped());
         let mut child = cmd.spawn()?;
         if let (Some(b), Some(mut stdin)) = (body, child.stdin.take()) {
-            stdin.write_all(b.as_bytes())?;
+            // curl이 본문을 다 읽기 전에 끝나면(연결 거부 등) EPIPE다. 진짜 원인은 curl의 종료 코드와 stderr에 있다.
+            if let Err(e) = stdin.write_all(b.as_bytes())
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(e);
+            }
         }
         child.wait_with_output()
     })();
@@ -976,6 +981,26 @@ esac
         fn drop(&mut self) {
             fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    #[test]
+    fn curl_exiting_early_reports_its_own_error_not_epipe() {
+        let env = Env::new("epipe");
+        let curl = env.dir.join("curl");
+        fs::write(&curl, "#!/bin/sh\necho 'curl: (7) refused' >&2\nexit 7\n").unwrap();
+        let big = "x".repeat(1 << 20);
+        let err = request(
+            &env.ctx,
+            "POST",
+            "http://localhost/v1/artifacts",
+            "t",
+            None,
+            Some(&big),
+        )
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("refused"), "{text}");
+        assert!(!text.contains("Broken pipe"), "{text}");
     }
 
     fn mode(p: &Path) -> u32 {
