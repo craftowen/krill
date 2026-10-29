@@ -175,7 +175,6 @@ mod tests {
                     bytewise.advance(std::slice::from_ref(byte));
                 }
                 assert_eq!(chunked.pending, bytewise.pending, "prefix={prefix:?}");
-                assert_eq!(chunked.escaped, bytewise.escaped, "prefix={prefix:?}");
                 assert_eq!(
                     std::mem::discriminant(&chunked.state),
                     std::mem::discriminant(&bytewise.state),
@@ -224,7 +223,6 @@ mod tests {
 pub(crate) struct Boundary {
     state: BoundaryState,
     pub pending: usize,
-    escaped: bool,
 }
 #[derive(Default)]
 enum BoundaryState {
@@ -260,7 +258,7 @@ impl Boundary {
                 }
                 BoundaryState::Escape => match byte {
                     b'[' => self.state = BoundaryState::Csi,
-                    b']' | b'P' | b'_' | b'^' => {
+                    b']' | b'P' | b'X' | b'_' | b'^' => {
                         self.state = BoundaryState::String { osc: byte == b']' }
                     }
                     0x1b => self.start(byte),
@@ -272,23 +270,19 @@ impl Boundary {
                     0x1b => self.start(byte),
                     _ => {}
                 },
-                BoundaryState::String { osc } => {
-                    if (osc && byte == 7)
-                        || (self.escaped && byte == b'\\')
-                        || byte == 0x18
-                        || byte == 0x1a
-                    {
-                        self.clear();
-                    }
-                    self.escaped = byte == 0x1b;
-                }
+                // vte처럼 ESC는 문자열을 끝내고 새 이스케이프를 연다. ST(ESC 0x5c)는 Escape 상태에서 끝난다.
+                BoundaryState::String { osc } => match byte {
+                    0x1b => self.start(byte),
+                    0x18 | 0x1a => self.clear(),
+                    7 if osc => self.clear(),
+                    _ => {}
+                },
             }
         }
     }
     fn clear(&mut self) {
         self.pending = 0;
         self.state = BoundaryState::Ground;
-        self.escaped = false;
     }
     fn start(&mut self, byte: u8) {
         self.pending = 1;
