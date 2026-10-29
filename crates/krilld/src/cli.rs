@@ -193,6 +193,8 @@ mod tests {
             (b"before \x1b[31", b"mred"),
             (b"before \xe9\x9f", b"\x93"),
             (b"before \x1b]2;part", b"ial\x07after"),
+            (b"before \x1b]2;cut\x1b[31mred", b"more"),
+            (b"before \x1bXsos\x1b[31mred", b"more"),
             (b"before \x1b[?2026hbuffer", b"ed\x1b[?2026l"),
             (b"\x1b[31mred", b"more"),
         ];
