@@ -1790,3 +1790,151 @@ test("route attachment resolves the current saved desktop after storage reload w
  const saved=JSON.parse(h.store.get("krill-mobile-hosts-v1")).hosts[0];
  assert.equal(saved.routes.tailscale.origin,"https://desktop.tail123.ts.net:18449");assert.equal(saved.alias,"Changed in another tab");h.transport.close();
 });
+
+test("attaching a proved backup recovers the retained blocked owner", async () => {
+ const saved={device_id:"phone",credential:"11".repeat(32),rid:"a".repeat(32)},h=harness(saved,undefined,true),e=h.endpoint,id=e.profiles()[0].id;
+ const pool=h.context.KrillMobile.transport.pool({endpoint:e});pool.sync();await flush();
+ const entry=pool.get(id),owner=entry.transport,main=h.sockets.at(-1);
+ await h.advance(main,2);main.emit("close",{code:1008});await flush();
+ assert.equal(owner.blocked,true,"old sole route is auth-blocked");
+ assert.throws(()=>owner.recoverRoute("wss://unsaved.tail123.ts.net/ws"),/address is unavailable/);
+ assert.equal(owner.blocked,true,"an unregistered address cannot clear the authentication block");
+ const app=fs.readFileSync(path.join(__dirname,"../src/mobile/assets/app.js"),"utf8"),line=app.split("\n").find(l=>l.includes("async function pairWith("));
+ Object.assign(h.context,{pool,update(){},toast(){},t:s=>s,sheet(){},startPairing(){}});
+ vm.runInContext(line+";globalThis.reviewPair=pairWith;",h.context);
+ const attaching=h.context.reviewPair("",e.adopt(secureQr()));
+ await candidateReply(h,{device_id:"phone",credential:null,desktop:desktopManifest()});await attaching;await flush();
+ assert.equal(pool.get(id).transport,owner,"must retain the same mutation owner");
+ assert.equal(owner.blocked,false,"new authenticated backup must unblock and retry the retained owner");
+ assert.equal(h.sockets.at(-1).url,"wss://desktop.tail123.ts.net:18449/ws","retry should use the verified backup");
+ pool.close();h.transport.close();
+});
+
+test("attaching a proved backup clears obsolete authentication cooldown", async () => {
+ const saved={device_id:"phone",credential:"11".repeat(32),rid:"a".repeat(32)},h=harness(saved,undefined,true),e=h.endpoint,id=e.profiles()[0].id;
+ const pool=h.context.KrillMobile.transport.pool({endpoint:e});pool.sync();await flush();
+ const entry=pool.get(id),owner=entry.transport,main=h.sockets.at(-1);
+ await h.advance(main,2);main.emit("close",{code:1013});await flush();
+ assert(owner.state.retryAt>h.context.Date.now(),"old route has an authentication retry cooldown");
+ const previousRetry=owner.state.retryAt;
+ assert.throws(()=>owner.recoverRoute("wss://unsaved.tail123.ts.net/ws"),/address is unavailable/);
+ assert.equal(owner.state.retryAt,previousRetry,"an unregistered address cannot clear retry timing");
+ const app=fs.readFileSync(path.join(__dirname,"../src/mobile/assets/app.js"),"utf8"),line=app.split("\n").find(l=>l.includes("async function pairWith("));
+ Object.assign(h.context,{pool,update(){},toast(){},t:s=>s,sheet(){},startPairing(){}});
+ vm.runInContext(line+";globalThis.reviewPair=pairWith;",h.context);
+ const attaching=h.context.reviewPair("",e.adopt(secureQr()));
+ const probe=await candidateReply(h,{device_id:"phone",credential:null,desktop:desktopManifest()});await attaching;await flush();
+ const recovery=h.sockets.at(-1);
+ assert.notEqual(recovery,probe,"successful new route proof must start recovery immediately instead of waiting for old cooldown");
+ assert.equal(pool.get(id).transport,owner,"must retain the same mutation owner");
+ assert.equal(recovery.url,"wss://desktop.tail123.ts.net:18449/ws");
+ await h.advance(recovery,4);h.response(recovery,{sessions:[]});await flush();assert.equal(owner.ready,true);
+ pool.close();h.transport.close();
+});
+
+test("attaching a proved backup preserves an uncertain mutation while recovering", async () => {
+ const saved={device_id:"phone",credential:"11".repeat(32),rid:"a".repeat(32)},h=harness(saved,undefined,true),e=h.endpoint,id=e.profiles()[0].id;
+ const pool=h.context.KrillMobile.transport.pool({endpoint:e});pool.sync();await flush();
+ const entry=pool.get(id),owner=entry.transport,main=h.sockets.at(-1);
+ await h.advance(main,4);h.response(main,{sessions:[]});await flush();assert.equal(owner.ready,true);
+ const marker="unknown-mutation-preserved",mutation=owner.rpc({action:"prompt",text:marker});mutation.catch(()=>{});await flush();
+ main.emit("close",{code:1008});await assert.rejects(mutation);await flush();
+ assert.equal(owner.blocked,true);assert.equal(owner.updateBusy,true);
+ const app=fs.readFileSync(path.join(__dirname,"../src/mobile/assets/app.js"),"utf8"),line=app.split("\n").find(l=>l.includes("async function pairWith("));
+ Object.assign(h.context,{pool,update(){},toast(){},t:s=>s,sheet(){},startPairing(){}});
+ vm.runInContext(line+";globalThis.reviewPair=pairWith;",h.context);
+ const attaching=h.context.reviewPair("",e.adopt(secureQr()));
+ const probe=await candidateReply(h,{device_id:"phone",credential:null,desktop:desktopManifest()});await attaching;await flush();
+ const recovery=h.sockets.at(-1);assert.notEqual(recovery,probe,"must begin recovery on the newly proved route");
+ await h.advance(recovery,4);h.response(recovery,{sessions:[]});await flush();
+ assert.equal(pool.get(id).transport,owner);assert.equal(owner.ready,true);assert.equal(owner.updateBusy,true,"adding a route is not acknowledgement of uncertain mutation delivery");
+ const submissions=h.sockets.flatMap(socket=>socket.sent).filter(bytes=>typeof bytes!=="string"&&new TextDecoder().decode(bytes).includes(marker));
+ assert.equal(submissions.length,1,"must not replay the previously submitted mutation on recovery");
+ assert.equal(e.credentials.device_id,saved.device_id);assert.equal(e.credentials.credential,saved.credential);
+ pool.close();h.transport.close();
+});
+
+test("attaching a proved backup keeps a healthy retained owner and its relay socket", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) },
+    h = harness(saved, undefined, true), e = h.endpoint, id = e.profiles()[0].id,
+    pool = h.context.KrillMobile.transport.pool({ endpoint: e });
+  pool.sync(); await flush();
+  const owner = pool.get(id).transport, main = h.sockets.at(-1);
+  await h.advance(main, 4); h.response(main, { etag: "healthy-data", sessions: [] }); await flush();
+  assert.equal(owner.ready, true);
+  const app = fs.readFileSync(path.join(__dirname, "../src/mobile/assets/app.js"), "utf8"),
+    line = app.split("\n").find((value) => value.includes("async function pairWith("));
+  Object.assign(h.context, { pool, update() {}, toast() {}, t: (value) => value, sheet() {}, startPairing() {} });
+  vm.runInContext(line + ";globalThis.pairThroughApp=pairWith;", h.context);
+  const attaching = h.context.pairThroughApp("", e.adopt(secureQr())),
+    probe = await candidateReply(h, { device_id: "phone", credential: null, desktop: desktopManifest() });
+  await attaching; await flush();
+  assert.equal(pool.get(id).transport, owner);
+  assert.equal(owner.ready, true);
+  assert.equal(main.closed, undefined);
+  assert.equal(h.sockets.at(-1), probe, "a healthy owner opens no replacement main channel");
+  assert.equal(e.credentials.credential, saved.credential);
+  assert.equal(e.profiles().length, 1);
+  const refreshing = owner.refresh(); await flush();
+  assert(new TextDecoder().decode(main.sent.at(-1)).includes('"since":"healthy-data"'), "healthy route attachment retains its snapshot revision");
+  h.response(main, { unchanged: true, etag: "healthy-data" }); await refreshing;
+  assert.equal(pool.get(id).snapshot.etag, "healthy-data");
+  pool.close(); h.transport.close();
+});
+
+test("authenticated route recovery restores the cleared desktop snapshot when daemon data is unchanged", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) },
+    h = harness(saved, undefined, true), e = h.endpoint, id = e.profiles()[0].id,
+    pool = h.context.KrillMobile.transport.pool({ endpoint: e }),
+    snapshot = { etag: "same-desktop-data", sessions: [{ id: 7, title: "Restored session" }] };
+  pool.sync(); await flush();
+  const owner = pool.get(id).transport, main = h.sockets.at(-1);
+  await h.advance(main, 4); h.response(main, snapshot); await flush();
+  assert.equal(pool.get(id).snapshot.sessions[0].id, 7);
+  main.emit("close", { code: 1008 }); await flush();
+  assert.equal(pool.get(id).snapshot, null, "authentication rejection clears the displayed desktop snapshot");
+  const app = fs.readFileSync(path.join(__dirname, "../src/mobile/assets/app.js"), "utf8"),
+    line = app.split("\n").find((value) => value.includes("async function pairWith("));
+  Object.assign(h.context, { pool, update() {}, toast() {}, t: (value) => value, sheet() {}, startPairing() {} });
+  vm.runInContext(line + ";globalThis.pairThroughApp=pairWith;", h.context);
+  const attaching = h.context.pairThroughApp("", e.adopt(secureQr()));
+  await candidateReply(h, { device_id: "phone", credential: null, desktop: desktopManifest() });
+  await attaching; await flush();
+  const recovery = h.sockets.at(-1);
+  await h.advance(recovery, 4);
+  const request = recovery.sent.find((frame) => typeof frame !== "string" && new TextDecoder().decode(frame).includes('"action":"snapshot"'));
+  assert(request, "the recovered owner requests its desktop snapshot");
+  const query = new TextDecoder().decode(request), unchanged = query.includes('"since":"same-desktop-data"');
+  h.response(recovery, unchanged ? { unchanged: true, etag: snapshot.etag } : snapshot);
+  await flush();
+  assert.equal(pool.get(id).snapshot?.sessions?.[0]?.id, 7, "the retained owner restores the session displayed before rejection");
+  assert(!unchanged, "a cleared consumer requires a full snapshot even when the daemon etag is unchanged");
+  assert.equal(pool.get(id).transport, owner);
+  assert.equal(owner.ready, true);
+  assert.equal(e.credentials.credential, saved.credential);
+  pool.close(); h.transport.close();
+});
+
+test("explicit retry after authentication rejection restores the cleared desktop snapshot", async () => {
+  const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) },
+    h = harness(saved, undefined, true), e = h.endpoint, id = e.profiles()[0].id,
+    pool = h.context.KrillMobile.transport.pool({ endpoint: e }),
+    snapshot = { etag: "unchanged-manual-retry", sessions: [{ id: 9 }] };
+  pool.sync(); await flush();
+  const owner = pool.get(id).transport, main = h.sockets.at(-1);
+  await h.advance(main, 4); h.response(main, snapshot); await flush();
+  main.emit("close", { code: 1008 }); await flush();
+  assert.equal(pool.get(id).snapshot, null);
+  owner.reconnect(); await flush();
+  const recovery = h.sockets.at(-1);
+  await h.advance(recovery, 4);
+  const request = recovery.sent.find((frame) => typeof frame !== "string" && new TextDecoder().decode(frame).includes('"action":"snapshot"'));
+  assert(request);
+  const unchanged = new TextDecoder().decode(request).includes('"since":"unchanged-manual-retry"');
+  h.response(recovery, unchanged ? { unchanged: true, etag: snapshot.etag } : snapshot);
+  await flush();
+  assert.equal(pool.get(id).snapshot?.sessions?.[0]?.id, 9, "manual retry restores the snapshot that authentication rejection cleared");
+  assert(!unchanged);
+  assert.equal(pool.get(id).transport, owner);
+  pool.close(); h.transport.close();
+});

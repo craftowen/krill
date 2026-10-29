@@ -430,6 +430,13 @@
               selectedRoute = selected.url;
               return selectedRoute;
             },
+            selectRoute(url) {
+              const host = current();
+              if (!host || !routeUrls(host, hash).some((route) => route.url === url))
+                return false;
+              selectedRoute = url;
+              return true;
+            },
             authenticated(reply) {
               if (reply.device_id && reply.device_id !== source.device_id)
                 throw Error("Desktop identity changed.");
@@ -755,6 +762,7 @@
             ticket: ticket2,
             secret: secret2,
             existingId: existing?.id,
+            get routeUrl() { return route; },
             async attach() {
               if (!existing || !stillSaved(existing)) throw Error("Desktop is no longer saved.");
               const paired = { ...existing }, auth = await authenticateRoute(route, paired);
@@ -1947,6 +1955,7 @@
         }
       }
       function reconnect(acknowledge = !0) {
+        if (authBlocked) last = null;
         (acknowledge && (uncertainMutation = !1),
           connectController?.abort(),
           disconnect(
@@ -1966,6 +1975,16 @@
         rpcLatest,
         refresh,
         reconnect,
+        recoverRoute(url) {
+          if (stopped || connected) return false;
+          if (!options.endpoint?.selectRoute?.(url))
+            throw Error("Desktop address is unavailable.");
+          retryNotBefore = nextRetryAt = 0;
+          rejectedRoutes.clear();
+          authInterruptedRoutes.clear();
+          reconnect(false);
+          return true;
+        },
         get updateBusy() {
           return connecting || !!pair || pendingRpc > 0 || uncertainMutation;
         },

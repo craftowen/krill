@@ -27,6 +27,7 @@ const [root,targetFile,ready,hash]=process.argv.slice(2),peers=new Set();let blo
 const server=http.createServer((req,res)=>{
  const u=new URL(req.url,'http://localhost');res.setHeader('Cache-Control','no-store');
  if(u.pathname==='/probe'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({relaySockets:peers.size,blocked}));return;}
+ if(u.pathname==='/relay-deny'){blocked=true;for(const socket of peers)socket.end(Buffer.from([0x88,0x02,0x03,0xf0]));res.end('ok');return;}
  if(u.pathname==='/relay-off'||u.pathname==='/relay-on'){blocked=u.pathname==='/relay-off';if(blocked)for(const s of peers)s.destroy();res.end('ok');return;}
  if(u.pathname.startsWith('/r/')){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({relay:true,hash}));return;}
  const file=u.pathname.replace(/^\/m\/[0-9a-f]{16}\//,'').replace(/^\//,'')||'index.html',resolved=path.resolve(root,file);
@@ -92,6 +93,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tailscale-bin', default='/Applications/Tailscale.app/Contents/MacOS/Tailscale')
     parser.add_argument('--https-port', type=int, default=18343)
+    parser.add_argument('--order', action='append', choices=['relay-first', 'tailscale-first', 'blocked-relay-first'])
     parser.add_argument('--screenshots', default='/tmp/krill-dual-route-browser')
     args = parser.parse_args()
     tests = Path(__file__).resolve().parent
@@ -178,7 +180,9 @@ def main():
             def device_count():
                 return len(json.loads((Path(config['dir']) / 'mobile-devices.json').read_text()))
 
-            for order in ('relay-first', 'tailscale-first'):
+            orders = list(dict.fromkeys(args.order or ('blocked-relay-first', 'relay-first', 'tailscale-first')))
+            orders.sort(key=lambda order: order != 'blocked-relay-first')
+            for order in orders:
                 session = f'krill-dual-{os.getpid()}-{order}'
                 sessions.append(session)
 
@@ -203,11 +207,12 @@ def main():
                     return evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1"))')
 
                 def ready_terminal():
+                    wait(f'KrillMobile.store.connection.phase==="ready" && KrillMobile.store.sessions.has({sid})')
                     evaluate(f'KrillMobile.app.navigate("/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({sid}).groupKey)+"/s/{sid}");true')
                     wait('!!KrillMobile.activeTerminal && document.querySelector(".terminal-grid")?.getAttribute("aria-label").includes("READY")')
                     evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
 
-                start = relay_link() if order == 'relay-first' else offer(True)
+                start = offer(True) if order == 'tailscale-first' else relay_link()
                 assert start.startswith(base), start.split('#')[0]
                 browser('--headed', '--init-script', str(instrument), 'open', start)
                 browser('set', 'viewport', '393', '852')
@@ -223,8 +228,13 @@ def main():
                 session_route = evaluate('location.hash')
                 evaluate('KrillMobile.app.navigate("/");true')
                 wait('!!document.querySelector(".host-card")')
+                if order == 'blocked-relay-first':
+                    evaluate('(async()=>{await fetch("/relay-deny");return true})()')
+                    wait('KrillMobile.app.transport.blocked')
+                    evaluate('globalThis.blockedOwner=KrillMobile.app.transport;dualProbe.blocked=["relay"];true')
+                    observations['blocked_before_attach'] = True
                 live_before = evaluate('dualProbe.sockets.filter(s=>s.readyState===1).map(s=>dualProbe.sockets.indexOf(s))')
-                if order == 'relay-first':
+                if order != 'tailscale-first':
                     qr_log = (scratch / 'qr.log').open('w')
                     qr = subprocess.Popen([str(binaries / 'krill'), 'mobile', 'pair', '--tailscale', '--address', ip + ':' + str(urlsplit(config['base']).port)], env=env, stdout=qr_log, stderr=qr_log)
                     owned.append(qr)
@@ -244,6 +254,11 @@ def main():
                     browser('fill', 'input[type=url]', link)
                     click('Continue')
                     wait('document.getElementById("notice").textContent.includes("Desktop backup added")')
+                if order == 'blocked-relay-first':
+                    assert not evaluate('KrillMobile.app.transport.blocked'), 'an authenticated backup left the retained owner blocked'
+                    wait('KrillMobile.app.transport.ready')
+                    assert evaluate('KrillMobile.app.transport===blockedOwner'), 'route recovery replaced the RPC owner'
+                    evaluate('(async()=>{await fetch("/relay-on");dualProbe.blocked=[];return true})()')
                 second = saved()
                 assert len(second['hosts']) == 1, 'adding a route created another desktop profile'
                 identity = lambda book: [(h['id'], h['device_id'], h['credential']) for h in book['hosts']]
@@ -283,10 +298,10 @@ def main():
                 assert evaluate('document.getElementById("prompt").value') == mutation
                 click('Cancel')
                 assert evaluate('dualProbe.violations') == [], evaluate('dualProbe.violations')
-                observations['orders'].append({'order': order, 'profiles': len(second['hosts']), 'device_count_unchanged': True, 'same_origin': True, 'fallback': other_kind, 'pty_input_count': 1, 'uncertain_rpc_input_count': 1, 'csp_violations': []})
+                observations['orders'].append({'order': order, 'profiles': len(second['hosts']), 'device_count_unchanged': True, 'same_origin': True, 'fallback': other_kind, 'pty_input_count': 1, 'uncertain_rpc_input_count': 1, 'csp_violations': [], 'blocked_owner_recovered': order == 'blocked-relay-first'})
                 shot('no-replay')
                 browser('close')
-            print('PASS trusted HTTPS Chromium: relay→Tailscale QR photo, Tailscale→relay paste, one profile/credential, preserved draft/session, route fallback both ways, PTY input once, lost RPC reply not replayed, CSP', flush=True)
+            print('PASS trusted HTTPS Chromium: relay→Tailscale QR photo, Tailscale→relay paste, one profile/credential, preserved draft/session, blocked relay owner recovery, route fallback both ways, PTY input once, lost RPC reply not replayed, CSP', flush=True)
         except BaseException:
             for session in sessions:
                 subprocess.run(['agent-browser', '--session', session, 'screenshot', str(shots / (session + '-failure.png'))], capture_output=True, timeout=20)
