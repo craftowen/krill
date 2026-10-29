@@ -487,6 +487,33 @@ fn remove_clean_worktree_and_merged_branch() {
 }
 
 #[test]
+fn file_created_by_archive_hook_is_not_force_deleted() {
+    let script = "printf late > late.txt";
+    let f = Fixture::new(
+        "rm-late-file",
+        &format!("[worktree]\narchive = '{script}'\nsymlinks = [\"link\"]\n"),
+    );
+    let w = f.created("late", Setup::Skip).0;
+    let wt = path(&w);
+    symlink(&f.dir, wt.join("link")).unwrap();
+    remember(
+        &f.trust,
+        &digest(&fs::canonicalize(&f.repo).unwrap(), script),
+    )
+    .unwrap();
+    let err = f.remove(&w, false).unwrap_err();
+    assert!(err.contains("untracked"), "{err}");
+    assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
+    assert!(
+        fs::symlink_metadata(wt.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "failed removal must keep configured symlinks"
+    );
+}
+
+#[test]
 fn removal_even_forced_preserves_unmerged_branch() {
     let f = Fixture::new("rm-unmerged", "");
     for force in [false, true] {

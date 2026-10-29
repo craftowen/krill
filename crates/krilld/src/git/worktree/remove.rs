@@ -123,47 +123,56 @@ pub fn remove_with_state(
         }
     }
     reject_nested_worktrees(&entries(q, repo)?, &path)?;
-    unlink_symlinks(&path, &config.worktree.symlinks);
-    if target.is_none() {
-        remove_orphan(q, repo, &path)?;
-    } else {
-        let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
-        if req.force {
-            args.push("--force".into());
-        }
-        args.push("--".into());
-        args.push(path.as_os_str().to_owned());
-        if let Err(first_err) =
-            git(q, repo, args).and_then(|out| text(out, "git worktree remove failed"))
-        {
-            if registered(q, repo, &path)? {
-                // A clean tree with initialized submodules needs a single --force.
-                if req.force {
-                    return Err(first_err);
-                }
-                let retry_args = [
-                    OsString::from("worktree"),
-                    OsString::from("remove"),
-                    OsString::from("--force"),
-                    OsString::from("--"),
-                    path.as_os_str().to_owned(),
-                ];
-                if let Err(retry_err) =
-                    git(q, repo, retry_args).and_then(|out| text(out, &first_err))
-                {
-                    if registered(q, repo, &path)? {
-                        return Err(retry_err);
+    let unlinked = unlink_symlinks(&path, &config.worktree.symlinks);
+    let removal = (|| -> Result<(), String> {
+        if target.is_none() {
+            remove_orphan(q, repo, &path)?;
+        } else {
+            let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
+            if req.force {
+                args.push("--force".into());
+            }
+            args.push("--".into());
+            args.push(path.as_os_str().to_owned());
+            if let Err(first_err) =
+                git(q, repo, args).and_then(|out| text(out, "git worktree remove failed"))
+            {
+                if registered(q, repo, &path)? {
+                    // A clean tree with initialized submodules needs a single --force.
+                    // Files created after the dirty check (e.g. by the archive hook) must
+                    // not be discarded by the retry, so look again before forcing.
+                    if req.force || !worktree_is_clean(q, repo, &path) {
+                        return Err(first_err);
                     }
+                    let retry_args = [
+                        OsString::from("worktree"),
+                        OsString::from("remove"),
+                        OsString::from("--force"),
+                        OsString::from("--"),
+                        path.as_os_str().to_owned(),
+                    ];
+                    if let Err(retry_err) =
+                        git(q, repo, retry_args).and_then(|out| text(out, &first_err))
+                    {
+                        if registered(q, repo, &path)? {
+                            return Err(retry_err);
+                        }
+                        remove_orphan(q, repo, &path)?;
+                    }
+                } else {
                     remove_orphan(q, repo, &path)?;
                 }
-            } else {
+            }
+            // Even a successful Git exit is insufficient if a directory survived.
+            if !directory_absent(&path)? {
                 remove_orphan(q, repo, &path)?;
             }
         }
-        // Even a successful Git exit is insufficient if a directory survived.
-        if !directory_absent(&path)? {
-            remove_orphan(q, repo, &path)?;
-        }
+        Ok(())
+    })();
+    if let Err(e) = removal {
+        restore_symlinks(&path, &unlinked);
+        return Err(e);
     }
     if !directory_absent(&path)? {
         return Err(
@@ -480,12 +489,19 @@ fn is_dirty_ignoring_symlinks(stdout: &[u8], wt_real: &Path, symlinks: &[String]
     false
 }
 
-fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
+fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) -> Vec<(PathBuf, PathBuf)> {
+    let mut removed = Vec::new();
     for raw in symlinks {
         if is_valid_worktree_symlink(wt_real, raw) {
             let trimmed = raw.trim().trim_end_matches('/');
             let rel = Path::new(trimmed);
-            fs::remove_file(wt_real.join(rel)).ok();
+            let link = wt_real.join(rel);
+            let target = fs::read_link(&link).ok();
+            if fs::remove_file(&link).is_ok()
+                && let Some(target) = target
+            {
+                removed.push((link, target));
+            }
             let mut parent = rel.parent();
             while let Some(p) = parent {
                 if p.as_os_str().is_empty() {
@@ -498,6 +514,46 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
             }
         }
     }
+    removed
+}
+
+/// 삭제가 실패해 워크트리가 남으면 끊어 둔 심링크를 되살린다.
+fn restore_symlinks(wt_real: &Path, removed: &[(PathBuf, PathBuf)]) {
+    if !wt_real.is_dir() {
+        return;
+    }
+    for (link, target) in removed {
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).ok();
+        #[cfg(windows)]
+        {
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link).ok();
+            } else {
+                std::os::windows::fs::symlink_file(target, link).ok();
+            }
+        }
+    }
+}
+
+fn worktree_is_clean(q: &GitQueue, repo: &Path, wt: &Path) -> bool {
+    git(
+        q,
+        repo,
+        [
+            OsString::from("-C"),
+            wt.as_os_str().to_owned(),
+            OsString::from("status"),
+            OsString::from("--porcelain"),
+            OsString::from("-z"),
+            OsString::from("--untracked-files=all"),
+            OsString::from("--ignored=matching"),
+        ],
+    )
+    .is_ok_and(|out| out.status.success() && out.stdout.is_empty())
 }
 
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
