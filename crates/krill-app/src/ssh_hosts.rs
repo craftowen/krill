@@ -1091,7 +1091,10 @@ Host dev-box
         .unwrap();
         assert_eq!(list.len(), 1);
         let cmd = build_connect_command(&list[0]);
-        assert_eq!(cmd, "ssh -t -p 2200 -i '~/.ssh/office_key' owen@10.0.0.8\n");
+        assert_eq!(
+            cmd,
+            "ssh -t -p 2200 -i '~/.ssh/office_key' -- owen@10.0.0.8\n"
+        );
 
         let copy_cmd = build_connect_command(&list[0].clone().with_copy_id());
         assert_eq!(
