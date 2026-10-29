@@ -964,6 +964,36 @@ pub(crate) fn observe_sessions_on_target(target: &Target) -> Option<Vec<Observed
     )
 }
 
+/// 실행 중(`exit` 없는) 세션의 cwd 목록. 데몬을 새로 띄우지 않으며 연결·조회 실패는 `None`.
+pub(crate) fn running_session_cwds() -> Option<Vec<std::path::PathBuf>> {
+    let target = Target::establish(None).ok()?;
+    let mut c = target
+        .dial(&daemon::client_hello(ClientRole::Cli, "krill"), IO_TIMEOUT)
+        .ok()?;
+    if c.negotiated.features & (FEAT_CONTROL | FEAT_SIDEBAR) != FEAT_CONTROL | FEAT_SIDEBAR {
+        return None;
+    }
+    c.stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
+    c.stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
+    let Reply::Sessions(sessions) = request(&mut c.stream, &Request::List).ok()? else {
+        return None;
+    };
+    let Reply::Sidebar(sb) = request(&mut c.stream, &Request::Sidebar).ok()? else {
+        return None;
+    };
+    Some(
+        sb.sessions
+            .iter()
+            .filter(|e| {
+                sessions
+                    .iter()
+                    .any(|s| s.session == e.session && s.status.is_none())
+            })
+            .map(|e| std::path::PathBuf::from(String::from_utf8_lossy(&e.cwd).into_owned()))
+            .collect(),
+    )
+}
+
 pub(crate) fn list_session_ids() -> std::result::Result<Vec<u64>, String> {
     let target = Target::establish(None).map_err(|e| e.to_string())?;
     list_session_ids_on_target(&target)
