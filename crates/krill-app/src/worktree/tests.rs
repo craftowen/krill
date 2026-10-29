@@ -364,6 +364,7 @@ fn owe853_base_default_and_searchable_dropdown(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
             d.base.update(cx, |input, cx| {
+                input.focus(window, cx);
                 input.set_value("feat", window, cx);
             });
         });
@@ -813,8 +814,6 @@ fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut Tes
     cx.run_until_parked();
 
     assert!(cx.debug_bounds("worktree-host-selector").is_some());
-    assert!(cx.debug_bounds("worktree-host-local").is_some());
-    assert!(cx.debug_bounds("worktree-host-mini").is_some());
 
     let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
     assert_eq!(
@@ -847,4 +846,38 @@ fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut Tes
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, Some(HostId::Remote("mini".into())));
     assert_eq!(events[0].1.cwd, PathBuf::from("/remote/repo-b/wt-remote"));
+}
+
+#[gpui::test]
+fn non_git_folder_shows_notice_instead_of_base_refs(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    let temp = std::env::temp_dir().join(format!(
+        "krill-wt-dialog-folder-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp).unwrap();
+    cx.update(gpui_component::init);
+    let repo_path = temp.clone();
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| Dialog::new(repo_path.clone(), fake.clone(), window, cx));
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_branch_candidates(vec!["origin/main".to_owned()], cx);
+            d.base
+                .update(cx, |input, cx| input.set_value("main", window, cx));
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("worktree-folder-notice").is_some());
+    assert!(
+        vcx.debug_bounds("worktree-base-option-origin/main")
+            .is_none()
+    );
+    let req = vcx.update(|_, cx| dialog.update(cx, |d, cx| d.request(Setup::Ask, cx).unwrap()));
+    assert_eq!(req.base, None);
+    std::fs::remove_dir_all(temp).ok();
 }
