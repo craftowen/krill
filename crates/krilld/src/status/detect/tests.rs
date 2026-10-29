@@ -207,6 +207,62 @@ fn unknown_title_and_unseen_dialog_do_not_clear_hook_waiting() {
     );
 }
 
+/// 대화상자 없이 들어온 Claude waiting hook은 빈 입력줄이 유예 동안 이어지면 풀리고, 대화상자를 본 대기는 남는다.
+#[test]
+fn stray_claude_waiting_without_dialog_clears_after_grace() {
+    for (title, cleared) in [
+        ("✳ Claude Code", AgentState::Done),
+        ("⠋ Claude Code", AgentState::Working),
+    ] {
+        let st = Statuses::open(None);
+        let hook = crate::status::tests::event(
+            1,
+            10,
+            "claude",
+            r#"{"hook_event_name":"PermissionRequest"}"#,
+        );
+        st.hook(&[(ID, &hook)]).unwrap();
+        let mut detector = Detector::default();
+        let now = Instant::now();
+        let idle = "────\n❯ \n────";
+        // 유예 전에는 제목 근거가 나와도 hook waiting이 이긴다.
+        for at in [now, now + QUIET] {
+            if let Some(e) = detector.observe(title, idle, 1, &st.get(ID), at) {
+                st.inferred(ID, e, 15);
+            }
+            assert_eq!(st.get(ID).state, AgentState::Waiting);
+        }
+        let e = detector
+            .observe(title, idle, 1, &st.get(ID), now + STRAY_WAITING)
+            .unwrap();
+        st.inferred(ID, e, 20);
+        let status = st.get(ID);
+        assert_eq!(
+            (status.state, status.source),
+            (cleared, Some(Source::Screen))
+        );
+    }
+
+    // 대화상자가 떠 있으면 아무리 오래 대기해도 그대로다.
+    let st = Statuses::open(None);
+    let hook = crate::status::tests::event(
+        1,
+        10,
+        "claude",
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+    );
+    st.hook(&[(ID, &hook)]).unwrap();
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let dialog = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+    for at in [now, now + STRAY_WAITING * 2] {
+        if let Some(e) = detector.observe("✳ Claude Code", dialog, 1, &st.get(ID), at) {
+            st.inferred(ID, e, 20);
+        }
+    }
+    assert_eq!(st.get(ID).state, AgentState::Waiting);
+}
+
 /// 새 waiting hook이 도착한 뒤 이전 대화상자 소실 근거로 새 대기를 지우지 않는다.
 #[test]
 fn dismissal_does_not_clear_a_new_waiting_episode() {
@@ -366,6 +422,8 @@ fn orca_title_waiting_working_and_done_glyphs() {
         (6, "◇ Ready (krill)", AgentState::Done),
         (7, "Claude — Action Required", AgentState::Waiting),
         (8, "Antigravity: Permission Needed", AgentState::Waiting),
+        (10, "[ ! ] Action Required | krill", AgentState::Waiting),
+        (11, "[ . ] Action Required", AgentState::Waiting),
     ] {
         let e = detector
             .observe(title, "…", rev, &AgentStatus::UNKNOWN, now)
@@ -387,5 +445,105 @@ fn orca_title_waiting_working_and_done_glyphs() {
                 now
             )
             .is_none()
+    );
+}
+
+#[test]
+fn codex_queued_question_survives_continuous_redraw_and_hook_working() {
+    let st = Statuses::open(None);
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let work = crate::status::tests::event(
+        1,
+        10,
+        "codex",
+        r#"{"hook_event_name":"PreToolUse","tool_name":"exec_command"}"#,
+    );
+    st.hook(&[(ID, &work)]).unwrap();
+    let screen = "• Working (14m 03s • esc to interrupt)\n• Queued follow-up inputs\n  ? 1 question\n  ⇧← to answer\n\n› Ask Codex to do anything";
+    // 스피너·경과 시간으로 revision이 매번 바뀌어도 질문이 계속 있으면 Waiting이다.
+    for tick in 0..=6 {
+        let e = detector
+            .observe(
+                "⠋ | Codex task",
+                screen,
+                tick + 1,
+                &st.get(ID),
+                now + Duration::from_millis(tick * 100),
+            )
+            .unwrap();
+        st.inferred(ID, e, 20 + tick);
+        assert_eq!(
+            st.get(ID).state,
+            if tick < 3 {
+                AgentState::Working
+            } else {
+                AgentState::Waiting
+            }
+        );
+    }
+    assert_eq!(st.get(ID).source, Some(Source::Screen));
+    // 병렬 도구 hook이 Working을 알려도 미응답 질문은 다음 관찰에서 다시 잡는다.
+    let work = crate::status::tests::event(
+        2,
+        40,
+        "codex",
+        r#"{"hook_event_name":"PostToolUse","tool_name":"exec_command"}"#,
+    );
+    st.hook(&[(ID, &work)]).unwrap();
+    let e = detector
+        .observe("⠙ | Codex task", screen, 8, &st.get(ID), now + QUIET * 3)
+        .unwrap();
+    st.inferred(ID, e, 50);
+    assert_eq!(st.get(ID).state, AgentState::Waiting);
+    // 응답 뒤에는 작업 중으로 돌아간다. 일반 입력창만 있다고 Done으로 바꾸지 않는다.
+    let e = detector
+        .observe(
+            "⠹ | Codex task",
+            "• Working\n› Ask Codex to do anything",
+            9,
+            &st.get(ID),
+            now + QUIET * 4,
+        )
+        .unwrap();
+    st.inferred(ID, e, 60);
+    assert_eq!(st.get(ID).state, AgentState::Working);
+}
+
+#[test]
+fn codex_queued_question_must_remain_visible_without_a_title() {
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let question = "• Queued follow-up inputs\n? 1 question\n⇧← to answer\n›";
+    for (rev, ms, screen) in [
+        (1, 0, question),
+        (2, 200, "Working..."),
+        (3, 400, question),
+        (4, 500, question),
+    ] {
+        assert!(
+            detector
+                .observe(
+                    "",
+                    screen,
+                    rev,
+                    &AgentStatus::UNKNOWN,
+                    now + Duration::from_millis(ms),
+                )
+                .is_none()
+        );
+    }
+    let e = detector
+        .observe(
+            "",
+            question,
+            5,
+            &AgentStatus::UNKNOWN,
+            now + Duration::from_millis(700),
+        )
+        .unwrap();
+    assert_eq!(
+        (e.state, e.source, e.confidence),
+        (AgentState::Waiting, Source::Screen, Confidence::Low)
     );
 }

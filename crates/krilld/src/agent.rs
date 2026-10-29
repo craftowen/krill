@@ -32,12 +32,24 @@ mod skills;
 #[cfg(any(windows, test))]
 mod windows;
 #[cfg(windows)]
-pub use windows::run as run_windows_agent;
+pub(crate) use windows::wrap_shell as wrap_windows_shell;
+#[cfg(windows)]
+pub use windows::{AGENT_THEN_SHELL, run as run_windows_agent};
+
+/// 래퍼 셸의 `$0`. 상태 모니터는 루트 인자에서 이 값이 사라지면 에이전트가 끝나 로그인 셸로 넘어간 것으로 본다.
+#[cfg(unix)]
+pub(crate) const WRAPPER_ARG0: &str = "mk-agent";
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
+/// 에이전트가 끝나면 같은 PTY에서 로그인 셸로 돌아간다(Orca처럼 종료 화면·세션 id가 남고 다른 CLI를 바로 띄운다).
+/// 설치 안 됨(127)과 종료 신호(HUP·TERM — 탭 닫기·동면)는 셸 없이 끝난다. 계정 env는 서브셸 안에서만 에이전트에 준다.
+/// `set +m`: 에이전트를 루트와 같은 프로세스 그룹에 둬 holder의 `killpg`(종료·신호)가 에이전트까지 닿게 한다.
 // ponytail: POSIX 문법이라 fish·nu 같은 로그인 셸에서는 깨진다. 지원하려면 그때 `/bin/zsh -l -i -c`로 감싼다.
 #[cfg(unix)]
 const PREFLIGHT: &str = r#"
+hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }
+set +m; trap : INT QUIT; trap 'exit 129' HUP; trap 'exit 143' TERM
+(
 case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
@@ -45,7 +57,10 @@ case "${KRILL_ACCOUNT_PROVIDER-}" in
   agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill; fi;;
 esac
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
-hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }; if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
+if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
+)
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
+exec "${SHELL:-/bin/zsh}" -l
 "#;
 
 /// 이 프로세스의 환경과 passwd로 에이전트 실행 argv·env를 만든다.
@@ -101,6 +116,26 @@ if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/
 fi
 unset _krill_self_zdotdir
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
+  # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
+  # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
+  __krill_opencode_xdg() {
+    if [ -n "${1-}" ]; then
+      if [ -z "${__krill_xdg_dir-}" ] || [ "${XDG_DATA_HOME-}" != "$__krill_xdg_dir/data" ]; then
+        if [ -n "${XDG_DATA_HOME+x}" ]; then typeset -g __krill_xdg_data="$XDG_DATA_HOME"; else unset __krill_xdg_data; fi
+        if [ -n "${XDG_STATE_HOME+x}" ]; then typeset -g __krill_xdg_state="$XDG_STATE_HOME"; else unset __krill_xdg_state; fi
+      fi
+      typeset -g __krill_xdg_dir="$1"
+      export XDG_DATA_HOME="$1/data" XDG_STATE_HOME="$1/state"
+    elif [ -n "${__krill_xdg_dir-}" ]; then
+      if [ "${XDG_DATA_HOME-}" = "$__krill_xdg_dir/data" ]; then
+        if [ -n "${__krill_xdg_data+x}" ]; then export XDG_DATA_HOME="$__krill_xdg_data"; else unset XDG_DATA_HOME; fi
+      fi
+      if [ "${XDG_STATE_HOME-}" = "$__krill_xdg_dir/state" ]; then
+        if [ -n "${__krill_xdg_state+x}" ]; then export XDG_STATE_HOME="$__krill_xdg_state"; else unset XDG_STATE_HOME; fi
+      fi
+      unset __krill_xdg_dir __krill_xdg_data __krill_xdg_state
+    fi
+  }
   __krill_sync_accounts() {
     if (( $+functions[__krill_flush_compdef] )); then
       __krill_flush_compdef
@@ -117,10 +152,13 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
       if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ] || [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME/.gemini/antigravity-cli" ]; then
         unset ANTIGRAVITY_CLI_HOME
       fi
-      if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
-        export XDG_DATA_HOME="$OPENCODE_CONFIG_DIR/data" XDG_STATE_HOME="$OPENCODE_CONFIG_DIR/state" OPENCODE_DB=opencode.db
+      # 호스트 기본 계정은 `host_default_dir`(`$HOME/.config/opencode`)이다. 옛 `.local/share` 경로도 호스트로 본다.
+      if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
+        __krill_opencode_xdg "$OPENCODE_CONFIG_DIR"
+        export OPENCODE_DB=opencode.db
         unset OPENCODE_CONFIG_DIR
       else
+        __krill_opencode_xdg
         unset OPENCODE_CONFIG_DIR OPENCODE_DB
       fi
     fi
@@ -582,7 +620,7 @@ pub(crate) fn resume_account_in(
     session_id: Option<&str>,
 ) -> Option<LaunchAccount> {
     use krill_proto::agent_history::{VaultAgent, VaultTarget};
-    let program = Path::new(profile.program()?).file_name()?.to_str()?;
+    let program = krill_proto::agent::executable_id(profile.program()?);
     let provider = ProviderKind::parse(program)?;
     let file = accounts::load_file(home, state);
     // 프로필의 프로그램이 바뀌었으면(다른 프로바이더) 기록을 쓰지 않는다.
@@ -646,7 +684,7 @@ pub(crate) fn account_for_stored_in(
     state: Option<&Path>,
     stored: &control::StoredLaunch,
 ) -> Option<LaunchAccount> {
-    let program = Path::new(profile.program()?).file_name()?.to_str()?;
+    let program = krill_proto::agent::executable_id(profile.program()?);
     let provider = ProviderKind::parse(program)?;
     let file = accounts::load_file(home, state);
     if let Some(account) = stored.account.as_ref().filter(|a| {
@@ -731,7 +769,7 @@ pub(crate) fn account_for_stored_in(
 
 /// 지금 활성 계정. 호스트 기본이면 `dir`이 빈 기록이라 이후 계정을 바꿔도 재개는 기본 프로필로 간다.
 fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
-    let provider = ProviderKind::parse(Path::new(program).file_name()?.to_str()?)?;
+    let provider = ProviderKind::parse(program)?;
     let home = accounts::default_home();
     let (id, dir) = match accounts::active_account_info(&home, state, program) {
         Some((_, active)) => (active.id, active.profile_dir),
@@ -1442,7 +1480,8 @@ pub(crate) fn pre_trust_codex_in_with_hook(
     if is_too_broad_to_pre_trust(home, cwd) {
         return Ok(false);
     }
-    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    // Codex uses ordinary Windows paths as trust lookup keys, without `\\?\`.
+    let canon = krill_proto::os::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let Some(project_path) = canon.to_str().filter(|s| !s.is_empty()) else {
         return Ok(false);
     };
@@ -2046,7 +2085,22 @@ pub(crate) fn pane_env_in(
     session: krill_proto::SessionId,
     state: Option<&Path>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pane_env_with_socket(
+        session,
+        state,
+        std::env::var_os("KRILL_SOCKET_DIR").as_deref(),
+    )
+}
+
+fn pane_env_with_socket(
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    socket_dir: Option<&std::ffi::OsStr>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut env = vec![(b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes())];
+    if let Some(socket_dir) = socket_dir {
+        env.push((b"KRILL_SOCKET_DIR".to_vec(), socket_dir.as_bytes().to_vec()));
+    }
     if let Ok(executable) = mk_bin() {
         env.push((
             b"KRILL_CLI".to_vec(),
@@ -2119,8 +2173,9 @@ fn codex_hooks(
                     }
                     snake.push(ch.to_ascii_lowercase());
                 }
-                let key = format!("/<session-flags>/config.toml:{snake}:0:0");
-                added.contains_key(&key)
+                added
+                    .keys()
+                    .any(|key| hooks::codex_session_event(key).is_some_and(|event| event == snake))
             })
             .flat_map(|event| {
                 [
@@ -2173,14 +2228,14 @@ fn wrap_account(
     }
     #[cfg(windows)]
     {
-        windows::wrap(login, &hint, agent_argv)
+        windows::wrap(login, &hint, agent_argv, true)
     }
     #[cfg(unix)]
     {
         let Launch { mut argv, env } = login;
         argv.truncate(1);
         argv.extend(
-            ["-l", "-i", "-c", PREFLIGHT, "mk-agent", &hint]
+            ["-l", "-i", "-c", PREFLIGHT, WRAPPER_ARG0, &hint]
                 .into_iter()
                 .map(|s| s.as_bytes().to_vec()),
         );
@@ -2192,3 +2247,91 @@ fn wrap_account(
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod executable_account_regressions {
+    use super::*;
+    #[test]
+    fn windows_executable_profiles_keep_recorded_resume_account() {
+        let mut profile = krill_proto::agent::Agents::load(None)
+            .unwrap()
+            .profiles
+            .get("claude")
+            .unwrap()
+            .clone();
+        let recorded = LaunchAccount {
+            id: "claude-selected".into(),
+            env_key: "CLAUDE_CONFIG_DIR".into(),
+            dir: String::new(),
+        };
+        for program in [r"C:\Tools\Claude.EXE", r"C:\Tools\claude.cmd"] {
+            profile.launch = vec![program.into()];
+            assert_eq!(
+                resume_account_in(
+                    Path::new("/nonexistent-krill-fixture"),
+                    &profile,
+                    None,
+                    Some(&recorded),
+                    None
+                ),
+                Some(recorded.clone())
+            );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod independent_state_verifier {
+    use super::*;
+    #[test]
+    fn independent_codex_executable_resume_uses_requested_state_not_other_active_account() {
+        let root =
+            std::env::temp_dir().join(format!("independent-codex-state-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let sid = "12345678-1234-4234-8234-123456789abc";
+        let mut profile = krill_proto::agent::Agents::load(None)
+            .unwrap()
+            .profiles
+            .get("codex")
+            .unwrap()
+            .clone();
+        profile.launch = vec![r"C:\Tools\Codex.EXE".into()];
+        for name in ["state-a", "state-b"] {
+            let state = root.join(name);
+            let data = state.join("profiles/codex/private");
+            std::fs::create_dir_all(data.join("sessions/2026/10/28")).unwrap();
+            std::fs::write(
+                data.join("sessions/2026/10/28/rollout-only.jsonl"),
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"id":"{sid}","cwd":"/independent"}}}}"#
+                ),
+            )
+            .unwrap();
+            let file = accounts::AccountsFile {
+                accounts: vec![accounts::StoredAccount {
+                    id: format!("codex-{name}"),
+                    provider: "codex".into(),
+                    label: name.into(),
+                    email: None,
+                    profile_dir: data.display().to_string(),
+                }],
+                ..Default::default()
+            };
+            let path = accounts::config_path(&home, Some(&state));
+            std::fs::write(&path, toml::to_string(&file).unwrap()).unwrap();
+        }
+        for name in ["state-a", "state-b"] {
+            let state = root.join(name);
+            let data = state.join("profiles/codex/private");
+            let path = accounts::config_path(&home, Some(&state));
+            let before = std::fs::read(&path).unwrap();
+            let actual = resume_account_in(&home, &profile, Some(&state), None, Some(sid)).unwrap();
+            assert_eq!(actual.dir, data.display().to_string());
+            assert_eq!(actual.id, format!("codex-{name}"));
+            assert_eq!(actual.env_key, "CODEX_HOME");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

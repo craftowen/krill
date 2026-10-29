@@ -238,7 +238,7 @@ fn wrapped_url_click_and_context_menu_copy_complete_address(cx: &mut TestAppCont
             Some(expected)
         );
     }
-    // 원격 세션의 웹 URL도 복사·열기가 가능해야 한다.
+    // 연결이 없는 원격 세션의 루프백 URL은 복사만 되고 로컬 브라우저로 열리지 않아야 한다.
     view.update(cx, |s, _| {
         s.layout
             .set_host(pane, krill_app::hosts::HostId::Remote("other-host".into()));
@@ -249,7 +249,7 @@ fn wrapped_url_click_and_context_menu_copy_complete_address(cx: &mut TestAppCont
     );
     right_click(at, cx);
     click("terminal-url-open", cx);
-    assert_eq!(cx.opened_url().as_deref(), Some(expected));
+    assert_eq!(cx.opened_url(), None);
     cx.simulate_click(
         at,
         Modifiers {
@@ -258,7 +258,7 @@ fn wrapped_url_click_and_context_menu_copy_complete_address(cx: &mut TestAppCont
         },
     );
     cx.run_until_parked();
-    assert_eq!(cx.opened_url().as_deref(), Some(expected));
+    assert_eq!(cx.opened_url(), None);
 }
 
 #[gpui::test]

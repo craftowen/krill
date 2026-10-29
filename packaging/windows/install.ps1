@@ -27,7 +27,7 @@ if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows x64.' }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
 if ($arch -ne 'AMD64') { throw 'Windows release packages require an x64 PC.' }
-$required = @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe')
+$required = @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe')
 $alreadyInstalled = Test-Path -LiteralPath $Dest
 if ($alreadyInstalled) {
     foreach ($file in $required) {

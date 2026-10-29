@@ -98,6 +98,7 @@ impl Recorder {
         if !store.recording {
             return Ok(rec);
         }
+        segment::warm_decoder();
         if !pause.paused {
             privacy::prepare(&store.sessions)?;
             mkdir(&rec.dir)?;

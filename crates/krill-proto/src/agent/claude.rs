@@ -27,7 +27,9 @@ fn version(text: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// 지원되는 이벤트만 순서대로 반환한다. 1.0.62 미만은 hook 없이 보조 감지를 쓴다.
-/// 버전 미확인은 MK-011 결정의 {`PreToolUse`, `PostToolUse`, `Stop`, `SessionStart`}다.
+/// 버전 미확인은 MK-011 결정의 {`PreToolUse`, `PostToolUse`, `Stop`, `SessionStart`}에
+/// `UserPromptSubmit`을 더한다. `SessionStart`(1.0.62)보다 먼저 나온 이벤트라 위험이 늘지 않고,
+/// 빠지면 셸에서 직접 실행한 Claude의 프롬프트 히스토리가 비는 문제가 생긴다.
 pub fn events(text: Option<&str>) -> Vec<&'static str> {
     let v = text.and_then(version);
     if v.is_some_and(|v| v < (1, 0, 62)) {
@@ -53,7 +55,7 @@ pub fn events(text: Option<&str>) -> Vec<&'static str> {
                 || {
                     matches!(
                         *event,
-                        "PreToolUse" | "PostToolUse" | "Stop" | "SessionStart"
+                        "PreToolUse" | "PostToolUse" | "Stop" | "SessionStart" | "UserPromptSubmit"
                     )
                 },
                 |v| v >= *min,
@@ -108,7 +110,13 @@ mod tests {
 
     #[test]
     fn unreadable_version_uses_conservative_set() {
-        let base = ["PreToolUse", "PostToolUse", "Stop", "SessionStart"];
+        let base = [
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SessionStart",
+            "UserPromptSubmit",
+        ];
         for text in [None, Some(""), Some("unknown"), Some("2.1.299-beta")] {
             assert_eq!(events(text), base);
         }

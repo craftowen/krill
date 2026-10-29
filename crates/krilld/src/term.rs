@@ -6,8 +6,9 @@
 //!
 //! - alacritty가 내는 응답 이벤트를 질의 순서 그대로 모아 한 문자열로 돌려준다. 세 에이전트 모두 DA1을 질의 묶음의
 //!   센티널로 쓰므로 순서가 바뀌면 안 된다(MK-008 결정 5).
-//! - `PtyWrite`(DA1·DA2·DSR 5/6·kitty `CSI ?u`·DECRQM·`CSI 18t`)는 그대로, `ColorRequest`는 프로그램이 OSC로 바꾼
-//!   색 → [`Appearance`] 테마 순서로, `TextAreaSizeRequest`(`CSI 14t`)는 셀 픽셀 크기를 받았을 때만 답한다.
+//! - `PtyWrite`(DA1·DA2·DSR 5/6·kitty `CSI ?u`·DECRQM·`CSI 18t`)는 그대로, `ColorRequest`는 OSC 4 팔레트
+//!   변경을 반영하되 기본 전경·배경·커서는 실제 화면의 [`Appearance`] 테마로 답한다.
+//!   `TextAreaSizeRequest`(`CSI 14t`)는 셀 픽셀 크기를 받았을 때만 답한다.
 //!   OSC 52 읽기는 답하지 않는다(보안). OSC 52 쓰기는 [`Feed::Live`]만 [`Engine::clipboard`]에 남겨 앱에 알린다(MK-033). 나머지(XTVERSION·XTGETTCAP·OSC 13~19·kitty 그래픽·OSC 99·1337·7501)는
 //!   alacritty가 이벤트를 내지 않아 자연히 무응답이다.
 //! - alacritty가 모르는 모드 2031(색 구성 알림)은 원본 바이트를 작은 vte 파서로 따로 훑어 추적한다.
@@ -19,10 +20,29 @@
 //!
 //! 창 제목(OSC 0·2, 제목 스택 포함)과 벨은 alacritty 이벤트로 받아 엔진이 들고, [`Engine::screen`]이 화면과 함께 뜬다.
 //! 벨은 [`Feed::Live`]만 센다(재생한 바이트의 벨은 이미 울렸다). OSC 4로 바꾼 팔레트 0~255는 칸 색을 RGB로 풀어
-//! 보낸다(앱은 테마로 색을 풀기 때문). OSC 10·11·12(기본 전경·배경·커서)는 아직 앱에 전하지 않는다.
+//! 보낸다(앱은 테마로 색을 풀기 때문). OSC 10·11·12 변경은 지원하지 않으며 질의도 실제 화면 테마로 답한다.
 //!
 //! 셸이 알리는 현재 디렉터리(OSC 7 `file://host/path`, Windows Terminal식 OSC 9;9 `"C:\path"`)도 alacritty가
 //! 버리므로 같은 곁 파서가 본다([`Engine::cwd`]). 프로세스 cwd를 읽지 못하는 Windows의 세션 cwd가 이것이다.
+
+/// Printed text from a bounded native CLI output slice; ANSI control/OSC payloads are omitted.
+/// This is command confirmation evidence, never a substitute for the current screen/cursor guards.
+pub(crate) fn printed_text(bytes: &[u8]) -> String {
+    struct Text(String);
+    impl Perform for Text {
+        fn print(&mut self, c: char) {
+            self.0.push(c);
+        }
+        fn execute(&mut self, byte: u8) {
+            if byte == b'\n' || byte == b'\r' {
+                self.0.push(' ');
+            }
+        }
+    }
+    let mut text = Text(String::new());
+    Parser::new().advance(&mut text, bytes);
+    text.0
+}
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -721,8 +741,9 @@ impl Engine {
                 }
                 Event::PtyWrite(text) => text,
                 Event::ColorRequest(index, fmt) => {
-                    // 프로그램이 OSC 4·10·11·12로 바꾼 색이 먼저다(alacritty 앱과 같은 규칙).
-                    let set = (index < COUNT).then(|| self.term.colors()[index]).flatten();
+                    // Only OSC 4 palette overrides are rendered. Do not report OSC
+                    // 10/11/12 mutations that the client cannot display.
+                    let set = (index < 256).then(|| self.term.colors()[index]).flatten();
                     let Some(c) = set.map(from_ansi).or_else(|| color(&look.theme(), index)) else {
                         continue;
                     };
@@ -915,6 +936,7 @@ impl Engine {
         self.scheme.clear = ClearTrack::None;
         self.scheme.stop = StopReason::None;
         self.term.grid_mut().clear_history();
+        self.term.grid_mut().truncate();
     }
 
     /// Orca/xterm clear처럼 현재 커서 행만 맨 위에 남긴다. PTY나 모드에는 쓰지 않는다.
@@ -943,6 +965,40 @@ impl Engine {
         }
         self.clear_history();
         rows
+    }
+
+    /// 콜드 페이지 구간 `[start, end)`에 속하는 스크롤백 행만 추출하고 스크롤백을 비운다.
+    pub(crate) fn take_history_window(
+        &mut self,
+        at: &mut usize,
+        start: usize,
+        end: usize,
+        out: &mut Vec<Vec<Cell>>,
+    ) {
+        if !self.parked_hot.is_empty() {
+            for row in self.take_history() {
+                if (start..end).contains(at) {
+                    out.push(row);
+                }
+                *at = at.saturating_add(1);
+            }
+            return;
+        }
+        let n = self.history_len();
+        let batch_start = *at;
+        let batch_end = batch_start.saturating_add(n);
+        if start < end && start < batch_end && batch_start < end {
+            let grid = self.term.grid();
+            let from = start.saturating_sub(batch_start);
+            let to = end.saturating_sub(batch_start).min(n);
+            for i in from..to {
+                if let Ok(k) = i32::try_from(n - i) {
+                    out.push(capture_row(&grid[Line(-k)], self.term.colors()).0);
+                }
+            }
+        }
+        *at = batch_end;
+        self.clear_history();
     }
 
     /// 핫 스크롤백 행 수와, 아래(화면 바로 위)에서 `skip`행 위부터 위로 최대 `count`행(오래된 행부터).
@@ -1054,6 +1110,7 @@ impl Engine {
                 },
                 blink: style.blinking,
             },
+            cursor_explicit: self.term.cursor_style.is_some(),
             links,
         }
     }

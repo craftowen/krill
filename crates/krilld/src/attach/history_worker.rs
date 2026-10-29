@@ -4,11 +4,16 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::Shutdown;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+#[cfg(test)]
+use std::sync::PoisonError;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
+#[cfg(test)]
 use krill_proto::SessionId;
-use krill_proto::screen::{HistoryRequest, HistoryRows, HistoryViewRequest, Msg};
+#[cfg(test)]
+use krill_proto::screen::HistoryRows;
+use krill_proto::screen::{HistoryRequest, HistoryViewRequest, Msg};
 
 use super::{Conn, Tap};
 use crate::session::lock;
@@ -35,6 +40,15 @@ struct Queue {
 }
 
 impl Queue {
+    fn pop_now(&self) -> Option<(u64, Request)> {
+        let mut state = lock(&self.state);
+        if state.closed {
+            return None;
+        }
+        state.pending.pop_front().map(|req| (state.generation, req))
+    }
+
+    #[cfg(test)]
     fn next(&self) -> Option<(u64, Request)> {
         let mut state = lock(&self.state);
         loop {
@@ -64,73 +78,149 @@ impl Queue {
     }
 }
 
+struct SharedTask {
+    queue: Arc<Queue>,
+    conn: Arc<Conn>,
+    tap: Tap,
+    features: u64,
+    views: Arc<Mutex<super::history_view::Service>>,
+}
+
+#[derive(Default)]
+struct SharedPoolState {
+    tasks: VecDeque<SharedTask>,
+    running: bool,
+}
+
+#[derive(Default)]
+struct SharedPool {
+    state: Mutex<SharedPoolState>,
+}
+
+fn enqueue_shared(task: SharedTask) -> io::Result<()> {
+    static POOL: OnceLock<Arc<SharedPool>> = OnceLock::new();
+    let pool = Arc::clone(POOL.get_or_init(Arc::default));
+    let mut state = lock(&pool.state);
+    state.tasks.push_back(task);
+    if !state.running {
+        state.running = true;
+        let worker_pool = Arc::clone(&pool);
+        if let Err(err) = thread::Builder::new()
+            .name("history".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                crate::alloc::mobile_thread().ok();
+                loop {
+                    let task = {
+                        let mut state = lock(&worker_pool.state);
+                        let Some(task) = state.tasks.pop_front() else {
+                            state.running = false;
+                            break;
+                        };
+                        task
+                    };
+                    let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+                        while let Some((generation, req)) = task.queue.pop_now() {
+                            let mut stable = match &req {
+                                Request::View(req) => Some(lock(&task.views).load(
+                                    &task.tap,
+                                    req,
+                                    &|| !task.queue.current(generation),
+                                )),
+                                Request::Legacy(_) => None,
+                            };
+                            let reply = match &req {
+                                Request::Legacy(req) => {
+                                    super::history(&task.tap, req, task.features).encode()?
+                                }
+                                Request::View(_) => Vec::new(),
+                            };
+                            crate::alloc::purge();
+                            let mut out = lock(&task.conn.out);
+                            if task.queue.current(generation) && !task.conn.gone() {
+                                if let Some(reply) = stable.as_mut() {
+                                    task.tap.publish_history(
+                                        reply,
+                                        &|| !task.queue.current(generation),
+                                        |bytes| std::io::Write::write_all(&mut *out, bytes),
+                                    )?;
+                                } else {
+                                    std::io::Write::write_all(&mut *out, &reply)?;
+                                }
+                            }
+                            drop(out);
+                            drop(reply);
+                            drop(stable);
+                            crate::alloc::purge();
+                        }
+                        Ok(())
+                    }));
+                    crate::alloc::purge();
+                    if !matches!(result, Ok(Ok(()))) {
+                        lock(&task.conn.out).shutdown(Shutdown::Both).ok();
+                        task.queue.close();
+                    }
+                }
+                crate::alloc::purge();
+                crate::session::purge_soon();
+            })
+        {
+            state.running = false;
+            state.tasks.pop_back();
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct Worker {
     queue: Arc<Queue>,
     conn: Arc<Conn>,
+    shared: Option<(Tap, u64, Arc<Mutex<super::history_view::Service>>)>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
+    #[expect(clippy::unnecessary_wraps, reason = "호출부 IO 결과 시그니처 유지")]
     pub(super) fn start(tap: Tap, conn: Arc<Conn>, features: u64) -> io::Result<Self> {
-        let legacy = tap.clone();
-        Self::spawn_inner(
-            tap.id(),
+        Ok(Self {
+            queue: Arc::new(Queue::default()),
             conn,
-            move |req| super::history(&legacy, req, features),
-            Some(tap),
-        )
+            shared: Some((tap, features, Arc::default())),
+            thread: None,
+        })
     }
 
     #[cfg(test)]
     fn spawn(
         session: SessionId,
         conn: Arc<Conn>,
-        load: impl FnMut(&HistoryRequest) -> HistoryRows + Send + 'static,
-    ) -> io::Result<Self> {
-        Self::spawn_inner(session, conn, load, None)
-    }
-
-    fn spawn_inner(
-        session: SessionId,
-        conn: Arc<Conn>,
         mut load: impl FnMut(&HistoryRequest) -> HistoryRows + Send + 'static,
-        tap: Option<Tap>,
     ) -> io::Result<Self> {
         let queue = Arc::new(Queue::default());
         let (pending, output) = (Arc::clone(&queue), Arc::clone(&conn));
         let worker = thread::Builder::new()
             .name(format!("history-{}", session.0))
+            .stack_size(128 * 1024)
             .spawn(move || {
+                crate::alloc::mobile_thread().ok();
                 let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
-                    let mut views = super::history_view::Service::default();
                     while let Some((generation, req)) = pending.next() {
-                        let mut stable = match &req {
-                            Request::View(req) => tap
-                                .as_ref()
-                                .map(|tap| views.load(tap, req, &|| !pending.current(generation))),
-                            Request::Legacy(_) => None,
-                        };
                         let reply = match &req {
                             Request::Legacy(req) => load(req).encode()?,
                             Request::View(_) => Vec::new(),
                         };
-                        // invalidate와 같은 순서(out → state)로 잠근다. clear ACK 뒤에
-                        // 이전 세대의 이력 응답이 도착하지 않도록 전송과 무효화를 직렬화한다.
                         let mut out = lock(&output.out);
                         if pending.current(generation) && !output.gone() {
-                            if let (Some(tap), Some(reply)) = (tap.as_ref(), stable.as_mut()) {
-                                tap.publish_history(
-                                    reply,
-                                    &|| !pending.current(generation),
-                                    |bytes| std::io::Write::write_all(&mut *out, bytes),
-                                )?;
-                            } else {
-                                std::io::Write::write_all(&mut *out, &reply)?;
-                            }
+                            std::io::Write::write_all(&mut *out, &reply)?;
                         }
+                        drop(out);
+                        drop(reply);
+                        crate::alloc::purge();
                     }
                     Ok(())
                 }));
+                crate::alloc::purge();
                 if !matches!(result, Ok(Ok(()))) {
                     lock(&output.out).shutdown(Shutdown::Both).ok();
                 }
@@ -139,6 +229,7 @@ impl Worker {
         Ok(Self {
             queue,
             conn,
+            shared: None,
             thread: Some(worker),
         })
     }
@@ -150,18 +241,29 @@ impl Worker {
         self.enqueue(Request::View(req))
     }
     fn enqueue(&self, req: Request) -> io::Result<()> {
-        let mut state = lock(&self.queue.state);
-        if state.closed {
-            return Err(io::ErrorKind::BrokenPipe.into());
+        {
+            let mut state = lock(&self.queue.state);
+            if state.closed {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            if state.pending.len() >= MAX_PENDING {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "history request queue full",
+                ));
+            }
+            state.pending.push_back(req);
+            self.queue.changed.notify_one();
         }
-        if state.pending.len() >= MAX_PENDING {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "history request queue full",
-            ));
+        if let Some((tap, features, views)) = &self.shared {
+            enqueue_shared(SharedTask {
+                queue: Arc::clone(&self.queue),
+                conn: Arc::clone(&self.conn),
+                tap: tap.clone(),
+                features: *features,
+                views: Arc::clone(views),
+            })?;
         }
-        state.pending.push_back(req);
-        self.queue.changed.notify_one();
         Ok(())
     }
 

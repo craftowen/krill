@@ -22,6 +22,8 @@ struct Script {
     events: Sender<Event>,
     /// When set, `dispatch` blocks until a unit arrives (simulates a hung AX call).
     hold: Option<Receiver<()>>,
+    /// When set, `prepare` blocks until a unit arrives (simulates slow AX revalidation).
+    hold_prepare: Option<Receiver<()>>,
     delivery: Delivery,
     refuse_prepare: bool,
     /// Size of the string an `apps` read returns (0 = small answer).
@@ -75,6 +77,9 @@ impl Backend for Script {
     }
     fn prepare(&mut self, op: &Op, _deadline: Instant) -> Result<Op, Refusal> {
         self.events.send(Event::Prepared(op_name(op))).unwrap();
+        if let Some(hold) = &self.hold_prepare {
+            hold.recv().ok();
+        }
         if self.refuse_prepare || element(op) == "gone" {
             return Err(Refusal::new("element_gone", "gone"));
         }
@@ -144,13 +149,16 @@ struct Harness {
     stdout: Option<BufReader<PipeReader>>,
     events: Receiver<Event>,
     release: Option<Sender<()>>,
+    release_prepare: Option<Sender<()>>,
     join: Option<JoinHandle<u8>>,
     lock_path: PathBuf,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "테스트 시나리오 플래그 모음")]
 #[derive(Default)]
 struct Options {
     hold: bool,
+    hold_prepare: bool,
     delivery: Option<Delivery>,
     refuse_prepare: bool,
     blob: usize,
@@ -171,6 +179,12 @@ impl Harness {
         } else {
             (None, None)
         };
+        let (release_prepare, hold_prepare) = if options.hold_prepare {
+            let (tx, rx) = channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let dir = std::env::temp_dir().join(format!(
             "krill-computer-worker-test-{}-{name}",
             std::process::id()
@@ -180,6 +194,7 @@ impl Harness {
         let backend = Script {
             events: events_tx,
             hold,
+            hold_prepare,
             delivery: options
                 .delivery
                 .unwrap_or(Delivery::Submitted { issued_units: 1 }),
@@ -233,6 +248,7 @@ impl Harness {
             stdout,
             events,
             release,
+            release_prepare,
             join: Some(join),
             lock_path,
         };
@@ -323,6 +339,19 @@ impl Harness {
         self.release.as_ref().unwrap().send(()).unwrap();
     }
 
+    fn release_prepare(&mut self) {
+        self.release_prepare.as_ref().unwrap().send(()).unwrap();
+    }
+
+    /// Makes the consumer disappear while the worker is busy: stdout is closed and a status
+    /// query forces the writer into EPIPE, which marks the transport dead. stdin stays open and
+    /// quiet, so nothing cancels the queued request on the reader side.
+    fn kill_transport(&mut self) {
+        drop(self.stdout.take());
+        self.send(&json!({"type":"status","seq":1}));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     /// Whether another thread of this process (own open file description) is shut out of the input lock.
     fn lock_held(&self) -> bool {
         lock::acquire(
@@ -362,6 +391,7 @@ with open(sys.argv[1], 'r+') as lock:
         drop(self.input.take());
         // Unblock any held dispatch so the executor can drain.
         drop(self.release.take());
+        drop(self.release_prepare.take());
         let code = self.join.take().unwrap().join().unwrap();
         let mut rest = Vec::new();
         while let Ok(frame) = self.frames.recv_timeout(WAIT) {
@@ -741,6 +771,54 @@ fn disappeared_consumer_fails_transport_without_further_dispatch() {
     h.request(2, &click());
     std::thread::sleep(Duration::from_millis(100));
     h.release();
+    assert_eq!(h.exit_code(), EXIT_TRANSPORT);
+    h.no_more_events();
+    h.remove_lock_dir();
+}
+
+/// APP-RUNTIME-005: the consumer disappears while the backend is still revalidating (`prepare`).
+/// The request is still queued, so the first dispatch must not happen: no side effect whose
+/// result can never be delivered.
+#[test]
+fn transport_failure_during_prepare_blocks_the_first_dispatch() {
+    let mut h = Harness::start(
+        "dead-during-prepare",
+        Options {
+            hold_prepare: true,
+            unread: true,
+            ..Options::default()
+        },
+    );
+    h.request(1, &click());
+    assert_eq!(h.event(), Event::Prepared("click".into()));
+    h.kill_transport();
+    h.release_prepare();
+    assert_eq!(h.exit_code(), EXIT_TRANSPORT);
+    h.no_more_events();
+    h.remove_lock_dir();
+}
+
+/// APP-RUNTIME-005: the consumer disappears while the executor waits for the input lock.
+/// Once the lock frees, neither revalidation nor dispatch may run.
+#[test]
+fn transport_failure_while_waiting_for_the_lock_is_not_dispatched() {
+    let mut h = Harness::start(
+        "dead-in-lock-wait",
+        Options {
+            unread: true,
+            ..Options::default()
+        },
+    );
+    let held = lock::acquire(
+        &h.lock_path,
+        Instant::now() + Duration::from_millis(100),
+        || true,
+    )
+    .unwrap();
+    h.request(1, &click());
+    std::thread::sleep(Duration::from_millis(50));
+    h.kill_transport();
+    drop(held);
     assert_eq!(h.exit_code(), EXIT_TRANSPORT);
     h.no_more_events();
     h.remove_lock_dir();

@@ -32,6 +32,29 @@ fn value(command: &Command, name: &str) -> Option<OsString> {
 }
 
 #[test]
+fn custom_batch_commands_use_the_trampoline_without_changing_native_programs() {
+    for program in [r"C:\Users\한글 O'wen\claude.cmd", r"C:\tools\agent.BAT"] {
+        let login = Launch {
+            argv: [program, "has space", "percent% ^ ! & |", "", "trailing\\"]
+                .map(|arg| arg.as_bytes().to_vec())
+                .to_vec(),
+            env: env(),
+        };
+        let launch = wrap_shell(login.clone());
+        assert_eq!(launch.argv[1], b"--agent-exec");
+        assert_eq!(launch.argv[3..], login.argv);
+        assert_eq!(launch.env, login.env);
+    }
+    for program in [r"C:\tools\node.exe", "powershell.exe"] {
+        let login = Launch {
+            argv: vec![program.as_bytes().to_vec()],
+            env: env(),
+        };
+        assert_eq!(wrap_shell(login.clone()), login);
+    }
+}
+
+#[test]
 fn windows_wrapper_keeps_argv_literal_and_accepts_later_session_flags() {
     let args = vec![
         "codex".into(),
@@ -43,11 +66,11 @@ fn windows_wrapper_keeps_argv_literal_and_accepts_later_session_flags() {
         argv: vec![b"powershell.exe".to_vec()],
         env: env(),
     };
-    let mut launch = wrap(login.clone(), "install hint", args.clone());
+    let mut launch = wrap(login.clone(), "install hint", args.clone(), true);
     launch
         .argv
         .extend([b"resume".to_vec(), b"conversation-id".to_vec()]);
-    assert_eq!(launch.argv[1], b"--agent-exec");
+    assert_eq!(launch.argv[1], AGENT_THEN_SHELL);
     assert_eq!(launch.argv[2], b"install hint");
     assert_eq!(
         launch.argv[3..7],
@@ -104,4 +127,31 @@ fn opencode_and_agy_keep_their_account_isolation() {
 #[test]
 fn missing_agent_is_not_resolved_to_a_shell() {
     assert!(command(OsStr::new("krill-no-such-agent-20261023"), env()).is_none());
+}
+
+#[test]
+fn codex_trust_preset_uses_the_native_project_path() {
+    let root = std::env::temp_dir().join(format!("krill trust 한글 {}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let profile = root.join("account");
+    let workspace = root.join("한국어 프로젝트");
+    for dir in [&home, &profile, &workspace] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let config = profile.join("config.toml");
+    std::fs::write(&config, "# user settings\nmodel = 'mine'\n").unwrap();
+    assert!(crate::agent::pre_trust_codex_in(&home, Some(&profile), &workspace).unwrap());
+    assert!(!crate::agent::pre_trust_codex_in(&home, Some(&profile), &workspace).unwrap());
+    let text = std::fs::read_to_string(&config).unwrap();
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    let native = krill_proto::os::canonicalize(&workspace).unwrap();
+    assert_eq!(
+        value["projects"][native.to_str().unwrap()]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert_eq!(value["projects"].as_table().unwrap().len(), 1);
+    assert_eq!(value["model"].as_str(), Some("mine"));
+    assert!(text.contains("# user settings"));
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -165,12 +165,15 @@ fn collect_and_deliver(agent: &str, hint: Option<&str>, start: Instant) -> io::R
     } else {
         Instant::now() + BUDGET
     };
-    if deliver(
-        &state.join("run/krilld.sock"),
-        &frame,
-        deadline.checked_sub(ACK_GRACE).unwrap_or(deadline),
-    )
-    .is_err()
+    if daemon::socket_path(&state)
+        .and_then(|socket| {
+            deliver(
+                &socket,
+                &frame,
+                deadline.checked_sub(ACK_GRACE).unwrap_or(deadline),
+            )
+        })
+        .is_err()
     {
         hook::append_spool(
             &state.join(hook::SPOOL_FILE),

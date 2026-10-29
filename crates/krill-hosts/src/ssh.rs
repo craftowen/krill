@@ -811,6 +811,12 @@ impl Tunnel {
         matches!(self.child.try_wait(), Ok(None))
             && self.relay.as_ref().is_none_or(bridge::Relay::is_alive)
     }
+
+    /// 원격 중계([`RemoteEndpoint::Bridge`])로 붙은 호스트가 `krill __bridge --probe`로 보고한 OS 이름
+    /// (`windows` 등). 소켓 포워딩(POSIX 원격)이면 `None`.
+    pub fn remote_os(&self) -> Option<&str> {
+        self.relay.as_ref().map(bridge::Relay::os)
+    }
 }
 
 /// 로컬 포워딩 소켓 자리를 비운다(디렉터리 0700 생성, 죽은 터널 소켓 정리).

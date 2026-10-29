@@ -15,13 +15,30 @@ const MAX_ENTRIES: usize = 256;
 const MAX_REQUESTS: usize = 128;
 const PEER_REQUESTS: usize = 64;
 const TOMBSTONE_TIME: Duration = Duration::from_secs(10);
+const PENDING_OPEN_TIMEOUT: Duration = HANDSHAKE_TIMEOUT.saturating_mul(2);
 
 #[derive(Debug)]
 struct Entry {
     owner: EndpointId,
+    created_at: Instant,
     logical: Option<Arc<Logical>>,
     task: Option<JoinHandle<()>>,
     closed_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct PendingOpen<'a> {
+    registry: &'a Registry,
+    id: StreamId,
+    armed: bool,
+}
+
+impl Drop for PendingOpen<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.abort_pending(self.id);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -68,17 +85,20 @@ impl Registry {
     }
     pub fn sweep(&self) {
         if let Ok(mut inner) = self.inner.lock() {
+            let now = Instant::now();
             for entry in inner.entries.values_mut() {
-                if entry.logical.as_ref().is_some_and(|l| l.is_closed())
+                let stale_pending = entry.logical.is_none()
+                    && now.saturating_duration_since(entry.created_at) >= PENDING_OPEN_TIMEOUT;
+                if (entry.logical.as_ref().is_some_and(|l| l.is_closed()) || stale_pending)
                     && entry.closed_at.is_none()
                 {
-                    entry.closed_at = Some(Instant::now());
+                    entry.closed_at = Some(now);
                 }
             }
             inner.entries.retain(|_, entry| {
                 !(entry
                     .closed_at
-                    .is_some_and(|at| at.elapsed() >= TOMBSTONE_TIME)
+                    .is_some_and(|at| now.saturating_duration_since(at) >= TOMBSTONE_TIME)
                     && entry.task.as_ref().is_none_or(JoinHandle::is_finished))
             });
         }
@@ -160,6 +180,7 @@ impl Registry {
             hello.id,
             Entry {
                 owner: node,
+                created_at: now,
                 logical: None,
                 task: None,
                 closed_at: None,
@@ -186,6 +207,11 @@ impl Registry {
         let logical = match found {
             Ok(Some(l)) => l,
             Ok(None) => {
+                let mut pending = PendingOpen {
+                    registry: self,
+                    id: hello.id,
+                    armed: true,
+                };
                 let unix = tokio::time::timeout(HANDSHAKE_TIMEOUT, Stream::connect(socket)).await;
                 let opened = match unix {
                     Ok(Ok(unix)) => Logical::spawn(
@@ -198,18 +224,24 @@ impl Registry {
                 };
                 let Ok((logical, task)) = opened else {
                     self.fail_open(hello.id);
+                    pending.armed = false;
                     send.write_all(&[1]).await.ok();
                     send.finish().ok();
                     return;
                 };
                 let installed = if let Ok(mut inner) = self.inner.lock() {
-                    if let Some(entry) = inner.entries.get_mut(&hello.id)
-                        && entry.closed_at.is_none()
-                        && allowed.read().is_ok_and(|set| set.contains(&node))
-                    {
-                        entry.logical = Some(Arc::clone(&logical));
-                        entry.task = Some(task);
-                        true
+                    if let Some(entry) = inner.entries.get_mut(&hello.id) {
+                        if entry.closed_at.is_none()
+                            && allowed.read().is_ok_and(|set| set.contains(&node))
+                        {
+                            entry.logical = Some(Arc::clone(&logical));
+                            entry.task = Some(task);
+                            true
+                        } else {
+                            entry.closed_at.get_or_insert_with(Instant::now);
+                            logical.close("device revoked during open");
+                            false
+                        }
                     } else {
                         logical.close("device revoked during open");
                         false
@@ -218,6 +250,7 @@ impl Registry {
                     logical.close("registry unavailable");
                     false
                 };
+                pending.armed = false;
                 if !installed {
                     return;
                 }
@@ -242,6 +275,16 @@ impl Registry {
             tokio::time::timeout(HANDSHAKE_TIMEOUT.saturating_mul(2), rx)
                 .await
                 .ok();
+        }
+    }
+    fn abort_pending(&self, id: StreamId) {
+        if let Ok(mut inner) = self.inner.lock()
+            && inner
+                .entries
+                .get(&id)
+                .is_some_and(|e| e.logical.is_none() && e.closed_at.is_none())
+        {
+            inner.entries.remove(&id);
         }
     }
     fn fail_open(&self, id: StreamId) {
@@ -317,5 +360,126 @@ mod tests {
                 .closed_at
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn aborted_pending_opens_cleanup_without_exhausting_capacity_and_keep_revoked_tombstones()
+    {
+        let registry = Arc::new(Registry::new(Duration::from_secs(120), 1024));
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let allowed = Arc::new(RwLock::new(BTreeSet::from([node])));
+
+        for i in 0_u16..300 {
+            registry.inner.lock().unwrap().attempts.clear();
+            let mut raw = [0_u8; 16];
+            raw[..2].copy_from_slice(&i.to_le_bytes());
+            let id = StreamId(raw);
+            let hello = wire::Hello {
+                id,
+                generation: 1,
+                received: 0,
+                received_fin: false,
+                resume: false,
+                grace_ms: 120_000,
+                sent: 0,
+            };
+            let reg = Arc::clone(&registry);
+            let allow = Arc::clone(&allowed);
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                assert!(reg.locate(node, hello, &allow).unwrap().is_none());
+                let _pending = PendingOpen {
+                    registry: &reg,
+                    id,
+                    armed: true,
+                };
+                entered_tx.send(()).ok();
+                std::future::pending::<()>().await;
+            });
+            entered_rx.await.unwrap();
+            handle.abort();
+            handle.await.ok();
+        }
+        assert!(registry.inner.lock().unwrap().entries.is_empty());
+
+        // Subsequent open succeeds (not "stream registry full") and revocation during pending open retains tombstone.
+        registry.inner.lock().unwrap().attempts.clear();
+        let revoked_id = StreamId([0xee; 16]);
+        let hello = wire::Hello {
+            id: revoked_id,
+            generation: 1,
+            received: 0,
+            received_fin: false,
+            resume: false,
+            grace_ms: 120_000,
+            sent: 0,
+        };
+        {
+            assert!(registry.locate(node, hello, &allowed).unwrap().is_none());
+            let _pending = PendingOpen {
+                registry: &registry,
+                id: revoked_id,
+                armed: true,
+            };
+            registry.revoke(node);
+        }
+        assert!(
+            registry.inner.lock().unwrap().entries[&revoked_id]
+                .closed_at
+                .is_some()
+        );
+        assert!(registry.locate(node, hello, &allowed).is_err());
+    }
+
+    #[test]
+    fn sweep_reclaims_stale_orphaned_pending_reservations() {
+        let registry = Registry::new(Duration::from_secs(120), 1024);
+        let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
+        let allowed = RwLock::new(BTreeSet::from([node]));
+        let id = StreamId([0xab; 16]);
+        let hello = wire::Hello {
+            id,
+            generation: 1,
+            received: 0,
+            received_fin: false,
+            resume: false,
+            grace_ms: 120_000,
+            sent: 0,
+        };
+        assert!(registry.locate(node, hello, &allowed).unwrap().is_none());
+        registry.sweep();
+        assert!(
+            registry.inner.lock().unwrap().entries[&id]
+                .closed_at
+                .is_none()
+        );
+
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&id)
+            .unwrap()
+            .created_at = Instant::now()
+            .checked_sub(PENDING_OPEN_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
+        registry.sweep();
+        assert!(
+            registry.inner.lock().unwrap().entries[&id]
+                .closed_at
+                .is_some()
+        );
+
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&id)
+            .unwrap()
+            .closed_at = Instant::now().checked_sub(TOMBSTONE_TIME + Duration::from_secs(1));
+        registry.sweep();
+        assert!(registry.inner.lock().unwrap().entries.is_empty());
     }
 }

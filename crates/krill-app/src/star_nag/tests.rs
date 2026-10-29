@@ -165,6 +165,44 @@ fn card_appears_at_threshold_and_buttons_update_state(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
+fn repeated_prompt_rechecks_stars_added_outside_app(cx: &mut gpui::TestAppContext) {
+    let dir = temp_dir("external-star");
+    let mut state = fresh(env!("CARGO_PKG_VERSION"));
+    state.total = INITIAL_THRESHOLD - 1;
+    save(&dir, &state).unwrap();
+    cx.update(gpui_component::init);
+    cx.update(|cx| init(dir.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        cx.global_mut::<StarNag>().mock_gh = Some((Some(false), false));
+    });
+    let (_host, cx) = cx.add_window_view(|_, _| Host);
+    cx.update(|_, cx| record_agent_start(cx));
+    cx.run_until_parked();
+    assert_eq!(nag(cx).1, Card::Shown);
+
+    click("star-nag-later", cx);
+    cx.run_until_parked();
+    // The user stars on GitHub between prompts. Expire the cooldown and reach
+    // the next threshold without restarting the app or clearing its cache.
+    cx.update(|_, cx| {
+        let nag = cx.global_mut::<StarNag>();
+        nag.mock_gh = Some((Some(true), false));
+        nag.state.deferred_until = 0;
+        nag.state.total = nag.state.baseline + nag.state.next_threshold - 1;
+        record_agent_start(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(nag(cx).1, Card::Hidden);
+    assert!(nag(cx).0.completed);
+    assert!(
+        load(&dir).completed,
+        "verified star suppression is persisted"
+    );
+    assert!(cx.debug_bounds("star-nag-card").is_none());
+}
+
+#[gpui::test]
 fn star_without_gh_opens_web_and_defers(cx: &mut gpui::TestAppContext) {
     let dir = temp_dir("star");
     let mut s = fresh(env!("CARGO_PKG_VERSION"));

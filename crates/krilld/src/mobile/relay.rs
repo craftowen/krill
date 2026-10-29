@@ -884,6 +884,11 @@ fn serve_mux_client(
     let mut outgoing = local.try_clone()?;
     let cipher = Arc::new(Mutex::new(channel));
     let (c_out, out_clone, close_clone) = (Arc::clone(&cipher), outbox.clone(), close_tx.clone());
+    let send = Arc::new(sealed_sender(c_out, out_clone, close_tx.clone(), conn_id));
+    let feed = super::pwa_rpc::feed::Feed::new(Arc::downgrade(&registry), {
+        let send = Arc::clone(&send);
+        move |frame: &[u8]| send(frame)
+    });
     let reader = thread::Builder::new()
         .name("mobile-relay-out".into())
         .stack_size(STACK)
@@ -891,15 +896,14 @@ fn serve_mux_client(
             crate::alloc::mobile_thread().ok();
             let result = (|| -> io::Result<()> {
                 while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
-                    let frame = ipc::encode_frame(kind, &body)?;
-                    let sealed = lock(&c_out).seal(&frame)?;
-                    out_clone.send_mux(MUX_BINARY, conn_id, &sealed)?;
+                    send(&ipc::encode_frame(kind, &body)?)?;
                 }
                 Ok(())
             })();
             close_clone.close();
             result
         })?;
+    let installed = Arc::clone(&feed);
     let hello_owned = hello.clone();
     let worker = thread::Builder::new()
         .name("mobile-relay-ipc".into())
@@ -907,6 +911,7 @@ fn serve_mux_client(
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
             let done = server.try_clone();
+            installed.install();
             let result = registry.serve_mobile(server, &hello_owned);
             if let Ok(done) = done {
                 done.shutdown(Shutdown::Both).ok();
@@ -937,6 +942,7 @@ fn serve_mux_client(
     };
     local.shutdown(Shutdown::Both).ok();
     server_stop.shutdown(Shutdown::Both).ok();
+    feed.stop();
     reader.join().ok();
     if let Ok(worker) = worker {
         worker.join().ok();
@@ -947,9 +953,77 @@ fn serve_mux_client(
     }
 }
 
+/// 응답·피드 푸시 공용 전송. 아웃박스 넣기는 막히지 않으므로 봉인 잠금을 쥔 채 넣어 nonce 순서 = 전송 순서를 지킨다.
+/// 가득 참(`WouldBlock`) 밖의 봉인·넣기 실패는 이 연결을 닫는다. 가득 참은 호출자 몫이다:
+/// 응답 경로는 연결을 닫고, 피드는 그 푸시만 버리고 다음 간격에 최신 상태를 다시 보낸다(nonce 공백은 양쪽 open이 허용).
+fn sealed_sender(
+    cipher: Arc<Mutex<Channel>>,
+    outbox: Outbox,
+    close: Arc<Mailbox<(u8, Vec<u8>)>>,
+    conn_id: u32,
+) -> impl Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static {
+    move |frame: &[u8]| {
+        let result = lock(&cipher)
+            .seal(frame)
+            .and_then(|sealed| outbox.send_mux(MUX_BINARY, conn_id, &sealed));
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() != io::ErrorKind::WouldBlock)
+        {
+            close.close();
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn feed_sender_closes_the_peer_on_fatal_failures_but_not_on_a_full_outbox() {
+        let (wake, _receiver) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let wake = Arc::new(Mutex::new(wake));
+        let cipher = || {
+            Arc::new(Mutex::new(
+                Channel::new(&[1; 32], &[2; 64], Endpoint::Daemon).unwrap(),
+            ))
+        };
+        // Full outbox: the push is refused, the connection stays open.
+        let queue = Arc::new(Mailbox::new(64, 64, 1));
+        queue.send(7, vec![0; 8], 8).unwrap();
+        let close = Arc::new(Mailbox::new(8, 8, 1));
+        let send = sealed_sender(
+            cipher(),
+            Outbox {
+                tx: Arc::clone(&queue),
+                wake: Arc::clone(&wake),
+            },
+            Arc::clone(&close),
+            7,
+        );
+        assert_eq!(send(b"push").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(!close.is_closed());
+        // Closed outbox and seal failure both close the peer immediately.
+        for (outbox_closed, frame) in [(true, vec![0; 4]), (false, vec![0; MAX_PLAINTEXT + 1])] {
+            let queue = Arc::new(Mailbox::new(1 << 22, 1 << 22, 8));
+            if outbox_closed {
+                queue.close();
+            }
+            let close = Arc::new(Mailbox::new(8, 8, 1));
+            let send = sealed_sender(
+                cipher(),
+                Outbox {
+                    tx: Arc::clone(&queue),
+                    wake: Arc::clone(&wake),
+                },
+                Arc::clone(&close),
+                7,
+            );
+            assert!(send(&frame).is_err());
+            assert!(close.is_closed());
+        }
+    }
     #[test]
     fn a_required_close_resets_a_saturated_relay_queue() {
         let (wake, _receiver) = UnixStream::pair().unwrap();

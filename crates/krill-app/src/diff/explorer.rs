@@ -32,6 +32,8 @@ use super::{OpenFile, Panel, text};
 use crate::open_in::Target;
 use crate::ui;
 
+mod transfer;
+
 const ROW_HEIGHT: f32 = 26.0;
 
 /// 필터 검색 시 재귀 스캔하는 최대 엔트리 수 상한(메모리 ≤ 120MB 및 응답성 보호).
@@ -51,12 +53,17 @@ pub struct DirEntry {
 }
 
 /// `uniform_list`에 그려지는 평탄화된 파일 트리 행.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent cached file attributes and UI row states"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeRow {
     pub name: String,
     pub path: PathBuf,
     pub relative_path: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub depth: usize,
     pub expanded: bool,
     pub ignored: bool,
@@ -71,10 +78,26 @@ pub enum EditKind {
 }
 
 enum Operation {
-    CreateFile { parent: PathBuf, name: String },
-    CreateFolder { parent: PathBuf, name: String },
-    Rename { target: PathBuf, name: String },
-    Delete { target: PathBuf },
+    CreateFile {
+        parent: PathBuf,
+        name: String,
+    },
+    CreateFolder {
+        parent: PathBuf,
+        name: String,
+    },
+    Rename {
+        target: PathBuf,
+        name: String,
+    },
+    Delete {
+        target: PathBuf,
+    },
+    Transfer {
+        sources: Vec<PathBuf>,
+        directory: PathBuf,
+        import: bool,
+    },
 }
 
 /// UI 핸들을 포함하지 않는 백그라운드 IO용 상태.
@@ -116,6 +139,13 @@ impl DiskState {
             Operation::CreateFolder { parent, name } => model.create_folder(&parent, &name),
             Operation::Rename { target, name } => model.rename_path(&target, &name),
             Operation::Delete { target } => model.delete_path(&target),
+            Operation::Transfer {
+                sources,
+                directory,
+                import,
+            } => sources.iter().try_fold(directory.clone(), |_, source| {
+                model.transfer_path(source, &directory, import)
+            }),
         };
         (Self::capture(&model), result, open)
     }
@@ -157,6 +187,8 @@ pub struct Explorer {
     filter_normalized: Vec<String>,
     pub(crate) rows: Vec<TreeRow>,
     pub(crate) selected: Option<PathBuf>,
+    selection: BTreeSet<PathBuf>,
+    selection_anchor: Option<PathBuf>,
     pub(crate) scroll: UniformListScrollHandle,
     pub(crate) tree_focus: Option<gpui::FocusHandle>,
     pub(crate) filter_input: Option<Entity<InputState>>,
@@ -210,6 +242,8 @@ impl Explorer {
             filter_normalized: Vec::new(),
             rows: Vec::new(),
             selected: None,
+            selection: BTreeSet::new(),
+            selection_anchor: None,
             scroll: UniformListScrollHandle::new(),
             tree_focus: None,
             filter_input: None,
@@ -258,6 +292,8 @@ impl Explorer {
         self.filter_normalized.clear();
         self.rows.clear();
         self.selected = None;
+        self.selection.clear();
+        self.selection_anchor = None;
         self.editing = None;
         self.pending_delete = None;
         self.error = None;
@@ -293,6 +329,63 @@ impl Explorer {
         }
     }
 
+    /// 원격 경로 대소문자를 보존하며 현재 보이는 행 순서로 범위를 선택한다.
+    fn select_row(&mut self, path: PathBuf, additive: bool, range: bool) {
+        if !range || self.selection_anchor.is_none() {
+            self.selection_anchor = Some(path.clone());
+        }
+        if range {
+            let anchor = self
+                .rows
+                .iter()
+                .position(|r| Some(&r.path) == self.selection_anchor.as_ref());
+            let end = self.rows.iter().position(|r| r.path == path);
+            if let (Some(start), Some(end)) = (anchor, end) {
+                if !additive {
+                    self.selection.clear();
+                }
+                self.selection.extend(
+                    self.rows[start.min(end)..=start.max(end)]
+                        .iter()
+                        .map(|r| r.path.clone()),
+                );
+            } else {
+                self.selection.clear();
+                self.selection.insert(path.clone());
+                self.selection_anchor = Some(path.clone());
+            }
+        } else if additive {
+            if self.selection.remove(&path) {
+                self.selected = self.selection.iter().next_back().cloned();
+                return;
+            }
+            self.selection.insert(path.clone());
+        } else {
+            self.selection.clear();
+            self.selection.insert(path.clone());
+        }
+        self.selected = Some(path);
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let paths = if self.selection.is_empty() {
+            self.selected.iter().cloned().collect::<BTreeSet<_>>()
+        } else {
+            self.selection.clone()
+        };
+        // 이동·가져오기에서는 부모가 선택된 자식 경로까지 포함한다.
+        paths
+            .iter()
+            .filter(|path| self.rows.iter().any(|row| &row.path == *path))
+            .filter(|path| {
+                !paths
+                    .iter()
+                    .any(|parent| parent != *path && path.starts_with(parent))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// 현재 선택 행의 가상 리스트 인덱스를 반환한다.
     pub fn selected_index(&self) -> Option<usize> {
         let selected = self.selected.as_ref()?;
@@ -318,6 +411,8 @@ impl Explorer {
             }
         };
         self.selected = self.rows.get(next).map(|row| row.path.clone());
+        self.selection.clear();
+        self.selection_anchor = self.selected.clone();
     }
 
     /// 선택 행의 부모 폴더를 선택한다(좌측 화살표 탐색용).
@@ -332,6 +427,8 @@ impl Explorer {
         for row in self.rows[..index].iter().rev() {
             if row.depth == depth - 1 {
                 self.selected = Some(row.path.clone());
+                self.selection.clear();
+                self.selection_anchor = self.selected.clone();
                 return true;
             }
         }
@@ -828,6 +925,7 @@ impl Explorer {
                 path: entry.path.clone(),
                 relative_path: entry.relative_path.clone(),
                 is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
                 depth,
                 expanded,
                 ignored,
@@ -855,6 +953,7 @@ impl Explorer {
                 path: entry.path.clone(),
                 relative_path: entry.relative_path.clone(),
                 is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
                 depth,
                 expanded,
                 ignored,
@@ -999,6 +1098,16 @@ fn read_dir_entries(repo: &Path, dir: &Path) -> Vec<DirEntry> {
         let path = entry.path();
         let (is_dir, is_symlink) = entry.file_type().map_or((false, false), |ft| {
             let is_symlink = ft.is_symlink();
+            #[cfg(windows)]
+            let is_symlink = {
+                use std::os::windows::fs::MetadataExt as _;
+                is_symlink
+                    || entry.metadata().is_ok_and(|meta| {
+                        meta.file_attributes()
+                            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                            != 0
+                    })
+            };
             (ft.is_dir() || (is_symlink && path.is_dir()), is_symlink)
         });
         let relative_path = path
@@ -1383,6 +1492,29 @@ impl Panel {
         cx.notify();
     }
 
+    fn open_explorer_external(&mut self, target: Target, path: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer.remote_target().is_some() {
+            return;
+        }
+        let generation = self.explorer.operation_generation;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { target.open_path(&path) })
+                .await;
+            this.update(cx, |panel, cx| {
+                if panel.explorer.operation_generation == generation
+                    && let Err(error) = result
+                {
+                    panel.explorer.error = Some(error.to_string());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn queue_explorer_operation(&mut self, operation: Operation, cx: &mut Context<Self>) {
         self.explorer.operations.push_back(operation);
         if self.explorer.operation_task.is_some() {
@@ -1434,6 +1566,8 @@ impl Panel {
                             }
                             if s.explorer.selected == original_selection {
                                 s.explorer.selected = state.selected;
+                                s.explorer.selection.clear();
+                                s.explorer.selection_anchor = s.explorer.selected.clone();
                             }
                             s.explorer.error = None;
                             s.explorer.filter_files_cache = None;
@@ -1451,7 +1585,14 @@ impl Panel {
                                 cx.emit(OpenFile(path));
                             }
                         }
-                        Err(error) => s.explorer.error = Some(error.to_string()),
+                        Err(error) => {
+                            s.explorer.error = Some(error.to_string());
+                            // 가져오기·일괄 이동이 일부만 끝났어도 실제 디스크 상태를 다시 표시한다.
+                            s.explorer.load_generation = s.explorer.load_generation.wrapping_add(1);
+                            s.explorer.load_task = None;
+                            s.explorer.loading = false;
+                            s.refresh_explorer_async(cx);
+                        }
                     }
                     cx.notify();
                     true
@@ -1820,10 +1961,59 @@ impl Panel {
                     .id("explorer-tree-container")
                     .track_focus(&tree_focus)
                     .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                        this.on_explorer_tree_key(ev.keystroke.key.as_str(), cx);
+                        if ev.keystroke.modifiers.shift
+                            && matches!(ev.keystroke.key.as_str(), "up" | "down")
+                        {
+                            let prior = this.explorer.selection.clone();
+                            let anchor = this
+                                .explorer
+                                .selection_anchor
+                                .clone()
+                                .or_else(|| this.explorer.selected.clone());
+                            this.explorer.move_selection(if ev.keystroke.key == "up" {
+                                -1
+                            } else {
+                                1
+                            });
+                            this.explorer.selection_anchor = anchor;
+                            this.explorer.selection = prior;
+                            if let Some(path) = this.explorer.selected.clone() {
+                                this.explorer.select_row(
+                                    path,
+                                    ev.keystroke.modifiers.platform
+                                        || ev.keystroke.modifiers.control,
+                                    true,
+                                );
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        } else {
+                            this.on_explorer_tree_key(ev.keystroke.key.as_str(), cx);
+                        }
+                        if let Some(index) = this.explorer.selected_index() {
+                            this.explorer
+                                .scroll
+                                .scroll_to_item(index, gpui::ScrollStrategy::Nearest);
+                        }
                     }))
                     .flex_1()
                     .min_h_0()
+                    .when(self.explorer.remote_target().is_none(), |d| {
+                        let move_repo = self.explorer.repo.clone();
+                        let drop_repo = move_repo.clone();
+                        d.on_drop(cx.listener(move |this, drag: &transfer::Drag, _, cx| {
+                            cx.stop_propagation();
+                            if drag.repo == move_repo {
+                                this.queue_transfer(&drag.paths, &move_repo, false, cx);
+                            }
+                        }))
+                        .on_drop(cx.listener(
+                            move |this, paths: &gpui::ExternalPaths, _, cx| {
+                                cx.stop_propagation();
+                                this.queue_transfer(paths.paths(), &drop_repo, true, cx);
+                            },
+                        ))
+                    })
                     .context_menu(move |menu, _, _| {
                         background_context_menu(menu, &weak_bg, &root_repo)
                     })
@@ -2056,12 +2246,15 @@ impl Panel {
                     _ => ix,
                 };
                 let row = self.explorer.rows.get(data_ix)?.clone();
-                let is_selected = self.explorer.selected.as_ref() == Some(&row.path);
+                let is_selected = self.explorer.selection.contains(&row.path)
+                    || (self.explorer.selection.is_empty()
+                        && self.explorer.selected.as_ref() == Some(&row.path));
                 let selected_bg = p.sidebar_accent;
                 let indent_px =
                     f32::from(u16::try_from(row.depth).unwrap_or(16).min(16)) * 14.0 + 8.0;
                 let row_path = row.path.clone();
                 let is_dir = row.is_dir;
+                let transfer_allowed = self.explorer.remote_target().is_none() && !row.is_symlink;
                 let weak = cx.weak_entity();
                 let menu_row = row.clone();
                 let repo = self.explorer.repo.clone();
@@ -2137,28 +2330,83 @@ impl Panel {
                         )
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                 window.focus(&focus, cx);
-                                if is_dir {
-                                    this.toggle_explorer_dir(&row_path, cx);
-                                } else {
-                                    this.explorer.selected = Some(row_path.clone());
-                                    // 단일 클릭은 미리보기 탭으로 연다(OWE-849).
-                                    this.open_file_preview = true;
-                                    cx.emit(OpenFile(row_path.clone()));
-                                    cx.notify();
+                                let additive = event.modifiers.platform || event.modifiers.control;
+                                let range = event.modifiers.shift;
+                                if additive || range || !this.explorer.selection.contains(&row_path)
+                                {
+                                    this.explorer.select_row(row_path.clone(), additive, range);
                                 }
+                                cx.notify();
                             }),
                         )
                         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                            // 더블클릭은 고정 탭으로 연다(OWE-849).
-                            if e.click_count() >= 2 && !is_dir {
-                                this.open_file_preview = false;
+                            let modifiers = e.modifiers();
+                            if modifiers.shift || modifiers.platform || modifiers.control {
+                                return;
+                            }
+                            this.explorer
+                                .select_row(row_path_click.clone(), false, false);
+                            if is_dir {
+                                this.toggle_explorer_dir(&row_path_click, cx);
+                            } else {
+                                this.open_file_preview = e.click_count() < 2;
                                 cx.emit(OpenFile(row_path_click.clone()));
+                                cx.notify();
                             }
                         }))
-                        .context_menu(move |menu, _, _| {
-                            row_context_menu(menu, &weak, &menu_row, &repo)
+                        .when(transfer_allowed, |d| {
+                            let drag_path = row.path.clone();
+                            let paths = if self.explorer.selection.contains(&drag_path) {
+                                self.explorer.selected_paths()
+                            } else {
+                                vec![drag_path]
+                            };
+                            let drag = transfer::Drag {
+                                repo: repo.clone(),
+                                paths,
+                            };
+                            let owner_repo = repo.clone();
+                            let directory = if row.is_dir {
+                                row.path.clone()
+                            } else {
+                                row.path.parent().unwrap_or(&repo).to_path_buf()
+                            };
+                            let import_directory = directory.clone();
+                            let ring = p.ring;
+                            d.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                .drag_over::<transfer::Drag>(move |d, _, _, _| {
+                                    d.bg(selected_bg).border_color(ring)
+                                })
+                                .drag_over::<gpui::ExternalPaths>(move |d, _, _, _| {
+                                    d.bg(selected_bg)
+                                })
+                                .on_drop(cx.listener(move |this, drag: &transfer::Drag, _, cx| {
+                                    cx.stop_propagation();
+                                    if drag.repo == owner_repo {
+                                        this.queue_transfer(&drag.paths, &directory, false, cx);
+                                    }
+                                }))
+                                .on_drop(cx.listener(
+                                    move |this, paths: &gpui::ExternalPaths, _, cx| {
+                                        cx.stop_propagation();
+                                        this.queue_transfer(
+                                            paths.paths(),
+                                            &import_directory,
+                                            true,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                        })
+                        .when(row.is_symlink, |d| {
+                            // Do not let a refused link-row drop bubble to the root target.
+                            d.on_drop::<transfer::Drag>(|_, _, cx| cx.stop_propagation())
+                                .on_drop::<gpui::ExternalPaths>(|_, _, cx| cx.stop_propagation())
+                        })
+                        .context_menu(move |menu, _, cx| {
+                            row_context_menu(menu, &weak, &menu_row, &repo, cx)
                         })
                         .into_any_element(),
                 )
@@ -2243,6 +2491,7 @@ fn row_context_menu(
     weak: &gpui::WeakEntity<Panel>,
     row: &TreeRow,
     repo: &Path,
+    cx: &gpui::App,
 ) -> PopupMenu {
     let target_dir = if row.is_dir {
         row.path.clone()
@@ -2356,8 +2605,17 @@ fn row_context_menu(
         }),
     );
 
-    for target in [Target::VsCode, Target::Cursor, Target::Zed] {
-        let p = row.path.clone();
+    // 모든 전송 방식에 외부 에디터 주소가 있는 것은 아니다.
+    // 원격 경로를 로컬에서 해석하지 않도록 미지원 항목은 숨긴다.
+    let local_editors = weak
+        .read_with(cx, |panel, _| panel.explorer.remote_target().is_none())
+        .unwrap_or(false);
+    for target in [Target::VsCode, Target::Cursor, Target::Zed]
+        .into_iter()
+        .filter(|_| local_editors)
+    {
+        let path = row.path.clone();
+        let weak = weak.clone();
         menu = menu.item(
             PopupMenuItem::new(format!(
                 "{}{}",
@@ -2365,8 +2623,11 @@ fn row_context_menu(
                 crate::i18n::catalog::sidebar::OPEN_IN.get()
             ))
             .icon(IconName::ExternalLink)
-            .on_click(move |_, _, _| {
-                target.open_path(&p).ok();
+            .on_click(move |_, _, cx| {
+                weak.update(cx, |panel, cx| {
+                    panel.open_explorer_external(target, path.clone(), cx);
+                })
+                .ok();
             }),
         );
     }
@@ -2440,5 +2701,88 @@ mod performance_tests {
         explorer.rebuild_rows();
         assert_eq!(explorer.rows.len(), 2);
         assert_eq!(explorer.rows[1].relative_path, "src/MATCH-0010");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn selection_ranges_follow_visible_order_and_preserve_case() {
+        let mut explorer = Explorer::new("/repo".into());
+        explorer.rows = ["A", "a", "folder", "folder/child", "z"]
+            .into_iter()
+            .map(|name| TreeRow {
+                name: name.into(),
+                path: PathBuf::from("/repo").join(name),
+                relative_path: name.into(),
+                is_dir: name == "folder",
+                is_symlink: false,
+                depth: usize::from(name.contains('/')),
+                expanded: true,
+                ignored: false,
+            })
+            .collect();
+        explorer.select_row("/repo/A".into(), false, false);
+        explorer.select_row("/repo/folder".into(), false, true);
+        assert_eq!(explorer.selection.len(), 3);
+        assert!(explorer.selection.contains(Path::new("/repo/A")));
+        assert!(explorer.selection.contains(Path::new("/repo/a")));
+        explorer.select_row("/repo/z".into(), true, false);
+        assert_eq!(explorer.selection.len(), 4);
+        explorer.select_row("/repo/z".into(), true, false);
+        assert_eq!(explorer.selection.len(), 3);
+        explorer.select_row("/repo/folder/child".into(), true, false);
+        assert_eq!(
+            explorer.selected_paths().len(),
+            3,
+            "ancestor covers selected child"
+        );
+        explorer.select_row("/repo/z".into(), false, false);
+        assert_eq!(explorer.selected_paths(), [PathBuf::from("/repo/z")]);
+    }
+}
+
+#[cfg(test)]
+mod external_open_tests {
+    use super::*;
+    #[gpui::test]
+    fn external_open_reports_async_errors_and_guards_remote_paths(cx: &mut gpui::TestAppContext) {
+        let panel = cx.new(|cx| Panel::unconnected(PathBuf::from("/repo"), cx));
+        panel.update(cx, |panel, cx| {
+            panel.open_explorer_external(
+                Target::VsCode,
+                PathBuf::from("/krill-missing-external-editor-file"),
+                cx,
+            );
+            assert!(
+                panel.explorer.error.is_none(),
+                "IO must run after the UI callback"
+            );
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert!(
+                panel.explorer.error.is_some(),
+                "launch failure must reach the UI"
+            );
+            panel.explorer.error = None;
+            panel.explorer.connect(crate::hosts::HostTarget::remote(
+                "other",
+                "/unused.sock".into(),
+            ));
+            panel.open_explorer_external(
+                Target::VsCode,
+                PathBuf::from("/krill-missing-external-editor-file"),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.explorer.error.is_none(),
+                "remote path must never enter the local opener"
+            );
+        });
     }
 }

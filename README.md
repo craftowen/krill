@@ -137,13 +137,15 @@ Let a coordinator agent break down dependent tasks (`krill orchestration run-cre
 ### 5. Mobile E2EE Companion (PWA)
 Scan a QR code in **Settings → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
 
+Sign in with Google on your desktop when you choose the hosted relay. Your phone opens the PWA without signing in and authenticates with its QR pairing or saved device key.
+
 [Mobile Setup →](https://krill.page/en/docs)
 
 </td>
 <td width="50%" valign="top">
 
 ### 6. 1-Click Sandboxed Artifacts (`share.krill.page`)
-Publish agent-generated HTML reports, architecture diagrams, and Markdown documents as a single sandboxed public link (90-day expiry, 2 MB limit) and update or revoke the same URL anytime with `krill artifacts share`.
+Publish agent-generated HTML reports, architecture diagrams, and Markdown documents as a single sandboxed public link (configurable expiry, including no expiry; 10 MiB limit) and update or revoke the same URL anytime with `krill artifacts share`.
 
 [Artifacts Guide →](docs/ARTIFACTS.md)
 

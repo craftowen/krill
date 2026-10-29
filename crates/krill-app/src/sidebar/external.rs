@@ -3472,7 +3472,10 @@ fn linked_worktree_registers_and_groups_under_main_repo() {
     // v0.1.8이 남긴 잘못된 항목(linked 워크트리 경로)도 주 저장소 그룹으로 합친다.
     fs::write(
         state.join(PROJECTS_FILE),
-        format!("[[projects]]\npath = \"{}\"\n", canon(&wt).display()),
+        format!(
+            "[[projects]]\npath = \"{}\"\n",
+            canon(&wt).display().to_string().replace('\\', "\\\\")
+        ),
     )
     .unwrap();
     let mut trees = BTreeMap::new();
@@ -3599,9 +3602,9 @@ display_name = "구글드라이브"
 badge_color = "#ef4444"
 kind = "folder"
 "##,
-            repo_local_icon.display(),
-            repo_github.display(),
-            folder_drive.display(),
+            repo_local_icon.display().to_string().replace('\\', "\\\\"),
+            repo_github.display().to_string().replace('\\', "\\\\"),
+            folder_drive.display().to_string().replace('\\', "\\\\"),
         ),
     )
     .unwrap();
@@ -3675,9 +3678,9 @@ display_name = "가상 세션"
 repo_id = "gdrive"
 display_name = "지워진 워크트리"
 "#,
-            drive = drive_canon.display(),
-            polluted = polluted,
-            deleted = deleted_wt.display(),
+            drive = drive_canon.display().to_string().replace('\\', "\\\\"),
+            polluted = polluted.replace('\\', "\\\\"),
+            deleted = deleted_wt.display().to_string().replace('\\', "\\\\"),
         ),
     )
     .unwrap();

@@ -39,10 +39,60 @@ pub fn configure_background(command: &mut std::process::Command) {
 /// [`std::fs::canonicalize`] without the Win32 verbatim prefix (`\\?\C:\x` → `C:\x`), so it agrees with
 /// shell-reported cwds and stays readable on other hosts' sidebars. Identity wrapper on Unix.
 pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    let path = std::fs::canonicalize(path)?;
+    std::fs::canonicalize(path).map(|path| shell_path(&path))
+}
+
+/// Use ordinary DOS/UNC paths for shell working directories and arguments. A Windows
+/// verbatim prefix from canonicalization makes `cmd.exe` treat a local drive as UNC
+/// and silently change to the Windows directory. Other device namespaces are preserved.
+/// This only changes the representation and does not resolve or access the path.
+pub fn shell_path(path: &std::path::Path) -> std::path::PathBuf {
     #[cfg(windows)]
-    let path = crate::daemon::executable_path(&path);
-    Ok(path)
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let ordinary = crate::daemon::executable_path(path);
+        // Preserve names that only the verbatim namespace can represent, and
+        // long paths that would otherwise acquire the Win32 MAX_PATH limit.
+        if ordinary.as_os_str().encode_wide().count() >= 260
+            || path.components().any(|part| {
+                let name = match part {
+                    std::path::Component::Normal(name) => name,
+                    std::path::Component::CurDir | std::path::Component::ParentDir => return true,
+                    _ => return false,
+                };
+                let text = name.to_string_lossy();
+                let stem = text.split('.').next().unwrap_or_default();
+                let upper = stem.to_ascii_uppercase();
+                text.ends_with(['.', ' '])
+                    || text.contains(['/', '<', '>', ':', '"', '|', '?', '*'])
+                    || text.chars().any(char::is_control)
+                    || matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                    || ["COM", "LPT"].iter().any(|prefix| {
+                        upper.strip_prefix(prefix).is_some_and(|n| {
+                            matches!(
+                                n,
+                                "1" | "2"
+                                    | "3"
+                                    | "4"
+                                    | "5"
+                                    | "6"
+                                    | "7"
+                                    | "8"
+                                    | "9"
+                                    | "¹"
+                                    | "²"
+                                    | "³"
+                            )
+                        })
+                    })
+            })
+        {
+            return path.to_owned();
+        }
+        ordinary
+    }
+    #[cfg(not(windows))]
+    path.to_owned()
 }
 
 /// Append standard per-user Windows CLI install folders (`%USERPROFILE%\.local\bin`,

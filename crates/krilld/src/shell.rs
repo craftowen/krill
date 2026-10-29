@@ -23,6 +23,29 @@ use krill_proto::os::ffi::{OsStrExt as _, OsStringExt};
 
 use crate::sys::{self, User};
 
+/// Batch trampoline: std's Windows Command handles cmd-specific argv escaping.
+#[cfg(windows)]
+pub fn run_windows_shell(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> std::process::ExitCode {
+    use std::io::Write as _;
+    let Some(program) = args.next() else {
+        return std::process::ExitCode::from(2);
+    };
+    sys::console_utf8();
+    let result = sys::protect_agent_launcher()
+        .and_then(|()| std::process::Command::new(program).args(args).status());
+    match result {
+        Ok(status) => {
+            std::process::ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1))
+        }
+        Err(error) => {
+            writeln!(std::io::stderr().lock(), "shell launch failed: {error}").ok();
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// launchd가 GUI 앱에 주는 PATH(실측, Terminal.app 셸이 받는 값). 나머지는 `/etc/zprofile`의 `path_helper`가 붙인다.
 #[cfg(all(unix, not(target_os = "linux")))]
 const LAUNCHD_PATH: &[u8] = b"/usr/bin:/bin:/usr/sbin:/sbin";
@@ -65,6 +88,7 @@ const KEEP_WINDOWS: &[&[u8]] = &[
     b"ProgramFiles(x86)",
     b"ProgramW6432",
     b"PSModulePath",
+    b"PROMPT",
     b"PUBLIC",
     b"SystemDrive",
     b"SystemRoot",
@@ -101,6 +125,7 @@ const PATH_PROBE: &str = "/usr/bin/printf '\\n__MK_PATH__='; /usr/bin/printenv P
 /// `XPC_*`·`__CFBundleIdentifier`는 부모 잡을 가리키는 값이라 넘기지 않는다.
 const KEEP: &[&[u8]] = &[
     b"TMPDIR",
+    b"KRILL_SOCKET_DIR",
     b"SSH_AUTH_SOCK",
     b"__CF_USER_TEXT_ENCODING",
     b"COMMAND_MODE",
@@ -171,6 +196,8 @@ impl Shell {
         if matches!(self, Self::Custom { .. }) {
             set_path(&mut launch, login_path());
         }
+        #[cfg(windows)]
+        let launch = crate::agent::wrap_windows_shell(launch);
         launch
     }
 
@@ -272,8 +299,59 @@ impl Shell {
                     .collect()
             }
         };
+        #[cfg(windows)]
+        let argv = windows_interactive(argv, &mut env);
         Launch { argv, env }
     }
+}
+
+/// Only implicit interactive starts are bootstrapped; explicit -File/-Command/-c
+/// invocations retain their arguments and execute exactly once.
+#[cfg(any(windows, test))]
+fn windows_interactive(mut argv: Vec<Vec<u8>>, env: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Vec<Vec<u8>> {
+    if argv.len() != 1 {
+        return argv;
+    }
+    let Some(program) = argv.first().and_then(|p| std::str::from_utf8(p).ok()) else {
+        return argv;
+    };
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "powershell" | "pwsh" => {
+            // PowerShell loads profiles once before -Command. Preserve their prompt
+            // and native pipeline encoding while reporting filesystem cwd via OSC 9;9.
+            const BOOTSTRAP: &str = concat!(
+                "$global:OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding $false;",
+                "$global:__KrillOriginalPrompt=$function:prompt;",
+                "function global:prompt { ",
+                "$p=$executionContext.SessionState.Path.CurrentFileSystemLocation.Path -replace '[\\x00-\\x1f\\x7f-\\x9f]','';",
+                "[Console]::Write(([string][char]27)+']9;9;\"'+$p+'\"'+[char]7);",
+                "if($global:__KrillOriginalPrompt){ & $global:__KrillOriginalPrompt } else { 'PS '+$pwd+'> ' } }"
+            );
+            argv.extend([
+                b"-NoExit".to_vec(),
+                b"-Command".to_vec(),
+                BOOTSTRAP.as_bytes().to_vec(),
+            ]);
+        }
+        "cmd" => {
+            let prompt = env
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(b"PROMPT"))
+                .map_or_else(|| b"$P$G".to_vec(), |(_, value)| value.clone());
+            env.retain(|(key, _)| !key.eq_ignore_ascii_case(b"PROMPT"));
+            let mut integrated = b"$e]9;9;\"$P\"$e\\".to_vec();
+            integrated.extend(prompt);
+            env.push((b"PROMPT".to_vec(), integrated));
+            argv.extend([b"/K".to_vec(), b"chcp 65001 >nul".to_vec()]);
+        }
+        _ => {}
+    }
+    argv
 }
 
 /// 환경 변수 이름 비교. Windows는 대소문자를 가리지 않는다.
@@ -603,7 +681,11 @@ mod windows_tests {
         let login = Shell::Login.launch_with_lang(None, env.clone(), None);
         let shell = String::from_utf8(login.argv[0].clone()).unwrap();
         eprintln!("login shell: {shell}");
-        assert_eq!(login.argv.len(), 1);
+        // Only the UTF-8/cwd bootstrap follows the shell itself.
+        assert_eq!(
+            login.argv[1..],
+            super::windows_interactive(vec![login.argv[0].clone()], &mut login.env.clone())[1..]
+        );
         assert!(
             std::path::Path::new(&shell).is_absolute() || shell.eq_ignore_ascii_case("cmd.exe")
         );
@@ -638,5 +720,103 @@ mod windows_tests {
         .launch_with_lang(None, env, None);
         assert_eq!(missing.argv[0], b"no-such-agent");
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod windows_bootstrap_tests {
+    use super::windows_interactive;
+
+    #[test]
+    fn interactive_bootstrap_preserves_profiles_prompt_and_explicit_commands() {
+        let mut env = vec![(b"PrOmPt".to_vec(), b"custom $P$G".to_vec())];
+        let cmd = windows_interactive(vec![br"C:\Windows\System32\cmd.exe".to_vec()], &mut env);
+        assert_eq!(&cmd[1..], &[b"/K".to_vec(), b"chcp 65001 >nul".to_vec()]);
+        assert_eq!(
+            env,
+            vec![(b"PROMPT".to_vec(), b"$e]9;9;\"$P\"$e\\custom $P$G".to_vec())]
+        );
+        let ps = windows_interactive(vec![b"powershell.exe".to_vec()], &mut Vec::new());
+        assert_eq!(&ps[1..3], &[b"-NoExit".to_vec(), b"-Command".to_vec()]);
+        let bootstrap = String::from_utf8(ps[3].clone()).unwrap();
+        assert!(bootstrap.contains("[Console]::InputEncoding"));
+        assert!(bootstrap.contains("$global:__KrillOriginalPrompt"));
+        assert!(
+            bootstrap.contains("[char]27"),
+            "PowerShell 5.1 has no backtick-e"
+        );
+        assert!(!bootstrap.contains("$PROFILE"));
+        for program in ["pwsh.exe", "powershell.exe", "cmd.exe", "bash.exe"] {
+            let explicit = vec![
+                program.as_bytes().to_vec(),
+                b"-c".to_vec(),
+                b"echo hi".to_vec(),
+            ];
+            assert_eq!(
+                windows_interactive(explicit.clone(), &mut Vec::new()),
+                explicit
+            );
+        }
+    }
+
+    /// Agents started from the default PowerShell (agy runs `powershell -NoProfile` with piped
+    /// stdout) inherit the console code page. At the Korean default 949 their tool output is not
+    /// UTF-8, so the bootstrap must switch the console itself, not only PowerShell's variables.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_keeps_noprofile_child_pipe_output_utf8_under_codepage_949() {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let root = std::env::temp_dir().join(format!("krill-shell-cp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("emit.ps1");
+        std::fs::write(
+            &script,
+            "Write-Output ([string][char]0xD55C + [char]0xAE00 + '-notion.md')\r\n",
+        )
+        .unwrap();
+        let mut argv = windows_interactive(vec![b"powershell.exe".to_vec()], &mut Vec::new());
+        assert_eq!(argv.remove(1), b"-NoExit");
+        let bootstrap = String::from_utf8(argv.pop().unwrap()).unwrap();
+        // A fresh hidden console stands in for the session ConPTY at its Korean default.
+        let output = std::process::Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-Command"])
+            .arg(format!(
+                "chcp.com 949 > $null; {bootstrap}; & powershell -NoProfile -File '{}'",
+                script.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).as_deref(),
+            Ok("한글-notion.md\r\n")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(test)]
+mod socket_environment_tests {
+    use super::*;
+
+    #[test]
+    fn socket_override_survives_filtered_shell_environment() {
+        let inherited = vec![
+            (
+                b"KRILL_SOCKET_DIR".to_vec(),
+                b"private-socket-root".to_vec(),
+            ),
+            (b"UNRELATED_SECRET".to_vec(), b"do-not-inherit".to_vec()),
+        ];
+        let launch = Shell::Login.launch_with_lang(None, inherited, None);
+        assert!(launch.env.contains(&(
+            b"KRILL_SOCKET_DIR".to_vec(),
+            b"private-socket-root".to_vec()
+        )));
+        assert!(!launch.env.iter().any(|(key, _)| key == b"UNRELATED_SECRET"));
+        #[cfg(windows)]
+        assert!(keep(b"krill_socket_dir"));
     }
 }

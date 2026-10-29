@@ -46,7 +46,9 @@ fn fixture() -> (OwnedFd, Tap) {
             generation: 0,
         }),
         changed: Condvar::new(),
+        paused: AtomicBool::new(false),
         store: None,
+        reader: Mutex::new(None),
     };
     (pty.user, Tap(Arc::new(shared)))
 }

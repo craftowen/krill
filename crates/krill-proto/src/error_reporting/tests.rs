@@ -1767,3 +1767,91 @@ proptest::proptest! {
         proptest::prop_assert_eq!((report.dropped, report.pending), (1, 0));
     }
 }
+
+/// 2026-10-28: krill-app updater 단위 테스트의 `single_flight(Err)`가 `capture`로 실제 상태 폴더 대기열에 썼다.
+#[test]
+fn test_process_markers_are_test_only() {
+    let keys = |names: &[&str]| {
+        names
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
+    };
+    let dev = Path::new("/w/target/debug/krill-app");
+    assert!(is_test_process_in(keys(&["NEXTEST"]), Some(dev)));
+    assert!(is_test_process_in(
+        keys(&["CARGO_BIN_EXE_krilld"]),
+        Some(dev)
+    ));
+    let libtest = Path::new("/w/target/release/deps/pane_e2e-0123abcd");
+    assert!(is_test_process_in(keys(&[]), Some(libtest)));
+    // 일반 `cargo run -p krill-app`: cargo 변수는 있지만 테스트 표식은 없다.
+    assert!(!is_test_process_in(
+        keys(&["CARGO", "CARGO_MANIFEST_DIR", "CARGO_PKG_NAME"]),
+        Some(dev)
+    ));
+    let installed = Path::new("/Applications/Krill.app/Contents/MacOS/krill-app");
+    assert!(!is_test_process_in(keys(&[]), Some(installed)));
+    assert!(!is_test_process_in(keys(&[]), None));
+}
+
+#[test]
+fn same_dir_sees_through_aliases() {
+    let state = State::new();
+    let real = state.path().join("dev.krill.app");
+    fs::create_dir_all(&real).unwrap();
+    assert!(same_dir(&real.join("../dev.krill.app"), &real));
+    #[cfg(unix)]
+    {
+        let link = state.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_dir(&link, &real));
+    }
+    assert!(!same_dir(state.path(), &real));
+    assert!(same_dir(
+        Path::new("/nonexistent/a"),
+        Path::new("/nonexistent/a")
+    ));
+    // 아직 만들어지지 않은 기본 폴더도 `..`·심볼릭 링크 별칭으로 우회되지 않는다(첫 실행 전 상태).
+    let missing = state.path().join("fresh").join("dev.krill.app");
+    assert!(same_dir(&missing.join("../dev.krill.app"), &missing));
+    assert!(same_dir(&missing.join("./x/.."), &missing));
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(state.path().join("fresh")).unwrap();
+        let link = state.path().join("fresh-link");
+        std::os::unix::fs::symlink(state.path().join("fresh"), &link).unwrap();
+        assert!(same_dir(&link.join("dev.krill.app"), &missing));
+    }
+    assert!(!same_dir(&missing.join("../other"), &missing));
+}
+
+/// 이 테스트 프로세스 자신은 기본 상태 폴더(Krill 세션이 `KRILL_STATE_DIR`로 물려줘도, `..` 별칭으로 줘도)의
+/// 동의를 읽지도 바꾸지도 못한다. 그래서 `capture`·`capture_at`·`record_at`·`RunGuard::start`가 모두 멈춘다.
+/// 실제 폴더에는 아무것도 쓰지 않는다: 동의가 `None`이면 각 진입점은 파일을 열기 전에 돌아간다.
+#[test]
+fn test_process_cannot_touch_the_default_state_dir() {
+    let Some(default) = crate::daemon::default_state_dir() else {
+        return;
+    };
+    let name = default.file_name().unwrap().to_owned();
+    let alias = default.join("..").join(name);
+    for state in [default.as_path(), alias.as_path()] {
+        if !state.is_dir() {
+            continue;
+        }
+        assert!(shielded(state), "{state:?}");
+        assert_eq!(consent_at(state).unwrap(), None);
+        assert_eq!(
+            enable(state).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            disable(state).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    // 임시 상태 폴더는 그대로 기록할 수 있다.
+    let temp = State::new();
+    assert!(!shielded(temp.path()));
+}

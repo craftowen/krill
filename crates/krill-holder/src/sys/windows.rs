@@ -222,11 +222,14 @@ impl Api {
     pub fn load() -> Self {
         static API: std::sync::OnceLock<Api> = std::sync::OnceLock::new();
         *API.get_or_init(|| {
-            Self::bundle().unwrap_or(Self {
-                create: winconsole::CreatePseudoConsole,
-                resize: winconsole::ResizePseudoConsole,
-                close: winconsole::ClosePseudoConsole,
-                pack: None,
+            Self::bundle().unwrap_or_else(|error| {
+                tracing::warn!(%error, "bundled ConPTY unavailable; only legacy inbox adoption is supported");
+                Self {
+                    create: winconsole::CreatePseudoConsole,
+                    resize: winconsole::ResizePseudoConsole,
+                    close: winconsole::ClosePseudoConsole,
+                    pack: None,
+                }
             })
         })
     }
@@ -306,10 +309,19 @@ pub struct Console {
 }
 impl Console {
     pub fn create(api: Api, size: WinSize) -> io::Result<Self> {
+        // Preserve adoption of existing inbox sessions, but never dereference a new
+        // opaque OS HPCON. Only the packaging-pinned bundled ABI is supported here.
+        if api.inbox() {
+            tracing::error!("new sessions require bundled conpty.dll and x64/OpenConsole.exe");
+            // Preserve a meaningful Windows error across the existing errno-only
+            // SpawnFailed contract; a synthetic ErrorKind would become access denied.
+            return Err(io::Error::from_raw_os_error(126)); // ERROR_MOD_NOT_FOUND
+        }
         let (input, writer) = pipe()?;
         let (reader, output) = pipe()?;
         let mut h = 0;
-        // SAFETY: pipe ends and output are live. Bundled flag 0x8 enables passthrough (OWE-826).
+        // SAFETY: pipe ends and output are live. Pinned conpty.h defines 0x08 as
+        // PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES; it does not enable VT passthrough.
         hr(unsafe {
             (api.create)(
                 coord(size)?,
@@ -319,8 +331,8 @@ impl Console {
                 &raw mut h,
             )
         })?;
-        // SAFETY: winconpty.h defines the ABI as signal/reference/conhost process handles.
-        // Inbox layout remains an OS compatibility dependency (OWE-826); never use it for pack.
+        // SAFETY: the packaging-pinned bundled winconpty.h ABI has these three fields;
+        // the undocumented inbox HPCON path was rejected before creation.
         let fields = unsafe { *(h as *const [HANDLE; 3]) };
         let copies = fields
             .into_iter()
@@ -442,6 +454,10 @@ pub struct Process {
     pub pid: u32,
 }
 impl Process {
+    /// Stop this owned child process; dropping the handle alone leaves it running.
+    pub fn terminate(&self) -> io::Result<()> {
+        terminate(self)
+    }
     pub fn status(&self) -> io::Result<Option<i32>> {
         // SAFETY: borrowed process handle, nonblocking wait.
         match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
@@ -942,13 +958,18 @@ impl Console {
 /// Bootstrap is short-lived: its inherited std/SSH handles die before returning
 /// to the caller. Only this raw `CreateProcess` call creates the resident holder.
 pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
+    spawn_detached(std::env::current_exe()?.as_os_str(), args, true).map(|_| ())
+}
+
+/// Start without inheriting any handles, including captured stdout in ancestors.
+/// Only the holder bootstrap needs to escape a caller's Job.
+pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::Result<Process> {
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, STARTUPINFOW,
     };
-    let app = std::env::current_exe()?;
-    let path = wide(app.as_os_str())?;
-    let mut command = quote(app.as_os_str());
+    let command_path = wide(path)?;
+    let mut command = quote(path);
     for arg in args {
         command.push(32);
         command.extend(quote(arg));
@@ -960,8 +981,10 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     let mut in_job = 0;
     // SAFETY: current process pseudo handle and valid output storage; null means any Job.
     let current = unsafe { GetCurrentProcess() };
-    // SAFETY: current is our process pseudo handle and in_job is valid output storage.
-    cvt(unsafe { IsProcessInJob(current, null_mut(), &raw mut in_job) })?;
+    if break_away {
+        // SAFETY: current is our process pseudo handle and output storage is live.
+        cvt(unsafe { IsProcessInJob(current, null_mut(), &raw mut in_job) })?;
+    }
     let flags = DETACHED_PROCESS
         | CREATE_NEW_PROCESS_GROUP
         | if in_job != 0 {
@@ -979,7 +1002,7 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     // default environment/cwd. A restrictive Job rejects breakaway: never retry in it.
     cvt(unsafe {
         CreateProcessW(
-            path.as_ptr(),
+            command_path.as_ptr(),
             command.as_mut_ptr(),
             null(),
             null(),
@@ -993,15 +1016,41 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     })?;
     // SAFETY: successful CreateProcessW returned two exclusive handles. Closing
     // them does not terminate the independent holder process.
-    let _process = unsafe { owned(info.hProcess) }?;
+    let process = unsafe { owned(info.hProcess) }?;
     // SAFETY: independent exclusive initial thread handle from CreateProcessW.
     let _thread = unsafe { owned(info.hThread) }?;
-    Ok(())
+    Ok(Process {
+        handle: process,
+        pid: info.dwProcessId,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_inbox_session_is_rejected_before_calling_an_opaque_backend() {
+        static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        extern "system" fn forbidden_create(
+            _: COORD,
+            _: HANDLE,
+            _: HANDLE,
+            _: u32,
+            _: *mut HPCON,
+        ) -> i32 {
+            CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            -1
+        }
+        let api = Api {
+            create: forbidden_create,
+            resize: winconsole::ResizePseudoConsole,
+            close: winconsole::ClosePseudoConsole,
+            pack: None,
+        };
+        let error = Console::create(api, WinSize { cols: 80, rows: 24 }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(126));
+        assert!(!CALLED.load(std::sync::atomic::Ordering::SeqCst));
+    }
     #[test]
     fn failed_send_reclaims_remote_copy() -> io::Result<()> {
         let target = duplicate_target(std::process::id())?;

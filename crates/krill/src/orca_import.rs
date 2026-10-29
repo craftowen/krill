@@ -291,9 +291,8 @@ impl ImportOptions {
         domains: Vec<ImportDomain>,
         dry_run: bool,
     ) -> io::Result<Self> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        let home = krill_proto::os::home_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user home is not set"))?;
         let state_dir = daemon::state_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "state directory not found"))?;
         let orca_dir = orca_dir_override
@@ -315,9 +314,37 @@ impl ImportOptions {
 
 #[must_use]
 pub fn default_orca_dir(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join("orca")
+    #[cfg(windows)]
+    let roots = [
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        Some(home.join("AppData/Roaming")),
+    ];
+    #[cfg(target_os = "macos")]
+    let roots = [Some(home.join("Library/Application Support"))];
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let roots = [
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        Some(home.join(".config")),
+    ];
+    discover_orca_dir(roots.into_iter().flatten())
+}
+
+fn discover_orca_dir(roots: impl IntoIterator<Item = PathBuf>) -> PathBuf {
+    let candidates: Vec<_> = roots
+        .into_iter()
+        .flat_map(|root| [root.join("orca"), root.join("Orca")])
+        .collect();
+    candidates
+        .iter()
+        .find(|p| p.join("orca-profile-index.json").is_file() || p.join("profiles").is_dir())
+        .or_else(|| candidates.iter().find(|p| p.is_dir()))
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// 이관 결과 요약 리포트(`--json` 출력 및 `OWE-727` UI 미리보기 겸용).
@@ -1267,9 +1294,12 @@ fn import_accounts_domain_inner(
         return summary;
     }
 
-    let socket = opts.state_dir.join("run").join("krilld.sock");
+    let socket = daemon::socket_path(&opts.state_dir).map_err(|error| error.to_string());
     let auto_start = should_auto_start_daemon(opts.dry_run);
-    match daemon_usage_request(&socket, &UsageRequest::ListAccounts, auto_start) {
+    match socket.and_then(|socket| {
+        daemon_usage_request(&socket, &UsageRequest::ListAccounts, auto_start)
+            .map(|snapshot| (socket, snapshot))
+    }) {
         Err(e) if !opts.dry_run => {
             // AS-03: 데몬 자동 기동까지 실패해 연결할 수 없으면 로컬 파일(accounts.toml)을 직접 쓰지 않고
             // '데몬 필요' 사유로 accounts 도메인을 스킵한 뒤 다른 도메인만 진행한다.
@@ -1325,7 +1355,7 @@ fn import_accounts_domain_inner(
             }
             return summary;
         }
-        Ok(mut snap) => {
+        Ok((socket, mut snap)) => {
             for cand in planned {
                 if let Some(existing) = find_registered_account(&snap, &cand) {
                     let kept_id = existing.id.clone();
@@ -1618,7 +1648,7 @@ fn find_registered_account<'a>(
 /// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
 /// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
 fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
-    let mut parts = dir.split('/');
+    let mut parts = dir.split(['/', '\\']);
     let leaf = parts.next_back()?;
     let uuid = parts.next_back()?;
     let parent = parts.next_back()?;
@@ -1960,11 +1990,13 @@ fn import_sessions_domain(
         .collect();
     let mut conn = None;
     if !opts.dry_run {
-        let socket = opts.state_dir.join("run").join("krilld.sock");
+        let socket = daemon::socket_path(&opts.state_dir).map_err(|error| error.to_string());
         let mut hello = daemon::client_hello(ClientRole::Cli, "krill import orca");
         let required = FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_AI_VAULT;
         hello.features |= required;
-        match connect_daemon(&socket, &hello, should_auto_start_daemon(false)) {
+        match socket
+            .and_then(|socket| connect_daemon(&socket, &hello, should_auto_start_daemon(false)))
+        {
             Ok(c) if c.negotiated.features & required == required => conn = Some(c),
             Ok(_) => {
                 summary.skipped = true;
@@ -5431,7 +5463,7 @@ mod tests {
             "automations".to_owned(),
             serde_json::json!([
                 { "id": "current", "name": "Current Job", "prompt": "audit", "agentId": "codex", "rrule": "15 3 * * 1-5", "dtstart": 1_792_850_000_123_u64, "enabled": false,
-                  "runContext": { "path": "/tmp/current" }, "precheck": { "command": "git diff --quiet", "timeoutSeconds": 120 }, "workspaceMode": "new_per_run", "baseBranch": "dev", "reuseSession": true, "extraAgentArgs": "--model gpt", "missedRunGraceMinutes": 720 },
+                  "runContext": { "path": opts.home.join("current") }, "precheck": { "command": "git diff --quiet", "timeoutSeconds": 120 }, "workspaceMode": "new_per_run", "baseBranch": "dev", "reuseSession": true, "extraAgentArgs": "--model gpt", "missedRunGraceMinutes": 720 },
                 { "id": "float-date", "name": "Float", "prompt": "review", "dtstart": 1.5, "rrule": "FREQ=HOURLY;BYMINUTE=5", "precheck": "exit 0", "reuseSession": true },
                 { "id": "malformed", "prompt": 99 },
                 { "id": "null-date", "prompt": "null date", "dtstart": null, "rrule": "FREQ=DAILY;BYHOUR=10" },
@@ -5453,7 +5485,7 @@ mod tests {
         assert_eq!(entry.name.as_deref(), Some("Current Job"));
         assert!(!entry.enabled);
         assert_eq!(entry.cron, "15 3 * * 1-5");
-        assert_eq!(entry.cwd, "/tmp/current");
+        assert_eq!(Path::new(&entry.cwd), opts.home.join("current"));
         assert_eq!(entry.agent.as_deref(), Some("codex"));
         assert_eq!(entry.command, ["codex"]);
         assert_eq!(entry.precheck.as_deref(), Some("git diff --quiet"));
@@ -6031,5 +6063,29 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod source_discovery_tests {
+    use super::*;
+    #[test]
+    fn windows_roaming_candidates_prefer_profile_index_and_keep_override() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-discovery-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let custom = root.join("custom-roaming");
+        let fallback = root.join("home/AppData/Roaming");
+        fs::create_dir_all(custom.join("orca")).unwrap();
+        fs::create_dir_all(fallback.join("Orca/profiles/default")).unwrap();
+        let discovered = discover_orca_dir([custom.clone(), fallback.clone()]);
+        assert!(same_file::is_same_file(&discovered, fallback.join("Orca")).unwrap());
+        assert!(discovered.join("profiles/default").is_dir());
+        fs::write(custom.join("orca/orca-profile-index.json"), "{}").unwrap();
+        let discovered = discover_orca_dir([custom.clone(), fallback]);
+        assert!(same_file::is_same_file(&discovered, custom.join("orca")).unwrap());
+        assert!(discovered.join("orca-profile-index.json").is_file());
+        // from_env preserves explicit --orca-dir and KRILL_ORCA_DIR before discovery.
+        fs::remove_dir_all(root).unwrap();
     }
 }

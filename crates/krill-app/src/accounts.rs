@@ -482,9 +482,9 @@ pub fn request_local(
                 if let Some(existing) = file.accounts.iter().find(|a| a.id == id) {
                     let current = PathBuf::from(&existing.profile_dir);
                     if *provider == ProviderKind::Codex {
-                        krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(
+                        krill_proto::usage::profiles::try_migrate_long_codex_profile(
                             home, &slug, &current,
-                        )
+                        )?
                     } else {
                         current
                     }
@@ -962,22 +962,26 @@ fn run_browser_login_with_mode(
         let browser_link = login_browser::read_link(&link_file);
         let printed_link = links.try_iter().last();
         if !opened
-            && let Some(raw) = browser_link.or(printed_link)
-            && let Some(url) = authorize_url(account.provider, &raw)
+            && let Some((url, handed)) = login_link(
+                account.provider,
+                browser_link.as_deref(),
+                printed_link.as_deref(),
+            )
         {
             record_login_url(&account.id, url);
-            opened = if open_browser {
-                if cfg!(target_os = "macos") {
-                    crate::platform::background_command("open")
-                        .arg(url)
-                        .status()
-                        .is_ok_and(|status| status.success())
+            opened = handed
+                && if open_browser {
+                    if cfg!(target_os = "macos") {
+                        crate::platform::background_command("open")
+                            .arg(url)
+                            .status()
+                            .is_ok_and(|status| status.success())
+                    } else {
+                        crate::platform::permissions::open_url(url)
+                    }
                 } else {
-                    crate::platform::permissions::open_url(url)
-                }
-            } else {
-                true
-            };
+                    true
+                };
         }
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
@@ -1071,6 +1075,24 @@ fn run_browser_login_with_mode(
         fail(reason);
     }
     std::fs::remove_dir_all(temp).ok();
+}
+
+/// 기록할 인증 링크와, 그 링크를 Krill이 직접 열어야 하는지. `BROWSER`로 넘겨받은 링크만 연다.
+/// Codex는 macOS·Windows에서 `BROWSER`를 무시하고 스스로 브라우저를 연 뒤 같은 링크를 출력한다.
+/// 출력된 링크까지 열면 로그인 페이지가 두 개 뜬다. 출력 링크는 [링크 복사]용으로만 기록한다.
+fn login_link<'a>(
+    provider: ProviderKind,
+    handed: Option<&'a str>,
+    printed: Option<&'a str>,
+) -> Option<(&'a str, bool)> {
+    handed
+        .and_then(|raw| authorize_url(provider, raw))
+        .map(|url| (url, true))
+        .or_else(|| {
+            printed
+                .and_then(|raw| authorize_url(provider, raw))
+                .map(|url| (url, false))
+        })
 }
 
 pub(super) fn authorize_url(provider: ProviderKind, raw: &str) -> Option<&str> {

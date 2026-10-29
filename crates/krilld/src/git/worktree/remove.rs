@@ -502,13 +502,7 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
 
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
     let envs = super::compat::environment_in(q, wt)?;
-    #[cfg(windows)]
-    let shell = output_path(
-        git(q, wt, ["var", "GIT_SHELL_PATH"])?,
-        "cannot find Git shell",
-    )?;
-    #[cfg(unix)]
-    let shell = Path::new("/bin/sh");
+    let shell = super::script_shell(q, wt)?;
     let mut cmd = std::process::Command::new(shell);
     crate::child::own_group(&mut cmd)
         .arg("-c")

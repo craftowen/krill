@@ -33,7 +33,7 @@ Usage recording and upload run outside the UI and PTY processing paths. Pending 
 
 The default endpoint is `https://telemetry.krill.page/v1/telemetry`. `KRILL_TELEMETRY_ENDPOINT` overrides it; HTTPS is required except for explicit loopback HTTP addresses used in local testing. No collector admin secret is included in a desktop build.
 
-The collector implementation is in [services/telemetry](README.md). Code in this repository does not prove the production hostname, database, secrets, or an updated desktop release are deployed. Until those steps are completed, production collection is unavailable; inspect CLI delivery state rather than interpreting missing data as zero usage.
+The collector implementation is in [services/telemetry](README.md). The production hostname, database, and admin authentication were provisioned on 2026-10-27. Collection requires a desktop version with usage events enabled; older versions do not acquire that capability from a server deployment. Queued events retry with their original event IDs. Inspect CLI delivery state rather than interpreting missing data or time before collection began as zero usage.
 
 ## Operator metrics
 

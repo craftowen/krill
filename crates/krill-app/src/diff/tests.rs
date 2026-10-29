@@ -1147,6 +1147,7 @@ fn explorer_keyboard_navigation_clamps_and_finds_parent() {
             name: "src".to_owned(),
             path: repo.0.join("src"),
             relative_path: "src".to_owned(),
+            is_symlink: false,
             is_dir: true,
             depth: 0,
             expanded: true,
@@ -1156,6 +1157,7 @@ fn explorer_keyboard_navigation_clamps_and_finds_parent() {
             name: "a.rs".to_owned(),
             path: repo.0.join("src/a.rs"),
             relative_path: "src/a.rs".to_owned(),
+            is_symlink: false,
             is_dir: false,
             depth: 1,
             expanded: false,
@@ -1165,6 +1167,7 @@ fn explorer_keyboard_navigation_clamps_and_finds_parent() {
             name: "b.txt".to_owned(),
             path: repo.0.join("b.txt"),
             relative_path: "b.txt".to_owned(),
+            is_symlink: false,
             is_dir: false,
             depth: 0,
             expanded: false,
@@ -1312,6 +1315,353 @@ fn workspace_search_engine_options_and_globs_work() {
         assert_eq!(trunc_res.total_matches, 2);
         assert!(trunc_res.truncated);
     }
+}
+
+/// APP-F06: 폴백 정규식 엔진은 `rg`(Rust regex 문법)와 같은 의미여야 한다. 인라인 플래그·교대·
+/// 반복 횟수·그룹 반복이 `rg` 유무와 무관하게 같은 줄을 찾고, 잘못된 패턴은 명시적 오류다.
+#[test]
+fn workspace_search_regex_semantics_match_ripgrep_on_both_engines() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.0.join("words.txt"),
+        "needle\nNEEDLE\nfoo\nbar\nbaz\nabab\nabbb\na\naa\naaa\nfoo bar\n",
+    )
+    .unwrap();
+
+    for run_fn in [search_worktree, search_worktree_fallback] {
+        let lines = |query: &str, whole_word: bool| -> Vec<u32> {
+            let res = run_fn(
+                &repo.0,
+                &SearchOptions {
+                    query: query.to_owned(),
+                    use_regex: true,
+                    case_sensitive: true,
+                    whole_word,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+            res.files
+                .iter()
+                .flat_map(|f| f.matches.iter().map(|m| m.line))
+                .collect()
+        };
+        assert_eq!(lines("(?i)needle", false), [1, 2]);
+        assert_eq!(lines("foo|bar", false), [3, 4, 11, 11]);
+        assert_eq!(lines("^(ab)+$", false), [6]);
+        assert_eq!(lines("^a{2,3}$", false), [9, 10]);
+        assert_eq!(lines("ba.", true), [4, 5, 11]);
+        assert!(
+            run_fn(
+                &repo.0,
+                &SearchOptions {
+                    query: "(".to_owned(),
+                    use_regex: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .is_err()
+        );
+    }
+}
+
+/// APP-F05: 원격 호스트 작업공간 검색은 같은 절대 경로의 로컬 디렉터리를 뒤지지 않고 명시적 미지원
+/// 상태를 보여 준다. 호스트 전환은 이전 호스트의 검색 결과를 지운다.
+#[gpui::test]
+fn remote_workspace_search_fails_closed_and_host_switch_clears_results(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = Repo::new();
+    std::fs::write(repo.0.join("local.txt"), "SECRET_LOCAL_TOKEN\n").unwrap();
+
+    cx.update(gpui_component::init);
+    let repo_path = repo.0.clone();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(repo_path, cx);
+        p.visible = false;
+        p
+    });
+    cx.run_until_parked();
+
+    // 로컬 작업공간: 검색이 로컬 파일을 찾는다.
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| {
+            p.show_search(window, cx);
+            p.set_search_query("SECRET_LOCAL_TOKEN", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search_result().total_matches),
+        1
+    );
+    assert!(cx.debug_bounds("search-remote-unsupported").is_none());
+
+    // 같은 경로의 원격 호스트로 전환: 이전 결과가 지워지고 로컬을 검색하지 않는다.
+    let sock = repo.0.join("missing.sock");
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.connect(HostTarget::remote("fixture", sock), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.search.remote);
+        assert_eq!(p.search_result().total_matches, 0);
+        assert!(p.search_rows().is_empty());
+        assert!(!p.search.searching);
+        assert!(p.search.error.is_none());
+        assert_eq!(p.search_options().query, "SECRET_LOCAL_TOKEN");
+    });
+    assert!(cx.debug_bounds("search-remote-unsupported").is_some());
+    assert!(cx.debug_bounds("search-empty-no-results").is_none());
+    assert!(cx.debug_bounds("search-loading").is_none());
+
+    // 원격 상태에서 다시 검색을 요청해도 로컬 결과는 나오지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_search_query("SECRET_LOCAL_TOKEN", cx));
+    });
+    cx.executor()
+        .advance_clock(search::SEARCH_DEBOUNCE + Duration::from_millis(50));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert_eq!(p.search_result().total_matches, 0);
+        assert!(p.search_rows().is_empty());
+        assert!(!p.search.searching);
+    });
+    assert!(cx.debug_bounds("search-remote-unsupported").is_some());
+}
+
+/// APP-F06: 단어 단위(`-w`) 검색은 `rg`의 반쪽 경계 의미를 따른다 — 패턴이 비단어 문자로 시작·끝나도
+/// (`foo()`·`--flag`·`$VAR`·`.env`·`@user`) 매치 앞뒤가 단어 문자가 아니면 찾고, 교대는 경계에 맞는
+/// 더 긴 대안(`foobar`)을 고르며, 위치·길이(하이라이트)가 두 엔진에서 같다. 기대값은 설치된
+/// `rg 15.2 --json -w`의 실측이다.
+#[test]
+fn workspace_search_whole_word_matches_ripgrep_half_boundaries() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.0.join("words.txt"),
+        "call foo() here\nfoo()x\nxfoo()\n--flag and --flagged\n$VAR $VARIANT\nfoo foobar foo\nfoofoo\nCafé café CAFÉ\n한글 한글날\nbar_foo foo_bar\n.env .envrc\n@user @username\n",
+    )
+    .unwrap();
+
+    for run_fn in [search_worktree, search_worktree_fallback] {
+        let hits = |query: &str, use_regex: bool, case_sensitive: bool| -> Vec<(u32, u32, u32)> {
+            let res = run_fn(
+                &repo.0,
+                &SearchOptions {
+                    query: query.to_owned(),
+                    use_regex,
+                    case_sensitive,
+                    whole_word: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+            res.files
+                .iter()
+                .flat_map(|f| f.matches.iter().map(|m| (m.line, m.column, m.match_length)))
+                .collect()
+        };
+        assert_eq!(hits(r"foo\(\)", true, true), [(1, 6, 5)]);
+        assert_eq!(hits("foo()", false, true), [(1, 6, 5)]);
+        assert_eq!(hits("--flag", false, true), [(4, 1, 6)]);
+        assert_eq!(hits("$VAR", false, true), [(5, 1, 4)]);
+        assert_eq!(
+            hits("foo|foobar", true, true),
+            [(1, 6, 3), (2, 1, 3), (6, 1, 3), (6, 5, 6), (6, 12, 3)]
+        );
+        assert_eq!(
+            hits("foo", false, true),
+            [(1, 6, 3), (2, 1, 3), (6, 1, 3), (6, 12, 3)]
+        );
+        assert_eq!(
+            hits("café", false, false),
+            [(8, 1, 4), (8, 6, 4), (8, 11, 4)]
+        );
+        assert_eq!(
+            hits("(?i)café", true, true),
+            [(8, 1, 4), (8, 6, 4), (8, 11, 4)]
+        );
+        assert_eq!(hits("café", false, true), [(8, 6, 4)]);
+        assert_eq!(hits("한글", false, true), [(9, 1, 2)]);
+        assert!(
+            hits("bar", false, true).is_empty(),
+            "underscore is a word char"
+        );
+        assert_eq!(hits(".env", false, true), [(11, 1, 4)]);
+        assert_eq!(hits("@user", false, true), [(12, 1, 5)]);
+    }
+}
+
+/// APP-F01·F05: 원격 호스트 작업공간인데 전송이 없으면(시작 중·호스트 제거) 같은 절대 경로의 로컬
+/// 저장소에 붙은 채로 두지 않는다. 변경 목록·검색·PR 체크·기록 범위가 모두 닫히고 연결 안내만 보이며,
+/// 전송이 생겨 실제 원격 타깃이 오면 원격 모드를 유지하고, 로컬로 돌아오면 로컬 목록이 다시 로드된다.
+#[gpui::test]
+fn remote_workspace_without_transport_never_touches_colliding_local_repo(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::agent_history::VaultScope;
+
+    let repo = Repo::new();
+    repo.git(&["config", "user.email", "test@example.com"]);
+    repo.git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.0.join("tracked.txt"), "one\n").unwrap();
+    repo.git(&["add", "tracked.txt"]);
+    repo.git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.0.join("tracked.txt"), "two\n").unwrap();
+
+    cx.update(gpui_component::init);
+    let history = cx.update(|cx| {
+        cx.new(|_| {
+            crate::agent_history::Panel::new(Arc::new(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no daemon in tests",
+                ))
+            }))
+        })
+    });
+    let repo_path = repo.0.clone();
+    let hist = history.clone();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        // `Panel::new`는 테스트에서 실제 git을 읽는 인메모리 감시 허브를 단다(로컬 호스트).
+        let mut p = Panel::new(repo_path, cx);
+        p.set_history(hist, cx);
+        p
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        history.update(cx, |h, cx| h.set_scope(VaultScope::Workspace, cx));
+    });
+    let local_files = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .changes
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    // 허브의 첫 스냅샷은 FSEvents 등록·백그라운드 git을 기다린다(기존 감시 테스트와 같은 대기).
+    let wait_local_files = |cx: &mut gpui::VisualTestContext| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while local_files(cx) != [b"tracked.txt".to_vec()] {
+            assert!(Instant::now() < deadline, "local snapshot should load");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_local_files(cx);
+    assert!(!cx.update(|_, cx| view.read(cx).remote_host()));
+    let scope_path = repo.0.display().to_string();
+    assert_eq!(
+        cx.update(|_, cx| history.read(cx).build_search_query().paths),
+        [scope_path.as_str()]
+    );
+
+    // 전송 없는 원격 호스트로 전환: 로컬 목록·감시를 끄고 기록은 같은 경로의 원격 호스트에 묶는다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.disconnect_remote(&HostId::Remote("studio".into()), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.source.is_none());
+        assert!(p.watch_task.is_none());
+        assert!(p.changes.files.is_empty());
+        assert!(p.loaded);
+        assert_eq!(
+            p.repo_error.as_deref(),
+            Some(text::REMOTE_DISCONNECTED.get())
+        );
+        assert!(p.search.remote);
+        assert!(p.checks.inspection.is_none());
+        assert_eq!(history.read(cx).host(), &HostId::Remote("studio".into()));
+        assert_eq!(
+            history.read(cx).build_search_query().paths,
+            [scope_path.as_str()]
+        );
+    });
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+
+    // 다른 폴더로 바꾸거나(셸의 `set_repo` 순서) 같은 경로를 다시 지정하거나 새로고침해도 로컬 저장소를
+    // 읽지 않고 연결 안내를 유지한다.
+    let repo_path = repo.0.clone();
+    let other = repo.0.join("other");
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.set_repo(other, cx);
+            p.set_repo(repo_path, cx);
+            p.refresh(cx);
+            p.disconnect_remote(&HostId::Remote("studio".into()), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.source.is_none());
+        assert!(p.changes.files.is_empty());
+        assert!(p.remote_host());
+        assert_eq!(
+            p.repo_error.as_deref(),
+            Some(text::REMOTE_DISCONNECTED.get())
+        );
+    });
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+
+    // 로컬 호스트는 `disconnect_remote`의 대상이 아니다(전송 없는 로컬은 그대로 둔다).
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.disconnect_remote(&HostId::Local, cx));
+    });
+    assert!(cx.update(|_, cx| view.read(cx).remote_host()));
+
+    // 전송이 생기면 같은 호스트의 실제 타깃으로 바꾸되 원격 모드는 유지한다(로컬 목록이 돌아오지 않는다).
+    let sock = repo.0.join("missing.sock");
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.connect(HostTarget::remote("studio", sock), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.source.is_some());
+        assert!(p.changes.files.is_empty());
+        assert!(p.search.remote);
+    });
+
+    // 로컬 호스트로 돌아오면 이 Mac의 저장소 목록이 다시 로드된다.
+    let paths = Paths {
+        socket: repo.0.join("local.sock"),
+        holder: PathBuf::new(),
+        krilld: PathBuf::new(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            let hub: Arc<dyn Source> = Arc::new(TestHubSource(Mutex::new(
+                krilld::git::watch::Hub::default(),
+            )));
+            p.connect_with(HostTarget::local(paths), Some(hub), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).remote_host()));
+    wait_local_files(cx);
+    assert!(cx.update(|_, cx| view.read(cx).repo_error.is_none()));
+    assert_eq!(
+        cx.update(|_, cx| history.read(cx).build_search_query().paths),
+        [scope_path.as_str()]
+    );
 }
 
 #[gpui::test]
@@ -1593,7 +1943,8 @@ fn workspace_search_long_line_highlight_regex_step_cap_and_rg_truncation_work() 
         assert_eq!(after, suffix);
     }
 
-    // 2. Catastrophic backtracking regex in fallback engine completes bounded by step cap.
+    // 2. Patterns that explode in a backtracking engine stay bounded (the fallback compiles the
+    //    same linear-time `regex` engine `rg` uses, APP-F06).
     std::fs::write(
         repo.0.join("src/backtrack.txt"),
         format!("{}!\naaaaaab\n", "a".repeat(60)),
@@ -2799,4 +3150,105 @@ fn panel_tab_arrows_move_focus_and_native_space_keeps_selection(cx: &mut gpui::T
         assert_eq!(view.read(cx).tab, PanelTab::Changes);
         assert!(view.read(cx).tab_focus[0].is_focused(window));
     });
+}
+
+#[gpui::test]
+fn explorer_range_drag_and_os_drop_use_local_transfer_queue(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::plain();
+    std::fs::create_dir(repo.0.join("dest")).unwrap();
+    std::fs::write(repo.0.join("b.txt"), "b").unwrap();
+    std::fs::write(repo.0.join("c.txt"), "c").unwrap();
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo.0.clone(), cx));
+    panel.update(cx, |panel, cx| panel.set_tab(PanelTab::Files, cx));
+    cx.run_until_parked();
+    let b = cx.debug_bounds("explorer-item-b.txt").unwrap().center();
+    let c = cx.debug_bounds("explorer-item-c.txt").unwrap().center();
+    cx.simulate_click(b, Modifiers::default());
+    cx.simulate_click(
+        c,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    let dest = cx.debug_bounds("explorer-item-dest").unwrap().center();
+    cx.simulate_mouse_down(b, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(
+        gpui::point(b.x + px(20.), b.y),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(dest, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(repo.0.join("dest/b.txt").is_file());
+    assert!(repo.0.join("dest/c.txt").is_file());
+    assert!(!repo.0.join("b.txt").exists());
+    assert!(!repo.0.join("c.txt").exists());
+    let external = Repo::plain();
+    let source = external.0.join("import.txt");
+    std::fs::write(&source, "import").unwrap();
+    let dest = cx.debug_bounds("explorer-item-dest").unwrap().center();
+    cx.simulate_event(gpui::FileDropEvent::Entered {
+        position: dest,
+        paths: gpui::ExternalPaths(vec![source.clone()].into()),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::FileDropEvent::Submit { position: dest });
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(repo.0.join("dest/import.txt")).unwrap(),
+        "import"
+    );
+    assert!(
+        source.is_file(),
+        "OS drop imports without deleting its source"
+    );
+    let second = external.0.join("second.txt");
+    std::fs::write(&second, "second").unwrap();
+    cx.simulate_event(gpui::FileDropEvent::Entered {
+        position: dest,
+        paths: gpui::ExternalPaths(vec![source.clone(), second.clone()].into()),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::FileDropEvent::Submit { position: dest });
+    cx.run_until_parked();
+    assert!(
+        !repo.0.join("dest/second.txt").exists(),
+        "a conflicting batch stops and keeps later sources"
+    );
+    assert!(second.is_file());
+    assert!(
+        cx.update(|_, cx| panel.read(cx).explorer.error.is_some()),
+        "a later success must not erase a batch failure"
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn explorer_link_row_drop_is_rejected_without_bubbling_to_root(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::plain();
+    std::fs::create_dir(repo.0.join(".git")).unwrap();
+    std::os::unix::fs::symlink(repo.0.join(".git"), repo.0.join("alias")).unwrap();
+    let external = Repo::plain();
+    let source = external.0.join("never-import.txt");
+    std::fs::write(&source, "original").unwrap();
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo.0.clone(), cx));
+    panel.update(cx, |panel, cx| panel.set_tab(PanelTab::Files, cx));
+    cx.run_until_parked();
+    let alias = cx.debug_bounds("explorer-item-alias").unwrap().center();
+    cx.simulate_event(gpui::FileDropEvent::Entered {
+        position: alias,
+        paths: gpui::ExternalPaths(vec![source.clone()].into()),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::FileDropEvent::Submit { position: alias });
+    cx.run_until_parked();
+    assert!(!repo.0.join(".git/never-import.txt").exists());
+    assert!(!repo.0.join("never-import.txt").exists());
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "original");
 }

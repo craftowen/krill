@@ -4,6 +4,13 @@ Krill messages are addressed to worker names, not Orca terminal or Delivery IDs.
 Use distinct names across active Runs. For lifecycle messages always include the
 assigned Run/Task/Dispatch and send to the coordinator, never to a group.
 
+A successful `send` records mail; it does not prove the recipient read it or
+accepted new work. An idle-session notification is only a pointer to that mail.
+For a follow-up, inspect `worker-show <dispatch-id> --json`, then send to its
+unique worker name with the owning `--run`. Do not reuse worker names for later
+attempts. `--dispatch` is message metadata, not a `dispatch:<id>` mailbox address;
+Krill does not implement Orca's Dispatch-address routing.
+
 `inbox --to <name> --run <run-id> --json` inspects pending mail with a Run filter.
 `check --to <name> --run <run-id> --unread --wait --timeout-ms 60000 --json` waits
 without acknowledging (plain `--wait` defaults to 60s, max 300s).
@@ -23,6 +30,14 @@ its full returned receipt and handle every row it returns, including newly arriv
 messages. Avoid bulk `--ack` without `--run` in a shared coordinator inbox when
 another active Run owns matching mail. On restart reconcile the receipt and task
 state rather than assuming acknowledged means successfully processed.
+
+Workers use the same read-process-ack discipline. `inbox` is useful for inspection;
+`check --to <worker> --run <run-id> --unread --json` gives a batch receipt for
+processing. Handle its messages, acknowledge that exact `delivery.id`, then read
+again until no unread messages remain. Krill's named ACK returns the acknowledged
+batch, not the next batch. Do not keep replaying it as new guidance.
+Avoid type filters in the normal supervision loop so questions and redirects are
+not missed; a filtered Krill check selects messages, not merely wake-up conditions.
 
 Worker questions use `ask`; timeout leaves a durable pending question. Re-wait
 with its message ID. Answer with `reply <message-id> --body "<answer>" --json`.

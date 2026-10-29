@@ -4,6 +4,7 @@
 //! `krill_proto::worktree_space`, 앱은 `krill worktree space|cleanup --json`을 하위 프로세스로 호출한다.
 
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -646,48 +647,67 @@ fn remove_worktree_live_or_git(
 ) -> Result<RemovedWorktree, String> {
     if let Some(p) = paths
         && p.socket.exists()
-        && let Ok(res) = remove_via_socket(&p.socket, req)
     {
-        return res;
+        match remove_via_socket(&p.socket, req) {
+            Ok(result) => return result,
+            Err(RemoveSocketError::Unavailable) => {}
+            Err(RemoveSocketError::OutcomeUnknown(error)) => return Err(error),
+        }
     }
     remove_worktree_git(req, state_dir)
+}
+
+enum RemoveSocketError {
+    Unavailable,
+    OutcomeUnknown(String),
+}
+
+fn unknown_removal(error: impl std::fmt::Display) -> RemoveSocketError {
+    RemoveSocketError::OutcomeUnknown(format!(
+        "daemon removal outcome unknown: {error}; inspect the worktree before retrying (no local deletion attempted)"
+    ))
 }
 
 fn remove_via_socket(
     socket: &Path,
     req: &RemoveWorktree,
-) -> Result<Result<RemovedWorktree, String>, ()> {
-    let mut stream = krill_proto::os::net::UnixStream::connect(socket).map_err(|_| ())?;
+) -> Result<Result<RemovedWorktree, String>, RemoveSocketError> {
+    let unavailable = |_| RemoveSocketError::Unavailable;
+    let mut stream = krill_proto::os::net::UnixStream::connect(socket).map_err(unavailable)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|_| ())?;
+        .set_read_timeout(Some(Duration::from_secs(35)))
+        .map_err(unavailable)?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| ())?;
+        .map_err(unavailable)?;
     let hello = daemon::client_hello(ClientRole::Cli, "krill worktree cleanup");
-    let (kind, body) = ipc::read_frame(&mut stream).map_err(|_| ())?.ok_or(())?;
-    let server = ipc::ServerHello::decode(kind, &body).map_err(|_| ())?;
-    let negotiated = ipc::negotiate(&server, &hello).ok_or(())?;
+    let (kind, body) = ipc::read_frame(&mut stream)
+        .map_err(unavailable)?
+        .ok_or(RemoveSocketError::Unavailable)?;
+    let server =
+        ipc::ServerHello::decode(kind, &body).map_err(|_| RemoveSocketError::Unavailable)?;
+    let negotiated = ipc::negotiate(&server, &hello).ok_or(RemoveSocketError::Unavailable)?;
     let required = FEAT_CONTROL | FEAT_WORKTREE_REMOVE;
     if negotiated.features & required != required {
-        return Err(());
+        return Err(RemoveSocketError::Unavailable);
     }
     stream
-        .write_all(&hello.encode().map_err(|_| ())?)
-        .map_err(|_| ())?;
-    stream
-        .write_all(
-            &Request::RemoveWorktree(req.clone())
-                .encode()
-                .map_err(|_| ())?,
-        )
-        .map_err(|_| ())?;
-    let (rk, rb) = ipc::read_frame(&mut stream).map_err(|_| ())?.ok_or(())?;
-    match Reply::decode(rk, &rb).map_err(|_| ())? {
+        .write_all(&hello.encode().map_err(|_| RemoveSocketError::Unavailable)?)
+        .map_err(unavailable)?;
+    let request = match Request::RemoveWorktree(req.clone()).encode() {
+        Ok(bytes) => bytes,
+        Err(error) => return Ok(Err(format!("cannot encode removal: {error}"))),
+    };
+    // Once any request bytes may have been sent, the daemon may finish the mutation after disconnect.
+    stream.write_all(&request).map_err(unknown_removal)?;
+    let (rk, rb) = ipc::read_frame(&mut stream)
+        .map_err(unknown_removal)?
+        .ok_or_else(|| unknown_removal("connection closed before reply"))?;
+    match Reply::decode(rk, &rb).map_err(unknown_removal)? {
         Reply::WorktreeRemoved(w) => Ok(Ok(w)),
         Reply::WorktreeFailed(e) => Ok(Err(e)),
         Reply::Failed(e) => Ok(Err(e.to_string())),
-        _ => Err(()),
+        _ => Err(unknown_removal("unexpected daemon reply")),
     }
 }
 
@@ -698,6 +718,7 @@ pub fn remove_worktree_git(
     state_dir: Option<&Path>,
 ) -> Result<RemovedWorktree, String> {
     let given = Path::new(OsStr::from_bytes(&req.repo));
+    let _transaction = offline_transaction(given)?;
     let entries = list_repo_worktrees(given);
     let main = entries.first().ok_or("repository has no worktrees")?;
     let path = fs::canonicalize(Path::new(OsStr::from_bytes(&req.path)))
@@ -712,7 +733,21 @@ pub fn remove_worktree_git(
     if target.locked {
         return Err("worktree is locked; unlock it explicitly before removal".to_owned());
     }
+    if entries
+        .iter()
+        .any(|entry| entry.path != path && entry.path.starts_with(&path))
+    {
+        return Err("worktree contains another registered worktree; remove it first".to_owned());
+    }
     let repo = &main.path;
+    if krill_proto::orchestration::offline_archive_configured(repo, state_dir)
+        .map_err(|error| format!("cannot inspect archive configuration: {error}"))?
+    {
+        return Err(
+            "archive hooks require the daemon; start krilld and retry (no files removed)"
+                .to_owned(),
+        );
+    }
     let symlinks = effective_worktree_symlinks(repo, state_dir);
     let (dirty, _) = check_worktree_dirty_status(repo, &path, &symlinks)?;
     if !req.force && dirty {
@@ -755,6 +790,36 @@ pub fn remove_worktree_git(
         ));
     }
     Ok(result)
+}
+
+fn offline_transaction(repo: &Path) -> Result<fs::File, String> {
+    let out = run_git(
+        repo,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    if !out.status.success() {
+        return Err(git_err(&out, "cannot locate common Git directory"));
+    }
+    let raw = out
+        .stdout
+        .strip_suffix(b"\r\n")
+        .or_else(|| out.stdout.strip_suffix(b"\n"))
+        .unwrap_or(&out.stdout);
+    if raw.is_empty() {
+        return Err("empty common Git directory".to_owned());
+    }
+    let common = Path::new(OsStr::from_bytes(raw));
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(common.join("krill-worktree.lock"))
+        .map_err(|error| format!("cannot open worktree transaction lock: {error}"))?;
+    file.try_lock()
+        .map_err(|error| format!("worktree transaction unavailable: {error}"))?;
+    Ok(file)
 }
 
 fn delete_merged_branch_git(repo: &Path, branch: &str) -> Result<(), String> {
@@ -1161,6 +1226,161 @@ mod tests {
     use krill_proto::worktree_space::{CleanupFilter, CleanupPrFilter, filter_cleanup_candidates};
 
     use super::*;
+
+    fn removal_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, RemoveWorktree) {
+        let root = temp_dir(label);
+        let repo = root.join("repo");
+        let wt = root.join("worktree");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join(".gitignore"), "nested/\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "fixture"]);
+        git(
+            &repo,
+            &["worktree", "add", "-b", "fixture", wt.to_str().unwrap()],
+        );
+        let req = RemoveWorktree {
+            repo: repo.as_os_str().as_bytes().to_vec(),
+            path: wt.as_os_str().as_bytes().to_vec(),
+            force: true,
+        };
+        (root, repo, wt, req)
+    }
+
+    #[test]
+    fn force_offline_cleanup_preserves_nested_worktree_data() {
+        let (root, repo, wt, req) = removal_fixture("nested-force");
+        let nested = wt.join("nested");
+        git(
+            &repo,
+            &["worktree", "add", "-b", "nested", nested.to_str().unwrap()],
+        );
+        fs::write(nested.join("uncommitted"), "must survive").unwrap();
+        let error = remove_worktree_git(&req, None).unwrap_err();
+        assert!(error.contains("another registered worktree"), "{error}");
+        assert_eq!(
+            fs::read_to_string(nested.join("uncommitted")).unwrap(),
+            "must survive"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offline_cleanup_respects_archive_configuration_and_transaction_lock() {
+        let (root, repo, wt, req) = removal_fixture("archive-lock");
+        fs::write(
+            repo.join("krill.toml"),
+            "[worktree]\narchive = 'echo save'\n",
+        )
+        .unwrap();
+        let error = remove_worktree_git(&req, None).unwrap_err();
+        assert!(
+            error.contains("archive hooks require the daemon"),
+            "{error}"
+        );
+        assert!(wt.is_dir());
+        fs::write(repo.join("krill.toml"), "[worktree\narchive =").unwrap();
+        assert!(
+            remove_worktree_git(&req, None)
+                .unwrap_err()
+                .contains("cannot inspect archive")
+        );
+        assert!(wt.is_dir());
+        fs::remove_file(repo.join("krill.toml")).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(repo.join(".git/krill-worktree.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        assert!(
+            remove_worktree_git(&req, None)
+                .unwrap_err()
+                .contains("transaction unavailable")
+        );
+        assert!(wt.is_dir());
+        drop(lock);
+        remove_worktree_git(&req, None).unwrap();
+        assert!(!wt.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offline_archive_checks_orca_store_and_explicit_native_disable() {
+        let (root, repo, wt, req) = removal_fixture("archive-sources");
+        fs::write(repo.join("orca.yaml"), "scripts:\n  archive: echo save\n").unwrap();
+        assert!(
+            remove_worktree_git(&req, None)
+                .unwrap_err()
+                .contains("archive hooks")
+        );
+        fs::remove_file(repo.join("orca.yaml")).unwrap();
+        let state = root.join("state");
+        let key = krill_proto::orchestration::worktree_key(&repo);
+        krill_proto::orchestration::WorktreeStore::mutate(&state, |store| {
+            store.set_archive_script(&key, "echo save")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            remove_worktree_git(&req, Some(&state))
+                .unwrap_err()
+                .contains("archive hooks")
+        );
+        assert!(wt.is_dir());
+        fs::write(repo.join("krill.toml"), "[worktree]\narchive = ''\n").unwrap();
+        remove_worktree_git(&req, Some(&state)).unwrap();
+        assert!(!wt.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lost_daemon_removal_reply_never_falls_back_to_git() {
+        use krill_proto::os::net::UnixListener;
+        let (root, _repo, wt, req) = removal_fixture("lost-reply");
+        let socket = root.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    &ipc::ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_CONTROL | FEAT_WORKTREE_REMOVE,
+                        build: "fixture".into(),
+                        instance_id: 1,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            ipc::read_frame(&mut stream).unwrap().unwrap(); // client hello
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::RemoveWorktree(_)
+            ));
+            // An accepted mutation can finish after the connection drops; deliberately omit its reply.
+        });
+        let paths = Paths {
+            socket,
+            holder: root.join("unused-holder"),
+            krilld: root.join("unused-krilld"),
+        };
+        let error = remove_worktree_live_or_git(Some(&paths), &req, None).unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("outcome unknown"), "{error}");
+        assert!(
+            wt.is_dir(),
+            "the transport failure must not trigger local deletion"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("krill-wt-space-{}-{label}", std::process::id()));

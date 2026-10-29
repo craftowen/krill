@@ -518,7 +518,7 @@ struct Cached {
 impl Cache {
     /// `row`의 `column` 칸을 덮는 파일 링크. 존재하는 일반 파일만(디렉터리 제외).
     pub fn link_at(&mut self, row: &[Cell], column: u16, cwd: Option<&Path>) -> Option<PathLink> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = krill_proto::os::home_dir();
         self.link_at_with_home(row, column, cwd, home.as_deref())
     }
 
@@ -541,7 +541,7 @@ impl Cache {
         budget: &mut usize,
         crossing: Option<(u16, u16)>,
     ) -> Option<PathLink> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = krill_proto::os::home_dir();
         let mut candidates = candidates_at(row, column);
         if let Some((first_end, last_start)) = crossing {
             candidates.retain(|candidate| {
@@ -574,7 +574,9 @@ impl Cache {
                     }))
         }) {
             let mut is_file = |path: &PathBuf| {
-                if *budget == 0 {
+                // Win32 ignores a trailing dot: do not consume sentence punctuation
+                // as part of an existing filename before the trimmed candidate is tried.
+                if *budget == 0 || cfg!(windows) && path.to_string_lossy().ends_with('.') {
                     return false;
                 }
                 *budget -= 1;

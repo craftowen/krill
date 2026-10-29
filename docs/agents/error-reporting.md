@@ -31,13 +31,15 @@ The local queue is limited to 64 events, 4 KiB per event, and seven days of rete
 
 Repeated ordinary errors, panics, and responsiveness reports with the same component, code, public source location, version/build and duration bucket are admitted once per hour. A bounded local cache keeps this suppression after uploads and is deleted when consent is withdrawn. Distinct native crashes and uncertain exits keep their incident IDs. Server counts describe admitted reports rather than every occurrence. Retry delays use the greater of exponential backoff and the server's `Retry-After`, subject to the daily maximum delay.
 
-The default receiver is `https://errors.krill.page/v1/events`. A receiver must be provisioned and deployed before reports can be received; enabling consent alone does not establish a working server. Server deployment is separate from building the desktop app. Queued events remain subject to the local retention and retry limits while the receiver is unavailable.
+The default receiver is `https://errors.krill.page/v1/events`. The [Worker and D1 receiver](../../services/errors/README.md) is implemented in `services/errors`. Its provisioning, database migration, custom domain activation and deployment are separate from building the desktop app; enabling consent alone does not establish a working server. Queued events remain subject to the local retention and retry limits while the receiver is unavailable.
 
 TLS verification remains enabled. The uploader disables curl configuration-file loading and redirects, and limits request duration, response size, and work per flush. Failed reporting never changes a session command's result. Local diagnostic bundles remain available through `krill doctor --bundle`; creating one does not upload it.
 
 ## Receiver contract
 
 `POST /v1/events` accepts a schema-versioned JSON object containing a bounded array of strictly validated events. The response acknowledges committed event IDs through `accepted_ids` and `duplicate_ids`. A partial response acknowledges only the IDs it names; other events remain pending. Unknown response IDs never authorize deleting a local event.
+
+The response contains only `schema_version`, `accepted_ids`, and `duplicate_ids`, matching deployed clients' closed ACK schema. A conflicting event ID returns HTTP 400 and rolls back the whole batch. Existing clients split rejected batches and discard rejected single events. Quota-limited IDs receive no acknowledgement and remain pending for retry.
 
 The receiver applies a streaming request-size limit, edge throttling, transactional daily admission and storage caps, and an event-ID uniqueness constraint. Edge throttling is approximate per Cloudflare location and is not a global cost limit. Storage caps use logical rows and bytes; they do not rely on SQLite's physical file size. The receiver hides expired events from queries and deletes them in bounded scheduled batches. Its retention policy is 30 days after receipt.
 

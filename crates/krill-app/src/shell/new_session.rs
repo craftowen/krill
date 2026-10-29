@@ -72,6 +72,7 @@ impl Shell {
         p: &krill_app::ui::Palette,
         yolo: bool,
         menu: impl gpui::IntoElement,
+        shortcut: Option<String>,
     ) -> gpui::Stateful<gpui::Div> {
         use krill_app::i18n::catalog::sidebar as sb_text;
 
@@ -125,10 +126,7 @@ impl Shell {
                         div()
                             .invisible()
                             .group_hover("sidebar-search-row", gpui::Styled::visible)
-                            .child(krill_app::ui::keycap(
-                                p,
-                                krill_app::i18n::catalog::general::JUMP_SHORTCUT.get(),
-                            )),
+                            .children(shortcut.map(|shortcut| krill_app::ui::keycap(p, shortcut))),
                     )
                     .when(yolo, |d| {
                         d.child(
@@ -305,7 +303,11 @@ impl Shell {
     }
 
     /// MK-078: 스크린 리더는 이 줄을 "에이전트 새 세션" 그룹으로 읽는다.
-    pub(super) fn render_agents(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn render_agents(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         use krill_app::i18n::catalog::sidebar as sb_text;
         use krill_app::ui::icons;
 
@@ -453,8 +455,13 @@ impl Shell {
             .flex_col()
             .gap_0p5()
             .child(
-                Self::jump_row(p, permission == Permission::Yolo, menu)
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_jump(window, cx))),
+                Self::jump_row(
+                    p,
+                    permission == Permission::Yolo,
+                    menu,
+                    krill_app::keys::shortcut_label(window, &super::Jump),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_jump(window, cx))),
             )
             .child(
                 Self::nav_row(
@@ -645,7 +652,7 @@ mod tests {
         let p = &krill_app::ui::DARK;
         let jump_label = sb_text::SEARCH_SHORT.get();
         for yolo in [false, true] {
-            let el = Shell::jump_row(p, yolo, gpui::div());
+            let el = Shell::jump_row(p, yolo, gpui::div(), None);
             let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
             gpui::Element::write_a11y_info(&el, &mut node);
             assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Button));

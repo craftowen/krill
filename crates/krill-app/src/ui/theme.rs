@@ -106,6 +106,10 @@ pub const STATUS_BAR_BUTTON_HEIGHT: Pixels = px(18.);
 pub const STATUS_USAGE_CONTROLS_WIDTH: Pixels = px(480.);
 /// Budget per expanded provider, including both usage windows and reset countdowns.
 pub const STATUS_USAGE_PROVIDER_WIDTH: Pixels = px(280.);
+/// Maximum account popup body height; long local/remote lists scroll inside it.
+pub const STATUS_PROVIDER_BODY_MAX_HEIGHT: Pixels = px(320.);
+/// Header/action space reserved before fitting the account body, scaled with UI zoom.
+pub const STATUS_PROVIDER_CHROME_RESERVE: Rems = rems(16.);
 /// 사이드바 세션 행 높이(32px, `sidebar::ROW_HEIGHT` 정본).
 pub const SIDEBAR_ROW_HEIGHT: Pixels = px(32.);
 /// 우측 패널 파일·검색 행 높이(26px, `diff::explorer::ROW_HEIGHT` 정본).

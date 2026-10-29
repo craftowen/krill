@@ -51,11 +51,15 @@ pub(crate) fn capture(
         CaptureFormat::Ansi => {
             style(&mut out, active);
             out.push_str(modes);
-            let shape = match s.cursor_style.shape {
-                CursorShape::Block => 1,
-                CursorShape::Underline => 3,
-                CursorShape::Bar => 5,
-            } + u8::from(!s.cursor_style.blink);
+            let shape = if s.cursor_explicit {
+                (match s.cursor_style.shape {
+                    CursorShape::Block => 1,
+                    CursorShape::Underline => 3,
+                    CursorShape::Bar => 5,
+                }) + u8::from(!s.cursor_style.blink)
+            } else {
+                0
+            };
             write!(
                 out,
                 "\x1b[{shape} q\x1b[{};{}H",

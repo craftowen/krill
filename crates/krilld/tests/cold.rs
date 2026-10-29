@@ -364,6 +364,8 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
     };
     std::io::Write::write_all(&mut hook_conn, &ev.encode().unwrap()).unwrap();
     let _ = ipc::read_frame(&mut hook_conn).unwrap();
+    // 에이전트가 끝나면 같은 PTY가 로그인 셸로 돌아간다. 탭 닫기(holder 종료 첫 단계)처럼 HUP으로 세션을 끝낸다.
+    rustix::process::kill_process_group(pid(codex_pid), Signal::HUP).unwrap();
 
     // 살아 있는 데몬에서 종료된 codex 세션을 Resume(Restart 칩).
     let deadline = Instant::now() + WAIT;
@@ -505,7 +507,8 @@ fn hibernation_auto_resume_keeps_conversation_and_is_idempotent() {
         assert!(Instant::now() < deadline, "fixture never started");
         thread::sleep(Duration::from_millis(20));
     }
-    kill_process(pid(old_pid), Signal::TERM).unwrap();
+    // holder 동면 종료처럼 프로세스 그룹에 보낸다. 루트 래퍼 셸은 에이전트가 끝난 뒤 TERM 트랩으로 끝난다.
+    rustix::process::kill_process_group(pid(old_pid), Signal::TERM).unwrap();
     let deadline = Instant::now() + WAIT;
     loop {
         if let Reply::Sessions(rows) = request(&mut c, &Request::List)

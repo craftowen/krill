@@ -1,3 +1,5 @@
+// Krill modification (Apache-2.0 §4(b)): decode Windows DIB/V5 screenshots to PNG
+// and preserve embedded bitfield masks when constructing the BMP header.
 use std::{borrow::Cow, sync::LazyLock};
 
 use anyhow::Result;
@@ -12,7 +14,7 @@ use windows::Win32::{
             SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
     UI::Shell::{DragQueryFileW, HDROP},
 };
@@ -23,6 +25,7 @@ use gpui::{
 };
 
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
+const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
@@ -94,7 +97,7 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
 
     let mut entries = Vec::new();
     let mut have_text = false;
-    let mut have_image = false;
+    let mut images = Vec::new();
     let mut have_files = false;
 
     let count = unsafe { CountClipboardFormats() };
@@ -107,11 +110,8 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                 entries.push(entry);
                 have_text = true;
             }
-        } else if !have_image && is_image_format(format) {
-            if let Some(entry) = read_image(format) {
-                entries.push(entry);
-                have_image = true;
-            }
+        } else if is_image_format(format) {
+            images.push(format);
         } else if !have_files && format == CF_HDROP.0 as u32 {
             if let Some(entry) = read_files() {
                 entries.push(entry);
@@ -120,8 +120,47 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
         }
     }
 
-    if entries.is_empty() {
+    if entries.is_empty() && images.is_empty() {
         log_unsupported_clipboard_formats();
+        return None;
+    }
+    images.sort_by_key(|format| {
+        if *format == *CLIPBOARD_PNG_FORMAT {
+            0
+        } else if IMAGE_FORMATS_MAP.contains_key(format) {
+            1
+        } else if is_dib_format(*format) {
+            // Stable sorting preserves Windows' native-before-synthesized order.
+            // A synthesized V5 can retain the classic DIB's external masks;
+            // preferring it over the original DIB shifts the decoded pixels.
+            2
+        } else {
+            3
+        }
+    });
+    // Prefer explicit formats over Windows' synthesized DIB copies. Bound the
+    // total copied data, then decode outside the system clipboard lock.
+    let mut remaining = MAX_IMAGE_BYTES;
+    let images: Vec<_> = images
+        .into_iter()
+        .filter_map(|format| {
+            let locked = get_clipboard_data(format)?;
+            let size = locked.as_bytes().len();
+            if size == 0 || size > remaining {
+                return None;
+            }
+            remaining -= size;
+            Some((format, locked.as_bytes().to_vec()))
+        })
+        .collect();
+    drop(_clip);
+    if let Some(entry) = images
+        .into_iter()
+        .find_map(|(format, bytes)| read_image(format, bytes))
+    {
+        entries.push(entry);
+    }
+    if entries.is_empty() {
         return None;
     }
     Some(ClipboardItem { entries })
@@ -174,7 +213,11 @@ fn get_clipboard_string(format: u32) -> Option<String> {
 }
 
 fn is_image_format(format: u32) -> bool {
-    IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
+    IMAGE_FORMATS_MAP.contains_key(&format) || is_dib_format(format)
+}
+
+fn is_dib_format(format: u32) -> bool {
+    format == CF_DIB.0 as u32 || format == CF_DIBV5.0 as u32
 }
 
 fn write_string(item: &ClipboardString) -> Result<()> {
@@ -221,7 +264,12 @@ fn write_image(item: &Image) -> Result<()> {
 
 fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
     let img_format = gpui_to_image_format(format)?;
-    let image = image::load_from_memory_with_format(bytes, img_format)
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), img_format);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_IMAGE_BYTES as u64);
+    reader.limits(limits);
+    let image = reader
+        .decode()
         .map_err(|e| log::warn!("Failed to decode image for PNG conversion: {e}"))
         .ok()?;
     let mut buf = Vec::new();
@@ -248,13 +296,14 @@ fn read_clipboard_metadata(text: &str) -> Option<String> {
     get_clipboard_string(*CLIPBOARD_METADATA_FORMAT)
 }
 
-fn read_image(format: u32) -> Option<ClipboardEntry> {
-    let locked = get_clipboard_data(format)?;
-    let (bytes, image_format) = if format == CF_DIB.0 as u32 {
-        (convert_dib_to_bmp(locked.as_bytes())?, ImageFormat::Bmp)
+fn read_image(format: u32, bytes: Vec<u8>) -> Option<ClipboardEntry> {
+    let (bytes, image_format) = if is_dib_format(format) {
+        // Agent image attachments accept PNG, while native screenshots are DIBs.
+        let bmp = convert_dib_to_bmp(&bytes)?;
+        (convert_to_png(&bmp, ImageFormat::Bmp)?, ImageFormat::Png)
     } else {
         let image_format = *IMAGE_FORMATS_MAP.get(&format)?;
-        (locked.as_bytes().to_vec(), image_format)
+        (bytes, image_format)
     };
     let id = hash(&bytes);
     Some(ClipboardEntry::Image(Image {
@@ -284,21 +333,38 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
     let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
 
-    let color_table_size = if bit_count <= 8 {
-        let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
-        (if colors_used == 0 {
-            1u32 << bit_count
-        } else {
-            colors_used
-        }) * 4
-    } else if compression == 3 {
-        12 // BI_BITFIELDS
+    if !matches!(header_size, 40 | 52 | 56 | 108 | 124)
+        || usize::try_from(header_size).ok()? > dib.len()
+        || !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32)
+    {
+        return None;
+    }
+    let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
+    let colors = if bit_count <= 8 && colors_used == 0 {
+        1u32 << bit_count
+    } else {
+        colors_used
+    };
+    if bit_count <= 8 && colors > 1u32 << bit_count {
+        return None;
+    }
+    // BITMAPINFOHEADER stores BI_BITFIELDS masks after its 40-byte header;
+    // V2/V3/V4/V5 include them in the declared header size already.
+    let external_masks = if header_size == 40 && compression == 3 {
+        12
+    } else if header_size == 40 && compression == 6 {
+        16 // BI_ALPHABITFIELDS
     } else {
         0
     };
-
-    let pixel_offset = 14 + header_size + color_table_size;
-    let file_size = 14 + dib.len() as u32;
+    let data_offset = header_size
+        .checked_add(external_masks)?
+        .checked_add(colors.checked_mul(4)?)?;
+    if usize::try_from(data_offset).ok()? >= dib.len() {
+        return None;
+    }
+    let pixel_offset = 14u32.checked_add(data_offset)?;
+    let file_size = 14u32.checked_add(u32::try_from(dib.len()).ok()?)?;
 
     let mut bmp = Vec::with_capacity(file_size as usize);
     bmp.extend_from_slice(b"BM");
@@ -390,5 +456,135 @@ impl LockedGlobal {
 impl Drop for LockedGlobal {
     fn drop(&mut self) {
         unsafe { GlobalUnlock(self.global).ok() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dib(header: usize, bits: u16, compression: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; header];
+        bytes[..4].copy_from_slice(&(header as u32).to_le_bytes());
+        bytes[4..8].copy_from_slice(&1i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1i32.to_le_bytes());
+        bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
+        bytes[14..16].copy_from_slice(&bits.to_le_bytes());
+        bytes[16..20].copy_from_slice(&compression.to_le_bytes());
+        bytes.extend_from_slice(pixels);
+        bytes
+    }
+
+    fn png_pixel(dib: &[u8]) -> [u8; 4] {
+        let bmp = convert_dib_to_bmp(dib).expect("valid DIB");
+        let png = convert_to_png(&bmp, ImageFormat::Bmp).expect("PNG conversion");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        image::load_from_memory(&png)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0
+    }
+
+    #[test]
+    fn native_screenshot_is_a_png_with_the_same_pixel() {
+        assert_eq!(png_pixel(&dib(40, 24, 0, &[3, 2, 1, 0])), [1, 2, 3, 255]);
+        // GDI's reserved fourth byte is not an alpha channel in BI_RGB.
+        assert_eq!(png_pixel(&dib(40, 32, 0, &[3, 2, 1, 0])), [1, 2, 3, 255]);
+        let mut top_down = dib(40, 24, 0, &[3, 2, 1, 0]);
+        top_down[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(png_pixel(&top_down), [1, 2, 3, 255]);
+        assert!(is_image_format(CF_DIBV5.0 as u32));
+    }
+
+    #[test]
+    fn v5_screenshot_masks_are_not_counted_twice() {
+        let mut bytes = dib(124, 32, 3, &[3, 2, 1, 255]);
+        for (offset, mask) in [
+            (40, 0x00ff0000u32),
+            (44, 0x0000ff00),
+            (48, 0x000000ff),
+            (52, 0xff000000),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&mask.to_le_bytes());
+        }
+        bytes[56..60].copy_from_slice(&0x73524742u32.to_le_bytes());
+        assert_eq!(png_pixel(&bytes), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn v5_nondefault_masks_preserve_partial_and_zero_alpha() {
+        let mut bytes = dib(124, 32, 3, &[3, 2, 1, 128, 6, 5, 4, 0]);
+        bytes[4..8].copy_from_slice(&2i32.to_le_bytes());
+        for (offset, mask) in [
+            (40, 0x000000ffu32),
+            (44, 0x00ff0000),
+            (48, 0x0000ff00),
+            (52, 0xff000000),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&mask.to_le_bytes());
+        }
+        let png = convert_to_png(&convert_dib_to_bmp(&bytes).unwrap(), ImageFormat::Bmp).unwrap();
+        assert_eq!(
+            image::load_from_memory(&png).unwrap().to_rgba8().into_raw(),
+            [3, 1, 2, 128, 6, 4, 5, 0]
+        );
+    }
+
+    #[test]
+    fn classic_bitfields_follow_the_info_header() {
+        let mut pixels = Vec::new();
+        for mask in [0xf800u32, 0x07e0, 0x001f] {
+            pixels.extend_from_slice(&mask.to_le_bytes());
+        }
+        pixels.extend_from_slice(&[0, 248, 0, 0]);
+        assert_eq!(png_pixel(&dib(40, 16, 3, &pixels)), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn invalid_or_truncated_dib_is_refused() {
+        assert!(convert_dib_to_bmp(&[0; 39]).is_none());
+        assert!(convert_dib_to_bmp(&dib(40, 24, 0, &[])).is_none());
+        let mut bytes = dib(40, 8, 0, &[0; 4]);
+        bytes[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(convert_dib_to_bmp(&bytes).is_none());
+        let mut bytes = dib(40, 24, 0, &[0; 4]);
+        bytes[..4].copy_from_slice(&124u32.to_le_bytes());
+        assert!(convert_dib_to_bmp(&bytes).is_none());
+    }
+
+    #[test]
+    #[ignore = "Requires a desktop clipboard with the controlled Korean text fixture"]
+    fn desktop_unicode_clipboard_keeps_text() {
+        assert_eq!(
+            read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("윈도우 검증 작업")
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires a desktop clipboard with the controlled 3x2 RGB DIB fixture"]
+    fn desktop_dib_clipboard_keeps_pixels_as_png() {
+        let item = read_from_clipboard().expect("desktop clipboard item");
+        let image = item
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image),
+                _ => None,
+            })
+            .expect("native clipboard image");
+        assert_eq!(image.format, ImageFormat::Png);
+        let pixels = image::load_from_memory(&image.bytes).unwrap().to_rgba8();
+        assert_eq!(pixels.dimensions(), (3, 2));
+        assert_eq!(
+            pixels.into_raw(),
+            [
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255, 255, 0, 255, 255,
+                0, 255, 255, 255
+            ]
+        );
     }
 }

@@ -120,6 +120,7 @@ pub(super) fn snapshot(
         sessions,
         repositories: repositories.into_values().collect(),
         branches: Vec::new(),
+        prompt_histories: Vec::new(),
     };
     populate_branches(&mut data);
     Ok(data)
@@ -157,7 +158,9 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
             let (shared, owned, done) = (Arc::clone(cache), path.to_owned(), Arc::clone(&flight));
             let spawned = std::thread::Builder::new()
                 .name("krilld-sidebar-lookup".into())
+                .stack_size(128 * 1024)
                 .spawn(move || {
+                    crate::alloc::mobile_thread().ok();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         discover_cached(&shared, &owned)
                     }))
@@ -173,6 +176,7 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
                     }
                     *lock(&done.result) = DiscoveryResult::Ready(result);
                     done.ready.notify_all();
+                    crate::alloc::purge();
                 });
             if spawned.is_err() {
                 return state.last.get(path).cloned();
@@ -492,7 +496,7 @@ mod tests {
                  [[projects]]\npath = \"{}\"\n\n\
                  [[projects]]\npath = \"/old\"\narchived = true\n\n\
                  [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
-                git_repo.display()
+                git_repo.to_string_lossy().replace('\\', "\\\\")
             ),
         )
         .unwrap();
@@ -503,6 +507,7 @@ mod tests {
                 worktrees: vec![b"/repo".to_vec(), b"/repo-wt".to_vec()],
             }],
             branches: Vec::new(),
+            prompt_histories: Vec::new(),
         };
         merge_projects(&mut data, &dir);
         let git_repo_bytes = git_repo.as_os_str().as_bytes().to_vec();

@@ -122,7 +122,9 @@ fn watch_exits(reg: &Arc<Registry>) {
 
 /// 리더를 멈추고 세션을 모두 넘긴 뒤 상대의 `Ready`를 기다린다.
 fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
-    halt_all(reg)?;
+    // A peer may have started reading transferred masters before failing. Retain
+    // the old rejoin policy: keep parked until another successor adopts them.
+    halt_all(reg)?.commit();
     s.set_read_timeout(Some(PEER_TIMEOUT))?;
     s.set_write_timeout(Some(PEER_TIMEOUT))?;
     #[cfg(unix)]
@@ -151,23 +153,27 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     }
 }
 
-/// PTY 리더를 모두 멈추고(읽은 묶음은 기록·세그먼트 봉인까지) 끝나기를 기다린다. 되돌릴 수 없다.
-/// 인계와 업그레이드([`crate::upgrade`])가 쓴다.
-pub(crate) fn halt_all(reg: &Registry) -> io::Result<()> {
-    crate::session::halt()?;
+/// Park readers after recording and sealing. Dropping preparation resumes the
+/// same readers; a successful handoff commits the pause before allowing a successor.
+pub(crate) fn halt_all(reg: &Registry) -> io::Result<crate::session::Handoff> {
+    // spawn_holder holds this from before Session::start through registry insertion.
+    // Once HALTED is set, subsequently created workers park before their first read.
+    let _creation = reg.session_start_barrier();
     let deadline = Instant::now() + HALT_TIMEOUT;
+    let pause = crate::session::Handoff::begin()?;
     while !all_halted(reg) {
         if Instant::now() > deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
+        crate::session::wake_halt();
         thread::sleep(Duration::from_millis(1));
     }
-    Ok(())
+    Ok(pause)
 }
 
 fn all_halted(reg: &Registry) -> bool {
     let mut all = true;
-    reg.each(|_, _, _, s| all &= s.is_closed());
+    reg.each(|_, _, _, s| all &= s.is_closed() || s.is_paused());
     all
 }
 

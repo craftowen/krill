@@ -2198,3 +2198,177 @@ fn antigravity_auto_switch_ignores_exhausted_claude_gpt_pool_by_default_and_resp
     fs::remove_dir_all(&home).ok();
     fs::remove_dir_all(&state).ok();
 }
+
+/// 2026-10-28 장애: 5h 규칙의 지정 타깃은 토큰이 죽어 사용량을 모르는데 공유 rollout에 다른 계정
+/// 값이 남아 있었고, 5h 창이 없는 Pro 계정은 '모름'으로 빠져 전환이 0회였다.
+#[cfg(unix)]
+#[test]
+fn dead_target_is_never_chosen_and_account_without_five_hour_window_is() {
+    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
+
+    let root = dir("codex-shared-rollout");
+    let (home, state) = (root.join("home"), root.join("state"));
+    let [czyb, tnlvof, pro] = ["czyb", "tnlvof", "pro"].map(|n| root.join(n));
+    for d in [&czyb, &tnlvof, &pro] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::write(
+        czyb.join(CLAUDE_CACHE),
+        r#"{"five_hour":{"utilization":96},"seven_day":{"utilization":16}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pro.join(CLAUDE_CACHE),
+        r#"{"seven_day":{"utilization":12}}"#,
+    )
+    .unwrap();
+    // 마지막 rollout은 Pro 계정이 쓴 값(5h 없음, 7d 10%)이다.
+    let rollout = |sessions: &std::path::Path| {
+        fs::create_dir_all(sessions.join("2026/10/28")).unwrap();
+        fs::write(
+            sessions.join("2026/10/28/rollout-2026-10-28T15-35-18-x.jsonl"),
+            "{\"rate_limits\":{\"primary\":{\"used_percent\":10.0,\"window_minutes\":10080},\"secondary\":null}}\n",
+        )
+        .unwrap();
+    };
+    let shared = root.join("shared");
+    rollout(&shared);
+    std::os::unix::fs::symlink(&shared, tnlvof.join("sessions")).unwrap();
+
+    let mut file = accounts::AccountsFile {
+        accounts: [
+            ("codex-czyb", &czyb),
+            ("codex-tnlvof", &tnlvof),
+            ("codex-pro", &pro),
+        ]
+        .map(|(id, d)| accounts::StoredAccount {
+            id: id.into(),
+            provider: "codex".into(),
+            label: id.into(),
+            email: None,
+            profile_dir: d.display().to_string(),
+        })
+        .into(),
+        ..Default::default()
+    };
+    file.auto_switch.enabled = false;
+    let switch_with = |file: &mut accounts::AccountsFile, metric| {
+        file.active.insert("codex".into(), "codex-czyb".into());
+        file.auto_switch.rules = vec![AutoSwitchRule {
+            provider: ProviderKind::Codex,
+            from_account_id: "codex-czyb".into(),
+            enabled: true,
+            threshold_percent: 95,
+            metric,
+            target_account_id: Some("codex-tnlvof".into()),
+        }];
+        accounts::save_file(&home, Some(&state), file).unwrap();
+        accounts::refresh_accounts(&home, Some(&state))
+    };
+
+    // 공유 세션 폴더의 rollout은 tnlvof 값이 아니다(사용량·미터 모두).
+    for metric in [AutoSwitchMetric::FiveHour, AutoSwitchMetric::Max] {
+        let snap = switch_with(&mut file, metric);
+        let dead = snap
+            .accounts
+            .iter()
+            .find(|a| a.id == "codex-tnlvof")
+            .unwrap();
+        assert!(dead.usage.is_empty(), "{dead:?}");
+        assert_eq!(snap.switched[0].to_id, "codex-pro", "{metric:?} {snap:?}");
+    }
+    // 자기 rollout이 남아 있어도 직접 조회가 401로 실패한 계정은 후보가 아니다.
+    fs::remove_file(tnlvof.join("sessions")).unwrap();
+    rollout(&tnlvof.join("sessions"));
+    super::direct::fail_for_tests(&home, ProviderKind::Codex, &tnlvof);
+    let snap = switch_with(&mut file, AutoSwitchMetric::Max);
+    assert_eq!(snap.switched[0].to_id, "codex-pro", "{snap:?}");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// 5h 창이 없는 계정을 후보로 열면서 생기는 비대칭 규칙 왕복(Plus 5h ↔ Pro 7d)을 막는다.
+#[test]
+fn asymmetric_rules_do_not_ping_pong_but_exhausted_account_still_escapes() {
+    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
+
+    let root = dir("codex-ping-pong");
+    let (home, state) = (root.join("home"), root.join("state"));
+    let [plus, pro] = ["plus", "pro"].map(|n| root.join(n));
+    for d in [&plus, &pro] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::write(
+        pro.join(CLAUDE_CACHE),
+        r#"{"seven_day":{"utilization":90}}"#,
+    )
+    .unwrap();
+    let rule = |from: &str, metric, threshold| AutoSwitchRule {
+        provider: ProviderKind::Codex,
+        from_account_id: from.into(),
+        enabled: true,
+        threshold_percent: threshold,
+        metric,
+        target_account_id: None,
+    };
+    let mut file = accounts::AccountsFile {
+        accounts: [("codex-plus", &plus), ("codex-pro", &pro)]
+            .map(|(id, d)| accounts::StoredAccount {
+                id: id.into(),
+                provider: "codex".into(),
+                label: id.into(),
+                email: None,
+                profile_dir: d.display().to_string(),
+            })
+            .into(),
+        ..Default::default()
+    };
+    file.active.insert("codex".into(), "codex-plus".into());
+    file.auto_switch.enabled = false;
+    file.auto_switch.rules = vec![
+        rule("codex-plus", AutoSwitchMetric::FiveHour, 95),
+        rule("codex-pro", AutoSwitchMetric::SevenDay, 90),
+    ];
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+    let plus_usage = |five: u8| {
+        fs::write(
+            plus.join(CLAUDE_CACHE),
+            format!(r#"{{"five_hour":{{"utilization":{five}}},"seven_day":{{"utilization":20}}}}"#),
+        )
+        .unwrap();
+    };
+
+    // Pro는 자기 7d 규칙(90%)으로 바로 되돌아오므로 고르지 않는다.
+    plus_usage(96);
+    assert!(
+        accounts::refresh_accounts(&home, Some(&state))
+            .switched
+            .is_empty()
+    );
+    // 소진되면 피신하고, 소진 계정으로는 되돌아가지 않는다.
+    plus_usage(100);
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    assert_eq!(snap.switched[0].to_id, "codex-pro", "{snap:?}");
+    assert!(
+        accounts::refresh_accounts(&home, Some(&state))
+            .switched
+            .is_empty()
+    );
+
+    // 같은 지표에서 임계 이상 후보로 가는 기존 폴백은 그대로다(되돌아올 수 없다).
+    file.active.insert("codex".into(), "codex-plus".into());
+    file.auto_switch.rules.clear();
+    file.auto_switch.enabled = true;
+    file.auto_switch.threshold_percent = 80;
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+    plus_usage(97);
+    fs::write(
+        pro.join(CLAUDE_CACHE),
+        r#"{"seven_day":{"utilization":82}}"#,
+    )
+    .unwrap();
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    assert_eq!(snap.switched[0].to_id, "codex-pro", "{snap:?}");
+
+    fs::remove_dir_all(&root).ok();
+}

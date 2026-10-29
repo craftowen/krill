@@ -8,7 +8,7 @@
 //!   (`primary` 300분 창 = 5시간, `secondary` 10080분 창 = 주간, `used_percent`).
 //! - 80% 이상이면 [`Usage::warn`]이 참이다. 상태바 표시는 후속 이슈에서 붙는다.
 //!
-//! 로컬 파일이 없거나 깨졌으면 모름으로 둔다. OWE-719의 선택 직접 조회는 [`direct`]가 맡는다.
+//! 로컬 파일 수집을 보완하는 계정별 자동 조회는 [`direct`]가 맡는다. 조회 전까지는 모름으로 둔다.
 //! 자격증명·토큰은 읽기만 하며 토큰 갱신은 하지 않는다.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -345,9 +345,28 @@ fn read_tail(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(slice).into_owned())
 }
 
+/// 이 계정만 쓴 최신 rollout. 심링크로 공유한 `sessions`(가져오기·프로비저닝)나 계정 인계로
+/// 하드링크된 rollout은 마지막에 쓴 계정을 알 수 없어 다른 계정의 사용량을 옮겨 오므로 쓰지 않는다.
+/// ponytail: 다른 프로필이 심링크로 들어와 쓰는 실제 폴더(호스트 `~/.codex/sessions`)는 가려내지 못한다.
+/// 그 폴더 값도 직접 조회 값이 없을 때(재시작 직후·조회 실패·직접 조회 끔)만 쓰인다.
+pub(crate) fn own_rollout(sessions: &Path) -> Option<PathBuf> {
+    if sessions.is_symlink() {
+        return None;
+    }
+    let path = latest_rollout(sessions)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if std::fs::metadata(&path).ok()?.nlink() > 1 {
+            return None;
+        }
+    }
+    Some(path)
+}
+
 /// `~/.codex/sessions`에서 읽는다. 없거나 비었으면 `None`(모름). 읽기만 한다.
 pub fn read_codex(sessions: &Path) -> Option<Usage> {
-    let tail = read_tail(&latest_rollout(sessions)?)?;
+    let tail = read_tail(&own_rollout(sessions)?)?;
     parse_codex_rollout(&tail)
 }
 

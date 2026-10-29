@@ -299,7 +299,17 @@ fn mobile_urgent_echo_sends_immediately_after_clock_mark_and_skips_empty_diff_ma
 
     // 빈 diff 배치는 clock.mark를 찍지 않아야 직후 에코가 33ms 밀리지 않는다.
     let empty_at = t0 + Duration::from_millis(1);
-    assert!(!sync_client(&conn, &mut clock, Revision(1), Seq(1), Vec::new(), empty_at).unwrap());
+    assert!(
+        !sync_client(
+            &conn,
+            &mut clock,
+            Revision(1),
+            (Seq(1), false),
+            Vec::new(),
+            empty_at
+        )
+        .unwrap()
+    );
     assert_eq!(clock.next_delay(empty_at, MOBILE_FRAME_MIN), Duration::ZERO);
 
     // 직전 프레임 전송으로 clock.mark가 찍힌 직후(1ms 뒤) 일반 출력은 32ms 대기한다.
@@ -318,7 +328,17 @@ fn mobile_urgent_echo_sends_immediately_after_clock_mark_and_skips_empty_diff_ma
     );
 
     // 아직 화면 변경이 없는 빈 PTY 출력 배치에서는 프레임이 안 나가고 echo와 시계가 유지된다.
-    assert!(!sync_client(&conn, &mut clock, Revision(2), Seq(2), Vec::new(), t1).unwrap());
+    assert!(
+        !sync_client(
+            &conn,
+            &mut clock,
+            Revision(2),
+            (Seq(2), false),
+            Vec::new(),
+            t1
+        )
+        .unwrap()
+    );
     assert!(conn.echo.load(Ordering::Acquire));
     assert_eq!(clock.last, Some(t0));
 
@@ -326,7 +346,7 @@ fn mobile_urgent_echo_sends_immediately_after_clock_mark_and_skips_empty_diff_ma
     let prev = screen(&["$ "]);
     let next = screen(&["$ a"]);
     let ops = diff(&prev, &next);
-    assert!(sync_client(&conn, &mut clock, Revision(3), Seq(3), ops, t1).unwrap());
+    assert!(sync_client(&conn, &mut clock, Revision(3), (Seq(3), false), ops, t1).unwrap());
     assert!(!conn.echo.load(Ordering::Acquire));
     assert_eq!(clock.last, Some(t1));
 
@@ -337,4 +357,38 @@ fn mobile_urgent_echo_sends_immediately_after_clock_mark_and_skips_empty_diff_ma
     let mut got = prev;
     got.apply(update.ops).unwrap();
     assert_eq!(got, next);
+}
+
+#[test]
+fn explicit_default_cursor_emits_delta_and_survives_snapshot_and_reset() {
+    use krill_proto::screen::{Msg as _, Update, View, encode_update_with_cursor};
+    let initial = screen(&["a"]);
+    let mut explicit = initial.clone();
+    explicit.cursor_explicit = true;
+    assert_eq!(initial.cursor_style, explicit.cursor_style);
+    assert!(diff(&initial, &explicit).contains(&Op::CursorStyle(CursorStyle::default())));
+    for (previous, next, reconnect) in [
+        (&initial, &explicit, false),
+        (&explicit, &initial, false),
+        (&initial, &explicit, true),
+    ] {
+        let ops = if reconnect {
+            snapshot(next)
+        } else {
+            diff(previous, next)
+        };
+        let mut view = View {
+            screen: previous.clone(),
+            ..View::default()
+        };
+        for frame in
+            encode_update_with_cursor(Revision(1), Seq(1), ops, Some(next.cursor_explicit)).unwrap()
+        {
+            let (kind, body) = krill_proto::ipc::read_frame(&mut frame.as_slice())
+                .unwrap()
+                .unwrap();
+            view.apply(Update::decode(kind, &body).unwrap()).unwrap();
+        }
+        assert_eq!(view.screen, *next);
+    }
 }

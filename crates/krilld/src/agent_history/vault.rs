@@ -34,6 +34,8 @@ struct CachedVaultDoc {
     size: u64,
     doc: VaultDoc,
     has_primary_title: bool,
+    partial: bool,
+    skipped: bool,
 }
 
 static VAULT_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, CachedVaultDoc>>> =
@@ -371,6 +373,22 @@ fn root_contains_target(dir: &Path, target: &VaultTarget) -> bool {
                     .is_file()
         }),
         VaultAgent::OpenCode => {
+            for path in super::opencode_sqlite::candidates(dir) {
+                if super::opencode_sqlite::read(&path, Some(&target.id), false).is_ok_and(|batch| {
+                    batch.sessions.iter().any(|session| {
+                        target.cwd.is_empty()
+                            || (krill_proto::agent_history::path_inside_or_equal(
+                                &session.cwd,
+                                &target.cwd,
+                            ) && krill_proto::agent_history::path_inside_or_equal(
+                                &target.cwd,
+                                &session.cwd,
+                            ))
+                    })
+                }) {
+                    return true;
+                }
+            }
             for base in opencode_candidate_bases(dir) {
                 if base.join(format!("{}.json", target.id)).is_file()
                     || base.join(format!("{}.jsonl", target.id)).is_file()
@@ -484,8 +502,8 @@ impl ParsedQuery {
         let mut paths: Vec<String> = req
             .paths
             .iter()
-            .map(|p| normalize_path(p))
             .filter(|p| !p.is_empty())
+            .cloned()
             .collect();
         let mut terms = Vec::new();
         for token in req.query.split_whitespace() {
@@ -499,9 +517,10 @@ impl ParsedQuery {
                 .strip_prefix("path:")
                 .or_else(|| token.strip_prefix("repo:"))
             {
-                let norm = normalize_path(rest);
-                if !norm.is_empty() {
-                    paths.push(norm);
+                // Native identity lookup needs the original spelling, particularly
+                // in Windows directories with case sensitivity enabled.
+                if !rest.is_empty() {
+                    paths.push(rest.to_owned());
                 }
                 continue;
             }
@@ -523,15 +542,13 @@ impl ParsedQuery {
         if self.paths.is_empty() {
             return true;
         }
-        let doc_norm = normalize_path(cwd);
         self.paths.iter().any(|filter| {
-            if filter.starts_with('/') {
-                doc_norm == *filter
-                    || doc_norm
-                        .strip_prefix(filter.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
+            if krill_proto::agent_history::is_absolute_history_path(filter) {
+                krill_proto::agent_history::path_inside_or_equal(cwd, filter)
             } else {
-                doc_norm.to_lowercase().contains(&filter.to_lowercase())
+                normalize_path(cwd)
+                    .to_lowercase()
+                    .contains(&filter.to_lowercase())
             }
         })
     }
@@ -663,28 +680,9 @@ impl ParsedQuery {
     }
 }
 
-/// macOS `/private/tmp` ↔ `/tmp`, `/private/var` ↔ `/var` 심링크 차이와 끝 `/`를 정규화한다.
+/// Comparison only; never rewrite a transcript's stored filesystem path.
 pub(crate) fn normalize_path(path: &str) -> String {
-    // Windows transcripts write `C:\x` while shells may report `c:/x` or `\\?\C:\x`: one separator, one case.
-    #[cfg(windows)]
-    let owned = path.trim().replace('\\', "/").to_lowercase();
-    #[cfg(windows)]
-    let path = owned.strip_prefix("//?/").unwrap_or(&owned);
-    let trimmed = path.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/private/tmp")
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("/tmp{rest}");
-    }
-    if let Some(rest) = trimmed.strip_prefix("/private/var")
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("/var{rest}");
-    }
-    trimmed.to_owned()
+    krill_proto::agent_history::normalize_path_for_comparison(path)
 }
 
 fn one_line(s: &str) -> String {
@@ -843,6 +841,7 @@ impl Indexer {
             .unwrap_or_default()
             .as_secs();
         let file_len = meta.len();
+        self.truncated |= file_len > u64::try_from(FILE_BYTES).unwrap_or(u64::MAX);
         let limit =
             u64::try_from(FILE_BYTES.min(MAX_BYTES.saturating_sub(self.bytes))).unwrap_or(u64::MAX);
         if limit == 0 {
@@ -871,6 +870,7 @@ impl Indexer {
             return Ok(modified);
         }
 
+        self.truncated = true;
         // 파일 크기가 FILE_BYTES(512KiB) 예산을 초과할 때는 Head(절반) + Tail(절반)을 분할해 읽는다.
         // 앞부분의 세션 메타데이터(sessionId·cwd·첫 프롬프트)와 뒷부분의 최신 대화·customTitle·summary를 함께 보존한다.
         let head_budget = limit / 2;
@@ -1007,6 +1007,40 @@ impl Indexer {
     }
 
     fn scan_opencode(&mut self, root: &Path) {
+        for path in super::opencode_sqlite::candidates(root) {
+            if self.exhausted() {
+                break;
+            }
+            match super::opencode_sqlite::read(&path, None, true) {
+                Ok(batch) => {
+                    self.truncated |= batch.truncated;
+                    self.skipped |= batch.skipped;
+                    self.bytes = self.bytes.saturating_add(batch.bytes);
+                    for session in batch.sessions {
+                        let mut messages = Vec::new();
+                        for value in session.messages {
+                            let role = value.get("role").and_then(Value::as_str).unwrap_or("user");
+                            extract_content_messages(role, &value, &mut messages);
+                            if let Some(parts) = value.get("parts").and_then(Value::as_array) {
+                                for part in parts {
+                                    extract_content_messages(role, part, &mut messages);
+                                }
+                            }
+                        }
+                        self.insert(VaultDoc {
+                            agent: VaultAgent::OpenCode,
+                            id: session.id,
+                            cwd: session.cwd,
+                            title: session.title,
+                            modified: session.modified,
+                            summary: String::new(),
+                            messages,
+                        });
+                    }
+                }
+                Err(_) => self.skipped = true,
+            }
+        }
         for session_dir in opencode_candidate_bases(root) {
             if !session_dir.is_dir() {
                 continue;
@@ -1105,6 +1139,8 @@ impl Indexer {
         if let Some((mtime_ns, size)) = stamp
             && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
         {
+            self.truncated |= cached.partial;
+            self.skipped |= cached.skipped;
             self.insert(cached.doc);
             return;
         }
@@ -1242,6 +1278,8 @@ impl Indexer {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
+                    partial: self.truncated,
+                    skipped: self.skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -1288,6 +1326,8 @@ impl Indexer {
         if let Some((mtime_ns, size)) = stamp
             && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
         {
+            self.truncated |= cached.partial;
+            self.skipped |= cached.skipped;
             let mut doc = cached.doc;
             if !cached.has_primary_title
                 && let Some(t) = titles.get(&doc.id)
@@ -1498,6 +1538,8 @@ impl Indexer {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
+                    partial: self.truncated,
+                    skipped: self.skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -1557,6 +1599,8 @@ impl Indexer {
         if let Some((mtime_ns, size)) = stamp
             && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
         {
+            self.truncated |= cached.partial;
+            self.skipped |= cached.skipped;
             let mut doc = cached.doc;
             if !cached.has_primary_title {
                 if let Some(ann_title) = read_agy_annotation_title(agy_root, &doc.id) {
@@ -1694,6 +1738,8 @@ impl Indexer {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
+                    partial: self.truncated,
+                    skipped: self.skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -1925,6 +1971,8 @@ impl Indexer {
         if let Some((mtime_ns, size)) = stamp
             && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
         {
+            self.truncated |= cached.partial;
+            self.skipped |= cached.skipped;
             self.insert(cached.doc);
             return;
         }
@@ -2002,6 +2050,8 @@ impl Indexer {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
+                    partial: self.truncated,
+                    skipped: self.skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -2888,5 +2938,64 @@ mod excerpt_window_tests {
         assert!(extract_snippet(&text, std::slice::from_ref(&term)).contains(&term));
         assert_eq!(extract_snippet("짧은 문장", &[]), "짧은 문장");
         assert!(extract_snippet(&"끝".repeat(300), &[]).ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod path_scope_regressions {
+    use super::*;
+    #[test]
+    fn query_paths_and_inline_drive_filters_use_directory_boundaries() {
+        for query in [
+            SearchQuery {
+                paths: vec![r"C:\work\app".into()],
+                ..Default::default()
+            },
+            SearchQuery {
+                query: "path:C:/work/app".into(),
+                ..Default::default()
+            },
+        ] {
+            let parsed = ParsedQuery::parse(&query);
+            assert!(parsed.matches_path(r"C:\WORK\app\sub"));
+            assert!(!parsed.matches_path("c:/work/app-old"));
+        }
+        let parsed = ParsedQuery::parse(&SearchQuery {
+            paths: vec!["/work/App".into()],
+            ..Default::default()
+        });
+        assert!(!parsed.matches_path("/work/app"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn native_query_scope_keeps_case_sensitive_filesystem_identity() {
+        let root =
+            std::env::temp_dir().join(format!("krill-vault-query-case-{}", std::process::id()));
+        let upper = root.join("Case");
+        let lower = root.join("case");
+        std::fs::create_dir_all(upper.join("sub")).unwrap();
+        std::fs::create_dir_all(lower.join("sub")).unwrap();
+        let same = same_file::is_same_file(&upper, &lower).unwrap();
+        for requested in [&upper, &lower] {
+            for query in [
+                SearchQuery {
+                    paths: vec![requested.display().to_string()],
+                    ..Default::default()
+                },
+                SearchQuery {
+                    query: format!("path:{}", requested.display()),
+                    ..Default::default()
+                },
+            ] {
+                let parsed = ParsedQuery::parse(&query);
+                assert!(parsed.matches_path(&requested.join("sub").display().to_string()));
+                let other = if requested == &upper { &lower } else { &upper };
+                assert_eq!(
+                    parsed.matches_path(&other.join("sub").display().to_string()),
+                    same
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

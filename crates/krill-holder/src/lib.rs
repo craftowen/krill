@@ -25,6 +25,6 @@ mod teardown;
 mod windows;
 
 #[cfg(windows)]
-pub use windows::{close_inherited, run};
+pub use windows::{DetachedProcess, close_inherited, run, spawn_detached};
 #[cfg(unix)]
 pub use {holder::run, sys::close_inherited};

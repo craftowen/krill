@@ -13,6 +13,7 @@ use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 
 /// 공개 허용 표시 파일(상태 디렉터리 바로 아래, 0600). 있으면 허용, 없으면 거부(기본값).
@@ -25,6 +26,64 @@ Ask the user to turn on Settings > Artifacts > Allow public sharing in the Krill
 or deliver the file locally instead. Do not retry.";
 /// 공유할 수 있는 확장자(소문자).
 pub const SHAREABLE_EXTENSIONS: [&str; 4] = ["html", "htm", "md", "markdown"];
+/// HTML·Markdown 원본 UTF-8 파일 상한(10 MiB).
+pub const MAX_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
+/// 기본 보존 기간. 0은 무기한이며, 양수는 갱신 시점부터의 일수다.
+pub const DEFAULT_RETENTION_DAYS: u16 = 30;
+pub const MAX_RETENTION_DAYS: u16 = 3650;
+const RETENTION_FILE: &str = "artifact-retention-days";
+
+/// CLI 기간 표기(`1`~`3650`, `never`)를 파싱한다.
+#[must_use]
+pub fn parse_retention_days(value: &str) -> Option<u16> {
+    if value == "never" {
+        return Some(0);
+    }
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|days| (1..=MAX_RETENTION_DAYS).contains(days))
+}
+
+/// 새로 발행하는 아티팩트의 기기별 기본 보존 기간.
+pub fn default_retention_days(state: &Path) -> io::Result<u16> {
+    match fs::read_to_string(state.join(RETENTION_FILE)) {
+        Ok(value) => value
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|days| *days <= MAX_RETENTION_DAYS)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid artifact retention days",
+                )
+            }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DEFAULT_RETENTION_DAYS),
+        Err(error) => Err(error),
+    }
+}
+
+/// 기기별 기본 기간을 저장한다. 기존 링크의 기한은 바꾸지 않는다.
+pub fn set_default_retention_days(state: &Path, days: u16) -> io::Result<()> {
+    if days > MAX_RETENTION_DAYS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid artifact retention days",
+        ));
+    }
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state)?;
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(state.join(RETENTION_FILE))?
+        .write_all(days.to_string().as_bytes())
+}
 
 /// 공개 공유가 허용됐는가.
 #[must_use]
@@ -80,6 +139,8 @@ pub struct ShareOutcome {
     pub share_url: String,
     #[serde(default)]
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u16>,
 }
 
 /// `status <file> --json` 출력. 네트워크 없이 로컬 공유 기록만 본다.
@@ -95,6 +156,8 @@ pub struct LinkStatus {
     pub share_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u16>,
 }
 
 /// `list --json` 출력(서버 응답을 그대로 넘긴다).
@@ -131,6 +194,8 @@ pub struct ArtifactMeta {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_size: Option<u64>,
 }
@@ -180,6 +245,60 @@ pub struct ErrorDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_defaults_persist_and_reject_invalid_settings() {
+        let dir = std::env::temp_dir().join(format!("krill-art-retention-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(default_retention_days(&dir).unwrap(), 30);
+        for days in [0, 7, 30, 90, 365, MAX_RETENTION_DAYS] {
+            set_default_retention_days(&dir, days).unwrap();
+            assert_eq!(default_retention_days(&dir).unwrap(), days);
+        }
+        assert!(set_default_retention_days(&dir, MAX_RETENTION_DAYS + 1).is_err());
+        assert_eq!(default_retention_days(&dir).unwrap(), MAX_RETENTION_DAYS);
+        fs::write(dir.join(RETENTION_FILE), "invalid").unwrap();
+        assert_eq!(
+            default_retention_days(&dir).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn retention_parser_accepts_only_supported_periods(value in ".{0,64}") {
+            let parsed = parse_retention_days(&value);
+            if let Some(days) = parsed {
+                proptest::prop_assert!(days <= MAX_RETENTION_DAYS);
+                proptest::prop_assert!(days != 0 || value == "never");
+            }
+        }
+    }
+
+    #[test]
+    fn retention_wire_fields_keep_legacy_responses_readable() {
+        for (raw, expected) in [
+            ("never", Some(0)),
+            ("1", Some(1)),
+            ("3650", Some(3650)),
+            ("0", None),
+            ("-1", None),
+            ("1.5", None),
+            ("3651", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_retention_days(raw), expected);
+        }
+        let legacy: ShareOutcome = serde_json::from_str(
+            r#"{"change":"created","slug":"s","shareUrl":"u","expiresAt":"date"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.retention_days, None);
+        let permanent: ListPage = serde_json::from_str(r#"{"artifacts":[{"artifact":{"slug":"s","retentionDays":0,"expiresAt":null},"shareUrl":"u"}]}"#).unwrap();
+        assert_eq!(permanent.artifacts[0].artifact.retention_days, Some(0));
+        assert_eq!(permanent.artifacts[0].artifact.expires_at, None);
+    }
 
     #[test]
     fn gate_defaults_off_and_toggles() {

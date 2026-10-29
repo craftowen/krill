@@ -113,7 +113,7 @@ pub(crate) fn capture_session_output(
     use krill_proto::screen::Msg as _;
     use std::path::PathBuf;
 
-    let socket = dir.join("run/krilld.sock");
+    let socket = krill_proto::daemon::socket_path(dir).ok()?;
     if !socket.exists() {
         return None;
     }
@@ -788,7 +788,7 @@ impl SettingsView {
         self.file_job(
             "schedule-run",
             move || {
-                let socket = dir.join("run/krilld.sock");
+                let socket = krill_proto::daemon::socket_path(&dir)?;
                 if !socket.exists() || krill_proto::os::net::UnixStream::connect(&socket).is_err() {
                     return Err(std::io::Error::other(text::ACCOUNTS_DAEMON_REQUIRED.get()));
                 }

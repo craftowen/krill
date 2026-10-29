@@ -160,7 +160,11 @@ fn stage_unstage_discard_multiline_commit_cmd_enter_failure_and_retry(cx: &mut T
             .unwrap()
             .update(cx, |input, cx| input.focus(window, cx));
     });
-    cx.simulate_keystrokes("cmd-enter");
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
     cx.run_until_parked();
     panel.read_with(cx, |p, cx| {
         assert!(
@@ -533,6 +537,14 @@ fn discard_worktree_file_restores_tracked_changes_and_trashes_untracked_files() 
             .unwrap()
             .success()
     );
+    assert!(
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&repo)
@@ -627,6 +639,14 @@ fn hunk_and_line_stage_unstage_discard_on_real_repo() {
         .current_dir(&dir)
         .status()
         .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&dir)
@@ -697,6 +717,296 @@ fn hunk_and_line_stage_unstage_discard_on_real_repo() {
     assert!(disk_after.contains("line1_mod\nline2_mod\n"));
     assert!(disk_after.contains("line12\n"));
     assert!(!disk_after.contains("line12_mod"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// APP-F04: 부분 패치 빌더는 줄 종결자를 바이트 그대로 보존해야 한다(`\r\n` 포함). 종결자 없는
+/// 마지막 줄만 `\n`을 보충한다(기존 LF 동작 유지).
+#[test]
+fn partial_patch_builders_preserve_crlf_bytes() {
+    let raw = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\r\n-two\r\n+TWO\r\n three\r\n";
+    let (header, hunks) = extract_patch_header_and_hunks(raw);
+    assert_eq!(
+        header,
+        "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n"
+    );
+    assert_eq!(
+        hunks,
+        ["@@ -1,3 +1,3 @@\n one\r\n-two\r\n+TWO\r\n three\r\n".to_owned()]
+    );
+    assert_eq!(build_hunk_patch(raw, 0).unwrap(), raw);
+    assert_eq!(build_line_patch(raw, false, 2, 2, true).unwrap(), raw);
+    assert_eq!(hunk_index_for_line(raw, 2, true), Some(0));
+
+    let no_trailing = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b";
+    assert_eq!(
+        build_hunk_patch(no_trailing, 0).unwrap(),
+        format!("{no_trailing}\n")
+    );
+}
+
+/// APP-F04: `core.autocrlf=false` 저장소의 CRLF 파일은 hunk·줄 단위 stage/unstage/discard가
+/// `git apply`에 그대로 받아들여져야 한다(`\r`을 잃으면 "patch does not apply").
+#[test]
+fn crlf_hunk_and_line_patches_apply_on_real_repo() {
+    /// 12줄 CRLF 문서. `edits`의 (줄 번호, 내용)만 바꾼다.
+    fn crlf_doc(edits: &[(usize, &str)]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for i in 1..=12 {
+            match edits.iter().find(|(line, _)| *line == i) {
+                Some((_, text)) => out.push_str(text),
+                None => write!(out, "line{i}").unwrap(),
+            }
+            out.push_str("\r\n");
+        }
+        out
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "krill-crlf-patch-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "core.autocrlf", "false"]);
+
+    let original = crlf_doc(&[]);
+    std::fs::write(dir.join("crlf.txt"), &original).unwrap();
+    git(&["add", "crlf.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let modified = crlf_doc(&[(2, "LINE2"), (12, "LINE12")]);
+    std::fs::write(dir.join("crlf.txt"), &modified).unwrap();
+
+    let file = ChangedFile {
+        path: b"crlf.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    assert!(wt_patch.contains("+LINE2\r\n"), "{wt_patch:?}");
+    let hunk0 = build_hunk_patch(&wt_patch, 0).unwrap();
+    assert!(hunk0.contains("-line2\r\n") && hunk0.contains("+LINE2\r\n"));
+    assert!(!hunk0.contains("LINE12"));
+
+    // 1. Stage hunk 0 only.
+    apply_git_patch(&dir, &hunk0, true, false).unwrap();
+    let staged = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(staged.contains("+LINE2\r\n"));
+    assert!(!staged.contains("LINE12"));
+
+    // 2. Unstage line 2 with a line patch on the index.
+    let unstage_line2 = build_line_patch(&staged, true, 2, 2, true).unwrap();
+    apply_git_patch(&dir, &unstage_line2, true, true).unwrap();
+    assert!(
+        super::super::raw_patch(&dir, &file, Comparison::Index)
+            .unwrap()
+            .trim()
+            .is_empty()
+    );
+
+    // 3. Stage line 12 (hunk 1) with a line patch.
+    let stage_line12 = build_line_patch(&wt_patch, false, 12, 12, true).unwrap();
+    apply_git_patch(&dir, &stage_line12, true, false).unwrap();
+    let staged = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(staged.contains("+LINE12\r\n"));
+    assert!(!staged.contains("LINE2\r"));
+
+    // 4. Discard hunk 0 in the worktree: line 2 restored, line 12 keeps its edit, CRLF intact.
+    apply_git_patch(&dir, &hunk0, false, true).unwrap();
+    let expected = crlf_doc(&[(12, "LINE12")]);
+    assert_eq!(
+        std::fs::read(dir.join("crlf.txt")).unwrap(),
+        expected.as_bytes()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// APP-F01: 원격 호스트 타깃의 `Daemon` 소스는 같은 절대 경로에 로컬 저장소가 있어도 로컬 git·휴지통을
+/// 건드리지 않고 실패로 닫힌다. 원격 krilld가 실행하는 Push/Pull/Sync 게이트(`has_remote`)는 열어 둔다.
+#[test]
+fn remote_daemon_source_fails_closed_without_touching_local_repo() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-remote-source-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let repo = dir.join("repo");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "scratch\n").unwrap();
+
+    let tracked = ChangedFile {
+        path: b"tracked.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let untracked = ChangedFile {
+        path: b"untracked.txt".to_vec(),
+        old_path: None,
+        status: *b"??",
+        staged: None,
+        unstaged: None,
+    };
+    let hunk = build_hunk_patch(
+        &super::super::raw_patch(&repo, &tracked, Comparison::Worktree).unwrap(),
+        0,
+    )
+    .unwrap();
+
+    let remote = Daemon(Some(HostTarget::remote(
+        "fixture",
+        dir.join("missing.sock"),
+    )));
+    assert!(remote.remote());
+    for err in [
+        remote.discard(&repo, &home, &tracked).unwrap_err(),
+        remote.discard(&repo, &home, &untracked).unwrap_err(),
+        remote.apply_patch(&repo, &hunk, true, false).unwrap_err(),
+        remote.apply_patch(&repo, &hunk, false, true).unwrap_err(),
+        remote.generate_commit_message(&repo).unwrap_err(),
+    ] {
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+    }
+    assert_eq!(remote.branch_sync(&repo), (0, 0));
+    assert!(remote.has_remote(&repo));
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+        "modified\n"
+    );
+    assert!(repo.join("untracked.txt").is_file());
+    assert!(git(&["diff", "--cached", "--name-only"]).trim().is_empty());
+
+    // 같은 경로의 로컬 타깃은 기본 구현(로컬 git)을 그대로 쓴다.
+    let local = Daemon(None);
+    assert!(!local.remote());
+    local.apply_patch(&repo, &hunk, true, false).unwrap();
+    assert_eq!(
+        git(&["diff", "--cached", "--name-only"]).trim(),
+        "tracked.txt"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// APP-F01: 원격 호스트 작업공간에서는 로컬 git을 쓰는 Discard·AI 커밋·PR 버튼을 그리지 않고,
+/// 파일을 선택해도 같은 경로의 로컬 저장소에서 `git diff`를 읽지 않는다. 전체 파일 Stage(원격 IPC)는 남는다.
+#[gpui::test]
+fn remote_workspace_hides_local_only_actions_and_skips_local_patch(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!(
+        "krill-remote-panel-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.join("file"), "a\n").unwrap();
+    git(&["add", "file"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(dir.join("file"), "b\n").unwrap();
+
+    let remote = HostTarget::remote("fixture", dir.join("missing.sock"));
+    let repo = dir.clone();
+    let (panel, cx) = cx.add_window_view(|window, cx| {
+        let mut p = Panel::unconnected(repo, cx);
+        p.visible = false;
+        p.connect(remote, cx);
+        p.changes = Changes {
+            files: vec![ChangedFile {
+                path: b"file".into(),
+                old_path: None,
+                status: *b".M",
+                staged: None,
+                unstaged: None,
+            }],
+            limited: false,
+        };
+        drop(p.render_editor(window, cx));
+        p
+    });
+    cx.run_until_parked();
+
+    assert!(cx.update(|_, cx| panel.read(cx).remote_host()));
+    assert!(cx.debug_bounds("git-discard-0").is_none());
+    assert!(cx.debug_bounds("git-stage-0").is_some());
+    assert!(cx.debug_bounds("git-ai-commit").is_none());
+    assert!(cx.debug_bounds("git-create-pr").is_none());
+    assert!(cx.debug_bounds("git-commit").is_some());
+
+    cx.update(|_, cx| panel.update(cx, |p, cx| p.select(0, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = panel.read(cx);
+        assert!(p.raw_patch.is_empty(), "{:?}", p.raw_patch);
+        assert_eq!(
+            p.message,
+            crate::i18n::catalog::diff::PATCH_REMOTE_UNSUPPORTED.get()
+        );
+        assert_eq!(p.hunk_count(), 0);
+    });
+    assert!(cx.debug_bounds("diff-stage-hunk").is_none());
+    assert!(cx.debug_bounds("diff-discard-hunk").is_none());
+    assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "b\n");
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -1,6 +1,6 @@
 # Krill telemetry collector
 
-Cloudflare Worker + D1 collector and authenticated operations dashboard. **Not deployed:** the production database ID is an explicit placeholder and no production secret is included. `https://telemetry.krill.page/v1/telemetry` requires operator provisioning and deployment before it can collect events. See [desktop behavior and opt-out controls](CLIENT.md). Error reporting is a separate feature and is unchanged by this collector.
+Cloudflare Worker + D1 collector and authenticated operations dashboard. **Production deployed on 2026-10-27:** `https://telemetry.krill.page/v1/telemetry` accepts usage events, and `https://telemetry.krill.page/` serves the authenticated operations dashboard. The production account and D1 binding are recorded in `wrangler.jsonc`; the admin credential is provisioned separately and is never included in source or desktop builds. See [desktop behavior and opt-out controls](CLIENT.md). Error reporting is a separate feature and is unchanged by this collector.
 
 ## Wire contract
 
@@ -84,22 +84,20 @@ wrangler d1 migrations apply krill-telemetry --local --persist-to /tmp/krill-tel
 wrangler dev --local --ip 127.0.0.1 --port 8787 --persist-to /tmp/krill-telemetry-d1
 ```
 
-Wrangler reads ignored `.dev.vars` for `ADMIN_TOKEN`. The descriptive placeholder D1 ID works locally and must be replaced for production. If an older installed workerd rejects `compatibility_date: 2026-10-27`, upgrade Wrangler or use a supported date **only for local execution**, for example `wrangler dev --local --compatibility-date 2026-09-28 …`. The checked-in production date stays current. Run the same `test:http` path against Wrangler to verify real Worker+D1 ingestion, deduplication, transaction rollback and authenticated metrics.
+Wrangler reads ignored `.dev.vars` for a local `ADMIN_TOKEN`; use a different value from production. The checked-in D1 binding is simulated locally unless `--remote` is explicitly supplied. If an older installed workerd rejects `compatibility_date: 2026-10-27`, upgrade Wrangler or use a supported date **only for local execution**, for example `wrangler dev --local --compatibility-date 2026-09-28 …`. The checked-in production date stays current. Run the same `test:http` path against Wrangler to verify real Worker+D1 ingestion, deduplication, transaction rollback and authenticated metrics.
 
 `wrangler types` can generate an ignored local `worker-configuration.d.ts`; no manually maintained binding interface is used. The checked-in config uses the official portable Wrangler schema reference. Local bindings/schema can be validated without deploying.
 
-## Production operator steps (not performed)
+## Production operations
 
-These commands create/modify remote resources and are provided for the operator, not executed by this implementation:
+The `krill-telemetry` Worker, its D1 database and schema, admin secret, and `telemetry.krill.page` custom domain are provisioned. The rate-limit namespace is dedicated to this collector. Existing desktop installations with queued events retry with their original event IDs; data before collection began is incomplete and must not be interpreted as zero usage.
 
-1. Select the intended Cloudflare account and ensure it controls `krill.page`. Install an up-to-date Wrangler. Review billing/edge controls in that account.
-2. Run `wrangler d1 create krill-telemetry`. Copy its returned database ID into `wrangler.jsonc`, replacing `REPLACE_WITH_D1_DATABASE_ID`. Keep `DB`, database name, and migration directory aligned.
-3. Apply `wrangler d1 migrations apply krill-telemetry --remote`.
-4. Provision a generated 32–256-character admin secret with `wrangler secret put ADMIN_TOKEN` through its secure prompt. Optionally provision `GITHUB_TOKEN` the same way, limited to public repository read access. Never put either value in config/source/URLs.
-5. Review the route `telemetry.krill.page` (`custom_domain: true`), rate-limit namespace `1001` (choose an account-unique namespace if already used), disabled `workers_dev`/preview URLs, and disabled request observability. No production ingest key belongs in a desktop build.
-6. Validate with `wrangler deploy --dry-run --outdir /tmp/krill-telemetry-preview`, then explicitly deploy with `wrangler deploy` when authorized. The placeholder must already be replaced; dry-run alone does not prove the remote D1/route/secret exists.
-7. Open the HTTPS dashboard and confirm unauthenticated stats return 401, the admin token loads metrics, synthetic current events are acknowledged only after persistence, identical retries are idempotent, and GitHub download failures leave application stats usable. Verify the desktop endpoint only after the collector is live. Publish a desktop release separately when authorized.
+1. Confirm `wrangler whoami` can access the account selected in `wrangler.jsonc` and its `krill.page` zone. A token inherited from another project can override the saved Wrangler login; use the intended credential rather than changing the account binding.
+2. Run `npm test`. Review and apply new schema migrations with `wrangler d1 migrations apply krill-telemetry --remote`; do not create a replacement production database for routine deployments.
+3. Retain the existing `ADMIN_TOKEN`. Rotate it only deliberately with `wrangler secret put ADMIN_TOKEN` through its secure prompt, updating dependent report credentials together. Optional `GITHUB_TOKEN` can raise public GitHub read limits. Never put secrets in config/source/URLs.
+4. Validate with `wrangler deploy --dry-run --outdir /tmp/krill-telemetry-preview`, then deploy with `wrangler deploy` when authorized. Keep `workers_dev`, preview URLs, and request observability disabled. No production admin key belongs in a desktop build.
+5. Open the HTTPS dashboard and confirm unauthenticated stats return 401, authenticated stats load, actual desktop events are acknowledged after persistence, and identical retries do not inflate metrics. Keep synthetic installations out of product reporting. A newly provisioned hostname can remain negatively cached in local DNS after public DNS is ready. Publish desktop releases separately when authorized.
 
-The repository does not establish that production collection is working. No deployment, database creation, remote migration, secret installation, GitHub publication, commit, or push is part of this change.
+Daily reports must distinguish missing collection, incomplete collection windows, immature retention cohorts, and measured zero values. Installation UUIDs identify app state directories, not people; download requests remain a separate metric.
 
 References: [D1 atomic batches](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch), [Workers rate limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/), [GitHub release API](https://docs.github.com/en/rest/releases/releases#list-releases).

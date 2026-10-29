@@ -23,7 +23,12 @@ pub(super) struct Confirmation {
 
 impl Panel {
     pub fn merge_pr(&mut self, method: PrMergeMethod, window: &mut Window, cx: &mut Context<Self>) {
-        if self.checks.loading || self.checks.merging || self.checks.pending_merge.is_some() {
+        // 원격 호스트의 PR은 로컬 gh로 병합할 수 없다(같은 경로의 로컬 PR을 병합하면 안 된다, APP-F01).
+        if self.checks.loading
+            || self.checks.merging
+            || self.checks.pending_merge.is_some()
+            || self.remote_host()
+        {
             return;
         }
         let Some(inspection) = self
@@ -63,6 +68,7 @@ impl Panel {
         };
         if self.checks.loading
             || self.checks.merging
+            || self.remote_host()
             || self.repo != confirmation.repo
             || self.checks.branch != confirmation.branch
             || self.checks.branch_override != confirmation.branch_override

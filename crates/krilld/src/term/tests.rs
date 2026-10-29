@@ -139,9 +139,9 @@ fn pushed_theme_cell_size_and_program_colors() {
         e.feed(q.as_bytes(), Feed::Live, &look),
         "\x1b]11;rgb:0606/1616/2020\x07\x1b[4;720;720t\x1b[?6c"
     );
-    // 프로그램이 OSC 11로 바꾼 배경색이 테마보다 먼저다.
+    // Default color mutation is unsupported; report the actual theme background.
     let r = e.feed(b"\x1b]11;#123456\x07\x1b]11;?\x07", Feed::Live, &look);
-    assert_eq!(r, "\x1b]11;rgb:1212/3434/5656\x07");
+    assert_eq!(r, "\x1b]11;rgb:0606/1616/2020\x07");
 }
 
 #[test]
@@ -910,4 +910,85 @@ fn dec2026_sync_csi_2j_3j_preserves_hot_rows_across_single_and_split_feeds() {
         row_texts(timeout.snapshot_hot_rows()),
         vec!["row-2", "row-1"]
     );
+}
+
+#[test]
+fn explicit_cursor_default_survives_replay_and_resets() {
+    let look = fresh();
+    for feed in [Feed::Live, Feed::Replay] {
+        let mut engine = Engine::new(SIZE);
+        assert!(!engine.screen().cursor_explicit);
+        for style in 1..=6 {
+            engine.feed(format!("\x1b[{style} q").as_bytes(), feed, &look);
+            assert!(engine.screen().cursor_explicit, "DECSCUSR {style}");
+        }
+        engine.feed(b"\x1b[2 q", feed, &look);
+        assert_eq!(engine.screen().cursor_style, CursorStyle::default());
+        assert!(engine.screen().cursor_explicit);
+        engine.feed(b"\x1b[0 q", feed, &look);
+        assert!(!engine.screen().cursor_explicit);
+        engine.feed(b"\x1b[2 q\x1bc", feed, &look);
+        assert!(!engine.screen().cursor_explicit);
+    }
+}
+
+#[test]
+fn default_color_queries_follow_render_theme_after_mutations_resets_and_theme_changes() {
+    let look = fresh();
+    let mut engine = Engine::new(SIZE);
+    for osc in [10, 11, 12] {
+        let query = format!("\x1b]{osc};?\x07");
+        let initial = engine.feed(query.as_bytes(), Feed::Live, &look);
+        engine.feed(
+            format!("\x1b]{osc};#ff0102\x07").as_bytes(),
+            Feed::Live,
+            &look,
+        );
+        assert_eq!(engine.feed(query.as_bytes(), Feed::Live, &look), initial);
+        engine.feed(
+            format!("\x1b]{}\x07", osc + 100).as_bytes(),
+            Feed::Live,
+            &look,
+        );
+        assert_eq!(engine.feed(query.as_bytes(), Feed::Live, &look), initial);
+    }
+    engine.feed(b"\x1b]4;1;#123456\x07", Feed::Live, &look);
+    assert_eq!(
+        engine.feed(b"\x1b]4;1;?\x07", Feed::Live, &look),
+        "\x1b]4;1;rgb:1212/3434/5656\x07"
+    );
+    let mut theme = look.theme();
+    theme.background = Rgb {
+        r: 0xaa,
+        g: 0xbb,
+        b: 0xcc,
+    };
+    look.set_theme(theme).ok(); // memory updates even when the test path cannot be written.
+    assert_eq!(
+        engine.feed(b"\x1b]11;?\x07", Feed::Live, &look),
+        "\x1b]11;rgb:aaaa/bbbb/cccc\x07"
+    );
+    assert_eq!(
+        engine.screen().rows[0]
+            .first()
+            .map_or(Color::Default, |c| c.bg),
+        Color::Default
+    );
+}
+
+#[test]
+fn cold_keyframe_does_not_turn_implicit_cursor_into_explicit_default() {
+    let look = fresh();
+    for command in [b"".as_slice(), b"\x1b[2 q", b"\x1b[5 q"] {
+        let mut original = Engine::new(SIZE);
+        original.feed(command, Feed::Live, &look);
+        let ansi = original.cold_keyframe().unwrap().unwrap();
+        let mut replay = Engine::new(SIZE);
+        replay.feed(&ansi, Feed::Replay, &look);
+        assert_eq!(original.screen().cursor_style, replay.screen().cursor_style);
+        assert_eq!(
+            original.screen().cursor_explicit,
+            replay.screen().cursor_explicit
+        );
+    }
 }

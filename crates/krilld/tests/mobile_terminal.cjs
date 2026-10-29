@@ -64,8 +64,8 @@ async function testInsertText(){
 }
 async function testLivePreview(){
  const {root,handle,socket}=await mount(1951,{preferences:{inputMode:'direct',fitToPhone:false}}),capture=find(root,'live-capture'),live=find(root,'live-input-copy'),title=live.children[0],detail=live.children[1],keybar=find(root,'keybar');handle.focus();
- assert.deepEqual(keybar.children.slice(2,13).map(b=>b.dataset.keyId),['escape','tab','enter','shiftTab','space','backspace','delete','arrowUp','arrowDown','arrowLeft','arrowRight']);
- assert.equal(keybar.children[1].children[0].tagName,'svg');assert.equal(keybar.children[1].getAttribute('aria-pressed'),'true');
+ assert.deepEqual(keybar.children.slice(3,14).map(b=>b.dataset.keyId),['escape','tab','enter','shiftTab','space','backspace','delete','arrowUp','arrowDown','arrowLeft','arrowRight']);
+ assert.equal(keybar.children[0].children[0].tagName,'svg');assert.equal(keybar.children[0].getAttribute('aria-pressed'),'true');
  assert.deepEqual(keybar.children.slice(-3).map(b=>b.dataset.keyId),['shift','ctrl','alt']);assert.equal(capture.parent,find(root,'accessory-row'));
  capture.value='hello';event(capture,'input');assert.equal(detail.textContent,'hello');assert.deepEqual(inputs(socket),['hello']);
  await advance(1000);assert.equal(root.dataset.phase,'input-pending');assert.match(title.textContent,/Waiting for input/);assert.equal(detail.textContent,'hello');
@@ -75,7 +75,7 @@ async function testLivePreview(){
  capture.value='hello한';event(capture,'input',{isComposing:true});assert.equal(detail.textContent,'hello한');event(capture,'compositionend',{data:'한'});event(capture,'input',{inputType:'insertFromComposition'});await flush();assert.deepEqual(inputs(socket),['hello','한']);assert.equal(detail.textContent,'hello한');
  socket.autoAck=true;capture.value='hello';event(capture,'input',{inputType:'deleteContentBackward'});await flush();assert.deepEqual(inputs(socket),['hello','한','\x7f']);assert.equal(detail.textContent,'hello');
  event(capture,'keydown',{key:'Enter'});await flush();assert.equal(inputs(socket).at(-1),'\r');assert.equal(detail.dataset.preview,'false');assert.equal(capture.value,'');
- handle.setInputMode('buffered');assert.equal(keybar.children[1].children[0].tagName,'svg');assert.equal(keybar.children[1].getAttribute('aria-pressed'),'false');handle.setInputMode('direct');handle.focus();capture.value='not replayed';event(capture,'input');socket.close();await flush();assert.equal(detail.dataset.preview,'false');handle.unmount();
+ handle.setInputMode('buffered');assert.equal(keybar.children[0].children[0].tagName,'svg');assert.equal(keybar.children[0].getAttribute('aria-pressed'),'false');handle.setInputMode('direct');handle.focus();capture.value='not replayed';event(capture,'input');socket.close();await flush();assert.equal(detail.dataset.preview,'false');handle.unmount();
  const again=await mount(1951,{preferences:{inputMode:'direct',fitToPhone:false}});assert.deepEqual(inputs(again.socket),[]);assert.equal(find(again.root,'live-input-copy').children[1].dataset.preview,'false');again.handle.unmount();
  console.log('PASS Orca dock order/icon, stable live preview through delayed ACK/output/viewport, IME no duplicate commit, backspace, Enter and reconnect no replay');
 }
@@ -118,9 +118,36 @@ async function testQuestions(){
  socket.question(menu);socket.close();event(choices()[0],'click');assert.equal(inputs(socket).length,before+1);assert.equal(panel.hidden,true);handle.unmount();
  console.log('PASS live question touch answers: Claude/Codex arrows+Enter, wrapped labels, SS3, checkboxes+submit, duplicate/stale/partial/history/hidden/IME/pending/disconnect guards and malformed-menu fuzz');
 }
+
+async function testChatQuestionReplies(){
+ const snapshots=[],f=await mount(1971,{visible:false,questionActive:true,preferences:{fitToPhone:false},onQuestion:q=>snapshots.push(q)}),{handle,socket}=f;
+ const single=['Which approach?', '❯ 1. Keep the current flow', '  2. Change the flow', 'Enter to select'];
+ socket.question(single);let question=handle.getQuestion();assert(question.enabled);assert.equal(question.title,'Which approach?');assert.equal(inputs(socket).length,0);
+ // Hidden Chat can answer only this API, not arbitrary terminal input.
+ await assert.rejects(handle.sendKey('enter'),/Resume/);socket.autoAck=true;
+ const reply=handle.replyQuestion(question.token,[1]);await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);await reply;
+ assert.deepEqual(inputs(socket),['\x1b[B\r']);assert(!handle.getQuestion().enabled,'ACK alone cannot replay the same question');
+ socket.question(['Next question', '❯ 1. Yes', '  2. No', 'Enter to select']);await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);
+ question=handle.getQuestion();handle.setQuestionActive(false);await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);handle.setQuestionActive(true);
+ question=handle.getQuestion();context.document.visibilityState='hidden';await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);context.document.visibilityState='visible';
+ socket.screen('Working');socket.question(single,false);assert.equal(handle.getQuestion(),null,'partial screen cannot supply a reply target');socket.question(single);
+ await assert.rejects(handle.replyQuestion(handle.getQuestion().token,[3]),/Choose an answer/);assert.equal(inputs(socket).length,1);
+ const menu=(first,second,active=0)=>['Pick features', `${active===0?'❯':' '} ${first?'☑':'☐'} Search`, `${active===1?'❯':' '} ${second?'☑':'☐'} Export`, 'Space to select · Enter to submit'];
+ socket.question(menu(false,true));question=handle.getQuestion();const batch=handle.replyQuestion(question.token,[0]);await flush();
+ assert.equal(inputs(socket).at(-1),' ');assert.equal(inputs(socket).length,2,'no second step before the authoritative checkbox frame');
+ socket.question(menu(true,true),false);await flush();assert.equal(inputs(socket).length,2,'partial checkbox frames do not trigger another step');socket.question(menu(true,true));await flush();assert.equal(inputs(socket).at(-1),'\x1b[B ');assert.equal(inputs(socket).length,3);
+ socket.question(menu(true,false,1));await batch;assert.equal(inputs(socket).at(-1),'\r');assert.equal(inputs(socket).length,4,'one checkbox change per observed frame, then one final Enter');
+ socket.screen('Working');socket.question(menu(false,false));await handle.replyQuestion(handle.getQuestion().token,[]);assert.equal(inputs(socket).at(-1),'\r','native multi-select permits an explicitly empty submission');socket.screen('Working');socket.question(menu(false,false));const stale=handle.replyQuestion(handle.getQuestion().token,[0]);const rejected=assert.rejects(stale,/question changed/i);await flush();socket.question(['Changed question', '❯ 1. Yes', '  2. No', 'Enter to select']);await rejected;assert.equal(inputs(socket).at(-1),' ','a changed question never receives the final Enter');
+ socket.screen('Working');socket.question(menu(false,false));const timeout=handle.replyQuestion(handle.getQuestion().token,[1]);const expired=assert.rejects(timeout,/Could not confirm/);await flush();await advance(3000);await expired;assert.equal(inputs(socket).at(-1),'\x1b[B ','unconfirmed checkbox state never submits');
+ socket.screen('Working');socket.question(menu(false,false));const lost=handle.replyQuestion(handle.getQuestion().token,[0]);const disconnected=assert.rejects(lost,/question changed|uncertain/i);await flush();socket.close();await disconnected;assert.equal(handle.getQuestion(),null);handle.unmount();
+ assert(snapshots.some(q=>q?.multiple)&&snapshots.at(-1)===null);
+ console.log('PASS Chat live replies: hidden single submit, native-key guard, stale/generation/background/partial/duplicate validation, authoritative multi-select pacing, timeout and disconnect never submit');
+}
+
 async function main(){
  await testInsertText();
  await testQuestions();
+ await testChatQuestionReplies();
  await testPageZoom();
  await testHiddenPaint();
  await testLivePreview();
@@ -128,15 +155,12 @@ async function main(){
  for(const text of ['', 'a', '\0', '한글', 'é', '😀']){const r=T.reader(T.text(text));assert.equal(r.text(),text);r.end();}assert.throws(()=>T.reader(Uint8Array.of(1,255)).text());assert.throws(()=>T.reader(Uint8Array.of(2,97)).text(),/Truncated/);
  assert(!source.includes('innerHTML'));assert(!source.includes('getElementById'));assert.equal(api.keys.length,24);
  const expected=['\x1b','\t','\r','\x1b[Z',' ','\x7f','\x1b[3~','\x1b[A','\x1b[B','\x1b[D','\x1b[C','\x03','\x04','\x0c','\x1a','\x12','\x01','\x05','\x17','\x15','\x1b[H','\x1b[F','\x1b[5~','\x1b[6~'];
- let quickOpened=0;
- const quickFixture=await mount(711,{onQuickActions:()=>quickOpened++});
- const dockKeys=find(quickFixture.root,'keybar'),quickButton=find(quickFixture.root,'quick-actions');
- assert.deepEqual(dockKeys.children.slice(2,13).map(b=>b.dataset.keyId),['escape','tab','enter','shiftTab','space','backspace','delete','arrowUp','arrowDown','arrowLeft','arrowRight']);
- assert.equal(quickButton.parent,find(quickFixture.root,'accessory-row'),'quick actions stay outside the scrolling keys');
- assert.equal(quickButton.getAttribute('aria-haspopup'),'dialog');assert(event(quickButton,'pointerdown').defaultPrevented);
- event(quickButton,'click');assert.equal(quickOpened,1);assert.deepEqual(inputs(quickFixture.socket),[],'opening quick actions never sends terminal input');
- quickFixture.handle.unmount();event(quickButton,'click');assert.equal(quickOpened,1,'unmount removes the quick action listener');
- console.log('PASS priority keys first, fixed quick actions, no input on open and listener cleanup');
+ const quickFixture=await mount(711),dockKeys=find(quickFixture.root,'keybar');
+ assert.deepEqual(dockKeys.children.slice(3,14).map(b=>b.dataset.keyId),['escape','tab','enter','shiftTab','space','backspace','delete','arrowUp','arrowDown','arrowLeft','arrowRight']);
+ for(const name of ['quick-actions','dismiss-keyboard'])assert.equal(find(quickFixture.root,name),undefined,name+' is absent from the dock');
+ for(const name of ['paste-key','display-mode'])assert.equal(find(quickFixture.root,name).parent,dockKeys,name+' scrolls inside the terminal key list');
+ assert.deepEqual(inputs(quickFixture.socket),[],'building the dock never sends input');quickFixture.handle.unmount();
+ console.log('PASS priority keys first and paste/display actions inside the scrolling key list');
  let {root,handle,socket}=await mount();socket.autoAck=true;
  for(const k of api.keys)await handle.sendKey(k.id);assert.deepEqual(inputs(socket),expected);console.log('PASS exact 24-key order and bytes');
  // Switching visible panes invalidates a late IME commit, deferred keys, repeat and paste review.
@@ -151,8 +175,8 @@ async function main(){
  event(key(root,'ctrl'),'click');event(key(root,'shift'),'click');await handle.sendKey('pageUp');assert.equal(inputs(socket).at(-1),'\x1b[5;6~');event(key(root,'alt'),'click');await handle.sendKey('backspace');assert.equal(inputs(socket).at(-1),'\x1b\x7f');
  console.log('PASS Shift, Ctrl and Alt one-shot modifiers');
  {const html=context.document.documentElement,writes=[],set=html.style.setProperty;html.style.setProperty=(k,v)=>{writes.push([k,v]);set.call(html.style,k,v);};
-  viewport.height=700;event(viewport,'resize');viewport.height=544;event(viewport,'resize');event(viewport,'scroll');assert.deepEqual(writes,[],'keyboard events only schedule; no layout write before the frame');await advance(16);assert.deepEqual(writes,[['--keyboard-inset','300px']],'one CSS variable write per frame on <html>');assert.equal(root.style['--keyboard-inset'],undefined,'terminal does not keep its own inset');assert.equal(find(root,'dismiss-keyboard').hidden,false);assert.equal(root.dataset.keyboardOpen,'true');
-  viewport.scale=1.5;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','0px'],'pinch zoom is not a keyboard');assert.equal(find(root,'dismiss-keyboard').hidden,true);viewport.scale=undefined;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','300px'],'a WebView without scale is unzoomed');
+  viewport.height=700;event(viewport,'resize');viewport.height=544;event(viewport,'resize');event(viewport,'scroll');assert.deepEqual(writes,[],'keyboard events only schedule; no layout write before the frame');await advance(16);assert.deepEqual(writes,[['--keyboard-inset','300px']],'one CSS variable write per frame on <html>');assert.equal(root.style['--keyboard-inset'],undefined,'terminal does not keep its own inset');assert.equal(find(root,'show-keyboard').getAttribute('aria-pressed'),'true');assert.equal(root.dataset.keyboardOpen,'true');
+  viewport.scale=1.5;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','0px'],'pinch zoom is not a keyboard');assert.equal(find(root,'show-keyboard').getAttribute('aria-pressed'),'true','zoom does not blur the focused input');viewport.scale=undefined;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','300px'],'a WebView without scale is unzoomed');
   const scrolls=[];context.scrollY=40;context.scrollTo=(x,y)=>{scrolls.push([x,y]);context.scrollY=0;};context.document.activeElement={closest:s=>s.includes('.command-dock')?{}:null};viewport.offsetTop=40;viewport.height=504;event(viewport,'scroll');await advance(16);assert.deepEqual(scrolls,[[0,0]],'iOS focus scroll is put back for the docked input');viewport.offsetTop=0;viewport.height=544;event(viewport,'scroll');await advance(16);assert.equal(scrolls.length,1);assert.equal(writes.length,3,'unchanged inset is not rewritten');
   context.document.activeElement=null;viewport.scale=1;viewport.height=844;event(viewport,'resize');await advance(16);assert.deepEqual(writes.at(-1),['--keyboard-inset','0px']);html.style.setProperty=set;}
  {const prevented=[],container={addEventListener(type,fn,opts){assert.equal(type,'mousedown');assert.equal(opts.capture,true);this.fn=fn;},contains:()=>true},button={},tap=target=>{const e={target,preventDefault(){prevented.push(target);}};container.fn(e);};context.MkKeyboard.keepFocus(container);const onButton={closest:s=>s==='button'?button:null,matches:()=>false},onText={closest:()=>null,matches:()=>true};
@@ -161,19 +185,19 @@ async function main(){
  const attach=socket.sent.find(a=>a[4]===0x10),role=socket.sent.find(a=>a[4]===0x17);assert.deepEqual([...attach.slice(-2)],[0,0]);assert.deepEqual([...role.slice(5)],[0,2,0]);
  let count=inputs(socket).length;event(key(root,'backspace'),'pointerdown',{button:0,pointerId:1});await flush();assert.equal(inputs(socket).length,count+1);await advance(399);assert.equal(inputs(socket).length,count+1);await advance(1);assert.equal(inputs(socket).length,count+2);await advance(45);assert.equal(inputs(socket).length,count+3);event(key(root,'backspace'),'pointerup');await advance(500);assert.equal(inputs(socket).length,count+3);console.log('PASS repeat immediate / 400ms / 45ms and release');
  const capture=find(root,'live-capture');handle.focus();count=inputs(socket).length;event(capture,'compositionstart');capture.value='ㅎ';event(capture,'input',{isComposing:true});capture.value='한';event(capture,'input',{isComposing:true});assert.equal(inputs(socket).length,count);event(capture,'compositionend',{data:'한'});capture.value='한';event(capture,'input',{isComposing:false});await flush();assert.deepEqual(inputs(socket).slice(count),['한']);
- event(capture,'compositionstart');capture.value='한글';const pending=handle.sendKey('enter');event(capture,'compositionend',{data:'글'});await pending;assert.deepEqual(inputs(socket).slice(-2),['글','\r']);console.log('PASS Korean IME commit once and control-key ordering');
+ event(capture,'compositionstart');capture.value='한글';const pending=handle.sendKey('enter');event(capture,'compositionend',{data:'글'});await advance(0);await pending;handle.focus();assert.deepEqual(inputs(socket).slice(-2),['글','\r']);console.log('PASS Korean IME commit once and control-key ordering');
  // iOS 한글 키보드 모델: 조합 이벤트 없이 앞 음절을 지우고(deleteContentBackward) 새 음절을 넣는다. textarea를 비우지 않아야 다음 자모가 앞 글자와 합쳐진다.
  count=inputs(socket).length;handle.sendKey('escape');count++;const type=(value,inputType)=>{const before=event(capture,'beforeinput',{inputType});if(!before.defaultPrevented)capture.value=value;event(capture,'input',{inputType});return before;};
  for(const [value,inputType] of [['ㅎ','insertText'],['','deleteContentBackward'],['하','insertText'],['','deleteContentBackward'],['한','insertText'],['한ㄱ','insertText'],['한','deleteContentBackward'],['한그','insertText'],['한','deleteContentBackward'],['한글','insertText']]){assert.equal(type(value,inputType).defaultPrevented,false);assert.equal(capture.value,value);}
- await flush();assert.deepEqual(inputs(socket).slice(count),['ㅎ','\x7f','하','\x7f','한','ㄱ','\x7f','그','\x7f','글']);
- count=inputs(socket).length;capture.value='한글!';event(capture,'input');capture.value='한글?';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['!','\x7f?']);
+ await flush();assert.deepEqual(inputs(socket).slice(count),['한']);assert.equal(find(root,'terminal-preedit').textContent,'글');
+ count=inputs(socket).length;capture.value='한글!';event(capture,'input');capture.value='한글?';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['글!','\x7f?']);
  count=inputs(socket).length;await handle.sendKey('enter');assert.equal(capture.value,'');assert(type('','deleteContentBackward').defaultPrevented);event(capture,'keydown',{key:'Backspace'});await flush();assert.deepEqual(inputs(socket).slice(count),['\r','\x7f','\x7f']);
- capture.value='a';event(capture,'input');assert.equal(event(capture,'keydown',{key:'Backspace'}).defaultPrevented,false);await flush();count=inputs(socket).length;handle.toggleShift(true);capture.value='ab';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['B']);console.log('PASS iOS-style replace-in-place Hangul keeps textarea context, diff sends DEL+syllable, control keys reset context');
+ capture.value='a';event(capture,'input');assert.equal(event(capture,'keydown',{key:'Backspace'}).defaultPrevented,false);await flush();count=inputs(socket).length;handle.toggleShift(true);capture.value='ab';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['B']);console.log('PASS eventless WebKit Hangul keeps native context, holds tail without DEL repair, controls flush once');
  count=inputs(socket).length;event(capture,'compositionstart');handle.setInputMode('buffered');handle.setInputMode('direct');event(capture,'compositionend',{data:'늦음'});capture.value='늦음';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(capture.value,'');
  handle.focus();event(capture,'compositionstart');handle.unmount();event(capture,'compositionend',{data:'이전'});capture.value='이전';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(root.children.length,0);console.log('PASS generation discard on mode switch / unmount');
  ({root,handle,socket}=await mount());handle.setInputMode('buffered');let command=find(root,'command-input');command.value='echo 한글';event(command,'input');event(find(root,'buffered-command'),'submit');await flush();assert.equal(command.value,'echo 한글');let sent=socket.sent.at(-1),r=T.reader(sent.slice(5)),id=r.n();socket.frame(0x27,T.v(id),T.v(0));await flush();assert.equal(command.value,'');
  command.value='saved draft';event(command,'input');handle.unmount();({root,handle,socket}=await mount());assert.equal(handle.getInputMode(),'buffered');assert.equal(find(root,'command-input').value,'saved draft');const mode=find(root,'direct-toggle');assert.equal(mode.children[0].tagName,'svg');assert.equal(mode.attrs?.['aria-label']??mode.getAttribute?.('aria-label'),'Buffered input');handle.setInputMode('direct');assert.equal(mode.getAttribute('aria-pressed'),'true');console.log('PASS buffered draft retention, opt-out and ACK-only clear');
- let fit=handle.fitToPhone();assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');socket.frame(0x2c,T.v(1));await assert.rejects(fit,/rejected/);assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');fit=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fit;assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'true');fit=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fit;
+ let fit=handle.fitToPhone();assert.equal(find(root,'display-mode').getAttribute('aria-label'),'Fit to Phone');socket.frame(0x2c,T.v(1));await assert.rejects(fit,/rejected/);assert.equal(find(root,'display-mode').getAttribute('aria-label'),'Fit to Phone');fit=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fit;assert.equal(find(root,'display-mode').getAttribute('aria-label'),'Match Desktop');fit=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fit;
  count=socket.sent.filter(a=>a[4]===0x17).length;handle.setFontScale(1.4);assert.equal(socket.sent.filter(a=>a[4]===0x17).length,count);assert.equal(find(root,'terminal-history').style.fontSize,'20px');console.log('PASS Fit ownership ACK, failure rollback and local font sizing');
  handle.loadHistory();sent=socket.sent.at(-1);r=T.reader(sent.slice(5));const req=r.n();assert.equal(r.n(),0);assert.equal(r.n(),0);assert.equal(r.n(),300);const rows=Array.from({length:100},()=>[{ch:'x',zero:'',flags:0}]);const row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));socket.frame(0x26,T.v(req),T.v(100),T.v(2),T.v(0),T.v(100),...Array(100).fill(row));handle.loadHistory();r=T.reader(socket.sent.at(-1).slice(5));r.n();assert.equal(r.n(),1);assert.equal(r.n(),1);let historyReq;for(let page=0;page<9;page++){r=T.reader(socket.sent.at(-1).slice(5));historyReq=r.n();socket.frame(0x26,T.v(historyReq),T.v(10000),T.v(2),T.v(page*100),T.v(100),...Array(100).fill(row));handle.loadHistory();}assert.equal(find(root,'terminal-history').textContent.split('\n').length,1001);assert.equal(find(root,'load-history').disabled,true);const before=socket.sent.length;handle.loadHistory();assert.equal(socket.sent.length,before);console.log('PASS 300-row requests, hot-to-cold history and 1000-row cap');
  ({root,handle,socket}=await mount(46));handle.loadHistory();r=T.reader(socket.sent.at(-1).slice(5));const wreq=r.n();const wc=(ch,zero,flags,fg=T.v(0),bg=T.v(0),ul=T.v(0))=>C.concat(T.text(ch),T.v(zero.length),...zero.map(z=>T.text(z)),fg,bg,ul,T.v(flags));
@@ -186,6 +210,8 @@ async function main(){
  update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(1,'def'),line(2,'ghi'),cursor(1,2));calls.texts=[];let rectBefore=calls.fillRect;assert.deepEqual(await drawn(),{text:3,font:0,draws:1});assert.deepEqual(calls.texts,['abc','def','ghi']);assert.equal(calls.fillRect-rectBefore,25,'24 dirty row clears + cursor only; default #1a1b26 cell backgrounds skip fillRect');calls.texts=null;
  update(line(1,'xy'));assert.deepEqual(await drawn(),{text:1,font:0,draws:1});
  update(cursor(2,0));assert.equal((await drawn()).text,2);
+ // 후행 cursor_explicit 바이트(0x01)와 미래 확장 바이트가 붙은 Update도 해독해야 한다(v0.2.25부터 모바일 터미널이 'Trailing screen data'로 안 뜬 회귀).
+ socket.frame(0x21,T.v(2),T.v(2),T.v(1),T.v(1),line(1,'zz'),Uint8Array.of(1,9));assert.deepEqual(await drawn(),{text:1,font:0,draws:1},'update with optional postfix still draws');
  update(line(0,'a'));update(line(2,'g'));assert.deepEqual(await drawn(),{text:2,font:0,draws:1});
  update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(3,'jk'));assert.equal((await drawn()).text,2);
  handle.setFontScale(1.25);assert.deepEqual(await drawn(),{text:2,font:1,draws:1});assert.equal(canvas.width,Math.round(80*8*16/13));
@@ -198,7 +224,7 @@ async function main(){
  // 터미널 탭·스크롤은 키보드를 열지 않는다. 키 줄의 키보드 버튼만 연다.
  event(port,'pointerdown',{clientX:100,clientY:100});event(port,'pointermove',{clientX:104,clientY:103});event(port,'click');assert.equal(focused,0);
  event(port,'pointerdown',{clientX:100,clientY:100});event(port,'pointermove',{clientX:100,clientY:130});event(port,'click');assert.equal(focused,0);
- event(find(root,'show-keyboard'),'click');assert.equal(focused,1);
+ const keyboard=find(root,'show-keyboard');assert.equal(event(keyboard,'pointerdown').defaultPrevented,true);event(keyboard,'click');assert.equal(focused,1);assert.equal(keyboard.getAttribute('aria-pressed'),'true');let blurred=0;capture2.addEventListener('blur',()=>blurred++);event(keyboard,'click');assert.equal(blurred,1);assert.equal(keyboard.getAttribute('aria-pressed'),'false');assert.equal(keyboard.getAttribute('aria-label'),'Show keyboard');
  port.scrollLeft=50;const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]});
  touch('touchstart',200,400);let te=touch('touchmove',190,330);assert.equal(te.defaultPrevented,false);touch('touchmove',150,200);assert.equal(port.scrollLeft,50);touch('touchend');
  touch('touchstart',200,400);te=touch('touchmove',190,398);assert(te.defaultPrevented);te=touch('touchmove',120,390);assert(te.defaultPrevented);assert.equal(port.scrollLeft,130);touch('touchend');
@@ -250,8 +276,8 @@ async function main(){
  {// 자동 Fit: 크기 요청이 첫 화면을 기다리지 않고 attach와 함께 나가고, 첫 화면 뒤 fitToPhone은 같은 응답을 기다린다(중복 요청 없음).
   const root=new Element('div'),handle=context.mountFixture(root,11,{preferences:{fitToPhone:true}});await flush();const socket=context.sockets.at(-1);find(root,'terminal-scroll').clientHeight=600;socket.handshake();await flush();
   const resizes=()=>socket.sent.filter(a=>a[4]===0x17&&a[5]===1).map(a=>[...a.slice(5)]);assert.equal(JSON.stringify(resizes()),"[[1,48,33]]");
-  socket.screen();await flush();assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');socket.frame(0x2c,T.v(0));await flush();
-  assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'true');assert.equal(resizes().length,1);handle.unmount();console.log('PASS auto-fit resize pipelined with attach, no duplicate after first frame');}
+  socket.screen();await flush();assert.equal(find(root,'display-mode').getAttribute('aria-label'),'Fit to Phone');socket.frame(0x2c,T.v(0));await flush();
+  assert.equal(find(root,'display-mode').getAttribute('aria-label'),'Match Desktop');assert.equal(resizes().length,1);handle.unmount();console.log('PASS auto-fit resize pipelined with attach, no duplicate after first frame');}
  await testHistoryGestures();
  await testHistoryPrefetch();
  await testScrollAnchor();
@@ -436,33 +462,57 @@ async function testLivePreviewAndHeldIme(){
  socket.frame(0x27,T.v(id2),T.v(0));assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'hello'+longText);
  // P1-1: Repeated ready status with identical phase/message skips DOM write and onStatus callback.
  const statusCount=statuses.length;socket.screen('same size');await flush();assert.equal(statuses.length,statusCount);
- // P0-2: Hangul Held IME (300ms hold, committed prefix sent immediately, local Backspace, control key flush).
- socket.autoAck=true;handle.sendKey('escape');await flush();const base=inputs(socket).length;
+ // Native IME owns its entire preedit, including pauses and jamo Backspace.
+ socket.autoAck=true;handle.sendKey('escape');await flush();const base=inputs(socket).length,preedit=find(root,'terminal-preedit');
  event(capture,'compositionstart');
- capture.value='ㅎ';event(capture,'input',{isComposing:true});
- assert.equal(inputs(socket).length,base);assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'ㅎ');
- capture.value='한';event(capture,'input',{isComposing:true});
- assert.equal(inputs(socket).length,base);assert.equal(preview.textContent,'한');
- capture.value='한ㄱ';event(capture,'input',{isComposing:true});
- assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'한ㄱ');
- capture.value='한글';event(capture,'input',{isComposing:true});
- assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(preview.textContent,'한글');
- // Local Backspace on held syllable does not send DEL (\x7f) to server.
- assert(event(capture,'beforeinput',{inputType:'deleteContentBackward'}).defaultPrevented);
- await flush();assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(capture.value,'한');assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'한');
- capture.value='한글';event(capture,'input',{isComposing:true});assert.equal(preview.textContent,'한글');
- assert(event(capture,'keydown',{key:'Backspace'}).defaultPrevented);
- await flush();assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(capture.value,'한');assert.equal(preview.dataset.preview,'true');assert.equal(preview.textContent,'한');
- // 300ms timer flushes held syllable if composition continues without new input.
- capture.value='한글';event(capture,'input',{isComposing:true});
- await advance(299);assert.deepEqual(inputs(socket).slice(base),['한']);
- await advance(1);assert.deepEqual(inputs(socket).slice(base),['한','글']);
- event(capture,'compositionend',{data:'한글'});await flush();assert.deepEqual(inputs(socket).slice(base),['한','글']);
- // Control key / sendKey flushes held syllable before sending the control key.
- event(capture,'compositionstart');capture.value='한글마';event(capture,'input',{isComposing:true});
- assert.deepEqual(inputs(socket).slice(base),['한','글']);assert.equal(preview.textContent,'한글마');
- await handle.sendKey('enter');await flush();
- assert.deepEqual(inputs(socket).slice(base),['한','글','마','\r']);assert.equal(preview.dataset.preview,'false');
+ for(const text of ['ㅎ','하','한','한ㄱ','한글']){capture.value=text;event(capture,'input',{isComposing:true,inputType:'insertCompositionText'});assert.equal(preview.textContent,text);assert.equal(preedit.hidden,false);assert.equal(preedit.textContent,text);}
+ await advance(1500);assert.deepEqual(inputs(socket).slice(base),[],'a pause never commits native IME');
+ assert.equal(event(capture,'beforeinput',{inputType:'deleteContentBackward',isComposing:true}).defaultPrevented,false);
+ assert.equal(event(capture,'keydown',{key:'Backspace',isComposing:true}).defaultPrevented,false);
+ assert.equal(capture.value,'한글','the browser owns deletion');
+ for(const text of ['한그','한ㄱ','한']){capture.value=text;event(capture,'input',{isComposing:true});assert.equal(preedit.textContent,text);}
+ event(capture,'compositionend',{data:'unreliable'});await advance(0);assert.deepEqual(inputs(socket).slice(base),['한']);assert.equal(preedit.hidden,true);
+ // The Enter accepting IME must not insert a newline or submit a command.
+ await handle.sendKey('escape');handle.focus();const accepting=inputs(socket).length;event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'한'});assert.equal(api.updateBusy('1960'),true);assert.equal(event(capture,'keydown',{key:'Enter',keyCode:13}).defaultPrevented,true);assert.equal(event(capture,'beforeinput',{inputType:'insertLineBreak'}).defaultPrevented,true);await advance(0);assert.deepEqual(inputs(socket).slice(accepting),['한']);assert.equal(find(root,'paste-review'),undefined);
+ // Back-to-back commits cannot cancel the previous zero-delay finalization.
+ event(capture,'compositionstart');capture.value='한가';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'가'});
+ event(capture,'compositionstart');capture.value='한가나';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'나'});await advance(0);
+ assert.deepEqual(inputs(socket).slice(accepting),['한','가','나']);
+ // A late DOM edit after compositionend wins over stale event.data.
+ event(capture,'compositionstart');capture.value='한가나ㅎ';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'ㅎ'});capture.value='한가나한';event(capture,'input',{inputType:'insertFromComposition'});await advance(0);
+ assert.deepEqual(inputs(socket).slice(-1),['한']);
+ // Toolbar controls ask the native IME to finish, then send text before Enter.
+ event(capture,'compositionstart');capture.value='한가나한마';event(capture,'input',{isComposing:true});const enter=handle.sendKey('enter');
+ assert.equal(inputs(socket).at(-1),'한');event(capture,'compositionend',{data:'마'});await advance(0);await enter;
+ assert.deepEqual(inputs(socket).slice(-2),['마','\r']);assert.equal(preedit.hidden,true);
+ // Native final input arriving after that explicit control is never replayed.
+ capture.value='한가나한마';event(capture,'input',{inputType:'insertFromComposition'});await flush();assert.equal(inputs(socket).at(-1),'\r');assert.equal(capture.value,'');
+ handle.focus();const fallback=inputs(socket).length;
+ for(const value of ['ㅎ','하','한']){capture.value=value;event(capture,'input',{inputType:'insertText'});}
+ await advance(1500);assert.equal(inputs(socket).length,fallback);assert.equal(preedit.textContent,'한');
+ // Resyllabification and compound final consonants only send stable prefixes.
+ for(const value of ['하나','하나 ','하나 값','하나 갑사']){capture.value=value;event(capture,'input',{inputType:'insertText'});}
+ assert.deepEqual(inputs(socket).slice(fallback),['하','나 ','갑']);assert.equal(preedit.textContent,'사');
+ await handle.sendKey('enter');assert.deepEqual(inputs(socket).slice(-2),['사','\r']);
+ // A ten-key vowel dot can resegment the preceding final consonant too.
+ handle.focus();const dots=inputs(socket).length;for(const value of ['감','감ㆍ','가머','가머 ']){capture.value=value;event(capture,'input');}assert.deepEqual(inputs(socket).slice(dots),['가','머 ']);await handle.sendKey('enter');
+ // Decomposed jamo are held together, never split by Unicode codepoint.
+ handle.focus();const decomposed=inputs(socket).length;capture.value='한';event(capture,'input');await advance(1500);assert.equal(inputs(socket).length,decomposed);assert.equal(preedit.textContent,'한');
+ capture.value+=' ';event(capture,'input');await flush();assert.equal(inputs(socket).at(-1),'한 ');
+ // Cancellation and switching panes discard local preedit without sending it.
+ await handle.sendKey('escape');handle.focus();const cancelled=inputs(socket).length;event(capture,'compositionstart');capture.value='취소';event(capture,'input',{isComposing:true});capture.value='';event(capture,'compositionend',{data:''});await advance(0);assert.equal(inputs(socket).length,cancelled);assert.equal(preedit.hidden,true);
+ // Quick insertion/paste waits for native preedit instead of clearing it.
+ await handle.sendKey('escape');handle.focus();const quick=inputs(socket).length;event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});assert.equal(handle.insertText('/help'),true);assert.equal(capture.value,'한');assert.equal(inputs(socket).length,quick);event(capture,'compositionend',{data:'한'});await advance(0);assert.deepEqual(inputs(socket).slice(quick),['한','/help']);capture.value='한';event(capture,'input',{inputType:'insertFromComposition'});assert.deepEqual(inputs(socket).slice(quick),['한','/help']);handle.focus();
+ // Native final events may fire synchronously from blur while switching panes.
+ await handle.sendKey('escape');handle.focus();event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});const blur=capture.blur.bind(capture);capture.blur=()=>{blur();event(capture,'compositionend',{data:'한'});event(capture,'input',{inputType:'insertFromComposition'});};const switching=inputs(socket).length;handle.setInputActive(false);assert.equal(find(root,'command-input').value,'한');assert.equal(inputs(socket).length,switching);assert.doesNotMatch(find(root,'terminal-status').textContent,/Resume terminal input/);capture.blur=blur;handle.setInputActive(true);handle.setInputMode('direct');handle.focus();find(root,'command-input').value='';event(find(root,'command-input'),'input');
+ // End-pending quick insertion must not synchronously refocus and replay a late commit.
+ await handle.sendKey('escape');handle.focus();const endingQuick=inputs(socket).length;event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'한'});handle.insertText('/help');capture.value='한';event(capture,'input',{inputType:'insertFromComposition'});await handle.sendKey('enter');assert.deepEqual(inputs(socket).slice(endingQuick),['한','/help','\r']);
+ // An explicit key during end-finalization also blurs before disarming.
+ await handle.sendKey('escape');handle.focus();event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});event(capture,'compositionend',{data:'한'});let endingBlurred=false;const originalBlur=capture.blur.bind(capture);capture.blur=()=>{endingBlurred=true;originalBlur();};await handle.sendKey('tab');assert.equal(endingBlurred,true);capture.blur=originalBlur;handle.focus();const afterEnding=inputs(socket).length;capture.value='x';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(afterEnding),['x']);
+ // A missing native end cannot leave composition stuck after focusing again.
+ await handle.sendKey('escape');handle.focus();event(capture,'compositionstart');capture.value='한';event(capture,'input',{isComposing:true});const interrupted=handle.sendKey('tab'),rejected=assert.rejects(interrupted,/Input target changed/);handle.focus();await rejected;const resumed=inputs(socket).length;capture.value='x';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(resumed),['x']);await handle.sendKey('escape');handle.focus();
+ // Switching the active pane preserves eventless preedit as an unsent draft.
+ capture.value='남겨';event(capture,'input');handle.setInputActive(false);assert.equal(find(root,'command-input').value,'겨');assert.equal(preedit.hidden,true);handle.setInputActive(true);assert.equal(handle.getInputMode(),'direct','temporary draft recovery never changes the chosen input mode');handle.setInputMode('direct');handle.focus();
  // invalidateInput() clears the reserved preview immediately.
  handle.focus();event(capture,'compositionstart');capture.value='가';event(capture,'input',{isComposing:true});
  assert.equal(preview.dataset.preview,'true');handle.setInputMode('buffered');assert.equal(preview.dataset.preview,'false');assert.equal(preview.textContent,'Tap to show keyboard');
@@ -486,7 +536,7 @@ async function testLivePreviewAndHeldIme(){
  event(p3,'touchmove',{touches:[{clientX:50,clientY:100},{clientX:250,clientY:300}]});
  event(p3,'touchend',{touches:[]});
  assert.equal(p3.scrollLeft,350);assert.equal(p3.scrollTop,600);h3.unmount();
- console.log('PASS Direct live-preview, Hangul held IME + local Backspace, unready contextBlocked guard, canvas style runs, pinch midpoint');
+ console.log('PASS native/eventless Hangul: pause, jamo deletion, boundaries, resyllabification, final DOM, controls/no replay, cancellation, preedit; unready contextBlocked guard, canvas style runs, pinch midpoint');
 }
 async function testTextLayer(){
  // 캔버스 위 투명 글자 층: 셀 폭 정렬, 바뀐 행 반영, 선택 중에는 고정했다가 선택이 풀리면 반영.
@@ -562,7 +612,7 @@ async function testHistoryGestures(){
 }
 async function testPasteButton(){
  let clip='one\r\ntwo';context.navigator={clipboard:{readText:async()=>{if(clip instanceof Error)throw clip;return clip;}}};
- let {root,handle,socket}=await mount(704,{preferences:{inputMode:'direct'}});socket.autoAck=true;const paste=find(root,'paste-key');assert.equal(paste.parent,find(root,'accessory-row'),'paste stays outside the scrolling keys');assert.equal(paste.dataset.testid,'terminal-paste');assert.equal(event(paste,'pointerdown').defaultPrevented,true);
+ let {root,handle,socket}=await mount(704,{preferences:{inputMode:'direct'}});socket.autoAck=true;const paste=find(root,'paste-key');assert.equal(paste.parent,find(root,'keybar'),'paste scrolls with the terminal key list');assert.equal(paste.getAttribute('aria-label'),'Paste');assert.equal(event(paste,'pointerdown').defaultPrevented,true);
  socket.frame(0x2b,Uint8Array.of(0),T.v(32));event(paste,'click');await flush();assert.deepEqual(inputs(socket),['\x1b[200~one\ntwo\x1b[201~']);
  socket.frame(0x2b,Uint8Array.of(0),T.v(0));clip='ls -la';event(paste,'click');await flush();assert.equal(inputs(socket).at(-1),'ls -la');
  // 권한 거부·API 없음(비보안 연결)은 빈 확인 칸을 열어 길게 눌러 붙여넣게 한다. 빈 칸 전송은 아무것도 보내지 않는다.
@@ -576,7 +626,7 @@ async function testFailurePaths(){
  let {root,handle,socket}=await mount(701,{preferences:{inputMode:'direct'},onPhoto:()=>{}});socket.autoAck=true;handle.focus();let capture=find(root,'live-capture');
  const hello=socket.sent.find(a=>a[4]===2),hr=T.reader(hello.slice(5));hr.n();hr.n();assert(hr.u()&8192n);
  const photo=find(root,'photo-attach'),accessory=find(root,'accessory-row'),inputRow=find(root,'input-row');assert.equal(photo.parent,accessory,'Direct mode shares one toolbar for keyboard, keys and photos');assert.equal(accessory.hidden,undefined);assert.equal(inputRow.hidden,true);assert.equal(find(root,'show-keyboard').parent,accessory);assert.equal(capture.parent,accessory,'Direct capture stays focusable outside the hidden input row');assert.equal(find(root,'show-keyboard').hidden,false);assert.equal(find(root,'buffered-command').hidden,true);let picked=0;find(root,'photo-picker').click=()=>picked++;event(photo,'click');assert.equal(picked,1,'Direct photo action opens its existing image picker without sending input');assert.equal(inputs(socket).length,0);assert.equal(find(root,'photo-picker').accept,'image/*');assert.equal(find(root,'file-picker').accept,'image/*');
- assert.equal(find(root,'photo-attach').parent,find(root,'accessory-row'));assert.equal(!find(root,'accessory-row').hidden,true);handle.setInputMode('buffered');assert.equal(find(root,'photo-attach').parent,find(root,'buffered-command'));assert.equal(find(root,'buffered-command').hidden,false);assert.equal(find(root,'show-keyboard').hidden,true);handle.setInputMode('direct');assert.equal(find(root,'photo-attach').parent,find(root,'accessory-row'));assert.equal(find(root,'show-keyboard').hidden,false);handle.focus();
+ assert.equal(find(root,'photo-attach').parent,find(root,'accessory-row'));assert.equal(!find(root,'accessory-row').hidden,true);handle.setInputMode('buffered');assert.equal(find(root,'photo-attach').parent,find(root,'buffered-command'));assert.equal(find(root,'buffered-command').hidden,false);assert.equal(find(root,'show-keyboard').hidden,false);handle.setInputMode('direct');assert.equal(find(root,'photo-attach').parent,find(root,'accessory-row'));assert.equal(find(root,'show-keyboard').hidden,false);handle.focus();
  socket.frame(0x2b,Uint8Array.of(0),T.v(32));event(capture,'paste',{clipboardData:{getData:()=>'one\r\ntwo\x1b[201~'}});await flush();assert.deepEqual(inputs(socket),['\x1b[200~one\ntwo[201~\x1b[201~']);
  capture.value='fallback\npaste';event(capture,'input',{inputType:'insertFromPaste'});await flush();assert.equal(inputs(socket).at(-1),'\x1b[200~fallback\npaste\x1b[201~');
  socket.frame(0x2b,Uint8Array.of(0),T.v(0));capture.value='review\nsecond';event(capture,'input',{inputType:'insertFromPaste'});await flush();const review=root.children.at(-1).children.at(-1),editor=review.children[0].children[0];assert.equal(editor.tagName,'textarea');assert.equal(editor.value,'review\nsecond');const before=inputs(socket).length;assert.equal(before,2);

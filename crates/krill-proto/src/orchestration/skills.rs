@@ -127,6 +127,9 @@ pub struct SkillSyncReport {
     pub updated: usize,
     pub unchanged: usize,
     pub failures: Vec<String>,
+    /// Roots another installer (app, daemon, or CLI) was writing; it publishes the same bundle,
+    /// and every later launch or session start retries, so this is expected, not a failure.
+    pub busy: Vec<PathBuf>,
 }
 
 /// Best-effort synchronization: one foreign or unwritable root does not block other agents.
@@ -143,13 +146,14 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
                         report.unchanged = report.unchanged.saturating_add(1);
                     }
                 }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    report.busy.push(dir.clone());
+                    break;
+                }
                 Err(error) => {
                     report
                         .failures
                         .push(format!("{} ({}): {error}", skill.name, dir.display()));
-                    if error.kind() == io::ErrorKind::WouldBlock {
-                        break;
-                    }
                 }
             }
         }

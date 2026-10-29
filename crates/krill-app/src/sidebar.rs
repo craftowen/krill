@@ -40,6 +40,7 @@ pub mod options;
 mod path_identity;
 mod pr;
 mod profiles;
+mod session_order;
 mod startup;
 mod view;
 mod viewport;
@@ -157,6 +158,8 @@ pub struct Snapshot {
 /// Worktree -> 브랜치·미커밋 수.
 pub type Meta = BTreeMap<PathBuf, Tree>;
 
+pub type PromptHistories = BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>;
+
 /// IPC boundary: gpui tests supply snapshots without waiting for external IO.
 /// [`Source::poll_snapshot`]의 결과를 기다리는 future.
 pub type PollSnapshot =
@@ -170,6 +173,10 @@ pub trait Source: Send + Sync {
     }
     fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
         self.fetch().map(Arc::new)
+    }
+    /// 마지막으로 읽은 호스트 스냅샷의 프롬프트 기록.
+    fn prompt_histories(&self) -> PromptHistories {
+        PromptHistories::new()
     }
     /// 워크트리 행의 git 정보. 모르면 비워 둔다(UI가 숨긴다).
     fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
@@ -192,6 +199,10 @@ pub trait Source: Send + Sync {
     }
     /// OWE-730 `Request::RemoveWorktree` 한 번. 삭제가 끝난 뒤에 답한다.
     fn remove_worktree(&self, _req: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// 저장소가 있는 호스트의 실제 브랜치·태그. 미지원 데몬은 `Unsupported`.
+    fn worktree_refs(&self, _repo: &Path) -> io::Result<Vec<String>> {
         Err(io::ErrorKind::Unsupported.into())
     }
     /// MK-095: only the open creation dialog owns this speculative preparation token.
@@ -880,6 +891,8 @@ pub struct Sidebar {
     /// 사용자가 끌어다 놓아 정한 프로젝트(저장소·폴더) 순서(`sidebar.bin` 5번째 구간).
     project_order: Vec<PathBuf>,
     worktree_order: Vec<PathBuf>,
+    /// Runtime projection of Layout order; Layout remains the persisted source.
+    session_order: BTreeMap<HostId, BTreeMap<SessionId, usize>>,
     row_hosts: Vec<HostId>,
     action_host: Option<HostId>,
     prs: BTreeMap<PathBuf, crate::pull_request::Status>,
@@ -966,6 +979,7 @@ pub struct Sidebar {
     auto_titles: BTreeMap<SessionId, String>,
     /// 세션별 최근 프롬프트 턴 히스토리(`session-prompts.json`).
     prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
+    remote_prompt_histories: BTreeMap<String, PromptHistories>,
     /// 활성 Claude 프롬프트 캐시 카운트다운의 마지막 1초 틱(`now_ns / 1e9`, OWE-737).
     last_cache_tick_sec: Option<u64>,
     last_activity_minute: Option<u64>,
@@ -1270,6 +1284,7 @@ impl Sidebar {
             collapsed_hosts: ui.collapsed_hosts,
             project_order: Vec::new(),
             worktree_order: Vec::new(),
+            session_order: BTreeMap::new(),
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -1334,6 +1349,7 @@ impl Sidebar {
             titles: BTreeMap::new(),
             auto_titles: BTreeMap::new(),
             prompt_histories: BTreeMap::new(),
+            remote_prompt_histories: BTreeMap::new(),
             last_cache_tick_sec: None,
             last_activity_minute: None,
             now_override_ns: None,
@@ -1979,10 +1995,11 @@ impl Sidebar {
                     let bg = bg.clone();
                     let this = this.clone();
                     tasks.push(cx.spawn(async move |cx| {
-                        let (id, source, res) = bg
+                        let (id, source, res, histories) = bg
                             .spawn(async move {
                                 let res = source.poll_snapshot().await;
-                                (id, source, res)
+                                let histories = source.prompt_histories();
+                                (id, source, res, histories)
                             })
                             .await;
                         this.update(cx, |s, cx| {
@@ -2018,10 +2035,12 @@ impl Sidebar {
                                 if entry.status != HostStatus::Connected
                                     || entry.snapshot != snap
                                     || entry.meta != meta
+                                    || s.remote_prompt_histories.get(&id) != Some(&histories)
                                 {
                                     entry.status = HostStatus::Connected;
                                     entry.snapshot = snap;
                                     entry.meta = meta;
+                                    s.remote_prompt_histories.insert(id.clone(), histories);
                                     changed = true;
                                 }
                                 let repo_keys: Vec<PathBuf> =
@@ -2851,7 +2870,7 @@ impl Sidebar {
         if !self.host_connected(host) {
             return Vec::new();
         }
-        self.snapshot_for(host)
+        self.ordered_snapshot(host, self.snapshot_for(host))
             .sessions
             .iter()
             .filter(|s| {
@@ -3576,6 +3595,12 @@ impl Sidebar {
     pub fn scroll_to_row(&mut self, index: usize, cx: &mut Context<Self>) {
         self.scroll_row_into_view(index, ScrollStrategy::Top);
         cx.notify();
+    }
+
+    /// Keep the list stationary while the shell opens a selection made in this sidebar.
+    #[must_use]
+    pub fn preserve_scroll(&self) -> impl Drop + use<> {
+        self.card_list.preserve_scroll()
     }
 
     /// 셸 단축키로 사이드바에 들어온다. Enter로 세션을 열거나 Esc를 누르면 `back`으로 돌아간다.
@@ -4710,7 +4735,20 @@ impl Sidebar {
             .or(auto_title)
             .or(live_title.as_deref())
             .or(session.status.title.as_deref());
-        session_label(session, title)
+        let (mut name, detail) = session_label(session, title);
+        // Derive provenance from dispatch metadata so OSC/custom title changes and
+        // already-settled workers keep the marker. Session IDs are host-local.
+        if local
+            && self.disk.orchestration.dispatches.iter().any(|dispatch| {
+                dispatch.session_id == Some(session.id.0)
+                    && dispatch.session_origin
+                        == krill_proto::orchestration::DispatchSessionOrigin::Created
+            })
+            && !name.starts_with("[orchestration]")
+        {
+            name = format!("[orchestration] {name}");
+        }
+        (name, detail)
     }
 
     /// 로컬 세션의 최근 프롬프트 턴 히스토리를 돌려준다.
@@ -4722,16 +4760,22 @@ impl Sidebar {
         self.prompt_histories.get(&id)
     }
 
-    /// 호스트 구분을 포함해 세션의 최근 프롬프트 턴 히스토리를 돌려준다(현재는 로컬 호스트 지원).
+    /// 호스트 구분을 포함해 세션의 최근 프롬프트 턴 히스토리를 돌려준다.
     #[must_use]
     pub fn session_prompt_history_on(
         &self,
         host: &HostId,
         id: SessionId,
     ) -> Option<&krill_proto::git::SessionPromptHistory> {
-        host.is_local()
-            .then(|| self.prompt_histories.get(&id))
-            .flatten()
+        match host {
+            HostId::Local => self.prompt_histories.get(&id),
+            HostId::Remote(host) => self
+                .remote_hosts
+                .iter()
+                .any(|remote| remote.id == *host)
+                .then(|| self.remote_prompt_histories.get(host)?.get(&id))
+                .flatten(),
+        }
     }
 
     /// 하이브리드 채팅 등 앱 내부에서 프롬프트를 전송했을 때 즉시 메모리·디스크 히스토리에 반영한다.

@@ -114,6 +114,7 @@ fn fixtures_v1() {
                         foreground: None,
                         title: None,
                         subagents: Vec::new(),
+                        root_shell: None,
                     },
                 },
             ])),
@@ -369,6 +370,7 @@ fn sidebar_fixtures_and_shared_badge() {
             sessions: vec![],
             repositories: vec![],
             branches: vec![],
+            prompt_histories: Vec::new(),
         })),
         "04000000310e0000"
     );
@@ -383,6 +385,7 @@ fn sidebar_fixtures_and_shared_badge() {
                 worktrees: vec![b"/a".to_vec()]
             }],
             branches: vec![],
+            prompt_histories: Vec::new(),
         })),
         "0f000000310e0101022f6101022f6101022f61"
     );
@@ -393,6 +396,7 @@ fn sidebar_fixtures_and_shared_badge() {
             worktrees: vec![b"/a".to_vec()],
         }],
         branches: vec![(b"/a".to_vec(), "main".into())],
+        prompt_histories: Vec::new(),
     });
     let _ = roundtrip(&with_branches);
     let mut status = AgentStatus::UNKNOWN;
@@ -414,16 +418,19 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(vec![b'x'; 4097], "main".into())],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(b"/a".to_vec(), "x".repeat(MAX_TITLE_TEXT + 1))],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(b"/a".to_vec(), "main".into()); 513],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![SessionDirectory {
@@ -432,6 +439,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             }],
             repositories: vec![],
             branches: vec![],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![
@@ -443,6 +451,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             ],
             repositories: vec![],
             branches: vec![],
+            prompt_histories: Vec::new(),
         },
         SidebarData {
             sessions: vec![],
@@ -451,6 +460,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
                 worktrees: vec![vec![]; 513],
             }],
             branches: vec![],
+            prompt_histories: Vec::new(),
         },
     ];
     for data in cases {
@@ -1060,6 +1070,7 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
                 foreground: None,
                 title: None,
                 subagents: Vec::new(),
+                root_shell: None,
             },
         },
     ];
@@ -1235,4 +1246,234 @@ fn capture_since_is_appended_and_distinguishes_empty_from_unchanged() {
     };
     let encoded = postcard::to_stdvec(&too_large).unwrap();
     assert!(postcard::from_bytes::<Reply>(&encoded).is_err());
+}
+
+#[test]
+fn states_root_shell_tail_is_bounded_and_preserves_old_frames() {
+    let base = Reply::States(vec![SessionStatus {
+        session: SessionId(1),
+        status: AgentStatus::UNKNOWN,
+    }]);
+    let old = base.encode().unwrap();
+    let old_body = &old[5..];
+    assert_eq!(Reply::decode(kind::REPLY, old_body).unwrap(), base);
+    let Reply::States(mut rows) = base.clone() else {
+        unreachable!()
+    };
+    rows[0].status.root_shell = Some(Box::new(RootShell {
+        os: ShellOs::Windows,
+        program: "powershell".into(),
+    }));
+    let reply = Reply::States(rows.clone());
+    let frame = reply.encode().unwrap();
+    assert_eq!(Reply::decode(kind::REPLY, &frame[5..]).unwrap(), reply);
+    // The N-1 decoder consumes foreground/title/subagent extensions, then ignores
+    // the root shell extension. Its base postcard representation stays identical.
+    let (old_reply, mut tail) = postcard::take_from_bytes::<Reply>(&frame[5..]).unwrap();
+    assert_eq!(old_reply, base);
+    for _ in 0..2 {
+        tail = postcard::take_from_bytes::<Option<String>>(tail).unwrap().1;
+    }
+    tail = postcard::take_from_bytes::<Vec<Subagent>>(tail).unwrap().1;
+    assert_eq!(
+        postcard::from_bytes::<Option<Box<RootShell>>>(tail).unwrap(),
+        rows[0].status.root_shell
+    );
+    for invalid in [String::new(), "a".repeat(257), "pwsh\ncmd".into()] {
+        rows[0].status.root_shell.as_mut().unwrap().program = invalid;
+        let frame = Reply::States(rows.clone()).encode().unwrap();
+        assert_eq!(Reply::decode(kind::REPLY, &frame[5..]).unwrap(), base);
+        // Still reject invalid metadata arriving from an unvalidated peer.
+        let mut body = postcard::to_stdvec(&base).unwrap();
+        body.extend(postcard::to_stdvec(&Option::<String>::None).unwrap());
+        body.extend(postcard::to_stdvec(&Option::<String>::None).unwrap());
+        body.extend(postcard::to_stdvec(&Vec::<Subagent>::new()).unwrap());
+        body.extend(postcard::to_stdvec(&rows[0].status.root_shell).unwrap());
+        assert!(Reply::decode(kind::REPLY, &body).is_err());
+    }
+}
+
+#[test]
+fn invalid_observed_root_metadata_does_not_poison_other_rows_or_status() {
+    let valid = [
+        "a".repeat(256),
+        "한".repeat(85),
+        "🦀".repeat(64),
+        "sh name'quoted".into(),
+    ];
+    let invalid = [
+        String::new(),
+        "a".repeat(257),
+        "한".repeat(86),
+        "🦀".repeat(65),
+        "sh\ncmd".into(),
+        "sh\rcmd".into(),
+        "sh\0cmd".into(),
+        "sh\u{85}cmd".into(),
+    ];
+    for name in valid.iter().chain(&invalid) {
+        let accepted = valid.contains(name);
+        assert_eq!(
+            RootShell::new(ShellOs::Unix, name.clone()).is_some(),
+            accepted
+        );
+        let mut rows = vec![
+            SessionStatus {
+                session: SessionId(1),
+                status: AgentStatus::UNKNOWN,
+            },
+            SessionStatus {
+                session: SessionId(2),
+                status: AgentStatus::UNKNOWN,
+            },
+        ];
+        rows[0].status.root_shell = RootShell::new(ShellOs::Windows, "pwsh".into()).map(Box::new);
+        rows[1].status.agent = "claude".into();
+        rows[1].status.title = Some("working".into());
+        // Public struct literals are possible: the encoder also omits only invalid metadata.
+        rows[1].status.root_shell = Some(Box::new(RootShell {
+            os: ShellOs::Unix,
+            program: name.clone(),
+        }));
+        let frame = Reply::States(rows.clone()).encode().unwrap();
+        if !accepted {
+            rows[1].status.root_shell = None;
+        }
+        assert_eq!(
+            Reply::decode(kind::REPLY, &frame[5..]).unwrap(),
+            Reply::States(rows.clone())
+        );
+        let (Reply::States(old_rows), _) = postcard::take_from_bytes::<Reply>(&frame[5..]).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(old_rows.len(), 2);
+        assert_eq!(old_rows[1].status.agent, "claude");
+        assert!(old_rows.iter().all(|row| row.status.root_shell.is_none()));
+    }
+}
+
+#[test]
+fn sidebar_prompt_tail_roundtrip_and_legacy_compatibility() {
+    use crate::git::{SessionPromptHistory, SessionPromptTurn};
+    let history = SessionPromptHistory {
+        total_turns: 1,
+        turns: vec![SessionPromptTurn {
+            text: "hi".into(),
+            unix_ns: 1,
+            turn: 1,
+        }],
+    };
+    let reply = Reply::Sidebar(SidebarData {
+        prompt_histories: vec![(SessionId(7), history)],
+        ..SidebarData::default()
+    });
+    assert_eq!(roundtrip(&reply), "0e000000310e000000010701010268690101");
+    let bytes = reply.encode().unwrap();
+    let (_, body) = read_frame(&mut &bytes[..]).unwrap().unwrap();
+    // N-1 decoder consumes the original sidebar and optional branches, ignoring newer tails.
+    let (Reply::Sidebar(legacy), rest) = postcard::take_from_bytes::<Reply>(&body).unwrap() else {
+        panic!("expected sidebar");
+    };
+    assert!(legacy.prompt_histories.is_empty());
+    let (Branches(branches), _) = postcard::take_from_bytes::<Branches>(rest).unwrap();
+    assert!(branches.is_empty());
+    let Reply::Sidebar(old) = Reply::decode(kind::REPLY, &[14, 0, 0]).unwrap() else {
+        panic!("expected legacy sidebar");
+    };
+    assert!(old.prompt_histories.is_empty());
+}
+
+#[test]
+fn sidebar_prompt_tail_rejects_unbounded_peer_data() {
+    use crate::git::{SessionPromptHistory, SessionPromptTurn};
+    let turn = SessionPromptTurn {
+        text: "hello".into(),
+        unix_ns: 1,
+        turn: 1,
+    };
+    for histories in [
+        vec![(SessionId(1), SessionPromptHistory::default()); MAX_SESSIONS + 1],
+        vec![(
+            SessionId(1),
+            SessionPromptHistory {
+                total_turns: 6,
+                turns: vec![turn.clone(); crate::git::MAX_PROMPT_HISTORY_TURNS + 1],
+            },
+        )],
+        vec![(
+            SessionId(1),
+            SessionPromptHistory {
+                total_turns: 1,
+                turns: vec![SessionPromptTurn {
+                    text: "x".repeat(crate::git::MAX_PROMPT_DISPLAY_CHARS + 2),
+                    ..turn.clone()
+                }],
+            },
+        )],
+    ] {
+        let bytes = Reply::Sidebar(SidebarData {
+            prompt_histories: histories,
+            ..SidebarData::default()
+        })
+        .encode()
+        .unwrap();
+        let (kind, body) = read_frame(&mut &bytes[..]).unwrap().unwrap();
+        assert!(Reply::decode(kind, &body).is_err());
+    }
+}
+
+#[test]
+fn worktree_refs_roundtrip_append_only_fixtures() {
+    assert_ne!(crate::ipc::FEATURES & FEAT_WORKTREE_REFS, 0);
+    assert_eq!(
+        roundtrip(&Request::WorktreeRefs {
+            repo: b"/r".to_vec()
+        }),
+        "05000000301c022f72"
+    );
+    assert_eq!(
+        roundtrip(&Reply::WorktreeRefs(vec!["main".into()])),
+        "08000000312001046d61696e"
+    );
+    assert_eq!(roundtrip(&Reply::WorktreeRefs(vec![])), "03000000312000");
+    // N-1 opcodes and payloads remain unchanged in both directions.
+    assert_eq!(roundtrip(&Request::List), "020000003001");
+    assert_eq!(roundtrip(&Reply::Closed), "020000003102");
+    assert_eq!(
+        Reply::decode(kind::REPLY, &[3, 5]).unwrap(),
+        Reply::Failed(Failure::BadRequest)
+    );
+}
+
+#[test]
+fn worktree_refs_decode_rejects_oversized_and_invalid_payloads() {
+    for refs in [
+        vec!["main".to_owned(); MAX_WORKTREE_REFS + 1],
+        vec!["x".repeat(MAX_WORKTREE_REF_BYTES + 1)],
+        vec![String::new()],
+        vec!["bad name".to_owned()],
+        vec!["bad\nname".to_owned()],
+    ] {
+        let bytes = postcard::to_stdvec(&Reply::WorktreeRefs(refs)).unwrap();
+        assert!(Reply::decode(kind::REPLY, &bytes).is_err());
+    }
+    let bytes = postcard::to_stdvec(&Request::WorktreeRefs {
+        repo: vec![b'x'; 4097],
+    })
+    .unwrap();
+    assert!(Request::decode(kind::REQUEST, &bytes).is_err());
+    roundtrip(&Reply::WorktreeRefs(vec![
+        "x".repeat(MAX_WORKTREE_REF_BYTES);
+        MAX_WORKTREE_REFS
+    ]));
+}
+
+proptest::proptest! {
+    #[test]
+    fn worktree_refs_decoder_does_not_panic(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+        let mut body = vec![32];
+        body.extend(bytes);
+        Reply::decode(kind::REPLY, &body).ok();
+    }
 }

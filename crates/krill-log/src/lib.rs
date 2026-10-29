@@ -9,7 +9,7 @@ mod writer;
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use writer::{FILE_BYTES, RollingLog};
 
@@ -41,12 +41,13 @@ impl Component {
     }
 }
 
-/// Explicit override isolates tests (nextest runs fall back to a temp directory);
-/// production uses `LocalAppData` on Windows and the Console.app-visible directory
-/// on macOS (XDG state on Linux).
+/// Explicit override isolates tests (test processes fall back to a temp directory, see
+/// [`is_test_process`]); production uses `LocalAppData` on Windows and the Console.app-visible
+/// directory on macOS (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
     directory_in(
         |key| std::env::var_os(key),
+        is_test_process(),
         || {
             #[cfg(windows)]
             {
@@ -63,13 +64,13 @@ pub fn directory() -> Option<PathBuf> {
 /// [`directory`]의 본체. 환경변수를 직접 만지지 않아 병렬 테스트에 안전하다.
 fn directory_in(
     get: impl Fn(&str) -> Option<OsString>,
+    test_process: bool,
     home: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(dir) = get("KRILL_LOG_DIR") {
         return Some(PathBuf::from(dir));
     }
-    // nextest가 띄운 테스트와 그 자식(holder·krilld·앱)은 운영 로그를 더럽히지 않는다(`NEXTEST`는 nextest가 늘 1로 둔다).
-    if get("NEXTEST").is_some() {
+    if test_process {
         return Some(std::env::temp_dir().join("krill-test-logs"));
     }
     #[cfg(windows)]
@@ -87,6 +88,35 @@ fn directory_in(
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     base.map(|h| h.join("Library/Logs/Krill"))
+}
+
+/// 테스트 하네스가 띄운 프로세스(와 그 자식)인가. 테스트에만 있는 표식만 본다 — 일반 `cargo run`·설치본·
+/// 사용자가 고른 `KRILL_STATE_DIR`은 해당하지 않는다.
+/// - `NEXTEST`: nextest가 늘 1로 둔다.
+/// - `CARGO_BIN_EXE_<이름>`: `cargo test`가 통합 테스트 프로세스에 런타임으로도 둔다(`cargo run`에는 없다).
+/// - 실행 파일이 `target/<프로필>/deps/<이름>-<해시>`: libtest 바이너리 자신(직접 실행 포함).
+///
+/// 앞의 둘은 환경이라 holder → krilld 재기동·exec 핸드오프까지 그대로 이어진다. 테스트 바이너리를 직접 실행하는
+/// 게이트(`packaging/release_check.py`)의 자식은 테스트가 `KRILL_LOG_DIR`을 넘긴다.
+/// `krill_proto::error_reporting`에 같은 판정이 있다(krill-proto는 이 크레이트에 의존하지 않는다).
+#[must_use]
+pub fn is_test_process() -> bool {
+    is_test_process_in(
+        std::env::vars_os().map(|(key, _)| key),
+        std::env::current_exe().ok().as_deref(),
+    )
+}
+
+fn is_test_process_in(keys: impl IntoIterator<Item = OsString>, exe: Option<&Path>) -> bool {
+    keys.into_iter().any(|key| {
+        key == "NEXTEST"
+            || key
+                .to_str()
+                .is_some_and(|key| key.starts_with("CARGO_BIN_EXE_"))
+    }) || exe
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|dir| dir == "deps")
 }
 
 /// Install INFO/WARN/ERROR events from Krill targets. No spans are retained.
@@ -110,34 +140,53 @@ mod tests {
     #[test]
     fn directory_prefers_override() {
         let override_dir = |k: &str| Some(OsString::from(format!("/{k}")));
-        assert_eq!(
-            directory_in(override_dir, || None),
-            Some(PathBuf::from("/KRILL_LOG_DIR"))
-        );
-        assert_eq!(directory_in(|_| None, || None), None);
+        for test in [false, true] {
+            assert_eq!(
+                directory_in(override_dir, test, || None),
+                Some(PathBuf::from("/KRILL_LOG_DIR"))
+            );
+        }
+        assert_eq!(directory_in(|_| None, false, || None), None);
     }
 
     #[test]
-    fn nextest_runs_never_use_the_production_directory() {
-        let nextest = |k: &str| (k == "NEXTEST").then(|| OsString::from("1"));
-        let home = PathBuf::from("/h");
+    fn test_processes_never_use_the_production_directory() {
+        let temp = std::env::temp_dir().join("krill-test-logs");
         assert_eq!(
-            directory_in(nextest, || Some(home.clone())),
-            Some(std::env::temp_dir().join("krill-test-logs"))
+            directory_in(|_| None, true, || Some(PathBuf::from("/h"))),
+            Some(temp.clone())
         );
-        let both = |k: &str| match k {
-            "NEXTEST" => Some(OsString::from("1")),
-            "KRILL_LOG_DIR" => Some(OsString::from("/x")),
-            _ => None,
-        };
-        assert_eq!(directory_in(both, || None), Some(PathBuf::from("/x")));
-        // 실제 테스트 프로세스(이 테스트도 nextest 아래에서 돈다)가 운영 경로를 고르지 않는다.
-        if std::env::var_os("NEXTEST").is_some() && std::env::var_os("KRILL_LOG_DIR").is_none() {
-            assert_eq!(
-                directory(),
-                Some(std::env::temp_dir().join("krill-test-logs"))
-            );
+        // 실제 테스트 프로세스(nextest든 `cargo test`든)가 운영 경로를 고르지 않는다.
+        if std::env::var_os("KRILL_LOG_DIR").is_none() {
+            assert_eq!(directory(), Some(temp));
         }
+    }
+
+    /// 2026-10-28 사건: `cargo test -p krilld --test upgrade`(nextest 아님)가 띄운 holder·krilld가 운영 로그에 썼다.
+    /// 일반 `cargo run`(`CARGO_MANIFEST_DIR`만 있음)과 임시 폴더의 사용자 상태 폴더는 테스트가 아니다.
+    #[test]
+    fn only_test_harness_markers_mark_a_test_process() {
+        let keys = |names: &[&str]| names.iter().map(OsString::from).collect::<Vec<_>>();
+        let dev = Path::new("/w/target/debug/krill-holder");
+        assert!(is_test_process_in(keys(&["NEXTEST"]), Some(dev)));
+        assert!(is_test_process_in(
+            keys(&["CARGO_MANIFEST_DIR", "CARGO_BIN_EXE_krill-holder"]),
+            Some(dev)
+        ));
+        let libtest = Path::new("/w/target/release/deps/survive-0123abcd");
+        assert!(is_test_process_in(keys(&[]), Some(libtest)));
+        assert!(!is_test_process_in(
+            keys(&[
+                "CARGO",
+                "CARGO_MANIFEST_DIR",
+                "CARGO_PKG_NAME",
+                "KRILL_STATE_DIR"
+            ]),
+            Some(dev)
+        ));
+        let installed = Path::new("/Applications/Krill.app/Contents/Helpers/krilld");
+        assert!(!is_test_process_in(keys(&["HOME"]), Some(installed)));
+        assert!(!is_test_process_in(keys(&[]), None));
     }
 
     #[cfg(not(windows))]
@@ -149,7 +198,7 @@ mod tests {
             "/h/Library/Logs/Krill"
         };
         assert_eq!(
-            directory_in(|_| None, || Some(PathBuf::from("/h"))),
+            directory_in(|_| None, false, || Some(PathBuf::from("/h"))),
             Some(PathBuf::from(want))
         );
     }
@@ -159,11 +208,11 @@ mod tests {
     fn directory_prefers_local_app_data_then_home() {
         let local = |k: &str| (k == "LOCALAPPDATA").then(|| OsString::from(r"C:\local"));
         assert_eq!(
-            directory_in(local, || Some(PathBuf::from(r"C:\home"))),
+            directory_in(local, false, || Some(PathBuf::from(r"C:\home"))),
             Some(PathBuf::from(r"C:\local\Krill\Logs"))
         );
         assert_eq!(
-            directory_in(|_| None, || Some(PathBuf::from(r"C:\home"))),
+            directory_in(|_| None, false, || Some(PathBuf::from(r"C:\home"))),
             Some(PathBuf::from(r"C:\home\Krill\Logs"))
         );
     }
@@ -173,7 +222,7 @@ mod tests {
     fn directory_is_library_logs_krill() {
         let home = PathBuf::from("/Users/u");
         assert_eq!(
-            directory_in(|_| None, || Some(home.clone())),
+            directory_in(|_| None, false, || Some(home.clone())),
             Some(home.join("Library/Logs/Krill"))
         );
     }

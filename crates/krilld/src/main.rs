@@ -52,7 +52,22 @@ fn main() -> ExitCode {
     // 세션 Job/ConPTY 안에서 에이전트만 실행한다. 데몬 소켓·상태·스레드는 만들지 않는다.
     #[cfg(windows)]
     if argument == "--agent-exec" {
-        return krilld::agent::run_windows_agent(std::env::args_os().skip(2));
+        return krilld::agent::run_windows_agent(std::env::args_os().skip(2), false);
+    }
+    #[cfg(windows)]
+    if argument.as_encoded_bytes() == krilld::agent::AGENT_THEN_SHELL {
+        return krilld::agent::run_windows_agent(std::env::args_os().skip(2), true);
+    }
+    #[cfg(windows)]
+    if argument == "--shell-exec" {
+        return krilld::run_windows_shell(std::env::args_os().skip(2));
+    }
+    #[cfg(windows)]
+    if argument == "--console-members" {
+        return std::env::args()
+            .nth(2)
+            .and_then(|pid| pid.parse().ok())
+            .map_or(ExitCode::from(2), krilld::run_console_probe);
     }
     let path = PathBuf::from(argument);
     krill_log::init(krill_log::Component::Daemon).ok();
@@ -69,6 +84,7 @@ fn main() -> ExitCode {
     });
     // 실패해도 데몬은 뜬다: 해제 페이지가 늦게 돌아올 뿐 세션에는 영향이 없다.
     krilld::alloc::return_freed_pages().ok();
+    krilld::alloc::mobile_thread().ok();
     // MK-066: 메모리 게이트가 의도적 회귀를 잡는지 확인하는 주입(`scripts/memory-gate.sh --inject`). 평소에는 빈 Vec.
     let _ballast = std::hint::black_box(ballast());
     #[cfg(unix)]
@@ -143,7 +159,9 @@ fn main() -> ExitCode {
         let (r, path, done) = (Arc::clone(&registry), path.clone(), done.clone());
         let reader = thread::Builder::new()
             .name("holder".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
                 r.run_holder(link);
                 if rejoin::orphan(&r, &path).is_ok() {
                     done.send(()).ok();
@@ -156,7 +174,11 @@ fn main() -> ExitCode {
     let r = Arc::clone(&registry);
     if thread::Builder::new()
         .name("agent-status".to_owned())
-        .spawn(move || r.monitor_status())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            krilld::alloc::mobile_thread().ok();
+            r.monitor_status();
+        })
         .is_err()
     {
         return ExitCode::FAILURE;
@@ -167,7 +189,9 @@ fn main() -> ExitCode {
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("spool".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
                 loop {
                     thread::sleep(krilld::status::SPOOL_POLL);
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -209,7 +233,12 @@ fn main() -> ExitCode {
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("scheduler".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
+                // 연속 실패는 보고를 한 번만 하고 재시도 간격을 늘린다. 상태 디렉터리가 사라진 고아 데몬이 초당
+                // 오류 보고를 13시간 쏟아낸 적이 있다(2026-10-26 pid 51545, 47,263줄).
+                let mut failures = 0u32;
                 loop {
                     // 한 번의 panic으로 스케줄러가 영구 정지하지 않게 격리한다(K-06).
                     // `poll_schedules`의 오류는 이미 안에서 처리하고 `io::Result`로만 나온다.
@@ -218,17 +247,21 @@ fn main() -> ExitCode {
                     })) {
                         Err(_) => tracing::warn!("schedule poll panicked; continuing"),
                         Ok(Err(error)) => {
-                            tracing::warn!(kind = ?error.kind(), "schedule poll failed");
-                            krill_proto::error_reporting::capture(
-                                krill_proto::error_reporting::Process::Daemon,
-                                krill_proto::error_reporting::Code::SchedulerFailed,
-                                file!(),
-                                line!(),
-                            );
+                            if failures == 0 {
+                                tracing::warn!(kind = ?error.kind(), "schedule poll failed");
+                                krill_proto::error_reporting::capture(
+                                    krill_proto::error_reporting::Process::Daemon,
+                                    krill_proto::error_reporting::Code::SchedulerFailed,
+                                    file!(),
+                                    line!(),
+                                );
+                            }
+                            failures = failures.saturating_add(1);
                         }
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => failures = 0,
                     }
-                    thread::sleep(std::time::Duration::from_secs(1));
+                    let backoff = 1u64 << failures.min(6);
+                    thread::sleep(std::time::Duration::from_secs(backoff));
                 }
             })
             .ok();
@@ -238,8 +271,9 @@ fn main() -> ExitCode {
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("usage-tick".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
-                let mut seen = None;
+                krilld::alloc::mobile_thread().ok();
                 let mut quota_tick = std::time::Instant::now();
                 loop {
                     r.wait_account_work(
@@ -247,14 +281,13 @@ fn main() -> ExitCode {
                     );
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if quota_tick.elapsed() >= krilld::registry::usage_tick::TICK {
-                            r.tick_accounts(&mut seen);
+                            r.tick_accounts();
                             quota_tick = std::time::Instant::now();
                         }
                         r.process_account_work();
                     }))
                     .is_err()
                     {
-                        seen = None;
                         tracing::warn!("usage tick panicked; continuing");
                     }
                 }
@@ -276,7 +309,9 @@ fn main() -> ExitCode {
     }
     let accept = thread::Builder::new()
         .name("accept".to_owned())
+        .stack_size(256 * 1024)
         .spawn(move || {
+            krilld::alloc::mobile_thread().ok();
             // 여기서 닫는 연결은 Hello 없이 끝나 클라이언트에는 EOF로만 보인다. 상태가 바뀔 때만 남긴다.
             let mut rejected = None;
             let mut spawn_error = None;
@@ -308,7 +343,11 @@ fn main() -> ExitCode {
                 let (hello, r) = (hello.clone(), Arc::clone(&registry));
                 match thread::Builder::new()
                     .name("conn".to_owned())
-                    .spawn(move || r.serve_admitted(s, &hello, permit).ok())
+                    .stack_size(256 * 1024)
+                    .spawn(move || {
+                        krilld::alloc::mobile_thread().ok();
+                        r.serve_admitted(s, &hello, permit).ok()
+                    })
                 {
                     Ok(_) => spawn_error = None,
                     Err(error) => {
@@ -332,7 +371,8 @@ fn main() -> ExitCode {
 /// 다른 소켓으로 뜬 데몬(테스트·수동 실행)이 같은 상태 폴더의 `mobile-gateway.json`을 쓰면
 /// 실사용 데몬의 터널을 죽이고 같은 릴레이 ID로 붙는다.
 fn owns_mobile(socket: &Path) -> bool {
-    daemon::state_dir().is_some_and(|dir| dir.join("run/krilld.sock") == socket)
+    daemon::state_dir()
+        .is_some_and(|dir| daemon::socket_path(&dir).is_ok_and(|path| path == socket))
 }
 
 /// 환경 변수 `KRILL_TEST_BALLAST_MB`(메비바이트 단위)만큼을 0이 아닌 값으로 채워 쥔다(dirty 페이지라 footprint에 잡힌다). 없거나 잘못된 값이면 빈 Vec.

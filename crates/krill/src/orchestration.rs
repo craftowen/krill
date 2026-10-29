@@ -16,9 +16,10 @@ use krill_proto::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
-    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchSessionOrigin, DispatchStatus, GateStatus,
-    MessageType, OrchAction, OrchResponse, OrchestrationStore, Run, SendParams, TaskStatus,
-    WorkerOperation, WorkerStartSpec, worker_preamble,
+    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchSessionOrigin, DispatchStatus,
+    FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType, OrchAction, OrchResponse,
+    OrchestrationStore, Run, SendParams, TaskStatus, WorkerOperation, WorkerStartSpec,
+    worker_preamble,
 };
 use krill_proto::screen::Msg;
 
@@ -103,6 +104,15 @@ impl<'a> OrchCtx<'a> {
     /// `krilld` socket is active for `daemon::state_dir()`. Returns `Ok(None)` when local
     /// and no daemon is listening so unit tests and offline invocations can use disk fallback.
     fn try_ipc(&self, action: &OrchAction, timeout: Duration) -> io::Result<Option<OrchResponse>> {
+        let Some(mut conn) = self.connect_ipc()? else {
+            return Ok(None);
+        };
+        self.request_ipc(&mut conn, action, timeout)
+    }
+
+    /// Opens one orchestration connection (see [`Self::try_ipc`]); `Ok(None)` means local without a
+    /// listening daemon. The control connection serves several requests, so paged reads reuse it.
+    fn connect_ipc(&self) -> io::Result<Option<krill_proto::daemon::Connection>> {
         let is_remote = self.is_remote();
         if !is_remote && daemon::state_dir().as_deref() != Some(self.state_dir) {
             return Ok(None);
@@ -115,7 +125,7 @@ impl<'a> OrchCtx<'a> {
             },
         };
         let hello = daemon::client_hello(ClientRole::Cli, "krill");
-        let mut conn = if is_remote {
+        let conn = if is_remote {
             target
                 .connect(&hello)
                 .map_err(|e| io::Error::other(e.to_string()))?
@@ -134,6 +144,18 @@ impl<'a> OrchCtx<'a> {
             }
             return Ok(None);
         }
+        Ok(Some(conn))
+    }
+
+    /// One request on an open connection. `Ok(None)`: an older local daemon rejected a legacy
+    /// opcode, so the caller may apply the same change on disk (never for `requires_v2` opcodes).
+    fn request_ipc(
+        &self,
+        conn: &mut krill_proto::daemon::Connection,
+        action: &OrchAction,
+        timeout: Duration,
+    ) -> io::Result<Option<OrchResponse>> {
+        let is_remote = self.is_remote();
         if matches!(action, OrchAction::RetainWorker { .. })
             && conn.negotiated.features & krill_proto::orchestration::FEAT_ORCH_RETAIN == 0
         {
@@ -168,14 +190,59 @@ impl<'a> OrchCtx<'a> {
         }
     }
 
+    /// Read-only snapshot. A daemon with `FEAT_ORCH_SNAPSHOT_PAGE` streams it in bounded pages so
+    /// a valid store larger than one IPC frame is still read losslessly. An older daemon serves one
+    /// `SnapshotV2` frame; if that frame cannot fit (EOF from a prior build, or the explicit frame-limit
+    /// error), a local caller reads the same `orchestration.json` the daemon serves — read-only, never
+    /// for mutations — while a remote caller gets an explicit error instead of any local state.
     fn load_store(&self) -> io::Result<OrchestrationStore> {
-        if let Some(OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store)) =
-            self.try_ipc(&OrchAction::SnapshotV2, Duration::from_secs(2))?
-        {
-            return Ok(store);
+        let Some(mut conn) = self.connect_ipc()? else {
+            return OrchestrationStore::load(self.state_dir);
+        };
+        let timeout = Duration::from_secs(2);
+        let fetched = if conn.negotiated.features & FEAT_ORCH_SNAPSHOT_PAGE != 0 {
+            OrchestrationStore::fetch_paged(|generation, offset| {
+                self.request_ipc(
+                    &mut conn,
+                    &OrchAction::SnapshotPage { generation, offset },
+                    timeout,
+                )?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "update krilld for orchestration v2",
+                    )
+                })
+            })
+        } else {
+            match self.request_ipc(&mut conn, &OrchAction::SnapshotV2, timeout) {
+                Ok(Some(OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store))) => {
+                    Ok(store)
+                }
+                Ok(Some(_)) => Err(io::Error::other("unexpected orchestration reply")),
+                Ok(None) => return OrchestrationStore::load(self.state_dir),
+                Err(e) => Err(e),
+            }
+        };
+        match fetched {
+            Err(e) if snapshot_unavailable(&e) => {
+                if self.is_remote() {
+                    Err(io::Error::other(format!(
+                        "remote orchestration state exceeds the IPC frame limit; update the remote krilld ({e})"
+                    )))
+                } else {
+                    OrchestrationStore::load(self.state_dir)
+                }
+            }
+            other => other,
         }
-        OrchestrationStore::load(self.state_dir)
     }
+}
+
+/// A single-frame snapshot that an older daemon could not deliver: a prior build closes the stream
+/// (EOF) and the current build answers with the frame-limit error. Nothing else qualifies.
+fn snapshot_unavailable(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::UnexpectedEof || e.to_string().contains(FRAME_LIMIT_ERROR)
 }
 
 fn classify_orch_error(msg: String) -> io::Error {
@@ -962,8 +1029,20 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         if spec.task_id.is_none() {
             spec.task_id.clone_from(&previous.task_id);
         }
-        spec.worker
-            .get_or_insert_with(|| previous.worker_name.clone());
+        spec.worker.get_or_insert_with(|| {
+            let mut suffix = initial_store.dispatches.len().saturating_add(1);
+            loop {
+                let candidate = format!("{}-retry-{suffix}", previous.worker_name);
+                if !initial_store
+                    .dispatches
+                    .iter()
+                    .any(|d| d.worker_name == candidate)
+                {
+                    break candidate;
+                }
+                suffix = suffix.saturating_add(1);
+            }
+        });
         spec.agent.get_or_insert_with(|| previous.agent.clone());
         spec.cwd.get_or_insert_with(|| previous.cwd.clone());
         spec.prompt.get_or_insert_with(|| previous.prompt.clone());
@@ -1140,8 +1219,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                         error.kind(),
                         format!("spawn {agent} worker session: {error}"),
                     );
-                    mark_worker_start_failed(ctx, &dispatch.id, &error.to_string())?;
-                    return Err(error);
+                    return report_worker_start_failure(ctx, &dispatch, &error, json);
                 }
             }
         }
@@ -1160,6 +1238,15 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             Ok(())
         });
 
+        // Report the persisted failure, not the active snapshot from before delivery.
+        if let Err(error) = delivered {
+            return report_worker_start_failure(
+                ctx,
+                &dispatch,
+                &io::Error::other(format!("worker {}: {error}", dispatch.worker_name)),
+                json,
+            );
+        }
         if json {
             print_json(&dispatch)?;
         } else {
@@ -1174,14 +1261,6 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                     .map_or_else(|| "-".to_owned(), |n| n.to_string())
             );
         }
-        // 디스패치는 기록됐으니 출력은 남기고, 프롬프트를 못 넣었으면 실패로 끝낸다(`krill send`로 다시 넣을 수 있다).
-        if let Err(error) = delivered {
-            mark_worker_start_failed(ctx, &dispatch.id, &error)?;
-            return Err(io::Error::other(format!(
-                "worker {}: {error}",
-                dispatch.worker_name
-            )));
-        }
         Ok(())
     })
 }
@@ -1190,7 +1269,11 @@ fn caller_session_id() -> Option<u32> {
     std::env::var("MK_PANE_ID").ok()?.parse().ok()
 }
 
-fn mark_worker_start_failed(ctx: &OrchCtx<'_>, dispatch_id: &str, reason: &str) -> io::Result<()> {
+fn mark_worker_start_failed(
+    ctx: &OrchCtx<'_>,
+    dispatch_id: &str,
+    reason: &str,
+) -> io::Result<Dispatch> {
     let dispatch = match ctx.try_ipc(
         &OrchAction::WorkerStartFailed {
             dispatch_id: dispatch_id.to_owned(),
@@ -1205,10 +1288,60 @@ fn mark_worker_start_failed(ctx: &OrchCtx<'_>, dispatch_id: &str, reason: &str) 
         })?,
         Some(_) => return Err(io::Error::other("unexpected worker start failure reply")),
     };
-    if let Some(summary) = dispatch.summary.filter(|s| s.contains("circuit breaker")) {
-        return Err(io::Error::other(summary));
+    Ok(dispatch)
+}
+
+fn report_worker_start_failure(
+    ctx: &OrchCtx<'_>,
+    dispatch: &Dispatch,
+    error: &io::Error,
+    json: bool,
+) -> io::Result<()> {
+    let identity = format!(
+        "dispatch {}, request {}, session {}",
+        dispatch.id,
+        dispatch.request_id.as_deref().unwrap_or("unrecorded"),
+        dispatch
+            .session_id
+            .map_or_else(|| "unbound".to_owned(), |id| id.to_string()),
+    );
+    let failed = mark_worker_start_failed(ctx, &dispatch.id, &error.to_string()).map_err(|e| {
+        io::Error::new(
+            error.kind(),
+            format!("{error} ({identity}); failure state not confirmed: {e}; inspect worker-show before retrying"),
+        )
+    })?;
+    if json {
+        print_json(&failed)?;
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\tsession={}",
+            failed.id,
+            failed.worker_name,
+            failed.agent,
+            failed.status.as_str(),
+            failed
+                .session_id
+                .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+        );
     }
-    Ok(())
+    let breaker = failed
+        .summary
+        .as_deref()
+        .filter(|summary| summary.contains("circuit breaker"));
+    let detail = failed
+        .summary
+        .as_deref()
+        .filter(|summary| summary.contains("circuit breaker"))
+        .map_or_else(|| error.to_string(), str::to_owned);
+    Err(io::Error::new(
+        if breaker.is_some() {
+            io::ErrorKind::Other
+        } else {
+            error.kind()
+        },
+        format!("{detail} ({identity})"),
+    ))
 }
 
 fn cmd_request_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
@@ -1293,7 +1426,7 @@ fn resolve_worker_cwd(cwd: Option<&str>, remote: bool) -> io::Result<PathBuf> {
         let cwd = cwd.ok_or_else(|| {
             bad_arg("remote worker-start requires --cwd <absolute path on the remote host>")
         })?;
-        if !cwd.starts_with('/') {
+        if !crate::remote::is_remote_absolute_path(cwd.as_bytes()) {
             return Err(bad_arg(
                 "remote --cwd must be an absolute path on the remote host",
             ));
@@ -1807,7 +1940,7 @@ fn cmd_reply(state_dir: &Path, args: &[String]) -> io::Result<()> {
 
 fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut msg_id = None;
-    let mut from = "coordinator".to_owned();
+    let mut from = None;
     let mut body = None;
     let mut json = false;
     let mut it = args.iter();
@@ -1818,7 +1951,7 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 msg_id = Some(id.clone());
             }
             "--from" => {
-                from.clone_from(it.next().ok_or_else(|| bad_arg("missing --from"))?);
+                from = Some(it.next().ok_or_else(|| bad_arg("missing --from"))?.clone());
             }
             "--body" | "--answer" => body = it.next().cloned(),
             "--json" => json = true,
@@ -1830,6 +1963,13 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     let msg_id = msg_id.ok_or_else(|| bad_arg("missing <msg-id>"))?;
     let body = body.ok_or_else(|| bad_arg("missing --body"))?;
+    let from = match from {
+        Some(explicit) => explicit,
+        None => match caller_session_id() {
+            Some(sid) => inferred_reply_sender(&ctx.load_store()?, u64::from(sid))?,
+            None => "coordinator".to_owned(),
+        },
+    };
     let reply = match ctx.try_ipc(
         &OrchAction::ReplyMessage {
             question_id: msg_id.clone(),
@@ -1839,7 +1979,11 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Duration::from_secs(2),
     )? {
         Some(OrchResponse::Message(m)) => m,
-        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(&msg_id, &from, &body))?,
+        Some(OrchResponse::Error(e)) => return Err(bad_arg(e)),
+        None => {
+            OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(&msg_id, &from, &body))?
+        }
+        Some(_) => return Err(io::Error::other("unexpected orchestration reply response")),
     };
     if json {
         print_json(&reply)?;
@@ -1847,6 +1991,27 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         println!("{}\treply->{}\t{}", reply.id, reply.to, reply.body);
     }
     Ok(())
+}
+
+fn inferred_reply_sender(store: &OrchestrationStore, sid: u64) -> io::Result<String> {
+    let mut workers = store
+        .dispatches
+        .iter()
+        .filter(|d| d.session_id == Some(sid) && d.status == DispatchStatus::Active);
+    if let Some(worker) = workers.next() {
+        if workers.any(|other| other.worker_name != worker.worker_name) {
+            return Err(bad_arg(
+                "session has multiple worker identities; specify --from",
+            ));
+        }
+        return Ok(worker.worker_name.clone());
+    }
+    if store.dispatches.iter().any(|d| d.session_id == Some(sid)) {
+        return Err(bad_arg(
+            "worker dispatch has settled; specify --from explicitly",
+        ));
+    }
+    Ok("coordinator".to_owned())
 }
 
 #[cfg(test)]
@@ -2029,10 +2194,7 @@ fn dispatch_owns_session(all_dispatches: &[Dispatch], disp: &Dispatch) -> bool {
     let owner = all_dispatches
         .iter()
         .rev()
-        .find(|d| {
-            d.session_id == Some(sid)
-                && matches!(d.status, DispatchStatus::Active | DispatchStatus::Retained)
-        })
+        .find(|d| d.session_id == Some(sid) && d.status == DispatchStatus::Active)
         .or_else(|| {
             all_dispatches
                 .iter()
@@ -2090,14 +2252,17 @@ fn build_worker_report(
                     "retained"
                 }
             }
-            DispatchStatus::Released | DispatchStatus::Abandoned => {
+            DispatchStatus::Released => {
                 if disp.session_id.is_some() && !owns_session {
                     "reassigned"
                 } else {
                     "released"
                 }
             }
-            DispatchStatus::Succeeded | DispatchStatus::Failed | DispatchStatus::Stopped => {
+            DispatchStatus::Succeeded
+            | DispatchStatus::Failed
+            | DispatchStatus::Stopped
+            | DispatchStatus::Abandoned => {
                 if disp.session_id.is_none() || session_live == Some(false) {
                     "released"
                 } else if !owns_session {
@@ -2118,9 +2283,9 @@ fn build_worker_report(
         && disp.session_origin == DispatchSessionOrigin::Borrowed
     {
         Some(WorkerNextAction {
-            action: "abandon",
-            reason: "the dispatch borrowed an existing session; fence it without closing the session",
-            command: format!("krill orchestration worker-abandon {}", disp.id),
+            action: "retain",
+            reason: "preserve the settled outcome and borrowed session without closing it",
+            command: format!("krill orchestration worker-retain {}", disp.id),
         })
     } else if terminal_state == "reclaimable" {
         Some(WorkerNextAction {
@@ -2478,9 +2643,14 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
         selected.validate_release()?;
     }
     if selected.session_origin == DispatchSessionOrigin::Borrowed {
-        return Err(bad_arg(
-            "cannot close a borrowed session; use worker-abandon for non-destructive fencing",
-        ));
+        let action = if selected.status == DispatchStatus::Active {
+            "worker-abandon for non-destructive fencing"
+        } else {
+            "worker-retain to preserve its settled outcome"
+        };
+        return Err(bad_arg(format!(
+            "cannot close a borrowed session; use {action}; neither stops the existing process"
+        )));
     }
     let owns_session = dispatch_owns_session(&store.dispatches, selected);
     let target = ctx.effective_target()?;
@@ -2930,6 +3100,26 @@ mod tests {
             krill_proto::orchestration::DispatchReleaseState::Released
         );
         std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn reply_sender_uses_worker_session_binding_and_rejects_settled_identity() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("reply sender", None)?;
+        store.start_worker(
+            &run.id,
+            None,
+            "actual-worker",
+            "codex",
+            Some(42),
+            "/tmp",
+            "p",
+        )?;
+        assert_eq!(inferred_reply_sender(&store, 42)?, "actual-worker");
+        assert_eq!(inferred_reply_sender(&store, 99)?, "coordinator");
+        store.dispatches[0].status = DispatchStatus::Succeeded;
+        assert!(inferred_reply_sender(&store, 42).is_err());
+        Ok(())
     }
 
     #[test]
@@ -3881,6 +4071,83 @@ mod tests {
     }
 
     #[test]
+    fn retained_predecessor_cannot_reclaim_a_completed_reused_session() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("reuse ownership", None)?;
+        let predecessor =
+            store.start_worker(&run.id, None, "old", "codex", Some(10), "/tmp", "old work")?;
+        store.retain_worker(&predecessor.id)?;
+        let replacement = store.start_worker_configured(&WorkerStartSpec {
+            run_id: Some(run.id.clone()),
+            worker: Some("new".into()),
+            session_id: Some(10),
+            ..WorkerStartSpec::default()
+        })?;
+        store.send_message(&SendParams {
+            from: "new".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "done".into(),
+            body: String::new(),
+            run_id: Some(run.id),
+            task_id: None,
+            dispatch_id: Some(replacement.id.clone()),
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        })?;
+        let old = store
+            .dispatches
+            .iter()
+            .find(|d| d.id == predecessor.id)
+            .unwrap();
+        let new = store
+            .dispatches
+            .iter()
+            .find(|d| d.id == replacement.id)
+            .unwrap();
+        assert!(!dispatch_owns_session(&store.dispatches, old));
+        assert!(dispatch_owns_session(&store.dispatches, new));
+        let report = build_worker_report(new, &store.dispatches, None);
+        assert_eq!(report.next_action.unwrap().action, "retain");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_live_sessions_remain_visible_for_cleanup() -> io::Result<()> {
+        use krill_proto::control::AgentState;
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("residual sessions", None)?;
+        let owned = store.start_worker(&run.id, None, "owned", "codex", Some(10), "/tmp", "p")?;
+        let borrowed = store.start_worker_configured(&WorkerStartSpec {
+            run_id: Some(run.id),
+            worker: Some("borrowed".into()),
+            session_id: Some(20),
+            ..WorkerStartSpec::default()
+        })?;
+        let observed: Vec<_> = [10, 20]
+            .into_iter()
+            .map(|id| crate::session::ObservedSession {
+                id,
+                exit_code: None,
+                agent_state: Some(AgentState::Working),
+            })
+            .collect();
+        for (dispatch, action) in [(owned, "release_or_retain"), (borrowed, "retain")] {
+            let abandoned = store.abandon_worker(&dispatch.id)?;
+            let report = build_worker_report(&abandoned, &store.dispatches, Some(&observed));
+            assert_eq!(report.session_state, "live");
+            assert_eq!(report.terminal_state, "reclaimable");
+            assert_eq!(report.next_action.unwrap().action, action);
+            let retained = store.retain_worker(&dispatch.id)?;
+            assert_eq!(retained.status, DispatchStatus::Abandoned);
+            let kept = build_worker_report(&retained, &store.dispatches, Some(&observed));
+            assert_eq!(kept.terminal_state, "retained");
+            assert!(kept.next_action.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn worker_report_projects_liveness_reuse_and_next_actions() -> io::Result<()> {
         use krill_proto::control::AgentState;
         let mut store = OrchestrationStore::default();
@@ -3986,7 +4253,7 @@ mod tests {
         retained.release_state = krill_proto::orchestration::DispatchReleaseState::Active;
         retained.session_origin = DispatchSessionOrigin::Borrowed;
         let report = build_worker_report(&retained, &store.dispatches, Some(&observed));
-        assert_eq!(report.next_action.unwrap().action, "abandon");
+        assert_eq!(report.next_action.unwrap().action, "retain");
 
         let dead_disp = store.dispatches.iter().find(|d| d.id == d_dead.id).unwrap();
         let r_dead = build_worker_report(dead_disp, &store.dispatches, Some(&observed));
@@ -4164,6 +4431,52 @@ mod delivery_and_launch_cli_tests {
     }
 
     #[test]
+    fn late_start_failure_preserves_accepted_completion_and_reports_identity() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-start-settled-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let dispatch = OrchestrationStore::mutate(&dir, |store| {
+            let run = store.create_run("accepted before start reply", None)?;
+            let task = store.create_task(&run.id, "work", "", Vec::new())?;
+            let dispatch = store.start_worker_configured(&WorkerStartSpec {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                worker: Some("worker".into()),
+                ..WorkerStartSpec::default()
+            })?;
+            store.send_message(&SendParams {
+                from: "worker".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                summary: "accepted".into(),
+                body: String::new(),
+                run_id: Some(run.id),
+                task_id: Some(task.id),
+                dispatch_id: Some(dispatch.id.clone()),
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            })?;
+            Ok(dispatch)
+        })?;
+        let before = OrchestrationStore::load(&dir)?;
+        let error = report_worker_start_failure(
+            &OrchCtx::local(&dir),
+            &dispatch,
+            &io::Error::other("submit response lost"),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failure state not confirmed"));
+        assert!(error.to_string().contains(&dispatch.id));
+        assert!(
+            error
+                .to_string()
+                .contains(dispatch.request_id.as_deref().unwrap())
+        );
+        assert_eq!(OrchestrationStore::load(&dir)?, before);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
     fn request_show_and_retry_inherit_launch_preferences() -> io::Result<()> {
         let dir =
             std::env::temp_dir().join(format!("krill-retry-request-cli-{}", std::process::id()));
@@ -4213,6 +4526,7 @@ mod delivery_and_launch_cli_tests {
         let store = OrchestrationStore::load(&dir)?;
         let retry = store.dispatches.last().unwrap();
         assert_eq!(retry.retry_of.as_deref(), Some(first.id.as_str()));
+        assert_ne!(retry.worker_name, first.worker_name);
         assert_eq!(retry.model, first.model);
         assert_eq!(retry.effort, first.effort);
         assert_ne!(retry.request_id, first.request_id);
@@ -4248,5 +4562,33 @@ mod delivery_and_launch_cli_tests {
         assert_eq!(fenced.session_id, Some(1234));
         assert_eq!(fenced.status, DispatchStatus::Abandoned);
         std::fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_fallback_tests {
+    use super::*;
+
+    /// foundation-02: 읽기 전용 디스크 fallback(로컬)·명시 오류(원격)는 구 데몬의 단일 프레임 초과 신호
+    /// 두 가지(이전 빌드의 EOF, 현재 빌드의 프레임 상한 오류)에만 반응한다.
+    #[test]
+    fn snapshot_unavailable_matches_only_prior_daemon_overflow_signals() {
+        assert!(snapshot_unavailable(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(snapshot_unavailable(&io::Error::new(
+            io::ErrorKind::InvalidInput,
+            krill_proto::orchestration::frame_limit_error(1_204_357),
+        )));
+        assert!(!snapshot_unavailable(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "run not found"
+        )));
+        assert!(!snapshot_unavailable(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+        assert!(!snapshot_unavailable(&io::Error::other(
+            "orchestration snapshot kept changing while paging; retry"
+        )));
     }
 }

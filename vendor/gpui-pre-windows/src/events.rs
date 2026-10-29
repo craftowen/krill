@@ -1531,7 +1531,26 @@ where
             }))
         }
         vkey => {
+            // Consume the matching physical release before logical-key parsing:
+            // Shift/layout changes can turn a character-preferred @ down into 2 up.
+            let release = lparam.0 & (1isize << 31) != 0;
+            if release && state.character_input_keys.borrow_mut().release(vkey.0) {
+                // Keep WM_SYSKEYUP handled as well; DefWindowProc must not turn
+                // the consumed AltGr release into menu activation.
+                state.last_reported_modifiers.set(Some(modifiers));
+                return Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers,
+                    capslock: current_capslock(),
+                }));
+            }
             let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
+            if !release {
+                state.character_input_keys.borrow_mut().press(
+                    vkey.0,
+                    lparam.0 & (1isize << 30) != 0,
+                    keystroke.1,
+                );
+            }
             Some(f(keystroke.0, keystroke.1))
         }
     }

@@ -1,6 +1,6 @@
 """Two isolated desktops behind a local relay substitute; real E2EE and Chromium UI.
 
-Run after building krill/krilld/krill-holder, with CARGO_TARGET_DIR on krill-build.
+Run after building krill/krilld/krill-holder, with KRILL_BIN and KRILLD_BIN set.
 The proxy only substitutes the relay routing; desktop authentication/RPC stay real.
 """
 import json
@@ -14,8 +14,10 @@ from mobile_browser import until
 
 
 def main():
-    target = Path(os.environ['CARGO_TARGET_DIR'])
+    target = Path(os.environ.get('CARGO_TARGET_DIR', Path(__file__).resolve().parents[3] / 'target'))
     binaries = Path(os.environ.get('KRILL_MOBILE_TEST_BIN', str(target / 'debug')))
+    krilld = Path(os.environ.get('KRILLD_BIN', str(binaries / 'krilld')))
+    krill = Path(os.environ.get('KRILL_BIN', str(binaries / 'krill')))
     tests = Path(__file__).resolve().parent
     assets = tests.parent / 'src/mobile/assets'
     session = f'krill-hosts-{os.getpid()}'
@@ -33,7 +35,7 @@ def main():
                 log = (scratch / f'desktop-{index}.log').open('w+')
                 logs.append(log)
                 fixture = subprocess.Popen(
-                    ['node', str(tests / 'mobile_pwa.cjs'), str(binaries / 'krilld'), '--keep'],
+                    ['node', str(tests / 'mobile_pwa.cjs'), str(krilld), '--keep'],
                     env=dict(os.environ, M9_BROWSER_METADATA=str(metadata), M9_BROWSER_ADDRESS='127.0.0.1:0'),
                     stdout=log, stderr=log,
                 )
@@ -106,7 +108,7 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
                 wait("document.querySelector('input[type=url]')!==null && document.querySelector('#action-sheet').open")
                 # Fresh ticket, since a previous scan may already have consumed one.
                 offer = json.loads(subprocess.check_output(
-                    [str(binaries / 'krill'), 'mobile', 'pair', '--address', configs[index]['base'].split('://')[1], '--json'],
+                    [str(krill), 'mobile', 'pair', '--address', configs[index]['base'].split('://')[1], '--json'],
                     env=dict(os.environ, KRILL_STATE_DIR=configs[index]['dir']), text=True,
                 ))['PairingOffer']['url']
                 fragment = offer.split('#', 1)[1]
@@ -157,13 +159,13 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             browser('reload')
             wait('KrillMobile.app.getConnections().length===2 && KrillMobile.app.getConnections().every(h=>h.connection.phase==="ready")')
             home()
-            assert evaluate('document.querySelectorAll(".recent-session-row").length') == 2
-            evaluate("[...document.querySelectorAll('.recent-session-row')].find(n=>n.dataset.host==="+json.dumps(hosts[0]['id'])+").click();true")
+            assert evaluate('document.querySelectorAll(".recent-session-row[data-session]").length') == 2
+            evaluate("[...document.querySelectorAll('.recent-session-row[data-session]')].find(n=>n.dataset.host==="+json.dumps(hosts[0]['id'])+").click();true")
             wait('!!document.querySelector(".session-tabs")')
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).active') == hosts[0]['id']
             assert evaluate('KrillMobile.store.sessions.get('+str(hosts[0]['session'])+').cwd') == hosts[0]['cwd']
             home()
-            evaluate("[...document.querySelectorAll('.recent-session-row')].find(n=>n.dataset.host==="+json.dumps(hosts[1]['id'])+").click();true")
+            evaluate("[...document.querySelectorAll('.recent-session-row[data-session]')].find(n=>n.dataset.host==="+json.dumps(hosts[1]['id'])+").click();true")
             wait('!!document.querySelector(".session-tabs")')
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).active') == hosts[1]['id']
             assert evaluate('KrillMobile.store.sessions.get('+str(hosts[1]['session'])+').cwd') == hosts[1]['cwd']
@@ -185,10 +187,10 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             home()
             # One unavailable PC must not disconnect the other or mislabel cached rows as live.
             evaluate("globalThis.offlineHost="+json.dumps(hosts[0]['id'])+";true")
-            subprocess.check_output([str(binaries / 'krill'), 'mobile', 'revoke', '--all'], env=dict(os.environ, KRILL_STATE_DIR=configs[0]['dir']), text=True)
+            subprocess.check_output([str(krill), 'mobile', 'revoke', '--all'], env=dict(os.environ, KRILL_STATE_DIR=configs[0]['dir']), text=True)
             wait('KrillMobile.app.getConnections().find(h=>h.id===offlineHost).connection.phase!=="ready"')
             assert evaluate('KrillMobile.app.getConnections().find(h=>h.id!==offlineHost).connection.phase==="ready"')
-            assert evaluate('[...document.querySelectorAll(".recent-session-row")].some(b=>b.disabled)')
+            assert evaluate('[...document.querySelectorAll(".recent-session-row[data-session]")].some(b=>b.disabled)')
             evaluate("KrillMobile.store.preferences.language='ko';KrillMobile.i18n.configure('ko');KrillMobile.app.navigate('/accounts');true")
             wait('!!document.querySelector(".accounts")')
             # Choose the remaining connected PC, then inspect Korean UI with English duration units.

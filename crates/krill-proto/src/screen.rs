@@ -297,6 +297,8 @@ pub struct Screen {
     /// 받은 벨 수(이 화면을 만든 쪽 기준으로 센다, 넘치면 0으로 돈다). 늘었으면 벨이 울린 것이다.
     pub bells: u64,
     pub cursor_style: CursorStyle,
+    /// A program explicitly selected the cursor, including steady block.
+    pub cursor_explicit: bool,
     /// 행마다 OSC 8 링크 구간(열 오름차순). 비어 있거나 `rows`보다 짧으면 링크 없음.
     pub links: Vec<Vec<Link>>,
 }
@@ -484,6 +486,9 @@ impl View {
     pub fn apply(&mut self, u: Update) -> Result<(), ApplyError> {
         self.revision = None;
         self.screen.apply(u.ops)?;
+        if let Some(explicit) = u.cursor_explicit {
+            self.screen.cursor_explicit = explicit;
+        }
         if u.done {
             self.revision = Some(u.revision);
             self.seq = u.seq;
@@ -537,6 +542,9 @@ pub struct Update {
     /// 이 revision의 마지막 조각.
     pub done: bool,
     pub ops: Vec<Op>,
+    /// Optional postfix; skipped in the base representation for N-1 compatibility.
+    #[serde(default, skip)]
+    pub cursor_explicit: Option<bool>,
 }
 
 /// [`kind::GAP`]: 원본 `[start, start + len)`을 보낼 수 없다. `len == 0`은 크래시로 길이를 모르는 구간(seq는 이어진다).
@@ -636,6 +644,30 @@ impl Msg for Attached {
 }
 impl Msg for Update {
     const KIND: u8 = kind::UPDATE;
+
+    fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut body = postcard::to_stdvec(self).map_err(Error::Codec)?;
+        if let Some(explicit) = self.cursor_explicit {
+            body.extend(postcard::to_stdvec(&explicit).map_err(Error::Codec)?);
+        }
+        ipc::encode_frame(Self::KIND, &body)
+    }
+
+    fn decode(kind: u8, body: &[u8]) -> Result<Self, Error> {
+        if kind != Self::KIND {
+            return Err(Error::UnexpectedKind {
+                want: Self::KIND,
+                got: kind,
+            });
+        }
+        let (mut update, rest) = postcard::take_from_bytes::<Self>(body).map_err(Error::Codec)?;
+        if !rest.is_empty() {
+            let (explicit, _future) =
+                postcard::take_from_bytes::<bool>(rest).map_err(Error::Codec)?;
+            update.cursor_explicit = Some(explicit);
+        }
+        Ok(update)
+    }
 }
 impl Msg for GapMsg {
     const KIND: u8 = kind::GAP;
@@ -717,6 +749,17 @@ fn fit_links(line: u16, links: Vec<Link>) -> Result<Vec<Link>, Error> {
 /// `Op::Links` 하나가 예산을 넘으면 앞부분 링크만 남기고 자른다(칸의 `LINK` 표시는 그대로라 화면은
 /// 그려진다, [`fit_links`]). 그 외 연산이 예산을 넘으면 `BadLength`.
 pub fn encode_update(revision: Revision, seq: Seq, ops: Vec<Op>) -> Result<Vec<Vec<u8>>, Error> {
+    encode_update_with_cursor(revision, seq, ops, None)
+}
+
+/// The final chunk carries the exact program cursor selection state. Old decoders
+/// consume the unchanged base Update and ignore this optional postfix.
+pub fn encode_update_with_cursor(
+    revision: Revision,
+    seq: Seq,
+    ops: Vec<Op>,
+    cursor_explicit: Option<bool>,
+) -> Result<Vec<Vec<u8>>, Error> {
     let mut parts: Vec<Vec<Op>> = vec![Vec::new()];
     let mut used = 0usize;
     for op in ops {
@@ -753,6 +796,9 @@ pub fn encode_update(revision: Revision, seq: Seq, ops: Vec<Op>) -> Result<Vec<V
                 seq,
                 done: i.checked_add(1) == Some(count),
                 ops,
+                cursor_explicit: (i.checked_add(1) == Some(count))
+                    .then_some(cursor_explicit)
+                    .flatten(),
             }
             .encode()
         })

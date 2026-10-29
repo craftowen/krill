@@ -46,6 +46,7 @@ pub struct Panel {
     account: AccountView,
 }
 struct AccountView {
+    connect_after_login: Option<ConnectMode>,
     email: Option<String>,
     required: bool,
     pending: bool,
@@ -56,6 +57,7 @@ struct AccountView {
 impl Default for AccountView {
     fn default() -> Self {
         Self {
+            connect_after_login: None,
             email: None,
             required: true,
             pending: false,
@@ -412,10 +414,16 @@ impl SettingsView {
             && self.mobile.account.email.is_none()
             && address.as_deref().is_none_or(|raw| !raw.contains('@'))
         {
-            self.mobile.error = Some(text::ACCOUNT_REQUIRED.get().to_owned());
+            self.mobile.mode = mode;
+            self.mobile.address = address;
+            self.mobile.account.connect_after_login = Some(mode);
+            if !self.mobile.account.pending {
+                self.mobile_account_action(false, cx);
+            }
             cx.notify();
             return;
         }
+        self.mobile.account.connect_after_login = None;
         if self.mobile.pending
             || (self.mobile.pairing_pending()
                 && self.mobile.mode == mode
@@ -455,16 +463,16 @@ impl SettingsView {
         root = root.child(self.mobile_account_card(cx));
         let mode_options = [
             (
-                ConnectMode::Tunnel,
-                "mobile-tunnel",
-                text::TUNNEL.get(),
-                text::TUNNEL_DESC.get(),
-            ),
-            (
                 ConnectMode::Tailscale,
                 "mobile-tailscale",
                 text::TAILSCALE.get(),
                 text::TAILSCALE_DESC.get(),
+            ),
+            (
+                ConnectMode::Tunnel,
+                "mobile-tunnel",
+                text::TUNNEL.get(),
+                text::TUNNEL_DESC.get(),
             ),
         ];
         let mut mode_card = layout::card(p)
@@ -931,14 +939,14 @@ impl SettingsView {
         let mut modes = div().flex().gap_1p5();
         for (mode, id, label) in [
             (
-                ConnectMode::Tunnel,
-                "mobile-page-tunnel",
-                text::PAGE_TUNNEL.get(),
-            ),
-            (
                 ConnectMode::Tailscale,
                 "mobile-page-tailscale",
                 text::PAGE_TAILSCALE.get(),
+            ),
+            (
+                ConnectMode::Tunnel,
+                "mobile-page-tunnel",
+                text::PAGE_TUNNEL.get(),
             ),
         ] {
             modes = modes.child(

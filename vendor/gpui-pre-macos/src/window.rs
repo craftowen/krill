@@ -3430,8 +3430,12 @@ fn spawn_display_link_watchdog(state: &Arc<Mutex<MacWindowState>>) {
                 }
                 lock.stop_display_link();
                 lock.start_display_link();
-                // Give the restarted link a full window before judging it again.
-                lock.last_step_at = Some(now);
+                // Give the restarted link a full window before judging it again. Repeated failures (no active
+                // display, e.g. asleep or remote-only) back off up to 30s instead of restarting every second.
+                let backoff = std::time::Duration::from_secs(
+                    (1u64 << lock.link_stalls.saturating_sub(2).min(5)).min(30) - 1,
+                );
+                lock.last_step_at = Some(now + backoff);
             }
         })
         .detach();

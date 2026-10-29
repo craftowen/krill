@@ -67,6 +67,8 @@ pub struct PairedHost {
     pub id: String,
     pub name: String,
     pub status: krill_hosts::HostStatus,
+    /// 연결된 상대 데몬의 빌드 문자열. 연결 전이거나 읽지 못했으면 `None`.
+    pub version: Option<String>,
 }
 
 /// 같은 Wi-Fi에서 발견된 근처 Mac 항목.
@@ -166,6 +168,11 @@ pub trait LinkBackend: Send + Sync + std::fmt::Debug {
     /// 등록된 원격 Mac 연결을 제거한다. 상대 Mac의 세션은 계속 실행된다.
     fn disconnect_host(&self, _id: &str) -> Result<Vec<PairedHost>, String> {
         Err(text::ERR_DISCONNECT.get().to_owned())
+    }
+
+    /// 원격 Mac의 Krill을 그 Mac에서 직접 업데이트하게 한다(상대 Mac이 서명된 매니페스트를 받아 교체).
+    fn update_host(&self, _id: &str) -> Result<(), String> {
+        Err(text::ERR_UNAVAILABLE.get().to_owned())
     }
 
     /// 이 Mac에 저장된 원격 Mac의 표시 이름만 바꾸고 갱신된 원격 Mac 목록을 돌려준다.

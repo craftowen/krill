@@ -28,7 +28,7 @@ fn fixture<'a>(
         shell.panel_collapsed = true;
         let pane = shell.layout.focused().unwrap();
         shell.layout.set_session(pane, SESSION);
-        shell.chat.active_sessions.insert(SESSION);
+        shell.layout.set_chat_view(pane, true);
         shell.apply_chat_poll(SESSION, snapshot(items));
         cx.notify();
     });
@@ -441,6 +441,7 @@ fn chat_reader_anchor_survives_term_and_tab_remount_until_explicit_latest(cx: &m
         shell.layout.split(krill_app::layout::Axis::Horizontal);
         let pane = shell.layout.focused().unwrap();
         shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
         cx.notify();
         pane
     });
@@ -481,6 +482,7 @@ fn chat_reader_anchor_survives_term_and_tab_remount_until_explicit_latest(cx: &m
     let replacement = shell.update(cx, |shell, cx| {
         let pane = shell.layout.focused().unwrap();
         shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
         cx.notify();
         pane
     });

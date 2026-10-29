@@ -134,14 +134,14 @@ fn a_busy_skill_lock_never_blocks_startup_and_retries_after_release() {
     let worker = std::thread::spawn(move || send.send(sync_builtin_skills(&dirs)).unwrap());
     let report = receive.recv_timeout(Duration::from_secs(2)).unwrap();
     worker.join().unwrap();
-    assert_eq!(report.failures.len(), 1);
-    assert!(report.failures[0].contains("already running"));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.busy, std::slice::from_ref(&locked));
     assert_eq!(report.installed.len(), builtin_skills().len());
     assert!(!locked.join("krill-orchestration").exists());
     assert!(other.join("krill-orchestration/SKILL.md").is_file());
     drop(guard);
     let report = sync_builtin_skills(&[locked]);
-    assert!(report.failures.is_empty());
+    assert!(report.failures.is_empty() && report.busy.is_empty());
     assert_eq!(report.updated, builtin_skills().len());
     fs::remove_dir_all(home).unwrap();
 }

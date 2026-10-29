@@ -1,6 +1,67 @@
 use super::*;
 use std::fs;
 
+#[cfg(windows)]
+#[test]
+fn codex_idle_resume_requires_a_live_owned_writer_lock() {
+    let root = std::env::temp_dir().join(format!("krill writer 한글 {}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let home = root.join("account");
+    let transcript = home.join("sessions/2026/10/28/rollout-known.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::create_dir(home.join("thread-writer-locks")).unwrap();
+    fs::write(
+        &transcript,
+        r#"{"type":"session_meta","payload":{"id":"known"}}"#,
+    )
+    .unwrap();
+    // Register before Codex creates its lock. A stale filename alone is insufficient.
+    let watch = CodexResume::new(&transcript).unwrap();
+    let me = std::process::id();
+    assert!(watch.observe(me, None).unwrap().is_none());
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(home.join("thread-writer-locks/known.lock"))
+        .unwrap();
+    assert!(watch.observe(me, None).unwrap().is_none());
+    guard.lock().unwrap();
+    let found = watch.observe(me, None).unwrap().unwrap();
+    assert_eq!(found.id, "known");
+    assert_eq!(found.path, transcript);
+    assert!(watch.observe(u32::MAX, None).unwrap().is_none());
+    let mut unrelated = krill_proto::os::background_command("cmd.exe")
+        .args(["/d", "/c", "more"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(crate::sys::start_us(unrelated.id()).is_ok());
+    assert!(watch.observe(unrelated.id(), None).unwrap().is_none());
+    unrelated.kill().ok();
+    unrelated.wait().ok();
+    // Holding an unrelated thread's writer lock cannot confirm this conversation.
+    let other = transcript.with_file_name("rollout-other.jsonl");
+    fs::write(
+        &other,
+        r#"{"type":"session_meta","payload":{"id":"other"}}"#,
+    )
+    .unwrap();
+    assert!(
+        CodexResume::new(&other)
+            .unwrap()
+            .observe(me, None)
+            .unwrap()
+            .is_none()
+    );
+    drop(guard);
+    assert!(watch.observe(me, None).unwrap().is_none());
+    drop(watch);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn open_transcript_metadata_recovers_identity_and_source_without_project_guessing() {
     for provider in [ProviderKind::Codex, ProviderKind::Claude] {
@@ -95,4 +156,60 @@ fn agy_presence_beats_old_brain_handles_but_ambiguity_fails_closed() {
     assert_eq!(wal_found.id, "wal-only");
     assert_eq!(wal_found.home, root);
     assert_eq!(wal_found.path, root.join("conversations/wal-only.db"));
+}
+
+#[test]
+fn resume_retries_only_pending_metadata_and_disappearing_files() {
+    let root = std::env::temp_dir().join(format!("kas-pending-header-{}", std::process::id()));
+    let path = root.join("sessions/2026/10/24/rollout-known.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for pending in [
+        "",
+        r#"{"type":"session_meta","payload":{"id":"kn"#,
+        // A complete record without identity followed by the metadata line still being written.
+        "{\"type\":\"turn_context\"}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"kn",
+    ] {
+        fs::write(&path, pending).unwrap();
+        assert_eq!(
+            from_paths(ProviderKind::Codex, [path.clone()])
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+                .unwrap()
+                .is_none()
+        );
+    }
+    fs::write(&path, r#"{"type":"session_meta","payload":{"id":"known"}}"#).unwrap();
+    assert_eq!(
+        super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+            .unwrap()
+            .unwrap()
+            .id,
+        "known"
+    );
+    for invalid in [
+        r#"{"type":"session_meta","payload":{"id":"../invalid"}}"#,
+        r#"{"type":"session_meta","payload":{}}"#,
+        "corrupt\n",
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert_eq!(
+            super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    fs::remove_file(&path).unwrap();
+    assert!(
+        super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_dir_all(root).unwrap();
 }

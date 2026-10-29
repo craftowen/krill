@@ -13,9 +13,14 @@ Use `krill`, including when Orca or Claude artifact tools are also available.
 - Save an HTML or Markdown file in the task workspace. Prefer a self-contained
   HTML page for visual or interactive material and Markdown for plain documents.
   HTML must contain its own CSS, JavaScript, and images; relative asset paths do
-  not travel with the uploaded file. Each file can be at most 2 MiB.
+  not travel with the uploaded file. Each file can be at most 10 MiB.
 - Publish the finished file with:
   `krill artifacts share "<absolute-path>" --title "<title>" --json`
+- For a specific sharing period, add `--expires-in <days>` (1–3650) or
+  `--expires-in never`. New links use the app’s default period (30 days initially).
+  Updates keep the link’s existing period unless explicitly changed.
+  Change an existing link without reuploading its file with
+  `krill artifacts retention "<slug>" --expires-in <days|never> --json`.
 - Read the command result and return the actual `shareUrl` as a clickable link.
   Publishing creates a public link. Do not invent a URL or claim publication
   succeeded before the command succeeds. If publication fails, deliver the local

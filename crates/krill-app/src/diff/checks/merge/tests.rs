@@ -546,3 +546,84 @@ fn pr_merge_in_flight_repo_switch_completion_clears_busy_without_stale_result(
         assert!(panel.checks.fix_status.is_none());
     });
 }
+
+/// APP-F01: 원격 호스트 작업공간에서는 PR · CI 탭이 로컬 git·gh를 부르지 않는다 — 조회·초안 전환·병합이
+/// 모두 닫히고 미지원 상태만 보이며, 전환 전에 시작된 로컬 조회 결과는 버린다. 로컬로 돌아오면 다시 조회한다.
+#[gpui::test]
+fn remote_host_disables_pr_checks_and_drops_stale_local_inspection(cx: &mut gpui::TestAppContext) {
+    let fake = Fake::new(false);
+    let (view, cx) = setup(cx, &fake);
+    assert!(cx.debug_bounds("pr-merge-squash").is_some());
+    let inspections = || fake.inspections.lock().unwrap().len();
+    let before = inspections();
+
+    // 로컬 조회를 시작한 채 원격으로 전환: 결과가 도착해도 원격 상태를 덮어쓰지 않는다.
+    let sock =
+        std::env::temp_dir().join(format!("krill-checks-remote-{}.sock", std::process::id()));
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.refresh_checks(cx);
+            p.connect(crate::hosts::HostTarget::remote("fixture", sock), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.remote_host());
+        assert!(p.checks.inspection.is_none());
+        assert!(!p.checks.loading);
+        assert!(p.checks.pending_merge.is_none());
+    });
+    assert!(cx.debug_bounds("pr-checks-remote-unsupported").is_some());
+    assert!(cx.debug_bounds("pr-merge-squash").is_none());
+    assert!(cx.debug_bounds("pr-checks-loading").is_none());
+    let after_switch = inspections();
+
+    // 원격에서는 조회·초안 전환·병합이 아무것도 실행하지 않는다.
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| {
+            p.set_tab(super::super::PanelTab::Changes, cx);
+            p.set_tab(super::super::PanelTab::Checks, cx);
+            p.refresh_checks(cx);
+            p.toggle_pr_draft(cx);
+            p.merge_pr(PrMergeMethod::Squash, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        inspections(),
+        after_switch,
+        "remote host must not run gh/git inspection"
+    );
+    assert!(fake.merges.lock().unwrap().is_empty());
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert!(p.checks.inspection.is_none());
+        assert!(!p.checks.loading);
+        assert!(p.checks.pending_merge.is_none());
+        assert!(p.checks.fix_status.is_none());
+    });
+    assert!(cx.debug_bounds("pr-merge-confirmation").is_none());
+    assert!(cx.debug_bounds("pr-checks-remote-unsupported").is_some());
+
+    // 로컬 호스트로 돌아오면 다시 조회해 PR 동작이 돌아온다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            let paths = krill_proto::daemon::Paths {
+                socket: PathBuf::from("/fake/local.sock"),
+                holder: PathBuf::new(),
+                krilld: PathBuf::new(),
+            };
+            let hub: Arc<dyn crate::diff::Source> = Arc::new(crate::diff::TestHubSource(
+                std::sync::Mutex::new(krilld::git::watch::Hub::default()),
+            ));
+            p.connect_with(crate::hosts::HostTarget::local(paths), Some(hub), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(inspections() > after_switch);
+    assert!(!cx.update(|_, cx| view.read(cx).remote_host()));
+    assert!(cx.update(|_, cx| view.read(cx).checks.inspection.is_some()));
+    assert!(cx.debug_bounds("pr-merge-squash").is_some());
+    assert!(before <= after_switch);
+}

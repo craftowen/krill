@@ -3,7 +3,7 @@
 //!
 use std::fmt;
 use std::io::{self, Write as _};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use krill_proto::{SessionId, control::AgentState};
 use serde::{Deserialize, Serialize};
@@ -136,7 +136,13 @@ fn post(config: &str) -> io::Result<()> {
     // Disable user curlrc, proxies and URL globbing. Do not follow redirects:
     // neither credentials nor payload may move to another endpoint. Discard
     // response bodies and diagnostics; only the fixed-size HTTP status is read.
-    let mut child = Command::new("/usr/bin/curl")
+    let curl = if cfg!(windows) {
+        "curl.exe"
+    } else {
+        "/usr/bin/curl"
+    };
+    let discard = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut child = krill_proto::os::background_command(curl)
         .args([
             "--disable",
             "--silent",
@@ -150,7 +156,7 @@ fn post(config: &str) -> io::Result<()> {
             "--max-time",
             "5",
             "--output",
-            "/dev/null",
+            discard,
             "--write-out",
             "%{http_code}",
             "--config",

@@ -44,7 +44,7 @@ root=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || exit 0
 root=$(cd "$root" && pwd -P)
 rel="$(cd "$d" && pwd -P)${path#"$d"}"; rel=${rel#"$root"}; rel=${rel#/}
 case $rel in
-  AGENTS.md|CLAUDE.md|docs/CONVENTIONS.md|clippy.toml|rustfmt.toml|deny.toml|.config/nextest.toml|scripts/*|.github/*|.claude/settings.json|.claude/hooks/*) ;;
+  AGENTS.md|CLAUDE.md|docs/CONVENTIONS.md|clippy.toml|rustfmt.toml|deny.toml|.cargo/*|.config/nextest.toml|scripts/*|.github/*|.claude/settings.json|.claude/hooks/*) ;;
   *) exit 0 ;;
 esac
 echo "차단: 하네스 파일 $rel — AGENTS.md 규칙 8. 메인테이너 승인 필요 — 승인받았으면 사람이 KRILL_HARNESS_APPROVED=1로 Claude를 다시 띄운다." >&2

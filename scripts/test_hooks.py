@@ -80,9 +80,52 @@ class HookTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("공개 표면 점검 실패", result.stderr)
 
+    def test_annotated_tags_check_the_peeled_commit(self):
+        env = dict(self.env, KRILL_ALLOW_PROTECTED_PUSH="isolated annotated-tag fixture")
+        self.git(self.work, "-c", "tag.gpgsign=false", "tag", "-a", "v0.1.0", "-m", "fixture")
+        allowed = subprocess.run(
+            ["git", "push", "origin", "refs/tags/v0.1.0"], cwd=self.work,
+            env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn("public-surface: ok", allowed.stdout + allowed.stderr)
+
+        (self.work / "docs").mkdir()
+        (self.work / "docs/unapproved.md").write_text("internal fixture\n")
+        self.commit()
+        self.git(self.work, "-c", "tag.gpgsign=false", "tag", "-a", "v0.1.1", "-m", "fixture")
+        blocked = subprocess.run(
+            ["git", "push", "origin", "refs/tags/v0.1.1"], cwd=self.work,
+            env=env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("공개 표면 점검 실패", blocked.stderr)
+        refs = self.git(self.root, "--git-dir", str(self.origin), "for-each-ref",
+                        "--format=%(refname)").stdout.splitlines()
+        self.assertEqual(refs, ["refs/tags/v0.1.0"])
+
     def test_feature_branch_needs_no_protected_ref_reason(self):
         result = self.push("refs/heads/feature")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_tree_and_blob_tags_cannot_bypass_public_surface_inspection(self):
+        tree = self.git(self.work, "rev-parse", "HEAD^{tree}").stdout.strip()
+        blob = self.git(self.work, "hash-object", "-w", "--stdin", input="internal fixture\n").stdout.strip()
+        for index, (kind, target, annotated) in enumerate(
+                [(kind, target, annotated) for kind, target in (("tree", tree), ("blob", blob))
+                 for annotated in (False, True)]):
+            with self.subTest(kind=kind, annotated=annotated):
+                tag = "v9.0." + str(index)
+                args = ["-c", "tag.gpgsign=false", "tag"]
+                if annotated:
+                    args += ["-a", "-m", "fixture"]
+                self.git(self.work, *args, tag, target)
+                result = subprocess.run(
+                    ["git", "push", "origin", "refs/tags/" + tag], cwd=self.work,
+                    env={**self.env, "KRILL_ALLOW_PROTECTED_PUSH": "isolated non-commit tag fixture"},
+                    capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("커밋으로 해석할 수 없는 ref", result.stderr)
+        self.assertEqual(self.git(self.root, "--git-dir", str(self.origin),
+                                  "for-each-ref", "--format=%(refname)").stdout, "")
 
     def test_ci_refuses_missing_gitleaks(self):
         empty_path = self.root / "empty-path"
@@ -133,6 +176,11 @@ class HookTests(unittest.TestCase):
     def test_remote_authorization_does_not_authorize_harness_edits(self):
         path = str(self.work / "AGENTS.md")
         self.assertEqual(self.guard(path=path, KRILL_ALLOW_REMOTE="1").returncode, 2)
+        self.assertEqual(self.guard(path=path, KRILL_HARNESS_APPROVED="1").returncode, 0)
+
+    def test_cargo_configuration_is_a_protected_harness_file(self):
+        path = str(self.work / ".cargo/config.toml")
+        self.assertEqual(self.guard(path=path).returncode, 2)
         self.assertEqual(self.guard(path=path, KRILL_HARNESS_APPROVED="1").returncode, 0)
 
 

@@ -11,6 +11,40 @@ use krill_proto::control::AgentState;
 
 use super::*;
 
+/// Enumerate only enabled tab stops in the rendered menu. GPUI's global
+/// `focus_prev` from the container can select a control behind the popover.
+fn navigate_menu(
+    menu: &gpui::FocusHandle,
+    key: &str,
+    count: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let current = window.focused(cx);
+    menu.focus(window, cx);
+    let mut items = Vec::new();
+    for _ in 0..count {
+        window.focus_next(cx);
+        let Some(next) = window.focused(cx) else {
+            break;
+        };
+        if !menu.contains_focused(window, cx) || items.contains(&next) {
+            break;
+        }
+        items.push(next);
+    }
+    let index = current.and_then(|handle| items.iter().position(|item| *item == handle));
+    let target = match key {
+        "home" => items.first(),
+        "end" => items.last(),
+        "up" => items.get(index.map_or(items.len().saturating_sub(1), |i| {
+            if i == 0 { items.len() - 1 } else { i - 1 }
+        })),
+        _ => items.get(index.map_or(0, |i| (i + 1) % items.len())),
+    };
+    target.unwrap_or(menu).focus(window, cx);
+}
+
 /// 탭 안에서 편집하는 이름과 입력 이벤트 구독.
 pub(super) struct TabRename {
     pub(super) pane: PaneId,
@@ -122,7 +156,14 @@ impl Shell {
             return self
                 .sidebar
                 .read(cx)
-                .session_label_on_with_title(host, session, title)
+                // Local screen titles already enter the sidebar through
+                // on_frame. Its cache expires when the daemon title changes;
+                // overriding it with this pane's older copy freezes hidden tabs.
+                .session_label_on_with_title(
+                    host,
+                    session,
+                    host.is_remote().then_some(title).flatten(),
+                )
                 .0;
         }
         let launched = match self.layout.launch(pane).map(|l| &l.program) {
@@ -688,20 +729,38 @@ impl Shell {
             .or_else(|| visible.last().map(|i| i + 1))
             .unwrap_or(self.layout.tabs().len());
         self.change(true, cx, |l| {
-            if let Some(file) = closed.file {
-                l.open_file(file);
+            // 호스트를 먼저 정해 연다: 포커스 칸 기준으로 같은 경로의 로컬 칸을 재사용한 뒤 호스트만
+            // 바꾸면 로컬에서 읽은 버퍼가 원격 칸이 된다(APP-F01 후속).
+            let pane = if let Some(file) = closed.file {
+                l.open_file_on(closed.workspace.host, file)
             } else {
                 l.new_tab();
-            }
-            if let Some(pane) = l.focused() {
+                let pane = l.active_tab().focused;
                 l.set_host(pane, closed.workspace.host);
-                l.set_launch(pane, closed.launch);
-            }
+                pane
+            };
+            l.set_launch(pane, closed.launch);
             let active = l.active();
             l.set_tab_title(active, closed.title.as_deref());
             l.set_tab_color(active, closed.color);
             l.reorder_tab(active, destination.min(l.tabs().len().saturating_sub(1)));
         });
+    }
+
+    pub(super) fn shift_closed_tabs_after_restore(&mut self, saved_tab_count: usize, cx: &App) {
+        if self.closed_tabs.is_empty() || saved_tab_count == 0 {
+            return;
+        }
+        let saved_workspaces: Vec<Option<workspaces::Workspace>> = (0..saved_tab_count)
+            .map(|i| self.tab_workspace(i, cx))
+            .collect();
+        for closed in &mut self.closed_tabs {
+            let prepended = saved_workspaces
+                .iter()
+                .filter(|ws| ws.as_ref() == Some(&closed.workspace))
+                .count();
+            closed.position = closed.position.saturating_add(prepended);
+        }
     }
 
     /// OWE-734: 탭 닫기 요청. 고정된 탭(`pinned`)이면 확인 모달을 띄우고, 아니면 바로 닫는다.
@@ -1087,35 +1146,42 @@ impl Shell {
             pos.y - ui::SPACE_2
         };
 
-        let menu_item = |id: &'static str,
-                         label: &'static str,
-                         enabled: bool,
-                         shortcut: Option<&'static str>| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .role(gpui::Role::MenuItem)
-                .aria_label(label)
-                .tab_index(0)
-                .tab_stop(enabled)
-                .focus_visible(|d| d.bg(p.accent).border_1().border_color(p.ring))
-                .px_2()
-                .py_1()
-                .rounded(ui::RADIUS_SM)
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .text_size(ui::TEXT_SM)
-                .when(enabled, |d| {
-                    d.cursor_pointer()
-                        .text_color(p.popover_foreground)
-                        .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-                })
-                .when(!enabled, |d| d.text_color(p.muted_foreground).opacity(0.5))
-                .child(div().flex_1().min_w_0().truncate().child(label))
-                .children(shortcut.map(|sc| ui::keycap(p, sc)))
-        };
+        // Pin plus color swatches are always enabled. Other actual builders add
+        // themselves below; navigation never needs to visit a global tab stop.
+        let item_count = std::rc::Rc::new(std::cell::Cell::new(
+            2 + krill_app::layout::TabColor::ALL.len(),
+        ));
+        let key_item_count = item_count.clone();
+        let menu_item =
+            |id: &'static str, label: &'static str, enabled: bool, shortcut: Option<String>| {
+                if enabled {
+                    item_count.set(item_count.get() + 1);
+                }
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(label)
+                    .tab_index(0)
+                    .tab_stop(enabled)
+                    .focus_visible(|d| d.bg(p.accent).border_1().border_color(p.ring))
+                    .px_2()
+                    .py_1()
+                    .rounded(ui::RADIUS_SM)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_SM)
+                    .when(enabled, |d| {
+                        d.cursor_pointer()
+                            .text_color(p.popover_foreground)
+                            .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+                    })
+                    .when(!enabled, |d| d.text_color(p.muted_foreground).opacity(0.5))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .children(shortcut.map(|sc| ui::keycap(p, sc)))
+            };
 
         let pin_label = if is_pinned {
             text::UNPIN_TAB.get()
@@ -1247,21 +1313,36 @@ impl Shell {
                 .track_focus(&self.tab_menu_focus)
                 .role(gpui::Role::Menu)
                 .tab_group()
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         this.tab_context_menu = None;
                         cx.stop_propagation();
                         cx.notify();
+                    } else if matches!(event.keystroke.key.as_str(), "down" | "up" | "home" | "end")
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                    {
+                        navigate_menu(
+                            &this.tab_menu_focus,
+                            &event.keystroke.key,
+                            key_item_count.get(),
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                        window.prevent_default();
                     } else if event.keystroke.key == "tab"
                         && !event.keystroke.modifiers.control
                         && !event.keystroke.modifiers.alt
                         && !event.keystroke.modifiers.platform
                     {
-                        if event.keystroke.modifiers.shift {
-                            window.focus_prev(cx);
+                        let key = if event.keystroke.modifiers.shift {
+                            "up"
                         } else {
-                            window.focus_next(cx);
-                        }
+                            "down"
+                        };
+                        navigate_menu(&this.tab_menu_focus, key, key_item_count.get(), window, cx);
                         cx.stop_propagation();
                         window.prevent_default();
                     }
@@ -1296,7 +1377,7 @@ impl Shell {
                 .child(
                     div()
                         .id("tab-menu-pin")
-                        .role(gpui::Role::Button)
+                        .role(gpui::Role::MenuItem)
                         .tab_index(0)
                         .focus_visible(|d| d.border_1().border_color(p.ring))
                         .debug_selector(|| "tab-menu-pin".into())
@@ -1332,11 +1413,7 @@ impl Shell {
                         "tab-menu-close",
                         text::CLOSE_TAB_MENU.get(),
                         !is_pinned,
-                        Some(if cfg!(target_os = "macos") {
-                            "⌘W"
-                        } else {
-                            "Ctrl+Alt+W"
-                        }),
+                        krill_app::keys::shortcut_label(window, &super::CloseTab),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab_context_menu = None;
@@ -1917,6 +1994,103 @@ fn color_label(color: krill_app::layout::TabColor) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// APP-F01 후속: 닫은 원격 파일 탭을 다시 열 때(⌘⇧T) 포커스 칸 기준으로 같은 경로의 로컬 칸을
+    /// 재사용한 뒤 호스트만 바꾸면 로컬에서 읽은 버퍼가 원격 칸이 된다. 원격 호스트의 새 칸으로 열어야 한다.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn reopen_closed_remote_file_tab_never_rebinds_loaded_local_pane(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::shell::tests::{layout_of, open, state_path};
+        use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!("mk-tabs-reopen-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let wt = dir.join("wt-1");
+        std::fs::create_dir_all(&wt).unwrap();
+        let readme = wt.join("README.md");
+        std::fs::write(&readme, "# local\n").unwrap();
+        let (view, cx) = open(cx, state_path("tabs-reopen-remote-file"));
+        let host = HostId::Remote("studio".into());
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                s.host_manager.sync_specs(&[RemoteHostSpec {
+                    id: "studio".into(),
+                    label: "Studio".into(),
+                    address: "owen@studio.local".into(),
+                    port: None,
+                    identity_file: None,
+                    remote_socket: None,
+                }]);
+                s.sidebar.update(cx, |sb, cx| {
+                    sb.set_remote_snapshot_for_test(
+                        "studio",
+                        HostStatus::Connected,
+                        krill_app::sidebar::Snapshot {
+                            sessions: Vec::new(),
+                            trees: BTreeMap::from([(dir.clone(), vec![wt.clone()])]),
+                        },
+                        cx,
+                    );
+                    sb.select_worktree(Some(wt.clone()), cx);
+                });
+                // 같은 경로를 로컬 칸으로 연다(로컬 내용을 읽은 에디터).
+                s.open_file_on(HostId::Local, readme.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+        let local_pane = layout_of(&view, cx).active_tab().focused;
+        assert_eq!(layout_of(&view, cx).host(local_pane), &HostId::Local);
+        let launch = Create {
+            account: None,
+            program: Program::Login,
+            cwd: wt.as_os_str().as_bytes().to_vec(),
+            cols: pane::SIZE.0,
+            rows: pane::SIZE.1,
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                // 같은 탭에 선택된 원격 작업공간의 칸을 두면 탭의 작업공간이 원격으로 판정되고,
+                // 포커스는 로컬 파일 칸에 남는다(분할 탭).
+                s.layout.split(Axis::Horizontal);
+                let remote_pane = s.layout.focused().unwrap();
+                s.layout.set_host(remote_pane, host.clone());
+                s.layout.set_launch(remote_pane, launch.clone());
+                s.layout.focus(local_pane);
+                let active = s.layout.active();
+                assert_eq!(
+                    s.tab_workspace(active, cx).map(|w| w.host),
+                    Some(host.clone())
+                );
+                s.closed_tabs.push(ClosedTab {
+                    workspace: workspaces::Workspace {
+                        host: host.clone(),
+                        folder: wt.clone(),
+                    },
+                    position: 0,
+                    launch,
+                    file: Some(readme.clone()),
+                    title: None,
+                    color: None,
+                });
+                s.reopen_closed_tab(cx);
+            });
+        });
+        let l = layout_of(&view, cx);
+        assert_eq!(
+            l.host(local_pane),
+            &HostId::Local,
+            "a loaded local editor pane must never be rebound to the remote host"
+        );
+        assert_eq!(l.file(local_pane), Some(readme.as_path()));
+        let reopened = l.active_tab().focused;
+        assert_ne!(reopened, local_pane);
+        assert_eq!(l.host(reopened), &host);
+        assert_eq!(l.file(reopened), Some(readme.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[cfg(unix)]
     #[gpui::test]
