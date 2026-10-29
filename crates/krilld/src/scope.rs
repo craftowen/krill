@@ -1,13 +1,15 @@
-//! 세션 범위 권한(MK-036, T2-D11). 연결한 프로세스가 어느 세션의 후손인지 `LOCAL_PEERPID` + ppid 체인으로 판정해,
-//! 세션 안에서 온 요청(에이전트·hook·에이전트가 실행한 `krill`)은 그 세션만 다루게 한다. 거부는 감사 로그에 남긴다.
+//! 피어 계보(MK-036, T2-D11). 연결한 프로세스가 어느 세션의 후손인지 `LOCAL_PEERPID` + ppid 체인으로 판정한다.
+//! 세션 안에서 온 요청(에이전트·hook·에이전트가 실행한 `krill`)도 외부 셸과 같은 전체 권한을 받는다(Orca와 같은
+//! 소유자 권한 모델). 계보는 hook 귀속·setup 크기처럼 "어느 세션에서 왔는지"를 알아야 하는 곳에만 쓴다.
+//! 거부는 감사 로그에 남긴다.
 //!
-//! **보안 경계가 아니라 실수 방지용 범위 제한이다**(ARCHITECTURE §3). 같은 UID 프로세스는 setsid·이중 fork로
-//! 부모를 launchd로 바꿔 외부 셸처럼 보일 수 있다. 계보를 끝까지 확인하지 못하면 [`Scope::Restricted`]다.
+//! 같은 UID 프로세스는 이미 같은 권한으로 명령을 실행할 수 있으므로 세션 사이를 막는 것은 보안 경계가 아니다
+//! (ARCHITECTURE §3). 계보를 끝까지 확인하지 못한 피어만 [`Scope::Restricted`]로 막는다.
 //!
 //! | 피어 | 범위 |
 //! |---|---|
 //! | 체인이 세션 루트에 닿지 않고 launchd(PID 1)까지 감(외부 셸·앱) | [`Scope::Full`] |
-//! | 세션 X 루트 프로세스 또는 그 후손 | [`Scope::Session`]`(X)` — X와 X가 만든 하위 세션만 |
+//! | 세션 X 루트 프로세스 또는 그 후손 | [`Scope::Session`]`(X)` — 전체 권한, 출신 세션 X를 기억 |
 //! | 피어 PID·부모 조회 실패, 체인이 [`MAX_DEPTH`]를 넘음 | [`Scope::Restricted`] — 어떤 세션도 못 다룸 |
 
 use crate::os::AsFd;
@@ -28,71 +30,31 @@ pub const MAX_DEPTH: usize = 128;
 /// 감사 로그가 이 크기를 넘으면 `<path>.1`로 밀어내고 새로 쓴다(직전 한 벌만 보관).
 const AUDIT_MAX: u64 = 1 << 20;
 
-/// 피어가 다룰 수 있는 세션 범위.
+/// 피어의 출신과 권한.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// 모든 세션(외부 셸·앱).
+    /// 세션 밖(외부 셸·앱). 전체 권한.
     Full,
-    /// 이 세션과 이 세션이 만든 하위 세션(세션 후손).
+    /// 이 세션의 후손. 전체 권한이며 출신 세션을 기억한다.
     Session(SessionId),
-    /// 아무 세션도(계보 조회 실패).
+    /// 계보 조회 실패. 아무 권한도 없다.
     Restricted,
 }
 
 impl Scope {
-    /// `target` 세션을 읽거나 쓸 수 있는지. 세션을 만든 상위 세션도 허용한다.
-    pub fn allows(self, target: SessionId, roots: &Roots) -> bool {
-        match self {
-            Self::Full => true,
-            Self::Session(id) => id == target || roots.created_by(target, id),
-            Self::Restricted => false,
-        }
+    /// 모든 세션과 전역 요청을 다룰 수 있는지. 계보를 확인한 피어는 세션 안이든 밖이든 전부 허용한다.
+    pub fn full(self) -> bool {
+        self != Self::Restricted
     }
 }
 
-/// 세션 루트 프로세스(holder가 띄운 셸·에이전트) 목록과 생성 계보. PID 재사용을 구분하려고 등록 시점의 시작 시각을 같이 둔다.
+/// 세션 루트 프로세스(holder가 띄운 셸·에이전트) 목록. PID 재사용을 구분하려고 등록 시점의 시작 시각을 같이 둔다.
 #[derive(Debug, Default)]
 pub struct Roots {
     pids: HashMap<u32, (SessionId, u64)>,
-    creators: HashMap<SessionId, SessionId>,
-    path: Option<PathBuf>,
 }
 
 impl Roots {
-    /// 생성 계보만 디스크에서 복원한다. PID와 시작 시각은 holder 재전달 시 새로 검증한다.
-    pub fn open(path: Option<PathBuf>) -> Self {
-        let creators = path
-            .as_deref()
-            .and_then(|p| fs::read(p).ok())
-            .and_then(|bytes| serde_json::from_slice::<Vec<(SessionId, SessionId)>>(&bytes).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        Self {
-            creators,
-            path,
-            ..Self::default()
-        }
-    }
-
-    fn save(&self, creators: &HashMap<SessionId, SessionId>) -> io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        let mut rows: Vec<_> = creators.iter().map(|(&id, &parent)| (id, parent)).collect();
-        rows.sort_unstable();
-        let bytes = serde_json::to_vec(&rows).map_err(io::Error::other)?;
-        let tmp = path.with_extension("tmp");
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?
-            .write_all(&bytes)?;
-        fs::rename(tmp, path)
-    }
-
     /// 세션 `id`의 루트 `pid`를 등록한다(holder `Spawned`·`Session`을 받은 직후).
     ///
     /// # Errors
@@ -103,70 +65,9 @@ impl Roots {
         Ok(())
     }
 
-    /// 세션 `id`를 만든 피어의 범위를 기록한다(세션 안에서 만든 하위 세션이면 만든 세션을 상위 생성자로 남긴다).
-    pub fn record_creator(&mut self, id: SessionId, creator: Scope) -> io::Result<()> {
-        let mut next = self.creators.clone();
-        next.remove(&id);
-        if let Scope::Session(parent) = creator
-            && parent != id
-        {
-            next.insert(id, parent);
-        }
-        if next != self.creators {
-            self.save(&next)?;
-            self.creators = next;
-        }
-        Ok(())
-    }
-
-    /// `target`이 `ancestor` 세션(또는 그 하위 세션)에서 만들어졌는지.
-    pub fn created_by(&self, mut target: SessionId, ancestor: SessionId) -> bool {
-        for _ in 0..MAX_DEPTH {
-            let Some(&creator) = self.creators.get(&target) else {
-                return false;
-            };
-            if creator == ancestor {
-                return true;
-            }
-            target = creator;
-        }
-        false
-    }
-
-    /// 세션 `id`의 루트를 지운다(세션 종료). 하위 세션이 남아 있으면 상위 생성자로 이어 준다.
+    /// 세션 `id`의 루트를 지운다(세션 종료).
     pub fn remove(&mut self, id: SessionId) {
-        self.forget(id);
-        self.save(&self.creators).ok();
-    }
-
-    /// 기동 시 `live`에 없는 자식 ID 항목을 버린다(죽은 세션의 계보 잔류 정리).
-    /// 남는 하위 세션은 [`Roots::remove`]와 같이 상위 생성자로 이어 준다.
-    pub fn prune_dead(&mut self, live: &[SessionId]) {
-        let dead: Vec<SessionId> = self
-            .creators
-            .keys()
-            .copied()
-            .filter(|id| !live.contains(id))
-            .collect();
-        if dead.is_empty() {
-            return;
-        }
-        for id in dead {
-            self.forget(id);
-        }
-        self.save(&self.creators).ok();
-    }
-
-    fn forget(&mut self, id: SessionId) {
         self.pids.retain(|_, (sid, _)| *sid != id);
-        let parent = self.creators.remove(&id);
-        for creator in self.creators.values_mut() {
-            if *creator == id
-                && let Some(p) = parent
-            {
-                *creator = p;
-            }
-        }
     }
 
     /// `pid`가 등록된 루트이고 시작 시각도 같으면(재사용된 PID가 아니면) 그 세션.
@@ -339,21 +240,15 @@ impl Peer {
 
     /// `op`(정적 이름, 예: `"send"`)로 `target`을 다뤄도 되는지. 안 되면 감사 로그에 한 줄 남기고 `false`.
     /// 감사 로그 쓰기 실패는 판정을 바꾸지 않는다(거부는 그대로 거부).
-    pub fn authorize(
-        &self,
-        op: &'static str,
-        target: SessionId,
-        roots: &Roots,
-        audit: &Audit,
-    ) -> bool {
-        if self.scope.allows(target, roots) {
+    pub fn authorize(&self, op: &'static str, target: SessionId, audit: &Audit) -> bool {
+        if self.scope.full() {
             return true;
         }
         audit.deny(self, op, target).ok();
         false
     }
 
-    /// 서명 정책을 전체 범위 피어에 적용한다(MK-096). 정책이 꺼졌거나 세션·제한 피어면 그대로 두고 `false`.
+    /// 서명 정책을 전체 권한 피어(세션 피어 포함)에 적용한다(MK-096). 정책이 꺼졌거나 제한 피어면 그대로 두고 `false`.
     /// 정책을 못 넘긴 전체 피어는 [`Scope::Restricted`]으로 내리고 감사 로그(`op=peer-sign`)에 남긴 뒤 `true`를
     /// 돌려준다. 호출자는 `true`면 연결을 닫는다(감시 연결 같은 범위 검사가 없는 경로도 막는다).
     pub fn gate_signing(
@@ -362,7 +257,7 @@ impl Peer {
         sign: Option<&CodeSign>,
         audit: &Audit,
     ) -> bool {
-        if self.scope != Scope::Full || policy.allows(sign) {
+        if !self.scope.full() || policy.allows(sign) {
             return false;
         }
         audit.deny(self, "peer-sign", SessionId(0)).ok();

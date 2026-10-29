@@ -536,7 +536,7 @@ fn role_message_requires_negotiated_feature() {
 }
 
 #[test]
-fn creator_session_can_wait_read_and_send_to_created_child_while_unrelated_session_is_denied() {
+fn session_peer_can_wait_read_and_send_to_created_child_and_unrelated_session() {
     use std::os::fd::AsFd;
 
     use krill_holder::link::Link;
@@ -697,37 +697,21 @@ fn creator_session_can_wait_read_and_send_to_created_child_while_unrelated_sessi
         )
     });
 
-    // 무관한 세션 C는 계속 거부되고 감사 로그에 남는다(MK-036).
-    assert_eq!(
-        ctrl.control(&Request::WaitStatus { session: session_c }),
-        Reply::Failed(Failure::NoSession)
-    );
-    assert_eq!(
+    // 무관한 세션 C도 세션 피어가 다룰 수 있다(Orca 소유자 모델). 거부가 없으니 감사 로그도 없다.
+    assert!(matches!(
         ctrl.control(&Request::Capture {
             session: session_c,
             format: CaptureFormat::Plain,
         }),
-        Reply::Failed(Failure::NoSession)
-    );
-    assert_eq!(
-        ctrl.control(&Request::Close { session: session_c }),
-        Reply::Failed(Failure::Denied)
-    );
+        Reply::Captured { .. }
+    ));
     let Reply::Sessions(listed) = ctrl.control(&Request::List) else {
         panic!("list");
     };
-    let ids: Vec<_> = listed.into_iter().map(|i| i.session).collect();
-    assert_eq!(ids, vec![session_a, session_b]);
-
-    let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
-    assert!(
-        audit.contains("deny op=attach target=3") && audit.contains("scope=session:1"),
-        "{audit}"
-    );
-    assert!(
-        audit.contains("deny op=close target=3") && audit.contains("scope=session:1"),
-        "{audit}"
-    );
+    let mut ids: Vec<_> = listed.into_iter().map(|i| i.session).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![session_a, session_c, session_b]);
+    assert!(!dir.join("audit.log").exists());
 
     drop(wait_conn);
     drop(ctrl);
