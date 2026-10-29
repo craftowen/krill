@@ -579,7 +579,8 @@ impl Panel {
                     return;
                 }
                 this.busy = false;
-                if this.pending_search {
+                let resumed = matches!(got, Ok(Reply::AgentHistory(Response::Resumed { .. })));
+                if this.pending_search && !resumed {
                     this.search_vault(cx);
                     return;
                 }
