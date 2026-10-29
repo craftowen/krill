@@ -487,6 +487,12 @@ fn push_patch_line(buf: &mut String, line: &str) {
     }
 }
 
+/// `raw_patch`는 UTF-8 손실 변환 문자열이다. U+FFFD가 있으면 다시 만든 패치가 파일 바이트와 달라져
+/// 엉뚱한 내용을 적용할 수 있으므로 헝크·줄 단위 편집을 거부한다.
+fn patch_roundtrips(raw_patch: &str) -> bool {
+    !raw_patch.contains('\u{FFFD}')
+}
+
 pub fn extract_patch_header_and_hunks(raw_patch: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut hunks = Vec::new();
@@ -513,6 +519,9 @@ pub fn extract_patch_header_and_hunks(raw_patch: &str) -> (String, Vec<String>) 
 
 #[must_use]
 pub fn build_hunk_patch(raw_patch: &str, hunk_index: usize) -> Option<String> {
+    if !patch_roundtrips(raw_patch) {
+        return None;
+    }
     let (header, hunks) = extract_patch_header_and_hunks(raw_patch);
     if header.trim().is_empty() {
         return None;
@@ -553,6 +562,9 @@ pub fn build_line_patch(
     end_line: usize,
     use_new_line_numbers: bool,
 ) -> Option<String> {
+    if !patch_roundtrips(raw_patch) {
+        return None;
+    }
     let (lo, hi) = if start_line <= end_line {
         (start_line, end_line)
     } else {
@@ -1058,6 +1070,7 @@ impl Panel {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, false, cx);
@@ -1068,6 +1081,7 @@ impl Panel {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, true, cx);
@@ -1078,6 +1092,7 @@ impl Panel {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.confirm_discard_patch(text::CONFIRM_DISCARD_HUNK.get(), patch_text, window, cx);
@@ -1094,6 +1109,7 @@ impl Panel {
         let Some(patch_text) =
             build_line_patch(&self.raw_patch, false, range.start(), range.end(), use_new)
         else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, false, cx);
@@ -1110,6 +1126,7 @@ impl Panel {
         let Some(patch_text) =
             build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
         else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, true, cx);
@@ -1126,9 +1143,17 @@ impl Panel {
         let Some(patch_text) =
             build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
         else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.confirm_discard_patch(text::CONFIRM_DISCARD_LINES.get(), patch_text, window, cx);
+    }
+
+    fn reject_unsafe_patch(&mut self, cx: &mut Context<Self>) {
+        if !patch_roundtrips(&self.raw_patch) {
+            self.editing.note = text::PATCH_UNSAFE.get().into();
+            cx.notify();
+        }
     }
 
     fn confirm_discard_patch(
@@ -1138,6 +1163,11 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.remote_host() {
+            self.editing.note = text::REMOTE_UNSUPPORTED.get().into();
+            cx.notify();
+            return;
+        }
         self.editing.busy = true;
         let detail = self.repo.display().to_string();
         let answer = window.prompt(

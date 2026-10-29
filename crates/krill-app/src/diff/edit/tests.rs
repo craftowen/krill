@@ -1182,3 +1182,12 @@ fn unknown_remote_blocks_sync_until_background_probe_and_repo_reset(cx: &mut Tes
     cx.run_until_parked();
     assert!(fake.edits.lock().unwrap().is_empty());
 }
+
+#[test]
+fn hunk_and_line_patches_refuse_lossy_text() {
+    let head = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n";
+    assert!(build_hunk_patch(&format!("{head}-a\n+b\n"), 0).is_some());
+    let raw = format!("{head}-a\n+\u{FFFD}\n");
+    assert!(build_hunk_patch(&raw, 0).is_none());
+    assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
+}
