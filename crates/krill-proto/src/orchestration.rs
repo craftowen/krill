@@ -965,11 +965,25 @@ impl OrchestrationStore {
         fs::create_dir_all(state_dir)?;
         let body = crate::config_document::save_json(&state_dir.join(ORCH_FILE), self)?;
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_ORCH_BYTES {
-            return Err(invalid(
-                "orchestration.json exceeds size limit and nothing safe to prune is left (current Run, \
-                 active dispatches, pending questions/gates are kept); free space with \
-                 `krill orchestration reset --run <run-id>` for a finished Run",
-            ));
+            let unread: usize = self
+                .messages
+                .iter()
+                .filter(|m| !m.acked)
+                .map(|m| m.summary.len() + m.body.len())
+                .sum();
+            let outputs: usize = self
+                .dispatches
+                .iter()
+                .map(|d| d.archived_output.as_deref().map_or(0, str::len))
+                .sum();
+            return Err(invalid(format!(
+                "orchestration.json exceeds size limit and nothing safe to prune is left \
+                 (unread mail ~{unread}B, archived worker output ~{outputs}B, {} runs). \
+                 Read and ack mail with `krill orchestration check --to <name> --ack`, or discard a \
+                 finished/abandoned Run with `krill orchestration reset --run <run-id>` \
+                 (see `krill orchestration runs`)",
+                self.runs.len()
+            )));
         }
         atomic_write(&state_dir.join(ORCH_FILE), body.as_bytes())
     }
@@ -1970,7 +1984,9 @@ impl OrchestrationStore {
             .iter()
             .flat_map(|d| d.message_ids.iter().cloned())
             .collect();
-        self.messages.retain(|m| !m.acked || pinned.contains(&m.id));
+        let unanswered = self.unanswered_questions();
+        self.messages
+            .retain(|m| !m.acked || pinned.contains(&m.id) || unanswered.contains(&m.id));
         let now = now_ms();
         for stale_only in [false, true] {
             let mut victims: Vec<_> = self
@@ -1988,6 +2004,20 @@ impl OrchestrationStore {
             }
         }
         Ok(())
+    }
+
+    /// 답이 없는 question(ACK 여부 무관 — `reply_message`는 질문을 먼저 ACK한다)의 메시지 ID.
+    fn unanswered_questions(&self) -> BTreeSet<String> {
+        let answered: BTreeSet<_> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.reply_to.as_deref())
+            .collect();
+        self.messages
+            .iter()
+            .filter(|m| m.msg_type == MessageType::Question && !answered.contains(m.id.as_str()))
+            .map(|m| m.id.clone())
+            .collect()
     }
 
     fn run_last_activity_ms(&self, run: &Run) -> u64 {
@@ -2022,8 +2052,13 @@ impl OrchestrationStore {
         } else {
             run.status != RunStatus::Active
         };
+        let unanswered = self.unanswered_questions();
         eligible
             && self.current_run_id.as_deref() != id
+            // 코디네이터 세션에 묶인 Active Run은 바인딩이 사라지지 않게 남긴다(세션 생존 여부는 모른다).
+            && !(stale_only
+                && (run.coordinator_session_id.is_some()
+                    || self.session_runs.values().any(|r| r == &run.id)))
             && !self
                 .dispatches
                 .iter()
@@ -2032,9 +2067,10 @@ impl OrchestrationStore {
                 .gates
                 .iter()
                 .any(|g| g.run_id.as_deref() == id && g.status == GateStatus::Pending)
-            && !self.messages.iter().any(|m| {
-                m.run_id.as_deref() == id && !m.acked && m.msg_type == MessageType::Question
-            })
+            && !self
+                .messages
+                .iter()
+                .any(|m| m.run_id.as_deref() == id && unanswered.contains(&m.id))
     }
 
     pub fn resolve_recipients(&self, to: &str, run_id: Option<&str>) -> Vec<String> {
@@ -5788,6 +5824,83 @@ mod mailbox_and_worker_safety_tests {
         assert!(ids.contains(&with_gate.as_str()));
         assert!(ids.contains(&fresh.as_str()));
         assert!(!ids.contains(&victim.as_str()));
+        Ok(())
+    }
+
+    fn pad_message(store: &mut OrchestrationStore, run: &str, t: MessageType, acked: bool) {
+        let mut m = store
+            .send_message(&mail(Some(run), "coordinator", &"x".repeat(200_000)))
+            .unwrap()
+            .remove(0);
+        m.msg_type = t;
+        m.acked = acked;
+        let stored = store.messages.iter_mut().find(|s| s.id == m.id).unwrap();
+        *stored = m;
+    }
+
+    #[test]
+    fn byte_pressure_keeps_acked_but_unanswered_question() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let day = 24 * 60 * 60 * 1000;
+        let old = now_ms() - 3 * day;
+        let waiting = store.create_run("waiting", None)?;
+        pad_message(&mut store, &waiting.id, MessageType::Question, true);
+        store
+            .runs
+            .iter_mut()
+            .find(|r| r.id == waiting.id)
+            .unwrap()
+            .status = RunStatus::Completed;
+        for _ in 0..9 {
+            let r = store.create_run("junk", None)?;
+            fill_run(&mut store, &r.id, 1, 200_000);
+            age_run(&mut store, &r.id, old);
+        }
+        store.create_run("current", None)?;
+        store.prune_if_needed()?;
+        assert!(store.runs.iter().any(|r| r.id == waiting.id));
+        assert!(
+            store
+                .messages
+                .iter()
+                .any(|m| m.run_id.as_deref() == Some(waiting.id.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn byte_pressure_keeps_stale_run_bound_to_coordinator_session() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let old = now_ms() - 3 * 24 * 60 * 60 * 1000;
+        let bound = store.create_run("bound", Some(7))?;
+        fill_run(&mut store, &bound.id, 1, 200_000);
+        age_run(&mut store, &bound.id, old);
+        for _ in 0..9 {
+            let r = store.create_run("junk", None)?;
+            fill_run(&mut store, &r.id, 1, 200_000);
+            age_run(&mut store, &r.id, old);
+        }
+        store.create_run("current", None)?;
+        store.prune_if_needed()?;
+        assert!(store.runs.iter().any(|r| r.id == bound.id));
+        assert!(store.session_runs.values().any(|id| id == &bound.id));
+        Ok(())
+    }
+
+    #[test]
+    fn size_limit_error_says_what_to_do() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let cur = store.create_run("current", None)?;
+        for _ in 0..11 {
+            pad_message(&mut store, &cur.id, MessageType::Status, false);
+        }
+        let dir = std::env::temp_dir().join(format!("mk-sizeerr-{}", std::process::id()));
+        let err = store.save(&dir).unwrap_err().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            err.contains("unread mail") && err.contains("orchestration check"),
+            "{err}"
+        );
         Ok(())
     }
 }
