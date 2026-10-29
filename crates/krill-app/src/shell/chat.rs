@@ -131,6 +131,10 @@ pub(crate) struct ChatState {
     multiline_blocked: BTreeSet<SessionId>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
+    #[cfg(test)]
+    prompt_delivery: Option<krill_proto::input::Delivery>,
+    #[cfg(test)]
+    prompt_confirmed: Option<bool>,
 }
 
 impl ChatState {
@@ -521,14 +525,6 @@ impl Shell {
             log.agent = snap.agent;
         }
         log.bound = snap.bound;
-        if reset
-            || snap
-                .items
-                .iter()
-                .any(|item| matches!(item.kind, ChatItemKind::User | ChatItemKind::Assistant))
-        {
-            self.chat.prompt_review.remove(&session);
-        }
         if reset || !snap.items.is_empty() {
             log.revision = log.revision.wrapping_add(1);
         }
@@ -609,10 +605,22 @@ impl Shell {
         bytes: &[u8],
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.chat.prompt_tasks.contains_key(&session) {
+            return false;
+        }
+        self.send_chat_prompt_input(pane, session, bytes, cx)
+    }
+
+    fn send_chat_prompt_input(
+        &mut self,
+        pane: super::PaneId,
+        session: SessionId,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Pane::input also returns None when disconnected: preflight the exact
         // pane before interpreting its queue result. This is not an agent ACK.
         if self.paste_queue.has_pending_for(pane)
-            || self.chat.prompt_tasks.contains_key(&session)
             || self.layout.file(pane).is_some()
             || self.layout.session(pane) != Some(session)
             || self.live.get(&pane).is_none_or(|live| {
@@ -732,9 +740,11 @@ impl Shell {
             return;
         };
         self.chat.multiline_blocked.remove(&session);
-        if text.contains(['\n', '\r']) {
-            self.start_multiline_chat_prompt(
-                prompt::MultilinePrompt {
+        if modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+            || text.contains(['\n', '\r'])
+        {
+            self.start_chat_prompt(
+                prompt::ChatPrompt {
                     pane,
                     session,
                     input,

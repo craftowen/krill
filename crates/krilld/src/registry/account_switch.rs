@@ -1387,7 +1387,9 @@ impl Registry {
                 let observed = resume_identity(|| {
                     let mut observed = identity::discover(provider, new_pid, tap.foreground())?;
                     #[cfg(windows)]
-                    if observed.is_none() && let Some(watch) = &codex_resume {
+                    if observed.is_none()
+                        && let Some(watch) = &codex_resume
+                    {
                         observed = watch.observe(new_pid, tap.foreground())?;
                     }
                     if observed.is_none() && provider == ProviderKind::Claude {

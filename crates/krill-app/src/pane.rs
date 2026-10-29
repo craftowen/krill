@@ -1140,6 +1140,14 @@ impl<W: Write> Pane<W> {
         self.journal.has_pending_input()
     }
 
+    pub fn input_receipt(&self) -> input::Receipt {
+        self.journal.receipt()
+    }
+
+    pub fn input_delivery(&self, receipt: input::Receipt) -> input::Delivery {
+        self.journal.delivery(receipt)
+    }
+
     /// A cancelled switch may continue on the original account. A failed switch drops the held
     /// bytes with a notice, so prompts intended for the new account never reach the original
     /// one, and the pane goes back to the preserved original session. The daemon keeps failed

@@ -57,8 +57,8 @@ mod child;
 mod file_users;
 mod foreground;
 pub(crate) use child::{CommandJob, pipe_available};
-pub use foreground::run_probe as run_console_probe;
 pub(crate) use file_users::FileUsers;
+pub use foreground::run_probe as run_console_probe;
 pub(crate) use foreground::session_agent_process;
 
 /// Windows에는 UID가 없어 "이 프로세스와 같은 사용자 SID"를 이 값 하나로 나타낸다([`crate::os::euid`]).

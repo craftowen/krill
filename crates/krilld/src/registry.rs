@@ -2828,7 +2828,7 @@ impl Registry {
             framed.extend_from_slice(b"\x1b[201~");
             tap.write_input(&framed, None)?;
             if submit {
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(krill_proto::input::PASTE_SUBMIT_DELAY);
                 tap.write_input(b"\r", None)?;
             }
         } else {

@@ -367,3 +367,96 @@ fn report_ack_does_not_discard_earlier_unacknowledged_typing() {
     assert_eq!(notice.bytes, b"keep me");
     assert_eq!(notice.fate, Fate::Unsupported);
 }
+
+#[test]
+fn receipt_needs_real_applied_ack_not_queueing_or_ephemeral_reports() {
+    let mut journal = Journal::new();
+    let now = Now::get();
+    journal.relink(Incarnation::Same, now);
+    let frames = journal.input(&vec![b'x'; MAX_INPUT + 1], now).unwrap();
+    let receipt = journal.receipt();
+    assert_eq!(journal.delivery(receipt), Delivery::Pending);
+    let report = journal.report(b"mouse").unwrap();
+    journal.ack(&InputAck {
+        id: report.id,
+        result: InputResult::Applied,
+    });
+    assert_eq!(journal.delivery(receipt), Delivery::Pending);
+    journal.ack(&InputAck {
+        id: frames[0].id,
+        result: InputResult::Applied,
+    });
+    assert_eq!(journal.delivery(receipt), Delivery::Pending);
+    journal.ack(&InputAck {
+        id: frames[1].id,
+        result: InputResult::Applied,
+    });
+    assert_eq!(journal.delivery(receipt), Delivery::Applied);
+    journal.input(b"competing typing", now).unwrap();
+    assert_eq!(journal.delivery(receipt), Delivery::Uncertain);
+}
+
+#[test]
+fn receipts_fail_closed_on_disconnect_pause_changed_session_or_rejected_ack() {
+    for failure in 0..5 {
+        let mut journal = Journal::new();
+        let now = Now::get();
+        journal.relink(Incarnation::Same, now);
+        let frame = journal.input(b"prompt", now).unwrap().remove(0);
+        let receipt = journal.receipt();
+        match failure {
+            0 => {
+                journal.unlink();
+                journal.relink(Incarnation::Same, now);
+            }
+            1 => {
+                journal.pause();
+                journal.relink(Incarnation::Same, now);
+            }
+            2 => {
+                journal.relink(Incarnation::Changed, now);
+            }
+            3 | 4 => {
+                journal.ack(&InputAck {
+                    id: frame.id,
+                    result: if failure == 3 {
+                        InputResult::Closed
+                    } else {
+                        InputResult::Denied
+                    },
+                });
+            }
+            _ => unreachable!(),
+        }
+        journal.ack(&InputAck {
+            id: frame.id,
+            result: InputResult::Applied,
+        });
+        assert_eq!(
+            journal.delivery(receipt),
+            Delivery::Uncertain,
+            "failure {failure}"
+        );
+    }
+}
+
+#[test]
+fn receipt_cannot_settle_against_a_replacement_journal() {
+    let now = Now::get();
+    let mut first = Journal::new();
+    first.relink(Incarnation::Same, now);
+    first.input(b"first", now).unwrap();
+    let receipt = first.receipt();
+    let mut replacement = Journal::new();
+    replacement.relink(Incarnation::Same, now);
+    let frame = replacement.input(b"replacement", now).unwrap().remove(0);
+    replacement.ack(&InputAck {
+        id: frame.id,
+        result: InputResult::Applied,
+    });
+    assert_eq!(replacement.delivery(receipt), Delivery::Uncertain);
+    assert_eq!(
+        replacement.delivery(replacement.receipt()),
+        Delivery::Applied
+    );
+}
