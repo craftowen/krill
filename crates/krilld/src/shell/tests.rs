@@ -276,6 +276,25 @@ fn custom_program_inherits_login_shell_rc_path() {
 }
 
 #[test]
+fn failed_login_path_probe_is_not_repeated_within_retry_window() {
+    let cache = std::sync::OnceLock::new();
+    let failed = std::sync::Mutex::new(None);
+    let calls = std::cell::Cell::new(0);
+    let login = || {
+        calls.set(calls.get() + 1);
+        Launch {
+            argv: vec![b"/nonexistent/shell".to_vec()],
+            env: vec![],
+        }
+    };
+    let window = std::time::Duration::from_secs(60);
+    for _ in 0..3 {
+        assert_eq!(cached_path(&cache, &failed, window, login), LAUNCHD_PATH);
+    }
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
 fn failed_login_path_probe_is_retried_and_success_is_cached() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = std::env::temp_dir().join(format!("mk595-path-{}", std::process::id()));
@@ -284,19 +303,29 @@ fn failed_login_path_probe_is_retried_and_success_is_cached() {
     std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let cache = std::sync::OnceLock::new();
+    let failed = std::sync::Mutex::new(None);
     let login = || Launch {
         argv: vec![script.as_os_str().as_bytes().to_vec()],
         env: vec![],
     };
-    assert_eq!(cached_path(&cache, login), LAUNCHD_PATH);
+    assert_eq!(
+        cached_path(&cache, &failed, std::time::Duration::ZERO, login),
+        LAUNCHD_PATH
+    );
     std::fs::write(
         &script,
         "#!/bin/sh\nprintf '__MK_PATH__=/recovered/bin:/usr/bin\\n'\n",
     )
     .unwrap();
-    assert_eq!(cached_path(&cache, login), b"/recovered/bin:/usr/bin");
+    assert_eq!(
+        cached_path(&cache, &failed, std::time::Duration::ZERO, login),
+        b"/recovered/bin:/usr/bin"
+    );
     std::fs::remove_file(&script).unwrap();
-    assert_eq!(cached_path(&cache, login), b"/recovered/bin:/usr/bin");
+    assert_eq!(
+        cached_path(&cache, &failed, std::time::Duration::ZERO, login),
+        b"/recovered/bin:/usr/bin"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
