@@ -93,6 +93,9 @@ pub fn consent_with(state: &Path, env: &Env) -> io::Result<Option<Consent>> {
 /// 환경과 무관한 동의 파일 내용. 없거나 손상됐거나 일반 파일이 아니면(FIFO·링크) `None`이다 — 동의를 증명하지
 /// 못하면 꺼진 것으로 본다. 막히지 않는 열기라 panic hook에서도 기다리지 않는다.
 pub(crate) fn read(state: &Path) -> io::Result<Option<Consent>> {
+    if super::shielded(state) {
+        return Ok(None);
+    }
     let raw = match file::read_bounded(&dir(state).join(CONSENT_FILE), MAX_CONSENT_BYTES) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
@@ -111,12 +114,25 @@ pub(crate) fn read(state: &Path) -> io::Result<Option<Consent>> {
         .filter(|c| is_hex32(&c.generation)))
 }
 
+/// 테스트 프로세스는 실제 사용자 동의를 바꾸지 않는다([`super::shielded`]). `read`가 `None`을 주므로 그대로 두면
+/// `enable`이 실제 대기열을 지우고 세대를 새로 쓴다.
+fn refuse_shielded(state: &Path) -> io::Result<()> {
+    if super::shielded(state) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test process must not change the default error-reporting consent",
+        ));
+    }
+    Ok(())
+}
+
 /// 동의한다(멱등: 이미 유효한 동의가 있으면 세대를 유지한다). 새 동의는 남아 있던 대기열·재시도·native
 /// 캐시·실행 표식을 먼저 지우고 새 세대를 원자적으로 쓴다. 거부 변수가 켜져 있어도 파일은 남긴다.
 ///
 /// # Errors
 /// 디렉터리·파일 쓰기 실패.
 pub fn enable(state: &Path) -> io::Result<()> {
+    refuse_shielded(state)?;
     let dir = dir(state);
     DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
     let lock = Lock::wait(&dir, QUEUE_LOCK, MANAGE_WAIT)?;
@@ -140,6 +156,7 @@ pub fn enable(state: &Path) -> io::Result<()> {
 /// # Errors
 /// 없음 외의 동의 파일 삭제 실패, 또는 동시 관리 작업 때문에 정리를 직렬화하지 못한 경우.
 pub fn disable(state: &Path) -> io::Result<()> {
+    refuse_shielded(state)?;
     let dir = dir(state);
     match fs::remove_file(dir.join(CONSENT_FILE)) {
         Ok(()) => {}
