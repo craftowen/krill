@@ -1913,7 +1913,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
             1024,
         )
         .ok();
-        let _ = spawn_detached_relauncher(
+        let status = spawn_detached_relauncher(
             &exe,
             &app_bundle,
             &state_dir,
@@ -1921,7 +1921,21 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
             &manifest.version,
             Some(gui_pid),
             DEFAULT_HEALTH_TIMEOUT,
-        )?;
+        )?
+        .wait()?;
+        // relauncher는 롤백한 뒤에도 0으로 끝난다. 새 버전이 시작 확인을 통과했는지는 저널만 안다.
+        let journal = Journal::load(&state_dir)?;
+        if !status.success()
+            || !journal
+                .as_ref()
+                .is_some_and(|j| j.to_version == manifest.version && j.stage == Stage::Healthy)
+        {
+            return Err(Error::Io(io::Error::other(format!(
+                "update to v{} did not complete (relauncher {status}, journal {:?})",
+                manifest.version,
+                journal.map(|j| j.stage)
+            ))));
+        }
     } else {
         let _ = swap_bundles(
             &app_bundle,

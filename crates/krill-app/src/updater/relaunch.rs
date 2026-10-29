@@ -673,6 +673,9 @@ pub fn spawn_detached_relauncher(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
+    // `krill update`가 relauncher를 기다리는 동안 터미널 Ctrl-C가 교체·새 앱까지 죽이지 않게 한다.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.arg(RELAUNCH_ARG)
         .arg(app_bundle)
         .arg(state_dir)
