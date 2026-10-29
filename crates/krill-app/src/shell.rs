@@ -4565,6 +4565,15 @@ impl Shell {
             Ok((session, linked)) => self.linked(pane, session, linked, cx),
             Err(e) => {
                 let permanent = is_permanent_error(&e);
+                // krilld가 이 칸을 영구히 거절했다(이미 이어졌거나 닫힌 세션 등)는 건 앱과 데몬이 정상적으로 대화 중이라는
+                // 뜻이다. 복원 칸이 전부 이렇게 거절돼도 ready를 보내야 한다. 안 보내면 업데이트가 30초 health 기한을
+                // 넘겨 롤백되고, 구버전이 다시 업데이트를 시도하며 앱이 34초마다 갈아엎어진다(2026-10-29 v0.2.28 실측 9회+).
+                if permanent && let Some(state) = self.update_ready.take() {
+                    cx.background_spawn(async move {
+                        krill_app::updater::mark_ready(&state, env!("CARGO_PKG_VERSION"));
+                    })
+                    .detach();
+                }
                 let old = self.layout.session(pane);
                 match self.live.get_mut(&pane) {
                     Some(l) => {

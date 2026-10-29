@@ -2844,6 +2844,28 @@ fn update_ready_waits_for_successful_link(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(state).unwrap();
 }
 
+/// 복원 칸이 전부 krilld에 영구 거절돼도(이미 이어졌거나 닫힌 세션) ready를 보낸다. 안 보내면 업데이트 health 확인이
+/// 30초 뒤 롤백되고 앱이 34초마다 재시작되는 루프에 빠졌다(2026-10-29 v0.2.28).
+#[gpui::test]
+fn update_ready_is_sent_when_every_restored_pane_is_permanently_refused(cx: &mut TestAppContext) {
+    let state = std::env::temp_dir().join(format!("mk-shell-ready-refused-{}", std::process::id()));
+    std::fs::remove_dir_all(&state).ok();
+    let (view, cx) = open(cx, state_path("update-ready-refused"));
+    let ready = krill_app::updater::ready_path(&state, env!("CARGO_PKG_VERSION"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.arm_update_ready(state.clone());
+            let pane = s.layout.active_tab().focused;
+            s.live.insert(pane, Live::new(Task::ready(())));
+            s.settled(pane, Err(std::io::ErrorKind::InvalidInput.into()), cx);
+            assert!(s.update_ready.is_none());
+        });
+    });
+    cx.run_until_parked();
+    assert!(ready.exists());
+    std::fs::remove_dir_all(state).unwrap();
+}
+
 /// 설 실기(v0.1.11): 보이는 칸이 원격뿐이면(호스트 꺼짐) 원격 연결을 기다리지 않고 바로 ready를 보낸다.
 /// 기다리면 30초 health 기한을 넘겨 업데이트가 롤백된다.
 #[gpui::test]
