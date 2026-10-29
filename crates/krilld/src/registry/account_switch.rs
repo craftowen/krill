@@ -1210,10 +1210,10 @@ impl Registry {
                 .and_then(|e| e.session.tap().foreground())
                 .or(old_fg);
             let mut observed = identity::discover(provider, old_pid, foreground)
-                .map_err(|e| prepare_failure("process_identity", &e))?;
+                .map_err(|e| prepare_failure(old, "process_identity", &e))?;
             if observed.is_none() && provider == ProviderKind::Claude {
                 observed = identity::discover_claude(&claude_homes, old_pid, foreground)
-                    .map_err(|e| prepare_failure("process_identity", &e))?;
+                    .map_err(|e| prepare_failure(old, "process_identity", &e))?;
             }
             if observed.is_none()
                 && provider == ProviderKind::Antigravity
@@ -1237,7 +1237,7 @@ impl Registry {
                 // observation must agree even when a record already contains an ID.
                 if (stored.session_id.is_some() || stored.transcript_path.is_some())
                     && transcript::session_id(provider, &stored)
-                        .map_err(|e| prepare_failure("process_identity", &e))?
+                        .map_err(|e| prepare_failure(old, "process_identity", &e))?
                         != found.id
                 {
                     return Err(Failure::Os(libc::EILSEQ));
@@ -1261,13 +1261,13 @@ impl Registry {
         // A project path never identifies a conversation. Only launch/resume/hooks or
         // files held by this process can supply the identity used for retirement.
         let session_id = transcript::session_id(provider, &stored)
-            .map_err(|error| prepare_failure("transcript_preparation", &error))?;
+            .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
         stored.session_id = Some(session_id.clone());
         let bound_path = stored.transcript_path.clone();
         stored = self
             .agents
             .bind_switch_identity(old, &stored)
-            .map_err(|e| prepare_failure("identity_binding", &e))?;
+            .map_err(|e| prepare_failure(old, "identity_binding", &e))?;
         let source = transcript_home
             .map(|home| crate::agent::control::LaunchAccount {
                 id: String::new(),
@@ -1301,7 +1301,7 @@ impl Registry {
             &cwd,
             bound_path.as_deref(),
         )
-        .map_err(|error| prepare_failure("transcript_preparation", &error))?;
+        .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
         let new = self.next_id();
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
@@ -1365,6 +1365,7 @@ impl Registry {
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut ready = false;
+        let mut confirmed_at = None;
         let mut next_identity_probe = Instant::now();
         while Instant::now() < deadline {
             if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
@@ -1375,12 +1376,15 @@ impl Registry {
                 && Instant::now() >= next_identity_probe
             {
                 next_identity_probe = Instant::now() + Duration::from_millis(200);
-                let mut observed = identity::discover(provider, new_pid, tap.foreground())
-                    .map_err(|e| prepare_failure("resume_identity", &e))?;
-                if observed.is_none() && provider == ProviderKind::Claude {
-                    observed = identity::discover_claude(&claude_homes, new_pid, tap.foreground())
-                        .map_err(|e| prepare_failure("resume_identity", &e))?;
-                }
+                let observed = resume_identity(|| {
+                    let observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    if observed.is_none() && provider == ProviderKind::Claude {
+                        identity::discover_claude(&claude_homes, new_pid, tap.foreground())
+                    } else {
+                        Ok(observed)
+                    }
+                })
+                .map_err(|e| prepare_failure(old, "resume_identity", &e))?;
                 let observed = observed
                     .filter(|found| {
                         if provider != ProviderKind::Antigravity {
@@ -1407,17 +1411,27 @@ impl Registry {
                     self.agents.observe_account_resume(new, &session_id);
                 }
             }
-            if self.agents.account_resume_observed(new, &session_id)
-                && tap.pulse().end > 0
-                && tap.quiet_ms() >= 150
-            {
-                ready = true;
-                break;
+            // Preserve a short preflight interval to observe immediate exits, but do not
+            // restart it on every output byte: a verified resume may already be working.
+            if self.agents.account_resume_observed(new, &session_id) && tap.pulse().end > 0 {
+                if confirmed_at.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_millis(150)
+                {
+                    ready = true;
+                    break;
+                }
+            } else {
+                confirmed_at = None;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         if !ready {
             tracing::warn!(
+                original = old.0,
+                replacement = new.0,
+                provider = provider.as_str(),
+                identity_confirmed = self.agents.account_resume_observed(new, &session_id),
+                output_observed = tap.pulse().end > 0,
                 stage = "resume_confirmation",
                 "account handoff timed out without a confirmed conversation"
             );
@@ -1434,7 +1448,7 @@ impl Registry {
         }
         prepared_transcript
             .verify()
-            .map_err(|error| prepare_failure("transcript_preparation", &error))?;
+            .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
         for session in [old, new] {
             let current = self
                 .agents
@@ -1450,7 +1464,7 @@ impl Registry {
                 return Err(Failure::BadRequest);
             }
             if transcript::session_id(provider, &current)
-                .map_err(|e| prepare_failure("conversation_recheck", &e))?
+                .map_err(|e| prepare_failure(old, "conversation_recheck", &e))?
                 != session_id
             {
                 return Err(Failure::Os(libc::EILSEQ));
@@ -1600,10 +1614,28 @@ impl Drop for Replacement<'_> {
     }
 }
 
+// Process/file discovery races with the resumed CLI creating or rotating its transcript.
+// Keep polling within the existing deadline; ambiguous/invalid identities remain fatal.
+fn resume_identity(
+    discover: impl FnOnce() -> std::io::Result<Option<identity::Identity>>,
+) -> std::io::Result<Option<identity::Identity>> {
+    match discover() {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
 // Validation errors constructed without an OS errno must retain their meaning on the wire.
-fn prepare_failure(stage: &'static str, error: &std::io::Error) -> Failure {
+fn prepare_failure(original: SessionId, stage: &'static str, error: &std::io::Error) -> Failure {
     use std::io::ErrorKind;
-    tracing::warn!(stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    tracing::warn!(original = original.0, stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
     Failure::Os(error.raw_os_error().unwrap_or_else(|| match error.kind() {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
         ErrorKind::NotFound => libc::ENOENT,

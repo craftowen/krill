@@ -96,3 +96,54 @@ fn agy_presence_beats_old_brain_handles_but_ambiguity_fails_closed() {
     assert_eq!(wal_found.home, root);
     assert_eq!(wal_found.path, root.join("conversations/wal-only.db"));
 }
+
+#[test]
+fn resume_retries_only_pending_metadata_and_disappearing_files() {
+    let root = std::env::temp_dir().join(format!("kas-pending-header-{}", std::process::id()));
+    let path = root.join("sessions/2026/10/24/rollout-known.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for pending in ["", r#"{"type":"session_meta","payload":{"id":"kn"#] {
+        fs::write(&path, pending).unwrap();
+        assert_eq!(
+            from_paths(ProviderKind::Codex, [path.clone()])
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+                .unwrap()
+                .is_none()
+        );
+    }
+    fs::write(&path, r#"{"type":"session_meta","payload":{"id":"known"}}"#).unwrap();
+    assert_eq!(
+        super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+            .unwrap()
+            .unwrap()
+            .id,
+        "known"
+    );
+    for invalid in [
+        r#"{"type":"session_meta","payload":{"id":"../invalid"}}"#,
+        r#"{"type":"session_meta","payload":{}}"#,
+        "corrupt\n",
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert_eq!(
+            super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    fs::remove_file(&path).unwrap();
+    assert!(
+        super::super::resume_identity(|| from_paths(ProviderKind::Codex, [path.clone()]))
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_dir_all(root).unwrap();
+}

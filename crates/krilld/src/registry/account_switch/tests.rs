@@ -12,17 +12,18 @@ use krill_proto::os::net::UnixStream;
 
 #[test]
 fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_old() {
-    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook) in [
-        (false, false, false, false, false, false),
-        (true, false, false, false, false, false),
-        (false, true, false, false, false, false),
-        (false, false, true, false, false, false),
-        (false, false, false, true, false, false),
-        (false, false, false, false, true, false),
-        (false, false, false, false, false, true),
+    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook, streaming) in [
+        (false, false, false, false, false, false, false),
+        (true, false, false, false, false, false, false),
+        (false, true, false, false, false, false, false),
+        (false, false, true, false, false, false, false),
+        (false, false, false, true, false, false, false),
+        (false, false, false, false, true, false, false),
+        (false, false, false, false, false, true, false),
+        (false, false, false, false, false, false, true),
     ] {
         let root = Path::new("/tmp").join(format!(
-            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}",
+            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}-{streaming}",
             std::process::id()
         ));
         fs::remove_dir_all(&root).ok();
@@ -109,6 +110,8 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             .join(transcript.file_name().unwrap());
         let reselect = cancel.then(|| Arc::clone(&reg));
         let hook_reg = Arc::clone(&reg);
+        let stop_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_stop = Arc::clone(&stop_output);
         let mock = std::thread::spawn(move || {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn {
@@ -148,6 +151,17 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 )
                 .unwrap();
             process.write_all(b"resumed selected account\r\n").unwrap();
+            let output_worker = streaming.then(|| {
+                let mut stream = process.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    while !output_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        if stream.write_all(b"continuing output\r\n").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })
+            });
             if !unconfirmed && !process_bound {
                 hook_reg.agents.record_hook_session(
                     id,
@@ -204,7 +218,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                     .unwrap();
             }
             // Keep the new PTY open until the parent has committed its handoff.
-            Some((id, process, replacement_process))
+            Some((id, process, replacement_process, output_worker))
         });
         reg.queue_account_switch(ProviderKind::Codex, &target);
         reg.queue_account_switch(ProviderKind::Codex, "codex-old");
@@ -225,6 +239,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             })
         });
         reg.process_account_work_in(&home);
+        stop_output.store(true, std::sync::atomic::Ordering::Release);
         if let Some(binding) = late_binding {
             binding.join().unwrap();
         }
@@ -254,7 +269,12 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             fs::read_to_string(to.join("auth.json")).unwrap(),
             "selected fixture credentials"
         );
-        drop(mock.join().unwrap());
+        if let Some((_, process, replacement, output_worker)) = mock.join().unwrap() {
+            if let Some(worker) = output_worker {
+                worker.join().unwrap();
+            }
+            drop((process, replacement));
+        }
         reader_worker.join().unwrap();
         drop(source_process);
         drop(reg);

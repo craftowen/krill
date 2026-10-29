@@ -213,6 +213,10 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
     }
     let mut head = Vec::new();
     File::open(path)?.take(128 * 1024).read_to_end(&mut head)?;
+    // A newly opened rollout may be visible before its metadata write completes.
+    // Only empty/incomplete JSON is retryable; complete invalid metadata stays fatal.
+    let pending_header = head.is_empty()
+        || serde_json::from_slice::<serde_json::Value>(&head).is_err_and(|e| e.is_eof());
     let mut identity: Option<String> = None;
     for record in String::from_utf8_lossy(&head)
         .lines()
@@ -252,7 +256,11 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
     }
     identity.ok_or_else(|| {
         io::Error::new(
-            io::ErrorKind::InvalidData,
+            if pending_header {
+                io::ErrorKind::WouldBlock
+            } else {
+                io::ErrorKind::InvalidData
+            },
             "conversation transcript has no verified identity",
         )
     })
