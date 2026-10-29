@@ -686,6 +686,11 @@ globalThis.MkTerminalCodec = (() => {
       this.setFontScale(this.fontScale, false);
       this.updateMode();
       this.status("connecting", "Connecting…");
+      this.routeUnsubscribe = options.onRouteChange?.(() => {
+        if (this.disposed || this.phase === "ended") return;
+        this.disconnect("connecting", "Reconnecting…");
+        this.open();
+      });
       this.open();
     }
     listen(el, event, fn, extra = {}) {
@@ -3914,6 +3919,7 @@ globalThis.MkTerminalCodec = (() => {
     unmount() {
       if (this.disposed) return;
       instances.delete(this);
+      this.routeUnsubscribe?.();
       this.command.value
         ? drafts.set(this.stateKey, this.command.value)
         : drafts.delete(this.stateKey);

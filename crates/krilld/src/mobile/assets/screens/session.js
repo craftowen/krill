@@ -1524,6 +1524,7 @@
         sessionId: target.id,
         stateKey: key,
         connect: () => ctx.transport.terminalConnect(),
+        onRouteChange: (fn) => ctx.transport.onRouteChange?.(fn),
         visible: viewMode !== "chat",
         questionActive: viewMode === "chat",
         onQuestion: (question, status) => {
@@ -1823,6 +1824,7 @@
         sessionId: target.id,
         stateKey: key,
         connect: () => ctx.transport.terminalConnect(),
+        onRouteChange: (fn) => ctx.transport.onRouteChange?.(fn),
         preferences: {
           ...state.preferences,
           fitToPhone: state.preferences.fitToPhone ?? true,

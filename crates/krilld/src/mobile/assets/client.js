@@ -78,6 +78,98 @@
       );
     return `${origin.protocol === "https:" ? "wss:" : "ws:"}//${origin.host}/ws`;
   }
+  const validHostId = (value) => typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
+  function secureDirect(value) {
+    if (typeof value !== "string") return null;
+    try {
+      const u = new URL(value.includes("://") ? value : "https://" + value);
+      return u.protocol === "https:" && !u.username && !u.password &&
+        u.pathname === "/" && !u.search && !u.hash &&
+        /^[a-z0-9.-]+\.ts\.net$/.test(u.hostname) ? u.origin : null;
+    } catch { return null; }
+  }
+  function manifestPatch(host, reply, provenUrl) {
+    const desktop = reply.desktop;
+    if (!desktop) return {};
+    if (!validHostId(desktop.host_id) || host.host_id && host.host_id !== desktop.host_id)
+      throw Error("Desktop identity changed.");
+    const routes = { ...host.routes };
+    if (desktop.relay) {
+      const u = new URL(desktop.relay.origin);
+      if (!validHostId(desktop.relay.rid) || u.protocol !== "https:" ||
+          u.username || u.password || u.pathname !== "/" || u.search || u.hash)
+        throw Error("Invalid desktop relay address.");
+      routes.relay = { origin: u.origin, rid: desktop.relay.rid };
+    }
+    if (desktop.tailscale) {
+      const origin = secureDirect(desktop.tailscale.origin);
+      if (!origin) throw Error("Invalid desktop Tailscale address.");
+      routes.tailscale = { origin };
+    }
+    if (provenUrl) {
+      const u = new URL(provenUrl), origin = u.origin.replace(/^wss:/, "https:"),
+        relayId = /^\/r\/([0-9a-f]{32})$/.exec(u.pathname)?.[1];
+      if (u.protocol === "wss:" && relayId && !routes.relay)
+        routes.relay = { origin, rid: relayId };
+      const direct = secureDirect(origin);
+      if (u.protocol === "wss:" && u.pathname === "/ws" && direct && !routes.tailscale)
+        routes.tailscale = { origin: direct };
+    }
+    return { host_id: desktop.host_id, routes, ...(routes.relay && { rid: routes.relay.rid, relay_origin: routes.relay.origin }) };
+  }
+  function routeUrls(host, hash) {
+    const routes = [];
+    const relay = host.routes?.relay || (validHostId(host.rid) && {
+      origin: host.relay_origin || location.origin, rid: host.rid,
+    });
+    if (relay) {
+      const u = new URL(relay.origin);
+      routes.push({ kind: "relay", url: `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}/r/${relay.rid}?v=${hash}` });
+    }
+    const direct = secureDirect(host.routes?.tailscale?.origin);
+    if (direct) routes.push({ kind: "tailscale", url: directSocket(direct) });
+    if (host.url && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(host.url))
+      routes.push({ kind: "tunnel", url: `wss://${host.url.slice(8)}/ws?v=${hash}` });
+    if (!host.fixed && !direct) routes.push({ kind: "direct", url: directSocket(host.origin || location.origin) });
+    return routes;
+  }
+  function authenticateRoute(url, credential) {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(url);
+      socket.binaryType = "arraybuffer";
+      let channel, finished = false;
+      const finish = (error, reply) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        socket.close();
+        error ? reject(error) : resolve(reply);
+      };
+      const timer = setTimeout(() => finish(Error("Desktop route authentication timed out.")), 10000);
+      socket.addEventListener("error", () => finish(Error("Could not connect to desktop backup.")));
+      socket.addEventListener("close", (event) => finish(Object.assign(Error("Desktop rejected backup authentication. Keep the current connection and scan a fresh QR code."), { authenticationRejected: event.code === 1008 })));
+      socket.addEventListener("message", (event) => {
+        try {
+          if (!channel) {
+            const challenge = JSON.parse(event.data), nonce = crypto.getRandomValues(new Uint8Array(32));
+            if (challenge.version !== 2) throw Error("Unsupported desktop protocol");
+            channel = new C.Channel(C.sha256(C.unhex(credential.credential)), C.concat(C.unhex(challenge.challenge), nonce));
+            socket.send(JSON.stringify({ token: null, device_id: credential.device_id, client_nonce: C.hex(nonce) }));
+            socket.send(channel.seal(C.enc.encode('{"label":"Backup route"}')));
+          } else finish(null, JSON.parse(decode.decode(channel.open(event.data))));
+        } catch (error) { finish(error); }
+      });
+    });
+  }
+  function pairingToken(fragment) {
+    const compact = fragment.get("p");
+    if (compact === null) return fragment.get("pair");
+    if (fragment.has("pair") || !/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(compact)) return null;
+    try {
+      const bytes = C.unbase64(compact);
+      return bytes.length === 32 ? C.hex(bytes) : null;
+    } catch { return null; }
+  }
   function bootstrap() {
     const match = /^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname),
       fixed = !!match,
@@ -94,7 +186,7 @@
     } catch {}
     const parameters = new URLSearchParams(location.search),
       fragment = new URLSearchParams(returnedFragment.slice(1)),
-      ticket = fragment.get("pair"),
+      ticket = pairingToken(fragment),
       secret = fragment.get("key"),
       STORE = "krill-mobile-v2",
       HOSTS = "krill-mobile-hosts-v1",
@@ -133,12 +225,15 @@
       : [];
     let active = hosts.find((h) => h.id === book?.active) || hosts[0] || null;
     Array.isArray(book?.hosts) && (saved = active);
-    const pair =
-        ticket && secret && !(fragment.has("install") && saved?.credential)
+    const hint = fragment.get("h") || fragment.get("r"),
+      hinted = hint && [...hosts, saved].some((host) => host && (host.host_id === hint || host.rid === fragment.get("r"))),
+      invalidDirect = fragment.has("d") && !secureDirect(fragment.get("d")),
+      pair =
+        ticket && secret && !invalidDirect && !hinted && !(fragment.has("install") && saved?.credential)
           ? { ticket, secret }
           : null,
       auth = parameters.get("auth"),
-      sensitive = ["pair", "key", "t", "r", "install"],
+      sensitive = ["p", "pair", "key", "t", "r", "d", "h", "install"],
       consumed = sensitive.some((key) => fragment.has(key));
     for (const key of [...sensitive, "auth"]) parameters.delete(key);
     history.replaceState(
@@ -148,10 +243,12 @@
         (parameters.size ? "?" + parameters : "") +
         (consumed ? "" : location.hash),
     );
+    const initialRouteLink = ticket && secret && hinted && !invalidDirect ? location.origin + location.pathname + "#" + fragment : null;
     let credentials = pair ? null : saved,
       directOrigin = location.origin,
       destinationFixed = fixed,
-      pairingPending = !!pair;
+      pairingPending = !!pair,
+      replacementId = null;
     const hostId = (c) =>
       c.rid
         ? "relay:" + c.rid
@@ -265,15 +362,18 @@
         /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(value),
       validRid = (value) =>
         typeof value == "string" && /^[0-9a-f]{32}$/.test(value);
+    let pairingDirect = pair ? secureDirect(fragment.get("d")) : null;
     let useRelay = validRid(rid);
     const relayUrl = () =>
-      `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/r/${rid}?v=${hash}`;
+      `${new URL(credentials?.routes?.relay?.origin || credentials?.relay_origin || location.origin).origin.replace(/^http/, "ws")}/r/${rid}?v=${hash}`;
     return (
       navigator.serviceWorker?.register("/sw.js").catch(() => {}),
       {
         parameters,
+        initialRouteLink,
+        pairingError: (fragment.has("p") && !ticket || invalidDirect) ? "This pairing code is invalid. Scan a fresh QR code from desktop Settings → Mobile." : null,
         pair,
-        credentials,
+        get credentials() { return credentials; },
         fixed,
         replacing: !!(pair && saved),
         get storageFailed() {
@@ -285,9 +385,9 @@
           const source = { ...found };
           let auth2 = { ...source },
             peerUrl = source.url,
-            relay = validRid(source.rid);
+            relay = validRid(source.rid),
+            selectedRoute = null;
           const current = () => hosts.find((h) => h.id === id && stillSaved(h)),
-            peerRid = source.rid,
             peerFixed = source.fixed ?? fixed,
             save = (patch) => {
               const host = current();
@@ -309,6 +409,7 @@
                 active?.id === id)
               ) {
                 active = saved = credentials = host;
+                rid = host.routes?.relay?.rid || host.rid;
                 try {
                   localStorage.setItem(STORE, JSON.stringify(host));
                 } catch {
@@ -322,29 +423,21 @@
               return auth2;
             },
             socketUrl() {
-              if (!peerFixed)
-                return directSocket(source.origin || location.origin);
-              if (relay && validRid(peerRid))
-                return `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/r/${peerRid}?v=${hash}`;
-              if (validUrl(peerUrl))
-                return `wss://${peerUrl.slice(8)}/ws?v=${hash}`;
-              throw Error("Desktop address is unavailable.");
+              const choices = routeUrls(current() || source, hash);
+              const selected = choices.find((r) => r.url === selectedRoute) ||
+                choices.find((r) => r.kind === source.preferred_route) || choices[0];
+              if (!selected) throw Error("Desktop address is unavailable.");
+              selectedRoute = selected.url;
+              return selectedRoute;
             },
             authenticated(reply) {
               if (reply.device_id && reply.device_id !== source.device_id)
                 throw Error("Desktop identity changed.");
-              return (
-                save({
-                  ...(reply.credential ? { credential: reply.credential } : {}),
-                  url: peerUrl,
-                  preferred_route: peerFixed
-                    ? relay
-                      ? "relay"
-                      : "tunnel"
-                    : "direct",
-                }),
-                auth2
-              );
+              if (reply.credential && reply.credential !== auth2.credential)
+                throw Error("Desktop credential changed.");
+              save({ ...manifestPatch(current() || source, reply, selectedRoute),
+                preferred_route: routeUrls(current() || source, hash).find((r) => r.url === selectedRoute)?.kind });
+              return auth2;
             },
             describeHost(info) {
               const patch = {};
@@ -353,18 +446,19 @@
                 save(patch));
             },
             fallback(attempted) {
-              peerFixed &&
-                attempted === this.socketUrl() &&
-                (!relay && validRid(peerRid)
-                  ? (relay = !0)
-                  : relay && validUrl(peerUrl) && (relay = !1));
+              const choices = routeUrls(current() || source, hash),
+                at = choices.findIndex((route) => route.url === attempted);
+              if (choices.length < 2 || at < 0) return false;
+              selectedRoute = choices[(at + 1) % choices.length].url;
+              return true;
             },
             async locate({
               isCurrent = () => !0,
               signal,
               diagnosticsTrace: trace,
             } = {}) {
-              if (!peerFixed || !validRid(peerRid)) return !1;
+              const host = current(), peerRid = host?.routes?.relay?.rid || host?.rid;
+              if ((!peerFixed && !host?.routes?.relay) || !validRid(peerRid)) return !1;
               trace?.mark("discovery", { route: "relay" });
               let timedOut = false;
               const controller = new AbortController(),
@@ -377,7 +471,7 @@
                 signal?.aborted && abort());
               try {
                 const response = await relayFetch(
-                  "/r/" + encodeURIComponent(peerRid),
+                  (current()?.routes?.relay?.origin || source.relay_origin || location.origin) + "/r/" + encodeURIComponent(peerRid),
                   { cache: "no-store", signal: controller.signal },
                 );
                 if (isCurrent() && !signal?.aborted) {
@@ -405,6 +499,8 @@
                   (validUrl(found2.url) || found2.url === "" || found2.relay) &&
                   ((peerUrl = validUrl(found2.url) ? found2.url : null),
                   (relay = !peerUrl),
+                  (selectedRoute = null),
+                  (source.preferred_route = relay ? "relay" : "tunnel"),
                   save({ url: peerUrl }));
               } catch (error) {
                 if (isCurrent() && !signal?.aborted)
@@ -460,7 +556,7 @@
               endpoint: h.fixed
                 ? h.rid
                   ? "Relay \xB7 " + h.rid.slice(0, 8)
-                  : h.url
+                  : h.routes?.tailscale?.origin || h.url
                 : h.origin,
               active: h.id === active?.id,
             }));
@@ -565,6 +661,7 @@
           return (
             clearRelayReturn(),
             (pairingPending = !1),
+            (replacementId = null),
             (updatePending = !1),
             (credentials = saved),
             (directOrigin = active?.origin || location.origin),
@@ -582,13 +679,17 @@
           );
         },
         socketUrl() {
+          if (pairingPending && pairingDirect) return directSocket(pairingDirect);
+          if (!pairingPending && credentials?.routes) {
+            const choices = routeUrls(credentials, hash),
+              selected = choices.find((r) => r.kind === (useRelay ? "relay" : "tailscale")) || choices[0];
+            if (selected) return selected.url;
+          }
           if (!destinationFixed) return directSocket(directOrigin);
           if (useRelay && validRid(rid)) return relayUrl();
           if (validUrl(url)) return `wss://${url.slice(8)}/ws?v=${hash}`;
           if (validRid(rid)) return relayUrl();
-          throw Error(
-            "Scan a fresh QR code from desktop Settings \u2192 Mobile.",
-          );
+          throw Error("Scan a fresh QR code from desktop Settings → Mobile.");
         },
         adopt(href) {
           const NOT =
@@ -600,7 +701,7 @@
             throw Error(NOT);
           }
           const f = new URLSearchParams(u.hash.slice(1)),
-            ticket2 = f.get("pair"),
+            ticket2 = pairingToken(f),
             secret2 = f.get("key"),
             version = /^\/m\/([0-9a-f]{16})\/?$/.exec(u.pathname)?.[1];
           if (
@@ -622,18 +723,8 @@
                   },
                 }
               : null;
-          // HTTPS pages cannot dial ws://. Open a validated tailnet QR at its
-          // own origin and keep this origin's saved relay credentials untouched.
-          if (
-            u.protocol === "http:" &&
-            u.pathname === "/" &&
-            !u.username &&
-            !u.password &&
-            !f.has("t") &&
-            !f.has("r") &&
-            /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$/.test(u.hostname)
-          )
-            return null;
+          if (u.protocol === "http:" && location.protocol === "https:")
+            throw Error("This desktop code uses an older Tailscale address. Create a new Tailscale QR code in desktop Settings → Mobile.");
           if (
             (u.protocol === "https:" &&
               !version &&
@@ -646,18 +737,54 @@
           )
             return null;
           const t = f.get("t"),
+            d = secureDirect(f.get("d")),
             r = f.get("r"),
             next = t ? "https://" + t : validUrl(u.origin) ? u.origin : null;
-          if (!validUrl(next) && !validRid(r))
+          if (f.has("d") && !d) throw Error(NOT);
+          if (!validUrl(next) && !validRid(r) && !d)
             throw Error(
               u.protocol === "http:"
                 ? "This direct code cannot be opened here. Choose Relay server in desktop Settings \u2192 Mobile, then tap New QR code."
                 : NOT,
             );
+          const hint = f.get("h") || r,
+            existing = hosts.find((host) => host.host_id === hint || host.rid === r || host.routes?.relay?.rid === r);
+          const candidate = { rid: r, fixed: true, url: next, routes: d ? { tailscale: { origin: d } } : null };
+          const route = d ? directSocket(d) : routeUrls(candidate, hash)[0]?.url;
           return {
             ticket: ticket2,
             secret: secret2,
-            use() {
+            existingId: existing?.id,
+            async attach() {
+              if (!existing || !stillSaved(existing)) throw Error("Desktop is no longer saved.");
+              const paired = { ...existing }, auth = await authenticateRoute(route, paired);
+              if (auth.device_id !== paired.device_id || auth.credential ||
+                  !auth.desktop || auth.desktop.host_id !== (paired.host_id || paired.rid))
+                throw Error("Desktop identity changed.");
+              const current = hosts.find((host) => host.id === paired.id && stillSaved(host));
+              if (!current || current.device_id !== paired.device_id || current.credential !== paired.credential)
+                throw Error("Desktop pairing changed. Scan the QR code again.");
+              const patch = manifestPatch(current, auth, route);
+              if (d) patch.routes = { ...patch.routes, tailscale: { origin: d } };
+              else if (validRid(r)) {
+                patch.routes = { ...patch.routes, relay: { origin: u.origin, rid: r } };
+                patch.rid = r; patch.relay_origin = u.origin;
+              }
+              Object.assign(current, patch);
+              persist();
+              if (storageFailed) throw Error("Could not save desktop backup.");
+              if (active?.id === current.id) {
+                active = saved = credentials = current;
+                rid = current.routes?.relay?.rid || current.rid;
+                try { localStorage.setItem(STORE, JSON.stringify(current)); } catch { storageFailed = true; }
+              }
+              for (const fn of hostListeners) fn();
+              return current.id;
+            },
+            use({ replace = false } = {}) {
+              if (existing && !replace) throw Error("Authenticate this route with the saved pairing first.");
+              replacementId = replace ? existing?.id : null;
+              pairingDirect = d;
               ((pairingPending = !0),
                 (updatePending = !1),
                 (destinationFixed = !0),
@@ -682,15 +809,28 @@
             !credentials)
           )
             return null;
-          const id = hostId({ ...credentials, origin: directOrigin }),
+          const patch = manifestPatch(credentials, auth2, this.socketUrl()),
+            daemonId = patch.host_id,
+            matching = daemonId && hosts.find((h) => h.host_id === daemonId),
+            id = replacementId || (!pairingPending && active ? active.id : matching?.id) || hostId({ ...credentials, origin: directOrigin }),
             existing = hosts.find((h) => h.id === id);
+          if (pairingDirect && !patch.routes?.relay) {
+            patch.rid = null;
+            patch.relay_origin = null;
+          }
+          if (replacementId && auth2.desktop && auth2.desktop.host_id !== (existing?.host_id || existing?.rid))
+            throw Error("Desktop identity changed.");
+          if (existing && !replacementId && (existing.device_id !== credentials.device_id || existing.credential !== credentials.credential))
+            throw Error("Desktop is already saved. Add this route using its saved credential.");
           if (
             ((active = {
               ...existing,
               ...credentials,
+              ...patch,
               id,
               origin: directOrigin,
               fixed: destinationFixed,
+              ...(pairingDirect && { preferred_route: "tailscale", routes: { ...patch.routes, tailscale: { origin: pairingDirect } } }),
               name: existing?.name || "Desktop",
             }),
             existing
@@ -699,7 +839,7 @@
             removed(active))
           )
             throw Error("Desktop is no longer saved.");
-          ((saved = credentials = active), persist());
+          ((saved = credentials = active), (rid = active.rid), persist());
           try {
             localStorage.setItem(STORE, JSON.stringify(credentials));
           } catch {
@@ -708,6 +848,10 @@
           return ((pairingPending = !1), credentials);
         },
         fallback(attempted) {
+          if (credentials?.routes?.tailscale && credentials?.routes?.relay) {
+            useRelay = !attempted.includes("/r/");
+            return true;
+          }
           if (destinationFixed)
             try {
               attempted === this.socketUrl() &&
@@ -839,7 +983,7 @@
           signal,
           diagnosticsTrace: trace,
         } = {}) {
-          if (!destinationFixed || !validRid(rid)) return !1;
+          if ((pairingPending && pairingDirect) || !destinationFixed || !validRid(rid)) return !1;
           trace?.mark("discovery", { route: "relay" });
           let timedOut = false;
           const requestRid = rid,
@@ -1080,6 +1224,7 @@
         retryTimer,
         connectController,
         warm = null,
+        terminalSockets = new Set(),
         terminalActive = options.warmTerminal !== !1,
         timing = null,
         retryDelay = 1e3,
@@ -1088,7 +1233,9 @@
         retryNotBefore = 0,
         authBlocked = !1,
         retryCount = 0,
-        nextRetryAt = 0;
+        nextRetryAt = 0,
+        routeAlternative = false;
+      const rejectedRoutes = new Set(), authInterruptedRoutes = new Set(), routeListeners = new Set();
       const socketUrl = () =>
           options.endpoint ? options.endpoint.socketUrl() : options.url,
         clock = () => globalThis.performance?.now?.() ?? Date.now(),
@@ -1250,13 +1397,16 @@
         retryTimer = setTimeout(connect, wait);
         retryDelay = Math.min(retryDelay * 2, 15000);
       }
-      function disconnect(error) {
+      function disconnect(error, fallback = true) {
         if (failed) return;
         const wasConnected = connected;
+        if (wasConnected && fallback && !routeAlternative) options.endpoint?.fallback?.(socket?.url || socketUrl());
         ((failed = error),
           (connected = !1),
           clearTimeout(timer),
           clearWarm(!0));
+        for (const terminal of terminalSockets) terminal.close();
+        terminalSockets.clear();
         for (const w of waiters.splice(0)) w.reject(error);
         (status("disconnected", error.message),
           socket?.close(),
@@ -1487,6 +1637,7 @@
         waiters = [];
         failed = null;
         channel = null;
+        routeAlternative = false;
         armed = 0;
         rev = 0;
         timing = { started: clock() };
@@ -1582,7 +1733,11 @@
                 const capacity = e?.code === 4009,
                   cooldown = e?.code === 1013,
                   denied = e?.code === 1008 || capacity;
-                if (denied) {
+                if (denied && !pair && !capacity) {
+                  rejectedRoutes.add(attempted);
+                  routeAlternative = !!options.endpoint?.fallback?.(attempted) && !rejectedRoutes.has(socketUrl());
+                }
+                if (denied && !routeAlternative) {
                   authBlocked = true;
                   clearTimeout(retryTimer);
                 }
@@ -1720,12 +1875,15 @@
               if (!resumed) mark("readyMs");
               retryDelay = 1000;
               authFailures = 0;
+              rejectedRoutes.clear();
+              authInterruptedRoutes.clear();
               retryCount = 0;
               nextRetryAt = 0;
               retryNotBefore = 0;
               warmTerminal();
               if (!resumed) status("ready", "Encrypted · connected");
               established = true;
+              for (const fn of routeListeners) fn();
               poll();
             })(),
             20000,
@@ -1765,7 +1923,14 @@
                   (quick = retryDelay <= 1e3 && socketUrl() !== attempted));
               } catch {}
           }
-          (stage === 2 &&
+          if (stage === 2 && !pair && !authBlocked && (e?.transport || failed?.transport)) {
+            authInterruptedRoutes.add(attempted);
+            if (options.endpoint?.fallback?.(attempted) && socketUrl() !== attempted && !authInterruptedRoutes.has(socketUrl())) {
+              routeAlternative = true;
+              quick = true;
+            }
+          }
+          (stage === 2 && !routeAlternative &&
             ((e?.transport || failed?.transport) && !authBlocked
               ? (authFailures++,
                 (retryNotBefore = Date.now() + 65e3 * authFailures),
@@ -1785,7 +1950,7 @@
         (acknowledge && (uncertainMutation = !1),
           connectController?.abort(),
           disconnect(
-            Error("Reconnecting\u2026 Pending actions were not resent."),
+            Error("Reconnecting\u2026 Pending actions were not resent."), false,
           ),
           generation++,
           (connecting = !1),
@@ -1851,6 +2016,10 @@
             connected && current === generation && options.onError?.(e);
           });
         },
+        onRouteChange(fn) {
+          routeListeners.add(fn);
+          return () => routeListeners.delete(fn);
+        },
         terminalConnect() {
           if (!connected || !credentials)
             throw Error(
@@ -1875,6 +2044,8 @@
           } else
             (clearWarm(!0),
               (out = { socket: new WebSocket(socketUrl()), credentials }));
+          terminalSockets.add(out.socket);
+          out.socket.addEventListener("close", () => terminalSockets.delete(out.socket), { once: true });
           return (warmTerminal(), out);
         },
         close() {

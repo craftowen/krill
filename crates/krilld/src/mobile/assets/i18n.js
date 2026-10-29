@@ -3,6 +3,12 @@
   const M = (globalThis.KrillMobile ||= {});
   let language = "en";
   const ko = {
+    "This pairing code is invalid. Scan a fresh QR code from desktop Settings → Mobile.": "올바르지 않은 페어링 코드입니다. 데스크톱 설정 → 모바일에서 새 QR 코드를 스캔하세요.",
+    "Desktop backup added.": "데스크톱의 예비 연결을 추가했습니다.",
+    "Pair this desktop again?": "이 데스크톱을 다시 페어링할까요?",
+    "Pair again": "다시 페어링",
+    "The saved pairing was rejected. Pairing again replaces its saved credential on this phone.": "저장된 페어링 인증이 거부되었습니다. 다시 페어링하면 이 휴대폰에 저장된 인증 정보가 교체됩니다.",
+    "This desktop code uses an older Tailscale address. Create a new Tailscale QR code in desktop Settings → Mobile.": "이 코드는 이전 방식의 Tailscale 주소를 사용합니다. 데스크톱 설정 → 모바일에서 새 Tailscale QR 코드를 만드세요.",
     "Automatic technical error collection": "기술적 오류 자동 수집",
     "Your browser privacy signal is enabled. Error collection is off.":
       "브라우저의 추적 방지 설정에 따라 오류 수집이 꺼져 있습니다.",
