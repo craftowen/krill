@@ -9,7 +9,7 @@ mod writer;
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use writer::{FILE_BYTES, RollingLog};
 
@@ -41,7 +41,7 @@ impl Component {
     }
 }
 
-/// Explicit override isolates tests (nextest runs fall back to a temp directory);
+/// Explicit override isolates tests (test runs fall back to a temp directory, see [`is_test_run`]);
 /// production uses `LocalAppData` on Windows and the Console.app-visible directory
 /// on macOS (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
@@ -68,8 +68,7 @@ fn directory_in(
     if let Some(dir) = get("KRILL_LOG_DIR") {
         return Some(PathBuf::from(dir));
     }
-    // nextest가 띄운 테스트와 그 자식(holder·krilld·앱)은 운영 로그를 더럽히지 않는다(`NEXTEST`는 nextest가 늘 1로 둔다).
-    if get("NEXTEST").is_some() {
+    if is_test_run(&get) {
         return Some(std::env::temp_dir().join("krill-test-logs"));
     }
     #[cfg(windows)]
@@ -87,6 +86,29 @@ fn directory_in(
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     base.map(|h| h.join("Library/Logs/Krill"))
+}
+
+/// 테스트·예제·검증이 띄운 프로세스와 그 자식(holder·krilld·앱·CLI)인가. 셋 다 자식에게 그대로 물려진다.
+/// - `NEXTEST`: nextest가 늘 1로 둔다.
+/// - `CARGO_MANIFEST_DIR`: `cargo test`·`cargo run --example`이 런타임에 둔다(설치본은 cargo 밖에서 뜬다).
+/// - 임시 폴더의 `KRILL_STATE_DIR`: 테스트 바이너리를 직접 돌리는 릴리스 검증·통합 테스트는 이것만 준다.
+///   원격 호스트·사용자가 고른 상태 폴더는 임시 폴더 밖이라 그대로 운영 로그에 쓴다.
+fn is_test_run(get: &impl Fn(&str) -> Option<OsString>) -> bool {
+    get("NEXTEST").is_some()
+        || get("CARGO_MANIFEST_DIR").is_some()
+        || get("KRILL_STATE_DIR").is_some_and(|dir| is_temp(Path::new(&dir)))
+}
+
+fn is_temp(path: &Path) -> bool {
+    path.starts_with(std::env::temp_dir())
+        || [
+            "/tmp",
+            "/private/tmp",
+            "/var/folders",
+            "/private/var/folders",
+        ]
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 /// Install INFO/WARN/ERROR events from Krill targets. No spans are retained.
@@ -131,13 +153,35 @@ mod tests {
             _ => None,
         };
         assert_eq!(directory_in(both, || None), Some(PathBuf::from("/x")));
-        // 실제 테스트 프로세스(이 테스트도 nextest 아래에서 돈다)가 운영 경로를 고르지 않는다.
-        if std::env::var_os("NEXTEST").is_some() && std::env::var_os("KRILL_LOG_DIR").is_none() {
+        // 실제 테스트 프로세스(nextest든 `cargo test`든)가 운영 경로를 고르지 않는다.
+        if std::env::var_os("KRILL_LOG_DIR").is_none() {
             assert_eq!(
                 directory(),
                 Some(std::env::temp_dir().join("krill-test-logs"))
             );
         }
+    }
+
+    /// 2026-10-28 사건: `cargo test -p krilld --test upgrade`(nextest 아님)가 띄운 holder·krilld가 운영 로그에 썼다.
+    #[test]
+    fn cargo_runs_and_temp_state_dirs_never_use_the_production_directory() {
+        let temp = std::env::temp_dir().join("krill-test-logs");
+        let home = || Some(PathBuf::from("/h"));
+        let cargo = |k: &str| (k == "CARGO_MANIFEST_DIR").then(|| OsString::from("/src/krilld"));
+        assert_eq!(directory_in(cargo, home), Some(temp.clone()));
+        let mk062 = std::env::temp_dir().join("mk062-1");
+        for state in [
+            mk062.as_path(),
+            Path::new("/tmp/krill-qa"),
+            Path::new("/private/var/folders/x/T/s"),
+        ] {
+            let get = |k: &str| (k == "KRILL_STATE_DIR").then(|| state.as_os_str().to_owned());
+            assert_eq!(directory_in(get, home), Some(temp.clone()), "{state:?}");
+        }
+        // 사용자가 고른 상태 폴더(원격 호스트 포함)는 운영 로그를 그대로 쓴다.
+        let user =
+            |k: &str| (k == "KRILL_STATE_DIR").then(|| OsString::from("/Users/u/krill-state"));
+        assert_ne!(directory_in(user, home), Some(temp));
     }
 
     #[cfg(not(windows))]
