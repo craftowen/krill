@@ -212,11 +212,20 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
         return Err(io::ErrorKind::InvalidData.into());
     }
     let mut head = Vec::new();
-    File::open(path)?.take(128 * 1024).read_to_end(&mut head)?;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    file.take(128 * 1024).read_to_end(&mut head)?;
     // A newly opened rollout may be visible before its metadata write completes.
-    // Only empty/incomplete JSON is retryable; complete invalid metadata stays fatal.
+    // Only an empty file or an incomplete last line is retryable; complete invalid
+    // metadata stays fatal. A read cut at the size cap is not a pending write.
+    let last_line = head
+        .rsplit(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
     let pending_header = head.is_empty()
-        || serde_json::from_slice::<serde_json::Value>(&head).is_err_and(|e| e.is_eof());
+        || (len <= head.len() as u64
+            && !last_line.is_empty()
+            && serde_json::from_slice::<serde_json::Value>(last_line).is_err_and(|e| e.is_eof()));
     let mut identity: Option<String> = None;
     for record in String::from_utf8_lossy(&head)
         .lines()

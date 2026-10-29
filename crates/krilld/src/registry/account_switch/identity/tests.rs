@@ -102,7 +102,12 @@ fn resume_retries_only_pending_metadata_and_disappearing_files() {
     let root = std::env::temp_dir().join(format!("kas-pending-header-{}", std::process::id()));
     let path = root.join("sessions/2026/10/24/rollout-known.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    for pending in ["", r#"{"type":"session_meta","payload":{"id":"kn"#] {
+    for pending in [
+        "",
+        r#"{"type":"session_meta","payload":{"id":"kn"#,
+        // A complete record without identity followed by the metadata line still being written.
+        "{\"type\":\"turn_context\"}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"kn",
+    ] {
         fs::write(&path, pending).unwrap();
         assert_eq!(
             from_paths(ProviderKind::Codex, [path.clone()])
