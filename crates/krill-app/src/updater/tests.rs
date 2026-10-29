@@ -310,7 +310,7 @@ fn channel_mismatch_surfaces_configured_and_offered_without_staging() {
     };
     let d = TempGuard(temp_dir("channel-mismatch"));
     let app = d.0.join("Krill.app");
-    let status = decide_and_stage(&cfg, &m, &app, &d.0).unwrap();
+    let status = decide_and_stage(&cfg, &m, &app, &d.0, true).unwrap();
     assert!(matches!(
         status,
         CheckStatus::ChannelMismatch {
@@ -341,7 +341,8 @@ fn newer_release_skipped_by_rollout_or_protocol_never_reports_up_to_date() {
         rollout_pct: 0,
     };
     sign_manifest(&mut manifest, &sk);
-    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0).unwrap() else {
+    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0, true).unwrap()
+    else {
         panic!("a newer release outside rollout must not appear up to date");
     };
     assert_eq!(
@@ -351,7 +352,8 @@ fn newer_release_skipped_by_rollout_or_protocol_never_reports_up_to_date() {
     manifest.rollout_pct = 100;
     manifest.min_daemon_protocol = PROTO_MAX.checked_add(1).unwrap();
     sign_manifest(&mut manifest, &sk);
-    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0).unwrap() else {
+    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0, true).unwrap()
+    else {
         panic!("a newer incompatible release must not appear up to date");
     };
     assert!(message.contains("0.2.7"));
@@ -1197,6 +1199,13 @@ fn automatic_poll_does_not_restage_a_rolled_back_version() {
         "automatic poll must not restage the version that just rolled back"
     );
     assert!(!staging_path(&app).exists());
+    assert!(
+        matches!(
+            check_and_stage_with(Some(&url), &app, &state, false).unwrap(),
+            CheckStatus::Ready(_)
+        ),
+        "an explicit check still retries the rolled-back version"
+    );
 
     fetch_bytes(&format!("{base_url}/stop"), 64).ok();
     server.join().ok();
