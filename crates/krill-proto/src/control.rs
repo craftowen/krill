@@ -105,6 +105,12 @@ pub const FEAT_SESSION_ACCOUNT: u64 = 1 << 58;
 pub const FEAT_CLEAR_SCROLLBACK: u64 = 1 << 47;
 /// 원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩. [`Request::RemoteFs`]·[`Reply::RemoteFs`] 한 쌍.
 pub const FEAT_REMOTE_FS: u64 = 1 << 27;
+/// 실제 브랜치·태그 조회. `FEAT_CONTROL`과 함께 협상한다.
+pub const FEAT_WORKTREE_REFS: u64 = 1 << 29;
+/// 조회 한 번의 ref 수 상한.
+pub const MAX_WORKTREE_REFS: usize = 2048;
+/// UI에서 선택할 ref 이름의 UTF-8 바이트 상한.
+pub const MAX_WORKTREE_REF_BYTES: usize = 256;
 /// 캡처 한 번의 최대 바이트. 넘으면 잘라내지 않고 `BadRequest`로 거부한다.
 pub const MAX_CAPTURE: usize = 512 * 1024;
 
@@ -246,6 +252,11 @@ pub enum Request {
     },
     /// `FEAT_REMOTE_FS` 필요. 원격 파일 탐색·읽기·원자적 저장·Quick Open·루프백 포트 포워딩.
     RemoteFs(crate::remote_fs::RemoteFsRequest),
+    /// `FEAT_WORKTREE_REFS` 필요. 명령·옵션은 받지 않는 읽기 전용 Git 조회.
+    WorktreeRefs {
+        #[serde(deserialize_with = "sidebar_path")]
+        repo: Vec<u8>,
+    },
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -1001,6 +1012,20 @@ pub enum Reply {
     },
     /// `FEAT_REMOTE_FS` 필요. [`Request::RemoteFs`]의 응답.
     RemoteFs(crate::remote_fs::RemoteFsReply),
+    /// `FEAT_WORKTREE_REFS` 필요. 실패는 기존 `WorktreeFailed`로 답한다.
+    WorktreeRefs(#[serde(deserialize_with = "worktree_refs")] Vec<String>),
+}
+
+fn worktree_refs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let refs = bounded::<D, String, MAX_WORKTREE_REFS>(d)?;
+    if refs.iter().any(|name| {
+        name.is_empty()
+            || name.len() > MAX_WORKTREE_REF_BYTES
+            || name.chars().any(|c| c.is_control() || c.is_whitespace())
+    }) {
+        return Err(serde::de::Error::custom("invalid worktree ref name"));
+    }
+    Ok(refs)
 }
 
 /// Only meaningful in one negotiated daemon incarnation; includes session to prevent cross-scope reuse.

@@ -843,6 +843,11 @@ impl Registry {
                 )) if n.features & krill_proto::orchestration::FEAT_ORCH_SNAPSHOT_PAGE == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::WorktreeRefs { .. })
+                    if n.features & control::FEAT_WORKTREE_REFS == 0 =>
+                {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(Request::RemoteFs(_)) if n.features & control::FEAT_REMOTE_FS == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
@@ -1076,6 +1081,13 @@ impl Registry {
                     }
                     Reply::Sidebar(data)
                 })
+            }
+            Request::WorktreeRefs { repo } => {
+                if self.authorize_cwd(peer, "worktree-refs", &repo) {
+                    Ok(crate::git::worktree_refs::serve(&repo))
+                } else {
+                    Err(Failure::Denied)
+                }
             }
             Request::PrepareWorktree(w) => {
                 if peer.authorize("worktree-prepare", SessionId(0), &self.audit) {
@@ -3730,6 +3742,7 @@ fn read_only(req: &Request) -> bool {
             | Request::CaptureSince { .. }
             | Request::Capture { .. }
             | Request::GitChanges { .. }
+            | Request::WorktreeRefs { .. }
             | Request::WaitStatus { .. }
             | Request::Sidebar
             | Request::AgentLaunch { .. }

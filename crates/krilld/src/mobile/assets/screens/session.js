@@ -1,182 +1,2184 @@
-(()=>{const M=globalThis.KrillMobile||={};M.screens||={};
+(() => {
+  const M = (globalThis.KrillMobile ||= {});
+  M.screens ||= {};
 
- const quickText=text=>String(text??'').replace(/\r\n?/g,'\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'').replace(/^\n+|\n+$/g,'');
- const normalizeCommands=commands=>(Array.isArray(commands)?commands:[]).filter(c=>c&&typeof c.name==='string'&&typeof c.text==='string').map(c=>({name:c.name.trim(),text:quickText(c.text)})).filter(c=>c.name&&c.text);
- const commandScope=ctx=>ctx.sessionKey?.('quickCommands'),snapshotHost=s=>s?.host===undefined?null:typeof s.host==='string'?s.host:JSON.stringify(s.host);
- const commandOwner=ctx=>({scope:commandScope(ctx),transport:ctx.transport,hash:globalThis.location?.hash,snapshot:ctx.state.snapshot,host:snapshotHost(ctx.state.snapshot)});
- const ownsCommands=(ctx,owner)=>!ctx.signal?.aborted&&owner.scope===commandScope(ctx)&&owner.transport===ctx.transport&&owner.hash===globalThis.location?.hash&&(owner.host!==null?owner.host===snapshotHost(ctx.state.snapshot):owner.scope!==undefined||!owner.snapshot||owner.snapshot===ctx.state.snapshot);
- function cacheCommands(ctx,commands){const next=normalizeCommands(commands),scope=commandScope(ctx);ctx.state.preferences||={};const patch=scope===undefined?{quickCommands:next}:{quickCommands:next,quickCommandsByScope:{...ctx.state.preferences.quickCommandsByScope,[scope]:next},quickCommandsByHost:{...ctx.state.preferences.quickCommandsByHost,[scope]:next}};Object.assign(ctx.state.preferences,patch);ctx.savePreferences?.(patch);return next;}
- const dirtyCommandScopes=new Map();
- function readCommands(ctx){const scopeKey=commandScope(ctx)??'';if(dirtyCommandScopes.has(scopeKey)){const next=dirtyCommandScopes.get(scopeKey);if(ctx.state.snapshot)ctx.state.snapshot.quick_commands=next;return next;}const commands=ctx.state.snapshot?.quick_commands,scope=commandScope(ctx);return Array.isArray(commands)?cacheCommands(ctx,commands):normalizeCommands(scope===undefined?ctx.state.preferences?.quickCommands:ctx.state.preferences?.quickCommandsByScope?.[scope]??ctx.state.preferences?.quickCommandsByHost?.[scope]);}
- async function saveCommands(ctx,commands){const owner=commandOwner(ctx);if(!ownsCommands(ctx,owner))return;const next=cacheCommands(ctx,commands),scopeKey=commandScope(ctx)??'';if(ctx.state.snapshot)ctx.state.snapshot.quick_commands=next;
-  try{const res=await ctx.rpc({action:'save_quick_commands',commands:next});if(ownsCommands(ctx,owner)){dirtyCommandScopes.delete(scopeKey);if(Array.isArray(res?.quick_commands)){const saved=cacheCommands(ctx,res.quick_commands);if(ctx.state.snapshot)ctx.state.snapshot.quick_commands=saved;}}}
-  catch{if(ownsCommands(ctx,owner)){dirtyCommandScopes.set(scopeKey,next);ctx.error?.(Error((ctx.t||(s=>s))('Saved on this phone. Could not sync quick actions to desktop. Reconnect and save again.')));}}
- }
- const invocation=text=>quickText(text).trim();
- function commandEditor(root,ctx,onInsert){const {el,button}=ctx,t=ctx.t||(s=>s),owner=commandOwner(ctx);let busy=false,revision=0,refresh=()=>{},browseButton;
-  const current=()=>ownsCommands(ctx,owner)&&root.isConnected!==false;
-  const disable=node=>{for(const tag of ['button','input','textarea','select'])for(const control of node.querySelectorAll?.(tag)||[])control.disabled=true;};
-  const action=(label,fn,cls='ghost small')=>{const b=button(label,e=>{e?.stopPropagation?.();if(current())return fn();},cls);b.type='button';return b;};
-  const listStamp=()=>JSON.stringify([readCommands(ctx),ctx.state.snapshot?.capabilities?.command_catalog===true]);
-  function draw(){if(!current())return;const stamp=listStamp();refresh=()=>{if(stamp!==listStamp())draw();};revision++;disable(root);root.replaceChildren();const head=el('div',undefined,'quick-actions-header');head.append(action(`+ ${t('Add')}`,()=>edit(-1)));if(ctx.state.snapshot?.capabilities?.command_catalog===true){browseButton=action(t('Find installed skills'),browse);head.append(browseButton);}if(onInsert)head.append(action(t('Close'),()=>ctx.closeSheet()));root.append(head);
-   const commands=readCommands(ctx),list=el('div',undefined,'quick-actions-list');root.append(list);
-   if(!commands.length){list.append(el('p',t('No quick actions yet. Save skills like /krill-orchestration, shell commands, or prompts to insert without pressing Enter.'),'muted'),action(`+ ${t('Add quick action')}`,()=>edit(-1),'secondary'));}
-   commands.forEach((cmd,index)=>{const row=el('div',undefined,'quick-action-card'),copy=onInsert?action('',()=>onInsert(cmd.text),'quick-action-insert'):el('div',undefined,'quick-action-insert');if(onInsert)copy.setAttribute('aria-label',cmd.name);copy.append(el('strong',cmd.name),el('pre',cmd.text,'quick-action-preview'));const controls=el('div',undefined,'quick-action-controls');if(commands.length>1)for(const [step,glyph,label] of [[-1,'↑','Move up'],[1,'↓','Move down']]){const b=action(glyph,async()=>{if(busy)return;busy=true;try{const reordered=readCommands(ctx).slice(),next=index+step;[reordered[index],reordered[next]]=[reordered[next],reordered[index]];await saveCommands(ctx,reordered);if(!ctx.signal?.aborted)draw();}finally{busy=false;}});b.setAttribute('aria-label',t(label));b.disabled=step<0?index===0:index===commands.length-1;controls.append(b);}controls.append(action(t('Edit'),()=>edit(index)),action(t('Delete'),async()=>{if(busy)return;busy=true;try{await saveCommands(ctx,readCommands(ctx).filter((_,i)=>i!==index));if(!ctx.signal?.aborted)draw();}finally{busy=false;}},'ghost small danger'));row.append(copy,controls);list.append(row);});
+  const quickText = (text) =>
+    String(text ?? "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
+      .replace(/^\n+|\n+$/g, "");
+  const normalizeCommands = (commands) =>
+    (Array.isArray(commands) ? commands : [])
+      .filter(
+        (c) => c && typeof c.name === "string" && typeof c.text === "string",
+      )
+      .map((c) => ({ name: c.name.trim(), text: quickText(c.text) }))
+      .filter((c) => c.name && c.text);
+  const commandScope = (ctx) => ctx.sessionKey?.("quickCommands"),
+    snapshotHost = (s) =>
+      s?.host === undefined
+        ? null
+        : typeof s.host === "string"
+          ? s.host
+          : JSON.stringify(s.host);
+  const commandOwner = (ctx) => ({
+    scope: commandScope(ctx),
+    transport: ctx.transport,
+    hash: globalThis.location?.hash,
+    snapshot: ctx.state.snapshot,
+    host: snapshotHost(ctx.state.snapshot),
+  });
+  const ownsCommands = (ctx, owner) =>
+    !ctx.signal?.aborted &&
+    owner.scope === commandScope(ctx) &&
+    owner.transport === ctx.transport &&
+    owner.hash === globalThis.location?.hash &&
+    (owner.host !== null
+      ? owner.host === snapshotHost(ctx.state.snapshot)
+      : owner.scope !== undefined ||
+        !owner.snapshot ||
+        owner.snapshot === ctx.state.snapshot);
+  function cacheCommands(ctx, commands) {
+    const next = normalizeCommands(commands),
+      scope = commandScope(ctx);
+    ctx.state.preferences ||= {};
+    const patch =
+      scope === undefined
+        ? { quickCommands: next }
+        : {
+            quickCommands: next,
+            quickCommandsByScope: {
+              ...ctx.state.preferences.quickCommandsByScope,
+              [scope]: next,
+            },
+            quickCommandsByHost: {
+              ...ctx.state.preferences.quickCommandsByHost,
+              [scope]: next,
+            },
+          };
+    Object.assign(ctx.state.preferences, patch);
+    ctx.savePreferences?.(patch);
+    return next;
   }
-  function closePicker(){draw();browseButton?.focus?.();}
-  function browse(){const token=++revision,cache=new Map();let selected=ctx.commandSession?.()?.id||null,items=[],result,serial=0,contextKey,select,optionsStamp,renderStamp;
-   root.replaceChildren();const picker=el('div',undefined,'quick-catalog'),head=el('div',undefined,'quick-actions-header'),search=el('input',undefined,'quick-catalog-search'),status=el('p',undefined,'muted quick-catalog-status'),results=el('div',undefined,'quick-actions-list');head.append(el('strong',t('Installed skills and commands')),action(t('Back'),closePicker));search.type='search';search.placeholder=t('Search skills and commands');search.setAttribute('aria-label',t('Search skills and commands'));status.setAttribute('role','status');status.setAttribute('aria-live','polite');picker.append(head);root.append(picker);
-   if(!ctx.commandSession){const label=el('label',t('Session for installed skills'));select=el('select');select.setAttribute('aria-label',t('Session for installed skills'));select.addEventListener('change',()=>{if(!valid())return;selected=Number(select.value)||null;load();},{signal:ctx.signal});label.append(select);picker.append(label);}
-   picker.append(search,status,results);search.addEventListener('input',render,{signal:ctx.signal});picker.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closePicker();}},{signal:ctx.signal});search.focus?.();
-   const identity=()=>{const target=ctx.state.sessions.get(selected);if(!live(target)||ctx.commandSession&&ctx.commandSession()?.id!==selected)return null;return JSON.stringify([ctx.sessionKey?.(selected)??selected,target.agent,target.foreground,target.cwd,target.groupKey,target.account_id,target.provider,target.profile_id,target.account,target.command_context]);};
-   const valid=()=>current()&&token===revision;
-   const same=()=>valid()&&contextKey!==null&&contextKey===identity()&&!ctx.state.cached&&ctx.state.connection?.phase==='ready'&&ctx.state.snapshot?.capabilities?.command_catalog===true;
-   function syncSessions(){if(!select)return;const options=[...ctx.state.sessions.values()].filter(live).map(session=>[String(session.id),`${ctx.state.groups.get(session.groupKey)?.label||t('Workspace')} · ${cleanTitle(session.title)||M.agentName?.(sessionAgent(session))||t('Terminal')} #${session.id}`]),stamp=JSON.stringify(options);if(stamp===optionsStamp)return;optionsStamp=stamp;const existing=new Map([...select.children].map(option=>[option.value,option]));let before=null;for(const [value,label] of [['',t('Choose a session')],...options].reverse()){const option=existing.get(value)||el('option');existing.delete(value);option.value=value;if(option.textContent!==label)option.textContent=label;if(option.parentElement!==select||option.nextSibling!==before)select.insertBefore(option,before);before=option;}for(const option of existing.values())option.remove();select.value=options.some(([id])=>id===String(selected))?String(selected):'';}
-   function render(){if(!valid())return;const stamp=JSON.stringify([selected,same(),result,search.value,readCommands(ctx),busy,[...ctx.state.sessions.values()].some(live)]);if(stamp===renderStamp)return;renderStamp=stamp;disable(results);results.replaceChildren();if(!selected){status.textContent=t([...ctx.state.sessions.values()].some(live)?'Choose a session to see its installed skills and commands.':'No live sessions. Open a session to find installed skills.');return;}if(!same()){status.textContent=t('Session context changed. Reopen installed skills.');return;}if(!result)return;
-    if(result.error){status.textContent=t('Could not load installed skills. Reopen to try again.');return;}if(result.supported===false){status.textContent=t('Installed skills are unavailable for this agent.');return;}
-    const query=search.value?.trim().toLocaleLowerCase()||'',matches=items.filter(item=>[item.name,item.description,item.text].some(value=>value.toLocaleLowerCase().includes(query))),saved=new Set(readCommands(ctx).map(cmd=>invocation(cmd.text)));status.textContent=t(items.length?matches.length?result.truncated?'Showing a limited list of installed skills.':'Add a skill to your saved quick actions.':'No skills or commands match your search.':'No installed skills or commands found.');
-    for(const item of matches){const request=serial,row=el('div',undefined,'quick-action-card'),copy=el('div',undefined,'quick-action-insert'),added=saved.has(invocation(item.text));copy.append(el('strong',item.name),el('pre',item.text,'quick-action-preview'));if(item.description)copy.append(el('p',item.description,'muted'));const add=action(t(added?'Already saved':'Add to quick actions'),async()=>{if(busy||request!==serial||!same())return;const commands=readCommands(ctx);if(commands.some(cmd=>invocation(cmd.text)===invocation(item.text))){render();return;}busy=true;add.disabled=true;try{await saveCommands(ctx,[...commands,{name:item.name,text:item.text}]);}finally{busy=false;if(same())render();}},'ghost small');add.disabled=added||busy;row.append(copy,add);results.append(row);}
-   }
-   async function load(){const request=++serial;items=[];result=null;renderStamp=undefined;contextKey=identity();status.textContent='';disable(results);results.replaceChildren();if(!selected){render();return;}if(!same()){render();return;}const key=contextKey,sessionId=selected;
-    const timer=setTimeout(()=>{if(request===serial&&same()&&!result)status.textContent=t('Loading installed skills…');},1000);
-    try{let pending=cache.get(key);if(!pending){pending=Promise.resolve(ctx.rpc({action:'command_catalog',session:sessionId}));cache.set(key,pending);}const data=await pending;if(request!==serial||!same()){if(valid()&&request===serial)render();return;}result=data||{};const seen=new Set();items=(Array.isArray(result.items)?result.items:[]).filter(item=>item&&typeof item.name==='string'&&typeof item.text==='string').map(item=>({name:item.name.trim(),text:quickText(item.text),description:typeof item.description==='string'?item.description:''})).filter(item=>{const key=invocation(item.text);if(!item.name||!key||seen.has(key))return false;seen.add(key);return true;});render();}
-    catch{if(request===serial&&same()){result={error:true};render();}}finally{clearTimeout(timer);}
-   }
-   refresh=()=>{syncSessions();if(selected&&!same()&&contextKey!==null){serial++;contextKey=null;items=[];result=null;cache.clear();}render();};syncSessions();load();
+  const dirtyCommandScopes = new Map();
+  function readCommands(ctx) {
+    const scopeKey = commandScope(ctx) ?? "";
+    if (dirtyCommandScopes.has(scopeKey)) {
+      const next = dirtyCommandScopes.get(scopeKey);
+      if (ctx.state.snapshot) ctx.state.snapshot.quick_commands = next;
+      return next;
+    }
+    const commands = ctx.state.snapshot?.quick_commands,
+      scope = commandScope(ctx);
+    return Array.isArray(commands)
+      ? cacheCommands(ctx, commands)
+      : normalizeCommands(
+          scope === undefined
+            ? ctx.state.preferences?.quickCommands
+            : (ctx.state.preferences?.quickCommandsByScope?.[scope] ??
+                ctx.state.preferences?.quickCommandsByHost?.[scope]),
+        );
   }
-  function edit(index){const commands=readCommands(ctx),cmd=commands[index];refresh=()=>{};revision++;root.replaceChildren();const form=el('form',undefined,'quick-action-form'),nameLabel=el('label',t('Name')),name=el('input'),textLabel=el('label',t('Skill, command, or prompt')),text=el('textarea');name.type='text';name.required=true;name.value=cmd?.name||'';name.placeholder='Orchestrate';name.setAttribute('aria-label',t('Name'));text.required=true;text.rows=4;text.value=cmd?.text||'';text.placeholder='/krill-orchestration ';text.setAttribute('aria-label',t('Skill, command, or prompt'));nameLabel.append(name);textLabel.append(text);
-   const controls=el('div',undefined,'quick-action-form-controls'),save=action(t('Save'),submit,'primary'),cancel=action(t('Cancel'),draw);controls.append(save,cancel);if(cmd)controls.append(action(t('Delete'),async()=>{if(busy)return;busy=true;try{await saveCommands(ctx,commands.filter((_,i)=>i!==index));draw();}finally{busy=false;}},'ghost danger'));
-   async function submit(){if(!current()||busy||!name.value.trim()||!quickText(text.value))return;busy=true;save.disabled=true;try{const next=commands.slice(),value={name:name.value.trim(),text:quickText(text.value)};if(cmd)next[index]=value;else next.push(value);await saveCommands(ctx,next);draw();}finally{busy=false;save.disabled=false;}}
-   form.addEventListener('submit',event=>{event.preventDefault();submit();});form.append(nameLabel,textLabel,el('p',t('Inserted into the active terminal or chat input without pressing Enter.'),'muted'),controls);root.append(form);name.focus?.();
+  async function saveCommands(ctx, commands) {
+    const owner = commandOwner(ctx);
+    if (!ownsCommands(ctx, owner)) return;
+    const next = cacheCommands(ctx, commands),
+      scopeKey = commandScope(ctx) ?? "";
+    if (ctx.state.snapshot) ctx.state.snapshot.quick_commands = next;
+    try {
+      const res = await ctx.rpc({
+        action: "save_quick_commands",
+        commands: next,
+      });
+      if (ownsCommands(ctx, owner)) {
+        dirtyCommandScopes.delete(scopeKey);
+        if (Array.isArray(res?.quick_commands)) {
+          const saved = cacheCommands(ctx, res.quick_commands);
+          if (ctx.state.snapshot) ctx.state.snapshot.quick_commands = saved;
+        }
+      }
+    } catch {
+      if (ownsCommands(ctx, owner)) {
+        dirtyCommandScopes.set(scopeKey, next);
+        ctx.error?.(
+          Error(
+            (ctx.t || ((s) => s))(
+              "Saved on this phone. Could not sync quick actions to desktop. Reconnect and save again.",
+            ),
+          ),
+        );
+      }
+    }
   }
-  draw();return {update:()=>{if(current())refresh();else{revision++;disable(root);}}};
- }
- M.quickCommands={read:readCommands,save:saveCommands,mount:commandEditor};
- const sessionView=(preferences,key,chatAvailable)=>{const mode=Object.hasOwn(preferences?.sessionViewModes||{},key)?preferences.sessionViewModes[key]:preferences?.defaultSessionView;return chatAvailable&&mode==='chat'?'chat':'term';};M.sessionView=sessionView;
- // Agent marks/names follow krill-app ui/icons.rs agent_brand_icon (paths from Orca, MIT) and builtin agents.toml names.
- const BRANDS={"claude":["Claude Code","24",[["M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"]]],"codex":["Codex","24",[["M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z","e"]]],"agy":["Antigravity","24",[["M12 2.2C9.1 2.2 6.8 5.4 4.9 10.5C3.1 15.1 1.9 18.7 1.4 20.3C1.1 21.3 2.1 22.1 3.0 21.4C4.5 20.3 6.5 17.9 8.3 15.9C9.5 14.6 10.7 13.9 12 13.9C13.3 13.9 14.5 14.6 15.7 15.9C17.5 17.9 19.5 20.3 21.0 21.4C21.9 22.1 22.9 21.3 22.6 20.3C22.1 18.7 20.9 15.1 19.1 10.5C17.2 5.4 14.9 2.2 12 2.2Z"],["M12 2.2C9.7 2.2 7.8 4.4 6.1 8.0C7.8 6.7 9.8 6.0 12 6.0C14.2 6.0 16.2 6.7 17.9 8.0C16.2 4.4 14.3 2.2 12 2.2Z","layer"]]],"cursor":["Cursor CLI","24",[["M12 1.75L20.88 6.88V17.12L12 22.25L3.12 17.12V6.88L12 1.75ZM5.4 8.2L12 12.0V19.6L18.6 8.2H5.4Z","e"],["M12 1.75L20.88 6.88L12 12.0L3.12 6.88L12 1.75Z","layer"]]],"opencode":["OpenCode","512",[["M320 224V352H192V224H320Z","o0.28"],["M384 416H128V96H384V416ZM320 160H192V352H320V160Z","e"],["M320 224V352H192V224H320Z","layer"]]]};
- BRANDS.pi=["Pi","800",[["M165.29 165.29 H517.36 V400 H400 V517.36 H282.65 V634.72 H165.29 Z M282.65 282.65 V400 H400 V282.65 Z","e"],["M517.36 400 H634.72 V634.72 H517.36 Z"]]];
- const agentKey=a=>{const id=String(a||'').trim(),name=id.split(/[\\/]/).pop().replace(/\.exe$/i,'').toLowerCase();return ({antigravity:'agy','cursor-agent':'cursor','π':'pi'})[name]||BRANDS[name]&&name||/^(?:sh|bash|zsh|fish|nu|pwsh|powershell|cmd|shell)$/.test(name)&&name||id;},agentName=a=>BRANDS[agentKey(a)]?.[0]||agentKey(a);M.agentName=agentName;
-
- const cleanTitle=title=>String(title||'').replace(/^[\s\u2800-\u28ff\u2700-\u27bf\u25a0-\u25ff·*]+/u,'').trim();
- const sessionAgent=s=>{const id=agentKey(s.agent);if(id&&!/^(?:sh|bash|zsh|fish|nu|pwsh|powershell|cmd|shell)$/i.test(id))return id;const foreground=agentKey(s.foreground);if(BRANDS[foreground])return foreground;const title=String(s.title||'').toLowerCase();return ['claude','codex','agy','opencode','cursor'].find(a=>title.includes(a==='agy'?'antigravity':a))||title.split(/[^\p{L}\p{N}_-]+/u).some(word=>word==='pi'||word==='π')&&'pi'||'';};
- M.agentKey=agentKey;M.sessionAgent=sessionAgent;M.cleanTitle=cleanTitle;
-
- M.agentIcon=(agent,{el,icon})=>{const id=agentKey(agent),brand=BRANDS[id];if(!id){const i=icon('terminal');i.setAttribute('class','agent-icon');return i;}if(!brand){const b=el('span',[...id][0].toUpperCase(),'agent-icon custom');b.setAttribute('aria-hidden','true');return b;}const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');for(const [k,v] of [['viewBox',`0 0 ${brand[1]} ${brand[1]}`],['class',`agent-icon ${id}`],['aria-hidden','true']])svg.setAttribute(k,v);for(const [d,...flags] of brand[2]){const path=document.createElementNS(ns,'path');path.setAttribute('d',d);path.setAttribute('fill','currentColor');if(flags.includes('e'))path.setAttribute('fill-rule','evenodd');const o=flags.find(f=>f[0]==='o');if(o)path.setAttribute('fill-opacity',o.slice(1));if(flags.includes('layer'))path.setAttribute('class','layer');svg.append(path);}return svg;};
-
-
- function pendingSession(root,ctx){const {el,button,go,state,route}=ctx,t=ctx.t||(s=>s),job=ctx.creating?.(),group=state.groups.get(route.groupKey)||job?.group;
-  if(!job||!group||job.group.key!==route.groupKey){go(ctx.groupRoute(group),true);return {};}
-  const screen=el('section',undefined,'session screen pending-session'),header=ctx.header(group.label,'/host/local',()=>ctx.backTo('/host/local')),summary=el('small',undefined,'session-summary'),liveDot=el('span',undefined,'live-dot'),summaryText=el('span','\u00a0'),tabs=el('nav',undefined,'session-tabs'),scroll=el('div',undefined,'tab-scroll'),add=button(t('Create Tab'),()=>{},'tab-add','plus'),panels=el('div',undefined,'session-panels'),pane=el('section',undefined,'terminal-pane primary-pane'),mount=el('div',undefined,'terminal-mount');
-  liveDot.dataset.live='false';summary.append(liveDot,summaryText);header.querySelector('h1').parentElement.append(summary);
-
-  const git=button(t('Git changes'),()=>{},'icon-button','git');git.hidden=!group.sessions.some(s=>s.branch!==null&&s.branch!==undefined);for(const node of [button(t('Chat'),()=>{},'ghost small mode-toggle'),git,button(t('Terminal actions'),()=>{},'icon-button','more')]){node.disabled=true;header.append(node);}const split=button(t('Split terminal'),()=>{},'ghost small split-toggle');split.disabled=true;split.hidden=!globalThis.matchMedia?.('(min-width:1000px)')?.matches;header.insertBefore(split,header.lastElementChild||header.children[header.children.length-1]);tabs.setAttribute('aria-label',t('Terminals'));scroll.setAttribute('role','tablist');add.disabled=true;tabs.append(scroll,add);
-  const tab=(status,label,agent,selected,action)=>{const node=button('',action,'session-tab');node.tabIndex=selected?0:-1;node.setAttribute('role','tab');node.setAttribute('aria-selected',String(selected));node.setAttribute('aria-label',label);const dot=ctx.dot(status);dot.setAttribute('aria-label',t(status));node.append(dot,M.agentIcon(agent,ctx),el('span',label,'tab-label'));return node;};
-
-  const seen=new Map(),named=base=>{const n=(seen.get(base)||0)+1;seen.set(base,n);return n>1?`${base} ${n}`:base;};
-  for(const s of group.sessions.filter(live))scroll.append(tab(s.exited?'Exited':s.state||'Unknown',named(cleanTitle(s.title)||state.titles?.get(s.id)||agentName(sessionAgent(s))||'Shell'),sessionAgent(s),false,()=>go(ctx.groupRoute(group,s.id))));
-  const fresh=tab('Unknown',named(job.agent?agentName(job.agent):'Shell'),job.agent,true,()=>{});scroll.append(fresh);const frame=el('div',undefined,'terminal-frame'),dock=el('footer',undefined,'command-dock'),accessory=el('div',undefined,'accessory-row pending-accessory');dock.setAttribute('aria-hidden','true');dock.append(accessory);if(state.preferences?.inputMode==='buffered')dock.append(el('div',undefined,'input-row pending-buffered'));mount.append(frame,dock);pane.append(mount);panels.append(pane);screen.append(header,tabs,panels);root.append(screen);fresh.scrollIntoView?.({block:'nearest',inline:'nearest'});
-  const timer=setTimeout(()=>{summaryText.textContent=t('Connecting…');},1000);
-  return {update(){if(!ctx.creating?.())go(ctx.groupRoute(state.groups.get(route.groupKey)||group),true);},cleanup(){clearTimeout(timer);}};}
- const live=s=>!!s&&!s.exited&&s.state!=='Exited';
- M.screens.session=(root,ctx)=>{
- if(ctx.route.sessionId==='new')return pendingSession(root,ctx);
- const {el,button,go,state,route}=ctx,t=(s,...v)=>v.reduce((out,value,i)=>out.replaceAll(`{${i}}`,String(value)),ctx.t?.(s,...v)??s);let session=state.sessions.get(route.sessionId),group=state.groups.get(route.groupKey)||session&&state.groups.get(session.groupKey);if(!group||!live(session)){const next=group?.sessions.find(s=>live(state.sessions.get(s.id))),path=next?ctx.groupRoute(group,next.id):'/host/local';Promise.resolve().then(()=>{if(!ctx.signal.aborted)go(path,true);});return {};}
- if(!group||!session){root.append(ctx.header('Workspace','/host/local'),el('p',t('Session not found'),'empty'),button(t('Open workspaces'),()=>go('/host/local'),'primary'));return {};}
-
- ctx.rememberSession?.(session,group);
- let selectedId=session.id,stateKey=ctx.sessionKey?.(session.id)??session.id;
- let viewMode=sessionView(state.preferences,stateKey,Boolean(M.chat?.mount));
- const screen=el('section',undefined,'session screen'),header=ctx.header(group.label,'/host/local',()=>ctx.backTo('/host/local')),title=header.querySelector('h1'),summary=el('small',undefined,'session-summary'),liveDot=el('span',undefined,'live-dot'),summaryText=el('span',t('Connecting…'));summary.append(liveDot,summaryText);title.parentElement.append(summary);
-
- const isConnected=()=>state.connection.phase==='ready'&&(viewMode==='chat'||(activePane===1&&splitSession?secondaryPhase:terminalPhase)==='ready');
- const onSummaryTap=()=>{if(!isConnected()){if(state.connection.phase==='ready'&&viewMode!=='chat'&&activePane===1&&splitSession){stopSecondary();syncSplit();}else ctx.transport?.reconnect?.();}};
- summary.addEventListener('click',onSummaryTap);summary.action=onSummaryTap;
- function syncSummary(){const activeMessage=activePane===1&&splitSession?secondaryMessage:terminalMessage;const connected=isConnected(),count=(state.groups.get(activeSession()?.groupKey)||group).sessions.filter(live).length,text=connected?t(count===1?'{0} terminal':'{0} terminals',count):t(viewMode==='chat'?'Connecting…':activeMessage);liveDot.dataset.live=String(connected);if(connected)delete summary.dataset.reconnectable;else summary.dataset.reconnectable='true';if(summaryText.textContent!==text)summaryText.textContent=text;}
- const modeBtn=button(t(viewMode==='chat'?'Term':'Chat'),()=>toggleViewMode(),'ghost small mode-toggle');header.append(modeBtn);
-  const quick=button(t('Quick actions'),quickActions,'icon-button session-quick-actions','zap');quick.dataset.testid='session-quick-actions';quick.setAttribute('aria-haspopup','dialog');quick.addEventListener('pointerdown',e=>e.preventDefault());header.append(quick);
- const git=button(t('Git changes'),()=>go(`/git/${activeSession().id}`),'icon-button','git');header.append(git);
-
- const more=button(t('Terminal actions'),()=>actions(activeSession()),'icon-button','more');more.addEventListener('pointerdown',e=>e.preventDefault());header.append(more);screen.append(header);const tabs=el('nav',undefined,'session-tabs');tabs.setAttribute('aria-label',t('Terminals'));const scroll=el('div',undefined,'tab-scroll');scroll.setAttribute('role','tablist');scroll.addEventListener('keydown',e=>{const items=[...scroll.children].filter(n=>n.classList?.contains('session-tab')&&!n.disabled);if(!items.length||!['ArrowRight','ArrowLeft','Home','End'].includes(e.key))return;const cur=Math.max(0,items.indexOf(globalThis.document?.activeElement)),next=e.key==='Home'?0:e.key==='End'?items.length-1:(cur+(e.key==='ArrowRight'?1:-1)+items.length)%items.length;e.preventDefault();for(let i=0;i<items.length;i++)items[i].tabIndex=i===next?0:-1;items[next].focus();items[next].scrollIntoView?.({block:'nearest',inline:'nearest'});});tabs.append(scroll);let add;
- if(state.snapshot?.capabilities?.session_create){add=button(t('Create Tab'),newSession,'tab-add','plus');tabs.append(add);}
- screen.append(tabs);
- const panels=el('div',undefined,'session-panels'),primaryPane=el('section',undefined,'terminal-pane primary-pane'),mount=el('div',undefined,'terminal-mount'),chatMount=el('div',undefined,'terminal-mount');chatMount.hidden=true;primaryPane.append(mount);panels.append(primaryPane);screen.append(panels,chatMount);root.append(screen);let revealTab=true,refocus=false,titles=state.titles||=new Map(),handle,chatHandle,terminalPhase,terminalMessage='Connecting…',connectionPhase=state.connection.phase,quickHandle,retryTimer,retryDelay=1000,generation=0,disposed=false;const tabEntries=new Map();
- function syncViewMode(){const inChat=viewMode==='chat'&&Boolean(M.chat?.mount);mount.hidden=inChat;panels.hidden=inChat;chatMount.hidden=!inChat;Promise.resolve(handle?.setVisible?.(!inChat)).catch(ctx.error);
-
-  if(!chatHandle&&M.chat?.mount)chatHandle=M.chat.mount(chatMount,{ctx,sessionId:session.id,agentIcon,visible:inChat,onSwitchTerm:()=>setViewMode('term')});
-  chatHandle?.setVisible?.(inChat);
-  if(inChat){syncSummary();chatHandle?.update?.();if(M.activeTerminal===handle)M.activeTerminal=null;}else{if(!handle)attach();else if(handle){if(activePane===0)M.activeTerminal=handle;syncSummary();}}}
- function setViewMode(next){if(next==='chat'&&!M.chat?.mount)return;if(next==='chat'&&splitSession&&activePane===1){const target=activeSession();ctx.savePreferences?.({sessionViewModes:{...state.preferences?.sessionViewModes,[ctx.sessionKey?.(target.id)??target.id]:'chat'}});closeSplit();go(ctx.groupRoute(state.groups.get(target.groupKey)||group,target.id));return;}if(next==='chat'&&splitSession)closeSplit();viewMode=next;modeBtn.textContent=t(viewMode==='chat'?'Term':'Chat');modeBtn.setAttribute('aria-label',modeBtn.textContent);ctx.savePreferences?.({sessionViewModes:{...state.preferences?.sessionViewModes,[stateKey]:viewMode}});syncViewMode();}
- function toggleViewMode(){setViewMode(viewMode==='chat'?'term':'chat');}
- function actions(target){target=state.sessions.get(target.id);if(!target)return;const entries=[...target.id===activeSession().id?[{label:t('Select text'),action:screenText},...viewMode==='term'?[{label:t('Load earlier output'),action:()=>M.activeTerminal?.loadHistory(true)}]:[]]:[],{label:t('Send prompt'),action:()=>prompt(target)},{label:t('Hand off to {0}','Codex'),action:()=>handoff(target,'codex')},{label:t('Hand off to {0}','Claude'),action:()=>handoff(target,'claude')}];if(target.branch!==null&&target.branch!==undefined)entries.unshift({label:t('Git changes'),action:()=>go(`/git/${target.id}`)});if(['Waiting','Blocked'].includes(target.state)){entries.unshift({label:t('Review in Terminal'),action:()=>reviewTerminal(target.id)});}if(state.snapshot?.capabilities?.session_close)entries.push({label:t('Close terminal'),danger:true,action:()=>ctx.sheet(t('Close terminal?'), [{label:t('Close terminal'),danger:true,action:async()=>{await ctx.rpc({action:'close_terminal',session:target.id});ctx.refresh().then(()=>{if(ctx.signal.aborted)return;const next=state.groups.get(group.key);go(next?ctx.groupRoute(next):'/host/local');}).catch(ctx.error);}}],t('Terminal #{0} will be stopped.',target.id))});// 승인 전 맥락: 스냅샷의 마지막 줄(lines)을 시트 제목 아래에 보여 터미널을 열지 않고도 무엇을 승인하는지 확인한다.
- if(M.chat?.mount&&target.id===activeSession().id)entries.unshift({label:t(viewMode==='chat'?'Switch to Terminal':'Switch to Chat'),action:()=>toggleViewMode()});
- const context=['Waiting','Blocked'].includes(target.state)&&target.lines?.length?target.lines.join('\n'):'';ctx.sheet(cleanTitle(target.title)||titles.get(target.id)||agentName(sessionAgent(target))||t('Terminal #{0}',target.id),entries,undefined,context?body=>{const pre=el('pre',context,'sheet-context');pre.setAttribute('aria-label',t('Latest terminal output'));body.querySelector('h2')?.after(pre);}:undefined);}
- function quickActions(){ctx.sheet(t('Quick actions'),[],t('Insert a saved skill, command, or prompt. Press Enter separately to run.'),body=>{const manager=el('div',undefined,'quick-actions-manager');body.append(manager);quickHandle=commandEditor(manager,Object.assign(Object.create(ctx),{commandSession:activeSession}),text=>{ctx.closeSheet();if(viewMode==='chat'&&chatHandle?.insertText)chatHandle.insertText(text);else(M.activeTerminal||handle)?.insertText?.(text);});});}
-
- function newSession(){const agents=state.snapshot?.agents||['claude','codex'].map(id=>({id,name:agentName(id)}));ctx.sheet(t('New session'),[],undefined,body=>{for(const a of [...agents,{id:'',name:t('Terminal')}]){const b=button(a.name||agentName(a.id),async()=>{ctx.closeSheet();await create(a.id);},'sheet-action provider');b.prepend(agentIcon(a.id));body.append(b);}});}
- function create(agent){const target=activeSession();return ctx.createSession(state.groups.get(target.groupKey)||group,agent,{action:'create_terminal',cwd_session:target.id,...agent?{agent}:{}});}
- function reviewTerminal(id){if(!state.sessions.has(id))throw Error('This terminal is no longer available.');ctx.closeSheet();if(id===activeSession().id){setViewMode('term');M.activeTerminal?.focus();}else{ctx.savePreferences?.({sessionViewModes:{...state.preferences?.sessionViewModes,[ctx.sessionKey?.(id)??id]:'term'}});go(ctx.groupRoute(group,id));}}
- const promptDraftVersions=M.promptDraftVersions||=new WeakMap();let promptGeneration=0;
- function prompt(target){const sheetGeneration=++promptGeneration;ctx.sheet(t('Send prompt'),[],undefined,body=>{const form=el('form'),input=el('textarea');input.id='prompt';input.placeholder=t('Write a prompt…');input.setAttribute('aria-label',t('Prompt'));input.value=state.drafts.get(target.id)||'';let composing=false,pending=false,version=0;const versions=promptDraftVersions.get(state.drafts)||new Map();promptDraftVersions.set(state.drafts,versions);const edit=()=>{version++;versions.set(target.id,(versions.get(target.id)||0)+1);input.value?state.drafts.set(target.id,input.value):state.drafts.delete(target.id);};input.addEventListener('input',edit);input.addEventListener('compositionstart',()=>composing=true);input.addEventListener('compositionend',()=>composing=false);const send=el('button',t('Send prompt'),'primary');send.type='submit';form.id='composer';form.append(input,send);globalThis.MkKeyboard?.keepFocus(form,ctx.signal);form.addEventListener('submit',e=>{e.preventDefault();if(composing||e.isComposing||pending||disposed||ctx.signal.aborted)return;const text=input.value,sentVersion=version,draftVersion=versions.get(target.id);if(!text)return;pending=true;send.disabled=true;ctx.act(async()=>{try{await ctx.rpc({action:'prompt',session:target.id,text});const current=!disposed&&!ctx.signal.aborted&&sheetGeneration===promptGeneration&&input.isConnected!==false&&body.closest?.('dialog')?.open!==false&&version===sentVersion&&versions.get(target.id)===draftVersion&&input.value===text&&state.drafts.get(target.id)===text;if(current){state.drafts.delete(target.id);input.value='';ctx.closeSheet();}ctx.refresh().catch(ctx.error);}finally{pending=false;send.disabled=false;}});});body.append(form);});}
- async function handoff(target,agent){const initialHash=globalThis.location?.hash,result=await ctx.rpc({action:'handoff',session:target.id,agent});await ctx.refresh?.();if(disposed||ctx.signal?.aborted||globalThis.location?.hash&&globalThis.location.hash!==initialHash)return;const id=Number(result.to_session),next=state.sessions.get(id);if(Number.isSafeInteger(id)&&id>0){go(ctx.groupRoute(state.groups.get(next?.groupKey)||group,id));ctx.toast?.(t('Handed off to {0}.',agent==='codex'?'Codex':'Claude'));}}
- function agentIcon(agent){return M.agentIcon(agent,ctx);}
- function nodeText(n){
-  if(!n||n.className==='chat-meta')return '';
-  if(n.childNodes)return Array.from(n.childNodes,c=>c.nodeType===3?c.textContent:c.nodeType===1?nodeText(c):'').join('');
-  const self=typeof n._text==='string'?n._text:n.textContent||'';
-  const sep=String(n.className||'').includes('chat-card')||n.className==='chat-md'?'\n':'';
-  return [self,...(n.children||[]).map(nodeText)].filter(Boolean).join(sep);
- }
- function screenText(){
-  let text=M.activeTerminal?.text?.()||'';
-  if(!text){
-   const nodes=chatMount.descendants?chatMount.descendants():Array.from(chatMount.querySelectorAll?.('*')||[]);
-   const feed=nodes.find(n=>String(n.className||'').split(/\s+/).includes('chat-feed'));
-   const cards=(feed?feed.descendants?feed.descendants():Array.from(feed.querySelectorAll?.('*')||[]):[]).filter(n=>String(n.className||'').split(/\s+/).includes('chat-card'));
-   text=cards.map(nodeText).filter(Boolean).join('\n\n');
+  const invocation = (text) => quickText(text).trim();
+  function commandEditor(root, ctx, onInsert) {
+    const { el, button } = ctx,
+      t = ctx.t || ((s) => s),
+      owner = commandOwner(ctx);
+    let busy = false,
+      revision = 0,
+      refresh = () => {},
+      browseButton;
+    const current = () =>
+      ownsCommands(ctx, owner) && root.isConnected !== false;
+    const disable = (node) => {
+      for (const tag of ["button", "input", "textarea", "select"])
+        for (const control of node.querySelectorAll?.(tag) || [])
+          control.disabled = true;
+    };
+    const action = (label, fn, cls = "ghost small") => {
+      const b = button(
+        label,
+        (e) => {
+          e?.stopPropagation?.();
+          if (current()) return fn();
+        },
+        cls,
+      );
+      b.type = "button";
+      return b;
+    };
+    const listStamp = () =>
+      JSON.stringify([
+        readCommands(ctx),
+        ctx.state.snapshot?.capabilities?.command_catalog === true,
+      ]);
+    function draw() {
+      if (!current()) return;
+      const stamp = listStamp();
+      refresh = () => {
+        if (stamp !== listStamp()) draw();
+      };
+      revision++;
+      disable(root);
+      root.replaceChildren();
+      const head = el("div", undefined, "quick-actions-header");
+      head.append(action(`+ ${t("Add")}`, () => edit(-1)));
+      if (ctx.state.snapshot?.capabilities?.command_catalog === true) {
+        browseButton = action(t("Find installed skills"), browse);
+        head.append(browseButton);
+      }
+      if (onInsert) head.append(action(t("Close"), () => ctx.closeSheet()));
+      root.append(head);
+      const commands = readCommands(ctx),
+        list = el("div", undefined, "quick-actions-list");
+      root.append(list);
+      if (!commands.length) {
+        list.append(
+          el(
+            "p",
+            t(
+              "No quick actions yet. Save skills like /krill-orchestration, shell commands, or prompts to insert without pressing Enter.",
+            ),
+            "muted",
+          ),
+          action(`+ ${t("Add quick action")}`, () => edit(-1), "secondary"),
+        );
+      }
+      commands.forEach((cmd, index) => {
+        const row = el("div", undefined, "quick-action-card"),
+          copy = onInsert
+            ? action("", () => onInsert(cmd.text), "quick-action-insert")
+            : el("div", undefined, "quick-action-insert");
+        if (onInsert) copy.setAttribute("aria-label", cmd.name);
+        copy.append(
+          el("strong", cmd.name),
+          el("pre", cmd.text, "quick-action-preview"),
+        );
+        const controls = el("div", undefined, "quick-action-controls");
+        if (commands.length > 1)
+          for (const [step, glyph, label] of [
+            [-1, "↑", "Move up"],
+            [1, "↓", "Move down"],
+          ]) {
+            const b = action(glyph, async () => {
+              if (busy) return;
+              busy = true;
+              try {
+                const reordered = readCommands(ctx).slice(),
+                  next = index + step;
+                [reordered[index], reordered[next]] = [
+                  reordered[next],
+                  reordered[index],
+                ];
+                await saveCommands(ctx, reordered);
+                if (!ctx.signal?.aborted) draw();
+              } finally {
+                busy = false;
+              }
+            });
+            b.setAttribute("aria-label", t(label));
+            b.disabled = step < 0 ? index === 0 : index === commands.length - 1;
+            controls.append(b);
+          }
+        controls.append(
+          action(t("Edit"), () => edit(index)),
+          action(
+            t("Delete"),
+            async () => {
+              if (busy) return;
+              busy = true;
+              try {
+                await saveCommands(
+                  ctx,
+                  readCommands(ctx).filter((_, i) => i !== index),
+                );
+                if (!ctx.signal?.aborted) draw();
+              } finally {
+                busy = false;
+              }
+            },
+            "ghost small danger",
+          ),
+        );
+        row.append(copy, controls);
+        list.append(row);
+      });
+    }
+    function closePicker() {
+      draw();
+      browseButton?.focus?.();
+    }
+    function browse() {
+      const token = ++revision,
+        cache = new Map();
+      let selected = ctx.commandSession?.()?.id || null,
+        items = [],
+        result,
+        serial = 0,
+        contextKey,
+        select,
+        optionsStamp,
+        renderStamp;
+      root.replaceChildren();
+      const picker = el("div", undefined, "quick-catalog"),
+        head = el("div", undefined, "quick-actions-header"),
+        search = el("input", undefined, "quick-catalog-search"),
+        status = el("p", undefined, "muted quick-catalog-status"),
+        results = el("div", undefined, "quick-actions-list");
+      head.append(
+        el("strong", t("Installed skills and commands")),
+        action(t("Back"), closePicker),
+      );
+      search.type = "search";
+      search.placeholder = t("Search skills and commands");
+      search.setAttribute("aria-label", t("Search skills and commands"));
+      status.setAttribute("role", "status");
+      status.setAttribute("aria-live", "polite");
+      picker.append(head);
+      root.append(picker);
+      if (!ctx.commandSession) {
+        const label = el("label", t("Session for installed skills"));
+        select = el("select");
+        select.setAttribute("aria-label", t("Session for installed skills"));
+        select.addEventListener(
+          "change",
+          () => {
+            if (!valid()) return;
+            selected = Number(select.value) || null;
+            load();
+          },
+          { signal: ctx.signal },
+        );
+        label.append(select);
+        picker.append(label);
+      }
+      picker.append(search, status, results);
+      search.addEventListener("input", render, { signal: ctx.signal });
+      picker.addEventListener(
+        "keydown",
+        (event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            closePicker();
+          }
+        },
+        { signal: ctx.signal },
+      );
+      search.focus?.();
+      const identity = () => {
+        const target = ctx.state.sessions.get(selected);
+        if (
+          !live(target) ||
+          (ctx.commandSession && ctx.commandSession()?.id !== selected)
+        )
+          return null;
+        return JSON.stringify([
+          ctx.sessionKey?.(selected) ?? selected,
+          target.agent,
+          target.foreground,
+          target.cwd,
+          target.groupKey,
+          target.account_id,
+          target.provider,
+          target.profile_id,
+          target.account,
+          target.command_context,
+        ]);
+      };
+      const valid = () => current() && token === revision;
+      const same = () =>
+        valid() &&
+        contextKey !== null &&
+        contextKey === identity() &&
+        !ctx.state.cached &&
+        ctx.state.connection?.phase === "ready" &&
+        ctx.state.snapshot?.capabilities?.command_catalog === true;
+      function syncSessions() {
+        if (!select) return;
+        const options = [...ctx.state.sessions.values()]
+            .filter(live)
+            .map((session) => [
+              String(session.id),
+              `${ctx.state.groups.get(session.groupKey)?.label || t("Workspace")} · ${cleanTitle(session.title) || M.agentName?.(sessionAgent(session)) || t("Terminal")} #${session.id}`,
+            ]),
+          stamp = JSON.stringify(options);
+        if (stamp === optionsStamp) return;
+        optionsStamp = stamp;
+        const existing = new Map(
+          [...select.children].map((option) => [option.value, option]),
+        );
+        let before = null;
+        for (const [value, label] of [
+          ["", t("Choose a session")],
+          ...options,
+        ].reverse()) {
+          const option = existing.get(value) || el("option");
+          existing.delete(value);
+          option.value = value;
+          if (option.textContent !== label) option.textContent = label;
+          if (option.parentElement !== select || option.nextSibling !== before)
+            select.insertBefore(option, before);
+          before = option;
+        }
+        for (const option of existing.values()) option.remove();
+        select.value = options.some(([id]) => id === String(selected))
+          ? String(selected)
+          : "";
+      }
+      function render() {
+        if (!valid()) return;
+        const stamp = JSON.stringify([
+          selected,
+          same(),
+          result,
+          search.value,
+          readCommands(ctx),
+          busy,
+          [...ctx.state.sessions.values()].some(live),
+        ]);
+        if (stamp === renderStamp) return;
+        renderStamp = stamp;
+        disable(results);
+        results.replaceChildren();
+        if (!selected) {
+          status.textContent = t(
+            [...ctx.state.sessions.values()].some(live)
+              ? "Choose a session to see its installed skills and commands."
+              : "No live sessions. Open a session to find installed skills.",
+          );
+          return;
+        }
+        if (!same()) {
+          status.textContent = t(
+            "Session context changed. Reopen installed skills.",
+          );
+          return;
+        }
+        if (!result) return;
+        if (result.error) {
+          status.textContent = t(
+            "Could not load installed skills. Reopen to try again.",
+          );
+          return;
+        }
+        if (result.supported === false) {
+          status.textContent = t(
+            "Installed skills are unavailable for this agent.",
+          );
+          return;
+        }
+        const query = search.value?.trim().toLocaleLowerCase() || "",
+          matches = items.filter((item) =>
+            [item.name, item.description, item.text].some((value) =>
+              value.toLocaleLowerCase().includes(query),
+            ),
+          ),
+          saved = new Set(readCommands(ctx).map((cmd) => invocation(cmd.text)));
+        status.textContent = t(
+          items.length
+            ? matches.length
+              ? result.truncated
+                ? "Showing a limited list of installed skills."
+                : "Add a skill to your saved quick actions."
+              : "No skills or commands match your search."
+            : "No installed skills or commands found.",
+        );
+        for (const item of matches) {
+          const request = serial,
+            row = el("div", undefined, "quick-action-card"),
+            copy = el("div", undefined, "quick-action-insert"),
+            added = saved.has(invocation(item.text));
+          copy.append(
+            el("strong", item.name),
+            el("pre", item.text, "quick-action-preview"),
+          );
+          if (item.description) copy.append(el("p", item.description, "muted"));
+          const add = action(
+            t(added ? "Already saved" : "Add to quick actions"),
+            async () => {
+              if (busy || request !== serial || !same()) return;
+              const commands = readCommands(ctx);
+              if (
+                commands.some(
+                  (cmd) => invocation(cmd.text) === invocation(item.text),
+                )
+              ) {
+                render();
+                return;
+              }
+              busy = true;
+              add.disabled = true;
+              try {
+                await saveCommands(ctx, [
+                  ...commands,
+                  { name: item.name, text: item.text },
+                ]);
+              } finally {
+                busy = false;
+                if (same()) render();
+              }
+            },
+            "ghost small",
+          );
+          add.disabled = added || busy;
+          row.append(copy, add);
+          results.append(row);
+        }
+      }
+      async function load() {
+        const request = ++serial;
+        items = [];
+        result = null;
+        renderStamp = undefined;
+        contextKey = identity();
+        status.textContent = "";
+        disable(results);
+        results.replaceChildren();
+        if (!selected) {
+          render();
+          return;
+        }
+        if (!same()) {
+          render();
+          return;
+        }
+        const key = contextKey,
+          sessionId = selected;
+        const timer = setTimeout(() => {
+          if (request === serial && same() && !result)
+            status.textContent = t("Loading installed skills…");
+        }, 1000);
+        try {
+          let pending = cache.get(key);
+          if (!pending) {
+            pending = Promise.resolve(
+              ctx.rpc({ action: "command_catalog", session: sessionId }),
+            );
+            cache.set(key, pending);
+          }
+          const data = await pending;
+          if (request !== serial || !same()) {
+            if (valid() && request === serial) render();
+            return;
+          }
+          result = data || {};
+          const seen = new Set();
+          items = (Array.isArray(result.items) ? result.items : [])
+            .filter(
+              (item) =>
+                item &&
+                typeof item.name === "string" &&
+                typeof item.text === "string",
+            )
+            .map((item) => ({
+              name: item.name.trim(),
+              text: quickText(item.text),
+              description:
+                typeof item.description === "string" ? item.description : "",
+            }))
+            .filter((item) => {
+              const key = invocation(item.text);
+              if (!item.name || !key || seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          render();
+        } catch {
+          if (request === serial && same()) {
+            result = { error: true };
+            render();
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      refresh = () => {
+        syncSessions();
+        if (selected && !same() && contextKey !== null) {
+          serial++;
+          contextKey = null;
+          items = [];
+          result = null;
+          cache.clear();
+        }
+        render();
+      };
+      syncSessions();
+      load();
+    }
+    function edit(index) {
+      const commands = readCommands(ctx),
+        cmd = commands[index];
+      refresh = () => {};
+      revision++;
+      root.replaceChildren();
+      const form = el("form", undefined, "quick-action-form"),
+        nameLabel = el("label", t("Name")),
+        name = el("input"),
+        textLabel = el("label", t("Skill, command, or prompt")),
+        text = el("textarea");
+      name.type = "text";
+      name.required = true;
+      name.value = cmd?.name || "";
+      name.placeholder = "Orchestrate";
+      name.setAttribute("aria-label", t("Name"));
+      text.required = true;
+      text.rows = 4;
+      text.value = cmd?.text || "";
+      text.placeholder = "/krill-orchestration ";
+      text.setAttribute("aria-label", t("Skill, command, or prompt"));
+      nameLabel.append(name);
+      textLabel.append(text);
+      const controls = el("div", undefined, "quick-action-form-controls"),
+        save = action(t("Save"), submit, "primary"),
+        cancel = action(t("Cancel"), draw);
+      controls.append(save, cancel);
+      if (cmd)
+        controls.append(
+          action(
+            t("Delete"),
+            async () => {
+              if (busy) return;
+              busy = true;
+              try {
+                await saveCommands(
+                  ctx,
+                  commands.filter((_, i) => i !== index),
+                );
+                draw();
+              } finally {
+                busy = false;
+              }
+            },
+            "ghost danger",
+          ),
+        );
+      async function submit() {
+        if (!current() || busy || !name.value.trim() || !quickText(text.value))
+          return;
+        busy = true;
+        save.disabled = true;
+        try {
+          const next = commands.slice(),
+            value = { name: name.value.trim(), text: quickText(text.value) };
+          if (cmd) next[index] = value;
+          else next.push(value);
+          await saveCommands(ctx, next);
+          draw();
+        } finally {
+          busy = false;
+          save.disabled = false;
+        }
+      }
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        submit();
+      });
+      form.append(
+        nameLabel,
+        textLabel,
+        el(
+          "p",
+          t(
+            "Inserted into the active terminal or chat input without pressing Enter.",
+          ),
+          "muted",
+        ),
+        controls,
+      );
+      root.append(form);
+      name.focus?.();
+    }
+    draw();
+    return {
+      update: () => {
+        if (current()) refresh();
+        else {
+          revision++;
+          disable(root);
+        }
+      },
+    };
   }
-  ctx.sheet(t('Terminal text'),[],t('Touch and hold to select and copy.'),body=>{const area=el('textarea',undefined,'screen-text');area.readOnly=true;area.value=text;area.setAttribute('aria-label',t('Terminal text'));body.append(area);});
- }
- function clearTabs(){for(const e of tabEntries.values()){e.abort.abort();e.stop?.();}tabEntries.clear();}
- function ended(id){Promise.resolve().then(()=>{if(disposed||ctx.signal.aborted)return;const target=state.sessions.get(id);if(target)target.exited=true;draw();if(!disposed&&!ctx.signal.aborted)return ctx.refresh();}).catch(ctx.error);}
- function cancelRetry(){clearTimeout(retryTimer);retryTimer=null;}
- function retry(){if(disposed||retryTimer||state.connection.phase!=='ready')return;const current=generation;retryTimer=setTimeout(()=>{retryTimer=null;if(!disposed&&current===generation&&state.connection.phase==='ready')attach();},retryDelay);retryDelay=Math.min(retryDelay*2,65000);}
- function attach(){cancelRetry();const current=++generation,target=session,key=stateKey;handle?.unmount();handle=null;mount.replaceChildren();handle=M.terminal.mount(mount,{sessionId:target.id,stateKey:key,connect:()=>ctx.transport.terminalConnect(),visible:viewMode!=='chat',preferences:{...state.preferences,...splitSession?{fitToPhone:state.preferences.fitToPhone??true}:{},inputMode:state.preferences.terminalInputModes?.[key]||state.preferences.inputMode},onPreferenceChange:patch=>{if(patch.inputMode)ctx.savePreferences({terminalInputModes:{...state.preferences.terminalInputModes,[key]:patch.inputMode}});else ctx.savePreferences(patch);},onStatus:status=>{if(disposed||current!==generation)return;terminalPhase=status.phase;terminalMessage=status.message||'Connecting…';if(status.typing&&status.phase!=='ready')refocus=true;if(status.phase==='ready'){retryDelay=1000;cancelRetry();if(refocus){refocus=false;handle?.focus();}}else if(status.phase==='disconnected')retry();else if(status.phase==='ended')ended(target.id);syncSummary();if(status.error)ctx.error(status.error);},onPhoto:file=>ctx.photo(target.id,file),onEditKeys:()=>go('/settings/terminal'),onTitle:title=>{if(disposed||current!==generation)return;const clean=cleanTitle(title);if(clean===(titles.get(target.id)||''))return;if(clean)titles.set(target.id,clean);else titles.delete(target.id);draw();}});if(viewMode!=='chat'&&activePane===0)M.activeTerminal=handle;}
+  M.quickCommands = {
+    read: readCommands,
+    save: saveCommands,
+    mount: commandEditor,
+  };
+  const sessionView = (preferences, key, chatAvailable) => {
+    const mode = Object.hasOwn(preferences?.sessionViewModes || {}, key)
+      ? preferences.sessionViewModes[key]
+      : preferences?.defaultSessionView;
+    return chatAvailable && mode === "chat" ? "chat" : "term";
+  };
+  M.sessionView = sessionView;
+  // Agent marks/names follow krill-app ui/icons.rs agent_brand_icon (paths from Orca, MIT) and builtin agents.toml names.
+  const BRANDS = {
+    claude: [
+      "Claude Code",
+      "24",
+      [
+        [
+          "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z",
+        ],
+      ],
+    ],
+    codex: [
+      "Codex",
+      "24",
+      [
+        [
+          "M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z",
+          "e",
+        ],
+      ],
+    ],
+    agy: [
+      "Antigravity",
+      "24",
+      [
+        [
+          "M12 2.2C9.1 2.2 6.8 5.4 4.9 10.5C3.1 15.1 1.9 18.7 1.4 20.3C1.1 21.3 2.1 22.1 3.0 21.4C4.5 20.3 6.5 17.9 8.3 15.9C9.5 14.6 10.7 13.9 12 13.9C13.3 13.9 14.5 14.6 15.7 15.9C17.5 17.9 19.5 20.3 21.0 21.4C21.9 22.1 22.9 21.3 22.6 20.3C22.1 18.7 20.9 15.1 19.1 10.5C17.2 5.4 14.9 2.2 12 2.2Z",
+        ],
+        [
+          "M12 2.2C9.7 2.2 7.8 4.4 6.1 8.0C7.8 6.7 9.8 6.0 12 6.0C14.2 6.0 16.2 6.7 17.9 8.0C16.2 4.4 14.3 2.2 12 2.2Z",
+          "layer",
+        ],
+      ],
+    ],
+    cursor: [
+      "Cursor CLI",
+      "24",
+      [
+        [
+          "M12 1.75L20.88 6.88V17.12L12 22.25L3.12 17.12V6.88L12 1.75ZM5.4 8.2L12 12.0V19.6L18.6 8.2H5.4Z",
+          "e",
+        ],
+        ["M12 1.75L20.88 6.88L12 12.0L3.12 6.88L12 1.75Z", "layer"],
+      ],
+    ],
+    opencode: [
+      "OpenCode",
+      "512",
+      [
+        ["M320 224V352H192V224H320Z", "o0.28"],
+        ["M384 416H128V96H384V416ZM320 160H192V352H320V160Z", "e"],
+        ["M320 224V352H192V224H320Z", "layer"],
+      ],
+    ],
+  };
+  BRANDS.pi = [
+    "Pi",
+    "800",
+    [
+      [
+        "M165.29 165.29 H517.36 V400 H400 V517.36 H282.65 V634.72 H165.29 Z M282.65 282.65 V400 H400 V282.65 Z",
+        "e",
+      ],
+      ["M517.36 400 H634.72 V634.72 H517.36 Z"],
+    ],
+  ];
+  const agentKey = (a) => {
+      const id = String(a || "").trim(),
+        name = id
+          .split(/[\\/]/)
+          .pop()
+          .replace(/\.exe$/i, "")
+          .toLowerCase();
+      return (
+        { antigravity: "agy", "cursor-agent": "cursor", π: "pi" }[name] ||
+        (BRANDS[name] && name) ||
+        (/^(?:sh|bash|zsh|fish|nu|pwsh|powershell|cmd|shell)$/.test(name) &&
+          name) ||
+        id
+      );
+    },
+    agentName = (a) => BRANDS[agentKey(a)]?.[0] || agentKey(a);
+  M.agentName = agentName;
 
- const wide=globalThis.matchMedia?.('(min-width:1000px)')||{matches:false},splitKey=ctx.sessionKey?.('tabletSplit')??'tabletSplit',savedSplit=state.preferences?.tabletSplits?.[splitKey];
- let direction=['auto','columns','rows'].includes(savedSplit?.direction)?savedSplit.direction:'auto',panelWidth=panels.clientWidth||root.clientWidth||(typeof window!=='undefined'&&window.innerWidth)||0;
- let splitSession=state.sessions.get(savedSplit?.session),activePane=savedSplit?.active===1?1:0,secondary,secondaryHandle,secondaryMount,secondaryTitle,secondaryRetry,secondaryPhase,secondaryMessage='Connecting…',secondaryGeneration=0;const splitAbort=new AbortController();
- if(viewMode==='chat'||!live(splitSession)||splitSession.id===selectedId){splitSession=null;activePane=0;}
- const splitButton=button(t('Split terminal'),chooseSplit,'ghost small split-toggle');header.insertBefore(splitButton,more);
+  const cleanTitle = (title) =>
+    String(title || "")
+      .replace(/^[\s\u2800-\u28ff\u2700-\u27bf\u25a0-\u25ff·*]+/u, "")
+      .trim();
+  const sessionAgent = (s) => {
+    const id = agentKey(s.agent);
+    if (id && !/^(?:sh|bash|zsh|fish|nu|pwsh|powershell|cmd|shell)$/i.test(id))
+      return id;
+    const foreground = agentKey(s.foreground);
+    if (BRANDS[foreground]) return foreground;
+    const title = String(s.title || "").toLowerCase();
+    return (
+      ["claude", "codex", "agy", "opencode", "cursor"].find((a) =>
+        title.includes(a === "agy" ? "antigravity" : a),
+      ) ||
+      (title
+        .split(/[^\p{L}\p{N}_-]+/u)
+        .some((word) => word === "pi" || word === "π") &&
+        "pi") ||
+      ""
+    );
+  };
+  M.agentKey = agentKey;
+  M.sessionAgent = sessionAgent;
+  M.cleanTitle = cleanTitle;
 
- const directionNames={auto:'Automatic',columns:'Side by side',rows:'Stacked'},splitControls=el('div',undefined,'split-controls'),directionButton=button('',chooseDirection,'ghost split-direction');splitControls.hidden=true;splitControls.append(directionButton);screen.insertBefore(splitControls,panels);
- function syncDirection(){const columns=direction==='columns'?panelWidth>=721:direction==='auto'&&panelWidth>=800,layout=columns?'columns':'rows',fallback=direction==='columns'&&!columns;panels.dataset.layout=layout;directionButton.dataset.direction=direction;directionButton.dataset.fallback=String(fallback);const effective=t(fallback?'Stacked: panes would be too narrow':directionNames[layout]),label=direction==='auto'?`${t(directionNames.auto)} · ${effective}`:effective;if(directionButton.title!==label)directionButton.replaceChildren(ctx.icon(layout),el('span',label));directionButton.setAttribute('aria-label',t('Split direction')+': '+label);directionButton.title=label;}
- function chooseDirection(){ctx.sheet(t('Split direction'),[],undefined,body=>{const choices=el('div',undefined,'split-direction-choices');for(const value of ['auto','columns','rows']){const b=button(t(directionNames[value]),()=>{direction=value;ctx.closeSheet();syncDirection();persistSplit();},'ghost split-direction-choice');b.dataset.direction=value;b.setAttribute('aria-pressed',String(direction===value));b.prepend(ctx.icon(value==='rows'?'rows':'columns'));choices.append(b);}body.append(choices);});}
- const primaryHeader=el('header',undefined,'pane-header'),primaryTitle=button('',()=>activate(0,true),'ghost pane-title');primaryHeader.hidden=true;primaryHeader.append(primaryTitle,button(t('Close pane'),closePrimary,'icon-button pane-close','close'));primaryPane.insertBefore(primaryHeader,mount);primaryPane.dataset.session=selectedId;
- function activeSession(){return activePane===1&&splitSession?state.sessions.get(splitSession.id)||session:session;}
- function paneLabel(target){return `${state.groups.get(target.groupKey)?.label||group.label} · ${cleanTitle(target.title)||titles.get(target.id)||agentName(sessionAgent(target))||t('Terminal')} #${target.id}`;}
- function drawPaneTitle(button,target,index){if(!button||!target)return;const label=paneLabel(target),status=target.exited?'Exited':target.state||'Unknown';const signature=label+'\n'+status;if(button.dataset.signature!==signature){button.dataset.signature=signature;button.replaceChildren(ctx.dot(status),el('span',label,'pane-label'),el('span',t('Active'),'pane-active'));}button.setAttribute('aria-label',label+' · '+t(activePane===index?'Active':'Activate pane'));button.title=label;button.setAttribute('aria-pressed',String(activePane===index));}
- function selectTab(target){if(target.id===activeSession().id)return;if(!splitSession){go(ctx.groupRoute(state.groups.get(target.groupKey)||group,target.id));return;}if(target.id===(activePane===1?selectedId:splitSession.id))return;
+  M.agentIcon = (agent, { el, icon }) => {
+    const id = agentKey(agent),
+      brand = BRANDS[id];
+    if (!id) {
+      const i = icon("terminal");
+      i.setAttribute("class", "agent-icon");
+      return i;
+    }
+    if (!brand) {
+      const b = el("span", [...id][0].toUpperCase(), "agent-icon custom");
+      b.setAttribute("aria-hidden", "true");
+      return b;
+    }
+    const ns = "http://www.w3.org/2000/svg",
+      svg = document.createElementNS(ns, "svg");
+    for (const [k, v] of [
+      ["viewBox", `0 0 ${brand[1]} ${brand[1]}`],
+      ["class", `agent-icon ${id}`],
+      ["aria-hidden", "true"],
+    ])
+      svg.setAttribute(k, v);
+    for (const [d, ...flags] of brand[2]) {
+      const path = document.createElementNS(ns, "path");
+      path.setAttribute("d", d);
+      path.setAttribute("fill", "currentColor");
+      if (flags.includes("e")) path.setAttribute("fill-rule", "evenodd");
+      const o = flags.find((f) => f[0] === "o");
+      if (o) path.setAttribute("fill-opacity", o.slice(1));
+      if (flags.includes("layer")) path.setAttribute("class", "layer");
+      svg.append(path);
+    }
+    return svg;
+  };
 
-  if(activePane===1){stopSecondary();splitSession=target;}else{chatHandle?.unmount();chatHandle=null;session=target;selectedId=target.id;stateKey=ctx.sessionKey?.(target.id)??target.id;group=state.groups.get(target.groupKey)||group;primaryPane.dataset.session=selectedId;refocus=false;retryDelay=1000;attach();}
-  syncSplit();persistSplit();draw();syncSummary();
- }
- function closePrimary(){if(!splitSession)return;const target=splitSession,targetGroup=state.groups.get(target.groupKey)||group;closeSplit();go(ctx.groupRoute(targetGroup,target.id));}
- function persistSplit(){const value=splitSession?{session:splitSession.id,active:activePane,direction}:null;if(JSON.stringify(state.preferences?.tabletSplits?.[splitKey]??null)!==JSON.stringify(value))ctx.savePreferences?.({tabletSplits:{...state.preferences?.tabletSplits,[splitKey]:value}});}
- function activate(index,focus=false){const next=splitSession?index:0,changed=next!==activePane,typing=next!==activePane&&[primaryPane,secondary].some(p=>p?.contains?.(globalThis.document?.activeElement)&&/^(TEXTAREA|INPUT)$/.test(globalThis.document.activeElement?.tagName));activePane=next;handle?.setInputActive?.(activePane===0);secondaryHandle?.setInputActive?.(activePane===1);primaryPane.dataset.active=String(activePane===0);if(secondary)secondary.dataset.active=String(activePane===1);M.activeTerminal=viewMode==='chat'?null:activePane===1?secondaryHandle:handle;persistSplit();drawPaneTitle(primaryTitle,session,0);drawPaneTitle(secondaryTitle,splitSession,1);if(changed)draw();syncSummary();if(focus||typing)M.activeTerminal?.focus();}
- function stopSecondary(){clearTimeout(secondaryRetry);secondaryRetry=null;secondaryGeneration++;secondaryPhase=null;secondaryMessage='Connecting…';const old=secondaryHandle;secondaryHandle=null;old?.unmount();if(M.activeTerminal===old)M.activeTerminal=null;}
- function attachSecondary(){if(disposed||secondaryHandle||!splitSession)return;const target=state.sessions.get(splitSession.id);if(!target)return;const generation=++secondaryGeneration,key=ctx.sessionKey?.(target.id)??target.id;secondaryMount.replaceChildren();secondaryHandle=M.terminal.mount(secondaryMount,{sessionId:target.id,stateKey:key,connect:()=>ctx.transport.terminalConnect(),preferences:{...state.preferences,fitToPhone:state.preferences.fitToPhone??true,inputMode:state.preferences.terminalInputModes?.[key]||state.preferences.inputMode},onPreferenceChange:patch=>{if(patch.inputMode)ctx.savePreferences({terminalInputModes:{...state.preferences.terminalInputModes,[key]:patch.inputMode}});else ctx.savePreferences(patch);},onPhoto:file=>ctx.photo(target.id,file),onEditKeys:()=>go('/settings/terminal'),onStatus:status=>{if(disposed||generation!==secondaryGeneration)return;secondaryPhase=status.phase;secondaryMessage=status.message||'Connecting…';syncSummary();if(status.error)ctx.error(status.error);if(status.phase==='ended')ended(target.id);if(status.phase==='disconnected'&&state.connection.phase==='ready'&&!secondaryRetry)secondaryRetry=setTimeout(()=>{secondaryRetry=null;stopSecondary();if(state.connection.phase==='ready')syncSplit();},1000);},onTitle:label=>{if(disposed||generation!==secondaryGeneration)return;const clean=cleanTitle(label);if(clean)titles.set(target.id,clean);else titles.delete(target.id);drawPaneTitle(secondaryTitle,target,1);draw();}});if(activePane===1)M.activeTerminal=secondaryHandle;}
- function chooseSplit(){const candidates=[...state.sessions.values()].filter(s=>s.id!==selectedId&&live(s));ctx.sheet(t('Open beside this terminal'),candidates.map(s=>({label:`${state.groups.get(s.groupKey)?.label||''} · ${cleanTitle(s.title)||titles.get(s.id)||agentName(sessionAgent(s))||t('Terminal')} #${s.id}`,action:()=>{stopSecondary();splitSession=s;activePane=1;if(viewMode==='chat')setViewMode('term');syncSplit();persistSplit();draw();}})),candidates.length?undefined:t('No other terminals available.'));}
- function closeSplit(){stopSecondary();splitSession=null;secondary?.remove();secondary=null;activePane=0;primaryPane.hidden=false;panels.classList.remove('is-split');splitControls.hidden=true;primaryHeader.hidden=true;if(!handle&&viewMode==='term')attach();activate(0);persistSplit();draw();}
- function syncSplit(){if(disposed)return;splitButton.hidden=!wide.matches&&!splitSession;splitControls.hidden=!splitSession;primaryHeader.hidden=!splitSession;syncDirection();const enteringSplit=!!splitSession&&!secondary;const target=splitSession&&state.sessions.get(splitSession.id);if(splitSession&&!live(target)){closeSplit();return;}panels.classList.toggle('is-split',!!splitSession);if(!splitSession){primaryPane.hidden=false;return;}splitSession=target;
-  if(!secondary){secondary=el('section',undefined,'terminal-pane secondary-pane');const bar=el('header',undefined,'pane-header');secondaryTitle=button('',()=>activate(1,true),'ghost pane-title');bar.append(secondaryTitle,button(t('Close pane'),closeSplit,'icon-button pane-close','close'));secondaryMount=el('div',undefined,'terminal-mount');secondary.dataset.session=splitSession.id;secondary.append(bar,secondaryMount);panels.append(secondary);secondary.addEventListener('pointerdown',()=>activate(1),{signal:splitAbort.signal});secondary.addEventListener('focusin',()=>activate(1),{signal:splitAbort.signal});}
-  secondary.dataset.session=splitSession.id;drawPaneTitle(primaryTitle,session,0);drawPaneTitle(secondaryTitle,target,1);
+  function pendingSession(root, ctx) {
+    const { el, button, go, state, route } = ctx,
+      t = ctx.t || ((s) => s),
+      job = ctx.creating?.(),
+      group = state.groups.get(route.groupKey) || job?.group;
+    if (!job || !group || job.group.key !== route.groupKey) {
+      go(ctx.groupRoute(group), true);
+      return {};
+    }
+    const screen = el("section", undefined, "session screen pending-session"),
+      header = ctx.header(group.label, "/host/local", () =>
+        ctx.backTo("/host/local"),
+      ),
+      summary = el("small", undefined, "session-summary"),
+      liveDot = el("span", undefined, "live-dot"),
+      summaryText = el("span", "\u00a0"),
+      tabs = el("nav", undefined, "session-tabs"),
+      scroll = el("div", undefined, "tab-scroll"),
+      add = button(t("Create Tab"), () => {}, "tab-add", "plus"),
+      panels = el("div", undefined, "session-panels"),
+      pane = el("section", undefined, "terminal-pane primary-pane"),
+      mount = el("div", undefined, "terminal-mount");
+    liveDot.dataset.live = "false";
+    summary.append(liveDot, summaryText);
+    header.querySelector("h1").parentElement.append(summary);
 
-  primaryPane.hidden=false;secondary.hidden=false;
-  if(!handle&&viewMode==='term')attach();attachSecondary();if(enteringSplit&&state.preferences.fitToPhone!==false&&handle&&terminalPhase==='ready')Promise.resolve(handle.fitToPhone(true,false)).catch(ctx.error);activate(activePane);
- }
- primaryPane.addEventListener('pointerdown',()=>activate(0),{signal:splitAbort.signal});primaryPane.addEventListener('focusin',()=>activate(0),{signal:splitAbort.signal});
- wide.addEventListener?.('change',syncSplit);const panelObserver=globalThis.ResizeObserver?new ResizeObserver(entries=>{panelWidth=entries[0].contentRect.width;syncDirection();}):null;panelObserver?.observe(panels);
- function draw(){quickHandle?.update?.();session=state.sessions.get(selectedId);group=state.groups.get(group.key)||session&&state.groups.get(session.groupKey);if(!group||!live(session)){const next=group?.sessions.find(s=>live(state.sessions.get(s.id)));disposed=true;cancelRetry();stopSecondary();clearTabs();handle?.unmount();chatHandle?.unmount();go(next?ctx.groupRoute(group,next.id):'/host/local',true);return;}const active=activeSession(),activeGroup=state.groups.get(active.groupKey)||group;ctx.rememberSession?.(active,activeGroup);title.textContent=activeGroup.label;git.hidden=active.branch===null||active.branch===undefined;tabs.setAttribute('aria-label',t(splitSession?'Terminals in active pane':'Terminals'));if(splitSession)tabs.dataset.activePane=String(activePane);else delete tabs.dataset.activePane;const left=scroll.scrollLeft,bounds=scroll.clientWidth>0&&scroll.getBoundingClientRect?scroll.getBoundingClientRect():null,visibleTabs=bounds?Array.from(scroll.children).filter(tab=>{const r=tab.getBoundingClientRect();return r.right>bounds.left&&r.left<bounds.right;}):[],anchor=visibleTabs.find(tab=>tab.getAttribute?.('aria-selected')==='true')||visibleTabs[0],anchorLeft=anchor?.getBoundingClientRect().left,seen=new Map(),wanted=new Set(),tabNodes=[];for(const s of activeGroup.sessions.filter(live)){const status=s.exited?'Exited':s.state||'Unknown',agent=sessionAgent(s),base=cleanTitle(s.title)||titles.get(s.id)||agentName(agent)||'Shell',n=(seen.get(base)||0)+1;seen.set(base,n);const label=n>1?`${base} ${n}`:base;wanted.add(s.id);let e=tabEntries.get(s.id);if(!e){const abort=new AbortController(),tab=button('',()=>{const latest=state.sessions.get(s.id);if(latest)selectTab(latest);},'session-tab'),dot=ctx.dot(status),labelNode=el('span',undefined,'tab-label');tab.append(dot,labelNode);e={tab,dot,label:labelNode,abort,agent:null,mark:null};e.stop=ctx.longPress(tab,()=>{const latest=state.sessions.get(s.id);if(latest)actions(latest);},abort.signal);tab.addEventListener('contextmenu',event=>{event.preventDefault();const latest=state.sessions.get(s.id);if(latest)actions(latest);},{signal:abort.signal});tabEntries.set(s.id,e);}const {tab}=e;tab.dataset.session=s.id;tab.disabled=!!splitSession&&s.id===(activePane===1?selectedId:splitSession.id);tab.tabIndex=s.id===active.id?0:-1;tab.setAttribute('role','tab');tab.setAttribute('aria-selected',String(s.id===active.id));tab.setAttribute('aria-label',`${label} · ${t(status)} · ${t('Terminal #{0}',s.id)}`);tab.title=`${label} · ${status}`;e.dot.className=`status-dot ${status.toLowerCase()}`;e.dot.setAttribute('aria-label',t(status));if(e.agent!==agent){e.mark?.remove();e.mark=agentIcon(agent);e.agent=agent;tab.insertBefore(e.mark,e.label);}if(e.label.textContent!==label)e.label.textContent=label;tabNodes.push(tab);}for(const [id,e] of tabEntries)if(!wanted.has(id)){e.abort.abort();e.stop?.();e.tab.remove();tabEntries.delete(id);}const focused=globalThis.document?.activeElement;let before=null;for(const tab of tabNodes.reverse()){if(tab.parentElement!==scroll||tab.nextSibling!==before&&tab!==focused&&!tab.contains?.(focused))scroll.insertBefore(tab,before);before=tab;}if(revealTab){revealTab=false;const tab=scroll.querySelector('[aria-selected=true]');if(tab?.getBoundingClientRect){const a=tab.getBoundingClientRect(),b=scroll.getBoundingClientRect();if(a.left<b.left)scroll.scrollLeft+=a.left-b.left;else if(a.right>b.right)scroll.scrollLeft+=a.right-b.right;}}else{scroll.scrollLeft=left;if(anchor?.parentElement===scroll)scroll.scrollLeft+=anchor.getBoundingClientRect().left-anchorLeft;}if(add)add.disabled=state.connection.phase!=='ready';chatHandle?.update?.();if(connectionPhase!=='ready'&&state.connection.phase==='ready'&&['disconnected','error'].includes(terminalPhase))attach();if(state.connection.phase!=='ready')cancelRetry();else if(terminalPhase==='disconnected')retry();if(connectionPhase!=='ready'&&state.connection.phase==='ready'&&['disconnected','error'].includes(secondaryPhase))stopSecondary();connectionPhase=state.connection.phase;if(splitSession)syncSplit();}
- draw();if(!handle&&(!splitSession||wide.matches||activePane===0))attach();syncViewMode();syncSplit();return {update(){draw();if(!disposed&&group&&live(session))syncSummary();},cleanup(){disposed=true;generation++;splitAbort.abort();wide.removeEventListener?.('change',syncSplit);panelObserver?.disconnect();stopSecondary();clearTabs();cancelRetry();handle?.unmount();chatHandle?.unmount();if(M.activeTerminal===handle)M.activeTerminal=null;}};
-};})();
+    const git = button(t("Git changes"), () => {}, "icon-button", "git");
+    git.hidden = !group.sessions.some(
+      (s) => s.branch !== null && s.branch !== undefined,
+    );
+    for (const node of [
+      button(t("Chat"), () => {}, "ghost small mode-toggle"),
+      git,
+      button(t("Terminal actions"), () => {}, "icon-button", "more"),
+    ]) {
+      node.disabled = true;
+      header.append(node);
+    }
+    const split = button(
+      t("Split terminal"),
+      () => {},
+      "ghost small split-toggle",
+    );
+    split.disabled = true;
+    split.hidden = !globalThis.matchMedia?.("(min-width:1000px)")?.matches;
+    header.insertBefore(
+      split,
+      header.lastElementChild || header.children[header.children.length - 1],
+    );
+    tabs.setAttribute("aria-label", t("Terminals"));
+    scroll.setAttribute("role", "tablist");
+    add.disabled = true;
+    tabs.append(scroll, add);
+    const tab = (status, label, agent, selected, action) => {
+      const node = button("", action, "session-tab");
+      node.tabIndex = selected ? 0 : -1;
+      node.setAttribute("role", "tab");
+      node.setAttribute("aria-selected", String(selected));
+      node.setAttribute("aria-label", label);
+      const dot = ctx.dot(status);
+      dot.setAttribute("aria-label", t(status));
+      node.append(dot, M.agentIcon(agent, ctx), el("span", label, "tab-label"));
+      return node;
+    };
+
+    const seen = new Map(),
+      named = (base) => {
+        const n = (seen.get(base) || 0) + 1;
+        seen.set(base, n);
+        return n > 1 ? `${base} ${n}` : base;
+      };
+    for (const s of group.sessions.filter(live))
+      scroll.append(
+        tab(
+          s.exited ? "Exited" : s.state || "Unknown",
+          named(
+            cleanTitle(s.title) ||
+              state.titles?.get(s.id) ||
+              agentName(sessionAgent(s)) ||
+              "Shell",
+          ),
+          sessionAgent(s),
+          false,
+          () => go(ctx.groupRoute(group, s.id)),
+        ),
+      );
+    const fresh = tab(
+      "Unknown",
+      named(job.agent ? agentName(job.agent) : "Shell"),
+      job.agent,
+      true,
+      () => {},
+    );
+    scroll.append(fresh);
+    const frame = el("div", undefined, "terminal-frame"),
+      dock = el("footer", undefined, "command-dock"),
+      accessory = el("div", undefined, "accessory-row pending-accessory");
+    dock.setAttribute("aria-hidden", "true");
+    dock.append(accessory);
+    if (state.preferences?.inputMode === "buffered")
+      dock.append(el("div", undefined, "input-row pending-buffered"));
+    mount.append(frame, dock);
+    pane.append(mount);
+    panels.append(pane);
+    screen.append(header, tabs, panels);
+    root.append(screen);
+    fresh.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    const timer = setTimeout(() => {
+      summaryText.textContent = t("Connecting…");
+    }, 1000);
+    return {
+      update() {
+        if (!ctx.creating?.())
+          go(ctx.groupRoute(state.groups.get(route.groupKey) || group), true);
+      },
+      cleanup() {
+        clearTimeout(timer);
+      },
+    };
+  }
+  const live = (s) => !!s && !s.exited && s.state !== "Exited";
+  M.screens.session = (root, ctx) => {
+    if (ctx.route.sessionId === "new") return pendingSession(root, ctx);
+    const { el, button, go, state, route } = ctx,
+      t = (s, ...v) =>
+        v.reduce(
+          (out, value, i) => out.replaceAll(`{${i}}`, String(value)),
+          ctx.t?.(s, ...v) ?? s,
+        );
+    let session = state.sessions.get(route.sessionId),
+      group =
+        state.groups.get(route.groupKey) ||
+        (session && state.groups.get(session.groupKey));
+    if (!group || !live(session)) {
+      const next = group?.sessions.find((s) => live(state.sessions.get(s.id))),
+        path = next ? ctx.groupRoute(group, next.id) : "/host/local";
+      Promise.resolve().then(() => {
+        if (!ctx.signal.aborted) go(path, true);
+      });
+      return {};
+    }
+    if (!group || !session) {
+      root.append(
+        ctx.header("Workspace", "/host/local"),
+        el("p", t("Session not found"), "empty"),
+        button(t("Open workspaces"), () => go("/host/local"), "primary"),
+      );
+      return {};
+    }
+
+    ctx.rememberSession?.(session, group);
+    let selectedId = session.id,
+      stateKey = ctx.sessionKey?.(session.id) ?? session.id;
+    let viewMode = sessionView(
+      state.preferences,
+      stateKey,
+      Boolean(M.chat?.mount),
+    );
+    const screen = el("section", undefined, "session screen"),
+      header = ctx.header(group.label, "/host/local", () =>
+        ctx.backTo("/host/local"),
+      ),
+      title = header.querySelector("h1"),
+      summary = el("small", undefined, "session-summary"),
+      liveDot = el("span", undefined, "live-dot"),
+      summaryText = el("span", t("Connecting…"));
+    summary.append(liveDot, summaryText);
+    title.parentElement.append(summary);
+
+    const isConnected = () =>
+      state.connection.phase === "ready" &&
+      (viewMode === "chat" ||
+        (activePane === 1 && splitSession ? secondaryPhase : terminalPhase) ===
+          "ready");
+    const onSummaryTap = () => {
+      if (!isConnected()) {
+        if (
+          state.connection.phase === "ready" &&
+          viewMode !== "chat" &&
+          activePane === 1 &&
+          splitSession
+        ) {
+          stopSecondary();
+          syncSplit();
+        } else ctx.transport?.reconnect?.();
+      }
+    };
+    summary.addEventListener("click", onSummaryTap);
+    summary.action = onSummaryTap;
+    function syncSummary() {
+      const activeMessage =
+        activePane === 1 && splitSession ? secondaryMessage : terminalMessage;
+      const connected = isConnected(),
+        count = (
+          state.groups.get(activeSession()?.groupKey) || group
+        ).sessions.filter(live).length,
+        text = connected
+          ? t(count === 1 ? "{0} terminal" : "{0} terminals", count)
+          : t(viewMode === "chat" ? "Connecting…" : activeMessage);
+      liveDot.dataset.live = String(connected);
+      if (connected) delete summary.dataset.reconnectable;
+      else summary.dataset.reconnectable = "true";
+      if (summaryText.textContent !== text) summaryText.textContent = text;
+    }
+    const modeBtn = button(
+      t(viewMode === "chat" ? "Term" : "Chat"),
+      () => toggleViewMode(),
+      "ghost small mode-toggle",
+    );
+    header.append(modeBtn);
+    const quick = button(
+      t("Quick actions"),
+      quickActions,
+      "icon-button session-quick-actions",
+      "zap",
+    );
+    quick.dataset.testid = "session-quick-actions";
+    quick.setAttribute("aria-haspopup", "dialog");
+    quick.addEventListener("pointerdown", (e) => e.preventDefault());
+    header.append(quick);
+    const git = button(
+      t("Git changes"),
+      () => go(`/git/${activeSession().id}`),
+      "icon-button",
+      "git",
+    );
+    header.append(git);
+
+    const more = button(
+      t("Terminal actions"),
+      () => actions(activeSession()),
+      "icon-button",
+      "more",
+    );
+    more.addEventListener("pointerdown", (e) => e.preventDefault());
+    header.append(more);
+    screen.append(header);
+    const tabs = el("nav", undefined, "session-tabs");
+    tabs.setAttribute("aria-label", t("Terminals"));
+    const scroll = el("div", undefined, "tab-scroll");
+    scroll.setAttribute("role", "tablist");
+    scroll.addEventListener("keydown", (e) => {
+      const items = [...scroll.children].filter(
+        (n) => n.classList?.contains("session-tab") && !n.disabled,
+      );
+      if (
+        !items.length ||
+        !["ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)
+      )
+        return;
+      const cur = Math.max(
+          0,
+          items.indexOf(globalThis.document?.activeElement),
+        ),
+        next =
+          e.key === "Home"
+            ? 0
+            : e.key === "End"
+              ? items.length - 1
+              : (cur + (e.key === "ArrowRight" ? 1 : -1) + items.length) %
+                items.length;
+      e.preventDefault();
+      for (let i = 0; i < items.length; i++)
+        items[i].tabIndex = i === next ? 0 : -1;
+      items[next].focus();
+      items[next].scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    });
+    tabs.append(scroll);
+    let add;
+    if (state.snapshot?.capabilities?.session_create) {
+      add = button(t("Create Tab"), newSession, "tab-add", "plus");
+      tabs.append(add);
+    }
+    screen.append(tabs);
+    const panels = el("div", undefined, "session-panels"),
+      primaryPane = el("section", undefined, "terminal-pane primary-pane"),
+      mount = el("div", undefined, "terminal-mount"),
+      chatMount = el("div", undefined, "terminal-mount");
+    chatMount.hidden = true;
+    primaryPane.append(mount);
+    panels.append(primaryPane);
+    screen.append(panels, chatMount);
+    root.append(screen);
+    let revealTab = true,
+      refocus = false,
+      titles = (state.titles ||= new Map()),
+      handle,
+      chatHandle,
+      terminalPhase,
+      terminalMessage = "Connecting…",
+      connectionPhase = state.connection.phase,
+      quickHandle,
+      retryTimer,
+      retryDelay = 1000,
+      generation = 0,
+      disposed = false;
+    const tabEntries = new Map();
+    function syncViewMode() {
+      const inChat = viewMode === "chat" && Boolean(M.chat?.mount);
+      mount.hidden = inChat;
+      panels.hidden = inChat;
+      chatMount.hidden = !inChat;
+      handle?.setQuestionActive?.(inChat);
+      Promise.resolve(handle?.setVisible?.(!inChat)).catch(ctx.error);
+
+      if (!chatHandle && M.chat?.mount)
+        chatHandle = M.chat.mount(chatMount, {
+          ctx,
+          sessionId: session.id,
+          agentIcon,
+          visible: inChat,
+          onQuickActions: () => quickActions(),
+          getQuestion: () => handle?.getQuestion?.(),
+          onAnswerQuestion: (token, selected) =>
+            handle.replyQuestion(token, selected),
+          onSwitchTerm: () => setViewMode("term"),
+        });
+      chatHandle?.setVisible?.(inChat);
+      chatHandle?.setQuestion?.(handle?.getQuestion?.() || null);
+      if (inChat) {
+        syncSummary();
+        chatHandle?.update?.();
+        if (M.activeTerminal === handle) M.activeTerminal = null;
+      } else {
+        if (!handle) attach();
+        else if (handle) {
+          if (activePane === 0) M.activeTerminal = handle;
+          syncSummary();
+        }
+      }
+    }
+    function setViewMode(next) {
+      if (next === "chat" && !M.chat?.mount) return;
+      if (next === "chat" && splitSession && activePane === 1) {
+        const target = activeSession();
+        ctx.savePreferences?.({
+          sessionViewModes: {
+            ...state.preferences?.sessionViewModes,
+            [ctx.sessionKey?.(target.id) ?? target.id]: "chat",
+          },
+        });
+        closeSplit();
+        go(
+          ctx.groupRoute(state.groups.get(target.groupKey) || group, target.id),
+        );
+        return;
+      }
+      if (next === "chat" && splitSession) closeSplit();
+      viewMode = next;
+      modeBtn.textContent = t(viewMode === "chat" ? "Term" : "Chat");
+      modeBtn.setAttribute("aria-label", modeBtn.textContent);
+      ctx.savePreferences?.({
+        sessionViewModes: {
+          ...state.preferences?.sessionViewModes,
+          [stateKey]: viewMode,
+        },
+      });
+      syncViewMode();
+    }
+    function toggleViewMode() {
+      setViewMode(viewMode === "chat" ? "term" : "chat");
+    }
+    function actions(target) {
+      target = state.sessions.get(target.id);
+      if (!target) return;
+      const entries = [
+        ...(target.id === activeSession().id
+          ? [
+              { label: t("Select text"), action: screenText },
+              ...(viewMode === "term"
+                ? [
+                    {
+                      label: t("Load earlier output"),
+                      action: () => M.activeTerminal?.loadHistory(true),
+                    },
+                  ]
+                : []),
+            ]
+          : []),
+        { label: t("Send prompt"), action: () => prompt(target) },
+        {
+          label: t("Hand off to {0}", "Codex"),
+          action: () => handoff(target, "codex"),
+        },
+        {
+          label: t("Hand off to {0}", "Claude"),
+          action: () => handoff(target, "claude"),
+        },
+      ];
+      if (target.branch !== null && target.branch !== undefined)
+        entries.unshift({
+          label: t("Git changes"),
+          action: () => go(`/git/${target.id}`),
+        });
+      if (["Waiting", "Blocked"].includes(target.state)) {
+        entries.unshift({
+          label: t("Review in Terminal"),
+          action: () => reviewTerminal(target.id),
+        });
+      }
+      if (state.snapshot?.capabilities?.session_close)
+        entries.push({
+          label: t("Close terminal"),
+          danger: true,
+          action: () =>
+            ctx.sheet(
+              t("Close terminal?"),
+              [
+                {
+                  label: t("Close terminal"),
+                  danger: true,
+                  action: async () => {
+                    await ctx.rpc({
+                      action: "close_terminal",
+                      session: target.id,
+                    });
+                    ctx
+                      .refresh()
+                      .then(() => {
+                        if (ctx.signal.aborted) return;
+                        const next = state.groups.get(group.key);
+                        go(next ? ctx.groupRoute(next) : "/host/local");
+                      })
+                      .catch(ctx.error);
+                  },
+                },
+              ],
+              t("Terminal #{0} will be stopped.", target.id),
+            ),
+        }); // 승인 전 맥락: 스냅샷의 마지막 줄(lines)을 시트 제목 아래에 보여 터미널을 열지 않고도 무엇을 승인하는지 확인한다.
+      if (M.chat?.mount && target.id === activeSession().id)
+        entries.unshift({
+          label: t(
+            viewMode === "chat" ? "Switch to Terminal" : "Switch to Chat",
+          ),
+          action: () => toggleViewMode(),
+        });
+      const context =
+        ["Waiting", "Blocked"].includes(target.state) && target.lines?.length
+          ? target.lines.join("\n")
+          : "";
+      ctx.sheet(
+        cleanTitle(target.title) ||
+          titles.get(target.id) ||
+          agentName(sessionAgent(target)) ||
+          t("Terminal #{0}", target.id),
+        entries,
+        undefined,
+        context
+          ? (body) => {
+              const pre = el("pre", context, "sheet-context");
+              pre.setAttribute("aria-label", t("Latest terminal output"));
+              body.querySelector("h2")?.after(pre);
+            }
+          : undefined,
+      );
+    }
+    function quickActions() {
+      ctx.sheet(
+        t("Quick actions"),
+        [],
+        t(
+          "Insert a saved skill, command, or prompt. Press Enter separately to run.",
+        ),
+        (body) => {
+          const manager = el("div", undefined, "quick-actions-manager");
+          body.append(manager);
+          quickHandle = commandEditor(
+            manager,
+            Object.assign(Object.create(ctx), {
+              commandSession: activeSession,
+            }),
+            (text) => {
+              ctx.closeSheet();
+              if (viewMode === "chat" && chatHandle?.insertText)
+                chatHandle.insertText(text);
+              else (M.activeTerminal || handle)?.insertText?.(text);
+            },
+          );
+        },
+      );
+    }
+
+    function newSession() {
+      const agents =
+        state.snapshot?.agents ||
+        ["claude", "codex"].map((id) => ({ id, name: agentName(id) }));
+      ctx.sheet(t("New session"), [], undefined, (body) => {
+        for (const a of [...agents, { id: "", name: t("Terminal") }]) {
+          const b = button(
+            a.name || agentName(a.id),
+            async () => {
+              ctx.closeSheet();
+              await create(a.id);
+            },
+            "sheet-action provider",
+          );
+          b.prepend(agentIcon(a.id));
+          body.append(b);
+        }
+      });
+    }
+    function create(agent) {
+      const target = activeSession();
+      return ctx.createSession(
+        state.groups.get(target.groupKey) || group,
+        agent,
+        {
+          action: "create_terminal",
+          cwd_session: target.id,
+          ...(agent ? { agent } : {}),
+        },
+      );
+    }
+    function reviewTerminal(id) {
+      if (!state.sessions.has(id))
+        throw Error("This terminal is no longer available.");
+      ctx.closeSheet();
+      if (id === activeSession().id) {
+        setViewMode("term");
+        M.activeTerminal?.focus();
+      } else {
+        ctx.savePreferences?.({
+          sessionViewModes: {
+            ...state.preferences?.sessionViewModes,
+            [ctx.sessionKey?.(id) ?? id]: "term",
+          },
+        });
+        go(ctx.groupRoute(group, id));
+      }
+    }
+    const promptDraftVersions = (M.promptDraftVersions ||= new WeakMap());
+    let promptGeneration = 0;
+    function prompt(target) {
+      const sheetGeneration = ++promptGeneration;
+      ctx.sheet(t("Send prompt"), [], undefined, (body) => {
+        const form = el("form"),
+          input = el("textarea");
+        input.id = "prompt";
+        input.placeholder = t("Write a prompt…");
+        input.setAttribute("aria-label", t("Prompt"));
+        input.value = state.drafts.get(target.id) || "";
+        let composing = false,
+          pending = false,
+          version = 0;
+        const versions = promptDraftVersions.get(state.drafts) || new Map();
+        promptDraftVersions.set(state.drafts, versions);
+        const edit = () => {
+          version++;
+          versions.set(target.id, (versions.get(target.id) || 0) + 1);
+          input.value
+            ? state.drafts.set(target.id, input.value)
+            : state.drafts.delete(target.id);
+        };
+        input.addEventListener("input", edit);
+        input.addEventListener("compositionstart", () => (composing = true));
+        input.addEventListener("compositionend", () => (composing = false));
+        const send = el("button", t("Send prompt"), "primary");
+        send.type = "submit";
+        form.id = "composer";
+        form.append(input, send);
+        globalThis.MkKeyboard?.keepFocus(form, ctx.signal);
+        form.addEventListener("submit", (e) => {
+          e.preventDefault();
+          if (
+            composing ||
+            e.isComposing ||
+            pending ||
+            disposed ||
+            ctx.signal.aborted
+          )
+            return;
+          const text = input.value,
+            sentVersion = version,
+            draftVersion = versions.get(target.id);
+          if (!text) return;
+          pending = true;
+          send.disabled = true;
+          ctx.act(async () => {
+            try {
+              await ctx.rpc({ action: "prompt", session: target.id, text });
+              const current =
+                !disposed &&
+                !ctx.signal.aborted &&
+                sheetGeneration === promptGeneration &&
+                input.isConnected !== false &&
+                body.closest?.("dialog")?.open !== false &&
+                version === sentVersion &&
+                versions.get(target.id) === draftVersion &&
+                input.value === text &&
+                state.drafts.get(target.id) === text;
+              if (current) {
+                state.drafts.delete(target.id);
+                input.value = "";
+                ctx.closeSheet();
+              }
+              ctx.refresh().catch(ctx.error);
+            } finally {
+              pending = false;
+              send.disabled = false;
+            }
+          });
+        });
+        body.append(form);
+      });
+    }
+    async function handoff(target, agent) {
+      const initialHash = globalThis.location?.hash,
+        result = await ctx.rpc({
+          action: "handoff",
+          session: target.id,
+          agent,
+        });
+      await ctx.refresh?.();
+      if (
+        disposed ||
+        ctx.signal?.aborted ||
+        (globalThis.location?.hash && globalThis.location.hash !== initialHash)
+      )
+        return;
+      const id = Number(result.to_session),
+        next = state.sessions.get(id);
+      if (Number.isSafeInteger(id) && id > 0) {
+        go(ctx.groupRoute(state.groups.get(next?.groupKey) || group, id));
+        ctx.toast?.(
+          t("Handed off to {0}.", agent === "codex" ? "Codex" : "Claude"),
+        );
+      }
+    }
+    function agentIcon(agent) {
+      return M.agentIcon(agent, ctx);
+    }
+    function nodeText(n) {
+      if (!n || n.className === "chat-meta") return "";
+      if (n.childNodes)
+        return Array.from(n.childNodes, (c) =>
+          c.nodeType === 3
+            ? c.textContent
+            : c.nodeType === 1
+              ? nodeText(c)
+              : "",
+        ).join("");
+      const self = typeof n._text === "string" ? n._text : n.textContent || "";
+      const sep =
+        String(n.className || "").includes("chat-card") ||
+        n.className === "chat-md"
+          ? "\n"
+          : "";
+      return [self, ...(n.children || []).map(nodeText)]
+        .filter(Boolean)
+        .join(sep);
+    }
+    function screenText() {
+      let text = M.activeTerminal?.text?.() || "";
+      if (!text) {
+        const nodes = chatMount.descendants
+          ? chatMount.descendants()
+          : Array.from(chatMount.querySelectorAll?.("*") || []);
+        const feed = nodes.find((n) =>
+          String(n.className || "")
+            .split(/\s+/)
+            .includes("chat-feed"),
+        );
+        const cards = (
+          feed
+            ? feed.descendants
+              ? feed.descendants()
+              : Array.from(feed.querySelectorAll?.("*") || [])
+            : []
+        ).filter((n) =>
+          String(n.className || "")
+            .split(/\s+/)
+            .includes("chat-card"),
+        );
+        text = cards.map(nodeText).filter(Boolean).join("\n\n");
+      }
+      ctx.sheet(
+        t("Terminal text"),
+        [],
+        t("Touch and hold to select and copy."),
+        (body) => {
+          const area = el("textarea", undefined, "screen-text");
+          area.readOnly = true;
+          area.value = text;
+          area.setAttribute("aria-label", t("Terminal text"));
+          body.append(area);
+        },
+      );
+    }
+    function clearTabs() {
+      for (const e of tabEntries.values()) {
+        e.abort.abort();
+        e.stop?.();
+      }
+      tabEntries.clear();
+    }
+    function ended(id) {
+      Promise.resolve()
+        .then(() => {
+          if (disposed || ctx.signal.aborted) return;
+          const target = state.sessions.get(id);
+          if (target) target.exited = true;
+          draw();
+          if (!disposed && !ctx.signal.aborted) return ctx.refresh();
+        })
+        .catch(ctx.error);
+    }
+    function cancelRetry() {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    function retry() {
+      if (disposed || retryTimer || state.connection.phase !== "ready") return;
+      const current = generation;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        if (
+          !disposed &&
+          current === generation &&
+          state.connection.phase === "ready"
+        )
+          attach();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 65000);
+    }
+    function attach() {
+      cancelRetry();
+      const current = ++generation,
+        target = session,
+        key = stateKey;
+      handle?.unmount();
+      handle = null;
+      mount.replaceChildren();
+      handle = M.terminal.mount(mount, {
+        sessionId: target.id,
+        stateKey: key,
+        connect: () => ctx.transport.terminalConnect(),
+        visible: viewMode !== "chat",
+        questionActive: viewMode === "chat",
+        onQuestion: (question, status) => {
+          if (!disposed && current === generation)
+            chatHandle?.setQuestion?.(question, status);
+        },
+        onQuestionOpen: M.chat?.mount
+          ? () => chatHandle?.openQuestion?.()
+          : undefined,
+        preferences: {
+          ...state.preferences,
+          ...(splitSession
+            ? { fitToPhone: state.preferences.fitToPhone ?? true }
+            : {}),
+          inputMode:
+            state.preferences.terminalInputModes?.[key] ||
+            state.preferences.inputMode,
+        },
+        onPreferenceChange: (patch) => {
+          if (patch.inputMode)
+            ctx.savePreferences({
+              terminalInputModes: {
+                ...state.preferences.terminalInputModes,
+                [key]: patch.inputMode,
+              },
+            });
+          else ctx.savePreferences(patch);
+        },
+        onStatus: (status) => {
+          if (disposed || current !== generation) return;
+          terminalPhase = status.phase;
+          terminalMessage = status.message || "Connecting…";
+          if (status.typing && status.phase !== "ready") refocus = true;
+          if (status.phase === "ready") {
+            retryDelay = 1000;
+            cancelRetry();
+            if (refocus) {
+              refocus = false;
+              handle?.focus();
+            }
+          } else if (status.phase === "disconnected") retry();
+          else if (status.phase === "ended") ended(target.id);
+          syncSummary();
+          if (status.error) ctx.error(status.error);
+        },
+        onPhoto: (file) => ctx.photo(target.id, file),
+        onEditKeys: () => go("/settings/terminal"),
+        onTitle: (title) => {
+          if (disposed || current !== generation) return;
+          const clean = cleanTitle(title);
+          if (clean === (titles.get(target.id) || "")) return;
+          if (clean) titles.set(target.id, clean);
+          else titles.delete(target.id);
+          draw();
+        },
+      });
+      if (viewMode !== "chat" && activePane === 0) M.activeTerminal = handle;
+    }
+
+    const wide = globalThis.matchMedia?.("(min-width:1000px)") || {
+        matches: false,
+      },
+      splitKey = ctx.sessionKey?.("tabletSplit") ?? "tabletSplit",
+      savedSplit = state.preferences?.tabletSplits?.[splitKey];
+    let direction = ["auto", "columns", "rows"].includes(savedSplit?.direction)
+        ? savedSplit.direction
+        : "auto",
+      panelWidth =
+        panels.clientWidth ||
+        root.clientWidth ||
+        (typeof window !== "undefined" && window.innerWidth) ||
+        0;
+    let splitSession = state.sessions.get(savedSplit?.session),
+      activePane = savedSplit?.active === 1 ? 1 : 0,
+      secondary,
+      secondaryHandle,
+      secondaryMount,
+      secondaryTitle,
+      secondaryRetry,
+      secondaryPhase,
+      secondaryMessage = "Connecting…",
+      secondaryGeneration = 0;
+    const splitAbort = new AbortController();
+    if (
+      viewMode === "chat" ||
+      !live(splitSession) ||
+      splitSession.id === selectedId
+    ) {
+      splitSession = null;
+      activePane = 0;
+    }
+    const splitButton = button(
+      t("Split terminal"),
+      chooseSplit,
+      "ghost small split-toggle",
+    );
+    header.insertBefore(splitButton, more);
+
+    const directionNames = {
+        auto: "Automatic",
+        columns: "Side by side",
+        rows: "Stacked",
+      },
+      splitControls = el("div", undefined, "split-controls"),
+      directionButton = button("", chooseDirection, "ghost split-direction");
+    splitControls.hidden = true;
+    splitControls.append(directionButton);
+    screen.insertBefore(splitControls, panels);
+    function syncDirection() {
+      const columns =
+          direction === "columns"
+            ? panelWidth >= 721
+            : direction === "auto" && panelWidth >= 800,
+        layout = columns ? "columns" : "rows",
+        fallback = direction === "columns" && !columns;
+      panels.dataset.layout = layout;
+      directionButton.dataset.direction = direction;
+      directionButton.dataset.fallback = String(fallback);
+      const effective = t(
+          fallback
+            ? "Stacked: panes would be too narrow"
+            : directionNames[layout],
+        ),
+        label =
+          direction === "auto"
+            ? `${t(directionNames.auto)} · ${effective}`
+            : effective;
+      if (directionButton.title !== label)
+        directionButton.replaceChildren(ctx.icon(layout), el("span", label));
+      directionButton.setAttribute(
+        "aria-label",
+        t("Split direction") + ": " + label,
+      );
+      directionButton.title = label;
+    }
+    function chooseDirection() {
+      ctx.sheet(t("Split direction"), [], undefined, (body) => {
+        const choices = el("div", undefined, "split-direction-choices");
+        for (const value of ["auto", "columns", "rows"]) {
+          const b = button(
+            t(directionNames[value]),
+            () => {
+              direction = value;
+              ctx.closeSheet();
+              syncDirection();
+              persistSplit();
+            },
+            "ghost split-direction-choice",
+          );
+          b.dataset.direction = value;
+          b.setAttribute("aria-pressed", String(direction === value));
+          b.prepend(ctx.icon(value === "rows" ? "rows" : "columns"));
+          choices.append(b);
+        }
+        body.append(choices);
+      });
+    }
+    const primaryHeader = el("header", undefined, "pane-header"),
+      primaryTitle = button("", () => activate(0, true), "ghost pane-title");
+    primaryHeader.hidden = true;
+    primaryHeader.append(
+      primaryTitle,
+      button(t("Close pane"), closePrimary, "icon-button pane-close", "close"),
+    );
+    primaryPane.insertBefore(primaryHeader, mount);
+    primaryPane.dataset.session = selectedId;
+    function activeSession() {
+      return activePane === 1 && splitSession
+        ? state.sessions.get(splitSession.id) || session
+        : session;
+    }
+    function paneLabel(target) {
+      return `${state.groups.get(target.groupKey)?.label || group.label} · ${cleanTitle(target.title) || titles.get(target.id) || agentName(sessionAgent(target)) || t("Terminal")} #${target.id}`;
+    }
+    function drawPaneTitle(button, target, index) {
+      if (!button || !target) return;
+      const label = paneLabel(target),
+        status = target.exited ? "Exited" : target.state || "Unknown";
+      const signature = label + "\n" + status;
+      if (button.dataset.signature !== signature) {
+        button.dataset.signature = signature;
+        button.replaceChildren(
+          ctx.dot(status),
+          el("span", label, "pane-label"),
+          el("span", t("Active"), "pane-active"),
+        );
+      }
+      button.setAttribute(
+        "aria-label",
+        label + " · " + t(activePane === index ? "Active" : "Activate pane"),
+      );
+      button.title = label;
+      button.setAttribute("aria-pressed", String(activePane === index));
+    }
+    function selectTab(target) {
+      if (target.id === activeSession().id) return;
+      if (!splitSession) {
+        go(
+          ctx.groupRoute(state.groups.get(target.groupKey) || group, target.id),
+        );
+        return;
+      }
+      if (target.id === (activePane === 1 ? selectedId : splitSession.id))
+        return;
+
+      if (activePane === 1) {
+        stopSecondary();
+        splitSession = target;
+      } else {
+        chatHandle?.unmount();
+        chatHandle = null;
+        session = target;
+        selectedId = target.id;
+        stateKey = ctx.sessionKey?.(target.id) ?? target.id;
+        group = state.groups.get(target.groupKey) || group;
+        primaryPane.dataset.session = selectedId;
+        refocus = false;
+        retryDelay = 1000;
+        attach();
+      }
+      syncSplit();
+      persistSplit();
+      draw();
+      syncSummary();
+    }
+    function closePrimary() {
+      if (!splitSession) return;
+      const target = splitSession,
+        targetGroup = state.groups.get(target.groupKey) || group;
+      closeSplit();
+      go(ctx.groupRoute(targetGroup, target.id));
+    }
+    function persistSplit() {
+      const value = splitSession
+        ? { session: splitSession.id, active: activePane, direction }
+        : null;
+      if (
+        JSON.stringify(state.preferences?.tabletSplits?.[splitKey] ?? null) !==
+        JSON.stringify(value)
+      )
+        ctx.savePreferences?.({
+          tabletSplits: {
+            ...state.preferences?.tabletSplits,
+            [splitKey]: value,
+          },
+        });
+    }
+    function activate(index, focus = false) {
+      const next = splitSession ? index : 0,
+        changed = next !== activePane,
+        typing =
+          next !== activePane &&
+          [primaryPane, secondary].some(
+            (p) =>
+              p?.contains?.(globalThis.document?.activeElement) &&
+              /^(TEXTAREA|INPUT)$/.test(
+                globalThis.document.activeElement?.tagName,
+              ),
+          );
+      activePane = next;
+      handle?.setInputActive?.(activePane === 0);
+      secondaryHandle?.setInputActive?.(activePane === 1);
+      primaryPane.dataset.active = String(activePane === 0);
+      if (secondary) secondary.dataset.active = String(activePane === 1);
+      M.activeTerminal =
+        viewMode === "chat"
+          ? null
+          : activePane === 1
+            ? secondaryHandle
+            : handle;
+      persistSplit();
+      drawPaneTitle(primaryTitle, session, 0);
+      drawPaneTitle(secondaryTitle, splitSession, 1);
+      if (changed) draw();
+      syncSummary();
+      if (focus || typing) M.activeTerminal?.focus();
+    }
+    function stopSecondary() {
+      clearTimeout(secondaryRetry);
+      secondaryRetry = null;
+      secondaryGeneration++;
+      secondaryPhase = null;
+      secondaryMessage = "Connecting…";
+      const old = secondaryHandle;
+      secondaryHandle = null;
+      old?.unmount();
+      if (M.activeTerminal === old) M.activeTerminal = null;
+    }
+    function attachSecondary() {
+      if (disposed || secondaryHandle || !splitSession) return;
+      const target = state.sessions.get(splitSession.id);
+      if (!target) return;
+      const generation = ++secondaryGeneration,
+        key = ctx.sessionKey?.(target.id) ?? target.id;
+      secondaryMount.replaceChildren();
+      secondaryHandle = M.terminal.mount(secondaryMount, {
+        sessionId: target.id,
+        stateKey: key,
+        connect: () => ctx.transport.terminalConnect(),
+        preferences: {
+          ...state.preferences,
+          fitToPhone: state.preferences.fitToPhone ?? true,
+          inputMode:
+            state.preferences.terminalInputModes?.[key] ||
+            state.preferences.inputMode,
+        },
+        onPreferenceChange: (patch) => {
+          if (patch.inputMode)
+            ctx.savePreferences({
+              terminalInputModes: {
+                ...state.preferences.terminalInputModes,
+                [key]: patch.inputMode,
+              },
+            });
+          else ctx.savePreferences(patch);
+        },
+        onPhoto: (file) => ctx.photo(target.id, file),
+        onEditKeys: () => go("/settings/terminal"),
+        onStatus: (status) => {
+          if (disposed || generation !== secondaryGeneration) return;
+          secondaryPhase = status.phase;
+          secondaryMessage = status.message || "Connecting…";
+          syncSummary();
+          if (status.error) ctx.error(status.error);
+          if (status.phase === "ended") ended(target.id);
+          if (
+            status.phase === "disconnected" &&
+            state.connection.phase === "ready" &&
+            !secondaryRetry
+          )
+            secondaryRetry = setTimeout(() => {
+              secondaryRetry = null;
+              stopSecondary();
+              if (state.connection.phase === "ready") syncSplit();
+            }, 1000);
+        },
+        onTitle: (label) => {
+          if (disposed || generation !== secondaryGeneration) return;
+          const clean = cleanTitle(label);
+          if (clean) titles.set(target.id, clean);
+          else titles.delete(target.id);
+          drawPaneTitle(secondaryTitle, target, 1);
+          draw();
+        },
+      });
+      if (activePane === 1) M.activeTerminal = secondaryHandle;
+    }
+    function chooseSplit() {
+      const candidates = [...state.sessions.values()].filter(
+        (s) => s.id !== selectedId && live(s),
+      );
+      ctx.sheet(
+        t("Open beside this terminal"),
+        candidates.map((s) => ({
+          label: `${state.groups.get(s.groupKey)?.label || ""} · ${cleanTitle(s.title) || titles.get(s.id) || agentName(sessionAgent(s)) || t("Terminal")} #${s.id}`,
+          action: () => {
+            stopSecondary();
+            splitSession = s;
+            activePane = 1;
+            if (viewMode === "chat") setViewMode("term");
+            syncSplit();
+            persistSplit();
+            draw();
+          },
+        })),
+        candidates.length ? undefined : t("No other terminals available."),
+      );
+    }
+    function closeSplit() {
+      stopSecondary();
+      splitSession = null;
+      secondary?.remove();
+      secondary = null;
+      activePane = 0;
+      primaryPane.hidden = false;
+      panels.classList.remove("is-split");
+      splitControls.hidden = true;
+      primaryHeader.hidden = true;
+      if (!handle && viewMode === "term") attach();
+      activate(0);
+      persistSplit();
+      draw();
+    }
+    function syncSplit() {
+      if (disposed) return;
+      splitButton.hidden = !wide.matches && !splitSession;
+      splitControls.hidden = !splitSession;
+      primaryHeader.hidden = !splitSession;
+      syncDirection();
+      const enteringSplit = !!splitSession && !secondary;
+      const target = splitSession && state.sessions.get(splitSession.id);
+      if (splitSession && !live(target)) {
+        closeSplit();
+        return;
+      }
+      panels.classList.toggle("is-split", !!splitSession);
+      if (!splitSession) {
+        primaryPane.hidden = false;
+        return;
+      }
+      splitSession = target;
+      if (!secondary) {
+        secondary = el("section", undefined, "terminal-pane secondary-pane");
+        const bar = el("header", undefined, "pane-header");
+        secondaryTitle = button(
+          "",
+          () => activate(1, true),
+          "ghost pane-title",
+        );
+        bar.append(
+          secondaryTitle,
+          button(
+            t("Close pane"),
+            closeSplit,
+            "icon-button pane-close",
+            "close",
+          ),
+        );
+        secondaryMount = el("div", undefined, "terminal-mount");
+        secondary.dataset.session = splitSession.id;
+        secondary.append(bar, secondaryMount);
+        panels.append(secondary);
+        secondary.addEventListener("pointerdown", () => activate(1), {
+          signal: splitAbort.signal,
+        });
+        secondary.addEventListener("focusin", () => activate(1), {
+          signal: splitAbort.signal,
+        });
+      }
+      secondary.dataset.session = splitSession.id;
+      drawPaneTitle(primaryTitle, session, 0);
+      drawPaneTitle(secondaryTitle, target, 1);
+
+      primaryPane.hidden = false;
+      secondary.hidden = false;
+      if (!handle && viewMode === "term") attach();
+      attachSecondary();
+      if (
+        enteringSplit &&
+        state.preferences.fitToPhone !== false &&
+        handle &&
+        terminalPhase === "ready"
+      )
+        Promise.resolve(handle.fitToPhone(true, false)).catch(ctx.error);
+      activate(activePane);
+    }
+    primaryPane.addEventListener("pointerdown", () => activate(0), {
+      signal: splitAbort.signal,
+    });
+    primaryPane.addEventListener("focusin", () => activate(0), {
+      signal: splitAbort.signal,
+    });
+    wide.addEventListener?.("change", syncSplit);
+    const panelObserver = globalThis.ResizeObserver
+      ? new ResizeObserver((entries) => {
+          panelWidth = entries[0].contentRect.width;
+          syncDirection();
+        })
+      : null;
+    panelObserver?.observe(panels);
+    function draw() {
+      quickHandle?.update?.();
+      session = state.sessions.get(selectedId);
+      group =
+        state.groups.get(group.key) ||
+        (session && state.groups.get(session.groupKey));
+      if (!group || !live(session)) {
+        const next = group?.sessions.find((s) =>
+          live(state.sessions.get(s.id)),
+        );
+        disposed = true;
+        cancelRetry();
+        stopSecondary();
+        clearTabs();
+        handle?.unmount();
+        chatHandle?.unmount();
+        go(next ? ctx.groupRoute(group, next.id) : "/host/local", true);
+        return;
+      }
+      const active = activeSession(),
+        activeGroup = state.groups.get(active.groupKey) || group;
+      ctx.rememberSession?.(active, activeGroup);
+      title.textContent = activeGroup.label;
+      git.hidden = active.branch === null || active.branch === undefined;
+      tabs.setAttribute(
+        "aria-label",
+        t(splitSession ? "Terminals in active pane" : "Terminals"),
+      );
+      if (splitSession) tabs.dataset.activePane = String(activePane);
+      else delete tabs.dataset.activePane;
+      const left = scroll.scrollLeft,
+        bounds =
+          scroll.clientWidth > 0 && scroll.getBoundingClientRect
+            ? scroll.getBoundingClientRect()
+            : null,
+        visibleTabs = bounds
+          ? Array.from(scroll.children).filter((tab) => {
+              const r = tab.getBoundingClientRect();
+              return r.right > bounds.left && r.left < bounds.right;
+            })
+          : [],
+        anchor =
+          visibleTabs.find(
+            (tab) => tab.getAttribute?.("aria-selected") === "true",
+          ) || visibleTabs[0],
+        anchorLeft = anchor?.getBoundingClientRect().left,
+        seen = new Map(),
+        wanted = new Set(),
+        tabNodes = [];
+      for (const s of activeGroup.sessions.filter(live)) {
+        const status = s.exited ? "Exited" : s.state || "Unknown",
+          agent = sessionAgent(s),
+          base =
+            cleanTitle(s.title) ||
+            titles.get(s.id) ||
+            agentName(agent) ||
+            "Shell",
+          n = (seen.get(base) || 0) + 1;
+        seen.set(base, n);
+        const label = n > 1 ? `${base} ${n}` : base;
+        wanted.add(s.id);
+        let e = tabEntries.get(s.id);
+        if (!e) {
+          const abort = new AbortController(),
+            tab = button(
+              "",
+              () => {
+                const latest = state.sessions.get(s.id);
+                if (latest) selectTab(latest);
+              },
+              "session-tab",
+            ),
+            dot = ctx.dot(status),
+            labelNode = el("span", undefined, "tab-label");
+          tab.append(dot, labelNode);
+          e = { tab, dot, label: labelNode, abort, agent: null, mark: null };
+          e.stop = ctx.longPress(
+            tab,
+            () => {
+              const latest = state.sessions.get(s.id);
+              if (latest) actions(latest);
+            },
+            abort.signal,
+          );
+          tab.addEventListener(
+            "contextmenu",
+            (event) => {
+              event.preventDefault();
+              const latest = state.sessions.get(s.id);
+              if (latest) actions(latest);
+            },
+            { signal: abort.signal },
+          );
+          tabEntries.set(s.id, e);
+        }
+        const { tab } = e;
+        tab.dataset.session = s.id;
+        tab.disabled =
+          !!splitSession &&
+          s.id === (activePane === 1 ? selectedId : splitSession.id);
+        tab.tabIndex = s.id === active.id ? 0 : -1;
+        tab.setAttribute("role", "tab");
+        tab.setAttribute("aria-selected", String(s.id === active.id));
+        tab.setAttribute(
+          "aria-label",
+          `${label} · ${t(status)} · ${t("Terminal #{0}", s.id)}`,
+        );
+        tab.title = `${label} · ${status}`;
+        e.dot.className = `status-dot ${status.toLowerCase()}`;
+        e.dot.setAttribute("aria-label", t(status));
+        if (e.agent !== agent) {
+          e.mark?.remove();
+          e.mark = agentIcon(agent);
+          e.agent = agent;
+          tab.insertBefore(e.mark, e.label);
+        }
+        if (e.label.textContent !== label) e.label.textContent = label;
+        tabNodes.push(tab);
+      }
+      for (const [id, e] of tabEntries)
+        if (!wanted.has(id)) {
+          e.abort.abort();
+          e.stop?.();
+          e.tab.remove();
+          tabEntries.delete(id);
+        }
+      const focused = globalThis.document?.activeElement;
+      let before = null;
+      for (const tab of tabNodes.reverse()) {
+        if (
+          tab.parentElement !== scroll ||
+          (tab.nextSibling !== before &&
+            tab !== focused &&
+            !tab.contains?.(focused))
+        )
+          scroll.insertBefore(tab, before);
+        before = tab;
+      }
+      if (revealTab) {
+        revealTab = false;
+        const tab = scroll.querySelector("[aria-selected=true]");
+        if (tab?.getBoundingClientRect) {
+          const a = tab.getBoundingClientRect(),
+            b = scroll.getBoundingClientRect();
+          if (a.left < b.left) scroll.scrollLeft += a.left - b.left;
+          else if (a.right > b.right) scroll.scrollLeft += a.right - b.right;
+        }
+      } else {
+        scroll.scrollLeft = left;
+        if (anchor?.parentElement === scroll)
+          scroll.scrollLeft += anchor.getBoundingClientRect().left - anchorLeft;
+      }
+      if (add) add.disabled = state.connection.phase !== "ready";
+      chatHandle?.update?.();
+      if (
+        connectionPhase !== "ready" &&
+        state.connection.phase === "ready" &&
+        ["disconnected", "error"].includes(terminalPhase)
+      )
+        attach();
+      if (state.connection.phase !== "ready") cancelRetry();
+      else if (terminalPhase === "disconnected") retry();
+      if (
+        connectionPhase !== "ready" &&
+        state.connection.phase === "ready" &&
+        ["disconnected", "error"].includes(secondaryPhase)
+      )
+        stopSecondary();
+      connectionPhase = state.connection.phase;
+      if (splitSession) syncSplit();
+    }
+    draw();
+    if (!handle && (!splitSession || wide.matches || activePane === 0))
+      attach();
+    syncViewMode();
+    syncSplit();
+    return {
+      update() {
+        draw();
+        if (!disposed && group && live(session)) syncSummary();
+      },
+      cleanup() {
+        disposed = true;
+        generation++;
+        splitAbort.abort();
+        wide.removeEventListener?.("change", syncSplit);
+        panelObserver?.disconnect();
+        stopSecondary();
+        clearTabs();
+        cancelRetry();
+        handle?.unmount();
+        chatHandle?.unmount();
+        if (M.activeTerminal === handle) M.activeTerminal = null;
+      },
+    };
+  };
+})();

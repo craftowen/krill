@@ -1422,3 +1422,58 @@ fn sidebar_prompt_tail_rejects_unbounded_peer_data() {
         assert!(Reply::decode(kind, &body).is_err());
     }
 }
+
+#[test]
+fn worktree_refs_roundtrip_append_only_fixtures() {
+    assert_ne!(crate::ipc::FEATURES & FEAT_WORKTREE_REFS, 0);
+    assert_eq!(
+        roundtrip(&Request::WorktreeRefs {
+            repo: b"/r".to_vec()
+        }),
+        "05000000301c022f72"
+    );
+    assert_eq!(
+        roundtrip(&Reply::WorktreeRefs(vec!["main".into()])),
+        "08000000312001046d61696e"
+    );
+    assert_eq!(roundtrip(&Reply::WorktreeRefs(vec![])), "03000000312000");
+    // N-1 opcodes and payloads remain unchanged in both directions.
+    assert_eq!(roundtrip(&Request::List), "020000003001");
+    assert_eq!(roundtrip(&Reply::Closed), "020000003102");
+    assert_eq!(
+        Reply::decode(kind::REPLY, &[3, 5]).unwrap(),
+        Reply::Failed(Failure::BadRequest)
+    );
+}
+
+#[test]
+fn worktree_refs_decode_rejects_oversized_and_invalid_payloads() {
+    for refs in [
+        vec!["main".to_owned(); MAX_WORKTREE_REFS + 1],
+        vec!["x".repeat(MAX_WORKTREE_REF_BYTES + 1)],
+        vec![String::new()],
+        vec!["bad name".to_owned()],
+        vec!["bad\nname".to_owned()],
+    ] {
+        let bytes = postcard::to_stdvec(&Reply::WorktreeRefs(refs)).unwrap();
+        assert!(Reply::decode(kind::REPLY, &bytes).is_err());
+    }
+    let bytes = postcard::to_stdvec(&Request::WorktreeRefs {
+        repo: vec![b'x'; 4097],
+    })
+    .unwrap();
+    assert!(Request::decode(kind::REQUEST, &bytes).is_err());
+    roundtrip(&Reply::WorktreeRefs(vec![
+        "x".repeat(MAX_WORKTREE_REF_BYTES);
+        MAX_WORKTREE_REFS
+    ]));
+}
+
+proptest::proptest! {
+    #[test]
+    fn worktree_refs_decoder_does_not_panic(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+        let mut body = vec![32];
+        body.extend(bytes);
+        Reply::decode(kind::REPLY, &body).ok();
+    }
+}

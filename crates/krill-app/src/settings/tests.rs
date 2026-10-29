@@ -7675,8 +7675,8 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
         );
     }
     assert!(
-        bounds(vcx, "mobile-tunnel").top() < bounds(vcx, "mobile-tailscale").top(),
-        "Tunnel must be prioritized above Tailscale in mobile mode card"
+        bounds(vcx, "mobile-tailscale").top() < bounds(vcx, "mobile-tunnel").top(),
+        "Tailscale must be prioritized above Relay in mobile mode card"
     );
     for sel in [
         "admin-mobile-pair-section",

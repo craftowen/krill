@@ -141,13 +141,13 @@
       sensitive = ["pair", "key", "t", "r", "install"],
       consumed = sensitive.some((key) => fragment.has(key));
     for (const key of [...sensitive, "auth"]) parameters.delete(key);
-    (history.replaceState(
+    history.replaceState(
       {},
       "",
       location.pathname +
         (parameters.size ? "?" + parameters : "") +
         (consumed ? "" : location.hash),
-    ));
+    );
     let credentials = pair ? null : saved,
       directOrigin = location.origin,
       destinationFixed = fixed,
@@ -1041,7 +1041,11 @@
     create(options) {
       let diagnosticsTrace;
       let pendingRpc = 0,
-        uncertainMutation = !1;
+        uncertainMutation = false,
+        armed = 0,
+        rev = 0,
+        heard = 0,
+        denied = -1;
       const latestReads = new Map(),
         isRead = (request) =>
           ["snapshot", "chat_poll", "git", "accounts"].includes(
@@ -1120,16 +1124,16 @@
         ]).finally(() => clearTimeout(timeout));
       }
       const next = () =>
-          queue.length
-            ? Promise.resolve(queue.shift())
-            : failed
-              ? Promise.reject(failed)
-              : new Promise((resolve, reject) =>
-                  waiters.push({ resolve, reject }),
-                ),
-        send = (bytes) => socket.send(channel.seal(bytes)),
-        plain = async () => channel.open(await next());
-      function clearWarm(close = !1) {
+        queue.length
+          ? Promise.resolve(queue.shift())
+          : failed
+            ? Promise.reject(failed)
+            : new Promise((resolve, reject) =>
+                waiters.push({ resolve, reject }),
+              );
+      const send = (bytes) => socket.send(channel.seal(bytes));
+      const plain = next;
+      function clearWarm(close = false) {
         if (!warm) return;
         const w = warm;
         if (((warm = null), w.cleanup(), close))
@@ -1224,15 +1228,15 @@
         }
         if (stopped || authBlocked || (!credentials && !pair)) return;
         const wait = Math.max(delay, retryNotBefore - Date.now());
-        ((nextRetryAt = Date.now() + wait),
-          status(
-            "disconnected",
-            retryNotBefore > Date.now()
-              ? "Authentication retry is cooling down. Wait, or scan a fresh QR code."
-              : failed?.message || "Reconnecting\u2026",
-          ),
-          (retryTimer = setTimeout(connect, wait)),
-          (retryDelay = Math.min(retryDelay * 2, 15e3)));
+        nextRetryAt = Date.now() + wait;
+        status(
+          "disconnected",
+          retryNotBefore > Date.now()
+            ? "Connection temporarily limited. Wait before reconnecting."
+            : failed?.message || "Reconnecting…",
+        );
+        retryTimer = setTimeout(connect, wait);
+        retryDelay = Math.min(retryDelay * 2, 15000);
       }
       function disconnect(error) {
         if (failed) return;
@@ -1321,41 +1325,122 @@
           slot.promise
         );
       }
+      // 폴링은 직전 etag를 보내고, 바뀐 게 없으면 데몬이 본문을 생략한다(unchanged). 화면도 다시 그리지 않는다.
+      // 변경 피드: 새 데몬은 capabilities.change_feed를 알리고, 그걸 본 클라이언트만 snapshot에 feed 간격(ms)을 싣는다.
+      // 데몬은 같은 간격으로 같은 스냅샷을 계산해 바뀐 것만 같은 채널로 푸시한다. rev는 늦게 온 옛 스냅샷을 거른다.
+      const FEED_FALLBACK = 30000,
+        wanted = () =>
+          globalThis.document?.hidden ? 0 : M.activeTerminal ? 10000 : 2500;
+      const query = () => ({
+        action: "snapshot",
+        ...(last?.etag && { since: last.etag }),
+        ...(last?.capabilities?.change_feed &&
+          denied !== generation && { feed: wanted() }),
+      });
+      // 옛 데몬은 모르는 feed 필드를 확정 거절한다. 이 연결에서 피드가 아직 받아들여지지 않았을 때만 그렇게 보고
+      // 읽기 요청을 feed 없이 한 번만 다시 묻는다. 이미 켜진 뒤의 오류는 그대로 올리고 피드·재동기화를 유지한다.
+      const downgrade = (request, current, e, again) => {
+        if (
+          !("feed" in request) ||
+          !e?.definitive ||
+          current !== generation ||
+          armed > 0
+        )
+          throw e;
+        denied = current;
+        return again();
+      };
+      function apply(data, push) {
+        heard = Date.now();
+        if (!push) armed = Number.isSafeInteger(data.feed) ? data.feed : 0;
+        if (Number.isSafeInteger(data.rev)) {
+          if (data.rev < rev) return last;
+          rev = data.rev;
+        }
+        if ((data.unchanged || push) && last && data.etag === last.etag)
+          return last;
+        for (const s of data.sessions || [])
+          if (!Number.isSafeInteger(s.id) || s.id <= 0)
+            throw Error("Unsupported session ID. Update the desktop.");
+        last = data;
+        options.onSnapshot?.(data);
+        return data;
+      }
+      const PUSH = C.enc.encode('{"push":'),
+        pushed = (b) => {
+          if (b?.[4] !== 0x65 || b[5] !== 6) return null;
+          let at = 6;
+          while (b[at] & 128) at++;
+          at++;
+          if (!PUSH.every((c, i) => b[at + i] === c)) return null;
+          try {
+            return JSON.parse(reader(b.slice(6)).text());
+          } catch {
+            return {};
+          }
+        };
+      function feedPush(current, p) {
+        if (current !== generation) return;
+        try {
+          if (p.data && typeof p.data === "object") apply(p.data, true);
+          else refresh().catch(() => {});
+        } catch (e) {
+          options.onError?.(e);
+        }
+      }
       function snapshot(current, operation) {
         const pending = operation
-          .then((data) => {
-            if (current === generation) {
-              if (data.unchanged && last && data.etag === last.etag)
-                return last;
-              for (const s of data.sessions || [])
-                if (!Number.isSafeInteger(s.id) || s.id <= 0)
-                  throw Error("Unsupported session ID. Update the desktop.");
-              return ((last = data), options.onSnapshot?.(data), data);
-            }
-          })
+          .then((data) =>
+            current === generation ? apply(data, false) : undefined,
+          )
           .finally(() => {
             refreshing === pending && (refreshing = null);
           });
         return ((refreshing = pending), pending);
       }
       function refresh() {
-        return (
-          refreshing ||
-          snapshot(
-            generation,
-            rpc({
-              action: "snapshot",
-              ...(last?.etag && { since: last.etag }),
-            }),
-          )
+        if (refreshing) return refreshing;
+        const request = query(),
+          current = generation;
+        return snapshot(
+          current,
+          rpc(request).catch((e) =>
+            downgrade(request, current, e, () => rpc(query())),
+          ),
         );
       }
+      // 숨기면 피드를 멈춘다(feed:0). 진행 중인 갱신이 옛 간격을 실었을 수 있어 그 뒤에 맞춘다.
+      function visibility() {
+        const current = generation;
+        if (connected && armed > 0 && globalThis.document?.hidden)
+          Promise.resolve(refreshing)
+            .catch(() => {})
+            .then(() => {
+              if (
+                connected &&
+                current === generation &&
+                armed > 0 &&
+                armed !== wanted()
+              )
+                return refresh();
+            })
+            .catch(() => {});
+      }
+      globalThis.document?.addEventListener?.("visibilitychange", visibility);
+      // 숨은 탭은 갱신하지 않고(복귀 시 resume이 즉시 갱신), 라이브 터미널이 열려 있으면 화면 스트림이 주가 되므로 간격을 늘린다.
+      // 피드가 켜져 있으면 타이머는 로컬 확인만 한다: 간격이 바뀌었거나(터미널 전환) 30초 동안 소식이 없을 때만 묻는다.
       function poll() {
         if ((clearTimeout(timer), !connected || stopped)) return;
         const current = generation;
         timer = setTimeout(
           async () => {
-            if (!globalThis.document?.hidden)
+            const feeding = armed > 0;
+            if (
+              !globalThis.document?.hidden &&
+              (!feeding ||
+                armed !== wanted() ||
+                Date.now() - heard >= FEED_FALLBACK)
+            )
               try {
                 await refresh();
               } catch (e) {
@@ -1363,7 +1448,7 @@
               }
             poll();
           },
-          M.activeTerminal ? 1e4 : 2500,
+          armed > 0 ? 2500 : M.activeTerminal ? 10000 : 2500,
         );
       }
       async function connect() {
@@ -1386,16 +1471,16 @@
           controller = (connectController = new AbortController()),
           isCurrent = () =>
             !stopped && current === generation && !controller.signal.aborted;
-        if (
-          ((queue = []),
-          (waiters = []),
-          (failed = null),
-          (timing = { started: clock() }),
-          status("connecting", "Connecting\u2026"),
-          await serial,
-          !isCurrent())
-        )
-          return;
+        queue = [];
+        waiters = [];
+        failed = null;
+        channel = null;
+        armed = 0;
+        rev = 0;
+        timing = { started: clock() };
+        status("connecting", "Connecting…");
+        await serial;
+        if (!isCurrent()) return;
         mark("queueMs");
         let stage = 0,
           established = false,
@@ -1413,34 +1498,45 @@
                 Error("Disconnected. Pending actions were not resent.")
               );
           };
-          if (
-            (await deadline(
-              (async () => {
-                attempted = socketUrl();
-                const target = new URL(attempted);
-                timing.route = target.pathname.startsWith("/r/")
-                  ? "relay"
-                  : target.hostname.endsWith(".trycloudflare.com")
-                    ? "tunnel"
-                    : "direct";
-                const octets = target.hostname.split(".").map(Number);
-                if (
-                  octets.length === 4 &&
-                  octets[0] === 100 &&
-                  octets[1] >= 64 &&
-                  octets[1] <= 127
-                )
-                  timing.route = "tailscale";
-                trace?.mark("socket_open", { route: timing.route });
-                const active = (socket = new WebSocket(attempted));
-                ((active.binaryType = "arraybuffer"),
-                  active.addEventListener("message", (e) => {
-                    if (current !== generation) return;
-                    const w = waiters.shift();
-                    w ? w.resolve(e.data) : queue.push(e.data);
-                  }));
-                const end = (e) => {
-                  if (current !== generation) return;
+          await deadline(
+            (async () => {
+              attempted = socketUrl();
+              const target = new URL(attempted);
+              timing.route = target.pathname.startsWith("/r/")
+                ? "relay"
+                : target.hostname.endsWith(".trycloudflare.com")
+                  ? "tunnel"
+                  : "direct";
+              const octets = target.hostname.split(".").map(Number);
+              if (octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) timing.route = "tailscale";
+              trace?.mark("socket_open", {route: timing.route});
+              const active = (socket = new WebSocket(attempted));
+              active.binaryType = "arraybuffer";
+              // Bound stalled opening handshakes so discovery/fallback can run.
+              // Deadline includes authentication and the first snapshot.
+              // 인증 뒤 프레임은 도착 순서대로 바로 연다. 피드 푸시는 응답 대기열을 거치지 않는다.
+              active.addEventListener("message", (e) => {
+                if (current !== generation) return;
+                let data = e.data;
+                if (channel && typeof data !== "string") {
+                  try {
+                    data = channel.open(data);
+                  } catch (error) {
+                    disconnect(error);
+                    return;
+                  }
+                  const p = pushed(data);
+                  if (p) {
+                    feedPush(current, p);
+                    return;
+                  }
+                }
+                const w = waiters.shift();
+                if (w) w.resolve(data);
+                else queue.push(data);
+              });
+              const end = (e) => {
+                if (current !== generation) return;
                   const diagnosticReason =
                     e?.code === 1008 || e?.code === 4009
                       ? "auth_rejected"
@@ -1471,146 +1567,160 @@
                           : "ipc",
                       },
                     );
-                  const capacity = e?.code === 4009,
-                    cooldown = e?.code === 1013,
-                    denied = e?.code === 1008 || capacity;
-                  (denied && ((authBlocked = !0), clearTimeout(retryTimer)),
-                    cooldown && (retryNotBefore = Date.now() + 65e3));
-                  const error = Error(
-                    capacity
-                      ? "Desktop device limit reached. Revoke an unused device in desktop Settings \u2192 Mobile, then scan a new QR code."
-                      : cooldown
-                        ? "Authentication retry is cooling down. Wait before reconnecting."
-                        : denied
-                          ? pair
-                            ? "This QR code expired or was already used. Tap New QR code on desktop and scan again."
-                            : "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code."
-                          : "Disconnected. Pending actions were not resent. If desktop access was revoked, scan a fresh QR code.",
-                  );
-                  error.diagnosticReason = diagnosticReason;
-                  error.diagnosticReported = true;
-                  if (((error.transport = !denied), denied && failed)) {
-                    ((failed = error), status("disconnected", error.message));
-                    return;
-                  }
-                  disconnect(error);
-                };
-                (active.addEventListener("close", end),
-                  active.addEventListener("error", end),
-                  await new Promise((resolve, reject) => {
-                    (active.addEventListener(
-                      "open",
-                      () => {
-                        ((stage = 1), resolve());
-                      },
-                      { once: !0 },
-                    ),
-                      active.addEventListener(
-                        "error",
-                        () => reject(Error("Could not connect to desktop")),
-                        { once: !0 },
-                      ),
-                      active.addEventListener(
-                        "close",
-                        () => reject(failed || Error("Disconnected")),
-                        { once: !0 },
-                      ));
+                const capacity = e?.code === 4009,
+                  cooldown = e?.code === 1013,
+                  denied = e?.code === 1008 || capacity;
+                if (denied) {
+                  authBlocked = true;
+                  clearTimeout(retryTimer);
+                }
+                if (cooldown) retryNotBefore = Date.now() + 65000;
+                const error = Error(
+                  capacity
+                    ? "Desktop device limit reached. Revoke an unused device in desktop Settings → Mobile, then scan a new QR code."
+                    : cooldown
+                      ? "Connection temporarily limited. Wait before reconnecting."
+                      : denied
+                        ? pair
+                          ? "This QR code expired or was already used. Tap New QR code on desktop and scan again."
+                          : "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code."
+                        : "Disconnected. Pending actions were not resent. If desktop access was revoked, scan a fresh QR code.",
+                );
+                error.diagnosticReason = diagnosticReason;
+                error.diagnosticReported = true;
+                error.transport = !denied;
+                if (denied && failed) {
+                  failed = error;
+                  status("disconnected", error.message);
+                  return;
+                }
+                disconnect(error);
+              };
+              active.addEventListener("close", end);
+              active.addEventListener("error", end);
+              await new Promise((resolve, reject) => {
+                active.addEventListener(
+                  "open",
+                  () => {
+                    stage = 1;
+                    resolve();
+                  },
+                  { once: true },
+                );
+                active.addEventListener(
+                  "error",
+                  () => reject(Error("Could not connect to desktop")),
+                  { once: true },
+                );
+                active.addEventListener(
+                  "close",
+                  () => reject(failed || Error("Disconnected")),
+                  { once: true },
+                );
+              });
+              ensureCurrent();
+              mark("socketOpenMs");
+              trace?.mark("challenge");
+              const challengeBytes = await next();
+              ensureCurrent();
+              const challenge = JSON.parse(challengeBytes),
+                nonce = crypto.getRandomValues(new Uint8Array(32));
+              stage = 2;
+              mark("challengeMs");
+              if (challenge.version !== 2)
+                throw Error("Unsupported desktop protocol");
+              trace?.mark("authentication");
+              const pairing = !!pair,
+                secret = pairing
+                  ? C.unbase64(pair.secret)
+                  : C.sha256(C.unhex(credentials.credential));
+              channel = new C.Channel(
+                secret,
+                C.concat(C.unhex(challenge.challenge), nonce),
+              );
+              secret.fill(0);
+              active.send(
+                JSON.stringify({
+                  token: pairing ? pair.ticket : null,
+                  device_id: pairing ? null : credentials.device_id,
+                  client_nonce: C.hex(nonce),
+                }),
+              );
+              send(
+                C.enc.encode(
+                  JSON.stringify({ label: options.label || "Mobile browser" }),
+                ),
+              );
+              // 게이트웨이는 proof 프레임만 읽고 나머지를 IPC로 넘기며 협상은 교집합이다. ServerHello를 기다리지 않고
+              // ClientHello(전 비트 제시 = 서버 제시값 그대로)와 첫 snapshot 요청을 바로 보내 왕복을 줄인다.
+              send(
+                frame(
+                  2,
+                  C.concat(
+                    v(1),
+                    v(1),
+                    v(FEATURES),
+                    v(0),
+                    text("krill-mobile-pwa"),
+                  ),
+                ),
+              );
+              const firstRequest = query();
+              ask(firstRequest);
+              mark("proofSentMs");
+              const authBytes = await plain();
+              ensureCurrent();
+              const auth = JSON.parse(decode.decode(authBytes));
+              stage = 3;
+              mark("authenticatedMs");
+              if (auth.credential || options.endpoint) {
+                credentials = options.endpoint
+                  ? options.endpoint.authenticated(auth)
+                  : auth;
+                pair = null;
+                options.onAuthenticated?.(credentials);
+              }
+              trace?.mark("ipc");
+              const hello = await plain();
+              ensureCurrent();
+              if (hello[4] !== 1) throw Error("Unexpected daemon response");
+              mark("helloMs");
+              connected = true;
+              warmTerminal();
+              trace?.mark("snapshot");
+              const first = serial.then(() =>
+                answer(current).catch((e) =>
+                  downgrade(firstRequest, current, e, () => {
+                    ask(query());
+                    return answer(current);
                   }),
-                  ensureCurrent(),
-                  mark("socketOpenMs"));
-                trace?.mark("challenge");
-                const challengeBytes = await next();
-                ensureCurrent();
-                const challenge = JSON.parse(challengeBytes),
-                  nonce = crypto.getRandomValues(new Uint8Array(32));
-                if (((stage = 2), mark("challengeMs"), challenge.version !== 2))
-                  throw Error("Unsupported desktop protocol");
-                trace?.mark("authentication");
-                const pairing = !!pair,
-                  secret = pairing
-                    ? C.unbase64(pair.secret)
-                    : C.sha256(C.unhex(credentials.credential));
-                ((channel = new C.Channel(
-                  secret,
-                  C.concat(C.unhex(challenge.challenge), nonce),
-                )),
-                  secret.fill(0),
-                  active.send(
-                    JSON.stringify({
-                      token: pairing ? pair.ticket : null,
-                      device_id: pairing ? null : credentials.device_id,
-                      client_nonce: C.hex(nonce),
-                    }),
-                  ),
-                  send(
-                    C.enc.encode(
-                      JSON.stringify({
-                        label: options.label || "Mobile browser",
-                      }),
-                    ),
-                  ),
-                  send(
-                    frame(
-                      2,
-                      C.concat(
-                        v(1),
-                        v(1),
-                        v(FEATURES),
-                        v(0),
-                        text("krill-mobile-pwa"),
-                      ),
-                    ),
-                  ),
-                  ask({
-                    action: "snapshot",
-                    ...(last?.etag && { since: last.etag }),
-                  }),
-                  mark("proofSentMs"));
-                const authBytes = await plain();
-                ensureCurrent();
-                const auth = JSON.parse(decode.decode(authBytes));
-                ((stage = 3),
-                  mark("authenticatedMs"),
-                  (auth.credential || options.endpoint) &&
-                    ((credentials = options.endpoint
-                      ? options.endpoint.authenticated(auth)
-                      : auth),
-                    (pair = null),
-                    options.onAuthenticated?.(credentials)));
-                trace?.mark("ipc");
-                const hello = await plain();
-                if ((ensureCurrent(), hello[4] !== 1))
-                  throw Error("Unexpected daemon response");
-                (mark("helloMs"), (connected = !0), warmTerminal());
-                trace?.mark("snapshot");
-                stage = 4;
-                const first = serial.then(() => answer(current));
-                serial = first.catch(() => {});
-                const pending = snapshot(current, first),
-                  resumed = !!last;
-                (resumed &&
-                  (mark("readyMs"),
-                  status("ready", "Encrypted \xB7 connected")),
-                  await pending,
-                  ensureCurrent(),
-                  resumed || mark("readyMs"),
-                  (retryDelay = 1e3),
-                  (authFailures = 0),
-                  (retryCount = 0),
-                  (nextRetryAt = 0),
-                  (retryNotBefore = 0),
-                  warmTerminal(),
-                  resumed || status("ready", "Encrypted \xB7 connected"),
-                  (established = true),
-                  poll());
-              })(),
-              2e4,
-              "Connection timed out. Pending actions were not resent.",
-              current,
-            ),
-            !isCurrent())
-          )
-            return;
+                ),
+              );
+              serial = first.catch(() => {});
+              const pending = snapshot(current, first),
+                resumed = !!last;
+              if (resumed) {
+                mark("readyMs");
+                status("ready", "Encrypted · connected");
+              }
+              await pending;
+              ensureCurrent();
+              if (!resumed) mark("readyMs");
+              retryDelay = 1000;
+              authFailures = 0;
+              retryCount = 0;
+              nextRetryAt = 0;
+              retryNotBefore = 0;
+              warmTerminal();
+              if (!resumed) status("ready", "Encrypted · connected");
+              established = true;
+              poll();
+            })(),
+            20000,
+            "Connection timed out. Pending actions were not resent.",
+            current,
+          );
+          if (!isCurrent()) return;
         } catch (e) {
           if (!isCurrent()) return;
           if (!e.diagnosticReported && !failed?.diagnosticReported)
@@ -1651,7 +1761,7 @@
               : (authBlocked = !0)),
             options.onError?.(e),
             disconnect(e),
-            status("disconnected", failed?.message || e.message            ));
+            status("disconnected", failed?.message || e.message));
         } finally {
           (connectController === controller && (connectController = null),
             controller.abort(),
@@ -1756,14 +1866,18 @@
           return (warmTerminal(), out);
         },
         close() {
-          ((stopped = !0),
-            connectController?.abort(),
-            clearTimeout(timer),
-            clearTimeout(retryTimer),
-            clearWarm(!0),
-            disconnect(Error("Disconnected")),
-            generation++,
-            (connecting = !1));
+          stopped = true;
+          globalThis.document?.removeEventListener?.(
+            "visibilitychange",
+            visibility,
+          );
+          connectController?.abort();
+          clearTimeout(timer);
+          clearTimeout(retryTimer);
+          clearWarm(true);
+          disconnect(Error("Disconnected"));
+          generation++;
+          connecting = false;
         },
       };
     },

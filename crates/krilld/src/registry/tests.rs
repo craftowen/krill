@@ -2748,3 +2748,113 @@ fn spawn_cwd_preserves_long_verbatim_paths() {
     sanitize_spawn_cwd(&mut cwd);
     assert_eq!(cwd, path.as_bytes());
 }
+
+#[test]
+fn worktree_refs_are_read_only_but_enforce_scope_and_negotiation() {
+    let request = Request::WorktreeRefs {
+        repo: b"/reserved".to_vec(),
+    };
+    assert!(read_only(&request));
+    let registry = Registry::new(None, None);
+    for scope in [Scope::Restricted, Scope::Session(SessionId(999))] {
+        assert_eq!(
+            registry.handle(
+                &Peer { pid: None, scope },
+                request.clone(),
+                &mut HashMap::new()
+            ),
+            Reply::Failed(Failure::Denied)
+        );
+    }
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let thread = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        Registry::new(None, None).serve(server, &hello).unwrap();
+    });
+    ipc::read_frame(&mut client).unwrap().unwrap();
+    let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+    hello.features = FEAT_CONTROL;
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    client.write_all(&request.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(
+        Reply::decode(kind, &body).unwrap(),
+        Reply::Failed(Failure::BadRequest)
+    );
+    // Legacy clients remain usable on the same connection after the feature-gated rejection.
+    client.write_all(&Request::List.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), Reply::Sessions(vec![]));
+    drop(client);
+    thread.join().unwrap();
+}
+
+#[test]
+fn negotiated_worktree_refs_allow_observers_and_preserve_sessions() {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let dir = PathBuf::from("/tmp").join(format!("registry-refs-observer-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+        .unwrap();
+    let thread = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        Registry::new(None, None)
+            .serve_mobile(server, &hello)
+            .unwrap();
+    });
+    ipc::read_frame(&mut client).unwrap().unwrap();
+    let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+    hello.features = FEAT_CONTROL | control::FEAT_WORKTREE_REFS | FEAT_ROLES;
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    client
+        .write_all(&roles::Request::Set(Role::Observer).encode().unwrap())
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(Ack::decode(kind, &body).unwrap(), Ack::Applied);
+    client
+        .write_all(
+            &Request::WorktreeRefs {
+                repo: dir.as_os_str().as_bytes().to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(
+        Reply::decode(kind, &body).unwrap(),
+        Reply::WorktreeRefs(vec![])
+    );
+    client.write_all(&Request::List.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), Reply::Sessions(vec![]));
+    drop(client);
+    thread.join().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}

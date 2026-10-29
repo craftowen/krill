@@ -237,6 +237,15 @@ impl Detector {
 
 fn title_indicates_agent_waiting(title: &str) -> bool {
     let lower = title.to_ascii_lowercase();
+    // Codex는 질문·승인 대기 중 제목을 `[ ! ] Action Required`와 `[ . ] Action Required`로
+    // 번갈아 바꾼다. 에이전트 이름이 없으므로 이 접두 모양으로만 인식한다.
+    if let Some(rest) = lower
+        .strip_prefix("[ ! ]")
+        .or_else(|| lower.strip_prefix("[ . ]"))
+        && rest.trim_start().starts_with("action required")
+    {
+        return true;
+    }
     let has_waiting_keyword = lower.contains("action required") || lower.contains("permission");
     if !has_waiting_keyword {
         return false;

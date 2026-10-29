@@ -463,16 +463,16 @@ impl SettingsView {
         root = root.child(self.mobile_account_card(cx));
         let mode_options = [
             (
-                ConnectMode::Tunnel,
-                "mobile-tunnel",
-                text::TUNNEL.get(),
-                text::TUNNEL_DESC.get(),
-            ),
-            (
                 ConnectMode::Tailscale,
                 "mobile-tailscale",
                 text::TAILSCALE.get(),
                 text::TAILSCALE_DESC.get(),
+            ),
+            (
+                ConnectMode::Tunnel,
+                "mobile-tunnel",
+                text::TUNNEL.get(),
+                text::TUNNEL_DESC.get(),
             ),
         ];
         let mut mode_card = layout::card(p)
@@ -939,14 +939,14 @@ impl SettingsView {
         let mut modes = div().flex().gap_1p5();
         for (mode, id, label) in [
             (
-                ConnectMode::Tunnel,
-                "mobile-page-tunnel",
-                text::PAGE_TUNNEL.get(),
-            ),
-            (
                 ConnectMode::Tailscale,
                 "mobile-page-tailscale",
                 text::PAGE_TAILSCALE.get(),
+            ),
+            (
+                ConnectMode::Tunnel,
+                "mobile-page-tunnel",
+                text::PAGE_TUNNEL.get(),
             ),
         ] {
             modes = modes.child(

@@ -540,6 +540,28 @@ impl Source for Socket {
         Reply::decode(kind, &bytes).map_err(io::Error::other)
     }
 
+    fn worktree_refs(&self, repo: &Path) -> io::Result<Vec<String>> {
+        let mut stream = control(
+            &self.shared.target,
+            FEAT_CONTROL | krill_proto::control::FEAT_WORKTREE_REFS,
+            Duration::from_secs(8),
+        )?;
+        stream.write_all(
+            &Request::WorktreeRefs {
+                repo: repo.as_os_str().as_bytes().to_vec(),
+            }
+            .encode()?,
+        )?;
+        let (kind, bytes) =
+            krill_proto::ipc::read_frame(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        match Reply::decode(kind, &bytes).map_err(io::Error::other)? {
+            Reply::WorktreeRefs(refs) => Ok(refs),
+            Reply::WorktreeFailed(error) => Err(io::Error::other(error)),
+            Reply::Failed(error) => Err(io::Error::other(error.to_string())),
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+
     fn prepare_worktree(&self, req: krill_proto::control::PrepareWorktree) -> io::Result<Reply> {
         let mut stream = control(
             &self.shared.target,
@@ -967,6 +989,98 @@ mod tests {
                 assert_eq!(histories[&krill_proto::SessionId(7)].total_turns, 1);
             }
         }
+    }
+
+    #[test]
+    fn worktree_refs_source_roundtrips_through_real_registry() {
+        use krill_proto::ipc::{self, ServerHello};
+        use std::os::unix::net::UnixListener;
+        let dir = PathBuf::from("/tmp").join(format!("krill-source-refs-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let repo = dir.join("레포");
+        fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+            vec!["branch", "한글-브랜치"],
+            vec!["tag", "v1"],
+            vec!["update-ref", "refs/remotes/upstream/release", "HEAD"],
+        ] {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "tag.gpgSign=false",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        for (supported, remote) in [(true, false), (false, false), (true, true), (false, true)] {
+            let path = dir.join(format!("{supported}-{remote}.sock"));
+            let listener = UnixListener::bind(&path).unwrap();
+            let thread = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let hello = ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: if supported {
+                        ipc::FEATURES
+                    } else {
+                        ipc::FEATURES & !krill_proto::control::FEAT_WORKTREE_REFS
+                    },
+                    build: "test".into(),
+                    instance_id: 1,
+                };
+                if supported {
+                    krilld::registry::Registry::new(None, None)
+                        .serve(stream, &hello)
+                        .unwrap();
+                } else {
+                    stream.write_all(&hello.encode().unwrap()).unwrap();
+                    // The forwarded transport sends ClientHello before Source checks its required bits.
+                    if remote {
+                        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+                        ipc::ClientHello::decode(kind, &body).unwrap();
+                    }
+                    // N-1: the new request is never sent, and there is no local Git fallback here.
+                    assert!(ipc::read_frame(&mut stream).unwrap().is_none());
+                }
+            });
+            let target = if remote {
+                HostTarget::remote("remote-test", path)
+            } else {
+                HostTarget::local(krill_proto::daemon::Paths {
+                    socket: path,
+                    holder: "/unused/holder".into(),
+                    krilld: "/unused/daemon".into(),
+                })
+            };
+            let source: Arc<dyn Source> = Arc::new(Socket::new(target));
+            let result = source.worktree_refs(&repo);
+            if supported {
+                assert_eq!(
+                    result.unwrap(),
+                    ["main", "upstream/release", "v1", "한글-브랜치"]
+                );
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+            }
+            thread.join().unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     const FIXTURE: &str = r#"[

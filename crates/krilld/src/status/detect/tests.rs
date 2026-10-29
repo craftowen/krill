@@ -422,6 +422,8 @@ fn orca_title_waiting_working_and_done_glyphs() {
         (6, "◇ Ready (krill)", AgentState::Done),
         (7, "Claude — Action Required", AgentState::Waiting),
         (8, "Antigravity: Permission Needed", AgentState::Waiting),
+        (10, "[ ! ] Action Required | krill", AgentState::Waiting),
+        (11, "[ . ] Action Required", AgentState::Waiting),
     ] {
         let e = detector
             .observe(title, "…", rev, &AgentStatus::UNKNOWN, now)

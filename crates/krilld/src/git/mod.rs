@@ -26,6 +26,7 @@ pub mod changes;
 pub mod edit;
 pub mod watch;
 pub mod worktree;
+pub mod worktree_refs;
 
 /// git 동시 실행 상한(T4 G8: Orca 일반 작업 2~4).
 pub const MAX_CONCURRENT: usize = 4;

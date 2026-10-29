@@ -1,5 +1,7 @@
 //! OWE-496 워크트리 생성 대화상자(MK-042 후속). 사이드바 레포 행의 "+"로 연다.
 //! OWE-687 모양은 Orca `NewWorkspaceComposerModal`처럼 창 가운데 모달(라벨 붙은 입력칸, 오른쪽 아래 버튼).
+//! Orca NewWorkspaceComposer{Modal,Card}, ComposerBaseRefPicker/CreateFromPicker의 선택·검색 분리와 고급 노출을 이식.
+//! Copyright (c) 2026 Lovecast Inc. (MIT License; docs/licensing/spdx/MIT.txt).
 //! IPC는 사이드바 [`Source`] 뒤에 있어 gpui 테스트는 인메모리 응답을 쓴다.
 //! setup 스크립트는 내용과 해시를 보여 주고 사람이 승인한 해시만 돌려보낸다(krilld가 내용 변경 시 다시 묻는다).
 
@@ -148,6 +150,13 @@ pub struct Dialog {
     parent: Option<PathBuf>,
     name: Entity<InputState>,
     base: Entity<InputState>,
+    branch_query: Entity<InputState>,
+    branch_picker_open: bool,
+    advanced_open: bool,
+    branch_generation: u64,
+    branch_task: Option<Task<()>>,
+    branch_error: Option<std::io::ErrorKind>,
+    branch_scroll: gpui::UniformListScrollHandle,
     initial_prompt: Entity<InputState>,
     selected_agents: Vec<String>,
     pending_fan_out: usize,
@@ -156,7 +165,7 @@ pub struct Dialog {
     phase: Phase,
     source: Arc<dyn Source>,
     task: Option<Task<()>>,
-    _enter: [Subscription; 3],
+    _enter: [Subscription; 4],
     /// Orca처럼 프로젝트를 먼저 고르고(검색 콤보박스), 그 프로젝트가 있는 호스트 중 실행 위치를 고른다.
     project_picker: Entity<ProjectPicker>,
     host_picker: Entity<HostPicker>,
@@ -165,7 +174,7 @@ pub struct Dialog {
     preparation: Option<Preparation>,
     preparation_task: Option<Task<()>>,
     preparation_ready: bool,
-    /// OWE-853: 기준 ref 후보(호출 워크트리 브랜치·데몬 폴백·git refs). 입력값으로 필터해 드롭다운에 보인다.
+    /// 실제 메타데이터·git refs만 보관한다. 선택한 base와 검색어는 독립적이다.
     candidates: Vec<String>,
     /// OWE-853: 드롭다운 키보드 하이라이트(필터 목록 내 인덱스). `None`이면 Enter가 생성 제출이다.
     highlight: Option<usize>,
@@ -228,96 +237,8 @@ fn hex_string(bytes: &[u8]) -> String {
     })
 }
 
-/// OWE-853: 호출 워크트리·레포 브랜치를 앞에 둔 기준 ref 후보.
-/// 데몬 폴백 순서(`origin/HEAD` → `origin/main` → … → `HEAD`)와 로컬 git refs를 뒤에 붙인다.
-pub fn branch_suggestions(
-    parent_branch: Option<&str>,
-    repo_branch: Option<&str>,
-    git_refs: &[String],
-) -> (Option<String>, Vec<String>) {
-    let default = parent_branch
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            repo_branch
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        });
-    let mut out: Vec<String> = Vec::new();
-    let push = |out: &mut Vec<String>, s: &str| {
-        let trimmed = s.trim();
-        if !trimmed.is_empty()
-            && trimmed.len() <= 256
-            && !trimmed.chars().any(char::is_control)
-            && !out.iter().any(|e| e == trimmed)
-        {
-            out.push(trimmed.to_owned());
-        }
-    };
-    if let Some(ref d) = default {
-        push(&mut out, d);
-    }
-    if let Some(repo) = repo_branch {
-        push(&mut out, repo);
-    }
-    for fallback in [
-        "origin/HEAD",
-        "origin/main",
-        "origin/master",
-        "main",
-        "master",
-        "HEAD",
-    ] {
-        push(&mut out, fallback);
-    }
-    for git_ref in git_refs {
-        push(&mut out, git_ref);
-        if out.len() >= 100 {
-            break;
-        }
-    }
-    (default, out)
-}
-
-/// OWE-853: 로컬 `git for-each-ref`로 브랜치·태그를 읽는다(새 IPC 없이).
-/// 실패·타임아웃 시 빈 목록으로 조용히 넘어간다. 호출자는 백그라운드에서 부른다.
-pub fn list_git_refs(repo: &Path) -> Vec<String> {
-    let mut command = crate::platform::background_command("git");
-    command
-        .current_dir(repo)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "for-each-ref",
-            "--count=50",
-            "--format=%(refname:short)",
-            "refs/heads",
-            "refs/remotes",
-            "refs/tags",
-        ]);
-    let output =
-        crate::pull_request::execute(&mut command, Duration::from_millis(1500)).unwrap_or_default();
-    let text = String::from_utf8_lossy(&output);
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.len() > 256
-            || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
-            continue;
-        }
-        if !out.iter().any(|e: &String| e == trimmed) {
-            out.push(trimmed.to_owned());
-        }
-        if out.len() >= 50 {
-            break;
-        }
-    }
-    out
-}
+mod branches;
+pub use branches::{branch_suggestions, list_git_refs};
 
 impl Dialog {
     pub fn new(
@@ -356,6 +277,8 @@ impl Dialog {
             }
             state
         });
+        let branch_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder(text::SEARCH_BRANCHES.get()));
         let initial_prompt = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get())
         });
@@ -392,6 +315,21 @@ impl Dialog {
                     d.select_host(host.clone(), window, cx);
                 },
             ),
+            cx.subscribe_in(
+                &branch_query,
+                window,
+                |d, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => {
+                        d.highlight = Some(0);
+                        d.branch_scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        d.handle_branch_key("enter", window, cx);
+                    }
+                    _ => {}
+                },
+            ),
         ];
         let mut dialog = Self {
             language: crate::i18n::language(),
@@ -402,6 +340,13 @@ impl Dialog {
             name,
             base,
             initial_prompt,
+            branch_query,
+            branch_picker_open: false,
+            advanced_open: false,
+            branch_generation: 0,
+            branch_task: None,
+            branch_error: None,
+            branch_scroll: gpui::UniformListScrollHandle::new(),
             selected_agents: Vec::new(),
             focus: cx.focus_handle(),
             pending_fan_out: 0,
@@ -610,44 +555,8 @@ impl Dialog {
         cx.notify();
     }
 
-    fn apply_repo_branch_options(
-        &mut self,
-        repo_branch: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (default_base, initial_candidates) = branch_suggestions(None, repo_branch, &[]);
-        self.set_branch_candidates(initial_candidates, cx);
-        let default_str = default_base.unwrap_or_default();
-        self.base.update(cx, |input, cx| {
-            input.set_value(&default_str, window, cx);
-        });
-        if self.host.is_local() {
-            let refs_repo = self.repo.clone();
-            let repo_branch = repo_branch.map(str::to_owned);
-            let target_host = self.host.clone();
-            let target_repo = self.repo.clone();
-            let weak_dialog = cx.weak_entity();
-            cx.spawn_in(window, async move |_, cx| {
-                let refs = cx
-                    .background_executor()
-                    .spawn(async move { list_git_refs(&refs_repo) })
-                    .await;
-                let (base, candidates) = branch_suggestions(None, repo_branch.as_deref(), &refs);
-                weak_dialog
-                    .update_in(cx, |dialog, window, cx| {
-                        if dialog.host == target_host && dialog.repo == target_repo {
-                            dialog.set_branch_candidates(candidates, cx);
-                            dialog.set_base_default(base, window, cx);
-                        }
-                    })
-                    .ok();
-            })
-            .detach();
-        }
-    }
-
     fn refresh_repo_hooks(&mut self, cx: &mut Context<Self>) {
+        self.hooks = krill_proto::orchestration::RepoHookSummary::default();
         if !self.host.is_local() {
             self.hooks = krill_proto::orchestration::RepoHookSummary::default();
             self.hooks_task = None;
@@ -751,153 +660,6 @@ impl Dialog {
     #[must_use]
     pub fn has_pending_fan_out(&self) -> bool {
         self.pending_fan_out > 0
-    }
-
-    /// OWE-853: 기준 ref 후보를 교체한다(중복·빈값 제거, 최대 100개). 입력 필터는 렌더 시 계산한다.
-    pub fn set_branch_candidates(&mut self, candidates: Vec<String>, cx: &mut Context<Self>) {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut cleaned = Vec::new();
-        for raw in candidates {
-            let trimmed = raw.trim().to_owned();
-            if trimmed.is_empty()
-                || trimmed.len() > 256
-                || trimmed.chars().any(char::is_control)
-                || !seen.insert(trimmed.clone())
-            {
-                continue;
-            }
-            cleaned.push(trimmed);
-            if cleaned.len() >= 100 {
-                break;
-            }
-        }
-        self.candidates = cleaned;
-        self.highlight = None;
-        cx.notify();
-    }
-
-    /// OWE-853: 호출한 워크트리의 현재 브랜치를 기준 ref 기본값으로 넣는다(입력済み면 덮지 않는다).
-    pub fn set_base_default(
-        &mut self,
-        base: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(default) = base.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) else {
-            return;
-        };
-        let current = self.base.read(cx).value().trim().to_owned();
-        if current.is_empty() {
-            self.base.update(cx, |input, cx| {
-                input.set_value(&default, window, cx);
-            });
-            self.highlight = None;
-            self.prepare(cx);
-            cx.notify();
-        }
-    }
-
-    /// OWE-853: 현재 입력값으로 필터한 후보(최대 8개). 빈 입력이면 상위 후보를 그대로 보인다.
-    fn filtered_bases(&self, cx: &App) -> Vec<String> {
-        let query = self.base.read(cx).value().trim().to_lowercase();
-        let mut out = Vec::new();
-        for candidate in &self.candidates {
-            if query.is_empty() || candidate.to_lowercase().contains(query.as_str()) {
-                out.push(candidate.clone());
-                if out.len() >= 8 {
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    fn base_is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.base.read(cx).focus_handle(cx).is_focused(window)
-    }
-
-    /// OWE-853: 드롭다운 키보드 처리. 하이라이트를 소비하면 `true`(전파 중단).
-    fn on_key(
-        &mut self,
-        e: &gpui::KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !matches!(self.phase, Phase::Edit(_)) {
-            return false;
-        }
-        if e.keystroke.key == "enter"
-            && (e.keystroke.modifiers.platform
-                || (!cfg!(target_os = "macos") && e.keystroke.modifiers.control))
-        {
-            self.submit(Setup::Ask, cx);
-            return true;
-        }
-        if e.keystroke.key == "enter" && self.name.read(cx).focus_handle(cx).is_focused(window) {
-            self.base.update(cx, |input, cx| input.focus(window, cx));
-            return true;
-        }
-        match e.keystroke.key.as_str() {
-            "escape" => {
-                if self.highlight.is_some() {
-                    self.highlight = None;
-                    cx.notify();
-                    return true;
-                }
-                false
-            }
-            "down" if self.base_is_focused(window, cx) => {
-                let filtered = self.filtered_bases(cx);
-                if filtered.is_empty() {
-                    return false;
-                }
-                let next = self
-                    .highlight
-                    .map_or(0, |i| if i + 1 >= filtered.len() { 0 } else { i + 1 });
-                self.highlight = Some(next);
-                cx.notify();
-                true
-            }
-            "up" if self.base_is_focused(window, cx) => {
-                let filtered = self.filtered_bases(cx);
-                if filtered.is_empty() {
-                    return false;
-                }
-                let next = self
-                    .highlight
-                    .map_or(filtered.len().saturating_sub(1), |i| {
-                        if i == 0 { filtered.len() - 1 } else { i - 1 }
-                    });
-                self.highlight = Some(next);
-                cx.notify();
-                true
-            }
-            "enter" if self.base_is_focused(window, cx) => {
-                if let Some(index) = self.highlight {
-                    let filtered = self.filtered_bases(cx);
-                    if let Some(picked) = filtered.get(index).cloned() {
-                        self.base.update(cx, |input, cx| {
-                            input.set_value(&picked, window, cx);
-                        });
-                        self.highlight = None;
-                        self.prepare(cx);
-                        cx.notify();
-                        return true;
-                    }
-                    self.highlight = None;
-                    cx.notify();
-                }
-                self.initial_prompt
-                    .update(cx, |input, cx| input.focus(window, cx));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn base_value(&self, cx: &App) -> String {
-        self.base.read(cx).value().to_string()
     }
 
     fn cancel_preparation(&mut self, cx: &mut Context<Self>) {
@@ -1137,468 +899,7 @@ impl Dialog {
     }
 }
 
-impl Render for Dialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.language != crate::i18n::language() {
-            self.language = crate::i18n::language();
-            self.name.update(cx, |input, cx| {
-                input.set_placeholder(text::NAME.get(), window, cx);
-            });
-            self.base.update(cx, |input, cx| {
-                input.set_placeholder(text::BASE.get(), window, cx);
-            });
-            self.initial_prompt.update(cx, |input, cx| {
-                input.set_placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get(), window, cx);
-            });
-        }
-        if self.pickers_dirty {
-            self.sync_pickers(window, cx);
-        }
-        let p = crate::ui::palette(cx);
-        let (warning, muted) = (p.warning, p.muted_foreground);
-        let close = Button::new("worktree-close")
-            .disabled(matches!(self.phase, Phase::Creating))
-            .ghost()
-            .label(text::CLOSE.get())
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close)));
-        let footer = || div().flex_none().flex().flex_wrap().justify_end().gap_2();
-        let repo_hooks = &self.hooks;
-        let body = div()
-            .id("worktree-dialog-body")
-            .debug_selector(|| "worktree-dialog-body".into())
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_4();
-        // Orca `CreateFromPicker`처럼 후보는 기준 ref 칸을 쓰는 동안만 펼친다.
-        let filtered = match &self.phase {
-            Phase::Edit(_) if self.base_is_focused(window, cx) => self.filtered_bases(cx),
-            _ => Vec::new(),
-        };
-        let highlight = self.highlight;
-        let base_candidates = filtered.clone();
-        let selected_agents = self.selected_agents.clone();
-        let current_host = self.host.clone();
-        let current_repo = self.repo.clone();
-        let host_options = self.host_options.clone();
-        let host_label = host_options
-            .iter()
-            .find(|o| o.host == current_host)
-            .map(|o| o.label.clone());
-        let repo_name = current_repo
-            .file_name()
-            .unwrap_or(current_repo.as_os_str())
-            .to_string_lossy()
-            .into_owned();
-        let subtitle = match host_label {
-            Some(ref hl) if !current_host.is_local() || host_options.len() > 1 => {
-                format!("{hl} · {repo_name}")
-            }
-            _ => repo_name,
-        };
-        let body = match &self.phase {
-            Phase::Edit(error) => body
-                .when(!host_options.is_empty(), |d| {
-                    d.child(
-                        div()
-                            .id("worktree-repo-selector")
-                            .debug_selector(|| "worktree-repo-selector".into())
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(crate::ui::field_label(text::REPO_LABEL.get(), None, p))
-                            .child(
-                                Select::new(&self.project_picker)
-                                    .id("worktree-project-picker")
-                                    .w_full()
-                                    .menu_width(px(420.))
-                                    .placeholder(text::PROJECT_PLACEHOLDER.get())
-                                    .search_placeholder(text::PROJECT_SEARCH.get())
-                                    .accessibility_label(text::REPO_LABEL.get()),
-                            ),
-                    )
-                })
-                .when(host_options.len() > 1, |d| {
-                    d.child(
-                        div()
-                            .id("worktree-host-selector")
-                            .debug_selector(|| "worktree-host-selector".into())
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(crate::ui::field_label(text::HOST_LABEL.get(), None, p))
-                            .child(
-                                Select::new(&self.host_picker)
-                                    .id("worktree-host-picker")
-                                    .w_full()
-                                    .menu_width(px(420.))
-                                    .search_placeholder(text::HOST_SEARCH.get())
-                                    .accessibility_label(text::HOST_LABEL.get()),
-                            ),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(crate::ui::field_label(text::NAME_LABEL.get(), None, p))
-                        .child(Input::new(&self.name)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(crate::ui::field_label(
-                            text::BASE_LABEL.get(),
-                            Some(text::OPTIONAL.get()),
-                            p,
-                        ))
-                        .child(Input::new(&self.base))
-                        .when(!base_candidates.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .id("worktree-base-options")
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .mt_1()
-                                    .rounded(crate::ui::RADIUS_SM)
-                                    .border_1()
-                                    .border_color(p.border)
-                                    .bg(p.background)
-                                    .p_1()
-                                    .children(base_candidates.iter().enumerate().map(
-                                        |(index, candidate)| {
-                                            let label = candidate.clone();
-                                            let picked = candidate.clone();
-                                            let is_active = highlight == Some(index);
-                                            div()
-                                                .id(("worktree-base-option", index))
-                                                .debug_selector(move || {
-                                                    format!("worktree-base-option-{label}")
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(crate::ui::RADIUS_XS)
-                                                .font_family(crate::ui::FONT_MONO)
-                                                .text_size(crate::ui::TEXT_SM)
-                                                .text_color(if is_active {
-                                                    p.accent_foreground
-                                                } else {
-                                                    p.muted_foreground
-                                                })
-                                                .when(is_active, |row| row.bg(p.accent))
-                                                .cursor_pointer()
-                                                .child(picked.clone())
-                                                // 마우스 누름에서 고르고 기본 동작을 막아 입력칸 포커스(=목록)가 유지되게 한다.
-                                                .on_mouse_down(
-                                                    gpui::MouseButton::Left,
-                                                    cx.listener(move |d, _, window, cx| {
-                                                        window.prevent_default();
-                                                        d.base.update(cx, |input, cx| {
-                                                            input.set_value(&picked, window, cx);
-                                                        });
-                                                        d.highlight = None;
-                                                        d.prepare(cx);
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                        },
-                                    )),
-                            )
-                        })
-                        .when(self.preparation.is_some(), |d| {
-                            d.child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .text_color(muted)
-                                    .child(if self.preparation_ready {
-                                        text::PREPARED.get()
-                                    } else {
-                                        text::PREPARING.get()
-                                    })
-                                    .child(
-                                        Button::new("cancel-preparation")
-                                            .ghost()
-                                            .xsmall()
-                                            .label(text::CANCEL_PREPARATION.get())
-                                            .on_click(
-                                                cx.listener(|d, _, _, cx| d.cancel_preparation(cx)),
-                                            ),
-                                    ),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .id("worktree-fanout-agents")
-                        .debug_selector(|| "worktree-fanout-agents".into())
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(crate::ui::field_label(
-                            text::AGENTS_LABEL.get(),
-                            Some(text::OPTIONAL.get()),
-                            p,
-                        ))
-                        .child(
-                            div().flex().flex_wrap().gap_1().children(
-                                FAN_OUT_AGENTS.iter().enumerate().map(
-                                    |(idx, &(agent_id, label))| {
-                                        let selected =
-                                            selected_agents.iter().any(|a| a == agent_id);
-                                        let btn = Button::new(("worktree-agent", idx))
-                                            .xsmall()
-                                            .icon(crate::ui::icons::agent_menu_icon(agent_id))
-                                            .label(label)
-                                            .selected(selected)
-                                            .toggled(selected);
-                                        let btn = btn.ghost();
-                                        btn.on_click(cx.listener(move |d, _, _, cx| {
-                                            d.toggle_agent(agent_id, cx);
-                                        }))
-                                    },
-                                ),
-                            ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("worktree-initial-prompt")
-                        .debug_selector(|| "worktree-initial-prompt".into())
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(crate::ui::field_label(
-                            text::INITIAL_PROMPT_LABEL.get(),
-                            Some(text::OPTIONAL.get()),
-                            p,
-                        ))
-                        .child(Input::new(&self.initial_prompt)),
-                )
-                .when(!repo_hooks.effective_symlinks.is_empty(), |d| {
-                    let paths = repo_hooks.effective_symlinks.join(", ");
-                    d.child(
-                        div()
-                            .id("worktree-symlinks-preview")
-                            .debug_selector(|| "worktree-symlinks-preview".into())
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_SM)
-                            .text_color(muted)
-                            .child(text::SYMLINKS_PREVIEW.format(&[("paths", &paths)])),
-                    )
-                })
-                .when_some(repo_hooks.effective_setup.clone(), |d, script| {
-                    d.child(
-                        div()
-                            .id("worktree-setup-preview")
-                            .debug_selector(|| "worktree-setup-preview".into())
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_SM)
-                            .text_color(muted)
-                            .child(text::SETUP_PREVIEW.format(&[("script", &visible(&script))])),
-                    )
-                })
-                .when_some(repo_hooks.effective_archive.clone(), |d, script| {
-                    d.child(
-                        div()
-                            .id("worktree-archive-preview")
-                            .debug_selector(|| "worktree-archive-preview".into())
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_SM)
-                            .text_color(muted)
-                            .child(text::ARCHIVE_PREVIEW.format(&[("script", &visible(&script))])),
-                    )
-                })
-                .children(
-                    error
-                        .clone()
-                        .map(|e| crate::ui::error_banner(p, crate::i18n::cached_notice(&e))),
-                ),
-            Phase::Creating => body.child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(muted)
-                    .child(text::CREATING.get()),
-            ),
-            Phase::Untrusted { script, hash } => body
-                .child(
-                    div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(warning)
-                        .child(text::UNTRUSTED.get()),
-                )
-                .child(
-                    div()
-                        .id("setup-script")
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .p_2()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .bg(p.muted)
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_SM)
-                        .child(visible(script)),
-                )
-                .child(
-                    div()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_2XS)
-                        .text_color(muted)
-                        .child(
-                            crate::i18n::catalog::general::HASH
-                                .format(&[("hash", &hex_string(hash))]),
-                        ),
-                ),
-            Phase::Done(w) => body
-                .child(
-                    div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.success)
-                        .child(text::CREATED.get()),
-                )
-                .child(
-                    div()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_SM)
-                        .text_color(muted)
-                        .child(
-                            PathBuf::from(std::ffi::OsStr::from_bytes(&w.path))
-                                .display()
-                                .to_string(),
-                        ),
-                )
-                .child(
-                    div()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_SM)
-                        .child(format!("{} ← {}", w.branch, w.base)),
-                )
-                .children(w.setup.map(|id| format!("{} {}", text::SETUP.get(), id.0)))
-                .children(w.warnings.iter().map(|e| {
-                    div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(warning)
-                        .child(e.clone())
-                })),
-        };
-        let actions = match &self.phase {
-            Phase::Edit(_) => footer().child(close).child(
-                Button::new("worktree-create")
-                    .debug_selector(|| "worktree-create".into())
-                    .primary()
-                    .label(text::CREATE.get())
-                    .on_click(cx.listener(|d, _, _, cx| d.submit(Setup::Ask, cx))),
-            ),
-            Phase::Untrusted { hash, .. } => {
-                let approve = hash.clone();
-                footer()
-                    .child(close)
-                    .child(
-                        Button::new("setup-skip")
-                            .ghost()
-                            .label(text::SKIP.get())
-                            .on_click(cx.listener(|d, _, _, cx| d.submit(Setup::Skip, cx))),
-                    )
-                    .child(
-                        Button::new("setup-approve")
-                            .danger()
-                            .label(text::APPROVE.get())
-                            .on_click(cx.listener(move |d, _, _, cx| {
-                                d.submit(Setup::Approve(approve.clone()), cx);
-                            })),
-                    )
-            }
-            Phase::Creating | Phase::Done(_) => footer().child(close),
-        };
-        let card = div()
-            .id("worktree-dialog")
-            .debug_selector(|| "worktree-dialog".into())
-            .occlude()
-            .w(crate::ui::DIALOG_WIDTH)
-            .max_w((window.viewport_size().width - crate::ui::SPACE_4 * 2.).max(px(0.)))
-            .max_h((window.viewport_size().height - crate::ui::SPACE_4 * 2.).max(px(0.)))
-            .role(gpui::Role::Dialog)
-            .aria_label(text::TITLE.get())
-            .p_6()
-            .rounded(crate::ui::RADIUS_LG)
-            .bg(p.popover)
-            .font_family(crate::ui::FONT_UI)
-            .text_size(crate::ui::TEXT_MD)
-            .text_color(p.popover_foreground)
-            .border_1()
-            .border_color(p.border)
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .capture_key_down(cx.listener(|d, e: &gpui::KeyDownEvent, window, cx| {
-                if d.on_key(e, window, cx) {
-                    cx.stop_propagation();
-                    return;
-                }
-                if e.keystroke.key == "escape" {
-                    cx.stop_propagation();
-                    if !matches!(d.phase, Phase::Creating) {
-                        cx.emit(Event::Close);
-                    }
-                }
-            }))
-            .on_mouse_down_out(cx.listener(|d, _, _, cx| {
-                if !matches!(d.phase, Phase::Creating) {
-                    cx.emit(Event::Close);
-                }
-            }))
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_LG)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(text::TITLE.get()),
-                    )
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(muted)
-                            .child(subtitle),
-                    )
-                    .when_some(self.parent.as_ref(), |d, parent| {
-                        let parent_name = parent
-                            .file_name()
-                            .unwrap_or(parent.as_os_str())
-                            .to_string_lossy()
-                            .into_owned();
-                        d.child(
-                            div()
-                                .id("worktree-parent")
-                                .debug_selector(|| "worktree-parent".into())
-                                .text_size(crate::ui::TEXT_2XS)
-                                .text_color(muted)
-                                .child(format!("{}: {parent_name}", text::PARENT_LABEL.get())),
-                        )
-                    }),
-            )
-            .child(body)
-            .child(actions);
-        crate::ui::modal_backdrop(
-            window.viewport_size(),
-            crate::ui::modal_focus_scope(card, &self.focus),
-        )
-    }
-}
+mod render;
 
 #[cfg(test)]
 #[path = "worktree/tests.rs"]

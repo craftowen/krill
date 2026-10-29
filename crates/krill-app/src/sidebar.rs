@@ -201,6 +201,10 @@ pub trait Source: Send + Sync {
     fn remove_worktree(&self, _req: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
         Err(io::ErrorKind::Unsupported.into())
     }
+    /// 저장소가 있는 호스트의 실제 브랜치·태그. 미지원 데몬은 `Unsupported`.
+    fn worktree_refs(&self, _repo: &Path) -> io::Result<Vec<String>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// MK-095: only the open creation dialog owns this speculative preparation token.
     fn prepare_worktree(&self, _req: krill_proto::control::PrepareWorktree) -> io::Result<Reply> {
         Err(io::ErrorKind::Unsupported.into())

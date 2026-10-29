@@ -118,9 +118,36 @@ async function testQuestions(){
  socket.question(menu);socket.close();event(choices()[0],'click');assert.equal(inputs(socket).length,before+1);assert.equal(panel.hidden,true);handle.unmount();
  console.log('PASS live question touch answers: Claude/Codex arrows+Enter, wrapped labels, SS3, checkboxes+submit, duplicate/stale/partial/history/hidden/IME/pending/disconnect guards and malformed-menu fuzz');
 }
+
+async function testChatQuestionReplies(){
+ const snapshots=[],f=await mount(1971,{visible:false,questionActive:true,preferences:{fitToPhone:false},onQuestion:q=>snapshots.push(q)}),{handle,socket}=f;
+ const single=['Which approach?', '❯ 1. Keep the current flow', '  2. Change the flow', 'Enter to select'];
+ socket.question(single);let question=handle.getQuestion();assert(question.enabled);assert.equal(question.title,'Which approach?');assert.equal(inputs(socket).length,0);
+ // Hidden Chat can answer only this API, not arbitrary terminal input.
+ await assert.rejects(handle.sendKey('enter'),/Resume/);socket.autoAck=true;
+ const reply=handle.replyQuestion(question.token,[1]);await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);await reply;
+ assert.deepEqual(inputs(socket),['\x1b[B\r']);assert(!handle.getQuestion().enabled,'ACK alone cannot replay the same question');
+ socket.question(['Next question', '❯ 1. Yes', '  2. No', 'Enter to select']);await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);
+ question=handle.getQuestion();handle.setQuestionActive(false);await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);handle.setQuestionActive(true);
+ question=handle.getQuestion();context.document.visibilityState='hidden';await assert.rejects(handle.replyQuestion(question.token,[0]),/question changed/i);context.document.visibilityState='visible';
+ socket.screen('Working');socket.question(single,false);assert.equal(handle.getQuestion(),null,'partial screen cannot supply a reply target');socket.question(single);
+ await assert.rejects(handle.replyQuestion(handle.getQuestion().token,[3]),/Choose an answer/);assert.equal(inputs(socket).length,1);
+ const menu=(first,second,active=0)=>['Pick features', `${active===0?'❯':' '} ${first?'☑':'☐'} Search`, `${active===1?'❯':' '} ${second?'☑':'☐'} Export`, 'Space to select · Enter to submit'];
+ socket.question(menu(false,true));question=handle.getQuestion();const batch=handle.replyQuestion(question.token,[0]);await flush();
+ assert.equal(inputs(socket).at(-1),' ');assert.equal(inputs(socket).length,2,'no second step before the authoritative checkbox frame');
+ socket.question(menu(true,true),false);await flush();assert.equal(inputs(socket).length,2,'partial checkbox frames do not trigger another step');socket.question(menu(true,true));await flush();assert.equal(inputs(socket).at(-1),'\x1b[B ');assert.equal(inputs(socket).length,3);
+ socket.question(menu(true,false,1));await batch;assert.equal(inputs(socket).at(-1),'\r');assert.equal(inputs(socket).length,4,'one checkbox change per observed frame, then one final Enter');
+ socket.screen('Working');socket.question(menu(false,false));await handle.replyQuestion(handle.getQuestion().token,[]);assert.equal(inputs(socket).at(-1),'\r','native multi-select permits an explicitly empty submission');socket.screen('Working');socket.question(menu(false,false));const stale=handle.replyQuestion(handle.getQuestion().token,[0]);const rejected=assert.rejects(stale,/question changed/i);await flush();socket.question(['Changed question', '❯ 1. Yes', '  2. No', 'Enter to select']);await rejected;assert.equal(inputs(socket).at(-1),' ','a changed question never receives the final Enter');
+ socket.screen('Working');socket.question(menu(false,false));const timeout=handle.replyQuestion(handle.getQuestion().token,[1]);const expired=assert.rejects(timeout,/Could not confirm/);await flush();await advance(3000);await expired;assert.equal(inputs(socket).at(-1),'\x1b[B ','unconfirmed checkbox state never submits');
+ socket.screen('Working');socket.question(menu(false,false));const lost=handle.replyQuestion(handle.getQuestion().token,[0]);const disconnected=assert.rejects(lost,/question changed|uncertain/i);await flush();socket.close();await disconnected;assert.equal(handle.getQuestion(),null);handle.unmount();
+ assert(snapshots.some(q=>q?.multiple)&&snapshots.at(-1)===null);
+ console.log('PASS Chat live replies: hidden single submit, native-key guard, stale/generation/background/partial/duplicate validation, authoritative multi-select pacing, timeout and disconnect never submit');
+}
+
 async function main(){
  await testInsertText();
  await testQuestions();
+ await testChatQuestionReplies();
  await testPageZoom();
  await testHiddenPaint();
  await testLivePreview();

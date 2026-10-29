@@ -493,6 +493,9 @@ impl Gateway {
         }
         self.request(request)
     }
+    pub(super) fn backend(&self) -> &super::pwa_rpc::Backend {
+        &self.backend
+    }
     pub fn request(&self, request: MobileRequest) -> MobileReply {
         if let MobileRequest::Workflow(json) = request {
             if serde_json::from_str::<serde_json::Value>(&json).ok()
@@ -1586,6 +1589,23 @@ fn bridge(
     let output = Arc::new(Mutex::new(socket.try_clone()?));
     let cipher = Arc::new(Mutex::new(channel));
     let (c, w) = (Arc::clone(&cipher), Arc::clone(&output));
+    // 응답과 변경 피드 푸시가 같은 순서로 봉인·전송되도록 출력 잠금을 봉인까지 쥔다(nonce 순서 = 전송 순서).
+    // 쓰기 실패(부분 쓰기 포함)는 WS 프레이밍을 깨므로 소켓을 닫아 연결을 끝낸다. WouldBlock도 예외가 아니다.
+    // 봉인 잠금은 봉인 직후 놓는다(네트워크 쓰기 동안 수신 복호화를 막지 않게). 순서는 출력 잠금이 지킨다.
+    let send = Arc::new(move |frame: &[u8]| -> io::Result<()> {
+        let mut out = lock(&w);
+        let sealed = lock(&c).seal(frame);
+        let result = sealed.and_then(|sealed| ws::write(&mut *out, ws::BINARY, &sealed));
+        if result.is_err() {
+            out.shutdown(Shutdown::Both).ok();
+        }
+        result
+    });
+    let feed = super::pwa_rpc::feed::Feed::new(Arc::downgrade(&registry), {
+        let send = Arc::clone(&send);
+        move |frame: &[u8]| send(frame)
+    });
+    let w = Arc::clone(&output);
     let reader = thread::Builder::new()
         .name("mobile-out".into())
         .stack_size(STACK)
@@ -1596,10 +1616,8 @@ fn bridge(
                     let large = body.len() > 8 * 1024;
                     let frame = ipc::encode_frame(kind, &body)?;
                     drop(body);
-                    let sealed = lock(&c).seal(&frame)?;
+                    send(&frame)?;
                     drop(frame);
-                    ws::write(&mut *lock(&w), ws::BINARY, &sealed)?;
-                    drop(sealed);
                     if large {
                         crate::alloc::purge();
                     }
@@ -1610,6 +1628,7 @@ fn bridge(
             lock(&w).shutdown(Shutdown::Both).ok();
             result
         })?;
+    let installed = Arc::clone(&feed);
     let worker = thread::Builder::new()
         .name("mobile-ipc".into())
         .stack_size(RPC_STACK)
@@ -1618,6 +1637,7 @@ fn bridge(
             // server_stop 복제가 fd를 붙잡고 있어 serve가 끝나도 local 쪽에 EOF가 오지 않는다.
             // 레지스트리가 먼저 끝내면(첫 요청 기한 초과·세션 종료) 여기서 닫아 WS도 닫히게 한다.
             let done = server.try_clone();
+            installed.install();
             let result = registry.serve_mobile(server, &hello);
             if let Ok(done) = done {
                 done.shutdown(Shutdown::Both).ok();
@@ -1672,6 +1692,7 @@ fn bridge(
     local.shutdown(Shutdown::Both).ok();
     server_stop.shutdown(Shutdown::Both).ok();
     socket.shutdown(Shutdown::Both).ok();
+    feed.stop();
     reader.join().ok();
     if let Ok(worker) = worker {
         worker.join().ok();

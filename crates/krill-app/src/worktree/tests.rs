@@ -18,6 +18,7 @@ struct Fake {
     fetches: AtomicUsize,
     preparations: Mutex<Vec<PrepareWorktree>>,
     prep_supported: AtomicBool,
+    refs: Mutex<std::collections::BTreeMap<PathBuf, Vec<String>>>,
 }
 
 impl Source for Fake {
@@ -39,6 +40,15 @@ impl Source for Fake {
         } else {
             WorktreePreparation::Ready
         }))
+    }
+    fn worktree_refs(&self, repo: &Path) -> io::Result<Vec<String>> {
+        Ok(self
+            .refs
+            .lock()
+            .unwrap()
+            .get(repo)
+            .cloned()
+            .unwrap_or_default())
     }
     fn new_worktree(&self, req: NewWorktree) -> io::Result<Reply> {
         self.requests.lock().unwrap().push(req);
@@ -63,15 +73,15 @@ fn owe853_branch_suggestions_prefers_parent_and_dedupes() {
         candidates.iter().filter(|c| c.as_str() == "main").count(),
         1
     );
-    assert!(candidates.contains(&"origin/main".to_owned()));
+    assert!(!candidates.contains(&"origin/main".to_owned()));
     assert!(candidates.contains(&"feat/x".to_owned()));
 
     let (default, _) = branch_suggestions(None, Some("develop"), &[]);
-    assert_eq!(default.as_deref(), Some("develop"));
+    assert_eq!(default, None);
 
     let (default, candidates) = branch_suggestions(None, None, &[]);
     assert_eq!(default, None);
-    assert!(candidates.contains(&"HEAD".to_owned()));
+    assert!(candidates.is_empty());
 }
 
 #[test]
@@ -120,16 +130,14 @@ fn hangul_name_setup_approval_and_sidebar_refresh(cx: &mut TestAppContext) {
     let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
     let phase = |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| dialog.read(cx).phase.clone());
 
-    // Enter는 다음 입력칸으로만 이동하며 생성하지 않는다.
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    assert_eq!(phase(cx), Phase::Edit(None));
-    assert!(fake.requests.lock().unwrap().is_empty());
-    cx.update(|window, cx| {
-        dialog.update(cx, |d, cx| {
-            d.name.update(cx, |input, cx| input.focus(window, cx));
-        });
-    });
+    assert!(cx.update(|window, cx| {
+        dialog
+            .read(cx)
+            .name
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }));
 
     // 데몬 오류는 입력을 유지한 채 보인다.
     cx.simulate_input("한글 이름");
@@ -319,6 +327,14 @@ fn dialog_renders_symlinks_setup_and_archive_preview(cx: &mut TestAppContext) {
             Some("./scripts/cleanup.sh")
         );
     });
+    assert!(vcx.debug_bounds("worktree-symlinks-preview").is_none());
+    vcx.update(|_, cx| {
+        dialog.update(cx, |d, cx| {
+            d.advanced_open = true;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
     assert!(vcx.debug_bounds("worktree-symlinks-preview").is_some());
     assert!(vcx.debug_bounds("worktree-setup-preview").is_some());
     assert!(vcx.debug_bounds("worktree-archive-preview").is_some());
@@ -326,26 +342,31 @@ fn dialog_renders_symlinks_setup_and_archive_preview(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn owe853_base_default_and_searchable_dropdown(cx: &mut TestAppContext) {
+fn branch_picker_separates_selection_search_and_keyboard(cx: &mut TestAppContext) {
     let fake = Arc::new(Fake::default());
     cx.update(gpui_component::init);
-    let (dialog, cx) =
-        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
-    cx.update(|window, cx| {
-        dialog.update(cx, |d, cx| {
-            d.set_branch_candidates(
-                vec![
-                    "main".to_owned(),
-                    "feat/parent".to_owned(),
-                    "origin/main".to_owned(),
-                ],
-                cx,
-            );
-            d.set_base_default(Some("feat/parent".to_owned()), window, cx);
-        });
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new_with_options(
+            "/repo".into(),
+            None,
+            Some("feat/parent"),
+            vec!["main".into(), "feat/parent".into(), "origin/dev".into()],
+            fake.clone(),
+            window,
+            cx,
+        )
+    });
+    let closed = Rc::new(Cell::new(0));
+    let closed_sink = closed.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, event: &Event, _| {
+            if *event == Event::Close {
+                closed_sink.set(closed_sink.get() + 1);
+            }
+        })
+        .detach();
     });
     cx.run_until_parked();
-    // 현재 브랜치가 기본값으로 들어간다.
     assert_eq!(
         cx.update(|_, cx| dialog.read(cx).base_value(cx)),
         "feat/parent"
@@ -381,10 +402,12 @@ fn owe853_base_default_and_searchable_dropdown(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("worktree-base-option-feat/parent")
-            .is_some()
+        fake.requests.lock().unwrap().is_empty(),
+        "name Enter advances to agent controls"
     );
-    assert!(cx.debug_bounds("worktree-base-option-main").is_none());
+    cx.simulate_keystrokes("cmd-enter");
+    cx.run_until_parked();
+    assert_eq!(fake.requests.lock().unwrap().len(), 1);
 }
 
 #[gpui::test]
@@ -554,6 +577,7 @@ fn worktree_modal_keeps_create_visible_with_long_hook_preview(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     dialog.update(cx, |d, cx| {
+        d.advanced_open = true;
         d.hooks.effective_setup = Some("very long setup script with many lines\n".repeat(50));
         cx.notify();
     });
@@ -684,19 +708,15 @@ fn submit_immediately_hides_modal_and_renders_pending_row_until_created(cx: &mut
         "modal must be visible before submit"
     );
 
-    // 모달이 열릴 때 빈 base(None)로 잘못 선행 준비하지 않고 저장소 기본 브랜치("main")로 곧장 준비한다.
+    // 프로젝트 기본값은 None sentinel로 준비·생성에 일관되게 전달한다.
     cx.run_until_parked();
     cx.executor().advance_clock(Duration::from_millis(300));
     cx.run_until_parked();
     {
         let preps = fake.preparations.lock().unwrap();
         assert!(
-            !preps.is_empty()
-                && preps
-                    .iter()
-                    .filter(|p| !p.cancel)
-                    .all(|p| p.base.as_deref() == Some("main")),
-            "initial speculative preparation must target 'main' directly: {preps:?}"
+            !preps.is_empty() && preps.iter().filter(|p| !p.cancel).all(|p| p.base.is_none()),
+            "initial speculative preparation must use project default: {preps:?}"
         );
     }
 
@@ -859,4 +879,190 @@ fn remote_host_and_repo_selection_creates_worktree_on_selected_host(cx: &mut Tes
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, Some(HostId::Remote("mini".into())));
     assert_eq!(events[0].1.cwd, PathBuf::from("/remote/repo-b/wt-remote"));
+}
+
+#[gpui::test]
+fn branch_results_are_host_repo_scoped_and_never_replace_a_pick(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let local = Arc::new(Fake::default());
+    let remote = Arc::new(Fake::default());
+    local
+        .refs
+        .lock()
+        .unwrap()
+        .insert("/same".into(), vec!["local-only".into()]);
+    remote.refs.lock().unwrap().insert(
+        "/same".into(),
+        vec!["remote-only".into(), "origin/dev".into()],
+    );
+    remote
+        .refs
+        .lock()
+        .unwrap()
+        .insert("/other".into(), vec!["other-only".into()]);
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new_with_options(
+            "/same".into(),
+            Some("/parent".into()),
+            Some("parent"),
+            vec!["parent".into()],
+            local.clone(),
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_host_options(
+                HostId::Local,
+                vec![
+                    WorktreeHostOption {
+                        host: HostId::Local,
+                        label: "Local".into(),
+                        source: local.clone(),
+                        repos: vec![WorktreeRepoOption {
+                            path: "/same".into(),
+                            label: "Same".into(),
+                            branch: Some("local-only".into()),
+                        }],
+                    },
+                    WorktreeHostOption {
+                        host: HostId::Remote("mini".into()),
+                        label: "Mac mini".into(),
+                        source: remote.clone(),
+                        repos: vec![
+                            WorktreeRepoOption {
+                                path: "/same".into(),
+                                label: "Same".into(),
+                                branch: Some("remote-only".into()),
+                            },
+                            WorktreeRepoOption {
+                                path: "/other".into(),
+                                label: "Other".into(),
+                                branch: Some("other-only".into()),
+                            },
+                        ],
+                    },
+                ],
+                cx,
+            );
+            d.load_branches(Some("parent".into()), Some("local-only".into()), cx);
+            d.select_host(HostId::Remote("mini".into()), window, cx);
+            assert!(d.parent.is_none());
+            assert_eq!(
+                d.base_value(cx),
+                "",
+                "host switch resets to project default"
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            assert!(d.candidates.contains(&"origin/dev".into()));
+            assert!(!d.candidates.contains(&"local-only".into()));
+            d.open_branch_picker(window, cx);
+            d.branch_query
+                .update(cx, |query, cx| query.set_value("remote", window, cx));
+            d.select_repo("/other".into(), window, cx);
+            assert!(!d.branch_picker_open);
+            assert_eq!(d.base_value(cx), "");
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            assert_eq!(d.candidates, ["other-only"]);
+            let stale_generation = d.branch_generation;
+            d.select_repo("/same".into(), window, cx);
+            d.pick_base("origin/dev", window, cx);
+            d.finish_branches(
+                stale_generation,
+                vec!["stale-other".into()],
+                Some(io::ErrorKind::Other),
+                cx,
+            );
+            assert!(!d.candidates.contains(&"stale-other".into()));
+            assert!(d.branch_error.is_none());
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| dialog.read(cx).base_value(cx)),
+        "origin/dev"
+    );
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.open_branch_picker(window, cx);
+            assert!(
+                d.branch_query.read(cx).value().is_empty(),
+                "repo changes drop the query"
+            );
+            d.set_branch_candidates((0..300).map(|n| format!("feature/{n:03}")).collect(), cx);
+        });
+    });
+    cx.simulate_input("299");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("worktree-base-option-feature/299")
+            .is_some()
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| dialog.read(cx).base_value(cx)),
+        "feature/299"
+    );
+}
+
+#[gpui::test]
+fn ime_escape_and_enter_do_not_close_or_submit_the_composer(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    cx.update(gpui_component::init);
+    let fake = Arc::new(Fake::default());
+    let (dialog, cx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
+    cx.run_until_parked();
+    let closed = Rc::new(Cell::new(false));
+    let sink = closed.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, event: &Event, _| {
+            if *event == Event::Close {
+                sink.set(true);
+            }
+        })
+        .detach();
+    });
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.name.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| dialog.update(cx, |d, cx| d.input_is_composing(window, cx))),
+        "name is focused with an active IME composition before Escape"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !closed.get(),
+        "IME cancellation must not dismiss the composer"
+    );
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.name.update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+        });
+    });
+    cx.simulate_keystrokes("cmd-enter");
+    cx.run_until_parked();
+    assert!(
+        fake.requests.lock().unwrap().is_empty(),
+        "IME confirmation must not create a worktree"
+    );
 }

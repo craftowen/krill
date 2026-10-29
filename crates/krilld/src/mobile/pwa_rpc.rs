@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 mod command_catalog;
 mod composer;
+pub(super) mod feed;
 mod mention_files;
 mod requests;
 
@@ -101,6 +102,8 @@ pub(super) struct Backend {
     git_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     git_revision: Arc<AtomicU64>,
     snapshot_cache: Mutex<Option<DashboardSnapshot>>,
+    /// 스냅샷을 새로 만들 때마다 늘어난다. 늦게 도착한 옛 스냅샷이 새 것을 덮지 않게 한다.
+    snapshot_rev: AtomicU64,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
     settings_lock: Mutex<()>,
 }
@@ -114,6 +117,7 @@ struct DashboardSnapshot {
     at: Instant,
     data: Value,
     etag: String,
+    rev: u64,
 }
 
 struct CatalogSnapshot {
@@ -145,6 +149,9 @@ enum Action {
     Snapshot {
         #[serde(default)]
         since: Option<String>,
+        /// 변경 피드 간격(ms, 0=일시정지). `capabilities.change_feed`를 본 클라이언트만 보낸다.
+        #[serde(default)]
+        feed: Option<u64>,
     },
     #[serde(alias = "set_quick_commands")]
     SaveQuickCommands {
@@ -312,6 +319,7 @@ impl Backend {
             git_inflight: Arc::default(),
             git_revision: Arc::default(),
             snapshot_cache: Mutex::default(),
+            snapshot_rev: AtomicU64::default(),
             catalog_cache: Mutex::default(),
             settings_lock: Mutex::default(),
         }
@@ -337,7 +345,20 @@ impl Backend {
     }
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
-            Action::Snapshot { since } => self.snapshot_since(since.as_deref()),
+            Action::Snapshot { since, feed } => {
+                let (mut value, rev) = self.snapshot_versioned(since.as_deref())?;
+                // 응답은 언제나 피드에 반영한다. rev·현재 간격은 feed를 보낸(새) 클라이언트에만 덧붙여
+                // 옛 클라이언트의 응답은 그대로 둔다(etag 밖이라 본문 동일성에도 영향 없음).
+                if let Some(etag) = value.get("etag").and_then(Value::as_str).map(str::to_owned)
+                    && let Some(armed) = feed::observe(feed, &etag, rev)
+                    && feed.is_some()
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.insert("rev".into(), rev.into());
+                    object.insert("feed".into(), armed.into());
+                }
+                Ok(value)
+            }
             Action::SaveQuickCommands { commands } => self.save_quick_commands(commands),
             Action::CreateTerminal {
                 cwd_session,
@@ -876,7 +897,12 @@ impl Backend {
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
+    #[cfg(test)]
     fn snapshot_since(&self, since: Option<&str>) -> io::Result<Value> {
+        self.snapshot_versioned(since).map(|(value, _)| value)
+    }
+
+    fn snapshot_versioned(&self, since: Option<&str>) -> io::Result<(Value, u64)> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         // This mutex is a snapshot-only singleflight, independent of registry/session IO.
         let mut cached = crate::session::lock(&self.snapshot_cache);
@@ -886,11 +912,11 @@ impl Backend {
             && snapshot.at.elapsed() < GIT_TTL
             && snapshot.stamps == file_stamps(&snapshot.paths)
         {
-            return if since == Some(snapshot.etag.as_str()) {
-                Ok(json!({"unchanged":true,"etag":snapshot.etag}))
+            return Ok(if since == Some(snapshot.etag.as_str()) {
+                (json!({"unchanged":true,"etag":snapshot.etag}), snapshot.rev)
             } else {
-                Ok(snapshot.data.clone())
-            };
+                (snapshot.data.clone(), snapshot.rev)
+            });
         }
         // Drop stale terminal bodies before rebuilding (including a viewport clear).
         *cached = None;
@@ -898,6 +924,7 @@ impl Backend {
         let before = file_stamps(&base_paths);
         let mut catalog_used = None;
         let mut data = self.snapshot(&mut catalog_used)?;
+        let rev = self.snapshot_rev.fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = serde_json::to_vec(&data).map_err(io::Error::other)?;
         let etag: String = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref())
             .chars()
@@ -919,13 +946,14 @@ impl Backend {
                 at: Instant::now(),
                 data: data.clone(),
                 etag: etag.clone(),
+                rev,
             });
         }
-        if since == Some(etag.as_str()) {
-            Ok(json!({"unchanged":true,"etag":etag}))
+        Ok(if since == Some(etag.as_str()) {
+            (json!({"unchanged":true,"etag":etag}), rev)
         } else {
-            Ok(data)
-        }
+            (data, rev)
+        })
     }
 
     fn snapshot_dependencies(
@@ -1165,7 +1193,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"model_set":cfg!(unix)},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"model_set":cfg!(unix),"change_feed":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
@@ -3085,7 +3113,7 @@ mod revision_tests {
             let sessions: Vec<_> = (1..=64).map(|id| json!({"id":id,"title":"fixture","state":"Working","lines":["one","two","three"]})).collect();
             let data = json!({"sessions":sessions,"padding":"x".repeat(ipc::MAX_FRAME - 20_000),"etag":"stack"});
             *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
-                revision: backend.effective_revision(&registry), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
+                revision: backend.effective_revision(&registry), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(), rev: 1,
             });
             let reply = backend.request("{\"action\":\"snapshot\"}");
             assert!(reply.len() > ipc::MAX_FRAME - 20_000);
@@ -3127,6 +3155,7 @@ mod revision_tests {
             at: Instant::now(),
             data: json!({"sessions":[],"etag":"same"}),
             etag: "same".into(),
+            rev: 1,
         });
         assert_eq!(
             backend.snapshot_since(Some("same")).unwrap(),
