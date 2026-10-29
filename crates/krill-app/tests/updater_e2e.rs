@@ -445,3 +445,118 @@ fn update_and_rollback_preserve_live_session_and_reject_forged_package() {
     assert_eq!(request(&paths, &Request::Close { session }), Reply::Closed);
     guard.session = None;
 }
+
+/// `krill update`가 실행 중인 앱을 relauncher에 넘긴 뒤 교체·시작 확인 결과를 보지 않고 성공을 출력했다.
+/// 새 버전이 시작 확인에 실패해 롤백되면 명령도 실패해야 한다.
+#[test]
+fn update_cli_reports_failure_when_relaunched_update_rolls_back() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let dir = PathBuf::from(format!("/tmp/mk-ucli-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let _cleanup = Cleanup(dir.clone());
+
+    let sk = [43; 32];
+    let pk = Ed25519KeyPair::from_seed_unchecked(&sk)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    let state = dir.join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join(krill_app::updater::CONFIG_FILE),
+        format!("public_key = \"{}\"\n", encode_hex(&pk)),
+    )
+    .unwrap();
+
+    // 실행 중인 구 앱: 인자가 있으면 TERM을 받을 때까지 머물고, relauncher가 복원해 띄우면 곧바로 끝난다.
+    let app = dir.join("Krill.app");
+    build_bundle(&app, "0.1.0", "exit 0");
+    let gui_exe = app.join("Contents/MacOS/krill-app");
+    let mut cc = Command::new("/usr/bin/clang")
+        .args(["-x", "c", "-", "-o"])
+        .arg(&gui_exe)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    cc.stdin
+        .take()
+        .unwrap()
+        .write_all(b"#include <unistd.h>\nint main(int c, char **v) { (void)v; if (c > 1) for (;;) pause(); return 0; }\n")
+        .unwrap();
+    assert!(cc.wait().unwrap().success());
+
+    let broken_src = dir.join("v2/Krill.app");
+    build_bundle(&broken_src, "0.2.0", "exit 42");
+    let broken_zip = zip_bundle(&broken_src, &dir.join("v2.zip"));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let mut manifest = Manifest {
+        version: "0.2.0".to_owned(),
+        url: format!("{base_url}/v2.zip"),
+        sha256: sha256_hex(&broken_zip),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    sign_manifest(&mut manifest, &sk);
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let body: &[u8] = match req.lines().next().and_then(|l| l.split_whitespace().nth(1)) {
+                Some("/latest.json") => &manifest_bytes,
+                Some("/v2.zip") => &broken_zip,
+                Some("/stop") => break,
+                _ => b"not found",
+            };
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(hdr.as_bytes()).ok();
+            stream.write_all(body).ok();
+        }
+    });
+
+    let mut gui = Command::new(&gui_exe).arg("gui").spawn().unwrap();
+    let reaper = thread::spawn(move || gui.wait().unwrap());
+    let cli = Command::new(APP)
+        .args(["--update-cli", "--json", "--app"])
+        .arg(&app)
+        .arg("--state-dir")
+        .arg(&state)
+        .env(
+            "KRILL_UPDATE_MANIFEST_URL",
+            format!("{base_url}/latest.json"),
+        )
+        .output()
+        .unwrap();
+    assert!(!reaper.join().unwrap().success(), "running app got TERM");
+    fetch_bytes(&format!("{base_url}/stop"), 64).ok();
+    server.join().ok();
+
+    assert!(
+        !cli.status.success(),
+        "a rolled-back update must not report success: {}",
+        String::from_utf8_lossy(&cli.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(app.join("Contents/Resources/version.txt")).unwrap(),
+        "0.1.0"
+    );
+    assert!(matches!(
+        Journal::load(&state).unwrap().unwrap().stage,
+        Stage::RolledBack { .. }
+    ));
+}
