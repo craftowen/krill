@@ -95,7 +95,7 @@ fn read_local(home: &Path, account: &AccountInfo) -> AccountMeters {
         }
     }
     if account.provider == ProviderKind::Codex
-        && let Some(path) = super::latest_rollout(&dir.join("sessions"))
+        && let Some(path) = super::own_rollout(&dir.join("sessions"))
         && let Ok(file) = std::fs::File::open(path)
     {
         use std::io::{Read as _, Seek as _, SeekFrom};

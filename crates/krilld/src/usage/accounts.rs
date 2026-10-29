@@ -26,8 +26,8 @@ use krill_proto::usage::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccountUsage, CLAUDE_CACHE, ORCA_CACHE, ProfileUsage, Usage, Window, latest_rollout,
-    mtime_secs, parse_claude, parse_orca, read_codex,
+    AccountUsage, CLAUDE_CACHE, ORCA_CACHE, ProfileUsage, Usage, Window, mtime_secs, own_rollout,
+    parse_claude, parse_orca, read_codex,
 };
 use crate::session::lock;
 
@@ -40,6 +40,8 @@ type StatusMeta = (Option<String>, Option<String>, Option<u64>);
 /// 사라진다. OWE-712가 소진 창 리셋 또는 리셋 미상의 15분 뒤 해제한다.
 /// `SAVE_LOCK`과 중첩하지 않게 `refresh_*`는 시작 때 통째로 복사해 쓴다.
 static RATE_LIMITED: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+/// 프로바이더별로 전환 조건은 섰는데 고를 계정이 없던 활성 계정. 막힐 때 한 번만 경고한다(리프 잠금).
+static SWITCH_BLOCKED: Mutex<BTreeMap<ProviderKind, String>> = Mutex::new(BTreeMap::new());
 
 /// 한도 도달을 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 전환 평가가 일어난다.
 /// 수동 전환 경로(`switch_account`)·`switch_on_rate_limit=false`·비활성 정책은 그대로 존중된다.
@@ -533,8 +535,8 @@ pub fn read_profile_usage(
             // `read_codex`와 같은 순서(세션 dir → 프로필 root)로 최신 rollout을 본다.
             let usage = read_codex(&sessions).or_else(|| read_codex(profile_dir));
             if let Some(u) = usage {
-                let updated_at = latest_rollout(&sessions)
-                    .or_else(|| latest_rollout(profile_dir))
+                let updated_at = own_rollout(&sessions)
+                    .or_else(|| own_rollout(profile_dir))
                     .as_deref()
                     .and_then(mtime_secs);
                 return ProfileUsage {
@@ -1265,26 +1267,28 @@ fn refresh_accounts_authenticated(
                 || rate_limited_at(&limited, provider, &current_id).is_some()
                 || !runtime.cooling(provider, now_secs))
         {
-            let rule = policy.rule_for(provider, &current_id);
-            let (enabled, threshold, metric, target) = rule.map_or(
-                (
-                    policy.enabled,
-                    policy
-                        .threshold_percent
-                        .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
-                    AutoSwitchMetric::Max,
-                    None,
-                ),
-                |r| {
+            let rule_params = |id: &str| {
+                policy.rule_for(provider, id).map_or(
                     (
-                        r.enabled,
-                        r.threshold_percent
+                        policy.enabled,
+                        policy
+                            .threshold_percent
                             .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
-                        r.metric,
-                        r.target_account_id.as_deref(),
-                    )
-                },
-            );
+                        AutoSwitchMetric::Max,
+                        None,
+                    ),
+                    |r| {
+                        (
+                            r.enabled,
+                            r.threshold_percent
+                                .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
+                            r.metric,
+                            r.target_account_id.as_deref(),
+                        )
+                    },
+                )
+            };
+            let (enabled, threshold, metric, target) = rule_params(&current_id);
             // K-10·K-11: 사용량을 모르면(`None`) 전환을 걸지도 후보로 고르지도 않는다.
             // 지난 창의 수치(`resets_at` 경과)는 버리고 유효 창만 본다.
             // Max는 제공자가 보고한 모든 풀을 본다. 5h/7d 명시 규칙은 해당 창만 본다.
@@ -1309,7 +1313,7 @@ fn refresh_accounts_authenticated(
                 // 지정 타깃이 동률이거나 더 차면 폴백도 막혀 왕복이 멈춘다.
                 // 어느 한 창이라도 소진(100%)이면 후보에서 제외한다(레이트리밋 계정으로 전환 금지).
                 // OWE-703 2단계 지시: 한도 기록 계정도 후보에서 제외한다(캐시 사용량과 무관).
-                let exhaustion_metric = match metric {
+                let exhaustion_of = |metric| match metric {
                     AutoSwitchMetric::AntigravityClaudeGptMax
                     | AutoSwitchMetric::AntigravityClaudeGptFiveHour
                     | AutoSwitchMetric::AntigravityClaudeGptSevenDay => {
@@ -1318,12 +1322,30 @@ fn refresh_accounts_authenticated(
                     AutoSwitchMetric::AntigravityAllMax => AutoSwitchMetric::AntigravityAllMax,
                     _ => AutoSwitchMetric::Max,
                 };
+                let exhaustion_metric = exhaustion_of(metric);
+                // Codex는 플랜에 없는 창(Pro의 5h)을 응답에서 뺀다. 그 창 한도는 없으므로 보고된 창의
+                // 최대값으로 본다. 리셋이 지난 창은 여전히 모름이다.
+                let window_value = |a: &AccountInfo, m: AutoSwitchMetric| {
+                    effective(a, m, now).or_else(|| {
+                        let absent = a.provider == ProviderKind::Codex
+                            && !a.usage.is_empty()
+                            && match m {
+                                AutoSwitchMetric::FiveHour => a.usage.five_hour.is_none(),
+                                AutoSwitchMetric::SevenDay => a.usage.seven_day.is_none(),
+                                _ => false,
+                            };
+                        absent
+                            .then(|| effective(a, AutoSwitchMetric::Max, now))
+                            .flatten()
+                    })
+                };
                 let better = |a: &&AccountInfo| -> Option<u8> {
+                    // 갱신에 실패한 계정(만료·회전된 토큰 401 등)은 남은 미터 값이 있어도 후보가 아니다.
                     if a.stale
+                        || meta.get(&a.id).is_some_and(|(error, _, _)| error.is_some())
                         || auth
                             .get(&(a.provider, PathBuf::from(&a.profile_dir)))
                             .is_some_and(|status| !status.logged_in)
-                        || effective(a, exhaustion_metric, now).is_none()
                         || !runnable(a)
                         || rate_limited_at(&limited, provider, &a.id).is_some()
                     {
@@ -1332,7 +1354,23 @@ fn refresh_accounts_authenticated(
                     if effective(a, exhaustion_metric, now).is_none_or(|max| max >= 100) {
                         return None;
                     }
-                    let v = effective(a, metric, now)?;
+                    let v = window_value(a, metric)?;
+                    // 후보 자신의 규칙이 다음 틱에 지금 계정으로 되돌릴 조합(5h↔7d 같은 비대칭 규칙)이면
+                    // 고르지 않는다. 같은 지표면 히스테리시스가 막고, 지금 계정이 소진·한도 기록이면 못 돌아온다.
+                    let (back_enabled, back_threshold, back_metric, _) = rule_params(&a.id);
+                    let bounces = back_enabled
+                        && !limited_active
+                        && effective(active_acc, exhaustion_of(back_metric), now)
+                            .is_some_and(|max| max < 100)
+                        && window_value(a, back_metric)
+                            .zip(window_value(active_acc, back_metric))
+                            .is_some_and(|(back, current)| {
+                                back >= back_threshold
+                                    && current.saturating_add(AUTO_SWITCH_HYSTERESIS) <= back
+                            });
+                    if bounces {
+                        return None;
+                    }
                     (v.saturating_add(AUTO_SWITCH_HYSTERESIS) <= pct).then_some(v)
                 };
                 let preferred = target
@@ -1375,7 +1413,20 @@ fn refresh_accounts_authenticated(
                         to_label: candidate.label.clone(),
                         reason_percent: pct,
                     });
+                    lock(&SWITCH_BLOCKED).remove(&provider);
+                } else if lock(&SWITCH_BLOCKED)
+                    .insert(provider, current_id.clone())
+                    .is_none_or(|previous| previous != current_id)
+                {
+                    tracing::warn!(
+                        provider = provider.as_str(),
+                        from = %current_id,
+                        percent = pct,
+                        "auto-switch triggered but no eligible account"
+                    );
                 }
+            } else {
+                lock(&SWITCH_BLOCKED).remove(&provider);
             }
         }
 

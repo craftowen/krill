@@ -366,6 +366,13 @@ fn mark_failed(
     );
 }
 
+/// 테스트용: 직접 조회가 401로 실패한 상태를 만든다(이전 정상값 없음).
+#[cfg(test)]
+pub(super) fn fail_for_tests(home: &Path, provider: ProviderKind, dir: &Path) {
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    mark_failed(&mut lock(&CACHE), &key, None, Failure::Http(401));
+}
+
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
 #[cfg(test)]
 fn fetch(_: ProviderKind, _: &Path, _: bool, _: &Path, _: Option<&Path>) -> Fetched {
