@@ -18,7 +18,7 @@ use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 
-use crate::hosts::HostTarget;
+use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::agent_history as text;
 
 pub type Call = Arc<dyn Fn(&Request) -> io::Result<Reply> + Send + Sync>;
@@ -130,8 +130,11 @@ fn path_matches_scope(cwd: &str, filter_paths: &[String]) -> bool {
 }
 
 /// 성공한 새 세션만 셸에 알려 새 탭을 만든다. 실패하면 기존 탭은 그대로다.
-#[derive(Debug, Clone, Copy)]
-pub struct Open(pub SessionId);
+#[derive(Debug, Clone)]
+pub struct Open {
+    pub host: HostId,
+    pub session: SessionId,
+}
 
 /// 상태바에서 우측 세션 기록 탭을 열거나 접는다.
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +146,8 @@ pub struct Toggle;
 )]
 pub struct Panel {
     call: Call,
+    host: HostId,
+    target: Option<HostTarget>,
     generation: u64,
     open: bool,
     active: bool,
@@ -188,6 +193,8 @@ impl Panel {
     pub fn new(call: Call) -> Self {
         Self {
             call,
+            host: HostId::Local,
+            target: None,
             generation: 0,
             open: false,
             active: false,
@@ -218,7 +225,61 @@ impl Panel {
         self.pending_search = false;
         self.data = None;
         self.vault = None;
+        self.error = None;
+        self.list_hits = Arc::default();
         self.call = call;
+    }
+
+    #[must_use]
+    pub fn host(&self) -> &HostId {
+        &self.host
+    }
+
+    #[must_use]
+    pub fn context(&self) -> (HostId, u64) {
+        (self.host.clone(), self.generation)
+    }
+
+    /// Bind history and resume to the workspace's daemon. An unavailable remote
+    /// must never fall back to the local daemon, even when paths or IDs coincide.
+    pub fn set_host(&mut self, host: HostId, target: Option<HostTarget>, cx: &mut Context<Self>) {
+        self.set_context(
+            host,
+            target,
+            self.workspace_path.clone(),
+            self.project_paths.clone(),
+            cx,
+        );
+    }
+
+    /// Update host and path filters together before starting the next request.
+    pub fn set_context(
+        &mut self,
+        host: HostId,
+        target: Option<HostTarget>,
+        workspace: Option<String>,
+        project: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let host_changed = self.host != host || self.target != target;
+        if !host_changed && self.workspace_path == workspace && self.project_paths == project {
+            return;
+        }
+        if host_changed {
+            let call = if target.is_none() && host.is_remote() {
+                Arc::new(|_: &Request| Err(io::ErrorKind::NotConnected.into())) as Call
+            } else {
+                daemon_call_for(target.clone())
+            };
+            self.set_call(call);
+            self.host = host;
+            self.target = target;
+        }
+        self.set_scope_paths(workspace, project);
+        if self.active {
+            self.scan(cx);
+        }
+        cx.notify();
     }
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
@@ -263,8 +324,11 @@ impl Panel {
             self.generation = self.generation.wrapping_add(1);
             self.task = None;
             self.busy = false;
+            self.pending_search = false;
             self.data = None;
             self.vault = None;
+            self.error = None;
+            self.list_hits = Arc::default();
         }
         self.workspace_path = workspace;
         self.project_paths = project;
@@ -504,6 +568,7 @@ impl Panel {
         self.error = None;
         let call = Arc::clone(&self.call);
         let generation = self.generation;
+        let host = self.host.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let got = cx
                 .background_executor()
@@ -531,7 +596,7 @@ impl Panel {
                         this.pending_search = false;
                         this.data = None;
                         this.vault = None;
-                        cx.emit(Open(session));
+                        cx.emit(Open { host, session });
                     }
                     Ok(Reply::Failed(e)) => this.error = Some(e.to_string()),
                     Err(e) if e.kind() == io::ErrorKind::Unsupported => {
@@ -626,13 +691,14 @@ impl Panel {
             .border_color(p.border)
             .child(detail.w_full());
         let busy = self.busy;
+        let context = self.context();
         let target = hit.target();
         row.child(
             crate::ui::secondary(("agent-history-resume", i), text::RESUME.get())
                 .debug_selector(move || format!("agent-history-resume-{i}"))
                 .disabled(busy)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if !busy {
+                    if !busy && this.context() == context {
                         if let Some(entry) = &matching_entry {
                             this.resume(entry.clone(), cx);
                         } else {

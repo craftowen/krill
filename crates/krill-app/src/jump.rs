@@ -18,7 +18,7 @@ use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::SessionId;
-use krill_proto::agent_history::{VaultAgent, VaultHit, VaultScope};
+use krill_proto::agent_history::{VaultAgent, VaultHit, VaultScope, VaultTarget};
 use krill_proto::control::AgentState;
 
 use crate::hosts::HostId;
@@ -700,7 +700,10 @@ pub enum Event {
     OpenWorktree(usize),
     /// 빠른 액션 실행(빠른 명령은 설정 목록 인덱스).
     Action(ActionKind),
-    ResumeVault(usize),
+    ResumeVault {
+        target: VaultTarget,
+        context: Option<(HostId, u64)>,
+    },
     Dismiss,
 }
 
@@ -750,6 +753,7 @@ pub struct Palette {
     scroll: ScrollHandle,
     quick_scroll: ScrollHandle,
     history: Option<Entity<crate::agent_history::Panel>>,
+    history_context: Option<(HostId, u64)>,
     history_sub: Option<Subscription>,
     _observe: Subscription,
 }
@@ -826,6 +830,7 @@ impl Palette {
             scroll: ScrollHandle::new(),
             quick_scroll: ScrollHandle::new(),
             history: None,
+            history_context: None,
             history_sub: None,
             _observe: observe,
         };
@@ -839,15 +844,16 @@ impl Palette {
         cx: &mut Context<Self>,
     ) {
         let initial_hits = history.read(cx).loaded_hits();
+        self.history_context = Some(history.read(cx).context());
         if !initial_hits.is_empty() {
             self.vault_hits = initial_hits;
             self.rebuild_projects();
             self.recompute_all_matches(cx);
         }
         let sub = cx.observe(history, |this, history, cx| {
-            let (has_loaded, hits) =
-                history.read_with(cx, |h, _| (h.has_loaded(), h.loaded_hits()));
-            if has_loaded && this.vault_hits != hits {
+            let hits = history.read(cx).loaded_hits();
+            this.history_context = Some(history.read(cx).context());
+            if this.vault_hits != hits {
                 this.set_vault_hits(hits, cx);
             }
         });
@@ -892,6 +898,14 @@ impl Palette {
     #[must_use]
     pub fn vault_hit(&self, index: usize) -> Option<&VaultHit> {
         self.vault_hits.get(index)
+    }
+
+    #[must_use]
+    pub fn vault_event(&self, index: usize) -> Option<Event> {
+        self.vault_hit(index).map(|hit| Event::ResumeVault {
+            target: hit.target(),
+            context: self.history_context.clone(),
+        })
     }
 
     #[must_use]
@@ -1041,8 +1055,8 @@ impl Palette {
     }
 
     pub fn resume_vault_at(&mut self, hit_index: usize, cx: &mut Context<Self>) {
-        if self.vault_hits.get(hit_index).is_some() {
-            cx.emit(Event::ResumeVault(hit_index));
+        if let Some(event) = self.vault_event(hit_index) {
+            cx.emit(event);
         }
     }
 
@@ -1455,7 +1469,7 @@ impl Palette {
             }
             Some((Section::Vault, pos)) => {
                 if let Some(&vault_idx) = self.vault_matches.get(pos) {
-                    cx.emit(Event::ResumeVault(vault_idx));
+                    self.resume_vault_at(vault_idx, cx);
                 }
             }
             Some((Section::Worktrees, pos)) => {

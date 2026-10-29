@@ -1565,7 +1565,7 @@ fn remote_workspace_without_transport_never_touches_colliding_local_repo(
         [scope_path.as_str()]
     );
 
-    // 전송 없는 원격 호스트로 전환: 로컬 목록·기록 범위가 사라지고 감시도 돌지 않는다.
+    // 전송 없는 원격 호스트로 전환: 로컬 목록·감시를 끄고 기록은 같은 경로의 원격 호스트에 묶는다.
     cx.update(|_, cx| {
         view.update(cx, |p, cx| {
             p.disconnect_remote(&HostId::Remote("studio".into()), cx);
@@ -1585,7 +1585,11 @@ fn remote_workspace_without_transport_never_touches_colliding_local_repo(
         );
         assert!(p.search.remote);
         assert!(p.checks.inspection.is_none());
-        assert!(history.read(cx).build_search_query().paths.is_empty());
+        assert_eq!(history.read(cx).host(), &HostId::Remote("studio".into()));
+        assert_eq!(
+            history.read(cx).build_search_query().paths,
+            [scope_path.as_str()]
+        );
     });
     assert!(cx.debug_bounds("diff-empty-error").is_some());
 

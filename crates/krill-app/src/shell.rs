@@ -1028,13 +1028,13 @@ impl Shell {
         });
         let history_open = cx.subscribe(
             &history,
-            |this, _, &krill_app::agent_history::Open(s), cx| {
+            |this, _, event: &krill_app::agent_history::Open, cx| {
                 if !this.panel_collapsed
                     && this.diff.read(cx).active_tab() == krill_app::diff::PanelTab::History
                 {
                     this.toggle_panel(cx);
                 }
-                this.open_session(s, cx);
+                this.open_session_on(event.host.clone(), event.session, cx);
             },
         );
         cx.subscribe(
@@ -2107,9 +2107,7 @@ impl Shell {
             self.commit_ime(pane, Some(window), cx);
         }
         let (items, worktrees) = self.jump_entries(cx);
-        let ws = Some(self.folder().display().to_string());
-        self.history
-            .update(cx, |h, cx| h.update_scope_paths(ws.clone(), Vec::new(), cx));
+        let ws = self.sync_history_host(cx);
         let history = self.history.clone();
         let (actions, quick_commands) = Self::palette_entries(cx);
         let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
@@ -2246,9 +2244,7 @@ impl Shell {
             self.commit_ime(pane, Some(window), cx);
         }
         let (items, worktrees) = self.jump_entries(cx);
-        let ws = Some(self.folder().display().to_string());
-        self.history
-            .update(cx, |h, cx| h.update_scope_paths(ws.clone(), Vec::new(), cx));
+        let ws = self.sync_history_host(cx);
         let history = self.history.clone();
         let (actions, quick_commands) = Self::palette_entries(cx);
         let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
@@ -2287,11 +2283,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let vault_target = match *event {
-            jump::Event::ResumeVault(idx) => palette
-                .read(cx)
-                .vault_hit(idx)
-                .map(krill_proto::agent_history::VaultHit::target),
+        let vault_target = match event {
+            jump::Event::ResumeVault { target, context } => {
+                context.clone().map(|context| (target.clone(), context))
+            }
             _ => None,
         };
         let worktree = match *event {
@@ -2308,9 +2303,13 @@ impl Shell {
                 }
             }
             jump::Event::Action(kind) => self.run_palette_action(kind, window, cx),
-            jump::Event::ResumeVault(_) => {
-                if let Some(target) = vault_target {
-                    self.history.update(cx, |h, cx| h.resume_vault(target, cx));
+            jump::Event::ResumeVault { .. } => {
+                if let Some((target, context)) = vault_target {
+                    self.history.update(cx, |h, cx| {
+                        if h.context() == context {
+                            h.resume_vault(target, cx);
+                        }
+                    });
                 }
             }
             jump::Event::Dismiss => {}
@@ -2894,7 +2893,28 @@ impl Shell {
         cx.open_url(uri);
     }
 
+    fn sync_history_host(&self, cx: &mut Context<Self>) -> Option<String> {
+        let ws = self.active_workspace(cx);
+        let folder = self
+            .layout
+            .focused()
+            .map(|_| self.folder())
+            .unwrap_or_default();
+        let folder = if folder.as_os_str().is_empty() {
+            ws.folder
+        } else {
+            folder
+        };
+        let workspace = (!folder.as_os_str().is_empty()).then(|| folder.display().to_string());
+        let target = self.target_for_host(&ws.host);
+        self.history.update(cx, |history, cx| {
+            history.set_context(ws.host, target, workspace.clone(), Vec::new(), cx);
+        });
+        workspace
+    }
+
     pub(super) fn sync_diff_workspace(&mut self, cx: &mut Context<Self>) {
+        let _ = self.sync_history_host(cx);
         if self.layout.focused().is_none() {
             return;
         }
@@ -8594,3 +8614,6 @@ mod selection_tests;
 
 #[cfg(all(test, unix))]
 mod sidebar_scroll_tests;
+
+#[cfg(all(test, unix))]
+mod history_tests;

@@ -723,19 +723,30 @@ impl Panel {
         history: Entity<crate::agent_history::Panel>,
         cx: &mut Context<Self>,
     ) {
+        history.update(cx, |h, cx| {
+            h.update_scope_paths(Some(self.repo.display().to_string()), Vec::new(), cx);
+        });
         self.history = Some(history);
+        self.bind_history_target(cx);
         self.sync_history(cx);
+    }
+
+    fn bind_history_target(&self, cx: &mut Context<Self>) {
+        if let Some(history) = &self.history
+            && let Some(target) = self.explorer.target.clone()
+        {
+            let host = target.host().clone();
+            let connected = !target.socket().as_os_str().is_empty();
+            history.update(cx, |h, cx| {
+                h.set_host(host, connected.then_some(target), cx);
+            });
+        }
     }
 
     fn sync_history(&self, cx: &mut Context<Self>) {
         if let Some(history) = &self.history {
-            // 세션 히스토리는 이 Mac의 볼트를 작업공간 경로로 거른다. 원격 호스트 작업공간이면 같은 경로의
-            // 로컬 기록을 그 작업공간 것으로 보여 주지 않는다: 범위를 비우고 패널을 열지 않는다(APP-F01).
-            let remote = self.remote_host();
-            let open = self.visible && self.tab == PanelTab::History && !remote;
-            let scope = (!remote).then(|| self.repo.display().to_string());
+            let open = self.visible && self.tab == PanelTab::History;
             history.update(cx, |h, cx| {
-                h.update_scope_paths(scope, Vec::new(), cx);
                 if open != h.is_open() {
                     h.toggle(cx);
                 }
@@ -774,6 +785,7 @@ impl Panel {
         let previous_host = self.explorer.target.as_ref().map(HostTarget::host).cloned();
         let host_changed = previous_host.as_ref() != Some(target.host());
         self.explorer.connect(target.clone());
+        self.bind_history_target(cx);
         if host_changed {
             // 같은 경로라도 호스트가 다르면 다른 저장소다. 이전 호스트의 변경 목록·패치·검색 결과·PR 체크·
             // 병합 확인·기록 범위를 남기지 않는다. 목록은 새 호스트의 첫 스냅샷이 올 때까지 비워 둔다.
@@ -866,6 +878,11 @@ impl Panel {
         self.pending_diff_path = None;
         self.checks.reset();
         let old_repo = std::mem::replace(&mut self.repo, repo);
+        if let Some(history) = &self.history {
+            history.update(cx, |h, cx| {
+                h.update_scope_paths(Some(self.repo.display().to_string()), Vec::new(), cx);
+            });
+        }
         self.sync_history(cx);
         if self.visible
             && let Some(source) = self.source.clone()
@@ -2311,23 +2328,6 @@ impl Render for Panel {
         let top_bar = self.render_top_bar(cx);
 
         if self.tab == PanelTab::History {
-            // 원격 호스트의 기록은 이 Mac의 볼트에 없다. 같은 경로의 로컬 기록을 보여 주지 않는다(APP-F01).
-            let body = if self.remote_host() {
-                Self::render_empty_state(
-                    "history-remote-unsupported",
-                    IconName::Search,
-                    text::HISTORY_REMOTE_UNSUPPORTED.get(),
-                    "",
-                    cx,
-                )
-                .into_any_element()
-            } else {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .children(self.history.clone())
-                    .into_any_element()
-            };
             return div()
                 .size_full()
                 .min_w_0()
@@ -2339,7 +2339,7 @@ impl Render for Panel {
                 .text_size(crate::ui::TEXT_SM)
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
-                .child(body);
+                .child(div().flex_1().min_h_0().children(self.history.clone()));
         }
 
         if self.tab == PanelTab::Files {

@@ -3569,7 +3569,10 @@ fn history_resume_opens_new_tab_without_replacing_existing_session(cx: &mut Test
     });
     let panel = view.read_with(cx, |shell, _| shell.history.clone());
     panel.update(cx, |_, cx| {
-        cx.emit(krill_app::agent_history::Open(krill_proto::SessionId(99)));
+        cx.emit(krill_app::agent_history::Open {
+            host: krill_app::hosts::HostId::Local,
+            session: krill_proto::SessionId(99),
+        });
     });
     cx.run_until_parked();
     let layout = layout_of(&view, cx);
