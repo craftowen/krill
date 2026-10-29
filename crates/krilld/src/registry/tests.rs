@@ -828,6 +828,33 @@ fn telemetry_publisher_defaults_on_and_respects_opt_out_and_environment_vetoes()
 }
 
 #[test]
+fn daemon_startup_collects_expired_orphan_launch_metadata() {
+    let dir = std::env::temp_dir().join(format!("startup-launch-gc-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let agents = crate::agent::control::Control::new(Some(&dir));
+    let id = SessionId(42);
+    agents
+        .remember(
+            id,
+            &control::AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+        )
+        .unwrap();
+    let old = SystemTime::now() - Duration::from_hours(8 * 24);
+    fs::File::options()
+        .write(true)
+        .open(dir.join("agent-launches/42.json"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    assert!(!reg.agents.has(id));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn monitor_tick_collects_history_on_interval_without_restart() {
     let dir = std::env::temp_dir().join(format!("mk587-gc-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
@@ -2080,6 +2107,20 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
         st.exited.insert(id, 0);
     }
 
+    reg.agents
+        .remember(
+            id,
+            &control::AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+        )
+        .unwrap();
+    reg.on_exited(id, 0);
+    assert!(
+        reg.agents.has(id),
+        "natural exit must preserve resume metadata"
+    );
     let full = Peer {
         pid: None,
         scope: Scope::Full,
@@ -2089,6 +2130,10 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
         Reply::Closed
     );
     assert!(dir.join("sessions/42.noindex/closed").is_file());
+    assert!(
+        !reg.agents.has(id),
+        "explicit close must forget launch metadata"
+    );
     assert_eq!(
         reg.handle(&full, Request::Cold { session: id }, &mut HashMap::new()),
         Reply::Failed(Failure::NoSession)

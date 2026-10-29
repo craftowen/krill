@@ -209,6 +209,7 @@ impl Registry {
         });
         let (holder, kept) = holder.map_or((None, Vec::new()), |(h, k)| (Some(Arc::new(h)), k));
         let kept_count = kept.len();
+        let kept_ids: Vec<_> = kept.iter().map(|session| session.id).collect();
         let reg = Self {
             app_opened: OnceLock::new(),
             last_gc: Mutex::new(Instant::now()),
@@ -298,6 +299,12 @@ impl Registry {
             crate::agent::claude::sweep(d, &live);
         }
         drop(st);
+        // A missing recorder must not turn recoverable launch metadata into an orphan.
+        if reg.store.is_some()
+            && let Err(error) = reg.agents.sweep(&kept_ids, SystemTime::now())
+        {
+            tracing::warn!(kind = ?error.kind(), "orphan agent launch cleanup failed");
+        }
         reg.status.retain(&live);
         reg.drain_spool();
         if kept_count > 0 {

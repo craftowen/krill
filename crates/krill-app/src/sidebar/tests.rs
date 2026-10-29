@@ -6406,6 +6406,62 @@ fn remote_host_worktree_creation_and_child_lineage(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn missing_daemon_sessions_leave_sidebar_and_local_caches(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+    sidebar.update(cx, |sidebar, cx| {
+        let mut done = session(203, AgentState::Done, None);
+        done.cwd = Some("/tmp/probe".into());
+        done.status.agent = "claude".into();
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![done.clone()],
+                    ..Snapshot::default()
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(
+            sidebar
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Session(s, _) if s.id == done.id))
+        );
+        sidebar.titles.insert(done.id, "screen title".into());
+        sidebar.auto_titles.insert(done.id, "prompt title".into());
+        sidebar.unread.insert(done.id);
+        sidebar.set_remote_snapshot_for_test(
+            "remote",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![done.clone()],
+                ..Snapshot::default()
+            },
+            cx,
+        );
+        sidebar.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
+        assert!(sidebar.snapshot.sessions.is_empty());
+        assert!(!sidebar.titles.contains_key(&done.id));
+        assert!(!sidebar.auto_titles.contains_key(&done.id));
+        assert!(!sidebar.unread.contains(&done.id));
+        assert_eq!(
+            sidebar.dashboard_sessions().len(),
+            1,
+            "the other host matching ID must survive"
+        );
+        assert!(
+            sidebar
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Session(s, _) if s.id == done.id))
+        );
+    });
+}
+
+#[gpui::test]
 fn exited_processes_leave_sidebar_dashboard_counts_and_unread(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));

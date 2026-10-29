@@ -758,6 +758,50 @@ impl Control {
         lock(&self.veto).contains(&session)
     }
 
+    /// Prune expired orphan metadata before the daemon accepts new launches. Keep holder-owned
+    /// sessions (including failed reader reattachments), cold history and hibernation resumes.
+    /// This is startup-only: a running daemon may have remembered a launch before registering it.
+    pub fn sweep(&self, kept: &[SessionId], now: std::time::SystemTime) -> io::Result<()> {
+        let Some(root) = &self.dir else { return Ok(()) };
+        let _guard = lock(&self.config);
+        let entries = match fs::read_dir(root.join("agent-launches")) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|name| name.parse::<u64>().ok())
+                .map(SessionId)
+            else {
+                continue;
+            };
+            if kept.contains(&id) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if !metadata.is_file()
+                || now.duration_since(metadata.modified()?).unwrap_or_default()
+                    <= crate::store::Limits::default().keep_closed
+                || root
+                    .join("sessions")
+                    .join(format!("{}.noindex", id.0))
+                    .try_exists()?
+                || root
+                    .join("hibernated")
+                    .join(id.0.to_string())
+                    .try_exists()?
+            {
+                continue;
+            }
+            fs::remove_file(entry.path())?;
+        }
+        Ok(())
+    }
+
     pub fn forget(&self, session: SessionId) {
         self.finish_account_resume(session);
         lock(&self.veto).remove(&session);
