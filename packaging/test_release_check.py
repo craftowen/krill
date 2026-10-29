@@ -139,5 +139,18 @@ class ValidationTests(unittest.TestCase):
                     rc.validate(HEAD, root / "stage4", key)
 
 
+class MobileBrowserGateTests(unittest.TestCase):
+    def test_gate_runs_every_real_browser_suite_against_release_binaries_and_restores_env(self):
+        release = Path("/tmp/release-bin")
+        seen = []
+        with patch.object(rc, "run", lambda args, **kwargs: seen.append((list(args), os.environ["KRILLD_BIN"]))):
+            os.environ.pop("KRILLD_BIN", None)
+            rc.mobile_browser_gate(release)
+        self.assertEqual([Path(args[1]).name for args, _ in seen], [script for script, *_ in rc.MOBILE_BROWSER_TESTS])
+        self.assertTrue(all(binary == str(release / "krilld") for _, binary in seen))
+        self.assertNotIn("KRILLD_BIN", os.environ)
+        self.assertIn("mobile-real-browser", rc.SCOPE)
+
+
 if __name__ == "__main__":
     unittest.main()
