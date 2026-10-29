@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(all(test, unix))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -78,16 +77,49 @@ fn lookup_cached_doc(path: &Path, mtime_ns: u128, size: u64) -> Option<CachedVau
     }
 }
 
+/// 캐시가 붙드는 문서 텍스트 총량 상한(데몬 메모리 예산 보호). 항목 수 상한과 별개로 바이트로 막는다.
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+static VAULT_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+impl VaultDoc {
+    fn text_bytes(&self) -> usize {
+        self.id.len()
+            + self.cwd.len()
+            + self.title.len()
+            + self.summary.len()
+            + self
+                .messages
+                .iter()
+                .map(|(role, text)| role.len() + text.len())
+                .sum::<usize>()
+    }
+}
+
 fn store_cached_doc(path: &Path, entry: CachedVaultDoc) {
+    store_cached_doc_capped(path, entry, MAX_CACHE_BYTES);
+}
+
+fn store_cached_doc_capped(path: &Path, entry: CachedVaultDoc, max_bytes: usize) {
     let mut guard = VAULT_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.len() >= MAX_CACHE_ENTRIES
-        && !guard.contains_key(path)
+    // 락을 잡은 채로만 합계를 바꾼다.
+    if let Some(old) = guard.remove(path) {
+        VAULT_CACHE_BYTES.fetch_sub(old.doc.text_bytes(), Ordering::Relaxed);
+    }
+    let bytes = entry.doc.text_bytes();
+    if bytes > max_bytes {
+        return;
+    }
+    while (guard.len() >= MAX_CACHE_ENTRIES
+        || VAULT_CACHE_BYTES.load(Ordering::Relaxed) + bytes > max_bytes)
         && let Some(first_key) = guard.keys().next().cloned()
     {
-        guard.remove(&first_key);
+        if let Some(evicted) = guard.remove(&first_key) {
+            VAULT_CACHE_BYTES.fetch_sub(evicted.doc.text_bytes(), Ordering::Relaxed);
+        }
     }
+    VAULT_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     guard.insert(path.to_path_buf(), entry);
 }
 
@@ -2997,5 +3029,45 @@ mod path_scope_regressions {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cache_budget_tests {
+    use super::*;
+
+    fn entry(bytes: usize) -> CachedVaultDoc {
+        CachedVaultDoc {
+            mtime_ns: 1,
+            size: 1,
+            doc: VaultDoc {
+                agent: VaultAgent::Claude,
+                id: String::new(),
+                cwd: String::new(),
+                modified: 0,
+                title: String::new(),
+                summary: String::new(),
+                messages: vec![(String::new(), "x".repeat(bytes))],
+            },
+            has_primary_title: true,
+            partial: false,
+            skipped: false,
+        }
+    }
+
+    #[test]
+    fn cache_is_bounded_by_bytes() {
+        let (a, b, c) = (Path::new("/a"), Path::new("/b"), Path::new("/c"));
+        store_cached_doc_capped(a, entry(600), 1000);
+        store_cached_doc_capped(b, entry(600), 1000);
+        assert!(lookup_cached_doc(a, 1, 1).is_none(), "oldest entry evicted");
+        assert!(lookup_cached_doc(b, 1, 1).is_some());
+        store_cached_doc_capped(c, entry(2000), 1000);
+        assert!(
+            lookup_cached_doc(c, 1, 1).is_none(),
+            "oversized doc not retained"
+        );
+        assert!(lookup_cached_doc(b, 1, 1).is_some());
+        assert_eq!(VAULT_CACHE_BYTES.load(Ordering::Relaxed), 600);
     }
 }
