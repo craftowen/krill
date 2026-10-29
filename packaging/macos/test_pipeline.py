@@ -146,6 +146,7 @@ class PipelineTests(unittest.TestCase):
         )
         pub_hex = keygen.stdout.strip()
         self.assertRegex(pub_hex, r"^[0-9a-f]{64}$")
+        self.assertIn("created a NEW Ed25519 update signing key", keygen.stderr)
         self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
         pub_file = pathlib.Path(f"{key_file}.pub")
         self.assertTrue(pub_file.is_file())
@@ -157,6 +158,7 @@ class PipelineTests(unittest.TestCase):
             capture_output=True, text=True, check=True,
         )
         self.assertEqual(keygen2.stdout.strip(), pub_hex)
+        self.assertEqual(keygen2.stderr, "")
 
         manifest_path = self.output / "latest.json"
         sha = "ab" * 32
