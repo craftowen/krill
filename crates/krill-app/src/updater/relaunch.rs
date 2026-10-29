@@ -528,7 +528,16 @@ pub fn relaunch_and_verify(
 
     let ready = ready_path(state_dir, to_version);
     fs::remove_file(&ready).ok();
-    let mut child = spawn_bundle_app(app_bundle, state_dir, Some(&ready))?;
+    let mut child = match spawn_bundle_app(app_bundle, state_dir, Some(&ready)) {
+        Ok(child) => child,
+        Err(error) => {
+            // 구 앱은 이미 끝났다. 새 앱을 띄우지 못한 채 끝나면 아무 앱도 없이 새 번들만 남는다.
+            let reason = format!("new app exited before ready ({error})");
+            rollback_from(MODE, app_bundle, state_dir, &reason, Backup::Complete)?;
+            let restored = spawn_bundle_app(app_bundle, state_dir, None)?;
+            return Ok(RelaunchOutcome::RolledBack { reason, restored });
+        }
+    };
     let deadline = Instant::now()
         .checked_add(health_timeout)
         .unwrap_or_else(Instant::now);
