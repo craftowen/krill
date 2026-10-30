@@ -296,7 +296,15 @@ enum BoundaryState {
     String {
         osc: bool,
     },
-    Utf8(u8),
+    /// 남은 연속 바이트 수와 다음 바이트가 가질 수 있는 범위(선두 바이트별 잘못된 인코딩 거절).
+    Utf8 {
+        left: u8,
+        lo: u8,
+        hi: u8,
+    },
+}
+const fn utf8(left: u8, lo: u8, hi: u8) -> BoundaryState {
+    BoundaryState::Utf8 { left, lo, hi }
 }
 impl Boundary {
     pub fn advance(&mut self, bytes: &[u8]) {
@@ -310,13 +318,21 @@ impl Boundary {
             self.pending = self.pending.saturating_add(1);
             match self.state {
                 BoundaryState::Ground => self.start(byte),
-                BoundaryState::Utf8(left) => {
-                    if byte & 0xc0 != 0x80 {
-                        self.start(byte);
+                BoundaryState::Utf8 { left, lo, hi } => {
+                    if !(lo..=hi).contains(&byte) {
+                        if byte & 0xc0 == 0x80 {
+                            self.clear();
+                        } else {
+                            self.start(byte);
+                        }
                     } else if left == 1 {
                         self.clear();
                     } else {
-                        self.state = BoundaryState::Utf8(left - 1);
+                        self.state = BoundaryState::Utf8 {
+                            left: left - 1,
+                            lo: 0x80,
+                            hi: 0xbf,
+                        };
                     }
                 }
                 BoundaryState::Escape => match byte {
@@ -358,9 +374,13 @@ impl Boundary {
         self.pending = 1;
         self.state = match byte {
             0x1b => BoundaryState::Escape,
-            0xc2..=0xdf => BoundaryState::Utf8(1),
-            0xe0..=0xef => BoundaryState::Utf8(2),
-            0xf0..=0xf4 => BoundaryState::Utf8(3),
+            0xc2..=0xdf => utf8(1, 0x80, 0xbf),
+            0xe0 => utf8(2, 0xa0, 0xbf),
+            0xed => utf8(2, 0x80, 0x9f),
+            0xe1..=0xef => utf8(2, 0x80, 0xbf),
+            0xf0 => utf8(3, 0x90, 0xbf),
+            0xf4 => utf8(3, 0x80, 0x8f),
+            0xf1..=0xf3 => utf8(3, 0x80, 0xbf),
             _ => {
                 self.clear();
                 return;
