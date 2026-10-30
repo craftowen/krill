@@ -307,3 +307,19 @@ fn chain_that_never_exits_is_killed_at_the_deadline() {
         started.elapsed()
     );
 }
+
+#[test]
+fn chain_output_is_kept_when_a_background_child_holds_stdout_open() {
+    let started = std::time::Instant::now();
+    let out = run_chain_within(
+        OsStr::new("echo hi; sleep 3 2>/dev/null &"),
+        b"{}",
+        Duration::from_secs(1),
+    );
+    assert_eq!(String::from_utf8_lossy(&out), "hi\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
