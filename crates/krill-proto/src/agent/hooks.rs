@@ -87,19 +87,7 @@ pub fn command(exe: &Path, agent: Agent) -> Option<String> {
     let exe = exe.to_str()?;
     #[cfg(windows)]
     if agent == Agent::Codex {
-        use base64::Engine as _;
-        // Codex invokes hooks through cmd.exe. Encode the fixed PowerShell script
-        // so %, $, quotes and shell metacharacters in the executable stay literal.
-        // The native hook already returns {} outside a Krill pane.
-        let script = format!(
-            "& '{}' hook codex; exit $LASTEXITCODE",
-            exe.replace('\'', "''")
-        );
-        let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        return Some(format!(
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}"
-        ));
+        return Some(windows_codex_command(exe));
     }
     Some(format!(
         "if [ -n \"${{MK_PANE_ID:-}}\" ]; then exec {} hook {}; else printf '{{}}\\n'; fi",
@@ -107,6 +95,31 @@ pub fn command(exe: &Path, agent: Agent) -> Option<String> {
         agent.id()
     ))
 }
+
+#[cfg(any(windows, test))]
+fn windows_codex_command(exe: &str) -> String {
+    use base64::Engine as _;
+    // Codex starts this through cmd.exe. Encoding protects the literal path;
+    // ProcessStartInfo forwards raw stdin without PowerShell's object pipeline.
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         if (-not $env:MK_PANE_ID) {{ [Console]::WriteLine('{{}}'); exit 0 }}; \
+         $info=[Diagnostics.ProcessStartInfo]::new(); \
+         $info.FileName='{}'; $info.Arguments='hook codex'; \
+         $info.UseShellExecute=$false; $info.RedirectStandardInput=$true; \
+         $info.CreateNoWindow=$true; $child=[Diagnostics.Process]::Start($info); \
+         try {{ [Console]::OpenStandardInput().CopyTo($child.StandardInput.BaseStream) }} \
+         finally {{ $child.StandardInput.Close() }}; \
+         $child.WaitForExit(); $code=$child.ExitCode; $child.Dispose(); exit $code",
+        exe.replace('\'', "''")
+    );
+    let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}")
+}
+
+#[cfg(all(windows, test))]
+mod windows_tests;
 
 /// Event from Codex's synthetic session layer key. Keep the original key when
 /// persisting trust: Windows uses C:\\<session-flags> while Unix uses /<session-flags>.
@@ -361,6 +374,28 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_codex_command_encodes_literal_path_and_raw_stdin() {
+        use base64::Engine as _;
+        let command = windows_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe");
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let utf16: Vec<_> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        let script = String::from_utf16(&utf16).unwrap();
+        assert!(script.contains(r"$info.FileName='C:\한글 ''$ & %USERNAME%\krill.exe'"));
+        assert!(script.contains("$ErrorActionPreference='Stop'"));
+        assert!(script.contains("if (-not $env:MK_PANE_ID)"));
+        assert!(script.contains("OpenStandardInput().CopyTo($child.StandardInput.BaseStream)"));
+        assert!(script.contains("exit $code"));
+    }
 
     #[test]
     fn codex_session_keys_accept_native_roots_without_trusting_other_sources() {

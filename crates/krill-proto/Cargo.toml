@@ -28,6 +28,7 @@ uds_windows = { workspace = true }
 same-file = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 proptest = { workspace = true }
 
 [lints]
