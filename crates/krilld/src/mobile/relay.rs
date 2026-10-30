@@ -35,6 +35,8 @@ const PEER_QUEUE_BYTES: usize = 2 * MAX_PLAINTEXT;
 const READ_BUDGET: usize = 64 * 1024;
 const MAX_RX_BUFFER: usize = MAX_PLAINTEXT + 80;
 const PING: Duration = Duration::from_secs(30);
+/// Close code for a full relay. client.js reads 1013 as an auth cooldown and waits 65s.
+const RETRY_CLOSE: u16 = 1011;
 
 pub fn encode_mux(kind: u8, conn_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len().saturating_add(5));
@@ -671,7 +673,7 @@ fn handle_mux_frame(
                     .filter(|c| c.device.is_none())
                     .count();
                 if pending >= MAX_PENDING || state.connections.len() >= MAX_CONNECTIONS {
-                    outbox.send_close(conn_id, 1013);
+                    outbox.send_close(conn_id, RETRY_CLOSE);
                     return;
                 }
                 let Some(id) = state.next.checked_add(1) else {
@@ -737,7 +739,7 @@ fn handle_mux_frame(
             {
                 s.tx.close();
                 s.stream.shutdown(Shutdown::Both).ok();
-                outbox.send_close(conn_id, 1013);
+                outbox.send_close(conn_id, RETRY_CLOSE);
             }
         }
         MUX_BINARY => {
@@ -748,7 +750,7 @@ fn handle_mux_frame(
             {
                 s.tx.close();
                 s.stream.shutdown(Shutdown::Both).ok();
-                outbox.send_close(conn_id, 1013);
+                outbox.send_close(conn_id, RETRY_CLOSE);
             }
         }
         MUX_CLOSE => {
