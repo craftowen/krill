@@ -70,7 +70,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
 }
 
 /// `--check` 결과: 실행 중인 krilld가 이 빌드보다 오래됐는지만 보고한다(교체하지 않는다).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn daemon_check_report(current: &str, running: &str, json: bool) -> String {
     let available = krill_proto::control::is_newer(current, running) == Some(true);
     if json {
