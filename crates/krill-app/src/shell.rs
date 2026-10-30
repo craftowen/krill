@@ -4180,6 +4180,7 @@ impl Shell {
             visible.contains(p)
                 || layout.pane_exists(*p)
                     && (live.pane.keep_account_input()
+                        || live.pane.has_pending_input()
                         || live.pane.session().is_none()
                         || paste_queue.has_pending_for(*p))
         });
@@ -4545,7 +4546,7 @@ impl Shell {
             && !self
                 .live
                 .get(&pane)
-                .is_some_and(|live| live.pane.keep_account_input())
+                .is_some_and(|live| live.pane.keep_account_input() || live.pane.has_pending_input())
         {
             self.live.remove(&pane);
             return Next::Gone;

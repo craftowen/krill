@@ -715,9 +715,12 @@ fn keys_ime_and_frames_reach_the_focused_pane(cx: &mut TestAppContext) {
     cx.simulate_input("한");
 
     let mut got = Vec::new();
+    let mut last = None;
     while got.len() < 4 {
         let (k, b) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
-        got.push(Input::decode(k, &b).unwrap().bytes);
+        let input = Input::decode(k, &b).unwrap();
+        last = Some(input.id);
+        got.push(input.bytes);
     }
     assert_eq!(
         got,
@@ -730,6 +733,17 @@ fn keys_ime_and_frames_reach_the_focused_pane(cx: &mut TestAppContext) {
     );
     theirs.set_nonblocking(true).unwrap();
     assert!(theirs.read(&mut [0; 16]).is_err(), "no more input");
+    // 숨긴 칸은 ACK를 기다리는 입력이 없을 때만 연결을 놓는다.
+    let ack = krill_proto::input::InputAck {
+        id: last.unwrap(),
+        result: krill_proto::input::InputResult::Applied,
+    }
+    .encode()
+    .unwrap();
+    let (k, b) = krill_proto::ipc::read_frame(&mut ack.as_slice())
+        .unwrap()
+        .unwrap();
+    cx.update(|_, cx| view.update(cx, |s, cx| assert!(s.on_frame(pane, k, &b, cx))));
     // 단축키는 세션에 가지 않고, 새 탭으로 안 보이게 된 칸은 연결을 닫는다(EOF).
     cx.simulate_keystrokes("cmd-t");
     assert_eq!(theirs.read(&mut [0; 16]).unwrap(), 0);
