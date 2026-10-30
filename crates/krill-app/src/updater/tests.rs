@@ -1211,6 +1211,124 @@ fn automatic_poll_does_not_restage_a_rolled_back_version() {
     server.join().ok();
 }
 
+/// 롤백 직후 자동 점검이 매니페스트를 받는 중에 사용자가 직접 점검하면, 직접 점검은 자동 점검의
+/// "건너뜀" 결과를 공유하지 말고 스스로 다시 시도해야 한다.
+#[test]
+fn explicit_check_during_automatic_poll_is_not_given_the_skip_result() {
+    let d = TempGuard(temp_dir("rolled-back-overlap"));
+    let state = d.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let (kp, pk) = fresh_key();
+    fs::write(
+        state.join(CONFIG_FILE),
+        format!("public_key = \"{}\"\n", encode_hex(&pk)),
+    )
+    .unwrap();
+
+    let app = d.0.join("Krill.app");
+    build_test_app_bundle(&app, "0.1.0", "exit 0", true);
+    let broken = d.0.join("src-0.2.0/Krill.app");
+    build_test_app_bundle(&broken, "0.2.0", "exit 42", true);
+    let zip = zip_bundle(&broken, &d.0.join("v2.zip"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let mut m = Manifest {
+        version: "0.2.0".to_owned(),
+        url: format!("{base_url}/Krill-0.2.0.zip"),
+        sha256: sha256_hex(&zip),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    sign_manifest_with(&kp, &mut m);
+    let m_json = serde_json::to_vec(&m).unwrap();
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let hold_server = hold.clone();
+    let server = thread::spawn(move || {
+        let mut held_first = false;
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/");
+            if path == "/latest.json"
+                && hold_server.load(std::sync::atomic::Ordering::SeqCst)
+                && !held_first
+            {
+                held_first = true;
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+            }
+            let body: &[u8] = match path {
+                "/latest.json" => &m_json,
+                "/Krill-0.2.0.zip" => &zip,
+                "/stop" => break,
+                _ => b"not found",
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).ok();
+            stream.write_all(body).ok();
+        }
+    });
+
+    let url = format!("{base_url}/latest.json");
+    let exe = std::env::current_exe().unwrap();
+    let bundle = app.to_string_lossy().into_owned();
+    let staged = poll_update_with(Some(&url), Some(&bundle), false, &exe, &state)
+        .unwrap()
+        .expect("first automatic poll stages 0.2.0");
+    let outcome = relaunch_and_verify(
+        &app,
+        &state,
+        &staged.from_version,
+        &staged.to_version,
+        None,
+        Duration::from_secs(5),
+        &CodesignVerifier::adhoc(),
+    )
+    .unwrap();
+    let RelaunchOutcome::RolledBack { mut restored, .. } = outcome else {
+        panic!("broken 0.2.0 must roll back");
+    };
+    restored.wait().unwrap();
+
+    hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    let auto = {
+        let (url, app, state) = (url.clone(), app.clone(), state.clone());
+        thread::spawn(move || stage_update_for_bundle(Some(&url), &app, &state))
+    };
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("automatic poll reaches the manifest request");
+    let manual = {
+        let (url, app, state) = (url.clone(), app.clone(), state.clone());
+        thread::spawn(move || check_and_stage_with(Some(&url), &app, &state, false))
+    };
+    thread::sleep(Duration::from_millis(300));
+    release_tx.send(()).unwrap();
+
+    assert_eq!(auto.join().unwrap().unwrap().map(|s| s.to_version), None);
+    assert!(
+        matches!(manual.join().unwrap().unwrap(), CheckStatus::Ready(_)),
+        "an explicit check must retry instead of sharing the automatic skip"
+    );
+
+    fetch_bytes(&format!("{base_url}/stop"), 64).ok();
+    server.join().ok();
+}
+
 /// AS-05: 점진 롤아웃 버킷은 기기마다 안정적이고 0..100에 든다.
 #[test]
 fn rollout_bucket_is_stable_per_state_dir() {
