@@ -1,0 +1,48 @@
+{
+  "repository": "https://github.com/stablyai/orca",
+  "revision": "a0c46b405ff33aa950e26d5e4c67f373932c3a2f",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 Lovecast Inc.",
+  "files": [
+    {
+      "file": "openai.svg",
+      "source": "src/renderer/src/components/status-bar/icons.tsx",
+      "component": "OpenAIIcon",
+      "modifications": "JSX converted to SVG; size and React/CSS attributes removed; geometry, fills and viewBox preserved",
+      "sha256": "b3f7744d8234a15d8d084d1b636791216d59a8832e3d207ed26274ab7dfe4f48"
+    },
+    {
+      "file": "claude.svg",
+      "source": "src/renderer/src/components/status-bar/icons.tsx",
+      "component": "ClaudeIcon",
+      "modifications": "JSX converted to SVG; size and React/CSS attributes removed; geometry, fills and viewBox preserved",
+      "sha256": "f4db671ba36810d046b366612b51cc8f65a05f5e78210bb690bd3778d420e0a5"
+    },
+    {
+      "file": "pi.svg",
+      "source": "src/renderer/src/lib/agent-icon-glyphs.tsx",
+      "component": "PiIcon",
+      "modifications": "JSX converted to SVG; size and React/CSS attributes removed; geometry, fills and viewBox preserved",
+      "sha256": "15d76337e4c694ad2bc808fb34c2d9c4f6d9d1bb64c61e6ca849dbc2c595348d"
+    },
+    {
+      "file": "opencode.svg",
+      "source": "src/renderer/src/lib/agent-icon-glyphs.tsx",
+      "component": "OpenCodeIcon",
+      "modifications": "JSX converted to SVG; size and React/CSS attributes removed; geometry, fills and viewBox preserved",
+      "sha256": "c8bcf9cfeb40bd21cc9d206afac48dfb04f80ccafa764e2a09045a878c6e5fac"
+    },
+    {
+      "file": "antigravity.png",
+      "source": "src/shared/agent-icons/antigravity.png",
+      "modifications": "none",
+      "sha256": "837e7b113fba39a6258cb43db6b69a5548688912ffeac1dccad213d9ff537db3"
+    },
+    {
+      "file": "cursor.png",
+      "source": "src/shared/agent-icons/cursor.png",
+      "modifications": "none",
+      "sha256": "1910c1c724f7c7e33188885b237d2bc64a261a7d8afa38c88679cf6e42d9c432"
+    }
+  ]
+}

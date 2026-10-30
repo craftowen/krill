@@ -2131,16 +2131,16 @@ mod tests {
         });
     }
 
-    /// OWE-886: 탭·패인 헤더 에이전트 아이콘은 브랜드 SVG(`agent_svg_bytes`)로 통일하며,
+    /// OWE-886: 탭·패인 헤더 에이전트 아이콘은 브랜드 자산(`agent_icon_bytes`)로 통일하며,
     /// 핀 고정 아이콘(`PIN_SVG`)과 겹치지 않아야 한다.
     #[test]
     fn brand_icons_differ_from_pin() {
         let pin = ui::icons::PIN_SVG;
         let icons = [
-            ("claude", ui::icons::agent_svg_bytes("claude")),
-            ("codex", ui::icons::agent_svg_bytes("codex")),
-            ("agy", ui::icons::agent_svg_bytes("agy")),
-            ("cursor", ui::icons::agent_svg_bytes("cursor")),
+            ("claude", ui::icons::agent_icon_bytes("claude")),
+            ("codex", ui::icons::agent_icon_bytes("codex")),
+            ("agy", ui::icons::agent_icon_bytes("agy")),
+            ("cursor", ui::icons::agent_icon_bytes("cursor")),
         ];
         for (name, bytes) in icons {
             assert_ne!(bytes, pin, "{name}가 핀 아이콘과 같음");

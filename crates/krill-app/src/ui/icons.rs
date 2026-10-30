@@ -1,8 +1,8 @@
-//! 공식 배포 원본을 사용하는 AI 프로바이더·에이전트 브랜드 아이콘.
+//! Orca의 프로바이더·에이전트 로고와 표시 방식을 공유한다.
 //!
-//! 원본·출처·SHA-256은 `icons/official/`에 보존한다. 브랜드는 RGB 이미지로 표시하고,
-//! 유틸리티 아이콘만 단색 SVG 마스크를 사용한다. 프로젝트 아이콘 매핑은 Orca에서 차용했다
-//! (Copyright (c) 2026 Lovecast Inc., MIT License).
+//! Copyright (c) 2026 Lovecast Inc., MIT License.
+//! 출처·SHA-256·라이선스는 `icons/orca/`에 보존한다. 단색 글리프는 테마 전경색,
+//! Claude는 원래 Clay 색, Antigravity·Cursor는 Orca의 PNG 원본으로 표시한다.
 
 use gpui::{Hsla, ParentElement as _, Styled as _, div, px, rgb};
 use gpui_component::{Icon, Sizable as _};
@@ -10,7 +10,7 @@ use krill_proto::usage::ProviderKind;
 
 mod brands;
 
-pub use brands::{ANTIGRAVITY_SVG, CLAUDE_SVG, CURSOR_SVG, OPENAI_SVG, OPENCODE_SVG, PI_SVG};
+pub use brands::{ANTIGRAVITY_PNG, CLAUDE_SVG, CURSOR_PNG, OPENAI_SVG, OPENCODE_SVG, PI_SVG};
 
 /// 커스텀 에이전트 메뉴용 중립 봇 마크. 특정 프로바이더 로고로 오인하지 않게 한다.
 pub const CUSTOM_AGENT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5M23 12v5M9 17h6"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>"#;
@@ -142,34 +142,34 @@ pub const ANTIGRAVITY_BLUE: u32 = 0x0031_86ff;
 /// 사용자 정의 커스텀 에이전트 기본 브랜드 앰버(`#F59E0B`).
 pub const CUSTOM_AGENT_COLOR: u32 = 0x00f5_9e0b;
 
-/// 에이전트 ID에 대응하는 공식 SVG 바이트를 돌려준다.
+/// 에이전트 ID에 대응하는 Orca 자산 바이트(SVG 또는 PNG)를 돌려준다.
 #[must_use]
-pub fn agent_svg_bytes(agent_id: &str) -> &'static [u8] {
+pub fn agent_icon_bytes(agent_id: &str) -> &'static [u8] {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => CLAUDE_SVG,
         "codex" => OPENAI_SVG,
-        "agy" => ANTIGRAVITY_SVG,
+        "agy" => ANTIGRAVITY_PNG,
         "pi" => PI_SVG,
-        "cursor" | "cursor-agent" => CURSOR_SVG,
+        "cursor" | "cursor-agent" => CURSOR_PNG,
         "opencode" => OPENCODE_SVG,
         _ => CUSTOM_AGENT_SVG,
     }
 }
 
-/// 프로바이더 종류에 대응하는 공식 SVG 바이트를 돌려준다.
+/// 프로바이더 종류에 대응하는 Orca 자산 바이트(SVG 또는 PNG)를 돌려준다.
 #[must_use]
-pub const fn provider_svg_bytes(provider: ProviderKind) -> &'static [u8] {
+pub const fn provider_icon_bytes(provider: ProviderKind) -> &'static [u8] {
     match provider {
         ProviderKind::Claude => CLAUDE_SVG,
         ProviderKind::Codex => OPENAI_SVG,
         // `Gemini`는 제거된 wire tombstone(krill-proto `usage.rs`)이라 빈 값을 유지한다.
         ProviderKind::Gemini => &[],
-        ProviderKind::Antigravity => ANTIGRAVITY_SVG,
+        ProviderKind::Antigravity => ANTIGRAVITY_PNG,
         ProviderKind::OpenCode => OPENCODE_SVG,
     }
 }
 
-/// 계정 아바타 보조 색. 공식 마크 렌더링에는 사용하지 않는다.
+/// 계정 아바타와 SVG 글리프 색. PNG 원본의 색은 바꾸지 않는다.
 #[must_use]
 pub fn provider_brand_color(provider: ProviderKind, fg: Hsla) -> Hsla {
     match provider {
@@ -180,7 +180,7 @@ pub fn provider_brand_color(provider: ProviderKind, fg: Hsla) -> Hsla {
     }
 }
 
-/// 에이전트의 보조 UI 색. 공식 마크 렌더링에는 사용하지 않는다.
+/// 에이전트의 보조 UI와 SVG 글리프 색. PNG 원본의 색은 바꾸지 않는다.
 #[must_use]
 pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
     match krill_proto::agent::canonical_id(agent_id) {
@@ -191,13 +191,13 @@ pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
     }
 }
 
-/// 버튼·팝업 메뉴에도 원본 RGB와 공식 테마 변형을 보존한다.
+/// 메뉴에서도 Orca의 단색 글리프·Clay 색·PNG 원본을 사용한다.
 #[must_use]
 pub fn provider_menu_icon(provider: ProviderKind) -> Icon {
     brands::provider_icon(provider).unwrap_or_default()
 }
 
-/// 버튼·팝업 메뉴 항목용 공식 원본. 사용자 정의 에이전트만 중립 봇으로 표시한다.
+/// 버튼·팝업 메뉴 항목용 Orca 자산. 사용자 정의 에이전트만 중립 봇으로 표시한다.
 #[must_use]
 pub fn agent_menu_icon(agent_id: &str) -> Icon {
     brands::agent_icon(agent_id).unwrap_or_else(|| {
@@ -207,8 +207,8 @@ pub fn agent_menu_icon(agent_id: &str) -> Icon {
     })
 }
 
-/// 상태바·계정 화면·메뉴 모두 같은 공식 원본과 이미지 렌더 경로를 쓴다.
-pub fn provider_icon(provider: ProviderKind, size_px: f32, _fg: Hsla) -> gpui::Div {
+/// 상태바·계정 화면·메뉴 모두 같은 Orca 자산을 쓴다.
+pub fn provider_icon(provider: ProviderKind, size_px: f32, fg: Hsla) -> gpui::Div {
     let boxed = div()
         .size(px(size_px))
         .flex_none()
@@ -216,13 +216,16 @@ pub fn provider_icon(provider: ProviderKind, size_px: f32, _fg: Hsla) -> gpui::D
         .items_center()
         .justify_center();
     match brands::provider_icon(provider) {
-        Some(icon) => boxed.child(icon.with_size(px(size_px))),
+        Some(icon) => boxed.child(
+            icon.with_size(px(size_px))
+                .text_color(provider_brand_color(provider, fg)),
+        ),
         None => boxed,
     }
 }
 
 /// 에이전트 ID에 맞는 공식 브랜드 아이콘 요소를 만든다(관리자 페이지·탭 바·사이드바 공용).
-pub fn agent_brand_icon(agent_id: &str, size_px: f32, _fg: Hsla) -> gpui::Div {
+pub fn agent_brand_icon(agent_id: &str, size_px: f32, fg: Hsla) -> gpui::Div {
     if let Some(icon) = brands::agent_icon(agent_id) {
         return div()
             .size(px(size_px))
@@ -230,7 +233,10 @@ pub fn agent_brand_icon(agent_id: &str, size_px: f32, _fg: Hsla) -> gpui::Div {
             .flex()
             .items_center()
             .justify_center()
-            .child(icon.with_size(px(size_px)));
+            .child(
+                icon.with_size(px(size_px))
+                    .text_color(agent_brand_color(agent_id, fg)),
+            );
     }
     let other = krill_proto::agent::canonical_id(agent_id);
     let brand: Hsla = rgb(CUSTOM_AGENT_COLOR).into();
@@ -424,62 +430,50 @@ mod tests {
 
     #[test]
     fn pi_mark_is_shared_by_agent_and_menu_paths() {
-        assert_eq!(agent_svg_bytes("pi"), PI_SVG);
-        assert_ne!(agent_svg_bytes("pi"), OPENCODE_SVG);
+        assert_eq!(agent_icon_bytes("pi"), PI_SVG);
+        assert_ne!(agent_icon_bytes("pi"), OPENCODE_SVG);
         let svg = std::str::from_utf8(PI_SVG).expect("Pi SVG");
-        for color in ["#F09082", "#4D9ABF", "#F1BE58"] {
-            assert!(svg.contains(color));
-        }
+        assert!(svg.contains("currentColor"));
+        assert!(svg.contains("M165.29 165.29 H517.36"));
     }
 
     #[test]
     fn custom_menu_icon_does_not_impersonate_opencode() {
-        assert_eq!(agent_svg_bytes("opencode"), OPENCODE_SVG);
+        assert_eq!(agent_icon_bytes("opencode"), OPENCODE_SVG);
         for id in ["custom-agent", "gemini", ""] {
-            assert_eq!(agent_svg_bytes(id), CUSTOM_AGENT_SVG);
-            assert_ne!(agent_svg_bytes(id), OPENCODE_SVG);
+            assert_eq!(agent_icon_bytes(id), CUSTOM_AGENT_SVG);
+            assert_ne!(agent_icon_bytes(id), OPENCODE_SVG);
         }
     }
 
     #[gpui::test]
-    fn official_brand_sources_parse_and_keep_their_original_colors(cx: &mut gpui::TestAppContext) {
+    fn orca_brand_sources_preserve_glyphs_and_pngs(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            for provider in ProviderKind::ALL {
-                let bytes = provider_svg_bytes(provider);
-                cx.svg_renderer()
-                    .parse_svg(bytes)
-                    .expect("valid official provider SVG");
-            }
-            for agent in [
-                "claude",
-                "codex",
-                "agy",
-                "pi",
-                "cursor",
-                "opencode",
-                "custom-agent",
+            for bytes in [
+                CLAUDE_SVG,
+                OPENAI_SVG,
+                OPENCODE_SVG,
+                PI_SVG,
+                CUSTOM_AGENT_SVG,
             ] {
-                cx.svg_renderer()
-                    .parse_svg(agent_svg_bytes(agent))
-                    .expect("valid agent SVG");
+                cx.svg_renderer().parse_svg(bytes).expect("valid Orca SVG");
             }
         });
-        // 다색 원본과 흑백 원본을 임의의 유채색으로 강제하는 회귀를 막는다.
-        assert!(
-            std::str::from_utf8(ANTIGRAVITY_SVG)
-                .unwrap()
-                .contains("feGaussianBlur")
-        );
+        for bytes in [ANTIGRAVITY_PNG, CURSOR_PNG] {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        }
+        let openai = std::str::from_utf8(OPENAI_SVG).unwrap();
+        assert!(openai.contains("viewBox=\"0 0 24 24\""));
+        assert!(openai.contains("currentColor"));
         assert!(
             std::str::from_utf8(OPENCODE_SVG)
                 .unwrap()
-                .contains("#CFCECD")
+                .contains("fill-opacity=\"0.28\"")
         );
-        assert!(
-            std::str::from_utf8(OPENAI_SVG)
-                .unwrap()
-                .contains("fill=\"black\"")
-        );
+        for provider in ProviderKind::ALL {
+            assert!(brands::provider_icon(provider).is_some());
+        }
+        assert!(brands::provider_icon(ProviderKind::Gemini).is_none());
     }
 
     struct IconGallery;
@@ -571,7 +565,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn gpui_renders_official_provider_and_agent_icons_across_themes(cx: &mut gpui::TestAppContext) {
+    fn gpui_renders_orca_provider_and_agent_icons_across_themes(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         for mode in [
             gpui_component::ThemeMode::Light,

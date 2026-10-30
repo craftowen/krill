@@ -250,7 +250,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 ### 6.4 아이콘 및 에이전트 상태 인디케이터 (`ui::icons`, `ui::status`)
 
-- **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Antigravity, OpenCode, Cursor, Pi는 [`ui/icons/official/`](../crates/krill-app/src/ui/icons/official/)에 번들한 공식 SVG 원본을 사용한다. 원본의 색·그라데이션·마스크·여백·비율을 보존하는 RGB 이미지 경로로 그리고 런타임 네트워크 요청은 하지 않는다. Krill 코랄 로고는 `ui::icons::krill_brand_icon`을 사용한다.
+- **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Antigravity, OpenCode, Cursor, Pi는 Orca에서 쓰는 자산을 [`ui/icons/orca/`](../crates/krill-app/src/ui/icons/orca/)에 번들한다. Orca의 글리프 경로·색·여백·비율과 PNG 원본을 보존하며 런타임 네트워크 요청은 하지 않는다. Krill 코랄 로고는 `ui::icons::krill_brand_icon`을 사용한다.
 - **Krill 브랜드 마크 (`ui::icons::krill_brand_icon(size_px, p)`, `ui::icons::brand_mark_tile(size_px)`)**:
   - 마크는 코랄 크릴 하나로 통일한다(데스크톱·메뉴 막대 모노·모바일·웹). 사용처: 사이드바 헤더("Krill" 앞, `ICON_MD`), 빈 작업 공간 히어로(`brand_mark_tile`, 남색 `#08090e` 둥근 상자 `RADIUS_LG` 안 코랄 마크), 메뉴 막대(모노 크릴), 모바일 PWA·웹 랜딩(같은 크릴 SVG).
   - 색: 다크 바탕 `KRILL_CORAL` `#ff5238`, 라이트 바탕 `KRILL_CORAL_LIGHT` `#d63a24`(흰 바탕 4.68:1; `#ff5238`은 3.09:1). `krill_brand_icon`이 팔레트 바탕에 맞춰 고르고(`ui::icons::krill_coral(p)`), `brand_mark_tile`은 바탕이 늘 남색이라 `#ff5238`을 쓴다.
@@ -265,13 +265,13 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 ### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)
 
-프로바이더(`ProviderKind`: Claude, Codex, Antigravity, OpenCode)나 에이전트(`claude`, `codex`, `agy` / `antigravity`, `opencode`, `cursor` / `cursor-agent`, `pi`, 커스텀 에이전트)가 표기되는 모든 화면 지점은 [`ui/icons.rs`](../crates/krill-app/src/ui/icons.rs)의 공용 브랜드 아이콘 헬퍼와 **토큰화된 아이콘 크기(`ICON_*`)**를 사용한다. 공식 마크가 단색이면 그 단색을 유지한다. `ProviderKind::Gemini`는 제거된 wire tombstone(계정·사용량 화면에 미표시)이라 빈 박스로 두고, 미분류·제거된 에이전트 ID는 앰버 문자 폴백으로 그린다. 에이전트 ID·전경 프로세스 이름·제목의 독립된 `pi`/`π` 표기를 공용 `ui::status`에서 식별한다.
+프로바이더(`ProviderKind`: Claude, Codex, Antigravity, OpenCode)나 에이전트(`claude`, `codex`, `agy` / `antigravity`, `opencode`, `cursor` / `cursor-agent`, `pi`, 커스텀 에이전트)가 표기되는 모든 화면 지점은 [`ui/icons.rs`](../crates/krill-app/src/ui/icons.rs)의 공용 브랜드 아이콘 헬퍼와 **토큰화된 아이콘 크기(`ICON_*`)**를 사용한다. Codex·OpenCode·Pi의 단색 글리프는 Orca처럼 주변 텍스트의 전경색을 따른다. `ProviderKind::Gemini`는 제거된 wire tombstone(계정·사용량 화면에 미표시)이라 빈 박스로 두고, 미분류·제거된 에이전트 ID는 앰버 문자 폴백으로 그린다. 에이전트 ID·전경 프로세스 이름·제목의 독립된 `pi`/`π` 표기를 공용 `ui::status`에서 식별한다.
 
-1. **공식 원본 및 테마 변형**:
-   - 자산은 각 서비스의 공식 배포 파일을 수정 없이 [`ui/icons/official/`](../crates/krill-app/src/ui/icons/official/)에 보관한다. [`sources.json`](../crates/krill-app/src/ui/icons/official/sources.json)에 공식 페이지·다운로드 URL·압축파일 항목 또는 다운로드 payload·SHA-256·수집일을 기록한다. 출처 주석만으로 원본 일치를 주장하지 않는다.
-   - **Claude**는 공식 Spark Clay SVG, **Codex (OpenAI)**는 공식 Blossom 흑백 SVG, **Antigravity**는 공식 Full Color SVG, **OpenCode**는 공식 정사각 로고 SVG, **Cursor**는 공식 2D Cube SVG, **Pi**는 공식 primary logo SVG를 쓴다.
-   - OpenAI·OpenCode·Cursor는 배경에 맞는 공식 light/dark 파일을 선택한다. 색을 임의로 입히거나 시인성을 이유로 원본 색을 바꾸지 않는다. Antigravity의 그라데이션·블러·마스크, OpenCode의 두 색, Pi의 세 색도 원본대로 보존한다. 경로를 다시 그리거나 별도 하이라이트 레이어를 합성하지 않는다.
-   - SVG의 viewBox·내부 여백·가로세로비를 유지한다. `img`의 contain 방식으로 토큰 크기의 상자 안에 맞추고, 꽉 채우려고 자르거나 늘이지 않는다.
+1. **Orca 자산 및 테마 처리**:
+   - 자산은 Orca의 `components/status-bar/icons.tsx`, `lib/agent-icon-glyphs.tsx`, `src/shared/agent-icons/`에서 가져와 [`ui/icons/orca/`](../crates/krill-app/src/ui/icons/orca/)에 보관한다. [`sources.json`](../crates/krill-app/src/ui/icons/orca/sources.json)에 원본 리비전·경로·변환 내용·SHA-256을 기록하고 MIT 라이선스를 함께 보존한다.
+   - **Claude**는 Orca의 Clay 스파크, **Codex (OpenAI)**는 24×24 블로섬 글리프, **OpenCode**는 내부 블록 투명도 0.28을 포함한 글리프, **Pi**는 단색 π 글리프를 쓴다. JSX를 SVG로 옮길 때 경로·fill·viewBox를 그대로 유지한다.
+   - Codex·OpenCode·Pi는 `currentColor`를 테마·선택·비활성 전경색에 맞춰 그린다. Claude는 `#D97757`을 유지한다. **Antigravity·Cursor**는 Orca의 PNG 원본을 RGB 이미지로 그린다. 경로를 다시 그리거나 별도 하이라이트를 합성하지 않는다.
+   - SVG의 viewBox·내부 여백·가로세로비와 PNG 비율을 유지한다. 토큰 크기의 상자 안에 맞추고, 꽉 채우려고 자르거나 늘이지 않는다.
    - **커스텀 / 미분류 에이전트**만 `CUSTOM_AGENT_COLOR` (`#F59E0B`, 일반 요소는 앰버 문자, 메뉴는 중립 봇 `CUSTOM_AGENT_SVG`) 폴백을 쓴다.
 2. **아이콘 크기 토큰 (`crate::ui::ICON_*`)**:
    - `ICON_XS` (`12px`): 고밀도 인라인 배지 — 사이드바 세션 행(`session_row`), 관리자 계정 행 프로바이더 배지, AI Vault / Jump 에이전트 필터 칩
@@ -280,8 +280,8 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
    - `ICON_LG` (`16px`): 섹션 머리글 — 관리자 > 계정(`Accounts`) 프로바이더 섹션 헤더
    - `ICON_XL` (`18px`): 프로필 아바타 — 관리자 > 에이전트(`Agents`) 프로필 카드(32×32px 타일 내부)
 3. **렌더링 헬퍼 선택 및 텍스트 병기 원칙**:
-   - 일반 `div` 자식에는 공식 원본을 RGB 이미지로 그리는 `ui::icons::provider_icon(provider, size_px, fallback)` / `ui::icons::agent_brand_icon(agent_id, size_px, fallback)`을 사용한다.
-   - 버튼·메뉴도 동일한 공식 원본을 RGB 이미지로 그린다. 알파 마스크에 단색을 입히는 `gpui_component::Icon` 경로는 다색 원본을 보존하지 못하므로 브랜드 자산에는 사용하지 않는다. `ui::icons::provider_menu_icon(provider)` / `ui::icons::agent_menu_icon(agent_id)`은 `Icon::image_variants`를 사용하며 `Button::icon`·`PopupMenuItem::icon`·`PopupMenu::submenu_with_icon` 슬롯에 그대로 넣는다.
+   - 일반 `div` 자식에는 공용 Orca 자산을 그리는 `ui::icons::provider_icon(provider, size_px, fallback)` / `ui::icons::agent_brand_icon(agent_id, size_px, fallback)`을 사용한다.
+   - 버튼·메뉴도 동일한 Orca 자산을 쓴다. `ui::icons::provider_menu_icon(provider)` / `ui::icons::agent_menu_icon(agent_id)`은 SVG 글리프에는 `Icon::data`, PNG에는 `Icon::image_variants`를 사용하며 `Button::icon`·`PopupMenuItem::icon`·`PopupMenu::submenu_with_icon` 슬롯에 그대로 넣는다.
    - **텍스트 유지/대체 기준**: 탭·사이드바 세션 행·워크트리 요약 알약처럼 세션/워크트리 제목이 함께 표시되는 고밀도 영역은 공식 아이콘만으로 에이전트를 식별하고, 메뉴 항목·설정 섹션 헤더·필터 칩·온보딩 선택지처럼 명확한 이름 식별이나 접근성이 필요한 곳은 `[공식 아이콘 + 텍스트]`를 함께 표기한다.
    - 제3자 상표·아이콘 출처 고지는 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)(`docs/licensing/generate_notices.py`)에 유지한다.
 

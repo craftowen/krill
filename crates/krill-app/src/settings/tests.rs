@@ -1210,23 +1210,18 @@ fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
 fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
     use krill_proto::usage::{ProviderKind, UsageRequest};
 
-    for provider in [
-        ProviderKind::Claude,
-        ProviderKind::Codex,
-        ProviderKind::Antigravity,
-        ProviderKind::OpenCode,
-    ] {
+    for provider in ProviderKind::ALL {
+        let bytes = crate::ui::icons::provider_icon_bytes(provider);
         assert!(
-            std::str::from_utf8(crate::ui::icons::provider_svg_bytes(provider))
-                .is_ok_and(|svg| svg.contains("<svg")),
-            "missing svg for {provider:?}"
+            bytes.starts_with(b"<svg") || bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "missing Orca asset for {provider:?}"
         );
     }
-    for agent_id in ["claude", "codex", "agy", "cursor", "opencode"] {
+    for agent_id in ["claude", "codex", "agy", "cursor", "opencode", "pi"] {
+        let bytes = crate::ui::icons::agent_icon_bytes(agent_id);
         assert!(
-            std::str::from_utf8(crate::ui::icons::agent_svg_bytes(agent_id))
-                .is_ok_and(|svg| svg.contains("<svg")),
-            "missing svg for {agent_id}"
+            bytes.starts_with(b"<svg") || bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "missing Orca asset for {agent_id}"
         );
     }
     assert!(crate::ui::icons::KRILL_SVG.starts_with(b"<svg"));
