@@ -822,3 +822,53 @@ fn cleanup_removes_nothing_when_the_daemon_cannot_report_sessions() {
     assert!(no_daemon.status.success(), "{no_daemon:?}");
     assert!(!busy.exists(), "{no_daemon:?}");
 }
+
+#[test]
+fn cleanup_preview_shows_worktrees_with_running_sessions_as_skipped() {
+    let f = Fixture::new("cleanup-preview");
+    let (busy, idle, session) = busy_and_idle_worktrees(&f);
+    let repo = f.repo.to_str().unwrap();
+
+    let preview = krill_in(
+        &f.state,
+        &["worktree", "cleanup", "--repo", repo, "--pr", "any"],
+    );
+    assert!(preview.status.success(), "{preview:?}");
+    let stdout = String::from_utf8_lossy(&preview.stdout);
+    let line = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} missing from preview:\n{stdout}"))
+    };
+    assert!(line("wt-busy").contains("running session"), "{stdout}");
+    assert!(!line("wt-idle").contains("skipped"), "{stdout}");
+
+    let json = krill_in(
+        &f.state,
+        &[
+            "worktree", "cleanup", "--repo", repo, "--pr", "any", "--json",
+        ],
+    );
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let skipped: Vec<&str> = report["summary"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| {
+            i["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("running session"))
+        })
+        .filter_map(|i| i["path"].as_str())
+        .collect();
+    assert!(
+        skipped.len() == 1 && skipped[0].ends_with("wt-busy"),
+        "{report}"
+    );
+    assert!(busy.exists() && idle.exists(), "a preview removes nothing");
+
+    let killed = krill_in(&f.state, &["kill", &session]);
+    assert!(killed.status.success(), "{killed:?}");
+}
