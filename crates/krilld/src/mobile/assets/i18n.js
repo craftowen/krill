@@ -3,6 +3,15 @@
   const M = (globalThis.KrillMobile ||= {});
   let language = "en";
   const ko = {
+    "Requested {0}": "요청한 설정 {0}",
+    "Context usage unknown": "컨텍스트 사용량 확인 불가",
+    "Context used {0}%": "컨텍스트 {0}% 사용",
+    "No model catalog is available. Open the model picker in Term.": "모델 목록을 불러올 수 없습니다. 터미널에서 모델을 선택하세요.",
+    "Applying…": "적용 중…",
+    "Effort unknown": "사고 수준 확인 불가",
+    "Model unknown": "모델 확인 불가",
+    "Model and effort": "모델 및 사고 수준",
+    "Effort": "사고 수준",
     "This pairing code is invalid. Scan a fresh QR code from desktop Settings → Mobile.": "올바르지 않은 페어링 코드입니다. 데스크톱 설정 → 모바일에서 새 QR 코드를 스캔하세요.",
     "Desktop backup added.": "데스크톱의 예비 연결을 추가했습니다.",
     "Pair this desktop again?": "이 데스크톱을 다시 페어링할까요?",

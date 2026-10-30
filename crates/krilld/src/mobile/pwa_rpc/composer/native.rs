@@ -1,4 +1,4 @@
-//! Verified Codex 0.164 direct /model argument semantics. Unknown layouts fail closed.
+//! Verified Codex 0.164/0.165 direct /model argument semantics. Unknown layouts fail closed.
 use krill_proto::screen::{Flags, Screen};
 
 pub(super) fn row(screen: &Screen, y: usize) -> String {
@@ -14,11 +14,22 @@ pub(super) fn row(screen: &Screen, y: usize) -> String {
 }
 
 pub(super) fn verified(screen: &Screen) -> bool {
-    screen
-        .rows
-        .iter()
-        .enumerate()
-        .any(|(y, _)| row(screen, y).trim() == ">_ OpenAI Codex (v0.164.0)")
+    screen.rows.iter().enumerate().any(|(y, _)| {
+        matches!(
+            row(screen, y).trim(),
+            ">_ OpenAI Codex (v0.164.0)" | ">_ OpenAI Codex (v0.165.0)"
+        )
+    })
+}
+
+pub(super) fn effort(screen: &Screen) -> Option<String> {
+    let footer = row(screen, usize::from(screen.cursor.line) + 2);
+    let (model, _) = footer.split_once(" · ")?;
+    model
+        .split_whitespace()
+        .last()
+        .filter(|effort| super::valid_effort(effort))
+        .map(str::to_owned)
 }
 
 pub(super) fn composer(screen: &Screen, command: Option<&str>) -> bool {
@@ -241,5 +252,25 @@ mod tests {
         );
         assert!(!latest_confirmation(&before, "model-a"));
         assert!(latest_confirmation(&after, "model-a"));
+    }
+    #[test]
+    fn effort_is_read_from_the_verified_native_footer_only() {
+        let mut current = screen("");
+        current.rows[4] = "  Actual model xhigh · /workspace"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        assert_eq!(effort(&current).as_deref(), Some("xhigh"));
+        current.rows[4] = "arbitrary assistant response high"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        assert!(effort(&current).is_none());
     }
 }

@@ -2359,9 +2359,14 @@ async function recoveryPaint() {
     "legacy",
   ]) {
     for (const failure of ["unbound", "throw", "null"]) {
+      const earlierResponse = (req) => origin === "nested-history" && req.end_offset === P
+        ? page(P - 1, P, [row(4)])
+        : page(0, 0, [], { bound: false, reset: true });
       const f = fixture({
         capabilities: { chat_tail: true },
-        handler: async () => page(P, E, [row(5), row(6)]),
+        handler: async (req) => req.end_offset !== undefined
+          ? earlierResponse(req)
+          : page(P, E, [row(5), row(6)]),
       });
       await flush();
       if (origin === "nested-history") {
@@ -2385,6 +2390,7 @@ async function recoveryPaint() {
         live = f.entry.live;
       let n = 0;
       f.handler = async (req) => {
+        if (req.end_offset !== undefined) return earlierResponse(req);
         n++;
         if (
           (origin === "live" || origin === "legacy") &&
@@ -2429,6 +2435,7 @@ async function recoveryPaint() {
         assert.deepEqual(f.entry.items, old);
       }
       f.handler = async (req) => {
+        if (req.end_offset !== undefined) return earlierResponse(req);
         assert.equal(req.offset, 0);
         assert.equal(req.latest, origin === "legacy" ? undefined : true);
         return page(100, E + 1, [row(100)]);
@@ -2730,6 +2737,7 @@ async function liveQuestionSheet() {
 
 
 async function main() {
+  await require("./chat_release_ui.cjs")({fixture,flush,deferred,scroll,historyPage});
   await liveQuestionSheet();
   await recoveryPaint();
   await recoveryOwnership();
